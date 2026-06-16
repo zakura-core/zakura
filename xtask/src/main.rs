@@ -7,16 +7,14 @@ use std::{
     process::{Command, ExitStatus},
 };
 
-const DEFAULT_FEATURES: &str = "default-release-binaries tx_v6";
+const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
 const DEFAULT_RUST_VERSION: &str = "1.91";
 const DEFAULT_IMAGE_TAG: &str = "zebra-ubuntu-package:local";
 const OUTPUT_BINARY_NAME: &str = "zebra";
 
-// Enable the NU6.3 + NSM (ZIP-235) consensus paths gated behind the `zcash_unstable`
-// custom cfg. Multiple `--cfg key="value"` flags compose: `cfg(zcash_unstable = "X")`
-// passes if any of the supplied values matches.
-const DEFAULT_RUSTFLAGS: &str = "--cfg zcash_unstable=\"nu6.3\" --cfg zcash_unstable=\"zip235\"";
+// Enable the NU6.3 consensus paths gated behind the `zcash_unstable` custom cfg.
+const DEFAULT_RUSTFLAGS: &str = "--cfg zcash_unstable=\"nu6.3\"";
 
 type BoxError = Box<dyn Error>;
 
@@ -246,6 +244,6 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "(NU6.3 + NSM/ZIP-235 paths), and writes the binary to target/ubuntu/{OUTPUT_BINARY_NAME}.",
+        "(NU6.3 paths), and writes the binary to target/ubuntu/{OUTPUT_BINARY_NAME}.",
     )
 }

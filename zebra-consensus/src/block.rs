@@ -239,6 +239,13 @@ where
             // Next, check the Merkle root validity, to ensure that
             // the header binds to the transactions in the blocks.
 
+            // Reject non-canonical shielded proof sizes before computing
+            // transaction hashes, because V6 hashes are delegated to
+            // librustzcash, which expects canonical proof sizes.
+            for transaction in block.transactions.iter() {
+                tx::check::shielded_proof_size_is_canonical(transaction, height, &network)?;
+            }
+
             // Precomputing this avoids duplicating transaction hash computations.
             let transaction_hashes: Arc<[_]> =
                 block.transactions.iter().map(|t| t.hash()).collect();

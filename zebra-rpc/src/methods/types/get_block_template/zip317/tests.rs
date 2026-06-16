@@ -34,7 +34,8 @@ fn excludes_tx_with_unselected_dependencies() {
             &MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20]))),
             vec![unmined_tx],
             mempool_tx_deps,
-        ),
+        )
+        .expect("transaction selection should succeed"),
         vec![],
         "should not select any transactions when dependencies are unavailable"
     );
@@ -73,7 +74,8 @@ fn includes_tx_with_selected_dependencies() {
         &MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20]))),
         unmined_txs.clone(),
         mempool_tx_deps.clone(),
-    );
+    )
+    .expect("transaction selection should succeed");
 
     assert_eq!(
         selected_txs.len(),

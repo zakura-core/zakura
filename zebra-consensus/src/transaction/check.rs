@@ -12,7 +12,7 @@ use std::{
 use chrono::{DateTime, Utc};
 
 use zebra_chain::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative},
     block::Height,
     orchard::Flags,
     parameters::{Network, NetworkUpgrade},
@@ -147,6 +147,55 @@ pub fn has_enough_orchard_flags(tx: &Transaction) -> Result<(), TransactionError
     Ok(())
 }
 
+/// Check that Ironwood actions have at least one active flag.
+pub fn has_enough_ironwood_flags(tx: &Transaction) -> Result<(), TransactionError> {
+    if !tx.has_enough_ironwood_flags() {
+        return Err(TransactionError::NotEnoughIronwoodFlags);
+    }
+    Ok(())
+}
+
+/// Checks that Orchard shielded data does not enable cross-address transfers.
+///
+/// In the NU6.3 flag format, bit 2 is `enableCrossAddress`. The Orchard pool uses the Ironwood
+/// circuit in V6 transactions, but consensus still requires transactional Orchard bundles to keep
+/// cross-address transfers disabled. Ironwood shielded data is allowed to set this flag.
+pub fn orchard_cross_address_disabled(tx: &Transaction) -> Result<(), TransactionError> {
+    if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
+        if orchard_shielded_data
+            .flags
+            .contains(Flags::ENABLE_CROSS_ADDRESS)
+        {
+            return Err(TransactionError::OrchardHasEnableCrossAddress);
+        }
+    }
+
+    Ok(())
+}
+
+/// Checks that shielded proof sizes are canonical when the proof-size rule is active.
+pub fn shielded_proof_size_is_canonical(
+    tx: &Transaction,
+    height: Height,
+    network: &Network,
+) -> Result<(), TransactionError> {
+    if network.orchard_canonical_proof_size_rule_active(height) {
+        if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
+            if !orchard_shielded_data.proof_size_is_canonical() {
+                return Err(TransactionError::OrchardProofSize);
+            }
+        }
+
+        if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
+            if !ironwood_shielded_data.proof_size_is_canonical() {
+                return Err(TransactionError::IronwoodProofSize);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Check that a coinbase transaction has no PrevOut inputs, JoinSplits, or spends.
 ///
 /// # Consensus
@@ -175,6 +224,12 @@ pub fn coinbase_tx_no_prevout_joinsplit_spend(tx: &Transaction) -> Result<(), Tr
         if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
             if orchard_shielded_data.flags.contains(Flags::ENABLE_SPENDS) {
                 return Err(TransactionError::CoinbaseHasEnableSpendsOrchard);
+            }
+        }
+
+        if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
+            if ironwood_shielded_data.flags.contains(Flags::ENABLE_SPENDS) {
+                return Err(TransactionError::CoinbaseHasEnableSpendsIronwood);
             }
         }
     }
@@ -239,6 +294,30 @@ pub fn disabled_add_to_sprout_pool(
     Ok(())
 }
 
+/// Check if a transaction is adding value to the Orchard pool after NU6.3 activation.
+///
+/// This is a net value balance rule. Negative `valueBalanceOrchard` adds value
+/// to the Orchard chain pool, so it is rejected. Positive values withdraw from
+/// Orchard, and zero leaves the Orchard chain pool unchanged even if the
+/// transaction has both Orchard spends and outputs.
+pub fn disabled_add_to_orchard_pool(
+    tx: &Transaction,
+    height: Height,
+    network: &Network,
+) -> Result<(), TransactionError> {
+    let Some(nu6_3_activation_height) = NetworkUpgrade::Nu6_3.activation_height(network) else {
+        return Ok(());
+    };
+
+    let zero = Amount::<NegativeAllowed>::zero();
+
+    if height >= nu6_3_activation_height && tx.orchard_value_balance().orchard_amount() < zero {
+        return Err(TransactionError::DisabledAddToOrchardPool);
+    }
+
+    Ok(())
+}
+
 /// Check if a transaction has any internal spend conflicts.
 ///
 /// An internal spend conflict happens if the transaction spends a UTXO more than once or if it
@@ -265,11 +344,13 @@ pub fn spend_conflicts(transaction: &Transaction) -> Result<(), TransactionError
     let sprout_nullifiers = transaction.sprout_nullifiers().map(Cow::Borrowed);
     let sapling_nullifiers = transaction.sapling_nullifiers().map(Cow::Borrowed);
     let orchard_nullifiers = transaction.orchard_nullifiers().map(Cow::Borrowed);
+    let ironwood_nullifiers = transaction.ironwood_nullifiers().map(Cow::Borrowed);
 
     check_for_duplicates(transparent_outpoints, DuplicateTransparentSpend)?;
     check_for_duplicates(sprout_nullifiers, DuplicateSproutNullifier)?;
     check_for_duplicates(sapling_nullifiers, DuplicateSaplingNullifier)?;
     check_for_duplicates(orchard_nullifiers, DuplicateOrchardNullifier)?;
+    check_for_duplicates(ironwood_nullifiers, DuplicateIronwoodNullifier)?;
 
     Ok(())
 }

@@ -17,6 +17,8 @@ use halo2::pasta::{group::ff::PrimeField, pallas};
 use tokio::time::timeout;
 use tower::{buffer::Buffer, service_fn, ServiceExt};
 
+#[cfg(zcash_unstable = "nu6.3")]
+use zebra_chain::{amount::NegativeAllowed, ironwood, orchard, primitives::Halo2Proof};
 use zebra_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, Height},
@@ -125,6 +127,284 @@ fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
 
         assert!(check::has_inputs_and_outputs(&tx).is_ok());
     }
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn nu6_3_test_network_and_height() -> (Network, Height) {
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            ..Default::default()
+        })
+        .expect("failed to set NU6.3 activation height")
+        .clear_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+
+    (network, Height(1))
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn orchard_fixture() -> orchard::ShieldedData {
+    let default_testnet = Network::new_default_testnet();
+
+    v5_transactions(default_testnet.block_iter())
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include a transaction with Orchard shielded data")
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn orchard_shielded_data(value_balance: i64, flags: Flags) -> orchard::ShieldedData {
+    let mut shielded_data = orchard_fixture();
+    shielded_data.value_balance =
+        Amount::<NegativeAllowed>::try_from(value_balance).expect("valid test amount");
+    shielded_data.flags = flags;
+
+    shielded_data
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn ironwood_shielded_data(value_balance: i64, flags: ironwood::Flags) -> ironwood::ShieldedData {
+    let mut shielded_data = orchard_fixture();
+    shielded_data.value_balance =
+        Amount::<NegativeAllowed>::try_from(value_balance).expect("valid test amount");
+    shielded_data.flags = flags;
+
+    shielded_data
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn v6_pool_flow_transaction(
+    orchard_shielded_data: Option<orchard::ShieldedData>,
+    ironwood_shielded_data: Option<ironwood::ShieldedData>,
+    transparent_outputs: Vec<transparent::Output>,
+) -> Transaction {
+    Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(block::Height(0)),
+        expiry_height: Height(1),
+        inputs: vec![],
+        outputs: transparent_outputs,
+        sapling_shielded_data: None,
+        orchard_shielded_data,
+        ironwood_shielded_data,
+    }
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn transparent_output(value: u64) -> transparent::Output {
+    transparent::Output {
+        value: Amount::<NonNegative>::try_from(value).expect("valid test amount"),
+        lock_script: transparent::Script::new(&[1, 1]),
+    }
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn empty_utxos() -> HashMap<transparent::OutPoint, transparent::Utxo> {
+    HashMap::new()
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+#[test]
+fn orchard_rejects_net_deposits_after_nu6_3() {
+    let (network, height) = nu6_3_test_network_and_height();
+
+    let orchard_withdraw = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(10, Flags::ENABLE_SPENDS)),
+        None,
+        vec![transparent_output(10)],
+    );
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&orchard_withdraw, height, &network),
+        Ok(())
+    );
+    assert_eq!(check::has_inputs_and_outputs(&orchard_withdraw), Ok(()));
+    assert_eq!(
+        orchard_withdraw
+            .value_balance(&empty_utxos())
+            .expect("valid value balance")
+            .remaining_transaction_value(),
+        Ok(Amount::<NonNegative>::zero())
+    );
+
+    let orchard_no_flow = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(
+            0,
+            Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+        )),
+        None,
+        vec![],
+    );
+
+    // Zero value balance leaves the Orchard chain pool unchanged, so Orchard
+    // spends and outputs in the same transaction remain valid after NU6.3.
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&orchard_no_flow, height, &network),
+        Ok(())
+    );
+
+    let orchard_deposit = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(-10, Flags::ENABLE_OUTPUTS)),
+        None,
+        vec![],
+    );
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&orchard_deposit, height, &network),
+        Err(TransactionError::DisabledAddToOrchardPool)
+    );
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+#[test]
+fn orchard_cross_address_flag_is_disabled_after_nu6_3() {
+    let orchard_cross_address = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(
+            0,
+            Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS | Flags::ENABLE_CROSS_ADDRESS,
+        )),
+        None,
+        vec![],
+    );
+
+    assert_eq!(
+        check::orchard_cross_address_disabled(&orchard_cross_address),
+        Err(TransactionError::OrchardHasEnableCrossAddress)
+    );
+
+    let ironwood_cross_address = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(
+            0,
+            ironwood::Flags::ENABLE_SPENDS
+                | ironwood::Flags::ENABLE_OUTPUTS
+                | ironwood::Flags::ENABLE_CROSS_ADDRESS,
+        )),
+        vec![],
+    );
+
+    assert_eq!(
+        check::orchard_cross_address_disabled(&ironwood_cross_address),
+        Ok(())
+    );
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+#[test]
+fn orchard_to_ironwood_migration_balances() {
+    let (network, height) = nu6_3_test_network_and_height();
+    let tx = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(10, Flags::ENABLE_SPENDS)),
+        Some(ironwood_shielded_data(-10, ironwood::Flags::ENABLE_OUTPUTS)),
+        vec![],
+    );
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&tx, height, &network),
+        Ok(())
+    );
+    assert_eq!(check::has_inputs_and_outputs(&tx), Ok(()));
+
+    let value_balance = tx
+        .value_balance(&empty_utxos())
+        .expect("valid value balance");
+
+    assert_eq!(
+        value_balance.orchard_amount(),
+        Amount::<NegativeAllowed>::try_from(10).expect("valid test amount")
+    );
+    assert_eq!(
+        value_balance.ironwood_amount(),
+        Amount::<NegativeAllowed>::try_from(-10).expect("valid test amount")
+    );
+    assert_eq!(
+        value_balance.remaining_transaction_value(),
+        Ok(Amount::<NonNegative>::zero())
+    );
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+#[test]
+fn ironwood_withdraw_balances() {
+    let tx = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(10, ironwood::Flags::ENABLE_SPENDS)),
+        vec![transparent_output(10)],
+    );
+
+    assert_eq!(check::has_inputs_and_outputs(&tx), Ok(()));
+
+    let value_balance = tx
+        .value_balance(&empty_utxos())
+        .expect("valid value balance");
+
+    assert_eq!(
+        value_balance.transparent_amount(),
+        Amount::<NegativeAllowed>::try_from(-10).expect("valid test amount")
+    );
+    assert_eq!(
+        value_balance.ironwood_amount(),
+        Amount::<NegativeAllowed>::try_from(10).expect("valid test amount")
+    );
+    assert_eq!(
+        value_balance.remaining_transaction_value(),
+        Ok(Amount::<NonNegative>::zero())
+    );
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+#[tokio::test]
+async fn v6_with_padded_orchard_proof_returns_consensus_error() {
+    let (network, height) = nu6_3_test_network_and_height();
+    let mut orchard_shielded_data =
+        orchard_shielded_data(0, Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS);
+    orchard_shielded_data.proof.0.push(0);
+
+    let transaction = v6_pool_flow_transaction(Some(orchard_shielded_data), None, vec![]);
+
+    let state_service =
+        service_fn(|_| async { unreachable!("State service should not be called") });
+    let result = Verifier::new_for_tests(&network, state_service)
+        .oneshot(Request::Block {
+            transaction_hash: Hash::from([0; 32]),
+            transaction: Arc::new(transaction),
+            known_utxos: Arc::new(HashMap::new()),
+            known_outpoint_hashes: Arc::new(HashSet::new()),
+            height,
+            time: DateTime::<Utc>::MAX_UTC,
+        })
+        .await;
+
+    assert_eq!(result, Err(TransactionError::OrchardProofSize));
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+#[tokio::test]
+async fn v6_with_padded_ironwood_proof_returns_consensus_error() {
+    let (network, height) = nu6_3_test_network_and_height();
+    let mut ironwood_shielded_data = ironwood_shielded_data(
+        0,
+        ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
+    );
+    ironwood_shielded_data.proof.0.push(0);
+
+    let transaction = v6_pool_flow_transaction(None, Some(ironwood_shielded_data), vec![]);
+
+    let state_service =
+        service_fn(|_| async { unreachable!("State service should not be called") });
+    let result = Verifier::new_for_tests(&network, state_service)
+        .oneshot(Request::Block {
+            transaction_hash: Hash::from([0; 32]),
+            transaction: Arc::new(transaction),
+            known_utxos: Arc::new(HashMap::new()),
+            known_outpoint_hashes: Arc::new(HashSet::new()),
+            height,
+            time: DateTime::<Utc>::MAX_UTC,
+        })
+        .await;
+
+    assert_eq!(result, Err(TransactionError::IronwoodProofSize));
 }
 
 #[test]
@@ -3815,6 +4095,58 @@ fn coinbase_outputs_are_decryptable_for_fake_v5_blocks() {
                 Ok(())
             );
         }
+    }
+}
+
+/// Test that V6 Ironwood coinbase outputs use the NU6.3 flag format during zero-key recovery.
+#[cfg(zcash_unstable = "nu6.3")]
+#[test]
+fn coinbase_outputs_are_decryptable_for_v6_ironwood() {
+    let (network, height) = nu6_3_test_network_and_height();
+
+    for v in zebra_test::vectors::ORCHARD_NOTE_ENCRYPTION_ZERO_VECTOR.iter() {
+        let mut fixture = v5_transactions(Network::new_default_testnet().block_iter())
+            .find(|tx| tx.is_coinbase())
+            .expect("coinbase V5 tx");
+
+        let shielded_data = insert_fake_orchard_shielded_data(&mut fixture);
+        shielded_data.flags =
+            ironwood::Flags::ENABLE_OUTPUTS | ironwood::Flags::ENABLE_CROSS_ADDRESS;
+        shielded_data.value_balance =
+            Amount::<NegativeAllowed>::try_from(-1).expect("valid test amount");
+
+        let action =
+            fill_action_with_note_encryption_test_vector(&shielded_data.actions.first().action, v);
+        let sig = shielded_data.actions.first().spend_auth_sig;
+        shielded_data.actions = vec![AuthorizedAction::from_parts(action, sig)]
+            .try_into()
+            .unwrap();
+        shielded_data.proof = Halo2Proof(vec![
+            0;
+            ::orchard::Proof::expected_proof_size(
+                shielded_data.actions.len()
+            )
+        ]);
+
+        let transaction = Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu6_3,
+            lock_time: LockTime::Height(Height(0)),
+            expiry_height: height,
+            inputs: vec![transparent::Input::Coinbase {
+                height,
+                data: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: Some(shielded_data.clone()),
+        };
+
+        assert_eq!(
+            check::coinbase_outputs_are_decryptable(&transaction, &network, height),
+            Ok(())
+        );
     }
 }
 

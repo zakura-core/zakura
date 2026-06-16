@@ -5,7 +5,16 @@
 use color_eyre::eyre::{eyre, Report};
 use once_cell::sync::Lazy;
 use tower::{buffer::Buffer, util::BoxService};
+#[cfg(zcash_unstable = "nu6.3")]
+use tower::{service_fn, ServiceExt};
 
+#[cfg(zcash_unstable = "nu6.3")]
+use zebra_chain::{
+    amount::NegativeAllowed,
+    ironwood, orchard,
+    parameters::testnet::{ConfiguredActivationHeights, Parameters},
+    transaction::arbitrary::v5_transactions,
+};
 use zebra_chain::{
     amount::{DeferredPoolBalanceChange, MAX_MONEY},
     block::{
@@ -574,6 +583,204 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
     );
 
     Ok(())
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+#[test]
+fn miner_fees_validation_includes_ironwood_balance() {
+    let _init_guard = zebra_test::init();
+
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            ..Default::default()
+        })
+        .expect("failed to set NU6.3 activation height")
+        .clear_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let height = Height(1);
+    let output_value = Amount::try_from(10).expect("valid test amount");
+    let coinbase_tx = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(Height(0)),
+        expiry_height: height,
+        inputs: vec![transparent::Input::Coinbase {
+            height,
+            data: vec![],
+            sequence: u32::MAX,
+        }],
+        outputs: vec![transparent::Output {
+            value: output_value,
+            lock_script: transparent::Script::new(&[0]),
+        }],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood_shielded_data(1)),
+    };
+
+    assert_eq!(
+        check::miner_fees_are_valid(
+            &coinbase_tx,
+            height,
+            Amount::zero(),
+            output_value,
+            DeferredPoolBalanceChange::zero(),
+            &network,
+        ),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::InvalidMinerFees,
+        )))
+    );
+
+    assert_eq!(
+        check::miner_fees_are_valid(
+            &coinbase_tx,
+            height,
+            Amount::zero(),
+            Amount::try_from(9).expect("valid test amount"),
+            DeferredPoolBalanceChange::zero(),
+            &network,
+        ),
+        Ok(())
+    );
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+#[tokio::test]
+async fn padded_v6_orchard_proof_returns_consensus_error_before_block_hashes() {
+    let (network, block) = block_with_padded_v6_shielded_data(true);
+
+    let state_service = service_fn(|request| async move {
+        match request {
+            zs::Request::KnownBlock(_) => Ok::<_, BoxError>(zs::Response::KnownBlock(None)),
+            _ => unreachable!("state service should only check if the block is known"),
+        }
+    });
+    let transaction_verifier = service_fn(|_: transaction::Request| async {
+        Err::<transaction::Response, BoxError>("transaction verifier should not be called".into())
+    });
+
+    let result = SemanticBlockVerifier::new(&network, state_service, transaction_verifier)
+        .oneshot(Request::CheckProposal(Arc::new(block)))
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(VerifyBlockError::Transaction(
+                TransactionError::OrchardProofSize
+            ))
+        ),
+        "unexpected result: {result:?}"
+    );
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+#[tokio::test]
+async fn padded_v6_ironwood_proof_returns_consensus_error_before_block_hashes() {
+    let (network, block) = block_with_padded_v6_shielded_data(false);
+
+    let state_service = service_fn(|request| async move {
+        match request {
+            zs::Request::KnownBlock(_) => Ok::<_, BoxError>(zs::Response::KnownBlock(None)),
+            _ => unreachable!("state service should only check if the block is known"),
+        }
+    });
+    let transaction_verifier = service_fn(|_: transaction::Request| async {
+        Err::<transaction::Response, BoxError>("transaction verifier should not be called".into())
+    });
+
+    let result = SemanticBlockVerifier::new(&network, state_service, transaction_verifier)
+        .oneshot(Request::CheckProposal(Arc::new(block)))
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(VerifyBlockError::Transaction(
+                TransactionError::IronwoodProofSize
+            ))
+        ),
+        "unexpected result: {result:?}"
+    );
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn block_with_padded_v6_shielded_data(use_orchard: bool) -> (Network, Block) {
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            ..Default::default()
+        })
+        .expect("failed to set NU6.3 activation height")
+        .clear_funding_streams()
+        .with_disable_pow(true)
+        .to_network()
+        .expect("failed to build configured network");
+    let height = Height(1);
+    let coinbase_tx = Arc::new(Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(Height(0)),
+        expiry_height: height,
+        inputs: vec![transparent::Input::Coinbase {
+            height,
+            data: vec![],
+            sequence: u32::MAX,
+        }],
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+    });
+
+    let (orchard_shielded_data, ironwood_shielded_data) = if use_orchard {
+        let mut shielded_data = orchard_shielded_data(0);
+        shielded_data.proof.0.push(0);
+        (Some(shielded_data), None)
+    } else {
+        let mut shielded_data = ironwood_shielded_data(0);
+        shielded_data.proof.0.push(0);
+        (None, Some(shielded_data))
+    };
+
+    let shielded_tx = Arc::new(Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(Height(0)),
+        expiry_height: height,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data,
+        ironwood_shielded_data,
+    });
+
+    let header = Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+        .expect("genesis block should deserialize")
+        .header;
+    let block = Block {
+        header,
+        transactions: vec![coinbase_tx, shielded_tx],
+    };
+
+    (network, block)
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn orchard_shielded_data(value_balance: i64) -> orchard::ShieldedData {
+    let mut shielded_data = v5_transactions(Network::new_default_testnet().block_iter())
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include a transaction with Orchard shielded data");
+
+    shielded_data.value_balance =
+        Amount::<NegativeAllowed>::try_from(value_balance).expect("valid test amount");
+
+    shielded_data
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn ironwood_shielded_data(value_balance: i64) -> ironwood::ShieldedData {
+    orchard_shielded_data(value_balance)
 }
 
 #[test]

@@ -81,6 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Parallelize NU5-onward block auth-data-root computation across transactions,
   reducing contextual validation time for blocks with many or large shielded
   transactions.
+- Align V6 Orchard and Ironwood flag parsing and proof verification with the
+  Ironwood circuit and NU6.3 flag format.
 - Use V3 chain history metadata from NU6.3 onward, including Ironwood note
   commitment tree roots and Ironwood transaction counts in FlyClient history
   tree leaves.

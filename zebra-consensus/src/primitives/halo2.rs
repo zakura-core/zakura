@@ -50,19 +50,20 @@ type Sender = watch::Sender<Option<VerifyResult>>;
 /// This is the key used to verify individual items.
 pub type ItemVerifyingKey = VerifyingKey;
 
-// NU6.2 re-enables Orchard actions and ships the *fixed* variable-base
-// scalar-multiplication Orchard circuit (the circuit bug that caused Orchard to be temporarily
-// disabled; see GHSA-jfw5-j458-pfv6). The fix changes the Orchard Action circuit, and therefore
-// its verifying key: a proof produced under one circuit version does not verify under the other
-// key. So we keep BOTH keys, each in its own dedicated verifier, and route each bundle to the
-// correct verifier by the block's network upgrade (see [`verifier_for`]):
+// The Orchard Action circuit, and therefore its verifying key, changes across protocol eras.
+// A proof produced under one circuit version does not verify under the other keys. So we keep
+// each key in its own dedicated verifier and route each bundle to the verifier for its transaction
+// format and block era:
 //
 //   * Orchard bundles mined before NU6.2 (NU5..NU6.2) were produced by the historical, insecure
 //     circuit and only verify under the [`InsecurePreNu6_2`] key. These must keep verifying so
 //     that nodes can re-sync and reindex pre-soft-fork Orchard history.
 //
-//   * Orchard bundles mined at NU6.2 onward are produced by the fixed circuit and only verify
+//   * V5 Orchard bundles mined at NU6.2 onward are produced by the fixed circuit and only verify
 //     under the [`FixedPostNu6_2`] key.
+//
+//   * V6 Orchard-style bundles use the NU6.3 flag format and the Ironwood circuit, including the
+//     separate Ironwood bundle in V6 transactions. They only verify under the [`Ironwood`] key.
 //
 // NOTE: this deliberately does NOT copy zcashd PR #176's WIP shortcut of validating everything
 // against the fixed key; that is incorrect for re-syncing pre-soft-fork Orchard blocks, whose
@@ -84,6 +85,13 @@ lazy_static::lazy_static! {
     /// only verify under this key. See [`VERIFYING_KEY_PRE_NU6_2`] for the era split.
     pub static ref VERIFYING_KEY_POST_NU6_2: ItemVerifyingKey =
         ItemVerifyingKey::build(OrchardCircuitVersion::FixedPostNu6_2);
+
+    /// The Orchard Action verifying key for the **V6/Ironwood** circuit.
+    ///
+    /// V6 Orchard and Ironwood bundles use the NU6.3 flag format and prove with the Ironwood
+    /// circuit. They must not be verified with the post-NU6.2 V5 Orchard key.
+    pub static ref VERIFYING_KEY_IRONWOOD: ItemVerifyingKey =
+        ItemVerifyingKey::build(OrchardCircuitVersion::Ironwood);
 }
 
 /// A Halo2 verification item, used as the request type of the service.
@@ -194,8 +202,8 @@ impl Service<Item> for OrchardFallback {
 /// The concrete type of a global Halo2 verification service.
 ///
 /// Each Orchard circuit era gets its own instance — see [`VERIFIER_PRE_NU6_2`] and
-/// [`VERIFIER_POST_NU6_2`] — so that batches, fallbacks, and verifying keys are fully separated
-/// per era.
+/// [`VERIFIER_POST_NU6_2`], or [`VERIFIER_IRONWOOD`] — so that batches, fallbacks, and verifying
+/// keys are fully separated per era.
 type VerifierService = Fallback<Batch<Verifier, Item>, OrchardFallback>;
 
 /// Builds a global Halo2 verifier that validates every item against `vk`.
@@ -203,8 +211,8 @@ type VerifierService = Fallback<Batch<Verifier, Item>, OrchardFallback>;
 /// The returned service batches contemporaneous proof verifications and, if a batch fails, falls
 /// back to verifying each item individually. The batch and its fallback share the single `vk`
 /// passed here, so an item built by this verifier is always checked against exactly one era's key.
-/// Callers select the correct era's key by which `VERIFYING_KEY_*` they pass (see the two statics
-/// below); there is no runtime key resolution.
+/// Callers select the correct era's key by which `VERIFYING_KEY_*` they pass; there is no runtime
+/// key resolution.
 fn batch_verifier(vk: &'static ItemVerifyingKey) -> VerifierService {
     Fallback::new(
         Batch::new(
@@ -239,21 +247,34 @@ pub static VERIFIER_PRE_NU6_2: Lazy<VerifierService> =
 pub static VERIFIER_POST_NU6_2: Lazy<VerifierService> =
     Lazy::new(|| batch_verifier(&VERIFYING_KEY_POST_NU6_2));
 
-/// Returns the global Halo2 verifier for Orchard bundles in blocks at `network_upgrade`.
+/// Global batch verification context for **V6/Ironwood** Halo2 Action proofs.
 ///
-/// The Orchard Action circuit — and therefore its verifying key — changed at NU6.2 (the fixed
-/// variable-base scalar-multiplication circuit; see GHSA-jfw5-j458-pfv6), and a proof produced
-/// under one circuit does not verify under the other key. So each bundle must be checked against
-/// the key for the upgrade of the block it appears in:
+/// Items routed here are verified against [`VERIFYING_KEY_IRONWOOD`] (the Ironwood circuit). This
+/// service transparently batches contemporaneous proof verifications, handling batch failures by
+/// falling back to individual verification.
+///
+/// Note that making a `Service` call requires mutable access to the service, so you should call
+/// `.clone()` on the global handle to create a local, mutable handle.
+pub static VERIFIER_IRONWOOD: Lazy<VerifierService> =
+    Lazy::new(|| batch_verifier(&VERIFYING_KEY_IRONWOOD));
+
+/// Returns the global Halo2 verifier for V5 Orchard bundles in blocks at `network_upgrade`.
+///
+/// The V5 Orchard Action circuit changed at NU6.2 (the fixed variable-base
+/// scalar-multiplication circuit; see GHSA-jfw5-j458-pfv6), and a proof produced under one circuit
+/// does not verify under the other key. So each V5 Orchard bundle must be checked against the key
+/// for the upgrade of the block it appears in:
 ///
 ///   * upgrades before NU6.2 are routed to [`VERIFIER_PRE_NU6_2`] (the historical insecure key),
 ///     so pre-soft-fork Orchard history still verifies on re-sync;
-///   * NU6.2 and every later upgrade are routed to [`VERIFIER_POST_NU6_2`] (the fixed key).
+///   * NU6.2 and later V5 Orchard bundles are routed to [`VERIFIER_POST_NU6_2`] (the fixed key).
+///
+/// V6 Orchard and Ironwood bundles use [`VERIFIER_IRONWOOD`] instead.
 ///
 /// The mapping is an explicit, exhaustive `match` on every [`NetworkUpgrade`] variant: there is
 /// no version-comparison fallthrough and no default-to-insecure arm, so adding a future upgrade
 /// is a compile error here until it is bound to a key on purpose.
-pub fn verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierService {
+pub fn v5_verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierService {
     use NetworkUpgrade::*;
 
     match network_upgrade {
@@ -263,9 +284,9 @@ pub fn verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierService
         Genesis | BeforeOverwinter | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5
         | Nu6 | Nu6_1 => &VERIFIER_PRE_NU6_2,
 
-        // NU6.2 ships the fixed circuit, and every upgrade after it inherits that fixed circuit,
-        // so all of them verify under the fixed key.
-        Nu6_2 | Nu6_3 | Nu7 => &VERIFIER_POST_NU6_2,
+        // NU6.2 ships the fixed V5 Orchard circuit. Later V5 transactions keep the V5 Orchard
+        // transaction format, so they also verify under the fixed V5 key.
+        Nu6_2 | Nu6_3 => &VERIFIER_POST_NU6_2,
 
         // `ZFuture` only exists under the `zcash_unstable = "zfuture"` cfg. It is a post-NU6.2
         // upgrade, so it inherits the fixed circuit and is bound to the fixed key here on purpose
@@ -276,15 +297,19 @@ pub fn verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierService
     }
 }
 
+/// Returns the global Halo2 verifier for V6 Orchard and Ironwood bundles.
+pub fn v6_verifier() -> &'static VerifierService {
+    &VERIFIER_IRONWOOD
+}
+
 /// Halo2 proof verifier implementation
 ///
 /// This is the core implementation for the batch verification logic of the
 /// Halo2 verifier. It handles batching incoming requests, driving batches to
 /// completion, and reporting results.
 ///
-/// Each verifier validates against a single, fixed [`ItemVerifyingKey`]; the two Orchard circuit
-/// eras are served by two independent verifiers, so a batch never mixes pre- and post-NU6.2
-/// proofs.
+/// Each verifier validates against a single, fixed [`ItemVerifyingKey`]; the Orchard circuit eras
+/// are served by independent verifiers, so a batch never mixes proofs for different keys.
 pub struct Verifier {
     /// The verifying key that every batch and fallback from this verifier uses.
     vk: &'static ItemVerifyingKey,

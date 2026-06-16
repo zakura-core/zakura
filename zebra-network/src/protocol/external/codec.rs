@@ -20,7 +20,7 @@ use zebra_chain::{
         SerializationError as Error, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
         MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
     },
-    transaction::Transaction,
+    transaction::{Transaction, UnminedTx},
 };
 
 use crate::constants;
@@ -770,7 +770,10 @@ impl Codec {
 
     fn read_tx<R: Read + std::marker::Send>(&self, reader: R) -> Result<Message, Error> {
         let result = Self::deserialize_transaction_spawning(reader);
-        Ok(Message::Tx(result?.into()))
+        let transaction = UnminedTx::try_from_mempool_transaction(result?)
+            .map_err(|_| Error::Parse("non-canonical shielded proof size"))?;
+
+        Ok(Message::Tx(transaction))
     }
 
     fn read_mempool<R: Read>(&self, mut _reader: R) -> Result<Message, Error> {

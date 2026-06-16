@@ -5,7 +5,7 @@ use std::iter;
 use zebra_chain::amount::Amount;
 
 use strum::IntoEnumIterator;
-use zcash_keys::address::Address;
+use zcash_keys::address::{Address, UnifiedAddress};
 
 use zebra_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 
@@ -93,4 +93,91 @@ fn coinbase() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+fn coinbase_errors_for_orchard_only_unified_address_after_nu6_3() {
+    let net = nu6_3_testnet();
+    let nu6_3_height = NetworkUpgrade::Nu6_3
+        .activation_height(&net)
+        .expect("NU6.3 activation height is configured");
+
+    let miner_params = MinerParams::from(Address::Unified(orchard_only_unified_address()));
+
+    let error = TransactionTemplate::new_coinbase(
+        &net,
+        nu6_3_height,
+        &miner_params,
+        Amount::zero(),
+        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+        None,
+    )
+    .expect_err("Orchard-only unified addresses cannot receive coinbase rewards after NU6.3");
+
+    assert!(
+        error
+            .to_string()
+            .contains("must include a Sapling or transparent receiver"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn miner_params_validate_orchard_only_unified_address_at_nu6_3() {
+    let net = nu6_3_testnet();
+    let nu6_3_height = NetworkUpgrade::Nu6_3
+        .activation_height(&net)
+        .expect("NU6.3 activation height is configured");
+    let pre_nu6_3_height = Height(nu6_3_height.0 - 1);
+    let miner_params = MinerParams::from(Address::Unified(orchard_only_unified_address()));
+
+    miner_params
+        .validate_coinbase_receiver(&net, pre_nu6_3_height)
+        .expect("Orchard-only unified addresses are valid before NU6.3");
+
+    let error = miner_params
+        .validate_coinbase_receiver(&net, nu6_3_height)
+        .expect_err("Orchard-only unified addresses are invalid after NU6.3");
+
+    assert!(
+        error
+            .to_string()
+            .contains("must include a Sapling or transparent receiver"),
+        "unexpected error: {error}"
+    );
+}
+
+fn nu6_3_testnet() -> Network {
+    testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            overwinter: Some(1),
+            sapling: Some(2),
+            blossom: Some(3),
+            heartwood: Some(4),
+            canopy: Some(5),
+            nu5: Some(6),
+            nu6: Some(7),
+            nu6_1: Some(8),
+            nu6_3: Some(9),
+            ..Default::default()
+        })
+        .expect("configured activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured network is valid")
+}
+
+fn orchard_only_unified_address() -> UnifiedAddress {
+    let orchard_spending_key = Option::<orchard::keys::SpendingKey>::from(
+        orchard::keys::SpendingKey::from_bytes([0u8; 32]),
+    )
+    .expect("test Orchard spending key is valid");
+    let orchard_full_viewing_key = orchard::keys::FullViewingKey::from(&orchard_spending_key);
+    let orchard_address = orchard_full_viewing_key.address_at(
+        orchard::keys::DiversifierIndex::from([0u8; 11]),
+        orchard::keys::Scope::External,
+    );
+
+    UnifiedAddress::from_receivers(Some(orchard_address), None, None)
+        .expect("Orchard-only unified addresses are valid")
 }

@@ -9,8 +9,9 @@
 //!     blocks still re-sync;
 //!   * the same proof is **rejected** by the post-NU6.2 (fixed) key, so the verifier is not
 //!     "fail-open" — it does not accept whatever it is handed regardless of era; and
-//!   * [`verifier_for`] routes each network upgrade to the service holding the matching key,
-//!     with NU6.2 and every later upgrade going to the fixed-key verifier.
+//!   * [`v5_verifier_for`] routes each network upgrade to the service holding the matching V5
+//!     Orchard key; and
+//!   * [`v6_verifier`] routes V6 Orchard and Ironwood bundles to the Ironwood-key verifier.
 
 use std::sync::Arc;
 
@@ -25,8 +26,8 @@ use zebra_chain::{
 };
 
 use super::{
-    verifier_for, Item, VERIFIER_POST_NU6_2, VERIFIER_PRE_NU6_2, VERIFYING_KEY_POST_NU6_2,
-    VERIFYING_KEY_PRE_NU6_2,
+    v5_verifier_for, v6_verifier, Item, VERIFIER_IRONWOOD, VERIFIER_POST_NU6_2, VERIFIER_PRE_NU6_2,
+    VERIFYING_KEY_POST_NU6_2, VERIFYING_KEY_PRE_NU6_2,
 };
 
 /// Returns one real pre-NU6.2 Orchard bundle and its sighash, extracted from the mainnet test
@@ -88,21 +89,22 @@ fn pre_nu6_2_proof_only_verifies_under_pre_nu6_2_key() {
     );
 }
 
-/// [`verifier_for`] routes each upgrade to the service that holds the correct era key.
+/// [`v5_verifier_for`] routes each upgrade to the service that holds the correct V5 era key,
+/// while [`v6_verifier`] routes V6 Orchard and Ironwood bundles to the Ironwood key.
 ///
-/// We compare service identity by pointer: `verifier_for` returns a borrow of one of the two
-/// global `Lazy` services, so the pre-NU6.2 upgrades must alias [`VERIFIER_PRE_NU6_2`] and NU6.2+
-/// must alias [`VERIFIER_POST_NU6_2`]. Because the pre/post split is what binds an item to a key,
-/// routing to the wrong service is exactly routing to the wrong key.
+/// We compare service identity by pointer: the routing functions return borrows of global `Lazy`
+/// services, so each expected route must alias the matching service. Because the route is what
+/// binds an item to a key, routing to the wrong service is exactly routing to the wrong key.
 ///
 /// This is an async test because forcing the global `Lazy` verifiers builds their `Batch` layer,
 /// which spawns a worker task and therefore needs a Tokio runtime.
 #[tokio::test(flavor = "multi_thread")]
-async fn verifier_for_routes_each_upgrade_to_the_correct_key() {
-    // Deref each `Lazy` to the inner service it guards, matching what `verifier_for` returns, so
-    // the pointer comparisons below compare the same service type.
+async fn verifier_routes_each_transaction_format_to_the_correct_key() {
+    // Deref each `Lazy` to the inner service it guards, matching what the routing functions
+    // return, so the pointer comparisons below compare the same service type.
     let pre: &'static super::VerifierService = &VERIFIER_PRE_NU6_2;
     let post: &'static super::VerifierService = &VERIFIER_POST_NU6_2;
+    let ironwood: &'static super::VerifierService = &VERIFIER_IRONWOOD;
 
     // Everything before NU6.2 (including upgrades from before Orchard existed) routes to the
     // insecure key, which is the only key any pre-NU6.2 Orchard history verifies under.
@@ -112,17 +114,21 @@ async fn verifier_for_routes_each_upgrade_to_the_correct_key() {
         NetworkUpgrade::Nu6_1,
     ] {
         assert!(
-            std::ptr::eq(verifier_for(nu), pre),
+            std::ptr::eq(v5_verifier_for(nu), pre),
             "{nu:?} must route to the pre-NU6.2 (insecure) verifier"
         );
     }
 
-    // NU6.2 and every later upgrade route to the fixed key. NU6.3 guards that "NU6.2 and later"
-    // does not silently fall back to the insecure verifier for future upgrades.
+    // NU6.2 and later V5 Orchard bundles route to the fixed V5 key.
     for nu in [NetworkUpgrade::Nu6_2, NetworkUpgrade::Nu6_3] {
         assert!(
-            std::ptr::eq(verifier_for(nu), post),
+            std::ptr::eq(v5_verifier_for(nu), post),
             "{nu:?} must route to the post-NU6.2 (fixed) verifier"
         );
     }
+
+    assert!(
+        std::ptr::eq(v6_verifier(), ironwood),
+        "V6 Orchard and Ironwood bundles must route to the Ironwood verifier"
+    );
 }

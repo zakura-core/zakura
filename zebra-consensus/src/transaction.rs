@@ -395,15 +395,17 @@ where
         let mempool = self.mempool.clone();
 
         let tx = req.transaction();
-        let tx_id = req.tx_id();
-        let span = tracing::debug_span!("tx", ?tx_id);
+        let tx_mined_id = req.tx_mined_id();
+        let span = tracing::debug_span!("tx", ?tx_mined_id);
 
         async move {
-            tracing::trace!(?tx_id, ?req, "got tx verify request");
+            tracing::trace!(?tx_mined_id, "got tx verify request");
 
             // Do quick checks first
             check::has_inputs_and_outputs(&tx)?;
             check::has_enough_orchard_flags(&tx)?;
+            check::has_enough_ironwood_flags(&tx)?;
+            check::orchard_cross_address_disabled(&tx)?;
             check::consensus_branch_id(&tx, req.height(), &network)?;
 
             // Soft fork: temporarily require transactions to not contain Orchard actions.
@@ -435,13 +437,7 @@ where
             // The gate activates at the NU6.2 activation height committed in
             // MAINNET/TESTNET_ACTIVATION_HEIGHTS. See
             // `Network::orchard_canonical_proof_size_rule_active`.
-            if network.orchard_canonical_proof_size_rule_active(req.height()) {
-                if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
-                    if !orchard_shielded_data.proof_size_is_canonical() {
-                        return Err(TransactionError::OrchardProofSize);
-                    }
-                }
-            }
+            check::shielded_proof_size_is_canonical(&tx, req.height(), &network)?;
 
             // Validate the coinbase input consensus rules
             if req.is_mempool() && tx.is_coinbase() {
@@ -471,10 +467,11 @@ where
             // [Canopy onward]: `vpub_old` MUST be zero.
             // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
             check::disabled_add_to_sprout_pool(&tx, req.height(), &network)?;
+            check::disabled_add_to_orchard_pool(&tx, req.height(), &network)?;
 
             check::spend_conflicts(&tx)?;
 
-            tracing::trace!(?tx_id, "passed quick checks");
+            tracing::trace!(?tx_mined_id, "passed quick checks");
 
             if let Some(block_time) = req.block_time() {
                 check::lock_time_has_passed(&tx, req.height(), block_time)?;
@@ -516,12 +513,11 @@ where
             }
 
             let nu = req.upgrade(&network);
-            let cached_ffi_transaction =
-                Arc::new(CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
+            let all_previous_outputs = Arc::new(spent_outputs);
 
-            tracing::trace!(?tx_id, "got state UTXOs");
+            tracing::trace!(?tx_mined_id, "got state UTXOs");
 
-            let mut async_checks = match tx.as_ref() {
+            let (mut async_checks, cached_ffi_transaction) = match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
                     tracing::debug!(?tx, "got transaction with wrong version");
                     return Err(TransactionError::WrongVersion);
@@ -529,29 +525,43 @@ where
                 Transaction::V4 {
                     joinsplit_data,
                     ..
-                } => Self::verify_v4_transaction(
-                    &req,
-                    &network,
-                    script_verifier,
-                    cached_ffi_transaction.clone(),
-                    joinsplit_data,
-                )?,
+                } => {
+                    let cached_ffi_transaction =
+                        Self::cached_ffi_transaction(tx.clone(), all_previous_outputs.clone(), nu)?;
+
+                    let async_checks = Self::verify_v4_transaction(
+                        &req,
+                        &network,
+                        script_verifier,
+                        cached_ffi_transaction.clone(),
+                        joinsplit_data,
+                    )?;
+
+                    (async_checks, cached_ffi_transaction)
+                }
                 Transaction::V5 {
                     ..
-                } => Self::verify_v5_transaction(
-                    &req,
-                    &network,
-                    script_verifier,
-                    cached_ffi_transaction.clone(),
-                )?,
-                #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+                } => {
+                    let cached_ffi_transaction =
+                        Self::cached_ffi_transaction(tx.clone(), all_previous_outputs.clone(), nu)?;
+
+                    let async_checks = Self::verify_v5_transaction(
+                        &req,
+                        &network,
+                        script_verifier,
+                        cached_ffi_transaction.clone(),
+                    )?;
+
+                    (async_checks, cached_ffi_transaction)
+                }
+                #[cfg(zcash_unstable = "nu6.3")]
                 Transaction::V6 {
                     ..
                 } => Self::verify_v6_transaction(
                     &req,
                     &network,
                     script_verifier,
-                    cached_ffi_transaction.clone(),
+                    all_previous_outputs.clone(),
                 )?,
             };
 
@@ -573,9 +583,11 @@ where
                 async_checks.push(check_anchors_and_revealed_nullifiers_query);
             }
 
-            tracing::trace!(?tx_id, "awaiting async checks...");
+            tracing::trace!(?tx_mined_id, "awaiting async checks...");
 
             async_checks.check().await?;
+
+            let tx_id = req.tx_id();
 
             tracing::trace!(?tx_id, "finished async checks");
 
@@ -588,7 +600,7 @@ where
                 // TODO: deduplicate this code with remaining_transaction_value()?
                 miner_fee = match value_balance {
                     Ok(vb) => match vb.remaining_transaction_value() {
-                        Ok(tx_rtv) => Some(tx_rtv),
+                        Ok(fee) => Some(fee),
                         Err(_) => return Err(TransactionError::IncorrectFee),
                     },
                     Err(_) => return Err(TransactionError::IncorrectFee),
@@ -610,11 +622,8 @@ where
                     sigops: sigops.saturating_add(cached_ffi_transaction.p2sh_sigops()),
                 },
                 Request::Mempool { transaction: tx, .. } => {
-                    // TODO: `spent_outputs` may not align with `tx.inputs()` when a transaction
-                    // spends both chain and mempool UTXOs (mempool outputs are appended last by
-                    // `spent_utxos()`), causing policy checks to pair the wrong input with
-                    // the wrong spent output.
-                    // https://github.com/ZcashFoundation/zebra/issues/10346
+                    // `spent_utxos()` fills chain and mempool UTXOs by input index,
+                    // so these outputs are ordered to match `tx.inputs()`.
                     let spent_outputs = cached_ffi_transaction.all_previous_outputs().clone();
                     let transaction = VerifiedUnminedTx::new(
                         tx,
@@ -646,7 +655,7 @@ where
         }
             .inspect(move |result| {
                 // Hide the transaction data to avoid filling the logs
-                tracing::trace!(?tx_id, result = ?result.as_ref().map(|_tx| ()), "got tx verify result");
+                tracing::trace!(?tx_mined_id, result = ?result.as_ref().map(|_tx| ()), "got tx verify result");
             })
             .instrument(span)
             .boxed()
@@ -911,8 +920,7 @@ where
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
             | NetworkUpgrade::Overwinter
-            | NetworkUpgrade::Nu6_3
-            | NetworkUpgrade::Nu7 => Err(TransactionError::UnsupportedByNetworkUpgrade(
+            | NetworkUpgrade::Nu6_3 => Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),
                 network_upgrade,
             )),
@@ -963,7 +971,7 @@ where
             cached_ffi_transaction,
         )?
         .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
-        .and(Self::verify_orchard_bundle(orchard_bundle, &sighash, nu)))
+        .and(Self::verify_v5_orchard_bundle(orchard_bundle, &sighash, nu)))
     }
 
     /// Verifies if a V5 `transaction` is supported by `network_upgrade`.
@@ -988,8 +996,7 @@ where
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
-            | NetworkUpgrade::Nu6_3
-            | NetworkUpgrade::Nu7 => Ok(()),
+            | NetworkUpgrade::Nu6_3 => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),
@@ -1008,15 +1015,72 @@ where
         }
     }
 
-    /// Passthrough to verify_v5_transaction, but for V6 transactions.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    /// Constructs cached FFI transaction data for transparent and shielded verification.
+    fn cached_ffi_transaction(
+        transaction: Arc<Transaction>,
+        all_previous_outputs: Arc<Vec<transparent::Output>>,
+        nu: NetworkUpgrade,
+    ) -> Result<Arc<CachedFfiTransaction>, TransactionError> {
+        let version = transaction.version();
+
+        Ok(Arc::new(
+            CachedFfiTransaction::new(transaction, all_previous_outputs, nu)
+                .map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(version, nu))?,
+        ))
+    }
+
+    /// Verifies a V6 transaction.
+    #[cfg(zcash_unstable = "nu6.3")]
     fn verify_v6_transaction(
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
-    ) -> Result<AsyncChecks, TransactionError> {
-        Self::verify_v5_transaction(request, network, script_verifier, cached_ffi_transaction)
+        all_previous_outputs: Arc<Vec<transparent::Output>>,
+    ) -> Result<(AsyncChecks, Arc<CachedFfiTransaction>), TransactionError> {
+        let transaction = request.transaction();
+        let nu = request.upgrade(network);
+
+        Self::verify_v6_transaction_network_upgrade(transaction.as_ref(), nu)?;
+
+        let cached_ffi_transaction =
+            Self::cached_ffi_transaction(transaction.clone(), all_previous_outputs, nu)?;
+
+        let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
+        let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
+        let ironwood_bundle = cached_ffi_transaction.sighasher().ironwood_bundle();
+
+        let sighash = cached_ffi_transaction
+            .sighasher()
+            .sighash(HashType::ALL, None);
+
+        let async_checks = Self::verify_transparent_inputs_and_outputs(
+            request,
+            script_verifier,
+            cached_ffi_transaction.clone(),
+        )?
+        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
+        .and(Self::verify_v6_orchard_bundle(orchard_bundle, &sighash))
+        .and(Self::verify_ironwood_bundle(ironwood_bundle, &sighash));
+
+        Ok((async_checks, cached_ffi_transaction))
+    }
+
+    /// Verifies if a V6 `transaction` is supported by `network_upgrade`.
+    #[cfg(zcash_unstable = "nu6.3")]
+    fn verify_v6_transaction_network_upgrade(
+        transaction: &Transaction,
+        network_upgrade: NetworkUpgrade,
+    ) -> Result<(), TransactionError> {
+        if network_upgrade == NetworkUpgrade::Nu6_3
+            && transaction.network_upgrade() == Some(NetworkUpgrade::Nu6_3)
+        {
+            return Ok(());
+        }
+
+        Err(TransactionError::UnsupportedByNetworkUpgrade(
+            transaction.version(),
+            network_upgrade,
+        ))
     }
 
     /// Verifies if a transaction's transparent inputs are valid using the provided
@@ -1184,17 +1248,17 @@ where
         async_checks
     }
 
-    /// Verifies a transaction's Orchard shielded data.
+    /// Verifies a V5 transaction's Orchard shielded data.
     ///
     /// `network_upgrade` is the network upgrade active at the verified transaction's block
-    /// height. It selects the Orchard verifier: the Orchard Action circuit (and its verifying
+    /// height. It selects the V5 Orchard verifier: the Orchard Action circuit (and its verifying
     /// key) changed at NU6.2 to fix the variable-base scalar-multiplication bug
-    /// (GHSA-jfw5-j458-pfv6), so pre-NU6.2 bundles must be verified against the historical
-    /// (insecure) key and NU6.2+ bundles against the fixed key. A proof from one era does not
-    /// verify under the other era's key. [`primitives::halo2::verifier_for`] maps the upgrade to
-    /// the verifier holding the matching key; the two verifiers keep separate batches, so eras
-    /// are never mixed.
-    fn verify_orchard_bundle(
+    /// (GHSA-jfw5-j458-pfv6), so pre-NU6.2 V5 bundles must be verified against the historical
+    /// key and NU6.2+ V5 bundles against the fixed key. A proof from one era does not verify
+    /// under the other era's key. [`primitives::halo2::v5_verifier_for`] maps the upgrade to the
+    /// verifier holding the matching key; the verifiers keep separate batches, so eras are never
+    /// mixed.
+    fn verify_v5_orchard_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
         network_upgrade: NetworkUpgrade,
@@ -1214,16 +1278,50 @@ where
             // Actions in one transaction. So we queue it for verification
             // only once instead of queuing it up for every Action description.
             //
-            // Route the bundle to the verifier for its circuit era: pre-NU6.2 bundles only
-            // verify under the insecure key, NU6.2+ bundles only under the fixed key.
+            // Route the V5 bundle to the verifier for its circuit era: pre-NU6.2 bundles only
+            // verify under the insecure key, NU6.2+ V5 bundles only under the fixed key.
             async_checks.push(
-                primitives::halo2::verifier_for(network_upgrade)
+                primitives::halo2::v5_verifier_for(network_upgrade)
                     .clone()
                     .oneshot(primitives::halo2::Item::new(bundle, *sighash)),
             );
         }
 
         async_checks
+    }
+
+    /// Verifies a V6 transaction's Orchard shielded data.
+    ///
+    /// V6 Orchard uses the NU6.3 flag format and proves with the Ironwood circuit, even though it
+    /// is still the Orchard value pool.
+    #[cfg(zcash_unstable = "nu6.3")]
+    fn verify_v6_orchard_bundle(
+        bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
+        sighash: &SigHash,
+    ) -> AsyncChecks {
+        let mut async_checks = AsyncChecks::new();
+
+        if let Some(bundle) = bundle {
+            async_checks.push(
+                primitives::halo2::v6_verifier()
+                    .clone()
+                    .oneshot(primitives::halo2::Item::new(bundle, *sighash)),
+            );
+        }
+
+        async_checks
+    }
+
+    /// Verifies a transaction's Ironwood shielded data.
+    ///
+    /// Ironwood uses the same V6 action proof system as Orchard, but its note commitment and
+    /// nullifier state are tracked separately.
+    #[cfg(zcash_unstable = "nu6.3")]
+    fn verify_ironwood_bundle(
+        bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
+        sighash: &SigHash,
+    ) -> AsyncChecks {
+        Self::verify_v6_orchard_bundle(bundle, sighash)
     }
 }
 

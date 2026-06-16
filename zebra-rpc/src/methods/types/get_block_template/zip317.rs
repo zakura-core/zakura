@@ -19,7 +19,7 @@ use zebra_chain::{
     parameters::Network,
     transaction::{self, zip317::BLOCK_UNPAID_ACTION_LIMIT, VerifiedUnminedTx},
 };
-use zebra_consensus::MAX_BLOCK_SIGOPS;
+use zebra_consensus::{error::TransactionError, MAX_BLOCK_SIGOPS};
 use zebra_node_services::mempool::TransactionDependencies;
 
 use crate::methods::types::transaction::TransactionTemplate;
@@ -57,12 +57,15 @@ pub fn select_mempool_transactions(
     miner_params: &MinerParams,
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
-) -> Vec<SelectedMempoolTx> {
+) -> Result<Vec<SelectedMempoolTx>, TransactionError> {
     // Use a fake coinbase transaction to break the dependency between transaction
     // selection, the miner fee, and the fee payment in the coinbase transaction.
-    let fake_coinbase_tx =
-        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero())
-            .expect("valid coinbase transaction template");
+    let fake_coinbase_tx = TransactionTemplate::new_coinbase(
+        net,
+        height,
+        miner_params,
+        Amount::zero(),
+    )?;
 
     let tx_dependencies = mempool_tx_deps.dependencies();
     let (independent_mempool_txs, mut dependent_mempool_txs): (HashMap<_, _>, HashMap<_, _>) =
@@ -79,7 +82,9 @@ pub fn select_mempool_transactions(
     let mut selected_txs = Vec::new();
 
     // Set up limit tracking
-    let mut remaining_block_bytes: usize = MAX_BLOCK_BYTES.try_into().expect("fits in memory");
+    let mut remaining_block_bytes: usize = MAX_BLOCK_BYTES.try_into().map_err(|_| {
+        TransactionError::CoinbaseConstruction("MAX_BLOCK_BYTES must fit in usize".to_string())
+    })?;
     let mut remaining_block_sigops = MAX_BLOCK_SIGOPS;
     let mut remaining_block_unpaid_actions: u32 = BLOCK_UNPAID_ACTION_LIMIT;
 
@@ -122,7 +127,7 @@ pub fn select_mempool_transactions(
         );
     }
 
-    selected_txs
+    Ok(selected_txs)
 }
 
 /// Returns a fee-weighted index and the total weight of `transactions`.

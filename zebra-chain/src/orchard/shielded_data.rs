@@ -280,6 +280,30 @@ pub(crate) enum FlagFormat {
 }
 
 impl Flags {
+    /// Serializes Orchard-style flags using the selected transaction format.
+    pub(crate) fn zcash_serialize_with_format<W: io::Write>(
+        &self,
+        mut writer: W,
+        format: FlagFormat,
+    ) -> Result<(), io::Error> {
+        match format {
+            FlagFormat::PreNu6_3 => {
+                if self.contains(Self::ENABLE_CROSS_ADDRESS) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid reserved orchard flags",
+                    ));
+                }
+            }
+            #[cfg(any(zcash_unstable = "nu6.3", test))]
+            FlagFormat::Nu6_3 => {}
+        }
+
+        writer.write_u8(self.bits())?;
+
+        Ok(())
+    }
+
     /// Deserializes Orchard-style flags using the selected transaction format.
     pub(crate) fn zcash_deserialize_with_format<R: io::Read>(
         mut reader: R,
@@ -326,9 +350,7 @@ impl<'de> serde::Deserialize<'de> for Flags {
 
 impl ZcashSerialize for Flags {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        writer.write_u8(self.bits())?;
-
-        Ok(())
+        self.zcash_serialize_with_format(&mut writer, FlagFormat::PreNu6_3)
     }
 }
 

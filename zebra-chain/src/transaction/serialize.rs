@@ -362,56 +362,92 @@ fn deserialize_v5_sapling_shielded_data<R: io::Read>(
 
 impl ZcashSerialize for Option<orchard::ShieldedData> {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        match self {
-            None => {
-                // Denoted as `nActionsOrchard` in the spec.
-                zcash_serialize_empty_list(writer)?;
-
-                // We don't need to write anything else here.
-                // "The fields flagsOrchard, valueBalanceOrchard, anchorOrchard, sizeProofsOrchard,
-                // proofsOrchard , and bindingSigOrchard are present if and only if nActionsOrchard > 0."
-                // `§` note of the second table of https://zips.z.cash/protocol/protocol.pdf#txnencoding
-            }
-            Some(orchard_shielded_data) => {
-                orchard_shielded_data.zcash_serialize(&mut writer)?;
-            }
-        }
-        Ok(())
+        serialize_optional_orchard_shielded_data_with_flags(
+            self,
+            &mut writer,
+            orchard::shielded_data::FlagFormat::PreNu6_3,
+        )
     }
 }
 
+fn serialize_optional_orchard_shielded_data_with_flags<W: io::Write>(
+    orchard_shielded_data: &Option<orchard::ShieldedData>,
+    mut writer: W,
+    flag_format: orchard::shielded_data::FlagFormat,
+) -> Result<(), io::Error> {
+    match orchard_shielded_data {
+        None => {
+            // Denoted as `nActionsOrchard` in the spec.
+            zcash_serialize_empty_list(writer)?;
+
+            // We don't need to write anything else here.
+            // "The fields flagsOrchard, valueBalanceOrchard, anchorOrchard, sizeProofsOrchard,
+            // proofsOrchard , and bindingSigOrchard are present if and only if nActionsOrchard > 0."
+            // `§` note of the second table of https://zips.z.cash/protocol/protocol.pdf#txnencoding
+        }
+        Some(orchard_shielded_data) => {
+            serialize_orchard_shielded_data_with_flags(
+                orchard_shielded_data,
+                &mut writer,
+                flag_format,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn serialize_orchard_shielded_data_with_flags<W: io::Write>(
+    orchard_shielded_data: &orchard::ShieldedData,
+    mut writer: W,
+    flag_format: orchard::shielded_data::FlagFormat,
+) -> Result<(), io::Error> {
+    // Split the AuthorizedAction
+    let (actions, sigs): (Vec<orchard::Action>, Vec<Signature<SpendAuth>>) = orchard_shielded_data
+        .actions
+        .iter()
+        .cloned()
+        .map(orchard::AuthorizedAction::into_parts)
+        .unzip();
+
+    // Denoted as `nActionsOrchard` and `vActionsOrchard` in the spec.
+    actions.zcash_serialize(&mut writer)?;
+
+    // Denoted as `flagsOrchard` in the spec.
+    orchard_shielded_data
+        .flags
+        .zcash_serialize_with_format(&mut writer, flag_format)?;
+
+    // Denoted as `valueBalanceOrchard` in the spec.
+    orchard_shielded_data
+        .value_balance
+        .zcash_serialize(&mut writer)?;
+
+    // Denoted as `anchorOrchard` in the spec.
+    orchard_shielded_data
+        .shared_anchor
+        .zcash_serialize(&mut writer)?;
+
+    // Denoted as `sizeProofsOrchard` and `proofsOrchard` in the spec.
+    orchard_shielded_data.proof.zcash_serialize(&mut writer)?;
+
+    // Denoted as `vSpendAuthSigsOrchard` in the spec.
+    zcash_serialize_external_count(&sigs, &mut writer)?;
+
+    // Denoted as `bindingSigOrchard` in the spec.
+    orchard_shielded_data
+        .binding_sig
+        .zcash_serialize(&mut writer)?;
+
+    Ok(())
+}
+
 impl ZcashSerialize for orchard::ShieldedData {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        // Split the AuthorizedAction
-        let (actions, sigs): (Vec<orchard::Action>, Vec<Signature<SpendAuth>>) = self
-            .actions
-            .iter()
-            .cloned()
-            .map(orchard::AuthorizedAction::into_parts)
-            .unzip();
-
-        // Denoted as `nActionsOrchard` and `vActionsOrchard` in the spec.
-        actions.zcash_serialize(&mut writer)?;
-
-        // Denoted as `flagsOrchard` in the spec.
-        self.flags.zcash_serialize(&mut writer)?;
-
-        // Denoted as `valueBalanceOrchard` in the spec.
-        self.value_balance.zcash_serialize(&mut writer)?;
-
-        // Denoted as `anchorOrchard` in the spec.
-        self.shared_anchor.zcash_serialize(&mut writer)?;
-
-        // Denoted as `sizeProofsOrchard` and `proofsOrchard` in the spec.
-        self.proof.zcash_serialize(&mut writer)?;
-
-        // Denoted as `vSpendAuthSigsOrchard` in the spec.
-        zcash_serialize_external_count(&sigs, &mut writer)?;
-
-        // Denoted as `bindingSigOrchard` in the spec.
-        self.binding_sig.zcash_serialize(&mut writer)?;
-
-        Ok(())
+    fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
+        serialize_orchard_shielded_data_with_flags(
+            self,
+            writer,
+            orchard::shielded_data::FlagFormat::PreNu6_3,
+        )
     }
 }
 
@@ -773,13 +809,21 @@ impl ZcashSerialize for Transaction {
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
-                orchard_shielded_data.zcash_serialize(&mut writer)?;
+                serialize_optional_orchard_shielded_data_with_flags(
+                    orchard_shielded_data,
+                    &mut writer,
+                    orchard::shielded_data::FlagFormat::Nu6_3,
+                )?;
 
                 // A bundle of fields denoted in the spec as `nActionsIronwood`,
                 // `vActionsIronwood`, `flagsIronwood`, `valueBalanceIronwood`,
                 // `anchorIronwood`, `sizeProofsIronwood`, `proofsIronwood`,
                 // `vSpendAuthSigsIronwood`, and `bindingSigIronwood`.
-                ironwood_shielded_data.zcash_serialize(&mut writer)?;
+                serialize_optional_orchard_shielded_data_with_flags(
+                    ironwood_shielded_data,
+                    &mut writer,
+                    orchard::shielded_data::FlagFormat::Nu6_3,
+                )?;
             }
         }
         Ok(())

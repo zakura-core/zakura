@@ -5,6 +5,7 @@ use chrono::DateTime;
 use color_eyre::eyre::Result;
 use lazy_static::lazy_static;
 use rand::{seq::IteratorRandom, thread_rng};
+use std::io::ErrorKind;
 
 use crate::{
     block::{Block, Height, MAX_BLOCK_BYTES},
@@ -125,6 +126,34 @@ fn librustzcash_tx_hash() {
         .expect("hash should parse correctly");
 
     assert_eq!(hash, expected);
+}
+
+#[test]
+fn v5_orchard_cross_address_flag_fails_serialization() {
+    let _init_guard = zebra_test::init();
+
+    let mut tx = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find(|transaction| transaction.orchard_shielded_data().is_some())
+        .expect("test vectors include an Orchard transaction");
+
+    let Transaction::V5 {
+        orchard_shielded_data: Some(orchard_shielded_data),
+        ..
+    } = &mut tx
+    else {
+        unreachable!("test transaction is V5 with Orchard shielded data");
+    };
+
+    orchard_shielded_data
+        .flags
+        .insert(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
+
+    let error = tx
+        .zcash_serialize_to_vec()
+        .expect_err("V5 Orchard flags must reject reserved cross-address bit");
+
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
 }
 
 #[test]

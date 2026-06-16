@@ -87,6 +87,7 @@ pub fn resolve_managed_zcashd_binary(state_cache_dir: &Path) -> Result<PathBuf, 
 
 /// Returns the managed zcashd binary cache path without creating directories,
 /// or `None` when managed downloads are unsupported for this target.
+#[cfg(target_os = "linux")]
 pub(super) fn managed_zcashd_binary_path(state_cache_dir: &Path) -> Option<PathBuf> {
     let target = zcashd_target_triple()?;
 
@@ -102,6 +103,7 @@ pub(super) fn managed_zcashd_binary_path(state_cache_dir: &Path) -> Option<PathB
 
 /// Returns whether the cached managed zcashd binary is current for this target,
 /// or `None` when managed downloads are unsupported for this target.
+#[cfg(target_os = "linux")]
 pub(super) fn cached_managed_zcashd_binary_is_current(
     state_cache_dir: &Path,
 ) -> Result<Option<bool>, Report> {
@@ -347,18 +349,20 @@ fn sha256_hex_file(path: &Path) -> Result<String, Report> {
 }
 
 /// Makes `path` executable on Unix targets.
-///
-/// Non-Unix targets currently no-op because managed release targets are Linux.
+#[cfg(unix)]
 fn make_executable(path: &Path) -> Result<(), Report> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt;
 
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
-    }
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)?;
 
+    Ok(())
+}
+
+/// No-ops on non-Unix targets because managed release targets are Linux.
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<(), Report> {
     Ok(())
 }
 

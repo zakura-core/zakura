@@ -241,13 +241,16 @@ impl TrustedPreallocate for Signature<SpendAuth> {
 bitflags! {
     /// Per-Transaction flags for Orchard.
     ///
-    /// The spend and output flags are passed to the `Halo2Proof` verifier, which verifies
-    /// the relevant note spending and creation consensus rules.
+    /// The spend, output, and cross address flags are passed to the `Halo2Proof` verifier, which
+    /// verifies the relevant note spending and creation consensus rules.
     ///
     /// # Consensus
     ///
     /// > [NU5 onward] In a version 5 transaction, the reserved bits 2..7 of the flagsOrchard
     /// > field MUST be zero.
+    ///
+    /// In V6 Orchard-style bundle formats, bit 2 is `enableCrossAddress`, and bits 3..7 are
+    /// reserved.
     ///
     /// <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
     ///
@@ -261,6 +264,41 @@ bitflags! {
         const ENABLE_SPENDS = 0b00000001;
         /// Enable creating new non-zero valued Orchard notes.
         const ENABLE_OUTPUTS = 0b00000010;
+        /// Enable cross address transfers in NU6.3 style Orchard bundle formats.
+        const ENABLE_CROSS_ADDRESS = 0b00000100;
+    }
+}
+
+/// The transaction format used to encode Orchard-style flags.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FlagFormat {
+    /// V5 Orchard format, where bit 2 is reserved.
+    PreNu6_3,
+    /// V6 Orchard-style format, where bit 2 is `enableCrossAddress`.
+    #[cfg(any(zcash_unstable = "nu6.3", test))]
+    Nu6_3,
+}
+
+impl Flags {
+    /// Deserializes Orchard-style flags using the selected transaction format.
+    pub(crate) fn zcash_deserialize_with_format<R: io::Read>(
+        mut reader: R,
+        format: FlagFormat,
+    ) -> Result<Self, SerializationError> {
+        let bits = reader.read_u8()?;
+        let flags = match format {
+            FlagFormat::PreNu6_3 => {
+                if bits & Self::ENABLE_CROSS_ADDRESS.bits() == 0 {
+                    Self::from_bits(bits)
+                } else {
+                    None
+                }
+            }
+            #[cfg(any(zcash_unstable = "nu6.3", test))]
+            FlagFormat::Nu6_3 => Self::from_bits(bits),
+        };
+
+        flags.ok_or(SerializationError::Parse("invalid reserved orchard flags"))
     }
 }
 
@@ -295,11 +333,10 @@ impl ZcashSerialize for Flags {
 }
 
 impl ZcashDeserialize for Flags {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
         // Consensus rule: "In a version 5 transaction,
         // the reserved bits 2..7 of the flagsOrchard field MUST be zero."
         // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
-        Flags::from_bits(reader.read_u8()?)
-            .ok_or(SerializationError::Parse("invalid reserved orchard flags"))
+        Flags::zcash_deserialize_with_format(reader, FlagFormat::PreNu6_3)
     }
 }

@@ -1,6 +1,10 @@
 
 # cargo-vet imports lock
 
+[[unpublished.zebrad]]
+version = "5.0.0-rc.3"
+audited_as = "4.5.1"
+
 [[publisher.bumpalo]]
 version = "3.20.2"
 when = "2026-02-19"

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- V6 Orchard and Ironwood transaction parsing now accepts the NU6.3
+  `enableCrossAddress` flag while preserving V5 reserved-bit enforcement.
+- Use `zcash_history::V3` from NU6.3 onward so chain history leaves commit to
+  Ironwood note commitment tree roots and Ironwood transaction counts.
+- `HistoryTree`, `NonEmptyHistoryTree`, and `zcash_history::Tree` constructors
+  and mutators now require an Ironwood note commitment tree root.
+
 ## [9.0.0] - 2026-06-02
 
 ### Added

@@ -81,6 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Parallelize NU5-onward block auth-data-root computation across transactions,
   reducing contextual validation time for blocks with many or large shielded
   transactions.
+- Use V3 chain history metadata from NU6.3 onward, including Ironwood note
+  commitment tree roots and Ironwood transaction counts in FlyClient history
+  tree leaves.
 - Tune public-fork sync defaults for faster block sync: retry sync rounds after
   10 seconds, allow 30 seconds for tip acquisition, increase default block
   download concurrency to 100, increase the default peer target size to 100, and

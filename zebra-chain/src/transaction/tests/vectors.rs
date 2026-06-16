@@ -1011,38 +1011,8 @@ fn binding_signatures() {
                             at_least_one_v5_checked = true;
                         }
                     }
-                    #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-                    Transaction::V6 {
-                        sapling_shielded_data,
-                        ..
-                    } => {
-                        if let Some(sapling_shielded_data) = sapling_shielded_data {
-                            // V6 txs have the outputs spent by their transparent inputs hashed into
-                            // their SIGHASH, so we need to exclude txs with transparent inputs.
-                            //
-                            // References:
-                            //
-                            // <https://zips.z.cash/zip-0244#s-2c-amounts-sig-digest>
-                            // <https://zips.z.cash/zip-0244#s-2d-scriptpubkeys-sig-digest>
-                            if tx.has_transparent_inputs() {
-                                continue;
-                            }
-
-                            let sighash = tx
-                                .sighash(nu, HashType::ALL, Arc::new(Vec::new()), None)
-                                .expect("network upgrade is valid for tx");
-
-                            let bvk = redjubjub::VerificationKey::try_from(
-                                sapling_shielded_data.binding_verification_key(),
-                            )
-                            .expect("a valid redjubjub::VerificationKey");
-
-                            bvk.verify(sighash.as_ref(), &sapling_shielded_data.binding_sig)
-                                .expect("verification passes");
-
-                            at_least_one_v5_checked = true;
-                        }
-                    }
+                    #[cfg(zcash_unstable = "nu6.3")]
+                    Transaction::V6 { .. } => {}
                 }
             }
         }
@@ -1070,11 +1040,253 @@ fn test_coinbase_script() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[cfg(zcash_unstable = "nu6.3")]
+fn v6_transactions_reject_pre_nu6_3_branch_id() {
+    use crate::parameters::TX_V6_VERSION_GROUP_ID;
+
+    let _init_guard = zebra_test::init();
+
+    let mut tx_bytes = Vec::new();
+    tx_bytes.extend_from_slice(&((1u32 << 31) | 6).to_le_bytes());
+    tx_bytes.extend_from_slice(&TX_V6_VERSION_GROUP_ID.to_le_bytes());
+    tx_bytes.extend_from_slice(&u32::from(NetworkUpgrade::Nu5.branch_id().unwrap()).to_le_bytes());
+    tx_bytes.extend_from_slice(&0u32.to_le_bytes());
+    tx_bytes.extend_from_slice(&0u32.to_le_bytes());
+    tx_bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+
+    let error = Transaction::zcash_deserialize(&tx_bytes[..])
+        .expect_err("V6 transactions must use the NU6.3 branch ID");
+
+    assert!(
+        matches!(error, SerializationError::Parse(message) if message.contains("NU6.3")),
+        "unexpected V6 branch ID parse error: {error:?}"
+    );
+}
+
+#[test]
+#[cfg(zcash_unstable = "nu6.3")]
+fn v6_txid_commits_to_ironwood_digest() {
+    use proptest::{
+        prelude::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+
+    use crate::{
+        at_least_one,
+        ironwood::{self, tree},
+        orchard::Flags,
+        primitives::Halo2Proof,
+    };
+
+    let _init_guard = zebra_test::init();
+
+    let tx_without_ironwood = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+    };
+
+    let mut runner = TestRunner::default();
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut runner)
+        .expect("test action strategy creates a value")
+        .current();
+
+    let ironwood_shielded_data = ironwood::ShieldedData {
+        flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+        value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
+        shared_anchor: tree::Root::default(),
+        proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
+        actions: at_least_one![ironwood::AuthorizedAction {
+            action,
+            spend_auth_sig: [0u8; 64].into(),
+        }],
+        binding_sig: [0u8; 64].into(),
+    };
+
+    let mut tx_with_ironwood = tx_without_ironwood.clone();
+    let Transaction::V6 {
+        ironwood_shielded_data: tx_ironwood_shielded_data,
+        ..
+    } = &mut tx_with_ironwood
+    else {
+        unreachable!("test transaction is V6");
+    };
+    *tx_ironwood_shielded_data = Some(ironwood_shielded_data);
+
+    assert_ne!(
+        tx_with_ironwood.hash(),
+        tx_without_ironwood.hash(),
+        "V6 txid must commit to Ironwood shielded data"
+    );
+}
+
+#[test]
+#[cfg(zcash_unstable = "nu6.3")]
+fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
+    use proptest::{
+        prelude::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+
+    use crate::{
+        at_least_one,
+        ironwood::{self, tree},
+        orchard::Flags,
+        primitives::Halo2Proof,
+    };
+
+    fn test_anchor(byte: u8) -> tree::Root {
+        let mut bytes = [0u8; 32];
+        bytes[0] = byte;
+        tree::Root::try_from(bytes).expect("test anchor must be canonical")
+    }
+
+    let _init_guard = zebra_test::init();
+
+    let mut runner = TestRunner::default();
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut runner)
+        .expect("test action strategy creates a value")
+        .current();
+
+    let ironwood_shielded_data = ironwood::ShieldedData {
+        flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+        value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
+        shared_anchor: test_anchor(1),
+        proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
+        actions: at_least_one![ironwood::AuthorizedAction {
+            action,
+            spend_auth_sig: [0u8; 64].into(),
+        }],
+        binding_sig: [0u8; 64].into(),
+    };
+
+    let tx_a = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood_shielded_data.clone()),
+    };
+
+    let mut tx_b = tx_a.clone();
+    let Transaction::V6 {
+        ironwood_shielded_data: Some(ironwood_shielded_data),
+        ..
+    } = &mut tx_b
+    else {
+        unreachable!("test transaction is V6 with Ironwood shielded data");
+    };
+    ironwood_shielded_data.shared_anchor = test_anchor(2);
+
+    assert_eq!(
+        tx_a.hash(),
+        tx_b.hash(),
+        "V6 txid must not commit to the Ironwood anchor"
+    );
+    assert_ne!(
+        tx_a.auth_digest(),
+        tx_b.auth_digest(),
+        "V6 auth digest must commit to the Ironwood anchor"
+    );
+}
+
+#[test]
+#[cfg(zcash_unstable = "nu6.3")]
+fn unmined_v6_rejects_padded_orchard_proof_before_hashing() {
+    let _init_guard = zebra_test::init();
+
+    let mut orchard_shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+    orchard_shielded_data.proof.0.push(0);
+
+    let transaction = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(orchard_shielded_data),
+        ironwood_shielded_data: None,
+    };
+
+    let error = UnminedTx::try_from_mempool_transaction(transaction)
+        .expect_err("padded Orchard proof must be rejected before hashing");
+
+    assert_eq!(error, UnminedTxError::OrchardProofSize);
+}
+
+#[test]
+#[cfg(zcash_unstable = "nu6.3")]
+fn unmined_v6_rejects_padded_ironwood_proof_before_hashing() {
+    use proptest::{
+        prelude::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+
+    use crate::{
+        at_least_one,
+        ironwood::{self, tree},
+        orchard::Flags,
+        primitives::Halo2Proof,
+    };
+
+    let _init_guard = zebra_test::init();
+
+    let mut runner = TestRunner::default();
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut runner)
+        .expect("test action strategy creates a value")
+        .current();
+
+    let transaction = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood::ShieldedData {
+            flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+            value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
+            shared_anchor: tree::Root::default(),
+            proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1) + 1]),
+            actions: at_least_one![ironwood::AuthorizedAction {
+                action,
+                spend_auth_sig: [0u8; 64].into(),
+            }],
+            binding_sig: [0u8; 64].into(),
+        }),
+    };
+
+    let error = UnminedTx::try_from_mempool_transaction(transaction)
+        .expect_err("padded Ironwood proof must be rejected before hashing");
+
+    assert_eq!(error, UnminedTxError::IronwoodProofSize);
+}
+
 /// Regression test for the Orchard `rk` identity-point DoS vulnerability.
 ///
-/// A v5 transaction whose Orchard action has `rk = [0u8; 32]` (the Pallas
-/// identity point) **deserializes successfully** — Zebra performs no
-/// identity-point check in [`crate::orchard::Action::zcash_deserialize`].
+/// A transaction whose Orchard action has `rk = [0u8; 32]` (the Pallas
+/// identity point) **deserializes successfully** unless Zebra validates it
+/// using the corresponding librustzcash transaction parser before returning.
 ///
 /// When the same transaction is subsequently fed to the Orchard Halo2 batch
 /// verifier via [`orchard::bundle::BatchValidator::add_bundle`], the call
@@ -1093,7 +1305,7 @@ fn test_coinbase_script() -> Result<()> {
 /// (`zebra-chain/src/orchard/keys.rs:225-238`), demonstrating the correct
 /// pattern.
 #[test]
-fn orchard_rk_identity_point() {
+fn orchard_rk_identity_point_rejected_during_deserialization() {
     use group::prime::PrimeCurveAffine;
     use reddsa::Signature;
 
@@ -1140,7 +1352,7 @@ fn orchard_rk_identity_point() {
         binding_sig: Signature::from([0u8; 64]),
     };
 
-    let tx = Transaction::V5 {
+    let v5_tx = Transaction::V5 {
         network_upgrade: NetworkUpgrade::Nu5,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(0),
@@ -1150,13 +1362,39 @@ fn orchard_rk_identity_point() {
         orchard_shielded_data: Some(shielded_data),
     };
 
-    // Step 1: serialize the transaction.
-    let tx_bytes = tx
+    let v5_tx_bytes = v5_tx
         .zcash_serialize_to_vec()
-        .expect("crafted transaction must serialize without error");
+        .expect("crafted V5 transaction must serialize without error");
 
-    // Step 2: deserialize
-    Transaction::zcash_deserialize(&tx_bytes[..]).expect_err("rk = identity should fail");
+    Transaction::zcash_deserialize(&v5_tx_bytes[..]).expect_err("V5 rk = identity should fail");
+
+    #[cfg(zcash_unstable = "nu6.3")]
+    {
+        let Transaction::V5 {
+            orchard_shielded_data,
+            ..
+        } = v5_tx
+        else {
+            unreachable!("test transaction is V5");
+        };
+
+        let v6_tx = Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu6_3,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![],
+            outputs: vec![],
+            sapling_shielded_data: None,
+            orchard_shielded_data,
+            ironwood_shielded_data: None,
+        };
+
+        let v6_tx_bytes = v6_tx
+            .zcash_serialize_to_vec()
+            .expect("crafted V6 transaction must serialize without error");
+
+        Transaction::zcash_deserialize(&v6_tx_bytes[..]).expect_err("V6 rk = identity should fail");
+    }
 }
 
 /// Reproduction for GHSA-rgwx-8r98-p34c:

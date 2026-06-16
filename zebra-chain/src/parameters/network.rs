@@ -390,7 +390,7 @@ impl Network {
     /// is active at `height`.
     ///
     /// This rule activates with the network upgrade that re-enables Orchard actions
-    /// (NU6.2). On networks where NU6.2 is unscheduled the rule is always inactive. It is a
+    /// (NU6.2), or with NU6.3 on configured networks that skip NU6.2. It is a
     /// constricting rule, so it must stay height-gated, or it would reject historical
     /// Orchard actions mined before the soft fork that temporarily disabled them, and
     /// prevent syncing.
@@ -398,6 +398,9 @@ impl Network {
         NetworkUpgrade::Nu6_2
             .activation_height(self)
             .is_some_and(|h| height >= h)
+            || NetworkUpgrade::Nu6_3
+                .activation_height(self)
+                .is_some_and(|h| height >= h)
     }
 }
 

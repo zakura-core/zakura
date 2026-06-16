@@ -6,8 +6,8 @@ FROM ${UBUNTU_IMAGE} AS build
 ARG DEBIAN_FRONTEND=noninteractive
 ARG RUST_VERSION=1.91
 ARG FEATURES="default-release-binaries tx_v6"
-# Custom rustc cfgs that gate the NU7 + NSM (ZIP-235) consensus paths.
-ARG RUSTFLAGS='--cfg zcash_unstable="nu7" --cfg zcash_unstable="zip235"'
+# Custom rustc cfgs that gate the NU6.3 + NSM (ZIP-235) consensus paths.
+ARG RUSTFLAGS='--cfg zcash_unstable="nu6.3" --cfg zcash_unstable="zip235"'
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \

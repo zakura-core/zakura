@@ -17,6 +17,7 @@ ignore = [
     "RUSTSEC-2021-0145", # atty (unsound) — transitive via abscissa_core -> structopt
     "RUSTSEC-2024-0370", # proc-macro-error — transitive via abscissa_core -> structopt
     "RUSTSEC-2026-0173", # proc-macro-error2 (unmaintained) — transitive via getset
+    "RUSTSEC-2025-0134", # rustls-pemfile — direct dependency via zebra-rpc
     "RUSTSEC-2025-0119", # number_prefix — transitive via indicatif
     "RUSTSEC-2025-0141", # bincode — direct dependency
     "RUSTSEC-2026-0118", # hickory-proto — transitive via iroh
@@ -226,7 +227,8 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # List of URLs for allowed Git repositories
 # TODO: Remove the URLs once the patch table in Cargo.toml is removed.
 allow-git = [
-    "https://github.com/zcash/librustzcash.git",
+    "https://github.com/valargroup/librustzcash.git",
+    "https://github.com/valargroup/qr_orchard",
 ]
 
 [sources.allow-org]

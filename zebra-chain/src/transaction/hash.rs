@@ -6,10 +6,10 @@
 //! * [`WtxId`]: a 64-byte witnessed transaction ID, which uniquely identifies unmined transactions
 //!   (transactions that are sent by wallets or stored in node mempools).
 //!
-//! Transaction version 5 uses both these unique identifiers:
-//! * [`struct@Hash`] uniquely identifies the effects of a v5 transaction (spends and outputs),
+//! Transaction versions 5 and 6 use both these unique identifiers:
+//! * [`struct@Hash`] uniquely identifies the effects of a v5 or v6 transaction (spends and outputs),
 //!   so it uniquely identifies the transaction's data after it has been mined into a block;
-//! * [`WtxId`] uniquely identifies the effects and authorizing data of a v5 transaction
+//! * [`WtxId`] uniquely identifies the effects and authorizing data of a v5 or v6 transaction
 //!   (signatures, proofs, and scripts), so it uniquely identifies the transaction's data
 //!   outside a block. (For example, transactions produced by Zcash wallets, or in node mempools.)
 //!
@@ -42,7 +42,7 @@ use crate::serialization::{
 
 use super::{txid::TxIdBuilder, AuthDigest, Transaction};
 
-/// A transaction ID, which uniquely identifies mined v5 transactions,
+/// A transaction ID, which uniquely identifies mined v5 and v6 transactions,
 /// and all v1-v4 transactions.
 ///
 /// Note: Zebra displays transaction and block hashes in big-endian byte-order,
@@ -195,7 +195,7 @@ impl ZcashDeserialize for Hash {
     }
 }
 
-/// A witnessed transaction ID, which uniquely identifies unmined v5 transactions.
+/// A witnessed transaction ID, which uniquely identifies unmined v5 and v6 transactions.
 ///
 /// Witnessed transaction IDs are not used for transaction versions 1-4.
 ///
@@ -227,7 +227,7 @@ impl From<Transaction> for WtxId {
     ///
     /// # Panics
     ///
-    /// If passed a pre-v5 transaction.
+    /// If passed a transaction without an authorizing data commitment.
     fn from(transaction: Transaction) -> Self {
         // use the ref implementation, to avoid cloning the transaction
         WtxId::from(&transaction)
@@ -239,11 +239,13 @@ impl From<&Transaction> for WtxId {
     ///
     /// # Panics
     ///
-    /// If passed a pre-v5 transaction.
+    /// If passed a transaction without an authorizing data commitment.
     fn from(transaction: &Transaction) -> Self {
         Self {
             id: transaction.into(),
-            auth_digest: transaction.into(),
+            auth_digest: transaction
+                .auth_digest()
+                .expect("witnessed transaction IDs require an authorizing data commitment"),
         }
     }
 }
@@ -253,7 +255,7 @@ impl From<Arc<Transaction>> for WtxId {
     ///
     /// # Panics
     ///
-    /// If passed a pre-v5 transaction.
+    /// If passed a transaction without an authorizing data commitment.
     fn from(transaction: Arc<Transaction>) -> Self {
         transaction.as_ref().into()
     }

@@ -1,14 +1,12 @@
 //! Unmined Zcash transaction identifiers and transactions.
 //!
-//! Transaction version 5 is uniquely identified by [`WtxId`] when unmined, and
-//! [`struct@Hash`] in the blockchain. The effects of a v5 transaction
+//! Transaction versions 5 and 6 are uniquely identified by [`WtxId`] when
+//! unmined, and [`struct@Hash`] in the blockchain. The effects of a v5 or v6 transaction
 //! (spends and outputs) are uniquely identified by the same
 //! [`struct@Hash`] in both cases.
 //!
 //! Transaction versions 1-4 are uniquely identified by legacy
 //! [`struct@Hash`] transaction IDs, whether they have been mined or not.
-//! So Zebra, and the Zcash network protocol, don't use witnessed transaction
-//! IDs for them.
 //!
 //! Zebra's [`UnminedTxId`] and [`UnminedTx`] enums provide the correct unique
 //! ID for unmined transactions. They can be used to handle transactions
@@ -94,14 +92,14 @@ pub enum UnminedTxId {
     /// A legacy unmined transaction identifier.
     ///
     /// Used to uniquely identify unmined version 1-4 transactions.
-    /// (After v1-4 transactions are mined, they can be uniquely identified
-    /// using the same [`struct@Hash`].)
+    /// (After these transactions are mined, they can be identified using the
+    /// same [`struct@Hash`].)
     Legacy(Hash),
 
     /// A witnessed unmined transaction identifier.
     ///
-    /// Used to uniquely identify unmined version 5 transactions.
-    /// (After v5 transactions are mined, they can be uniquely identified
+    /// Used to uniquely identify unmined version 5 and 6 transactions.
+    /// (After v5 and v6 transactions are mined, they can be uniquely identified
     /// using only the [`struct@Hash`] in their `WtxId.id`.)
     ///
     /// For more details, see [`WtxId`].
@@ -143,7 +141,7 @@ impl From<&Transaction> for UnminedTxId {
         match transaction {
             V1 { .. } | V2 { .. } | V3 { .. } | V4 { .. } => Legacy(transaction.into()),
             V5 { .. } => Witnessed(transaction.into()),
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+            #[cfg(zcash_unstable = "nu6.3")]
             V6 { .. } => Witnessed(transaction.into()),
         }
     }
@@ -168,6 +166,18 @@ impl From<&WtxId> for UnminedTxId {
 }
 
 impl UnminedTxId {
+    /// Try to create an [`UnminedTxId`] for an unverified mempool transaction.
+    ///
+    /// This rejects version 6 transactions with non-canonical shielded proof
+    /// sizes before computing their transaction ID.
+    pub fn try_from_mempool_transaction(
+        transaction: &Transaction,
+    ) -> Result<UnminedTxId, UnminedTxError> {
+        mempool_transaction_proof_size_is_canonical(transaction)?;
+
+        Ok(transaction.into())
+    }
+
     /// Create a new [`UnminedTxId`] using a v1-v4 legacy transaction ID.
     ///
     /// # Correctness
@@ -262,8 +272,88 @@ impl fmt::Display for UnminedTx {
     }
 }
 
+/// An error caused by constructing an unmined transaction from unverified data.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum UnminedTxError {
+    /// An Orchard proof has a non-canonical size.
+    OrchardProofSize,
+
+    /// An Ironwood proof has a non-canonical size.
+    IronwoodProofSize,
+}
+
+impl fmt::Display for UnminedTxError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            UnminedTxError::OrchardProofSize => "Orchard proof size is not canonical",
+            UnminedTxError::IronwoodProofSize => "Ironwood proof size is not canonical",
+        };
+
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for UnminedTxError {}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn mempool_transaction_proof_size_is_canonical(
+    transaction: &Transaction,
+) -> Result<(), UnminedTxError> {
+    let V6 {
+        orchard_shielded_data,
+        ironwood_shielded_data,
+        ..
+    } = transaction
+    else {
+        return Ok(());
+    };
+
+    if let Some(orchard_shielded_data) = orchard_shielded_data {
+        if !orchard_shielded_data.proof_size_is_canonical() {
+            return Err(UnminedTxError::OrchardProofSize);
+        }
+    }
+
+    if let Some(ironwood_shielded_data) = ironwood_shielded_data {
+        if !ironwood_shielded_data.proof_size_is_canonical() {
+            return Err(UnminedTxError::IronwoodProofSize);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(zcash_unstable = "nu6.3"))]
+fn mempool_transaction_proof_size_is_canonical(
+    _transaction: &Transaction,
+) -> Result<(), UnminedTxError> {
+    Ok(())
+}
+
 // Each of these conversions is implemented slightly differently,
 // to avoid cloning the transaction where possible.
+
+impl UnminedTx {
+    /// Try to create an [`UnminedTx`] from an unverified mempool transaction.
+    ///
+    /// This rejects version 6 transactions with non-canonical shielded proof
+    /// sizes before computing their transaction ID.
+    pub fn try_from_mempool_transaction(
+        transaction: impl Into<Arc<Transaction>>,
+    ) -> Result<Self, UnminedTxError> {
+        let transaction = transaction.into();
+        let id = UnminedTxId::try_from_mempool_transaction(&transaction)?;
+        let size = transaction.zcash_serialized_size();
+        let conventional_fee = zip317::conventional_fee(&transaction);
+
+        Ok(Self {
+            transaction,
+            id,
+            size,
+            conventional_fee,
+        })
+    }
+}
 
 impl From<Transaction> for UnminedTx {
     fn from(transaction: Transaction) -> Self {

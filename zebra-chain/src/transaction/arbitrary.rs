@@ -702,7 +702,7 @@ impl Arbitrary for orchard::ShieldedData {
 
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
         (
-            any::<orchard::shielded_data::Flags>(),
+            orchard_flags_pre_nu6_3_strategy(),
             any::<Amount>(),
             any::<orchard::tree::Root>(),
             vec(
@@ -746,6 +746,18 @@ impl Arbitrary for orchard::ShieldedData {
     }
 
     type Strategy = BoxedStrategy<Self>;
+}
+
+fn orchard_flags_pre_nu6_3_strategy() -> BoxedStrategy<orchard::shielded_data::Flags> {
+    use orchard::shielded_data::Flags;
+
+    prop_oneof![
+        Just(Flags::empty()),
+        Just(Flags::ENABLE_SPENDS),
+        Just(Flags::ENABLE_OUTPUTS),
+        Just(Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS),
+    ]
+    .boxed()
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -800,7 +812,7 @@ impl Arbitrary for Transaction {
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
-            | NetworkUpgrade::Nu7 => prop_oneof![
+            | NetworkUpgrade::Nu6_3 => prop_oneof![
                 Self::v4_strategy(ledger_state.clone()),
                 Self::v5_strategy(ledger_state)
             ]
@@ -957,7 +969,7 @@ pub fn transaction_to_fake_v5(
             orchard_shielded_data: None,
         },
         v5 @ V5 { .. } => v5.clone(),
-        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+        #[cfg(zcash_unstable = "nu6.3")]
         v6 @ V6 { .. } => v6.clone(),
     }
 }
@@ -1043,7 +1055,7 @@ pub fn v5_transactions<'b>(
         | Transaction::V3 { .. }
         | Transaction::V4 { .. } => None,
         ref tx @ Transaction::V5 { .. } => Some(tx.clone()),
-        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+        #[cfg(zcash_unstable = "nu6.3")]
         ref tx @ Transaction::V6 { .. } => Some(tx.clone()),
     })
 }

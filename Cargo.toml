@@ -179,6 +179,18 @@ zcash_script = "0.4.5"
 config = { version = "0.15.14", features = ["toml"] }
 which = "8.0.0"
 
+[patch.crates-io]
+equihash = { git = "https://github.com/valargroup/librustzcash.git", rev = "288bc4e2b12fd720f972ad913bea441978380951" }
+orchard = { git = "https://github.com/valargroup/qr_orchard", rev = "4cdd4991eb014a2831718969a12506347ff2a6ea" }
+zcash_address = { git = "https://github.com/valargroup/librustzcash.git", rev = "288bc4e2b12fd720f972ad913bea441978380951" }
+zcash_encoding = { git = "https://github.com/valargroup/librustzcash.git", rev = "288bc4e2b12fd720f972ad913bea441978380951" }
+zcash_history = { git = "https://github.com/valargroup/librustzcash.git", rev = "288bc4e2b12fd720f972ad913bea441978380951" }
+zcash_keys = { git = "https://github.com/valargroup/librustzcash.git", rev = "288bc4e2b12fd720f972ad913bea441978380951" }
+zcash_primitives = { git = "https://github.com/valargroup/librustzcash.git", rev = "288bc4e2b12fd720f972ad913bea441978380951" }
+zcash_proofs = { git = "https://github.com/valargroup/librustzcash.git", rev = "288bc4e2b12fd720f972ad913bea441978380951" }
+zcash_protocol = { git = "https://github.com/valargroup/librustzcash.git", rev = "288bc4e2b12fd720f972ad913bea441978380951" }
+zcash_transparent = { git = "https://github.com/valargroup/librustzcash.git", rev = "288bc4e2b12fd720f972ad913bea441978380951" }
+
 [workspace.metadata.release]
 
 # We always do releases from the main branch
@@ -343,7 +355,7 @@ debug = false
 # The linter should ignore these expected config flags/values
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(tokio_unstable)', # Used by tokio-console
-    'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu7", "zip235"))' # Used in Zebra and librustzcash
+    'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu6.3"))' # Used in Zebra and librustzcash
 ] }
 
 # High-risk code

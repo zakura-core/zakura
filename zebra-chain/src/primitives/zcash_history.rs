@@ -9,11 +9,11 @@ mod tests;
 use std::{collections::BTreeMap, io, sync::Arc};
 
 use serde_big_array::BigArray;
-pub use zcash_history::{V1, V2};
+pub use zcash_history::{V1, V2, V3};
 
 use crate::{
     block::{Block, ChainHistoryMmrRootHash},
-    orchard,
+    ironwood, orchard,
     parameters::{Network, NetworkUpgrade},
     sapling,
 };
@@ -26,6 +26,7 @@ pub trait Version: zcash_history::Version {
         network: &Network,
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
+        ironwood_root: &ironwood::tree::Root,
     ) -> Self::NodeData;
 }
 
@@ -73,13 +74,17 @@ impl Entry {
     /// `sapling_root` is the root of the Sapling note commitment tree of the block.
     /// `orchard_root` is the root of the Orchard note commitment tree of the block;
     ///  (ignored for V1 trees).
+    /// `ironwood_root` is the root of the Ironwood note commitment tree of the block;
+    ///  (ignored for V1 and V2 trees).
     fn new_leaf<V: Version>(
         block: Arc<Block>,
         network: &Network,
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
+        ironwood_root: &ironwood::tree::Root,
     ) -> Self {
-        let node_data = V::block_to_history_node(block, network, sapling_root, orchard_root);
+        let node_data =
+            V::block_to_history_node(block, network, sapling_root, orchard_root, ironwood_root);
         let inner_entry = zcash_history::Entry::<V>::new_leaf(node_data);
         let mut entry = Entry {
             inner: [0; zcash_history::MAX_ENTRY_SIZE],
@@ -138,18 +143,22 @@ impl<V: Version> Tree<V> {
     /// `sapling_root` is the root of the Sapling note commitment tree of the block.
     /// `orchard_root` is the root of the Orchard note commitment tree of the block;
     ///  (ignored for V1 trees).
+    /// `ironwood_root` is the root of the Ironwood note commitment tree of the block;
+    ///  (ignored for V1 and V2 trees).
     #[allow(clippy::unwrap_in_result)]
     pub fn new_from_block(
         network: &Network,
         block: Arc<Block>,
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
+        ironwood_root: &ironwood::tree::Root,
     ) -> Result<(Self, Entry), io::Error> {
         let height = block
             .coinbase_height()
             .expect("block must have coinbase height during contextual verification");
         let network_upgrade = NetworkUpgrade::current(network, height);
-        let entry0 = Entry::new_leaf::<V>(block, network, sapling_root, orchard_root);
+        let entry0 =
+            Entry::new_leaf::<V>(block, network, sapling_root, orchard_root, ironwood_root);
         let mut peaks = BTreeMap::new();
         peaks.insert(0u32, entry0);
         Ok((
@@ -165,6 +174,8 @@ impl<V: Version> Tree<V> {
     /// `sapling_root` is the root of the Sapling note commitment tree of the block.
     /// `orchard_root` is the root of the Orchard note commitment tree of the block;
     ///  (ignored for V1 trees).
+    /// `ironwood_root` is the root of the Ironwood note commitment tree of the block;
+    ///  (ignored for V1 and V2 trees).
     ///
     /// Returns a vector of nodes added to the tree (leaf + internal nodes).
     ///
@@ -178,6 +189,7 @@ impl<V: Version> Tree<V> {
         block: Arc<Block>,
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
+        ironwood_root: &ironwood::tree::Root,
     ) -> Result<Vec<Entry>, zcash_history::Error> {
         let height = block
             .coinbase_height()
@@ -191,7 +203,13 @@ impl<V: Version> Tree<V> {
             self.network_upgrade
         );
 
-        let node_data = V::block_to_history_node(block, &self.network, sapling_root, orchard_root);
+        let node_data = V::block_to_history_node(
+            block,
+            &self.network,
+            sapling_root,
+            orchard_root,
+            ironwood_root,
+        );
         let appended = self.inner.append_leaf(node_data)?;
 
         let mut new_nodes = Vec::new();
@@ -236,6 +254,7 @@ impl Version for zcash_history::V1 {
         network: &Network,
         sapling_root: &sapling::tree::Root,
         _orchard_root: &orchard::tree::Root,
+        _ironwood_root: &ironwood::tree::Root,
     ) -> Self::NodeData {
         let height = block
             .coinbase_height()
@@ -279,7 +298,7 @@ impl Version for zcash_history::V1 {
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
-            | NetworkUpgrade::Nu7 => {}
+            | NetworkUpgrade::Nu6_3 => {}
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => {}
         };
@@ -311,15 +330,43 @@ impl Version for V2 {
         network: &Network,
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
+        _ironwood_root: &ironwood::tree::Root,
     ) -> Self::NodeData {
         let orchard_tx_count = block.orchard_transactions_count();
-        let node_data_v1 = V1::block_to_history_node(block, network, sapling_root, orchard_root);
+        let node_data_v1 =
+            V1::block_to_history_node(block, network, sapling_root, orchard_root, _ironwood_root);
         let orchard_root: [u8; 32] = orchard_root.into();
         Self::NodeData {
             v1: node_data_v1,
             start_orchard_root: orchard_root,
             end_orchard_root: orchard_root,
             orchard_tx: orchard_tx_count,
+        }
+    }
+}
+
+impl Version for V3 {
+    /// Convert a Block into a V3::NodeData used in the MMR tree.
+    ///
+    /// `sapling_root` is the root of the Sapling note commitment tree of the block.
+    /// `orchard_root` is the root of the Orchard note commitment tree of the block.
+    /// `ironwood_root` is the root of the Ironwood note commitment tree of the block.
+    fn block_to_history_node(
+        block: Arc<Block>,
+        network: &Network,
+        sapling_root: &sapling::tree::Root,
+        orchard_root: &orchard::tree::Root,
+        ironwood_root: &ironwood::tree::Root,
+    ) -> Self::NodeData {
+        let ironwood_tx_count = block.ironwood_transactions_count();
+        let node_data_v2 =
+            V2::block_to_history_node(block, network, sapling_root, orchard_root, ironwood_root);
+        let ironwood_root: [u8; 32] = ironwood_root.into();
+        Self::NodeData {
+            v2: node_data_v2,
+            start_ironwood_root: ironwood_root,
+            end_ironwood_root: ironwood_root,
+            ironwood_tx: ironwood_tx_count,
         }
     }
 }

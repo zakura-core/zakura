@@ -783,14 +783,13 @@ fn last_config_is_stored() -> Result<()> {
         fs::read_to_string(generated_config_path).expect("Should have been able to read the file");
 
     // We need to replace the cache dir path as stored configs has a dummy `cache_dir` string there.
+    let default_cache_dir = zebra_state::Config::default()
+        .cache_dir
+        .to_str()
+        .expect("a valid cache dir")
+        .to_string();
     let processed_generated_content = generated_content
-        .replace(
-            zebra_state::Config::default()
-                .cache_dir
-                .to_str()
-                .expect("a valid cache dir"),
-            "cache_dir",
-        )
+        .replace(&default_cache_dir, "cache_dir")
         .trim()
         .to_string();
 
@@ -847,7 +846,7 @@ fn last_config_is_stored() -> Result<()> {
          Or run: \n\
          cargo build --bin zebrad && \n\
          zebrad generate | \n\
-         sed 's/cache_dir = \".*\"/cache_dir = \"cache_dir\"/' > \n\
+         sed 's|{default_cache_dir}|cache_dir|g' > \n\
          zebrad/tests/common/configs/<next-release-tag>.toml",
     ))
 }

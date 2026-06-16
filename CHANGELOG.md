@@ -75,6 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   RPC listener without TLS for deployments where another boundary secures the
   listener, such as a private container network. Non-loopback listeners
   otherwise require TLS.
+- Added Ironwood RPC output for `getblock`, `getblockchaininfo`,
+  `getrawtransaction`, `z_gettreestate`, and `z_getsubtreesbyindex`.
 
 ### Changed
 

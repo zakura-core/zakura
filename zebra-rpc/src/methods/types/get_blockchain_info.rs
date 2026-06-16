@@ -37,8 +37,9 @@ pub struct GetBlockchainInfoBalance {
 }
 
 impl GetBlockchainInfoBalance {
-    /// Returns a list of [`GetBlockchainInfoBalance`]s converted from the default [`ValueBalance`].
-    pub fn zero_pools() -> [Self; 5] {
+    /// Returns zero-value transparent, Sprout, Sapling, Orchard, Ironwood, and
+    /// Lockbox value pools.
+    pub fn zero_pools() -> [Self; 6] {
         Self::value_pools(Default::default(), None)
     }
 
@@ -82,16 +83,22 @@ impl GetBlockchainInfoBalance {
         Self::new_internal("orchard", amount, delta)
     }
 
+    /// Creates a [`GetBlockchainInfoBalance`] for the Ironwood pool.
+    pub fn ironwood(amount: Amount<NonNegative>, delta: Option<Amount<NegativeAllowed>>) -> Self {
+        Self::new_internal("ironwood", amount, delta)
+    }
+
     /// Creates a [`GetBlockchainInfoBalance`] for the Lockbox pool.
     pub fn deferred(amount: Amount<NonNegative>, delta: Option<Amount<NegativeAllowed>>) -> Self {
         Self::new_internal("lockbox", amount, delta)
     }
 
-    /// Converts a [`ValueBalance`] to a list of [`GetBlockchainInfoBalance`]s.
+    /// Converts a [`ValueBalance`] to transparent, Sprout, Sapling, Orchard,
+    /// Ironwood, and Lockbox value pool entries, in zcashd-compatible order.
     pub fn value_pools(
         value_balance: ValueBalance<NonNegative>,
         delta_balance: Option<ValueBalance<NegativeAllowed>>,
-    ) -> [Self; 5] {
+    ) -> [Self; 6] {
         [
             Self::transparent(
                 value_balance.transparent_amount(),
@@ -108,6 +115,10 @@ impl GetBlockchainInfoBalance {
             Self::orchard(
                 value_balance.orchard_amount(),
                 delta_balance.map(|b| b.orchard_amount()),
+            ),
+            Self::ironwood(
+                value_balance.ironwood_amount(),
+                delta_balance.map(|b| b.ironwood_amount()),
             ),
             Self::deferred(
                 value_balance.deferred_amount(),

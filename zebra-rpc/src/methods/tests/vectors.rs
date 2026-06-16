@@ -281,7 +281,11 @@ async fn rpc_getblock() {
     // Create empty note commitment tree information.
     let sapling = SaplingTrees { size: 0 };
     let orchard = OrchardTrees { size: 0 };
-    let trees = GetBlockTrees { sapling, orchard };
+    let trees = GetBlockTrees {
+        sapling,
+        orchard,
+        ironwood: None,
+    };
 
     // Make height calls with verbosity=1 and check response
     let mut prev_block_info: Option<BlockInfo> = None;
@@ -715,6 +719,140 @@ async fn rpc_getblock() {
     mempool.expect_no_requests().await;
 
     // The queue task should continue without errors or panics
+    let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
+    assert!(rpc_tx_queue_task_result.is_none());
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getblock_includes_empty_ironwood_tree_after_nu6_3_activation() {
+    let _init_guard = zebra_test::init();
+
+    let network = Parameters::build()
+        .with_network_name("nu6_3_testnet")
+        .expect("failed to set network name")
+        .with_activation_heights(testnet::ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            ..Default::default()
+        })
+        .expect("failed to set activation heights")
+        .clear_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+
+    let block: Arc<Block> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .get(&1)
+        .expect("test vector should contain block 1")
+        .zcash_deserialize_into()
+        .expect("test block should deserialize");
+    let hash = block.hash();
+    let height = Height(1);
+    let hash_or_height = HashOrHeight::from(height);
+    let tx_hashes = block
+        .transactions
+        .iter()
+        .map(|tx| tx.hash())
+        .collect::<Vec<_>>();
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = RpcImpl::new(
+        network,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 8),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let block_future =
+        tokio::spawn(async move { rpc.get_block(height.0.to_string(), Some(1)).await });
+
+    read_state
+        .expect_request(ReadRequest::BlockHeader(hash_or_height))
+        .await
+        .respond(ReadResponse::BlockHeader {
+            header: block.header.clone(),
+            hash,
+            height,
+            next_block_hash: None,
+        });
+
+    read_state
+        .expect_request(ReadRequest::SaplingTree(hash_or_height))
+        .await
+        .respond(ReadResponse::SaplingTree(Some(Arc::new(
+            zebra_chain::sapling::tree::NoteCommitmentTree::default(),
+        ))));
+
+    read_state
+        .expect_request(ReadRequest::Depth(hash))
+        .await
+        .respond(ReadResponse::Depth(Some(0)));
+
+    read_state
+        .expect_request(ReadRequest::TransactionIdsForBlock(hash.into()))
+        .await
+        .respond(ReadResponse::TransactionIdsForBlock(Some(Arc::from(
+            tx_hashes.into_boxed_slice(),
+        ))));
+
+    read_state
+        .expect_request(ReadRequest::OrchardTree(hash.into()))
+        .await
+        .respond(ReadResponse::OrchardTree(Some(Arc::new(
+            zebra_chain::orchard::tree::NoteCommitmentTree::default(),
+        ))));
+
+    read_state
+        .expect_request(ReadRequest::IronwoodTree(hash.into()))
+        .await
+        .respond(ReadResponse::IronwoodTree(Some(Arc::new(
+            zebra_chain::ironwood::tree::NoteCommitmentTree::default(),
+        ))));
+
+    read_state
+        .expect_request(ReadRequest::BlockInfo(
+            block.header.previous_block_hash.into(),
+        ))
+        .await
+        .respond(ReadResponse::BlockInfo(Some(BlockInfo::default())));
+
+    read_state
+        .expect_request(ReadRequest::BlockInfo(hash.into()))
+        .await
+        .respond(ReadResponse::BlockInfo(Some(BlockInfo::new(
+            Default::default(),
+            block.zcash_serialized_size() as u32,
+        ))));
+
+    let get_block = block_future
+        .await
+        .expect("block future should not panic")
+        .expect("NU6.3 getblock should succeed");
+    let GetBlockResponse::Object(block) = get_block else {
+        panic!("expected a verbose getblock object");
+    };
+
+    assert_eq!(block.trees.ironwood(), Some(0));
+
+    let json = serde_json::to_value(block).expect("getblock object should serialize");
+    assert_eq!(json["trees"]["ironwood"]["size"], 0);
+
+    mempool.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+
     let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
     assert!(rpc_tx_queue_task_result.is_none());
 }

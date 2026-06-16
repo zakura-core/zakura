@@ -9,11 +9,13 @@
 
 use std::{env, path::Path, sync::Arc};
 
+use semver::Version;
 use tempfile::TempDir;
 
 use zebra_chain::{
     amount::{Amount, NonNegative, MAX_MONEY},
     block::{self, Block, Height},
+    ironwood, orchard,
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters as TestnetParameters},
         Network, NetworkKind, NetworkUpgrade,
@@ -32,7 +34,10 @@ use crate::{
     preview_rollback_finalized_state, rollback_finalized_state,
     service::{
         arbitrary::PreparedChain,
-        finalized_state::{CheckpointVerifiedBlock, FinalizedState, STATE_COLUMN_FAMILIES_IN_CODE},
+        finalized_state::{
+            disk_format::upgrade::{add_ironwood_tree, DiskFormatUpgrade},
+            CheckpointVerifiedBlock, FinalizedState, STATE_COLUMN_FAMILIES_IN_CODE,
+        },
     },
     DiskWriteBatch, RollbackFinalizedStateError, RollbackFinalizedStateOptions,
     SemanticallyVerifiedBlock, ZebraDb,
@@ -591,6 +596,49 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
     })
 }
 
+#[cfg(zcash_unstable = "nu6.3")]
+fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifier) {
+    use proptest::{prelude::any, strategy::ValueTree, test_runner::TestRunner};
+    use zebra_chain::{
+        at_least_one,
+        orchard::{self, tree},
+        primitives::Halo2Proof,
+    };
+
+    let mut runner = TestRunner::default();
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut runner)
+        .expect("test action strategy creates a value")
+        .current();
+    let nullifier = action.nullifier;
+
+    let ironwood_shielded_data = ironwood::ShieldedData {
+        flags: orchard::Flags::ENABLE_SPENDS,
+        value_balance: Amount::zero(),
+        shared_anchor: tree::Root::default(),
+        proof: Halo2Proof(vec![0; 4992]),
+        actions: at_least_one![ironwood::AuthorizedAction {
+            action,
+            spend_auth_sig: [0u8; 64].into(),
+        }],
+        binding_sig: [0u8; 64].into(),
+    };
+
+    (
+        Arc::new(Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu6_3,
+            lock_time: LockTime::unlocked(),
+            expiry_height,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: Some(ironwood_shielded_data),
+        }),
+        nullifier,
+    )
+}
+
 fn child_block_with_history_commitment(
     parent: &Block,
     transactions: Vec<Arc<Transaction>>,
@@ -779,7 +827,8 @@ fn modern_rollback_network() -> Network {
             nu6_1: Some(9),
             nu6_2: Some(10),
             nu6_3: Some(11),
-            nu7: None,
+            #[cfg(zcash_unstable = "zfuture")]
+            zfuture: None,
         })
         .expect("configured activation heights are valid")
         .extend_funding_streams()
@@ -1002,10 +1051,11 @@ fn rollback_prunes_subtrees_above_target() {
     let config = config_at(dir.path());
     sync_to(&config, &network, &chain);
 
-    // Insert subtrees straddling the rollback target (height 2): index 0 ends at/below it (kept),
-    // index 1 ends above it (pruned).
+    // Insert subtrees straddling the rollback target (height 2): index 0 ends at or below it,
+    // and index 1 ends above it.
     let sapling_node = sapling_crypto::Node::from_bytes([0; 32]).expect("dummy sapling node");
-    let orchard_node = zebra_chain::orchard::tree::Node::default();
+    let orchard_node = orchard::tree::Node::default();
+    let ironwood_node = ironwood::tree::Node::default();
     {
         let db = open_unchecked_db(&config, &network);
         let mut batch = DiskWriteBatch::new();
@@ -1024,6 +1074,14 @@ fn rollback_prunes_subtrees_above_target() {
         batch.insert_orchard_subtree(
             &db,
             &NoteCommitmentSubtree::new(1u16, Height(3), orchard_node),
+        );
+        batch.insert_ironwood_subtree(
+            &db,
+            &NoteCommitmentSubtree::new(0u16, Height(2), ironwood_node),
+        );
+        batch.insert_ironwood_subtree(
+            &db,
+            &NoteCommitmentSubtree::new(1u16, Height(3), ironwood_node),
         );
         db.write_batch(batch)
             .expect("database accepts the synthetic subtree batch");
@@ -1051,6 +1109,11 @@ fn rollback_prunes_subtrees_above_target() {
         .keys()
         .map(|index| index.0)
         .collect();
+    let ironwood: Vec<u16> = rolled
+        .ironwood_subtree_list_by_index_range(..)
+        .keys()
+        .map(|index| index.0)
+        .collect();
 
     assert_eq!(
         sapling,
@@ -1061,5 +1124,461 @@ fn rollback_prunes_subtrees_above_target() {
         orchard,
         vec![0],
         "orchard subtree above the target is pruned"
+    );
+    assert_eq!(
+        ironwood,
+        vec![0],
+        "ironwood subtree above the target is pruned"
+    );
+}
+
+fn rewrite_ironwood_trees_as_upgrade_backfill(config: &Config, network: &Network) {
+    let db = open_unchecked_db(config, network);
+    let tip_height = db.finalized_tip_height().expect("test state has a tip");
+    let existing_trees: Vec<_> = db.ironwood_tree_by_height_range(..).collect();
+    let ironwood_tree = ironwood::tree::NoteCommitmentTree::default();
+    let mut batch = DiskWriteBatch::new();
+
+    for (height, tree) in existing_trees {
+        batch.delete_ironwood_tree(&db, &height);
+        batch.delete_ironwood_anchor(&db, &tree.root());
+    }
+
+    batch.create_ironwood_tree(&db, &tip_height, &ironwood_tree);
+    db.write_batch(batch)
+        .expect("database accepts synthetic Ironwood upgrade backfill");
+}
+
+#[test]
+fn ironwood_tree_upgrade_backfills_first_finalized_height() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let address = Address::from_script_hash(NetworkKind::Mainnet, [0x42; 20]);
+    let dust = Amount::<NonNegative>::try_from(1).expect("1 fits in Amount<NonNegative>");
+
+    let genesis: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("mainnet genesis test vector deserializes");
+    let block1 = child_block(&genesis, vec![coinbase_tx(Height(1), dust, &address)]);
+    let block2 = child_block(&block1, vec![coinbase_tx(Height(2), dust, &address)]);
+
+    let chain: Vec<SemanticallyVerifiedBlock> = [genesis, block1, block2]
+        .into_iter()
+        .map(SemanticallyVerifiedBlock::from)
+        .collect();
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain);
+
+    let db = open_unchecked_db(&config, &network);
+    let tip_height = db.finalized_tip_height().expect("test state has a tip");
+    let existing_trees: Vec<_> = db.ironwood_tree_by_height_range(..).collect();
+    let mut batch = DiskWriteBatch::new();
+
+    for (height, tree) in existing_trees {
+        batch.delete_ironwood_tree(&db, &height);
+        batch.delete_ironwood_anchor(&db, &tree.root());
+    }
+
+    db.write_batch(batch)
+        .expect("database accepts synthetic pre-upgrade Ironwood tree deletion");
+    assert!(
+        db.ironwood_tree_by_height_range(..=tip_height)
+            .next()
+            .is_none(),
+        "the synthetic pre-upgrade database has no Ironwood trees"
+    );
+
+    let (_cancel_sender, cancel_receiver) = crossbeam_channel::unbounded();
+    add_ironwood_tree::Upgrade
+        .run(tip_height, &db, &cancel_receiver)
+        .expect("Ironwood tree upgrade succeeds");
+
+    let ironwood_tree = db
+        .ironwood_tree_by_height(&Height::MIN)
+        .expect("upgrade backfills the empty Ironwood tree at the first finalized height");
+    assert_eq!(
+        ironwood_tree.root(),
+        ironwood::tree::NoteCommitmentTree::default().root(),
+        "the backfilled Ironwood tree is empty"
+    );
+    assert!(
+        db.contains_ironwood_anchor(&ironwood_tree.root()),
+        "the backfilled Ironwood tree anchor is indexed"
+    );
+    assert_eq!(
+        db.ironwood_tree_by_height(&Height(1))
+            .expect("earlier finalized heights can read the backfilled Ironwood tree")
+            .root(),
+        ironwood_tree.root()
+    );
+    assert_eq!(
+        add_ironwood_tree::Upgrade
+            .validate(&db, &cancel_receiver)
+            .expect("Ironwood tree upgrade validation is not cancelled"),
+        Ok(())
+    );
+}
+
+#[test]
+fn history_tree_upgrade_write_guard_checks_tip_hash() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let genesis: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("mainnet genesis test vector deserializes");
+    let chain = vec![SemanticallyVerifiedBlock::from(genesis)];
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain);
+
+    let db = open_unchecked_db(&config, &network);
+    let (tip_height, tip_hash) = db.tip().expect("test state has a tip");
+    let mut wrong_hash = tip_hash;
+    wrong_hash.0[0] ^= 0xff;
+
+    assert_ne!(wrong_hash, tip_hash, "wrong hash differs from tip hash");
+
+    let wrote = db
+        .write_batch_if_finalized_tip(DiskWriteBatch::new(), (tip_height, wrong_hash))
+        .expect("conditional write succeeds");
+    assert!(
+        !wrote,
+        "write guard rejects the same tip height with a different hash"
+    );
+
+    let wrote = db
+        .write_batch_if_finalized_tip(DiskWriteBatch::new(), (tip_height, tip_hash))
+        .expect("conditional write succeeds");
+    assert!(wrote, "write guard accepts the exact finalized tip");
+}
+
+#[test]
+fn history_tree_upgrade_rebuilds_stale_tip_tree() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = TestnetParameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu6_2: Some(10),
+            nu6_3: Some(11),
+            #[cfg(zcash_unstable = "zfuture")]
+            zfuture: None,
+        })
+        .expect("valid configured activation heights")
+        .clear_funding_streams()
+        .to_network()
+        .expect("valid configured network");
+
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+
+    proptest!(
+        ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default()
+            .with_ledger_strategy(ledger_strategy)
+            .with_valid_commitments()
+            .no_shrink())
+        | {
+            let synced: Vec<SemanticallyVerifiedBlock> = chain.iter().cloned().collect();
+            let stale_height = NetworkUpgrade::Nu6_3
+                .activation_height(&network)
+                .expect("NU6.3 activation height is configured");
+            prop_assume!(
+                synced
+                    .last()
+                    .expect("generated chain has a tip")
+                    .height
+                    > stale_height
+            );
+
+            let dir = TempDir::new().expect("temp dir");
+            let config = config_at(dir.path());
+            sync_to(&config, &network, &synced);
+
+            let db = open_unchecked_db(&config, &network);
+            let tip_height = db.finalized_tip_height().expect("test state has a tip");
+            let tip_history_tree = db.history_tree();
+            let stale_block = db
+                .block(stale_height.into())
+                .expect("stale block exists in the finalized state");
+            let stale_sapling_root = db
+                .sapling_tree_by_height(&stale_height)
+                .expect("stale Sapling tree exists")
+                .root();
+            let stale_orchard_root = db
+                .orchard_tree_by_height(&stale_height)
+                .expect("stale Orchard tree exists")
+                .root();
+            let stale_ironwood_root = db
+                .ironwood_tree_by_height(&stale_height)
+                .expect("stale Ironwood tree exists")
+                .root();
+            let stale_history_tree = zebra_chain::history_tree::HistoryTree::from_block(
+                &network,
+                stale_block,
+                &stale_sapling_root,
+                &stale_orchard_root,
+                &stale_ironwood_root,
+            )
+            .expect("stale history tree rebuild succeeds");
+            let mut batch = DiskWriteBatch::new();
+            batch.update_history_tree(&db, &stale_history_tree);
+            db.write_batch(batch)
+                .expect("database accepts synthetic stale history tree");
+
+            let (_cancel_sender, cancel_receiver) = crossbeam_channel::unbounded();
+            prop_assert!(
+                add_ironwood_tree::Upgrade
+                    .validate(&db, &cancel_receiver)
+                    .expect("history tree validation is not cancelled")
+                    .is_err(),
+                "validation rejects the stale history tree"
+            );
+
+            add_ironwood_tree::Upgrade
+                .run(tip_height, &db, &cancel_receiver)
+                .expect("history tree rebuild upgrade succeeds");
+
+            prop_assert_eq!(
+                db.history_tree().hash(),
+                tip_history_tree.hash(),
+                "upgrade restores the tip history tree hash"
+            );
+            prop_assert_eq!(
+                add_ironwood_tree::Upgrade
+                    .validate(&db, &cancel_receiver)
+                    .expect("history tree validation is not cancelled"),
+                Ok(())
+            );
+        }
+    );
+
+    Ok(())
+}
+
+#[test]
+fn pre_v28_history_tree_rebuild_cache_catches_up_to_tip() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = TestnetParameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu6_2: Some(10),
+            nu6_3: Some(11),
+            #[cfg(zcash_unstable = "zfuture")]
+            zfuture: None,
+        })
+        .expect("valid configured activation heights")
+        .clear_funding_streams()
+        .to_network()
+        .expect("valid configured network");
+
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
+
+    proptest!(
+        ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default()
+            .with_ledger_strategy(ledger_strategy)
+            .with_valid_commitments()
+            .no_shrink())
+        | {
+            let synced: Vec<SemanticallyVerifiedBlock> = chain.iter().cloned().collect();
+            let stale_height = NetworkUpgrade::Nu6_3
+                .activation_height(&network)
+                .expect("NU6.3 activation height is configured");
+            prop_assume!(
+                synced
+                    .last()
+                    .expect("generated chain has a tip")
+                    .height
+                    > stale_height
+            );
+
+            let dir = TempDir::new().expect("temp dir");
+            let config = config_at(dir.path());
+            sync_to(&config, &network, &synced);
+
+            let db = open_unchecked_db(&config, &network);
+            let tip = db.tip().expect("test state has a tip");
+            db.update_format_version_on_disk(&Version::new(27, 0, 0))
+                .expect("test can mark database as pre-v28");
+
+            let expected_tip_tree = db
+                .rebuild_history_tree_to_height(tip.0, || Ok::<(), std::convert::Infallible>(()))
+                .expect("full tip history tree rebuild succeeds");
+
+            let pre_v28_history_tree = db.history_tree();
+            prop_assert_eq!(pre_v28_history_tree.hash(), expected_tip_tree.hash());
+            prop_assert_eq!(db.history_tree_rebuild_cache_tip(), Some(tip));
+
+            let stale_tip = (
+                stale_height,
+                db.hash(stale_height)
+                    .expect("stale height exists in finalized state"),
+            );
+            let stale_history_tree = db
+                .rebuild_history_tree_to_height(stale_height, || {
+                    Ok::<(), std::convert::Infallible>(())
+                })
+                .expect("stale history tree rebuild succeeds");
+            db.set_history_tree_rebuild_cache(stale_tip, Arc::new(stale_history_tree));
+
+            let Some((rebuilt_tip, caught_up_history_tree)) = db
+                .cached_rebuild_history_tree_to_tip(|| Ok::<(), std::convert::Infallible>(()))
+                .expect("cached rebuild cannot be cancelled")
+            else {
+                prop_assert!(false, "test state has a tip");
+                return Ok(());
+            };
+
+            prop_assert_eq!(rebuilt_tip, tip);
+            prop_assert_eq!(caught_up_history_tree.hash(), expected_tip_tree.hash());
+            prop_assert_eq!(db.history_tree_rebuild_cache_tip(), Some(tip));
+        }
+    );
+
+    Ok(())
+}
+
+#[test]
+fn rollback_preserves_backfilled_ironwood_tree_below_upgrade_tip() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let address = Address::from_script_hash(NetworkKind::Mainnet, [0x42; 20]);
+    let dust = Amount::<NonNegative>::try_from(1).expect("1 fits in Amount<NonNegative>");
+
+    let genesis: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("mainnet genesis test vector deserializes");
+    let block1 = child_block(&genesis, vec![coinbase_tx(Height(1), dust, &address)]);
+    let block2 = child_block(&block1, vec![coinbase_tx(Height(2), dust, &address)]);
+
+    let chain: Vec<SemanticallyVerifiedBlock> = [genesis, block1, block2]
+        .into_iter()
+        .map(SemanticallyVerifiedBlock::from)
+        .collect();
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain);
+    rewrite_ironwood_trees_as_upgrade_backfill(&config, &network);
+
+    let db = open_unchecked_db(&config, &network);
+    assert!(
+        db.ironwood_tree_by_height_range(..=Height(1))
+            .next()
+            .is_none(),
+        "the synthetic upgraded database only has an Ironwood tree above the rollback target"
+    );
+    drop(db);
+
+    rollback_finalized_state(
+        config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: Height(1),
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("rollback succeeds");
+
+    let db = open_unchecked_db(&config, &network);
+    let Some((height, ironwood_tree)) = db.ironwood_tree_by_height_range(..=Height(1)).last()
+    else {
+        panic!("rollback must preserve an Ironwood tree at or below the retained tip");
+    };
+
+    assert_eq!(
+        height,
+        Height(1),
+        "rollback writes the missing empty Ironwood tree at the retained tip"
+    );
+    assert_eq!(
+        ironwood_tree.root(),
+        ironwood::tree::NoteCommitmentTree::default().root(),
+        "the preserved Ironwood tree is empty"
+    );
+    assert!(
+        db.contains_ironwood_anchor(&ironwood_tree.root()),
+        "the preserved Ironwood tree anchor remains indexed"
+    );
+    assert_eq!(
+        db.ironwood_tree_for_tip().root(),
+        ironwood_tree.root(),
+        "tip lookups can find the preserved Ironwood tree"
+    );
+}
+
+#[test]
+#[cfg(zcash_unstable = "nu6.3")]
+fn rollback_prunes_ironwood_nullifiers_above_target() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let address = Address::from_script_hash(NetworkKind::Mainnet, [0x42; 20]);
+    let dust = Amount::<NonNegative>::try_from(1).expect("1 fits in Amount<NonNegative>");
+
+    let genesis: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("mainnet genesis test vector deserializes");
+    let block1 = child_block(&genesis, vec![coinbase_tx(Height(1), dust, &address)]);
+    let (ironwood_tx, ironwood_nullifier) = ironwood_v6_tx(Height(2));
+    let block2 = child_block(
+        &block1,
+        vec![coinbase_tx(Height(2), dust, &address), ironwood_tx],
+    );
+
+    let chain: Vec<SemanticallyVerifiedBlock> = [genesis, block1, block2]
+        .into_iter()
+        .map(SemanticallyVerifiedBlock::from)
+        .collect();
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain);
+
+    assert!(
+        open_unchecked_db(&config, &network).contains_ironwood_nullifier(&ironwood_nullifier),
+        "forward sync indexes the Ironwood nullifier"
+    );
+
+    rollback_finalized_state(
+        config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: Height(1),
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("rollback succeeds");
+
+    assert!(
+        !open_unchecked_db(&config, &network).contains_ironwood_nullifier(&ironwood_nullifier),
+        "rollback prunes Ironwood nullifiers above the target"
     );
 }

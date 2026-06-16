@@ -17,6 +17,9 @@ use zebra_chain::{
     transaction::{JoinSplitData, LockTime, Transaction},
 };
 
+#[cfg(zcash_unstable = "nu6.3")]
+use zebra_chain::{ironwood, parameters::NetworkUpgrade::Nu6_3, primitives::Halo2Proof};
+
 use crate::{
     arbitrary::Prepare,
     service::{
@@ -28,6 +31,9 @@ use crate::{
         DuplicateOrchardNullifier, DuplicateSaplingNullifier, DuplicateSproutNullifier,
     },
 };
+
+#[cfg(zcash_unstable = "nu6.3")]
+use crate::ValidateContextError::DuplicateIronwoodNullifier;
 
 // These tests use the `Arbitrary` trait to easily generate complex types,
 // then modify those types to cause an error (or to ensure success).
@@ -970,6 +976,117 @@ proptest! {
         prop_assert!(non_finalized_state.eq_internal_state(&previous_mem));
     }
 
+    /// Make sure duplicate ironwood nullifiers are rejected by state contextual
+    /// validation with an Ironwood-specific error.
+    #[test]
+    #[cfg(zcash_unstable = "nu6.3")]
+    fn reject_duplicate_ironwood_nullifiers_in_chain(
+        authorized_action1 in TypeNameToDebug::<ironwood::AuthorizedAction>::arbitrary(),
+        mut authorized_action2 in TypeNameToDebug::<ironwood::AuthorizedAction>::arbitrary(),
+        ironwood_shielded_data1 in TypeNameToDebug::<ironwood::ShieldedData>::arbitrary(),
+        ironwood_shielded_data2 in TypeNameToDebug::<ironwood::ShieldedData>::arbitrary(),
+        duplicate_in_finalized_state in any::<bool>(),
+    ) {
+        let _init_guard = zebra_test::init();
+
+        let mut block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("block should deserialize");
+        let mut block2 = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("block should deserialize");
+
+        let duplicate_nullifier = authorized_action1.action.nullifier;
+        authorized_action2.action.nullifier = duplicate_nullifier;
+
+        let transaction1 = Arc::new(transaction_v6_with_ironwood_shielded_data(
+            ironwood_shielded_data1.0,
+            [authorized_action1.0],
+        ));
+        let transaction2 = transaction_v6_with_ironwood_shielded_data(
+            ironwood_shielded_data2.0,
+            [authorized_action2.0],
+        );
+
+        block1.transactions[0] = transaction_v4_from_coinbase(&block1.transactions[0]).into();
+        block2.transactions[0] = transaction_v4_from_coinbase(&block2.transactions[0]).into();
+
+        block1.transactions.push(transaction1.clone());
+        block2.transactions.push(transaction2.into());
+
+        let (mut finalized_state, mut non_finalized_state, _genesis) = new_state_with_mainnet_genesis();
+
+        finalized_state.populate_with_anchors(&block1);
+        finalized_state.populate_with_anchors(&block2);
+
+        let mut previous_mem = non_finalized_state.clone();
+
+        let check_tx_no_duplicates_in_chain =
+            tx_no_duplicates_in_chain(&finalized_state.db, non_finalized_state.best_chain(), &transaction1);
+        prop_assert!(check_tx_no_duplicates_in_chain.is_ok());
+
+        let block1_hash;
+        if duplicate_in_finalized_state {
+            let block1 = CheckpointVerifiedBlock::from(Arc::new(block1));
+            let commit_result = finalized_state.commit_finalized_direct(block1.clone().into(), None, "test");
+
+            prop_assert_eq!(Some((Height(1), block1.hash)), read::best_tip(&non_finalized_state, &finalized_state.db));
+            prop_assert!(commit_result.is_ok());
+            prop_assert!(non_finalized_state.eq_internal_state(&previous_mem));
+            prop_assert!(finalized_state.contains_ironwood_nullifier(&duplicate_nullifier));
+
+            block1_hash = block1.hash;
+        } else {
+            let block1 = Arc::new(block1).prepare();
+            let commit_result = validate_and_commit_non_finalized(
+                &finalized_state.db,
+                &mut non_finalized_state,
+                block1.clone()
+            );
+
+            prop_assert_eq!(commit_result, Ok(()));
+            prop_assert_eq!(Some((Height(1), block1.hash)), read::best_tip(&non_finalized_state, &finalized_state.db));
+            prop_assert!(!non_finalized_state.eq_internal_state(&previous_mem));
+            prop_assert!(non_finalized_state
+                .best_chain()
+                .expect("block1 is the best non-finalized chain")
+                .ironwood_nullifiers
+                .contains_key(&duplicate_nullifier));
+
+            block1_hash = block1.hash;
+            previous_mem = non_finalized_state.clone();
+        }
+
+        let block2 = Arc::new(block2).prepare();
+        let commit_result = validate_and_commit_non_finalized(
+            &finalized_state.db,
+            &mut non_finalized_state,
+            block2
+        );
+
+        prop_assert_eq!(
+            commit_result,
+            Err(DuplicateIronwoodNullifier {
+                nullifier: duplicate_nullifier,
+                in_finalized_state: duplicate_in_finalized_state,
+            })
+        );
+
+        let check_tx_no_duplicates_in_chain =
+            tx_no_duplicates_in_chain(&finalized_state.db, non_finalized_state.best_chain(), &transaction1);
+
+        prop_assert_eq!(
+            check_tx_no_duplicates_in_chain,
+            Err(DuplicateIronwoodNullifier {
+                nullifier: duplicate_nullifier,
+                in_finalized_state: duplicate_in_finalized_state,
+            })
+        );
+
+        prop_assert_eq!(Some((Height(1), block1_hash)), read::best_tip(&non_finalized_state, &finalized_state.db));
+        prop_assert!(non_finalized_state.eq_internal_state(&previous_mem));
+    }
+
     /// A block whose sprout-shielded transaction has the same hash as one
     /// already finalized must be rejected with `DuplicateSproutNullifier`.
     #[test]
@@ -1372,5 +1489,51 @@ fn transaction_v5_with_orchard_shielded_data(
         expiry_height: Height(0),
         sapling_shielded_data: None,
         orchard_shielded_data,
+    }
+}
+
+/// Return a `Transaction::V6` containing `ironwood_shielded_data`,
+/// with its `AuthorizedAction`s replaced by `authorized_actions`.
+///
+/// Other fields have empty or default values.
+///
+/// # Panics
+///
+/// If there are no `AuthorizedAction`s in `authorized_actions`.
+#[cfg(zcash_unstable = "nu6.3")]
+fn transaction_v6_with_ironwood_shielded_data(
+    ironwood_shielded_data: impl Into<Option<ironwood::ShieldedData>>,
+    authorized_actions: impl IntoIterator<Item = ironwood::AuthorizedAction>,
+) -> Transaction {
+    let mut ironwood_shielded_data = ironwood_shielded_data.into();
+    let authorized_actions: Vec<_> = authorized_actions.into_iter().collect();
+
+    if let Some(ref mut ironwood_shielded_data) = ironwood_shielded_data {
+        const SINGLE_ACTION_ORCHARD_PROOF_SIZE: usize = 4_992;
+
+        assert_eq!(
+            authorized_actions.len(),
+            1,
+            "test helper uses the single action Orchard proof size"
+        );
+
+        ironwood_shielded_data.actions = authorized_actions.try_into().expect(
+            "unexpected invalid ironwood::ShieldedData: must have at least one AuthorizedAction",
+        );
+
+        let zero_amount = 0.try_into().expect("unexpected invalid zero amount");
+        ironwood_shielded_data.value_balance = zero_amount;
+        ironwood_shielded_data.proof = Halo2Proof(vec![0; SINGLE_ACTION_ORCHARD_PROOF_SIZE]);
+    }
+
+    Transaction::V6 {
+        network_upgrade: Nu6_3,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        lock_time: LockTime::min_lock_time_timestamp(),
+        expiry_height: Height(0),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data,
     }
 }

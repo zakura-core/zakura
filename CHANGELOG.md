@@ -86,6 +86,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Use V3 chain history metadata from NU6.3 onward, including Ironwood note
   commitment tree roots and Ironwood transaction counts in FlyClient history
   tree leaves.
+- Bump the state database format to 28 during upgrade, backfilling empty
+  Ironwood tree, value pool, and index data, then rebuilding stored history tree
+  entries so they use the Ironwood-capable entry size.
 - Tune public-fork sync defaults for faster block sync: retry sync rounds after
   10 seconds, allow 30 seconds for tip acquisition, increase default block
   download concurrency to 100, increase the default peer target size to 100, and

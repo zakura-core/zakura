@@ -3,6 +3,8 @@
 #![allow(clippy::unwrap_in_result)]
 
 use std::iter;
+#[cfg(zcash_unstable = "nu6.3")]
+use std::sync::Arc;
 
 use color_eyre::eyre::Result;
 
@@ -23,6 +25,73 @@ const EVICTION_MEMORY_TIME: Duration = Duration::from_secs(60 * 60);
 
 /// Transaction count used in some tests to derive the mempool test size.
 const MEMPOOL_TX_COUNT: usize = 4;
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn ironwood_action() -> zebra_chain::ironwood::Action {
+    use proptest::{
+        prelude::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+
+    let mut runner = TestRunner::default();
+    any::<zebra_chain::ironwood::Action>()
+        .new_tree(&mut runner)
+        .expect("test action strategy creates a value")
+        .current()
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn ironwood_v6_tx(
+    expiry_height: Height,
+    action: zebra_chain::ironwood::Action,
+) -> Arc<zebra_chain::transaction::Transaction> {
+    use zebra_chain::{
+        at_least_one, ironwood,
+        orchard::{self, tree},
+        parameters::NetworkUpgrade,
+        primitives::Halo2Proof,
+        transaction::{LockTime, Transaction},
+    };
+
+    Arc::new(Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood::ShieldedData {
+            flags: orchard::Flags::ENABLE_SPENDS,
+            value_balance: Amount::zero(),
+            shared_anchor: tree::Root::default(),
+            proof: Halo2Proof(vec![0; 4992]),
+            actions: at_least_one![ironwood::AuthorizedAction {
+                action,
+                spend_auth_sig: [0u8; 64].into(),
+            }],
+            binding_sig: [0u8; 64].into(),
+        }),
+    })
+}
+
+#[cfg(zcash_unstable = "nu6.3")]
+fn verified_ironwood_v6_tx(
+    expiry_height: Height,
+    action: zebra_chain::ironwood::Action,
+) -> zebra_chain::transaction::VerifiedUnminedTx {
+    let miner_fee = Amount::try_from(1_000_000).expect("valid test fee");
+
+    zebra_chain::transaction::VerifiedUnminedTx::new(
+        ironwood_v6_tx(expiry_height, action).into(),
+        miner_fee,
+        0,
+        0,
+        Arc::new(vec![]),
+    )
+    .expect("test transaction has a valid mempool fee")
+}
 
 #[test]
 fn mempool_storage_crud_exact_mainnet() {
@@ -239,6 +308,43 @@ fn mempool_storage_crud_same_effects_mainnet() {
     );
     assert_eq!(
         storage.insert(unmined_tx_2, Vec::new(), None),
+        Err(SameEffectsChainRejectionError::DuplicateSpend.into())
+    );
+}
+
+#[test]
+#[cfg(zcash_unstable = "nu6.3")]
+fn mempool_removes_ironwood_duplicate_spends() {
+    let _init_guard = zebra_test::init();
+
+    let mut storage: Storage = Storage::new(&config::Config {
+        tx_cost_limit: 160_000_000,
+        eviction_memory_time: EVICTION_MEMORY_TIME,
+        ..Default::default()
+    });
+
+    let action = ironwood_action();
+    let mempool_tx = verified_ironwood_v6_tx(Height(1), action.clone());
+    let mempool_id = mempool_tx.transaction.id;
+
+    assert_eq!(
+        storage.insert(mempool_tx.clone(), Vec::new(), None),
+        Ok(mempool_id)
+    );
+    assert!(storage.contains_transaction_exact(&mempool_id.mined_id()));
+
+    let removal_count = storage
+        .reject_and_remove_same_effects(&HashSet::new(), vec![ironwood_v6_tx(Height(2), action)])
+        .total_len();
+
+    assert_eq!(removal_count, 1);
+    assert!(!storage.contains_transaction_exact(&mempool_id.mined_id()));
+    assert_eq!(
+        storage.rejection_error(&mempool_id),
+        Some(SameEffectsChainRejectionError::DuplicateSpend.into())
+    );
+    assert_eq!(
+        storage.insert(mempool_tx, Vec::new(), None),
         Err(SameEffectsChainRejectionError::DuplicateSpend.into())
     );
 }

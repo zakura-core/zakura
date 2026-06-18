@@ -436,17 +436,30 @@ where
                 };
 
                 let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) = rsp {
-                    assert_eq!(
-                        blocks.len(),
-                        1,
-                        "wrong number of blocks in response to a single hash"
-                    );
+                    // A well-behaved peer returns exactly one available block in response
+                    // to a single-hash request. Treat a zero/multi-block response, or an
+                    // unavailable block status, as a retryable download failure instead of
+                    // panicking: a remote peer must not be able to crash the node.
+                    let single_block = if blocks.len() == 1 {
+                        blocks.first().and_then(|b| b.available())
+                    } else {
+                        None
+                    };
 
-                    blocks
-                        .first()
-                        .expect("just checked length")
-                        .available()
-                        .expect("unexpected missing block status: single block failures should be errors")
+                    match single_block {
+                        Some(block_and_advertiser) => block_and_advertiser,
+                        None => {
+                            return Err(BlockDownloadVerifyError::DownloadFailed {
+                                error: format!(
+                                    "peer returned {} block(s), or an unavailable block, \
+                                     for a single-hash request",
+                                    blocks.len()
+                                )
+                                .into(),
+                                hash,
+                            });
+                        }
+                    }
                 } else {
                     unreachable!("wrong response to block request");
                 };

@@ -62,6 +62,9 @@ default = ["default-release-binaries"]
 # Indexer support
 indexer = ["zebra-state/indexer"]
 
+# Per-block commit-phase timing histograms (zebra.state.write.*), for perf profiling
+commit-metrics = ["zebra-state/commit-metrics"]
+
 # Experimental internal miner support
 internal-miner = [
     "thread-priority",

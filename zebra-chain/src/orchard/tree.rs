@@ -401,6 +401,49 @@ impl NoteCommitmentTree {
         }
     }
 
+    /// Appends one block's note commitments in parallel.
+    ///
+    /// Returns the [`TRACKED_SUBTREE_HEIGHT`] subtree completed by this block, if
+    /// any. This must match calling [`Self::append`] for each commitment in order.
+    ///
+    /// `note_commitments` must come from one block, so the batch can cross at
+    /// most one tracked-subtree boundary.
+    ///
+    /// Returns an error if the tree would overflow its capacity.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn append_batch(
+        &mut self,
+        note_commitments: &[NoteCommitmentUpdate],
+    ) -> Result<Option<(NoteCommitmentSubtreeIndex, Node)>, NoteCommitmentTreeError> {
+        use crate::parallel::batch_frontier::append_batch_with_subtree;
+
+        if note_commitments.is_empty() {
+            return Ok(None);
+        }
+
+        // nodes.len() fits in u64: consensus rules cap a block at 2^16 actions.
+        let nodes: Vec<Node> = note_commitments
+            .iter()
+            .map(|commitment_x| (*commitment_x).into())
+            .collect();
+
+        let (frontier, completed) = append_batch_with_subtree(self.inner.clone(), nodes)
+            .map_err(|_| NoteCommitmentTreeError::FullTree)?;
+
+        self.inner = frontier;
+        *self
+            .cached_root
+            .get_mut()
+            .expect("a thread that previously held exclusive lock access panicked") = None;
+
+        Ok(completed.map(|(index_value, root)| {
+            let index = NoteCommitmentSubtreeIndex(
+                index_value.try_into().expect("subtree index fits in u16"),
+            );
+            (index, root)
+        }))
+    }
+
     /// Returns frontier of non-empty tree, or `None` if the tree is empty.
     fn frontier(&self) -> Option<&NonEmptyFrontier<Node>> {
         self.inner.value()
@@ -707,5 +750,239 @@ impl From<Vec<pallas::Base>> for NoteCommitmentTree {
         }
 
         tree
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use incrementalmerkletree::{frontier::Frontier, Position};
+
+    use super::*;
+
+    fn node(value: u64) -> Node {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+        Node(
+            Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
+                .expect("small little-endian integers are canonical field elements"),
+        )
+    }
+
+    fn note_commitment(value: u64) -> NoteCommitmentUpdate {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+
+        Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
+            .expect("small little-endian integers are canonical field elements")
+    }
+
+    fn build_tree(prefix_len: u64) -> NoteCommitmentTree {
+        let mut tree = NoteCommitmentTree::default();
+
+        for value in 0..prefix_len {
+            tree.append(note_commitment(value))
+                .expect("small test tree is not full");
+        }
+
+        tree
+    }
+
+    fn pre_subtree_boundary_tree() -> NoteCommitmentTree {
+        let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
+        let pre_boundary_pos = subtree_size - 2;
+        let leaf = node(1);
+        let ommers: Vec<Node> = (2..=16).map(node).collect();
+        let inner = Frontier::from_parts(Position::from(pre_boundary_pos), leaf, ommers)
+            .expect("frontier with 15 ommers at position 65534 is valid");
+
+        NoteCommitmentTree {
+            inner,
+            cached_root: Default::default(),
+        }
+    }
+
+    fn sequential_append_batch(
+        tree: &mut NoteCommitmentTree,
+        note_commitments: &[NoteCommitmentUpdate],
+    ) -> Result<Option<(NoteCommitmentSubtreeIndex, Node)>, NoteCommitmentTreeError> {
+        let mut completed_subtree = None;
+
+        for note_commitment in note_commitments {
+            tree.append(*note_commitment)?;
+
+            if let Some(subtree) = tree.completed_subtree_index_and_root() {
+                assert!(
+                    completed_subtree.is_none(),
+                    "test batches must cross at most one subtree boundary"
+                );
+                completed_subtree = Some(subtree);
+            }
+        }
+
+        Ok(completed_subtree)
+    }
+
+    #[test]
+    fn append_batch_matches_sequential_for_table_cases() {
+        let cases = [
+            ("empty tree, empty batch", 0, 0),
+            ("empty tree, one leaf", 0, 1),
+            ("empty tree, small batch", 0, 5),
+            ("one-leaf tree, empty batch", 1, 0),
+            ("one-leaf tree, one leaf", 1, 1),
+            ("odd tree, small batch", 3, 4),
+            ("power-of-two tree, small batch", 8, 7),
+            ("after power-of-two tree, empty batch", 9, 0),
+            ("after power-of-two tree, small batch", 9, 6),
+        ];
+
+        for (name, prefix_len, batch_len) in cases {
+            let start = build_tree(prefix_len);
+            let mut seq_tree = start.clone();
+            let mut batch_tree = start;
+            let note_commitments: Vec<_> = (0..batch_len)
+                .map(|value| note_commitment(1_000 + prefix_len + value))
+                .collect();
+
+            let _ = seq_tree.root();
+            let _ = batch_tree.root();
+            let seq_result = sequential_append_batch(&mut seq_tree, &note_commitments)
+                .expect("sequential append succeeds");
+            let batch_result = batch_tree
+                .append_batch(&note_commitments)
+                .expect("batch append succeeds");
+
+            assert_eq!(batch_result, seq_result, "{name}: subtree result mismatch");
+            batch_tree.assert_frontier_eq(&seq_tree);
+            assert_eq!(batch_tree.root(), seq_tree.root(), "{name}: root mismatch");
+        }
+    }
+
+    #[test]
+    fn append_batch_matches_sequential_near_subtree_boundary() {
+        let cases = [
+            ("before subtree boundary, empty batch", 0),
+            ("complete subtree boundary", 1),
+            ("complete and start next subtree", 2),
+            ("complete and keep appending", 3),
+        ];
+
+        for (name, batch_len) in cases {
+            let start = pre_subtree_boundary_tree();
+            let mut seq_tree = start.clone();
+            let mut batch_tree = start;
+            let note_commitments: Vec<_> = (0..batch_len)
+                .map(|value| note_commitment(10_000 + value))
+                .collect();
+
+            let _ = seq_tree.root();
+            let _ = batch_tree.root();
+            let seq_result = sequential_append_batch(&mut seq_tree, &note_commitments)
+                .expect("sequential append succeeds");
+            let batch_result = batch_tree
+                .append_batch(&note_commitments)
+                .expect("batch append succeeds");
+
+            assert_eq!(batch_result, seq_result, "{name}: subtree result mismatch");
+            batch_tree.assert_frontier_eq(&seq_tree);
+            assert_eq!(batch_tree.root(), seq_tree.root(), "{name}: root mismatch");
+        }
+    }
+
+    /// Verifies that `append_batch` returns the correct subtree index and root when
+    /// the batch crosses a `TRACKED_SUBTREE_HEIGHT` boundary, and that the resulting
+    /// frontier matches the sequential `append` path.
+    ///
+    /// Uses `Frontier::from_parts` to place the tree just before the first subtree
+    /// boundary (position 65534 = `2^16 - 2`) without executing 65534 real appends.
+    #[test]
+    fn append_batch_crosses_subtree_boundary() {
+        // position 65534 = 0xFFFE: bits 1–15 are set → 15 ommers required.
+        let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
+        let pre_boundary_pos = subtree_size - 2; // = 65534
+        let leaf = node(1);
+        let ommers: Vec<Node> = (2..=16).map(node).collect();
+        let inner = Frontier::from_parts(Position::from(pre_boundary_pos), leaf, ommers)
+            .expect("frontier with 15 ommers at position 65534 is valid");
+        let tree = NoteCommitmentTree {
+            inner,
+            cached_root: Default::default(),
+        };
+
+        // note_commitments[0] fills position 65535, completing subtree 0.
+        // note_commitments[1] starts subtree 1.
+        let note_commitments = [note_commitment(100), note_commitment(200)];
+
+        // Sequential reference: append one at a time.
+        let mut seq_tree = tree.clone();
+        seq_tree
+            .append(note_commitments[0])
+            .expect("sequential first append");
+        let expected_subtree = seq_tree.completed_subtree_index_and_root();
+        seq_tree
+            .append(note_commitments[1])
+            .expect("sequential second append");
+
+        // Batch must return the same subtree result and produce the same final tree.
+        let mut batch_tree = tree;
+        let batch_result = batch_tree
+            .append_batch(&note_commitments)
+            .expect("batch append succeeds");
+
+        assert!(
+            batch_result.is_some(),
+            "batch crossing boundary must return a subtree"
+        );
+        assert_eq!(
+            batch_result.unwrap().0,
+            NoteCommitmentSubtreeIndex(0),
+            "first subtree index"
+        );
+        assert_eq!(
+            batch_result, expected_subtree,
+            "subtree result matches sequential"
+        );
+        batch_tree.assert_frontier_eq(&seq_tree);
+        assert_eq!(batch_tree.root(), seq_tree.root());
+    }
+
+    #[test]
+    fn append_batch_overflow_preserves_tree_and_cached_root() {
+        let max_position = (1u64 << MERKLE_DEPTH) - 1;
+        let leaf = Node(note_commitment(1));
+        let ommers = vec![Node(note_commitment(2)); usize::from(MERKLE_DEPTH)];
+        let inner = Frontier::from_parts(Position::from(max_position), leaf, ommers)
+            .expect("max-depth frontier is valid");
+        let mut tree = NoteCommitmentTree {
+            inner,
+            cached_root: Default::default(),
+        };
+
+        let _ = tree.root();
+        let original = tree.clone();
+
+        let result = tree.append_batch(&[note_commitment(3)]);
+
+        assert_eq!(result, Err(NoteCommitmentTreeError::FullTree));
+        tree.assert_frontier_eq(&original);
+        assert_eq!(tree.root(), original.root());
+    }
+
+    #[test]
+    fn append_batch_multiple_subtrees_preserves_tree_and_cached_root() {
+        let mut tree = NoteCommitmentTree::default();
+        let _ = tree.root();
+        let original = tree.clone();
+
+        let subtree_size = 1usize << TRACKED_SUBTREE_HEIGHT;
+        let note_commitments: Vec<_> = (0..subtree_size * 2)
+            .map(|value| note_commitment(value as u64))
+            .collect();
+
+        let result = tree.append_batch(&note_commitments);
+
+        assert_eq!(result, Err(NoteCommitmentTreeError::FullTree));
+        tree.assert_frontier_eq(&original);
+        assert_eq!(tree.root(), original.root());
     }
 }

@@ -37,6 +37,20 @@ use crate::{
     CheckpointVerifiedBlock, Config, ValidateContextError,
 };
 
+/// Times `$body` and records its duration to the named histogram when the
+/// `commit-metrics` feature is enabled; otherwise just evaluates `$body` with
+/// zero overhead. Used to profile the finalized-state commit phases.
+macro_rules! timed_commit_phase {
+    ($name:expr, $body:expr) => {{
+        #[cfg(feature = "commit-metrics")]
+        let _start = std::time::Instant::now();
+        let result = $body;
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!($name).record(_start.elapsed().as_secs_f64());
+        result
+    }};
+}
+
 pub mod column_family;
 
 mod disk_db;
@@ -548,46 +562,71 @@ impl FinalizedState {
                     let prev_note_commitment_trees = prev_note_commitment_trees
                         .unwrap_or_else(|| self.db.note_commitment_trees_for_tip());
 
-                    // Update the note commitment trees.
                     let mut note_commitment_trees = prev_note_commitment_trees.clone();
-                    note_commitment_trees
-                        .update_trees_parallel(&block)
-                        .map_err(ValidateContextError::from)?;
+                    let network = self.network();
 
-                    // Check the block commitment if the history tree was not
-                    // supplied by the non-finalized state. Note that we don't do
-                    // this check for history trees supplied by the non-finalized
-                    // state because the non-finalized state checks the block
-                    // commitment.
+                    // Run two independent CPU-intensive crypto operations concurrently
+                    // on the rayon pool (Part 1 of the checkpoint-commit parallelization):
                     //
-                    // For Nu5-onward, the block hash commits only to
-                    // non-authorizing data (see ZIP-244). This checks the
-                    // authorizing data commitment, making sure the entire block
-                    // contents were committed to. The test is done here (and not
-                    // during semantic validation) because it needs the history tree
-                    // root. While it _is_ checked during contextual validation,
-                    // that is not called by the checkpoint verifier, and keeping a
-                    // history tree there would be harder to implement.
+                    // - updating the note commitment trees, and
+                    // - checking this block's commitment against the *parent* history tree.
                     //
-                    // TODO: run this CPU-intensive cryptography in a parallel rayon
-                    // thread, if it shows up in profiles
-                    check::block_commitment_is_valid_for_chain_history(
-                        block.clone(),
-                        &self.network(),
-                        &history_tree,
-                    )?;
+                    // These are independent: the commitment check reads only the parent
+                    // history tree (not this block's note commitment trees), and the
+                    // history tree push below depends on both, so it runs after the join.
+                    //
+                    // The commitment check is done here (and not during semantic
+                    // validation) because it needs the history tree root, and the
+                    // checkpoint verifier doesn't run contextual validation. For
+                    // Nu5-onward the block hash commits only to non-authorizing data
+                    // (ZIP-244), so this verifies the authorizing-data commitment.
+                    #[cfg(feature = "commit-metrics")]
+                    let _ckpt_compute = std::time::Instant::now();
+                    let mut commitment_result = None;
+                    let tree_result = rayon::in_place_scope_fifo(|scope| {
+                        scope.spawn_fifo(|_scope| {
+                            commitment_result = Some(timed_commit_phase!(
+                                "zebra.state.write.commitment_check.duration_seconds",
+                                check::block_commitment_is_valid_for_chain_history(
+                                    block.clone(),
+                                    &network,
+                                    &history_tree,
+                                )
+                            ));
+                        });
 
-                    // Update the history tree.
-                    //
-                    // TODO: run this CPU-intensive cryptography in a parallel rayon
-                    // thread, if it shows up in profiles
+                        // Runs on the in-place thread so its own internal rayon scope
+                        // (one task per note commitment tree) uses the pool directly.
+                        timed_commit_phase!(
+                            "zebra.state.write.update_trees.duration_seconds",
+                            note_commitment_trees.update_trees_parallel(&block)
+                        )
+                    });
+
+                    // Surface the tree-update error first, preserving the error
+                    // precedence of the previous sequential code.
+                    tree_result.map_err(ValidateContextError::from)?;
+                    // `rayon::in_place_scope_fifo` guarantees all spawned tasks
+                    // complete before the scope returns, so `commitment_result` is
+                    // always `Some` here: the spawned closure wrote to it before
+                    // the scope exited.
+                    commitment_result.expect("scope has already finished")?;
+
+                    // Update the history tree (depends on both operations above).
                     let history_tree_mut = Arc::make_mut(&mut history_tree);
                     let sapling_root = note_commitment_trees.sapling.root();
                     let orchard_root = note_commitment_trees.orchard.root();
                     history_tree_mut
-                        .push(&self.network(), block.clone(), &sapling_root, &orchard_root)
+                        .push(&network, block.clone(), &sapling_root, &orchard_root)
                         .map_err(Arc::new)
                         .map_err(ValidateContextError::from)?;
+
+                    // Total serial wall time of the checkpoint compute phase (note tree
+                    // update + commitment check, then history push). Compared against the
+                    // summed phase times, this shows the overlap win.
+                    #[cfg(feature = "commit-metrics")]
+                    metrics::histogram!("zebra.state.write.checkpoint_compute.duration_seconds")
+                        .record(_ckpt_compute.elapsed().as_secs_f64());
 
                     let treestate = Treestate {
                         note_commitment_trees,

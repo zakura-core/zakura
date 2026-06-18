@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Performance
+
+- Parallelize note-commitment tree updates during checkpoint-zone sync. Sapling
+  and Orchard note commitments for each block are now appended to the incremental
+  Merkle frontier using a parallel divide-and-conquer reduction across the rayon
+  pool (`parallel_append` in `zebra-chain`), and the note-commitment tree update
+  runs concurrently with the block-commitment validity check on the rayon pool.
+  Combined, these changes roughly double checkpoint-zone throughput on multi-core
+  hosts (~20 → ~42 blk/s on an 8-core machine at 1.7M height). A new
+  default-off `commit-metrics` feature emits per-block timing histograms
+  (`zebra.state.write.*`) for future profiling.
+
 ### Added
 
 - Report `pruned: true` in `getblockchaininfo` after Zebra has pruned

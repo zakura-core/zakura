@@ -26,6 +26,11 @@ progress-bar = [
 # Indexes spending transaction ids by spent outpoints and revealed nullifiers
 indexer = []
 
+# Emit fine-grained per-block commit-phase timing histograms (zebra.state.write.*),
+# used to profile and benchmark the finalized-state commit path. Off by default so
+# the timing has zero overhead in production builds; enable for perf investigations.
+commit-metrics = []
+
 # Test-only features
 proptest-impl = [
     "proptest",

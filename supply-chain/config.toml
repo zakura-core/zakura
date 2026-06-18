@@ -962,18 +962,6 @@ criteria = "safe-to-deploy"
 version = "0.1.65"
 criteria = "safe-to-deploy"
 
-[[exemptions.icu_locid_transform_data]]
-version = "1.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.icu_normalizer_data]]
-version = "1.5.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.icu_properties_data]]
-version = "1.5.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.id-arena]]
 version = "2.3.0"
 criteria = "safe-to-deploy"
@@ -1224,10 +1212,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.md5]]
 version = "0.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.memchr]]
-version = "2.8.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.memchr]]
@@ -2065,10 +2049,6 @@ version = "0.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.siphasher]]
-version = "1.0.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.siphasher]]
 version = "1.0.3"
 criteria = "safe-to-deploy"
 
@@ -2742,46 +2722,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.zcash_transparent]]
 version = "0.8.0@git:345c450abe91736c128de628f03a8723a34aa227"
-criteria = "safe-to-deploy"
-
-[[exemptions.zebra-chain]]
-version = "9.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zebra-consensus]]
-version = "8.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zebra-network]]
-version = "8.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zebra-node-services]]
-version = "7.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zebra-rpc]]
-version = "9.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zebra-script]]
-version = "8.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zebra-state]]
-version = "8.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zebra-test]]
-version = "3.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zebra-utils]]
-version = "7.0.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.zebrad]]
-version = "4.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy]]

@@ -67,6 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Parallelize NU5-onward block auth-data-root computation across transactions,
+  reducing contextual validation time for blocks with many or large shielded
+  transactions.
 - Tune public-fork sync defaults for faster block sync: retry sync rounds after
   10 seconds, allow 30 seconds for tip acquisition, increase default block
   download concurrency to 100, increase the default peer target size to 100, and

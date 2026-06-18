@@ -6,7 +6,7 @@ use halo2::pasta::pallas;
 
 use crate::{
     amount::{DeferredPoolBalanceChange, NegativeAllowed},
-    block::merkle::AuthDataRoot,
+    block::merkle::{auth_digest_or_placeholder, AuthDataRoot},
     fmt::DisplayToDebug,
     orchard,
     parameters::{Network, NetworkUpgrade},
@@ -252,7 +252,16 @@ impl Block {
     ///
     /// [ZIP-244]: https://zips.z.cash/zip-0244
     pub fn auth_data_root(&self) -> AuthDataRoot {
-        self.transactions.iter().collect::<AuthDataRoot>()
+        use rayon::prelude::*;
+
+        // Compute each transaction's auth digest in parallel, and collect into a
+        // Vec with the same ordering.
+        self.transactions
+            .par_iter()
+            .map(|tx| auth_digest_or_placeholder(tx))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<AuthDataRoot>()
     }
 }
 

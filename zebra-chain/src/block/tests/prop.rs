@@ -1,6 +1,6 @@
 //! Randomised property tests for Zcash blocks.
 
-use std::{env, io::ErrorKind};
+use std::{env, io::ErrorKind, sync::Arc};
 
 use proptest::{prelude::*, test_runner::Config};
 
@@ -11,6 +11,7 @@ use zebra_test::prelude::*;
 use crate::{
     parameters::GENESIS_PREVIOUS_BLOCK_HASH,
     serialization::{SerializationError, ZcashDeserializeInto, ZcashSerialize},
+    transaction::Transaction,
 };
 
 use super::super::{
@@ -19,6 +20,26 @@ use super::super::{
 };
 
 const DEFAULT_BLOCK_ROUNDTRIP_PROPTEST_CASES: u32 = 16;
+
+const AUTH_DATA_ROOT_TX_COUNTS: [usize; 7] = [0, 1, 2, 3, 7, 12, 16];
+
+fn block_with_exact_transaction_count(tx_count: usize) -> BoxedStrategy<Block> {
+    LedgerState::default_strategy()
+        .prop_flat_map(move |ledger_state| {
+            let header = Header::arbitrary_with(ledger_state.clone());
+            let transactions = proptest::collection::vec(
+                Transaction::arbitrary_with(ledger_state).prop_map(Arc::new),
+                tx_count..=tx_count,
+            );
+
+            (header, transactions)
+        })
+        .prop_map(|(header, transactions)| Block {
+            header: header.into(),
+            transactions,
+        })
+        .boxed()
+}
 
 proptest! {
     #[test]
@@ -139,6 +160,39 @@ proptest! {
                                  "blocks larger than the maximum size should fail with an io::Error");
                 }
             }
+        }
+    }
+
+    /// `Block::auth_data_root` computes per-transaction auth digests across the
+    /// rayon pool; this asserts the parallel result is byte-identical to the
+    /// sequential computation (same digests, same transaction order, same root).
+    #[test]
+    fn auth_data_root_parallel_matches_sequential_for_transaction_counts(
+        blocks in (
+            block_with_exact_transaction_count(0),
+            block_with_exact_transaction_count(1),
+            block_with_exact_transaction_count(2),
+            block_with_exact_transaction_count(3),
+            block_with_exact_transaction_count(7),
+            block_with_exact_transaction_count(12),
+            block_with_exact_transaction_count(16),
+        )
+    ) {
+        let _init_guard = zebra_test::init();
+
+        for (block, tx_count) in [
+            blocks.0, blocks.1, blocks.2, blocks.3, blocks.4, blocks.5, blocks.6,
+        ]
+        .into_iter()
+        .zip(AUTH_DATA_ROOT_TX_COUNTS)
+        {
+            prop_assert_eq!(block.transactions.len(), tx_count);
+
+            let sequential: crate::block::merkle::AuthDataRoot =
+                block.transactions.iter().collect();
+            let parallel = block.auth_data_root();
+
+            prop_assert_eq!(sequential, parallel);
         }
     }
 }

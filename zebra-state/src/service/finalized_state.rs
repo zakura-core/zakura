@@ -581,6 +581,9 @@ impl FinalizedState {
                     // Nu5-onward the block hash commits only to non-authorizing data
                     // (ZIP-244), so this verifies the authorizing-data commitment.
                     #[cfg(feature = "commit-metrics")]
+                    metrics::histogram!("zebra.state.write.block_tx_count")
+                        .record(block.transactions.len() as f64);
+                    #[cfg(feature = "commit-metrics")]
                     let _ckpt_compute = std::time::Instant::now();
                     let mut commitment_result = None;
                     let tree_result = rayon::in_place_scope_fifo(|scope| {

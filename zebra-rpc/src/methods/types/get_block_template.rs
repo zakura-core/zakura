@@ -332,12 +332,7 @@ impl BlockTemplateResponse {
 
         let coinbase_txn = match precomputed_coinbase {
             Some(coinbase_txn) => coinbase_txn,
-            None => TransactionTemplate::new_coinbase(
-                net,
-                height,
-                miner_params,
-                txs_fee,
-            )?,
+            None => TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)?,
         };
 
         let default_roots = DefaultRoots::from_coinbase(

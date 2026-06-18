@@ -91,7 +91,7 @@ lazy_static::lazy_static! {
     /// V6 Orchard and Ironwood bundles use the NU6.3 flag format and prove with the Ironwood
     /// circuit. They must not be verified with the post-NU6.2 V5 Orchard key.
     pub static ref VERIFYING_KEY_IRONWOOD: ItemVerifyingKey =
-        ItemVerifyingKey::build(OrchardCircuitVersion::Ironwood);
+        ItemVerifyingKey::build(OrchardCircuitVersion::PostNu6_3);
 }
 
 /// A Halo2 verification item, used as the request type of the service.
@@ -346,8 +346,8 @@ impl Verifier {
         (batch, tx)
     }
 
-    /// Synchronously process the batch, and send the result using the channel sender.
-    /// This function blocks until the batch is completed.
+    /// Synchronously process the batch using its bound verifying key, and send the result using
+    /// the channel sender. This function blocks until the batch is completed.
     fn verify(batch: BatchValidator<'static>, tx: Sender) {
         let result = batch.validate(thread_rng());
         let _ = tx.send(Some(result));
@@ -364,8 +364,9 @@ impl Verifier {
         tokio::task::block_in_place(|| rayon::spawn_fifo(move || Self::verify(batch, tx)));
     }
 
-    /// Flush the batch using a thread pool, returning the result via the channel.
-    /// This function returns a future that becomes ready when the batch is completed.
+    /// Flush the batch using a thread pool, validating against the batch's bound key and returning
+    /// the result via the channel. This function returns a future that becomes ready when the batch
+    /// is completed.
     async fn flush_spawning(batch: BatchValidator<'static>, tx: Sender) {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         let start = std::time::Instant::now();

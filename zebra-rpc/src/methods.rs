@@ -2482,12 +2482,7 @@ where
                 // when the tip changes.
                 let precompute_coinbase = |network, height, params| {
                     tokio::task::spawn_blocking(move || {
-                        TransactionTemplate::new_coinbase(
-                            &network,
-                            height,
-                            &params,
-                            Amount::zero(),
-                        )
+                        TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
                     })
                 };
 

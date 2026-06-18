@@ -104,15 +104,11 @@ fn coinbase_errors_for_orchard_only_unified_address_after_nu6_3() {
 
     let miner_params = MinerParams::from(Address::Unified(orchard_only_unified_address()));
 
-    let error = TransactionTemplate::new_coinbase(
-        &net,
-        nu6_3_height,
-        &miner_params,
-        Amount::zero(),
-        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-        None,
-    )
-    .expect_err("Orchard-only unified addresses cannot receive coinbase rewards after NU6.3");
+    let error =
+        TransactionTemplate::new_coinbase(&net, nu6_3_height, &miner_params, Amount::zero())
+            .expect_err(
+                "Orchard-only unified addresses cannot receive coinbase rewards after NU6.3",
+            );
 
     assert!(
         error

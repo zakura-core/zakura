@@ -24,7 +24,7 @@ use zebra_node_services::mempool::TransactionDependencies;
 
 use crate::methods::types::transaction::TransactionTemplate;
 
-#[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+#[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))]
 use zebra_chain::amount::NonNegative;
 
 #[cfg(test)]
@@ -60,7 +60,7 @@ pub fn select_mempool_transactions(
     miner_params: &MinerParams,
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
-    #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))] zip233_amount: Option<
+    #[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))] zip233_amount: Option<
         Amount<NonNegative>,
     >,
 ) -> Vec<SelectedMempoolTx> {
@@ -71,7 +71,7 @@ pub fn select_mempool_transactions(
         height,
         miner_params,
         Amount::zero(),
-        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+        #[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))]
         zip233_amount,
     )
     .expect("valid coinbase transaction template");

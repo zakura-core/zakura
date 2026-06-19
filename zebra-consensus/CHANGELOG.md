@@ -95,7 +95,8 @@ if you use it as a building block for a consensus node, you should update.
 
 ### Added
 
-- ZIP-235 support under the `zcash_unstable = "zip235"` flag
+- Future ZIP-233 support under the `zcash_unstable = "nu7"` and
+  `zcash_unstable = "zip233"` flags
 
 ## [5.0.0] - 2026-03-12
 

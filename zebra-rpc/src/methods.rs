@@ -2382,7 +2382,7 @@ where
                             height,
                             &params,
                             Amount::zero(),
-                            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+                            #[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))]
                             None,
                         )
                         .expect("valid coinbase tx")
@@ -2477,7 +2477,7 @@ where
                         server_long_poll_id,
                         vec![],
                         submit_old,
-                        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+                        #[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))]
                         None,
                     )
                     .into())
@@ -2523,7 +2523,7 @@ where
             miner_params,
             mempool_txs,
             mempool_tx_deps,
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+            #[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))]
             None,
         );
 
@@ -2545,7 +2545,7 @@ where
             server_long_poll_id,
             mempool_txs,
             submit_old,
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+            #[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))]
             None,
         )
         .into())

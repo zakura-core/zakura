@@ -576,7 +576,7 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
     Ok(())
 }
 
-#[cfg(all(feature = "tx_v6", zcash_unstable = "zip235"))]
+#[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))]
 #[test]
 fn miner_fees_validation_fails_when_zip233_amount_is_zero() -> Result<(), Report> {
     use zebra_chain::parameters::testnet::{
@@ -638,7 +638,7 @@ fn miner_fees_validation_fails_when_zip233_amount_is_zero() -> Result<(), Report
     Ok(())
 }
 
-#[cfg(all(feature = "tx_v6", zcash_unstable = "zip235"))]
+#[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))]
 #[test]
 fn miner_fees_validation_succeeds_when_zip233_amount_is_correct() -> Result<(), Report> {
     use zebra_chain::parameters::testnet::{
@@ -699,7 +699,7 @@ fn miner_fees_validation_succeeds_when_zip233_amount_is_correct() -> Result<(), 
     Ok(())
 }
 
-#[cfg(all(feature = "tx_v6", zcash_unstable = "zip235"))]
+#[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))]
 #[test]
 fn miner_fees_validation_fails_when_zip233_amount_is_incorrect() -> Result<(), Report> {
     use zebra_chain::parameters::testnet::{

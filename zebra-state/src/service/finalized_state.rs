@@ -18,7 +18,7 @@ use std::{
     io::{stderr, stdout, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, LazyLock,
     },
 };
 
@@ -50,6 +50,25 @@ macro_rules! timed_commit_phase {
         result
     }};
 }
+
+/// A dedicated rayon thread pool for checkpoint-commit treestate computation. Namely:
+/// - the note-commitment tree update
+/// - the ZIP-244 auth-data-root commitment leaf-hashes
+///
+/// These are the two dominant compute-steps during commit heavy shielded blocks.
+///
+/// This isolates the commit-compute phase from the main thread pool, allowing it
+/// to keep making progress when download/verify work is busy.
+static COMMIT_COMPUTE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("commit-compute-{i}"))
+        .build()
+        .expect("rayon thread pool configuration is valid")
+});
 
 pub mod column_family;
 
@@ -591,24 +610,27 @@ impl FinalizedState {
                     #[cfg(feature = "commit-metrics")]
                     let _ckpt_compute = std::time::Instant::now();
                     let mut commitment_result = None;
-                    let tree_result = rayon::in_place_scope_fifo(|scope| {
-                        scope.spawn_fifo(|_scope| {
-                            commitment_result = Some(timed_commit_phase!(
-                                "zebra.state.write.commitment_check.duration_seconds",
-                                check::block_commitment_is_valid_for_chain_history(
-                                    block.clone(),
-                                    &network,
-                                    &history_tree,
-                                )
-                            ));
-                        });
+                    // Run the two CPU-intensive operations inside the dedicated
+                    // commit-compute pool so their nested rayon work uses isolated workers instead of
+                    // contending with the verifier on the global pool.
+                    let tree_result = COMMIT_COMPUTE_POOL.install(|| {
+                        rayon::in_place_scope_fifo(|scope| {
+                            scope.spawn_fifo(|_scope| {
+                                commitment_result = Some(timed_commit_phase!(
+                                    "zebra.state.write.commitment_check.duration_seconds",
+                                    check::block_commitment_is_valid_for_chain_history(
+                                        block.clone(),
+                                        &network,
+                                        &history_tree,
+                                    )
+                                ));
+                            });
 
-                        // Runs on the in-place thread so its own internal rayon scope
-                        // (one task per note commitment tree) uses the pool directly.
-                        timed_commit_phase!(
-                            "zebra.state.write.update_trees.duration_seconds",
-                            note_commitment_trees.update_trees_parallel(&block)
-                        )
+                            timed_commit_phase!(
+                                "zebra.state.write.update_trees.duration_seconds",
+                                note_commitment_trees.update_trees_parallel(&block)
+                            )
+                        })
                     });
 
                     // Surface the tree-update error first, preserving the error

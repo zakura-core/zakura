@@ -3925,6 +3925,7 @@ fn should_run_freshness_reaper(
 /// The only stream-kind version this v1 handler serves. Every known kind is
 /// at version 1; a peer naming any other version of a known kind is rejected.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
+#[allow(dead_code)]
 const ZAKURA_STREAM_VERSION_2: u16 = 2;
 
 /// Returns whether the handler can serve a stream with this kind and version.

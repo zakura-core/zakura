@@ -262,15 +262,15 @@ pub trait RequestResponseService: Service {
     /// is the peer's negotiated full-message cap. Responders must size outbound
     /// frame payloads against the smaller of the two so the peer never receives
     /// a frame larger than its accepted message cap.
-    fn request_frame<'a>(
-        &'a self,
+    fn request_frame(
+        &self,
         peer_id: ZakuraPeerId,
         stream_kind: u16,
         request_id: u64,
         max_frame_bytes: u32,
         max_message_bytes: u32,
         frame: Frame,
-    ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>>;
+    ) -> BoxRunFuture<'_, Result<Vec<Frame>, SinkReject>>;
 }
 
 /// A per-stream reader owned by a service.

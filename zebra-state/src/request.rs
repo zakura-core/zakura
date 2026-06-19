@@ -369,7 +369,7 @@ pub enum FinalizableBlock {
     },
     Contextual {
         contextually_verified: ContextuallyVerifiedBlock,
-        treestate: Treestate,
+        treestate: Box<Treestate>,
     },
 }
 
@@ -429,7 +429,7 @@ impl FinalizableBlock {
     pub fn new(contextually_verified: ContextuallyVerifiedBlock, treestate: Treestate) -> Self {
         Self::Contextual {
             contextually_verified,
-            treestate,
+            treestate: Box::new(treestate),
         }
     }
 

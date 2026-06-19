@@ -437,8 +437,7 @@ impl OutstandingBlockRange {
         expected_bytes: Vec<(block::Height, u64)>,
     ) -> Option<BlockRangeRequest> {
         let (start_height, anchor_hash) = *expected_hashes.first()?;
-        let count = u32::try_from(expected_hashes.len())
-            .expect("block-sync retry segment length is bounded by original request count");
+        let count = u32::try_from(expected_hashes.len()).ok()?;
         let estimated_bytes = expected_bytes
             .iter()
             .fold(0u64, |total, (_, bytes)| total.saturating_add(*bytes));

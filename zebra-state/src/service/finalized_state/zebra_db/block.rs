@@ -1577,6 +1577,7 @@ impl DiskWriteBatch {
     }
 
     /// Prepare a database batch containing a contextually validated header range.
+    #[allow(clippy::unwrap_in_result)]
     pub fn prepare_header_range_batch(
         &mut self,
         zebra_db: &ZebraDb,

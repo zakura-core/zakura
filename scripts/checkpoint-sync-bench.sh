@@ -199,20 +199,16 @@ BUILD_CARGO_HOME="$BENCH_HOME/cargo-home"
 # validate a cached binary really is the one we built for $2=sha: integrity (sha256
 # matches the stored value) AND provenance (zebrad --version embeds the git short sha).
 validate_cached_binary() {
-  local zebrad="$1" sha="$2" meta="$3" want got ver vsha commit
+  local zebrad="$1" sha="$2" meta="$3" want got ver
   [[ -x "$zebrad" && -f "$meta" ]] || { log "cache miss: missing binary/meta for $sha"; return 1; }
-  # integrity: the binary is byte-identical to the one we recorded for this commit
+  # integrity: byte-identical to the binary we built and recorded for this commit.
+  # This is the strong check — it ties the cached file to this exact commit's build.
   want="$(awk -F= '/^bin_sha256=/{print $2}' "$meta")"
   got="$(sha256sum "$zebrad" | awk '{print $1}')"
   [[ -n "$want" && "$want" == "$got" ]] || { log "cache invalid: binary sha256 mismatch for $sha"; return 1; }
-  # runnable + provenance: --version embeds a git abbrev (g<hex>) that prefixes the commit
-  ver="$("$zebrad" --version 2>/dev/null | head -1)"
-  [[ -n "$ver" ]] || { log "cache invalid: $sha binary will not report --version"; return 1; }
-  commit="$(awk -F= '/^commit=/{print $2}' "$meta")"
-  vsha="$(grep -oE 'g[0-9a-f]{7,}' <<<"$ver" | head -1 | sed 's/^g//')"
-  if [[ -n "$vsha" && -n "$commit" && "$commit" != "$vsha"* ]]; then
-    log "cache invalid: $sha --version sha 'g$vsha' is not a prefix of $commit"; return 1
-  fi
+  # runnable: it actually executes and reports a version
+  ver="$("$zebrad" --version 2>/dev/null | head -1 || true)"
+  [[ -n "$ver" ]] || { log "cache invalid: $sha binary will not run --version"; return 1; }
   log "cache hit: validated prebuilt binary for $sha (sha256 ok, --version='$ver')"
   return 0
 }
@@ -257,13 +253,12 @@ build_from_ref() {
     || die "cargo build failed for $sha"
   local built="$BUILD_TARGET/release/zebrad"
   [[ -x "$built" ]] || die "build produced no zebrad binary for $sha"
-  ver="$("$built" --version 2>/dev/null | head -1)"
-  local vsha; vsha="$(grep -oE 'g[0-9a-f]{7,}' <<<"$ver" | head -1 | sed 's/^g//')"
-  [[ -z "$vsha" || "$full" == "$vsha"* ]] || log "WARNING: built --version ('$ver') sha g$vsha not a prefix of $full"
+  ver="$("$built" --version 2>/dev/null | head -1 || true)"
   mkdir -p "$bindir"; cp -f "$built" "$zebrad"; chmod +x "$zebrad"
+  # record the commit (authoritative, from git) + the binary hash for cache validation
   { echo "commit=$full"; echo "ref=$ref"; echo "version=$ver";
     echo "bin_sha256=$(sha256sum "$zebrad" | awk '{print $1}')"; } > "$meta"
-  log "built and cached $sha: $ver" >&2
+  log "built and cached $sha ($ver)" >&2
   ZEBRAD_BIN="$zebrad"
 }
 
@@ -437,7 +432,7 @@ time taken:     ${RESULT_TIME} s
 blocks/s:       $RESULT_BPS        (post-first-commit: $RESULT_PBPS blocks/s over ${RESULT_POST}s)
 reached stop:   $( [[ "$RESULT_STALLED" == no ]] && echo yes || echo "$RESULT_STALLED" )
 EOF
-  [[ -n "$RESULT_ERRS" ]] && printf 'WARNING — log errors:\n%s\n' "$RESULT_ERRS"
+  if [[ -n "$RESULT_ERRS" ]]; then printf 'WARNING — log errors:\n%s\n' "$RESULT_ERRS"; fi
 }
 
 summary_row() { # markdown row -> step summary

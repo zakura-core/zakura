@@ -102,6 +102,8 @@ fn fake_block_at_height(template: &Arc<block::Block>, height: block::Height) -> 
         | Transaction::V3 { inputs, .. }
         | Transaction::V4 { inputs, .. }
         | Transaction::V5 { inputs, .. } => &mut inputs[0],
+        #[cfg(zcash_unstable = "nu6.3")]
+        Transaction::V6 { inputs, .. } => &mut inputs[0],
     };
     match input {
         transparent::Input::Coinbase {

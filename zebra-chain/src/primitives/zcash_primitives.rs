@@ -11,7 +11,7 @@ use crate::{
     amount::{Amount, NonNegative},
     parameters::NetworkUpgrade,
     serialization::ZcashSerialize,
-    transaction::{AuthDigest, HashType, SigHash, Transaction},
+    transaction::{AuthDigest, Hash, HashType, SigHash, Transaction},
     transparent::{self, Script},
     Error,
 };
@@ -523,4 +523,28 @@ pub(crate) fn auth_digest(tx: &Transaction) -> AuthDigest {
             .try_into()
             .expect("digest has the correct size"),
     )
+}
+
+/// Compute both the transaction ID (txid) and the ZIP-244 authorizing-data
+/// commitment of a v5+ transaction from a single librustzcash conversion.
+///
+/// # Panics
+///
+/// If passed a pre-v5 transaction.
+pub(crate) fn txid_and_auth_digest(tx: &Transaction) -> (Hash, AuthDigest) {
+    let nu = tx.network_upgrade().expect("V5 tx has a network upgrade");
+
+    let tx = tx
+        .to_librustzcash(nu)
+        .expect("V5 tx is convertible to its `zcash_params` equivalent");
+
+    let txid = Hash(*tx.txid().as_ref());
+    let auth_digest = AuthDigest(
+        tx.auth_commitment()
+            .as_ref()
+            .try_into()
+            .expect("digest has the correct size"),
+    );
+
+    (txid, auth_digest)
 }

@@ -287,6 +287,30 @@ impl Transaction {
         }
     }
 
+    /// Compute this transaction's ID (txid) and ZIP-244 authorizing-data digest
+    /// together, sharing the librustzcash conversion used by both computations.
+    ///
+    /// Returns `None` for the auth digest of pre-v5 transactions.
+    pub fn txid_and_auth_digest(&self) -> (Hash, Option<AuthDigest>) {
+        match self {
+            Transaction::V1 { .. }
+            | Transaction::V2 { .. }
+            | Transaction::V3 { .. }
+            | Transaction::V4 { .. } => (self.hash(), None),
+            Transaction::V5 { .. } => {
+                let (txid, auth_digest) =
+                    crate::primitives::zcash_primitives::txid_and_auth_digest(self);
+                (txid, Some(auth_digest))
+            }
+            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+            Transaction::V6 { .. } => {
+                let (txid, auth_digest) =
+                    crate::primitives::zcash_primitives::txid_and_auth_digest(self);
+                (txid, Some(auth_digest))
+            }
+        }
+    }
+
     // other properties
 
     /// Does this transaction have transparent inputs?

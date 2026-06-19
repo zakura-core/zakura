@@ -47,6 +47,16 @@ proptest! {
     }
 
     #[test]
+    fn txid_and_auth_digest_matches_separate(tx in any::<Transaction>()) {
+        let _init_guard = zebra_test::init();
+
+        let (txid, auth_digest) = tx.txid_and_auth_digest();
+
+        prop_assert_eq![txid, tx.hash()];
+        prop_assert_eq![auth_digest, tx.auth_digest()];
+    }
+
+    #[test]
     fn transaction_hash_struct_display_roundtrip(hash in any::<Hash>()) {
         let _init_guard = zebra_test::init();
 

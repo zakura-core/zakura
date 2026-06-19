@@ -25,7 +25,9 @@ impl IntoDisk for ValueBalance<NonNegative> {
     type Bytes = [u8; 40];
 
     fn as_bytes(&self) -> Self::Bytes {
-        self.to_bytes()
+        self.to_bytes()[..40]
+            .try_into()
+            .expect("40-byte value balance prefix has the expected length")
     }
 }
 

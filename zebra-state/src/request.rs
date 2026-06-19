@@ -350,6 +350,8 @@ impl Treestate {
                 sapling_subtree,
                 orchard,
                 orchard_subtree,
+                ironwood: Default::default(),
+                ironwood_subtree: None,
             },
             history_tree,
         }

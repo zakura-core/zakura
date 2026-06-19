@@ -778,7 +778,7 @@ fn modern_rollback_network() -> Network {
             nu6: Some(8),
             nu6_1: Some(9),
             nu6_2: Some(10),
-            nu7: Some(11),
+            nu6_3: Some(11),
         })
         .expect("configured activation heights are valid")
         .extend_funding_streams()

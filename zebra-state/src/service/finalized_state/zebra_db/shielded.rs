@@ -457,6 +457,8 @@ impl ZebraDb {
             sapling_subtree: self.sapling_subtree_for_tip(),
             orchard: self.orchard_tree_for_tip(),
             orchard_subtree: self.orchard_subtree_for_tip(),
+            ironwood: Default::default(),
+            ironwood_subtree: None,
         }
     }
 }

@@ -3316,7 +3316,8 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
             NetworkUpgrade::Nu5
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
-            | NetworkUpgrade::Nu7 => {
+            | NetworkUpgrade::Nu6_2
+            | NetworkUpgrade::Nu6_3 => {
                 ChainHistoryBlockTxAuthCommitmentHash::from_commitments(&hist_root, &auth_root)
                     .bytes_in_serialized_order()
             }
@@ -4123,7 +4124,7 @@ async fn invalidate_and_reconsider_block() -> Result<()> {
     let _init_guard = zebra_test::init();
     let net = Network::new_regtest(
         ConfiguredActivationHeights {
-            nu7: Some(100),
+            nu6_3: Some(100),
             ..Default::default()
         }
         .into(),

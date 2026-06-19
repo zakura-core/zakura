@@ -552,12 +552,14 @@ fn rebuild_history_tree_from_upgrade_activation(
         .expect("current network upgrade must have an activation height");
 
     let (block, sapling_root, orchard_root) = history_rebuild_inputs_at_height(db, start_height)?;
-    let mut history_tree = HistoryTree::from_block(network, block, &sapling_root, &orchard_root)?;
+    let ironwood_root = Default::default();
+    let mut history_tree =
+        HistoryTree::from_block(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
 
     for height in ((start_height.0 + 1)..=target_height.0).map(Height) {
         let (block, sapling_root, orchard_root) = history_rebuild_inputs_at_height(db, height)?;
 
-        history_tree.push(network, block, &sapling_root, &orchard_root)?;
+        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
     }
 
     Ok(history_tree)
@@ -608,7 +610,8 @@ fn rebuild_treestate_to_height(
 
         let sapling_root = note_commitment_trees.sapling.root();
         let orchard_root = note_commitment_trees.orchard.root();
-        history_tree.push(network, block, &sapling_root, &orchard_root)?;
+        let ironwood_root = note_commitment_trees.ironwood.root();
+        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
     }
 
     Ok(RebuiltTreestate {

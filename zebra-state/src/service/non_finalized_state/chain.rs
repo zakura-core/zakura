@@ -1469,6 +1469,8 @@ impl Chain {
             sapling_subtree: self.sapling_subtree_for_tip(),
             orchard: self.orchard_note_commitment_tree_for_tip(),
             orchard_subtree: self.orchard_subtree_for_tip(),
+            ironwood: Default::default(),
+            ironwood_subtree: None,
         };
 
         let mut tree_result = None;
@@ -1506,6 +1508,7 @@ impl Chain {
 
         let sapling_root = self.sapling_note_commitment_tree_for_tip().root();
         let orchard_root = self.orchard_note_commitment_tree_for_tip().root();
+        let ironwood_root = nct.ironwood.root();
 
         // TODO: update the history trees in a rayon thread, if they show up in CPU profiles
         let mut history_tree = self.history_block_commitment_tree();
@@ -1516,6 +1519,7 @@ impl Chain {
                 contextually_valid.block.clone(),
                 &sapling_root,
                 &orchard_root,
+                &ironwood_root,
             )
             .map_err(Arc::new)?;
 

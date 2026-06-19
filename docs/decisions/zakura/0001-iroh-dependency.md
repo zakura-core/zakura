@@ -18,8 +18,12 @@ line selected during review fixes that resolves with the current tree, uses the
 patched `rustls-webpki 0.103.13` line, and still exposes the protocol router and
 endpoint APIs needed by later Zakura plans.
 
-`iroh 0.92.0` has `rust-version = "1.85"`, so this dependency does not raise
-the workspace MSRV.
+`iroh 0.92.0` declares `rust-version = "1.85"`, but its transitive dependencies
+(`time`, and the `tonic`/`darling`/`serde_with` chain) have since moved to
+`rust-version = "1.88"` to pick up upstream fixes — including the
+RUSTSEC-2026-0009 stack-exhaustion fix shipped in `time 0.3.47`. The workspace
+MSRV is therefore unified at 1.91 (matching the `zebrad` binary) rather than
+held at the former 1.85.1 library floor.
 
 ## Privacy Posture
 

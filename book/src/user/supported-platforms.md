@@ -9,7 +9,7 @@ Platforms are identified by their Rust "target triple" which is a string compose
 
 ## Minimum Supported Rust Version (MSRV)
 
-Zebra's minimum supported Rust version is **1.89**. We recommend using the latest
+Zebra's minimum supported Rust version is **1.91**. We recommend using the latest
 stable Rust release for best performance and security.
 
 ## Tier 1

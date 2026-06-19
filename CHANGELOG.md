@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   default-off `commit-metrics` feature emits per-block timing histograms
   (`zebra.state.write.*`) for future profiling.
 
+### Changed
+
+- Unified the workspace Minimum Supported Rust Version (MSRV) at 1.91, matching
+  the `zebrad` binary. The library crates previously declared 1.85.1, but the
+  dependency tree (via `iroh`/`sentry` → `time 0.3.47`, plus the
+  `tonic`/`darling`/`serde_with` chain) now requires Rust 1.88, and keeping
+  those current versions is required to stay clear of RUSTSEC-2026-0009, a
+  stack-exhaustion DoS fixed in `time 0.3.47`.
+
 ### Added
 
 - Report `pruned: true` in `getblockchaininfo` after Zebra has pruned

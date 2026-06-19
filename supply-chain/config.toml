@@ -2165,15 +2165,7 @@ version = "1.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.time]]
-version = "0.3.45"
-criteria = "safe-to-deploy"
-
-[[exemptions.time-core]]
-version = "0.1.7"
-criteria = "safe-to-deploy"
-
-[[exemptions.time-macros]]
-version = "0.2.25"
+version = "0.3.36"
 criteria = "safe-to-deploy"
 
 [[exemptions.tiny-keccak]]

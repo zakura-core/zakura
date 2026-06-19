@@ -146,8 +146,8 @@ jobs:
         # file". Unset it here so RocksDB is vendored and statically linked,
         # yielding a self-contained binary the slim image can run.
         run: |
-          unset ROCKSDB_LIB_DIR
-          cargo build -p zebrad --bin zebrad
+          cargo clean -p librocksdb-sys -p rocksdb -p zebra-state -p zebrad
+          env -u ROCKSDB_LIB_DIR cargo build -p zebrad --bin zebrad
         env:
           CXXFLAGS: "-include cstdint"
       - name: Run Zakura regtest PR gate
@@ -216,8 +216,8 @@ jobs:
         # system RocksDB; dynamically linking it crashes every node with
         # "librocksdb.so.8.9: cannot open shared object file".
         run: |
-          unset ROCKSDB_LIB_DIR
-          cargo build -p zebrad --bin zebrad
+          cargo clean -p librocksdb-sys -p rocksdb -p zebra-state -p zebrad
+          env -u ROCKSDB_LIB_DIR cargo build -p zebrad --bin zebrad
         env:
           CXXFLAGS: "-include cstdint"
       - name: Run Zakura regtest dual-stack e2e

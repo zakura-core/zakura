@@ -249,9 +249,10 @@ const FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT: HeightDiff = 100;
 /// tips and retrying the genesis block.
 ///
 /// This should be long enough for peers to respond to tip requests on a thin or
-/// flaky peer set. Shorter values can cause Zebra to loop on `obtain_tips`
-/// timeouts without making progress.
-const SYNC_RESTART_DELAY: Duration = Duration::from_secs(45);
+/// flaky peer set, and for peer inventory rotation and crawl requests to make
+/// progress between sync rounds. Shorter values can cause Zebra to loop on
+/// `obtain_tips` timeouts without making progress.
+const SYNC_RESTART_DELAY: Duration = Duration::from_secs(67);
 
 /// Controls how long the syncer sleeps between sync runs before obtaining new
 /// tips and restarting downloads.

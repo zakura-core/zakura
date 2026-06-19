@@ -1,0 +1,108 @@
+name: Checkpoint-sync benchmark
+
+# Manual, on-demand checkpoint-zone sync benchmark.
+#
+# Picks a published release of this repo (no build in CI), runs zebrad forward from a
+# pre-synced ~1.7M mainnet state snapshot through the checkpoint zone pinned to a single
+# peer, and reports: time taken, blocks covered, blocks/s. Demonstrates the checkpoint-sync
+# throughput work (CHECKPOINT_SYNC_FINDINGS.md / PARALLEL_IDEA.md).
+#
+# Runs on the roman-zakura-3 self-hosted runner (label `zakura-bench`). One-time setup:
+# register the runner and set the BENCH_* repo Actions variables (see
+# scripts/checkpoint-sync-bench.sh header and the repo runbook).
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_ref:
+        description: "Git branch/tag/SHA to build on the host (cached by commit SHA). Primary mode."
+        required: false
+        default: "ironwood-main"
+      force_rebuild:
+        description: "Rebuild even if a binary for this commit SHA is already cached"
+        type: boolean
+        required: false
+        default: false
+      baseline_ref:
+        description: "Optional second ref to build+run first, for a baseline -> primary speedup"
+        required: false
+        default: ""
+      release_tag:
+        description: "Alternative to build_ref: download this release tarball instead of building"
+        required: false
+        default: ""
+      stop_height:
+        description: "Sync stops after committing this height (snapshot tip is 1,707,210)"
+        required: true
+        default: "1730000"
+      wall_cap_seconds:
+        description: "Hard wall-clock cap for a single run"
+        required: false
+        default: "2400"
+      feed_peer:
+        description: "Peer to pin (ip:port). Leave blank to use public DNS-seeder peers."
+        required: false
+        default: ""
+      peerset_size:
+        description: "Target peer count (1 = strict single pinned peer; ~75 for DNS-seeder mode)"
+        required: false
+        default: "75"
+      checkpoint_verify_concurrency_limit:
+        required: false
+        default: "1500"
+      download_concurrency_limit:
+        required: false
+        default: "150"
+      baseline_tag:
+        description: "Optional (download mode): baseline release tag for a speedup comparison"
+        required: false
+        default: ""
+
+concurrency:
+  group: checkpoint-sync-bench   # one bench at a time (single host, single snapshot)
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: "checkpoint sync ${{ inputs.build_ref || inputs.release_tag }}"
+    runs-on: [self-hosted, "${{ vars.BENCH_RUNNER_LABEL || 'zakura-bench' }}"]
+    timeout-minutes: 300   # first-ever on-host build is cold; later builds are incremental
+    steps:
+      - name: Checkout (for the bench script)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        with:
+          persist-credentials: false
+
+      - name: Run checkpoint-sync benchmark
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_REF: ${{ inputs.build_ref }}
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild && '1' || '0' }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          BASELINE_TAG: ${{ inputs.baseline_tag }}
+          STOP_HEIGHT: ${{ inputs.stop_height }}
+          WALL_CAP: ${{ inputs.wall_cap_seconds }}
+          FEED_PEER: ${{ inputs.feed_peer }}    # blank = public DNS-seeder peers
+          PEERSET_SIZE: ${{ inputs.peerset_size }}
+          CKPT_LIMIT: ${{ inputs.checkpoint_verify_concurrency_limit }}
+          DL_LIMIT: ${{ inputs.download_concurrency_limit }}
+          SNAPSHOT_URL: ${{ vars.BENCH_SNAPSHOT_URL || 'https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst' }}
+          SNAPSHOT_SHA256: ${{ vars.BENCH_SNAPSHOT_SHA256 || '19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769' }}
+          START_HEIGHT: ${{ vars.BENCH_SNAPSHOT_START_HEIGHT || '1707210' }}
+          BENCH_HOME: ${{ vars.BENCH_HOME || '/opt/zebra-bench' }}
+          OUT_DIR: ${{ github.workspace }}/bench-out
+        run: bash scripts/checkpoint-sync-bench.sh
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: checkpoint-sync-bench-${{ inputs.build_ref || inputs.release_tag }}-${{ github.run_id }}
+          path: bench-out/
+          if-no-files-found: ignore
+          retention-days: 30

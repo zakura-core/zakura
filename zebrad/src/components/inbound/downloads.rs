@@ -1,9 +1,10 @@
 //! A download stream that handles gossiped blocks from peers.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::IpAddr,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -13,7 +14,10 @@ use futures::{
     stream::{FuturesUnordered, Stream},
 };
 use pin_project::pin_project;
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::{
+    sync::{oneshot, Mutex},
+    task::JoinHandle,
+};
 use tower::{Service, ServiceExt};
 use tracing_futures::Instrument;
 
@@ -28,13 +32,13 @@ use crate::components::sync::MIN_CONCURRENCY_LIMIT;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// Source key used for inbound block download accounting.
+/// Source key used for inbound block download ordering.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum AdvertiserSource {
-    /// Legacy TCP peers are capped per IP address, preserving the existing policy.
+    /// Legacy TCP peers are ordered per IP address, preserving existing source attribution.
     LegacyIp(IpAddr),
 
-    /// Zakura peers are capped per authenticated peer id.
+    /// Zakura peers are ordered per authenticated peer id.
     Zakura(zn::zakura::ZakuraPeerId),
 }
 
@@ -47,6 +51,25 @@ impl From<zn::PeerSource> for AdvertiserSource {
     }
 }
 
+impl AdvertiserSource {
+    fn max_in_flight(&self, global_limit: usize) -> usize {
+        match self {
+            Self::LegacyIp(_) => 1,
+            // Authenticated Zakura peers get a per-peer slice of the global queue
+            // rather than the whole thing, so one peer cannot monopolize inbound
+            // block gossip admission. Never exceed the global limit on small queues.
+            Self::Zakura(_) => MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER.min(global_limit),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DownloadTask {
+    hash: block::Hash,
+    download_source: Option<zn::PeerSource>,
+    advertiser: Option<AdvertiserSource>,
+}
+
 /// The maximum number of concurrent inbound download and verify tasks.
 /// Also used as the maximum lookahead limit, before block verification.
 ///
@@ -57,16 +80,34 @@ impl From<zn::PeerSource> for AdvertiserSource {
 ///
 /// The maximum block size is 2 million bytes. A deserialized malicious
 /// block with ~225_000 transparent outputs can take up 9MB of RAM.
-/// The total queue bound is `MAX_INBOUND_CONCURRENCY * 9 MB`. Each legacy peer IP
-/// or authenticated Zakura peer is limited to one in-flight download (9 MB) by
-/// the source cap enforced in [`Downloads::download_and_verify`], so a sybil or
-/// IPv6-range attacker still needs many distinct source IPs or authenticated
-/// Zakura identities to approach the total bound.
+/// The total queue bound is `MAX_INBOUND_CONCURRENCY * 9 MB`. Admission is
+/// bounded globally by [`Downloads::full_verify_concurrency_limit`], deduped by
+/// block hash, and bounded per advertiser source. Legacy TCP sources keep the
+/// historical one-in-flight per-IP bound; authenticated Zakura sources are bounded
+/// per peer id by [`MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER`], so a single Zakura
+/// peer cannot fill the global queue with distinct gossiped hashes and deny
+/// admission to honest peers (the block-gossip analogue of the mempool fix for
+/// `GHSA-4fc2-h7jh-287c`). Admitted same-source downloads fetch block bodies promptly, then
+/// wait on a fair source-local gate before verification. This preserves
+/// source-local commit order without needing a later inbound request to drain a
+/// passive queue.
 /// (See #1880 for more details.)
 ///
 /// Malicious blocks will eventually timeout or fail contextual validation.
 /// Once validation fails, the block is dropped, and its memory is deallocated.
 pub const MAX_INBOUND_CONCURRENCY: usize = 200;
+
+/// The maximum number of concurrent inbound block download tasks attributable to
+/// a single authenticated Zakura advertiser.
+///
+/// Caps how many slots of [`MAX_INBOUND_CONCURRENCY`] (or the configured
+/// `full_verify_concurrency_limit`) one Zakura peer's gossiped block hashes can
+/// occupy, so a single peer cannot saturate the global queue with distinct hashes
+/// and deny gossip-path block admission to honest peers. This mirrors the mempool
+/// per-peer cap added for `GHSA-4fc2-h7jh-287c`. Legacy TCP sources keep their
+/// historical one-in-flight per-IP bound; crawler/sync-driven downloads have no
+/// advertiser source and are not counted against this cap.
+pub const MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER: usize = 5;
 
 /// The action taken in response to a peer's gossiped block hash.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -84,13 +125,6 @@ pub enum DownloadAction {
     /// The sync service should discover this block later, when we are closer
     /// to the tip. The queue's capacity is [`Downloads::full_verify_concurrency_limit`].
     FullQueue,
-
-    /// The advertising peer's IP already has an in-flight download, so
-    /// this request was ignored. Zcash's post-Blossom target block spacing
-    /// is 75 seconds, so honest peers rarely gossip more than one block
-    /// before the first is verified; during reorgs or recovery the same
-    /// hash also arrives from other peers or via the syncer.
-    TooManyFromPeer,
 }
 
 /// Manages download and verification of blocks gossiped to this peer.
@@ -130,27 +164,25 @@ where
 
     // Internal downloads state
     //
-    /// A list of pending block download and verify tasks.
+    /// Active block download and verify tasks.
     #[pin]
     pending: FuturesUnordered<
         JoinHandle<Result<block::Hash, (BoxError, block::Hash, Option<PeerSocketAddr>)>>,
     >,
 
-    /// Cancellation handles for tasks in [`Self::pending`], keyed by block
-    /// hash. The optional source is recorded in [`Self::in_flight_sources`],
-    /// so completion can remove it by hash lookup.
+    /// Cancellation handles for active tasks in [`Self::pending`], keyed by block
+    /// hash. The optional source is recorded so completion can clear
+    /// [`Self::source_counts`] and [`Self::source_locks`].
     cancel_handles: HashMap<block::Hash, (oneshot::Sender<()>, Option<AdvertiserSource>)>,
 
-    /// Advertiser sources with an in-flight download and verify task.
+    /// Fair source-local verification gates for admitted downloads.
     ///
-    /// Invariant: a source is present iff some entry in [`Self::cancel_handles`]
-    /// has value `(_, Some(source))`. Enforces one in-flight download per
-    /// legacy IP or authenticated Zakura peer.
-    ///
-    /// Size-bounded by `full_verify_concurrency_limit` (≤ [`MAX_INBOUND_CONCURRENCY`]),
-    /// inherited from the [`DownloadAction::FullQueue`] check on
-    /// [`Self::pending`].
-    in_flight_sources: HashSet<AdvertiserSource>,
+    /// Tasks are spawned immediately, but same-source tasks must acquire this gate
+    /// before committing a downloaded block to the verifier.
+    source_locks: HashMap<AdvertiserSource, Arc<Mutex<()>>>,
+
+    /// Number of admitted tasks, active or waiting, per source.
+    source_counts: HashMap<AdvertiserSource, usize>,
 }
 
 impl<ZN, ZV, ZS> Stream for Downloads<ZN, ZV, ZS>
@@ -168,7 +200,7 @@ where
     type Item = Result<block::Hash, (BoxError, Option<PeerSocketAddr>)>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let this = self.project();
+        let mut this = self.project();
         // CORRECTNESS
         //
         // The current task must be scheduled for wakeup every time we return
@@ -178,17 +210,25 @@ where
         // task is scheduled for wakeup when the next task becomes ready.
         //
         // TODO: this would be cleaner with poll_map (#2693)
-        if let Some(join_result) = ready!(this.pending.poll_next(cx)) {
+        if let Some(join_result) = ready!(this.pending.as_mut().poll_next(cx)) {
             let (result, hash) =
                 match join_result.expect("block download and verify tasks must not panic") {
                     Ok(hash) => (Ok(hash), hash),
                     Err((e, hash, advertiser_addr)) => (Err((e, advertiser_addr)), hash),
                 };
             if let Some((_, Some(source))) = this.cancel_handles.remove(&hash) {
-                assert!(
-                    this.in_flight_sources.remove(&source),
-                    "every tracked source was inserted when its download was queued",
-                );
+                let source_count = this
+                    .source_counts
+                    .get_mut(&source)
+                    .expect("source count is inserted when a download task is admitted");
+                *source_count = source_count
+                    .checked_sub(1)
+                    .expect("source count is positive while a download task is admitted");
+
+                if *source_count == 0 {
+                    this.source_counts.remove(&source);
+                    this.source_locks.remove(&source);
+                }
             }
             Poll::Ready(Some(result))
         } else {
@@ -238,80 +278,127 @@ where
             latest_chain_tip,
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
-            in_flight_sources: HashSet::new(),
+            source_locks: HashMap::new(),
+            source_counts: HashMap::new(),
         }
     }
 
     /// Queue a block for download and verification.
     ///
-    /// When `advertiser` is `Some`, it is tracked in
-    /// [`Self::in_flight_sources`] and used to enforce one in-flight download
-    /// per legacy IP or authenticated Zakura peer; `None` bypasses source
-    /// accounting (for example when Zebra triggers the download internally).
+    /// When `download_source` is `Some`, the block request is directed to that
+    /// source. Admission is still controlled by the global queue bound and
+    /// per-hash dedupe, so valid consecutive blocks from one source are not
+    /// dropped solely because an earlier block is still being verified.
     #[instrument(skip(self, hash), fields(hash = %hash))]
     pub fn download_and_verify(
         &mut self,
         hash: block::Hash,
         download_source: Option<zn::PeerSource>,
     ) -> DownloadAction {
-        let advertiser = download_source.clone().map(AdvertiserSource::from);
-
         if self.cancel_handles.contains_key(&hash) {
             debug!(
                 ?hash,
-                queue_len = self.pending.len(),
+                queue_len = self.queue_len(),
                 concurrency_limit = self.full_verify_concurrency_limit,
                 "block hash already queued for inbound download: ignored block",
             );
 
-            metrics::gauge!("gossip.queued.block.count").set(self.pending.len() as f64);
+            metrics::gauge!("gossip.queued.block.count").set(self.queue_len() as f64);
             metrics::counter!("gossip.already.queued.dropped.block.hash.count").increment(1);
 
             return DownloadAction::AlreadyQueued;
         }
 
-        if self.pending.len() >= self.full_verify_concurrency_limit {
+        if self.queue_len() >= self.full_verify_concurrency_limit {
             debug!(
                 ?hash,
-                queue_len = self.pending.len(),
+                queue_len = self.queue_len(),
                 concurrency_limit = self.full_verify_concurrency_limit,
                 "too many blocks queued for inbound download: ignored block",
             );
 
-            metrics::gauge!("gossip.queued.block.count").set(self.pending.len() as f64);
+            metrics::gauge!("gossip.queued.block.count").set(self.queue_len() as f64);
             metrics::counter!("gossip.full.queue.dropped.block.hash.count").increment(1);
 
             return DownloadAction::FullQueue;
         }
 
+        let advertiser = download_source.clone().map(AdvertiserSource::from);
         if let Some(source) = &advertiser {
-            if self.in_flight_sources.contains(source) {
+            let source_count = self.source_counts.get(source).copied().unwrap_or_default();
+            let source_limit = source.max_in_flight(self.full_verify_concurrency_limit);
+            if source_count >= source_limit {
                 debug!(
                     ?hash,
-                    ?advertiser,
-                    "already have an in-flight inbound download from peer source: ignored block",
+                    ?source,
+                    source_count,
+                    source_limit,
+                    queue_len = self.queue_len(),
+                    concurrency_limit = self.full_verify_concurrency_limit,
+                    "too many blocks queued for inbound download from one source: ignored block",
                 );
 
-                metrics::counter!("gossip.peer.limit.dropped.block.hash.count").increment(1);
+                metrics::gauge!("gossip.queued.block.count").set(self.queue_len() as f64);
+                metrics::counter!("gossip.source.queue.dropped.block.hash.count").increment(1);
 
-                return DownloadAction::TooManyFromPeer;
+                return DownloadAction::FullQueue;
             }
         }
+
+        let download = DownloadTask {
+            hash,
+            advertiser,
+            download_source,
+        };
+
+        self.spawn_download_task(download);
+
+        debug!(
+            ?hash,
+            queue_len = self.queue_len(),
+            concurrency_limit = self.full_verify_concurrency_limit,
+            "queued hash for download",
+        );
+        metrics::gauge!("gossip.queued.block.count").set(self.queue_len() as f64);
+
+        DownloadAction::AddedToQueue
+    }
+
+    fn queue_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn spawn_download_task(&mut self, download: DownloadTask) {
+        let DownloadTask {
+            hash,
+            download_source,
+            advertiser,
+        } = download;
+
+        let source_lock = advertiser.as_ref().map(|source| {
+            *self.source_counts.entry(source.clone()).or_default() += 1;
+            self.source_locks
+                .entry(source.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        });
 
         // This oneshot is used to signal cancellation to the download task.
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
-        let state = self.state.clone();
         let network = self.network.clone();
         let verifier = self.verifier.clone();
+        let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
 
         let fut = async move {
-            // Check if the block is already in the state.
-            match state.oneshot(zs::Request::KnownBlock(hash)).await {
-                Ok(zs::Response::KnownBlock(None)) => Ok(()),
-                Ok(zs::Response::KnownBlock(Some(_))) => Err("already present".into()),
+            // Check if the full block body is already in the state. `KnownBlock`
+            // can be true for header-only Zakura sync state, but inbound gossip
+            // still needs to fetch and verify the block body in that case.
+            match state.oneshot(zs::Request::AnyChainBlock(hash.into())).await {
+                Ok(zs::Response::Block(None)) => Ok(()),
+                Ok(zs::Response::Block(Some(_))) => Err("already present".into()),
                 Ok(_) => unreachable!("wrong response"),
                 Err(e) => Err(e),
             }
@@ -357,6 +444,22 @@ where
             } else {
                 unreachable!("wrong response to block request");
             };
+
+            // Bind the delivered block to the hash we requested. A peer that
+            // substitutes a different (even valid) block must not be able to
+            // corrupt our hash/source accounting: the verifier returns the
+            // committed block's hash, and queue cleanup keys on it, so a
+            // mismatch would leave the originally requested entry stale.
+            if block.hash() != hash {
+                return Err((
+                    format!(
+                        "peer returned block {} in response to a request for {hash}",
+                        block.hash()
+                    )
+                    .into(),
+                    advertiser_addr,
+                ));
+            }
             metrics::counter!("gossip.downloaded.block.count").increment(1);
 
             // # Security & Performance
@@ -433,6 +536,11 @@ where
                     .map_err(|e| (e.into(), None))?;
             }
 
+            let _source_guard = match source_lock {
+                Some(source_lock) => Some(source_lock.lock_owned().await),
+                None => None,
+            };
+
             verifier
                 .oneshot(zebra_consensus::Request::Commit(block))
                 .await
@@ -463,28 +571,12 @@ where
         });
 
         self.pending.push(task);
-        if let Some(source) = advertiser.clone() {
-            assert!(
-                self.in_flight_sources.insert(source),
-                "the per-source cap check above rejects any source already in flight",
-            );
-        }
         assert!(
             self.cancel_handles
                 .insert(hash, (cancel_tx, advertiser))
                 .is_none(),
             "blocks are only queued once"
         );
-
-        debug!(
-            ?hash,
-            queue_len = self.pending.len(),
-            concurrency_limit = self.full_verify_concurrency_limit,
-            "queued hash for download",
-        );
-        metrics::gauge!("gossip.queued.block.count").set(self.pending.len() as f64);
-
-        DownloadAction::AddedToQueue
     }
 }
 
@@ -492,9 +584,10 @@ where
 mod tests {
     use super::*;
     use futures::StreamExt as _;
-    use std::{future, time::Duration};
+    use std::{collections::HashSet, future, time::Duration};
     use tower::{service_fn, util::BoxCloneService};
-    use zebra_chain::parameters::Network;
+    use zebra_chain::{parameters::Network, serialization::ZcashDeserializeInto};
+    use zebra_network::InventoryResponse::Available;
 
     type PendingNetwork = BoxCloneService<zn::Request, zn::Response, BoxError>;
     type PendingVerifier = BoxCloneService<zebra_consensus::Request, block::Hash, BoxError>;
@@ -523,7 +616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advertiser_sources_enforce_legacy_ip_and_zakura_peer_caps() {
+    async fn source_admission_limits_preserve_legacy_bound_and_allow_zakura_burst() {
         let mut downloads = pending_downloads();
         let legacy_a = zn::PeerSource::LegacySocket(([127, 0, 0, 1], 8233).into());
         let legacy_same_ip = zn::PeerSource::LegacySocket(([127, 0, 0, 1], 18233).into());
@@ -538,22 +631,284 @@ mod tests {
             downloads.download_and_verify(hash(1), Some(legacy_a)),
             DownloadAction::AddedToQueue
         );
+        assert_eq!(downloads.pending.len(), 1);
         assert_eq!(
             downloads.download_and_verify(hash(2), Some(legacy_same_ip)),
-            DownloadAction::TooManyFromPeer
+            DownloadAction::FullQueue
         );
+        assert_eq!(downloads.pending.len(), 1);
         assert_eq!(
             downloads.download_and_verify(hash(3), Some(zakura_a.clone())),
             DownloadAction::AddedToQueue
         );
+        assert_eq!(downloads.pending.len(), 2);
         assert_eq!(
-            downloads.download_and_verify(hash(4), Some(zakura_a)),
-            DownloadAction::TooManyFromPeer
-        );
-        assert_eq!(
-            downloads.download_and_verify(hash(5), Some(zakura_b)),
+            downloads.download_and_verify(hash(4), Some(zakura_a.clone())),
             DownloadAction::AddedToQueue
         );
+        assert_eq!(downloads.pending.len(), 3);
+        assert_eq!(
+            downloads.download_and_verify(hash(5), Some(zakura_a)),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(downloads.pending.len(), 4);
+        assert_eq!(
+            downloads.download_and_verify(hash(6), Some(zakura_b)),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(downloads.pending.len(), 5);
+        assert_eq!(downloads.queue_len(), 5);
+        assert_eq!(
+            downloads.download_and_verify(hash(6), None),
+            DownloadAction::AlreadyQueued
+        );
+    }
+
+    #[tokio::test]
+    async fn single_zakura_source_cannot_monopolize_inbound_block_queue() {
+        let mut downloads = pending_downloads();
+        let zakura_a = zn::PeerSource::Zakura(
+            zn::zakura::ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds"),
+        );
+        let zakura_b = zn::PeerSource::Zakura(
+            zn::zakura::ZakuraPeerId::new(vec![8; 32]).expect("test peer id is within bounds"),
+        );
+
+        // A single Zakura source may occupy at most
+        // `MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER` slots of the global inbound
+        // queue, even though the global queue still has plenty of room.
+        for index in 0..MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER {
+            let byte = u8::try_from(index).expect("per-peer cap fits in u8");
+            assert_eq!(
+                downloads.download_and_verify(hash(byte), Some(zakura_a.clone())),
+                DownloadAction::AddedToQueue
+            );
+        }
+        assert_eq!(
+            downloads.pending.len(),
+            MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER
+        );
+
+        // The next distinct hash from the same source is rejected: one Zakura peer
+        // cannot keep advertising until it owns the whole global gossip queue.
+        let over_cap = hash(
+            u8::try_from(MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER).expect("per-peer cap fits in u8"),
+        );
+        assert_eq!(
+            downloads.download_and_verify(over_cap, Some(zakura_a)),
+            DownloadAction::FullQueue
+        );
+        assert_eq!(
+            downloads.pending.len(),
+            MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER
+        );
+
+        // A different honest Zakura peer is still admitted while the first is at
+        // its cap, so no single peer monopolizes gossip admission.
+        assert_eq!(
+            downloads.download_and_verify(hash(200), Some(zakura_b)),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(
+            downloads.pending.len(),
+            MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn global_inbound_download_queue_bounds_admission() {
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let mut downloads = Downloads::new(
+            MIN_CONCURRENCY_LIMIT,
+            BoxCloneService::new(service_fn(|_request| {
+                future::pending::<Result<zn::Response, BoxError>>()
+            })),
+            BoxCloneService::new(service_fn(|_request| {
+                future::pending::<Result<block::Hash, BoxError>>()
+            })),
+            BoxCloneService::new(service_fn(|_request| {
+                future::pending::<Result<zs::Response, BoxError>>()
+            })),
+            latest_chain_tip,
+        );
+
+        for index in 0..MIN_CONCURRENCY_LIMIT {
+            let byte = u8::try_from(index).expect("minimum concurrency limit fits in u8");
+            assert_eq!(
+                downloads.download_and_verify(hash(byte), None),
+                DownloadAction::AddedToQueue
+            );
+        }
+        let overflow_hash = hash(
+            u8::try_from(MIN_CONCURRENCY_LIMIT).expect("minimum concurrency limit fits in u8"),
+        );
+        assert_eq!(
+            downloads.download_and_verify(overflow_hash, None),
+            DownloadAction::FullQueue
+        );
+    }
+
+    #[tokio::test]
+    async fn same_source_downloads_fetch_promptly_and_verify_in_order() -> Result<(), BoxError> {
+        let block_one: Arc<block::Block> =
+            zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let block_two: Arc<block::Block> =
+            zebra_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+        let hash_one = block_one.hash();
+        let hash_two = block_two.hash();
+        let peer_id =
+            zn::zakura::ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds");
+        let source = zn::PeerSource::Zakura(peer_id.clone());
+
+        let blocks = Arc::new(HashMap::from([
+            (hash_one, block_one.clone()),
+            (hash_two, block_two.clone()),
+        ]));
+        let (network_tx, mut network_rx) = tokio::sync::mpsc::unbounded_channel::<zn::Request>();
+        let network = BoxCloneService::new(service_fn(move |request: zn::Request| {
+            let blocks = blocks.clone();
+            let network_tx = network_tx.clone();
+
+            async move {
+                network_tx.send(request.clone())?;
+
+                let zn::Request::BlocksByHashFrom { hashes, .. } = request else {
+                    return Err("unexpected network request".into());
+                };
+                let hash = hashes
+                    .iter()
+                    .next()
+                    .copied()
+                    .expect("download requests contain one hash");
+                let block = blocks
+                    .get(&hash)
+                    .cloned()
+                    .expect("test network has a block for the requested hash");
+
+                Ok(zn::Response::Blocks(vec![Available((block, None))]))
+            }
+        }));
+
+        let (commit_tx, mut commit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let verifier =
+            BoxCloneService::new(service_fn(move |request: zebra_consensus::Request| {
+                let commit_tx = commit_tx.clone();
+                let release_rx = release_rx.clone();
+
+                async move {
+                    let zebra_consensus::Request::Commit(block) = request else {
+                        return Err("unexpected verifier request".into());
+                    };
+                    let hash = block.hash();
+                    commit_tx.send(hash)?;
+
+                    if hash == hash_one {
+                        let release_rx = release_rx
+                            .lock()
+                            .await
+                            .take()
+                            .expect("first block verifier is released once");
+                        release_rx.await?;
+                    }
+
+                    Ok(hash)
+                }
+            }));
+
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let mut downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            network,
+            verifier,
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(hash_one, Some(source.clone())),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(
+            downloads.download_and_verify(hash_two, Some(source)),
+            DownloadAction::AddedToQueue
+        );
+
+        let first_request = tokio::time::timeout(Duration::from_secs(1), network_rx.recv())
+            .await
+            .expect("first same-source download starts")
+            .expect("network request channel is open");
+        assert_eq!(
+            first_request,
+            zn::Request::BlocksByHashFrom {
+                hashes: HashSet::from([hash_one]),
+                source: zn::PeerSource::Zakura(peer_id.clone()),
+            }
+        );
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("first block reaches verifier"),
+            Some(hash_one)
+        );
+
+        let second_request = tokio::time::timeout(Duration::from_secs(1), network_rx.recv())
+            .await
+            .expect("second same-source download starts without waiting for verifier cleanup")
+            .expect("network request channel is open");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), commit_rx.recv())
+                .await
+                .is_err(),
+            "second same-source verifier commit must wait until the first verifier finishes",
+        );
+
+        release_tx
+            .send(())
+            .expect("first verifier task is waiting for release");
+
+        assert_eq!(
+            second_request,
+            zn::Request::BlocksByHashFrom {
+                hashes: HashSet::from([hash_two]),
+                source: zn::PeerSource::Zakura(peer_id),
+            }
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("second block reaches verifier after first release"),
+            Some(hash_two)
+        );
+
+        let first_result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("first completed download is yielded")
+            .expect("downloads stream is open")
+            .expect("first download succeeds");
+        let second_result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("second completed download is yielded")
+            .expect("downloads stream is open")
+            .expect("second download succeeds");
+        assert_eq!(
+            HashSet::from([first_result, second_result]),
+            HashSet::from([hash_one, hash_two])
+        );
+        assert_eq!(downloads.queue_len(), 0);
+        assert!(downloads.source_locks.is_empty());
+        assert!(downloads.source_counts.is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -578,7 +933,7 @@ mod tests {
             })),
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
-                    zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -604,5 +959,87 @@ mod tests {
             }
         );
         poll_task.abort();
+    }
+
+    #[tokio::test]
+    async fn substituted_block_response_is_rejected_and_cleans_up_requested_hash(
+    ) -> Result<(), BoxError> {
+        let requested_block: Arc<block::Block> =
+            zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let substitute_block: Arc<block::Block> =
+            zebra_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+        let requested_hash = requested_block.hash();
+        assert_ne!(requested_hash, substitute_block.hash());
+
+        let peer_id =
+            zn::zakura::ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds");
+        let source = zn::PeerSource::Zakura(peer_id);
+
+        // The peer answers a single-hash request with a *different* valid block.
+        let substitute = substitute_block.clone();
+        let network = BoxCloneService::new(service_fn(move |request: zn::Request| {
+            let substitute = substitute.clone();
+            async move {
+                let (zn::Request::BlocksByHashFrom { .. } | zn::Request::BlocksByHash(_)) = request
+                else {
+                    return Err("unexpected network request".into());
+                };
+                Ok(zn::Response::Blocks(vec![Available((substitute, None))]))
+            }
+        }));
+
+        // The verifier would happily commit whatever block it is handed.
+        let verifier =
+            BoxCloneService::new(service_fn(|request: zebra_consensus::Request| async move {
+                let zebra_consensus::Request::Commit(block) = request else {
+                    return Err("unexpected verifier request".into());
+                };
+                Ok(block.hash())
+            }));
+
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let mut downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            network,
+            verifier,
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(requested_hash, Some(source)),
+            DownloadAction::AddedToQueue
+        );
+
+        // The download must fail rather than accept the substituted block.
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("download completes")
+            .expect("downloads stream is open");
+        assert!(
+            result.is_err(),
+            "a substituted block must be rejected, not accepted as {result:?}",
+        );
+
+        // Cleanup must key on the requested hash: no stale queue or source-count
+        // state may remain under the originally requested hash.
+        assert!(
+            downloads.cancel_handles.is_empty(),
+            "queue entry under the requested hash must be removed",
+        );
+        assert!(
+            downloads.source_counts.is_empty(),
+            "source accounting must be decremented for the requested hash",
+        );
+        assert!(downloads.source_locks.is_empty());
+        assert_eq!(downloads.queue_len(), 0);
+
+        Ok(())
     }
 }

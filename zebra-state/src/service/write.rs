@@ -1,13 +1,15 @@
 //! Writing blocks to the finalized and non-finalized states.
 
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use indexmap::IndexMap;
 use tokio::sync::{
-    mpsc::{UnboundedReceiver, UnboundedSender},
+    mpsc::{error::TryRecvError, UnboundedReceiver, UnboundedSender},
     oneshot, watch,
 };
 
@@ -16,6 +18,7 @@ use zebra_chain::block::{self, Height};
 
 use crate::{
     constants::MAX_BLOCK_REORG_HEIGHT,
+    error::CommitHeaderRangeError,
     service::{
         check,
         finalized_state::{FinalizedState, ZebraDb},
@@ -118,6 +121,33 @@ fn update_latest_chain_channels(
     tip_block_height
 }
 
+fn commit_header_range(
+    finalized_state: &FinalizedState,
+    anchor: block::Hash,
+    headers: Vec<Arc<block::Header>>,
+    body_sizes: Vec<u32>,
+    rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
+) {
+    let mut batch = crate::service::finalized_state::DiskWriteBatch::new();
+    let result = batch
+        .prepare_header_range_batch(&finalized_state.db, anchor, &headers, &body_sizes)
+        .and_then(|hash| {
+            finalized_state
+                .db
+                .write_batch(batch)
+                .map(|()| hash)
+                .map_err(|error| {
+                    tracing::error!(?error, "failed to write validated header range");
+
+                    CommitHeaderRangeError::StorageWriteError {
+                        error: error.to_string(),
+                    }
+                })
+        });
+
+    let _ = rsp_tx.send(result);
+}
+
 /// A worker task that reads, validates, and writes blocks to the
 /// `finalized_state` or `non_finalized_state`.
 struct WriteBlockWorkerTask {
@@ -125,6 +155,7 @@ struct WriteBlockWorkerTask {
     non_finalized_block_write_receiver: UnboundedReceiver<NonFinalizedWriteMessage>,
     finalized_state: FinalizedState,
     non_finalized_state: NonFinalizedState,
+    seed_zakura_header_from_best_chain_commits: bool,
     invalid_block_reset_sender: UnboundedSender<block::Hash>,
     /// Signals the [`crate::service::StateService`] that a non-finalized block was rejected by
     /// the write task, so its hash should be removed from
@@ -146,6 +177,14 @@ pub enum NonFinalizedWriteMessage {
     /// A newly downloaded and semantically verified block prepared for
     /// contextual validation and insertion into the non-finalized state.
     Commit(QueuedSemanticallyVerified),
+    /// A validated header range prepared for contextual storage checks and
+    /// insertion into the durable header store.
+    CommitHeaderRange {
+        anchor: block::Hash,
+        headers: Vec<Arc<block::Header>>,
+        body_sizes: Vec<u32>,
+        rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
+    },
     /// The hash of a block that should be invalidated and removed from
     /// the non-finalized state, if present.
     Invalidate {
@@ -216,6 +255,11 @@ impl BlockWriteSender {
         let (non_finalized_rejected_sender, non_finalized_rejected_receiver) =
             tokio::sync::mpsc::unbounded_channel();
 
+        let seed_zakura_header_from_best_chain_commits = finalized_state
+            .db
+            .config()
+            .enable_zakura_header_seed_from_committed_blocks;
+
         let span = Span::current();
         let task = std::thread::spawn(move || {
             span.in_scope(|| {
@@ -224,6 +268,7 @@ impl BlockWriteSender {
                     non_finalized_block_write_receiver,
                     finalized_state,
                     non_finalized_state,
+                    seed_zakura_header_from_best_chain_commits,
                     invalid_block_reset_sender,
                     non_finalized_rejected_sender,
                     chain_tip_sender,
@@ -268,14 +313,40 @@ impl WriteBlockWorkerTask {
             non_finalized_rejected_sender,
             chain_tip_sender,
             non_finalized_state_sender,
+            seed_zakura_header_from_best_chain_commits,
             backup_dir_path,
         } = &mut self;
 
         let mut prev_finalized_note_commitment_trees = None;
+        let mut deferred_non_finalized_messages = VecDeque::new();
 
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
-        while let Some(ordered_block) = finalized_block_write_receiver.blocking_recv() {
+        loop {
+            match non_finalized_block_write_receiver.try_recv() {
+                Ok(NonFinalizedWriteMessage::CommitHeaderRange {
+                    anchor,
+                    headers,
+                    body_sizes,
+                    rsp_tx,
+                }) => {
+                    commit_header_range(finalized_state, anchor, headers, body_sizes, rsp_tx);
+                    continue;
+                }
+                Ok(msg) => deferred_non_finalized_messages.push_back(msg),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {}
+            }
+
+            let ordered_block = match finalized_block_write_receiver.try_recv() {
+                Ok(block) => block,
+                Err(TryRecvError::Empty) => {
+                    std::thread::park_timeout(Duration::from_millis(10));
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => break,
+            };
+
             // TODO: split these checks into separate functions
 
             if invalid_block_reset_sender.is_closed() {
@@ -354,9 +425,21 @@ impl WriteBlockWorkerTask {
         // Save any errors to propagate down to queued child blocks
         let mut parent_error_map: IndexMap<block::Hash, ValidateContextError> = IndexMap::new();
 
-        while let Some(msg) = non_finalized_block_write_receiver.blocking_recv() {
+        while let Some(msg) = deferred_non_finalized_messages
+            .pop_front()
+            .or_else(|| non_finalized_block_write_receiver.blocking_recv())
+        {
             let queued_child_and_rsp_tx = match msg {
                 NonFinalizedWriteMessage::Commit(queued_child) => Some(queued_child),
+                NonFinalizedWriteMessage::CommitHeaderRange {
+                    anchor,
+                    headers,
+                    body_sizes,
+                    rsp_tx,
+                } => {
+                    commit_header_range(finalized_state, anchor, headers, body_sizes, rsp_tx);
+                    continue;
+                }
                 NonFinalizedWriteMessage::Invalidate { hash, rsp_tx } => {
                     tracing::info!(?hash, "invalidating a block in the non-finalized state");
                     let _ = rsp_tx.send(non_finalized_state.invalidate_block(hash));
@@ -382,6 +465,8 @@ impl WriteBlockWorkerTask {
 
             let child_hash = queued_child.hash;
             let parent_hash = queued_child.block.header.previous_block_hash;
+            let child_height = queued_child.height;
+            let child_block = queued_child.block.clone();
             let parent_error = parent_error_map.get(&parent_hash);
 
             // If the parent block was marked as rejected, also reject all its children.
@@ -430,6 +515,19 @@ impl WriteBlockWorkerTask {
 
                 // Skip the things we only need to do for successfully committed blocks
                 continue;
+            }
+
+            if should_seed_zakura_header_from_non_finalized_commit(
+                *seed_zakura_header_from_best_chain_commits,
+                non_finalized_state,
+                child_height,
+                child_hash,
+            ) {
+                seed_zakura_header_from_committed_block(
+                    &finalized_state.db,
+                    child_height,
+                    &child_block,
+                );
             }
 
             // Committing blocks to the finalized state keeps the same chain,
@@ -483,5 +581,114 @@ impl WriteBlockWorkerTask {
         // done writing to the finalized state, so we can force it to shut down.
         finalized_state.db.shutdown(true);
         std::mem::drop(self.finalized_state);
+    }
+}
+
+fn seed_zakura_header_from_committed_block(
+    finalized_state: &ZebraDb,
+    height: block::Height,
+    block: &Arc<block::Block>,
+) {
+    match finalized_state.seed_zakura_header_from_committed_block(height, block) {
+        Ok(()) => {
+            tracing::trace!(?height, hash = ?block.hash(), "seeded Zakura header from committed block");
+        }
+        Err(error) => {
+            tracing::warn!(
+                ?height,
+                hash = ?block.hash(),
+                ?error,
+                "failed to seed Zakura header from committed block"
+            );
+        }
+    }
+}
+
+fn should_seed_zakura_header_from_non_finalized_commit(
+    enabled: bool,
+    non_finalized_state: &NonFinalizedState,
+    height: block::Height,
+    hash: block::Hash,
+) -> bool {
+    enabled && non_finalized_state.best_tip() == Some((height, hash))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use zebra_chain::{
+        parameters::Network, serialization::ZcashDeserializeInto, value_balance::ValueBalance,
+    };
+
+    use crate::{
+        arbitrary::Prepare,
+        service::{
+            finalized_state::FinalizedState,
+            non_finalized_state::NonFinalizedState,
+            write::{
+                seed_zakura_header_from_committed_block,
+                should_seed_zakura_header_from_non_finalized_commit,
+            },
+        },
+        tests::FakeChainHelper,
+        Config,
+    };
+
+    #[test]
+    fn side_chain_commit_does_not_seed_zakura_headers() {
+        let _init_guard = zebra_test::init();
+
+        let network = Network::Mainnet;
+        let mut config = Config::ephemeral();
+        config.enable_zakura_header_seed_from_committed_blocks = true;
+        let finalized_state = FinalizedState::new(
+            &config,
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        );
+        finalized_state.set_finalized_value_pool(ValueBalance::fake_populated_pool());
+
+        let parent = zebra_test::vectors::BLOCK_MAINNET_434873_BYTES
+            .zcash_deserialize_into::<Arc<zebra_chain::block::Block>>()
+            .expect("block deserializes");
+        let best_block = parent.make_fake_child().set_work(10);
+        let side_block = parent.make_fake_child().set_work(1);
+        let best_height = best_block
+            .coinbase_height()
+            .expect("fake child block has a coinbase height");
+
+        let mut non_finalized_state = NonFinalizedState::new(&network);
+
+        non_finalized_state
+            .commit_new_chain(best_block.clone().prepare(), &finalized_state)
+            .expect("best block commits to a new chain");
+        assert!(should_seed_zakura_header_from_non_finalized_commit(
+            true,
+            &non_finalized_state,
+            best_height,
+            best_block.hash(),
+        ));
+        seed_zakura_header_from_committed_block(&finalized_state.db, best_height, &best_block);
+
+        non_finalized_state
+            .commit_new_chain(side_block.clone().prepare(), &finalized_state)
+            .expect("side block commits to a losing fork");
+        assert!(!should_seed_zakura_header_from_non_finalized_commit(
+            true,
+            &non_finalized_state,
+            best_height,
+            side_block.hash(),
+        ));
+
+        assert_eq!(
+            finalized_state.db.best_header_tip(),
+            Some((best_height, best_block.hash()))
+        );
+        assert_eq!(
+            finalized_state.db.headers_by_height_range(best_height, 1),
+            vec![(best_height, best_block.hash(), best_block.header.clone())],
+        );
     }
 }

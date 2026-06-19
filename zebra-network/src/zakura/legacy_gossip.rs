@@ -1,27 +1,24 @@
 //! Legacy Zebra gossip compatibility over Zakura streams.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     future::Future,
     io::Cursor,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex as StdMutex, OnceLock,
     },
     task::{Context, Poll},
     time::Duration,
 };
 
-use futures::{
-    stream::{FuturesUnordered, StreamExt},
-    FutureExt,
-};
+use serde_json::{Map, Number, Value};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore},
-    time::{timeout, Instant},
+    time::{sleep, timeout, Instant},
 };
 use tower::{Service, ServiceExt};
 
@@ -43,8 +40,11 @@ use crate::{
 };
 
 use super::{
-    Frame, InboundSink, InboundSinkReject, ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle,
-    FRAME_HEADER_BYTES,
+    spawn_supervised_peer_task, trace::peer_label as trace_peer_label, BoxRunFuture, Frame,
+    FramedSend, OrderedSendError, Peer, RequestResponseService, Service as ZakuraService,
+    SinkReject, Stream, StreamMode, ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle,
+    ZakuraTrace, FRAME_HEADER_BYTES, LEGACY_REQUEST_TABLE, LOCAL_MAX_CONTROL_FRAME_BYTES,
+    ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
 /// Zakura stream kind reserved for legacy gossip compatibility.
@@ -95,17 +95,68 @@ const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
 const LEGACY_GOSSIP_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_FIRST_SEEN_TTL: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_FIRST_SEEN_CAPACITY: usize = 50_000;
-const GOSSIP_FANOUT_PEER_TIMEOUT: Duration = Duration::from_secs(10);
+/// A failed gossip inbound attempt that consumed at least this long is treated as
+/// "expensive" (a slow/backpressured/timed-out service), and the same inventory is
+/// placed in a short cooldown. The first-seen cache is only updated after a
+/// *successful* call, so without this an authenticated peer could replay the same
+/// valid advertisement while the inbound service is slow/erroring and make the
+/// serial gossip worker re-pay the full 30s readiness/call budget for every
+/// duplicate. Fast failures stay below this threshold and remain immediately
+/// retryable, so a transient blip does not drop the advertisement.
+const LEGACY_GOSSIP_EXPENSIVE_ATTEMPT: Duration = Duration::from_secs(1);
+/// How long an expensive failed attempt suppresses duplicate copies of the same
+/// inventory before a genuine re-advertisement may retry.
+const LEGACY_GOSSIP_DUPLICATE_COOLDOWN: Duration = Duration::from_secs(30);
 const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
+const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
+const LEGACY_REQUEST_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the dual-stack tries the (buffered) legacy peer set for an inventory
 /// fetch before falling back to Zakura. Without this bound, a node that upgraded
 /// all its peers to Zakura (and so has no ready legacy peer) would block every
 /// fetch on the legacy peer set forever, starving the Zakura path.
 const DUAL_STACK_LEGACY_INVENTORY_TIMEOUT: Duration = Duration::from_secs(3);
 const LEGACY_RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
+/// Maximum cumulative response payload bytes the inbound responder will buffer
+/// for a single legacy request before aborting.
+///
+/// A peer can name up to `MAX_TX_INV_IN_SENT_MESSAGE` block/transaction hashes
+/// on one request; without an aggregate cap `encode_response` would serialize
+/// and retain the entire multi-frame `Vec<Frame>` (worst case
+/// `MAX_TX_INV_IN_SENT_MESSAGE * MAX_PROTOCOL_MESSAGE_LEN`, tens of GiB) before
+/// the first byte is written. The outbound reader already enforces a symmetric
+/// per-response cap (`LegacyResponseBudget`); this is the responder-side mirror.
+/// Sized well above any single response the local service emits (zebrad caps
+/// `getdata` at ~1 MiB) yet far below memory-risk thresholds.
+const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize = 8 * MAX_PROTOCOL_MESSAGE_LEN;
 const REQUEST_ID_BYTES: usize = 8;
 const RESPONSE_CHUNK_HEADER_BYTES: usize = REQUEST_ID_BYTES + 1;
 const NO_STOP_HASH: block::Hash = block::Hash([0; 32]);
+const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
+    Stream {
+        kind: ZAKURA_STREAM_GOSSIP,
+        version: LEGACY_GOSSIP_VERSION,
+        // Advisory until the transport wires Stream::frame_cap end-to-end; the
+        // authoritative inbound cap is app_frame_cap_for_stream_kind.
+        frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+        capability: ZAKURA_CAP_LEGACY_GOSSIP,
+        mode: StreamMode::Ordered,
+    },
+    Stream {
+        kind: ZAKURA_STREAM_LEGACY_REQUESTS,
+        version: LEGACY_GOSSIP_VERSION,
+        // Advisory until the transport wires Stream::frame_cap end-to-end; the
+        // authoritative inbound cap is app_frame_cap_for_stream_kind.
+        frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+        capability: ZAKURA_CAP_LEGACY_GOSSIP,
+        mode: StreamMode::RequestResponse,
+    },
+];
+
+/// Service-declared streams for legacy gossip compatibility.
+pub(crate) fn legacy_gossip_streams() -> &'static [Stream] {
+    &LEGACY_GOSSIP_SERVICE_STREAMS
+}
 
 static FIRST_SEEN_BY_SUPERVISOR: OnceLock<std::sync::Mutex<HashMap<u64, FirstSeenCache>>> =
     OnceLock::new();
@@ -424,6 +475,18 @@ impl LegacyRequestKind {
             LegacyRequestKind::PushTransaction => "PushTransaction",
         }
     }
+
+    fn message_type(self) -> u16 {
+        match self {
+            LegacyRequestKind::Blocks => MSG_REQUEST_BLOCKS_BY_HASH,
+            LegacyRequestKind::Transactions => MSG_REQUEST_TRANSACTIONS_BY_ID,
+            LegacyRequestKind::FindBlocks => MSG_REQUEST_FIND_BLOCKS,
+            LegacyRequestKind::FindHeaders => MSG_REQUEST_FIND_HEADERS,
+            LegacyRequestKind::MempoolTransactionIds => MSG_REQUEST_MEMPOOL_TRANSACTION_IDS,
+            LegacyRequestKind::Ping => MSG_REQUEST_PING,
+            LegacyRequestKind::PushTransaction => MSG_REQUEST_PUSH_TRANSACTION,
+        }
+    }
 }
 
 pub(super) struct LegacyResponseCodec;
@@ -433,8 +496,14 @@ impl LegacyResponseCodec {
         request_id: u64,
         response: Response,
         max_frame_bytes: u32,
+        max_message_bytes: u32,
     ) -> Result<Vec<Frame>, LegacyGossipError> {
         let mut frames = Vec::new();
+        // Bound the cumulative response so a peer that requests many available
+        // blocks/transactions cannot force us to serialize and retain an
+        // unbounded `Vec<Frame>` before the first byte is written. The budget is
+        // shared across every frame of this response and aborts encoding early.
+        let mut budget = ResponseEncodeBudget::default();
         match response {
             Response::Blocks(blocks) => {
                 let mut missing = Vec::new();
@@ -443,9 +512,11 @@ impl LegacyResponseCodec {
                         InventoryResponse::Available((block, _)) => {
                             push_chunked_response(
                                 &mut frames,
+                                &mut budget,
                                 MSG_RESPONSE_BLOCK,
                                 request_id,
                                 max_frame_bytes,
+                                max_message_bytes,
                                 block.zcash_serialize_to_vec()?,
                             )?;
                         }
@@ -453,7 +524,11 @@ impl LegacyResponseCodec {
                     }
                 }
                 if !missing.is_empty() {
-                    frames.push(missing_blocks_frame(request_id, missing)?);
+                    push_response_frame(
+                        &mut frames,
+                        &mut budget,
+                        missing_blocks_frame(request_id, missing)?,
+                    )?;
                 }
             }
             Response::Transactions(transactions) => {
@@ -463,9 +538,11 @@ impl LegacyResponseCodec {
                         InventoryResponse::Available((transaction, _)) => {
                             push_chunked_response(
                                 &mut frames,
+                                &mut budget,
                                 MSG_RESPONSE_TRANSACTION,
                                 request_id,
                                 max_frame_bytes,
+                                max_message_bytes,
                                 transaction.transaction.zcash_serialize_to_vec()?,
                             )?;
                         }
@@ -473,29 +550,50 @@ impl LegacyResponseCodec {
                     }
                 }
                 if !missing.is_empty() {
-                    frames.push(missing_transactions_frame(request_id, missing)?);
+                    push_response_frame(
+                        &mut frames,
+                        &mut budget,
+                        missing_transactions_frame(request_id, missing)?,
+                    )?;
                 }
             }
             Response::BlockHashes(hashes) => {
                 // FindBlocks should already be service-capped; overflowing the wire cap is a bug.
-                frames.push(block_hashes_frame(request_id, hashes)?);
+                push_response_frame(
+                    &mut frames,
+                    &mut budget,
+                    block_hashes_frame(request_id, hashes)?,
+                )?;
             }
             Response::BlockHeaders(headers) => {
                 // FindHeaders is protocol-capped by MAX_HEADERS_PER_MESSAGE; reject overflow.
-                frames.push(block_headers_frame(request_id, headers)?);
+                push_response_frame(
+                    &mut frames,
+                    &mut budget,
+                    block_headers_frame(request_id, headers)?,
+                )?;
             }
             Response::TransactionIds(ids) => {
                 // Mempools can exceed one legacy inv response, so advertise the first capped page.
-                frames.push(transaction_ids_frame(
-                    request_id,
-                    truncate_to_inventory_cap(ids)?,
-                )?);
+                push_response_frame(
+                    &mut frames,
+                    &mut budget,
+                    transaction_ids_frame(request_id, truncate_to_inventory_cap(ids)?)?,
+                )?;
             }
             Response::Pong(_) => {
-                frames.push(id_only_frame(MSG_RESPONSE_PONG, request_id));
+                push_response_frame(
+                    &mut frames,
+                    &mut budget,
+                    id_only_frame(MSG_RESPONSE_PONG, request_id),
+                )?;
             }
             Response::Nil => {
-                frames.push(id_only_frame(MSG_RESPONSE_NIL, request_id));
+                push_response_frame(
+                    &mut frames,
+                    &mut budget,
+                    id_only_frame(MSG_RESPONSE_NIL, request_id),
+                )?;
             }
             response => return Err(LegacyGossipError::UnexpectedResponse(response.command())),
         }
@@ -506,6 +604,7 @@ impl LegacyResponseCodec {
         request_id: u64,
         request_kind: LegacyRequestKind,
         frames: Vec<Frame>,
+        requested_block_hashes: Option<&HashSet<block::Hash>>,
     ) -> Result<Response, LegacyGossipError> {
         let mut blocks = Vec::new();
         let mut transactions = Vec::new();
@@ -530,6 +629,17 @@ impl LegacyResponseCodec {
                         let block = Arc::new(Block::zcash_deserialize(&mut Cursor::new(
                             bytes.as_slice(),
                         ))?);
+                        // Bind the delivered block to a hash we actually requested.
+                        // Without this, a peer can substitute any other valid block
+                        // for the one requested, corrupting downstream hash/source
+                        // accounting (the response is correlated only by request id
+                        // and kind, not by hash).
+                        if let Some(requested) = requested_block_hashes {
+                            let hash = block.hash();
+                            if !requested.contains(&hash) {
+                                return Err(LegacyGossipError::UnsolicitedBlock(hash));
+                            }
+                        }
                         blocks.push(InventoryResponse::Available((block, None)));
                     }
                 }
@@ -552,6 +662,12 @@ impl LegacyResponseCodec {
                     }
                     reassembler.reject_if_active()?;
                     for hash in decode_hashes_response(request_id, frame.payload)? {
+                        // A peer may only report blocks we requested as missing.
+                        if let Some(requested) = requested_block_hashes {
+                            if !requested.contains(&hash) {
+                                return Err(LegacyGossipError::UnsolicitedBlock(hash));
+                            }
+                        }
                         blocks.push(InventoryResponse::Missing(hash));
                     }
                 }
@@ -811,18 +927,62 @@ fn ensure_header_count(count: usize) -> Result<(), LegacyGossipError> {
     Ok(())
 }
 
+/// Tracks the cumulative size of an encoded legacy response so the inbound
+/// responder aborts a single request's response early instead of buffering an
+/// unbounded `Vec<Frame>` before the first byte is written. The outbound reader
+/// enforces a symmetric per-response cap via `LegacyResponseBudget`.
+#[derive(Default)]
+struct ResponseEncodeBudget {
+    bytes: usize,
+}
+
+impl ResponseEncodeBudget {
+    /// Account for one buffered response frame's payload, rejecting the whole
+    /// response once cumulative payload bytes exceed the responder aggregate
+    /// budget.
+    fn account(&mut self, payload_len: usize) -> Result<(), LegacyGossipError> {
+        self.bytes = self.bytes.saturating_add(payload_len);
+        if self.bytes > LEGACY_RESPONSE_MAX_AGGREGATE_BYTES {
+            return Err(LegacyGossipError::ResponseAggregateBudget(self.bytes));
+        }
+        Ok(())
+    }
+}
+
+/// Push one fully-built response frame, charging it against the aggregate
+/// budget first so an over-budget response aborts before it is retained.
+fn push_response_frame(
+    frames: &mut Vec<Frame>,
+    budget: &mut ResponseEncodeBudget,
+    frame: Frame,
+) -> Result<(), LegacyGossipError> {
+    budget.account(frame.payload.len())?;
+    frames.push(frame);
+    Ok(())
+}
+
 fn push_chunked_response(
     frames: &mut Vec<Frame>,
+    budget: &mut ResponseEncodeBudget,
     message_type: u16,
     request_id: u64,
     max_frame_bytes: u32,
+    max_message_bytes: u32,
     bytes: Vec<u8>,
 ) -> Result<(), LegacyGossipError> {
     if bytes.len() > MAX_PROTOCOL_MESSAGE_LEN {
         return Err(LegacyGossipError::OversizedResponse(bytes.len()));
     }
 
-    let max_payload_bytes = usize::try_from(max_frame_bytes)?.saturating_sub(FRAME_HEADER_BYTES);
+    // Size each chunk frame against the *effective* outbound cap: the smaller of
+    // the negotiated frame payload cap (`max_frame_bytes - FRAME_HEADER_BYTES`)
+    // and the peer's negotiated `max_message_bytes`. The handshake clamps the two
+    // caps independently, so sizing against the frame cap alone produces chunk
+    // frames whose payload exceeds the peer's accepted message cap, which the
+    // peer (and our own `write_response_frame`) reject as oversize.
+    let max_payload_bytes = usize::try_from(max_frame_bytes)?
+        .saturating_sub(FRAME_HEADER_BYTES)
+        .min(usize::try_from(max_message_bytes)?);
     let max_chunk_bytes = max_payload_bytes
         .checked_sub(RESPONSE_CHUNK_HEADER_BYTES)
         .ok_or(LegacyGossipError::OversizedResponse(bytes.len()))?;
@@ -841,6 +1001,10 @@ fn push_chunked_response(
         payload.extend_from_slice(&request_id.to_le_bytes());
         payload.push(u8::from(index + 1 == chunks.len()));
         payload.extend_from_slice(chunk);
+        // Charge each chunk against the shared budget so a response that
+        // aggregates many available items aborts mid-encode rather than after
+        // the whole `Vec<Frame>` has been materialized.
+        budget.account(payload.len())?;
         frames.push(Frame {
             message_type,
             flags: 0,
@@ -1078,17 +1242,18 @@ fn reject_trailing(reader: &Cursor<&[u8]>) -> Result<(), LegacyGossipError> {
 /// Broadcasts legacy gossip frames to outbound-ready Zakura peers.
 #[derive(Clone, Debug)]
 pub struct ZakuraGossipBroadcast {
-    supervisor: ZakuraSupervisorHandle,
     first_seen: FirstSeenCache,
+    outbound: LegacyGossipOutbound,
 }
 
 impl ZakuraGossipBroadcast {
     /// Create a broadcaster from a Zakura supervisor.
     pub fn new(supervisor: ZakuraSupervisorHandle) -> Self {
         let first_seen = first_seen_for_supervisor(&supervisor);
+        let outbound = outbound_for_supervisor(&supervisor);
         Self {
-            supervisor,
             first_seen,
+            outbound,
         }
     }
 
@@ -1097,9 +1262,8 @@ impl ZakuraGossipBroadcast {
         frame: LegacyGossipFrame,
         exclude: Option<&ZakuraPeerId>,
     ) -> Result<(), BoxError> {
-        let frame = frame.encode_frame()?;
-        let handles = self.supervisor.outbound_peer_handles().await;
-        send_to_handles(handles, frame, exclude).await
+        self.outbound.remember_latest_block(&frame);
+        self.outbound.send_to_peers(frame, exclude).await
     }
 
     async fn record_first_seen(&self, frame: &LegacyGossipFrame) -> Option<LegacyGossipFrame> {
@@ -1115,6 +1279,160 @@ impl ZakuraGossipBroadcast {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct LegacyGossipOutbound {
+    sessions: Arc<StdMutex<HashMap<ZakuraPeerId, LegacyGossipPeerSession>>>,
+    latest_block: Arc<StdMutex<Option<block::Hash>>>,
+}
+
+impl LegacyGossipOutbound {
+    fn insert(&self, session: LegacyGossipPeerSession) {
+        self.sessions
+            .lock()
+            .expect("legacy gossip outbound mutex is never poisoned")
+            .insert(session.peer_id().clone(), session);
+    }
+
+    fn remove(&self, peer: &ZakuraPeerId) {
+        self.sessions
+            .lock()
+            .expect("legacy gossip outbound mutex is never poisoned")
+            .remove(peer);
+    }
+
+    #[cfg(test)]
+    fn contains(&self, peer: &ZakuraPeerId) -> bool {
+        self.sessions
+            .lock()
+            .expect("legacy gossip outbound mutex is never poisoned")
+            .contains_key(peer)
+    }
+
+    fn remember_latest_block(&self, frame: &LegacyGossipFrame) {
+        if let LegacyGossipFrame::AdvertiseBlock(hash) = frame {
+            *self
+                .latest_block
+                .lock()
+                .expect("legacy gossip latest-block mutex is never poisoned") = Some(*hash);
+        }
+    }
+
+    async fn replay_latest_block_to_peer(
+        &self,
+        session: LegacyGossipPeerSession,
+    ) -> Result<(), BoxError> {
+        let Some(hash) = *self
+            .latest_block
+            .lock()
+            .expect("legacy gossip latest-block mutex is never poisoned")
+        else {
+            return Ok(());
+        };
+
+        session.try_send_advertise_block(hash).map_err(Into::into)
+    }
+
+    async fn send_to_peers(
+        &self,
+        frame: LegacyGossipFrame,
+        exclude: Option<&ZakuraPeerId>,
+    ) -> Result<(), BoxError> {
+        let sessions: Vec<_> = {
+            let sessions = self
+                .sessions
+                .lock()
+                .expect("legacy gossip outbound mutex is never poisoned");
+            sessions
+                .iter()
+                .filter(|(peer_id, _)| !exclude.is_some_and(|exclude| exclude == *peer_id))
+                .map(|(_peer_id, session)| session.clone())
+                .collect()
+        };
+
+        send_to_sessions(sessions, frame)
+    }
+}
+
+#[cfg(test)]
+fn legacy_gossip_recv_loop_panic_target() -> &'static StdMutex<Option<ZakuraPeerId>> {
+    static TARGET: OnceLock<StdMutex<Option<ZakuraPeerId>>> = OnceLock::new();
+    TARGET.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn arm_legacy_gossip_recv_loop_panic(peer: ZakuraPeerId) {
+    *legacy_gossip_recv_loop_panic_target()
+        .lock()
+        .expect("legacy gossip recv-loop panic target mutex is never poisoned") = Some(peer);
+}
+
+#[cfg(test)]
+fn should_panic_legacy_gossip_recv_loop(peer: &ZakuraPeerId) -> bool {
+    let mut target = legacy_gossip_recv_loop_panic_target()
+        .lock()
+        .expect("legacy gossip recv-loop panic target mutex is never poisoned");
+    if target.as_ref() == Some(peer) {
+        *target = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Typed ordered legacy gossip sender for one peer.
+#[derive(Clone, Debug)]
+pub struct LegacyGossipPeerSession {
+    peer_id: ZakuraPeerId,
+    send: FramedSend,
+}
+
+impl LegacyGossipPeerSession {
+    fn new(peer_id: ZakuraPeerId, send: FramedSend) -> Self {
+        Self { peer_id, send }
+    }
+
+    /// Authenticated peer identity for this legacy gossip stream.
+    pub fn peer_id(&self) -> &ZakuraPeerId {
+        &self.peer_id
+    }
+
+    /// Send an explicit block advertisement.
+    pub fn try_send_advertise_block(&self, hash: block::Hash) -> Result<(), OrderedSendError> {
+        self.try_send_gossip_frame(LegacyGossipFrame::AdvertiseBlock(hash))
+    }
+
+    /// Send explicit transaction id advertisements.
+    pub fn try_send_advertise_transaction_ids(
+        &self,
+        ids: Vec<UnminedTxId>,
+    ) -> Result<(), OrderedSendError> {
+        self.try_send_gossip_frame(LegacyGossipFrame::AdvertiseTransactionIds(ids))
+    }
+
+    fn try_send_gossip_frame(&self, frame: LegacyGossipFrame) -> Result<(), OrderedSendError> {
+        let frame = frame
+            .encode_frame()
+            .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+        match self.send.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_frame)) => Err(OrderedSendError::Full),
+            Err(mpsc::error::TrySendError::Closed(_frame)) => Err(OrderedSendError::Closed),
+        }
+    }
+}
+
+static LEGACY_GOSSIP_OUTBOUND_BY_SUPERVISOR: OnceLock<
+    std::sync::Mutex<HashMap<u64, LegacyGossipOutbound>>,
+> = OnceLock::new();
+
+fn outbound_for_supervisor(supervisor: &ZakuraSupervisorHandle) -> LegacyGossipOutbound {
+    let registry = LEGACY_GOSSIP_OUTBOUND_BY_SUPERVISOR.get_or_init(Default::default);
+    let mut registry = registry
+        .lock()
+        .expect("legacy gossip outbound registry mutex is never poisoned");
+    registry.entry(supervisor.id()).or_default().clone()
+}
+
 fn first_seen_for_supervisor(supervisor: &ZakuraSupervisorHandle) -> FirstSeenCache {
     let registry = FIRST_SEEN_BY_SUPERVISOR.get_or_init(Default::default);
     let mut registry = registry
@@ -1126,39 +1444,27 @@ fn first_seen_for_supervisor(supervisor: &ZakuraSupervisorHandle) -> FirstSeenCa
         .clone()
 }
 
-async fn send_to_handles(
-    handles: Vec<ZakuraPeerHandle>,
-    frame: Frame,
-    exclude: Option<&ZakuraPeerId>,
+fn send_to_sessions(
+    sessions: Vec<LegacyGossipPeerSession>,
+    frame: LegacyGossipFrame,
 ) -> Result<(), BoxError> {
-    let mut completions = FuturesUnordered::new();
     let mut first_error = None;
-    for handle in handles {
-        if exclude.is_some_and(|peer_id| peer_id == handle.peer_id()) {
-            continue;
-        }
-        match handle.try_send(
-            ZAKURA_STREAM_GOSSIP,
-            frame.message_type,
-            frame.flags,
-            frame.payload.clone(),
-        ) {
-            Ok(completion) => {
-                let peer_id = handle.peer_id().clone();
-                completions.push(wait_for_send_completion(peer_id, completion).boxed());
+    for session in sessions {
+        let result = match &frame {
+            LegacyGossipFrame::AdvertiseBlock(hash) => session.try_send_advertise_block(*hash),
+            LegacyGossipFrame::AdvertiseTransactionIds(ids) => {
+                session.try_send_advertise_transaction_ids(ids.clone())
             }
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-    }
+        };
 
-    while let Some(result) = completions.next().await {
         if let Err(error) = result {
+            debug!(
+                peer = ?session.peer_id(),
+                ?error,
+                "failed to queue Zakura legacy gossip frame"
+            );
             if first_error.is_none() {
-                first_error = Some(error);
+                first_error = Some(error.into());
             }
         }
     }
@@ -1167,20 +1473,6 @@ async fn send_to_handles(
         return Err(error);
     }
     Ok(())
-}
-
-async fn wait_for_send_completion(
-    peer_id: ZakuraPeerId,
-    completion: oneshot::Receiver<Result<(), BoxError>>,
-) -> Result<(), BoxError> {
-    timeout(GOSSIP_FANOUT_PEER_TIMEOUT, completion)
-        .await
-        .map_err(|_| -> BoxError {
-            format!("Zakura gossip send timed out for peer {peer_id:?}").into()
-        })?
-        .map_err(|_| -> BoxError {
-            format!("Zakura outbound completion dropped for peer {peer_id:?}").into()
-        })?
 }
 
 /// Tower service that adapts legacy Zebra gossip requests onto Zakura streams.
@@ -1238,6 +1530,13 @@ impl LegacyRequestAdapter {
         }
     }
 
+    /// Create an adapter backed by the given Zakura supervisor and trace emitter.
+    pub fn new_with_trace(supervisor: ZakuraSupervisorHandle, trace: ZakuraTrace) -> Self {
+        Self {
+            client: ZakuraRequestClient::new_with_trace(supervisor, trace),
+        }
+    }
+
     #[cfg(test)]
     fn new_with_timeout(supervisor: ZakuraSupervisorHandle, request_timeout: Duration) -> Self {
         Self {
@@ -1252,7 +1551,7 @@ impl LegacyRequestAdapter {
         source: Option<PeerSource>,
     ) -> Result<Response, BoxError> {
         let frame = LegacyRequestFrame::from_request(request)?;
-        self.client.request(frame, source).await
+        self.client.request(frame, source, false).await
     }
 }
 
@@ -1269,8 +1568,9 @@ impl Service<Request> for LegacyRequestAdapter {
         let client = self.client.clone();
         Box::pin(async move {
             let source = request.inventory_source();
+            let retry_source_missing = source.is_some();
             let frame = LegacyRequestFrame::from_request(request)?;
-            client.request(frame, source).await
+            client.request(frame, source, retry_source_missing).await
         })
     }
 }
@@ -1329,11 +1629,27 @@ impl<L> ZakuraDualStackService<L> {
     ///
     /// `supervisor` must be the endpoint's supervisor so the first-seen cache is
     /// shared with the inbound sink.
+    #[cfg(test)]
     pub(crate) fn new(legacy: L, supervisor: ZakuraSupervisorHandle, legacy_enabled: bool) -> Self {
         Self {
             legacy,
             gossip: LegacyGossipAdapter::new(supervisor.clone()),
             request: LegacyRequestAdapter::new(supervisor),
+            legacy_enabled,
+        }
+    }
+
+    /// Wrap `legacy` with Zakura adapters and a trace emitter.
+    pub(crate) fn new_with_trace(
+        legacy: L,
+        supervisor: ZakuraSupervisorHandle,
+        legacy_enabled: bool,
+        trace: ZakuraTrace,
+    ) -> Self {
+        Self {
+            legacy,
+            gossip: LegacyGossipAdapter::new(supervisor.clone()),
+            request: LegacyRequestAdapter::new_with_trace(supervisor, trace),
             legacy_enabled,
         }
     }
@@ -1349,10 +1665,9 @@ where
     type Future = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + 'static>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Reserve readiness on every inner service we might dispatch to. The
-        // adapters are always ready; the legacy peer set is the only source of
-        // backpressure.
-        std::task::ready!(self.legacy.poll_ready(cx))?;
+        // The route is request-dependent, so legacy readiness is awaited inside
+        // the branches that actually use legacy. Source-aware Zakura requests
+        // must not block behind an empty or unready legacy peer set.
         std::task::ready!(self.gossip.poll_ready(cx))?;
         std::task::ready!(self.request.poll_ready(cx))?;
         Poll::Ready(Ok(()))
@@ -1377,12 +1692,7 @@ where
         let legacy_enabled = self.legacy_enabled;
         let mut gossip = self.gossip.clone();
         let mut request_adapter = self.request.clone();
-        // Consume the readiness reserved for `legacy` in `poll_ready`, leaving a
-        // fresh (un-reserved) clone behind for the next call. Dropping an unused
-        // ready clone returns its `Buffer` permit, so paths that skip `legacy`
-        // (e.g. Zakura-only inventory) don't leak readiness.
-        let legacy_replacement = self.legacy.clone();
-        let mut legacy = std::mem::replace(&mut self.legacy, legacy_replacement);
+        let mut legacy = self.legacy.clone();
 
         Box::pin(async move {
             match route {
@@ -1393,7 +1703,10 @@ where
                     let gossip_fut = gossip.call(request.clone());
                     let legacy_fut = async move {
                         if legacy_enabled {
-                            Some(legacy.call(request).await)
+                            Some(match legacy.ready().await {
+                                Ok(service) => service.call(request).await,
+                                Err(error) => Err(error),
+                            })
                         } else {
                             None
                         }
@@ -1408,6 +1721,9 @@ where
                     Ok(Response::Nil)
                 }
                 DualStackRoute::LegacyFirstThenZakura => {
+                    if matches!(request.inventory_source(), Some(PeerSource::Zakura(_))) {
+                        return request_adapter.call(request).await;
+                    }
                     if !legacy_enabled {
                         return request_adapter.call(request).await;
                     }
@@ -1415,10 +1731,9 @@ where
                     // even when it has no ready peer (e.g. every legacy peer was
                     // upgraded to Zakura). Bound the legacy attempt so we fall
                     // back to the Zakura path instead of blocking forever.
-                    let legacy_attempt = timeout(
-                        DUAL_STACK_LEGACY_INVENTORY_TIMEOUT,
-                        legacy.call(request.clone()),
-                    )
+                    let legacy_attempt = timeout(DUAL_STACK_LEGACY_INVENTORY_TIMEOUT, async {
+                        legacy.ready().await?.call(request.clone()).await
+                    })
                     .await;
                     match legacy_attempt {
                         Ok(Ok(response)) if !all_inventory_missing(&response) => Ok(response),
@@ -1434,7 +1749,7 @@ where
                         Err(_) => request_adapter.call(request).await,
                     }
                 }
-                DualStackRoute::Passthrough => legacy.call(request).await,
+                DualStackRoute::Passthrough => legacy.ready().await?.call(request).await,
             }
         })
     }
@@ -1445,14 +1760,21 @@ where
 pub struct ZakuraRequestClient {
     supervisor: ZakuraSupervisorHandle,
     request_timeout: Duration,
+    trace: ZakuraTrace,
 }
 
 impl ZakuraRequestClient {
     /// Create a client from a Zakura supervisor.
     pub fn new(supervisor: ZakuraSupervisorHandle) -> Self {
+        Self::new_with_trace(supervisor, ZakuraTrace::noop())
+    }
+
+    /// Create a client from a Zakura supervisor and trace emitter.
+    pub fn new_with_trace(supervisor: ZakuraSupervisorHandle, trace: ZakuraTrace) -> Self {
         Self {
             supervisor,
             request_timeout: LEGACY_REQUEST_TIMEOUT,
+            trace,
         }
     }
 
@@ -1461,6 +1783,7 @@ impl ZakuraRequestClient {
         Self {
             supervisor,
             request_timeout,
+            trace: ZakuraTrace::noop(),
         }
     }
 
@@ -1468,13 +1791,14 @@ impl ZakuraRequestClient {
         &self,
         frame: LegacyRequestFrame,
         source: Option<PeerSource>,
+        retry_source_missing: bool,
     ) -> Result<Response, BoxError> {
         let preferred = match source {
             Some(PeerSource::Zakura(peer_id)) => Some(peer_id),
             _ => None,
         };
 
-        let handles = self.supervisor.outbound_peer_handles().await;
+        let handles = self.ready_handles().await?;
         let Some(primary) = select_handle(&handles, preferred.as_ref()) else {
             return Err("no ready Zakura peer for legacy inventory request".into());
         };
@@ -1487,6 +1811,11 @@ impl ZakuraRequestClient {
             Ok(response) if !all_inventory_missing(&response) => Ok(response),
             Ok(response) => {
                 let Some(fallback) = select_fallback_handle(&handles, primary.peer_id()) else {
+                    if retry_source_missing && preferred.is_some() {
+                        return self
+                            .retry_source_missing(primary, frame, request_kind, response)
+                            .await;
+                    }
                     return Ok(response);
                 };
                 self.request_one(fallback, frame, request_kind)
@@ -1502,6 +1831,47 @@ impl ZakuraRequestClient {
         }
     }
 
+    async fn retry_source_missing(
+        &self,
+        handle: ZakuraPeerHandle,
+        frame: LegacyRequestFrame,
+        request_kind: LegacyRequestKind,
+        initial_response: Response,
+    ) -> Result<Response, BoxError> {
+        let mut last_response = initial_response;
+        for _ in 0..SOURCE_INVENTORY_MISSING_RETRIES {
+            sleep(SOURCE_INVENTORY_MISSING_RETRY_DELAY).await;
+            match self
+                .request_one(handle.clone(), frame.clone(), request_kind)
+                .await
+            {
+                Ok(response) if !all_inventory_missing(&response) => return Ok(response),
+                Ok(response) => last_response = response,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(last_response)
+    }
+
+    async fn ready_handles(&self) -> Result<Vec<ZakuraPeerHandle>, BoxError> {
+        let mut registered = self.supervisor.subscribe();
+
+        timeout(LEGACY_REQUEST_READY_TIMEOUT, async {
+            loop {
+                let handles = self.supervisor.outbound_peer_handles().await;
+                if !handles.is_empty() {
+                    return Ok(handles);
+                }
+
+                if registered.changed().await.is_err() {
+                    return Err("Zakura peer set closed before a peer was ready".into());
+                }
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError { "no ready Zakura peer for legacy inventory request".into() })?
+    }
+
     async fn request_one(
         &self,
         handle: ZakuraPeerHandle,
@@ -1509,9 +1879,23 @@ impl ZakuraRequestClient {
         request_kind: LegacyRequestKind,
     ) -> Result<Response, BoxError> {
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        // Capture the requested block hashes (if any) before consuming the frame,
+        // so the response can be bound to a hash we actually asked for.
+        let requested_block_hashes: Option<HashSet<block::Hash>> = match &frame {
+            LegacyRequestFrame::BlocksByHash(hashes) => Some(hashes.iter().copied().collect()),
+            _ => None,
+        };
         let frame = frame.encode_frame()?;
+        trace_legacy_request_start(
+            &self.trace,
+            "outbound.request",
+            Some(handle.peer_id()),
+            request_id,
+            request_kind,
+            frame.message_type,
+        );
         let started_at = Instant::now();
-        let response = timeout(
+        let response = match timeout(
             self.request_timeout,
             handle.request(
                 ZAKURA_STREAM_LEGACY_REQUESTS,
@@ -1522,19 +1906,67 @@ impl ZakuraRequestClient {
             ),
         )
         .await
-        .map_err(|_| -> BoxError {
-            format!(
-                "Zakura legacy request timed out for peer {:?}",
-                handle.peer_id()
-            )
-            .into()
-        })??;
-        let mut response =
-            LegacyResponseCodec::decode_response(request_id, request_kind, response)?;
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                trace_legacy_request_error(
+                    &self.trace,
+                    "outbound.error",
+                    Some(handle.peer_id()),
+                    request_id,
+                    request_kind.command(),
+                    error.to_string(),
+                );
+                return Err(error);
+            }
+            Err(_) => {
+                let error: BoxError = format!(
+                    "Zakura legacy request timed out for peer {:?}",
+                    handle.peer_id()
+                )
+                .into();
+                trace_legacy_request_error(
+                    &self.trace,
+                    "outbound.error",
+                    Some(handle.peer_id()),
+                    request_id,
+                    request_kind.command(),
+                    error.to_string(),
+                );
+                return Err(error);
+            }
+        };
+        let mut response = match LegacyResponseCodec::decode_response(
+            request_id,
+            request_kind,
+            response,
+            requested_block_hashes.as_ref(),
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                trace_legacy_request_error(
+                    &self.trace,
+                    "outbound.decode_error",
+                    Some(handle.peer_id()),
+                    request_id,
+                    request_kind.command(),
+                    error.to_string(),
+                );
+                return Err(error.into());
+            }
+        };
         if request_kind == LegacyRequestKind::Ping {
             // The responder can only acknowledge a Ping; the requester stamps the RTT.
             response = Response::Pong(started_at.elapsed());
         }
+        trace_legacy_request_response(
+            &self.trace,
+            "outbound.response",
+            Some(handle.peer_id()),
+            request_id,
+            request_kind.command(),
+            &response,
+        );
         Ok(response)
     }
 }
@@ -1569,32 +2001,158 @@ fn select_fallback_handle(
 fn all_inventory_missing(response: &Response) -> bool {
     match response {
         Response::Blocks(blocks) => {
-            !blocks.is_empty() && blocks.iter().all(|block| block.is_missing())
+            blocks.is_empty() || blocks.iter().all(|block| block.is_missing())
         }
         Response::Transactions(transactions) => {
-            !transactions.is_empty()
-                && transactions
+            transactions.is_empty()
+                || transactions
                     .iter()
                     .all(|transaction| transaction.is_missing())
         }
+        Response::BlockHashes(hashes) => hashes.is_empty(),
+        Response::BlockHeaders(headers) => headers.is_empty(),
+        Response::TransactionIds(ids) => ids.is_empty(),
         _ => false,
     }
+}
+
+fn trace_legacy_request_start(
+    trace: &ZakuraTrace,
+    event: &'static str,
+    peer: Option<&ZakuraPeerId>,
+    request_id: u64,
+    request_kind: LegacyRequestKind,
+    message_type: u16,
+) {
+    trace.emit_with(LEGACY_REQUEST_TABLE, |row| {
+        insert_trace_str(row, "event", event);
+        insert_trace_peer(row, peer);
+        insert_trace_u64(row, "request_id", request_id);
+        insert_trace_str(row, "request", request_kind.command());
+        insert_trace_u64(row, "message_type", u64::from(message_type));
+    });
+}
+
+fn trace_legacy_request_response(
+    trace: &ZakuraTrace,
+    event: &'static str,
+    peer: Option<&ZakuraPeerId>,
+    request_id: u64,
+    request: &'static str,
+    response: &Response,
+) {
+    let (response_kind, item_count, missing_count) = response_summary(response);
+    trace.emit_with(LEGACY_REQUEST_TABLE, |row| {
+        insert_trace_str(row, "event", event);
+        insert_trace_peer(row, peer);
+        insert_trace_u64(row, "request_id", request_id);
+        insert_trace_str(row, "request", request);
+        insert_trace_str(row, "response", response_kind);
+        insert_trace_u64(row, "item_count", item_count);
+        insert_trace_u64(row, "missing_count", missing_count);
+    });
+}
+
+fn trace_legacy_request_error(
+    trace: &ZakuraTrace,
+    event: &'static str,
+    peer: Option<&ZakuraPeerId>,
+    request_id: u64,
+    request: &'static str,
+    error: String,
+) {
+    trace.emit_with(LEGACY_REQUEST_TABLE, |row| {
+        insert_trace_str(row, "event", event);
+        insert_trace_peer(row, peer);
+        insert_trace_u64(row, "request_id", request_id);
+        insert_trace_str(row, "request", request);
+        row.insert("error".to_string(), Value::String(error));
+    });
+}
+
+fn response_summary(response: &Response) -> (&'static str, u64, u64) {
+    match response {
+        Response::Blocks(blocks) => (
+            "Blocks",
+            bounded_u64(blocks.len()),
+            bounded_u64(blocks.iter().filter(|block| block.is_missing()).count()),
+        ),
+        Response::Transactions(transactions) => (
+            "Transactions",
+            bounded_u64(transactions.len()),
+            bounded_u64(
+                transactions
+                    .iter()
+                    .filter(|transaction| transaction.is_missing())
+                    .count(),
+            ),
+        ),
+        Response::BlockHashes(hashes) => ("BlockHashes", bounded_u64(hashes.len()), 0),
+        Response::BlockHeaders(headers) => ("BlockHeaders", bounded_u64(headers.len()), 0),
+        Response::TransactionIds(ids) => ("TransactionIds", bounded_u64(ids.len()), 0),
+        Response::Pong(_) => ("Pong", 1, 0),
+        Response::Nil => ("Nil", 0, 0),
+        response => (response.command(), 0, 0),
+    }
+}
+
+fn insert_trace_peer(row: &mut Map<String, Value>, peer: Option<&ZakuraPeerId>) {
+    row.insert(
+        "peer".to_string(),
+        peer.map_or(Value::Null, |peer| Value::String(trace_peer_label(peer))),
+    );
+}
+
+fn insert_trace_str(row: &mut Map<String, Value>, key: &'static str, value: &'static str) {
+    row.insert(key.to_string(), Value::String(value.to_string()));
+}
+
+fn insert_trace_u64(row: &mut Map<String, Value>, key: &'static str, value: u64) {
+    row.insert(key.to_string(), Value::Number(Number::from(value)));
+}
+
+fn bounded_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Debug)]
 struct LegacyGossipForwarder {
     broadcast: ZakuraGossipBroadcast,
+    /// Short-lived dedup of inventory already handed to the inbound service but not
+    /// yet confirmed `mark_seen`. Bounds duplicate work when the service is slow,
+    /// not ready, or erroring (see [`LEGACY_GOSSIP_DUPLICATE_COOLDOWN`]).
+    attempt_cooldown: FirstSeenCache,
 }
 
 impl LegacyGossipForwarder {
     fn new(supervisor: ZakuraSupervisorHandle) -> Self {
         Self {
             broadcast: ZakuraGossipBroadcast::new(supervisor),
+            attempt_cooldown: FirstSeenCache::new(
+                DEFAULT_FIRST_SEEN_CAPACITY,
+                LEGACY_GOSSIP_DUPLICATE_COOLDOWN,
+            ),
         }
     }
 
     async fn unseen(&self, frame: &LegacyGossipFrame) -> Option<LegacyGossipFrame> {
         self.broadcast.unseen(frame).await
+    }
+
+    /// Return the subset of `frame`'s inventory not currently suppressed by a recent
+    /// expensive failed attempt. Read-only: the cooldown is populated only by
+    /// [`Self::note_failed_attempt`], so fast failures remain immediately retryable.
+    async fn fresh_attempt(&self, frame: &LegacyGossipFrame) -> Option<LegacyGossipFrame> {
+        self.attempt_cooldown.unseen(frame).await
+    }
+
+    /// Record `frame`'s inventory in the cooldown when a failed attempt consumed at
+    /// least [`LEGACY_GOSSIP_EXPENSIVE_ATTEMPT`], so queued duplicates skip re-paying
+    /// a slow readiness/call. Cheap failures are left immediately retryable.
+    async fn note_failed_attempt(&self, frame: &LegacyGossipFrame, elapsed: Duration) {
+        if elapsed >= LEGACY_GOSSIP_EXPENSIVE_ATTEMPT {
+            self.attempt_cooldown.record_seen(frame).await;
+        }
     }
 
     async fn mark_seen(&self, frame: &LegacyGossipFrame) {
@@ -1614,6 +2172,8 @@ impl LegacyGossipForwarder {
 #[derive(Debug)]
 pub struct LegacyGossipSink {
     inbound_tx: mpsc::Sender<LegacyInboundWork>,
+    outbound: LegacyGossipOutbound,
+    trace: ZakuraTrace,
 }
 
 impl LegacyGossipSink {
@@ -1623,43 +2183,68 @@ impl LegacyGossipSink {
         Inbound: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
         Inbound::Future: Send + 'static,
     {
+        Self::spawn_with_trace(inbound, supervisor, ZakuraTrace::noop())
+    }
+
+    /// Spawn a bounded inbound worker with a trace emitter.
+    pub fn spawn_with_trace<Inbound>(
+        inbound: Inbound,
+        supervisor: ZakuraSupervisorHandle,
+        trace: ZakuraTrace,
+    ) -> Self
+    where
+        Inbound: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
+        Inbound::Future: Send + 'static,
+    {
         let (inbound_tx, inbound_rx) = mpsc::channel(LEGACY_GOSSIP_INBOUND_QUEUE);
         tokio::spawn(legacy_gossip_worker(
             inbound,
             inbound_rx,
-            LegacyGossipForwarder::new(supervisor),
+            LegacyGossipForwarder::new(supervisor.clone()),
+            trace.clone(),
         ));
-        Self { inbound_tx }
+        let outbound = outbound_for_supervisor(&supervisor);
+        Self {
+            inbound_tx,
+            outbound,
+            trace,
+        }
     }
 }
 
-impl InboundSink for LegacyGossipSink {
-    fn deliver(
-        &self,
+impl LegacyGossipSink {
+    fn enqueue_gossip_frame(
+        inbound_tx: &mpsc::Sender<LegacyInboundWork>,
         peer_id: ZakuraPeerId,
-        stream_kind: u16,
         frame: Frame,
-    ) -> Result<(), InboundSinkReject> {
-        if stream_kind != ZAKURA_STREAM_GOSSIP {
-            return Ok(());
-        }
-
-        let frame = LegacyGossipFrame::decode_frame(frame).map_err(InboundSinkReject::protocol)?;
-        match self
-            .inbound_tx
-            .try_send(LegacyInboundWork::Gossip(LegacyGossipInbound {
-                peer_id,
-                frame,
-            })) {
+    ) -> Result<(), SinkReject> {
+        let frame = LegacyGossipFrame::decode_frame(frame).map_err(SinkReject::protocol)?;
+        match inbound_tx.try_send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+            peer_id,
+            frame,
+        })) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 debug!("legacy gossip inbound queue full: dropping frame");
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(InboundSinkReject::local(
-                "legacy gossip inbound queue closed",
-            )),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(SinkReject::local("legacy gossip inbound queue closed"))
+            }
         }
+    }
+
+    fn deliver(
+        &self,
+        peer_id: ZakuraPeerId,
+        stream_kind: u16,
+        frame: Frame,
+    ) -> Result<(), SinkReject> {
+        if stream_kind != ZAKURA_STREAM_GOSSIP {
+            return Ok(());
+        }
+
+        Self::enqueue_gossip_frame(&self.inbound_tx, peer_id, frame)
     }
 
     fn request<'a>(
@@ -1668,46 +2253,191 @@ impl InboundSink for LegacyGossipSink {
         stream_kind: u16,
         request_id: u64,
         max_frame_bytes: u32,
+        max_message_bytes: u32,
         frame: Frame,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>, InboundSinkReject>> + Send + 'a>> {
+    ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
         Box::pin(async move {
             if stream_kind != ZAKURA_STREAM_LEGACY_REQUESTS {
-                return Err(InboundSinkReject::protocol(
+                return Err(SinkReject::protocol(
                     "unsupported legacy request stream kind",
                 ));
             }
 
-            let frame =
-                LegacyRequestFrame::decode_frame(frame).map_err(InboundSinkReject::protocol)?;
+            let frame = LegacyRequestFrame::decode_frame(frame).map_err(SinkReject::protocol)?;
             let (response_tx, response_rx) = oneshot::channel();
             match self
                 .inbound_tx
                 .try_send(LegacyInboundWork::Request(LegacyRequestInbound {
-                    peer_id,
+                    peer_id: peer_id.clone(),
+                    request_id,
                     frame,
                     response_tx,
                 })) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    return Err(InboundSinkReject::local(
-                        "legacy request inbound queue full",
-                    ));
+                    return Err(SinkReject::local("legacy request inbound queue full"));
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(InboundSinkReject::local(
-                        "legacy request inbound queue closed",
-                    ));
+                    return Err(SinkReject::local("legacy request inbound queue closed"));
                 }
             }
 
             let response = timeout(LEGACY_REQUEST_TIMEOUT, response_rx)
                 .await
-                .map_err(|_| InboundSinkReject::local("legacy request service timed out"))?
-                .map_err(|_| InboundSinkReject::local("legacy request response dropped"))?
-                .map_err(InboundSinkReject::local)?;
-            LegacyResponseCodec::encode_response(request_id, response, max_frame_bytes)
-                .map_err(InboundSinkReject::local)
+                .map_err(|_| SinkReject::local("legacy request service timed out"))?
+                .map_err(|_| SinkReject::local("legacy request response dropped"))?
+                .map_err(SinkReject::local)?;
+            trace_legacy_request_response(
+                &self.trace,
+                "inbound.response",
+                Some(&peer_id),
+                request_id,
+                response.command(),
+                &response,
+            );
+            LegacyResponseCodec::encode_response(
+                request_id,
+                response,
+                max_frame_bytes,
+                max_message_bytes,
+            )
+            .map_err(SinkReject::local)
         })
+    }
+}
+
+impl ZakuraService for LegacyGossipSink {
+    fn name(&self) -> &'static str {
+        "legacy-gossip"
+    }
+
+    fn streams(&self) -> &[Stream] {
+        legacy_gossip_streams()
+    }
+
+    fn add_peer(&self, mut peer: Peer) {
+        let Some((mut recv, send)) = peer.take_stream(ZAKURA_STREAM_GOSSIP) else {
+            return;
+        };
+        let outbound = self.outbound.clone();
+        let inbound_tx = self.inbound_tx.clone();
+        let peer_id = peer.id.clone();
+        let cancel_token = peer.cancel_token();
+        let session = LegacyGossipPeerSession::new(peer_id.clone(), send);
+
+        outbound.insert(session.clone());
+        let replay_task_peer_id = peer_id.clone();
+        let replay_panic_peer_id = replay_task_peer_id.clone();
+        let replay_panic_outbound = outbound.clone();
+        let replay_panic_cancel = cancel_token.clone();
+        spawn_supervised_peer_task(
+            replay_task_peer_id,
+            || {},
+            move || {
+                replay_panic_cancel.cancel();
+                replay_panic_outbound.remove(&replay_panic_peer_id);
+            },
+            {
+                let outbound = outbound.clone();
+                let session = session.clone();
+                async move {
+                    if let Err(error) = outbound.replay_latest_block_to_peer(session).await {
+                        debug!(?error, "latest Zakura block gossip replay failed");
+                    }
+                }
+            },
+        );
+
+        let recv_task_peer_id = peer_id.clone();
+        let recv_panic_peer_id = recv_task_peer_id.clone();
+        let recv_panic_outbound = outbound.clone();
+        let recv_panic_cancel = cancel_token.clone();
+        spawn_supervised_peer_task(
+            recv_task_peer_id,
+            || {},
+            move || {
+                recv_panic_cancel.cancel();
+                recv_panic_outbound.remove(&recv_panic_peer_id);
+            },
+            async move {
+                loop {
+                    let frame = tokio::select! {
+                        _ = cancel_token.cancelled() => {
+                            outbound.remove(&peer_id);
+                            return;
+                        }
+                        frame = recv.recv() => {
+                            let Some(frame) = frame else {
+                                outbound.remove(&peer_id);
+                                return;
+                            };
+                            frame
+                        }
+                    };
+
+                    #[cfg(test)]
+                    if should_panic_legacy_gossip_recv_loop(&peer_id) {
+                        panic!("injected legacy gossip recv-loop panic after state registration");
+                    }
+
+                    match Self::enqueue_gossip_frame(&inbound_tx, peer_id.clone(), frame) {
+                        Ok(()) => {}
+                        Err(SinkReject::Protocol(error)) => {
+                            debug!(
+                                ?error,
+                                ?peer_id,
+                                "legacy gossip stream rejected protocol-invalid frame"
+                            );
+                            cancel_token.cancel();
+                            outbound.remove(&peer_id);
+                            return;
+                        }
+                        Err(SinkReject::Local(error)) => {
+                            debug!(?error, ?peer_id, "legacy gossip inbound queue closed");
+                            return;
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    fn remove_peer(&self, peer: &ZakuraPeerId) {
+        self.outbound.remove(peer);
+    }
+
+    fn deliver_frame(
+        &self,
+        peer_id: ZakuraPeerId,
+        stream_kind: u16,
+        frame: Frame,
+    ) -> Result<(), SinkReject> {
+        self.deliver(peer_id, stream_kind, frame)
+    }
+
+    fn as_request_response(&self) -> Option<&dyn RequestResponseService> {
+        Some(self)
+    }
+}
+
+impl RequestResponseService for LegacyGossipSink {
+    fn request_frame<'a>(
+        &'a self,
+        peer_id: ZakuraPeerId,
+        stream_kind: u16,
+        request_id: u64,
+        max_frame_bytes: u32,
+        max_message_bytes: u32,
+        frame: Frame,
+    ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
+        self.request(
+            peer_id,
+            stream_kind,
+            request_id,
+            max_frame_bytes,
+            max_message_bytes,
+            frame,
+        )
     }
 }
 
@@ -1726,6 +2456,7 @@ struct LegacyGossipInbound {
 #[derive(Debug)]
 struct LegacyRequestInbound {
     peer_id: ZakuraPeerId,
+    request_id: u64,
     frame: LegacyRequestFrame,
     response_tx: oneshot::Sender<Result<Response, BoxError>>,
 }
@@ -1734,6 +2465,7 @@ async fn legacy_gossip_worker<Inbound>(
     mut inbound: Inbound,
     mut inbound_rx: mpsc::Receiver<LegacyInboundWork>,
     forwarder: LegacyGossipForwarder,
+    trace: ZakuraTrace,
 ) where
     Inbound: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
     Inbound::Future: Send + 'static,
@@ -1752,7 +2484,12 @@ async fn legacy_gossip_worker<Inbound>(
                     ));
                     continue;
                 };
-                tokio::spawn(handle_legacy_request(inbound.clone(), request, permit));
+                tokio::spawn(handle_legacy_request(
+                    inbound.clone(),
+                    request,
+                    permit,
+                    trace.clone(),
+                ));
             }
         }
     }
@@ -1769,11 +2506,25 @@ async fn handle_legacy_gossip<Inbound>(
     let Some(unseen_frame) = forwarder.unseen(&gossip.frame).await else {
         return;
     };
+    // Skip inventory whose recent service attempt was expensive but did not succeed.
+    // The not-ready, call-error, and call-timeout paths below all return without
+    // `mark_seen`, so without this an authenticated peer could replay the same valid
+    // advertisement while the inbound service is slow/erroring and make the serial
+    // worker re-pay the full 30s+30s readiness/call budget for every queued
+    // duplicate. Fast failures are not recorded, so a transient blip stays retryable.
+    let Some(unseen_frame) = forwarder.fresh_attempt(&unseen_frame).await else {
+        debug!("legacy gossip duplicate suppressed after recent expensive attempt");
+        return;
+    };
     let request = unseen_frame.clone().into_request(gossip.peer_id.clone());
 
+    let started = Instant::now();
     let ready = timeout(LEGACY_GOSSIP_SERVICE_TIMEOUT, inbound.ready()).await;
     let Ok(Ok(service)) = ready else {
         debug!("legacy gossip inbound service was not ready");
+        forwarder
+            .note_failed_attempt(&unseen_frame, started.elapsed())
+            .await;
         return;
     };
 
@@ -1781,10 +2532,16 @@ async fn handle_legacy_gossip<Inbound>(
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
             debug!(?error, "legacy gossip inbound service call failed");
+            forwarder
+                .note_failed_attempt(&unseen_frame, started.elapsed())
+                .await;
             return;
         }
         Err(_) => {
             debug!("legacy gossip inbound service call timed out");
+            forwarder
+                .note_failed_attempt(&unseen_frame, started.elapsed())
+                .await;
             return;
         }
     }
@@ -1799,30 +2556,77 @@ async fn handle_legacy_request<Inbound>(
     mut inbound: Inbound,
     request: LegacyRequestInbound,
     _permit: OwnedSemaphorePermit,
+    trace: ZakuraTrace,
 ) where
     Inbound: Service<Request, Response = Response, Error = BoxError> + Send + 'static,
     Inbound::Future: Send + 'static,
 {
     let command = request.frame.to_string();
+    let peer_id = request.peer_id.clone();
+    let request_id = request.request_id;
+    let request_kind = request.frame.kind();
+    let mut response_tx = request.response_tx;
     let Some(legacy_request) = request.frame.into_service_request() else {
         // Inbound legacy Ping is handled locally; the requester measures round-trip time.
-        let _ = request.response_tx.send(Ok(Response::Pong(Duration::ZERO)));
+        let _ = response_tx.send(Ok(Response::Pong(Duration::ZERO)));
         return;
     };
-    let ready = timeout(LEGACY_REQUEST_TIMEOUT, inbound.ready()).await;
-    let result = match ready {
-        Ok(Ok(service)) => timeout(LEGACY_REQUEST_TIMEOUT, service.call(legacy_request))
-            .await
-            .map_err(|_| -> BoxError { format!("{command} inbound service timed out").into() })
-            .and_then(|response| response),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(format!("{command} inbound service readiness timed out").into()),
+    trace_legacy_request_start(
+        &trace,
+        "inbound.request",
+        Some(&peer_id),
+        request_id,
+        request_kind,
+        request_kind.message_type(),
+    );
+
+    let service_work = async move {
+        let ready = timeout(LEGACY_REQUEST_TIMEOUT, inbound.ready()).await;
+        match ready {
+            Ok(Ok(service)) => timeout(LEGACY_REQUEST_TIMEOUT, service.call(legacy_request))
+                .await
+                .map_err(|_| -> BoxError { format!("{command} inbound service timed out").into() })
+                .and_then(|response| response),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(format!("{command} inbound service readiness timed out").into()),
+        }
     };
 
-    if request.response_tx.send(result).is_err() {
+    // Tie the spawned handler's lifetime to the request stream. The request-stream
+    // side (`LegacyGossipSink::request`) waits only LEGACY_REQUEST_TIMEOUT for the
+    // oneshot result and then drops the receiver; the peer/connection going away
+    // drops it too. In either case `closed()` resolves, so abort the in-flight
+    // service work and release the permit instead of letting this orphaned handler
+    // keep one of LEGACY_REQUEST_IN_FLIGHT_LIMIT permits (and keep doing backend
+    // work) for up to another full readiness + service-call timeout.
+    let result = tokio::select! {
+        biased;
+        () = response_tx.closed() => {
+            debug!(
+                ?peer_id,
+                request_id,
+                "legacy request handler aborted: response receiver dropped before service completed"
+            );
+            return;
+        }
+        result = service_work => result,
+    };
+
+    if let Err(error) = &result {
+        trace_legacy_request_error(
+            &trace,
+            "inbound.error",
+            Some(&peer_id),
+            request_id,
+            request_kind.command(),
+            error.to_string(),
+        );
+    }
+
+    if response_tx.send(result).is_err() {
         debug!(
-            peer_id = ?request.peer_id,
-            "legacy request response receiver dropped before service completed"
+            ?peer_id,
+            request_id, "legacy request response receiver dropped before service completed"
         );
     }
 }
@@ -2008,12 +2812,19 @@ pub enum LegacyGossipError {
     /// A response exceeded the protocol message size.
     #[error("oversized legacy response: {0} bytes")]
     OversizedResponse(usize),
+    /// The encoded response would exceed the responder-side aggregate budget.
+    #[error("legacy response exceeded responder aggregate budget: {0} bytes")]
+    ResponseAggregateBudget(usize),
     /// The legacy service returned an unexpected response variant.
     #[error("unexpected legacy response: {0}")]
     UnexpectedResponse(&'static str),
     /// A request that requires an acknowledgement received none.
     #[error("missing legacy response: {0}")]
     MissingResponse(&'static str),
+    /// The peer returned a block we did not request, so the response is not bound
+    /// to the requested hash. Treated as a peer fault.
+    #[error("legacy block response contained an unrequested block: {0:?}")]
+    UnsolicitedBlock(block::Hash),
     /// Zcash serialization failed.
     #[error(transparent)]
     Serialization(#[from] SerializationError),
@@ -2072,6 +2883,7 @@ mod tests {
         task::{Context, Poll},
     };
 
+    use futures::FutureExt;
     use tokio::sync::mpsc::UnboundedReceiver;
     use tower::ServiceExt;
     use zebra_chain::{
@@ -2082,8 +2894,9 @@ mod tests {
     use zebra_test::vectors::BLOCK_TESTNET_141042_BYTES;
 
     use crate::zakura::{
+        framed_channel,
         testkit::{HostilePeer, ZakuraTestNode},
-        ZakuraOutboundFrame,
+        ZAKURA_CAP_LEGACY_GOSSIP,
     };
 
     fn block_hash(byte: u8) -> block::Hash {
@@ -2296,6 +3109,50 @@ mod tests {
         }
     }
 
+    /// Always ready, but every `call` future is pending forever. Models a slow or
+    /// backpressured inbound service whose work outlives the request-stream timeout.
+    #[derive(Clone, Debug)]
+    struct NeverCompletesService;
+
+    impl Service<Request> for NeverCompletesService {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            std::future::pending().boxed()
+        }
+    }
+
+    /// Always ready, but every `call` future is pending forever and counts
+    /// invocations. Models a slow/backpressured inbound service whose calls hit
+    /// `LEGACY_GOSSIP_SERVICE_TIMEOUT`, so `handle_legacy_gossip` returns without
+    /// `mark_seen`, exposing how many times duplicate gossip frames reach the
+    /// expensive readiness/call path.
+    #[derive(Clone, Debug)]
+    struct CountingPendingService {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<Request> for CountingPendingService {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().boxed()
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct RecordingInventoryResponder {
         transaction: Option<UnminedTx>,
@@ -2410,7 +3267,7 @@ mod tests {
     ) -> Result<(ZakuraTestNode, UnboundedReceiver<Request>), BoxError> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let node = ZakuraTestNode::builder(seed)
-            .inbound_sink_from_supervisor(move |supervisor| {
+            .service_from_supervisor(move |supervisor| {
                 Arc::new(LegacyGossipSink::spawn(RequestRecorder { tx }, supervisor))
             })
             .spawn()
@@ -2420,7 +3277,7 @@ mod tests {
 
     async fn inventory_node(seed: u64, transaction: UnminedTx) -> Result<ZakuraTestNode, BoxError> {
         let node = ZakuraTestNode::builder(seed)
-            .inbound_sink_from_supervisor(move |supervisor| {
+            .service_from_supervisor(move |supervisor| {
                 Arc::new(LegacyGossipSink::spawn(
                     InventoryResponder { transaction },
                     supervisor,
@@ -2436,7 +3293,7 @@ mod tests {
         block: Arc<Block>,
     ) -> Result<ZakuraTestNode, BoxError> {
         let node = ZakuraTestNode::builder(seed)
-            .inbound_sink_from_supervisor(move |supervisor| {
+            .service_from_supervisor(move |supervisor| {
                 Arc::new(LegacyGossipSink::spawn(
                     BlockInventoryResponder { block },
                     supervisor,
@@ -2453,7 +3310,7 @@ mod tests {
     ) -> Result<(ZakuraTestNode, UnboundedReceiver<Request>), BoxError> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let node = ZakuraTestNode::builder(seed)
-            .inbound_sink_from_supervisor(move |supervisor| {
+            .service_from_supervisor(move |supervisor| {
                 Arc::new(LegacyGossipSink::spawn(
                     RecordingInventoryResponder { transaction, tx },
                     supervisor,
@@ -2477,7 +3334,12 @@ mod tests {
     > {
         let (pushed_tx, pushed_rx) = tokio::sync::mpsc::unbounded_channel();
         let node = ZakuraTestNode::builder(seed)
-            .inbound_sink_from_supervisor(move |supervisor| {
+            // Multi-node gossip topologies dial several loopback peers from one
+            // node, so opt out of the production per-IP cap (1) that the default
+            // test node now enforces; these tests exercise gossip routing, not
+            // the per-IP admission gate.
+            .max_connections_per_ip(8)
+            .service_from_supervisor(move |supervisor| {
                 Arc::new(LegacyGossipSink::spawn(
                     NormalNetworkResponder {
                         block,
@@ -2514,6 +3376,39 @@ mod tests {
             .ok_or_else(|| "pushed transaction recorder closed".into())
     }
 
+    fn legacy_gossip_peer(
+        peer_id: ZakuraPeerId,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> (Peer, FramedSend) {
+        let (peer_send, service_recv) = framed_channel(8);
+        let (service_send, _peer_recv) = framed_channel(8);
+        let peer = Peer::new(
+            peer_id,
+            None,
+            ZAKURA_CAP_LEGACY_GOSSIP,
+            HashMap::from([(ZAKURA_STREAM_GOSSIP, (service_recv, service_send))]),
+            cancel_token,
+        );
+        (peer, peer_send)
+    }
+
+    async fn wait_for_legacy_gossip_panic_cleanup(
+        outbound: &LegacyGossipOutbound,
+        peer_id: &ZakuraPeerId,
+        cancel_token: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), BoxError> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if cancel_token.is_cancelled() && !outbound.contains(peer_id) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError { "timed out waiting for legacy gossip panic cleanup".into() })
+    }
+
     async fn wait_registered_count(node: &ZakuraTestNode, count: usize) -> Result<(), BoxError> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -2525,6 +3420,64 @@ mod tests {
         })
         .await
         .map_err(|_| -> BoxError { "timed out waiting for peer registration count".into() })
+    }
+
+    /// Regression for `claude-legacy-request-orphaned-handler-permits`.
+    ///
+    /// The request-stream side (`LegacyGossipSink::request`) waits only
+    /// `LEGACY_REQUEST_TIMEOUT` for the oneshot result and then drops the receiver;
+    /// the peer disconnecting drops it too. The spawned `handle_legacy_request` task
+    /// must not keep its in-flight permit (one of `LEGACY_REQUEST_IN_FLIGHT_LIMIT`)
+    /// or its backend service work alive after that. Before the fix it stayed blocked
+    /// in `service.call` for up to another full `LEGACY_REQUEST_TIMEOUT`, so an
+    /// attacker driving slow inbound work could occupy all 64 permits.
+    #[tokio::test(start_paused = true)]
+    async fn legacy_request_handler_releases_permit_when_request_stream_drops_receiver() {
+        let permits = Arc::new(Semaphore::new(LEGACY_REQUEST_IN_FLIGHT_LIMIT));
+        let permit = permits
+            .clone()
+            .try_acquire_owned()
+            .expect("a permit is available");
+        assert_eq!(
+            permits.available_permits(),
+            LEGACY_REQUEST_IN_FLIGHT_LIMIT - 1,
+            "one permit is held while the handler runs"
+        );
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let request = LegacyRequestInbound {
+            peer_id: ZakuraPeerId::new(vec![7u8; 32]).expect("valid peer id"),
+            request_id: 1,
+            // A non-Ping request so the handler drives the inbound service.
+            frame: LegacyRequestFrame::MempoolTransactionIds,
+            response_tx,
+        };
+
+        let handler = tokio::spawn(handle_legacy_request(
+            NeverCompletesService,
+            request,
+            permit,
+            ZakuraTrace::noop(),
+        ));
+
+        // Let the handler enter the (never-completing) service call, then model the
+        // request-stream side giving up: it drops the oneshot receiver.
+        tokio::task::yield_now().await;
+        drop(response_rx);
+
+        // The handler must observe the dropped receiver, abort the service work, and
+        // release the permit promptly. Without the fix this times out because the
+        // handler stays blocked in `service.call` until `LEGACY_REQUEST_TIMEOUT`.
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("handler aborts promptly after the request stream drops the receiver")
+            .expect("handler task does not panic");
+
+        assert_eq!(
+            permits.available_permits(),
+            LEGACY_REQUEST_IN_FLIGHT_LIMIT,
+            "the in-flight permit must be released once the handler aborts"
+        );
     }
 
     #[test]
@@ -2943,11 +3896,13 @@ mod tests {
             },
             inbound_rx,
             LegacyGossipForwarder::new(supervisor),
+            ZakuraTrace::noop(),
         ));
 
         inbound_tx
             .send(LegacyInboundWork::Request(LegacyRequestInbound {
                 peer_id: peer_id.clone(),
+                request_id: 1,
                 frame: LegacyRequestFrame::BlocksByHash(vec![block_hash(11)]),
                 response_tx: request_tx,
             }))
@@ -2980,6 +3935,57 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: while the legacy inbound service is slow/timing out,
+    /// `handle_legacy_gossip` returns without `mark_seen`, so an authenticated peer
+    /// could replay the same valid advertisement and make the serial worker re-pay
+    /// the full readiness/call timeout for every queued duplicate. After one
+    /// expensive failed attempt the cooldown must suppress identical duplicates.
+    ///
+    /// Paused time auto-advances the `LEGACY_GOSSIP_SERVICE_TIMEOUT` so the first
+    /// call's timeout fires without a real wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_gossip_does_not_repeat_expensive_attempts_while_service_is_slow(
+    ) -> Result<(), BoxError> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let peer_id = ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds");
+
+        let worker = tokio::spawn(legacy_gossip_worker(
+            CountingPendingService {
+                calls: calls.clone(),
+            },
+            inbound_rx,
+            LegacyGossipForwarder::new(supervisor),
+            ZakuraTrace::noop(),
+        ));
+
+        // The call never completes, so the permanent first-seen cache is never
+        // updated; only the post-timeout cooldown can suppress these duplicates.
+        let frame = LegacyGossipFrame::AdvertiseBlock(block_hash(99));
+        for _ in 0..4 {
+            inbound_tx
+                .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                    peer_id: peer_id.clone(),
+                    frame: frame.clone(),
+                }))
+                .await?;
+        }
+
+        drop(inbound_tx);
+        worker.await?;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "duplicate gossip frames must not each re-pay the inbound readiness/call \
+             timeout while the service is slow; expected one expensive attempt with \
+             the rest suppressed by the cooldown"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn service_request_routes_to_advertiser_then_fallback_after_missing(
     ) -> Result<(), BoxError> {
@@ -2989,7 +3995,13 @@ mod tests {
         let (advertiser, mut advertiser_rx) = recording_inventory_node(65, None).await?;
         let (fallback, mut fallback_rx) =
             recording_inventory_node(66, Some(transaction.clone())).await?;
-        let requester = ZakuraTestNode::builder(67).spawn().await?;
+        // The requester dials two loopback peers (advertiser + fallback), so it
+        // opts out of the production per-IP cap (1) that the default test node
+        // now enforces; this test exercises service routing, not per-IP admission.
+        let requester = ZakuraTestNode::builder(67)
+            .max_connections_per_ip(8)
+            .spawn()
+            .await?;
         requester
             .connect_native(&advertiser, Duration::from_secs(5))
             .await?;
@@ -3135,35 +4147,31 @@ mod tests {
     async fn saturated_peer_does_not_block_honest_fanout() -> Result<(), BoxError> {
         let saturated_peer = ZakuraPeerId::new(vec![1; 32]).expect("test peer id is within bounds");
         let honest_peer = ZakuraPeerId::new(vec![2; 32]).expect("test peer id is within bounds");
-        let (saturated_tx, _saturated_rx) = mpsc::channel(1);
-        let saturated = ZakuraPeerHandle::new_for_tests(saturated_peer, saturated_tx);
-        let _held_completion =
-            saturated.try_send(ZAKURA_STREAM_GOSSIP, MSG_ADVERTISE_BLOCK, 0, vec![1])?;
-
-        let (honest_tx, mut honest_rx) = mpsc::channel(1);
-        let honest = ZakuraPeerHandle::new_for_tests(honest_peer, honest_tx);
-        let frame = Frame {
+        let (saturated, _saturated_rx) = framed_channel(1);
+        saturated.try_send(Frame {
             message_type: MSG_ADVERTISE_BLOCK,
             flags: 0,
-            payload: vec![7],
-        };
+            payload: vec![1],
+        })?;
 
-        let fanout = tokio::spawn(send_to_handles(vec![saturated, honest], frame, None));
+        let (honest, mut honest_rx) = framed_channel(1);
+        let block_hash = block_hash(7);
+
+        let result = send_to_sessions(
+            vec![
+                LegacyGossipPeerSession::new(saturated_peer, saturated),
+                LegacyGossipPeerSession::new(honest_peer, honest),
+            ],
+            LegacyGossipFrame::AdvertiseBlock(block_hash),
+        );
         let outbound = tokio::time::timeout(Duration::from_secs(1), honest_rx.recv())
             .await?
             .expect("honest peer receives fanout");
-        let ZakuraOutboundFrame::Frame {
-            payload,
-            completion,
-            ..
-        } = outbound
-        else {
-            panic!("expected gossip outbound frame");
-        };
-        assert_eq!(payload, vec![7]);
-        let _ = completion.send(Ok(()));
+        assert_eq!(
+            LegacyGossipFrame::decode_frame(outbound)?,
+            LegacyGossipFrame::AdvertiseBlock(block_hash)
+        );
 
-        let result = fanout.await.expect("fanout task must not panic");
         assert!(
             result.is_err(),
             "saturated peer failure is reported after honest peer is attempted"
@@ -3172,24 +4180,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_peer_receives_latest_block_advertised_before_gossip_stream_ready(
+    ) -> Result<(), BoxError> {
+        let supervisor = ZakuraSupervisorHandle::new(991);
+        let broadcast = ZakuraGossipBroadcast::new(supervisor);
+        let block_hash = block_hash(91);
+
+        broadcast
+            .broadcast(LegacyGossipFrame::AdvertiseBlock(block_hash), None)
+            .await?;
+
+        let peer_id = ZakuraPeerId::new(vec![91; 32]).expect("test peer id is within bounds");
+        let (sender, mut receiver) = framed_channel(1);
+        let session = LegacyGossipPeerSession::new(peer_id, sender);
+        broadcast.outbound.insert(session.clone());
+        broadcast
+            .outbound
+            .replay_latest_block_to_peer(session)
+            .await?;
+
+        let replayed = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await?
+            .expect("new peer receives latest block replay");
+        assert_eq!(
+            LegacyGossipFrame::decode_frame(replayed)?,
+            LegacyGossipFrame::AdvertiseBlock(block_hash)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_gossip_replay_panic_cancels_peer_and_removes_outbound_session(
+    ) -> Result<(), BoxError> {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let outbound = LegacyGossipOutbound::default();
+        let sink = LegacyGossipSink {
+            inbound_tx,
+            outbound: outbound.clone(),
+            trace: ZakuraTrace::noop(),
+        };
+        let peer_id = ZakuraPeerId::new(vec![92; 32]).expect("test peer id is within bounds");
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let (peer, _peer_send) = legacy_gossip_peer(peer_id.clone(), cancel_token.clone());
+
+        let poisoned_latest_block = outbound.latest_block.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned_latest_block
+                .lock()
+                .expect("latest-block mutex starts unpoisoned");
+            panic!("poison latest-block mutex before replay");
+        });
+
+        sink.add_peer(peer);
+        wait_for_legacy_gossip_panic_cleanup(&outbound, &peer_id, &cancel_token).await
+    }
+
+    #[tokio::test]
+    async fn legacy_gossip_recv_loop_panic_cancels_peer_and_removes_outbound_session(
+    ) -> Result<(), BoxError> {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let outbound = LegacyGossipOutbound::default();
+        let sink = LegacyGossipSink {
+            inbound_tx,
+            outbound: outbound.clone(),
+            trace: ZakuraTrace::noop(),
+        };
+        let peer_id = ZakuraPeerId::new(vec![93; 32]).expect("test peer id is within bounds");
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let (peer, peer_send) = legacy_gossip_peer(peer_id.clone(), cancel_token.clone());
+
+        arm_legacy_gossip_recv_loop_panic(peer_id.clone());
+        sink.add_peer(peer);
+        peer_send
+            .send(LegacyGossipFrame::AdvertiseBlock(block_hash(93)).encode_frame()?)
+            .await
+            .map_err(|_| -> BoxError { "failed to send test gossip frame".into() })?;
+
+        wait_for_legacy_gossip_panic_cleanup(&outbound, &peer_id, &cancel_token).await
+    }
+
+    #[tokio::test]
     async fn disconnected_peer_send_returns_error() -> Result<(), BoxError> {
         let peer_id = ZakuraPeerId::new(vec![9; 32]).expect("test peer id is within bounds");
-        let (tx, rx) = mpsc::channel(1);
+        let (disconnected, rx) = framed_channel(1);
         drop(rx);
-        let disconnected = ZakuraPeerHandle::new_for_tests(peer_id, tx);
-        let frame = Frame {
-            message_type: MSG_ADVERTISE_BLOCK,
-            flags: 0,
-            payload: vec![8],
-        };
 
-        let error = send_to_handles(vec![disconnected], frame, None)
-            .await
-            .expect_err("closed outbound queue reports an adapter error");
+        let error = send_to_sessions(
+            vec![LegacyGossipPeerSession::new(peer_id, disconnected)],
+            LegacyGossipFrame::AdvertiseBlock(block_hash(8)),
+        )
+        .expect_err("closed outbound queue reports an adapter error");
         assert!(
             error
                 .to_string()
-                .contains("Zakura outbound peer queue unavailable"),
+                .contains("ordered stream send queue is closed"),
             "unexpected error: {error}"
         );
         Ok(())
@@ -3211,6 +4295,7 @@ mod tests {
             },
             inbound_rx,
             LegacyGossipForwarder::new(supervisor),
+            ZakuraTrace::noop(),
         ));
 
         inbound_tx
@@ -3256,7 +4341,11 @@ mod tests {
     #[test]
     fn inbound_queue_full_drops_without_rejecting_peer_but_malformed_rejects() {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
-        let sink = LegacyGossipSink { inbound_tx };
+        let sink = LegacyGossipSink {
+            inbound_tx,
+            outbound: LegacyGossipOutbound::default(),
+            trace: ZakuraTrace::noop(),
+        };
         let peer_id = ZakuraPeerId::new(vec![4; 32]).expect("test peer id is within bounds");
         let frame = LegacyGossipFrame::AdvertiseBlock(block_hash(6))
             .encode_frame()
@@ -3379,7 +4468,12 @@ mod tests {
             payload: wrong_id_payload,
         };
         assert!(matches!(
-            LegacyResponseCodec::decode_response(1, LegacyRequestKind::Blocks, vec![wrong_id]),
+            LegacyResponseCodec::decode_response(
+                1,
+                LegacyRequestKind::Blocks,
+                vec![wrong_id],
+                None
+            ),
             Err(LegacyGossipError::WrongRequestId {
                 expected: 1,
                 actual: 2
@@ -3399,7 +4493,12 @@ mod tests {
             payload: oversized_payload,
         };
         assert!(matches!(
-            LegacyResponseCodec::decode_response(1, LegacyRequestKind::Blocks, vec![oversized]),
+            LegacyResponseCodec::decode_response(
+                1,
+                LegacyRequestKind::Blocks,
+                vec![oversized],
+                None
+            ),
             Err(LegacyGossipError::OversizedResponse(_))
         ));
     }
@@ -3417,6 +4516,7 @@ mod tests {
                 request_id,
                 LegacyRequestKind::FindBlocks,
                 vec![nil()],
+                None,
             )
             .expect("nil is a valid empty FindBlocks response"),
             Response::BlockHashes(vec![]),
@@ -3426,6 +4526,7 @@ mod tests {
                 request_id,
                 LegacyRequestKind::FindHeaders,
                 vec![nil()],
+                None,
             )
             .expect("nil is a valid empty FindHeaders response"),
             Response::BlockHeaders(vec![]),
@@ -3435,6 +4536,7 @@ mod tests {
                 request_id,
                 LegacyRequestKind::MempoolTransactionIds,
                 vec![nil()],
+                None,
             )
             .expect("nil is a valid empty mempool response"),
             Response::TransactionIds(vec![]),
@@ -3444,6 +4546,7 @@ mod tests {
                 request_id,
                 LegacyRequestKind::PushTransaction,
                 vec![nil()],
+                None,
             )
             .expect("nil acknowledges a pushed transaction"),
             Response::Nil,
@@ -3459,7 +4562,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    LegacyResponseCodec::decode_response(request_id, kind, vec![nil()]),
+                    LegacyResponseCodec::decode_response(request_id, kind, vec![nil()], None),
                     Err(LegacyGossipError::UnexpectedResponse(_)),
                 ),
                 "nil must be rejected for {kind:?} so the caller can fall back",
@@ -3478,6 +4581,7 @@ mod tests {
             7,
             Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
             max_frame_bytes,
+            max_frame_bytes,
         )?;
 
         assert!(frames.len() > 1, "large block response must be chunked");
@@ -3485,7 +4589,8 @@ mod tests {
             frame.encode(max_frame_bytes)?;
         }
 
-        let response = LegacyResponseCodec::decode_response(7, LegacyRequestKind::Blocks, frames)?;
+        let response =
+            LegacyResponseCodec::decode_response(7, LegacyRequestKind::Blocks, frames, None)?;
         let Response::Blocks(blocks) = response else {
             panic!("unexpected response: {response:?}");
         };
@@ -3493,6 +4598,191 @@ mod tests {
             blocks.as_slice(),
             [InventoryResponse::Available((received, None))] if received.hash() == block.hash()
         ));
+
+        Ok(())
+    }
+
+    /// Regression test for `claude-outbound-write-ignores-message-cap` (legacy
+    /// response chunking facet).
+    ///
+    /// The handshake clamps `max_frame_bytes` and `max_message_bytes`
+    /// independently, so a peer can negotiate a message cap well below the frame
+    /// cap. `push_chunked_response` sized chunk frames against the frame cap
+    /// alone, so each chunk frame's payload could exceed the peer's accepted
+    /// `max_message_bytes`. The request-response writer (`write_response_frame`)
+    /// and the peer both reject such a frame as oversize, wasting the encode and
+    /// causing avoidable disconnects/interop loss. Chunking must size against the
+    /// effective cap `min(frame cap, message cap)` so every emitted chunk frame
+    /// fits the negotiated message cap while still round-tripping.
+    #[test]
+    fn encode_response_chunks_respect_message_cap() -> Result<(), BoxError> {
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+
+        // Large frame cap, small message cap: the divergence the handshake
+        // permits. The message cap allows a 256-byte chunk payload plus the
+        // per-chunk response header.
+        let max_frame_bytes = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let max_message_bytes = u32::try_from(RESPONSE_CHUNK_HEADER_BYTES + 256)?;
+
+        let frames = LegacyResponseCodec::encode_response(
+            7,
+            Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
+            max_frame_bytes,
+            max_message_bytes,
+        )?;
+
+        assert!(
+            frames.len() > 1,
+            "a block larger than the negotiated message cap must be chunked, not emitted as one \
+             over-cap frame"
+        );
+        for frame in &frames {
+            assert!(
+                frame.payload.len() <= max_message_bytes as usize,
+                "chunk frame payload {} exceeds the negotiated max_message_bytes {}; the peer \
+                 (and write_response_frame) would reject it as oversize",
+                frame.payload.len(),
+                max_message_bytes,
+            );
+            // Each chunk must still fit the frame cap so the transport encodes it.
+            frame.encode(max_frame_bytes)?;
+        }
+
+        // The smaller chunking must still round-trip back to the original block.
+        let response =
+            LegacyResponseCodec::decode_response(7, LegacyRequestKind::Blocks, frames, None)?;
+        let Response::Blocks(blocks) = response else {
+            panic!("unexpected response: {response:?}");
+        };
+        assert!(matches!(
+            blocks.as_slice(),
+            [InventoryResponse::Available((received, None))] if received.hash() == block.hash()
+        ));
+
+        Ok(())
+    }
+
+    /// A legacy block response must be bound to a hash we actually requested.
+    ///
+    /// Block responses are correlated only by request id and request kind, so
+    /// without binding, a peer can substitute any other valid block for the one
+    /// requested. The decoder must reject a delivered block whose hash is not in
+    /// the requested set, and accept it when it is.
+    #[test]
+    fn decode_response_binds_blocks_to_requested_hashes() -> Result<(), BoxError> {
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let frame_cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let frames = LegacyResponseCodec::encode_response(
+            7,
+            Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
+            frame_cap,
+            frame_cap,
+        )?;
+
+        // A peer substitutes a real block we never asked for. Bound against a
+        // requested-hash set that does not contain it, the codec rejects it
+        // instead of correlating the response by request id and kind alone.
+        let unrelated: HashSet<block::Hash> = std::iter::once(block_hash(99)).collect();
+        assert!(
+            matches!(
+                LegacyResponseCodec::decode_response(
+                    7,
+                    LegacyRequestKind::Blocks,
+                    frames.clone(),
+                    Some(&unrelated),
+                ),
+                Err(LegacyGossipError::UnsolicitedBlock(_)),
+            ),
+            "a block whose hash was not requested must be rejected",
+        );
+
+        // The same response is accepted when its hash is among those requested.
+        let requested: HashSet<block::Hash> = std::iter::once(block.hash()).collect();
+        let response = LegacyResponseCodec::decode_response(
+            7,
+            LegacyRequestKind::Blocks,
+            frames,
+            Some(&requested),
+        )?;
+        assert!(matches!(
+            response,
+            Response::Blocks(blocks)
+                if matches!(
+                    blocks.as_slice(),
+                    [InventoryResponse::Available((received, None))]
+                        if received.hash() == block.hash()
+                )
+        ));
+
+        Ok(())
+    }
+
+    /// Regression test for `claude-legacy-responder-response-aggregation-unbounded`.
+    ///
+    /// An authenticated peer can name up to `MAX_TX_INV_IN_SENT_MESSAGE`
+    /// block/transaction hashes on one request. Without a responder-side
+    /// aggregate budget, `encode_response` serializes and retains the entire
+    /// multi-frame `Vec<Frame>` for every available item before the first byte
+    /// is written (worst case `MAX_TX_INV_IN_SENT_MESSAGE *
+    /// MAX_PROTOCOL_MESSAGE_LEN`, tens of GiB). The outbound reader already
+    /// enforces a symmetric `LegacyResponseBudget`; the responder must too, and
+    /// must abort encoding early rather than buffering an over-budget response.
+    #[test]
+    fn encode_response_aborts_when_aggregation_exceeds_budget() -> Result<(), BoxError> {
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let block_bytes = block.zcash_serialize_to_vec()?.len();
+        let frame_cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+
+        // A single available block is well within budget and still encodes.
+        LegacyResponseCodec::encode_response(
+            1,
+            Response::Blocks(vec![InventoryResponse::Available((block.clone(), None))]),
+            frame_cap,
+            frame_cap,
+        )?;
+
+        // Enough available blocks to overflow the cumulative byte budget must be
+        // rejected, not fully materialized as a `Vec<Frame>`.
+        let block_copies = LEGACY_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
+        let many_blocks = Response::Blocks(
+            (0..block_copies)
+                .map(|_| InventoryResponse::Available((block.clone(), None)))
+                .collect(),
+        );
+        assert!(
+            matches!(
+                LegacyResponseCodec::encode_response(2, many_blocks, frame_cap, frame_cap),
+                Err(LegacyGossipError::ResponseAggregateBudget(_)),
+            ),
+            "an over-budget BlocksByHash response must abort encoding early",
+        );
+
+        // The same cumulative budget guards the transaction responder path,
+        // which shares `push_chunked_response`.
+        let tx_copies = 2 * LEGACY_RESPONSE_MAX_AGGREGATE_BYTES / block_bytes + 2;
+        let many_transactions = Response::Transactions(
+            (0..tx_copies)
+                .flat_map(|_| {
+                    block
+                        .transactions
+                        .iter()
+                        .map(|tx| InventoryResponse::Available((UnminedTx::from(tx.clone()), None)))
+                })
+                .collect(),
+        );
+        assert!(
+            matches!(
+                LegacyResponseCodec::encode_response(3, many_transactions, frame_cap, frame_cap),
+                Err(LegacyGossipError::ResponseAggregateBudget(_)),
+            ),
+            "an over-budget TransactionsById response must abort encoding early",
+        );
 
         Ok(())
     }
@@ -3511,9 +4801,10 @@ mod tests {
             8,
             block_hash_response.clone(),
             u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
+            u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
         )?;
         assert_eq!(
-            LegacyResponseCodec::decode_response(8, LegacyRequestKind::FindBlocks, frames)?,
+            LegacyResponseCodec::decode_response(8, LegacyRequestKind::FindBlocks, frames, None)?,
             block_hash_response
         );
 
@@ -3522,9 +4813,10 @@ mod tests {
             9,
             header_response.clone(),
             u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
+            u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
         )?;
         assert_eq!(
-            LegacyResponseCodec::decode_response(9, LegacyRequestKind::FindHeaders, frames)?,
+            LegacyResponseCodec::decode_response(9, LegacyRequestKind::FindHeaders, frames, None)?,
             header_response
         );
 
@@ -3533,12 +4825,14 @@ mod tests {
             10,
             tx_ids_response.clone(),
             u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
+            u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
         )?;
         assert_eq!(
             LegacyResponseCodec::decode_response(
                 10,
                 LegacyRequestKind::MempoolTransactionIds,
-                frames
+                frames,
+                None,
             )?,
             tx_ids_response
         );
@@ -3547,9 +4841,10 @@ mod tests {
             11,
             Response::Pong(Duration::ZERO),
             u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
+            u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
         )?;
         assert!(matches!(
-            LegacyResponseCodec::decode_response(11, LegacyRequestKind::Ping, frames)?,
+            LegacyResponseCodec::decode_response(11, LegacyRequestKind::Ping, frames, None)?,
             Response::Pong(_)
         ));
 
@@ -3557,9 +4852,15 @@ mod tests {
             12,
             Response::Nil,
             u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
+            u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?,
         )?;
         assert_eq!(
-            LegacyResponseCodec::decode_response(12, LegacyRequestKind::PushTransaction, frames)?,
+            LegacyResponseCodec::decode_response(
+                12,
+                LegacyRequestKind::PushTransaction,
+                frames,
+                None
+            )?,
             Response::Nil
         );
 
@@ -3742,7 +5043,9 @@ mod tests {
     async fn malformed_inbound_gossip_disconnects_peer() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
         let (node, _rx) = legacy_node(31).await?;
-        let hostile = HostilePeer::connect_native(&node, 32).await?;
+        let hostile =
+            HostilePeer::connect_native_with_capabilities(&node, 32, ZAKURA_CAP_LEGACY_GOSSIP)
+                .await?;
         wait_registered_count(&node, 1).await?;
 
         hostile.send_frame(ZAKURA_STREAM_GOSSIP, vec![1]).await?;
@@ -4023,7 +5326,7 @@ mod tests {
     async fn dual_stack_advertise_fans_out_to_legacy_and_zakura() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
         // node_a originates; node_b records gossip delivered over Zakura.
-        let node_a = ZakuraTestNode::builder(201).spawn().await?;
+        let (node_a, _rx_a) = legacy_node(201).await?;
         let (node_b, mut rx_b) = legacy_node(202).await?;
         node_a
             .connect_native(&node_b, Duration::from_secs(5))

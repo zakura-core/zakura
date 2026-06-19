@@ -132,6 +132,14 @@ pub const MIN_CHECKPOINT_CONCURRENCY_LIMIT: usize = zebra_consensus::MAX_CHECKPO
 /// See [`MIN_CHECKPOINT_CONCURRENCY_LIMIT`] for details.
 pub const DEFAULT_CHECKPOINT_CONCURRENCY_LIMIT: usize = MAX_TIPS_RESPONSE_HASH_COUNT * 2;
 
+/// Default combined concurrency for Zakura block-body applies.
+///
+/// Zakura block sync can download checkpoint and full-verification bodies through
+/// separate class limits. This cap bounds their combined apply queue so the
+/// state/verifier backend controls the download window by finishing applies,
+/// rather than accumulating a large backlog.
+pub const DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT: usize = 32;
+
 /// A lower bound on the user-specified concurrency limit.
 ///
 /// If the concurrency limit is 0, Zebra can't download or verify any blocks.
@@ -272,6 +280,155 @@ const REGTEST_SYNC_RESTART_DELAY: Duration = Duration::from_secs(2);
 /// network requests. If there are a lot of them, it could overwhelm the network.
 const GENESIS_TIMEOUT_RETRY: Duration = Duration::from_secs(10);
 
+/// How long the Zakura block-sync replacement waits for the verified tip to
+/// advance before falling back to the legacy `ChainSync` body downloader.
+///
+/// When `v2_p2p` is enabled, the legacy syncer only bootstraps genesis and then
+/// hands body sync to native Zakura sync (see [`ChainSync::bootstrap_genesis_then_pause`]).
+/// If Zakura never makes progress — for example the node's only reachable peers
+/// are legacy-only and do not advertise `NODE_P2P_V2`, or Zakura body sync has no
+/// usable peers — parking the legacy syncer forever would leave the node
+/// connected but stuck at genesis (an eclipse with non-upgrading peers can hold a
+/// node there indefinitely). After this much time with no verified-tip progress,
+/// the legacy syncer resumes as a fallback so legacy peers can drive body sync.
+///
+/// This is generous on purpose: a healthy node advancing its tip (mainnet
+/// produces a block roughly every 75 seconds) resets the timer and never falls
+/// back. Falling back when a node is genuinely caught up is harmless — the legacy
+/// syncer simply finds no new blocks and idles.
+const ZAKURA_BODY_SYNC_STALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// How often [`ChainSync::bootstrap_genesis_then_pause`] polls the verified tip
+/// while watching for Zakura body-sync progress.
+const ZAKURA_BODY_SYNC_STALL_POLL: Duration = Duration::from_secs(10);
+
+/// Gap (in blocks, best-header tip − verified tip) at or below which the node is
+/// treated as caught up to the network frontier. At this distance, gossip keeping
+/// the verified tip current is healthy, so the watchdog never falls back.
+const ZAKURA_NEAR_TIP_GAP: HeightDiff = 2;
+
+/// Minimum number of blocks the verified tip must close against the best-header
+/// (network frontier) tip — measured since the last credited progress — to count
+/// as real Zakura block-sync progress while the node is materially behind.
+///
+/// This is what distinguishes a working bulk downloader from a peer trickling
+/// occasional next-height blocks over the gossip path. A healthy Zakura block sync
+/// closes a real gap by hundreds to thousands of blocks per stall window, while a
+/// gossip trickle slow enough to never catch up to the advancing network tip closes
+/// only a handful (mainnet produces roughly one block per 75s, so over a single
+/// [`ZAKURA_BODY_SYNC_STALL_TIMEOUT`] window the chain itself grows by only a few
+/// blocks). Without this floor, one gossiped block per poll would reset the idle
+/// timer forever and hold the fallback off while the node stayed arbitrarily far
+/// behind the network.
+const ZAKURA_BLOCK_SYNC_MIN_CLOSURE: HeightDiff = 64;
+
+/// Cross-poll bookkeeping for [`ChainSync::bootstrap_genesis_then_pause`]'s Zakura
+/// body-sync stall watchdog. See [`zakura_block_sync_stalled`].
+#[derive(Clone, Copy, Debug)]
+struct ZakuraStallTracker {
+    /// Verified tip at the last poll. Only used by the degraded rule when no
+    /// best-header frontier is known yet.
+    last_verified_height: Option<Height>,
+
+    /// Gap (best-header tip − verified tip) at the poll that last credited progress.
+    /// Progress is credited again only once the gap closes a further
+    /// [`ZAKURA_BLOCK_SYNC_MIN_CLOSURE`] below this anchor.
+    progress_anchor_gap: Option<HeightDiff>,
+
+    /// Consecutive idle polls without credited progress.
+    idle_polls: u64,
+}
+
+impl ZakuraStallTracker {
+    fn new(verified_height: Option<Height>) -> Self {
+        Self {
+            last_verified_height: verified_height,
+            progress_anchor_gap: None,
+            idle_polls: 0,
+        }
+    }
+}
+
+/// Decides whether Zakura block sync should be considered stalled — so the legacy
+/// [`ChainSync::sync`] body downloader resumes as a fallback — from the latest
+/// verified body tip and the best-header (network frontier) tip. Returns `true`
+/// once `max_idle_polls` consecutive polls pass without credited progress.
+///
+/// Progress is deliberately **not** "the verified tip moved": inbound gossip blocks
+/// bump the verified tip without Zakura block sync running, so a peer trickling
+/// next-height blocks could otherwise hold the fallback off forever while the node
+/// stays materially behind (the F-88602 finding). Instead, progress is one of:
+///   * the node is within [`ZAKURA_NEAR_TIP_GAP`] of the frontier (caught up —
+///     gossip keeping it current is fine), or
+///   * the gap to the frontier has closed by at least
+///     [`ZAKURA_BLOCK_SYNC_MIN_CLOSURE`] since the last credited progress (only a
+///     working bulk downloader closes a real gap that fast).
+///
+/// When no frontier is known yet (`header_tip_height` is `None`), it degrades to the
+/// original "verified tip advanced at all" rule so behavior does not regress before
+/// header sync reports a frontier.
+fn zakura_block_sync_stalled(
+    tracker: &mut ZakuraStallTracker,
+    verified_height: Option<Height>,
+    header_tip_height: Option<Height>,
+    max_idle_polls: u64,
+) -> bool {
+    // `Height - Height` yields a `HeightDiff` (i64); the best-header tip is never
+    // below the verified tip in practice, but a negative gap is treated as caught up.
+    let gap = match (header_tip_height, verified_height) {
+        (Some(header), Some(verified)) => Some(header - verified),
+        _ => None,
+    };
+
+    let made_progress = match gap {
+        // No frontier known yet: fall back to the legacy "tip moved" rule.
+        None => verified_height > tracker.last_verified_height,
+        // Caught up to the frontier: healthy.
+        Some(gap) if gap <= ZAKURA_NEAR_TIP_GAP => {
+            tracker.progress_anchor_gap = Some(gap);
+            true
+        }
+        // Materially behind: only a substantial closure since the anchor counts. The
+        // anchor moves only when progress is credited (never on idle polls), so a
+        // steady moderate sync still credits across polls, while a slow trickle that
+        // never closes the floor keeps accumulating idle polls toward the fallback.
+        Some(gap) => match tracker.progress_anchor_gap {
+            None => {
+                tracker.progress_anchor_gap = Some(gap);
+                true
+            }
+            Some(anchor) if anchor - gap >= ZAKURA_BLOCK_SYNC_MIN_CLOSURE => {
+                tracker.progress_anchor_gap = Some(gap);
+                true
+            }
+            Some(_) => false,
+        },
+    };
+
+    tracker.last_verified_height = verified_height;
+
+    if made_progress {
+        tracker.idle_polls = 0;
+        false
+    } else {
+        tracker.idle_polls += 1;
+        tracker.idle_polls >= max_idle_polls
+    }
+}
+
+/// Queries the read-state service for the best-header (network frontier) tip height,
+/// returning `None` if the service is unavailable or has no header tip yet.
+async fn best_header_tip_height<RS>(read_state: &mut RS) -> Option<Height>
+where
+    RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>,
+{
+    let ready = read_state.ready().await.ok()?;
+    match ready.call(zs::ReadRequest::BestHeaderTip).await {
+        Ok(zs::ReadResponse::BestHeaderTip(tip)) => tip.map(|(height, _hash)| height),
+        _ => None,
+    }
+}
+
 /// Sync configuration section.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
@@ -312,12 +469,39 @@ pub struct Config {
     /// Increasing this value may improve performance on machines with many cores.
     pub full_verify_concurrency_limit: usize,
 
+    /// The combined number of Zakura block-sync bodies submitted in parallel.
+    ///
+    /// This bounds the sum of checkpoint and full-verification block applies
+    /// driven by Zakura block sync. The per-class limits still apply, but this
+    /// cap keeps checkpoint sync from building a deep apply backlog and lets
+    /// block-sync downloads self-throttle through the byte budget.
+    pub zakura_block_apply_concurrency_limit: usize,
+
     /// The number of threads used to verify signatures, proofs, and other CPU-intensive code.
     ///
     /// If the number of threads is not configured or zero, Zebra uses the number of logical cores.
     /// If the number of logical cores can't be detected, Zebra uses one thread.
     /// For details, see [the `rayon` documentation](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html#method.num_threads).
     pub parallel_cpu_threads: usize,
+
+    /// Skip the Regtest direct genesis self-seed at startup, forcing this node to
+    /// obtain the genesis block from peers like a Mainnet/Testnet node.
+    ///
+    /// On Regtest, zebrad normally commits the genesis block directly at startup
+    /// (the genesis block is a known constant and there may be no peer to download
+    /// it from). When this is `true`, that shortcut is skipped and genesis must be
+    /// downloaded and verified from a peer instead. This exercises the production
+    /// genesis-bootstrap path — in particular a Zakura-only node
+    /// (`legacy_p2p = false`) that must fetch genesis over Zakura before native
+    /// header/body sync can advance from an empty state.
+    ///
+    /// Defaults to `false`, so standalone Regtest nodes keep self-seeding genesis.
+    ///
+    /// Skipped when serializing so `zebrad generate` output (and the stored config
+    /// compatibility snapshot) stays stable; it is only ever set by hand in
+    /// test/bootstrap configs.
+    #[serde(skip_serializing)]
+    pub debug_skip_regtest_genesis_self_seed: bool,
 }
 
 impl Default for Config {
@@ -341,11 +525,17 @@ impl Default for Config {
             //   and CPU work to the rayon thread pool inside blocking tokio threads
             full_verify_concurrency_limit: 20,
 
+            zakura_block_apply_concurrency_limit: DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+
             // Use one thread per CPU.
             //
             // If this causes tokio executor starvation, move CPU-intensive tasks to rayon threads,
             // or reserve a few cores for tokio threads, based on `num_cpus()`.
             parallel_cpu_threads: 0,
+
+            // Standalone Regtest nodes self-seed genesis; only opt-in test/bootstrap
+            // setups download it from peers.
+            debug_skip_regtest_genesis_self_seed: false,
         }
     }
 }
@@ -626,6 +816,74 @@ where
                 "waiting to restart sync"
             );
             sleep(restart_delay).await;
+        }
+    }
+
+    /// Downloads and verifies genesis, then hands body sync to native Zakura sync
+    /// while watching for progress, falling back to the legacy syncer if Zakura
+    /// makes none.
+    ///
+    /// Zakura block sync uses this bootstrap path because header range validation needs the
+    /// committed genesis header before native Zakura header/body sync can advance from scratch.
+    ///
+    /// After genesis, native Zakura sync is expected to drive body downloads. But
+    /// it cannot always: the default config enables both `v2_p2p` and `legacy_p2p`,
+    /// and legacy-only peers (no `NODE_P2P_V2`) still connect, so a node whose
+    /// reachable peers are legacy-only — or one eclipsed by non-upgrading peers —
+    /// would have no usable Zakura body-sync peers. Parking forever there leaves
+    /// the node connected but stuck at genesis. So instead of parking, watch the
+    /// verified tip; if it does not advance for [`ZAKURA_BODY_SYNC_STALL_TIMEOUT`],
+    /// resume the legacy [`ChainSync::sync`] loop as a fallback.
+    ///
+    /// `read_state` answers [`ReadRequest::BestHeaderTip`](zs::ReadRequest::BestHeaderTip)
+    /// so the watchdog can tell genuine Zakura block-sync progress (the verified tip
+    /// closing a real gap to the network frontier) from a peer trickling next-height
+    /// blocks over gossip (which bumps the verified tip without body sync running).
+    #[instrument(skip(self, read_state))]
+    pub async fn bootstrap_genesis_then_pause<RS>(
+        mut self,
+        mut read_state: RS,
+    ) -> Result<(), Report>
+    where
+        RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+            + Send
+            + 'static,
+        RS::Future: Send,
+    {
+        self.request_genesis().await?;
+        info!(
+            "Zakura block sync replacement completed genesis bootstrap; \
+             monitoring for Zakura body-sync progress"
+        );
+
+        // Number of consecutive idle polls (no credited progress) that trip the
+        // fallback. `as_secs` is non-zero for both constants, so this is >= 1.
+        let max_idle_polls = (ZAKURA_BODY_SYNC_STALL_TIMEOUT.as_secs()
+            / ZAKURA_BODY_SYNC_STALL_POLL.as_secs())
+        .max(1);
+
+        let mut tracker = ZakuraStallTracker::new(self.latest_chain_tip.best_tip_height());
+        loop {
+            sleep(ZAKURA_BODY_SYNC_STALL_POLL).await;
+
+            let verified_height = self.latest_chain_tip.best_tip_height();
+            let header_tip_height = best_header_tip_height(&mut read_state).await;
+
+            if zakura_block_sync_stalled(
+                &mut tracker,
+                verified_height,
+                header_tip_height,
+                max_idle_polls,
+            ) {
+                warn!(
+                    verified_tip = ?verified_height,
+                    header_tip = ?header_tip_height,
+                    stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
+                    "Zakura body sync is not closing the gap to the network tip; falling back \
+                     to legacy ChainSync so legacy peers can drive body sync"
+                );
+                return self.sync().await;
+            }
         }
     }
 

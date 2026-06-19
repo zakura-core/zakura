@@ -230,8 +230,11 @@ where
     /// details.
     ///
     /// This function is designed for use in tests.
+    ///
+    /// Only reachable from test/`proptest-impl` builds: the `checkpoint` module is
+    /// private and [`CheckpointVerifier`] is re-exported only under those cfgs.
     #[allow(dead_code)]
-    pub(crate) fn from_list(
+    pub fn from_list(
         list: impl IntoIterator<Item = (block::Height, block::Hash)>,
         network: &Network,
         initial_tip: Option<(block::Height, block::Hash)>,

@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use iroh::{endpoint, Endpoint, NodeAddr, NodeId, RelayMode, SecretKey};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::watch;
 
@@ -14,20 +15,32 @@ use crate::{
     PeerSocketAddr,
 };
 
+mod block_sync;
+mod discovery;
+mod exchange;
 mod handler;
 mod handshake;
+mod header_sync;
 mod legacy_gossip;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub mod testkit;
 mod trace;
+pub mod transport;
 
+pub use block_sync::*;
+pub use discovery::*;
+pub use exchange::*;
 pub use handler::*;
 pub use handshake::*;
+pub use header_sync::*;
 pub use legacy_gossip::*;
 pub use trace::{
-    peer_label as zakura_trace_peer_label, reject_reason_label as zakura_trace_reject_reason_label,
-    ZakuraTrace, ZakuraTraceEvent, CONN_TABLE, HANDSHAKE_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
+    commit_state_trace, peer_label as zakura_trace_peer_label,
+    reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,
+    BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, CONN_TABLE, HANDSHAKE_TABLE, HEADER_SYNC_TABLE,
+    LEGACY_REQUEST_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
 };
+pub use transport::*;
 
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use handler::run_native_initiator_handshake_without_trace as run_native_initiator_handshake;
@@ -40,6 +53,122 @@ use std::sync::{
 
 /// The pinned iroh version the Zakura P2P plan was verified against.
 pub const IROH_VERSION: &str = "0.92.0";
+
+/// Capability bit for the legacy gossip compatibility service.
+pub const ZAKURA_CAP_LEGACY_GOSSIP: u64 = 1 << 0;
+
+/// Capability bit for the native header-sync service.
+pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 1;
+
+/// Capability bit for the native discovery service.
+pub const ZAKURA_CAP_DISCOVERY: u64 = 1 << 2;
+
+/// Production default for per-service peer caps.
+pub const DEFAULT_SERVICE_MAX_PEERS: usize = 256;
+/// Production default for per-service bounded inbound work queues.
+pub const DEFAULT_SERVICE_INBOUND_QUEUE_DEPTH: usize = 128;
+/// Production default for per-service bounded outbound work queues.
+pub const DEFAULT_SERVICE_OUTBOUND_QUEUE_DEPTH: usize = 128;
+/// Production default for demand-gated service escalations.
+pub const DEFAULT_SERVICE_MAX_PENDING_ESCALATIONS: usize = 32;
+
+/// Per-service peer and queue limits owned by a Zakura service reactor.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ServicePeerLimits {
+    /// Maximum inbound peers this service admits.
+    pub max_inbound_peers: usize,
+    /// Maximum outbound peers this service admits.
+    pub max_outbound_peers: usize,
+    /// Inbound queue depth reserved for this service.
+    ///
+    /// Reserved for future transport queue wiring; not enforced in this phase.
+    pub inbound_queue_depth: usize,
+    /// Outbound queue depth reserved for this service.
+    ///
+    /// Reserved for future transport queue wiring; not enforced in this phase.
+    pub outbound_queue_depth: usize,
+    /// Maximum service escalations that may be pending admission.
+    ///
+    /// Reserved for future lazy service escalation; not enforced in this phase.
+    pub max_pending_escalations: usize,
+}
+
+impl Default for ServicePeerLimits {
+    fn default() -> Self {
+        Self {
+            max_inbound_peers: DEFAULT_SERVICE_MAX_PEERS,
+            max_outbound_peers: DEFAULT_SERVICE_MAX_PEERS,
+            inbound_queue_depth: DEFAULT_SERVICE_INBOUND_QUEUE_DEPTH,
+            outbound_queue_depth: DEFAULT_SERVICE_OUTBOUND_QUEUE_DEPTH,
+            max_pending_escalations: DEFAULT_SERVICE_MAX_PENDING_ESCALATIONS,
+        }
+    }
+}
+
+/// Local service admission result.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ServiceAdmissionDecision {
+    /// The service accepted the typed peer session.
+    Admit,
+    /// The local service-specific peer cap is full.
+    RejectFull,
+    /// The peer is not useful for this service right now.
+    RejectNotUseful,
+    /// The peer is still in a local retry backoff window.
+    RejectBackoff,
+    /// The peer does not support this service.
+    RejectUnsupported,
+}
+
+/// Direction of the underlying Zakura connection.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum ServicePeerDirection {
+    /// The remote peer dialed this node.
+    Inbound,
+    /// This node dialed the remote peer.
+    Outbound,
+}
+
+impl ServicePeerDirection {
+    pub(crate) fn trace_label(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+}
+
+/// Current admitted peer counts and slot availability for one service.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ServicePeerSnapshot {
+    /// Currently admitted inbound peers.
+    pub inbound_peers: usize,
+    /// Currently admitted outbound peers.
+    pub outbound_peers: usize,
+    /// Free inbound slots under the configured cap.
+    pub inbound_slots_free: usize,
+    /// Free outbound slots under the configured cap.
+    pub outbound_slots_free: usize,
+}
+
+impl ServicePeerSnapshot {
+    /// Build a snapshot from current admitted counts.
+    pub fn new(inbound_peers: usize, outbound_peers: usize, limits: ServicePeerLimits) -> Self {
+        Self {
+            inbound_peers,
+            outbound_peers,
+            inbound_slots_free: limits.max_inbound_peers.saturating_sub(inbound_peers),
+            outbound_slots_free: limits.max_outbound_peers.saturating_sub(outbound_peers),
+        }
+    }
+}
+
+impl Default for ServicePeerSnapshot {
+    fn default() -> Self {
+        Self::new(0, 0, ServicePeerLimits::default())
+    }
+}
 
 /// How long the legacy->Zakura liveness keeper waits for the upgraded QUIC
 /// connection to register with the supervisor before giving up.
@@ -143,10 +272,15 @@ impl ZakuraHandshakeConnector {
     }
 
     /// Dial a peer over Zakura QUIC using the node id and direct-address hints it
-    /// advertised in the legacy upgrade prelude. Returns `false` when there is no
-    /// live endpoint or the hints cannot be parsed into a dial address.
-    pub(crate) fn spawn_zakura_dial_to_hints(
+    /// advertised in the legacy upgrade prelude, then wait until the connection
+    /// registers with the local supervisor.
+    ///
+    /// The legacy side drops its TCP connection once the upgrade is selected, so
+    /// the Zakura request adapter must have a usable outbound handle before the
+    /// handoff reports success.
+    pub(crate) async fn spawn_zakura_dial_to_hints_and_wait(
         &self,
+        peer_id: &ZakuraPeerId,
         node_id: &[u8],
         direct_addresses: &[Vec<u8>],
     ) -> bool {
@@ -156,8 +290,46 @@ impl ZakuraHandshakeConnector {
         let Some(node_addr) = node_addr_from_hints(node_id, direct_addresses) else {
             return false;
         };
-        endpoint.spawn_native_dial(node_addr);
-        true
+        let mut registered = endpoint.supervisor().subscribe();
+        if !endpoint.ensure_upgrade_native_dial(node_addr) {
+            return false;
+        }
+        if wait_for_zakura_peer(&mut registered, peer_id, ZAKURA_LIVENESS_APPEAR_TIMEOUT).await {
+            return true;
+        }
+
+        // The hand-off did not complete within the wait window. The dial spawned
+        // by `ensure_upgrade_native_dial` uses `RedialPolicy::maintain`, so it
+        // would keep redialing this peer-supplied address forever and retain its
+        // `upgrade_dials` entry. Unless the peer registered in the meantime
+        // (keep its maintained dial as the recovery path), cancel the dial and
+        // drop the entry so a malicious legacy responder cannot leak unbounded
+        // maintained dials and outbound QUIC traffic by repeating failed
+        // upgrades with distinct node ids.
+        if !registered.borrow().iter().any(|id| id == peer_id) {
+            endpoint.cancel_upgrade_native_dial(peer_id);
+        }
+        false
+    }
+
+    /// Wait until the upgraded peer's inbound native QUIC connection registers
+    /// with the local supervisor.
+    ///
+    /// Used by the inbound legacy responder, which does not dial: after sending
+    /// `Accept` the remote peer is expected to dial our advertised Zakura
+    /// endpoint, and our iroh router registers that connection separately. The
+    /// outer handshake drops the legacy TCP connection once the upgrade is
+    /// reported, so the responder must confirm a usable Zakura replacement
+    /// exists first. Returns `false` (keep legacy) if the peer never registers
+    /// within [`ZAKURA_LIVENESS_APPEAR_TIMEOUT`] or this node has no live
+    /// endpoint, so a peer that sends a valid `Init` and then never completes
+    /// the native dial cannot make us silently drop a working legacy peer.
+    pub(crate) async fn wait_for_zakura_registration(&self, peer_id: &ZakuraPeerId) -> bool {
+        let Some(endpoint) = self.endpoint.as_ref() else {
+            return false;
+        };
+        let mut registered = endpoint.supervisor().subscribe();
+        wait_for_zakura_peer(&mut registered, peer_id, ZAKURA_LIVENESS_APPEAR_TIMEOUT).await
     }
 
     /// Keep an upgraded peer's legacy address-book entry live for the lifetime

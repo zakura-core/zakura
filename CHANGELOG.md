@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Added bounded Zakura P2P v2 upgrade prelude and control-handshake wire types,
   including transcript binding, native-vs-upgraded control validation, and
   duplicate-peer handling scaffolding.
+- Added bounded Zakura header-sync stream-5 wire messages, stateless header
+  validation, and the default `network.zakura.header_sync` config surface.
 - Include the `zebra-rollback-state` and `zebra-prune-state` utilities alongside
   `zebrad` in release Docker images and Docker CI builds.
 - Use the `5.0.0-rc.3` release identity for this fork's v5 rollback build.
@@ -120,12 +122,29 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   long head-of-line freezes on thin-peer draws. New `pool.route_inv.*` metrics
   break down single-block routing outcomes (advertiser / maybe / synthetic
   not-found by cause) to diagnose peer-scarcity stalls.
+- Report a finalized block as known for `Request::KnownBlock` even after its body
+  has been pruned, deciding membership from the retained hash index rather than
+  body availability. Without this, a pruned-mode node treated already-finalized
+  historical blocks whose bodies were pruned as unknown and re-downloaded them over
+  Zakura sync and inbound gossip only to reject them as behind the finalized tip.
 
 ### Security
 
 - Write RPC authentication cookies through a freshly created private temporary
   file before replacing `.cookie`, so pre-existing permissive cookie files cannot
   expose the generated RPC authentication secret.
+- The Zakura body-sync fallback watchdog now distinguishes genuine block-sync
+  progress — the verified tip closing the gap to the best-header network frontier —
+  from inbound gossip that only nudges the tip. A peer trickling occasional
+  next-height blocks can no longer keep the node from falling back to legacy sync
+  while it stays materially behind the network tip.
+- Zakura header sync now compares cumulative chain work before replacing an
+  existing header chain: a conflicting header range is rejected unless it carries
+  strictly more work than the chain it would overwrite. Previously a shorter or
+  lower-work conflicting range (for example a low-difficulty header flood with
+  manipulated timestamps past the last checkpoint) could replace a longer,
+  higher-work header chain by height alone and steer body-gap discovery off the
+  real chain.
 
 ## [Zebra 5.0.0](https://github.com/ZcashFoundation/zebra/releases/tag/v5.0.0) - 2026-06-02
 

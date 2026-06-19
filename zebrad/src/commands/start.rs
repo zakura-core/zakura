@@ -73,6 +73,8 @@
 //!
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 
+mod zakura;
+
 use std::{net::SocketAddr, path::Path, sync::Arc};
 
 use abscissa_core::{config, Command, FrameworkError};
@@ -89,6 +91,11 @@ use zebra_chain::block::genesis::regtest_genesis_block;
 use zebra_consensus::router::BackgroundTaskHandles;
 use zebra_network::types::PeerServices;
 use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
+
+use zakura::{
+    drive_block_sync_actions, drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,
+    zakura_header_sync_driver_startup, ZakuraHeaderSyncDriverHandles,
+};
 
 use crate::{
     application::{build_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
@@ -155,6 +162,10 @@ fn check_tcp_slow_start_after_idle() {
          Hint: set `net.ipv4.tcp_slow_start_after_idle=0` via sysctl. \
          See https://zebra.zfnd.org/user/troubleshooting.html#linux-tcp-tuning-for-block-propagation"
     );
+}
+
+fn use_zakura_block_sync(config: &zebra_network::Config) -> bool {
+    config.v2_p2p
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -488,9 +499,12 @@ impl StartCmd {
 
         info!("opening database, this may take a few minutes");
 
+        let mut state_config = config.state.clone();
+        state_config.enable_zakura_header_seed_from_committed_blocks = config.network.v2_p2p;
+
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
             zebra_state::init(
-                config.state.clone(),
+                state_config,
                 &config.network.network,
                 max_checkpoint_height,
                 config.sync.checkpoint_verify_concurrency_limit
@@ -504,6 +518,18 @@ impl StartCmd {
         let state = ServiceBuilder::new()
             .buffer(Self::state_buffer_bound())
             .service(state_service);
+
+        let zakura_header_sync_driver_startup = if config.network.v2_p2p {
+            Some(
+                zakura_header_sync_driver_startup(
+                    read_only_state_service.clone(),
+                    &config.network.network,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         info!("initializing network");
         // The service that our node uses to respond to requests by peers. The
@@ -534,14 +560,16 @@ impl StartCmd {
             PeerServices::NODE_NETWORK
         };
 
-        let (peer_set, address_book, misbehavior_sender) = zebra_network::init(
-            config.network.clone(),
-            inbound,
-            latest_chain_tip.clone(),
-            user_agent(),
-            advertised_services,
-        )
-        .await;
+        let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
+            zebra_network::init_with_zakura_header_sync(
+                config.network.clone(),
+                inbound,
+                latest_chain_tip.clone(),
+                user_agent(),
+                advertised_services,
+                zakura_header_sync_driver_startup,
+            )
+            .await;
 
         // Start health server if configured (after sync_status is available)
 
@@ -555,6 +583,71 @@ impl StartCmd {
                 tx_verifier_setup_rx,
             )
             .await;
+
+        if let Some(endpoint) = zakura_endpoint.clone() {
+            let trace = endpoint.trace();
+            if let (Some(header_sync), Some(shutdown), Some(actions)) = (
+                endpoint.header_sync(),
+                endpoint.header_sync_shutdown(),
+                endpoint.take_header_sync_actions().await,
+            ) {
+                let driver_task = tokio::spawn(
+                    drive_zakura_header_sync_actions(
+                        actions,
+                        ZakuraHeaderSyncDriverHandles {
+                            endpoint: endpoint.clone(),
+                            header_sync: header_sync.clone(),
+                        },
+                        state.clone(),
+                        read_only_state_service.clone(),
+                        block_verifier_router.clone(),
+                        trace.clone(),
+                        shutdown.clone().cancelled_owned(),
+                    )
+                    .in_current_span(),
+                );
+                endpoint.push_header_sync_task(driver_task).await;
+
+                if let (Some(block_sync), Some(block_actions)) = (
+                    endpoint.block_sync(),
+                    endpoint.take_block_sync_actions().await,
+                ) {
+                    let block_driver_task = tokio::spawn(
+                        drive_block_sync_actions(
+                            block_actions,
+                            endpoint.supervisor(),
+                            Some(endpoint.clone()),
+                            block_sync.clone(),
+                            latest_chain_tip.clone(),
+                            read_only_state_service.clone(),
+                            block_verifier_router.clone(),
+                            max_checkpoint_height,
+                            config.sync.checkpoint_verify_concurrency_limit,
+                            config.sync.full_verify_concurrency_limit,
+                            config.sync.zakura_block_apply_concurrency_limit,
+                            trace.clone(),
+                            shutdown.clone().cancelled_owned(),
+                        )
+                        .in_current_span(),
+                    );
+                    endpoint.push_block_sync_task(block_driver_task).await;
+                }
+
+                let full_block_task = tokio::spawn(
+                    mirror_zakura_full_block_commits(
+                        chain_tip_change.clone(),
+                        latest_chain_tip.clone(),
+                        read_only_state_service.clone(),
+                        header_sync,
+                        endpoint.clone(),
+                        trace,
+                        shutdown.cancelled_owned(),
+                    )
+                    .in_current_span(),
+                );
+                endpoint.push_header_sync_task(full_block_task).await;
+            }
+        }
 
         info!("initializing syncer");
         let (mut syncer, sync_status) = ChainSync::new(
@@ -782,7 +875,12 @@ impl StartCmd {
         // that multi-hop block propagation works: gossiped blocks that arrive out of
         // order (e.g. only the latest tip hash was gossiped) will be recovered by the
         // syncer using block locators within REGTEST_SYNC_RESTART_DELAY (2 seconds).
+        //
+        // `debug_skip_regtest_genesis_self_seed` opts a node out of this shortcut so it
+        // downloads genesis from a peer instead, exercising the production
+        // genesis-bootstrap path (e.g. a Zakura-only node fetching genesis over Zakura).
         if is_regtest
+            && !config.sync.debug_skip_regtest_genesis_self_seed
             && !syncer
                 .state_contains(config.network.network.genesis_hash())
                 .await?
@@ -799,7 +897,16 @@ impl StartCmd {
                 "validated block hash should match network genesis hash"
             )
         }
-        let syncer_task_handle = tokio::spawn(syncer.sync().in_current_span());
+        let syncer_task_handle = if use_zakura_block_sync(&config.network) {
+            info!("Zakura block sync is replacing the legacy ChainSync body downloader");
+            tokio::spawn(
+                syncer
+                    .bootstrap_genesis_then_pause(read_only_state_service.clone())
+                    .in_current_span(),
+            )
+        } else {
+            tokio::spawn(syncer.sync().in_current_span())
+        };
 
         // And finally, spawn the internal Zcash miner, if it is enabled.
         //
@@ -1815,5 +1922,2568 @@ mod tests {
         assert!(!StartCmd::zcashd_compat_supervisor_should_exit(Err(
             join_err
         )));
+    }
+}
+
+#[cfg(test)]
+mod zakura_header_sync_driver_tests {
+    use super::*;
+    use std::{
+        collections::VecDeque,
+        future,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
+
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use tokio::sync::mpsc;
+    use tower::{service_fn, util::BoxService, ServiceExt};
+    use zebra_chain::block;
+    use zebra_chain::serialization::ZcashDeserializeInto;
+    use zebra_network::zakura::testkit::{TraceCapture, TraceValue};
+    use zebra_network::zakura::{
+        commit_state_trace as cs_trace, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
+        BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMisbehavior,
+        HeaderSyncCommitFailureKind, HeaderSyncFrontiers, Peer as ZakuraPeer,
+        Service as ZakuraService, Stream as ZakuraStream, ZakuraHeaderSyncDriverStartup,
+        COMMIT_STATE_TABLE, DEFAULT_HS_RANGE,
+    };
+    use zebra_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
+
+    use super::zakura::{
+        apply_block_sync_body, block_apply_class, block_sync_chain_tip_event,
+        block_sync_misbehavior_is_hard, block_sync_missing_body_window,
+        block_sync_needed_blocks_from_state, block_verify_error_is_duplicate,
+        body_sizes_for_served_header_range, chain_tip_mirror_frontier_change,
+        coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
+        commit_block_sync_body, drive_block_sync_actions, drive_zakura_header_sync_actions,
+        header_range_commit_failure_kind, notify_block_sync_header_tip, query_block_sync_frontiers,
+        query_block_sync_needed_blocks, verified_block_tip_from_state, BlockApplyClass,
+        ZakuraHeaderSyncDriverHandles, ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL,
+        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+    };
+
+    fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
+        Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
+    }
+
+    #[derive(Debug)]
+    struct NoopZakuraService;
+
+    impl ZakuraService for NoopZakuraService {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+
+        fn streams(&self) -> &[ZakuraStream] {
+            &[]
+        }
+
+        fn add_peer(&self, _peer: ZakuraPeer) {}
+
+        fn remove_peer(&self, _peer: &zebra_network::zakura::ZakuraPeerId) {}
+    }
+
+    fn block_sync_startup_for_test() -> zebra_network::zakura::BlockSyncStartup {
+        let (tip_tx, tip_rx) =
+            tokio::sync::watch::channel((block::Height(0), block::Hash([0; 32])));
+        drop(tip_tx);
+        zebra_network::zakura::BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            (block::Height(0), block::Hash([0; 32])),
+            tip_rx,
+            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+        )
+    }
+
+    #[test]
+    fn zakura_block_sync_replaces_chain_sync_when_v2_p2p_is_enabled() {
+        let mut config = zebra_network::Config::default();
+
+        assert!(use_zakura_block_sync(&config));
+
+        config.v2_p2p = false;
+        assert!(!use_zakura_block_sync(&config));
+    }
+
+    #[test]
+    fn missing_genesis_anchor_is_local_header_sync_commit_failure() {
+        let error = zebra_state::CommitHeaderRangeError::MissingGenesisAnchor {
+            anchor: block::Hash([0; 32]),
+        };
+
+        assert_eq!(
+            header_range_commit_failure_kind(&error),
+            HeaderSyncCommitFailureKind::Local
+        );
+    }
+
+    #[test]
+    fn served_header_body_size_hints_align_with_served_heights() {
+        let start = block::Height(10);
+        let header_heights = [
+            block::Height(10),
+            block::Height(11),
+            block::Height(12),
+            block::Height(13),
+        ];
+        let body_size_hints = [
+            (block::Height(10), Some(100)),
+            (block::Height(11), None),
+            (block::Height(12), Some(300)),
+            (block::Height(13), Some(400)),
+        ];
+
+        assert_eq!(
+            body_sizes_for_served_header_range(start, header_heights, &body_size_hints),
+            vec![100, 0, 300, 400],
+        );
+
+        assert_eq!(
+            body_sizes_for_served_header_range(start, header_heights, &[]),
+            vec![0, 0, 0, 0],
+        );
+    }
+
+    #[test]
+    fn block_verify_error_duplicate_classifier_detects_router_and_block_errors() {
+        let hash = block::Hash([1; 32]);
+        let duplicate_block_error = zebra_consensus::VerifyBlockError::Block {
+            source: zebra_consensus::BlockError::AlreadyInChain(
+                hash,
+                zebra_state::KnownBlock::BestChain,
+            ),
+        };
+        assert!(block_verify_error_is_duplicate(&duplicate_block_error));
+
+        let duplicate_router_error = zebra_consensus::RouterError::Block {
+            source: Box::new(zebra_consensus::VerifyBlockError::Block {
+                source: zebra_consensus::BlockError::AlreadyInChain(
+                    hash,
+                    zebra_state::KnownBlock::BestChain,
+                ),
+            }),
+        };
+        assert!(block_verify_error_is_duplicate(&duplicate_router_error));
+
+        let invalid_block_error = zebra_consensus::VerifyBlockError::Block {
+            source: zebra_consensus::BlockError::NoTransactions,
+        };
+        assert!(!block_verify_error_is_duplicate(&invalid_block_error));
+    }
+
+    #[test]
+    fn block_sync_missing_body_window_stays_inside_body_sync_bound() {
+        assert_eq!(
+            block_sync_missing_body_window(block::Height(10), block::Height(10)),
+            None
+        );
+        assert_eq!(
+            block_sync_missing_body_window(block::Height(10), block::Height(12)),
+            Some((block::Height(11), 2))
+        );
+        assert_eq!(
+            block_sync_missing_body_window(
+                block::Height(10),
+                block::Height(10 + ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW + 100)
+            ),
+            Some((block::Height(11), ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW))
+        );
+        assert_eq!(
+            block_sync_missing_body_window(block::Height(u32::MAX - 1), block::Height(u32::MAX)),
+            Some((block::Height(u32::MAX), 1))
+        );
+        assert_eq!(
+            block_sync_missing_body_window(block::Height(u32::MAX), block::Height(u32::MAX)),
+            None
+        );
+    }
+
+    #[test]
+    fn block_sync_needed_blocks_align_missing_hashes_and_size_hints() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let headers = vec![
+            (block::Height(1), block1.hash(), block1.header.clone()),
+            (block::Height(2), block2.hash(), block2.header.clone()),
+        ];
+        let hints = vec![(block::Height(1), Some(0)), (block::Height(2), Some(42))];
+
+        let needed = block_sync_needed_blocks_from_state(
+            vec![block::Height(1), block::Height(2), block::Height(3)],
+            headers,
+            hints,
+        );
+
+        assert_eq!(
+            needed,
+            vec![
+                BlockSyncBlockMeta {
+                    height: block::Height(1),
+                    hash: block1.hash(),
+                    size: BlockSizeEstimate::Unknown,
+                },
+                BlockSyncBlockMeta {
+                    height: block::Height(2),
+                    hash: block2.hash(),
+                    size: BlockSizeEstimate::Advertised(42),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn block_sync_needed_blocks_chunks_state_range_reads() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let header = block.header.clone();
+        let hash = block.hash();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let read_state = {
+            let requests = Arc::clone(&requests);
+            service_fn(move |request| {
+                let requests = Arc::clone(&requests);
+                let header = Arc::clone(&header);
+                async move {
+                    match request {
+                        zebra_state::ReadRequest::MissingBlockBodies { from, limit } => {
+                            requests
+                                .lock()
+                                .expect("request capture mutex is not poisoned")
+                                .push(("missing", from, limit));
+                            let heights = (0..limit)
+                                .filter_map(|offset| from.0.checked_add(offset).map(block::Height))
+                                .collect();
+                            Ok::<_, zebra_state::BoxError>(
+                                zebra_state::ReadResponse::MissingBlockBodies(heights),
+                            )
+                        }
+                        zebra_state::ReadRequest::HeadersByHeightRange { start, count } => {
+                            requests
+                                .lock()
+                                .expect("request capture mutex is not poisoned")
+                                .push(("headers", start, count));
+                            let headers = (0..count)
+                                .filter_map(|offset| {
+                                    start.0.checked_add(offset).map(|height| {
+                                        (block::Height(height), hash, Arc::clone(&header))
+                                    })
+                                })
+                                .collect();
+                            Ok(zebra_state::ReadResponse::Headers(headers))
+                        }
+                        zebra_state::ReadRequest::BlockSizeHints { from, count } => {
+                            requests
+                                .lock()
+                                .expect("request capture mutex is not poisoned")
+                                .push(("hints", from, count));
+                            let hints = (0..count)
+                                .filter_map(|offset| {
+                                    from.0
+                                        .checked_add(offset)
+                                        .map(|height| (block::Height(height), Some(32)))
+                                })
+                                .collect();
+                            Ok(zebra_state::ReadResponse::BlockSizeHints(hints))
+                        }
+                        request => panic!("unexpected read request: {request:?}"),
+                    }
+                }
+            })
+        };
+        let count = zebra_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE + 2;
+
+        let needed =
+            query_block_sync_needed_blocks(read_state, block::Height(0), block::Height(count))
+                .await
+                .expect("mock read state succeeds");
+
+        assert_eq!(
+            needed.len(),
+            usize::try_from(count).expect("test count fits usize")
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .expect("request capture mutex is not poisoned")
+                .as_slice(),
+            &[
+                (
+                    "missing",
+                    block::Height(1),
+                    zebra_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE,
+                ),
+                (
+                    "headers",
+                    block::Height(1),
+                    zebra_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE,
+                ),
+                (
+                    "hints",
+                    block::Height(1),
+                    zebra_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE,
+                ),
+                ("missing", block::Height(4001), 2),
+                ("headers", block::Height(4001), 2),
+                ("hints", block::Height(4001), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn block_sync_misbehavior_classifier_keeps_soft_reasons_soft() {
+        assert!(!block_sync_misbehavior_is_hard(
+            BlockSyncMisbehavior::SizeMismatch
+        ));
+        assert!(!block_sync_misbehavior_is_hard(
+            BlockSyncMisbehavior::RangeUnavailable
+        ));
+        assert!(!block_sync_misbehavior_is_hard(
+            BlockSyncMisbehavior::GetBlocksSpam
+        ));
+        assert!(block_sync_misbehavior_is_hard(
+            BlockSyncMisbehavior::InvalidBlock
+        ));
+    }
+
+    #[test]
+    fn block_sync_chain_tip_action_mapping_preserves_reset_vs_grow() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: block::Hash([1; 32]),
+        };
+        let tip_block = zebra_state::ChainTipBlock {
+            hash: block::Hash([1; 32]),
+            height: block::Height(1),
+            time: chrono::Utc::now(),
+            transactions: Vec::new(),
+            transaction_hashes: Arc::<[zebra_chain::transaction::Hash]>::from([]),
+            previous_block_hash: block::Hash([0; 32]),
+        };
+
+        assert!(matches!(
+            block_sync_chain_tip_event(
+                &zebra_state::TipAction::Grow {
+                    block: tip_block.clone()
+                },
+                frontiers
+            ),
+            BlockSyncEvent::ChainTipGrow(mapped) if mapped == frontiers
+        ));
+        assert!(matches!(
+            block_sync_chain_tip_event(
+                &zebra_state::TipAction::Reset {
+                    height: block::Height(1),
+                    hash: block::Hash([1; 32]),
+                },
+                frontiers
+            ),
+            BlockSyncEvent::ChainTipReset(mapped) if mapped == frontiers
+        ));
+    }
+
+    #[test]
+    fn chain_tip_mirror_classifies_forward_reset_as_verified_grow() {
+        let tip_block = zebra_state::ChainTipBlock {
+            hash: block::Hash([8; 32]),
+            height: block::Height(8),
+            time: chrono::Utc::now(),
+            transactions: Vec::new(),
+            transaction_hashes: Arc::<[zebra_chain::transaction::Hash]>::from([]),
+            previous_block_hash: block::Hash([7; 32]),
+        };
+        assert_eq!(
+            chain_tip_mirror_frontier_change(
+                &zebra_state::TipAction::Grow { block: tip_block },
+                block::Height(7),
+                block::Height(8),
+            ),
+            zebra_network::zakura::FrontierChange::VerifiedGrow
+        );
+        assert_eq!(
+            chain_tip_mirror_frontier_change(
+                &zebra_state::TipAction::Reset {
+                    height: block::Height(8),
+                    hash: block::Hash([8; 32]),
+                },
+                block::Height(7),
+                block::Height(8),
+            ),
+            zebra_network::zakura::FrontierChange::VerifiedGrow
+        );
+        assert_eq!(
+            chain_tip_mirror_frontier_change(
+                &zebra_state::TipAction::Reset {
+                    height: block::Height(7),
+                    hash: block::Hash([77; 32]),
+                },
+                block::Height(8),
+                block::Height(7),
+            ),
+            zebra_network::zakura::FrontierChange::VerifiedReset
+        );
+    }
+
+    #[test]
+    fn verified_block_tip_from_state_prefers_highest_frontier_with_matching_hash() {
+        let empty = (block::Height(0), block::Hash([0; 32]));
+
+        assert_eq!(
+            verified_block_tip_from_state(
+                Some((block::Height(2800), block::Hash([28; 32]))),
+                Some((block::Height(2561), block::Hash([25; 32]))),
+                empty,
+            ),
+            (block::Height(2800), block::Hash([28; 32]))
+        );
+
+        assert_eq!(
+            verified_block_tip_from_state(
+                Some((block::Height(2400), block::Hash([24; 32]))),
+                Some((block::Height(2801), block::Hash([29; 32]))),
+                empty,
+            ),
+            (block::Height(2801), block::Hash([29; 32]))
+        );
+
+        assert_eq!(
+            verified_block_tip_from_state(None, None, empty),
+            (block::Height(0), block::Hash([0; 32]))
+        );
+
+        assert_eq!(
+            verified_block_tip_from_state(
+                None,
+                Some((block::Height(3), block::Hash([3; 32]))),
+                empty
+            ),
+            (block::Height(3), block::Hash([3; 32]))
+        );
+    }
+
+    #[test]
+    fn block_apply_class_checkpoint_boundary_is_inclusive() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+
+        assert_eq!(
+            block_apply_class(&block1, block::Height(1)),
+            BlockApplyClass::Checkpoint
+        );
+        assert_eq!(
+            block_apply_class(&block2, block::Height(1)),
+            BlockApplyClass::Full
+        );
+    }
+
+    #[test]
+    fn zakura_checkpoint_static_limits_cover_checkpoint_gap() {
+        const {
+            assert!(
+                sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT
+                    >= zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP
+            );
+        }
+        assert!(
+            usize::try_from(DEFAULT_HS_RANGE)
+                .expect("DEFAULT_HS_RANGE fits usize on supported targets")
+                >= zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP
+        );
+        assert!(
+            usize::try_from(zebra_state::MAX_BLOCK_REORG_HEIGHT)
+                .expect("MAX_BLOCK_REORG_HEIGHT fits usize on supported targets")
+                >= zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP
+        );
+    }
+
+    #[tokio::test]
+    async fn header_tip_notification_drives_block_sync_needed_query() {
+        let startup = block_sync_startup_for_test();
+        let (block_sync, mut reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let header_hash = block::Hash([3; 32]);
+
+        notify_block_sync_header_tip(
+            Some(&block_sync),
+            block::Height(3),
+            header_hash,
+            &zebra_network::zakura::ZakuraTrace::noop(),
+        )
+        .await;
+
+        let action = tokio::time::timeout(Duration::from_secs(5), reactor_actions.recv())
+            .await
+            .expect("reactor emits a needed-block query after a header tip")
+            .expect("reactor action channel remains open");
+
+        assert!(matches!(
+            action,
+            BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(0),
+                best_header_tip: block::Height(3),
+            }
+        ));
+
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn header_sync_driver_header_advanced_updates_exchange_header_only() {
+        let network = zebra_chain::parameters::Network::Mainnet;
+        let genesis_hash = network.genesis_hash();
+        let mut config = zebra_network::Config {
+            network: network.clone(),
+            ..zebra_network::Config::default()
+        };
+        config.zakura.listen_addr = None;
+        let endpoint = zebra_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(
+            &config,
+            |_supervisor, _trace| Arc::new(NoopZakuraService) as Arc<dyn ZakuraService>,
+            Some(ZakuraHeaderSyncDriverStartup {
+                frontiers: HeaderSyncFrontiers {
+                    finalized_height: block::Height(0),
+                    verified_block_tip: block::Height(0),
+                    verified_block_hash: genesis_hash,
+                },
+                best_header_tip: Some((block::Height(0), genesis_hash)),
+                verified_block_tip_hash: genesis_hash,
+            }),
+        )
+        .await
+        .expect("Zakura endpoint starts")
+        .expect("v2_p2p starts an endpoint");
+
+        let initial = endpoint
+            .current_sync_frontier()
+            .expect("driver startup initializes exchange");
+        assert_eq!(initial.frontier.verified_body.height, block::Height(0));
+        assert_eq!(initial.frontier.best_header.height, block::Height(0));
+
+        let (action_tx, action_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handles = ZakuraHeaderSyncDriverHandles {
+            endpoint: endpoint.clone(),
+            header_sync: endpoint
+                .header_sync()
+                .expect("driver startup starts header sync"),
+        };
+        let state = service_fn(|request: zebra_state::Request| async move {
+            panic!("unexpected state request from HeaderAdvanced: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zebra_state::BoxError>(zebra_state::Response::Committed(block::Hash([0; 32])))
+        });
+        let read_state = service_fn(|request: zebra_state::ReadRequest| async move {
+            panic!("unexpected read request from HeaderAdvanced: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zebra_state::BoxError>(zebra_state::ReadResponse::Tip(None))
+        });
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            panic!("unexpected verifier request from HeaderAdvanced: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zebra_consensus::BoxError>(block::Hash([0; 32]))
+        });
+        let driver = tokio::spawn(drive_zakura_header_sync_actions(
+            action_rx,
+            handles,
+            state,
+            read_state,
+            verifier,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let advanced_hash = block::Hash([5; 32]);
+        action_tx
+            .send(zebra_network::zakura::HeaderSyncAction::HeaderAdvanced {
+                height: block::Height(5),
+                hash: advanced_hash,
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let update = endpoint
+                    .current_sync_frontier()
+                    .expect("exchange remains available");
+                if update.frontier.best_header.height == block::Height(5) {
+                    assert_eq!(
+                        update.change,
+                        zebra_network::zakura::FrontierChange::HeaderAdvanced
+                    );
+                    assert_eq!(update.frontier.best_header.hash, advanced_hash);
+                    assert_eq!(
+                        update.frontier.verified_body,
+                        initial.frontier.verified_body
+                    );
+                    assert_eq!(update.frontier.finalized, initial.frontier.finalized);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("HeaderAdvanced publishes to the exchange");
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        endpoint.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_coalesces_stale_needed_queries() {
+        let (action_tx, mut action_rx) = mpsc::channel(8);
+        action_tx
+            .send(BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(0),
+                best_header_tip: block::Height(1),
+            })
+            .await
+            .expect("first query queues");
+        action_tx
+            .send(BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(0),
+                best_header_tip: block::Height(2),
+            })
+            .await
+            .expect("stale query queues");
+        let deferred_peer =
+            zebra_network::zakura::ZakuraPeerId::new(vec![7; 32]).expect("test peer id is valid");
+        action_tx
+            .send(BlockSyncAction::Misbehavior {
+                peer: deferred_peer.clone(),
+                reason: BlockSyncMisbehavior::StatusSpam,
+            })
+            .await
+            .expect("non-query action queues");
+        action_tx
+            .send(BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(0),
+                best_header_tip: block::Height(8),
+            })
+            .await
+            .expect("latest query queues");
+
+        let first = action_rx.recv().await.expect("first action remains queued");
+        let mut deferred_actions = VecDeque::new();
+        let action =
+            coalesce_stale_needed_block_queries(first, &mut action_rx, &mut deferred_actions);
+
+        assert!(matches!(
+            action,
+            BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(0),
+                best_header_tip: block::Height(8),
+            }
+        ));
+        assert!(matches!(
+            deferred_actions.pop_front(),
+            Some(BlockSyncAction::Misbehavior {
+                peer,
+                reason: BlockSyncMisbehavior::StatusSpam,
+            }) if peer == deferred_peer
+        ));
+        assert!(deferred_actions.is_empty());
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_prioritizes_ready_needed_query_over_submit() {
+        let (action_tx, mut action_rx) = mpsc::channel(8);
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        action_tx
+            .send(BlockSyncAction::SubmitBlock { token: 7, block })
+            .await
+            .expect("submit action queues");
+        action_tx
+            .send(BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(0),
+                best_header_tip: block::Height(8),
+            })
+            .await
+            .expect("query action queues");
+
+        let mut deferred_actions = VecDeque::new();
+        let action = coalesce_ready_needed_block_queries(&mut action_rx, &mut deferred_actions)
+            .expect("ready query is prioritized");
+
+        assert!(matches!(
+            action,
+            BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(0),
+                best_header_tip: block::Height(8),
+            }
+        ));
+        assert!(matches!(
+            deferred_actions.pop_front(),
+            Some(BlockSyncAction::SubmitBlock { token: 7, .. })
+        ));
+        assert!(deferred_actions.is_empty());
+        assert!(action_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_answers_needed_block_queries_from_state() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+
+        let expected_headers = Arc::new(vec![
+            (block::Height(1), block1.hash(), block1.header.clone()),
+            (block::Height(2), block2.hash(), block2.header.clone()),
+        ]);
+        let expected_hints = Arc::new(vec![
+            (block::Height(1), Some(0)),
+            (block::Height(2), Some(42)),
+        ]);
+        let read_requests = Arc::new(Mutex::new(Vec::new()));
+        let read_requests_for_service = read_requests.clone();
+        let read_headers = expected_headers.clone();
+        let read_hints = expected_hints.clone();
+        let block1_hash = block1.hash();
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| {
+            let read_requests = read_requests_for_service.clone();
+            let read_headers = read_headers.clone();
+            let read_hints = read_hints.clone();
+            async move {
+                read_requests
+                    .lock()
+                    .expect("test read request log is not poisoned")
+                    .push(request.clone());
+                match request {
+                    zebra_state::ReadRequest::MissingBlockBodies { from, limit } => {
+                        assert_eq!(from, block::Height(1));
+                        assert_eq!(limit, 2);
+                        Ok(zebra_state::ReadResponse::MissingBlockBodies(vec![
+                            block::Height(1),
+                            block::Height(2),
+                        ]))
+                    }
+                    zebra_state::ReadRequest::HeadersByHeightRange { start, count } => {
+                        assert_eq!(start, block::Height(1));
+                        assert_eq!(count, 2);
+                        Ok(zebra_state::ReadResponse::Headers((*read_headers).clone()))
+                    }
+                    zebra_state::ReadRequest::BlockSizeHints { from, count } => {
+                        assert_eq!(from, block::Height(1));
+                        assert_eq!(count, 2);
+                        Ok(zebra_state::ReadResponse::BlockSizeHints(
+                            (*read_hints).clone(),
+                        ))
+                    }
+                    zebra_state::ReadRequest::FinalizedTip => {
+                        Ok(zebra_state::ReadResponse::FinalizedTip(None))
+                    }
+                    zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                        block::Height(1),
+                        block1_hash,
+                    )))),
+                    request => panic!("unexpected read request: {request:?}"),
+                }
+            }
+        });
+
+        let (commit_tx, mut commit_rx) = mpsc::channel(1);
+        let verifier = service_fn(move |request: zebra_consensus::Request| {
+            let commit_tx = commit_tx.clone();
+            async move {
+                match request {
+                    zebra_consensus::Request::Commit(block) => {
+                        let hash = block.hash();
+                        commit_tx
+                            .send(hash)
+                            .await
+                            .expect("test commit receiver stays open");
+                        Ok::<_, zebra_consensus::BoxError>(hash)
+                    }
+                    request => panic!("unexpected consensus request: {request:?}"),
+                }
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(0),
+                best_header_tip: block::Height(2),
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if read_requests
+                    .lock()
+                    .expect("test read request log is not poisoned")
+                    .len()
+                    >= 3
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("driver answers QueryNeededBlocks through state reads");
+
+        assert_eq!(
+            read_requests
+                .lock()
+                .expect("test read request log is not poisoned")
+                .as_slice(),
+            &[
+                zebra_state::ReadRequest::MissingBlockBodies {
+                    from: block::Height(1),
+                    limit: 2,
+                },
+                zebra_state::ReadRequest::HeadersByHeightRange {
+                    start: block::Height(1),
+                    count: 2,
+                },
+                zebra_state::ReadRequest::BlockSizeHints {
+                    from: block::Height(1),
+                    count: 2,
+                },
+            ]
+        );
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 1,
+                block: block1.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("commit arrives after query"),
+            Some(block1.hash())
+        );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_commits_parent_first_and_ignores_outbound_actions() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let (commit_tx, mut commit_rx) = mpsc::channel(8);
+        let verifier = service_fn(move |request: zebra_consensus::Request| {
+            let commit_tx = commit_tx.clone();
+            async move {
+                match request {
+                    zebra_consensus::Request::Commit(block) => {
+                        let hash = block.hash();
+                        commit_tx
+                            .send(hash)
+                            .await
+                            .expect("test commit receiver stays open");
+                        Ok::<_, zebra_consensus::BoxError>(hash)
+                    }
+                    request => panic!("unexpected consensus request: {request:?}"),
+                }
+            }
+        });
+        let block2_hash = block2.hash();
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => Ok::<_, zebra_state::BoxError>(
+                    zebra_state::ReadResponse::FinalizedTip(Some((block::Height(2), block2_hash))),
+                ),
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                    block::Height(2),
+                    block2_hash,
+                )))),
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let peer =
+            zebra_network::zakura::ZakuraPeerId::new(vec![8; 32]).expect("test peer id is valid");
+        action_tx
+            .send(BlockSyncAction::SendMessage {
+                peer,
+                msg: zebra_network::zakura::BlockSyncMessage::Status(
+                    zebra_network::zakura::BlockSyncStatus::default(),
+                ),
+            })
+            .await
+            .expect("driver action channel stays open");
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 1,
+                block: block1.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 2,
+                block: block2.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("first commit arrives"),
+            Some(block1.hash())
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("second commit arrives"),
+            Some(block2.hash())
+        );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_submits_checkpoint_blocks_without_waiting_for_first_commit() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let (commit_tx, mut commit_rx) = mpsc::channel(8);
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let verifier = {
+            let release_first = release_first.clone();
+            service_fn(move |request: zebra_consensus::Request| {
+                let commit_tx = commit_tx.clone();
+                let release_first = release_first.clone();
+                async move {
+                    match request {
+                        zebra_consensus::Request::Commit(block) => {
+                            let height = block.coinbase_height().expect("test block has height");
+                            let hash = block.hash();
+                            commit_tx
+                                .send(height)
+                                .await
+                                .expect("test commit receiver stays open");
+                            if height == block::Height(1) {
+                                release_first.notified().await;
+                            }
+                            Ok::<_, zebra_consensus::BoxError>(hash)
+                        }
+                        request => panic!("unexpected consensus request: {request:?}"),
+                    }
+                }
+            })
+        };
+        let block2_hash = block2.hash();
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => Ok::<_, zebra_state::BoxError>(
+                    zebra_state::ReadResponse::FinalizedTip(Some((block::Height(2), block2_hash))),
+                ),
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                    block::Height(2),
+                    block2_hash,
+                )))),
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height(2),
+            2,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 1,
+                block: block1.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("first checkpoint commit starts"),
+            Some(block::Height(1))
+        );
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 2,
+                block: block2.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("second checkpoint commit starts while first is pending"),
+            Some(block::Height(2))
+        );
+
+        release_first.notify_waiters();
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_combined_apply_limit_preserves_checkpoint_window() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let (commit_tx, mut commit_rx) = mpsc::channel(8);
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let verifier = {
+            let release_first = release_first.clone();
+            service_fn(move |request: zebra_consensus::Request| {
+                let commit_tx = commit_tx.clone();
+                let release_first = release_first.clone();
+                async move {
+                    match request {
+                        zebra_consensus::Request::Commit(block) => {
+                            let height = block.coinbase_height().expect("test block has height");
+                            let hash = block.hash();
+                            commit_tx
+                                .send(height)
+                                .await
+                                .expect("test commit receiver stays open");
+                            if height == block::Height(1) {
+                                release_first.notified().await;
+                            }
+                            Ok::<_, zebra_consensus::BoxError>(hash)
+                        }
+                        request => panic!("unexpected consensus request: {request:?}"),
+                    }
+                }
+            })
+        };
+        let block2_hash = block2.hash();
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => Ok::<_, zebra_state::BoxError>(
+                    zebra_state::ReadResponse::FinalizedTip(Some((block::Height(2), block2_hash))),
+                ),
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                    block::Height(2),
+                    block2_hash,
+                )))),
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height(2),
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            1,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 1,
+                block: block1.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("first checkpoint commit starts"),
+            Some(block::Height(1))
+        );
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 2,
+                block: block2.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("second checkpoint commit starts despite the smaller combined cap"),
+            Some(block::Height(2)),
+            "checkpoint applies need enough depth to complete a checkpoint verifier window",
+        );
+
+        release_first.notify_waiters();
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_combined_apply_limit_binds_full_applies() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let (commit_tx, mut commit_rx) = mpsc::channel(8);
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let verifier = {
+            let release_first = release_first.clone();
+            service_fn(move |request: zebra_consensus::Request| {
+                let commit_tx = commit_tx.clone();
+                let release_first = release_first.clone();
+                async move {
+                    match request {
+                        zebra_consensus::Request::Commit(block) => {
+                            let height = block.coinbase_height().expect("test block has height");
+                            let hash = block.hash();
+                            commit_tx
+                                .send(height)
+                                .await
+                                .expect("test commit receiver stays open");
+                            if height == block::Height(1) {
+                                release_first.notified().await;
+                            }
+                            Ok::<_, zebra_consensus::BoxError>(hash)
+                        }
+                        request => panic!("unexpected consensus request: {request:?}"),
+                    }
+                }
+            })
+        };
+        let block2_hash = block2.hash();
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => Ok::<_, zebra_state::BoxError>(
+                    zebra_state::ReadResponse::FinalizedTip(Some((block::Height(2), block2_hash))),
+                ),
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                    block::Height(2),
+                    block2_hash,
+                )))),
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height(0),
+            2,
+            2,
+            1,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 1,
+                block: block1.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("first checkpoint commit starts"),
+            Some(block::Height(1))
+        );
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 2,
+                block: block2.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), commit_rx.recv())
+                .await
+                .is_err(),
+            "combined apply cap must bind full applies",
+        );
+
+        release_first.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("second checkpoint commit starts after combined cap has room"),
+            Some(block::Height(2)),
+        );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    /// A checkpoint-class commit must wait for the checkpoint verifier to
+    /// assemble a full contiguous range and must never be torn down by the
+    /// driver timeout, while a full (post-checkpoint) commit still times out.
+    ///
+    /// Regression test for the from-scratch mainnet stall: the checkpoint
+    /// verifier buffers every body below the first checkpoint (height 400) until
+    /// the whole range arrives, so a per-block commit timeout fired before
+    /// height 400 was reached and rolled the partial range back, freezing sync
+    /// at genesis.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn checkpoint_commit_waits_past_driver_timeout_unlike_full_commit() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+
+        // A verifier that never answers a commit, mimicking the checkpoint
+        // verifier buffering a block until its range completes.
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            match request {
+                zebra_consensus::Request::Commit(_) => {
+                    std::future::pending::<Result<block::Hash, zebra_consensus::BoxError>>().await
+                }
+                request => panic!("unexpected consensus request: {request:?}"),
+            }
+        });
+
+        // A full-class commit gives up after the driver timeout. (`verifier` is
+        // a capture-free `service_fn`, so it is `Copy` and reused below as-is.)
+        assert_eq!(
+            commit_block_sync_body(verifier, block.clone(), BlockApplyClass::Full).await,
+            BlockApplyResult::TimedOut,
+            "full commit should time out when the verifier never answers"
+        );
+
+        // A checkpoint-class commit keeps waiting: an outer timeout several times
+        // longer than the driver timeout must elapse with the commit still
+        // unresolved. If the driver timeout still applied to checkpoint commits,
+        // this would instead resolve to Ok(TimedOut) long before the outer
+        // timeout fired.
+        let waited = tokio::time::timeout(
+            ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT * 4,
+            commit_block_sync_body(verifier, block, BlockApplyClass::Checkpoint),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "checkpoint commit must keep waiting past the driver timeout, got {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmatched_checkpoint_commit_success_does_not_refresh_block_sync_frontiers() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block_hash = block.hash();
+        let (tip_tx, tip_rx) =
+            tokio::sync::watch::channel((block::Height(10), block::Hash([10; 32])));
+        let _tip_tx = tip_tx;
+        let startup = zebra_network::zakura::BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            (block::Height(10), block::Hash([10; 32])),
+            tip_rx,
+            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+        );
+        let (block_sync, mut reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+
+        let startup_action = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
+            .await
+            .expect("reactor emits startup action")
+            .expect("reactor action channel remains open");
+        assert!(
+            matches!(
+                startup_action,
+                BlockSyncAction::QueryNeededBlocks {
+                    verified_block_tip: block::Height(0),
+                    best_header_tip: block::Height(10),
+                }
+            ),
+            "test setup should start with an initial body query, got {startup_action:?}"
+        );
+
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            match request {
+                zebra_consensus::Request::Commit(block) => {
+                    Ok::<_, zebra_consensus::BoxError>(block.hash())
+                }
+                request => panic!("unexpected consensus request: {request:?}"),
+            }
+        });
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => {
+                    Ok::<_, zebra_state::BoxError>(zebra_state::ReadResponse::FinalizedTip(Some((
+                        block::Height(2),
+                        block::Hash([2; 32]),
+                    ))))
+                }
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                    block::Height(1),
+                    block_hash,
+                )))),
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+
+        apply_block_sync_body(
+            verifier,
+            zebra_chain::chain_tip::NoChainTip,
+            None,
+            read_state,
+            block_sync.clone(),
+            1,
+            block,
+            BlockApplyClass::Checkpoint,
+            zebra_network::zakura::ZakuraTrace::noop(),
+        )
+        .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), reactor_actions.recv())
+                .await
+                .is_err(),
+            "a synthetic commit completion without a matching reactor apply must not refresh frontiers"
+        );
+
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_apply_emits_commit_state_trace_rows() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block_hash = block.hash();
+        let block_height = block.coinbase_height().expect("test block has height");
+        let mut capture =
+            TraceCapture::for_test("block_sync_apply_emits_commit_state_trace_rows").unwrap();
+        let trace = zebra_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            match request {
+                zebra_consensus::Request::Commit(block) => {
+                    Ok::<_, zebra_consensus::BoxError>(block.hash())
+                }
+                request => panic!("unexpected consensus request: {request:?}"),
+            }
+        });
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => {
+                    Ok::<_, zebra_state::BoxError>(zebra_state::ReadResponse::FinalizedTip(None))
+                }
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                    block_height,
+                    block_hash,
+                )))),
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+
+        apply_block_sync_body(
+            verifier,
+            zebra_chain::chain_tip::NoChainTip,
+            None,
+            read_state,
+            block_sync,
+            77,
+            block,
+            BlockApplyClass::Full,
+            trace,
+        )
+        .await;
+
+        capture.flush().await;
+        let reader = capture.reader().unwrap();
+        let commit_state = reader.table(COMMIT_STATE_TABLE.table());
+        let hash_label = format!("{block_hash}");
+        let common = [
+            (cs_trace::APPLY_TOKEN, TraceValue::U64(77)),
+            (cs_trace::HEIGHT, TraceValue::U64(u64::from(block_height.0))),
+            (cs_trace::HASH, TraceValue::Str(&hash_label)),
+        ];
+        commit_state.assert_row(cs_trace::COMMIT_START, &common);
+        commit_state.assert_row(
+            cs_trace::COMMIT_FINISH,
+            &[
+                (cs_trace::APPLY_TOKEN, TraceValue::U64(77)),
+                (cs_trace::RESULT, TraceValue::Str("committed")),
+            ],
+        );
+        commit_state.assert_row(
+            cs_trace::REACTOR_EVENT_SENT,
+            &[
+                (cs_trace::APPLY_TOKEN, TraceValue::U64(77)),
+                (cs_trace::RESULT, TraceValue::Str("committed")),
+            ],
+        );
+
+        let _ = capture.finish().await.unwrap();
+        reactor_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn block_sync_pending_checkpoint_apply_emits_stalled_trace_without_finishing() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block_hash = block.hash();
+        let block_height = block.coinbase_height().expect("test block has height");
+        let mut capture = TraceCapture::for_test(
+            "block_sync_pending_checkpoint_apply_emits_stalled_trace_without_finishing",
+        )
+        .unwrap();
+        let trace = zebra_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            match request {
+                zebra_consensus::Request::Commit(_block) => {
+                    future::pending::<Result<block::Hash, zebra_consensus::BoxError>>().await
+                }
+                request => panic!("unexpected consensus request: {request:?}"),
+            }
+        });
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => {
+                    Ok::<_, zebra_state::BoxError>(zebra_state::ReadResponse::FinalizedTip(None))
+                }
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                    block_height,
+                    block_hash,
+                )))),
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+
+        let apply_task = tokio::spawn(apply_block_sync_body(
+            verifier,
+            zebra_chain::chain_tip::NoChainTip,
+            None,
+            read_state,
+            block_sync,
+            88,
+            block,
+            BlockApplyClass::Checkpoint,
+            trace,
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT).await;
+        tokio::task::yield_now().await;
+
+        capture.flush().await;
+        let reader = capture.reader().unwrap();
+        let commit_state = reader.table(COMMIT_STATE_TABLE.table());
+        commit_state.assert_row(
+            cs_trace::COMMIT_START,
+            &[(cs_trace::APPLY_TOKEN, TraceValue::U64(88))],
+        );
+        commit_state.assert_row(
+            cs_trace::COMMIT_STALLED,
+            &[(cs_trace::APPLY_TOKEN, TraceValue::U64(88))],
+        );
+        assert_eq!(
+            commit_state.count(cs_trace::COMMIT_FINISH),
+            0,
+            "pending checkpoint verifier must not produce a finish row before it resolves"
+        );
+
+        apply_task.abort();
+        let _ = capture.finish().await.unwrap();
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_pending_checkpoint_apply_does_not_block_control_plane_actions() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            match request {
+                zebra_consensus::Request::Commit(_block) => {
+                    future::pending::<Result<block::Hash, zebra_consensus::BoxError>>().await
+                }
+                request => panic!("unexpected consensus request: {request:?}"),
+            }
+        });
+        let (query_seen_tx, query_seen_rx) = oneshot::channel();
+        let query_seen_tx = Arc::new(Mutex::new(Some(query_seen_tx)));
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| {
+            let query_seen_tx = query_seen_tx.clone();
+            async move {
+                match request {
+                    zebra_state::ReadRequest::MissingBlockBodies { from, limit } => {
+                        assert_eq!(from, block::Height(1));
+                        assert_eq!(limit, 1);
+                        if let Some(query_seen_tx) = query_seen_tx
+                            .lock()
+                            .expect("query seen sender mutex is not poisoned")
+                            .take()
+                        {
+                            let _ = query_seen_tx.send(());
+                        }
+                        Ok::<_, zebra_state::BoxError>(
+                            zebra_state::ReadResponse::MissingBlockBodies(Vec::new()),
+                        )
+                    }
+                    request => panic!("unexpected read request: {request:?}"),
+                }
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock { token: 1, block })
+            .await
+            .expect("driver action channel stays open");
+        action_tx
+            .send(BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(0),
+                best_header_tip: block::Height(1),
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        tokio::time::timeout(Duration::from_secs(1), query_seen_rx)
+            .await
+            .expect("driver processes unrelated query while checkpoint apply is pending")
+            .expect("read service reports query");
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_checkpoint_apply_limit_allows_two_checkpoint_gaps() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let two_checkpoint_gaps = zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP.saturating_mul(2);
+        let (action_tx, action_rx) = mpsc::channel(two_checkpoint_gaps + 8);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let commit_count = Arc::new(AtomicUsize::new(0));
+        let verifier_count = commit_count.clone();
+        let verifier = service_fn(move |request: zebra_consensus::Request| {
+            let verifier_count = verifier_count.clone();
+            async move {
+                match request {
+                    zebra_consensus::Request::Commit(_block) => {
+                        verifier_count.fetch_add(1, Ordering::SeqCst);
+                        future::pending::<Result<block::Hash, zebra_consensus::BoxError>>().await
+                    }
+                    request => panic!("unexpected consensus request: {request:?}"),
+                }
+            }
+        });
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            panic!("unexpected read request while checkpoint applies are pending: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zebra_state::BoxError>(zebra_state::ReadResponse::Tip(None))
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height::MAX,
+            two_checkpoint_gaps,
+            sync::MIN_CONCURRENCY_LIMIT,
+            zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        for token in 0..=two_checkpoint_gaps {
+            action_tx
+                .send(BlockSyncAction::SubmitBlock {
+                    token: u64::try_from(token).expect("test token fits in u64"),
+                    block: block.clone(),
+                })
+                .await
+                .expect("driver action channel stays open");
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while commit_count.load(Ordering::SeqCst) < two_checkpoint_gaps {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("driver starts exactly two checkpoint gaps of applies");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            commit_count.load(Ordering::SeqCst),
+            two_checkpoint_gaps,
+            "driver must not submit a third checkpoint range before earlier ranges complete"
+        );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn delayed_checkpoint_frontier_refresh_sends_committed_height() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block_hash = block.hash();
+        let (_tip_tx, tip_rx) =
+            tokio::sync::watch::channel((block::Height(10), block::Hash([10; 32])));
+        let startup = zebra_network::zakura::BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            (block::Height(10), block::Hash([10; 32])),
+            tip_rx,
+            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+        );
+        let (block_sync, mut reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+
+        let startup_action = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
+            .await
+            .expect("reactor emits startup action")
+            .expect("reactor action channel remains open");
+        assert!(
+            matches!(
+                startup_action,
+                BlockSyncAction::QueryNeededBlocks {
+                    verified_block_tip: block::Height(0),
+                    best_header_tip: block::Height(10),
+                }
+            ),
+            "test setup should start with an initial body query, got {startup_action:?}"
+        );
+
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            match request {
+                zebra_consensus::Request::Commit(block) => {
+                    Ok::<_, zebra_consensus::BoxError>(block.hash())
+                }
+                request => panic!("unexpected consensus request: {request:?}"),
+            }
+        });
+        let (mut tip_sender, latest_chain_tip, _tip_change) =
+            zebra_state::ChainTipSender::new(None, &zebra_chain::parameters::Network::Mainnet);
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| {
+            let read_index = read_count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let visible_tip = if read_index < 2 {
+                    None
+                } else {
+                    Some((block::Height(1), block_hash))
+                };
+
+                match request {
+                    zebra_state::ReadRequest::FinalizedTip => Ok::<_, zebra_state::BoxError>(
+                        zebra_state::ReadResponse::FinalizedTip(visible_tip),
+                    ),
+                    zebra_state::ReadRequest::Tip => {
+                        Ok(zebra_state::ReadResponse::Tip(visible_tip))
+                    }
+                    request => panic!("unexpected read request: {request:?}"),
+                }
+            }
+        });
+
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync.clone(),
+            latest_chain_tip,
+            read_state,
+            verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock { token: 1, block })
+            .await
+            .expect("driver action channel stays open");
+        tokio::task::yield_now().await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), reactor_actions.recv())
+                .await
+                .is_err(),
+            "the immediate refresh should not advance before state exposes the checkpoint"
+        );
+
+        tip_sender.set_finalized_tip(zebra_state::ChainTipBlock {
+            hash: block_hash,
+            height: block::Height(1),
+            time: chrono::Utc::now(),
+            transactions: Vec::new(),
+            transaction_hashes: Arc::from([]),
+            previous_block_hash: block::Hash([0; 32]),
+        });
+        tokio::time::advance(ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL).await;
+
+        let action = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
+            .await
+            .expect("reactor emits action after delayed checkpoint frontier")
+            .expect("reactor action channel remains open");
+        assert!(
+            matches!(
+                action,
+                BlockSyncAction::QueryNeededBlocks {
+                    verified_block_tip: block::Height(1),
+                    best_header_tip: block::Height(10),
+                }
+            ),
+            "delayed checkpoint refresh must send the committed height once state catches up, got {action:?}"
+        );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn delayed_checkpoint_frontier_refresh_is_coalesced_across_commits() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let block2_hash = block2.hash();
+        let (_tip_tx, tip_rx) =
+            tokio::sync::watch::channel((block::Height(10), block::Hash([10; 32])));
+        let startup = zebra_network::zakura::BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            (block::Height(10), block::Hash([10; 32])),
+            tip_rx,
+            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+        );
+        let (block_sync, mut reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let _startup_action = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
+            .await
+            .expect("reactor emits startup action")
+            .expect("reactor action channel remains open");
+
+        let mut capture = TraceCapture::for_test(
+            "delayed_checkpoint_frontier_refresh_is_coalesced_across_commits",
+        )
+        .unwrap();
+        let trace = zebra_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+        let visible = Arc::new(AtomicBool::new(false));
+        let visible_for_reads = visible.clone();
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let read_count_for_service = read_count.clone();
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| {
+            let visible = visible_for_reads.load(Ordering::SeqCst);
+            let read_count = read_count_for_service.clone();
+            async move {
+                read_count.fetch_add(1, Ordering::SeqCst);
+                let visible_tip = visible.then_some((block::Height(2), block2_hash));
+                match request {
+                    zebra_state::ReadRequest::FinalizedTip => Ok::<_, zebra_state::BoxError>(
+                        zebra_state::ReadResponse::FinalizedTip(visible_tip),
+                    ),
+                    zebra_state::ReadRequest::Tip => {
+                        Ok(zebra_state::ReadResponse::Tip(visible_tip))
+                    }
+                    request => panic!("unexpected read request: {request:?}"),
+                }
+            }
+        });
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            match request {
+                zebra_consensus::Request::Commit(block) => {
+                    Ok::<_, zebra_consensus::BoxError>(block.hash())
+                }
+                request => panic!("unexpected consensus request: {request:?}"),
+            }
+        });
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync.clone(),
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            trace,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 1,
+                block: block1,
+            })
+            .await
+            .expect("driver action channel stays open");
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 2,
+                block: block2,
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while read_count.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both immediate post-commit frontier reads complete");
+
+        visible.store(true, Ordering::SeqCst);
+        tokio::time::advance(ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL).await;
+
+        let action = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
+            .await
+            .expect("reactor emits action after coalesced delayed checkpoint frontier")
+            .expect("reactor action channel remains open");
+        assert!(
+            matches!(
+                action,
+                BlockSyncAction::QueryNeededBlocks {
+                    verified_block_tip: block::Height(2),
+                    best_header_tip: block::Height(10),
+                }
+            ),
+            "coalesced delayed checkpoint refresh must send the committed height once state catches up, got {action:?}"
+        );
+
+        capture.flush().await;
+        let reader = capture.reader().unwrap();
+        let commit_state = reader.table(COMMIT_STATE_TABLE.table());
+        assert_eq!(
+            commit_state.count(cs_trace::CHECKPOINT_REFRESH_ATTEMPT),
+            1,
+            "multiple committed checkpoint bodies should share one delayed frontier refresh attempt"
+        );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        let _ = capture.finish().await.unwrap();
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_treats_duplicate_commit_as_idempotent_and_keeps_draining() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let verifier_attempts = attempts.clone();
+        let (commit_tx, mut commit_rx) = mpsc::channel(8);
+        let verifier = service_fn(move |request: zebra_consensus::Request| {
+            let attempts = verifier_attempts.clone();
+            let commit_tx = commit_tx.clone();
+            async move {
+                match request {
+                    zebra_consensus::Request::Commit(block) => {
+                        let hash = block.hash();
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return Err(zebra_consensus::RouterError::Block {
+                                source: Box::new(zebra_consensus::VerifyBlockError::Block {
+                                    source: zebra_consensus::BlockError::AlreadyInChain(
+                                        hash,
+                                        zebra_state::KnownBlock::BestChain,
+                                    ),
+                                }),
+                            });
+                        }
+                        commit_tx
+                            .send(hash)
+                            .await
+                            .expect("test commit receiver stays open");
+                        Ok(hash)
+                    }
+                    request => panic!("unexpected consensus request: {request:?}"),
+                }
+            }
+        });
+        let read_requests = Arc::new(Mutex::new(Vec::new()));
+        let read_requests_for_service = read_requests.clone();
+        let block_hash = block.hash();
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| {
+            let read_requests = read_requests_for_service.clone();
+            async move {
+                read_requests
+                    .lock()
+                    .expect("test read request log is not poisoned")
+                    .push(request.clone());
+                match request {
+                    zebra_state::ReadRequest::FinalizedTip => {
+                        Ok(zebra_state::ReadResponse::FinalizedTip(None))
+                    }
+                    zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                        block::Height(1),
+                        block_hash,
+                    )))),
+                    request => panic!("unexpected read request: {request:?}"),
+                }
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height::MAX,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 1,
+                block: block.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 2,
+                block: block.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("second commit arrives after duplicate"),
+            Some(block.hash())
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(
+            read_requests
+                .lock()
+                .expect("test read request log is not poisoned")
+                .iter()
+                .any(|request| matches!(request, zebra_state::ReadRequest::Tip)),
+            "duplicate commit should refresh block-sync frontiers from state"
+        );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    /// Drives the block-sync apply loop against the *real* checkpoint verifier and a *real*
+    /// ephemeral state, reproducing the checkpoint-range batch-commit that Regtest (genesis
+    /// checkpoint only) cannot exercise.
+    ///
+    /// A checkpoint is placed at height 10 so an 11-block range covers a full checkpoint gap
+    /// without 400 real blocks. The whole range is submitted except one mid-range body, which
+    /// the verifier holds the entire range for (it commits nothing until the range is
+    /// contiguous to the next checkpoint). Delivering the withheld body must let the whole
+    /// range commit — i.e. a transiently-missing body recovers instead of wedging the floor,
+    /// which is the production "drop-through" failure mode.
+    #[tokio::test]
+    async fn block_sync_driver_recovers_checkpoint_range_after_withheld_body() {
+        const CHECKPOINT_HEIGHT: u32 = 10;
+        const WITHHELD: u32 = 5;
+
+        // Real, contiguous mainnet blocks 0..=10 (valid PoW, merkle roots, and parent
+        // linkage), so the real checkpoint verifier accepts them with no synthesis.
+        let chain: Vec<(block::Height, Arc<block::Block>)> = (0..=CHECKPOINT_HEIGHT)
+            .map(|height| {
+                let bytes: &[u8] = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+                    .get(&height)
+                    .copied()
+                    .expect("a contiguous mainnet block vector exists for heights 0..=10");
+                let block = mainnet_block(bytes);
+                assert_eq!(
+                    block.coinbase_height(),
+                    Some(block::Height(height)),
+                    "mainnet block vector height matches its coinbase height",
+                );
+                (block::Height(height), block)
+            })
+            .collect();
+        let genesis_hash = chain[0].1.hash();
+        let checkpoint_hash = chain[CHECKPOINT_HEIGHT as usize].1.hash();
+
+        let network = zebra_chain::parameters::Network::Mainnet;
+        let (write_state, read_state, _latest_tip, _tip_change) =
+            zebra_state::init_test_services(&network).await;
+
+        // A low checkpoint at height 10 turns the 11-block range into one checkpoint batch.
+        let checkpoint_verifier = zebra_consensus::CheckpointVerifier::from_list(
+            [
+                (block::Height(0), genesis_hash),
+                (block::Height(CHECKPOINT_HEIGHT), checkpoint_hash),
+            ],
+            &network,
+            None,
+            write_state,
+        )
+        .expect("a checkpoint list with genesis and one mid-chain checkpoint is valid");
+
+        // Adapt the checkpoint verifier (`Service<Arc<Block>>`) to the driver's
+        // `Service<zebra_consensus::Request, Response = block::Hash>` bound.
+        let checkpoint_verifier =
+            tower::buffer::Buffer::new(BoxService::new(checkpoint_verifier), 16);
+        let verifier = service_fn(move |request: zebra_consensus::Request| {
+            let checkpoint_verifier = checkpoint_verifier.clone();
+            async move {
+                match request {
+                    zebra_consensus::Request::Commit(block) => {
+                        checkpoint_verifier.oneshot(block).await
+                    }
+                    request => panic!("unexpected consensus request: {request:?}"),
+                }
+            }
+        });
+
+        let (action_tx, action_rx) = mpsc::channel(64);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            _latest_tip,
+            read_state.clone(),
+            verifier,
+            // Every block 0..=10 is at or below the checkpoint, so all are Checkpoint-class
+            // (indefinite-wait) commits — the path that wedges in production.
+            block::Height(CHECKPOINT_HEIGHT),
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let finalized_tip = || {
+            let read_state = read_state.clone();
+            async move {
+                match read_state
+                    .oneshot(zebra_state::ReadRequest::FinalizedTip)
+                    .await
+                    .expect("finalized tip read succeeds")
+                {
+                    zebra_state::ReadResponse::FinalizedTip(tip) => {
+                        tip.map(|(height, _hash)| height)
+                    }
+                    response => panic!("unexpected FinalizedTip response: {response:?}"),
+                }
+            }
+        };
+
+        // Submit the whole checkpoint range except the withheld mid-range body.
+        for (height, block) in &chain {
+            if height.0 == WITHHELD {
+                continue;
+            }
+            action_tx
+                .send(BlockSyncAction::SubmitBlock {
+                    token: u64::from(height.0),
+                    block: block.clone(),
+                })
+                .await
+                .expect("driver action channel stays open");
+        }
+
+        // While the body is missing the range cannot commit, and the driver must keep the
+        // checkpoint-class commits pending (not time them out): the tip never reaches the
+        // checkpoint.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_ne!(
+            finalized_tip().await,
+            Some(block::Height(CHECKPOINT_HEIGHT)),
+            "checkpoint range must not commit while a mid-range body is missing",
+        );
+
+        // Deliver the withheld body; the verifier can now commit the whole range.
+        let (withheld_height, withheld_block) = chain
+            .iter()
+            .find(|(height, _)| height.0 == WITHHELD)
+            .expect("withheld block is part of the test chain");
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: u64::from(withheld_height.0),
+                block: withheld_block.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        // Recovery: the entire range commits, so the finalized tip reaches the checkpoint.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if finalized_tip().await == Some(block::Height(CHECKPOINT_HEIGHT)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("delivering the withheld body must let the checkpoint range commit to the tip");
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    /// Drives a from-scratch body sync across two synthetic checkpoint boundaries using
+    /// real contiguous mainnet blocks, real ephemeral state, the real checkpoint verifier,
+    /// the block-sync reactor, and the block-sync driver apply loop.
+    #[tokio::test]
+    async fn block_sync_driver_finalizes_across_two_checkpoint_boundaries() {
+        const FIRST_CHECKPOINT_HEIGHT: u32 = 5;
+        const SECOND_CHECKPOINT_HEIGHT: u32 = 10;
+
+        let chain: Vec<(block::Height, Arc<block::Block>)> = (0..=SECOND_CHECKPOINT_HEIGHT)
+            .map(|height| {
+                let bytes: &[u8] = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+                    .get(&height)
+                    .copied()
+                    .expect("a contiguous mainnet block vector exists for heights 0..=10");
+                let block = mainnet_block(bytes);
+                assert_eq!(
+                    block.coinbase_height(),
+                    Some(block::Height(height)),
+                    "mainnet block vector height matches its coinbase height",
+                );
+                (block::Height(height), block)
+            })
+            .collect();
+        let genesis_hash = chain[0].1.hash();
+        let first_checkpoint_hash = chain[FIRST_CHECKPOINT_HEIGHT as usize].1.hash();
+        let second_checkpoint_height = block::Height(SECOND_CHECKPOINT_HEIGHT);
+        let second_checkpoint_hash = chain[SECOND_CHECKPOINT_HEIGHT as usize].1.hash();
+
+        let network = zebra_chain::parameters::Network::Mainnet;
+        let (write_state, read_state, latest_tip, _tip_change) =
+            zebra_state::init_test_services(&network).await;
+
+        let checkpoint_verifier = zebra_consensus::CheckpointVerifier::from_list(
+            [
+                (block::Height(0), genesis_hash),
+                (
+                    block::Height(FIRST_CHECKPOINT_HEIGHT),
+                    first_checkpoint_hash,
+                ),
+                (second_checkpoint_height, second_checkpoint_hash),
+            ],
+            &network,
+            None,
+            write_state,
+        )
+        .expect("a checkpoint list with two low checkpoint boundaries is valid");
+        let checkpoint_verifier =
+            tower::buffer::Buffer::new(BoxService::new(checkpoint_verifier), 32);
+        let verifier = service_fn(move |request: zebra_consensus::Request| {
+            let checkpoint_verifier = checkpoint_verifier.clone();
+            async move {
+                match request {
+                    zebra_consensus::Request::Commit(block) => {
+                        checkpoint_verifier.oneshot(block).await
+                    }
+                    request => panic!("unexpected consensus request: {request:?}"),
+                }
+            }
+        });
+
+        let (action_tx, action_rx) = mpsc::channel(64);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            latest_tip,
+            read_state.clone(),
+            verifier,
+            second_checkpoint_height,
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            sync::MIN_CONCURRENCY_LIMIT,
+            sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        for (height, block) in &chain {
+            action_tx
+                .send(BlockSyncAction::SubmitBlock {
+                    token: u64::from(height.0),
+                    block: block.clone(),
+                })
+                .await
+                .expect("driver action channel stays open");
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let finalized_tip = match read_state
+                    .clone()
+                    .oneshot(zebra_state::ReadRequest::FinalizedTip)
+                    .await
+                    .expect("finalized tip read succeeds")
+                {
+                    zebra_state::ReadResponse::FinalizedTip(tip) => tip,
+                    response => panic!("unexpected FinalizedTip response: {response:?}"),
+                };
+
+                if finalized_tip == Some((second_checkpoint_height, second_checkpoint_hash)) {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("driver must finalize through both checkpoint boundaries");
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_restart_reloads_checkpoint_frontier_after_missed_live_update() {
+        const CHECKPOINT_HEIGHT: u32 = 10;
+
+        // Real, contiguous mainnet blocks 0..=10, matching the low-checkpoint
+        // setup in the withheld-body regression above.
+        let chain: Vec<(block::Height, Arc<block::Block>)> = (0..=CHECKPOINT_HEIGHT)
+            .map(|height| {
+                let bytes: &[u8] = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+                    .get(&height)
+                    .copied()
+                    .expect("a contiguous mainnet block vector exists for heights 0..=10");
+                let block = mainnet_block(bytes);
+                assert_eq!(
+                    block.coinbase_height(),
+                    Some(block::Height(height)),
+                    "mainnet block vector height matches its coinbase height",
+                );
+                (block::Height(height), block)
+            })
+            .collect();
+        let genesis_hash = chain[0].1.hash();
+        let checkpoint_height = block::Height(CHECKPOINT_HEIGHT);
+        let checkpoint_hash = chain[CHECKPOINT_HEIGHT as usize].1.hash();
+        let best_header_tip = (block::Height(20), block::Hash([20; 32]));
+
+        let network = zebra_chain::parameters::Network::Mainnet;
+        let (write_state, read_state, _latest_tip, _tip_change) =
+            zebra_state::init_test_services(&network).await;
+
+        // Start a live reactor from the stale genesis frontier, with headers
+        // already above the checkpoint.
+        let (_tip_tx, tip_rx) = tokio::sync::watch::channel(best_header_tip);
+        let startup = zebra_network::zakura::BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: genesis_hash,
+            },
+            best_header_tip,
+            tip_rx,
+            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+        );
+        let (stale_block_sync, mut stale_actions, stale_reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+
+        let startup_action = tokio::time::timeout(Duration::from_secs(1), stale_actions.recv())
+            .await
+            .expect("stale reactor emits startup action")
+            .expect("stale reactor action channel remains open");
+        assert!(
+            matches!(
+                startup_action,
+                BlockSyncAction::QueryNeededBlocks {
+                    verified_block_tip: block::Height(0),
+                    best_header_tip: block::Height(20),
+                }
+            ),
+            "stale reactor should start querying from genesis, got {startup_action:?}"
+        );
+
+        // Commit the low checkpoint range through the real checkpoint verifier,
+        // but intentionally do not notify the live block-sync reactor.
+        let checkpoint_verifier = zebra_consensus::CheckpointVerifier::from_list(
+            [
+                (block::Height(0), genesis_hash),
+                (checkpoint_height, checkpoint_hash),
+            ],
+            &network,
+            None,
+            write_state,
+        )
+        .expect("a checkpoint list with genesis and one mid-chain checkpoint is valid");
+        let checkpoint_verifier =
+            tower::buffer::Buffer::new(BoxService::new(checkpoint_verifier), 16);
+        let mut commits = FuturesUnordered::new();
+        for (_height, block) in chain {
+            let checkpoint_verifier = checkpoint_verifier.clone();
+            commits.push(async move { checkpoint_verifier.oneshot(block).await });
+        }
+        while let Some(result) = commits.next().await {
+            result.expect("checkpoint verifier commits the contiguous range");
+        }
+
+        let finalized_tip = || {
+            let read_state = read_state.clone();
+            async move {
+                match read_state
+                    .oneshot(zebra_state::ReadRequest::FinalizedTip)
+                    .await
+                    .expect("finalized tip read succeeds")
+                {
+                    zebra_state::ReadResponse::FinalizedTip(tip) => tip,
+                    response => panic!("unexpected FinalizedTip response: {response:?}"),
+                }
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if finalized_tip()
+                    .await
+                    .is_some_and(|(height, _hash)| height == checkpoint_height)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("checkpoint range must reach durable finalized state");
+
+        assert_eq!(
+            stale_block_sync.local_status().servable_high,
+            block::Height(0),
+            "without a live frontier event, the old reactor remains stale"
+        );
+        notify_block_sync_header_tip(
+            Some(&stale_block_sync),
+            best_header_tip.0,
+            best_header_tip.1,
+            &zebra_network::zakura::ZakuraTrace::noop(),
+        )
+        .await;
+        let stale_nudge = tokio::time::timeout(Duration::from_secs(1), stale_actions.recv())
+            .await
+            .expect("stale reactor emits query after a header-tip nudge")
+            .expect("stale reactor action channel remains open");
+        assert!(
+            matches!(
+                stale_nudge,
+                BlockSyncAction::QueryNeededBlocks {
+                    verified_block_tip: block::Height(0),
+                    best_header_tip: block::Height(20),
+                }
+            ),
+            "without a live frontier event, the old reactor keeps querying from genesis, got {stale_nudge:?}"
+        );
+
+        stale_reactor_task.abort();
+
+        let restart_read_state = {
+            let read_state = read_state.clone();
+            service_fn(move |request: zebra_state::ReadRequest| {
+                let read_state = read_state.clone();
+                async move {
+                    match request {
+                        zebra_state::ReadRequest::FinalizedTip => read_state.oneshot(request).await,
+                        zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some(
+                            (block::Height(0), genesis_hash),
+                        ))),
+                        request => panic!("unexpected restart read request: {request:?}"),
+                    }
+                }
+            })
+        };
+        let restart_frontiers =
+            query_block_sync_frontiers(restart_read_state, zebra_chain::chain_tip::NoChainTip)
+                .await
+                .expect("restart reads block-sync frontiers from durable state");
+        assert_eq!(restart_frontiers.finalized_height, checkpoint_height);
+        assert_eq!(restart_frontiers.verified_block_tip, checkpoint_height);
+        assert_eq!(restart_frontiers.verified_block_hash, checkpoint_hash);
+
+        let (_restart_tip_tx, restart_tip_rx) = tokio::sync::watch::channel(best_header_tip);
+        let restart_startup = zebra_network::zakura::BlockSyncStartup::new(
+            restart_frontiers,
+            best_header_tip,
+            restart_tip_rx,
+            zebra_network::zakura::ZakuraBlockSyncConfig::default(),
+        );
+        let (_fresh_block_sync, mut fresh_actions, fresh_reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(restart_startup);
+        let restart_action = tokio::time::timeout(Duration::from_secs(1), fresh_actions.recv())
+            .await
+            .expect("fresh reactor emits startup action")
+            .expect("fresh reactor action channel remains open");
+        assert!(
+            matches!(
+                restart_action,
+                BlockSyncAction::QueryNeededBlocks {
+                    verified_block_tip: block::Height(10),
+                    best_header_tip: block::Height(20),
+                }
+            ),
+            "fresh reactor should query from the durable checkpoint frontier, got {restart_action:?}"
+        );
+
+        fresh_reactor_task.abort();
     }
 }

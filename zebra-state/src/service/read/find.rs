@@ -149,9 +149,11 @@ where
     // can only add overlapping blocks, and hashes are unique.
 
     let tip = tip_height(chain, db)?;
-    let height = height_by_hash(chain, db, hash)?;
+    let height = chain
+        .and_then(|chain| chain.as_ref().height_by_hash(hash))
+        .or_else(|| db.contains_hash(hash).then(|| db.height(hash)).flatten())?;
 
-    Some(tip.0 - height.0)
+    tip.0.checked_sub(height.0)
 }
 
 /// Returns the location of the block if present in the non-finalized state.
@@ -175,8 +177,15 @@ pub fn non_finalized_state_contains_block_hash(
 
 /// Returns the location of the block if present in the finalized state.
 /// Returns None if the block hash is not found in the finalized state.
+///
+/// Membership is decided by the retained hash index, not by body availability: a
+/// finalized block whose body was pruned (pruning removes `tx_by_loc` rows but keeps
+/// `height_by_hash`) is still a known finalized block. Using `contains_hash` here —
+/// which also requires the body — would report pruned historical blocks as unknown,
+/// so `Request::KnownBlock` callers (sync, inbound gossip) would re-download a full
+/// body we already finalized only to reject it as behind the finalized tip.
 pub fn finalized_state_contains_block_hash(db: &ZebraDb, hash: block::Hash) -> Option<KnownBlock> {
-    db.contains_hash(hash).then_some(KnownBlock::Finalized)
+    db.height(hash).map(|_| KnownBlock::Finalized)
 }
 
 /// Return the height for the block at `hash`, if `hash` is in `chain` or `db`.
@@ -210,7 +219,7 @@ where
 
     chain
         .and_then(|chain| chain.as_ref().hash_by_height(height))
-        .or_else(|| db.hash(height))
+        .or_else(|| db.body_hash(height))
 }
 
 /// Return true if `hash` is in `chain` or `db`.

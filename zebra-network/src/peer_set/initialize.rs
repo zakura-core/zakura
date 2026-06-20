@@ -10,11 +10,12 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 
 use futures::{
-    future::{self, FutureExt},
+    future::{self, BoxFuture, FutureExt},
     sink::SinkExt,
     stream::{FuturesUnordered, StreamExt},
     Future, TryFutureExt,
@@ -24,6 +25,7 @@ use rand::seq::SliceRandom;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc, watch},
+    task::{JoinError, JoinHandle},
     time::{sleep, Instant},
 };
 use tokio_stream::wrappers::IntervalStream;
@@ -32,7 +34,10 @@ use tower::{
 };
 use tracing_futures::Instrument;
 
-use zebra_chain::{chain_tip::ChainTip, diagnostic::task::WaitForPanics};
+use zebra_chain::{
+    chain_tip::ChainTip,
+    diagnostic::task::{CheckForPanics, WaitForPanics},
+};
 
 use crate::{
     address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
@@ -62,6 +67,66 @@ mod recent_by_ip;
 /// - The connection limits don't include failed connections
 /// - tower::Discover interprets an error as stream termination
 type DiscoveredPeer = (PeerSocketAddr, peer::Client);
+
+/// A spawned crawler child task that is aborted if the parent crawler is dropped.
+struct AbortOnDropTask<T> {
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropTask<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
+impl<T> Future for AbortOnDropTask<T> {
+    type Output = Result<T, JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let handle = self
+            .handle
+            .as_mut()
+            .expect("crawler child task future was polled after completion");
+
+        match Pin::new(handle).poll(cx) {
+            Poll::Ready(result) => {
+                self.handle = None;
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T> WaitForPanics for AbortOnDropTask<T>
+where
+    T: Send + 'static,
+{
+    type Output = BoxFuture<'static, T>;
+
+    fn wait_for_panics_with(self, panic_on_unexpected_termination: bool) -> Self::Output {
+        async move {
+            match self
+                .await
+                .check_for_panics_with(panic_on_unexpected_termination)
+            {
+                Ok(task_output) => task_output,
+                Err(_expected_cancel_error) => future::pending().await,
+            }
+        }
+        .boxed()
+    }
+}
 
 /// Initialize a peer set, using a network `config`, `inbound_service`,
 /// and `latest_chain_tip`.
@@ -1044,7 +1109,7 @@ where
                 // The peer crawler must be able to make progress even if some handshakes are
                 // rate-limited. So the async mutex and next peer timeout are awaited inside the
                 // spawned task.
-                let handshake_or_crawl_handle = tokio::spawn(
+                let handshake_or_crawl_handle = AbortOnDropTask::new(tokio::spawn(
                     async move {
                         // Try to get the next available peer for a handshake.
                         //
@@ -1078,7 +1143,7 @@ where
                         }
                     }
                     .in_current_span(),
-                )
+                ))
                 .wait_for_panics();
 
                 handshakes.push(handshake_or_crawl_handle);
@@ -1088,7 +1153,7 @@ where
                 let demand_tx = demand_tx.clone();
                 let should_always_dial = active_outbound_connections.update_count() == 0;
 
-                let crawl_handle = tokio::spawn(
+                let crawl_handle = AbortOnDropTask::new(tokio::spawn(
                     async move {
                         debug!(
                             ?tick,
@@ -1100,7 +1165,7 @@ where
                         Ok(TimerCrawlFinished)
                     }
                     .in_current_span(),
-                )
+                ))
                 .wait_for_panics();
 
                 handshakes.push(crawl_handle);

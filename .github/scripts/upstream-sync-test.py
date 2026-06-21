@@ -108,7 +108,7 @@ def main() -> int:
             "Carry the behavior into the fork.",
             "### Tests",
             "Fixture validation passed.",
-            "### AI Disclosure",
+            "**AI Disclosure**",
             "Codex was used to adapt this change.",
             "### Revert Plan",
             "Revert the generated PR.",

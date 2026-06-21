@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 
 use std::iter;
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use std::sync::Arc;
 
 use color_eyre::eyre::Result;
@@ -26,7 +26,7 @@ const EVICTION_MEMORY_TIME: Duration = Duration::from_secs(60 * 60);
 /// Transaction count used in some tests to derive the mempool test size.
 const MEMPOOL_TX_COUNT: usize = 4;
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn ironwood_action() -> zebra_chain::ironwood::Action {
     use proptest::{
         prelude::any,
@@ -41,7 +41,7 @@ fn ironwood_action() -> zebra_chain::ironwood::Action {
         .current()
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn ironwood_v6_tx(
     expiry_height: Height,
     action: zebra_chain::ironwood::Action,
@@ -76,7 +76,7 @@ fn ironwood_v6_tx(
     })
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn verified_ironwood_v6_tx(
     expiry_height: Height,
     action: zebra_chain::ironwood::Action,
@@ -313,7 +313,7 @@ fn mempool_storage_crud_same_effects_mainnet() {
 }
 
 #[test]
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn mempool_removes_ironwood_duplicate_spends() {
     let _init_guard = zebra_test::init();
 

@@ -649,37 +649,26 @@ fn miner_fees_validation_includes_ironwood_balance() {
 #[cfg(zcash_unstable = "nu6.3")]
 #[tokio::test]
 async fn padded_v6_orchard_proof_returns_consensus_error_before_block_hashes() {
-    let (network, block) = block_with_padded_v6_shielded_data(true);
-
-    let state_service = service_fn(|request| async move {
-        match request {
-            zs::Request::KnownBlock(_) => Ok::<_, BoxError>(zs::Response::KnownBlock(None)),
-            _ => unreachable!("state service should only check if the block is known"),
-        }
-    });
-    let transaction_verifier = service_fn(|_: transaction::Request| async {
-        Err::<transaction::Response, BoxError>("transaction verifier should not be called".into())
-    });
-
-    let result = SemanticBlockVerifier::new(&network, state_service, transaction_verifier)
-        .oneshot(Request::CheckProposal(Arc::new(block)))
+    assert_padded_v6_proof_errors_before_block_hashes(true, TransactionError::OrchardProofSize)
         .await;
-
-    assert!(
-        matches!(
-            result,
-            Err(VerifyBlockError::Transaction(
-                TransactionError::OrchardProofSize
-            ))
-        ),
-        "unexpected result: {result:?}"
-    );
 }
 
 #[cfg(zcash_unstable = "nu6.3")]
 #[tokio::test]
 async fn padded_v6_ironwood_proof_returns_consensus_error_before_block_hashes() {
-    let (network, block) = block_with_padded_v6_shielded_data(false);
+    assert_padded_v6_proof_errors_before_block_hashes(false, TransactionError::IronwoodProofSize)
+        .await;
+}
+
+/// Asserts that proposing a block whose V6 coinbase has an over-padded shielded
+/// proof (Orchard if `use_orchard`, otherwise Ironwood) fails with the `expected`
+/// consensus error before the block hashes are checked.
+#[cfg(zcash_unstable = "nu6.3")]
+async fn assert_padded_v6_proof_errors_before_block_hashes(
+    use_orchard: bool,
+    expected: TransactionError,
+) {
+    let (network, block) = block_with_padded_v6_shielded_data(use_orchard);
 
     let state_service = service_fn(|request| async move {
         match request {
@@ -696,12 +685,7 @@ async fn padded_v6_ironwood_proof_returns_consensus_error_before_block_hashes() 
         .await;
 
     assert!(
-        matches!(
-            result,
-            Err(VerifyBlockError::Transaction(
-                TransactionError::IronwoodProofSize
-            ))
-        ),
+        matches!(&result, Err(VerifyBlockError::Transaction(e)) if *e == expected),
         "unexpected result: {result:?}"
     );
 }

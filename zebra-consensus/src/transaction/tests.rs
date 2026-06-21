@@ -356,33 +356,19 @@ fn ironwood_withdraw_balances() {
 #[cfg(zcash_unstable = "nu6.3")]
 #[tokio::test]
 async fn v6_with_padded_orchard_proof_returns_consensus_error() {
-    let (network, height) = nu6_3_test_network_and_height();
     let mut orchard_shielded_data =
         orchard_shielded_data(0, Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS);
     orchard_shielded_data.proof.0.push(0);
 
     let transaction = v6_pool_flow_transaction(Some(orchard_shielded_data), None, vec![]);
 
-    let state_service =
-        service_fn(|_| async { unreachable!("State service should not be called") });
-    let result = Verifier::new_for_tests(&network, state_service)
-        .oneshot(Request::Block {
-            transaction_hash: Hash::from([0; 32]),
-            transaction: Arc::new(transaction),
-            known_utxos: Arc::new(HashMap::new()),
-            known_outpoint_hashes: Arc::new(HashSet::new()),
-            height,
-            time: DateTime::<Utc>::MAX_UTC,
-        })
+    assert_v6_padded_proof_returns_consensus_error(transaction, TransactionError::OrchardProofSize)
         .await;
-
-    assert_eq!(result, Err(TransactionError::OrchardProofSize));
 }
 
 #[cfg(zcash_unstable = "nu6.3")]
 #[tokio::test]
 async fn v6_with_padded_ironwood_proof_returns_consensus_error() {
-    let (network, height) = nu6_3_test_network_and_height();
     let mut ironwood_shielded_data = ironwood_shielded_data(
         0,
         ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
@@ -391,6 +377,21 @@ async fn v6_with_padded_ironwood_proof_returns_consensus_error() {
 
     let transaction = v6_pool_flow_transaction(None, Some(ironwood_shielded_data), vec![]);
 
+    assert_v6_padded_proof_returns_consensus_error(
+        transaction,
+        TransactionError::IronwoodProofSize,
+    )
+    .await;
+}
+
+/// Asserts that verifying a V6 `transaction` with an over-padded shielded proof
+/// fails with the `expected` consensus error.
+#[cfg(zcash_unstable = "nu6.3")]
+async fn assert_v6_padded_proof_returns_consensus_error(
+    transaction: Transaction,
+    expected: TransactionError,
+) {
+    let (network, height) = nu6_3_test_network_and_height();
     let state_service =
         service_fn(|_| async { unreachable!("State service should not be called") });
     let result = Verifier::new_for_tests(&network, state_service)
@@ -404,7 +405,7 @@ async fn v6_with_padded_ironwood_proof_returns_consensus_error() {
         })
         .await;
 
-    assert_eq!(result, Err(TransactionError::IronwoodProofSize));
+    assert_eq!(result, Err(expected));
 }
 
 #[test]

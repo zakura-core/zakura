@@ -2247,15 +2247,15 @@ impl LegacyGossipSink {
         Self::enqueue_gossip_frame(&self.inbound_tx, peer_id, frame)
     }
 
-    fn request(
-        &self,
+    fn request<'a>(
+        &'a self,
         peer_id: ZakuraPeerId,
         stream_kind: u16,
         request_id: u64,
         max_frame_bytes: u32,
         max_message_bytes: u32,
         frame: Frame,
-    ) -> BoxRunFuture<'_, Result<Vec<Frame>, SinkReject>> {
+    ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
         Box::pin(async move {
             if stream_kind != ZAKURA_STREAM_LEGACY_REQUESTS {
                 return Err(SinkReject::protocol(
@@ -2421,15 +2421,15 @@ impl ZakuraService for LegacyGossipSink {
 }
 
 impl RequestResponseService for LegacyGossipSink {
-    fn request_frame(
-        &self,
+    fn request_frame<'a>(
+        &'a self,
         peer_id: ZakuraPeerId,
         stream_kind: u16,
         request_id: u64,
         max_frame_bytes: u32,
         max_message_bytes: u32,
         frame: Frame,
-    ) -> BoxRunFuture<'_, Result<Vec<Frame>, SinkReject>> {
+    ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
         self.request(
             peer_id,
             stream_kind,

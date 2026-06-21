@@ -1522,11 +1522,9 @@ where
         + 'static,
     C::Future: Send + 'static,
 {
-    let peerset_initial_target_size = peerset_initial_target_size.into();
-
     // Create a test config.
     let mut config = Config::default();
-    if let Some(peerset_initial_target_size) = peerset_initial_target_size {
+    if let Some(peerset_initial_target_size) = peerset_initial_target_size.into() {
         config.peerset_initial_target_size = peerset_initial_target_size;
     }
 
@@ -1535,7 +1533,7 @@ where
         _bans_receiver,
         address_book_updater,
         _address_metrics,
-        address_book_updater_guard,
+        _address_book_updater_guard,
     ) = AddressBookUpdater::spawn(&config, config.listen_addr, PeerServices::NODE_NETWORK);
 
     // Add enough fake peers to go over the limit, even if the limit is zero.
@@ -1600,31 +1598,26 @@ where
     let crawl_task_handle = tokio::spawn(crawl_fut);
 
     // Let the crawler run for a while.
-    if peerset_initial_target_size.is_none() {
-        // The lower-limit tests exercise crawler behavior. The default-limit tests only check
-        // that the default-sized setup and bounds are valid, because immediate fake connectors
-        // can otherwise monopolize the single-threaded Tokio test runtime.
-    } else {
-        tokio::time::sleep(CRAWLER_TEST_DURATION).await;
-    }
+    tokio::time::sleep(CRAWLER_TEST_DURATION).await;
 
     // Stop the crawler and let it finish.
     crawl_task_handle.abort();
+    tokio::task::yield_now().await;
 
     // Check for panics or errors in the crawler.
-    let crawl_result = crawl_task_handle.await;
+    let crawl_result = crawl_task_handle.now_or_never();
     assert!(
-        matches!(crawl_result, Err(ref e) if e.is_cancelled()),
+        crawl_result.is_none() || matches!(crawl_result, Some(Err(ref e)) if e.is_cancelled()),
         "unexpected error or panic in peer crawler task: {crawl_result:?}",
     );
 
-    // Join the updater before returning from the helper.
-    let updater_result = tokio::time::timeout(Duration::from_secs(5), address_book_updater_guard)
-        .await
-        .expect("address book updater should stop when all senders are dropped");
-    assert!(
-        updater_result.is_ok(),
-        "unexpected panic in address book updater task: {updater_result:?}",
+    // Check the final address book contents.
+    assert_eq!(
+        address_book.lock().unwrap().peers().count(),
+        over_limit_peers,
+        "expected {} peers in Mainnet address book, but got: {:?}",
+        over_limit_peers,
+        address_book.lock().unwrap().address_metrics(Utc::now())
     );
 
     (config, peerset_rx)

@@ -1,15 +1,9 @@
-use super::{config::*, events::*, pipe::*, wire::*, *};
+use super::{config::*, events::*, wire::*, *};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, Flow, FramedSend, OrderedSendError, Peer,
-    PeerStreamSession, Pipe, Service, SinkReject, Stream, StreamMode, ZakuraPeerId,
-    FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
+    PeerStreamSession, Service, SinkReject, Stream, StreamMode, ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
-// The per-peer block-sync `Source` frame-pump is test-only scaffolding (see
-// `BlockSyncPeerRecord` / `add_peer`); its trait and boxed-future alias are only
-// referenced by that `cfg(test)` task.
-#[cfg(test)]
-use crate::zakura::{BoxRunFuture, Source};
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
@@ -179,8 +173,11 @@ pub(crate) struct BlockSyncService {
 #[derive(Debug)]
 struct BlockSyncServiceInner {
     config: ZakuraBlockSyncConfig,
-    events: mpsc::Sender<BlockSyncEvent>,
     lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
+    /// Shared download primitives every per-peer pipe-routine is wired with at
+    /// `add_peer` (per-peer routines). `None` for the inert/handle-less constructors that never
+    /// spawn routines (they only observe `events`/`lifecycle`).
+    routine_wiring: Option<super::state::RoutineWiring>,
     peers: StdMutex<HashMap<ZakuraPeerId, BlockSyncPeerRecord>>,
     next_session_id: AtomicU64,
 }
@@ -190,19 +187,6 @@ struct BlockSyncPeerRecord {
     session_id: u64,
     direction: ServicePeerDirection,
     cancel_token: CancellationToken,
-    // Production outbound block-sync sends are authoritative through
-    // `BlockSyncPeerSession`: the reactor calls `try_send_get_blocks`/etc.
-    // directly (see `reactor::schedule`). The per-peer `BlockSyncSource` action
-    // pump and its `actions` sender are test-only scaffolding — no non-test code
-    // produces into this channel, and `drive_block_sync_actions` deliberately
-    // ignores the reactor's duplicate `SendMessage` to avoid double-sending.
-    // Gating the sender and the task handle to `cfg(test)` keeps that contract
-    // compiler-enforced: production has no producer to wire and therefore cannot
-    // double-send, and it retains no idle frame-pump task/channel per peer.
-    #[cfg(test)]
-    actions: mpsc::Sender<BlockSyncAction>,
-    #[cfg(test)]
-    _tasks: Vec<JoinHandle<()>>,
 }
 
 impl BlockSyncService {
@@ -214,8 +198,8 @@ impl BlockSyncService {
         Self {
             inner: Arc::new(BlockSyncServiceInner {
                 config,
-                events: handle.events.clone(),
                 lifecycle: handle.lifecycle.clone(),
+                routine_wiring: handle.routine_wiring.clone(),
                 peers: StdMutex::new(HashMap::new()),
                 next_session_id: AtomicU64::new(1),
             }),
@@ -248,8 +232,8 @@ impl BlockSyncService {
         Self {
             inner: Arc::new(BlockSyncServiceInner {
                 config,
-                events: handle.events.clone(),
                 lifecycle: handle.lifecycle.clone(),
+                routine_wiring: handle.routine_wiring.clone(),
                 peers: StdMutex::new(HashMap::new()),
                 next_session_id: AtomicU64::new(1),
             }),
@@ -274,8 +258,8 @@ impl BlockSyncService {
             Self {
                 inner: Arc::new(BlockSyncServiceInner {
                     config,
-                    events,
                     lifecycle,
+                    routine_wiring: None,
                     peers: StdMutex::new(HashMap::new()),
                     next_session_id: AtomicU64::new(1),
                 }),
@@ -303,31 +287,37 @@ impl BlockSyncService {
             .len()
     }
 
-    #[cfg(test)]
-    pub(crate) async fn send_action(
-        &self,
-        action: BlockSyncAction,
-    ) -> Result<(), mpsc::error::SendError<BlockSyncAction>> {
-        let BlockSyncAction::SendMessage { peer, .. } = &action else {
-            return Err(mpsc::error::SendError(action));
-        };
-        let peer = peer.clone();
-        let sender = match self.inner.peers.lock() {
-            Ok(peers) => peers.get(&peer).map(|record| record.actions.clone()),
-            Err(_) => return Err(mpsc::error::SendError(action)),
-        };
-        let Some(sender) = sender else {
-            return Err(mpsc::error::SendError(action));
-        };
-        sender.send(action).await
-    }
-
     fn peer_slots_free(&self, direction: ServicePeerDirection) -> bool {
         let peers = self
             .inner
             .peers
             .lock()
             .expect("block-sync peer map mutex is never poisoned");
+        let count = peers
+            .values()
+            .filter(|record| record.direction == direction)
+            .count();
+        let cap = match direction {
+            ServicePeerDirection::Inbound => self.inner.config.peer_limits.max_inbound_peers,
+            ServicePeerDirection::Outbound => self.inner.config.peer_limits.max_outbound_peers,
+        };
+        count < cap
+    }
+
+    /// Whether `add_peer` may install a session for this peer. A peer that is
+    /// already registered may always *replace* its session (the
+    /// connection-symmetry collision where both sides opened a block-sync stream
+    /// resolves to the winner's stream by replacing the loser's already-counted
+    /// session); only genuinely new peers are held to the per-direction cap.
+    fn can_admit_peer(&self, peer_id: &ZakuraPeerId, direction: ServicePeerDirection) -> bool {
+        let peers = self
+            .inner
+            .peers
+            .lock()
+            .expect("block-sync peer map mutex is never poisoned");
+        if peers.contains_key(peer_id) {
+            return true;
+        }
         let count = peers
             .values()
             .filter(|record| record.direction == direction)
@@ -359,7 +349,7 @@ impl Service for BlockSyncService {
     }
 
     fn add_peer(&self, mut peer: Peer) {
-        if !self.peer_slots_free(peer.direction) {
+        if !self.can_admit_peer(&peer.id, peer.direction) {
             return;
         }
 
@@ -381,29 +371,14 @@ impl Service for BlockSyncService {
         let session_id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
         let (_session_peer, _stream_kind, recv, send, _session_cancel) = session.into_parts();
 
-        // The per-peer block-sync source frame-pump is test-only scaffolding (see
-        // `BlockSyncPeerRecord`). Production outbound frames go directly through
-        // `BlockSyncPeerSession`, so only the test build spawns the source to
-        // exercise `send_action`; production drops the redundant transport sender.
-        // The outbound stream stays alive through the `BlockSyncPeerSession` clone
-        // the reactor holds, so nothing is lost by not retaining it here.
-        #[cfg(test)]
-        let (actions_tx, source_task) = {
-            let (actions_tx, actions_rx) =
-                mpsc::channel(self.inner.config.peer_limits.outbound_queue_depth.max(1));
-            let source_task = spawn_block_sync_source(
-                peer_id.clone(),
-                actions_rx,
-                service_cancel_token.clone(),
-                send,
-            );
-            (actions_tx, source_task)
-        };
-        #[cfg(not(test))]
+        // Production outbound block-sync frames go directly through
+        // `BlockSyncPeerSession` (the per-peer routine's `try_send_get_blocks` /
+        // the reactor's `try_send_status`/serving sends), so the raw transport
+        // sender taken from the stream here is redundant. The outbound stream stays
+        // alive through the `BlockSyncPeerSession` clone the reactor holds, so
+        // nothing is lost by dropping it.
         drop(send);
 
-        let events = self.inner.events.clone();
-        let run_peer_id = peer_id.clone();
         let run_cancel = service_cancel_token.clone();
         let on_teardown = {
             let lifecycle = self.inner.lifecycle.clone();
@@ -433,15 +408,47 @@ impl Service for BlockSyncService {
             let connection_cancel_token = connection_cancel_token.clone();
             move || connection_cancel_token.cancel()
         };
-        // A protocol reject is fatal to the whole connection; a normal/parked exit
-        // leaves it for the other services riding on it. Panic teardown is in
-        // `on_panic`.
-        let pipe = async move {
-            handle_pipe_exit(
-                "block-sync",
-                &connection_cancel_token,
-                run_peer(run_peer_id, recv, events, run_cancel).await,
-            );
+        // the per-peer pipe-routine is spawned HERE (the pipe spawn point), so
+        // a protocol reject still cancels the whole connection via
+        // `handle_pipe_exit`. The routine owns `recv` (the transport read), decodes
+        // each frame, and runs the download/serving dispatch in its own task —
+        // there is no reactor inbound demux. When the service has no reactor wiring
+        // (inert/handle-less test constructors) there is no routine to run; drain
+        // the stream so frames are not silently mishandled and the lifecycle still
+        // flows.
+        let pipe = {
+            let connection_cancel_token = connection_cancel_token.clone();
+            let routine_wiring = self.inner.routine_wiring.clone();
+            let block_sync_session = block_sync_session.clone();
+            let peer_id = peer_id.clone();
+            let direction = peer.direction;
+            async move {
+                let result = match routine_wiring {
+                    Some(wiring) => {
+                        let generation = wiring.registry.admit(&peer_id, direction, &wiring.config);
+                        let routine = super::peer_routine::PeerRoutine::new(
+                            peer_id,
+                            block_sync_session,
+                            recv,
+                            wiring.config,
+                            generation,
+                            wiring.budget,
+                            wiring.work,
+                            wiring.registry,
+                            wiring.received_throughput,
+                            wiring.sequencer_input,
+                            wiring.actions,
+                            wiring.routine_to_reactor,
+                            wiring.view,
+                            run_cancel,
+                            wiring.trace,
+                        );
+                        routine.run().await
+                    }
+                    None => drain_inbound(recv, run_cancel).await,
+                };
+                handle_pipe_exit("block-sync", &connection_cancel_token, result);
+            }
         };
         // Let the returned handle drop to detach the supervised task (like
         // `tokio::spawn`); the `PipeTeardown` still runs on every exit path.
@@ -465,10 +472,6 @@ impl Service for BlockSyncService {
                     session_id,
                     direction: peer.direction,
                     cancel_token: service_cancel_token,
-                    #[cfg(test)]
-                    actions: actions_tx,
-                    #[cfg(test)]
-                    _tasks: vec![source_task],
                 },
             ) {
                 old_record.cancel_token.cancel();
@@ -499,102 +502,39 @@ impl Service for BlockSyncService {
 
     fn deliver_frame(
         &self,
-        peer_id: ZakuraPeerId,
-        stream_kind: u16,
-        frame: Frame,
+        _peer_id: ZakuraPeerId,
+        _stream_kind: u16,
+        _frame: Frame,
     ) -> Result<(), SinkReject> {
-        if stream_kind != ZAKURA_STREAM_BLOCK_SYNC {
-            return Ok(());
-        }
-
-        let mut pipe = block_sync_pipe(peer_id, self.inner.events.clone());
-        match pipe.run_one(frame) {
-            Flow::Continue(()) | Flow::Done => Ok(()),
-            Flow::Reject(reject) => Err(reject),
-        }
+        // The inbound data flow is inverted: block sync is an `Ordered` stream
+        // whose `FramedRecv` is taken by `add_peer` and owned by the per-peer
+        // pipe-routine ([`PeerRoutine`](super::peer_routine)), which decodes and
+        // dispatches every frame in its own task. The `Service::deliver_frame`
+        // entry point (driven only by the testkit recorder / `registry.deliver`,
+        // never the production ordered-stream reader) therefore has no routine to
+        // route into and no reactor inbound path to emit to. It is not the
+        // block-sync inbound path; accept-and-ignore rather than constructing a
+        // detached one-shot decode that could never reach the owning routine. No
+        // production frame reaches here (the routine consumes the stream), so this
+        // drops nothing that the routine would otherwise handle.
+        Ok(())
     }
 }
 
-// Test-only per-peer outbound frame-pump. Production block-sync sends go through
-// `BlockSyncPeerSession` directly (see `add_peer` / `BlockSyncPeerRecord`); this
-// source exists solely so tests can drive outbound frames via `send_action`.
-#[cfg(test)]
-fn spawn_block_sync_source(
-    peer_id: ZakuraPeerId,
-    actions: mpsc::Receiver<BlockSyncAction>,
-    cancel_token: CancellationToken,
-    send: FramedSend,
-) -> JoinHandle<()> {
-    tokio::task::spawn(async move {
-        let source = Box::new(BlockSyncSource {
-            peer_id,
-            actions,
-            cancel_token,
-        });
-        source.run(send).await;
-    })
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct BlockSyncSource {
-    peer_id: ZakuraPeerId,
-    actions: mpsc::Receiver<BlockSyncAction>,
-    cancel_token: CancellationToken,
-}
-
-#[cfg(test)]
-impl Source for BlockSyncSource {
-    fn run(mut self: Box<Self>, send: FramedSend) -> BoxRunFuture<'static, ()> {
-        Box::pin(async move {
-            loop {
-                let action = tokio::select! {
-                    _ = self.cancel_token.cancelled() => return,
-                    action = self.actions.recv() => {
-                        let Some(action) = action else {
-                            return;
-                        };
-                        action
-                    }
-                };
-
-                let BlockSyncAction::SendMessage { peer, msg } = action else {
-                    continue;
-                };
-                if peer != self.peer_id {
-                    continue;
-                }
-
-                let frame = match msg.encode_frame() {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        tracing::debug!(
-                            ?error,
-                            peer = ?self.peer_id,
-                            "block-sync source refused to encode outbound message"
-                        );
-                        continue;
-                    }
-                };
-
-                if send.send(frame).await.is_err() {
-                    return;
+/// Drain a peer's inbound block-sync stream when the service has no reactor
+/// wiring to spawn a pipe-routine (the inert / handle-less test constructors).
+/// Frames are read and discarded until cancellation or stream close, so the
+/// transport reader makes progress and the lifecycle still fires; no routine
+/// exists to act on them.
+async fn drain_inbound(mut recv: FramedRecv, cancel: CancellationToken) -> Result<(), SinkReject> {
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return Ok(()),
+            frame = recv.recv() => {
+                if frame.is_none() {
+                    return Ok(());
                 }
             }
-        })
+        }
     }
-}
-
-pub(super) fn block_sync_pipe(
-    peer_id: ZakuraPeerId,
-    events: mpsc::Sender<BlockSyncEvent>,
-) -> Pipe<BsLocal, BsEnv> {
-    Pipe::new(
-        peer_id,
-        BsLocal,
-        BsEnv::new(events),
-        block_sync_guard(),
-        run_inbound,
-        &PIPE_SHAPE,
-    )
 }

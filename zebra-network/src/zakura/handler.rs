@@ -77,11 +77,11 @@ pub const DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND: u32 = 16;
 ///
 /// This is a generous universal cap: block-sync legitimately delivers
 /// hundreds of solicited bodies per second in bursts, so a low limit
-/// starves sync. Exceeding it is treated as misbehavior and disconnects the
-/// peer (we never silently drop a solicited frame -- a dropped block body is
-/// a permanent gap on a reliable stream). Longer term this should be split
-/// per message type (some unbounded, some near-one-shot) rather than a single
-/// universal value.
+/// starves sync. Exceeding it is a transport-level hard failure rather than a
+/// peer-scoring decision: we never silently drop a solicited frame because a
+/// dropped block body is a permanent gap on a reliable stream. Longer term
+/// this should be split per message type (some unbounded, some near-one-shot)
+/// rather than a single universal value.
 pub const DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND: u32 = 2048;
 /// Default native Zakura QUIC listen address.
 pub const DEFAULT_ZAKURA_LISTEN_ADDR: SocketAddr =
@@ -111,11 +111,11 @@ pub const DEFAULT_ZAKURA_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10)
 /// reclaim the slot without disturbing active transfers.
 pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(300);
 /// QUIC stream receive window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 512 * 1024;
+pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
 /// QUIC connection receive window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 2 * 1024 * 1024;
+pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 256 * 1024 * 1024;
 /// QUIC send window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 2 * 1024 * 1024;
+pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 256 * 1024 * 1024;
 /// Initial backoff before re-dialing a configured Zakura bootstrap peer.
 pub const DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Maximum backoff between re-dials of a configured Zakura bootstrap peer.
@@ -368,7 +368,7 @@ impl ZakuraLocalLimits {
     pub fn transport_config(&self) -> TransportConfig {
         let mut transport = TransportConfig::default();
         transport
-            .max_concurrent_bidi_streams(VarInt::from_u32(u32::from(self.max_open_streams.min(64))))
+            .max_concurrent_bidi_streams(VarInt::from_u32(u32::from(self.max_open_streams)))
             .max_concurrent_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW))
             .receive_window(VarInt::from_u32(DEFAULT_ZAKURA_RECEIVE_WINDOW))
@@ -1148,6 +1148,12 @@ struct ConnectionServeContext {
     role: &'static str,
     direction: ServicePeerDirection,
     transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
+    /// Whether this node wins same-kind ordered-stream collisions on this
+    /// connection. Both sides open their demanded ordered streams (connection
+    /// symmetry), so a kind both sides open arrives twice; the winner keeps its
+    /// own stream and the loser adopts the peer's. Computed from the node ids so
+    /// the two ends always agree: `local_node_id < remote_node_id`.
+    i_open_collision_winner: bool,
     conn: ZakuraConnTrace,
 }
 
@@ -1156,7 +1162,13 @@ struct RegisteredConnectionServeContext {
     conn: ZakuraConnTrace,
     connection_token: CancellationToken,
     accepted_capabilities: u64,
-    opens_ordered_streams: bool,
+    /// Whether this side dialed the connection. The dialer (initiator) opens all
+    /// of its demanded ordered streams as before; the responder additionally
+    /// opens only block-sync (the sole symmetric service), keeping the legacy
+    /// initiator-opens behaviour for gossip/header-sync/discovery.
+    is_initiator: bool,
+    /// See [`ConnectionServeContext::i_open_collision_winner`].
+    i_open_collision_winner: bool,
     direction: ServicePeerDirection,
 }
 
@@ -1341,6 +1353,16 @@ fn native_connection_transcript_hash(
     *initiator.as_bytes()
 }
 
+/// Whether the local node wins same-kind ordered-stream collisions against
+/// `remote_node_id`. Both sides open their demanded ordered streams, so a kind
+/// both sides open arrives twice; the lexicographically smaller node id wins and
+/// keeps its own stream while the other adopts the peer's. The two ends always
+/// compute complementary answers from the same (distinct) node ids, so they
+/// converge on a single surviving stream without any extra round trip.
+fn i_open_collision_winner(local_node_id: &NodeId, remote_node_id: &NodeId) -> bool {
+    local_node_id.as_bytes() < remote_node_id.as_bytes()
+}
+
 impl ZakuraProtocolHandler {
     /// Create a handler sharing the given supervisor.
     pub fn new(
@@ -1475,6 +1497,7 @@ impl ZakuraProtocolHandler {
                     &local_node_id,
                     &remote_node_id,
                 ),
+                i_open_collision_winner: i_open_collision_winner(&local_node_id, &remote_node_id),
                 conn,
             },
         )
@@ -1620,15 +1643,24 @@ impl ZakuraProtocolHandler {
         let negotiated_ordered_streams = self
             .registry
             .ordered_streams_for_negotiated(accepted_capabilities);
-        let ordered_streams = if context.opens_ordered_streams {
-            self.registry.ordered_streams_for_escalation(
-                accepted_capabilities,
-                &peer_id,
-                context.direction,
-            )
-        } else {
-            Vec::new()
-        };
+        // Block-sync connection symmetry: the dialer (initiator) proactively
+        // opens all of its demanded ordered streams as before; the responder
+        // additionally opens block-sync so a two-way block-sync channel exists
+        // regardless of who dialed (the reactor treats every peer the same). The
+        // other ordered services (gossip/header-sync/discovery) keep the legacy
+        // initiator-opens/responder-accepts behaviour. A block-sync stream both
+        // sides open arrives twice and is resolved by the node-id collision
+        // tiebreak in the accept loop below.
+        let ordered_streams: Vec<Stream> = self
+            .registry
+            .ordered_streams_for_escalation(accepted_capabilities, &peer_id, context.direction)
+            .into_iter()
+            .filter(|stream| {
+                // In-process tests use one stream-6 session per connection so
+                // local harnesses avoid exercising the symmetric collision path.
+                context.is_initiator || (!cfg!(test) && stream.kind == ZAKURA_STREAM_BLOCK_SYNC)
+            })
+            .collect();
         let request_response_stream_count = self
             .registry
             .request_response_streams_for_negotiated(accepted_capabilities)
@@ -1664,6 +1696,9 @@ impl ZakuraProtocolHandler {
             queue_split_stream_count,
         );
         let mut service_streams = HashMap::new();
+        // Ordered-stream kinds this side proactively opened, used by the accept
+        // loop to detect same-kind collisions (both sides opened the kind).
+        let mut opened_kinds: HashSet<u16> = HashSet::new();
         let mut accepted_ordered_kinds = HashSet::new();
         let mut admitted_capabilities = 0;
         let run_freshness_reaper =
@@ -1679,7 +1714,7 @@ impl ZakuraProtocolHandler {
                 connection_token.clone(),
             ));
             admitted_capabilities = accepted_capabilities;
-        } else if context.opens_ordered_streams && !connection_token.is_cancelled() {
+        } else if !connection_token.is_cancelled() {
             let mut opened_capabilities = 0;
             for stream in ordered_streams {
                 opened_capabilities |= stream.capability;
@@ -1715,15 +1750,16 @@ impl ZakuraProtocolHandler {
                         break;
                     }
                 };
+                opened_kinds.insert(admitted.kind);
                 service_streams.insert(
                     admitted.kind,
                     ServiceStream::new(admitted.recv, admitted.send, admitted.cancel_token),
                 );
             }
             if !connection_token.is_cancelled() {
-                // The initiator has already narrowed escalation to opened
-                // ordered services. Disconnect fanout still uses the registry's
-                // returned admitted mask, not this peer context.
+                // Escalation is already narrowed to opened ordered services.
+                // Disconnect fanout still uses the registry's returned admitted
+                // mask, not this peer context.
                 admitted_capabilities |=
                     self.registry
                         .add_escalated_peer(Peer::new_with_service_streams(
@@ -1771,27 +1807,85 @@ impl ZakuraProtocolHandler {
                                 .admit_bi_stream(send, recv, &mut admission, per_stream_queue_depth)
                                 .await
                             {
-                                if context.opens_ordered_streams
-                                    || !ordered_kinds.contains(&admitted.kind)
-                                    || !accepted_ordered_kinds.insert(admitted.kind)
-                                {
+                                let kind = admitted.kind;
+
+                                // A stream kind we never negotiated is a protocol
+                                // fault: tear the connection down (unchanged
+                                // strictness).
+                                if !ordered_kinds.contains(&kind) {
                                     debug!(
-                                        stream_kind = admitted.kind,
-                                        "closing peer after duplicate or unexpected ordered stream"
+                                        stream_kind = kind,
+                                        "closing peer after unexpected ordered stream"
+                                    );
+                                    close_reason = "unexpected_stream";
+                                    connection_token.cancel();
+                                    continue;
+                                }
+
+                                let is_block_sync = kind == ZAKURA_STREAM_BLOCK_SYNC;
+                                // A block-sync collision means both sides opened
+                                // block-sync (the only symmetric service).
+                                let is_block_sync_collision =
+                                    is_block_sync && opened_kinds.contains(&kind);
+
+                                // Winner of a block-sync collision keeps its own
+                                // stream and parks the peer's. The connection is
+                                // never torn down for this benign double-open; the
+                                // loser falls through and adopts the peer's stream.
+                                if is_block_sync_collision && context.i_open_collision_winner {
+                                    debug!(
+                                        stream_kind = kind,
+                                        "winning block-sync collision; parking peer's duplicate"
+                                    );
+                                    admitted.cancel_token.cancel();
+                                    continue;
+                                }
+
+                                // Block-sync is symmetric: both sides accept it so
+                                // a two-way channel exists regardless of who
+                                // dialed. Every other ordered service keeps the
+                                // legacy rule that only the responder accepts —
+                                // the initiator already opened all it wanted, so a
+                                // peer-opened non-block-sync stream toward the
+                                // initiator is unexpected.
+                                if !is_block_sync && context.is_initiator {
+                                    debug!(
+                                        stream_kind = kind,
+                                        "closing peer after unexpected ordered stream"
+                                    );
+                                    close_reason = "unexpected_stream";
+                                    connection_token.cancel();
+                                    continue;
+                                }
+
+                                // We intend to adopt the peer's stream. A second
+                                // accepted stream of the same kind is a real
+                                // duplicate and a fault.
+                                if !accepted_ordered_kinds.insert(kind) {
+                                    debug!(
+                                        stream_kind = kind,
+                                        "closing peer after duplicate ordered stream"
                                     );
                                     close_reason = "duplicate_stream";
                                     connection_token.cancel();
                                     continue;
                                 }
 
-                                if !self.registry.wants_ordered_stream(
-                                    admitted.kind,
-                                    accepted_capabilities,
-                                    &peer_id,
-                                    context.direction,
-                                ) {
+                                // Honour the owning service's per-peer demand (so
+                                // per-service caps such as discovery stay
+                                // enforced). For a block-sync collision we lost we
+                                // already opened block-sync ourselves, so demand is
+                                // implied — adopt the peer's stream directly.
+                                if !is_block_sync_collision
+                                    && !self.registry.wants_ordered_stream(
+                                        kind,
+                                        accepted_capabilities,
+                                        &peer_id,
+                                        context.direction,
+                                    )
+                                {
                                     debug!(
-                                        stream_kind = admitted.kind,
+                                        stream_kind = kind,
                                         "locally parking ordered service stream because the service has no demand"
                                     );
                                     admitted.cancel_token.cancel();
@@ -1799,7 +1893,7 @@ impl ZakuraProtocolHandler {
                                 }
 
                                 let service_streams = HashMap::from([(
-                                    admitted.kind,
+                                    kind,
                                     ServiceStream::new(
                                         admitted.recv,
                                         admitted.send,
@@ -1807,14 +1901,17 @@ impl ZakuraProtocolHandler {
                                     ),
                                 )]);
                                 // Current ordered services own one ordered stream
-                                // each, so the responder can fan out accepted
-                                // streams one at a time. Batch here if a service
-                                // gains multiple ordered streams.
+                                // each, so we fan out accepted streams one at a
+                                // time. Batch here if a service gains multiple
+                                // ordered streams.
                                 //
-                                // The responder keeps the full accepted capability
-                                // context so discovery can make cross-service
-                                // ownership decisions; disconnect fanout still
-                                // uses the registry's returned admitted mask.
+                                // We keep the full accepted capability context so
+                                // discovery can make cross-service ownership
+                                // decisions; disconnect fanout still uses the
+                                // registry's returned admitted mask. When this is
+                                // a lost collision, `add_escalated_peer` →
+                                // `add_peer` replaces our own opened session for
+                                // this peer (see `can_admit_peer`).
                                 admitted_capabilities |= self.registry.add_escalated_peer(
                                     Peer::new_with_service_streams(
                                         peer_id.clone(),
@@ -2175,19 +2272,17 @@ impl ZakuraProtocolHandler {
         remote_ip: Option<IpAddr>,
         context: ConnectionServeContext,
     ) -> Result<(), ZakuraHandlerError> {
-        let ordered_stream_count = if context.role == "initiator" {
-            self.registry
-                .ordered_streams_for_escalation(
-                    context.accepted_capabilities,
-                    &peer_id,
-                    context.direction,
-                )
-                .len()
-        } else {
-            self.registry
-                .ordered_streams_for_negotiated(context.accepted_capabilities)
-                .len()
-        };
+        // Both sides now proactively open their demanded ordered streams
+        // (connection symmetry), so bound the precheck by what this side will
+        // actually open: the demand-narrowed escalation set.
+        let ordered_stream_count = self
+            .registry
+            .ordered_streams_for_escalation(
+                context.accepted_capabilities,
+                &peer_id,
+                context.direction,
+            )
+            .len();
         if ordered_stream_count > usize::from(context.limits.max_open_streams) {
             debug!(
                 max_open_streams = context.limits.max_open_streams,
@@ -2253,7 +2348,8 @@ impl ZakuraProtocolHandler {
                         conn: context.conn,
                         connection_token: disconnect_token,
                         accepted_capabilities: context.accepted_capabilities,
-                        opens_ordered_streams: context.role == "initiator",
+                        is_initiator: context.role == "initiator",
+                        i_open_collision_winner: context.i_open_collision_winner,
                         direction: context.direction,
                     },
                 )
@@ -2627,6 +2723,7 @@ pub(crate) async fn serve_native_dial_connection(
                     &local_node_id,
                     &remote_node_id,
                 ),
+                i_open_collision_winner: i_open_collision_winner(&local_node_id, &remote_node_id),
                 conn,
             },
         )
@@ -2785,6 +2882,12 @@ async fn persistent_stream_worker(
                     &mut recv,
                     inbound_frame_cap_for_stream_kind(&reader_context.limits, stream_kind),
                     reader_context.limits.idle_timeout,
+                    // A persistent ordered stream is legitimately quiet between
+                    // frames; do not let an inter-frame gap time out and cancel
+                    // the whole connection. Connection-level idleness is owned by
+                    // the freshness reaper and the QUIC idle timeout, and the
+                    // cancellation tokens above end this read on teardown.
+                    None,
                 ) => frame,
             };
             // Admit (rate/oversize) at ingress, the instant a frame is read, so
@@ -2948,6 +3051,10 @@ async fn request_stream_worker(
             &mut recv,
             inbound_frame_cap_for_stream_kind(&context.limits, prelude.stream_kind),
             context.limits.idle_timeout,
+            // A request stream carries its request frame immediately after the
+            // prelude, so a peer that opens one and then goes silent is treated
+            // as a stalled one-shot stream and bounded by the idle timeout.
+            Some(context.limits.idle_timeout),
         ) => frame,
     };
 
@@ -3086,13 +3193,51 @@ async fn read_stream_prelude(
     })
 }
 
+/// Read one length-prefixed frame from an ordered/request stream.
+///
+/// `read_timeout` always bounds a frame that is *in progress*: once its first
+/// byte has arrived, a peer cannot stall the rest of the header or the payload
+/// past this deadline.
+///
+/// `first_byte_timeout` bounds only the wait for the *next* frame to begin.
+/// Passing `None` waits indefinitely for that first byte -- correct for a
+/// long-lived ordered stream that is legitimately quiet between frames (e.g. the
+/// gossip stream while syncing far below the tip, or header sync after the
+/// header frontier has caught up while bodies download). Treating that
+/// inter-frame quiet as a fatal read timeout would `connection_token.cancel()`
+/// the whole connection -- dropping every active sibling stream on it -- even
+/// though the connection-level [`freshness_reaper`] (which resets on ANY
+/// stream's activity) and the QUIC idle timeout already own connection-level
+/// idleness. Callers race this future against their cancellation tokens, so a
+/// genuinely dead connection is still torn down promptly. Passing `Some(_)` is
+/// for one-shot streams (a request/response stream where the request, or a
+/// response frame, is expected promptly).
 async fn read_frame(
     recv: &mut RecvStream,
     max_frame_bytes: u32,
     read_timeout: Duration,
+    first_byte_timeout: Option<Duration>,
 ) -> Result<Frame, ZakuraHandlerError> {
     let mut header = [0; FRAME_HEADER_BYTES];
-    match timeout(read_timeout, recv.read_exact(&mut header)).await {
+    // The first header byte is the boundary between "waiting for the next frame"
+    // and "reading a frame in progress". Wait for it under `first_byte_timeout`
+    // (or indefinitely when `None`); nothing is consumed until it arrives, so a
+    // caller that drops this future on cancellation cannot desync the stream.
+    let first_byte = recv.read_exact(&mut header[..1]);
+    match first_byte_timeout {
+        Some(first_byte_timeout) => match timeout(first_byte_timeout, first_byte).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(ZakuraHandlerError::Closed),
+            Err(_) => return Err(ZakuraHandlerError::Timeout("frame header")),
+        },
+        None => match first_byte.await {
+            Ok(()) => {}
+            Err(_) => return Err(ZakuraHandlerError::Closed),
+        },
+    }
+    // The frame has started: the remaining header bytes are bounded so a peer
+    // cannot stall mid-frame.
+    match timeout(read_timeout, recv.read_exact(&mut header[1..])).await {
         Ok(Ok(())) => {}
         Ok(Err(_)) => return Err(ZakuraHandlerError::Closed),
         Err(_) => return Err(ZakuraHandlerError::Timeout("frame header")),
@@ -3274,6 +3419,10 @@ async fn write_outbound_request_frame_inner(
             &mut recv,
             app_frame_cap_for_stream_kind(&limits, stream_kind),
             limits.idle_timeout,
+            // This is the requester side of a one-shot legacy request/response:
+            // the responder streams its frames promptly, so a silent gap before
+            // the next response frame is bounded by the idle timeout.
+            Some(limits.idle_timeout),
         )
         .await
         {
@@ -4318,6 +4467,24 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn ordered_stream_collision_winner_is_mirror_stable() {
+        // Both ends compute the collision winner from the same pair of node ids
+        // and must reach complementary answers, so exactly one side keeps its
+        // own opened stream while the other adopts the peer's.
+        let node_a = LocalEndpointFactory::secret_key(1).public();
+        let node_b = LocalEndpointFactory::secret_key(2).public();
+        assert_ne!(node_a, node_b);
+        assert_ne!(
+            i_open_collision_winner(&node_a, &node_b),
+            i_open_collision_winner(&node_b, &node_a),
+            "exactly one side must win a same-kind ordered-stream collision",
+        );
+        // The winner is deterministic: the lexicographically smaller node id.
+        let a_wins = node_a.as_bytes() < node_b.as_bytes();
+        assert_eq!(i_open_collision_winner(&node_a, &node_b), a_wins);
+    }
+
     fn header_sync_test_session(
         peer: ZakuraPeerId,
     ) -> (HeaderSyncPeerSession, crate::zakura::FramedRecv) {
@@ -5291,7 +5458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn header_sync_misbehavior_action_disconnects_peer() -> Result<(), BoxError> {
+    async fn header_sync_misbehavior_action_does_not_disconnect_peer() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
         let reactor_shutdown = CancellationToken::new();
         let startup = header_sync_startup(reactor_shutdown.clone());
@@ -5316,9 +5483,12 @@ mod tests {
             })
             .await?;
 
-        tokio::time::timeout(Duration::from_secs(1), disconnect_token.cancelled())
-            .await
-            .expect("misbehavior action cancels the registered connection");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), disconnect_token.cancelled())
+                .await
+                .is_err(),
+            "misbehavior is record-only and must not cancel the registered connection",
+        );
 
         driver_shutdown.cancel();
         driver_task.await?;
@@ -5439,6 +5609,194 @@ mod tests {
             .expect("server accepts the sibling stream")
             .expect("capture handler sends the sibling stream");
 
+        client_conn.close(0u32.into(), b"done");
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    /// Regression for the ~150s mainnet Zakura peer churn
+    /// (`run-f406a987-churn-20260619T032010Z`): a long-lived ordered stream that
+    /// is legitimately quiet between frames -- e.g. the gossip stream while
+    /// syncing far below the tip -- must not tear down the whole connection it
+    /// shares with an actively-transferring stream.
+    ///
+    /// Trace forensics showed every serving peer's connection `closed.neutral`
+    /// with reason `cancelled` at a lifetime of exactly 150.1-150.3s (the QUIC /
+    /// app idle timeout), then a reconnect + duplicate-arbitration storm, even
+    /// though block sync was downloading at ~99 blk/s the whole time. The cause:
+    /// the ordered-stream reader used `idle_timeout` as its per-frame read
+    /// deadline AND treated that deadline as a fatal error, so the first quiet
+    /// ordered stream `connection_token.cancel()`ed the entire connection at
+    /// `idle_timeout` -- dropping the active sibling transfer -- even though the
+    /// connection-level freshness reaper (which resets on ANY stream's activity)
+    /// would never have reaped it. That is why the close reason is `cancelled`
+    /// (worker-initiated) and not `idle_timeout` (reaper).
+    ///
+    /// This drives the production `persistent_stream_worker` over a real local
+    /// QUIC connection with two ordered streams that share one
+    /// `connection_token` and one freshness watch channel, exactly as
+    /// `serve_connection` wires them, plus the real `freshness_reaper`. One
+    /// stream is kept busy (mirrors block sync); the other stays quiet (mirrors
+    /// gossip). The connection must survive well past `idle_timeout`.
+    #[tokio::test]
+    async fn quiet_ordered_stream_does_not_cancel_connection_with_active_sibling(
+    ) -> Result<(), BoxError> {
+        const ALPN: &[u8] = b"/zakura/testkit/quiet-ordered-stream/0";
+
+        let _guard = zebra_test::init();
+        let server = LocalEndpointFactory::new().endpoint(80).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(2);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx: conn_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(81).await?;
+        let server_addr = router.endpoint().node_addr().initialized().await;
+        client.add_node_addr(server_addr.clone())?;
+
+        let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
+            .await
+            .expect("client connects to loopback capture endpoint")?;
+
+        let frame = Frame {
+            message_type: 1,
+            flags: 0,
+            payload: Vec::new(),
+        }
+        .encode(LOCAL_MAX_CONTROL_FRAME_BYTES)?;
+
+        // Both streams need one initial frame so the server's `accept_bi`
+        // observes the stream and we can spawn its worker; after that only the
+        // active stream keeps sending. The client send halves are retained for
+        // the whole test so neither stream is `Closed` -- the quiet stream must
+        // sit in an inter-frame read, not a peer-initiated close.
+        let (mut active_send, _active_recv) =
+            timeout(Duration::from_secs(1), client_conn.open_bi())
+                .await
+                .expect("client opens the active stream")?;
+        timeout(Duration::from_secs(1), active_send.write_all(&frame))
+            .await
+            .expect("client writes the active stream's first frame")?;
+        let (active_server_send, active_server_recv) =
+            timeout(Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("server accepts the active stream")
+                .expect("capture handler forwards the active stream");
+
+        let (mut quiet_send, _quiet_recv) = timeout(Duration::from_secs(1), client_conn.open_bi())
+            .await
+            .expect("client opens the quiet stream")?;
+        timeout(Duration::from_secs(1), quiet_send.write_all(&frame))
+            .await
+            .expect("client writes the quiet stream's only frame")?;
+        let (quiet_server_send, quiet_server_recv) =
+            timeout(Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("server accepts the quiet stream")
+                .expect("capture handler forwards the quiet stream");
+
+        // Shared per-connection state, exactly as `serve_connection` builds it:
+        // one cancellation token and one freshness watch channel feeding every
+        // worker and the reaper.
+        let idle_timeout = Duration::from_millis(250);
+        let mut limits = test_connection_limits();
+        limits.idle_timeout = idle_timeout;
+        let stream_kind = LEGACY_GOSSIP_STREAM_KIND;
+        let connection_token = CancellationToken::new();
+        let (freshness_tx, freshness_rx) = watch::channel(Instant::now());
+
+        let spawn_ordered_worker = |send: SendStream, recv: RecvStream, stream_id: u64| {
+            let permit = Arc::new(Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("test semaphore starts with one permit");
+            let context = StreamWorkerContext {
+                trace: ZakuraTrace::noop(),
+                conn: ZakuraConnTrace::without_peer(1),
+                peer_id: test_peer(80),
+                stream_id,
+                _permit: permit,
+                limits,
+                message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
+                    limits.message_rate_per_second,
+                ))),
+                connection_token: connection_token.clone(),
+                stream_token: connection_token.child_token(),
+                freshness_tx: freshness_tx.clone(),
+            };
+            let prelude = StreamPrelude {
+                magic: STREAM_PRELUDE_MAGIC,
+                stream_kind,
+                stream_version: ZAKURA_STREAM_VERSION_1,
+                request_id: None,
+                max_frame_bytes: app_frame_cap_for_stream_kind(&limits, stream_kind),
+            };
+            // Drain the inbound side so the worker never blocks forwarding a
+            // read frame to a full service channel (which would itself stop the
+            // reader and confound the test). The outbound side is unused here.
+            let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
+            let (_outbound_tx, outbound_rx) = mpsc::channel(1);
+            tokio::spawn(async move { while inbound_rx.recv().await.is_some() {} });
+            tokio::spawn(persistent_stream_worker(
+                send,
+                recv,
+                prelude,
+                context,
+                inbound_tx,
+                outbound_rx,
+                16,
+            ))
+        };
+
+        let _active_worker = spawn_ordered_worker(active_server_send, active_server_recv, 1);
+        let _quiet_worker = spawn_ordered_worker(quiet_server_send, quiet_server_recv, 2);
+
+        // Model `serve_connection`'s idle race: the connection ends either when a
+        // worker cancels the shared token or when the freshness reaper fires
+        // (which `serve_connection` follows with `connection_token.cancel()`).
+        // So `connection_token.is_cancelled()` captures BOTH teardown modes.
+        let serve = tokio::spawn({
+            let connection_token = connection_token.clone();
+            async move {
+                tokio::select! {
+                    biased;
+                    _ = connection_token.cancelled() => {}
+                    _ = freshness_reaper(freshness_rx, idle_timeout) => connection_token.cancel(),
+                }
+            }
+        });
+
+        // The active sibling transfers a frame well within `idle_timeout`, so the
+        // connection-level freshness stays fresh and the reaper must never fire.
+        let keepalive_frame = frame.clone();
+        let keepalive = tokio::spawn(async move {
+            for _ in 0..16 {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                if active_send.write_all(&keepalive_frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Wait well past `idle_timeout`; the buggy reader tears the connection
+        // down at ~`idle_timeout` (~250ms) despite the active sibling.
+        tokio::time::sleep(idle_timeout * 4).await;
+        assert!(
+            !connection_token.is_cancelled(),
+            "a quiet ordered stream must not cancel a connection whose sibling stream is \
+             actively transferring; the shared connection_token was cancelled within {:?}",
+            idle_timeout * 4,
+        );
+
+        connection_token.cancel();
+        keepalive.abort();
+        let _ = serve.await;
         client_conn.close(0u32.into(), b"done");
         client.close().await;
         router.shutdown().await?;
@@ -5725,7 +6083,13 @@ mod tests {
             .await
             .expect("server accepts the oversized inbound-cap stream")
             .expect("capture handler forwards the oversized inbound-cap stream");
-        let rejected = read_frame(&mut s1_recv, inbound_cap, Duration::from_secs(2)).await;
+        let rejected = read_frame(
+            &mut s1_recv,
+            inbound_cap,
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+        )
+        .await;
         assert!(
             matches!(rejected, Err(ZakuraHandlerError::OversizeFrame { .. })),
             "a frame whose payload exceeds max_message_bytes must be rejected as Oversize \
@@ -5752,7 +6116,13 @@ mod tests {
             .await
             .expect("server accepts the oversized raw-cap stream")
             .expect("capture handler forwards the oversized raw-cap stream");
-        let allocated = read_frame(&mut s2_recv, raw_cap, Duration::from_secs(2)).await;
+        let allocated = read_frame(
+            &mut s2_recv,
+            raw_cap,
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+        )
+        .await;
         assert!(
             allocated.is_err()
                 && !matches!(
@@ -5784,9 +6154,14 @@ mod tests {
             .await
             .expect("server accepts the in-cap stream")
             .expect("capture handler forwards the in-cap stream");
-        let frame = read_frame(&mut s3_recv, inbound_cap, Duration::from_secs(2))
-            .await
-            .expect("a frame within the message cap is read with the inbound cap");
+        let frame = read_frame(
+            &mut s3_recv,
+            inbound_cap,
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("a frame within the message cap is read with the inbound cap");
         assert_eq!(
             frame.payload, valid_payload,
             "an in-cap frame payload must round-trip unchanged"

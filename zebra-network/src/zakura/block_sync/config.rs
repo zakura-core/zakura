@@ -2,27 +2,30 @@ use super::{error::*, wire::*, *};
 
 /// Default number of blocks advertised per response.
 ///
-/// Set to the wire ceiling so block-body requests batch as many blocks as the
-/// per-response byte cap ([`MAX_BS_RESPONSE_BYTES`]) allows. Small early-chain
-/// blocks ride in large counts; large near-tip blocks are byte-capped to fewer.
-pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 128;
-/// Default number of in-flight block requests advertised per peer.
+/// Keep block-body ranges narrow so a missing response only holds one height at
+/// the body-download floor.
+pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 1;
+/// Initial number of in-flight block requests advertised per peer.
 ///
-/// Combined with the global byte budget ([`DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES`])
-/// this gives each peer enough work to keep its stream busy while avoiding a
-/// response-frame backlog that can outlive the connection.
-pub const DEFAULT_BS_MAX_INFLIGHT: u16 = 16;
-/// Default expected serving-peer fanout used to derive the per-peer in-flight
-/// byte cap (`max_inflight_block_bytes / expected_peers`).
-///
-/// Bounds how much of the global byte budget a single peer can reserve so one
-/// fast peer cannot starve the others once the slot cap stops binding. `0`
-/// disables per-peer byte fairness.
-pub const DEFAULT_BS_EXPECTED_PEERS: usize = 4;
+/// Outbound scheduling starts at this window and adjusts per peer based on
+/// request timeouts, while peer advertisements can still allow growth up to
+/// [`MAX_BS_INFLIGHT_REQUESTS`].
+pub const DEFAULT_BS_MAX_INFLIGHT: u16 = 2048;
+/// Maximum peer-advertised in-flight request count accepted by this node.
+pub const MAX_BS_INFLIGHT_REQUESTS: u16 = 10_000;
 /// Default total response byte target advertised per range response.
 pub const DEFAULT_BS_MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
 /// Default global byte budget reserved for later block-download scheduling.
-pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Worst-case serialized bytes reserved per requested block body.
+///
+/// Block-sync reserves this much per requested block at send time and only ever
+/// shrinks the reservation toward the actual serialized size on receipt, so a
+/// valid, already-downloaded body is never discarded for a full budget. Each
+/// body arrives in its own `Block` frame bounded by [`block::MAX_BLOCK_BYTES`]
+/// at decode (`MAX_BS_MESSAGE_BYTES > MAX_BLOCK_BYTES`), so the actual size can
+/// never exceed this worst case and the shrink is always non-negative.
+pub const BS_PER_BLOCK_WORST_CASE_BYTES: u64 = block::MAX_BLOCK_BYTES;
 /// Default maximum submitted block applies awaiting verifier completion.
 ///
 /// The checkpoint verifier resolves a checkpoint window only after the whole
@@ -36,9 +39,7 @@ pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30)
 /// Default tolerated size-hint deviation percentage reserved for later soft scoring.
 pub const DEFAULT_BS_SIZE_DEVIATION_TOLERANCE: u32 = 200;
 /// Default block-sync peer fanout for the same requested range.
-pub const DEFAULT_BS_FANOUT: usize = 2;
-/// Default body lag where block sync pauses new downloads and lets block propagation finish.
-pub const DEFAULT_BS_NEAR_TIP_BODY_DOWNLOAD_PAUSE_BLOCKS: u32 = 2;
+pub const DEFAULT_BS_FANOUT: usize = 1;
 /// Maximum peer-advertised aggregate byte target accepted per requested range.
 ///
 /// A range response is sent as one `Block` frame per body, and each body frame
@@ -125,12 +126,6 @@ pub struct ZakuraBlockSyncConfig {
     /// Maximum block bodies submitted to the verifier before completed applies
     /// release more submission slots.
     pub max_submitted_block_applies: usize,
-    /// Expected serving-peer fanout used to derive the per-peer in-flight byte cap
-    /// (`max_inflight_block_bytes / expected_peers`).
-    ///
-    /// Prevents one fast peer from reserving the whole byte budget once the
-    /// per-peer slot cap stops binding. `0` disables per-peer byte fairness.
-    pub expected_peers: usize,
     /// Timeout for an outstanding block-body range request.
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
@@ -141,8 +136,6 @@ pub struct ZakuraBlockSyncConfig {
     pub size_deviation_tolerance: u32,
     /// Number of peers later range scheduling may fan out to for the same body gap.
     pub fanout: usize,
-    /// Body lag at or below which block sync pauses new downloads near the header tip.
-    pub near_tip_body_download_pause_blocks: u32,
     /// Block-sync peer caps and queue limits owned by this service.
     pub peer_limits: ServicePeerLimits,
 }
@@ -164,12 +157,10 @@ impl Default for ZakuraBlockSyncConfig {
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
             max_inflight_block_bytes: DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
             max_submitted_block_applies: DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
-            expected_peers: DEFAULT_BS_EXPECTED_PEERS,
             request_timeout: DEFAULT_BS_REQUEST_TIMEOUT,
             status_refresh_interval: DEFAULT_BS_STATUS_REFRESH_INTERVAL,
             size_deviation_tolerance: DEFAULT_BS_SIZE_DEVIATION_TOLERANCE,
             fanout: DEFAULT_BS_FANOUT,
-            near_tip_body_download_pause_blocks: DEFAULT_BS_NEAR_TIP_BODY_DOWNLOAD_PAUSE_BLOCKS,
             peer_limits: ServicePeerLimits::default(),
         }
     }
@@ -196,20 +187,6 @@ impl ZakuraBlockSyncConfig {
         self.max_submitted_block_applies.max(1)
     }
 
-    /// Per-peer in-flight byte cap derived from the global budget and expected fanout.
-    ///
-    /// Floored at one advertised response so a peer can always reserve at least a
-    /// full response (otherwise a tiny budget divided by `expected_peers` would
-    /// starve every peer); the fair-share cap only binds above that. Returns
-    /// `u64::MAX` (no per-peer limit) when `expected_peers` is `0`.
-    pub fn per_peer_byte_cap(&self) -> u64 {
-        match self.expected_peers {
-            0 => u64::MAX,
-            peers => (self.max_inflight_block_bytes / peers as u64)
-                .max(u64::from(self.advertised_max_response_bytes())),
-        }
-    }
-
     /// Build the inert local status used before the block-sync reactor is wired.
     pub fn initial_status(&self) -> BlockSyncStatus {
         BlockSyncStatus {
@@ -228,7 +205,7 @@ pub fn clamp_advertised_blocks(count: u32) -> u32 {
 
 /// Clamp an advertised in-flight request count to the local status ceiling.
 pub fn clamp_advertised_inflight(count: u16) -> u16 {
-    count.clamp(1, DEFAULT_BS_MAX_INFLIGHT)
+    count.clamp(1, MAX_BS_INFLIGHT_REQUESTS)
 }
 
 /// Clamp an advertised response byte target to the largest stream-6 message.

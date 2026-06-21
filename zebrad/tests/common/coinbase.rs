@@ -7,7 +7,16 @@ use futures::future::try_join_all;
 use strum::IntoEnumIterator;
 
 use zebra_chain::{
-    parameters::{testnet::ConfiguredActivationHeights, Network},
+    amount::Amount,
+    block::Height,
+    parameters::{
+        subsidy::FundingStreamReceiver,
+        testnet::{
+            ConfiguredActivationHeights, ConfiguredFundingStreamRecipient,
+            ConfiguredFundingStreams, ConfiguredLockboxDisbursement, RegtestParameters,
+        },
+        Network,
+    },
     primitives::byte_array::increment_big_endian,
 };
 use zebra_consensus::difficulty_is_valid;
@@ -27,13 +36,27 @@ pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
     async fn regtest_coinbase(addr_type: MinerAddressType) -> eyre::Result<()> {
         let _init_guard = zebra_test::init();
 
-        let net = Network::new_regtest(
-            ConfiguredActivationHeights {
-                nu5: Some(1),
+        let net = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                // Current coinbase construction can create Orchard outputs for
+                // unified miner addresses, so use the fixed Orchard circuit.
+                nu6_2: Some(1),
                 ..Default::default()
-            }
-            .into(),
-        );
+            },
+            funding_streams: Some(vec![ConfiguredFundingStreams {
+                height_range: Some(Height(1)..Height(100)),
+                recipients: Some(vec![ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::Deferred,
+                    numerator: 1,
+                    addresses: None,
+                }]),
+            }]),
+            lockbox_disbursements: Some(vec![ConfiguredLockboxDisbursement {
+                address: "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8".to_string(),
+                amount: Amount::new(6_250_000),
+            }]),
+            ..Default::default()
+        });
 
         let mut config = os_assigned_rpc_port_config(false, &net)?.with(addr_type);
         config.mempool.debug_enable_at_height = Some(0);

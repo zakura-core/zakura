@@ -1,4 +1,4 @@
-use super::{scheduler::*, state::*, wire::*, *};
+use super::{request::*, state::*, *};
 
 /// Committed header metadata used by block sync to schedule and validate a body.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -12,26 +12,18 @@ pub struct BlockSyncBlockMeta {
 }
 
 /// Facts accepted by the block-sync scaffold and later reactor.
+///
+/// The inbound data flow is inverted: a peer's stream-6 frames are decoded and
+/// the download logic runs in the per-peer pipe-routine
+/// ([`PeerRoutine`](super::peer_routine)). Inbound messages no longer flow
+/// through the reactor as a `WireMessage`; the routine forwards only shared
+/// concerns to the reactor over [`RoutineToReactor`].
 #[derive(Clone, Debug)]
 pub enum BlockSyncEvent {
     /// A peer became available for stream-6 block sync.
     PeerConnected(BlockSyncPeerSession),
     /// A peer disconnected; all of its outstanding work is dropped.
     PeerDisconnected(ZakuraPeerId),
-    /// Inbound stream-6 message from `peer`.
-    WireMessage {
-        /// Serving peer.
-        peer: ZakuraPeerId,
-        /// Decoded stream-6 message.
-        msg: BlockSyncMessage,
-    },
-    /// Stream-6 frame decoding failed after handler admission.
-    WireDecodeFailed {
-        /// Peer that sent the malformed frame.
-        peer: ZakuraPeerId,
-        /// Decode/validation error.
-        error: Arc<BlockSyncWireError>,
-    },
     /// Header sync advanced the committed header target.
     HeaderTipChanged {
         /// Current best header height.
@@ -108,13 +100,6 @@ pub type BlockApplyToken = u64;
 /// Actions emitted by the future block-sync reactor for the service seam.
 #[derive(Clone, Debug)]
 pub enum BlockSyncAction {
-    /// Queue a typed stream-6 message to a peer.
-    SendMessage {
-        /// Destination peer.
-        peer: ZakuraPeerId,
-        /// Message that should be written to the peer's stream.
-        msg: BlockSyncMessage,
-    },
     /// Ask node wiring to read `missing_block_bodies`, header hashes, and size hints.
     QueryNeededBlocks {
         /// Current verified body tip.
@@ -170,4 +155,49 @@ pub enum BlockSyncMisbehavior {
     RangeUnavailable,
     /// A peer sent too many status frames.
     StatusSpam,
+}
+
+/// The shared routine→reactor channel (per-peer routines inverted data flow).
+///
+/// Each per-peer pipe-routine ([`PeerRoutine`](super::peer_routine)) decodes its
+/// own frames and runs the download logic locally; it forwards only the concerns
+/// that need reactor-global state (serving, status advertisement, the producer,
+/// misbehavior aggregation) over this channel. The sender is `try_send`/bounded
+/// so a busy reactor never backpressures a routine's decode loop into stalling
+/// its transport (the only blocking routine send is the Sequencer `AcceptBody`).
+#[derive(Clone, Debug)]
+pub(super) enum RoutineToReactor {
+    /// A routine received a `Status` and updated its own servable/caps + the
+    /// registry. The reactor advertises our `Status` reply and republishes the
+    /// candidate set. `send_reply` is the routine's rate-meter decision (the
+    /// previous `unsolicited.try_take`) for whether a reply is due this time.
+    StatusReceived {
+        /// Peer whose status was applied.
+        peer: ZakuraPeerId,
+        /// Whether the rate meter allows sending a `Status` reply now.
+        send_reply: bool,
+    },
+    /// A peer requested OUR committed blocks (serving). The reactor runs the
+    /// state query + driver path and sends via the peer's session clone.
+    ServeGetBlocks {
+        /// Peer that requested the range.
+        peer: ZakuraPeerId,
+        /// First requested height.
+        start_height: block::Height,
+        /// Requested block count.
+        count: u32,
+    },
+    /// A routine drained its pending work; the producer should re-query (it
+    /// self-gates on low-water, so the ping is idempotent/cheap).
+    RequeryNeeded,
+    /// A routine scored a peer offense that needs the reactor-side
+    /// disconnect/scoring action (serving-side malformed frames report via this
+    /// path; download-side offenses score directly through the `actions`
+    /// channel + the shared registry count).
+    Misbehavior {
+        /// Misbehaving peer.
+        peer: ZakuraPeerId,
+        /// Reason for reporting.
+        reason: BlockSyncMisbehavior,
+    },
 }

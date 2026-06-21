@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -18,8 +18,8 @@ use tracing::{debug, warn};
 use zebra_chain::{block, chain_tip::ChainTip};
 use zebra_network::zakura::{
     commit_state_trace as cs_trace, BlockApplyResult, BlockApplyToken, BlockSizeEstimate,
-    BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncHandle, BlockSyncMessage,
-    BlockSyncMisbehavior, Frontier, FrontierChange, ZakuraEndpoint, ZakuraTrace,
+    BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncHandle, BlockSyncMisbehavior,
+    Frontier, FrontierChange, ZakuraEndpoint, ZakuraTrace,
 };
 
 use crate::components::sync;
@@ -27,7 +27,8 @@ use crate::components::sync;
 use super::{
     block_apply_result_label, block_verify_error_is_duplicate, emit_commit_state, insert_cs_bool,
     insert_cs_frontiers, insert_cs_hash, insert_cs_height, insert_cs_peer, insert_cs_str,
-    insert_cs_u64, query_block_sync_frontiers, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+    insert_cs_u64, query_block_sync_frontiers, BlocksyncThroughputProbe,
+    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
 };
 
 pub(crate) const ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration =
@@ -93,7 +94,9 @@ impl CheckpointFrontierRefresh {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<BlockSyncAction>,
-    supervisor: zebra_network::zakura::ZakuraSupervisorHandle,
+    // Retained so the disconnect capability stays wired into the driver, even
+    // though peer scoring no longer drives disconnects (misbehavior is record-only).
+    _supervisor: zebra_network::zakura::ZakuraSupervisorHandle,
     endpoint: Option<ZakuraEndpoint>,
     block_sync: BlockSyncHandle,
     latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
@@ -104,6 +107,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     full_apply_limit: usize,
     combined_apply_limit: usize,
     trace: ZakuraTrace,
+    throughput_probe: Option<BlocksyncThroughputProbe>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) where
     ReadState: Service<
@@ -132,6 +136,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     let full_apply_limit = full_apply_limit.max(sync::MIN_CONCURRENCY_LIMIT);
     let combined_apply_limit = combined_apply_limit.max(sync::MIN_CONCURRENCY_LIMIT);
     let mut pending_applies = VecDeque::new();
+    let mut pending_probe_applies = BTreeMap::new();
     let mut in_flight_applies: FuturesUnordered<BoxFuture<'static, BlockApplyCompletion>> =
         FuturesUnordered::new();
     let mut checkpoint_in_flight = 0usize;
@@ -157,6 +162,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block_verifier.clone(),
                     block_sync.clone(),
                     trace.clone(),
+                    throughput_probe.clone(),
                     &mut checkpoint_frontier_refresh,
                 );
                 continue;
@@ -191,6 +197,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         block_verifier.clone(),
                         block_sync.clone(),
                         trace.clone(),
+                        throughput_probe.clone(),
                         &mut checkpoint_frontier_refresh,
                     );
                     continue;
@@ -224,22 +231,9 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
 
         trace_block_driver_action(&trace, &action);
         match action {
-            BlockSyncAction::SendMessage { .. } => {}
             BlockSyncAction::Misbehavior { peer, reason } => {
-                if block_sync_misbehavior_is_hard(reason) {
-                    debug!(
-                        ?peer,
-                        ?reason,
-                        "disconnecting peer for Zakura block-sync violation"
-                    );
-                    let _ = supervisor.disconnect_peer(&peer).await;
-                } else {
-                    debug!(
-                        ?peer,
-                        ?reason,
-                        "recorded soft Zakura block-sync peer violation"
-                    );
-                }
+                // Record-only: peer scoring no longer drives disconnects.
+                debug!(?peer, ?reason, "recorded Zakura block-sync peer violation");
             }
             BlockSyncAction::QueryNeededBlocks {
                 verified_block_tip,
@@ -434,6 +428,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             }
             BlockSyncAction::SubmitBlock { token, block } => {
                 let class = block_apply_class(block.as_ref(), max_checkpoint_height);
+                let height = block.coinbase_height();
                 emit_commit_state(
                     &trace,
                     cs_trace::BLOCK_SUBMIT_QUEUED,
@@ -442,10 +437,15 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
                         insert_cs_str(row, cs_trace::APPLY_CLASS, block_apply_class_label(class));
                         insert_cs_hash(row, cs_trace::HASH, block.hash());
-                        if let Some(height) = block.coinbase_height() {
+                        if let Some(height) = height {
                             insert_cs_height(row, cs_trace::HEIGHT, height);
                         }
-                        insert_cs_u64(row, cs_trace::QUEUE_LEN, pending_applies.len() as u64);
+                        let queue_len = if throughput_probe.is_some() {
+                            pending_probe_applies.len()
+                        } else {
+                            pending_applies.len()
+                        };
+                        insert_cs_u64(row, cs_trace::QUEUE_LEN, queue_len as u64);
                         insert_cs_u64(
                             row,
                             cs_trace::IN_FLIGHT_COUNT,
@@ -453,6 +453,42 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         );
                     },
                 );
+                if let Some(probe) = throughput_probe.clone() {
+                    let pending = PendingBlockApply {
+                        token,
+                        class,
+                        block,
+                    };
+                    if let Some(height) = height {
+                        pending_probe_applies.insert(height, pending);
+                        drain_ordered_probe_applies(
+                            &mut pending_probe_applies,
+                            latest_chain_tip.clone(),
+                            endpoint.clone(),
+                            read_state.clone(),
+                            block_verifier.clone(),
+                            block_sync.clone(),
+                            trace.clone(),
+                            probe,
+                            &mut checkpoint_frontier_refresh,
+                        )
+                        .await;
+                    } else {
+                        let completed = apply_probe_block_sync_body(
+                            latest_chain_tip.clone(),
+                            endpoint.clone(),
+                            read_state.clone(),
+                            block_verifier.clone(),
+                            block_sync.clone(),
+                            trace.clone(),
+                            probe,
+                            pending,
+                        )
+                        .await;
+                        observe_block_apply_completion(completed, &mut checkpoint_frontier_refresh);
+                    }
+                    continue;
+                }
                 pending_applies.push_back(PendingBlockApply {
                     token,
                     class,
@@ -472,6 +508,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block_verifier.clone(),
                     block_sync.clone(),
                     trace.clone(),
+                    throughput_probe.clone(),
                 );
             }
         }
@@ -571,6 +608,7 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
     block_verifier: BlockVerifier,
     block_sync: BlockSyncHandle,
     trace: ZakuraTrace,
+    throughput_probe: Option<BlocksyncThroughputProbe>,
     checkpoint_frontier_refresh: &mut CheckpointFrontierRefresh,
 ) where
     ReadState: Service<
@@ -586,18 +624,8 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
-    match completed.class {
-        BlockApplyClass::Checkpoint => {
-            *checkpoint_in_flight = checkpoint_in_flight.saturating_sub(1);
-        }
-        BlockApplyClass::Full => {
-            *full_in_flight = full_in_flight.saturating_sub(1);
-        }
-    }
-
-    if let Some(highest_observed_at_apply) = completed.checkpoint_refresh_floor {
-        checkpoint_frontier_refresh.observe_checkpoint_commit(highest_observed_at_apply);
-    }
+    decrement_in_flight_apply_count(completed.class, checkpoint_in_flight, full_in_flight);
+    observe_block_apply_completion(completed, checkpoint_frontier_refresh);
 
     drain_pending_block_applies(
         pending_applies,
@@ -613,6 +641,7 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
         block_verifier,
         block_sync,
         trace,
+        throughput_probe,
     );
 }
 
@@ -631,6 +660,7 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
     block_verifier: BlockVerifier,
     block_sync: BlockSyncHandle,
     trace: ZakuraTrace,
+    throughput_probe: Option<BlocksyncThroughputProbe>,
 ) where
     ReadState: Service<
             zebra_state::ReadRequest,
@@ -687,10 +717,119 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                 pending.block,
                 class,
                 trace.clone(),
+                throughput_probe.clone(),
             )
             .boxed(),
         );
     }
+}
+
+fn decrement_in_flight_apply_count(
+    class: BlockApplyClass,
+    checkpoint_in_flight: &mut usize,
+    full_in_flight: &mut usize,
+) {
+    match class {
+        BlockApplyClass::Checkpoint => {
+            *checkpoint_in_flight = checkpoint_in_flight.saturating_sub(1);
+        }
+        BlockApplyClass::Full => {
+            *full_in_flight = full_in_flight.saturating_sub(1);
+        }
+    }
+}
+
+fn observe_block_apply_completion(
+    completed: BlockApplyCompletion,
+    checkpoint_frontier_refresh: &mut CheckpointFrontierRefresh,
+) {
+    if let Some(highest_observed_at_apply) = completed.checkpoint_refresh_floor {
+        checkpoint_frontier_refresh.observe_checkpoint_commit(highest_observed_at_apply);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_ordered_probe_applies<ReadState, BlockVerifier>(
+    pending_probe_applies: &mut BTreeMap<block::Height, PendingBlockApply>,
+    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
+    endpoint: Option<ZakuraEndpoint>,
+    read_state: ReadState,
+    block_verifier: BlockVerifier,
+    block_sync: BlockSyncHandle,
+    trace: ZakuraTrace,
+    throughput_probe: BlocksyncThroughputProbe,
+    checkpoint_frontier_refresh: &mut CheckpointFrontierRefresh,
+) where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+    BlockVerifier:
+        Service<zebra_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
+    BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
+    BlockVerifier::Future: Send + 'static,
+{
+    while let Ok(expected_height) = throughput_probe.verified_tip().next() {
+        let Some(pending) = pending_probe_applies.remove(&expected_height) else {
+            break;
+        };
+        let completed = apply_probe_block_sync_body(
+            latest_chain_tip.clone(),
+            endpoint.clone(),
+            read_state.clone(),
+            block_verifier.clone(),
+            block_sync.clone(),
+            trace.clone(),
+            throughput_probe.clone(),
+            pending,
+        )
+        .await;
+        observe_block_apply_completion(completed, checkpoint_frontier_refresh);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_probe_block_sync_body<ReadState, BlockVerifier>(
+    latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
+    endpoint: Option<ZakuraEndpoint>,
+    read_state: ReadState,
+    block_verifier: BlockVerifier,
+    block_sync: BlockSyncHandle,
+    trace: ZakuraTrace,
+    throughput_probe: BlocksyncThroughputProbe,
+    pending: PendingBlockApply,
+) -> BlockApplyCompletion
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+    BlockVerifier:
+        Service<zebra_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
+    BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
+    BlockVerifier::Future: Send + 'static,
+{
+    apply_block_sync_body(
+        block_verifier,
+        latest_chain_tip,
+        endpoint,
+        read_state,
+        block_sync,
+        pending.token,
+        pending.block,
+        pending.class,
+        trace,
+        Some(throughput_probe),
+    )
+    .await
 }
 
 pub(crate) fn block_apply_class(
@@ -718,6 +857,7 @@ pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
     block: Arc<block::Block>,
     class: BlockApplyClass,
     trace: ZakuraTrace,
+    throughput_probe: Option<BlocksyncThroughputProbe>,
 ) -> BlockApplyCompletion
 where
     BlockVerifier:
@@ -752,16 +892,25 @@ where
         insert_cs_hash(row, cs_trace::HASH, expected_hash);
     });
     let started = Instant::now();
-    let result = commit_block_sync_body_with_stall_trace(
-        block_verifier.clone(),
-        block,
-        class,
-        &trace,
-        token,
-        height,
-        expected_hash,
-    )
-    .await;
+    // Throughput-probe mode (debug only): skip consensus verify+commit and
+    // advance an in-memory synthetic frontier instead, discarding the body. In
+    // normal mode the frontier comes from re-reading committed state below.
+    let (result, probe_frontier) = match throughput_probe.as_ref() {
+        Some(probe) => probe.apply_block(block.as_ref()),
+        None => (
+            commit_block_sync_body_with_stall_trace(
+                block_verifier.clone(),
+                block,
+                class,
+                &trace,
+                token,
+                height,
+                expected_hash,
+            )
+            .await,
+            None,
+        ),
+    };
     emit_commit_state(
         &trace,
         cs_trace::COMMIT_FINISH,
@@ -785,8 +934,10 @@ where
             insert_cs_hash(row, cs_trace::HASH, expected_hash);
         },
     );
-    let local_frontier =
-        query_block_sync_frontiers(read_state.clone(), latest_chain_tip.clone()).await;
+    let local_frontier = match throughput_probe.as_ref() {
+        Some(_) => probe_frontier,
+        None => query_block_sync_frontiers(read_state.clone(), latest_chain_tip.clone()).await,
+    };
     if let Some(frontiers) = local_frontier {
         let change =
             if result == BlockApplyResult::Committed || result == BlockApplyResult::Duplicate {
@@ -844,19 +995,6 @@ where
                     .unwrap_or_else(|| height.previous().unwrap_or(height))
             }),
     }
-}
-
-pub(crate) fn block_sync_misbehavior_is_hard(reason: BlockSyncMisbehavior) -> bool {
-    matches!(
-        reason,
-        BlockSyncMisbehavior::MalformedMessage
-            | BlockSyncMisbehavior::UnsolicitedBlock
-            | BlockSyncMisbehavior::GetBlocksTooLong
-            | BlockSyncMisbehavior::InvalidBlock
-            | BlockSyncMisbehavior::InvalidStatus
-            | BlockSyncMisbehavior::UnsolicitedDone
-            | BlockSyncMisbehavior::StatusSpam
-    )
 }
 
 #[cfg(test)]
@@ -1255,11 +1393,6 @@ fn trace_block_driver_action(trace: &ZakuraTrace, action: &BlockSyncAction) {
         cs_trace::ACTION_RECEIVED,
         "block_sync_driver",
         |row| match action {
-            BlockSyncAction::SendMessage { peer, msg } => {
-                insert_cs_str(row, cs_trace::ACTION, "send_message");
-                insert_cs_peer(row, cs_trace::PEER, peer);
-                insert_cs_str(row, cs_trace::REASON, block_sync_message_label(msg));
-            }
             BlockSyncAction::Misbehavior { peer, reason } => {
                 insert_cs_str(row, cs_trace::ACTION, "misbehavior");
                 insert_cs_peer(row, cs_trace::PEER, peer);
@@ -1340,16 +1473,6 @@ fn block_apply_class_label(class: BlockApplyClass) -> &'static str {
     match class {
         BlockApplyClass::Checkpoint => "checkpoint",
         BlockApplyClass::Full => "full",
-    }
-}
-
-fn block_sync_message_label(msg: &BlockSyncMessage) -> &'static str {
-    match msg {
-        BlockSyncMessage::Status(_) => "status",
-        BlockSyncMessage::Block(_) => "block",
-        BlockSyncMessage::BlocksDone { .. } => "blocks_done",
-        BlockSyncMessage::RangeUnavailable { .. } => "range_unavailable",
-        BlockSyncMessage::GetBlocks { .. } => "get_blocks",
     }
 }
 

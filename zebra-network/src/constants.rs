@@ -321,9 +321,9 @@ pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize =
 /// messages from each of our peers.
 pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_170; // NU6.3 Mainnet.
-#[cfg(not(zcash_unstable = "nu6.3"))]
+#[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
 const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_150; // NU6.2 (Mainnet + Testnet).
 
 /// The Zcash network protocol version implemented by this crate, and advertised

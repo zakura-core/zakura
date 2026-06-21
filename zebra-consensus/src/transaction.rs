@@ -1063,7 +1063,7 @@ where
 
         // The Ironwood bundle only exists under NU6.3; nu7-V6 has no Ironwood, matching
         // librustzcash where the `ironwood_bundle()` accessor is gated nu6.3-only.
-        #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+        #[cfg(zcash_unstable = "nu6.3")]
         let async_checks = async_checks.and(Self::verify_ironwood_bundle(
             cached_ffi_transaction.sighasher().ironwood_bundle(),
             &sighash,

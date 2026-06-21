@@ -18,7 +18,7 @@ use tokio::time::timeout;
 use tower::{buffer::Buffer, service_fn, ServiceExt};
 
 use zebra_chain::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative},
     block::{self, Block, Height},
     orchard::{Action, AuthorizedAction, Flags},
     parameters::{
@@ -3665,6 +3665,76 @@ fn add_to_sprout_pool_after_nu() {
     assert_eq!(
         check::disabled_add_to_sprout_pool(&block.transactions[7], block_height, &network),
         Ok(())
+    );
+}
+
+#[test]
+fn add_to_orchard_pool_after_nu6_3() {
+    let _init_guard = zebra_test::init();
+
+    const ADD_TO_ORCHARD_POOL: i64 = -1;
+    const ORCHARD_POOL_UNCHANGED: i64 = 0;
+    const REMOVE_FROM_ORCHARD_POOL: i64 = 1;
+
+    let nu6_3_height = Height(10);
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_3: Some(nu6_3_height.0),
+            ..Default::default()
+        })
+        .expect("failed to set NU6.3 activation height")
+        .clear_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+
+    let mut tx = v5_transactions(Network::new_default_testnet().block_iter())
+        .find(|tx| tx.orchard_shielded_data().is_some())
+        .expect("test vectors include a transaction with Orchard shielded data");
+
+    let orchard_amount =
+        |amount| Amount::<NegativeAllowed>::try_from(amount).expect("valid test amount");
+
+    *tx.orchard_value_balance_mut()
+        .expect("transaction has Orchard shielded data") = orchard_amount(ADD_TO_ORCHARD_POOL);
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(
+            &tx,
+            (nu6_3_height - 1).expect("NU6.3 is not genesis"),
+            &network,
+        ),
+        Ok(()),
+        "transparent -> Orchard is allowed before NU6.3"
+    );
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&tx, nu6_3_height, &Network::Mainnet),
+        Ok(()),
+        "transparent -> Orchard is allowed if NU6.3 is unscheduled"
+    );
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&tx, nu6_3_height, &network),
+        Err(TransactionError::DisabledAddToOrchardPool),
+        "transparent -> Orchard is rejected after NU6.3"
+    );
+
+    *tx.orchard_value_balance_mut()
+        .expect("transaction has Orchard shielded data") = orchard_amount(REMOVE_FROM_ORCHARD_POOL);
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&tx, nu6_3_height, &network),
+        Ok(()),
+        "Orchard -> transparent is still allowed after NU6.3"
+    );
+
+    *tx.orchard_value_balance_mut()
+        .expect("transaction has Orchard shielded data") = orchard_amount(ORCHARD_POOL_UNCHANGED);
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&tx, nu6_3_height, &network),
+        Ok(()),
+        "zero-balance Orchard spends and outputs are still allowed after NU6.3"
     );
 }
 

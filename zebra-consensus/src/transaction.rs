@@ -471,6 +471,8 @@ where
             // [Canopy onward]: `vpub_old` MUST be zero.
             // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
             check::disabled_add_to_sprout_pool(&tx, req.height(), &network)?;
+            // [NU6.3 onward]: `vbalanceOrchard` MUST be non-negative.
+            check::disabled_add_to_orchard_pool(&tx, req.height(), &network)?;
 
             check::spend_conflicts(&tx)?;
 

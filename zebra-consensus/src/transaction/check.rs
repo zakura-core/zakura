@@ -12,7 +12,7 @@ use std::{
 use chrono::{DateTime, Utc};
 
 use zebra_chain::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative},
     block::Height,
     orchard::Flags,
     parameters::{Network, NetworkUpgrade},
@@ -234,6 +234,35 @@ pub fn disabled_add_to_sprout_pool(
                 return Err(TransactionError::DisabledAddToSproutPool);
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Check if a transaction is adding value to the Orchard pool after NU6.3 activation.
+///
+/// This is a net value balance rule. Negative `valueBalanceOrchard` adds value
+/// to the Orchard chain pool, so it is rejected. Positive values withdraw from
+/// Orchard, and zero leaves the Orchard chain pool unchanged even if the
+/// transaction has both Orchard spends and outputs.
+pub fn disabled_add_to_orchard_pool(
+    tx: &Transaction,
+    height: Height,
+    network: &Network,
+) -> Result<(), TransactionError> {
+    let Some(nu6_3_activation_height) = NetworkUpgrade::Nu6_3.activation_height(network) else {
+        return Ok(());
+    };
+
+    let zero = Amount::<NegativeAllowed>::zero();
+
+    let value_balance_orchard = tx
+        .orchard_shielded_data()
+        .map(|shielded_data| shielded_data.value_balance)
+        .unwrap_or_else(Amount::<NegativeAllowed>::zero);
+
+    if height >= nu6_3_activation_height && value_balance_orchard < zero {
+        return Err(TransactionError::DisabledAddToOrchardPool);
     }
 
     Ok(())

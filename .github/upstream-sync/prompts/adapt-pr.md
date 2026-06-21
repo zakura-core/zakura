@@ -28,6 +28,11 @@ Rules:
   changes. Return `needs_human` and explain the blocker with file-level evidence.
 - Run targeted validation when practical. Prefer fast checks over broad test
   suites unless the candidate is small enough to validate broadly.
+- Always run `cargo fmt --all -- --check` and `git diff --check` after editing.
+- Run `cargo clippy --workspace --all-targets --features "default-release-binaries"`
+  when dependencies are available. If it reports code lint failures, fix them
+  before returning `applied`. If it cannot run because registry/cache access is
+  unavailable, report that blocker in `validation`, `risks`, and `follow_up`.
 - Do not push, create branches, open pull requests, or call external write APIs.
 
 Return only JSON matching `.github/upstream-sync/schemas/result.schema.json`.
@@ -37,6 +42,8 @@ PR body requirements:
 - Use a conventional PR title. If the upstream title has an invalid multi-scope
   form such as `fix(state,zebrad): ...`, normalize it to a single valid scope or
   no scope.
+- Start the PR body with one concise confidence line:
+  `AI Confidence: <confidence_percent>% - <short merge-safety recommendation>`.
 - Use concise sections: Motivation, Solution, Tests, Follow-up Work,
   AI Disclosure, Revert Plan.
 - Include the source as prose such as `upstream PR 10676`; do not write

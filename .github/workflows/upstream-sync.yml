@@ -211,6 +211,12 @@ jobs:
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Delete stale upstream sync branch
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/scripts/upstream-sync-run.sh delete-stale-branch
+
       - name: Create upstream sync PR
         id: create-pr
         if: steps.changes.outputs.has_changes == 'true'

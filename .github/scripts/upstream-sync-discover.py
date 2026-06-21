@@ -106,6 +106,7 @@ def existing_marker(source_pr: int, branch: str, target_repo: str) -> dict[str, 
 
     search_query = f'"Upstream-Zebra-PR: {source_pr}" in:body repo:{target_repo}'
     prs: list[dict[str, Any]] = []
+    head_prs: list[dict[str, Any]] = []
     try:
         prs = run_json(
             [
@@ -125,16 +126,48 @@ def existing_marker(source_pr: int, branch: str, target_repo: str) -> dict[str, 
     except subprocess.CalledProcessError:
         prs = []
 
-    return {"branch_exists": branch_exists, "pull_requests": prs}
+    try:
+        head_prs = run_json(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                target_repo,
+                "--state",
+                "all",
+                "--head",
+                branch,
+                "--json",
+                "number,state,url,headRefName",
+            ]
+        )
+    except subprocess.CalledProcessError:
+        head_prs = []
+
+    return {
+        "branch_exists": branch_exists,
+        "pull_requests": prs,
+        "head_pull_requests": exact_head_pull_requests(head_prs, branch),
+    }
+
+
+def exact_head_pull_requests(pulls: list[dict[str, Any]], branch: str) -> list[dict[str, Any]]:
+    """Filter gh --head results to the exact branch name."""
+
+    return [pull for pull in pulls if pull.get("headRefName") == branch]
 
 
 def blocks_candidate(existing: dict[str, Any]) -> bool:
     """Return true when an existing PR means the upstream PR is already handled."""
 
-    return any(
-        pull.get("state") in {"OPEN", "MERGED"}
-        for pull in existing.get("pull_requests", [])
-    )
+    active_states = {"OPEN", "MERGED"}
+    tracked_prs = [
+        *existing.get("pull_requests", []),
+        *existing.get("head_pull_requests", []),
+    ]
+
+    return any(pull.get("state") in active_states for pull in tracked_prs)
 
 
 def write_source_diffs(source_repo: str, source_pr: int, output_dir: Path) -> None:

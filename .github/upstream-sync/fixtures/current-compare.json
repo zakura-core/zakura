@@ -1,0 +1,93 @@
+{
+  "source_repo": "ZcashFoundation/zebra",
+  "source_ref": "main",
+  "source_ref_sha": "upstream-main-fixture",
+  "target_repo": "valargroup/zebra",
+  "target_ref": "ironwood-main",
+  "target_ref_sha": "4d82758ce7297a38d8acd147558dd89629d553d0",
+  "merge_base": "1e6519ea91e2d3035c20aadd4d9a40dcac2eed3a",
+  "ahead_count": 80,
+  "behind_count": 26,
+  "missing_commits": [
+    {
+      "sha": "76a6bb0990ae3eeb2b821c1eefdf656ac58add1e",
+      "source_pr": 10676
+    },
+    {
+      "sha": "d5ab886869dc1c0f6d4c007720e5d6f813d8c200",
+      "source_pr": 10676
+    },
+    {
+      "sha": "94c09363d1c0ac2caf1d0e487de7ea5adc19d308",
+      "source_pr": 10676
+    },
+    {
+      "sha": "6784f720831fe650f7d84e30e493ec27ddd37a09",
+      "source_pr": 10676
+    },
+    {
+      "sha": "40eddc797106112d0a8fd906a054916c2f3d89fe",
+      "source_pr": 10676
+    },
+    {
+      "sha": "8ead00cabdf99c2eeb1f76d6c4c16a82e296770d",
+      "source_pr": 10676
+    },
+    {
+      "sha": "0a2b87f5b1651e590c0a9659105c53bfb801b899",
+      "source_pr": 10604
+    }
+  ],
+  "pulls": {
+    "10676": {
+      "number": 10676,
+      "title": "fix(state,zebrad): fix tests",
+      "state": "closed",
+      "merged_at": "2026-06-05T16:44:38Z",
+      "merge_commit_sha": "8ead00cabdf99c2eeb1f76d6c4c16a82e296770d",
+      "base_ref": "main",
+      "head_ref": "fix-tests",
+      "url": "https://github.com/ZcashFoundation/zebra/pull/10676",
+      "labels": [],
+      "commits": [
+        "76a6bb0990ae3eeb2b821c1eefdf656ac58add1e",
+        "d5ab886869dc1c0f6d4c007720e5d6f813d8c200",
+        "94c09363d1c0ac2caf1d0e487de7ea5adc19d308",
+        "6784f720831fe650f7d84e30e493ec27ddd37a09",
+        "40eddc797106112d0a8fd906a054916c2f3d89fe"
+      ],
+      "files": [
+        "zebra-consensus/src/block/check.rs",
+        "zebra-state/src/service/chain_tip.rs",
+        "zebra-state/src/service/tests.rs",
+        "zebrad/src/components/mempool/tests/vector.rs",
+        "zebrad/tests/common/coinbase.rs",
+        "zebrad/tests/common/sync.rs"
+      ],
+      "additions": 137,
+      "deletions": 57,
+      "changed_files": 6
+    },
+    "10604": {
+      "number": 10604,
+      "title": "fix(state): correct dequeue_children by_height index handling",
+      "state": "closed",
+      "merged_at": "2026-06-08T21:32:20Z",
+      "merge_commit_sha": "0a2b87f5b1651e590c0a9659105c53bfb801b899",
+      "base_ref": "main",
+      "head_ref": "fix/queued-children-by-height",
+      "url": "https://github.com/ZcashFoundation/zebra/pull/10604",
+      "labels": ["external contribution"],
+      "commits": [
+        "0a2b87f5b1651e590c0a9659105c53bfb801b899"
+      ],
+      "files": [
+        "zebra-state/src/service/queued_blocks.rs",
+        "zebra-state/src/service/queued_blocks/tests/vectors.rs"
+      ],
+      "additions": 56,
+      "deletions": 1,
+      "changed_files": 2
+    }
+  }
+}

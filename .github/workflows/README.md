@@ -42,6 +42,7 @@ graph TB
     CrateBuild[test-crates.yml]
     Docs[book.yml]
     Security[zizmor.yml]
+    UpstreamSync[upstream-sync.yml]
   end
 
   %% Integration tests on GCP
@@ -57,7 +58,7 @@ graph TB
   PR --> Unit & Lint & DockerCfg & CrateBuild & IT & Security
   Push --> Unit & Lint & Coverage & Docs & Security
   Schedule --> IT
-  Manual --> IT & DeployNodes & Cleanup
+  Manual --> IT & DeployNodes & Cleanup & UpstreamSync
 
   %% Build dependency
   BuildDocker --> IT
@@ -68,7 +69,7 @@ graph TB
   classDef secondary fill:#48a9a6,stroke:#48a9a6,color:white
   classDef trigger fill:#95a5a6,stroke:#95a5a6,color:white
   class BuildDocker primary
-  class Unit,Lint,Coverage,DockerCfg,CrateBuild,Docs,Security secondary
+  class Unit,Lint,Coverage,DockerCfg,CrateBuild,Docs,Security,UpstreamSync secondary
   class IT,FindDisks,Deploy,DeployNodes,Cleanup secondary
   class PR,Push,Schedule,Manual trigger
 ```
@@ -151,6 +152,7 @@ _The diagram above illustrates the parallel execution patterns in our CI/CD syst
 - **Release Binaries** (`release-binaries.yml`): Build and publish release artifacts
 - **Release Drafter** (`release-drafter.yml`): Automates release notes
 - **Integration Tests on GCP** (`zfnd-ci-integration-tests-gcp.yml`): Stateful tests, cached disks, lwd flows
+- **Upstream PR Sync Pilot** (`upstream-sync.yml`): Manual one-PR upstream discovery, Codex adaptation, and draft PR creation for fork maintenance
 
 ### Supporting/Re-usable Workflows
 

@@ -1,0 +1,236 @@
+# Manual upstream PR discovery and one-at-a-time adaptation for the Valar Zebra fork.
+#
+# v1 is intentionally manual-only and capped at a single upstream PR per run.
+name: Upstream PR Sync Pilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        type: choice
+        options:
+          - discover
+          - dry-run
+          - open-pr
+        default: discover
+      source_repo:
+        description: "Upstream repository to inspect"
+        type: string
+        default: ZcashFoundation/zebra
+      source_ref:
+        description: "Upstream branch or ref"
+        type: string
+        default: main
+      target_ref:
+        description: "Fork branch to target"
+        type: string
+        default: ironwood-main
+      candidate_pr:
+        description: "Optional upstream PR number override for debugging"
+        type: string
+        default: ""
+      limit:
+        description: "Maximum candidates to process. v1 only accepts 1."
+        type: string
+        default: "1"
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync-${{ github.ref }}-${{ inputs.mode }}
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    name: Discover missing upstream PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      status: ${{ steps.discover.outputs.status }}
+      has_candidate: ${{ steps.discover.outputs.has_candidate }}
+      source_pr: ${{ steps.discover.outputs.source_pr }}
+      branch_name: ${{ steps.discover.outputs.branch_name }}
+      pr_title: ${{ steps.discover.outputs.pr_title }}
+    steps:
+      - name: Validate inputs
+        env:
+          LIMIT: ${{ inputs.limit }}
+        run: |
+          if [ "$LIMIT" != "1" ]; then
+            echo "upstream-sync v1 only supports limit=1" >&2
+            exit 1
+          fi
+
+      - name: Checkout target branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Discover candidate
+        id: discover
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          TARGET_REPO: ${{ github.repository }}
+          TARGET_REF: ${{ inputs.target_ref }}
+          CANDIDATE_PR: ${{ inputs.candidate_pr }}
+          LIMIT: ${{ inputs.limit }}
+        run: |
+          .github/scripts/upstream-sync-discover.py \
+            --source-repo "$SOURCE_REPO" \
+            --source-ref "$SOURCE_REF" \
+            --target-repo "$TARGET_REPO" \
+            --target-ref "$TARGET_REF" \
+            --candidate-pr "$CANDIDATE_PR" \
+            --limit "$LIMIT" \
+            --output-dir .github/upstream-sync/work \
+            --write-diffs
+
+      - name: Add discovery summary
+        run: cat .github/upstream-sync/work/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload discovery artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: upstream-sync-discovery
+          path: .github/upstream-sync/work
+          include-hidden-files: true
+
+  codex-patch:
+    name: Ask Codex to adapt candidate
+    runs-on: ubuntu-latest
+    needs: discover
+    if: ${{ inputs.mode != 'discover' && needs.discover.outputs.has_candidate == 'true' }}
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      result_status: ${{ steps.collect.outputs.status }}
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download discovery artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+        with:
+          name: upstream-sync-discovery
+          path: .github/upstream-sync/work
+
+      - name: Prepare Codex context
+        run: .github/scripts/upstream-sync-run.sh prepare
+
+      - name: Run Codex
+        id: codex
+        uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 #v1
+        with:
+          openai-api-key: ${{ secrets.CODEX_API_KEY }}
+          prompt-file: .github/upstream-sync/prompts/adapt-pr.md
+          output-file: .github/upstream-sync/work/result.json
+          output-schema-file: .github/upstream-sync/schemas/result.schema.json
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+          codex-args: '["--ephemeral"]'
+          allow-users: ${{ github.actor }}
+
+      - name: Validate Codex result
+        run: |
+          .github/scripts/upstream-sync-validate.sh \
+            .github/upstream-sync/work/result.json \
+            .github/upstream-sync/work/candidate.json
+
+      - name: Collect Codex patch
+        id: collect
+        run: .github/scripts/upstream-sync-run.sh collect-patch
+
+      - name: Upload Codex artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: upstream-sync-codex
+          path: .github/upstream-sync/work
+          include-hidden-files: true
+
+  open-pr:
+    name: Open draft PR
+    runs-on: ubuntu-latest
+    needs:
+      - discover
+      - codex-patch
+    if: ${{ inputs.mode == 'open-pr' && needs.codex-patch.outputs.result_status == 'applied' }}
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download Codex artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+        with:
+          name: upstream-sync-codex
+          path: .github/upstream-sync/work
+
+      - name: Apply generated patch
+        run: .github/scripts/upstream-sync-run.sh apply-patch
+
+      - name: Validate generated changes
+        run: |
+          .github/scripts/upstream-sync-validate.sh \
+            .github/upstream-sync/work/result.json \
+            .github/upstream-sync/work/candidate.json
+          git diff --check
+          git diff --cached --check
+
+      - name: Prepare PR metadata
+        id: pr-meta
+        run: .github/scripts/upstream-sync-run.sh write-pr-body
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes to commit"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --stat
+            git diff --cached --stat
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create upstream sync PR
+        id: create-pr
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 #v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ steps.pr-meta.outputs.branch }}
+          base: ${{ inputs.target_ref }}
+          title: ${{ steps.pr-meta.outputs.title }}
+          body-path: .github/upstream-sync/work/pr-body.md
+          commit-message: ${{ steps.pr-meta.outputs.title }}
+          draft: always-true
+          delete-branch: false
+
+      - name: Verify PR state
+        if: steps.create-pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.create-pr.outputs.pull-request-number }}
+        run: |
+          gh pr view "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --json isDraft,mergeStateStatus,url \
+            --jq '.'

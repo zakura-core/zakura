@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "source_pr",
+    "confidence_percent",
+    "recommendation",
+    "branch_name",
+    "pr_title",
+    "pr_body",
+    "files_changed",
+    "validation",
+    "risks",
+    "follow_up"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["applied", "already_present", "needs_human", "failed"]
+    },
+    "source_pr": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "confidence_percent": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "recommendation": {
+      "type": "string",
+      "minLength": 1
+    },
+    "branch_name": {
+      "type": "string",
+      "pattern": "^upstream-sync/pr-[0-9]+$"
+    },
+    "pr_title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pr_body": {
+      "type": "string",
+      "minLength": 1
+    },
+    "files_changed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "validation": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "status", "output"],
+        "properties": {
+          "command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": ["passed", "failed", "not_run"]
+          },
+          "output": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "follow_up": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

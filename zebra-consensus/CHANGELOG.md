@@ -93,10 +93,6 @@ This release fixes an important security issue:
 The impact of the issue for crate users will depend on the particular usage;
 if you use it as a building block for a consensus node, you should update.
 
-### Added
-
-- ZIP-235 support under the `zcash_unstable = "zip235"` flag
-
 ## [5.0.0] - 2026-03-12
 
 ### Added

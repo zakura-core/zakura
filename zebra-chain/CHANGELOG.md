@@ -205,7 +205,6 @@ All `ParametersBuilder` methods and `Parameters::new_regtest()` now return `Resu
 
 - Added `From<SerializationError>` implementation for `std::io::Error`
 - Added `InvalidMinFee` error variant to `zebra_chain::transaction::zip317::Error`
-- Added `Transaction::zip233_amount()` method
 
 ## [3.0.0] - 2025-10-15
 

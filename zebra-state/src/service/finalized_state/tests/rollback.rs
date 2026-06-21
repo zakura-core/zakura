@@ -827,9 +827,7 @@ fn modern_rollback_network() -> Network {
             nu6_1: Some(9),
             nu6_2: Some(10),
             nu6_3: Some(11),
-            nu7: None,
-            #[cfg(zcash_unstable = "zfuture")]
-            zfuture: None,
+            nu7: Some(12),
         })
         .expect("configured activation heights are valid")
         .extend_funding_streams()

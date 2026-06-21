@@ -25,8 +25,8 @@ pub struct ValueBalance<C> {
     sprout: Amount<C>,
     sapling: Amount<C>,
     orchard: Amount<C>,
-    ironwood: Amount<C>,
     deferred: Amount<C>,
+    ironwood: Amount<C>,
 }
 
 impl<C> ValueBalance<C>
@@ -65,7 +65,7 @@ where
         }
     }
 
-    /// Creates a [`ValueBalance`] from the given Ironwood amount.
+    /// Creates a [`ValueBalance`] from the given ironwood amount.
     pub fn from_ironwood_amount(ironwood_amount: Amount<C>) -> Self {
         ValueBalance {
             ironwood: ironwood_amount,
@@ -124,18 +124,6 @@ where
         self
     }
 
-    /// Get the Ironwood amount from the [`ValueBalance`].
-    pub fn ironwood_amount(&self) -> Amount<C> {
-        self.ironwood
-    }
-
-    /// Insert an Ironwood value balance into a given [`ValueBalance`]
-    /// leaving the other values untouched.
-    pub fn set_ironwood_value_balance(&mut self, ironwood_value_balance: ValueBalance<C>) -> &Self {
-        self.ironwood = ironwood_value_balance.ironwood;
-        self
-    }
-
     /// Returns the deferred amount.
     pub fn deferred_amount(&self) -> Amount<C> {
         self.deferred
@@ -147,6 +135,18 @@ where
         self
     }
 
+    /// Get the ironwood amount from the [`ValueBalance`].
+    pub fn ironwood_amount(&self) -> Amount<C> {
+        self.ironwood
+    }
+
+    /// Insert an ironwood value balance into a given [`ValueBalance`]
+    /// leaving the other values untouched.
+    pub fn set_ironwood_value_balance(&mut self, ironwood_value_balance: ValueBalance<C>) -> &Self {
+        self.ironwood = ironwood_value_balance.ironwood;
+        self
+    }
+
     /// Creates a [`ValueBalance`] where all the pools are zero.
     pub fn zero() -> Self {
         let zero = Amount::zero();
@@ -155,8 +155,8 @@ where
             sprout: zero,
             sapling: zero,
             orchard: zero,
-            ironwood: zero,
             deferred: zero,
+            ironwood: zero,
         }
     }
 
@@ -171,8 +171,8 @@ where
             sprout: self.sprout.constrain().map_err(Sprout)?,
             sapling: self.sapling.constrain().map_err(Sapling)?,
             orchard: self.orchard.constrain().map_err(Orchard)?,
-            ironwood: self.ironwood.constrain().map_err(Ironwood)?,
             deferred: self.deferred.constrain().map_err(Deferred)?,
+            ironwood: self.ironwood.constrain().map_err(Ironwood)?,
         })
     }
 }
@@ -191,9 +191,12 @@ impl ValueBalance<NegativeAllowed> {
     ///
     /// Design: <https://github.com/ZcashFoundation/zebra/blob/main/book/src/dev/rfcs/0012-value-pools.md#definitions>
     pub fn remaining_transaction_value(&self) -> Result<Amount<NonNegative>, amount::Error> {
-        // Calculated by summing the transparent, sprout, sapling, orchard, and
-        // Ironwood value balances, as specified in:
+        // Calculated by summing the transparent, sprout, sapling, orchard, and ironwood value
+        // balances, as specified in:
         // https://zebra.zfnd.org/dev/rfcs/0012-value-pools.html#definitions
+        //
+        // The ironwood bundle (NU6.3 onward) contributes to the transaction value pool exactly
+        // like the orchard bundle; it is zero for transactions without an ironwood bundle.
         //
         // This will error if the remaining value in the transaction value pool is negative.
         (self.transparent + self.sprout + self.sapling + self.orchard + self.ironwood)?
@@ -346,6 +349,10 @@ impl ValueBalance<NonNegative> {
     }
 
     /// To byte array
+    ///
+    /// The `ironwood` pool (NU6.3 onward) is appended after `deferred`, so that records written by
+    /// earlier Zebra versions (32 bytes without `deferred`, or 40 bytes with it) remain parsable by
+    /// [`Self::from_bytes`].
     pub fn to_bytes(self) -> [u8; 48] {
         match [
             self.transparent.to_bytes(),
@@ -366,6 +373,9 @@ impl ValueBalance<NonNegative> {
     }
 
     /// From byte array
+    ///
+    /// Accepts 32-byte (pre-`deferred`), 40-byte (pre-`ironwood`), and 48-byte records; missing
+    /// trailing pools default to zero.
     #[allow(clippy::unwrap_in_result)]
     pub fn from_bytes(bytes: &[u8]) -> Result<ValueBalance<NonNegative>, ValueBalanceError> {
         let bytes_length = bytes.len();
@@ -431,8 +441,8 @@ impl ValueBalance<NonNegative> {
             sprout,
             sapling,
             orchard,
-            ironwood,
             deferred,
+            ironwood,
         })
     }
 }
@@ -452,11 +462,11 @@ pub enum ValueBalanceError {
     /// orchard amount error {0}
     Orchard(amount::Error),
 
-    /// Ironwood amount error {0}
-    Ironwood(amount::Error),
-
     /// deferred amount error {0}
     Deferred(amount::Error),
+
+    /// ironwood amount error {0}
+    Ironwood(amount::Error),
 
     /// ValueBalance is unparsable
     Unparsable,
@@ -469,8 +479,8 @@ impl fmt::Display for ValueBalanceError {
             Sprout(e) => format!("sprout amount err: {e}"),
             Sapling(e) => format!("sapling amount err: {e}"),
             Orchard(e) => format!("orchard amount err: {e}"),
-            Ironwood(e) => format!("ironwood amount err: {e}"),
             Deferred(e) => format!("deferred amount err: {e}"),
+            Ironwood(e) => format!("ironwood amount err: {e}"),
             Unparsable => "value balance is unparsable".to_string(),
         })
     }
@@ -487,8 +497,8 @@ where
             sprout: (self.sprout + rhs.sprout).map_err(Sprout)?,
             sapling: (self.sapling + rhs.sapling).map_err(Sapling)?,
             orchard: (self.orchard + rhs.orchard).map_err(Orchard)?,
-            ironwood: (self.ironwood + rhs.ironwood).map_err(Ironwood)?,
             deferred: (self.deferred + rhs.deferred).map_err(Deferred)?,
+            ironwood: (self.ironwood + rhs.ironwood).map_err(Ironwood)?,
         })
     }
 }
@@ -537,8 +547,8 @@ where
             sprout: (self.sprout - rhs.sprout).map_err(Sprout)?,
             sapling: (self.sapling - rhs.sapling).map_err(Sapling)?,
             orchard: (self.orchard - rhs.orchard).map_err(Orchard)?,
-            ironwood: (self.ironwood - rhs.ironwood).map_err(Ironwood)?,
             deferred: (self.deferred - rhs.deferred).map_err(Deferred)?,
+            ironwood: (self.ironwood - rhs.ironwood).map_err(Ironwood)?,
         })
     }
 }
@@ -607,8 +617,8 @@ where
             sprout: self.sprout.neg(),
             sapling: self.sapling.neg(),
             orchard: self.orchard.neg(),
-            ironwood: self.ironwood.neg(),
             deferred: self.deferred.neg(),
+            ironwood: self.ironwood.neg(),
         }
     }
 }

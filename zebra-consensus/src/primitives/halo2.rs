@@ -284,8 +284,8 @@ pub fn v5_verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierServ
         Genesis | BeforeOverwinter | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5
         | Nu6 | Nu6_1 => &VERIFIER_PRE_NU6_2,
 
-        // NU6.2 ships the fixed V5 Orchard circuit. Later V5 transactions keep the V5 Orchard
-        // transaction format, so they also verify under the fixed V5 key.
+        // NU6.2 ships the fixed circuit, and every upgrade after it inherits that fixed circuit,
+        // so all of them verify under the fixed key.
         Nu6_2 | Nu6_3 | Nu7 => &VERIFIER_POST_NU6_2,
 
         // `ZFuture` only exists under the `zcash_unstable = "zfuture"` cfg. It is a post-NU6.2

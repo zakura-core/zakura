@@ -1,7 +1,7 @@
-# Manual upstream PR discovery and one-at-a-time adaptation for the Valar Zebra fork.
+# Upstream PR discovery and conservative triage for the Valar Zebra fork.
 #
-# v1 is intentionally manual-only and capped at a single upstream PR per run.
-name: Upstream PR Sync Pilot
+# Scheduled runs batch quiet triage, but open at most one downstream PR.
+name: Upstream PR Triage Pilot
 
 on:
   workflow_dispatch:
@@ -31,14 +31,16 @@ on:
         type: string
         default: ""
       limit:
-        description: "Maximum candidates to process. v1 only accepts 1."
+        description: "Maximum candidates to triage. Must be between 1 and 25."
         type: string
-        default: "1"
+        default: "25"
+  schedule:
+    - cron: "17 * * * *"
 
 permissions: {}
 
 concurrency:
-  group: upstream-sync-${{ github.ref }}-${{ inputs.mode }}
+  group: upstream-sync-${{ github.ref }}-${{ inputs.mode || 'open-pr' }}
   cancel-in-progress: false
 
 jobs:
@@ -54,20 +56,27 @@ jobs:
       source_pr: ${{ steps.discover.outputs.source_pr }}
       branch_name: ${{ steps.discover.outputs.branch_name }}
       pr_title: ${{ steps.discover.outputs.pr_title }}
+      candidate_count: ${{ steps.discover.outputs.candidate_count }}
     steps:
       - name: Validate inputs
         env:
-          LIMIT: ${{ inputs.limit }}
+          LIMIT: ${{ inputs.limit || '25' }}
         run: |
-          if [ "$LIMIT" != "1" ]; then
-            echo "upstream-sync v1 only supports limit=1" >&2
+          case "$LIMIT" in
+            ""|*[!0-9]*)
+              echo "upstream-sync limit must be a number between 1 and 25" >&2
+              exit 1
+              ;;
+          esac
+          if [ "$LIMIT" -lt 1 ] || [ "$LIMIT" -gt 25 ]; then
+            echo "upstream-sync supports limit between 1 and 25" >&2
             exit 1
           fi
 
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-          ref: ${{ inputs.target_ref }}
+          ref: ${{ inputs.target_ref || 'ironwood-main' }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -75,12 +84,12 @@ jobs:
         id: discover
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SOURCE_REPO: ${{ inputs.source_repo }}
-          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_REPO: ${{ inputs.source_repo || 'ZcashFoundation/zebra' }}
+          SOURCE_REF: ${{ inputs.source_ref || 'main' }}
           TARGET_REPO: ${{ github.repository }}
-          TARGET_REF: ${{ inputs.target_ref }}
-          CANDIDATE_PR: ${{ inputs.candidate_pr }}
-          LIMIT: ${{ inputs.limit }}
+          TARGET_REF: ${{ inputs.target_ref || 'ironwood-main' }}
+          CANDIDATE_PR: ${{ inputs.candidate_pr || '' }}
+          LIMIT: ${{ inputs.limit || '25' }}
         run: |
           .github/scripts/upstream-sync-discover.py \
             --source-repo "$SOURCE_REPO" \
@@ -103,20 +112,21 @@ jobs:
           include-hidden-files: true
 
   codex-patch:
-    name: Ask Codex to adapt candidate
+    name: Ask Codex to triage candidate
     runs-on: ubuntu-latest
     needs: discover
-    if: ${{ inputs.mode != 'discover' && needs.discover.outputs.has_candidate == 'true' }}
+    if: ${{ (inputs.mode || 'open-pr') != 'discover' && needs.discover.outputs.has_candidate == 'true' }}
     permissions:
       contents: read
       pull-requests: read
     outputs:
       result_status: ${{ steps.collect.outputs.status }}
+      has_recordable_decisions: ${{ steps.collect.outputs.has_recordable_decisions }}
     steps:
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-          ref: ${{ inputs.target_ref }}
+          ref: ${{ inputs.target_ref || 'ironwood-main' }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -160,13 +170,44 @@ jobs:
           path: .github/upstream-sync/work
           include-hidden-files: true
 
-  open-pr:
-    name: Open draft PR
+  record-decision:
+    name: Record non-import triage decision
     runs-on: ubuntu-latest
     needs:
       - discover
       - codex-patch
-    if: ${{ inputs.mode == 'open-pr' && needs.codex-patch.outputs.result_status == 'applied' }}
+    if: >-
+      ${{
+        (inputs.mode || 'open-pr') == 'open-pr' &&
+        needs.discover.outputs.has_candidate == 'true' &&
+        needs.codex-patch.outputs.has_recordable_decisions == 'true'
+      }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          ref: ${{ inputs.target_ref || 'ironwood-main' }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download Codex artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+        with:
+          name: upstream-sync-codex
+          path: .github/upstream-sync/work
+
+      - name: Record triage decision
+        run: .github/scripts/upstream-sync-run.sh record-decision
+
+  open-needs-human-pr:
+    name: Open human review PR
+    runs-on: ubuntu-latest
+    needs:
+      - discover
+      - codex-patch
+    if: ${{ (inputs.mode || 'open-pr') == 'open-pr' && needs.codex-patch.outputs.result_status == 'needs_human' }}
     permissions:
       contents: write
       pull-requests: write
@@ -174,7 +215,64 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-          ref: ${{ inputs.target_ref }}
+          ref: ${{ inputs.target_ref || 'ironwood-main' }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download Codex artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+        with:
+          name: upstream-sync-codex
+          path: .github/upstream-sync/work
+
+      - name: Validate Codex result
+        run: |
+          .github/scripts/upstream-sync-validate.sh \
+            .github/upstream-sync/work/result.json \
+            .github/upstream-sync/work/candidate.json
+          git diff --check
+
+      - name: Prepare PR metadata
+        id: pr-meta
+        run: .github/scripts/upstream-sync-run.sh write-pr-body
+
+      - name: Delete stale upstream sync branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/scripts/upstream-sync-run.sh delete-stale-branch
+
+      - name: Create human review PR
+        id: create-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SYNC_TARGET_REF: ${{ inputs.target_ref || 'ironwood-main' }}
+        run: .github/scripts/upstream-sync-run.sh create-human-review-pr
+
+      - name: Verify PR state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.create-pr.outputs.pull_request_number }}
+        run: |
+          gh pr view "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --json isDraft,mergeStateStatus,url \
+            --jq '.'
+
+  open-pr:
+    name: Open draft PR
+    runs-on: ubuntu-latest
+    needs:
+      - discover
+      - codex-patch
+    if: ${{ (inputs.mode || 'open-pr') == 'open-pr' && needs.codex-patch.outputs.result_status == 'applied' }}
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          ref: ${{ inputs.target_ref || 'ironwood-main' }}
           fetch-depth: 0
           persist-credentials: true
 
@@ -224,12 +322,23 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: ${{ steps.pr-meta.outputs.branch }}
-          base: ${{ inputs.target_ref }}
+          base: ${{ inputs.target_ref || 'ironwood-main' }}
           title: ${{ steps.pr-meta.outputs.title }}
           body-path: .github/upstream-sync/work/pr-body.md
           commit-message: ${{ steps.pr-meta.outputs.title }}
+          sign-commits: true
           draft: always-true
           delete-branch: false
+
+      - name: Verify signed commits
+        if: >-
+          ${{
+            steps.create-pr.outputs.pull-request-number != '' &&
+            steps.create-pr.outputs.pull-request-commits-verified != 'true'
+          }}
+        run: |
+          echo "ERROR: upstream sync PR commits were not verified by GitHub" >&2
+          exit 1
 
       - name: Verify PR state
         if: steps.create-pr.outputs.pull-request-number != ''

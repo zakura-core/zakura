@@ -235,12 +235,16 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu6, ConsensusBranchId(0xc8e71055)),
     (Nu6_1, ConsensusBranchId(0x4dec4df0)),
     (Nu6_2, ConsensusBranchId(0x5437f330)),
-    // TODO: Replace this placeholder once the Ironwood / NU6.3 consensus branch ID is chosen.
+    // TODO: set the real NU6.3 (Ironwood) branch id once it is published.
+    // This placeholder matches the placeholder `BranchId::Nu6_3 = 0xffff_ffff`
+    // in our Ironwood librustzcash, so that `Transaction::to_librustzcash`
+    // resolves v6 transactions to the fork's NU6.3 branch id.
+    #[cfg(any(test, feature = "zebra-test"))]
     (Nu6_3, ConsensusBranchId(0xffffffff)),
-    // TODO: Replace this placeholder once the NU7 consensus branch ID is chosen.
-    (Nu7, ConsensusBranchId(0xfffffffd)),
+    // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
+    (Nu7, ConsensusBranchId(0xfffffffe)),
     #[cfg(zcash_unstable = "zfuture")]
-    (ZFuture, ConsensusBranchId(0xfffffffe)),
+    (ZFuture, ConsensusBranchId(0xfffffffd)),
 ];
 
 /// The target block spacing before Blossom.

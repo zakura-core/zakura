@@ -119,8 +119,13 @@ async fn verifier_routes_each_transaction_format_to_the_correct_key() {
         );
     }
 
-    // NU6.2 and later V5 Orchard bundles route to the fixed V5 key.
-    for nu in [NetworkUpgrade::Nu6_2, NetworkUpgrade::Nu6_3] {
+    // NU6.2 and every later upgrade route to the fixed key. Nu6_3 and the future Nu7 guard that
+    // "NU6.2 and later" does not silently fall back to the insecure verifier for later upgrades.
+    for nu in [
+        NetworkUpgrade::Nu6_2,
+        NetworkUpgrade::Nu6_3,
+        NetworkUpgrade::Nu7,
+    ] {
         assert!(
             std::ptr::eq(v5_verifier_for(nu), post),
             "{nu:?} must route to the post-NU6.2 (fixed) verifier"

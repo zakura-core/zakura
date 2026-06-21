@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Ironwood note commitment tree roots and Ironwood transaction counts.
 - `HistoryTree`, `NonEmptyHistoryTree`, and `zcash_history::Tree` constructors
   and mutators now require an Ironwood note commitment tree root.
+### Added
+
+- `ValueBalance` now has an Ironwood value-pool slot, with
+  `from_ironwood_amount`, `ironwood_amount`, and
+  `set_ironwood_value_balance` helpers.
 
 ## [9.0.0] - 2026-06-02
 
@@ -216,7 +221,6 @@ All `ParametersBuilder` methods and `Parameters::new_regtest()` now return `Resu
 
 - Added `From<SerializationError>` implementation for `std::io::Error`
 - Added `InvalidMinFee` error variant to `zebra_chain::transaction::zip317::Error`
-- Added `Transaction::zip233_amount()` method
 
 ## [3.0.0] - 2025-10-15
 

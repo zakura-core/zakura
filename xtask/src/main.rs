@@ -244,6 +244,6 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "(NU6.3 paths), and writes the binary to target/ubuntu/{OUTPUT_BINARY_NAME}.",
+        "(NU7 paths), and writes the binary to target/ubuntu/{OUTPUT_BINARY_NAME}.",
     )
 }

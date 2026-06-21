@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bumped the state database format to 28 during upgrade, backfilling empty
   Ironwood tree, value pool, and index data, then rebuilding stored history tree
   entries so they use the Ironwood-capable entry size.
+- Extended value-pool disk serialization with an Ironwood slot after the
+  deferred pool, and bumped the state database format version to `27.3.0`.
 
 ## [8.0.0] - 2026-06-02
 

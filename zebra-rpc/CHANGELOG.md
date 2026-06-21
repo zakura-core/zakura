@@ -48,10 +48,10 @@ This release fixes two RPC security issues:
 - `client::DefaultRoots::from_coinbase()` return type changed from `Result<Self, Box<dyn Error>>` to `Self`
 - `client::TransactionTemplate::new_coinbase()` parameter changed from `mempool_txs` to `txs_fee: Amount<NonNegative>`
 - `BlockTemplateResponse::new_internal` signature reworked: now takes
-  `(net, precomputed_coinbase: Option<TransactionTemplate<NegativeOrZero>>, miner_params: &MinerParams, chain_info: &GetBlockTemplateChainInfo, long_poll_id, mempool_txs, submit_old, [zip233_amount])`.
+  `(net, precomputed_coinbase: Option<TransactionTemplate<NegativeOrZero>>, miner_params: &MinerParams, chain_info: &GetBlockTemplateChainInfo, long_poll_id, mempool_txs, submit_old)`.
 - `validate_block_proposal` now takes `&Network` instead of `Network`.
 - `select_mempool_transactions` signature reworked: now takes
-  `(net, height, miner_params: &MinerParams, mempool_txs, mempool_tx_deps, [zip233_amount])`;
+  `(net, height, miner_params: &MinerParams, mempool_txs, mempool_tx_deps)`;
   the `extra_coinbase_data` argument has been removed.
 - `GetBlockTemplateHandler::new` no longer panics on an invalid miner address;
   it stores `Option<MinerParams>` and the request handler returns an error if
@@ -69,7 +69,7 @@ This release fixes two RPC security issues:
 
 - `client`:
   - `DefaultRoots::from_coinbase()`
-  - `TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee, [zip233_amount])`
+  - `TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)`
 - `MinerParams` struct and `MinerParamsError` enum
   (`MissingAddr`, `InvalidAddr`, `OversizedData`, `InvalidMemo`):
   - `addr()`, `data()`, `memo()`, `new()`

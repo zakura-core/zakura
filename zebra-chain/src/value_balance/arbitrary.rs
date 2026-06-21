@@ -19,8 +19,8 @@ impl Arbitrary for ValueBalance<NegativeAllowed> {
                     sprout,
                     sapling,
                     orchard,
-                    ironwood,
                     deferred,
+                    ironwood,
                 },
             )
             .boxed()
@@ -47,8 +47,8 @@ impl Arbitrary for ValueBalance<NonNegative> {
                     sprout,
                     sapling,
                     orchard,
-                    ironwood,
                     deferred,
+                    ironwood,
                 },
             )
             .boxed()

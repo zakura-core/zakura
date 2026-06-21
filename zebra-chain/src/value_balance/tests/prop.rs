@@ -18,17 +18,18 @@ proptest! {
         let orchard = value_balance1.orchard + value_balance2.orchard;
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
         let deferred = value_balance1.deferred + value_balance2.deferred;
+        let ironwood = value_balance1.ironwood + value_balance2.ironwood;
 
-        match (transparent, sprout, sapling, orchard, ironwood, deferred) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(ironwood), Ok(deferred)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood)) => prop_assert_eq!(
                 value_balance1 + value_balance2,
                 Ok(ValueBalance {
                     transparent,
                     sprout,
                     sapling,
                     orchard,
-                    ironwood,
-                    deferred
+                    deferred,
+                    ironwood
                 })
             ),
             _ => prop_assert!(
@@ -38,8 +39,8 @@ proptest! {
                         | ValueBalanceError::Sprout(_)
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
-                        | ValueBalanceError::Ironwood(_)
-                        | ValueBalanceError::Deferred(_))
+                        | ValueBalanceError::Deferred(_)
+                        | ValueBalanceError::Ironwood(_))
                 )
             ),
         }
@@ -57,17 +58,18 @@ proptest! {
         let orchard = value_balance1.orchard - value_balance2.orchard;
         let ironwood = value_balance1.ironwood - value_balance2.ironwood;
         let deferred = value_balance1.deferred - value_balance2.deferred;
+        let ironwood = value_balance1.ironwood - value_balance2.ironwood;
 
-        match (transparent, sprout, sapling, orchard, ironwood, deferred) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(ironwood), Ok(deferred)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood)) => prop_assert_eq!(
                 value_balance1 - value_balance2,
                 Ok(ValueBalance {
                     transparent,
                     sprout,
                     sapling,
                     orchard,
-                    ironwood,
-                    deferred
+                    deferred,
+                    ironwood
                 })
             ),
             _ => prop_assert!(matches!(
@@ -76,8 +78,8 @@ proptest! {
                         | ValueBalanceError::Sprout(_)
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
-                        | ValueBalanceError::Ironwood(_)
-                        | ValueBalanceError::Deferred(_))
+                        | ValueBalanceError::Deferred(_)
+                        | ValueBalanceError::Ironwood(_))
                 )),
         }
     }
@@ -97,17 +99,18 @@ proptest! {
         let orchard = value_balance1.orchard + value_balance2.orchard;
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
         let deferred = value_balance1.deferred + value_balance2.deferred;
+        let ironwood = value_balance1.ironwood + value_balance2.ironwood;
 
-        match (transparent, sprout, sapling, orchard, ironwood, deferred) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(ironwood), Ok(deferred)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood)) => prop_assert_eq!(
                 collection.iter().sum::<Result<ValueBalance<NegativeAllowed>, ValueBalanceError>>(),
                 Ok(ValueBalance {
                     transparent,
                     sprout,
                     sapling,
                     orchard,
-                    ironwood,
-                    deferred
+                    deferred,
+                    ironwood
                 })
             ),
             _ => prop_assert!(matches!(
@@ -116,8 +119,8 @@ proptest! {
                         | ValueBalanceError::Sprout(_)
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
-                        | ValueBalanceError::Ironwood(_)
-                        | ValueBalanceError::Deferred(_))
+                        | ValueBalanceError::Deferred(_)
+                        | ValueBalanceError::Ironwood(_))
                  ))
         }
     }

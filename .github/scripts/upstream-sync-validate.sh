@@ -13,7 +13,7 @@ fi
 
 jq -e '
   type == "object" and
-  (.status | IN("applied", "already_present", "needs_human", "failed")) and
+  (.status | IN("applied", "already_present", "needs_human", "failed", "skipped")) and
   (.source_pr | type == "number") and
   (.confidence_percent | type == "number" and . >= 0 and . <= 100) and
   (.recommendation | type == "string" and length > 0) and
@@ -23,7 +23,14 @@ jq -e '
   (.files_changed | type == "array") and
   (.validation | type == "array") and
   (.risks | type == "array") and
-  (.follow_up | type == "array")
+  (.follow_up | type == "array") and
+  (.triage_decisions | type == "array") and
+  all(.triage_decisions[]?; (
+    (.source_pr | type == "number") and
+    (.status | IN("already_present", "skipped")) and
+    (.confidence_percent | type == "number" and . >= 0 and . <= 100) and
+    (.recommendation | type == "string" and length > 0)
+  ))
 ' "$RESULT_JSON" >/dev/null
 
 if [ -n "$CANDIDATE_JSON" ]; then
@@ -31,22 +38,57 @@ if [ -n "$CANDIDATE_JSON" ]; then
     echo "ERROR: candidate JSON not found: $CANDIDATE_JSON" >&2
     exit 1
   fi
-  EXPECTED_PR="$(jq -r '.source_pr' "$CANDIDATE_JSON")"
   ACTUAL_PR="$(jq -r '.source_pr' "$RESULT_JSON")"
-  if [ "$EXPECTED_PR" != "$ACTUAL_PR" ]; then
-    echo "ERROR: result source_pr ${ACTUAL_PR} does not match candidate ${EXPECTED_PR}" >&2
+  CANDIDATE_MATCH="$(
+    jq -c --argjson source_pr "$ACTUAL_PR" '
+      if (.candidates | type) == "array" then
+        .candidates[] | select(.source_pr == $source_pr)
+      elif .source_pr == $source_pr then
+        .
+      else
+        empty
+      end
+    ' "$CANDIDATE_JSON" | head -n 1
+  )"
+  if [ -z "$CANDIDATE_MATCH" ]; then
+    echo "ERROR: result source_pr ${ACTUAL_PR} does not match any discovered candidate" >&2
     exit 1
   fi
 
-  EXPECTED_BRANCH="$(jq -r '.branch_name' "$CANDIDATE_JSON")"
+  EXPECTED_BRANCH="$(jq -r '.branch_name' <<<"$CANDIDATE_MATCH")"
   ACTUAL_BRANCH="$(jq -r '.branch_name' "$RESULT_JSON")"
   if [ "$EXPECTED_BRANCH" != "$ACTUAL_BRANCH" ]; then
     echo "ERROR: result branch_name ${ACTUAL_BRANCH} does not match candidate ${EXPECTED_BRANCH}" >&2
     exit 1
   fi
 
-  EXPECTED_PR_MARKER="$(jq -r '.body_markers.upstream_pr // "Upstream-Zebra-PR: \(.source_pr)"' "$CANDIDATE_JSON")"
-  EXPECTED_MERGE_MARKER="$(jq -r '.body_markers.upstream_merge // (if .source_merge_commit then "Upstream-Zebra-Merge: \(.source_merge_commit)" else "" end)' "$CANDIDATE_JSON")"
+  if ! jq -n -e \
+    --slurpfile result "$RESULT_JSON" \
+    --slurpfile candidate "$CANDIDATE_JSON" \
+    '
+      ($result[0]) as $result_root |
+      ($candidate[0]) as $candidate_root |
+      (if ($candidate_root.candidates | type) == "array" then
+        [$candidate_root.candidates[].source_pr]
+      else
+        [$candidate_root.source_pr]
+      end) as $candidate_prs |
+      ($candidate_prs | index($result_root.source_pr)) as $top_level_index |
+      ([$result_root.triage_decisions[]?.source_pr]) as $decision_prs |
+      all($result_root.triage_decisions[]?; (. as $decision |
+        (($candidate_prs | index($decision.source_pr)) != null) and
+        (($candidate_prs | index($decision.source_pr)) < $top_level_index) and
+        ($decision.status == "already_present" or $decision.status == "skipped")
+      )) and
+      (($decision_prs | length) == ($decision_prs | unique | length)) and
+      (($decision_prs | index($result_root.source_pr)) == null)
+    ' >/dev/null; then
+    echo "ERROR: triage_decisions must be unique, quiet decisions for discovered candidates before the top-level result" >&2
+    exit 1
+  fi
+
+  EXPECTED_PR_MARKER="$(jq -r '.body_markers.upstream_pr // "Upstream-Zebra-PR: \(.source_pr)"' <<<"$CANDIDATE_MATCH")"
+  EXPECTED_MERGE_MARKER="$(jq -r '.body_markers.upstream_merge // (if .source_merge_commit then "Upstream-Zebra-Merge: \(.source_merge_commit)" else "" end)' <<<"$CANDIDATE_MATCH")"
 else
   EXPECTED_PR_MARKER="Upstream-Zebra-PR: $(jq -r '.source_pr' "$RESULT_JSON")"
   EXPECTED_MERGE_MARKER=""

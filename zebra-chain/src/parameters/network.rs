@@ -389,11 +389,11 @@ impl Network {
     /// Returns whether the consensus rule requiring a canonically-sized Orchard proof
     /// is active at `height`.
     ///
-    /// This rule activates with the network upgrade that re-enables Orchard actions
-    /// (NU6.2), or with NU6.3 on configured networks that skip NU6.2. It is a
-    /// constricting rule, so it must stay height-gated, or it would reject historical
-    /// Orchard actions mined before the soft fork that temporarily disabled them, and
-    /// prevent syncing.
+    /// This rule activates with the network upgrade that re-enables Orchard
+    /// actions (NU6.2), or with NU6.3 on configured networks that skip NU6.2.
+    /// It is a constricting rule, so it must stay height-gated, or it would
+    /// reject historical Orchard actions mined before the soft fork that
+    /// temporarily disabled them, and prevent syncing.
     pub fn orchard_canonical_proof_size_rule_active(&self, height: Height) -> bool {
         NetworkUpgrade::Nu6_2
             .activation_height(self)

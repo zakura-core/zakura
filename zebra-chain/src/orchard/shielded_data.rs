@@ -275,7 +275,7 @@ pub(crate) enum FlagFormat {
     /// V5 Orchard format, where bit 2 is reserved.
     PreNu6_3,
     /// V6 Orchard-style format, where bit 2 is `enableCrossAddress`.
-    #[cfg(any(zcash_unstable = "nu6.3", test))]
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7", test))]
     Nu6_3,
 }
 
@@ -295,7 +295,7 @@ impl Flags {
                     ));
                 }
             }
-            #[cfg(any(zcash_unstable = "nu6.3", test))]
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7", test))]
             FlagFormat::Nu6_3 => {}
         }
 
@@ -318,7 +318,7 @@ impl Flags {
                     None
                 }
             }
-            #[cfg(any(zcash_unstable = "nu6.3", test))]
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7", test))]
             FlagFormat::Nu6_3 => Self::from_bits(bits),
         };
 

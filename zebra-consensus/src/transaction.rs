@@ -544,7 +544,7 @@ where
                     script_verifier,
                     cached_ffi_transaction.clone(),
                 )?,
-                #[cfg(zcash_unstable = "nu6.3")]
+                #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                 Transaction::V6 {
                     ..
                 } => Self::verify_v6_transaction(
@@ -911,7 +911,8 @@ where
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
             | NetworkUpgrade::Overwinter
-            | NetworkUpgrade::Nu6_3 => Err(TransactionError::UnsupportedByNetworkUpgrade(
+            | NetworkUpgrade::Nu6_3
+            | NetworkUpgrade::Nu7 => Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),
                 network_upgrade,
             )),
@@ -987,7 +988,8 @@ where
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
-            | NetworkUpgrade::Nu6_3 => Ok(()),
+            | NetworkUpgrade::Nu6_3
+            | NetworkUpgrade::Nu7 => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),
@@ -1007,7 +1009,7 @@ where
     }
 
     /// Passthrough to verify_v5_transaction, but for V6 transactions.
-    #[cfg(zcash_unstable = "nu6.3")]
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn verify_v6_transaction(
         request: &Request,
         network: &Network,

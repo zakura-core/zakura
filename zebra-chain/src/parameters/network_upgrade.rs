@@ -64,6 +64,9 @@ pub enum NetworkUpgrade {
     /// The Zcash protocol after the NU6.3 upgrade.
     #[serde(rename = "NU6.3")]
     Nu6_3,
+    /// The Zcash protocol after the NU7 upgrade.
+    #[serde(rename = "NU7")]
+    Nu7,
 
     #[cfg(zcash_unstable = "zfuture")]
     ZFuture,
@@ -234,6 +237,8 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu6_2, ConsensusBranchId(0x5437f330)),
     // TODO: Replace this placeholder once the Ironwood / NU6.3 consensus branch ID is chosen.
     (Nu6_3, ConsensusBranchId(0xffffffff)),
+    // TODO: Replace this placeholder once the NU7 consensus branch ID is chosen.
+    (Nu7, ConsensusBranchId(0xfffffffd)),
     #[cfg(zcash_unstable = "zfuture")]
     (ZFuture, ConsensusBranchId(0xfffffffe)),
 ];
@@ -400,7 +405,7 @@ impl NetworkUpgrade {
     pub fn target_spacing(&self) -> Duration {
         let spacing_seconds = match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling => PRE_BLOSSOM_POW_TARGET_SPACING,
-            Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 => {
+            Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7 => {
                 POST_BLOSSOM_POW_TARGET_SPACING.into()
             }
 
@@ -528,6 +533,8 @@ impl From<zcash_protocol::consensus::NetworkUpgrade> for NetworkUpgrade {
             zcash_protocol::consensus::NetworkUpgrade::Nu6_2 => Self::Nu6_2,
             #[cfg(zcash_unstable = "nu6.3")]
             zcash_protocol::consensus::NetworkUpgrade::Nu6_3 => Self::Nu6_3,
+            #[cfg(zcash_unstable = "nu7")]
+            zcash_protocol::consensus::NetworkUpgrade::Nu7 => Self::Nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zcash_protocol::consensus::NetworkUpgrade::ZFuture => Self::ZFuture,
         }

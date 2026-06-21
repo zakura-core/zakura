@@ -432,6 +432,7 @@ fn configured_activation_heights(
         nu6_1: None,
         nu6_2: (latest_network_upgrade >= Nu6_2).then_some(activation_height),
         nu6_3: (latest_network_upgrade >= Nu6_3).then_some(activation_height),
+        nu7: (latest_network_upgrade >= Nu7).then_some(activation_height),
     })
 }
 

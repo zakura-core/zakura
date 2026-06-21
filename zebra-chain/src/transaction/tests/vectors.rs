@@ -1040,7 +1040,7 @@ fn binding_signatures() {
                             at_least_one_v5_checked = true;
                         }
                     }
-                    #[cfg(zcash_unstable = "nu6.3")]
+                    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                     Transaction::V6 { .. } => {}
                 }
             }
@@ -1070,7 +1070,7 @@ fn test_coinbase_script() -> Result<()> {
 }
 
 #[test]
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_transactions_reject_pre_nu6_3_branch_id() {
     use crate::parameters::TX_V6_VERSION_GROUP_ID;
 
@@ -1094,7 +1094,7 @@ fn v6_transactions_reject_pre_nu6_3_branch_id() {
 }
 
 #[test]
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_txid_commits_to_ironwood_digest() {
     use proptest::{
         prelude::any,
@@ -1158,7 +1158,7 @@ fn v6_txid_commits_to_ironwood_digest() {
 }
 
 #[test]
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
     use proptest::{
         prelude::any,
@@ -1233,7 +1233,7 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
 }
 
 #[test]
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn unmined_v6_rejects_padded_orchard_proof_before_hashing() {
     let _init_guard = zebra_test::init();
 
@@ -1261,7 +1261,7 @@ fn unmined_v6_rejects_padded_orchard_proof_before_hashing() {
 }
 
 #[test]
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn unmined_v6_rejects_padded_ironwood_proof_before_hashing() {
     use proptest::{
         prelude::any,
@@ -1397,7 +1397,7 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
 
     Transaction::zcash_deserialize(&v5_tx_bytes[..]).expect_err("V5 rk = identity should fail");
 
-    #[cfg(zcash_unstable = "nu6.3")]
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     {
         let Transaction::V5 {
             orchard_shielded_data,

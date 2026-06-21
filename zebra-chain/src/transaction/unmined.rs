@@ -141,7 +141,7 @@ impl From<&Transaction> for UnminedTxId {
         match transaction {
             V1 { .. } | V2 { .. } | V3 { .. } | V4 { .. } => Legacy(transaction.into()),
             V5 { .. } => Witnessed(transaction.into()),
-            #[cfg(zcash_unstable = "nu6.3")]
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             V6 { .. } => Witnessed(transaction.into()),
         }
     }
@@ -295,7 +295,7 @@ impl fmt::Display for UnminedTxError {
 
 impl std::error::Error for UnminedTxError {}
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn mempool_transaction_proof_size_is_canonical(
     transaction: &Transaction,
 ) -> Result<(), UnminedTxError> {
@@ -323,7 +323,7 @@ fn mempool_transaction_proof_size_is_canonical(
     Ok(())
 }
 
-#[cfg(not(zcash_unstable = "nu6.3"))]
+#[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
 fn mempool_transaction_proof_size_is_canonical(
     _transaction: &Transaction,
 ) -> Result<(), UnminedTxError> {

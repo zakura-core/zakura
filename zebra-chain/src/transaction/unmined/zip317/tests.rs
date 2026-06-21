@@ -1,6 +1,6 @@
 //! ZIP-317 tests.
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use super::conventional_actions;
 use super::{mempool_checks, Amount, Error};
 
@@ -26,7 +26,7 @@ fn zip317_mempool_checks_ok() {
 }
 
 #[test]
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn zip317_counts_ironwood_actions() {
     use proptest::{
         prelude::any,

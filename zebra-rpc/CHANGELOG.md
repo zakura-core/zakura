@@ -225,7 +225,7 @@ process and third-party integration improvements.
 ### Breaking Changes
 
 - Removed the `GetAddressBalanceRequest::valid_address_strings` method.
-- Changed `GetTreestateResponse::new()` to take six parameters instead of five.
+- Changed `GetTreestateResponse::new()` to take `sprout` and `ironwood` as optional treestate parameters.
 - Changed `Commitments::new()` to take the new `final_root` parameter.
 - Changed `TransactionObject::new()` to take 26 parameters instead of 25.
 - Changed `Orchard::new()` to take seven parameters instead of three.

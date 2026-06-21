@@ -2062,7 +2062,7 @@ where
         let ironwood = ironwood
             .map(|(tree, root)| Treestate::new(trees::Commitments::new(Some(root), Some(tree))));
 
-        Ok(GetTreestateResponse::new_with_optional_ironwood(
+        Ok(GetTreestateResponse::new(
             hash,
             height,
             time,

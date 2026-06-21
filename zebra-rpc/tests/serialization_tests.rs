@@ -640,7 +640,7 @@ fn test_z_get_treestate() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let new_obj = GetTreestateResponse::new_with_optional_ironwood(
+    let new_obj = GetTreestateResponse::new(
         hash,
         height,
         time,
@@ -654,25 +654,6 @@ fn test_z_get_treestate() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     assert_eq!(obj, new_obj);
-
-    Ok(())
-}
-
-#[test]
-fn test_get_treestate_response_new_accepts_ironwood() -> Result<(), Box<dyn std::error::Error>> {
-    let obj = GetTreestateResponse::new(
-        zebra_chain::block::Hash([0; 32]),
-        zebra_chain::block::Height(0),
-        0,
-        None,
-        Treestate::default(),
-        Treestate::default(),
-        Treestate::default(),
-    );
-
-    assert!(obj.has_ironwood());
-    assert_eq!(obj.ironwood(), &Treestate::default());
-    assert!(serde_json::to_value(obj)?.get("ironwood").is_some());
 
     Ok(())
 }

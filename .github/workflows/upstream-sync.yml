@@ -326,8 +326,19 @@ jobs:
           title: ${{ steps.pr-meta.outputs.title }}
           body-path: .github/upstream-sync/work/pr-body.md
           commit-message: ${{ steps.pr-meta.outputs.title }}
+          sign-commits: true
           draft: always-true
           delete-branch: false
+
+      - name: Verify signed commits
+        if: >-
+          ${{
+            steps.create-pr.outputs.pull-request-number != '' &&
+            steps.create-pr.outputs.pull-request-commits-verified != 'true'
+          }}
+        run: |
+          echo "ERROR: upstream sync PR commits were not verified by GitHub" >&2
+          exit 1
 
       - name: Verify PR state
         if: steps.create-pr.outputs.pull-request-number != ''

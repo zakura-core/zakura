@@ -529,7 +529,7 @@ version = "0.20.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.darling]]
-version = "0.21.3"
+version = "0.23.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.darling_core]]
@@ -537,7 +537,7 @@ version = "0.20.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.darling_core]]
-version = "0.21.3"
+version = "0.23.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.darling_macro]]
@@ -545,7 +545,7 @@ version = "0.20.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.darling_macro]]
-version = "0.21.3"
+version = "0.23.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.data-encoding]]
@@ -1939,46 +1939,46 @@ version = "0.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.sentry]]
-version = "0.46.2"
+version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Pinned for Rust 1.85 CI"
+notes = "Sentry 0.47 upgrade"
 
 [[exemptions.sentry-backtrace]]
-version = "0.46.2"
+version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Pinned for Rust 1.85 CI"
+notes = "Sentry 0.47 upgrade"
 
 [[exemptions.sentry-contexts]]
-version = "0.46.2"
+version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Pinned for Rust 1.85 CI"
+notes = "Sentry 0.47 upgrade"
 
 [[exemptions.sentry-core]]
-version = "0.46.2"
+version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Pinned for Rust 1.85 CI"
+notes = "Sentry 0.47 upgrade"
 
 [[exemptions.sentry-log]]
-version = "0.46.2"
+version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Pinned for Rust 1.85 CI"
+notes = "Sentry 0.47 upgrade"
 
 [[exemptions.sentry-tracing]]
-version = "0.46.2"
+version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Pinned for Rust 1.85 CI"
+notes = "Sentry 0.47 upgrade"
 
 [[exemptions.sentry-types]]
-version = "0.46.2"
+version = "0.47.0"
 criteria = "safe-to-deploy"
 suggest = false
-notes = "Pinned for Rust 1.85 CI"
+notes = "Sentry 0.47 upgrade"
 
 [[exemptions.serde-big-array]]
 version = "0.5.1"
@@ -2009,11 +2009,11 @@ version = "0.7.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde_with]]
-version = "3.16.0"
+version = "3.20.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.serde_with_macros]]
-version = "3.16.0"
+version = "3.20.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.serdect]]
@@ -2233,23 +2233,23 @@ version = "1.1.1+spec-1.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tonic]]
-version = "0.14.2"
+version = "0.14.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.tonic-build]]
-version = "0.14.2"
+version = "0.14.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.tonic-prost]]
-version = "0.14.2"
+version = "0.14.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.tonic-prost-build]]
-version = "0.14.2"
+version = "0.14.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.tonic-reflection]]
-version = "0.14.2"
+version = "0.14.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.tower]]

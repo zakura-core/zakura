@@ -1,4 +1,8 @@
 //! Native Zakura block-sync stream messages and service scaffold.
+//!
+//! New to this subsystem? Start in [`pipe`] — it is the "start here" map of how a
+//! peer's stream-6 frames flow through the per-peer routine, the work queue, the
+//! commit pipeline, the registry, and the reactor.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -29,15 +33,20 @@ use super::{
 mod config;
 mod error;
 mod events;
+mod peer_registry;
+mod peer_routine;
 mod pipe;
 mod reactor;
 mod reorder;
-mod scheduler;
+mod request;
+mod sequencer;
+mod sequencer_task;
 mod service;
 mod state;
 #[cfg(test)]
 mod tests;
 mod wire;
+mod work_queue;
 
 pub use config::{BlockSyncStatus, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
 pub use error::BlockSyncWireError;
@@ -46,7 +55,7 @@ pub use events::{
     BlockSyncMisbehavior,
 };
 pub use reactor::spawn_block_sync_reactor;
-pub use scheduler::BlockSizeEstimate;
+pub use request::BlockSizeEstimate;
 #[cfg(test)]
 pub(crate) use service::block_sync_streams;
 pub use service::BlockSyncPeerSession;

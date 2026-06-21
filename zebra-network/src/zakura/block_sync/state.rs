@@ -1,4 +1,4 @@
-use super::{config::*, events::BlockApplyToken, reorder::*, scheduler::*, *};
+use super::{config::*, request::*, work_queue::WorkQueue, *};
 use crate::zakura::{
     chain_frontier_from_parts, Frontier, FrontierUpdate, ServicePeerDirection, ServicePeerSnapshot,
     ZakuraBlockSyncCandidateState,
@@ -8,8 +8,13 @@ use crate::zakura::{
 ///
 /// A safety bound only; the binding per-peer concurrency is the peer's advertised
 /// `max_inflight_requests` (config `max_inflight_requests`, clamped to
-/// [`DEFAULT_BS_MAX_INFLIGHT`]).
-pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = 16;
+/// [`MAX_BS_INFLIGHT_REQUESTS`]).
+// `MAX_BS_INFLIGHT_REQUESTS` is a `u16`, which always fits in `usize` on supported targets.
+pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = MAX_BS_INFLIGHT_REQUESTS as usize;
+/// Minimum additive growth after a successful response.
+const MIN_OUTBOUND_WINDOW_SUCCESS_GROWTH: usize = 64;
+/// Fractional additive-increase divisor after a successful response.
+const OUTBOUND_WINDOW_SUCCESS_GROWTH_DIVISOR: usize = 8;
 
 /// Cached chain frontiers used by the block-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -116,6 +121,11 @@ impl BlockSyncStartup {
 }
 
 /// Cheap cloneable handle used by services and drivers to inform block sync.
+///
+/// per-peer routines carries the shared per-peer download primitives here too, so
+/// `service::add_peer` (the pipe-routine spawn point) can wire each per-peer
+/// pipe-routine with the same `WorkQueue`/`ByteBudget`/`PeerRegistry`/Sequencer/
+/// action/routine-to-reactor channels the reactor created.
 #[derive(Clone, Debug)]
 pub struct BlockSyncHandle {
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
@@ -123,6 +133,27 @@ pub struct BlockSyncHandle {
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) status: watch::Receiver<BlockSyncStatus>,
     pub(super) candidates: watch::Receiver<ZakuraBlockSyncCandidateState>,
+    /// Shared primitives every per-peer pipe-routine is wired with at spawn
+    /// (`service::add_peer`). `None` for the inert/handle-less test constructors
+    /// that never spawn routines.
+    pub(super) routine_wiring: Option<RoutineWiring>,
+}
+
+/// The shared download primitives a per-peer pipe-routine is constructed with.
+/// Created once in `spawn_block_sync_reactor` and threaded through the handle to
+/// `service::add_peer`.
+#[derive(Clone, Debug)]
+pub(super) struct RoutineWiring {
+    pub(super) config: ZakuraBlockSyncConfig,
+    pub(super) budget: ByteBudget,
+    pub(super) work: Arc<WorkQueue>,
+    pub(super) registry: Arc<super::peer_registry::PeerRegistry>,
+    pub(super) received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
+    pub(super) sequencer_input: mpsc::Sender<super::sequencer_task::SequencerInput>,
+    pub(super) actions: mpsc::Sender<BlockSyncAction>,
+    pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
+    pub(super) view: watch::Receiver<super::sequencer_task::SequencerView>,
+    pub(super) trace: ZakuraTrace,
 }
 
 impl BlockSyncHandle {
@@ -186,29 +217,36 @@ impl BlockSyncHandle {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct BlockSyncState {
     pub(super) finalized_height: block::Height,
-    pub(super) verified_block_tip: block::Height,
     pub(super) verified_block_hash: block::Hash,
-    pub(super) body_download_floor: block::Height,
     pub(super) servable_high: block::Height,
     pub(super) servable_hash: block::Hash,
     pub(super) best_header_tip: block::Height,
     pub(super) best_header_hash: block::Hash,
+    /// Thin per-peer handles the reactor keeps for demux/serving/admission. The
+    /// per-peer *download* state moved into the spawned [`PeerRoutine`](super::peer_routine)
+    /// (per-peer routines); the cross-peer facts the reactor/producer need live in the
+    /// [`PeerRegistry`](super::peer_registry).
     pub(super) peers: HashMap<ZakuraPeerId, PeerBlockState>,
     pub(super) parked_peers: HashSet<ZakuraPeerId>,
-    pub(super) disconnected_peers: HashSet<ZakuraPeerId>,
-    pub(super) schedule: BlockRangeScheduler,
-    pub(super) reorder: ReorderBuffer,
-    pub(super) applying: BTreeMap<block::Height, ApplyingBlock>,
-    pub(super) submitted_applies: BTreeMap<block::Height, Vec<(block::Hash, usize)>>,
-    pub(super) next_apply_token: BlockApplyToken,
+    /// Sorted set of needed download heights. Replaces the central
+    /// `BlockRangeScheduler`: the per-peer issuance path pulls work in its own
+    /// servable range, dedup/covered are `in_flight`, and the floor is GC only.
+    /// `Arc` so the state stays cheaply `Clone` and the queue is shared with the
+    /// Sequencer task and the per-peer routines.
+    pub(super) work: Arc<WorkQueue>,
     pub(super) budget: ByteBudget,
     pub(super) needed_heights: Vec<block::Height>,
     pub(super) status_refresh: RateMeter,
     pub(super) pending_status_refresh: bool,
     pub(super) last_advertised_status: BlockSyncStatus,
+    /// Throughput of bodies received off the wire (the download rate). Shared
+    /// with the per-peer routines (they `record` on receipt); the reactor samples
+    /// it each trace tick. Compared against the Sequencer task's committed
+    /// throughput it separates a download-limited sync from a commit-limited one.
+    pub(super) received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
 }
 
 impl BlockSyncState {
@@ -224,26 +262,22 @@ impl BlockSyncState {
 
         Self {
             finalized_height: startup.frontiers.finalized_height,
-            verified_block_tip: startup.frontiers.verified_block_tip,
             verified_block_hash: startup.frontiers.verified_block_hash,
-            body_download_floor: startup.frontiers.verified_block_tip,
             servable_high: startup.frontiers.verified_block_tip,
             servable_hash: startup.frontiers.verified_block_hash,
             best_header_tip: startup.best_header_tip.0,
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
-            disconnected_peers: HashSet::new(),
-            schedule: BlockRangeScheduler::new(startup.config.fanout),
-            reorder: ReorderBuffer::new(),
-            applying: BTreeMap::new(),
-            submitted_applies: BTreeMap::new(),
-            next_apply_token: 1,
+            work: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
             needed_heights: Vec::new(),
             status_refresh: RateMeter::new(startup.config.status_refresh_interval),
             pending_status_refresh: false,
             last_advertised_status,
+            received_throughput: Arc::new(std::sync::Mutex::new(ThroughputMeter::new(
+                Instant::now(),
+            ))),
         }
     }
 
@@ -262,67 +296,76 @@ impl BlockSyncState {
     }
 }
 
+/// Adaptive per-peer outbound request window + outstanding requests.
+///
+/// Carved out of the old `PeerBlockState` so the window math stays unit-testable
+/// while the per-peer download state moves into the spawned
+/// [`PeerRoutine`](super::peer_routine) (per-peer routines). The routine embeds one of these.
 #[derive(Clone, Debug)]
-pub(super) struct ApplyingBlock {
-    pub(super) token: BlockApplyToken,
-    pub(super) hash: block::Hash,
-    pub(super) block: Arc<block::Block>,
-    pub(super) bytes: u64,
-    pub(super) submitted: bool,
-    /// The peer that delivered this body, used to attribute an apply rejection
-    /// for misbehavior scoring.
-    pub(super) source_peer: ZakuraPeerId,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct PeerBlockState {
-    pub(super) session: BlockSyncPeerSession,
-    pub(super) direction: ServicePeerDirection,
-    pub(super) servable_low: block::Height,
-    pub(super) servable_high: block::Height,
-    pub(super) max_blocks_per_response: u32,
+pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u16,
-    pub(super) max_response_bytes: u32,
-    pub(super) received_status: bool,
+    pub(super) outbound_request_window: usize,
+    pub(super) timeout_recovery_slots: usize,
     pub(super) outstanding: Vec<OutstandingBlockRange>,
-    pub(super) inbound_status: RateMeter,
-    pub(super) unsolicited: RateMeter,
-    pub(super) served_blocks_inflight: u16,
-    pub(super) misbehavior: u32,
 }
 
-impl PeerBlockState {
-    pub(super) fn new(session: BlockSyncPeerSession, config: &ZakuraBlockSyncConfig) -> Self {
+impl DownloadWindow {
+    pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
+        let max_inflight_requests = config.advertised_max_inflight_requests();
         Self {
-            direction: session.direction(),
-            session,
-            servable_low: block::Height::MIN,
-            servable_high: block::Height::MIN,
-            max_blocks_per_response: config.advertised_max_blocks_per_response(),
-            max_inflight_requests: config.advertised_max_inflight_requests(),
-            max_response_bytes: config.advertised_max_response_bytes(),
-            received_status: false,
+            max_inflight_requests,
+            outbound_request_window: usize::from(max_inflight_requests),
+            timeout_recovery_slots: 0,
             outstanding: Vec::new(),
-            inbound_status: RateMeter::new(
-                config.status_refresh_interval.min(Duration::from_secs(1)),
-            ),
-            unsolicited: RateMeter::new(config.status_refresh_interval),
-            served_blocks_inflight: 0,
-            misbehavior: 0,
         }
     }
 
     pub(super) fn available_slots(&self) -> usize {
-        usize::from(self.max_inflight_requests)
-            .min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER)
-            .saturating_sub(self.outstanding.len())
+        let hard_capacity = self.hard_outbound_capacity();
+        let adaptive_limit = hard_capacity.min(self.outbound_request_window);
+        let adaptive_slots = adaptive_limit.saturating_sub(self.outstanding.len());
+        if adaptive_slots > 0 {
+            return adaptive_slots;
+        }
+
+        self.timeout_recovery_slots
+            .min(hard_capacity.saturating_sub(self.outstanding.len()))
     }
 
-    pub(super) fn can_serve_any(&self, heights: &[block::Height]) -> bool {
-        self.received_status
-            && heights
-                .iter()
-                .any(|height| self.servable_low <= *height && *height <= self.servable_high)
+    pub(super) fn reduce_outbound_window_after_timeout(&mut self) {
+        self.outbound_request_window = self.outbound_request_window.saturating_div(2).max(1);
+        self.timeout_recovery_slots = self
+            .timeout_recovery_slots
+            .saturating_add(1)
+            .min(self.hard_outbound_capacity());
+    }
+
+    pub(super) fn increase_outbound_window_after_success(&mut self) {
+        let max_window = self.hard_outbound_capacity();
+        if self.outbound_request_window < max_window {
+            let growth = self
+                .outbound_request_window
+                .checked_div(OUTBOUND_WINDOW_SUCCESS_GROWTH_DIVISOR)
+                .unwrap_or(0)
+                .max(MIN_OUTBOUND_WINDOW_SUCCESS_GROWTH);
+            self.outbound_request_window = self
+                .outbound_request_window
+                .saturating_add(growth)
+                .min(max_window);
+        }
+    }
+
+    pub(super) fn record_outbound_request_scheduled(&mut self) {
+        let adaptive_limit = self
+            .hard_outbound_capacity()
+            .min(self.outbound_request_window);
+        if self.outstanding.len() >= adaptive_limit && self.timeout_recovery_slots > 0 {
+            self.timeout_recovery_slots = self.timeout_recovery_slots.saturating_sub(1);
+        }
+    }
+
+    pub(super) fn hard_outbound_capacity(&self) -> usize {
+        usize::from(self.max_inflight_requests).min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER)
     }
 
     pub(super) fn outstanding_index_for_height(&self, height: block::Height) -> Option<usize> {
@@ -336,35 +379,94 @@ impl PeerBlockState {
             .iter()
             .position(|outstanding| outstanding.request.start_height == start_height)
     }
+}
 
-    pub(super) fn try_start_serving_blocks(&mut self, local_inflight_cap: u16) -> bool {
+/// Thin per-peer handle the reactor keeps to serve inbound
+/// `GetBlocks` (the session clone + serving meters), advertise our `Status`, count
+/// admission, and tear down. The per-peer *download* state + inbound decode live
+/// in the per-peer pipe-routine ([`PeerRoutine`](super::peer_routine)); servable/
+/// caps live in the [`PeerRegistry`](super::peer_registry). There is no reactor→
+/// routine channel (inverted data flow): the routine owns its own `FramedRecv`.
+#[derive(Debug)]
+pub(super) struct PeerBlockState {
+    pub(super) session: BlockSyncPeerSession,
+    pub(super) direction: ServicePeerDirection,
+    /// Per-peer rate meter for the reactor's `Status` *advertisement* refresh
+    /// (serving-tip change broadcast + retry to peers that have not acknowledged
+    /// our Status). The previous `unsolicited` meter was dual-use; its inbound-status
+    /// *reply* half moved to the routine's `status_reply_meter`. This half stays
+    /// reactor-side because the reactor owns serving-tip advertisement.
+    pub(super) refresh_meter: RateMeter,
+    pub(super) served_blocks_inflight: u16,
+    pub(super) served_block_requests: VecDeque<(block::Height, Instant)>,
+}
+
+impl PeerBlockState {
+    pub(super) fn new(session: BlockSyncPeerSession, config: &ZakuraBlockSyncConfig) -> Self {
+        Self {
+            direction: session.direction(),
+            session,
+            refresh_meter: RateMeter::new(config.status_refresh_interval),
+            served_blocks_inflight: 0,
+            served_block_requests: VecDeque::new(),
+        }
+    }
+
+    pub(super) fn try_start_serving_blocks(
+        &mut self,
+        local_inflight_cap: u16,
+        start_height: block::Height,
+    ) -> bool {
         if self.served_blocks_inflight >= local_inflight_cap {
             return false;
         }
         self.served_blocks_inflight = self.served_blocks_inflight.saturating_add(1);
+        self.served_block_requests
+            .push_back((start_height, Instant::now()));
         true
     }
 
-    pub(super) fn finish_serving_blocks(&mut self) {
+    pub(super) fn serving_blocks_elapsed(&self, start_height: block::Height) -> Option<Duration> {
+        self.served_block_requests
+            .iter()
+            .find_map(|(start, started)| (*start == start_height).then(|| started.elapsed()))
+    }
+
+    pub(super) fn finish_serving_blocks(
+        &mut self,
+        start_height: block::Height,
+    ) -> Option<Duration> {
         self.served_blocks_inflight = self.served_blocks_inflight.saturating_sub(1);
+        self.served_block_requests
+            .iter()
+            .position(|(start, _)| *start == start_height)
+            .and_then(|index| self.served_block_requests.remove(index))
+            .map(|(_, started)| started.elapsed())
     }
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
+    pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
     pub(super) received: HashSet<block::Height>,
 }
 
 impl OutstandingBlockRange {
+    /// Worst-case bytes still reserved for this request: the per-block worst case
+    /// for every requested height not yet received. The reservation for a request
+    /// only ever shrinks, so releasing this (on timeout/disconnect/short response)
+    /// never over-releases bytes that were already handed to the reorder buffer.
     pub(super) fn reserved_bytes(&self) -> u64 {
-        self.request
-            .expected_bytes
-            .iter()
-            .filter(|(height, _)| !self.received.contains(height))
-            .map(|(_, bytes)| *bytes)
-            .sum()
+        let outstanding = self
+            .request
+            .expected_hashes
+            .len()
+            .saturating_sub(self.received.len());
+        // `outstanding` is a count bounded by `MAX_BS_BLOCKS_PER_REQUEST`, so the
+        // product cannot overflow `u64`; `saturating_mul` is belt-and-suspenders.
+        BS_PER_BLOCK_WORST_CASE_BYTES.saturating_mul(outstanding as u64)
     }
 
     pub(super) fn estimated_bytes_for_height(&self, height: block::Height) -> Option<u64> {
@@ -379,78 +481,22 @@ impl OutstandingBlockRange {
         self.received.insert(height);
     }
 
+    /// Mark every requested height at or below `tip` as received and return the
+    /// worst-case bytes that those newly-received heights had reserved, so the
+    /// caller releases exactly the reservation those heights still held.
     pub(super) fn mark_received_through(&mut self, tip: block::Height) -> u64 {
-        self.request
-            .expected_bytes
+        let newly_received = self
+            .request
+            .expected_hashes
             .iter()
-            .filter_map(|(height, bytes)| {
-                (*height <= tip && self.received.insert(*height)).then_some(*bytes)
-            })
-            .sum()
+            .filter(|(height, _)| *height <= tip && self.received.insert(*height))
+            .count();
+        // Bounded by `MAX_BS_BLOCKS_PER_REQUEST`; cannot overflow `u64`.
+        BS_PER_BLOCK_WORST_CASE_BYTES.saturating_mul(newly_received as u64)
     }
 
     pub(super) fn is_complete(&self) -> bool {
         self.received.len() == self.request.expected_hashes.len()
-    }
-
-    pub(super) fn missing_retry_requests<F>(&self, mut should_retry: F) -> Vec<BlockRangeRequest>
-    where
-        F: FnMut(block::Height, block::Hash) -> bool,
-    {
-        let mut requests = Vec::new();
-        let mut segment_hashes = Vec::new();
-        let mut segment_bytes = Vec::new();
-
-        for (height, hash) in &self.request.expected_hashes {
-            let retry = !self.received.contains(height) && should_retry(*height, *hash);
-            let contiguous = segment_hashes
-                .last()
-                .and_then(|(last_height, _)| next_height(*last_height))
-                == Some(*height);
-
-            if !retry || (!segment_hashes.is_empty() && !contiguous) {
-                if let Some(request) = Self::retry_request_from_segment(
-                    std::mem::take(&mut segment_hashes),
-                    std::mem::take(&mut segment_bytes),
-                ) {
-                    requests.push(request);
-                }
-            }
-
-            if retry {
-                if let Some(bytes) = self.request.estimated_bytes_for_height(*height) {
-                    segment_hashes.push((*height, *hash));
-                    segment_bytes.push((*height, bytes));
-                }
-            }
-        }
-
-        if let Some(request) = Self::retry_request_from_segment(segment_hashes, segment_bytes) {
-            requests.push(request);
-        }
-
-        requests
-    }
-
-    fn retry_request_from_segment(
-        expected_hashes: Vec<(block::Height, block::Hash)>,
-        expected_bytes: Vec<(block::Height, u64)>,
-    ) -> Option<BlockRangeRequest> {
-        let (start_height, anchor_hash) = *expected_hashes.first()?;
-        let count = u32::try_from(expected_hashes.len())
-            .expect("block-sync retry segment length is bounded by original request count");
-        let estimated_bytes = expected_bytes
-            .iter()
-            .fold(0u64, |total, (_, bytes)| total.saturating_add(*bytes));
-
-        Some(BlockRangeRequest {
-            start_height,
-            count,
-            anchor_hash,
-            estimated_bytes,
-            expected_hashes,
-            expected_bytes,
-        })
     }
 }
 
@@ -478,6 +524,65 @@ impl RateMeter {
 
     pub(super) fn mark_taken(&mut self, now: Instant) {
         self.next_allowed = now + self.interval;
+    }
+}
+
+/// Tracks block-body throughput (bytes and block counts) over the interval
+/// between samples, so the trace snapshot can report download/commit rates while
+/// driving toward the 1–2 Gbps target. `record` accumulates; `sample` snapshots
+/// the per-second rate since the last sample and resets the window. The last
+/// computed rate is cached so it can be read from the immutable trace path. Cost
+/// is two saturating adds per body and one division per sample tick.
+#[derive(Clone, Debug)]
+pub(super) struct ThroughputMeter {
+    bytes: u64,
+    blocks: u64,
+    window_start: Instant,
+    last_bytes_per_sec: u64,
+    last_blocks_per_sec: u64,
+}
+
+impl ThroughputMeter {
+    pub(super) fn new(now: Instant) -> Self {
+        Self {
+            bytes: 0,
+            blocks: 0,
+            window_start: now,
+            last_bytes_per_sec: 0,
+            last_blocks_per_sec: 0,
+        }
+    }
+
+    pub(super) fn record(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.blocks = self.blocks.saturating_add(1);
+    }
+
+    /// Recompute the cached per-second rates from the bytes/blocks accumulated
+    /// since the last sample, then reset the window. A non-positive interval
+    /// (clock not advanced between samples) leaves the cached rates untouched.
+    pub(super) fn sample(&mut self, now: Instant) {
+        let elapsed = now
+            .saturating_duration_since(self.window_start)
+            .as_secs_f64();
+        if elapsed <= 0.0 {
+            return;
+        }
+        // `as u64` truncates a finite, non-negative rate; both numerator and
+        // denominator are non-negative so the cast cannot wrap or go negative.
+        self.last_bytes_per_sec = (self.bytes as f64 / elapsed) as u64;
+        self.last_blocks_per_sec = (self.blocks as f64 / elapsed) as u64;
+        self.bytes = 0;
+        self.blocks = 0;
+        self.window_start = now;
+    }
+
+    pub(super) fn bytes_per_sec(&self) -> u64 {
+        self.last_bytes_per_sec
+    }
+
+    pub(super) fn blocks_per_sec(&self) -> u64 {
+        self.last_blocks_per_sec
     }
 }
 

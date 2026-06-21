@@ -36,19 +36,21 @@ impl ReorderBuffer {
             .map(|buffered| buffered.block.hash())
     }
 
+    /// Buffer a received body that already owns its `bytes` reservation.
+    ///
+    /// The caller reserved worst-case bytes for this height at send time and
+    /// shrank that reservation to `bytes` on receipt, so the reorder buffer takes
+    /// ownership of the existing reservation without touching the budget and can
+    /// never fail on budget. A `Duplicate` height is left to the caller to release.
     pub(super) fn insert(
         &mut self,
         height: block::Height,
         block: Arc<block::Block>,
         bytes: u64,
         source_peer: ZakuraPeerId,
-        budget: &mut ByteBudget,
     ) -> ReorderInsertResult {
         if self.blocks.contains_key(&height) {
             return ReorderInsertResult::Duplicate;
-        }
-        if !budget.try_reserve(bytes) {
-            return ReorderInsertResult::BudgetFull;
         }
 
         self.blocks.insert(
@@ -85,36 +87,46 @@ impl ReorderBuffer {
         released
     }
 
-    pub(crate) fn clear(&mut self, budget: &mut ByteBudget) {
-        self.drop_from(block::Height::MIN, budget);
+    /// Drop every buffered body and return the total bytes they held, so the
+    /// caller releases exactly that reservation. The reorder buffer is owned by
+    /// the `Sequencer`, which does not touch the byte budget; it returns the
+    /// freed bytes to the reactor instead.
+    pub(crate) fn clear(&mut self) -> u64 {
+        self.drop_from(block::Height::MIN)
     }
 
-    pub(crate) fn drop_through(&mut self, through: block::Height, budget: &mut ByteBudget) {
+    /// Drop buffered bodies at or below `through` and return the bytes they held.
+    pub(crate) fn drop_through(&mut self, through: block::Height) -> u64 {
         let heights: Vec<_> = self
             .blocks
             .range(..=through)
             .map(|(height, _)| *height)
             .collect();
+        let mut released = 0u64;
         for height in heights {
             if let Some(buffered) = self.blocks.remove(&height) {
                 self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
-                budget.release(buffered.bytes);
+                released = released.saturating_add(buffered.bytes);
             }
         }
+        released
     }
 
-    pub(crate) fn drop_from(&mut self, from: block::Height, budget: &mut ByteBudget) {
+    /// Drop buffered bodies at or above `from` and return the bytes they held.
+    pub(crate) fn drop_from(&mut self, from: block::Height) -> u64 {
         let heights: Vec<_> = self
             .blocks
             .range(from..)
             .map(|(height, _)| *height)
             .collect();
+        let mut released = 0u64;
         for height in heights {
             if let Some(buffered) = self.blocks.remove(&height) {
                 self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
-                budget.release(buffered.bytes);
+                released = released.saturating_add(buffered.bytes);
             }
         }
+        released
     }
 }
 
@@ -122,7 +134,6 @@ impl ReorderBuffer {
 pub(super) enum ReorderInsertResult {
     Inserted,
     Duplicate,
-    BudgetFull,
 }
 
 #[derive(Clone, Debug)]

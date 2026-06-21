@@ -123,6 +123,12 @@ pub mod block_sync_trace {
     pub const ESTIMATED_BYTES: &str = "estimated_bytes";
     /// Serialized byte size of a received body.
     pub const SERIALIZED_BYTES: &str = "serialized_bytes";
+    /// End-to-end elapsed milliseconds for a traced operation.
+    pub const ELAPSED_MS: &str = "elapsed_ms";
+    /// Elapsed milliseconds before response frames were ready to send.
+    pub const PREPARE_ELAPSED_MS: &str = "prepare_elapsed_ms";
+    /// Elapsed milliseconds spent enqueueing response frames.
+    pub const SEND_ELAPSED_MS: &str = "send_elapsed_ms";
     /// Commit result label (`committed`, `duplicate`, `rejected`, `timed_out`).
     pub const RESULT: &str = "result";
     /// Reactor-local verifier submission token.
@@ -131,6 +137,20 @@ pub mod block_sync_trace {
     pub const REASON: &str = "reason";
     /// Highest contiguous body height already submitted for apply.
     pub const BODY_DOWNLOAD_FLOOR: &str = "body_download_floor";
+    /// First height not yet in the contiguous body-download floor.
+    pub const FLOOR_GAP_HEIGHT: &str = "floor_gap_height";
+    /// Reactor-local classification for the first missing body height.
+    pub const FLOOR_GAP_STATE: &str = "floor_gap_state";
+    /// Peers advertising the first missing body height.
+    pub const FLOOR_GAP_SERVABLE_PEERS: &str = "floor_gap_servable_peers";
+    /// Peers with free request slots that advertise the first missing body height.
+    pub const FLOOR_GAP_AVAILABLE_PEERS: &str = "floor_gap_available_peers";
+    /// Peers with outstanding requests that include the first missing body height.
+    pub const FLOOR_GAP_OUTSTANDING_PEERS: &str = "floor_gap_outstanding_peers";
+    /// Age in milliseconds of the oldest outstanding request for the first missing body height.
+    pub const FLOOR_GAP_OLDEST_OUTSTANDING_MS: &str = "floor_gap_oldest_outstanding_ms";
+    /// Remaining milliseconds until the next outstanding request deadline for the first missing body height.
+    pub const FLOOR_GAP_NEXT_DEADLINE_MS: &str = "floor_gap_next_deadline_ms";
     /// Highest verified (committed) block-body height.
     pub const VERIFIED_BLOCK_TIP: &str = "verified_block_tip";
     /// Best header tip driving the body-download target.
@@ -149,6 +169,22 @@ pub mod block_sync_trace {
     pub const BUDGET_AVAILABLE: &str = "budget_available";
     /// Reserved in-flight body byte budget.
     pub const BUDGET_RESERVED: &str = "budget_reserved";
+    /// Reserved in-flight body byte budget observed at a single body event
+    /// (e.g. immediately after a receive-path shrink or a commit-path release).
+    pub const BUDGET_RESERVED_AFTER: &str = "budget_reserved_after";
+    /// Body bytes received off the wire per second (download throughput).
+    pub const RECEIVED_BYTES_PER_SEC: &str = "received_bytes_per_sec";
+    /// Bodies received off the wire per second (download throughput).
+    pub const RECEIVED_BLOCKS_PER_SEC: &str = "received_blocks_per_sec";
+    /// Body bytes committed to the chain per second (commit throughput).
+    pub const COMMITTED_BYTES_PER_SEC: &str = "committed_bytes_per_sec";
+    /// Bodies committed to the chain per second (commit throughput).
+    pub const COMMITTED_BLOCKS_PER_SEC: &str = "committed_blocks_per_sec";
+    /// 1 when at least one peer has free request slots but the byte budget is too
+    /// low to issue another worst-case block (download is budget-limited).
+    pub const DOWNLOAD_BLOCKED_ON_BUDGET: &str = "download_blocked_on_budget";
+    /// Peers with received status that currently have free outbound request slots.
+    pub const PEERS_WANTING_SLOTS: &str = "peers_wanting_slots";
     /// Connected block-sync peers.
     pub const PEERS: &str = "peers";
     /// Connected block-sync peers whose status we have received (schedulable).
@@ -186,6 +222,10 @@ pub mod block_sync_trace {
     pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
     /// Reactor accepted an inbound event.
     pub const BLOCK_EVENT_RECEIVED: &str = "block_event_received";
+    /// Reactor accepted a decoded inbound block-sync wire message.
+    pub const BLOCK_MESSAGE_RECEIVED: &str = "block_message_received";
+    /// Reactor queued an outbound block-sync wire message for transport.
+    pub const BLOCK_MESSAGE_SENT: &str = "block_message_sent";
     /// Reactor queued an outbound driver action.
     pub const BLOCK_ACTION_DISPATCHED: &str = "block_action_dispatched";
     /// Body received from a peer.
@@ -198,10 +238,10 @@ pub mod block_sync_trace {
     pub const BLOCK_RANGE_UNAVAILABLE: &str = "block_range_unavailable";
     /// Local node queued a block range response for transport.
     pub const BLOCK_RANGE_RESPONSE_SENT: &str = "block_range_response_sent";
-    /// New body downloads were paused (lag, near-tip, or budget).
-    pub const BLOCK_DOWNLOADS_PAUSED: &str = "block_downloads_paused";
-    /// Scheduler could not issue another request for a peer with free slots.
-    pub const BLOCK_SCHEDULE_SKIPPED: &str = "block_schedule_skipped";
+    /// Work-queue producer added needed heights to the pending set.
+    pub const BLOCK_WORK_EXTENDED: &str = "block_work_extended";
+    /// A peer claimed a contiguous chunk of pending work for issuance.
+    pub const BLOCK_WORK_TAKEN: &str = "block_work_taken";
     /// Verified body frontier advanced from state.
     pub const BLOCK_FRONTIERS_CHANGED: &str = "block_frontiers_changed";
     /// Chain tip reset rolled the body frontier back.

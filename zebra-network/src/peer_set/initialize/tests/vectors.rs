@@ -55,6 +55,10 @@ use Network::*;
 /// Using a very short time can make the crawler not run at all.
 const CRAWLER_TEST_DURATION: Duration = Duration::from_secs(10);
 
+/// A crawler peer limit large enough to exercise multi-peer behavior without
+/// flooding the test runtime with hundreds of immediate fake handshakes.
+const CRAWLER_MANY_PEER_LIMIT_FOR_TESTS: usize = 15;
+
 /// The amount of time to run the peer cache updater task, before testing what it has done.
 ///
 /// Using a very short time can make the peer cache updater not run at all.
@@ -579,9 +583,9 @@ async fn crawler_peer_limit_one_connect_ok_stay_open() {
     );
 }
 
-/// Test the crawler with the default outbound peer limit, and a connector that always errors.
+/// Test the crawler with a multi-peer outbound limit, and a connector that always errors.
 #[tokio::test]
-async fn crawler_peer_limit_default_connect_error() {
+async fn crawler_peer_limit_many_connect_error() {
     let _init_guard = zebra_test::init();
 
     // This test does not require network access, because the outbound connector
@@ -591,7 +595,8 @@ async fn crawler_peer_limit_default_connect_error() {
         service_fn(|_| async { Err("test outbound connector always returns errors".into()) });
 
     let (_config, mut peerset_rx) =
-        spawn_crawler_with_peer_limit(None, error_outbound_connector).await;
+        spawn_crawler_with_peer_limit(CRAWLER_MANY_PEER_LIMIT_FOR_TESTS, error_outbound_connector)
+            .await;
 
     let peer_result = peerset_rx.try_recv();
     assert!(
@@ -602,10 +607,10 @@ async fn crawler_peer_limit_default_connect_error() {
     );
 }
 
-/// Test the crawler with the default outbound peer limit,
+/// Test the crawler with a multi-peer outbound limit,
 /// and a connector that returns success then disconnects the peer.
 #[tokio::test]
-async fn crawler_peer_limit_default_connect_ok_then_drop() {
+async fn crawler_peer_limit_many_connect_ok_then_drop() {
     let _init_guard = zebra_test::init();
 
     // This test does not require network access, because the outbound connector
@@ -631,8 +636,11 @@ async fn crawler_peer_limit_default_connect_ok_then_drop() {
 
     // TODO: tweak the crawler timeouts and rate-limits so we get over the actual limit
     //       (currently, getting over the limit can take 30 seconds or more)
-    let (config, mut peerset_rx) =
-        spawn_crawler_with_peer_limit(15, success_disconnect_outbound_connector).await;
+    let (config, mut peerset_rx) = spawn_crawler_with_peer_limit(
+        CRAWLER_MANY_PEER_LIMIT_FOR_TESTS,
+        success_disconnect_outbound_connector,
+    )
+    .await;
 
     let mut peer_count: usize = 0;
     loop {
@@ -653,10 +661,10 @@ async fn crawler_peer_limit_default_connect_ok_then_drop() {
     );
 }
 
-/// Test the crawler with the default outbound peer limit,
+/// Test the crawler with a multi-peer outbound limit,
 /// and a connector that returns success then holds the peer open.
 #[tokio::test]
-async fn crawler_peer_limit_default_connect_ok_stay_open() {
+async fn crawler_peer_limit_many_connect_ok_stay_open() {
     let _init_guard = zebra_test::init();
 
     // This test does not require network access, because the outbound connector
@@ -683,9 +691,11 @@ async fn crawler_peer_limit_default_connect_ok_stay_open() {
         }
     });
 
-    // The initial target size is multiplied by 1.5 to give the actual limit.
-    let (config, mut peerset_rx) =
-        spawn_crawler_with_peer_limit(None, success_stay_open_outbound_connector).await;
+    let (config, mut peerset_rx) = spawn_crawler_with_peer_limit(
+        CRAWLER_MANY_PEER_LIMIT_FOR_TESTS,
+        success_stay_open_outbound_connector,
+    )
+    .await;
 
     let mut peer_change_count: usize = 0;
     loop {

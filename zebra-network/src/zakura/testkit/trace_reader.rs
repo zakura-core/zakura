@@ -260,6 +260,14 @@ impl<'a> TraceQuery<'a> {
         );
     }
 
+    /// Assert a header-sync peer violation row with its bounded reason label.
+    pub fn assert_header_violation(&self, reason: &str) {
+        self.assert_row(
+            hs_trace::HEADER_PEER_VIOLATION,
+            &[(hs_trace::REASON, TraceValue::Str(reason))],
+        );
+    }
+
     /// Assert a requested disconnect row with its bounded reason label.
     pub fn assert_header_disconnect(&self, reason: &str) {
         self.assert_row(

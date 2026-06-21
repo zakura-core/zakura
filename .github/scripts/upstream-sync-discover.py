@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Discover the next upstream Zebra PR missing from this fork.
+"""Discover upstream Zebra PRs missing from this fork.
 
-The script intentionally emits one candidate at a time. It uses the first
-missing upstream commit by compare order, maps that commit to its merged
-upstream PR through GitHub's commit-to-PR API, and then records the whole PR as
-the candidate.
+The script emits candidates in upstream compare order. It maps missing upstream
+commits to merged upstream PRs through GitHub's commit-to-PR API, and batches
+those PRs for triage. Closed generated PRs count as reviewed human skips.
 """
 
 from __future__ import annotations
@@ -12,14 +11,23 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 
-TERMINAL_LEDGER_STATUSES = {"imported", "skipped", "superseded"}
+TERMINAL_STATE_DECISIONS = {
+    "already_present",
+    "human_skipped",
+    "imported",
+    "needs_human",
+    "skipped",
+    "superseded",
+}
+
+DEFAULT_SOURCE_REPO = "ZcashFoundation/zebra"
+MAX_LIMIT = 25
 
 
 def run(args: list[str], *, cwd: Path | None = None) -> str:
@@ -75,26 +83,56 @@ def pr_metadata(source_repo: str, pr_number: int) -> dict[str, Any]:
     }
 
 
-def terminal_prs_from_ledger(path: Path) -> set[int]:
-    if not path.exists():
-        return set()
+def state_record_matches_source(record: dict[str, Any], source_repo: str) -> bool:
+    record_source_repo = record.get("source_repo")
+    if isinstance(record_source_repo, str) and record_source_repo:
+        return record_source_repo.lower() == source_repo.lower()
 
+    return source_repo.lower() == DEFAULT_SOURCE_REPO.lower()
+
+
+def terminal_prs_from_state_lines(text: str, *, source_repo: str, target_ref_sha: str) -> set[int]:
     terminal: set[int] = set()
-    current_pr: int | None = None
 
-    for line in path.read_text(encoding="utf-8").splitlines():
-        pr_match = re.match(r"\s*-\s+upstream_pr:\s+([0-9]+)\s*$", line)
-        if pr_match:
-            current_pr = int(pr_match.group(1))
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
             continue
 
-        status_match = re.match(r"\s*status:\s+([A-Za-z0-9_-]+)\s*$", line)
-        if current_pr is not None and status_match:
-            if status_match.group(1) in TERMINAL_LEDGER_STATUSES:
-                terminal.add(current_pr)
-            current_pr = None
+        decision = record.get("decision") or record.get("status")
+        upstream_pr = record.get("upstream_pr")
+        if not state_record_matches_source(record, source_repo):
+            continue
+        if decision == "already_present" and record.get("target_ref_sha", "").lower() != target_ref_sha.lower():
+            continue
+        if decision in TERMINAL_STATE_DECISIONS and isinstance(upstream_pr, int):
+            terminal.add(upstream_pr)
 
     return terminal
+
+
+def terminal_prs_from_state_branch(
+    target_repo: str,
+    branch: str,
+    path: str,
+    source_repo: str,
+    target_ref_sha: str,
+) -> set[int]:
+    local_ref = "refs/remotes/upstream-sync/state"
+    try:
+        fetch_ref(target_repo, branch, local_ref)
+        text = run(["git", "show", f"{local_ref}:{path}"])
+    except subprocess.CalledProcessError:
+        return set()
+
+    return terminal_prs_from_state_lines(
+        text,
+        source_repo=source_repo,
+        target_ref_sha=target_ref_sha,
+    )
 
 
 def existing_marker(source_pr: int, branch: str, target_repo: str) -> dict[str, Any]:
@@ -158,19 +196,54 @@ def exact_head_pull_requests(pulls: list[dict[str, Any]], branch: str) -> list[d
     return [pull for pull in pulls if pull.get("headRefName") == branch]
 
 
+def open_upstream_sync_prs_from_list(pulls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return open generated upstream sync PRs."""
+
+    return [
+        pull
+        for pull in pulls
+        if pull.get("state") == "OPEN"
+        and str(pull.get("headRefName", "")).startswith("upstream-sync/pr-")
+    ]
+
+
+def open_upstream_sync_prs(target_repo: str) -> list[dict[str, Any]]:
+    try:
+        pulls = run_json(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                target_repo,
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                "number,state,url,headRefName,title",
+            ]
+        )
+    except subprocess.CalledProcessError:
+        return []
+
+    return open_upstream_sync_prs_from_list(pulls)
+
+
 def blocks_candidate(existing: dict[str, Any]) -> bool:
     """Return true when an existing PR means the upstream PR is already handled."""
 
-    active_states = {"OPEN", "MERGED"}
+    handled_states = {"CLOSED", "MERGED", "OPEN"}
     tracked_prs = [
         *existing.get("pull_requests", []),
         *existing.get("head_pull_requests", []),
     ]
 
-    return any(pull.get("state") in active_states for pull in tracked_prs)
+    return any(pull.get("state") in handled_states for pull in tracked_prs)
 
 
 def write_source_diffs(source_repo: str, source_pr: int, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
     patch_path = output_dir / "source.patch"
     diff_path = output_dir / "source.diff"
     with patch_path.open("w", encoding="utf-8") as patch_file:
@@ -233,9 +306,63 @@ def candidate_from_pr(
     }
 
 
+def validate_limit(limit: int) -> None:
+    if limit < 1 or limit > MAX_LIMIT:
+        raise SystemExit(f"upstream-sync supports --limit between 1 and {MAX_LIMIT}")
+
+
+def result_from_candidates(
+    *,
+    source_repo: str,
+    source_ref: str,
+    source_ref_sha: str,
+    target_repo: str,
+    target_ref: str,
+    target_ref_sha: str,
+    merge_base: str,
+    ahead_count: int,
+    behind_count: int,
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not candidates:
+        return {
+            "status": "no_candidate",
+            "source_repo": source_repo,
+            "source_ref": source_ref,
+            "source_ref_sha": source_ref_sha,
+            "target_repo": target_repo,
+            "target_ref": target_ref,
+            "target_ref_sha": target_ref_sha,
+            "merge_base": merge_base,
+            "ahead_count": ahead_count,
+            "behind_count": behind_count,
+            "candidate_count": 0,
+            "candidates": [],
+            "message": "No untracked missing upstream PRs found.",
+        }
+
+    result = {
+        "status": "candidate",
+        "source_repo": source_repo,
+        "source_ref": source_ref,
+        "source_ref_sha": source_ref_sha,
+        "target_repo": target_repo,
+        "target_ref": target_ref,
+        "target_ref_sha": target_ref_sha,
+        "merge_base": merge_base,
+        "ahead_count": ahead_count,
+        "behind_count": behind_count,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+    }
+    result.update(candidates[0])
+    result["candidate_count"] = len(candidates)
+    result["candidates"] = candidates
+    return result
+
+
 def discover_live(args: argparse.Namespace) -> dict[str, Any]:
-    if args.limit != 1:
-        raise SystemExit("upstream-sync v1 only supports --limit 1")
+    validate_limit(args.limit)
 
     source_local_ref = "refs/remotes/upstream-sync/source"
     target_local_ref = "refs/remotes/upstream-sync/target"
@@ -247,24 +374,65 @@ def discover_live(args: argparse.Namespace) -> dict[str, Any]:
     )
     ahead_count, behind_count = [int(part) for part in counts.split()]
 
-    ledger_terminal = terminal_prs_from_ledger(args.ledger)
+    open_sync_prs = open_upstream_sync_prs(args.target_repo)
+    if open_sync_prs and not args.candidate_pr:
+        return {
+            "status": "no_candidate",
+            "source_repo": args.source_repo,
+            "source_ref": args.source_ref,
+            "source_ref_sha": source_sha,
+            "target_repo": args.target_repo,
+            "target_ref": args.target_ref,
+            "target_ref_sha": target_sha,
+            "merge_base": merge_base,
+            "ahead_count": ahead_count,
+            "behind_count": behind_count,
+            "open_generated_pull_requests": open_sync_prs,
+            "message": "An upstream sync PR is already open for human review.",
+        }
+
+    state_terminal = terminal_prs_from_state_branch(
+        args.target_repo,
+        args.state_branch,
+        args.state_ledger,
+        args.source_repo,
+        target_sha,
+    )
     missing_commits = run(
         ["git", "rev-list", "--reverse", f"{target_local_ref}..{source_local_ref}"]
     ).splitlines()
 
-    selected_pr: dict[str, Any] | None = None
-    first_missing_sha: str | None = None
+    candidates: list[dict[str, Any]] = []
+    seen_prs: set[int] = set()
 
     if args.candidate_pr:
         selected_pr = pr_metadata(args.source_repo, int(args.candidate_pr))
         first_missing_sha = selected_pr["commits"][0] if selected_pr["commits"] else None
+        candidates.append(
+            candidate_from_pr(
+                source_repo=args.source_repo,
+                target_repo=args.target_repo,
+                target_ref=args.target_ref,
+                source_ref=args.source_ref,
+                source_ref_sha=source_sha,
+                target_ref_sha=target_sha,
+                merge_base=merge_base,
+                ahead_count=ahead_count,
+                behind_count=behind_count,
+                first_missing_sha=first_missing_sha,
+                pr=selected_pr,
+            )
+        )
     else:
         for sha in missing_commits:
             pull = pr_from_commit(args.source_repo, sha)
             if not pull:
                 continue
             pr_number = int(pull["number"])
-            if pr_number in ledger_terminal:
+            if pr_number in seen_prs:
+                continue
+            seen_prs.add(pr_number)
+            if pr_number in state_terminal:
                 continue
             maybe_pr = pr_metadata(args.source_repo, pr_number)
             maybe_candidate = candidate_from_pr(
@@ -287,71 +455,87 @@ def discover_live(args: argparse.Namespace) -> dict[str, Any]:
             )
             if blocks_candidate(existing):
                 continue
-            selected_pr = maybe_pr
-            first_missing_sha = sha
-            break
+            maybe_candidate["existing"] = existing
+            candidates.append(maybe_candidate)
+            if len(candidates) >= args.limit:
+                break
 
-    if not selected_pr:
-        return {
-            "status": "no_candidate",
-            "source_repo": args.source_repo,
-            "source_ref": args.source_ref,
-            "source_ref_sha": source_sha,
-            "target_repo": args.target_repo,
-            "target_ref": args.target_ref,
-            "target_ref_sha": target_sha,
-            "merge_base": merge_base,
-            "ahead_count": ahead_count,
-            "behind_count": behind_count,
-            "message": "No untracked missing upstream PRs found.",
-        }
-
-    candidate = candidate_from_pr(
+    return result_from_candidates(
         source_repo=args.source_repo,
-        target_repo=args.target_repo,
-        target_ref=args.target_ref,
         source_ref=args.source_ref,
         source_ref_sha=source_sha,
+        target_repo=args.target_repo,
+        target_ref=args.target_ref,
         target_ref_sha=target_sha,
         merge_base=merge_base,
         ahead_count=ahead_count,
         behind_count=behind_count,
-        first_missing_sha=first_missing_sha,
-        pr=selected_pr,
+        candidates=candidates,
     )
-    candidate["existing"] = existing_marker(candidate["source_pr"], candidate["branch_name"], args.target_repo)
-    return candidate
 
 
 def discover_fixture(args: argparse.Namespace) -> dict[str, Any]:
     fixture = json.loads(args.fixture.read_text(encoding="utf-8"))
-    if args.limit != 1:
-        raise SystemExit("upstream-sync v1 only supports --limit 1")
+    validate_limit(args.limit)
 
     missing = fixture["missing_commits"]
-    selected = None
-    first_missing_sha = None
+    candidates: list[dict[str, Any]] = []
+    seen_prs: set[int] = set()
 
     if args.candidate_pr:
         selected = fixture["pulls"][str(args.candidate_pr)]
         first_missing_sha = selected["commits"][0]
+        candidates.append(
+            candidate_from_pr(
+                source_repo=fixture["source_repo"],
+                target_repo=fixture["target_repo"],
+                target_ref=fixture["target_ref"],
+                source_ref=fixture["source_ref"],
+                source_ref_sha=fixture["source_ref_sha"],
+                target_ref_sha=fixture["target_ref_sha"],
+                merge_base=fixture["merge_base"],
+                ahead_count=fixture["ahead_count"],
+                behind_count=fixture["behind_count"],
+                first_missing_sha=first_missing_sha,
+                pr=selected,
+            )
+        )
     else:
-        first = missing[0]
-        first_missing_sha = first["sha"]
-        selected = fixture["pulls"][str(first["source_pr"])]
+        for missing_commit in missing:
+            source_pr = int(missing_commit["source_pr"])
+            if source_pr in seen_prs:
+                continue
+            seen_prs.add(source_pr)
+            selected = fixture["pulls"][str(source_pr)]
+            candidates.append(
+                candidate_from_pr(
+                    source_repo=fixture["source_repo"],
+                    target_repo=fixture["target_repo"],
+                    target_ref=fixture["target_ref"],
+                    source_ref=fixture["source_ref"],
+                    source_ref_sha=fixture["source_ref_sha"],
+                    target_ref_sha=fixture["target_ref_sha"],
+                    merge_base=fixture["merge_base"],
+                    ahead_count=fixture["ahead_count"],
+                    behind_count=fixture["behind_count"],
+                    first_missing_sha=missing_commit["sha"],
+                    pr=selected,
+                )
+            )
+            if len(candidates) >= args.limit:
+                break
 
-    return candidate_from_pr(
+    return result_from_candidates(
         source_repo=fixture["source_repo"],
-        target_repo=fixture["target_repo"],
-        target_ref=fixture["target_ref"],
         source_ref=fixture["source_ref"],
         source_ref_sha=fixture["source_ref_sha"],
+        target_repo=fixture["target_repo"],
+        target_ref=fixture["target_ref"],
         target_ref_sha=fixture["target_ref_sha"],
         merge_base=fixture["merge_base"],
         ahead_count=fixture["ahead_count"],
         behind_count=fixture["behind_count"],
-        first_missing_sha=first_missing_sha,
-        pr=selected,
+        candidates=candidates,
     )
 
 
@@ -372,14 +556,25 @@ def write_outputs(candidate: dict[str, Any], output_dir: Path, github_output: st
     if candidate["status"] == "candidate":
         summary.extend(
             [
-                f"- Candidate: upstream PR {candidate['source_pr']}",
-                f"- Title: `{candidate['source_pr_title']}`",
-                f"- Branch: `{candidate['branch_name']}`",
-                f"- Merge commit: `{candidate.get('source_merge_commit')}`",
+                f"- Candidates: `{candidate.get('candidate_count', 1)}`",
             ]
         )
+        for entry in candidate.get("candidates", [candidate]):
+            summary.extend(
+                [
+                    f"- Candidate: upstream PR {entry['source_pr']}",
+                    f"  - Title: `{entry['source_pr_title']}`",
+                    f"  - Branch: `{entry['branch_name']}`",
+                    f"  - Merge commit: `{entry.get('source_merge_commit')}`",
+                ]
+            )
     else:
         summary.append(f"- Message: {candidate.get('message', '')}")
+        for pull in candidate.get("open_generated_pull_requests", []):
+            summary.append(
+                f"- Open upstream sync PR: {pull.get('url')} "
+                f"(`{pull.get('headRefName')}`)"
+            )
 
     (output_dir / "summary.md").write_text("\n".join(summary) + "\n", encoding="utf-8")
 
@@ -390,6 +585,7 @@ def write_outputs(candidate: dict[str, Any], output_dir: Path, github_output: st
             handle.write(f"source_pr={candidate.get('source_pr', '')}\n")
             handle.write(f"branch_name={candidate.get('branch_name', '')}\n")
             handle.write(f"pr_title={candidate.get('pr_title', '')}\n")
+            handle.write(f"candidate_count={candidate.get('candidate_count', 0)}\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -399,9 +595,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-repo", default=os.environ.get("GITHUB_REPOSITORY", "valargroup/zebra"))
     parser.add_argument("--target-ref", default="ironwood-main")
     parser.add_argument("--candidate-pr", default="")
-    parser.add_argument("--limit", type=int, default=1)
+    parser.add_argument("--limit", type=int, default=MAX_LIMIT)
     parser.add_argument("--output-dir", type=Path, default=Path(".github/upstream-sync/work"))
-    parser.add_argument("--ledger", type=Path, default=Path("docs/upstream-sync/ledger.yml"))
+    parser.add_argument("--state-branch", default="upstream-sync/state")
+    parser.add_argument("--state-ledger", default=".github/upstream-sync/triage-ledger.jsonl")
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--write-diffs", action="store_true")
     return parser.parse_args()
@@ -412,7 +609,12 @@ def main() -> int:
     candidate = discover_fixture(args) if args.fixture else discover_live(args)
     write_outputs(candidate, args.output_dir, os.environ.get("GITHUB_OUTPUT"))
     if args.write_diffs and candidate["status"] == "candidate" and not args.fixture:
-        write_source_diffs(args.source_repo, int(candidate["source_pr"]), args.output_dir)
+        for entry in candidate.get("candidates", [candidate]):
+            write_source_diffs(
+                args.source_repo,
+                int(entry["source_pr"]),
+                args.output_dir / "candidates" / f"pr-{entry['source_pr']}",
+            )
     print(json.dumps(candidate, indent=2, sort_keys=True))
     return 0
 

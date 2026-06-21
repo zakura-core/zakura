@@ -128,6 +128,15 @@ def existing_marker(source_pr: int, branch: str, target_repo: str) -> dict[str, 
     return {"branch_exists": branch_exists, "pull_requests": prs}
 
 
+def blocks_candidate(existing: dict[str, Any]) -> bool:
+    """Return true when an existing PR means the upstream PR is already handled."""
+
+    return any(
+        pull.get("state") in {"OPEN", "MERGED"}
+        for pull in existing.get("pull_requests", [])
+    )
+
+
 def write_source_diffs(source_repo: str, source_pr: int, output_dir: Path) -> None:
     patch_path = output_dir / "source.patch"
     diff_path = output_dir / "source.diff"
@@ -243,7 +252,7 @@ def discover_live(args: argparse.Namespace) -> dict[str, Any]:
                 maybe_candidate["branch_name"],
                 args.target_repo,
             )
-            if existing["branch_exists"] or existing["pull_requests"]:
+            if blocks_candidate(existing):
                 continue
             selected_pr = maybe_pr
             first_missing_sha = sha

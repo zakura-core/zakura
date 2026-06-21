@@ -75,7 +75,7 @@ if ! printf '%s\n' "$TITLE" | grep -Eq '^(feat|fix|perf|refactor|build|chore|doc
   exit 1
 fi
 
-if ! printf '%s\n' "$BODY" | grep -Eq '^(#{2,6}[[:space:]]+AI Disclosure|\*\*AI Disclosure\*\*)[[:space:]]*$'; then
+if ! printf '%s\n' "$BODY" | grep -Eq '^(#{2,6}[[:space:]]+AI Disclosure|\*\*AI Disclosure\*\*|AI Disclosure):?[[:space:]]*$'; then
   echo "ERROR: PR body must include an AI Disclosure section" >&2
   exit 1
 fi

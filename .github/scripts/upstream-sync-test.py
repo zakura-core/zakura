@@ -7,10 +7,21 @@ import json
 import os
 import subprocess
 import sys
+import importlib.util
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def load_discover_module():
+    module_path = ROOT / ".github" / "scripts" / "upstream-sync-discover.py"
+    spec = importlib.util.spec_from_file_location("upstream_sync_discover", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def result_for(
@@ -98,6 +109,12 @@ def main() -> int:
     assert candidate["source_merge_commit"].startswith("8ead00cab")
     assert candidate["branch_name"] == "upstream-sync/pr-10676"
 
+    discover = load_discover_module()
+    assert not discover.blocks_candidate({"branch_exists": True, "pull_requests": []})
+    assert not discover.blocks_candidate({"branch_exists": False, "pull_requests": [{"state": "CLOSED"}]})
+    assert discover.blocks_candidate({"branch_exists": False, "pull_requests": [{"state": "OPEN"}]})
+    assert discover.blocks_candidate({"branch_exists": False, "pull_requests": [{"state": "MERGED"}]})
+
     upstream_pr_marker = candidate["body_markers"]["upstream_pr"]
     upstream_merge_marker = candidate["body_markers"]["upstream_merge"]
     valid_body = "\n".join(
@@ -108,7 +125,7 @@ def main() -> int:
             "Carry the behavior into the fork.",
             "### Tests",
             "Fixture validation passed.",
-            "**AI Disclosure**",
+            "AI Disclosure",
             "Codex was used to adapt this change.",
             "### Revert Plan",
             "Revert the generated PR.",

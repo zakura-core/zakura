@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-#[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use crate::parameters::TX_V6_VERSION_GROUP_ID;
 
 use super::*;
@@ -710,7 +710,7 @@ impl ZcashSerialize for Transaction {
                 orchard_shielded_data.zcash_serialize(&mut writer)?;
             }
 
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 network_upgrade,
                 lock_time,
@@ -1047,7 +1047,7 @@ impl ZcashDeserialize for Transaction {
 
                 Ok(tx)
             }
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             (6, true) => {
                 // Denoted as `nVersionGroupId` in the spec.
                 let id = limited_reader.read_u32::<LittleEndian>()?;

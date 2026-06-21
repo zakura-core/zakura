@@ -544,7 +544,7 @@ where
                     script_verifier,
                     cached_ffi_transaction.clone(),
                 )?,
-                #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+                #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                 Transaction::V6 {
                     ..
                 } => Self::verify_v6_transaction(
@@ -1007,7 +1007,7 @@ where
     }
 
     /// Passthrough to verify_v5_transaction, but for V6 transactions.
-    #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn verify_v6_transaction(
         request: &Request,
         network: &Network,

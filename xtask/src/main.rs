@@ -7,14 +7,14 @@ use std::{
     process::{Command, ExitStatus},
 };
 
-const DEFAULT_FEATURES: &str = "default-release-binaries tx_v6";
+const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
 const DEFAULT_RUST_VERSION: &str = "1.91";
 const DEFAULT_IMAGE_TAG: &str = "zebra-ubuntu-package:local";
 const OUTPUT_BINARY_NAME: &str = "zebra";
 
-// Enable the NU7 consensus paths gated behind the `zcash_unstable` custom cfg.
-const DEFAULT_RUSTFLAGS: &str = "--cfg zcash_unstable=\"nu7\"";
+// Enable the NU6.3 consensus paths gated behind the `zcash_unstable` custom cfg.
+const DEFAULT_RUSTFLAGS: &str = "--cfg zcash_unstable=\"nu6.3\"";
 
 type BoxError = Box<dyn Error>;
 

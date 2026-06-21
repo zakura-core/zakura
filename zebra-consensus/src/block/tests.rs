@@ -5,10 +5,10 @@
 use color_eyre::eyre::{eyre, Report};
 use once_cell::sync::Lazy;
 use tower::{buffer::Buffer, util::BoxService};
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use tower::{service_fn, ServiceExt};
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use zebra_chain::{
     amount::NegativeAllowed,
     ironwood, orchard,
@@ -585,7 +585,7 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
     Ok(())
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
 fn miner_fees_validation_includes_ironwood_balance() {
     let _init_guard = zebra_test::init();
@@ -646,14 +646,14 @@ fn miner_fees_validation_includes_ironwood_balance() {
     );
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[tokio::test]
 async fn padded_v6_orchard_proof_returns_consensus_error_before_block_hashes() {
     assert_padded_v6_proof_errors_before_block_hashes(true, TransactionError::OrchardProofSize)
         .await;
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[tokio::test]
 async fn padded_v6_ironwood_proof_returns_consensus_error_before_block_hashes() {
     assert_padded_v6_proof_errors_before_block_hashes(false, TransactionError::IronwoodProofSize)
@@ -663,7 +663,7 @@ async fn padded_v6_ironwood_proof_returns_consensus_error_before_block_hashes() 
 /// Asserts that proposing a block whose V6 coinbase has an over-padded shielded
 /// proof (Orchard if `use_orchard`, otherwise Ironwood) fails with the `expected`
 /// consensus error before the block hashes are checked.
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 async fn assert_padded_v6_proof_errors_before_block_hashes(
     use_orchard: bool,
     expected: TransactionError,
@@ -690,7 +690,7 @@ async fn assert_padded_v6_proof_errors_before_block_hashes(
     );
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn block_with_padded_v6_shielded_data(use_orchard: bool) -> (Network, Block) {
     let network = Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
@@ -750,7 +750,7 @@ fn block_with_padded_v6_shielded_data(use_orchard: bool) -> (Network, Block) {
     (network, block)
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn orchard_shielded_data(value_balance: i64) -> orchard::ShieldedData {
     let mut shielded_data = v5_transactions(Network::new_default_testnet().block_iter())
         .find_map(|transaction| transaction.orchard_shielded_data().cloned())
@@ -762,7 +762,7 @@ fn orchard_shielded_data(value_balance: i64) -> orchard::ShieldedData {
     shielded_data
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn ironwood_shielded_data(value_balance: i64) -> ironwood::ShieldedData {
     orchard_shielded_data(value_balance)
 }

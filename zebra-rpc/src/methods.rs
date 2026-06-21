@@ -1351,11 +1351,11 @@ where
                 zebra_state::ReadRequest::OrchardTree(hash_or_height),
             ];
 
-            #[cfg(zcash_unstable = "nu6.3")]
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             let nu6_3_active =
                 network.is_nu_active(consensus::NetworkUpgrade::Nu6_3, height.into());
 
-            #[cfg(zcash_unstable = "nu6.3")]
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             if nu6_3_active {
                 // Ironwood trees
                 requests.push(zebra_state::ReadRequest::IronwoodTree(hash_or_height));
@@ -1440,7 +1440,7 @@ where
                 size: orchard_tree_size,
             };
 
-            #[cfg(zcash_unstable = "nu6.3")]
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             let ironwood = if nu6_3_active {
                 let ironwood_tree_response = futs.next().await.expect("`futs` should not be empty");
                 let zebra_state::ReadResponse::IronwoodTree(ironwood_tree) =
@@ -1458,7 +1458,7 @@ where
                 None
             };
 
-            #[cfg(not(zcash_unstable = "nu6.3"))]
+            #[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
             let ironwood = None;
 
             let trees = GetBlockTrees {
@@ -2038,7 +2038,7 @@ where
         let (orchard_tree, orchard_root) =
             orchard.map_or((None, None), |(tree, root)| (Some(tree), Some(root)));
 
-        #[cfg(zcash_unstable = "nu6.3")]
+        #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
         let ironwood = if network.is_nu_active(consensus::NetworkUpgrade::Nu6_3, height.into()) {
             match read_state
                 .ready()
@@ -2056,7 +2056,7 @@ where
         } else {
             None
         };
-        #[cfg(not(zcash_unstable = "nu6.3"))]
+        #[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
         let ironwood = None;
 
         let ironwood = ironwood

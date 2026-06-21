@@ -554,7 +554,7 @@ where
 
                     (async_checks, cached_ffi_transaction)
                 }
-                #[cfg(zcash_unstable = "nu6.3")]
+                #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                 Transaction::V6 {
                     ..
                 } => Self::verify_v6_transaction(
@@ -920,7 +920,8 @@ where
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
             | NetworkUpgrade::Overwinter
-            | NetworkUpgrade::Nu6_3 => Err(TransactionError::UnsupportedByNetworkUpgrade(
+            | NetworkUpgrade::Nu6_3
+            | NetworkUpgrade::Nu7 => Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),
                 network_upgrade,
             )),
@@ -996,7 +997,8 @@ where
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
-            | NetworkUpgrade::Nu6_3 => Ok(()),
+            | NetworkUpgrade::Nu6_3
+            | NetworkUpgrade::Nu7 => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),
@@ -1030,7 +1032,7 @@ where
     }
 
     /// Verifies a V6 transaction.
-    #[cfg(zcash_unstable = "nu6.3")]
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn verify_v6_transaction(
         request: &Request,
         network: &Network,
@@ -1047,8 +1049,6 @@ where
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
-        let ironwood_bundle = cached_ffi_transaction.sighasher().ironwood_bundle();
-
         let sighash = cached_ffi_transaction
             .sighasher()
             .sighash(HashType::ALL, None);
@@ -1059,14 +1059,21 @@ where
             cached_ffi_transaction.clone(),
         )?
         .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
-        .and(Self::verify_v6_orchard_bundle(orchard_bundle, &sighash))
-        .and(Self::verify_ironwood_bundle(ironwood_bundle, &sighash));
+        .and(Self::verify_v6_orchard_bundle(orchard_bundle, &sighash));
+
+        // The Ironwood bundle only exists under NU6.3; nu7-V6 has no Ironwood, matching
+        // librustzcash where the `ironwood_bundle()` accessor is gated nu6.3-only.
+        #[cfg(zcash_unstable = "nu6.3")]
+        let async_checks = async_checks.and(Self::verify_ironwood_bundle(
+            cached_ffi_transaction.sighasher().ironwood_bundle(),
+            &sighash,
+        ));
 
         Ok((async_checks, cached_ffi_transaction))
     }
 
     /// Verifies if a V6 `transaction` is supported by `network_upgrade`.
-    #[cfg(zcash_unstable = "nu6.3")]
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn verify_v6_transaction_network_upgrade(
         transaction: &Transaction,
         network_upgrade: NetworkUpgrade,
@@ -1294,7 +1301,7 @@ where
     ///
     /// V6 Orchard uses the NU6.3 flag format and proves with the Ironwood circuit, even though it
     /// is still the Orchard value pool.
-    #[cfg(zcash_unstable = "nu6.3")]
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn verify_v6_orchard_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,
@@ -1316,7 +1323,7 @@ where
     ///
     /// Ironwood uses the same V6 action proof system as Orchard, but its note commitment and
     /// nullifier state are tracked separately.
-    #[cfg(zcash_unstable = "nu6.3")]
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn verify_ironwood_bundle(
         bundle: Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
         sighash: &SigHash,

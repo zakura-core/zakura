@@ -836,6 +836,31 @@ fn modern_rollback_network() -> Network {
         .expect("configured network is valid")
 }
 
+/// A configured testnet with early modern activation heights and no funding
+/// streams, used by the NU6.3 history-tree rebuild tests.
+fn modern_nu63_testnet() -> Network {
+    TestnetParameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu6_2: Some(10),
+            nu6_3: Some(11),
+            #[cfg(zcash_unstable = "zfuture")]
+            zfuture: None,
+        })
+        .expect("valid configured activation heights")
+        .clear_funding_streams()
+        .to_network()
+        .expect("valid configured network")
+}
+
 /// Modern rollback targets must not replay note commitment trees from genesis. This test deletes
 /// the genesis block header after syncing; a genesis-to-target treestate rebuild would fail to load
 /// height 0, while the modern path only rebuilds the history tree from Canopy activation.
@@ -1261,26 +1286,7 @@ fn history_tree_upgrade_write_guard_checks_tip_hash() {
 fn history_tree_upgrade_rebuilds_stale_tip_tree() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    let network = TestnetParameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(2),
-            sapling: Some(3),
-            blossom: Some(4),
-            heartwood: Some(5),
-            canopy: Some(6),
-            nu5: Some(7),
-            nu6: Some(8),
-            nu6_1: Some(9),
-            nu6_2: Some(10),
-            nu6_3: Some(11),
-            #[cfg(zcash_unstable = "zfuture")]
-            zfuture: None,
-        })
-        .expect("valid configured activation heights")
-        .clear_funding_streams()
-        .to_network()
-        .expect("valid configured network");
+    let network = modern_nu63_testnet();
 
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);
@@ -1373,26 +1379,7 @@ fn history_tree_upgrade_rebuilds_stale_tip_tree() -> Result<()> {
 fn pre_v28_history_tree_rebuild_cache_catches_up_to_tip() -> Result<()> {
     let _init_guard = zebra_test::init();
 
-    let network = TestnetParameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(1),
-            overwinter: Some(2),
-            sapling: Some(3),
-            blossom: Some(4),
-            heartwood: Some(5),
-            canopy: Some(6),
-            nu5: Some(7),
-            nu6: Some(8),
-            nu6_1: Some(9),
-            nu6_2: Some(10),
-            nu6_3: Some(11),
-            #[cfg(zcash_unstable = "zfuture")]
-            zfuture: None,
-        })
-        .expect("valid configured activation heights")
-        .clear_funding_streams()
-        .to_network()
-        .expect("valid configured network");
+    let network = modern_nu63_testnet();
 
     let ledger_strategy =
         LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, None, false);

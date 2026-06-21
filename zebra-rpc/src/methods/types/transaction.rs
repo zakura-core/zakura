@@ -130,9 +130,6 @@ impl TransactionTemplate<NegativeOrZero> {
         height: Height,
         miner_params: &MinerParams,
         txs_fee: Amount<NonNegative>,
-        #[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))] zip233_amount: Option<
-            Amount<NonNegative>,
-        >,
     ) -> Result<Self, TransactionError> {
         let block_subsidy = block_subsidy(height, net)?;
         let miner_reward = miner_subsidy(height, net, block_subsidy)? + txs_fee;
@@ -148,14 +145,6 @@ impl TransactionTemplate<NegativeOrZero> {
 
         let default_memo = MemoBytes::empty();
         let memo = miner_params.memo().unwrap_or(&default_memo);
-
-        #[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))]
-        {
-            let zip233_amount =
-                zip233_amount.unwrap_or_else(|| ((txs_fee * 6).unwrap() / 10).unwrap());
-
-            builder.set_zip233_amount(Zatoshis::try_from(zip233_amount)?);
-        }
 
         macro_rules! trace_err {
             ($res:expr, $type:expr) => {

@@ -279,9 +279,6 @@ impl BlockTemplateResponse {
         #[cfg(not(test))] mempool_txs: Vec<VerifiedUnminedTx>,
         #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
         submit_old: Option<bool>,
-        #[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))] zip233_amount: Option<
-            Amount<NonNegative>,
-        >,
     ) -> Self {
         // Determine the next block height.
         let height = chain_info
@@ -332,15 +329,8 @@ impl BlockTemplateResponse {
             .expect("mempool tx fees must be non-negative");
 
         let coinbase_txn = precomputed_coinbase.unwrap_or_else(|| {
-            TransactionTemplate::new_coinbase(
-                net,
-                height,
-                miner_params,
-                txs_fee,
-                #[cfg(all(zcash_unstable = "nu7", zcash_unstable = "zip233"))]
-                zip233_amount,
-            )
-            .expect("valid coinbase tx")
+            TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
+                .expect("valid coinbase tx")
         });
 
         let default_roots = DefaultRoots::from_coinbase(

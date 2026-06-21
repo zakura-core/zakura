@@ -3956,7 +3956,7 @@ async fn invalidate_and_reconsider_block() -> Result<()> {
     let _init_guard = zebra_test::init();
     let net = Network::new_regtest(
         ConfiguredActivationHeights {
-            nu7: Some(100),
+            nu6_3: Some(100),
             ..Default::default()
         }
         .into(),

@@ -87,6 +87,7 @@ pub fn resolve_managed_zcashd_binary(state_cache_dir: &Path) -> Result<PathBuf, 
 
 /// Returns the managed zcashd binary cache path without creating directories,
 /// or `None` when managed downloads are unsupported for this target.
+#[allow(dead_code)]
 pub(super) fn managed_zcashd_binary_path(state_cache_dir: &Path) -> Option<PathBuf> {
     let target = zcashd_target_triple()?;
 
@@ -102,6 +103,7 @@ pub(super) fn managed_zcashd_binary_path(state_cache_dir: &Path) -> Option<PathB
 
 /// Returns whether the cached managed zcashd binary is current for this target,
 /// or `None` when managed downloads are unsupported for this target.
+#[allow(dead_code)]
 pub(super) fn cached_managed_zcashd_binary_is_current(
     state_cache_dir: &Path,
 ) -> Result<Option<bool>, Report> {

@@ -685,7 +685,7 @@ impl FinalizedState {
                         contextually_verified.hash,
                         FinalizedBlock::from_contextually_verified(
                             contextually_verified,
-                            treestate,
+                            *treestate,
                         ),
                         prev_note_commitment_trees,
                         self.retention_plan(height, false),

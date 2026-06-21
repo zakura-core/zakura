@@ -43,7 +43,7 @@ fn coinbase() -> anyhow::Result<()> {
             nu5: Some(6),
             nu6: Some(7),
             nu6_1: Some(8),
-            nu7: Some(9),
+            nu6_3: Some(9),
             ..Default::default()
         })?
         .with_funding_streams(vec![

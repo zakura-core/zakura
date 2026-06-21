@@ -33,7 +33,7 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
         with:
           persist-credentials: false
 
@@ -43,7 +43,7 @@ jobs:
           cache-key: zcashd-compat-regtest
           cache-on-failure: true
 
-      - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
+      - uses: taiki-e/install-action@8b3c737da4b541bf0fb5a3e0488ff20535badac9 #v2.82.1
         with:
           tool: cargo-nextest
 

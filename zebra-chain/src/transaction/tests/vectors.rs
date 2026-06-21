@@ -1040,6 +1040,11 @@ fn binding_signatures() {
                             at_least_one_v5_checked = true;
                         }
                     }
+                    // This test iterates real historical mainnet/testnet blocks, which
+                    // contain no V6 transactions, so this arm only exists for match
+                    // exhaustiveness and never executes. A V6 tx's Sapling binding
+                    // signature would reuse the V5 path checked above; Ironwood's own
+                    // binding signature is a consensus-layer concern, not exercised here.
                     #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                     Transaction::V6 { .. } => {}
                 }

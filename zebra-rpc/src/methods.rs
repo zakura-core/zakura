@@ -2620,8 +2620,7 @@ where
             miner_params,
             mempool_txs,
             mempool_tx_deps,
-        )
-        .map_err(gbt_transaction_error)?;
+        );
 
         tracing::debug!(
             selected_mempool_tx_hashes = ?mempool_txs

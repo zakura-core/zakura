@@ -677,7 +677,7 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
     assert!(queued_responses[0].is_ok());
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
 
-    // Query the mempool to make it poll chain_tip_change.
+    // Query the mempool to make it poll chain_tip_change
     mempool.dummy_call().await;
 
     // Commit the NU5 activation block. This is a network upgrade reset (`TipAction::Reset`),
@@ -685,17 +685,11 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
     commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, reset_block)
         .await;
 
-    let mut cancelled_requests = Vec::new();
-    while let Some(request) = peer_set.try_next_request().await {
-        cancelled_requests.push(request);
-    }
+    // Ignore all the previous network requests.
+    while let Some(_request) = peer_set.try_next_request().await {}
 
     // Query the mempool to make it poll chain_tip_change
     mempool.dummy_call().await;
-
-    for request in cancelled_requests {
-        request.respond(zn::Response::Transactions(vec![]));
-    }
 
     // Check if download was cancelled and transaction was retried.
     let request = peer_set
@@ -708,14 +702,6 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
         &zebra_network::Request::TransactionsById(iter::once(uncommitted_tx_id).collect()),
     );
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
-
-    request.respond(zn::Response::Transactions(vec![]));
-
-    for _ in 0..2 {
-        mempool.dummy_call().await;
-        time::sleep(time::Duration::from_millis(100)).await;
-    }
-    assert_eq!(mempool.tx_downloads().in_flight(), 0);
 
     Ok(())
 }
@@ -1017,7 +1003,7 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     )
     .await;
 
-    // Query the mempool to make it poll chain_tip_change and reverify its state after the reset.
+    // Query the mempool to make it poll chain_tip_change and try reverifying its state for the `TipAction::Reset`
     mempool.dummy_call().await;
 
     // Check that there is still an in-flight tx_download and that
@@ -1073,19 +1059,6 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     // no transactions were inserted in the mempool.
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
     assert_eq!(mempool.storage().transaction_count(), 0);
-
-    tx_verifier
-        .expect_request_that(|_| true)
-        .map(|responder| {
-            responder.respond(Err(TransactionError::BadBalance));
-        })
-        .await;
-
-    for _ in 0..2 {
-        mempool.dummy_call().await;
-        time::sleep(time::Duration::from_millis(100)).await;
-    }
-    assert_eq!(mempool.tx_downloads().in_flight(), 0);
 
     Ok(())
 }

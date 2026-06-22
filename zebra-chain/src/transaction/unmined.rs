@@ -166,18 +166,6 @@ impl From<&WtxId> for UnminedTxId {
 }
 
 impl UnminedTxId {
-    /// Try to create an [`UnminedTxId`] for an unverified mempool transaction.
-    ///
-    /// This rejects version 6 transactions with non-canonical shielded proof
-    /// sizes before computing their transaction ID.
-    pub fn try_from_mempool_transaction(
-        transaction: &Transaction,
-    ) -> Result<UnminedTxId, UnminedTxError> {
-        mempool_transaction_proof_size_is_canonical(transaction)?;
-
-        Ok(transaction.into())
-    }
-
     /// Create a new [`UnminedTxId`] using a v1-v4 legacy transaction ID.
     ///
     /// # Correctness
@@ -272,88 +260,8 @@ impl fmt::Display for UnminedTx {
     }
 }
 
-/// An error caused by constructing an unmined transaction from unverified data.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum UnminedTxError {
-    /// An Orchard proof has a non-canonical size.
-    OrchardProofSize,
-
-    /// An Ironwood proof has a non-canonical size.
-    IronwoodProofSize,
-}
-
-impl fmt::Display for UnminedTxError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self {
-            UnminedTxError::OrchardProofSize => "Orchard proof size is not canonical",
-            UnminedTxError::IronwoodProofSize => "Ironwood proof size is not canonical",
-        };
-
-        f.write_str(message)
-    }
-}
-
-impl std::error::Error for UnminedTxError {}
-
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-fn mempool_transaction_proof_size_is_canonical(
-    transaction: &Transaction,
-) -> Result<(), UnminedTxError> {
-    let V6 {
-        orchard_shielded_data,
-        ironwood_shielded_data,
-        ..
-    } = transaction
-    else {
-        return Ok(());
-    };
-
-    if let Some(orchard_shielded_data) = orchard_shielded_data {
-        if !orchard_shielded_data.proof_size_is_canonical() {
-            return Err(UnminedTxError::OrchardProofSize);
-        }
-    }
-
-    if let Some(ironwood_shielded_data) = ironwood_shielded_data {
-        if !ironwood_shielded_data.proof_size_is_canonical() {
-            return Err(UnminedTxError::IronwoodProofSize);
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
-fn mempool_transaction_proof_size_is_canonical(
-    _transaction: &Transaction,
-) -> Result<(), UnminedTxError> {
-    Ok(())
-}
-
 // Each of these conversions is implemented slightly differently,
 // to avoid cloning the transaction where possible.
-
-impl UnminedTx {
-    /// Try to create an [`UnminedTx`] from an unverified mempool transaction.
-    ///
-    /// This rejects version 6 transactions with non-canonical shielded proof
-    /// sizes before computing their transaction ID.
-    pub fn try_from_mempool_transaction(
-        transaction: impl Into<Arc<Transaction>>,
-    ) -> Result<Self, UnminedTxError> {
-        let transaction = transaction.into();
-        let id = UnminedTxId::try_from_mempool_transaction(&transaction)?;
-        let size = transaction.zcash_serialized_size();
-        let conventional_fee = zip317::conventional_fee(&transaction);
-
-        Ok(Self {
-            transaction,
-            id,
-            size,
-            conventional_fee,
-        })
-    }
-}
 
 impl From<Transaction> for UnminedTx {
     fn from(transaction: Transaction) -> Self {

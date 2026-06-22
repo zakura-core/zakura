@@ -1239,16 +1239,15 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
 
 #[test]
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-fn unmined_v6_rejects_padded_orchard_proof_before_hashing() {
+fn v6_padded_orchard_proof_is_rejected_on_deserialize() {
     let _init_guard = zebra_test::init();
 
-    let mut orchard_shielded_data = Network::iter()
+    let orchard_shielded_data = Network::iter()
         .flat_map(|network| v5_transactions(network.block_iter()))
         .find_map(|transaction| transaction.orchard_shielded_data().cloned())
         .expect("test vectors include an Orchard transaction");
-    orchard_shielded_data.proof.0.push(0);
 
-    let transaction = Transaction::V6 {
+    let make_tx = |orchard_shielded_data| Transaction::V6 {
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(1),
@@ -1259,61 +1258,20 @@ fn unmined_v6_rejects_padded_orchard_proof_before_hashing() {
         ironwood_shielded_data: None,
     };
 
-    let error = UnminedTx::try_from_mempool_transaction(transaction)
-        .expect_err("padded Orchard proof must be rejected before hashing");
+    // Control: the same tx with a canonical proof must round-trip, so any
+    // rejection below is attributable to the padding, not the test vector.
+    let canonical_bytes = make_tx(orchard_shielded_data.clone())
+        .zcash_serialize_to_vec()
+        .expect("serialize");
+    Transaction::zcash_deserialize(&canonical_bytes[..])
+        .expect("v6 tx with a canonical Orchard proof round-trips");
 
-    assert_eq!(error, UnminedTxError::OrchardProofSize);
-}
-
-#[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-fn unmined_v6_rejects_padded_ironwood_proof_before_hashing() {
-    use proptest::{
-        prelude::any,
-        strategy::{Strategy, ValueTree},
-        test_runner::TestRunner,
-    };
-
-    use crate::{
-        at_least_one,
-        ironwood::{self, tree},
-        orchard::Flags,
-        primitives::Halo2Proof,
-    };
-
-    let _init_guard = zebra_test::init();
-
-    let mut runner = TestRunner::default();
-    let action = any::<ironwood::Action>()
-        .new_tree(&mut runner)
-        .expect("test action strategy creates a value")
-        .current();
-
-    let transaction = Transaction::V6 {
-        network_upgrade: NetworkUpgrade::Nu6_3,
-        lock_time: LockTime::unlocked(),
-        expiry_height: Height(1),
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-        ironwood_shielded_data: Some(ironwood::ShieldedData {
-            flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
-            value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
-            shared_anchor: tree::Root::default(),
-            proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1) + 1]),
-            actions: at_least_one![ironwood::AuthorizedAction {
-                action,
-                spend_auth_sig: [0u8; 64].into(),
-            }],
-            binding_sig: [0u8; 64].into(),
-        }),
-    };
-
-    let error = UnminedTx::try_from_mempool_transaction(transaction)
-        .expect_err("padded Ironwood proof must be rejected before hashing");
-
-    assert_eq!(error, UnminedTxError::IronwoodProofSize);
+    let mut padded = orchard_shielded_data;
+    padded.proof.0.push(0);
+    let padded_bytes = make_tx(padded).zcash_serialize_to_vec().expect("serialize");
+    Transaction::zcash_deserialize(&padded_bytes[..]).expect_err(
+        "v6 transaction with a padded Orchard proof must be rejected on deserialization",
+    );
 }
 
 /// Regression test for the Orchard `rk` identity-point DoS vulnerability.

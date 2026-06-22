@@ -312,9 +312,7 @@ impl Runner {
         let mut retried = HashSet::new();
 
         for tx in transactions {
-            let Ok(unmined) = UnminedTx::try_from_mempool_transaction(tx) else {
-                continue;
-            };
+            let unmined = UnminedTx::from(tx);
             let gossip = Gossip::Tx(unmined.clone());
             let request = Request::Queue(vec![gossip]);
 

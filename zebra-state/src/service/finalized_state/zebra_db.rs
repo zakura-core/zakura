@@ -9,20 +9,12 @@
 //! [`crate::constants::state_database_format_version_in_code()`] must be incremented
 //! each time the database format (column, serialization, etc) changes.
 
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{path::Path, sync::Arc};
 
 use crossbeam_channel::bounded;
 use semver::Version;
 
-use zebra_chain::{
-    block::{self as chain_block, Height},
-    diagnostic::task::WaitForPanics,
-    history_tree::HistoryTree,
-    parameters::Network,
-};
+use zebra_chain::{block::Height, diagnostic::task::WaitForPanics, parameters::Network};
 
 use crate::{
     config::database_format_version_on_disk,
@@ -88,20 +80,8 @@ pub struct ZebraDb {
     // TODO: move the generic upgrade code and fields to DiskDb
     format_change_handle: Option<DbFormatChangeThreadHandle>,
 
-    /// Cached history tree rebuilt for older database formats.
-    history_tree_rebuild_cache: Arc<Mutex<Option<CachedHistoryTree>>>,
-
     /// The inner low-level database wrapper for the RocksDB database.
     db: DiskDb,
-}
-
-/// In-memory cache for history tree rebuilds while upgrading old database formats.
-#[derive(Clone, Debug)]
-pub(crate) struct CachedHistoryTree {
-    /// The finalized tip that this tree was rebuilt for.
-    pub(crate) tip: (Height, chain_block::Hash),
-    /// The history tree at `tip`.
-    pub(crate) history_tree: Arc<HistoryTree>,
 }
 
 impl ZebraDb {
@@ -150,7 +130,6 @@ impl ZebraDb {
             config: Arc::new(config.clone()),
             debug_skip_format_upgrades,
             format_change_handle: None,
-            history_tree_rebuild_cache: Arc::new(Mutex::new(None)),
             // After the database directory is created, a newly created database temporarily
             // changes to the default database version. Then we set the correct version in the
             // upgrade thread. We need to do the version change in this order, because the version

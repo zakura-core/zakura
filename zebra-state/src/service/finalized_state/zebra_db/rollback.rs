@@ -11,7 +11,6 @@ use zebra_chain::{
     amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
     block::{self, Block, Height},
     history_tree::{HistoryTree, HistoryTreeError},
-    ironwood,
     parallel::tree::{NoteCommitmentTreeError, NoteCommitmentTrees},
     parameters::{
         subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
@@ -203,13 +202,6 @@ pub enum RollbackFinalizedStateError {
     /// An Orchard note commitment tree required for rollback could not be loaded.
     #[error("missing Orchard note commitment tree at height {height:?}")]
     MissingOrchardTree {
-        /// Missing tree height.
-        height: block::Height,
-    },
-
-    /// An Ironwood note commitment tree required for rollback could not be loaded.
-    #[error("missing Ironwood note commitment tree at height {height:?}")]
-    MissingIronwoodTree {
         /// Missing tree height.
         height: block::Height,
     },
@@ -560,13 +552,13 @@ fn rebuild_history_tree_from_upgrade_activation(
         .expect("current network upgrade must have an activation height");
 
     let (block, sapling_root, orchard_root, ironwood_root) =
-        history_rebuild_inputs_at_height(db, network, start_height)?;
+        history_rebuild_inputs_at_height(db, start_height)?;
     let mut history_tree =
         HistoryTree::from_block(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
 
     for height in ((start_height.0 + 1)..=target_height.0).map(Height) {
         let (block, sapling_root, orchard_root, ironwood_root) =
-            history_rebuild_inputs_at_height(db, network, height)?;
+            history_rebuild_inputs_at_height(db, height)?;
 
         history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
     }
@@ -576,7 +568,6 @@ fn rebuild_history_tree_from_upgrade_activation(
 
 fn history_rebuild_inputs_at_height(
     db: &ZebraDb,
-    network: &Network,
     height: Height,
 ) -> Result<
     (
@@ -600,10 +591,7 @@ fn history_rebuild_inputs_at_height(
         .root();
     let ironwood_root = match db.ironwood_tree_by_height_range(..=height).last() {
         Some((_height, tree)) => tree.root(),
-        None if NetworkUpgrade::current(network, height) < NetworkUpgrade::Nu6_3 => {
-            Default::default()
-        }
-        None => return Err(RollbackFinalizedStateError::MissingIronwoodTree { height }),
+        None => Default::default(),
     };
 
     Ok((block, sapling_root, orchard_root, ironwood_root))
@@ -951,10 +939,6 @@ fn prune_tree_indexes(
         batch.delete_orchard_anchor(db, &tree.root());
     }
 
-    let needs_empty_ironwood_tree_at_target = db
-        .ironwood_tree_by_height_range(..=target_height)
-        .next()
-        .is_none();
     let ironwood_trees: BTreeMap<_, _> = db
         .ironwood_tree_by_height_range((
             std::ops::Bound::Excluded(target_height),
@@ -964,10 +948,6 @@ fn prune_tree_indexes(
     for (height, tree) in ironwood_trees {
         batch.delete_ironwood_tree(db, &height);
         batch.delete_ironwood_anchor(db, &tree.root());
-    }
-    if needs_empty_ironwood_tree_at_target {
-        let ironwood_tree = ironwood::tree::NoteCommitmentTree::default();
-        batch.create_ironwood_tree(db, &target_height, &ironwood_tree);
     }
 
     // Delete every sapling/orchard/ironwood subtree whose notes extend past the target height. Subtree

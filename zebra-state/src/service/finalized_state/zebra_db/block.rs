@@ -965,10 +965,6 @@ impl ZebraDb {
         self.db
             .write(batch)
             .expect("unexpected rocksdb error while writing block");
-        self.cache_rebuilt_history_tree(
-            (finalized.height, finalized.hash),
-            finalized.treestate.history_tree.clone(),
-        );
         metrics::histogram!("zebra.state.rocksdb.batch_commit.duration_seconds")
             .record(batch_start.elapsed().as_secs_f64());
 
@@ -1014,15 +1010,6 @@ impl ZebraDb {
             .map_err(|error| CommitHeaderRangeError::StorageWriteError {
                 error: error.to_string(),
             })
-    }
-
-    /// Writes the given batch only if the finalized tip still matches `expected_tip`.
-    pub(crate) fn write_batch_if_finalized_tip(
-        &self,
-        batch: DiskWriteBatch,
-        expected_tip: (Height, block::Hash),
-    ) -> Result<bool, rocksdb::Error> {
-        self.db.write_if(batch, || self.tip() == Some(expected_tip))
     }
 }
 

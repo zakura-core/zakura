@@ -21,6 +21,7 @@ use zebra_chain::{
     block::Height,
     ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
+    parameters::NetworkUpgrade,
     sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     transaction::Transaction,
@@ -474,15 +475,14 @@ impl ZebraDb {
     // Ironwood trees
 
     /// Returns the Ironwood note commitment tree of the finalized tip or the
-    /// empty tree if the state is empty.
+    /// empty tree if the state is empty or Ironwood is not active.
     pub fn ironwood_tree_for_tip(&self) -> Arc<ironwood::tree::NoteCommitmentTree> {
         let height = match self.finalized_tip_height() {
             Some(h) => h,
             None => return Default::default(),
         };
 
-        self.ironwood_tree_by_height(&height)
-            .expect("Ironwood note commitment tree must exist if there is a finalized tip")
+        self.ironwood_tree_by_height(&height).unwrap_or_default()
     }
 
     /// Returns the Ironwood note commitment tree matching the given block height,
@@ -500,12 +500,11 @@ impl ZebraDb {
 
         let ironwood_trees = self.db.cf_handle("ironwood_note_commitment_tree").unwrap();
 
-        let (_first_duplicate_height, tree) = self
-            .db
-            .zs_prev_key_value_back_from(&ironwood_trees, height)
-            .expect(
-                "Ironwood note commitment trees must exist for all heights below the finalized tip",
-            );
+        let Some((_first_duplicate_height, tree)) =
+            self.db.zs_prev_key_value_back_from(&ironwood_trees, height)
+        else {
+            return Some(Default::default());
+        };
 
         Some(Arc::new(tree))
     }
@@ -680,6 +679,11 @@ impl DiskWriteBatch {
             || zebra_db.ironwood_tree_for_tip(),
             |prev_trees| prev_trees.ironwood.clone(),
         );
+        let ironwood_activation_height =
+            NetworkUpgrade::Nu6_3.activation_height(&zebra_db.network());
+        let is_ironwood_active = ironwood_activation_height
+            .is_some_and(|activation_height| *height >= activation_height);
+        let is_ironwood_activation_height = ironwood_activation_height == Some(*height);
 
         // Update the Sprout tree and store its anchor only if it has changed
         if height.is_min() || prev_sprout_tree != note_commitment_trees.sprout {
@@ -705,7 +709,10 @@ impl DiskWriteBatch {
         }
 
         // Store the Ironwood tree, anchor, and any new subtrees only if they have changed.
-        if height.is_min() || prev_ironwood_tree != note_commitment_trees.ironwood {
+        if is_ironwood_active
+            && (is_ironwood_activation_height
+                || prev_ironwood_tree != note_commitment_trees.ironwood)
+        {
             self.create_ironwood_tree(zebra_db, height, &note_commitment_trees.ironwood);
 
             if let Some(subtree) = note_commitment_trees.ironwood_subtree {

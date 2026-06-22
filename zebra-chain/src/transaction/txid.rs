@@ -51,11 +51,9 @@ impl<'a> TxIdBuilder<'a> {
         Some(Hash(*self.trans.to_librustzcash(nu).ok()?.txid().as_ref()))
     }
 
-    /// Compute the Transaction ID for a V6 transaction.
+    /// Passthrough to txid_v5 for V6 transactions.
     #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn txid_v6(self) -> Option<Hash> {
-        let nu = self.trans.network_upgrade()?;
-
-        Some(Hash(*self.trans.to_librustzcash(nu).ok()?.txid().as_ref()))
+        self.txid_v5()
     }
 }

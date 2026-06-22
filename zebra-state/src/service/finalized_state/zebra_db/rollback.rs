@@ -343,7 +343,7 @@ fn open_rollback_db(config: &Config, network: &Network, read_only: bool) -> Zebr
             .iter()
             .map(ToString::to_string),
         read_only,
-    )
+    ).expect("opening the finalized state database failed; the configured cache directory must contain a readable Zebra database")
 }
 
 /// The validated bounds of a rollback: where the finalized tip is now, and where it will end up.
@@ -1181,6 +1181,7 @@ mod tests {
                 .map(ToString::to_string),
             false,
         )
+        .expect("opening the finalized state database should succeed")
     }
 
     fn sapling_note_commitment(value: u64) -> sapling::tree::NoteCommitmentUpdate {

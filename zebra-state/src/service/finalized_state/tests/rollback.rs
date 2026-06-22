@@ -75,7 +75,8 @@ fn sync_to(config: &Config, network: &Network, blocks: &[SemanticallyVerifiedBlo
         network,
         #[cfg(feature = "elasticsearch")]
         false,
-    );
+    )
+    .expect("opening an ephemeral database should succeed");
 
     for block in blocks {
         let checkpoint_verified = CheckpointVerifiedBlock::from(block.block.clone());
@@ -93,6 +94,7 @@ fn reopen(config: &Config, network: &Network) -> FinalizedState {
         #[cfg(feature = "elasticsearch")]
         false,
     )
+    .expect("opening an ephemeral database should succeed")
 }
 
 /// Opens the database at `config` directly, skipping format upgrades and their validation. The
@@ -110,6 +112,7 @@ fn open_unchecked_db(config: &Config, network: &Network) -> ZebraDb {
             .map(ToString::to_string),
         false,
     )
+    .expect("opening the finalized state database should succeed")
 }
 
 /// Asserts that `rolled` (a state rolled back to the tip of `retained`) is semantically equivalent

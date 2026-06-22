@@ -587,6 +587,7 @@ mod tests {
                 .map(ToString::to_string),
             false,
         )
+        .expect("opening the finalized state database should succeed")
     }
 
     fn sapling_note_commitment(value: u64) -> sapling::tree::NoteCommitmentUpdate {

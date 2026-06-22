@@ -174,7 +174,8 @@ fn reset_clears_the_lookahead() {
         &network,
         #[cfg(feature = "elasticsearch")]
         false,
-    );
+    )
+    .expect("opening an ephemeral database should succeed");
 
     manager.reset(&mut finalized_state);
 

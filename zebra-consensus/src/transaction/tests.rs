@@ -17,8 +17,6 @@ use halo2::pasta::{group::ff::PrimeField, pallas};
 use tokio::time::timeout;
 use tower::{buffer::Buffer, service_fn, ServiceExt};
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-use zebra_chain::{ironwood, orchard, primitives::Halo2Proof};
 use zebra_chain::{
     amount::{Amount, NegativeAllowed, NonNegative},
     block::{self, Block, Height},
@@ -40,6 +38,8 @@ use zebra_chain::{
     },
     transparent::{self, CoinbaseSpendRestriction},
 };
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+use zebra_chain::{ironwood, orchard, primitives::Halo2Proof};
 
 use zebra_node_services::mempool;
 use zebra_state::ValidateContextError;

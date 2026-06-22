@@ -11,7 +11,7 @@ use std::{
 use futures::{future::BoxFuture, FutureExt};
 use once_cell::sync::Lazy;
 use orchard::{
-    bundle::BatchValidator,
+    bundle::{BatchError, BatchValidator},
     circuit::{OrchardCircuitVersion, VerifyingKey},
 };
 use rand::thread_rng;
@@ -75,7 +75,7 @@ lazy_static::lazy_static! {
     /// MUST be retained to re-verify pre-NU6.2 history on resync. It must never be used to verify
     /// post-NU6.2 bundles.
     pub static ref VERIFYING_KEY_PRE_NU6_2: ItemVerifyingKey =
-        ItemVerifyingKey::build_for_version(OrchardCircuitVersion::InsecurePreNu6_2);
+        ItemVerifyingKey::build(OrchardCircuitVersion::InsecurePreNu6_2);
 
     /// The Orchard Action verifying key for the **NU6.2+** (fixed) circuit.
     ///
@@ -83,7 +83,7 @@ lazy_static::lazy_static! {
     /// NU6.2. Bundles mined at or after the NU6.2 activation height commit to this circuit and
     /// only verify under this key. See [`VERIFYING_KEY_PRE_NU6_2`] for the era split.
     pub static ref VERIFYING_KEY_POST_NU6_2: ItemVerifyingKey =
-        ItemVerifyingKey::build();
+        ItemVerifyingKey::build(OrchardCircuitVersion::FixedPostNu6_2);
 }
 
 /// A Halo2 verification item, used as the request type of the service.
@@ -118,19 +118,21 @@ impl Item {
     /// fallback logic when batch verification fails. The caller supplies the
     /// verifying key for the item's era.
     pub fn verify_single(self, vk: &ItemVerifyingKey) -> bool {
-        let mut batch = BatchValidator::default();
-        batch.queue(self);
-        batch.validate(vk, thread_rng())
+        let mut batch = BatchValidator::new(vk);
+        if batch.queue(self).is_err() {
+            return false;
+        }
+        batch.validate(thread_rng())
     }
 }
 
 trait QueueBatchVerify {
-    fn queue(&mut self, item: Item);
+    fn queue(&mut self, item: Item) -> Result<(), BatchError>;
 }
 
-impl QueueBatchVerify for BatchValidator {
-    fn queue(&mut self, Item { bundle, sighash }: Item) {
-        self.add_bundle(&bundle, sighash.0);
+impl QueueBatchVerify for BatchValidator<'_> {
+    fn queue(&mut self, Item { bundle, sighash }: Item) -> Result<(), BatchError> {
+        self.add_bundle(&bundle, sighash.0)
     }
 }
 
@@ -288,7 +290,7 @@ pub struct Verifier {
     vk: &'static ItemVerifyingKey,
 
     /// The synchronous Halo2 batch validator.
-    batch: BatchValidator,
+    batch: BatchValidator<'static>,
 
     /// A channel for broadcasting the result of a batch to the futures for each batch item.
     ///
@@ -303,48 +305,47 @@ impl Verifier {
         let (tx, _) = watch::channel(None);
         Self {
             vk,
-            batch: BatchValidator::default(),
+            batch: BatchValidator::new(vk),
             tx,
         }
     }
 
     /// Returns the batch verifier and channel sender,
     /// replacing the batch and channel with new empty ones.
-    fn take(&mut self) -> (BatchValidator, Sender) {
+    fn take(&mut self) -> (BatchValidator<'static>, Sender) {
         // Use a new verifier and channel for each batch.
-        let batch = mem::take(&mut self.batch);
+        let batch = mem::replace(&mut self.batch, BatchValidator::new(self.vk));
         let (tx, _) = watch::channel(None);
         let tx = mem::replace(&mut self.tx, tx);
 
         (batch, tx)
     }
 
-    /// Synchronously process the batch against `vk`, and send the result using
+    /// Synchronously process the batch using its bound verifying key, and send the result using
     /// the channel sender. This function blocks until the batch is completed.
-    fn verify(batch: BatchValidator, vk: &'static ItemVerifyingKey, tx: Sender) {
-        let result = batch.validate(vk, thread_rng());
+    fn verify(batch: BatchValidator<'static>, tx: Sender) {
+        let result = batch.validate(thread_rng());
         let _ = tx.send(Some(result));
     }
 
     /// Flush the batch using a thread pool, sending the result via the channel.
     /// This returns immediately, usually before the batch is completed.
     fn flush_blocking(&mut self) {
-        let vk = self.vk;
         let (batch, tx) = self.take();
 
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         //
         // We don't care about execution order here, because this method is only called on drop.
-        tokio::task::block_in_place(|| rayon::spawn_fifo(move || Self::verify(batch, vk, tx)));
+        tokio::task::block_in_place(|| rayon::spawn_fifo(move || Self::verify(batch, tx)));
     }
 
-    /// Flush the batch using a thread pool, validating against `vk` and
-    /// returning the result via the channel. This function returns a future that
-    /// becomes ready when the batch is completed.
-    async fn flush_spawning(batch: BatchValidator, vk: &'static ItemVerifyingKey, tx: Sender) {
+    /// Flush the batch using a thread pool, validating against the batch's bound key and returning
+    /// the result via the channel. This function returns a future that becomes ready when the batch
+    /// is completed.
+    async fn flush_spawning(batch: BatchValidator<'static>, tx: Sender) {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         let start = std::time::Instant::now();
-        let result = spawn_fifo(move || batch.validate(vk, thread_rng())).await;
+        let result = spawn_fifo(move || batch.validate(thread_rng())).await;
         let duration = start.elapsed().as_secs_f64();
 
         let result_label = match &result {
@@ -395,7 +396,9 @@ impl Service<BatchControl<Item>> for Verifier {
         match req {
             BatchControl::Item(item) => {
                 tracing::trace!("got item");
-                self.batch.queue(item);
+                if let Err(err) = self.batch.queue(item) {
+                    return Box::pin(async move { Err(BoxError::from(err)) });
+                }
                 let mut rx = self.tx.subscribe();
                 Box::pin(async move {
                     match rx.changed().await {
@@ -425,10 +428,9 @@ impl Service<BatchControl<Item>> for Verifier {
             BatchControl::Flush => {
                 tracing::trace!("got halo2 flush command");
 
-                let vk = self.vk;
                 let (batch, tx) = self.take();
 
-                Box::pin(Self::flush_spawning(batch, vk, tx).map(|()| Ok(())))
+                Box::pin(Self::flush_spawning(batch, tx).map(|()| Ok(())))
             }
         }
     }

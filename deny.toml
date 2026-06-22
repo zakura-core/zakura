@@ -16,6 +16,7 @@ ignore = [
     "RUSTSEC-2024-0375", # atty (unmaintained) — transitive via abscissa_core -> structopt
     "RUSTSEC-2021-0145", # atty (unsound) — transitive via abscissa_core -> structopt
     "RUSTSEC-2024-0370", # proc-macro-error — transitive via abscissa_core -> structopt
+    "RUSTSEC-2022-0104", # structopt (unmaintained) — direct dep of zebra-utils; no safe upgrade, migrate to clap 4
     "RUSTSEC-2026-0173", # proc-macro-error2 (unmaintained) — transitive via getset
     "RUSTSEC-2025-0119", # number_prefix — transitive via indicatif
     "RUSTSEC-2025-0141", # bincode — direct dependency
@@ -103,7 +104,8 @@ skip = [
 # dependencies starting at the specified crate, up to a certain depth, which is
 # by default infinite
 skip-tree = [
-    # wait for bindgen to update itertools
+    # wait for criterion and bindgen to update itertools
+    { name = "itertools", version = "0.10" },
     { name = "itertools", version = "0.13" },
 
     # wait for ordered-map to release a dependency fix
@@ -173,9 +175,6 @@ skip-tree = [
     # hashbrown 0.15.x pulled by various deps; 0.16.x pulled by indexmap 2.x
     { name = "hashbrown", version = "0.15" },
 
-    # itertools 0.13.x pulled by halo2 deps; 0.14.x pulled by other deps
-    { name = "itertools", version = "0.13" },
-
     { name = "getrandom", version = "0.2" },
     { name = "getrandom", version = "0.3" },
 
@@ -226,7 +225,8 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # List of URLs for allowed Git repositories
 # TODO: Remove the URLs once the patch table in Cargo.toml is removed.
 allow-git = [
-    "https://github.com/zcash/librustzcash.git",
+    "https://github.com/valargroup/librustzcash.git",
+    "https://github.com/zcash/orchard",
 ]
 
 [sources.allow-org]

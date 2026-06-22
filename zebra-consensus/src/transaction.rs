@@ -520,11 +520,14 @@ where
             }
 
             let nu = req.upgrade(&network);
-            let all_previous_outputs = Arc::new(spent_outputs);
+            let cached_ffi_transaction = Arc::new(
+                CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu)
+                    .map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?,
+            );
 
             tracing::trace!(?tx_mined_id, "got state UTXOs");
 
-            let (mut async_checks, cached_ffi_transaction) = match tx.as_ref() {
+            let mut async_checks = match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
                     tracing::debug!(?tx, "got transaction with wrong version");
                     return Err(TransactionError::WrongVersion);
@@ -532,35 +535,21 @@ where
                 Transaction::V4 {
                     joinsplit_data,
                     ..
-                } => {
-                    let cached_ffi_transaction =
-                        Self::cached_ffi_transaction(tx.clone(), all_previous_outputs.clone(), nu)?;
-
-                    let async_checks = Self::verify_v4_transaction(
-                        &req,
-                        &network,
-                        script_verifier,
-                        cached_ffi_transaction.clone(),
-                        joinsplit_data,
-                    )?;
-
-                    (async_checks, cached_ffi_transaction)
-                }
+                } => Self::verify_v4_transaction(
+                    &req,
+                    &network,
+                    script_verifier,
+                    cached_ffi_transaction.clone(),
+                    joinsplit_data,
+                )?,
                 Transaction::V5 {
                     ..
-                } => {
-                    let cached_ffi_transaction =
-                        Self::cached_ffi_transaction(tx.clone(), all_previous_outputs.clone(), nu)?;
-
-                    let async_checks = Self::verify_v5_transaction(
-                        &req,
-                        &network,
-                        script_verifier,
-                        cached_ffi_transaction.clone(),
-                    )?;
-
-                    (async_checks, cached_ffi_transaction)
-                }
+                } => Self::verify_v5_transaction(
+                    &req,
+                    &network,
+                    script_verifier,
+                    cached_ffi_transaction.clone(),
+                )?,
                 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                 Transaction::V6 {
                     ..
@@ -568,7 +557,7 @@ where
                     &req,
                     &network,
                     script_verifier,
-                    all_previous_outputs.clone(),
+                    cached_ffi_transaction.clone(),
                 )?,
             };
 
@@ -1026,35 +1015,18 @@ where
         }
     }
 
-    /// Constructs cached FFI transaction data for transparent and shielded verification.
-    fn cached_ffi_transaction(
-        transaction: Arc<Transaction>,
-        all_previous_outputs: Arc<Vec<transparent::Output>>,
-        nu: NetworkUpgrade,
-    ) -> Result<Arc<CachedFfiTransaction>, TransactionError> {
-        let version = transaction.version();
-
-        Ok(Arc::new(
-            CachedFfiTransaction::new(transaction, all_previous_outputs, nu)
-                .map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(version, nu))?,
-        ))
-    }
-
     /// Verifies a V6 transaction.
     #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn verify_v6_transaction(
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
-        all_previous_outputs: Arc<Vec<transparent::Output>>,
-    ) -> Result<(AsyncChecks, Arc<CachedFfiTransaction>), TransactionError> {
+        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+    ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
         let nu = request.upgrade(network);
 
         Self::verify_v6_transaction_network_upgrade(transaction.as_ref(), nu)?;
-
-        let cached_ffi_transaction =
-            Self::cached_ffi_transaction(transaction.clone(), all_previous_outputs, nu)?;
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
@@ -1078,7 +1050,7 @@ where
             &sighash,
         ));
 
-        Ok((async_checks, cached_ffi_transaction))
+        Ok(async_checks)
     }
 
     /// Verifies if a V6 `transaction` is supported by `network_upgrade`.

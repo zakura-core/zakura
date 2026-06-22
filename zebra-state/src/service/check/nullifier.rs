@@ -58,7 +58,7 @@ pub(crate) fn no_duplicates_in_finalized_chain(
 
     for nullifier in semantically_verified.block.ironwood_nullifiers() {
         if finalized_state.contains_ironwood_nullifier(nullifier) {
-            Err(nullifier.duplicate_nullifier_error(true))?;
+            Err(duplicate_ironwood_nullifier_error(nullifier, true))?;
         }
     }
 
@@ -72,6 +72,35 @@ pub(crate) fn no_duplicates_in_finalized_chain(
 /// non-finalized or finalized chains.
 ///
 /// Returns `Ok(())` if all the `revealed_nullifiers` have not been seen in either chain.
+fn find_duplicate_nullifier_with<
+    'a,
+    NullifierT,
+    FinalizedStateContainsFn,
+    NonFinalizedStateContainsFn,
+    DuplicateNullifierErrorFn,
+>(
+    revealed_nullifiers: impl IntoIterator<Item = &'a NullifierT>,
+    finalized_chain_contains: FinalizedStateContainsFn,
+    non_finalized_chain_contains: Option<NonFinalizedStateContainsFn>,
+    duplicate_nullifier_error: DuplicateNullifierErrorFn,
+) -> Result<(), ValidateContextError>
+where
+    NullifierT: 'a,
+    FinalizedStateContainsFn: Fn(&'a NullifierT) -> bool,
+    NonFinalizedStateContainsFn: Fn(&'a NullifierT) -> bool,
+    DuplicateNullifierErrorFn: Fn(&NullifierT, bool) -> ValidateContextError,
+{
+    for nullifier in revealed_nullifiers {
+        if let Some(true) = non_finalized_chain_contains.as_ref().map(|f| f(nullifier)) {
+            Err(duplicate_nullifier_error(nullifier, false))?
+        } else if finalized_chain_contains(nullifier) {
+            Err(duplicate_nullifier_error(nullifier, true))?
+        }
+    }
+
+    Ok(())
+}
+
 fn find_duplicate_nullifier<'a, NullifierT, FinalizedStateContainsFn, NonFinalizedStateContainsFn>(
     revealed_nullifiers: impl IntoIterator<Item = &'a NullifierT>,
     finalized_chain_contains: FinalizedStateContainsFn,
@@ -82,15 +111,25 @@ where
     FinalizedStateContainsFn: Fn(&'a NullifierT) -> bool,
     NonFinalizedStateContainsFn: Fn(&'a NullifierT) -> bool,
 {
-    for nullifier in revealed_nullifiers {
-        if let Some(true) = non_finalized_chain_contains.as_ref().map(|f| f(nullifier)) {
-            Err(nullifier.duplicate_nullifier_error(false))?
-        } else if finalized_chain_contains(nullifier) {
-            Err(nullifier.duplicate_nullifier_error(true))?
-        }
-    }
+    find_duplicate_nullifier_with(
+        revealed_nullifiers,
+        finalized_chain_contains,
+        non_finalized_chain_contains,
+        |nullifier, in_finalized_state| nullifier.duplicate_nullifier_error(in_finalized_state),
+    )
+}
 
-    Ok(())
+// Ironwood reuses `orchard::Nullifier` (`ironwood::Nullifier` is a re-export), so it
+// can't have its own `impl DuplicateNullifierError` without conflicting with the Orchard
+// impl (E0119). Its pool is distinguished at the call site via the `*_with` helpers below.
+fn duplicate_ironwood_nullifier_error(
+    nullifier: &ironwood::Nullifier,
+    in_finalized_state: bool,
+) -> ValidateContextError {
+    ValidateContextError::DuplicateIronwoodNullifier {
+        nullifier: *nullifier,
+        in_finalized_state,
+    }
 }
 
 /// Reject double-spends of nullifiers:
@@ -132,11 +171,12 @@ pub(crate) fn tx_no_duplicates_in_chain(
             .map(|chain| |nullifier| chain.orchard_nullifiers.contains_key(nullifier)),
     )?;
 
-    find_duplicate_nullifier(
+    find_duplicate_nullifier_with(
         transaction.ironwood_nullifiers(),
         |nullifier| finalized_chain.contains_ironwood_nullifier(nullifier),
         non_finalized_chain
             .map(|chain| |nullifier| chain.ironwood_nullifiers.contains_key(nullifier)),
+        duplicate_ironwood_nullifier_error,
     )?;
 
     Ok(())
@@ -171,14 +211,15 @@ pub(crate) fn tx_no_duplicates_in_chain(
 /// [2]: zebra_chain::sapling::Spend
 /// [3]: zebra_chain::orchard::Action
 /// [4]: zebra_chain::block::Block
-#[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
-pub(crate) fn add_to_non_finalized_chain_unique<'block, NullifierT>(
+fn add_to_non_finalized_chain_unique_with<'block, NullifierT, DuplicateNullifierErrorFn>(
     chain_nullifiers: &mut HashMap<NullifierT, SpendingTransactionId>,
     shielded_data_nullifiers: impl IntoIterator<Item = &'block NullifierT>,
     revealing_tx_id: SpendingTransactionId,
+    duplicate_nullifier_error: DuplicateNullifierErrorFn,
 ) -> Result<(), ValidateContextError>
 where
-    NullifierT: DuplicateNullifierError + Copy + std::fmt::Debug + Eq + std::hash::Hash + 'block,
+    NullifierT: Copy + std::fmt::Debug + Eq + std::hash::Hash + 'block,
+    DuplicateNullifierErrorFn: Fn(&NullifierT, bool) -> ValidateContextError,
 {
     for nullifier in shielded_data_nullifiers.into_iter() {
         trace!(?nullifier, "adding nullifier");
@@ -188,11 +229,42 @@ where
             .insert(*nullifier, revealing_tx_id)
             .is_some()
         {
-            Err(nullifier.duplicate_nullifier_error(false))?;
+            Err(duplicate_nullifier_error(nullifier, false))?;
         }
     }
 
     Ok(())
+}
+
+#[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
+pub(crate) fn add_to_non_finalized_chain_unique<'block, NullifierT>(
+    chain_nullifiers: &mut HashMap<NullifierT, SpendingTransactionId>,
+    shielded_data_nullifiers: impl IntoIterator<Item = &'block NullifierT>,
+    revealing_tx_id: SpendingTransactionId,
+) -> Result<(), ValidateContextError>
+where
+    NullifierT: DuplicateNullifierError + Copy + std::fmt::Debug + Eq + std::hash::Hash + 'block,
+{
+    add_to_non_finalized_chain_unique_with(
+        chain_nullifiers,
+        shielded_data_nullifiers,
+        revealing_tx_id,
+        |nullifier, in_finalized_state| nullifier.duplicate_nullifier_error(in_finalized_state),
+    )
+}
+
+#[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
+pub(crate) fn add_ironwood_to_non_finalized_chain_unique<'block>(
+    chain_nullifiers: &mut HashMap<ironwood::Nullifier, SpendingTransactionId>,
+    shielded_data_nullifiers: impl IntoIterator<Item = &'block ironwood::Nullifier>,
+    revealing_tx_id: SpendingTransactionId,
+) -> Result<(), ValidateContextError> {
+    add_to_non_finalized_chain_unique_with(
+        chain_nullifiers,
+        shielded_data_nullifiers,
+        revealing_tx_id,
+        duplicate_ironwood_nullifier_error,
+    )
 }
 
 /// Remove nullifiers that were previously added to this non-finalized

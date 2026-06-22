@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - V6 Orchard and Ironwood proof verification now routes through the Ironwood
   circuit verifying key.
+- Halo2 verifier names now distinguish V5 Orchard from V6 Orchard/Ironwood
+  routing. The old post-NU6.2 names remain as deprecated compatibility items.
 
 ## [8.0.0] - 2026-06-02
 

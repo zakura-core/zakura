@@ -4,6 +4,7 @@ use std::{
     fmt,
     future::Future,
     mem,
+    ops::Deref,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -83,15 +84,34 @@ lazy_static::lazy_static! {
     /// Built from the fixed variable-base scalar-multiplication Orchard Action circuit shipped in
     /// NU6.2. Bundles mined at or after the NU6.2 activation height commit to this circuit and
     /// only verify under this key. See [`VERIFYING_KEY_PRE_NU6_2`] for the era split.
-    pub static ref VERIFYING_KEY_POST_NU6_2: ItemVerifyingKey =
+    pub static ref VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD: ItemVerifyingKey =
         ItemVerifyingKey::build(OrchardCircuitVersion::FixedPostNu6_2);
 
     /// The Orchard Action verifying key for the **V6/Ironwood** circuit.
     ///
     /// V6 Orchard and Ironwood bundles use the NU6.3 flag format and prove with the Ironwood
     /// circuit. They must not be verified with the post-NU6.2 V5 Orchard key.
-    pub static ref VERIFYING_KEY_IRONWOOD: ItemVerifyingKey =
+    pub static ref VERIFYING_KEY_V6_ORCHARD_AND_IRONWOOD_NU6_3_ONWARD: ItemVerifyingKey =
         ItemVerifyingKey::build(OrchardCircuitVersion::PostNu6_3);
+}
+
+/// Deprecated compatibility name for [`VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD`].
+#[deprecated(
+    since = "8.0.0",
+    note = "use VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD instead"
+)]
+pub static VERIFYING_KEY_POST_NU6_2: DeprecatedPostNu6_2VerifyingKey =
+    DeprecatedPostNu6_2VerifyingKey;
+
+/// Compatibility wrapper for the deprecated post-NU6.2 verifying key name.
+pub struct DeprecatedPostNu6_2VerifyingKey;
+
+impl Deref for DeprecatedPostNu6_2VerifyingKey {
+    type Target = ItemVerifyingKey;
+
+    fn deref(&self) -> &Self::Target {
+        &VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD
+    }
 }
 
 /// A Halo2 verification item, used as the request type of the service.
@@ -201,9 +221,10 @@ impl Service<Item> for OrchardFallback {
 
 /// The concrete type of a global Halo2 verification service.
 ///
-/// Each Orchard circuit era gets its own instance — see [`VERIFIER_PRE_NU6_2`] and
-/// [`VERIFIER_POST_NU6_2`], or [`VERIFIER_IRONWOOD`] — so that batches, fallbacks, and verifying
-/// keys are fully separated per era.
+/// Each Orchard circuit era gets its own instance — see [`VERIFIER_PRE_NU6_2`],
+/// [`VERIFIER_V5_ORCHARD_NU6_2_ONWARD`], or
+/// [`VERIFIER_V6_ORCHARD_AND_IRONWOOD_NU6_3_ONWARD`] — so that batches, fallbacks, and
+/// verifying keys are fully separated per era.
 type VerifierService = Fallback<Batch<Verifier, Item>, OrchardFallback>;
 
 /// Builds a global Halo2 verifier that validates every item against `vk`.
@@ -238,25 +259,41 @@ pub static VERIFIER_PRE_NU6_2: Lazy<VerifierService> =
 
 /// Global batch verification context for **NU6.2+** Halo2 Action proofs.
 ///
-/// Items routed here are verified against [`VERIFYING_KEY_POST_NU6_2`] (the fixed circuit). This
-/// service transparently batches contemporaneous proof verifications, handling batch failures by
-/// falling back to individual verification.
+/// Items routed here are verified against [`VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD`] (the fixed
+/// circuit). This service transparently batches contemporaneous proof verifications, handling
+/// batch failures by falling back to individual verification.
 ///
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
-pub static VERIFIER_POST_NU6_2: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_POST_NU6_2));
+pub static VERIFIER_V5_ORCHARD_NU6_2_ONWARD: Lazy<VerifierService> =
+    Lazy::new(|| batch_verifier(&VERIFYING_KEY_V5_ORCHARD_NU6_2_ONWARD));
+
+/// Deprecated compatibility name for [`VERIFIER_V5_ORCHARD_NU6_2_ONWARD`].
+#[deprecated(since = "8.0.0", note = "use VERIFIER_V5_ORCHARD_NU6_2_ONWARD instead")]
+pub static VERIFIER_POST_NU6_2: DeprecatedPostNu6_2Verifier = DeprecatedPostNu6_2Verifier;
+
+/// Compatibility wrapper for the deprecated post-NU6.2 verifier name.
+pub struct DeprecatedPostNu6_2Verifier;
+
+impl Deref for DeprecatedPostNu6_2Verifier {
+    type Target = VerifierService;
+
+    fn deref(&self) -> &Self::Target {
+        &VERIFIER_V5_ORCHARD_NU6_2_ONWARD
+    }
+}
 
 /// Global batch verification context for **V6/Ironwood** Halo2 Action proofs.
 ///
-/// Items routed here are verified against [`VERIFYING_KEY_IRONWOOD`] (the Ironwood circuit). This
-/// service transparently batches contemporaneous proof verifications, handling batch failures by
-/// falling back to individual verification.
+/// Items routed here are verified against
+/// [`VERIFYING_KEY_V6_ORCHARD_AND_IRONWOOD_NU6_3_ONWARD`] (the Ironwood circuit). This service
+/// transparently batches contemporaneous proof verifications, handling batch failures by falling
+/// back to individual verification.
 ///
 /// Note that making a `Service` call requires mutable access to the service, so you should call
 /// `.clone()` on the global handle to create a local, mutable handle.
-pub static VERIFIER_IRONWOOD: Lazy<VerifierService> =
-    Lazy::new(|| batch_verifier(&VERIFYING_KEY_IRONWOOD));
+pub static VERIFIER_V6_ORCHARD_AND_IRONWOOD_NU6_3_ONWARD: Lazy<VerifierService> =
+    Lazy::new(|| batch_verifier(&VERIFYING_KEY_V6_ORCHARD_AND_IRONWOOD_NU6_3_ONWARD));
 
 /// Returns the global Halo2 verifier for V5 Orchard bundles in blocks at `network_upgrade`.
 ///
@@ -267,9 +304,10 @@ pub static VERIFIER_IRONWOOD: Lazy<VerifierService> =
 ///
 ///   * upgrades before NU6.2 are routed to [`VERIFIER_PRE_NU6_2`] (the historical insecure key),
 ///     so pre-soft-fork Orchard history still verifies on re-sync;
-///   * NU6.2 and later V5 Orchard bundles are routed to [`VERIFIER_POST_NU6_2`] (the fixed key).
+///   * NU6.2 and later V5 Orchard bundles are routed to
+///     [`VERIFIER_V5_ORCHARD_NU6_2_ONWARD`] (the fixed key).
 ///
-/// V6 Orchard and Ironwood bundles use [`VERIFIER_IRONWOOD`] instead.
+/// V6 Orchard and Ironwood bundles use [`VERIFIER_V6_ORCHARD_AND_IRONWOOD_NU6_3_ONWARD`] instead.
 ///
 /// The mapping is an explicit, exhaustive `match` on every [`NetworkUpgrade`] variant: there is
 /// no version-comparison fallthrough and no default-to-insecure arm, so adding a future upgrade
@@ -286,20 +324,20 @@ pub fn v5_verifier_for(network_upgrade: NetworkUpgrade) -> &'static VerifierServ
 
         // NU6.2 ships the fixed circuit, and every upgrade after it inherits that fixed circuit,
         // so all of them verify under the fixed key.
-        Nu6_2 | Nu6_3 | Nu7 => &VERIFIER_POST_NU6_2,
+        Nu6_2 | Nu6_3 | Nu7 => &VERIFIER_V5_ORCHARD_NU6_2_ONWARD,
 
         // `ZFuture` only exists under the `zcash_unstable = "zfuture"` cfg. It is a post-NU6.2
         // upgrade, so it inherits the fixed circuit and is bound to the fixed key here on purpose
         // (rather than via a wildcard) to keep this match exhaustive and fail-closed under every
         // build configuration.
         #[cfg(zcash_unstable = "zfuture")]
-        ZFuture => &VERIFIER_POST_NU6_2,
+        ZFuture => &VERIFIER_V5_ORCHARD_NU6_2_ONWARD,
     }
 }
 
 /// Returns the global Halo2 verifier for V6 Orchard and Ironwood bundles.
 pub fn v6_verifier() -> &'static VerifierService {
-    &VERIFIER_IRONWOOD
+    &VERIFIER_V6_ORCHARD_AND_IRONWOOD_NU6_3_ONWARD
 }
 
 /// Halo2 proof verifier implementation

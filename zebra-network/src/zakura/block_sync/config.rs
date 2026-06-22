@@ -10,13 +10,13 @@ pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 1;
 /// Outbound scheduling starts at this window and adjusts per peer based on
 /// request timeouts, while peer advertisements can still allow growth up to
 /// [`MAX_BS_INFLIGHT_REQUESTS`].
-pub const DEFAULT_BS_MAX_INFLIGHT: u16 = 2048;
+pub const DEFAULT_BS_MAX_INFLIGHT: u32 = 2_048;
 /// Maximum peer-advertised in-flight request count accepted by this node.
-pub const MAX_BS_INFLIGHT_REQUESTS: u16 = 10_000;
+pub const MAX_BS_INFLIGHT_REQUESTS: u32 = 240_000;
 /// Default total response byte target advertised per range response.
 pub const DEFAULT_BS_MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
 /// Default global byte budget reserved for later block-download scheduling.
-pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Worst-case serialized bytes reserved per requested block body.
 ///
 /// Block-sync reserves this much per requested block at send time and only ever
@@ -59,7 +59,7 @@ pub struct BlockSyncStatus {
     /// Maximum blocks the sender will serve per requested range.
     pub max_blocks_per_response: u32,
     /// Maximum concurrent `GetBlocks` requests the sender will service.
-    pub max_inflight_requests: u16,
+    pub max_inflight_requests: u32,
     /// Maximum total response bytes the sender targets per requested range.
     pub max_response_bytes: u32,
 }
@@ -70,7 +70,7 @@ impl BlockSyncStatus {
         write_height(writer, self.servable_high)?;
         self.tip_hash.zcash_serialize(&mut *writer)?;
         writer.write_u32::<LittleEndian>(clamp_advertised_blocks(self.max_blocks_per_response))?;
-        writer.write_u16::<LittleEndian>(self.max_inflight_requests)?;
+        writer.write_u32::<LittleEndian>(self.max_inflight_requests)?;
         writer.write_u32::<LittleEndian>(self.max_response_bytes.max(1))?;
         Ok(())
     }
@@ -81,7 +81,7 @@ impl BlockSyncStatus {
             servable_high: read_height(reader)?,
             tip_hash: block::Hash::zcash_deserialize(&mut *reader)?,
             max_blocks_per_response: clamp_advertised_blocks(reader.read_u32::<LittleEndian>()?),
-            max_inflight_requests: clamp_advertised_inflight(reader.read_u16::<LittleEndian>()?),
+            max_inflight_requests: clamp_advertised_inflight(reader.read_u32::<LittleEndian>()?),
             max_response_bytes: clamp_advertised_response_bytes(reader.read_u32::<LittleEndian>()?),
         })
     }
@@ -118,7 +118,7 @@ pub struct ZakuraBlockSyncConfig {
     /// Maximum blocks this node advertises per `GetBlocks` response.
     pub max_blocks_per_response: u32,
     /// Maximum concurrent `GetBlocks` requests this node advertises per peer.
-    pub max_inflight_requests: u16,
+    pub max_inflight_requests: u32,
     /// Maximum total response bytes this node advertises per `GetBlocks` response.
     pub max_response_bytes: u32,
     /// Maximum estimated bytes reserved for in-flight and buffered block bodies.
@@ -173,7 +173,7 @@ impl ZakuraBlockSyncConfig {
     }
 
     /// Return the locally capped in-flight advertisement for status messages.
-    pub fn advertised_max_inflight_requests(&self) -> u16 {
+    pub fn advertised_max_inflight_requests(&self) -> u32 {
         clamp_advertised_inflight(self.max_inflight_requests)
     }
 
@@ -204,7 +204,7 @@ pub fn clamp_advertised_blocks(count: u32) -> u32 {
 }
 
 /// Clamp an advertised in-flight request count to the local status ceiling.
-pub fn clamp_advertised_inflight(count: u16) -> u16 {
+pub fn clamp_advertised_inflight(count: u32) -> u32 {
     count.clamp(1, MAX_BS_INFLIGHT_REQUESTS)
 }
 

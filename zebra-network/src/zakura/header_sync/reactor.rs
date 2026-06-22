@@ -4,14 +4,6 @@ use crate::zakura::{
     ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
 };
 
-/// Upper bound on how long the reactor will wait to enqueue a data-plane action
-/// before abandoning it. The bounded `actions` channel is normally drained by
-/// the action driver almost immediately; this deadline only trips when that
-/// driver is genuinely stalled on backend/verifier work, and it keeps a stalled
-/// driver from wedging the reactor's control plane — peer-lifecycle draining,
-/// request timeouts, and above all misbehavior disconnects.
-const ACTION_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Spawn a header-sync reactor and return its handle plus action stream.
 pub fn spawn_header_sync_reactor(
     startup: HeaderSyncStartup,
@@ -74,16 +66,12 @@ impl HeaderSyncReactor {
         let mut frontier_updates = self.startup.frontier_updates.clone();
         let mut frontier_updates_open = frontier_updates.is_some();
         if self.startup.range_state_actions_enabled {
-            let _ = self
-                .dispatch_action(HeaderSyncAction::QueryBestHeaderTip)
-                .await;
-            let _ = self
-                .dispatch_action(HeaderSyncAction::QueryMissingBlockBodies {
-                    from: next_height(self.state.verified_block_tip)
-                        .unwrap_or(self.state.verified_block_tip),
-                    limit: DEFAULT_HS_RANGE,
-                })
-                .await;
+            let _ = self.dispatch_action(HeaderSyncAction::QueryBestHeaderTip);
+            let _ = self.dispatch_action(HeaderSyncAction::QueryMissingBlockBodies {
+                from: next_height(self.state.verified_block_tip)
+                    .unwrap_or(self.state.verified_block_tip),
+                limit: DEFAULT_HS_RANGE,
+            });
         }
 
         let mut ticks = time::interval(self.empty_headers_retry_delay());
@@ -786,14 +774,11 @@ impl HeaderSyncReactor {
             return;
         }
 
-        if !self
-            .dispatch_action(HeaderSyncAction::QueryHeadersByHeightRange {
-                peer: peer.clone(),
-                start: start_height,
-                count,
-            })
-            .await
-        {
+        if !self.dispatch_action(HeaderSyncAction::QueryHeadersByHeightRange {
+            peer: peer.clone(),
+            start: start_height,
+            count,
+        }) {
             if let Some(peer_state) = self.state.peers.get_mut(&peer) {
                 peer_state.finish_serving_headers();
             }
@@ -865,15 +850,12 @@ impl HeaderSyncReactor {
         let inserted = self.state.pending_new_blocks.insert(hash);
         debug_assert!(inserted, "pending acceptance was checked before insert");
 
-        if !self
-            .dispatch_action(HeaderSyncAction::NewBlockReceived {
-                peer,
-                height,
-                hash,
-                block,
-            })
-            .await
-        {
+        if !self.dispatch_action(HeaderSyncAction::NewBlockReceived {
+            peer,
+            height,
+            hash,
+            block,
+        }) {
             self.state.pending_new_blocks.remove(&hash);
         }
     }
@@ -1090,16 +1072,14 @@ impl HeaderSyncReactor {
             },
             outstanding.range,
         );
-        let _ = self
-            .dispatch_action(HeaderSyncAction::CommitHeaderRange {
-                peer,
-                anchor: outstanding.range.anchor_hash,
-                start_height: outstanding.range.start_height,
-                headers,
-                body_sizes,
-                finalized: outstanding.range.finalized,
-            })
-            .await;
+        let _ = self.dispatch_action(HeaderSyncAction::CommitHeaderRange {
+            peer,
+            anchor: outstanding.range.anchor_hash,
+            start_height: outstanding.range.start_height,
+            headers,
+            body_sizes,
+            finalized: outstanding.range.finalized,
+        });
     }
 
     async fn handle_possible_stale_anchor_link_failure(
@@ -1289,9 +1269,7 @@ impl HeaderSyncReactor {
         metrics::gauge!("sync.header.best_tip.height").set(height.0 as f64);
         self.trace_frontier_advanced(height, hash);
         let _ = self.tip.send((height, hash));
-        let _ = self
-            .dispatch_action(HeaderSyncAction::HeaderAdvanced { height, hash })
-            .await;
+        let _ = self.dispatch_action(HeaderSyncAction::HeaderAdvanced { height, hash });
         self.publish_candidate_state();
         self.broadcast_status_refresh().await;
     }
@@ -1303,12 +1281,10 @@ impl HeaderSyncReactor {
         metrics::gauge!("sync.header.best_tip.height").set(height.0 as f64);
         self.trace_frontier_reanchored(height, hash);
         let _ = self.tip.send((height, hash));
-        let _ = self
-            .dispatch_action(HeaderSyncAction::HeaderReanchored {
-                old,
-                new: (height, hash),
-            })
-            .await;
+        let _ = self.dispatch_action(HeaderSyncAction::HeaderReanchored {
+            old,
+            new: (height, hash),
+        });
         self.publish_candidate_state();
         self.broadcast_status_refresh().await;
     }
@@ -1372,31 +1348,25 @@ impl HeaderSyncReactor {
             metrics::gauge!("sync.header.missing_bodies")
                 .set(count_between(from, self.state.best_header_tip) as f64);
             self.trace_missing_bodies(from, self.state.best_header_tip);
-            let _ = self
-                .dispatch_action(HeaderSyncAction::BodyGaps {
-                    from,
-                    to: self.state.best_header_tip,
-                })
-                .await;
+            let _ = self.dispatch_action(HeaderSyncAction::BodyGaps {
+                from,
+                to: self.state.best_header_tip,
+            });
         }
     }
 
     /// Hand a data-plane action to the action driver without letting a slow or
-    /// stalled driver wedge the reactor. A full channel is awaited only up to
-    /// [`ACTION_SEND_TIMEOUT`]; past that the action is dropped so the reactor
-    /// keeps draining peer-lifecycle events, request timeouts, and misbehavior
-    /// disconnects. Returns `true` only if the action was accepted.
-    async fn dispatch_action(&self, action: HeaderSyncAction) -> bool {
+    /// stalled driver wedge the reactor. Returns `true` only if the action was
+    /// accepted.
+    fn dispatch_action(&self, action: HeaderSyncAction) -> bool {
         self.trace_action_dispatched(&action);
-        match time::timeout(ACTION_SEND_TIMEOUT, self.actions.send(action)).await {
-            Ok(Ok(())) => true,
-            // Receiver dropped: the driver is gone, treat like a send failure.
-            Ok(Err(_)) => false,
-            // Driver stalled past the deadline: drop the action and stay live.
-            Err(_) => {
-                metrics::counter!("sync.header.action.send_timeout").increment(1);
+        match self.actions.try_send(action) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                metrics::counter!("sync.header.action.send_queue_full").increment(1);
                 false
             }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 

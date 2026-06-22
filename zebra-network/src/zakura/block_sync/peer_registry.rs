@@ -40,7 +40,7 @@ pub(super) struct Entry {
     pub(super) servable_high: block::Height,
     pub(super) received_status: bool,
     pub(super) max_blocks_per_response: u32,
-    pub(super) max_inflight_requests: u16,
+    pub(super) max_inflight_requests: u32,
     pub(super) max_response_bytes: u32,
     /// The height→hash set of this peer's *unreceived* in-flight request heights.
     /// Per-*request* granularity (each outstanding `BlockRangeRequest` contributes
@@ -412,6 +412,8 @@ pub(super) struct DirectionStatusCounts {
 
 /// Hard outbound concurrency ceiling for a peer with the given advertised
 /// in-flight cap (the routine's slot bound; mirrors `PeerBlockState`).
-pub(super) fn hard_outbound_capacity(max_inflight_requests: u16) -> usize {
-    usize::from(max_inflight_requests).min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER)
+pub(super) fn hard_outbound_capacity(max_inflight_requests: u32) -> usize {
+    usize::try_from(max_inflight_requests)
+        .expect("u32 max inflight requests fits in usize on supported targets")
+        .min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER)
 }

@@ -6,7 +6,7 @@
 
 use zebra_chain::block::Height;
 
-use super::super::{zakura_block_sync_stalled, ZakuraStallTracker};
+use super::super::{zakura_block_sync_stalled, ZakuraLegacyProbe, ZakuraStallTracker};
 
 /// The original height-only rule, reproduced here only to demonstrate the F-88602
 /// hole: any increase in the verified tip — including a gossip-trickled block —
@@ -175,4 +175,66 @@ fn without_header_tip_uses_legacy_tip_moved_rule() {
         fell_back,
         "with no frontier and a frozen verified tip, the legacy rule still trips the fallback"
     );
+}
+
+/// The fleet-restart blind spot: every Zakura node restarts together and freezes
+/// at a common height with `header_tip == verified_tip`, so the gap is zero and
+/// the gap-based rule reads "caught up" forever. The legacy-informed probe must
+/// engage once the verified tip stays frozen while the node looks caught up.
+#[test]
+fn frozen_with_zero_gap_arms_the_legacy_probe() {
+    let min_frozen_polls = 3;
+    let frozen = Some(Height(1_000));
+    let mut probe = ZakuraLegacyProbe::new(frozen);
+
+    // Frozen tip, looks caught up (zero gap): the probe arms after the window.
+    let mut armed = false;
+    for poll in 1..=min_frozen_polls {
+        let now_armed = probe.should_probe(frozen, true, min_frozen_polls);
+        if poll < min_frozen_polls {
+            assert!(
+                !now_armed,
+                "must not probe before the freeze window elapses"
+            );
+        }
+        armed |= now_armed;
+    }
+    assert!(
+        armed,
+        "a frozen tip that looks caught up must arm the legacy cross-check probe"
+    );
+}
+
+/// A node still advancing its verified tip — however slowly — is left to the
+/// gap-based rule and must never arm the legacy probe.
+#[test]
+fn advancing_tip_never_arms_the_legacy_probe() {
+    let min_frozen_polls = 3;
+    let mut probe = ZakuraLegacyProbe::new(Some(Height(0)));
+
+    let mut height = 0u32;
+    for _ in 0..50 {
+        height += 1;
+        assert!(
+            !probe.should_probe(Some(Height(height)), true, min_frozen_polls),
+            "an advancing verified tip must never arm the legacy probe"
+        );
+    }
+}
+
+/// When the header gap is large the gap-based rule already owns the decision, so
+/// `looks_caught_up` is false and the legacy probe must stay off even with a
+/// frozen tip — the two triggers must not overlap.
+#[test]
+fn frozen_but_materially_behind_leaves_probe_to_gap_rule() {
+    let min_frozen_polls = 3;
+    let frozen = Some(Height(10));
+    let mut probe = ZakuraLegacyProbe::new(frozen);
+
+    for _ in 0..(min_frozen_polls * 4) {
+        assert!(
+            !probe.should_probe(frozen, false, min_frozen_polls),
+            "a large header gap is the gap-based rule's domain; the legacy probe must stay off"
+        );
+    }
 }

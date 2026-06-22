@@ -90,7 +90,7 @@ stream_open_rate_per_second = 16
 [network.zakura.block_sync]
 fanout = 1
 max_blocks_per_response = 1
-max_inflight_block_bytes = 8589934592
+max_inflight_block_bytes = 2147483648
 max_inflight_requests = 2048
 max_response_bytes = 33554432
 max_submitted_block_applies = 400

@@ -11,10 +11,7 @@ const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
 const DEFAULT_RUST_VERSION: &str = "1.91";
 const DEFAULT_IMAGE_TAG: &str = "zebra-ubuntu-package:local";
-const OUTPUT_BINARY_NAME: &str = "zebra";
-
-// Enable the NU6.3 consensus paths gated behind the `zcash_unstable` custom cfg.
-const DEFAULT_RUSTFLAGS: &str = "--cfg zcash_unstable=\"nu6.3\"";
+const OUTPUT_BINARY_NAME: &str = "zebrad";
 
 type BoxError = Box<dyn Error>;
 
@@ -72,8 +69,6 @@ fn package_ubuntu() -> Result<(), BoxError> {
             .arg(format!("RUST_VERSION={DEFAULT_RUST_VERSION}"))
             .arg("--build-arg")
             .arg(format!("FEATURES={DEFAULT_FEATURES}"))
-            .arg("--build-arg")
-            .arg(format!("RUSTFLAGS={DEFAULT_RUSTFLAGS}"))
             .arg(&repo_root),
     )?;
 
@@ -93,7 +88,7 @@ fn package_ubuntu() -> Result<(), BoxError> {
     let copy_result = run_command(
         Command::new("docker")
             .arg("cp")
-            .arg(format!("{container_id}:/zebra"))
+            .arg(format!("{container_id}:/zebrad"))
             .arg(&output_path),
     );
 
@@ -240,10 +235,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "enables features `{DEFAULT_FEATURES}` and rustflags `{DEFAULT_RUSTFLAGS}`"
+        "enables features `{DEFAULT_FEATURES}`, and writes the binary to"
     )?;
-    writeln!(
-        output,
-        "(NU7 paths), and writes the binary to target/ubuntu/{OUTPUT_BINARY_NAME}.",
-    )
+    writeln!(output, "target/ubuntu/{OUTPUT_BINARY_NAME}.")
 }

@@ -13,6 +13,7 @@ yanked = "deny"
 # Remove each ignore entry as the dependency chain is upgraded.
 ignore = [
     "RUSTSEC-2021-0139", # ansi_term — transitive via abscissa_core -> structopt
+    "RUSTSEC-2022-0104", # structopt (maintenance mode) — transitive via abscissa_core
     "RUSTSEC-2024-0375", # atty (unmaintained) — transitive via abscissa_core -> structopt
     "RUSTSEC-2021-0145", # atty (unsound) — transitive via abscissa_core -> structopt
     "RUSTSEC-2024-0370", # proc-macro-error — transitive via abscissa_core -> structopt

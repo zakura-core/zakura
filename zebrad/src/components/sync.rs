@@ -322,6 +322,25 @@ const ZAKURA_NEAR_TIP_GAP: HeightDiff = 2;
 /// behind the network.
 const ZAKURA_BLOCK_SYNC_MIN_CLOSURE: HeightDiff = 64;
 
+/// Consecutive polls the verified tip must stay frozen before
+/// [`ChainSync::bootstrap_genesis_then_pause`] runs its legacy-informed
+/// cross-check probe. Bounds how often the watchdog issues a `FindBlocks`
+/// fanout — only a genuinely stuck node pays for it. ~30s is long enough that a
+/// working bulk sync, which advances the verified tip every poll, never trips it.
+const ZAKURA_LEGACY_PROBE_STALL_POLLS: u64 = 3;
+
+/// How far ahead of the verified tip the legacy peer set must report — in block
+/// hashes offered beyond our locator — for the legacy-informed watchdog to treat
+/// the node as materially behind the network and fall back.
+///
+/// This is the "much higher height" signal for the fleet-restart failure mode:
+/// when every Zakura node restarts together it freezes at a common height with
+/// `header_tip == verified_tip`, so the gap to its own frontier is zero and the
+/// gap-based rule reads "caught up" forever. The legacy peers' advertised hashes
+/// do not depend on (the also-stalled) Zakura header sync, so they still expose
+/// the real network tip.
+const ZAKURA_LEGACY_BEHIND_THRESHOLD: HeightDiff = 64;
+
 /// Cross-poll bookkeeping for [`ChainSync::bootstrap_genesis_then_pause`]'s Zakura
 /// body-sync stall watchdog. See [`zakura_block_sync_stalled`].
 #[derive(Clone, Copy, Debug)]
@@ -346,6 +365,57 @@ impl ZakuraStallTracker {
             progress_anchor_gap: None,
             idle_polls: 0,
         }
+    }
+}
+
+/// Cross-poll state for the legacy-informed half of the Zakura body-sync
+/// watchdog. See [`ZakuraLegacyProbe::should_probe`] and
+/// [`ChainSync::bootstrap_genesis_then_pause`].
+#[derive(Clone, Copy, Debug)]
+struct ZakuraLegacyProbe {
+    /// Verified tip at the last poll, used to detect a frozen tip.
+    last_verified_height: Option<Height>,
+
+    /// Consecutive polls the verified tip has not advanced.
+    frozen_polls: u64,
+}
+
+impl ZakuraLegacyProbe {
+    fn new(verified_height: Option<Height>) -> Self {
+        Self {
+            last_verified_height: verified_height,
+            frozen_polls: 0,
+        }
+    }
+
+    /// Records this poll's verified tip and decides whether the legacy
+    /// cross-check probe should run now.
+    ///
+    /// The probe runs only when the node *looks* caught up to its own header
+    /// frontier (`looks_caught_up`) — so the gap-based [`zakura_block_sync_stalled`]
+    /// rule will never fall back — yet the verified tip has been frozen for
+    /// `min_frozen_polls` consecutive polls. Any advance of the verified tip
+    /// resets the freeze counter: a node still making progress, however slow, is
+    /// left to the gap-based rule and is never cross-checked.
+    ///
+    /// This deliberately covers only the gap-based rule's blind spot (a fleet
+    /// that restarts in lockstep and freezes at a common height with a zero
+    /// header gap). When the header gap is large the gap-based rule already owns
+    /// the decision, so `looks_caught_up` is false and the probe stays off.
+    fn should_probe(
+        &mut self,
+        verified_height: Option<Height>,
+        looks_caught_up: bool,
+        min_frozen_polls: u64,
+    ) -> bool {
+        let advanced = verified_height > self.last_verified_height;
+        self.last_verified_height = verified_height;
+        if advanced {
+            self.frozen_polls = 0;
+            return false;
+        }
+        self.frozen_polls += 1;
+        looks_caught_up && self.frozen_polls >= min_frozen_polls
     }
 }
 
@@ -878,7 +948,9 @@ where
             / ZAKURA_BODY_SYNC_STALL_POLL.as_secs())
         .max(1);
 
-        let mut tracker = ZakuraStallTracker::new(self.latest_chain_tip.best_tip_height());
+        let initial_tip = self.latest_chain_tip.best_tip_height();
+        let mut tracker = ZakuraStallTracker::new(initial_tip);
+        let mut legacy_probe = ZakuraLegacyProbe::new(initial_tip);
         loop {
             sleep(ZAKURA_BODY_SYNC_STALL_POLL).await;
 
@@ -900,7 +972,111 @@ where
                 );
                 return self.sync().await;
             }
+
+            // Second, legacy-informed trigger. The gap rule above is structurally
+            // blind to a fleet-wide simultaneous restart: every Zakura node freezes
+            // at the same height with `header_tip == verified_tip`, so the gap is
+            // zero and reads as "caught up" forever. When the verified tip is frozen
+            // yet our own view says we are at the frontier, cross-check the legacy
+            // peer set — whose advertised hashes do not depend on (the also-stalled)
+            // Zakura header sync — and fall back if it reports a much higher tip.
+            let looks_caught_up = match (header_tip_height, verified_height) {
+                (Some(header), Some(verified)) => header - verified <= ZAKURA_NEAR_TIP_GAP,
+                // No frontier known yet: our local view cannot tell us we are behind.
+                _ => true,
+            };
+            if legacy_probe.should_probe(
+                verified_height,
+                looks_caught_up,
+                ZAKURA_LEGACY_PROBE_STALL_POLLS,
+            ) {
+                if let Some(blocks_ahead) = self.legacy_peers_blocks_ahead().await {
+                    if blocks_ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD {
+                        warn!(
+                            verified_tip = ?verified_height,
+                            header_tip = ?header_tip_height,
+                            ?blocks_ahead,
+                            "Zakura body sync is frozen while legacy peers advertise a much \
+                             higher tip; falling back to legacy ChainSync so it can drive body \
+                             sync"
+                        );
+                        return self.sync().await;
+                    }
+                }
+            }
         }
+    }
+
+    /// Probes the legacy peer set for how far ahead the network is, returning the
+    /// greatest number of block hashes any peer offered beyond our tip (`None` if
+    /// no peer answered).
+    ///
+    /// This is the watchdog's network-truth cross-check. It deliberately uses the
+    /// legacy `FindBlocks` path rather than the Zakura header frontier: a fleet
+    /// that restarts in lockstep stalls every node's header sync at the same
+    /// height, so the Zakura frontier collapses to the common stuck tip and can no
+    /// longer reveal that the network has moved on. The legacy peers' advertised
+    /// hashes are independent of that, so they still expose the true tip.
+    ///
+    /// Read-only: unlike [`Self::obtain_tips`] it touches none of the syncer's
+    /// download bookkeeping, so it is safe to call from the watchdog loop.
+    async fn legacy_peers_blocks_ahead(&mut self) -> Option<HeightDiff> {
+        let block_locator = self
+            .state
+            .ready()
+            .await
+            .ok()?
+            .call(zebra_state::Request::BlockLocator)
+            .await
+            .ok()
+            .and_then(|response| match response {
+                zebra_state::Response::BlockLocator(block_locator) => Some(block_locator),
+                _ => None,
+            })?;
+
+        let mut requests = FuturesUnordered::new();
+        for attempt in 0..FANOUT {
+            if attempt > 0 {
+                // Let other tasks run, so we're more likely to choose a different peer.
+                tokio::task::yield_now().await;
+            }
+            let ready_tip_network = self.tip_network.ready().await.ok()?;
+            requests.push(tokio::spawn(ready_tip_network.call(
+                zn::Request::FindBlocks {
+                    known_blocks: block_locator.clone(),
+                    stop: None,
+                },
+            )));
+        }
+
+        let mut best_ahead: Option<HeightDiff> = None;
+        while let Some(res) = requests.next().await {
+            let hashes = match res {
+                Ok(Ok(zn::Response::BlockHashes(hashes))) => hashes,
+                // Best-effort: ignore failed/cancelled fanout requests and any
+                // unexpected response, exactly like the obtain_tips fanout does.
+                _ => continue,
+            };
+
+            // Count the hashes this peer offered that we do not already have: that
+            // run is how many blocks beyond our tip the peer is advertising. Stop
+            // at the threshold so a far-behind node never pays for the whole
+            // (up to 500-hash) response.
+            let mut ahead: HeightDiff = 0;
+            for hash in hashes {
+                // `state_contains` errs only if the state service is gone; treat
+                // an error as "known" so a failing probe never forces a fallback.
+                if !self.state_contains(hash).await.unwrap_or(true) {
+                    ahead += 1;
+                    if ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD {
+                        return Some(ahead);
+                    }
+                }
+            }
+            best_ahead = Some(best_ahead.unwrap_or(0).max(ahead));
+        }
+
+        best_ahead
     }
 
     /// Tries to synchronize the chain as far as it can.

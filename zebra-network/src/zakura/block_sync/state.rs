@@ -9,7 +9,7 @@ use crate::zakura::{
 /// A safety bound only; the binding per-peer concurrency is the peer's advertised
 /// `max_inflight_requests` (config `max_inflight_requests`, clamped to
 /// [`MAX_BS_INFLIGHT_REQUESTS`]).
-// `MAX_BS_INFLIGHT_REQUESTS` is a `u16`, which always fits in `usize` on supported targets.
+// `MAX_BS_INFLIGHT_REQUESTS` is a `u32`, which fits in `usize` on supported targets.
 pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = MAX_BS_INFLIGHT_REQUESTS as usize;
 /// Minimum additive growth after a successful response.
 const MIN_OUTBOUND_WINDOW_SUCCESS_GROWTH: usize = 64;
@@ -149,7 +149,8 @@ pub(super) struct RoutineWiring {
     pub(super) work: Arc<WorkQueue>,
     pub(super) registry: Arc<super::peer_registry::PeerRegistry>,
     pub(super) received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
-    pub(super) sequencer_input: mpsc::Sender<super::sequencer_task::SequencerInput>,
+    pub(super) sequencer_input: mpsc::Sender<super::sequencer_task::SequencedBody>,
+    pub(super) sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     pub(super) actions: mpsc::Sender<BlockSyncAction>,
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
     pub(super) view: watch::Receiver<super::sequencer_task::SequencerView>,
@@ -303,7 +304,7 @@ impl BlockSyncState {
 /// [`PeerRoutine`](super::peer_routine) (per-peer routines). The routine embeds one of these.
 #[derive(Clone, Debug)]
 pub(super) struct DownloadWindow {
-    pub(super) max_inflight_requests: u16,
+    pub(super) max_inflight_requests: u32,
     pub(super) outbound_request_window: usize,
     pub(super) timeout_recovery_slots: usize,
     pub(super) outstanding: Vec<OutstandingBlockRange>,
@@ -314,7 +315,8 @@ impl DownloadWindow {
         let max_inflight_requests = config.advertised_max_inflight_requests();
         Self {
             max_inflight_requests,
-            outbound_request_window: usize::from(max_inflight_requests),
+            outbound_request_window: usize::try_from(max_inflight_requests)
+                .expect("u32 max inflight requests fits in usize on supported targets"),
             timeout_recovery_slots: 0,
             outstanding: Vec::new(),
         }
@@ -365,7 +367,9 @@ impl DownloadWindow {
     }
 
     pub(super) fn hard_outbound_capacity(&self) -> usize {
-        usize::from(self.max_inflight_requests).min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER)
+        usize::try_from(self.max_inflight_requests)
+            .expect("u32 max inflight requests fits in usize on supported targets")
+            .min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER)
     }
 
     pub(super) fn outstanding_index_for_height(&self, height: block::Height) -> Option<usize> {
@@ -397,7 +401,7 @@ pub(super) struct PeerBlockState {
     /// *reply* half moved to the routine's `status_reply_meter`. This half stays
     /// reactor-side because the reactor owns serving-tip advertisement.
     pub(super) refresh_meter: RateMeter,
-    pub(super) served_blocks_inflight: u16,
+    pub(super) served_blocks_inflight: u32,
     pub(super) served_block_requests: VecDeque<(block::Height, Instant)>,
 }
 
@@ -414,7 +418,7 @@ impl PeerBlockState {
 
     pub(super) fn try_start_serving_blocks(
         &mut self,
-        local_inflight_cap: u16,
+        local_inflight_cap: u32,
         start_height: block::Height,
     ) -> bool {
         if self.served_blocks_inflight >= local_inflight_cap {

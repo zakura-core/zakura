@@ -48,6 +48,16 @@ impl FramedSend {
     pub fn try_send(&self, frame: Frame) -> Result<(), mpsc::error::TrySendError<Frame>> {
         self.sender.try_send(frame)
     }
+
+    /// Current free slots in the bounded transport queue.
+    pub fn capacity(&self) -> usize {
+        self.sender.capacity()
+    }
+
+    /// Total slots in the bounded transport queue.
+    pub fn max_capacity(&self) -> usize {
+        self.sender.max_capacity()
+    }
 }
 
 /// Build a bounded in-memory framed channel for scaffolding and tests.

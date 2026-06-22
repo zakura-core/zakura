@@ -361,7 +361,7 @@ impl HarnessConfig {
     fn block_sync_config(&self) -> ZakuraBlockSyncConfig {
         ZakuraBlockSyncConfig {
             max_blocks_per_response: self.max_blocks_per_response,
-            max_inflight_requests: self.max_inflight,
+            max_inflight_requests: u32::from(self.max_inflight),
             max_inflight_block_bytes: u64::MAX,
             max_submitted_block_applies: usize::from(self.max_inflight)
                 .saturating_mul(

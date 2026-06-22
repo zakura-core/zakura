@@ -428,19 +428,15 @@ fn window_request(height: u32) -> OutstandingBlockRange {
 #[test]
 fn peer_outbound_request_window_halves_on_timeout_and_grows_on_success() {
     let mut window = download_window();
+    let max_inflight =
+        usize::try_from(MAX_BS_INFLIGHT_REQUESTS).expect("test max inflight fits usize");
     window.max_inflight_requests = MAX_BS_INFLIGHT_REQUESTS;
-    window.outbound_request_window = usize::from(MAX_BS_INFLIGHT_REQUESTS);
+    window.outbound_request_window = max_inflight;
     window.outstanding.push(window_request(1));
-    assert_eq!(
-        window.available_slots(),
-        usize::from(MAX_BS_INFLIGHT_REQUESTS) - 1
-    );
+    assert_eq!(window.available_slots(), max_inflight - 1);
 
     window.reduce_outbound_window_after_timeout();
-    assert_eq!(
-        window.outbound_request_window,
-        usize::from(MAX_BS_INFLIGHT_REQUESTS) / 2
-    );
+    assert_eq!(window.outbound_request_window, max_inflight / 2);
 
     for _ in 0..16 {
         window.reduce_outbound_window_after_timeout();
@@ -453,12 +449,9 @@ fn peer_outbound_request_window_halves_on_timeout_and_grows_on_success() {
     window.increase_outbound_window_after_success();
     assert_eq!(window.outbound_request_window, 65);
 
-    window.outbound_request_window = usize::from(MAX_BS_INFLIGHT_REQUESTS);
+    window.outbound_request_window = max_inflight;
     window.increase_outbound_window_after_success();
-    assert_eq!(
-        window.outbound_request_window,
-        usize::from(MAX_BS_INFLIGHT_REQUESTS)
-    );
+    assert_eq!(window.outbound_request_window, max_inflight);
 }
 
 #[test]
@@ -535,7 +528,7 @@ async fn connect_peer_with_status(
     byte: u8,
     servable_high: block::Height,
     tip_hash: block::Hash,
-    max_inflight_requests: u16,
+    max_inflight_requests: u32,
     max_response_bytes: u32,
 ) -> (ZakuraPeerId, FramedSend, FramedRecv) {
     connect_peer_with_status_message(
@@ -617,7 +610,7 @@ fn block_meta(block: &Arc<block::Block>) -> BlockSyncBlockMeta {
 fn block_sync_config_defaults_and_round_trips() {
     let default = ZakuraBlockSyncConfig::default();
     assert_eq!(default.max_blocks_per_response, 1);
-    assert_eq!(default.max_inflight_requests, 2048);
+    assert_eq!(default.max_inflight_requests, 2_048);
     assert_eq!(
         default.max_submitted_block_applies,
         DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
@@ -826,7 +819,7 @@ fn status_decode_clamps_peer_capacity_advertisements() {
         .zcash_serialize(&mut payload)
         .expect("hash serializes");
     payload.extend_from_slice(&u32::MAX.to_le_bytes());
-    payload.extend_from_slice(&u16::MAX.to_le_bytes());
+    payload.extend_from_slice(&u32::MAX.to_le_bytes());
     payload.extend_from_slice(&u32::MAX.to_le_bytes());
 
     let BlockSyncMessage::Status(status) =
@@ -8838,6 +8831,189 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
         })
         .await
         .expect("serving slot release queues");
+
+    reactor_task.abort();
+}
+
+/// A full per-peer serving queue must drop the serving send, never disconnect
+/// the peer.
+///
+/// The reactor serves `Status`/`Block`/`BlocksDone`/`RangeUnavailable` with
+/// non-blocking `try_send_*`. On `Full` it drops the frame and bumps a
+/// `*.serve_queue_full` metric; only a genuine send *error* cancels the peer.
+/// A regression that collapsed those two arms (cancelling on `Full`) would
+/// disconnect honest-but-slow peers under serving load — a self-inflicted DoS.
+/// This guards the distinction: a saturated serving queue leaves the peer
+/// connected, and serving resumes once the queue drains.
+#[tokio::test]
+async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
+    let blocks = mainnet_blocks_1_to_3();
+    let config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 16,
+        max_response_bytes: MAX_BS_RESPONSE_BYTES,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    // Tip == verified tip: the reactor is caught up, so it only *serves* and
+    // never issues its own downloads into the tiny outbound queue below.
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(3),
+            verified_block_hash: blocks[2].hash(),
+        },
+        (block::Height(3), blocks[2].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    // A two-slot outbound queue, wired by hand so we keep the peer's
+    // cancellation token: serving three bodies plus a terminator is four sends
+    // through two slots, so `try_send` is guaranteed to hit `Full`.
+    let peer_id = peer(66);
+    let cancel = CancellationToken::new();
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(2);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    service.add_peer(Peer::new_with_direction(
+        peer_id.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        cancel.clone(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(3),
+                tip_hash: blocks[2].hash(),
+                max_blocks_per_response: 16,
+                max_inflight_requests: 8,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    // The peer asks for the whole committed range; answer it so the reactor
+    // serves all three bodies into the saturated queue.
+    inbound_tx
+        .send(
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 3,
+            }
+            .encode_frame()
+            .expect("GetBlocks frame encodes"),
+        )
+        .await
+        .expect("GetBlocks frame queues");
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(start, block::Height(1));
+                assert_eq!(count, 3);
+                break;
+            }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before block range query: {action:?}"),
+        }
+    }
+    let served: Vec<_> = blocks
+        .iter()
+        .map(|block| {
+            (
+                block.coinbase_height().expect("test block has height"),
+                block.clone(),
+                usize::try_from(block_size(block)).expect("block size fits usize"),
+            )
+        })
+        .collect();
+    handle
+        .send(BlockSyncEvent::BlockRangeResponseReady {
+            peer: peer_id.clone(),
+            start_height: block::Height(1),
+            requested_count: 3,
+            blocks: served,
+        })
+        .await
+        .expect("served block response queues");
+
+    // Let the reactor finish the serve, including the sends that hit `Full`.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !cancel.is_cancelled(),
+        "a full serving queue must drop sends, not cancel the peer",
+    );
+    assert_eq!(handle.peer_snapshot().outbound_peers, 1);
+
+    // Self-heal: drain the queue, release the serving slot, and re-request. The
+    // earlier drop neither wedged nor scored the peer, so a fresh serve lands.
+    while tokio::time::timeout(
+        Duration::from_millis(100),
+        next_outbound_message(&mut outbound_rx),
+    )
+    .await
+    .is_ok()
+    {}
+    handle
+        .send(BlockSyncEvent::BlockRangeResponseFinished {
+            peer: peer_id.clone(),
+            start_height: block::Height(1),
+            requested_count: 3,
+            returned_count: 3,
+        })
+        .await
+        .expect("serving slot release queues");
+    inbound_tx
+        .send(
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1,
+            }
+            .encode_frame()
+            .expect("GetBlocks frame encodes"),
+        )
+        .await
+        .expect("re-request GetBlocks frame queues");
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::QueryBlocksByHeightRange { start, count, .. } => {
+                assert_eq!(start, block::Height(1));
+                assert_eq!(count, 1);
+                break;
+            }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before re-request query: {action:?}"),
+        }
+    }
+    handle
+        .send(BlockSyncEvent::BlockRangeResponseReady {
+            peer: peer_id.clone(),
+            start_height: block::Height(1),
+            requested_count: 1,
+            blocks: vec![(
+                block::Height(1),
+                blocks[0].clone(),
+                usize::try_from(block_size(&blocks[0])).expect("block size fits usize"),
+            )],
+        })
+        .await
+        .expect("re-served block response queues");
+    assert_eq!(
+        wait_for_outbound_block(&mut outbound_rx).await.hash(),
+        blocks[0].hash(),
+        "serving resumes once the queue drains",
+    );
+    assert!(!cancel.is_cancelled());
 
     reactor_task.abort();
 }

@@ -122,8 +122,29 @@ impl Sequencer {
         self.applying.len()
     }
 
+    pub(super) fn applying_buffered_bytes(&self) -> u64 {
+        self.applying
+            .values()
+            .map(|applying| applying.bytes)
+            .fold(0u64, u64::saturating_add)
+    }
+
     pub(super) fn reorder_buffered_bytes(&self) -> u64 {
         self.reorder.buffered_bytes()
+    }
+
+    pub(super) fn unsubmitted_applying_count(&self) -> usize {
+        self.applying
+            .values()
+            .filter(|applying| !applying.submitted)
+            .count()
+    }
+
+    pub(super) fn submitted_applying_bytes(&self) -> u64 {
+        self.applying
+            .values()
+            .filter_map(|applying| applying.submitted.then_some(applying.bytes))
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Number of `applying` bodies already submitted to the verifier.

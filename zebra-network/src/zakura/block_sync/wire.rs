@@ -5,7 +5,7 @@ pub const ZAKURA_STREAM_BLOCK_SYNC: u16 = 6;
 /// Capability bit for the native block-sync service.
 pub const ZAKURA_CAP_BLOCK_SYNC: u64 = 1 << 3;
 /// Version of the native block-sync stream.
-pub const ZAKURA_BLOCK_SYNC_STREAM_VERSION: u16 = 1;
+pub const ZAKURA_BLOCK_SYNC_STREAM_VERSION: u16 = 2;
 
 /// Peer status advertisement.
 pub const MSG_BS_STATUS: u8 = 1;

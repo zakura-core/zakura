@@ -3,8 +3,9 @@
 //! Sequencer task moves the consensus-critical commit pipeline (`Sequencer`: reorder →
 //! applying → `SubmitBlock` → apply-finished) off the reactor's single thread
 //! and into this spawned serial task. The reactor keeps issuance, peer matching,
-//! serving, and the producer; it forwards every Sequencer-mutating event over a
-//! bounded ordered input channel ([`SequencerInput`]) and learns committed
+//! serving, and the producer; peer routines forward block bodies over a bounded
+//! body input channel, while the reactor forwards progress-critical control
+//! events over a non-blocking control channel. The reactor learns committed
 //! progress back over a non-blocking `watch` ([`SequencerView`]).
 //!
 //! The logic in each input handler is the **verbatim** logic that used to run
@@ -22,10 +23,10 @@ use super::{
     *,
 };
 
-/// A received body the reactor matched (or accepted unmatched) and forwards to
-/// the commit pipeline. This is the A2 backpressure path: a slow verifier blocks
-/// the task on `actions.send(SubmitBlock)`, the task stops draining input, the
-/// bounded input channel fills, and the reactor blocks on `input_tx.send`.
+/// A received body a peer routine matched (or accepted unmatched) and forwards
+/// to the commit pipeline. This is the only bounded Sequencer input: a slow
+/// verifier can backpressure body intake, but must not block apply/frontier
+/// control events that release budget and drive the next scheduling reaction.
 #[derive(Clone, Debug)]
 pub(super) struct SequencedBody {
     pub(super) height: block::Height,
@@ -33,15 +34,17 @@ pub(super) struct SequencedBody {
     pub(super) block: Arc<block::Block>,
     pub(super) bytes: u64,
     pub(super) peer: ZakuraPeerId,
+    pub(super) received_at: Instant,
 }
 
-/// Every Sequencer-mutating event, forwarded by the reactor in event-demux order
-/// so the task processes body/frontier/reset/apply in the same total order the
-/// single-task version did (consensus ordering identical).
+/// Progress-critical Sequencer events forwarded by the reactor.
+///
+/// These events must not sit behind downloaded bodies. `ApplyFinished` releases
+/// budget and verifier slots, and frontier/reset events can release or discard
+/// stale body work. They are locally generated and tiny, so they use a separate
+/// unbounded channel and are prioritized by the Sequencer task.
 #[derive(Clone, Debug)]
-pub(super) enum SequencerInput {
-    /// A matched/queued body to offer to the commit pipeline.
-    AcceptBody(SequencedBody),
+pub(super) enum SequencerControlInput {
     /// A verified-tip advance (frontier growth/commit).
     FrontierAdvance {
         frontiers: BlockSyncFrontiers,
@@ -93,7 +96,10 @@ pub(super) struct SequencerView {
     pub(super) reorder_len: u64,
     pub(super) applying_len: u64,
     pub(super) reorder_buffered_bytes: u64,
+    pub(super) applying_buffered_bytes: u64,
+    pub(super) unsubmitted_applying_count: u64,
     pub(super) submitted_applying_count: u64,
+    pub(super) submitted_applying_bytes: u64,
     pub(super) committed_bytes_per_sec: u64,
     pub(super) committed_blocks_per_sec: u64,
 }
@@ -110,7 +116,10 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
         reorder_len: 0,
         applying_len: 0,
         reorder_buffered_bytes: 0,
+        applying_buffered_bytes: 0,
+        unsubmitted_applying_count: 0,
         submitted_applying_count: 0,
+        submitted_applying_bytes: 0,
         committed_bytes_per_sec: 0,
         committed_blocks_per_sec: 0,
     }
@@ -132,7 +141,9 @@ pub(super) struct SequencerTask {
     verified_block_hash: block::Hash,
     reset_epoch: u64,
     reaction_epoch: u64,
-    input_rx: mpsc::Receiver<SequencerInput>,
+    body_input_rx: mpsc::Receiver<SequencedBody>,
+    control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
+    body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     view_tx: watch::Sender<SequencerView>,
     action_send_timeout: Duration,
     trace: ZakuraTrace,
@@ -147,7 +158,9 @@ impl SequencerTask {
         actions: mpsc::Sender<BlockSyncAction>,
         committed_throughput: ThroughputMeter,
         frontiers: BlockSyncFrontiers,
-        input_rx: mpsc::Receiver<SequencerInput>,
+        body_input_rx: mpsc::Receiver<SequencedBody>,
+        control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
+        body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
         view_tx: watch::Sender<SequencerView>,
         action_send_timeout: Duration,
         trace: ZakuraTrace,
@@ -162,7 +175,9 @@ impl SequencerTask {
             verified_block_hash: frontiers.verified_block_hash,
             reset_epoch: 0,
             reaction_epoch: 0,
-            input_rx,
+            body_input_rx,
+            control_input_rx,
+            body_input_bytes,
             view_tx,
             action_send_timeout,
             trace,
@@ -170,71 +185,99 @@ impl SequencerTask {
     }
 
     pub(super) async fn run(mut self) {
-        while let Some(input) = self.input_rx.recv().await {
-            // Each handler reports whether it did work that the single-task
-            // version would have followed with the reactor's heavy
-            // serving/producer/schedule tail. Bumping `reaction_epoch` only then
-            // keeps the reactor from re-querying/-scheduling on a pure body
-            // buffer/submit or a no-op (stale/duplicate) apply completion.
-            let needs_reaction = match input {
-                SequencerInput::AcceptBody(body) => {
+        loop {
+            tokio::select! {
+                biased;
+
+                Some(input) = self.control_input_rx.recv() => {
+                    let needs_reaction = self.handle_control_input(input).await;
+                    if needs_reaction {
+                        self.reaction_epoch = self.reaction_epoch.saturating_add(1);
+                    }
+                    self.publish_view();
+                }
+
+                Some(body) = self.body_input_rx.recv() => {
+                    self.release_body_input_bytes(body.bytes);
                     self.handle_accept_body(body).await;
-                    false
+                    self.publish_view();
                 }
-                SequencerInput::FrontierAdvance {
-                    frontiers,
-                    release_applied,
-                } => {
-                    self.handle_frontier_advance(frontiers, release_applied)
-                        .await;
-                    true
-                }
-                SequencerInput::FrontierReset {
+
+                else => break,
+            }
+        }
+    }
+
+    async fn handle_control_input(&mut self, input: SequencerControlInput) -> bool {
+        // Each handler reports whether it did work that the single-task version
+        // would have followed with the reactor's heavy serving/producer/schedule
+        // tail. Bumping `reaction_epoch` only then keeps the reactor from
+        // re-querying/-scheduling on a pure body buffer/submit or a no-op
+        // (stale/duplicate) apply completion.
+        match input {
+            SequencerControlInput::FrontierAdvance {
+                frontiers,
+                release_applied,
+            } => {
+                self.handle_frontier_advance(frontiers, release_applied)
+                    .await;
+                true
+            }
+            SequencerControlInput::FrontierReset {
+                frontiers,
+                preserve_active_successors,
+                peer_has_successor_after,
+                peer_outstanding_conflicts_at_tip,
+            } => {
+                self.handle_frontier_reset(
                     frontiers,
                     preserve_active_successors,
                     peer_has_successor_after,
                     peer_outstanding_conflicts_at_tip,
-                } => {
-                    self.handle_frontier_reset(
-                        frontiers,
-                        preserve_active_successors,
-                        peer_has_successor_after,
-                        peer_outstanding_conflicts_at_tip,
-                    )
-                    .await;
-                    true
-                }
-                SequencerInput::ApplyFinished {
-                    token,
-                    height,
-                    hash,
-                    result,
-                    local_frontier,
-                } => {
-                    self.handle_apply_finished(token, height, hash, result, local_frontier)
-                        .await
-                }
-            };
-            if needs_reaction {
-                self.reaction_epoch = self.reaction_epoch.saturating_add(1);
+                )
+                .await;
+                true
             }
-            self.publish_view();
+            SequencerControlInput::ApplyFinished {
+                token,
+                height,
+                hash,
+                result,
+                local_frontier,
+            } => {
+                self.handle_apply_finished(token, height, hash, result, local_frontier)
+                    .await
+            }
         }
+    }
+
+    fn release_body_input_bytes(&self, bytes: u64) {
+        let _ = self.body_input_bytes.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| Some(current.saturating_sub(bytes)),
+        );
     }
 
     /// Body-acceptance tail (verbatim from `handle_block` ~885-907 and
     /// `accept_unmatched_queued_body` ~1170-1183): offer the body, release on
     /// `Redundant`, then drain ready prefix into applying and submit.
     async fn handle_accept_body(&mut self, body: SequencedBody) {
-        match self
-            .sequencer
-            .accept_body(body.height, body.hash, body.block, body.bytes, body.peer)
-        {
-            AcceptOutcome::Buffered { .. } => {}
+        let queued_elapsed = body.received_at.elapsed();
+        let outcome = match self.sequencer.accept_body(
+            body.height,
+            body.hash,
+            body.block,
+            body.bytes,
+            body.peer,
+        ) {
+            AcceptOutcome::Buffered { .. } => "buffered",
             AcceptOutcome::Redundant { release_bytes } => {
                 self.budget.release(release_bytes);
+                "redundant"
             }
-        }
+        };
+        self.trace_body_accepted(body.height, queued_elapsed, outcome);
         self.release_contiguous_blocks().await;
     }
 
@@ -485,6 +528,25 @@ impl SequencerTask {
         });
     }
 
+    fn trace_body_accepted(&self, height: block::Height, queued_elapsed: Duration, outcome: &str) {
+        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
+            row.insert(
+                bs_trace::EVENT.to_string(),
+                serde_json::Value::String(bs_trace::BLOCK_BODY_ACCEPTED.to_string()),
+            );
+            bs_insert_height(row, bs_trace::HEIGHT, height);
+            bs_insert_u64(
+                row,
+                "sequencer_queue_elapsed_us",
+                u64::try_from(queued_elapsed.as_micros()).unwrap_or(u64::MAX),
+            );
+            row.insert(
+                bs_trace::RESULT.to_string(),
+                serde_json::Value::String(outcome.to_string()),
+            );
+        });
+    }
+
     /// `reset_tip_conflicts_with_local_work`'s Sequencer-internal predicates,
     /// with the peer-outstanding clause supplied by the reactor.
     fn reset_tip_conflicts_with_local_work(
@@ -575,7 +637,10 @@ impl SequencerTask {
             reorder_len: self.sequencer.reorder_len() as u64,
             applying_len: self.sequencer.applying_len() as u64,
             reorder_buffered_bytes: self.sequencer.reorder_buffered_bytes(),
+            applying_buffered_bytes: self.sequencer.applying_buffered_bytes(),
+            unsubmitted_applying_count: self.sequencer.unsubmitted_applying_count() as u64,
             submitted_applying_count: self.sequencer.submitted_applying_count() as u64,
+            submitted_applying_bytes: self.sequencer.submitted_applying_bytes(),
             committed_bytes_per_sec: self.committed_throughput.bytes_per_sec(),
             committed_blocks_per_sec: self.committed_throughput.blocks_per_sec(),
         });

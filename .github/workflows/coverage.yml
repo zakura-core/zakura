@@ -1,8 +1,12 @@
 name: Coverage
 
 on:
+  # Coverage is a 120-minute instrumented full build. Keep it off the per-push
+  # critical path: run it only on landings to the long-lived branches, once a
+  # night, and on demand. Pushes to short-lived dev branches no longer trigger
+  # it (it is not a merge gate).
   push:
-    branches: [main, ironwood-main, evan/ironwood-qol, feat/p2p-v2]
+    branches: [ironwood-main, "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -10,6 +14,11 @@ on:
       - .config/nextest.toml
       - codecov.yml
       - .github/workflows/coverage.yml
+
+  schedule:
+    - cron: "0 8 * * *"
+
+  workflow_dispatch:
 
 # Ensures that only one workflow task will run at a time. Previous builds, if
 # already in process, will get cancelled. Only the latest commit will be allowed

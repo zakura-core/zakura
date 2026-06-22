@@ -2,7 +2,7 @@ name: Test Crate Build
 
 on:
   pull_request:
-    branches: [main, ironwood-main, evan/ironwood-qol, feat/p2p-v2]
+    branches: [ironwood-main, "feat/**", "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -12,7 +12,7 @@ on:
       - .github/workflows/test-crates.yml
 
   push:
-    branches: [main, ironwood-main, evan/ironwood-qol, feat/p2p-v2]
+    branches: [ironwood-main, "feat/**", "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -47,15 +47,31 @@ env:
   COLORBT_SHOW_HIDDEN: 1
 
 jobs:
-  matrix:
-    name: Generate crates matrix
+  # Verify every crate builds, both with its default features and with no
+  # default features.
+  #
+  # This replaces the previous per-crate build matrix (each crate built 4 ways
+  # with clippy + build, throttled to 4 parallel cold jobs) and the lint
+  # `crate-checks` / `features` jobs with one `cargo hack` pass in a single warm
+  # target dir. cargo-hack iterates every workspace crate, so this preserves the
+  # matrix's unique guarantee — that each crate compiles with `--no-default-
+  # features` — which the lint clippy (`default-release-binaries`) and
+  # `check-cargo-lock` (`--all-features`) jobs do not cover. The all-targets /
+  # all-features dimension stays covered by those lint jobs.
+  #
+  # NOTE: we intentionally do NOT use `--each-feature` here. It checks every
+  # feature in isolation, which is stricter than anything this project gated on
+  # before and surfaces pre-existing non-additive-feature issues (e.g.
+  # zebra-chain's `async-error` not pulling in tokio's `rt` feature). Enforcing
+  # that is a separate, deliberate effort, not part of this CI change.
+  crate-checks:
+    name: Build crates (default and no-default features)
     permissions:
       contents: read
+      id-token: write
       statuses: write
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
@@ -64,145 +80,29 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
         with:
           toolchain: stable
-          components: clippy
+          cache-key: crate-checks
           cache-on-failure: true
-      - uses: ./.github/actions/setup-zebra-build
 
-      # This step dynamically creates a JSON containing the values of each crate
-      # available in this repo in the root directory. We use `cargo tree` to accomplish this task.
-      #
-      # The result from `cargo tree` is then sorted so the longest job (zebrad) runs first,
-      # transformed to JSON values between double quotes, and separated by commas,
-      # then added to a `crates.txt`.
-      #
-      # A JSON object is created and assigned to a $MATRIX variable, which is used to create an
-      # output named `matrix`, which is then used as the input in following steps,
-      # using ` ${{ fromJson(needs.matrix.outputs.matrix) }}`
-      - id: set-matrix
-        name: Dynamically build crates JSON
-        run: |
-          TEMP_DIR=$(mktemp -d)
-          cargo tree --depth 0 --edges no-normal,no-dev,no-build,no-proc-macro --prefix none | cut -d ' ' -f1 | sed '/^$/d' | LC_ALL=C sort --reverse | awk '{ printf "\"%s\",\n", $0 }' | sed '$ s/.$//' > $TEMP_DIR/crates.txt
-          MATRIX=$( (
-            echo '{ "crate" : ['
-            echo "$(cat $TEMP_DIR/crates.txt)"
-            echo " ]}"
-          ) | jq -c .)
-          echo $MATRIX
-          echo $MATRIX | jq .
-          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-
-  build:
-    name: Build ${{ matrix.crate }} crate
-    permissions:
-      contents: read
-      id-token: write
-      statuses: write
-    timeout-minutes: 90
-    needs: [matrix]
-    # Some of these builds take more than 14GB disk space
-    runs-on: ubuntu-latest
-    strategy:
-      # avoid rate-limit errors by only launching a few of these jobs at a time,
-      # but still finish in a similar time to the longest tests
-      max-parallel: 4
-      fail-fast: true
-      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
-
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+      - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
         with:
-          persist-credentials: false
-
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
-        with:
-          toolchain: stable
-          components: clippy
-          cache-key: crate-build-${{ matrix.crate }}
-          cache-on-failure: true
+          tool: cargo-hack
 
       - uses: ./.github/actions/setup-zebra-build
 
-      # We could use `features: ['', '--all-features', '--no-default-features']` as a matrix argument,
-      # but it's faster to run these commands sequentially, so they can re-use the local cargo cache.
-      #
-      # Some Zebra crates do not have any features, and most don't have any default features.
-      # Some targets activate features, but we still need to be able to build without them.
-      - name: Build ${{ matrix.crate }} crate with default features
+      - name: Check every crate with default and no-default features
         run: |
-          cargo clippy --package ${{ matrix.crate }} -- -D warnings
-          cargo build --package ${{ matrix.crate }}
-
-      - name: Build ${{ matrix.crate }} crate with no default features and all targets
-        run: |
-          cargo clippy --package ${{ matrix.crate }} --no-default-features --all-targets -- -D warnings
-          cargo build --package ${{ matrix.crate }} --no-default-features --all-targets
-
-      - name: Build ${{ matrix.crate }} crate with default features and all targets
-        run: |
-          cargo clippy --package ${{ matrix.crate }} --all-targets -- -D warnings
-          cargo build --package ${{ matrix.crate }} --all-targets
-
-      - name: Build ${{ matrix.crate }} crate with all features and all targets
-        run: |
-          cargo clippy --package ${{ matrix.crate }} --all-features --all-targets -- -D warnings
-          cargo build --package ${{ matrix.crate }} --all-features --all-targets
-
-  build-msrv:
-    name: Build ${{ matrix.crate }} crate with MSRV
-    permissions:
-      contents: read
-      id-token: write
-      statuses: write
-    timeout-minutes: 90
-    needs: [matrix]
-    runs-on: ubuntu-latest
-    strategy:
-      # avoid rate-limit errors by only launching a few of these jobs at a time,
-      # but still finish in a similar time to the longest tests
-      max-parallel: 4
-      fail-fast: true
-      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
-
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Extract MSRV from Cargo.toml
-        id: msrv
-        run: |
-          MSRV=$(grep 'rust-version' Cargo.toml | head -n1 | cut -d'"' -f2)
-          echo "version=$MSRV" >> "$GITHUB_OUTPUT"
-          echo "Extracted MSRV: $MSRV"
-
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
-        with:
-          toolchain: ${{ steps.msrv.outputs.version }}
-          components: clippy
-          cache-key: crate-build-msrv-${{ matrix.crate }}
-          cache-on-failure: true
-
-      - uses: ./.github/actions/setup-zebra-build
-
-      - name: Build ${{ matrix.crate }} crate with MSRV, all features and all targets
-        # zebrad and zebra-watchdog can have a higher MSRV than the other crates since they are
-        # binaries, not libraries, so we skip the MSRV build for them. zebra-watchdog depends on
-        # sentry, which requires a newer rustc than the workspace library MSRV.
-        if: matrix.crate != 'zebrad' && matrix.crate != 'zebra-watchdog'
-        run: |
-          cargo clippy --package ${{ matrix.crate }} --all-features --all-targets -- -D warnings
-          cargo build --package ${{ matrix.crate }} --all-features --all-targets
-
+          cargo hack check --workspace
+          cargo hack check --workspace --no-default-features
+        env:
+          # Treat warnings as errors, preserving the old `features` job behavior.
+          RUSTFLAGS: -D warnings
 
   test-crate-build-success:
     name: test crate build success
     runs-on: ubuntu-latest
     if: always()
     needs:
-      - matrix
-      - build
-      - build-msrv
+      - crate-checks
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed

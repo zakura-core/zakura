@@ -7,7 +7,7 @@ name: Status Check Patch
 
 on:
   pull_request:
-    branches: [main, ironwood-main, evan/ironwood-qol, feat/p2p-v2]
+    branches: [ironwood-main, "feat/**", "release/**"]
     paths-ignore:
       # This MUST be an exact inverse of paths in lint.yml, tests-unit.yml, and test-crates.yml
       # to ensure mutual exclusion - only one set of workflows runs

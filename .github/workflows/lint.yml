@@ -2,7 +2,7 @@ name: Lint
 
 on:
   pull_request:
-    branches: [main, ironwood-main, evan/ironwood-qol, feat/p2p-v2]
+    branches: [ironwood-main, "feat/**", "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -13,7 +13,7 @@ on:
       - supply-chain/**
 
   push:
-    branches: [main, ironwood-main, evan/ironwood-qol, feat/p2p-v2]
+    branches: [ironwood-main, "feat/**", "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -27,6 +27,13 @@ on:
   # merged result against the latest `main`. `merge_group` ignores path filters,
   # so this runs unconditionally on every queued entry.
   merge_group:
+
+  # Nightly run for the expensive, non-gating lints (unused-deps, docs) that are
+  # gated off the PR/merge path below.
+  schedule:
+    - cron: "0 8 * * *"
+
+  workflow_dispatch:
 
 # Ensures that only one workflow task will run at a time. Previous builds, if
 # already in process, will get cancelled. Only the latest commit will be allowed
@@ -54,7 +61,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust-version: [stable, beta]
+        # `beta` was dropped from the PR path: it doubled the clippy compile
+        # cost for marginal early-warning value. Re-add it on the nightly
+        # schedule if upcoming-toolchain regressions need tracking.
+        rust-version: [stable]
         type: [release, tests]
         include:
           - type: release
@@ -77,24 +87,10 @@ jobs:
       - name: Run clippy
         run: cargo clippy ${{ matrix.args }} --features "${{ matrix.features }}"
 
-  crate-checks:
-    permissions:
-      contents: read
-      statuses: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
-        with:
-          cache-on-failure: true
-      - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
-        with:
-          tool: cargo-hack
-      - uses: ./.github/actions/setup-zebra-build
-      - run: cargo hack check --workspace
+  # NOTE: per-crate default / no-default-features checks moved to
+  # `test-crates.yml`, which runs `cargo hack check --workspace` (and again with
+  # `--no-default-features`) in a single warm target dir, subsuming the old
+  # `crate-checks` and `features` jobs.
 
   msrv:
     name: MSRV
@@ -104,12 +100,6 @@ jobs:
       statuses: write
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      matrix:
-        include:
-          - binary: zebrad
-          - binary: zebra-rollback-state
-          - binary: zebra-prune-state
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
@@ -119,10 +109,18 @@ jobs:
           toolchain: 1.91 # MSRV
           cache-on-failure: true
       - uses: ./.github/actions/setup-zebra-build
-      - run: cargo build --bin "${{ matrix.binary }}" --workspace
+      # Build every workspace binary (and, transitively, every library) on the
+      # MSRV toolchain in a single warm target dir instead of a per-binary
+      # matrix. `zebra-watchdog` is excluded: it depends on `sentry`, which
+      # requires a newer rustc than the workspace library MSRV.
+      - run: cargo build --workspace --bins --exclude zebra-watchdog
 
   docs:
     name: docs
+    # A full `--all-features --document-private-items` doc build is expensive and
+    # not a correctness gate (book.yml builds docs on push to main). Run it
+    # nightly / on demand only, keeping it off the PR critical path.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       statuses: write
@@ -164,6 +162,10 @@ jobs:
 
   unused-deps:
     name: unused-deps
+    # cargo-udeps needs a clean from-scratch nightly build and is not a
+    # correctness gate (unused deps don't break compilation). Run it nightly /
+    # on demand only, keeping it off the PR critical path.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       id-token: write
@@ -199,31 +201,8 @@ jobs:
       - name: Ensure no arbitrary or proptest dependency on default build
         run: cargo tree --package zebrad -e=features,no-dev | grep -Eq "arbitrary|proptest" && exit 1 || exit 0
 
-  # Checks that selected rates can compile with power set of features
-  features:
-    name: features
-    permissions:
-      contents: read
-      id-token: write
-      statuses: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
-        with:
-          toolchain: nightly
-          cache-on-failure: true
-      - name: cargo install cargo-hack
-        uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
-        with:
-          tool: cargo-hack
-      - uses: ./.github/actions/setup-zebra-build
-      - run: cargo hack check --all
-        env:
-          RUSTFLAGS: -D warnings
+  # NOTE: the old `features` job (`cargo hack check --all`) is subsumed by the
+  # `cargo hack check --workspace` pass in `test-crates.yml`.
 
   check-cargo-lock:
     name: check-cargo-lock
@@ -315,13 +294,11 @@ jobs:
     if: always()
     needs:
       - clippy
-      - crate-checks
       - docs
       - fmt
       - unused-deps
       - check-cargo-lock
       - no-test-deps
-      - features
       - deny
       - vet
     timeout-minutes: 30
@@ -330,3 +307,6 @@ jobs:
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
+          # docs and unused-deps run only on the nightly schedule / on demand,
+          # so they are skipped (not failed) on the PR and merge paths.
+          allowed-skips: docs, unused-deps

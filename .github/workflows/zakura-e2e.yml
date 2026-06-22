@@ -1,0 +1,224 @@
+name: Zakura E2E
+
+# The Zakura regtest e2e drives a host-networked docker-compose stack and is the
+# heaviest, most flake-prone job on the PR path. It lives in its own workflow so
+# its run conditions are independent of the broad Rust filter used by the unit
+# tests. It runs when:
+#   - a pull request touches Zakura-relevant paths, OR carries the
+#     `run-zakura-e2e` label (gating is done in the `changes` job below, since a
+#     label cannot override a workflow-level `paths:` filter);
+#   - a push touches Zakura-relevant paths;
+#   - the change is in the merge queue (`merge_group` ignores path filters), so a
+#     change that breaks Zakura sync indirectly is still caught before it lands;
+#   - nightly / on demand, for the long four-node modes.
+on:
+  # No `paths:` filter here on purpose — see the `changes` job for PR gating.
+  pull_request:
+    branches: [ironwood-main, "feat/**", "release/**"]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+  push:
+    branches: [ironwood-main, "feat/**", "release/**"]
+    paths:
+      - "zebra-network/**"
+      - "zebrad/src/components/sync/**"
+      - "zebrad/tests/zakura_regtest_e2e.rs"
+      - "docker/zakura-regtest-e2e/**"
+      - "docker/docker-compose.zakura-regtest-e2e.yml"
+      - ".github/workflows/zakura-e2e.yml"
+
+  # Always run in the merge queue (path filters are ignored for merge_group),
+  # so a change that breaks Zakura sync indirectly is still caught at landing.
+  merge_group:
+
+  # Long four-node modes run nightly and on demand.
+  schedule:
+    - cron: "0 8 * * *"
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_LIB_BACKTRACE: 1
+  RUST_LOG: info
+  COLORBT_SHOW_HIDDEN: 1
+
+jobs:
+  # Decide whether the e2e should run for a pull request: either a
+  # Zakura-relevant path changed, or the PR carries the `run-zakura-e2e` label.
+  # merge_group / push / schedule are handled directly in the job `if`s below.
+  changes:
+    name: detect zakura-relevant changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      zakura: ${{ steps.filter.outputs.zakura }}
+    steps:
+      - id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          changed=$(gh api --paginate \
+            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --jq '.[].path')
+          if printf '%s\n' "$changed" | grep -qE '^(zebra-network/|zebrad/src/components/sync/|zebrad/tests/zakura_regtest_e2e\.rs|docker/zakura-regtest-e2e/|docker/docker-compose\.zakura-regtest-e2e\.yml|\.github/workflows/zakura-e2e\.yml)'; then
+            echo "zakura=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "zakura=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  zakura-regtest-e2e-pr-gate:
+    name: Zakura regtest e2e (pr-gate)
+    needs: [changes]
+    # Run in the merge queue and on (path-filtered) pushes, and on a pull request
+    # when a Zakura path changed or the `run-zakura-e2e` label is present.
+    # `always()` keeps this evaluable even though `changes` is skipped for non-PR
+    # events (where the merge_group / push clauses decide).
+    if: >-
+      always() &&
+      (github.event_name == 'merge_group' ||
+       github.event_name == 'push' ||
+       (github.event_name == 'pull_request' &&
+        (needs.changes.outputs.zakura == 'true' ||
+         contains(github.event.pull_request.labels.*.name, 'run-zakura-e2e'))))
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    runs-on: ubuntu-latest
+    # Observed warm run ~6 min; a cold zebrad debug build is the long pole. This
+    # ceiling catches a hung 4-node stack quickly given the e2e's flake history
+    # (it is NOT the expected runtime).
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1 # zizmor: ignore[cache-poisoning] -- CI e2e job; uploads only diagnostic traces and builds a throwaway debug binary, nothing published/released
+        with:
+          toolchain: stable
+          cache-key: zakura-regtest-e2e-pr-gate
+          cache-on-failure: true
+      - uses: ./.github/actions/setup-zebra-build
+      # Compile the e2e once. `cargo test --no-run` builds both the integration
+      # test binary and the `zebrad` bin (cargo always builds a package's
+      # binaries so its integration tests can find them via CARGO_BIN_EXE_*); the
+      # run step below reuses these artifacts instead of recompiling.
+      #
+      # `setup-zebra-build` exports `ROCKSDB_LIB_DIR`, which makes
+      # librocksdb-sys dynamically link the runner's `librocksdb.so`. The harness
+      # bind-mounts the `zebrad` bin into a stock `debian:trixie-slim` container
+      # that has no system RocksDB, so a dynamically linked bin crashes every
+      # node with "librocksdb.so.8.9: cannot open shared object file". Unset it so
+      # RocksDB is vendored and statically linked. Both steps must keep it unset:
+      # if the run step re-set it, cargo would relink the bin and re-break it.
+      - name: Build Zakura e2e (debug)
+        run: |
+          unset ROCKSDB_LIB_DIR
+          cargo test -p zebrad --test zakura_regtest_e2e --no-run
+        env:
+          CXXFLAGS: "-include cstdint"
+      - name: Run Zakura regtest PR gate
+        run: |
+          unset ROCKSDB_LIB_DIR
+          cargo test -p zebrad --test zakura_regtest_e2e -- --ignored --nocapture
+        env:
+          CXXFLAGS: "-include cstdint"
+          ZAKURA_REGTEST_E2E: "1"
+          ZAKURA_E2E_MODE: pr-gate
+          ZAKURA_E2E_TRACE_DIR: ${{ runner.temp }}/zakura-regtest-e2e-traces-pr-gate
+          ZAKURA_REGTEST_E2E_LABEL: zakura-pr-gate
+      - name: Upload Zakura e2e traces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: zakura-regtest-e2e-pr-gate
+          path: ${{ runner.temp }}/zakura-regtest-e2e-traces-pr-gate
+          if-no-files-found: ignore
+
+  zakura-regtest-e2e:
+    name: Zakura regtest e2e (${{ matrix.zakura-mode }})
+    # The long four-node docker stack runs only on the nightly schedule and on
+    # demand. PRs and the merge queue use the trimmed pr-gate job above.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        zakura-mode:
+          - checkpoint-long
+          - no-checkpoint-long
+          - restart-matrix
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1 # zizmor: ignore[cache-poisoning] -- CI e2e job; uploads only diagnostic traces and builds a throwaway debug binary, nothing published/released
+        with:
+          toolchain: stable
+          cache-key: zakura-regtest-e2e
+          cache-on-failure: true
+      - uses: ./.github/actions/setup-zebra-build
+      # Build once (see the pr-gate job for the ROCKSDB_LIB_DIR / static-link
+      # rationale); the run step reuses the compiled artifacts.
+      - name: Build Zakura e2e (debug)
+        run: |
+          unset ROCKSDB_LIB_DIR
+          cargo test -p zebrad --test zakura_regtest_e2e --no-run
+        env:
+          CXXFLAGS: "-include cstdint"
+      - name: Run Zakura regtest dual-stack e2e
+        run: |
+          unset ROCKSDB_LIB_DIR
+          cargo test -p zebrad --test zakura_regtest_e2e -- --ignored --nocapture
+        env:
+          CXXFLAGS: "-include cstdint"
+          ZAKURA_REGTEST_E2E: "1"
+          ZAKURA_E2E_MODE: ${{ matrix.zakura-mode }}
+          ZAKURA_E2E_TRACE_DIR: ${{ runner.temp }}/zakura-regtest-e2e-traces-${{ matrix.zakura-mode }}
+          ZAKURA_REGTEST_E2E_LABEL: zakura-${{ matrix.zakura-mode }}
+      - name: Upload Zakura e2e traces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: zakura-regtest-e2e-${{ matrix.zakura-mode }}
+          path: ${{ runner.temp }}/zakura-regtest-e2e-traces-${{ matrix.zakura-mode }}
+          if-no-files-found: ignore
+
+  zakura-e2e-success:
+    name: zakura e2e success
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - changes
+      - zakura-regtest-e2e-pr-gate
+      - zakura-regtest-e2e
+    timeout-minutes: 30
+    steps:
+      - name: Decide whether the needed jobs succeeded or failed
+        uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
+        with:
+          jobs: ${{ toJSON(needs) }}
+          # `changes` only runs for pull requests; the two e2e lanes are
+          # event-scoped (pr-gate on PR/push/queue, the mode matrix on
+          # schedule/dispatch), so whichever doesn't apply is skipped. A genuine
+          # failure in any of them still fails this aggregate.
+          allowed-skips: changes, zakura-regtest-e2e-pr-gate, zakura-regtest-e2e

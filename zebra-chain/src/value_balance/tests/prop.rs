@@ -16,7 +16,6 @@ proptest! {
         let sprout = value_balance1.sprout + value_balance2.sprout;
         let sapling = value_balance1.sapling + value_balance2.sapling;
         let orchard = value_balance1.orchard + value_balance2.orchard;
-        let ironwood = value_balance1.ironwood + value_balance2.ironwood;
         let deferred = value_balance1.deferred + value_balance2.deferred;
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
 
@@ -56,7 +55,6 @@ proptest! {
         let sprout = value_balance1.sprout - value_balance2.sprout;
         let sapling = value_balance1.sapling - value_balance2.sapling;
         let orchard = value_balance1.orchard - value_balance2.orchard;
-        let ironwood = value_balance1.ironwood - value_balance2.ironwood;
         let deferred = value_balance1.deferred - value_balance2.deferred;
         let ironwood = value_balance1.ironwood - value_balance2.ironwood;
 
@@ -97,7 +95,6 @@ proptest! {
         let sprout = value_balance1.sprout + value_balance2.sprout;
         let sapling = value_balance1.sapling + value_balance2.sapling;
         let orchard = value_balance1.orchard + value_balance2.orchard;
-        let ironwood = value_balance1.ironwood + value_balance2.ironwood;
         let deferred = value_balance1.deferred + value_balance2.deferred;
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
 

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ValueBalance` now has an Ironwood value-pool slot, with
+  `from_ironwood_amount`, `ironwood_amount`, and
+  `set_ironwood_value_balance` helpers.
+
 ### Changed
 
 - V6 Orchard and Ironwood transaction parsing now accepts the NU6.3
@@ -15,11 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Ironwood note commitment tree roots and Ironwood transaction counts.
 - `HistoryTree`, `NonEmptyHistoryTree`, and `zcash_history::Tree` constructors
   and mutators now require an Ironwood note commitment tree root.
-### Added
-
-- `ValueBalance` now has an Ironwood value-pool slot, with
-  `from_ironwood_amount`, `ironwood_amount`, and
-  `set_ironwood_value_balance` helpers.
 
 ## [9.0.0] - 2026-06-02
 

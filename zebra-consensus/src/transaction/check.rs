@@ -311,7 +311,12 @@ pub fn disabled_add_to_orchard_pool(
 
     let zero = Amount::<NegativeAllowed>::zero();
 
-    if height >= nu6_3_activation_height && tx.orchard_value_balance().orchard_amount() < zero {
+    let value_balance_orchard = tx
+        .orchard_shielded_data()
+        .map(|shielded_data| shielded_data.value_balance)
+        .unwrap_or_else(Amount::<NegativeAllowed>::zero);
+
+    if height >= nu6_3_activation_height && value_balance_orchard < zero {
         return Err(TransactionError::DisabledAddToOrchardPool);
     }
 

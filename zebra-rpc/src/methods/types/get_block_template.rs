@@ -483,38 +483,6 @@ impl MinerParams {
         &self.addr
     }
 
-    /// Returns true when the miner address has an Orchard receiver but no receiver
-    /// that can be used for coinbase rewards after NU6.3.
-    pub(crate) fn has_only_orchard_receiver(&self) -> bool {
-        Self::address_has_only_orchard_receiver(&self.addr)
-    }
-
-    /// Returns an error if this miner address cannot receive coinbase rewards at `height`.
-    pub(crate) fn validate_coinbase_receiver(
-        &self,
-        net: &Network,
-        height: block::Height,
-    ) -> Result<(), MinerParamsError> {
-        if zebra_chain::parameters::NetworkUpgrade::current(net, height)
-            >= zebra_chain::parameters::NetworkUpgrade::Nu6_3
-            && self.has_only_orchard_receiver()
-        {
-            Err(MinerParamsError::UnsupportedCoinbaseReceiver)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn address_has_only_orchard_receiver(addr: &Address) -> bool {
-        matches!(
-            addr,
-            Address::Unified(addr)
-                if addr.orchard().is_some()
-                    && addr.sapling().is_none()
-                    && addr.transparent().is_none()
-        )
-    }
-
     /// Returns the miner data.
     pub fn data(&self) -> &Option<PushValue> {
         &self.data
@@ -559,10 +527,6 @@ pub enum MinerParamsError {
     InvalidAddr(zcash_address::ConversionError<&'static str>),
     #[error("Miner data exceeds {MAX_MINER_DATA_LEN} bytes")]
     OversizedData,
-    #[error(
-        "Miner address cannot receive coinbase rewards after NU6.3 because unified addresses must include a Sapling or transparent receiver"
-    )]
-    UnsupportedCoinbaseReceiver,
     #[error(transparent)]
     InvalidMemo(#[from] zcash_protocol::memo::Error),
 }

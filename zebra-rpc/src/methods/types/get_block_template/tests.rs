@@ -5,7 +5,9 @@ use std::iter;
 use zebra_chain::amount::Amount;
 
 use strum::IntoEnumIterator;
-use zcash_keys::address::{Address, UnifiedAddress};
+use zcash_keys::address::Address;
+#[cfg(zcash_unstable = "nu6.3")]
+use zcash_keys::address::UnifiedAddress;
 
 use zebra_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 
@@ -95,31 +97,17 @@ fn coinbase() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Tests that a coinbase paying an Orchard-only unified address is routed to Orchard before
+/// NU6.3 and to Ironwood after NU6.3.
+///
+/// Ironwood reuses the Orchard receiver, and net-new value into Orchard is forbidden after
+/// NU6.3, so the Orchard receiver is paid via Ironwood once NU6.3 is active.
+///
+/// Like [`coinbase`], this builds real shielded outputs, so run it with the `--release` flag.
+#[cfg(zcash_unstable = "nu6.3")]
 #[test]
-fn coinbase_errors_for_orchard_only_unified_address_after_nu6_3() {
-    let net = nu6_3_testnet();
-    let nu6_3_height = NetworkUpgrade::Nu6_3
-        .activation_height(&net)
-        .expect("NU6.3 activation height is configured");
-
-    let miner_params = MinerParams::from(Address::Unified(orchard_only_unified_address()));
-
-    let error =
-        TransactionTemplate::new_coinbase(&net, nu6_3_height, &miner_params, Amount::zero())
-            .expect_err(
-                "Orchard-only unified addresses cannot receive coinbase rewards after NU6.3",
-            );
-
-    assert!(
-        error
-            .to_string()
-            .contains("must include a Sapling or transparent receiver"),
-        "unexpected error: {error}"
-    );
-}
-
-#[test]
-fn miner_params_validate_orchard_only_unified_address_at_nu6_3() {
+#[ignore]
+fn coinbase_routes_orchard_only_unified_address_by_network_upgrade() {
     let net = nu6_3_testnet();
     let nu6_3_height = NetworkUpgrade::Nu6_3
         .activation_height(&net)
@@ -127,22 +115,44 @@ fn miner_params_validate_orchard_only_unified_address_at_nu6_3() {
     let pre_nu6_3_height = Height(nu6_3_height.0 - 1);
     let miner_params = MinerParams::from(Address::Unified(orchard_only_unified_address()));
 
-    miner_params
-        .validate_coinbase_receiver(&net, pre_nu6_3_height)
-        .expect("Orchard-only unified addresses are valid before NU6.3");
-
-    let error = miner_params
-        .validate_coinbase_receiver(&net, nu6_3_height)
-        .expect_err("Orchard-only unified addresses are invalid after NU6.3");
+    // Before NU6.3, the Orchard receiver is paid via Orchard.
+    let pre_tx =
+        TransactionTemplate::new_coinbase(&net, pre_nu6_3_height, &miner_params, Amount::zero())
+            .expect("Orchard-only unified address is paid via Orchard before NU6.3")
+            .data()
+            .as_ref()
+            .zcash_deserialize_into::<Transaction>()
+            .expect("coinbase transaction deserializes");
 
     assert!(
-        error
-            .to_string()
-            .contains("must include a Sapling or transparent receiver"),
-        "unexpected error: {error}"
+        pre_tx.orchard_shielded_data().is_some(),
+        "pre-NU6.3 coinbase to an Orchard-only address should have an Orchard output"
+    );
+    assert!(
+        pre_tx.ironwood_shielded_data().is_none(),
+        "pre-NU6.3 coinbase should not have an Ironwood output"
+    );
+
+    // After NU6.3, the Orchard receiver is paid via Ironwood instead.
+    let post_tx =
+        TransactionTemplate::new_coinbase(&net, nu6_3_height, &miner_params, Amount::zero())
+            .expect("Orchard-only unified address is paid via Ironwood after NU6.3")
+            .data()
+            .as_ref()
+            .zcash_deserialize_into::<Transaction>()
+            .expect("coinbase transaction deserializes");
+
+    assert!(
+        post_tx.ironwood_shielded_data().is_some(),
+        "post-NU6.3 coinbase to an Orchard-only address should have an Ironwood output"
+    );
+    assert!(
+        post_tx.orchard_shielded_data().is_none(),
+        "post-NU6.3 coinbase should not have an Orchard output"
     );
 }
 
+#[cfg(zcash_unstable = "nu6.3")]
 fn nu6_3_testnet() -> Network {
     testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
@@ -163,6 +173,7 @@ fn nu6_3_testnet() -> Network {
         .expect("configured network is valid")
 }
 
+#[cfg(zcash_unstable = "nu6.3")]
 fn orchard_only_unified_address() -> UnifiedAddress {
     let orchard_spending_key = Option::<orchard::keys::SpendingKey>::from(
         orchard::keys::SpendingKey::from_bytes([0u8; 32]),

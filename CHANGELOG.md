@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   after the deferred pool, keeping older value-pool records readable.
 - Reject transactions that add net value to the Orchard pool after NU6.3
   activation.
+- Route post-NU6.3 coinbase rewards for Orchard-only unified miner addresses to
+  the Ironwood pool instead of rejecting them; the Orchard pool stops accepting
+  net-new value at NU6.3 and Ironwood reuses the Orchard receiver.
 - Unified the workspace Minimum Supported Rust Version (MSRV) at 1.91, matching
   the `zebrad` binary. The library crates previously declared 1.85.1, but the
   dependency tree (via `iroh`/`sentry` → `time 0.3.47`, plus the

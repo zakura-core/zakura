@@ -134,9 +134,6 @@ impl TransactionTemplate<NegativeOrZero> {
         let block_subsidy = block_subsidy(height, net)?;
         let miner_reward = miner_subsidy(height, net, block_subsidy)? + txs_fee;
         let miner_reward = Zatoshis::try_from(miner_reward?)?;
-        miner_params
-            .validate_coinbase_receiver(net, height)
-            .map_err(|error| TransactionError::CoinbaseConstruction(error.to_string()))?;
 
         let mut builder = Builder::new(
             net,
@@ -168,6 +165,19 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
+        #[cfg(zcash_unstable = "nu6.3")]
+        let add_ironwood_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+            trace_err!(
+                builder.add_ironwood_output::<String>(
+                    Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
+                    *addr,
+                    miner_reward,
+                    memo.clone(),
+                ),
+                "Ironwood"
+            )
+        };
+
         let add_sapling_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
             trace_err!(
                 builder.add_sapling_output::<String>(
@@ -187,10 +197,6 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        let nu6_3_active = NetworkUpgrade::Nu6_3
-            .activation_height(net)
-            .is_some_and(|nu6_3_height| height >= nu6_3_height);
-
         match miner_params.addr() {
             Address::Unified(addr) => addr
                 .sapling()
@@ -200,10 +206,25 @@ impl TransactionTemplate<NegativeOrZero> {
                         .and_then(|addr| add_transparent_reward(&mut builder, addr))
                 })
                 .or_else(|| {
-                    (!nu6_3_active)
-                        .then_some(addr)
-                        .and_then(|addr| addr.orchard())
-                        .and_then(|addr| add_orchard_reward(&mut builder, addr))
+                    addr.orchard().and_then(|addr| {
+                        let upgrade = NetworkUpgrade::current(net, height);
+                        // Before NU6.3, pay the Orchard receiver via Orchard.
+                        if upgrade < NetworkUpgrade::Nu6_3 {
+                            return add_orchard_reward(&mut builder, addr);
+                        }
+                        // From NU6.3 on, the Orchard pool is frozen
+                        // (disabled_add_to_orchard_pool). At NU6.3 the Orchard receiver is
+                        // paid via Ironwood — which reuses the Orchard address — when
+                        // Ironwood is compiled in; the verifier only accepts V6/Ironwood
+                        // coinbase outputs while NU6.3 is the current upgrade. After NU6.3
+                        // neither pool is accepted, so an Orchard-only address cannot
+                        // receive a coinbase reward.
+                        #[cfg(zcash_unstable = "nu6.3")]
+                        if upgrade == NetworkUpgrade::Nu6_3 {
+                            return add_ironwood_reward(&mut builder, addr);
+                        }
+                        None
+                    })
                 }),
 
             Address::Sapling(addr) => add_sapling_reward(&mut builder, addr),

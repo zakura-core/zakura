@@ -395,11 +395,11 @@ where
         let mempool = self.mempool.clone();
 
         let tx = req.transaction();
-        let tx_mined_id = req.tx_mined_id();
-        let span = tracing::debug_span!("tx", ?tx_mined_id);
+        let tx_id = req.tx_id();
+        let span = tracing::debug_span!("tx", ?tx_id);
 
         async move {
-            tracing::trace!(?tx_mined_id, "got tx verify request");
+            tracing::trace!(?tx_id, ?req, "got tx verify request");
 
             // Do quick checks first
             check::has_inputs_and_outputs(&tx)?;
@@ -472,7 +472,7 @@ where
 
             check::spend_conflicts(&tx)?;
 
-            tracing::trace!(?tx_mined_id, "passed quick checks");
+            tracing::trace!(?tx_id, "passed quick checks");
 
             if let Some(block_time) = req.block_time() {
                 check::lock_time_has_passed(&tx, req.height(), block_time)?;
@@ -516,7 +516,7 @@ where
             let nu = req.upgrade(&network);
             let all_previous_outputs = Arc::new(spent_outputs);
 
-            tracing::trace!(?tx_mined_id, "got state UTXOs");
+            tracing::trace!(?tx_id, "got state UTXOs");
 
             let (mut async_checks, cached_ffi_transaction) = match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
@@ -584,11 +584,9 @@ where
                 async_checks.push(check_anchors_and_revealed_nullifiers_query);
             }
 
-            tracing::trace!(?tx_mined_id, "awaiting async checks...");
+            tracing::trace!(?tx_id, "awaiting async checks...");
 
             async_checks.check().await?;
-
-            let tx_id = req.tx_id();
 
             tracing::trace!(?tx_id, "finished async checks");
 
@@ -656,7 +654,7 @@ where
         }
             .inspect(move |result| {
                 // Hide the transaction data to avoid filling the logs
-                tracing::trace!(?tx_mined_id, result = ?result.as_ref().map(|_tx| ()), "got tx verify result");
+                tracing::trace!(?tx_id, result = ?result.as_ref().map(|_tx| ()), "got tx verify result");
             })
             .instrument(span)
             .boxed()

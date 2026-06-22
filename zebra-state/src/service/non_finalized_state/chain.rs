@@ -1872,7 +1872,7 @@ impl Chain {
                 ))?;
                 self.update_chain_tip_with(&(orchard_shielded_data, &transaction_hash))?;
                 if let Some(ironwood_shielded_data) = ironwood_shielded_data {
-                    check::nullifier::add_ironwood_to_non_finalized_chain_unique(
+                    check::nullifier::add_to_non_finalized_chain_unique(
                         &mut self.ironwood_nullifiers,
                         ironwood_shielded_data.nullifiers(),
                         transaction_hash,

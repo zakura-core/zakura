@@ -618,6 +618,15 @@ impl DuplicateNullifierError for orchard::Nullifier {
     }
 }
 
+impl DuplicateNullifierError for ironwood::Nullifier {
+    fn duplicate_nullifier_error(&self, in_finalized_state: bool) -> ValidateContextError {
+        ValidateContextError::DuplicateIronwoodNullifier {
+            nullifier: *self,
+            in_finalized_state,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

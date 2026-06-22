@@ -597,7 +597,6 @@ where
     // vector in `zebra-chain`.
     if transaction.is_coinbase() {
         match &mut transaction {
-            Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {}
             Transaction::V4 {
                 sapling_shielded_data,
                 ..
@@ -611,6 +610,7 @@ where
                 sapling_shielded_data,
                 ..
             } => *sapling_shielded_data = None,
+            Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {}
         }
     }
 

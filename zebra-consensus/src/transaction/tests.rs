@@ -292,11 +292,46 @@ fn orchard_cross_address_flag_is_disabled_after_nu6_3() {
 
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
+fn ironwood_cross_address_flag_is_required_after_nu6_3() {
+    let ironwood_without_cross_address = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(
+            0,
+            ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
+        )),
+        vec![],
+    );
+
+    assert_eq!(
+        check::ironwood_cross_address_enabled(&ironwood_without_cross_address),
+        Err(TransactionError::IronwoodDoesNotHaveEnableCrossAddress)
+    );
+
+    let ironwood_with_cross_address = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(
+            0,
+            ironwood::Flags::ENABLE_OUTPUTS | ironwood::Flags::ENABLE_CROSS_ADDRESS,
+        )),
+        vec![],
+    );
+
+    assert_eq!(
+        check::ironwood_cross_address_enabled(&ironwood_with_cross_address),
+        Ok(())
+    );
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[test]
 fn orchard_to_ironwood_migration_balances() {
     let (network, height) = nu6_3_test_network_and_height();
     let tx = v6_pool_flow_transaction(
         Some(orchard_shielded_data(10, Flags::ENABLE_SPENDS)),
-        Some(ironwood_shielded_data(-10, ironwood::Flags::ENABLE_OUTPUTS)),
+        Some(ironwood_shielded_data(
+            -10,
+            ironwood::Flags::ENABLE_OUTPUTS | ironwood::Flags::ENABLE_CROSS_ADDRESS,
+        )),
         vec![],
     );
 
@@ -329,7 +364,10 @@ fn orchard_to_ironwood_migration_balances() {
 fn ironwood_withdraw_balances() {
     let tx = v6_pool_flow_transaction(
         None,
-        Some(ironwood_shielded_data(10, ironwood::Flags::ENABLE_SPENDS)),
+        Some(ironwood_shielded_data(
+            10,
+            ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_CROSS_ADDRESS,
+        )),
         vec![transparent_output(10)],
     );
 
@@ -371,7 +409,9 @@ async fn v6_with_padded_orchard_proof_returns_consensus_error() {
 async fn v6_with_padded_ironwood_proof_returns_consensus_error() {
     let mut ironwood_shielded_data = ironwood_shielded_data(
         0,
-        ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
+        ironwood::Flags::ENABLE_SPENDS
+            | ironwood::Flags::ENABLE_OUTPUTS
+            | ironwood::Flags::ENABLE_CROSS_ADDRESS,
     );
     ironwood_shielded_data.proof.0.push(0);
 
@@ -4169,10 +4209,10 @@ fn coinbase_outputs_are_decryptable_for_fake_v5_blocks() {
     }
 }
 
-/// Test that V6 Ironwood coinbase outputs use the NU6.3 flag format during zero-key recovery.
+/// Test that V6 Ironwood coinbase outputs reject Orchard note encryption.
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
-fn coinbase_outputs_are_decryptable_for_v6_ironwood() {
+fn coinbase_outputs_reject_v2_orchard_notes_for_v6_ironwood() {
     let (network, height) = nu6_3_test_network_and_height();
 
     for v in zebra_test::vectors::ORCHARD_NOTE_ENCRYPTION_ZERO_VECTOR.iter() {
@@ -4216,7 +4256,7 @@ fn coinbase_outputs_are_decryptable_for_v6_ironwood() {
 
         assert_eq!(
             check::coinbase_outputs_are_decryptable(&transaction, &network, height),
-            Ok(())
+            Err(TransactionError::CoinbaseOutputsNotDecryptable)
         );
     }
 }

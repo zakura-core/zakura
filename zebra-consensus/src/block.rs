@@ -270,7 +270,7 @@ where
 
             // Now do the slower checks
 
-            // Check compatibility with ZIP-212 shielded Sapling and Orchard coinbase output decryption
+            // Check compatibility with ZIP-212 shielded Sapling, Orchard, and Ironwood coinbase output decryption
             tx::check::coinbase_outputs_are_decryptable(&coinbase_tx, &network, height)?;
 
             // Send transactions to the transaction verifier to be checked

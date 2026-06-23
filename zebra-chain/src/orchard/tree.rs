@@ -25,7 +25,7 @@ use lazy_static::lazy_static;
 use thiserror::Error;
 use zcash_primitives::merkle_tree::HashSer;
 
-use super::sinsemilla::*;
+use sinsemilla::HashDomain;
 
 use crate::{
     serialization::{
@@ -43,6 +43,17 @@ use legacy::LegacyNoteCommitmentTree;
 pub type NoteCommitmentUpdate = pallas::Base;
 
 pub(super) const MERKLE_DEPTH: u8 = 32;
+
+lazy_static! {
+    /// The Sinsemilla hash domain for `MerkleCRH^Orchard`.
+    ///
+    /// The domain's `Q` generator is derived once (via `hash_to_curve` of the
+    /// constant domain string) and reused for every node hash. Constructing a
+    /// fresh [`HashDomain`] per hash would recompute that `hash_to_curve` on the
+    /// hot path, which is pure waste since the domain never changes.
+    static ref ORCHARD_MERKLE_CRH_DOMAIN: HashDomain =
+        HashDomain::new("z.cash:Orchard-MerkleCRH");
+}
 
 /// MerkleCRH^Orchard Hash Function
 ///
@@ -67,10 +78,13 @@ fn merkle_crh_orchard(layer: u8, left: pallas::Base, right: pallas::Base) -> pal
     s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(left.to_repr())[0..255]);
     s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(right.to_repr())[0..255]);
 
-    match sinsemilla_hash(b"z.cash:Orchard-MerkleCRH", &s) {
-        Some(h) => h,
-        None => pallas::Base::zero(),
-    }
+    // Hash with the cached domain instead of `sinsemilla_hash`, which would
+    // rebuild the `HashDomain` (and its `Q` generator) on every call.
+    let hash: Option<pallas::Base> = ORCHARD_MERKLE_CRH_DOMAIN
+        .hash(s.iter().map(|b| *b.as_ref()))
+        .into();
+
+    hash.unwrap_or_else(pallas::Base::zero)
 }
 
 lazy_static! {
@@ -774,6 +788,100 @@ mod tests {
 
         Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
             .expect("small little-endian integers are canonical field elements")
+    }
+
+    /// Verbatim copy of the pre-cache `merkle_crh_orchard`: it rebuilds the
+    /// Sinsemilla [`HashDomain`](sinsemilla::HashDomain) (and its `Q` generator)
+    /// from the domain string on every call. The production `merkle_crh_orchard`
+    /// caches that domain and must stay byte-identical to this.
+    fn merkle_crh_orchard_uncached(
+        layer: u8,
+        left: pallas::Base,
+        right: pallas::Base,
+    ) -> pallas::Base {
+        let mut s = bitvec![u8, Lsb0;];
+
+        let l = MERKLE_DEPTH - 1 - layer;
+        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from([l, 0])[0..10]);
+        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(left.to_repr())[0..255]);
+        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(right.to_repr())[0..255]);
+
+        match crate::orchard::sinsemilla::sinsemilla_hash(b"z.cash:Orchard-MerkleCRH", &s) {
+            Some(h) => h,
+            None => pallas::Base::zero(),
+        }
+    }
+
+    /// Field elements that exercise the full 255-bit width of `pallas::Base`,
+    /// which the small-integer `node(..)` helper never reaches (it only sets the
+    /// low 8 bytes). Real note-commitment x-coordinates are full-width, so the
+    /// cached domain must stay byte-identical on these too. `from_raw` reduces
+    /// mod the field modulus, so every value here is canonical.
+    fn full_width_field_elements() -> Vec<pallas::Base> {
+        vec![
+            // p - 1: the largest canonical field element.
+            pallas::Base::zero() - pallas::Base::one(),
+            // p - 2.
+            pallas::Base::zero() - pallas::Base::from(2),
+            // All bits set in the raw limbs, then reduced mod p.
+            pallas::Base::from_raw([u64::MAX, u64::MAX, u64::MAX, u64::MAX]),
+            // Only the high limb set.
+            pallas::Base::from_raw([0, 0, 0, u64::MAX]),
+            // A scattered full-width value.
+            pallas::Base::from_raw([
+                0x0123_4567_89ab_cdef,
+                0xfedc_ba98_7654_3210,
+                0xdead_beef_cafe_babe,
+                0x0f1e_2d3c_4b5a_6978,
+            ]),
+        ]
+    }
+
+    /// The cached-domain `merkle_crh_orchard` must produce byte-identical output
+    /// to recomputing the `HashDomain` from scratch on every call, across all
+    /// layers and a spread of input values — small integers, edge cases, and
+    /// full-width field elements.
+    #[test]
+    fn cached_domain_merkle_crh_matches_fresh_domain() {
+        let mut values: Vec<pallas::Base> = [0u64, 1, 2, 7, 65_535, u64::MAX]
+            .iter()
+            .map(|&v| node(v).0)
+            .collect();
+        values.extend(full_width_field_elements());
+
+        for layer in 0..MERKLE_DEPTH {
+            for &left in &values {
+                for &right in &values {
+                    assert_eq!(
+                        merkle_crh_orchard(layer, left, right).to_repr(),
+                        merkle_crh_orchard_uncached(layer, left, right).to_repr(),
+                        "cached domain must match fresh domain at layer {layer}",
+                    );
+                }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// Randomized differential check: across random layers and random
+        /// full-width field elements (raw limbs reduced mod p), the cached
+        /// domain must stay byte-identical to a freshly rebuilt one. This covers
+        /// the whole input domain that the fixed table above only samples.
+        #[test]
+        fn cached_domain_merkle_crh_matches_fresh_domain_random(
+            layer in 0u8..MERKLE_DEPTH,
+            left_limbs in proptest::prelude::any::<[u64; 4]>(),
+            right_limbs in proptest::prelude::any::<[u64; 4]>(),
+        ) {
+            let left = pallas::Base::from_raw(left_limbs);
+            let right = pallas::Base::from_raw(right_limbs);
+
+            proptest::prop_assert_eq!(
+                merkle_crh_orchard(layer, left, right).to_repr(),
+                merkle_crh_orchard_uncached(layer, left, right).to_repr(),
+                "cached domain must match fresh domain at layer {}", layer
+            );
+        }
     }
 
     fn build_tree(prefix_len: u64) -> NoteCommitmentTree {

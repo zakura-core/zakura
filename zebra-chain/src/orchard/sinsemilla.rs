@@ -1,10 +1,15 @@
 //! Sinsemilla hash functions and helpers.
 
-use bitvec::prelude::*;
 use halo2::{
     arithmetic::{Coordinates, CurveAffine, CurveExt},
     pasta::pallas,
 };
+
+// Only the test-vector hash below rebuilds a `HashDomain` from raw message bits;
+// the production Merkle path uses a cached domain in `crate::orchard::tree`.
+#[cfg(test)]
+use bitvec::prelude::*;
+#[cfg(test)]
 use sinsemilla::HashDomain;
 
 /// [Coordinate Extractor for Pallas][concreteextractorpallas]
@@ -52,6 +57,11 @@ pub fn pallas_group_hash(D: &[u8], M: &[u8]) -> pallas::Point {
 /// SinsemillaHash: B^Y^\[N\] × B[{0 .. 𝑘·𝑐}] → P_𝑥 ∪ {⊥}
 ///
 /// <https://zips.z.cash/protocol/nu5.pdf#concretesinsemillahash>
+///
+/// This rebuilds the [`HashDomain`] (and its `Q` generator) on every call, so it
+/// is only used by the test vectors. The production `MerkleCRH^Orchard` path in
+/// [`crate::orchard::tree`] hashes through a cached domain instead.
+#[cfg(test)]
 #[allow(non_snake_case)]
 pub fn sinsemilla_hash(D: &[u8], M: &BitVec<u8, Lsb0>) -> Option<pallas::Base> {
     let domain = std::str::from_utf8(D).expect("must be valid UTF-8");

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Cache the `MerkleCRH^Orchard` Sinsemilla hash domain. The Orchard
+  note-commitment Merkle hash previously rebuilt the Sinsemilla `HashDomain` —
+  including a full `hash_to_curve` for its `Q` generator — on every node hash,
+  even though the domain (`z.cash:Orchard-MerkleCRH`) is constant for the whole
+  tree. The domain is now derived once and reused, speeding up every Orchard
+  note-commitment tree hash, including the irreducibly-serial per-block `root()`
+  chain (`orchard_combine` microbench ~−15%). The output is byte-identical.
 - Parallelize note-commitment tree updates during checkpoint-zone sync. Sapling
   and Orchard note commitments for each block are now appended to the incremental
   Merkle frontier using a parallel divide-and-conquer reduction across the rayon

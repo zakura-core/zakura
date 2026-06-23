@@ -17,7 +17,7 @@ on:
       build_ref:
         description: "Git branch/tag/SHA to build on the host (cached by commit SHA). Primary mode."
         required: false
-        default: "ironwood-main"
+        default: "main"
       force_rebuild:
         description: "Rebuild even if a binary for this commit SHA is already cached"
         type: boolean

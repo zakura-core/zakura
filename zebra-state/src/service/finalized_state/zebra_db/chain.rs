@@ -17,8 +17,13 @@ use std::{
 };
 
 use zebra_chain::{
-    amount::NonNegative, block::Height, block_info::BlockInfo, history_tree::HistoryTree,
-    serialization::ZcashSerialize as _, transparent, value_balance::ValueBalance,
+    amount::NonNegative,
+    block::Height,
+    block_info::BlockInfo,
+    history_tree::HistoryTree,
+    serialization::{CompactSizeMessage, ZcashSerialize as _},
+    transparent,
+    value_balance::ValueBalance,
 };
 
 use crate::{
@@ -246,6 +251,7 @@ impl DiskWriteBatch {
     ///
     /// [`chain_value_pool_change`]: zebra_chain::block::Block::chain_value_pool_change
     /// [`add_chain_value_pool_change`]: ValueBalance::add_chain_value_pool_change
+    #[allow(clippy::unwrap_in_result)]
     pub fn prepare_chain_value_pools_batch(
         &mut self,
         db: &ZebraDb,
@@ -286,11 +292,35 @@ impl DiskWriteBatch {
             .with_batch_for_writing(self)
             .zs_insert(&(), &new_value_pool);
 
-        // Get the block size to store with the BlockInfo. This is a bit wasteful
-        // since the block header and txs were serialized previously when writing
-        // them to the DB, and we could get the size if we modified the database
-        // code to return the size of data written; but serialization should be cheap.
-        let block_size = finalized.block.zcash_serialized_size();
+        // Get the block size to store with the BlockInfo.
+        //
+        // `Block::zcash_serialized_size` walks the entire block's serialization
+        // on a single thread, which is a significant per-block cost on heavy
+        // shielded blocks (it re-traverses every transaction).
+        // Sum the independent per-transaction sizes across the rayon pool.
+        // Only fan out to rayon once the block has enough transactions to
+        // amortize the multi-threading overhead.
+        let block_size = {
+            let transactions = &finalized.block.transactions;
+            let transactions_size: usize =
+                if transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
+                    use rayon::prelude::*;
+                    transactions
+                        .par_iter()
+                        .map(|transaction| transaction.zcash_serialized_size())
+                        .sum()
+                } else {
+                    transactions
+                        .iter()
+                        .map(|transaction| transaction.zcash_serialized_size())
+                        .sum()
+                };
+            let tx_count_size = CompactSizeMessage::try_from(transactions.len())
+                .expect("block must have a valid transaction count")
+                .zcash_serialized_size();
+
+            finalized.block.header.zcash_serialized_size() + tx_count_size + transactions_size
+        };
 
         let _ = db.block_info_cf().with_batch_for_writing(self).zs_insert(
             &finalized.height,

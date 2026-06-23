@@ -1403,18 +1403,37 @@ impl DiskWriteBatch {
         self.zs_insert(&hash_by_height, height, hash);
         self.zs_insert(&height_by_hash, hash, height);
 
-        for (transaction_index, (transaction, transaction_hash)) in block
-            .transactions
-            .iter()
-            .zip(transaction_hashes.iter())
-            .enumerate()
-        {
+        // Serialize the raw transaction bytes up front: on heavy shielded blocks
+        // this serialization dominates the per-block write cost, and each
+        // transaction serializes independently.
+        //
+        // Only fan out to rayon once the block has enough transactions to amortize
+        // the multi-threading overhead. Small blocks serialize sequentially (see
+        // PARALLEL_BLOCK_TX_THRESHOLD).
+        let raw_transactions: Vec<RawBytes> = if !store_raw_transactions {
+            Vec::new()
+        } else if block.transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
+            use rayon::prelude::*;
+            block
+                .transactions
+                .par_iter()
+                .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
+                .collect()
+        } else {
+            block
+                .transactions
+                .iter()
+                .map(|transaction| RawBytes::new_raw_bytes(transaction.as_bytes()))
+                .collect()
+        };
+
+        for (transaction_index, transaction_hash) in transaction_hashes.iter().enumerate() {
             let transaction_location = TransactionLocation::from_usize(*height, transaction_index);
 
             // Commit each transaction's raw bytes only when the storage policy
             // keeps historical transaction data for this height.
-            if store_raw_transactions {
-                self.zs_insert(&tx_by_loc, transaction_location, transaction);
+            if let Some(raw_transaction) = raw_transactions.get(transaction_index) {
+                self.zs_insert(&tx_by_loc, transaction_location, raw_transaction);
             }
 
             // Index each transaction hash and location

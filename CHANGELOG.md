@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Parallelize per-block serialization in the finalized block writer. On heavy
+  shielded blocks, serializing the raw transaction bytes (`tx_by_loc`) and
+  computing the block size for `BlockInfo` dominate the per-block write cost. Both
+  are now done across the rayon pool — `par_iter` over the block's transactions —
+  inside the dedicated `COMMIT_COMPUTE_POOL` so the workers don't contend with the
+  download/verification pipeline. The raw-bytes path is byte-identical (`RawBytes`
+  is stored verbatim) and the size path is byte-count-identical (header +
+  CompactSize(tx_count) + sum of transaction sizes). Both fork-joins are gated on a
+  transaction-count threshold (`PARALLEL_BLOCK_TX_THRESHOLD = 16`) so small
+  early-chain blocks, where the fork-join overhead would outweigh the work, run
+  sequentially.
 - Cache the `MerkleCRH^Orchard` Sinsemilla hash domain. The Orchard
   note-commitment Merkle hash previously rebuilt the Sinsemilla `HashDomain` —
   including a full `hash_to_curve` for its `Q` generator — on every node hash,

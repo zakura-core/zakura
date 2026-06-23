@@ -724,13 +724,21 @@ impl FinalizedState {
         let finalized_inner_block = finalized.block.clone();
         let note_commitment_trees = finalized.treestate.note_commitment_trees.clone();
 
-        let result = self.db.write_block(
-            finalized,
-            prev_note_commitment_trees,
-            &self.network(),
-            source,
-            retention,
-        );
+        // Build and write the block's RocksDB batch inside the dedicated
+        // commit-compute pool. The par-iter calls inside write_block end up scheduled
+        // on a separate pool from global (which is used by download/verify pipeline).
+        // This leads to less contention and more throughput, as benchmarked over the
+        // sand-blasting region.
+        let network = self.network();
+        let result = COMMIT_COMPUTE_POOL.install(|| {
+            self.db.write_block(
+                finalized,
+                prev_note_commitment_trees,
+                &network,
+                source,
+                retention,
+            )
+        });
 
         if result.is_ok() {
             if retention.clears_archive_backlog() {

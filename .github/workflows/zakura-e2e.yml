@@ -14,11 +14,11 @@ name: Zakura E2E
 on:
   # No `paths:` filter here on purpose — see the `changes` job for PR gating.
   pull_request:
-    branches: [ironwood-main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**"]
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
   push:
-    branches: [ironwood-main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**"]
     paths:
       - "zebra-network/**"
       - "zebrad/src/components/sync/**"

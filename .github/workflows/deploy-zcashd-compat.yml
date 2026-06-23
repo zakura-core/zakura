@@ -7,7 +7,7 @@ on:
         description: "Git ref to build and deploy"
         required: true
         type: string
-        default: ironwood-main
+        default: main
       host:
         description: "Target host or IP address"
         required: true

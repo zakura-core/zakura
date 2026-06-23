@@ -340,6 +340,7 @@ pub struct Treestate {
 
 impl Treestate {
     #[allow(missing_docs)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         sprout: Arc<sprout::tree::NoteCommitmentTree>,
         sapling: Arc<sapling::tree::NoteCommitmentTree>,

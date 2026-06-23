@@ -284,6 +284,8 @@ async fn rpc_getblock() {
     let trees = GetBlockTrees {
         sapling,
         orchard,
+        // These mainnet vector blocks are before Ironwood activation. The
+        // NU6.3-active Ironwood tree case is covered by the focused test below.
         ironwood: None,
     };
 

@@ -196,6 +196,9 @@ impl fmt::Display for Transaction {
         fmter.field("sapling_spends", &self.sapling_spends_per_anchor().count());
         fmter.field("sapling_outputs", &self.sapling_outputs().count());
         fmter.field("orchard_actions", &self.orchard_actions().count());
+        // Keep `Display` limited to infallible summary fields. Computing `unmined_id` for V5/V6
+        // routes through txid/auth-digest conversion, which can panic before validation rejects
+        // invalid in-memory transactions.
 
         fmter.finish()
     }

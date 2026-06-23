@@ -133,6 +133,8 @@ impl GetTreestateResponse {
             sprout: None,
             sapling,
             orchard,
+            // This deprecated compatibility helper only accepts Sapling and
+            // Orchard tree bytes, so it cannot synthesize an Ironwood tree.
             ironwood: None,
         }
     }
@@ -159,7 +161,7 @@ impl Default for GetTreestateResponse {
             sprout: Default::default(),
             sapling: Default::default(),
             orchard: Default::default(),
-            ironwood: None,
+            ironwood: Default::default(),
         }
     }
 }

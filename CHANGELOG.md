@@ -120,6 +120,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Roll back the Zakura header store together with finalized block data, so
+  databases produced by `zebra-rollback-state` can resume Zakura body sync from
+  the new body tip instead of stalling behind stale headers and falling back to
+  legacy sync.
 - Report `pruned: true` in `getblockchaininfo` after Zebra has pruned
   historical raw transaction data, matching the node's storage mode instead of
   always reporting archive behavior.

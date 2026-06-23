@@ -51,6 +51,14 @@ pub type LegacyHistoryTreePartsCf<'cf> = TypedColumnFamily<'cf, Height, HistoryT
 /// This type should not be used in new code.
 pub type RawHistoryTreePartsCf<'cf> = TypedColumnFamily<'cf, RawBytes, HistoryTreeParts>;
 
+/// A type for reading the tip history tree value as raw bytes.
+///
+/// The tip tree is stored under the empty key `()`. Reading the value as [`RawBytes`] never fails,
+/// unlike reading it as [`HistoryTreeParts`], so this is used by format-compatibility code to
+/// inspect an entry that may have been written with an older, smaller `Entry` buffer.
+/// This type should not be used in new code.
+pub type RawHistoryTreeValueCf<'cf> = TypedColumnFamily<'cf, (), RawBytes>;
+
 /// The name of the tip-only chain value pools column family.
 ///
 /// This constant should be used so the compiler can detect typos.
@@ -93,6 +101,13 @@ impl ZebraDb {
     /// This should not be used in new code.
     pub(crate) fn raw_history_tree_cf(&self) -> RawHistoryTreePartsCf<'_> {
         RawHistoryTreePartsCf::new(&self.db, HISTORY_TREE)
+            .expect("column family was created when database was created")
+    }
+
+    /// Returns a handle to the `history_tree` column family that reads the tip tree value as raw
+    /// bytes. This should only be used by format-compatibility code.
+    pub(crate) fn raw_history_tree_value_cf(&self) -> RawHistoryTreeValueCf<'_> {
+        RawHistoryTreeValueCf::new(&self.db, HISTORY_TREE)
             .expect("column family was created when database was created")
     }
 

@@ -29,6 +29,7 @@ pub(crate) mod cache_genesis_roots;
 pub(crate) mod fix_tree_key_type;
 pub(crate) mod no_migration;
 pub(crate) mod prune_trees;
+pub(crate) mod rebuild_history_tree;
 pub(crate) mod tree_keys_and_caches_upgrade;
 
 #[cfg(not(feature = "indexer"))]
@@ -112,7 +113,8 @@ fn format_upgrades(
             Version::new(27, 2, 0),
         )),
         Box::new(add_ironwood_activation_tree::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 8])
+        Box::new(rebuild_history_tree::Upgrade),
+    ] as [Box<dyn DiskFormatUpgrade>; 9])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }

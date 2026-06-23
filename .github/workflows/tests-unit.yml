@@ -12,7 +12,7 @@ on:
       - .github/workflows/tests-unit.yml
 
   push:
-    branches: [ironwood-main, "feat/**", "release/**"]
+    branches: [ironwood-main]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -72,7 +72,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
         with:
           toolchain: ${{ matrix.rust-version }}
-          cache-key: unit-tests-${{ matrix.os }}-${{ matrix.rust-version }}-${{ matrix.features }}-${{ (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'A-release')) && 'debug' || 'release' }}
+          cache-key: unit-tests-${{ matrix.os }}-${{ matrix.rust-version }}-${{ matrix.features }}-${{ github.event_name == 'pull_request' && 'debug' || 'release' }}
           cache-on-failure: true
       - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
         with:
@@ -81,14 +81,14 @@ jobs:
 
       - name: Run unit tests
         run: |
-          if [[ "${RELEASE_TESTS}" == "true" ]]; then
-            cargo nextest run --profile all-tests --locked --release --features "${{ matrix.features }}" --run-ignored=all
+          if [[ "${FULL_COVERAGE}" == "true" ]]; then
+            export TEST_LARGE_CHECKPOINTS=1
+            cargo nextest run --profile full-tests --locked --release --features "${{ matrix.features }}" --run-ignored=all
           else
-            cargo nextest run --profile all-tests --locked --features "${{ matrix.features }}" --run-ignored=all
+            cargo nextest run --profile all-tests --locked --features "${{ matrix.features }}"
           fi
         env:
-          RELEASE_TESTS: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'A-release') }}
-          TEST_LARGE_CHECKPOINTS: 1
+          FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
 
   check-no-git-dependencies:
     name: Check no git dependencies

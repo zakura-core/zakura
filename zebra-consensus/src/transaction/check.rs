@@ -157,16 +157,29 @@ pub fn has_enough_ironwood_flags(tx: &Transaction) -> Result<(), TransactionErro
 
 /// Checks that Orchard shielded data does not enable cross-address transfers.
 ///
+/// PRE NU6.3, the flags do not contain this bit, as its unknown to the circuit.
 /// In the NU6.3 flag format, bit 2 is `enableCrossAddress`. The Orchard pool uses the Ironwood
 /// circuit in V6 transactions, but consensus still requires transactional Orchard bundles to keep
 /// cross-address transfers disabled. Ironwood shielded data is allowed to set this flag.
 pub fn orchard_cross_address_disabled(tx: &Transaction) -> Result<(), TransactionError> {
     if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
+        // bit will not be set pre NU6.3, and must equal 0 in NU 6.3 onwards.
         if orchard_shielded_data
             .flags
             .contains(Flags::ENABLE_CROSS_ADDRESS)
         {
             return Err(TransactionError::OrchardHasEnableCrossAddress);
+        }
+    }
+
+    Ok(())
+}
+
+/// Checks that Ironwood shielded data does enable cross-address transfers.
+pub fn ironwood_cross_address_enabled(tx: &Transaction) -> Result<(), TransactionError> {
+    if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
+        if !ironwood_shielded_data.flags.contains(Flags::ENABLE_CROSS_ADDRESS) {
+            return Err(TransactionError::IronwoodDoesNotHaveEnableCrossAddress);
         }
     }
 

@@ -189,11 +189,14 @@ pub enum TransactionError {
     #[error("must have at least one active orchard flag")]
     NotEnoughFlags,
 
-    #[error("must have at least one active ironwood flag")]
+    #[error("must have at least enable spend or enable output flag set")]
     NotEnoughIronwoodFlags,
 
     #[error("Orchard transactions MUST NOT have the EnableCrossAddress flag set")]
     OrchardHasEnableCrossAddress,
+
+    #[error("Ironwood transactions MUST have the EnableCrossAddress flag set")]
+    IronwoodDoesNotHaveEnableCrossAddress,
 
     #[error("could not find transparent input UTXO in the best chain or mempool")]
     TransparentInputNotFound,

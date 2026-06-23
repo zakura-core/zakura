@@ -44,6 +44,15 @@ pub mod metrics;
 /// The value was chosen by benchmarking over the sand-blasting region.
 pub(crate) const PARALLEL_BLOCK_TX_THRESHOLD: usize = 16;
 
+/// Minimum number of per-input/per-address database reads a block triggers before
+/// the committer's UTXO and address-balance lookups are spread across the rayon
+/// pool instead of run sequentially on the writer thread.
+///
+/// In the transparent-heavy ranges these point lookups are cache-served but
+/// serial, and dominate the per-block write time while most cores sit idle. Above
+/// this count the fan-out pays for the multithreading overhead.
+pub(crate) const PARALLEL_BLOCK_READ_THRESHOLD: usize = 16;
+
 pub mod prune;
 pub mod rollback;
 pub mod shielded;

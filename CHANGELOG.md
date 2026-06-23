@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   transaction-count threshold (`PARALLEL_BLOCK_TX_THRESHOLD = 16`) so small
   early-chain blocks, where the fork-join overhead would outweigh the work, run
   sequentially.
+- Parallelize the finalized writer's spent-UTXO and address-balance reads. In
+  transparent-heavy checkpoint ranges these cache-served point lookups were
+  issued serially on the writer thread; blocks with at least 16 reads now fan
+  them across the rayon pool and reuse each spent output location for the UTXO
+  lookup, reducing the serial read overhead without changing the committed batch.
 - Cache the `MerkleCRH^Orchard` Sinsemilla hash domain. The Orchard
   note-commitment Merkle hash previously rebuilt the Sinsemilla `HashDomain` —
   including a full `hash_to_curve` for its `Q` generator — on every node hash,

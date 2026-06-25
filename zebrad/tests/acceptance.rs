@@ -3406,7 +3406,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         );
     }
 
-    tracing::info!("restarting Zebra on Mainnet");
+    tracing::info!("restarting Zebra on Regtest");
 
     child.kill(false)?;
     let output = child.wait_with_output()?;
@@ -3416,16 +3416,14 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
 
     output.assert_failure()?;
 
-    let mut config = random_known_rpc_port_config(false, &Network::Mainnet)?;
+    let mut config = os_assigned_rpc_port_config(false, &net)?;
     config.state.ephemeral = false;
-    config.rpc.indexer_listen_addr = Some(std::net::SocketAddr::from((
-        [127, 0, 0, 1],
-        random_known_port(),
-    )));
-    let indexer_listen_addr = config.rpc.indexer_listen_addr.unwrap();
+    config.rpc.indexer_listen_addr = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
     let test_dir = testdir()?.with_config(&mut config)?;
 
-    let _child = test_dir.spawn_child(args!["start"])?;
+    let mut child = test_dir.spawn_child(args!["start"])?;
+    let _rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
+    let indexer_listen_addr = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
 
     tracing::info!("waiting for Zebra state cache to be opened");
 
@@ -3442,12 +3440,12 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         .await?
         .map_err(|err| eyre!(err))?;
 
-    tracing::info!("waiting for initial mainnet chain tip reset");
+    tracing::info!("waiting for initial regtest chain tip reset");
 
     let tip_action = timeout(LAUNCH_DELAY, chain_tip_change.wait_for_tip_change()).await??;
     assert!(
         tip_action.is_reset(),
-        "first mainnet tip action should be a reset"
+        "first regtest tip action should be a reset"
     );
 
     Ok(())

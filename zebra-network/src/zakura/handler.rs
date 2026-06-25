@@ -103,13 +103,23 @@ pub const DEFAULT_ZAKURA_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10)
 /// Minimum age of an incumbent Zakura connection before a duplicate connection
 /// for the same identity is allowed to evict it.
 ///
-/// Duplicates can be ordinary redial races while the incumbent is healthy and
-/// actively serving block sync. Evicting those incumbents drops in-flight body
-/// ranges and makes a fresh sync repeatedly re-download the same windows. Keep
-/// the incumbent through the transport idle timeout; genuinely dead connections
-/// are reaped by QUIC idle cleanup, and duplicate redials after that point can
-/// reclaim the slot without disturbing active transfers.
-pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(300);
+/// A duplicate for an already-connected identity is either a brief
+/// simultaneous-open race (both directions dial at once; the incumbent is
+/// brand-new, healthy, and must be kept so the connection does not flap) or a
+/// peer that has restarted and is redialing (the incumbent is a dead, stale
+/// connection that should be evicted so the redial reclaims the slot). Age
+/// distinguishes the two: a couple of keepalive intervals is long enough to
+/// clear the simultaneous-open race but short enough that a restarted peer is
+/// not stalled.
+///
+/// This MUST stay well below [`DEFAULT_ZAKURA_QUIC_IDLE_TIMEOUT`] (and the
+/// discovery redial settle window): the whole point of evicting here is to free
+/// the slot in milliseconds instead of waiting out the ~150s idle reaper. A
+/// value at or above the idle timeout makes the eviction shortcut unreachable —
+/// the dead incumbent is reaped by the idle timeout first, so a restarted peer
+/// stalls ~150s waiting for its own dead connection, which broke pure-Zakura
+/// genesis bootstrap on restart.
+pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(15);
 /// QUIC stream receive window used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 3 * 1024 * 1024;
 /// QUIC connection receive window used by Zakura endpoints.
@@ -5373,6 +5383,56 @@ mod tests {
         assert!(
             stale_incumbent.is_cancelled(),
             "a stale incumbent is evicted so the restarted peer's redial reclaims the slot",
+        );
+        assert!(
+            !newcomer.is_cancelled(),
+            "the rejected newcomer's token is never registered, so it is left to redial",
+        );
+
+        Ok(())
+    }
+
+    // Regression: a peer that restarts within the QUIC idle window (the common
+    // case — a restart takes seconds, far less than the 150s idle timeout) must
+    // still get its stale incumbent evicted promptly. The eviction shortcut
+    // exists precisely to beat the ~150s idle reaper, so its threshold must be
+    // BELOW the idle timeout; otherwise a restarted peer stalls ~150s waiting for
+    // its own dead connection to be reaped (the e2e restart-matrix genesis-
+    // bootstrap failure).
+    #[tokio::test(start_paused = true)]
+    async fn same_peer_reconnect_within_idle_window_evicts_stale_incumbent() -> Result<(), BoxError>
+    {
+        let supervisor = ZakuraSupervisorHandle::new(4);
+        let peer = test_peer(11);
+
+        // Incumbent: the peer's connection from before it restarts.
+        let incumbent = CancellationToken::new();
+        register_test_peer(&supervisor, peer.clone(), incumbent.clone()).await;
+
+        // A realistic restart gap: tens of seconds — well under the 150s QUIC
+        // idle timeout, so the dead incumbent has NOT been reaped when the peer
+        // redials with the same identity.
+        tokio::time::advance(Duration::from_secs(30)).await;
+
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
+        let newcomer = CancellationToken::new();
+        let registration = supervisor
+            .register(
+                peer.clone(),
+                None,
+                [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
+                outbound_handle,
+                newcomer.clone(),
+                ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
+            )
+            .await;
+
+        assert!(matches!(registration, ZakuraRegistration::Duplicate { .. }));
+        assert!(
+            incumbent.is_cancelled(),
+            "a peer that restarts within the idle window must have its stale \
+             incumbent evicted in seconds, not wait out the ~150s QUIC idle reaper",
         );
         assert!(
             !newcomer.is_cancelled(),

@@ -1,14 +1,12 @@
 //! Unmined Zcash transaction identifiers and transactions.
 //!
-//! Transaction version 5 is uniquely identified by [`WtxId`] when unmined, and
-//! [`struct@Hash`] in the blockchain. The effects of a v5 transaction
-//! (spends and outputs) are uniquely identified by the same
+//! Transaction versions 5 and 6 are uniquely identified by [`WtxId`] when
+//! unmined, and [`struct@Hash`] in the blockchain. The effects of a v5 or
+//! v6 transaction (spends and outputs) are uniquely identified by the same
 //! [`struct@Hash`] in both cases.
 //!
 //! Transaction versions 1-4 are uniquely identified by legacy
 //! [`struct@Hash`] transaction IDs, whether they have been mined or not.
-//! So Zebra, and the Zcash network protocol, don't use witnessed transaction
-//! IDs for them.
 //!
 //! Zebra's [`UnminedTxId`] and [`UnminedTx`] enums provide the correct unique
 //! ID for unmined transactions. They can be used to handle transactions
@@ -94,14 +92,14 @@ pub enum UnminedTxId {
     /// A legacy unmined transaction identifier.
     ///
     /// Used to uniquely identify unmined version 1-4 transactions.
-    /// (After v1-4 transactions are mined, they can be uniquely identified
-    /// using the same [`struct@Hash`].)
+    /// (After these transactions are mined, they can be identified using the
+    /// same [`struct@Hash`].)
     Legacy(Hash),
 
     /// A witnessed unmined transaction identifier.
     ///
-    /// Used to uniquely identify unmined version 5 transactions.
-    /// (After v5 transactions are mined, they can be uniquely identified
+    /// Used to uniquely identify unmined version 5 and 6 transactions.
+    /// (After v5 and v6 transactions are mined, they can be uniquely identified
     /// using only the [`struct@Hash`] in their `WtxId.id`.)
     ///
     /// For more details, see [`WtxId`].

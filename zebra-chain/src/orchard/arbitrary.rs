@@ -119,10 +119,20 @@ impl Arbitrary for Flags {
     type Parameters = ();
 
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        (any::<u8>()).prop_map(Self::from_bits_truncate).boxed()
+        orchard_flags_pre_nu6_3_strategy()
     }
 
     type Strategy = BoxedStrategy<Self>;
+}
+
+fn orchard_flags_pre_nu6_3_strategy() -> BoxedStrategy<Flags> {
+    prop_oneof![
+        Just(Flags::empty()),
+        Just(Flags::ENABLE_SPENDS),
+        Just(Flags::ENABLE_OUTPUTS),
+        Just(Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS),
+    ]
+    .boxed()
 }
 
 fn pallas_base_strat() -> BoxedStrategy<pallas::Base> {

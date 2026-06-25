@@ -241,13 +241,16 @@ impl TrustedPreallocate for Signature<SpendAuth> {
 bitflags! {
     /// Per-Transaction flags for Orchard.
     ///
-    /// The spend and output flags are passed to the `Halo2Proof` verifier, which verifies
-    /// the relevant note spending and creation consensus rules.
+    /// The spend, output, and cross-address flags are passed to the `Halo2Proof` verifier,
+    /// which verifies the relevant note spending and creation consensus rules.
     ///
     /// # Consensus
     ///
     /// > [NU5 onward] In a version 5 transaction, the reserved bits 2..7 of the flagsOrchard
     /// > field MUST be zero.
+    ///
+    /// [NU6.3 onward] In V6 Orchard-style bundle formats, bit 2 is `enableCrossAddress`, and bits
+    /// 3..7 are reserved.
     ///
     /// <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
     ///
@@ -261,6 +264,8 @@ bitflags! {
         const ENABLE_SPENDS = 0b00000001;
         /// Enable creating new non-zero valued Orchard notes.
         const ENABLE_OUTPUTS = 0b00000010;
+        /// Enable cross-address transfers in V6 Orchard-style bundle formats.
+        const ENABLE_CROSS_ADDRESS = 0b00000100;
     }
 }
 

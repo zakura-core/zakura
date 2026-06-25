@@ -31,9 +31,17 @@
 #   OUT_DIR               artifact output dir                  (default ./bench-out)
 #   METRICS_PORT          Prometheus port (auto-bumps if busy) (default 19999)
 #   LISTEN_PORT           P2P listen port  (auto-bumps if busy)(default 18233)
+#   DASHBOARD             1 = record metrics + emit bottleneck verdict (default 1)
+#   DASHBOARD_ARCHIVE     recorded-run dir the dashboard serves (default $BENCH_HOME/dashboard/runs)
+#   BUILD_FEATURES        cargo features for host builds (default prometheus,commit-metrics)
 #
 # Ports default high and auto-skip busy ones so the bench can coexist with another
 # zebrad already running on the host (which typically holds 8233 / 9999).
+#
+# Observability: each run records a Prometheus time series via scripts/zebra-metrics-dashboard.py
+# into DASHBOARD_ARCHIVE, classifies it into a commit/download/verify bottleneck verdict
+# (summary banner + verdict-*.json), and the always-on dashboard (scripts/zebra-dashboard.service)
+# replays every recorded run at http://<box>:8090/. See that unit file for one-time setup.
 set -euo pipefail
 
 # ---- inputs / defaults -------------------------------------------------------
@@ -58,6 +66,13 @@ SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-https://zebra-snapshots.nyc3.cdn.digitalocea
 BENCH_HOME="${BENCH_HOME:-/opt/zebra-bench}"
 GH_REPO="${GH_REPO:-valargroup/zebra}"
 OUT_DIR="${OUT_DIR:-$PWD/bench-out}"
+# Observability dashboard: record a per-run metrics time series + emit a bottleneck
+# verdict (commit / download / verify). DASHBOARD_ARCHIVE is where the always-on
+# dashboard service (scripts/zebra-dashboard.service) reads recorded runs from.
+DASHBOARD="${DASHBOARD:-1}"
+DASHBOARD_ARCHIVE="${DASHBOARD_ARCHIVE:-$BENCH_HOME/dashboard/runs}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DASHBOARD_PY="${DASHBOARD_PY:-$SCRIPT_DIR/zebra-metrics-dashboard.py}"
 
 SNAP_FILE="$(basename "$SNAPSHOT_URL")"
 MASTER="$BENCH_HOME/master-${START_HEIGHT}"
@@ -69,8 +84,9 @@ die()  { log "FATAL: $*"; exit 1; }
 
 # Always tear down a launched node + its fork, even on FATAL/interrupt, so a failed
 # run never leaves an orphan zebrad thrashing the box or a fork eating disk.
-CUR_PID=""; CUR_FORK=""
+CUR_PID=""; CUR_FORK=""; CUR_REC=""
 cleanup() {
+  [[ -n "$CUR_REC" ]] && kill "$CUR_REC" 2>/dev/null
   [[ -n "$CUR_PID" ]] && kill -9 "$CUR_PID" 2>/dev/null
   [[ -n "$CUR_FORK" ]] && rm -rf "$CUR_FORK" 2>/dev/null
   return 0
@@ -247,9 +263,11 @@ build_from_ref() {
 
   log "building $sha on host (incremental; first build is slow) ..." >&2
   git -C "$BUILD_SRC" checkout --quiet --detach "$full" >&2 || die "git checkout $sha failed"
+  # commit-metrics exports the per-phase commit histograms (update_trees, batch_commit, …)
+  # the dashboard needs for the commit-bottleneck signal. Override for refs predating it.
   ( cd "$BUILD_SRC" && \
     CARGO_TARGET_DIR="$BUILD_TARGET" CARGO_HOME="$BUILD_CARGO_HOME" CXXFLAGS="-include cstdint" \
-    cargo build --release -p zebrad --features prometheus --locked >&2 ) \
+    cargo build --release -p zebrad --features "${BUILD_FEATURES:-prometheus,commit-metrics}" --locked >&2 ) \
     || die "cargo build failed for $sha"
   local built="$BUILD_TARGET/release/zebrad"
   [[ -x "$built" ]] || die "build produced no zebrad binary for $sha"
@@ -358,6 +376,21 @@ run_one() {
     die "startup failure for $tag"
   fi
 
+  # Dashboard recorder sidecar: scrape this node's /metrics into a per-run series the
+  # always-on dashboard (scripts/zebra-dashboard.service) replays, and the classifier
+  # reads for the bottleneck verdict. Best-effort: a missing python3 never fails a bench.
+  local rec_dir=""
+  if [[ "$DASHBOARD" == "1" ]] && command -v python3 >/dev/null 2>&1 && [[ -f "$DASHBOARD_PY" ]]; then
+    rec_dir="$DASHBOARD_ARCHIVE/$run_id"
+    mkdir -p "$rec_dir"
+    python3 "$DASHBOARD_PY" --no-serve --record "$rec_dir" \
+      --target "127.0.0.1:$METRICS_PORT" --interval 2 \
+      --label "$tag" --ckpt-limit "$CKPT_LIMIT" --dl-limit "$DL_LIMIT" \
+      >"$OUT_DIR/dashboard-recorder-$prefix.log" 2>&1 &
+    CUR_REC=$!
+    log "dashboard recorder pid $CUR_REC -> $rec_dir"
+  fi
+
   echo "epoch,elapsed,height" > "$csv"
   local t_escape="" end_height="$START_HEIGHT" h now elapsed clean_stop=0
   while :; do
@@ -382,6 +415,9 @@ run_one() {
     sleep "$SAMPLE_INTERVAL"
   done
   local t_end; t_end=$(date +%s)
+
+  # stop the recorder (node is gone / about to be); give it a moment to flush jsonl
+  if [[ -n "$CUR_REC" ]]; then kill "$CUR_REC" 2>/dev/null || true; wait "$CUR_REC" 2>/dev/null || true; CUR_REC=""; fi
 
   # a clean exit means zebrad committed through debug_stop_at_height; otherwise the
   # last sane in-loop sample stands (wall-capped). The metrics endpoint is gone after
@@ -413,6 +449,22 @@ run_one() {
   rm -rf "$fork" "$cfg"   # reclaim divergent SSTs; keep csv/log artifacts
   CUR_PID=""; CUR_FORK=""
 
+  # Bottleneck verdict: classify the recorded series into commit / download / verify.
+  # The archive keeps the canonical run; copy the series + verdict into the artifact dir.
+  RESULT_VERDICT=""; RESULT_VERDICT_MD=""
+  if [[ -n "$rec_dir" && -f "$rec_dir/samples.jsonl" ]]; then
+    cp "$rec_dir/samples.jsonl" "$OUT_DIR/samples-$prefix.jsonl" 2>/dev/null || true
+    cp "$rec_dir/meta.json"     "$OUT_DIR/dashboard-meta-$prefix.json" 2>/dev/null || true
+    local md="$OUT_DIR/verdict-$prefix.md"
+    if python3 "$DASHBOARD_PY" --classify "$rec_dir" \
+         --verdict-out "$OUT_DIR/verdict-$prefix.json" --label "$tag" \
+         --ckpt-limit "$CKPT_LIMIT" --dl-limit "$DL_LIMIT" >"$md" 2>/dev/null; then
+      RESULT_VERDICT_MD="$md"
+      RESULT_VERDICT="$(awk -F'\\*\\*' '/^\*\*/{print $2; exit}' "$md")"
+      log "bottleneck verdict: ${RESULT_VERDICT:-n/a}"
+    fi
+  fi
+
   RESULT_TAG="$tag"; RESULT_START="$START_HEIGHT"; RESULT_END="$end_height"
   RESULT_BLOCKS="$blocks"; RESULT_TIME="$total"; RESULT_POST="$post"
   RESULT_BPS="$bps"; RESULT_PBPS="$pbps"; RESULT_STALLED="$stalled"; RESULT_ERRS="$errs"
@@ -431,6 +483,7 @@ blocks covered: $RESULT_BLOCKS
 time taken:     ${RESULT_TIME} s
 blocks/s:       $RESULT_BPS        (post-first-commit: $RESULT_PBPS blocks/s over ${RESULT_POST}s)
 reached stop:   $( [[ "$RESULT_STALLED" == no ]] && echo yes || echo "$RESULT_STALLED" )
+bottleneck:     ${RESULT_VERDICT:-n/a (no recorded series)}
 EOF
   if [[ -n "$RESULT_ERRS" ]]; then printf 'WARNING — log errors:\n%s\n' "$RESULT_ERRS"; fi
 }
@@ -468,17 +521,22 @@ SUMMARY="${GITHUB_STEP_SUMMARY:-$OUT_DIR/summary.md}"
   echo "|--------|-----------:|---------------:|-----------:|---------:|------------------:|"
 } >> "$SUMMARY"
 
+# append a recorded run's bottleneck-verdict banner below the throughput table
+append_verdict() { [[ -n "$1" && -f "$1" ]] && { echo ""; cat "$1"; } >> "$SUMMARY"; }
+
 if [[ -n "$BASELINE_SPEC" ]]; then
   log "A/B mode: baseline='$BASELINE_SPEC' vs primary='$PRIMARY_SPEC'"
   run_one "$BASELINE_SPEC" "baseline"; print_one "(baseline)"; summary_row "$BASELINE_SPEC (baseline)" >> "$SUMMARY"
-  B_BPS="$RESULT_BPS"
+  B_BPS="$RESULT_BPS"; B_VERDICT_MD="$RESULT_VERDICT_MD"
   run_one "$PRIMARY_SPEC" "primary";  print_one "(primary)";  summary_row "$PRIMARY_SPEC (primary)"  >> "$SUMMARY"
-  R_BPS="$RESULT_BPS"
+  R_BPS="$RESULT_BPS"; R_VERDICT_MD="$RESULT_VERDICT_MD"
   SPEEDUP="$(awk -v r="$R_BPS" -v b="$B_BPS" 'BEGIN{ if (b>0) printf "%.2f", r/b; else print "n/a" }')"
   { echo ""; echo "**Speedup:** ${B_BPS} → ${R_BPS} blocks/s = **${SPEEDUP}×**"; } >> "$SUMMARY"
   printf '\n=== A/B: %s -> %s = %s× faster ===\n' "$B_BPS" "$R_BPS" "$SPEEDUP"
+  append_verdict "$B_VERDICT_MD"; append_verdict "$R_VERDICT_MD"
 else
   run_one "$PRIMARY_SPEC" "primary"; print_one ""; summary_row "$PRIMARY_SPEC" >> "$SUMMARY"
+  append_verdict "$RESULT_VERDICT_MD"
 fi
 
-log "done. artifacts in $OUT_DIR"
+log "done. artifacts in $OUT_DIR (dashboard archive: $DASHBOARD_ARCHIVE)"

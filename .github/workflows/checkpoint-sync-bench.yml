@@ -7,9 +7,17 @@ name: Checkpoint-sync benchmark
 # peer, and reports: time taken, blocks covered, blocks/s. Demonstrates the checkpoint-sync
 # throughput work (CHECKPOINT_SYNC_FINDINGS.md / PARALLEL_IDEA.md).
 #
+# Each run also records a Prometheus time series and classifies the run into a single
+# bottleneck verdict — commit-starved / download-bound / verify-bound — shown in the step
+# summary and saved as verdict-*.json. The recorded series feed an always-on dashboard
+# on the runner (scripts/zebra-dashboard.service) at http://<box>:8090/, where you can log
+# in and replay any past run's charts.
+#
 # Runs on the roman-zakura-3 self-hosted runner (label `zakura-bench`). One-time setup:
-# register the runner and set the BENCH_* repo Actions variables (see
-# scripts/checkpoint-sync-bench.sh header and the repo runbook).
+# register the runner, set the BENCH_* repo Actions variables (see
+# scripts/checkpoint-sync-bench.sh header and the repo runbook), and install the dashboard
+# service once: `sudo cp scripts/zebra-dashboard.service /etc/systemd/system/ &&
+# sudo systemctl enable --now zebra-dashboard` (see that file's header).
 
 on:
   workflow_dispatch:
@@ -96,6 +104,10 @@ jobs:
           START_HEIGHT: ${{ vars.BENCH_SNAPSHOT_START_HEIGHT || '1707210' }}
           BENCH_HOME: ${{ vars.BENCH_HOME || '/opt/zebra-bench' }}
           OUT_DIR: ${{ github.workspace }}/bench-out
+          # record metrics + emit the bottleneck verdict; the always-on dashboard service
+          # serves this archive dir. Disable with the BENCH_DASHBOARD repo var = '0'.
+          DASHBOARD: ${{ vars.BENCH_DASHBOARD || '1' }}
+          DASHBOARD_ARCHIVE: ${{ vars.BENCH_DASHBOARD_ARCHIVE || '/opt/zebra-bench/dashboard/runs' }}
         run: bash scripts/checkpoint-sync-bench.sh
 
       - name: Upload benchmark artifacts

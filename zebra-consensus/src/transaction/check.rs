@@ -268,6 +268,29 @@ pub fn disabled_add_to_orchard_pool(
     Ok(())
 }
 
+/// Check that a coinbase transaction has no Orchard shielded bundle after NU6.3.
+///
+/// From NU6.3 onward, shielded coinbase outputs use the Ironwood pool instead
+/// of the Orchard pool. This structural rule is distinct from
+/// [`disabled_add_to_orchard_pool`], which only rejects net additions to the
+/// Orchard pool.
+pub fn coinbase_has_no_orchard_shielded_data(
+    tx: &Transaction,
+    height: Height,
+    network: &Network,
+) -> Result<(), TransactionError> {
+    let Some(nu6_3_activation_height) = NetworkUpgrade::Nu6_3.activation_height(network) else {
+        return Ok(());
+    };
+
+    if height >= nu6_3_activation_height && tx.is_coinbase() && tx.orchard_shielded_data().is_some()
+    {
+        return Err(TransactionError::CoinbaseHasOrchardShieldedData);
+    }
+
+    Ok(())
+}
+
 /// Check if a transaction has any internal spend conflicts.
 ///
 /// An internal spend conflict happens if the transaction spends a UTXO more than once or if it

@@ -3738,6 +3738,61 @@ fn add_to_orchard_pool_after_nu6_3() {
     );
 }
 
+#[test]
+fn coinbase_orchard_bundle_after_nu6_3() {
+    let _init_guard = zebra_test::init();
+
+    let nu6_3_height = Height(10);
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_3: Some(nu6_3_height.0),
+            ..Default::default()
+        })
+        .expect("failed to set NU6.3 activation height")
+        .clear_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+
+    let mut tx = v5_transactions(Network::new_default_testnet().block_iter())
+        .find(|tx| tx.orchard_shielded_data().is_some())
+        .expect("test vectors include a transaction with Orchard shielded data");
+
+    *tx.inputs_mut() = vec![transparent::Input::Coinbase {
+        height: nu6_3_height,
+        data: vec![],
+        sequence: u32::MAX,
+    }];
+
+    *tx.orchard_value_balance_mut()
+        .expect("transaction has Orchard shielded data") = Amount::<NegativeAllowed>::zero();
+
+    assert!(tx.is_coinbase());
+    assert_eq!(
+        check::coinbase_has_no_orchard_shielded_data(&tx, nu6_3_height, &network),
+        Err(TransactionError::CoinbaseHasOrchardShieldedData),
+        "coinbase Orchard bundles are rejected after NU6.3"
+    );
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&tx, nu6_3_height, &network),
+        Ok(()),
+        "zero-balance coinbase Orchard bundles need the structural check"
+    );
+    assert_eq!(
+        check::coinbase_has_no_orchard_shielded_data(
+            &tx,
+            (nu6_3_height - 1).expect("NU6.3 is not genesis"),
+            &network,
+        ),
+        Ok(()),
+        "coinbase Orchard bundles are still allowed before NU6.3"
+    );
+    assert_eq!(
+        check::coinbase_has_no_orchard_shielded_data(&tx, nu6_3_height, &Network::Mainnet),
+        Ok(()),
+        "the rule is inactive when NU6.3 is unscheduled"
+    );
+}
+
 /// Checks that Heartwood onward, all Sapling and Orchard outputs in coinbase txs decrypt to a note
 /// plaintext, i.e. the procedure in § 4.20.3 ‘Decryption using a Full Viewing Key (Sapling and
 /// Orchard )’ does not return ⊥, using a sequence of 32 zero bytes as the outgoing viewing key. We

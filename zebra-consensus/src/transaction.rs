@@ -450,6 +450,7 @@ where
 
             if tx.is_coinbase() {
                 check::coinbase_tx_no_prevout_joinsplit_spend(&tx)?;
+                check::coinbase_has_no_orchard_shielded_data(&tx, req.height(), &network)?;
             } else if !tx.is_valid_non_coinbase() {
                 return Err(TransactionError::NonCoinbaseHasCoinbaseInput);
             }

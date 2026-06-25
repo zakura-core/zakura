@@ -34,8 +34,12 @@ on:
         description: "Maximum candidates to triage. Must be between 1 and 25."
         type: string
         default: "25"
+  # Daily upstream triage (was an hourly cron — 24x/day and wasteful). Runs will
+  # fail until the org GitHub Actions billing/spending-limit block is cleared,
+  # then resume normally; the CODEX_API_KEY secret used by the codex-patch job is
+  # already configured.
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17 6 * * *"
 
 permissions: {}
 

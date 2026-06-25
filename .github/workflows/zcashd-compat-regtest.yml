@@ -7,6 +7,18 @@ name: zcashd-compat Regtest
 on:
   push:
     branches: [main]
+    # Only run the 120-min suite when something that can affect it changes;
+    # skip doc-only / CI-only pushes to main.
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - .cargo/config.toml
+      - Makefile
+      - make/**
+      - .config/nextest.toml
+      - .github/actions/setup-zebra-build/**
+      - .github/workflows/zcashd-compat-regtest.yml
 
   workflow_dispatch:
 

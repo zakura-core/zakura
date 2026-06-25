@@ -138,12 +138,21 @@ def int_field(row: dict[str, Any], field: str) -> int | None:
 
 
 def row_key(row: TraceRow) -> tuple[str, Any] | None:
-    token = int_field(row.row, "apply_token")
-    if token is not None:
-        return ("token", token)
-
     height = int_field(row.row, "height")
     block_hash = row.row.get("hash")
+
+    token = int_field(row.row, "apply_token")
+    if token is not None:
+        # `apply_token` is a recycled small integer: it repeats across blocks and
+        # across a node's multiple from-zero lifetimes (whose per-node JSONL is
+        # concatenated with per-lifetime clocks). Keying a commit pair by token
+        # alone lets a `commit_start` match a different-height `commit_finish`
+        # that merely reuses the token, inventing a false elapsed-window stall.
+        # Pin the key to a single commit by including height+hash when present.
+        if height is not None and block_hash is not None:
+            return ("token", token, height, block_hash)
+        return ("token", token)
+
     if height is not None and block_hash is not None:
         return ("height_hash", (height, block_hash))
 
@@ -847,6 +856,59 @@ def run_self_test() -> None:
             ],
         )
         assert not run_oracle(root / "good"), "good trace should pass"
+
+        # Regression: `apply_token` is recycled across blocks and across a node's
+        # multiple from-zero lifetimes, whose per-node JSONL is concatenated with
+        # per-lifetime clocks. A height-3961 finish (late, ts ~1.82e9) and a
+        # height-232 start from a later lifetime (clock reset to ts ~9e6) share
+        # token 232; keying commit pairs by token alone mispairs them into a
+        # bogus ~30-min "stall" even though each real commit is fast.
+        recycled_token = root / "recycled_token" / "node2"
+        write_jsonl(
+            recycled_token / "commit_state.jsonl",
+            [
+                {
+                    "ts": 1_820_614_570,
+                    "event": COMMIT_START,
+                    "apply_token": 232,
+                    "apply_class": APPLY_CLASS_FULL,
+                    "height": 3961,
+                    "hash": "bb",
+                },
+                {
+                    "ts": 1_820_622_377,
+                    "event": COMMIT_FINISH,
+                    "apply_token": 232,
+                    "apply_class": APPLY_CLASS_FULL,
+                    "height": 3961,
+                    "hash": "bb",
+                    "elapsed_ms": 7,
+                    "result": "duplicate",
+                },
+                {
+                    "ts": 9_041_826,
+                    "event": COMMIT_START,
+                    "apply_token": 232,
+                    "apply_class": APPLY_CLASS_FULL,
+                    "height": 232,
+                    "hash": "aa",
+                },
+                {
+                    "ts": 9_111_826,
+                    "event": COMMIT_FINISH,
+                    "apply_token": 232,
+                    "apply_class": APPLY_CLASS_FULL,
+                    "height": 232,
+                    "hash": "aa",
+                    "elapsed_ms": 69,
+                    "result": "committed",
+                },
+            ],
+        )
+        assert not any(
+            f.invariant == "commit_finish_within_elapsed_window"
+            for f in run_oracle(root / "recycled_token")
+        ), "recycled apply_token across heights must not be mispaired into a false stall"
 
         handoff = root / "handoff" / "node2"
         write_jsonl(

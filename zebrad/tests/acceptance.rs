@@ -2995,17 +2995,50 @@ async fn regtest_block_templates_are_valid_block_submissions() -> Result<()> {
 /// (including non-finalized blocks), not just the finalized-database tip.
 #[tokio::test]
 async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Result<()> {
-    use zebra_state::constants::MAX_BLOCK_REORG_HEIGHT;
-
     let _init_guard = zebra_test::init();
 
-    let network = Network::new_regtest(
+    let network_without_checkpoints = Network::new_regtest(
         ConfiguredActivationHeights {
             nu5: Some(100),
             ..Default::default()
         }
         .into(),
     );
+    let mut config = os_assigned_rpc_port_config(false, &network_without_checkpoints)?;
+    config.mempool.debug_enable_at_height = Some(0);
+
+    let mut zebrad = testdir()?
+        .with_config(&mut config)?
+        .spawn_child(args!["start"])?;
+    let rpc_address = read_listen_addr_from_logs(&mut zebrad, OPENED_RPC_ENDPOINT_MSG)?;
+
+    zebrad.expect_stdout_line_matches("activating mempool")?;
+
+    let client = RpcRequestClient::new(rpc_address);
+    client.generate(1).await?;
+
+    let block1 = client
+        .get_block(1)
+        .await
+        .map_err(|err| eyre::eyre!(err))?
+        .expect("block at height 1 should exist");
+
+    zebrad.kill(false)?;
+    let output = zebrad.wait_with_output()?;
+    output.assert_failure()?.assert_was_killed()?;
+
+    let checkpoints = ConfiguredCheckpoints::HeightsAndHashes(vec![
+        (Height(0), network_without_checkpoints.genesis_hash()),
+        (Height(1), block1.hash()),
+    ]);
+    let network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu5: Some(100),
+            ..Default::default()
+        },
+        checkpoints: Some(checkpoints),
+        ..Default::default()
+    });
     let mut config = os_assigned_rpc_port_config(false, &network)?;
     config.mempool.debug_enable_at_height = Some(0);
 
@@ -3014,27 +3047,23 @@ async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Resul
         .spawn_child(args!["start"])?;
     let rpc_address = read_listen_addr_from_logs(&mut zebrad, OPENED_RPC_ENDPOINT_MSG)?;
 
-    tokio::time::sleep(LAUNCH_DELAY).await;
+    zebrad.expect_stdout_line_matches("activating mempool")?;
 
     let client = RpcRequestClient::new(rpc_address);
+    client
+        .submit_block(Arc::unwrap_or_clone(block1.clone()))
+        .await?;
+    client.generate(1).await?;
 
-    // Mine enough blocks to push the first few blocks into the finalized state.
-    // Block at height 2 is finalized once tip > 2 + MAX_BLOCK_REORG_HEIGHT = 101.
-    let blocks_to_mine = MAX_BLOCK_REORG_HEIGHT + 10;
-    client.generate(blocks_to_mine).await?;
-
-    // Get the coinbase txid from block 2 (it will be in the finalized DB).
-    let block2 = client
-        .get_block(2)
-        .await
-        .map_err(|err| eyre::eyre!(err))?
-        .expect("block at height 2 should exist");
-    let txid = block2.transactions[0].hash();
+    // Get the coinbase txid from block 1, which is finalized by the
+    // configured checkpoint. The current tip is block 2, which is
+    // non-finalized.
+    let txid = block1.transactions[0].hash();
 
     // Confirm the tip height and compute expected confirmations.
     let info = client.blockchain_info().await?;
     let tip_height = info.blocks().0;
-    let expected_confirmations = 1 + tip_height - 2;
+    let expected_confirmations = tip_height;
 
     // getrawtransaction verbose=1 returns a JSON object that includes `confirmations`.
     let response: Value = client
@@ -4054,10 +4083,13 @@ fn check_no_git_dependencies() {
 
 #[tokio::test]
 async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
+    const INITIAL_NON_FINALIZED_BLOCKS: u32 = 3;
+
     let network = Network::new_regtest(Default::default());
 
     let mut config = os_assigned_rpc_port_config(false, &network)?;
     config.state.ephemeral = false;
+    config.state.debug_skip_non_finalized_state_backup_task = true;
     let test_dir = testdir()?.with_config(&mut config)?;
 
     // Start Zebra and generate some blocks.
@@ -4070,23 +4102,20 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     // Wait for Zebra to load its state cache
     tokio::time::sleep(Duration::from_secs(5)).await;
     let rpc_client = RpcRequestClient::new(rpc_address);
-    let generated_block_hashes = rpc_client.generate(50).await?;
-    // Wait for non-finalized backup task to make a second write to the backup cache
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    let generated_block_hashes = rpc_client.generate(INITIAL_NON_FINALIZED_BLOCKS).await?;
 
     child.kill(true)?;
     // Wait for zebrad to fully terminate to ensure database lock is released.
     child
         .wait_with_output()
         .wrap_err("failed to wait for zebrad to fully terminate")?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
     // Prepare checkpoint heights/hashes
     let last_hash = *generated_block_hashes
         .last()
         .expect("should have at least one block hash");
     let configured_checkpoints = ConfiguredCheckpoints::HeightsAndHashes(vec![
         (Height(0), network.genesis_hash()),
-        (Height(50), last_hash),
+        (Height(INITIAL_NON_FINALIZED_BLOCKS), last_hash),
     ]);
 
     // Check that Zebra will restore its non-finalized state from backup when the finalized tip is past the
@@ -4114,14 +4143,14 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
 
     tracing::info!("checking that Zebra can commit blocks after restoring non-finalized state");
     rpc_client
-        .generate(10)
+        .generate(1)
         .await
         .expect("should successfully commit more blocks to the state");
 
     tracing::info!("retrieving blocks to be used with configured checkpoints");
     let checkpointed_blocks = {
         let mut blocks = Vec::new();
-        for height in 1..=50 {
+        for height in 1..=INITIAL_NON_FINALIZED_BLOCKS.try_into()? {
             blocks.push(
                 rpc_client
                     .get_block(height)
@@ -4142,7 +4171,6 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     child
         .wait_with_output()
         .wrap_err("failed to wait for zebrad to fully terminate")?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Check that the non-finalized state is not restored from backup when the finalized tip height is below the
     // max checkpoint height and that it can still commit more blocks to its state
@@ -4180,11 +4208,11 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
         result?
     }
 
-    // Commit some blocks to check that Zebra's state will still commit blocks, and generate enough blocks
-    // for Zebra's finalized tip to pass the max checkpoint height.
+    // Commit a block to check that Zebra's state will still commit blocks
+    // after checkpoint verification.
 
     rpc_client
-        .generate(200)
+        .generate(1)
         .await
         .expect("should successfully commit more blocks to the state");
 
@@ -4193,7 +4221,6 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
     child
         .wait_with_output()
         .wrap_err("failed to wait for zebrad process to exit after kill")?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Check that Zebra will can commit blocks to its state when its finalized tip is past the max checkpoint height
     // and the non-finalized backup cache is disabled or empty.
@@ -4214,7 +4241,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
 
     tracing::info!("checking that Zebra commits blocks with empty non-finalized state");
     rpc_client
-        .generate(10)
+        .generate(1)
         .await
         .expect("should successfully commit more blocks to the state");
 

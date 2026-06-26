@@ -239,7 +239,12 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     // This placeholder matches the placeholder `BranchId::Nu6_3 = 0xffff_ffff`
     // in our Ironwood librustzcash, so that `Transaction::to_librustzcash`
     // resolves v6 transactions to the fork's NU6.3 branch id.
-    #[cfg(any(test, feature = "zebra-test"))]
+    //
+    // Kept unconditional, like the Nu7 entry below: the finalized-state
+    // history-tree path resolves `Nu6_3.branch_id()` for any network that
+    // configures a NU6.3 activation height, including no-`zcash_unstable` test
+    // builds, where a missing entry makes `branch_id()` return `None` and panics
+    // ("must have branch ID for chain history network upgrades").
     (Nu6_3, ConsensusBranchId(0xffffffff)),
     // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
     (Nu7, ConsensusBranchId(0xfffffffe)),

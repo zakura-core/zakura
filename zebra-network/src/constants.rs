@@ -321,6 +321,11 @@ pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize =
 /// messages from each of our peers.
 pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_170; // NU6.3 Mainnet.
+#[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
+const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_150; // NU6.2 (Mainnet + Testnet).
+
 /// The Zcash network protocol version implemented by this crate, and advertised
 /// during connection setup.
 ///
@@ -332,10 +337,9 @@ pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 ///
 /// This version of Zebra draws the current network protocol version from
 /// [ZIP-255](https://zips.z.cash/zip-0255).
-// TODO: Update this constant to the correct value after NU7 activation (see NU deployment ZIPs),
-pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_150); // NU6.2 (Mainnet + Testnet).
-                                                                        // pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_160); // NU7 Testnet.
-                                                                        // pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_170); // NU7 Mainnet.
+// TODO: Update this constant to the correct value after NU6.3 activation (see NU deployment ZIPs),
+pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version =
+    Version(CURRENT_NETWORK_PROTOCOL_VERSION_VALUE);
 
 /// The default RTT estimate for peer responses.
 ///
@@ -398,7 +402,7 @@ lazy_static! {
     ///
     /// The minimum network protocol version typically changes after Mainnet and
     /// Testnet network upgrades.
-    // TODO: Change `Nu6` to `Nu7` after NU7 activation.
+    // TODO: Change `Nu6` to `Nu6_3` after NU6.3 activation.
     // TODO: Move the value here to a field on `testnet::Parameters` (#8367)
     pub static ref INITIAL_MIN_NETWORK_PROTOCOL_VERSION: HashMap<NetworkKind, Version> = {
         let mut hash_map = HashMap::new();

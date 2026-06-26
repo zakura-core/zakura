@@ -286,6 +286,21 @@ impl PrecomputedTxData {
         self.tx_data.orchard_bundle().cloned()
     }
 
+    /// Returns the Ironwood bundle in `tx_data`.
+    pub fn ironwood_bundle(
+        &self,
+    ) -> Option<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>> {
+        #[cfg(zcash_unstable = "nu6.3")]
+        {
+            self.tx_data.ironwood_bundle().cloned()
+        }
+
+        #[cfg(not(zcash_unstable = "nu6.3"))]
+        {
+            None
+        }
+    }
+
     /// Returns the Sapling bundle in `tx_data`.
     pub fn sapling_bundle(
         &self,

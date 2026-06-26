@@ -329,6 +329,7 @@ fn mock_transparent_transaction(
             expiry_height,
             sapling_shielded_data: None,
             orchard_shielded_data: None,
+            ironwood_shielded_data: None,
             network_upgrade,
         },
         invalid_version => unreachable!("invalid transaction version: {}", invalid_version),

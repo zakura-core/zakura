@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ValueBalance` now has an Ironwood value-pool slot, with
   `from_ironwood_amount`, `ironwood_amount`, and
   `set_ironwood_value_balance` helpers.
+- `ironwood` module re-exporting Orchard-style Ironwood bundle types.
+- `Transaction::V6::ironwood_shielded_data` and Ironwood accessors on
+  `Transaction`, including actions, nullifiers, note commitments, flags,
+  shielded-data presence, flag sufficiency, and value balance.
+- `SigHasher::ironwood_bundle`.
 
 ## [9.0.0] - 2026-06-02
 

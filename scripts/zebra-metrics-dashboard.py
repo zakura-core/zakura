@@ -359,8 +359,8 @@ class Collector:
             "vf":  bare(m, "state_vct_fast_block_count"),
             "vl":  bare(m, "state_vct_legacy_block_count"),
             "vh":  bare(m, "checkpoint_verified_height"),
-            "nin": total(m, "zcash_net_in_bytes_total"),
-            "nout":total(m, "zcash_net_out_bytes_total"),
+            "net_in": total(m, "zcash_net_in_bytes_total"),
+            "net_out": total(m, "zcash_net_out_bytes_total"),
             "cm_s":bare(m, "zebra_committer_commit_duration_seconds_sum"),
             "cm_c":bare(m, "zebra_committer_commit_duration_seconds_count"),
             "nt_s":bare(m, "zebra_state_write_update_trees_duration_seconds_sum"),
@@ -387,8 +387,8 @@ class Collector:
             d["verified_per_s"]= rate(p["vh"], cur["vh"], dt)
             d["vct_fast_s"]    = rate(p["vf"], cur["vf"], dt)
             d["vct_legacy_s"]  = rate(p["vl"], cur["vl"], dt)
-            ni = rate(p["nin"], cur["nin"], dt);  d["net_in_mbps"]  = ni/1e6 if ni is not None else None
-            no = rate(p["nout"],cur["nout"],dt);  d["net_out_mbps"] = no/1e6 if no is not None else None
+            ni = rate(p["net_in"], cur["net_in"], dt);  d["net_in_mbps"]  = ni/1e6 if ni is not None else None
+            no = rate(p["net_out"], cur["net_out"], dt);  d["net_out_mbps"] = no/1e6 if no is not None else None
             d["p_note_tree"]    = avg(p["nt_s"], cur["nt_s"], p["nt_c"], cur["nt_c"])
             d["p_write_block"]  = avg(p["wb_s"], cur["wb_s"], p["wb_c"], cur["wb_c"])
             d["p_batch_commit"] = avg(p["bc_s"], cur["bc_s"], p["bc_c"], cur["bc_c"])

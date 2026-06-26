@@ -815,9 +815,17 @@ impl ZcashSerialize for Transaction {
                 outputs,
                 sapling_shielded_data,
                 orchard_shielded_data,
+                ironwood_shielded_data,
             } => {
+                if *network_upgrade != NetworkUpgrade::Nu6_3 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "v6 transaction must have NU6.3 consensus branch ID",
+                    ));
+                }
+
                 // Transaction V6 spec:
-                // https://zips.z.cash/zip-0230#specification
+                // https://zips.z.cash/zip-0229
 
                 // Denoted as `nVersionGroupId` in the spec.
                 writer.write_u32::<LittleEndian>(TX_V6_VERSION_GROUP_ID)?;
@@ -841,9 +849,10 @@ impl ZcashSerialize for Transaction {
                 // Denoted as `tx_out_count` and `tx_out` in the spec.
                 outputs.zcash_serialize(&mut writer)?;
 
-                // A bundle of fields denoted in the spec as `nSpendsSapling`, `vSpendsSapling`,
-                // `nOutputsSapling`,`vOutputsSapling`, `valueBalanceSapling`, `anchorSapling`,
-                // `vSpendProofsSapling`, `vSpendAuthSigsSapling`, `vOutputProofsSapling` and
+                // A bundle of fields denoted in the spec as `nSpendsSapling`,
+                // `vSpendsSapling`, `nOutputsSapling`, `vOutputsSapling`,
+                // `valueBalanceSapling`, `anchorSapling`, `vSpendProofsSapling`,
+                // `vSpendAuthSigsSapling`, `vOutputProofsSapling` and
                 // `bindingSigSapling`.
                 sapling_shielded_data.zcash_serialize(&mut writer)?;
 
@@ -852,6 +861,16 @@ impl ZcashSerialize for Transaction {
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
                 serialize_optional_orchard_shielded_data_with_flags(
                     orchard_shielded_data,
+                    &mut writer,
+                    ALLOW_CROSS_ADDRESS_BIT,
+                )?;
+
+                // A bundle of fields denoted in the spec as `nActionsIronwood`,
+                // `vActionsIronwood`, `flagsIronwood`, `valueBalanceIronwood`,
+                // `anchorIronwood`, `sizeProofsIronwood`, `proofsIronwood`,
+                // `vSpendAuthSigsIronwood`, and `bindingSigIronwood`.
+                serialize_optional_orchard_shielded_data_with_flags(
+                    ironwood_shielded_data,
                     &mut writer,
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
@@ -1152,6 +1171,9 @@ impl ZcashDeserialize for Transaction {
             }
             #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             (6, true) => {
+                // Transaction V6 spec:
+                // https://zips.z.cash/zip-0229
+
                 // Denoted as `nVersionGroupId` in the spec.
                 let id = limited_reader.read_u32::<LittleEndian>()?;
                 if id != TX_V6_VERSION_GROUP_ID {
@@ -1161,11 +1183,9 @@ impl ZcashDeserialize for Transaction {
                 // Convert it to a NetworkUpgrade
                 let network_upgrade =
                     NetworkUpgrade::try_from(limited_reader.read_u32::<LittleEndian>()?)?;
-                // V6 transactions are only valid from NU5 onward, so reject
-                // transactions with pre-NU5 consensus branch IDs.
-                if network_upgrade < NetworkUpgrade::Nu5 {
+                if network_upgrade != NetworkUpgrade::Nu6_3 {
                     return Err(SerializationError::Parse(
-                        "v6 transaction must have NU5 or later consensus branch ID",
+                        "v6 transaction must have NU6.3 consensus branch ID",
                     ));
                 }
                 // Denoted as `lock_time` in the spec.
@@ -1183,9 +1203,10 @@ impl ZcashDeserialize for Transaction {
                 let is_coinbase = inputs.len() == 1
                     && matches!(inputs.first(), Some(transparent::Input::Coinbase { .. }));
 
-                // A bundle of fields denoted in the spec as `nSpendsSapling`, `vSpendsSapling`,
-                // `nOutputsSapling`,`vOutputsSapling`, `valueBalanceSapling`, `anchorSapling`,
-                // `vSpendProofsSapling`, `vSpendAuthSigsSapling`, `vOutputProofsSapling` and
+                // A bundle of fields denoted in the spec as `nSpendsSapling`,
+                // `vSpendsSapling`, `nOutputsSapling`, `vOutputsSapling`,
+                // `valueBalanceSapling`, `anchorSapling`, `vSpendProofsSapling`,
+                // `vSpendAuthSigsSapling`, `vOutputProofsSapling` and
                 // `bindingSigSapling`.
                 let sapling_shielded_data =
                     deserialize_v5_sapling_shielded_data(&mut limited_reader, is_coinbase)?;
@@ -1198,6 +1219,15 @@ impl ZcashDeserialize for Transaction {
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
 
+                // A bundle of fields denoted in the spec as `nActionsIronwood`,
+                // `vActionsIronwood`, `flagsIronwood`, `valueBalanceIronwood`,
+                // `anchorIronwood`, `sizeProofsIronwood`, `proofsIronwood`,
+                // `vSpendAuthSigsIronwood`, and `bindingSigIronwood`.
+                let ironwood_shielded_data = deserialize_orchard_shielded_data_with_flags(
+                    &mut limited_reader,
+                    ALLOW_CROSS_ADDRESS_BIT,
+                )?;
+
                 Ok(Transaction::V6 {
                     network_upgrade,
                     lock_time,
@@ -1206,6 +1236,7 @@ impl ZcashDeserialize for Transaction {
                     outputs,
                     sapling_shielded_data,
                     orchard_shielded_data,
+                    ironwood_shielded_data,
                 })
             }
             (_, _) => Err(SerializationError::Parse("bad tx header")),

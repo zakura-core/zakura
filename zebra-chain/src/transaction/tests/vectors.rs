@@ -5,6 +5,7 @@ use chrono::DateTime;
 use color_eyre::eyre::Result;
 use lazy_static::lazy_static;
 use rand::{seq::IteratorRandom, thread_rng};
+use std::io::ErrorKind;
 
 use crate::{
     block::{Block, Height, MAX_BLOCK_BYTES},
@@ -125,6 +126,34 @@ fn librustzcash_tx_hash() {
         .expect("hash should parse correctly");
 
     assert_eq!(hash, expected);
+}
+
+#[test]
+fn v5_orchard_cross_address_flag_fails_serialization() {
+    let _init_guard = zebra_test::init();
+
+    let mut tx = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find(|transaction| transaction.orchard_shielded_data().is_some())
+        .expect("test vectors include an Orchard transaction");
+
+    let Transaction::V5 {
+        orchard_shielded_data: Some(orchard_shielded_data),
+        ..
+    } = &mut tx
+    else {
+        unreachable!("test transaction is V5 with Orchard shielded data");
+    };
+
+    orchard_shielded_data
+        .flags
+        .insert(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
+
+    let error = tx
+        .zcash_serialize_to_vec()
+        .expect_err("V5 Orchard flags must reject reserved cross-address bit");
+
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
 }
 
 #[test]
@@ -1068,6 +1097,190 @@ fn test_coinbase_script() -> Result<()> {
     assert_eq!(data, expected);
 
     Ok(())
+}
+
+#[test]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn v6_transactions_reject_pre_nu6_3_branch_id() {
+    use crate::parameters::TX_V6_VERSION_GROUP_ID;
+
+    let _init_guard = zebra_test::init();
+
+    let empty_v6_transaction_bytes = |branch_id| {
+        let mut tx_bytes = Vec::new();
+        tx_bytes.extend_from_slice(&((1u32 << 31) | 6).to_le_bytes());
+        tx_bytes.extend_from_slice(&TX_V6_VERSION_GROUP_ID.to_le_bytes());
+        tx_bytes.extend_from_slice(&u32::from(branch_id).to_le_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_le_bytes());
+        tx_bytes.extend_from_slice(&0u32.to_le_bytes());
+        tx_bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        tx_bytes
+    };
+
+    let nu6_3_branch_id = NetworkUpgrade::Nu6_3
+        .branch_id()
+        .expect("NU6.3 has a branch ID");
+
+    let tx = Transaction::zcash_deserialize(&empty_v6_transaction_bytes(nu6_3_branch_id)[..])
+        .expect("V6 transaction with NU6.3 branch ID must deserialize");
+    assert_eq!(tx.version(), 6);
+    assert_eq!(tx.network_upgrade(), Some(NetworkUpgrade::Nu6_3));
+
+    for network_upgrade in NetworkUpgrade::iter() {
+        let Some(branch_id) = network_upgrade.branch_id() else {
+            continue;
+        };
+        if network_upgrade == NetworkUpgrade::Nu6_3 {
+            continue;
+        }
+
+        let error = Transaction::zcash_deserialize(&empty_v6_transaction_bytes(branch_id)[..])
+            .expect_err("V6 transactions must use the NU6.3 branch ID");
+
+        assert!(
+            matches!(error, SerializationError::Parse(message) if message.contains("NU6.3")),
+            "unexpected V6 branch ID parse error for {network_upgrade:?}: {error:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn v6_txid_commits_to_ironwood_digest() {
+    use proptest::{
+        prelude::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+
+    use crate::{
+        at_least_one,
+        ironwood::{self, tree},
+        orchard::Flags,
+        primitives::Halo2Proof,
+    };
+
+    let _init_guard = zebra_test::init();
+
+    let tx_without_ironwood = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+    };
+
+    let mut runner = TestRunner::default();
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut runner)
+        .expect("test action strategy creates a value")
+        .current();
+
+    let ironwood_shielded_data = ironwood::ShieldedData {
+        flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+        value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
+        shared_anchor: tree::Root::default(),
+        proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
+        actions: at_least_one![ironwood::AuthorizedAction {
+            action,
+            spend_auth_sig: [0u8; 64].into(),
+        }],
+        binding_sig: [0u8; 64].into(),
+    };
+
+    let mut tx_with_ironwood = tx_without_ironwood.clone();
+    let Transaction::V6 {
+        ironwood_shielded_data: tx_ironwood_shielded_data,
+        ..
+    } = &mut tx_with_ironwood
+    else {
+        unreachable!("test transaction is V6");
+    };
+    *tx_ironwood_shielded_data = Some(ironwood_shielded_data);
+
+    assert_ne!(
+        tx_with_ironwood.hash(),
+        tx_without_ironwood.hash(),
+        "V6 txid must commit to Ironwood shielded data"
+    );
+}
+
+#[test]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
+    use proptest::{
+        prelude::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+
+    use crate::{
+        at_least_one,
+        ironwood::{self, tree},
+        orchard::Flags,
+        primitives::Halo2Proof,
+    };
+
+    fn test_anchor(byte: u8) -> tree::Root {
+        let mut bytes = [0u8; 32];
+        bytes[0] = byte;
+        tree::Root::try_from(bytes).expect("test anchor must be canonical")
+    }
+
+    let _init_guard = zebra_test::init();
+
+    let mut runner = TestRunner::default();
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut runner)
+        .expect("test action strategy creates a value")
+        .current();
+
+    let ironwood_shielded_data = ironwood::ShieldedData {
+        flags: Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+        value_balance: crate::amount::Amount::try_from(0).expect("zero is a valid amount"),
+        shared_anchor: test_anchor(1),
+        proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
+        actions: at_least_one![ironwood::AuthorizedAction {
+            action,
+            spend_auth_sig: [0u8; 64].into(),
+        }],
+        binding_sig: [0u8; 64].into(),
+    };
+
+    let tx_a = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood_shielded_data.clone()),
+    };
+
+    let mut tx_b = tx_a.clone();
+    let Transaction::V6 {
+        ironwood_shielded_data: Some(ironwood_shielded_data),
+        ..
+    } = &mut tx_b
+    else {
+        unreachable!("test transaction is V6 with Ironwood shielded data");
+    };
+    ironwood_shielded_data.shared_anchor = test_anchor(2);
+
+    assert_eq!(
+        tx_a.hash(),
+        tx_b.hash(),
+        "V6 txid must not commit to the Ironwood anchor"
+    );
+    assert_ne!(
+        tx_a.auth_digest(),
+        tx_b.auth_digest(),
+        "V6 auth digest must commit to the Ironwood anchor"
+    );
 }
 
 /// Regression test for the Orchard `rk` identity-point DoS vulnerability.

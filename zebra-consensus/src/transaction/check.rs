@@ -147,6 +147,35 @@ pub fn has_enough_orchard_flags(tx: &Transaction) -> Result<(), TransactionError
     Ok(())
 }
 
+/// Check that Ironwood actions have at least one active flag.
+pub fn has_enough_ironwood_flags(tx: &Transaction) -> Result<(), TransactionError> {
+    if !tx.has_enough_ironwood_flags() {
+        return Err(TransactionError::NotEnoughIronwoodFlags);
+    }
+    Ok(())
+}
+
+/// Checks that Orchard shielded data does not enable cross-address transfers.
+///
+/// Before NU6.3, the flags do not contain this bit, because it is unknown to
+/// the circuit. In the NU6.3 flag format, bit 2 is `enableCrossAddress`.
+/// The Orchard pool uses the Ironwood circuit in V6 transactions, but
+/// consensus still requires transactional Orchard bundles to keep cross-address
+/// transfers disabled. Ironwood shielded data is allowed to set this flag.
+pub fn orchard_cross_address_disabled(tx: &Transaction) -> Result<(), TransactionError> {
+    if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
+        // The bit is not set before NU6.3, and must be zero from NU6.3 onward.
+        if orchard_shielded_data
+            .flags
+            .contains(Flags::ENABLE_CROSS_ADDRESS)
+        {
+            return Err(TransactionError::OrchardHasEnableCrossAddress);
+        }
+    }
+
+    Ok(())
+}
+
 /// Checks that shielded proof sizes are canonical when the proof-size rule is active.
 pub fn shielded_proof_size_is_canonical(
     tx: &Transaction,
@@ -160,13 +189,11 @@ pub fn shielded_proof_size_is_canonical(
             }
         }
 
-        // TODO: enable when Ironwood shielded data is available on this branch.
-        //
-        // if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
-        //     if !ironwood_shielded_data.proof_size_is_canonical() {
-        //         return Err(TransactionError::IronwoodProofSize);
-        //     }
-        // }
+        if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
+            if !ironwood_shielded_data.proof_size_is_canonical() {
+                return Err(TransactionError::IronwoodProofSize);
+            }
+        }
     }
 
     Ok(())
@@ -200,6 +227,12 @@ pub fn coinbase_tx_no_prevout_joinsplit_spend(tx: &Transaction) -> Result<(), Tr
         if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
             if orchard_shielded_data.flags.contains(Flags::ENABLE_SPENDS) {
                 return Err(TransactionError::CoinbaseHasEnableSpendsOrchard);
+            }
+        }
+
+        if let Some(ironwood_shielded_data) = tx.ironwood_shielded_data() {
+            if ironwood_shielded_data.flags.contains(Flags::ENABLE_SPENDS) {
+                return Err(TransactionError::CoinbaseHasEnableSpendsIronwood);
             }
         }
     }
@@ -342,11 +375,13 @@ pub fn spend_conflicts(transaction: &Transaction) -> Result<(), TransactionError
     let sprout_nullifiers = transaction.sprout_nullifiers().map(Cow::Borrowed);
     let sapling_nullifiers = transaction.sapling_nullifiers().map(Cow::Borrowed);
     let orchard_nullifiers = transaction.orchard_nullifiers().map(Cow::Borrowed);
+    let ironwood_nullifiers = transaction.ironwood_nullifiers().map(Cow::Borrowed);
 
     check_for_duplicates(transparent_outpoints, DuplicateTransparentSpend)?;
     check_for_duplicates(sprout_nullifiers, DuplicateSproutNullifier)?;
     check_for_duplicates(sapling_nullifiers, DuplicateSaplingNullifier)?;
     check_for_duplicates(orchard_nullifiers, DuplicateOrchardNullifier)?;
+    check_for_duplicates(ironwood_nullifiers, DuplicateIronwoodNullifier)?;
 
     Ok(())
 }

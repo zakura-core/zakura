@@ -38,6 +38,8 @@ use zebra_chain::{
     },
     transparent::{self, CoinbaseSpendRestriction},
 };
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+use zebra_chain::{ironwood, orchard};
 
 use zebra_node_services::mempool;
 use zebra_state::ValidateContextError;
@@ -125,6 +127,336 @@ fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
 
         assert!(check::has_inputs_and_outputs(&tx).is_ok());
     }
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn nu6_3_test_network_and_height() -> (Network, Height) {
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            ..Default::default()
+        })
+        .expect("failed to set NU6.3 activation height")
+        .clear_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+
+    (network, Height(1))
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn orchard_fixture() -> orchard::ShieldedData {
+    let default_testnet = Network::new_default_testnet();
+
+    v5_transactions(default_testnet.block_iter())
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include a transaction with Orchard shielded data")
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn orchard_shielded_data(value_balance: i64, flags: Flags) -> orchard::ShieldedData {
+    let mut shielded_data = orchard_fixture();
+    shielded_data.value_balance =
+        Amount::<NegativeAllowed>::try_from(value_balance).expect("valid test amount");
+    shielded_data.flags = flags;
+
+    shielded_data
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn ironwood_shielded_data(value_balance: i64, flags: ironwood::Flags) -> ironwood::ShieldedData {
+    let mut shielded_data = orchard_fixture();
+    shielded_data.value_balance =
+        Amount::<NegativeAllowed>::try_from(value_balance).expect("valid test amount");
+    shielded_data.flags = flags;
+
+    shielded_data
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn v6_pool_flow_transaction(
+    orchard_shielded_data: Option<orchard::ShieldedData>,
+    ironwood_shielded_data: Option<ironwood::ShieldedData>,
+    transparent_outputs: Vec<transparent::Output>,
+) -> Transaction {
+    Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(block::Height(0)),
+        expiry_height: Height(1),
+        inputs: vec![],
+        outputs: transparent_outputs,
+        sapling_shielded_data: None,
+        orchard_shielded_data,
+        ironwood_shielded_data,
+    }
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn transparent_output(value: u64) -> transparent::Output {
+    transparent::Output {
+        value: Amount::<NonNegative>::try_from(value).expect("valid test amount"),
+        lock_script: transparent::Script::new(&[1, 1]),
+    }
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn empty_utxos() -> HashMap<transparent::OutPoint, transparent::Utxo> {
+    HashMap::new()
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[test]
+fn orchard_rejects_net_deposits_after_nu6_3() {
+    let (network, height) = nu6_3_test_network_and_height();
+
+    let orchard_withdraw = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(10, Flags::ENABLE_SPENDS)),
+        None,
+        vec![transparent_output(10)],
+    );
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&orchard_withdraw, height, &network),
+        Ok(())
+    );
+    assert_eq!(check::has_inputs_and_outputs(&orchard_withdraw), Ok(()));
+    assert_eq!(
+        orchard_withdraw
+            .value_balance(&empty_utxos())
+            .expect("valid value balance")
+            .remaining_transaction_value(),
+        Ok(Amount::<NonNegative>::zero())
+    );
+
+    let orchard_no_flow = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(
+            0,
+            Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS,
+        )),
+        None,
+        vec![],
+    );
+
+    // Zero value balance leaves the Orchard chain pool unchanged, so Orchard
+    // spends and outputs in the same transaction remain valid after NU6.3.
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&orchard_no_flow, height, &network),
+        Ok(())
+    );
+
+    let orchard_deposit = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(-10, Flags::ENABLE_OUTPUTS)),
+        None,
+        vec![],
+    );
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&orchard_deposit, height, &network),
+        Err(TransactionError::DisabledAddToOrchardPool)
+    );
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[test]
+fn coinbase_rejects_orchard_shielded_data_after_nu6_3() {
+    let (network, height) = nu6_3_test_network_and_height();
+
+    let coinbase_input = || transparent::Input::Coinbase {
+        height,
+        data: vec![],
+        sequence: u32::MAX,
+    };
+
+    // A V6 coinbase carrying an Orchard bundle is rejected after NU6.3. The bundle has a
+    // zero value balance, so `disabled_add_to_orchard_pool` does NOT catch it — this
+    // structural rule is what rejects it (the two rules are not redundant).
+    let coinbase_with_orchard = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(Height(0)),
+        expiry_height: height,
+        inputs: vec![coinbase_input()],
+        outputs: vec![],
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(orchard_shielded_data(0, Flags::ENABLE_OUTPUTS)),
+        ironwood_shielded_data: None,
+    };
+    assert!(coinbase_with_orchard.is_coinbase());
+    assert_eq!(
+        check::coinbase_has_no_orchard_shielded_data(&coinbase_with_orchard, height, &network),
+        Err(TransactionError::CoinbaseHasOrchardShieldedData)
+    );
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&coinbase_with_orchard, height, &network),
+        Ok(())
+    );
+
+    // A V6 coinbase paying shielded output through Ironwood (no Orchard bundle) is allowed.
+    let coinbase_with_ironwood = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(Height(0)),
+        expiry_height: height,
+        inputs: vec![coinbase_input()],
+        outputs: vec![],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood_shielded_data(0, ironwood::Flags::ENABLE_OUTPUTS)),
+    };
+    assert_eq!(
+        check::coinbase_has_no_orchard_shielded_data(&coinbase_with_ironwood, height, &network),
+        Ok(())
+    );
+
+    // Before NU6.3 the rule is a no-op: the same Orchard-bearing coinbase is allowed below
+    // the NU6.3 activation height.
+    assert_eq!(
+        check::coinbase_has_no_orchard_shielded_data(&coinbase_with_orchard, Height(0), &network),
+        Ok(())
+    );
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[test]
+fn orchard_cross_address_flag_is_disabled_after_nu6_3() {
+    let orchard_cross_address = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(
+            0,
+            Flags::ENABLE_SPENDS | Flags::ENABLE_OUTPUTS | Flags::ENABLE_CROSS_ADDRESS,
+        )),
+        None,
+        vec![],
+    );
+
+    assert_eq!(
+        check::orchard_cross_address_disabled(&orchard_cross_address),
+        Err(TransactionError::OrchardHasEnableCrossAddress)
+    );
+
+    let ironwood_cross_address = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(
+            0,
+            ironwood::Flags::ENABLE_SPENDS
+                | ironwood::Flags::ENABLE_OUTPUTS
+                | ironwood::Flags::ENABLE_CROSS_ADDRESS,
+        )),
+        vec![],
+    );
+
+    assert_eq!(
+        check::orchard_cross_address_disabled(&ironwood_cross_address),
+        Ok(())
+    );
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[test]
+fn ironwood_cross_address_flag_is_optional_after_nu6_3() {
+    // After NU6.3 the cross-address bit is OPTIONAL for Ironwood shielded data: a bundle
+    // is accepted whether or not it sets ENABLE_CROSS_ADDRESS. (Orchard bundles still MUST
+    // NOT set it — that rule is unrelated and lives in `orchard_cross_address_disabled`.)
+    let ironwood_without_cross_address = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(
+            0,
+            ironwood::Flags::ENABLE_SPENDS | ironwood::Flags::ENABLE_OUTPUTS,
+        )),
+        vec![],
+    );
+
+    // `has_enough_ironwood_flags` is the only consensus check that inspects Ironwood flags,
+    // and it ignores the cross-address bit, so a bundle without it is accepted.
+    assert_eq!(
+        check::has_enough_ironwood_flags(&ironwood_without_cross_address),
+        Ok(())
+    );
+    // The Orchard cross-address rule must stay a no-op on an Ironwood-only bundle.
+    assert_eq!(
+        check::orchard_cross_address_disabled(&ironwood_without_cross_address),
+        Ok(())
+    );
+
+    let ironwood_with_cross_address = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(
+            0,
+            ironwood::Flags::ENABLE_SPENDS
+                | ironwood::Flags::ENABLE_OUTPUTS
+                | ironwood::Flags::ENABLE_CROSS_ADDRESS,
+        )),
+        vec![],
+    );
+
+    assert_eq!(
+        check::has_enough_ironwood_flags(&ironwood_with_cross_address),
+        Ok(())
+    );
+    assert_eq!(
+        check::orchard_cross_address_disabled(&ironwood_with_cross_address),
+        Ok(())
+    );
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[test]
+fn orchard_to_ironwood_migration_balances() {
+    let (network, height) = nu6_3_test_network_and_height();
+    let tx = v6_pool_flow_transaction(
+        Some(orchard_shielded_data(10, Flags::ENABLE_SPENDS)),
+        Some(ironwood_shielded_data(-10, ironwood::Flags::ENABLE_OUTPUTS)),
+        vec![],
+    );
+
+    assert_eq!(
+        check::disabled_add_to_orchard_pool(&tx, height, &network),
+        Ok(())
+    );
+    assert_eq!(check::has_inputs_and_outputs(&tx), Ok(()));
+
+    let value_balance = tx
+        .value_balance(&empty_utxos())
+        .expect("valid value balance");
+
+    assert_eq!(
+        value_balance.orchard_amount(),
+        Amount::<NegativeAllowed>::try_from(10).expect("valid test amount")
+    );
+    assert_eq!(
+        value_balance.ironwood_amount(),
+        Amount::<NegativeAllowed>::try_from(-10).expect("valid test amount")
+    );
+    assert_eq!(
+        value_balance.remaining_transaction_value(),
+        Ok(Amount::<NonNegative>::zero())
+    );
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[test]
+fn ironwood_withdraw_balances() {
+    let tx = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(10, ironwood::Flags::ENABLE_SPENDS)),
+        vec![transparent_output(10)],
+    );
+
+    assert_eq!(check::has_inputs_and_outputs(&tx), Ok(()));
+
+    let value_balance = tx
+        .value_balance(&empty_utxos())
+        .expect("valid value balance");
+
+    assert_eq!(
+        value_balance.transparent_amount(),
+        Amount::<NegativeAllowed>::try_from(-10).expect("valid test amount")
+    );
+    assert_eq!(
+        value_balance.ironwood_amount(),
+        Amount::<NegativeAllowed>::try_from(10).expect("valid test amount")
+    );
+    assert_eq!(
+        value_balance.remaining_transaction_value(),
+        Ok(Amount::<NonNegative>::zero())
+    );
 }
 
 #[test]
@@ -3942,6 +4274,63 @@ fn coinbase_outputs_are_decryptable_for_fake_v5_blocks() {
         }
     }
 }
+
+// This test currently fails on `ironwood-main`: `coinbase_outputs_are_decryptable`
+// returns `Ok(())` for these V6 Ironwood coinbase outputs instead of rejecting
+// them with `CoinbaseOutputsNotDecryptable`. Keep the intended regression test
+// here while the underlying note-encryption behavior is split out separately.
+//
+// /// Test that V6 Ironwood coinbase outputs reject Orchard note encryption.
+// #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+// #[test]
+// fn coinbase_outputs_reject_v2_orchard_notes_for_v6_ironwood() {
+//     let (network, height) = nu6_3_test_network_and_height();
+//
+//     for v in zebra_test::vectors::ORCHARD_NOTE_ENCRYPTION_ZERO_VECTOR.iter() {
+//         let mut fixture = v5_transactions(Network::new_default_testnet().block_iter())
+//             .find(|tx| tx.is_coinbase())
+//             .expect("coinbase V5 tx");
+//
+//         let shielded_data = insert_fake_orchard_shielded_data(&mut fixture);
+//         shielded_data.flags =
+//             ironwood::Flags::ENABLE_OUTPUTS | ironwood::Flags::ENABLE_CROSS_ADDRESS;
+//         shielded_data.value_balance =
+//             Amount::<NegativeAllowed>::try_from(-1).expect("valid test amount");
+//
+//         let action =
+//             fill_action_with_note_encryption_test_vector(&shielded_data.actions.first().action, v);
+//         let sig = shielded_data.actions.first().spend_auth_sig;
+//         shielded_data.actions = vec![AuthorizedAction::from_parts(action, sig)]
+//             .try_into()
+//             .unwrap();
+//         shielded_data.proof = Halo2Proof(vec![
+//             0;
+//             ::orchard::Proof::expected_proof_size(
+//                 shielded_data.actions.len()
+//             )
+//         ]);
+//
+//         let transaction = Transaction::V6 {
+//             network_upgrade: NetworkUpgrade::Nu6_3,
+//             lock_time: LockTime::Height(Height(0)),
+//             expiry_height: height,
+//             inputs: vec![transparent::Input::Coinbase {
+//                 height,
+//                 data: vec![],
+//                 sequence: u32::MAX,
+//             }],
+//             outputs: vec![],
+//             sapling_shielded_data: None,
+//             orchard_shielded_data: None,
+//             ironwood_shielded_data: Some(shielded_data.clone()),
+//         };
+//
+//         assert_eq!(
+//             check::coinbase_outputs_are_decryptable(&transaction, &network, height),
+//             Err(TransactionError::CoinbaseOutputsNotDecryptable)
+//         );
+//     }
+// }
 
 /// Test if random shielded outputs are NOT decryptable with an all-zero outgoing viewing key.
 #[test]

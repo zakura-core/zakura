@@ -6,6 +6,13 @@ use color_eyre::eyre::{eyre, Report};
 use once_cell::sync::Lazy;
 use tower::{buffer::Buffer, util::BoxService};
 
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+use zebra_chain::{
+    amount::NegativeAllowed,
+    ironwood,
+    parameters::testnet::{ConfiguredActivationHeights, Parameters},
+    transaction::arbitrary::v5_transactions,
+};
 use zebra_chain::{
     amount::{DeferredPoolBalanceChange, MAX_MONEY},
     block::{
@@ -574,6 +581,79 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
     );
 
     Ok(())
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+#[test]
+fn miner_fees_validation_includes_ironwood_balance() {
+    let _init_guard = zebra_test::init();
+
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            ..Default::default()
+        })
+        .expect("failed to set NU6.3 activation height")
+        .clear_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let height = Height(1);
+    let output_value = Amount::try_from(10).expect("valid test amount");
+    let coinbase_tx = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(Height(0)),
+        expiry_height: height,
+        inputs: vec![transparent::Input::Coinbase {
+            height,
+            data: vec![],
+            sequence: u32::MAX,
+        }],
+        outputs: vec![transparent::Output {
+            value: output_value,
+            lock_script: transparent::Script::new(&[0]),
+        }],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood_shielded_data(1)),
+    };
+
+    assert_eq!(
+        check::miner_fees_are_valid(
+            &coinbase_tx,
+            height,
+            Amount::zero(),
+            output_value,
+            DeferredPoolBalanceChange::zero(),
+            &network,
+        ),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::InvalidMinerFees,
+        )))
+    );
+
+    assert_eq!(
+        check::miner_fees_are_valid(
+            &coinbase_tx,
+            height,
+            Amount::zero(),
+            Amount::try_from(9).expect("valid test amount"),
+            DeferredPoolBalanceChange::zero(),
+            &network,
+        ),
+        Ok(())
+    );
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn ironwood_shielded_data(value_balance: i64) -> ironwood::ShieldedData {
+    let mut shielded_data = v5_transactions(Network::new_default_testnet().block_iter())
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include a transaction with Orchard shielded data");
+
+    shielded_data.value_balance =
+        Amount::<NegativeAllowed>::try_from(value_balance).expect("valid test amount");
+
+    shielded_data
 }
 
 #[test]

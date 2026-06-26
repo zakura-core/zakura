@@ -54,7 +54,7 @@ impl Default for LocalTestnetGenesisOptions {
     fn default() -> Self {
         Self {
             network_name: "KreskoLocalGenesis".to_string(),
-            latest_network_upgrade: NetworkUpgrade::Nu7,
+            latest_network_upgrade: NetworkUpgrade::Nu6_3,
             disable_pow: true,
             target_spacing_secs: 1,
             seeded_tip_time: None,
@@ -427,7 +427,7 @@ fn configured_activation_heights(
         nu6: (latest_network_upgrade >= Nu6).then_some(activation_height),
         // Nu6.1 is the one-time ZIP-271 lockbox disbursement event from mainnet; activating it on
         // a local testnet would require synthesising disbursement outputs in the activation-block
-        // coinbase, which the local genesis builder does not produce. Skipping it lets NU7 activate
+        // coinbase, which the local genesis builder does not produce. Skipping it lets NU6.3 activate
         // directly without tripping the lockbox-disbursements consensus rule.
         nu6_1: None,
         nu6_2: (latest_network_upgrade >= Nu6_2).then_some(activation_height),
@@ -503,11 +503,11 @@ mod tests {
         );
         assert_eq!(NetworkUpgrade::Nu6.activation_height(network), None);
         assert_eq!(NetworkUpgrade::Nu6_1.activation_height(network), None);
-        assert_eq!(NetworkUpgrade::Nu7.activation_height(network), None);
+        assert_eq!(NetworkUpgrade::Nu6_3.activation_height(network), None);
     }
 
     #[test]
-    fn default_latest_network_upgrade_activates_nu7_after_seeded_blocks() {
+    fn default_latest_network_upgrade_activates_nu6_3_after_seeded_blocks() {
         let generated = generate_local_testnet_with_funded_keys(
             vec!["alice".to_string(), "bob".to_string()],
             Default::default(),
@@ -518,10 +518,10 @@ mod tests {
         let network = &generated.network;
 
         assert_eq!(
-            NetworkUpgrade::Nu7.activation_height(network),
+            NetworkUpgrade::Nu6_3.activation_height(network),
             Some(activation_height)
         );
-        // NU7 inherits the post-Blossom consensus target spacing (75s); this is the
+        // NU6.3 inherits the post-Blossom consensus target spacing (75s); this is the
         // protocol block spacing and is independent of the harness `target_spacing_secs`
         // option used to space the generated seeded-block timestamps.
         assert_eq!(

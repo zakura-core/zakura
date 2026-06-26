@@ -353,8 +353,25 @@ pub(crate) fn difficulty_threshold_and_time_are_valid(
     // > For a block at block height `Height`, `nBits` MUST be equal to `ThresholdBits(Height)`.
     //
     // https://zips.z.cash/protocol/protocol.pdf#blockheader
+    //
+    // On networks with proof-of-work disabled, the semantic PoW check in
+    // zebra-consensus is already skipped, so we also relax this contextual
+    // difficulty-adjustment check: a single node mining on a custom
+    // PoW-disabled network (e.g. a mainnet shadow-fork) declares a difficulty
+    // that cannot match the expectation derived from the grafted history. We
+    // still require the declared difficulty to be representable as work -- the
+    // equality check guaranteed this on PoW networks -- otherwise computing the
+    // chain's cumulative work later panics (`to_work().expect`), which a
+    // crafted block could use to crash the node.
     let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
-    if difficulty_threshold != expected_difficulty {
+    if network.disable_pow() {
+        if difficulty_threshold.to_work().is_none() {
+            Err(ValidateContextError::InvalidDifficultyThreshold {
+                difficulty_threshold,
+                expected_difficulty,
+            })?
+        }
+    } else if difficulty_threshold != expected_difficulty {
         Err(ValidateContextError::InvalidDifficultyThreshold {
             difficulty_threshold,
             expected_difficulty,

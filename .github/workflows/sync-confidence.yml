@@ -1,0 +1,161 @@
+name: Sync confidence
+
+# Catches consensus regressions that would break the ability to sync, by fully
+# (semantically) syncing two fixed mainnet windows bracketing the NU6.2 soft fork on
+# ephemeral DigitalOcean droplets that restore pruned cached state from Spaces.
+#
+# Triggers (push + schedule are currently disabled — see the note on `on:` below):
+# - push to ironwood-main: (re)build the test image and publish the `ironwood-main` tag
+#   to GHCR. No sync test runs on merge, so merges stay cheap.
+# - schedule (every 12h): reuse the latest `ironwood-main` image (no rebuild) and run
+#   both windows.
+# - workflow_dispatch: by default build the image from the dispatched ref and run both
+#   windows (so you can test a branch); uncheck `build_image` to reuse the `ironwood-main`
+#   image instead.
+#
+# The consumer opens the pruned snapshots in pruned storage mode and runs the image's
+# DB-format migration on open, so a red can mean a sync regression OR a broken format
+# migration. Snapshots are produced out-of-band by make-sync-confidence-snapshots.sh.
+# See docs/sync-confidence-do-setup.md.
+
+on:
+  # NOTE: the `push` (image build) and `schedule` (12h sync) triggers are intentionally
+  # disabled until ironwood-main ships DB format 28.3.0 and matching pruned snapshots.
+  # The sync-confidence snapshots are format 28.3.0, so an image built from ironwood-main
+  # before then would FormatMismatch when opening them and red the timer. Re-enable by
+  # restoring the `push` and `schedule` blocks (see docs/sync-confidence-do-setup.md).
+  # `workflow_dispatch` stays available so the job can still be run manually.
+  workflow_dispatch:
+    inputs:
+      build_image:
+        description: "Build the image from this ref (checked) or reuse the last ironwood-main image (unchecked)"
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  # Keep push (build), schedule, and dispatch in separate lanes so a merge-time image
+  # build never queues behind a long scheduled sync (or vice-versa).
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  # Build + push the GHCR test image. Runs on merge to ironwood-main (publishes the
+  # `ironwood-main` tag the scheduled runs reuse) and on a build_image=true dispatch
+  # (publishes a sha tag for that ref). Skipped on schedule and build_image=false dispatch.
+  # NOTE: same image used for snapshot generation (make-sync-confidence-snapshots.sh) —
+  # keep build-args and the Dockerfile target in sync.
+  build:
+    name: Build test image (GHCR)
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_image) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      # sha-<commit> tag (first metadata tag) — unique per ref; used by build_image dispatches.
+      image_ref: ghcr.io/${{ github.repository }}-tests:${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf
+        with:
+          images: ghcr.io/${{ github.repository }}-tests
+          # sha tag first => steps.meta.outputs.version (the job's image_ref). The branch
+          # tag (e.g. `ironwood-main`) is the stable tag scheduled runs reuse.
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+      - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          target: tests
+          platforms: linux/amd64
+          build-args: FEATURES=default-release-binaries
+          tags: ${{ steps.meta.outputs.tags }}
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  pre-nu62:
+    needs: build
+    # Run on schedule and dispatch (never on merge — merge only refreshes the image).
+    # Tolerate a skipped build: schedule / build_image=false reuse the ironwood-main image.
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/do-sync-test.yml
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      SPACES_ACCESS_KEY: ${{ secrets.SPACES_ACCESS_KEY }}
+      SPACES_SECRET_KEY: ${{ secrets.SPACES_SECRET_KEY }}
+      DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+    with:
+      state_key: pre-nu62
+      nextest_profile: sync-range-pre-nu62
+      test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
+      # Stable ironwood-main image on schedule / build_image=false; the freshly-built sha
+      # image on a build_image dispatch.
+      image_ref: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.build_image)) && format('ghcr.io/{0}-tests:ironwood-main', github.repository) || needs.build.outputs.image_ref }}
+      droplet_size: g-8vcpu-32gb
+
+  post-nu62:
+    needs: build
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/do-sync-test.yml
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      SPACES_ACCESS_KEY: ${{ secrets.SPACES_ACCESS_KEY }}
+      SPACES_SECRET_KEY: ${{ secrets.SPACES_SECRET_KEY }}
+      DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+    with:
+      state_key: post-nu62
+      nextest_profile: sync-range-post-nu62
+      test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
+      image_ref: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.build_image)) && format('ghcr.io/{0}-tests:ironwood-main', github.repository) || needs.build.outputs.image_ref }}
+      droplet_size: g-8vcpu-32gb
+
+  # Alert Slack #gh-alerts on any failure (the unattended 12h timer is the main case).
+  # Needs a `SLACK_BOT_TOKEN` repo secret (a Slack app bot token with chat:write, invited
+  # to the channel); the step no-ops if it's unset, so this is harmless until then.
+  notify-failure:
+    name: Alert Slack on failure
+    needs: [build, pre-nu62, post-nu62]
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post failure to #gh-alerts
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          PRE_RESULT: ${{ needs.pre-nu62.result }}
+          POST_RESULT: ${{ needs.post-nu62.result }}
+        run: |
+          if [ -z "${SLACK_BOT_TOKEN}" ]; then
+            echo "SLACK_BOT_TOKEN not set — skipping Slack alert."
+            exit 0
+          fi
+          text=":rotating_light: *Sync confidence* failed — \`${EVENT}\` on \`${REF_NAME}\`
+          build: ${BUILD_RESULT} · pre-nu62: ${PRE_RESULT} · post-nu62: ${POST_RESULT}
+          ${RUN_URL}"
+          payload=$(jq -n --arg channel "C0BCQ7PP32A" --arg text "${text}" '{channel: $channel, text: $text}')
+          resp=$(curl -sS -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            --data "${payload}")
+          echo "${resp}" | jq -e '.ok' >/dev/null || { echo "Slack post failed: ${resp}"; exit 1; }

@@ -222,6 +222,20 @@ use crate::common::regtest::MiningRpcMethods;
 /// This limit only applies to some tests.
 pub const MAX_ASYNC_BLOCKING_TIME: Duration = zebra_test::mock_service::DEFAULT_MAX_REQUEST_DELAY;
 
+/// Stop height for the `pre-nu62` sync-confidence window.
+///
+/// 5,000 blocks above the top mainnet checkpoint (3,358,006) and 1,594 blocks
+/// below the NU6.2 mainnet activation height (3,364,600), so the window exercises
+/// NU6.1-era consensus rules under full validation without crossing the soft fork.
+const SYNC_RANGE_PRE_NU62_STOP_HEIGHT: block::Height = block::Height(3_363_006);
+
+/// Stop height for the `post-nu62` sync-confidence window.
+///
+/// 5,000 blocks above the window start (3,375,000), which is ~10k blocks above the
+/// NU6.2 mainnet activation height (3,364,600), so the window exercises current
+/// post-NU6.2 consensus rules under full validation.
+const SYNC_RANGE_POST_NU62_STOP_HEIGHT: block::Height = block::Height(3_380_000);
+
 #[test]
 fn generate_no_args() -> Result<()> {
     let _init_guard = zebra_test::init();
@@ -1237,6 +1251,8 @@ fn create_cached_database(network: Network) -> Result<()> {
         height,
         // Use checkpoints to increase sync performance while caching the database
         true,
+        // Archive storage: keep all transaction data in the cached database.
+        zebra_state::StorageMode::Archive,
         // Check that we're still using checkpoints when we finish the cached sync
         &checkpoint_stop_regex,
     )
@@ -1253,6 +1269,8 @@ fn sync_past_mandatory_checkpoint(network: Network) -> Result<()> {
         height.unwrap(),
         // Test full validation by turning checkpoints off
         false,
+        // Archive storage: keep all transaction data in the cached database.
+        zebra_state::StorageMode::Archive,
         // Check that we're doing full validation when we finish the cached sync
         &full_validation_stop_regex,
     )
@@ -1282,6 +1300,8 @@ fn full_sync_test(network: Network, timeout_argument_name: &str) -> Result<()> {
             block::Height::MAX,
             // Use the checkpoints to sync quickly, then do full validation until the chain tip
             true,
+            // Archive storage: keep all transaction data in the cached database.
+            zebra_state::StorageMode::Archive,
             // Finish when we reach the chain tip
             SYNC_FINISHED_REGEX,
         )
@@ -1367,6 +1387,71 @@ fn sync_past_mandatory_checkpoint_testnet() -> Result<()> {
     let _init_guard = zebra_test::init();
     let network = Network::new_default_testnet();
     sync_past_mandatory_checkpoint(network)
+}
+
+/// Sync a fixed window of mainnet blocks from a cached state with full (semantic)
+/// validation, stopping at `stop_height`.
+///
+/// The cached state must already be synced to the window's start height — in CI it
+/// is restored from a pruned snapshot in Spaces (produced out-of-band by
+/// `make-sync-confidence-snapshots.sh`). Because
+/// both sync-confidence windows lie above the top compiled checkpoint (3,358,006),
+/// every block in the window is contextually verified, so this asserts the run
+/// finishes with a `contextually-verified` commit at `stop_height`.
+#[tracing::instrument]
+fn sync_confidence_range(stop_height: block::Height) -> Result<()> {
+    let network = Mainnet;
+    let full_validation_stop_regex =
+        format!("{STOP_AT_HEIGHT_REGEX}.*commit contextually-verified request");
+
+    create_cached_database_height(
+        &network,
+        stop_height,
+        // Full validation: do not use the optional checkpoints.
+        false,
+        // The sync-confidence snapshots are pruned, so the consumer must open the
+        // database in pruned storage mode (archive mode refuses a pruned database).
+        zebra_state::StorageMode::Pruned(zebra_state::PruningConfig {
+            tx_retention: zebra_state::constants::min_pruning_retention(&network),
+        }),
+        &full_validation_stop_regex,
+    )
+}
+
+/// Full-validation sync of ~5k mainnet blocks ending just below NU6.2, from a
+/// cached state at the top mainnet checkpoint.
+///
+/// Skipped unless `TEST_SYNC_RANGE` is set. Runs in CI on merge to `ironwood-main`
+/// via the `sync-range-pre-nu62` nextest profile.
+#[allow(dead_code)]
+#[test]
+fn sync_range_pre_nu62() -> Result<()> {
+    if std::env::var("TEST_SYNC_RANGE").is_err() {
+        tracing::warn!(
+            "Skipped sync_range_pre_nu62, set the TEST_SYNC_RANGE environmental variable to run the test"
+        );
+        return Ok(());
+    }
+    let _init_guard = zebra_test::init();
+    sync_confidence_range(SYNC_RANGE_PRE_NU62_STOP_HEIGHT)
+}
+
+/// Full-validation sync of ~5k mainnet blocks above NU6.2, from a cached state at
+/// height 3,375,000.
+///
+/// Skipped unless `TEST_SYNC_RANGE` is set. Runs in CI on merge to `ironwood-main`
+/// via the `sync-range-post-nu62` nextest profile.
+#[allow(dead_code)]
+#[test]
+fn sync_range_post_nu62() -> Result<()> {
+    if std::env::var("TEST_SYNC_RANGE").is_err() {
+        tracing::warn!(
+            "Skipped sync_range_post_nu62, set the TEST_SYNC_RANGE environmental variable to run the test"
+        );
+        return Ok(());
+    }
+    let _init_guard = zebra_test::init();
+    sync_confidence_range(SYNC_RANGE_POST_NU62_STOP_HEIGHT)
 }
 
 /// Test if `zebrad` can fully sync the chain on mainnet.

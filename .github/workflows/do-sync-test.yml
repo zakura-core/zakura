@@ -1,0 +1,151 @@
+name: DO sync test
+
+# Reusable: provisions one ephemeral nyc3 droplet, restores a pruned cached state
+# from Spaces, runs a sync-confidence window, then always deletes the droplet.
+
+on:
+  workflow_call:
+    inputs:
+      nextest_profile: { required: true, type: string }
+      test_variables:  { required: true, type: string }
+      state_key:       { required: true, type: string }
+      image_ref:       { required: true, type: string }
+      droplet_size:    { required: true, type: string }
+      region:          { required: false, type: string, default: nyc3 }
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN: { required: true }
+      SPACES_ACCESS_KEY:         { required: true }
+      SPACES_SECRET_KEY:         { required: true }
+      DO_SSH_PRIVATE_KEY:        { required: true }
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: ${{ inputs.state_key }}
+    runs-on: ubuntu-latest
+    # Backstop so a wedged droplet/SSH fails the job in ~1h instead of stalling for the 6h default.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Install doctl, s3cmd, zstd
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          DOCTL_VERSION=1.120.0
+          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
+          sudo install /tmp/doctl /usr/local/bin/doctl
+          sudo apt-get update -qq && sudo apt-get install -y -qq s3cmd zstd
+          doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
+
+      - name: Compute state version
+        id: ver
+        run: |
+          echo "v=$(grep -oE 'DATABASE_FORMAT_VERSION: .* [0-9]+' zebra-state/src/constants.rs | grep -oE '[0-9]+' | tail -n1)" >> "$GITHUB_OUTPUT"
+
+      - name: Write SSH key
+        env:
+          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+        run: |
+          install -m 600 /dev/null /tmp/do_ssh
+          printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
+
+      - name: Create droplet
+        id: droplet
+        env:
+          STATE_KEY: ${{ inputs.state_key }}
+          REGION: ${{ inputs.region }}
+          DROPLET_SIZE: ${{ inputs.droplet_size }}
+          SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          NAME="sync-conf-${STATE_KEY}-${GITHUB_SHA::7}-${GITHUB_RUN_ID}"
+          doctl compute droplet create "$NAME" \
+            --region "${REGION}" \
+            --size "${DROPLET_SIZE}" \
+            --image docker-20-04 \
+            --ssh-keys "${SSH_FINGERPRINT}" \
+            --tag-name sync-confidence-ci \
+            --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
+          echo "id=$(awk '{print $1}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
+          echo "ip=$(awk '{print $2}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i /tmp/do_ssh "root@${IP}" true 2>/dev/null; then
+              echo "SSH up"; exit 0
+            fi
+            sleep 10
+          done
+          echo "SSH did not come up in time"; exit 1
+
+      - name: Run workload
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+          IMAGE_REF: ${{ inputs.image_ref }}
+          NEXTEST_PROFILE: ${{ inputs.nextest_profile }}
+          TEST_VARIABLES: ${{ inputs.test_variables }}
+          STATE_KEY: ${{ inputs.state_key }}
+          STATE_VERSION: ${{ steps.ver.outputs.v }}
+          SPACES_BUCKET: ${{ vars.SPACES_BUCKET }}
+          # The Space must live in the same region as the droplet; if you override
+          # `region`, the SPACES_BUCKET must also be in that region.
+          SPACES_REGION: ${{ inputs.region }}
+          SPACES_ACCESS_KEY: ${{ secrets.SPACES_ACCESS_KEY }}
+          SPACES_SECRET_KEY: ${{ secrets.SPACES_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          {
+            printf 'IMAGE_REF=%q\n'         "${IMAGE_REF}"
+            printf 'NEXTEST_PROFILE=%q\n'   "${NEXTEST_PROFILE}"
+            printf 'TEST_VARIABLES=%q\n'    "${TEST_VARIABLES}"
+            printf 'STATE_KEY=%q\n'         "${STATE_KEY}"
+            printf 'STATE_VERSION=%q\n'     "${STATE_VERSION}"
+            printf 'FEATURES=%q\n'          "default-release-binaries"
+            printf 'SPACES_BUCKET=%q\n'     "${SPACES_BUCKET}"
+            printf 'SPACES_REGION=%q\n'     "${SPACES_REGION}"
+            printf 'SPACES_ACCESS_KEY=%q\n' "${SPACES_ACCESS_KEY}"
+            printf 'SPACES_SECRET_KEY=%q\n' "${SPACES_SECRET_KEY}"
+          } > /tmp/run.env
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            /tmp/run.env .github/workflows/scripts/do-sync-run.sh "root@${IP}:/root/"
+          # ServerAliveInterval sends keepalives during the long, low-output sync so an idle
+          # NAT/firewall timeout can't drop the connection (which previously severed the sync
+          # mid-run and left this step hung).
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \
+            'set -euo pipefail; set -a; . /root/run.env; set +a; bash /root/do-sync-run.sh'
+
+      - name: Destroy droplet + sweep orphans
+        if: always()
+        env:
+          DROPLET_ID: ${{ steps.droplet.outputs.id }}
+        run: |
+          set +e
+          # Delete this run's droplet, retrying transient API failures.
+          if [ -n "${DROPLET_ID}" ]; then
+            for _ in 1 2 3; do
+              doctl compute droplet delete "${DROPLET_ID}" -f && break
+              sleep 5
+            done
+          fi
+          # Backstop: delete any sync-confidence-ci droplet older than 1h.
+          # NOTE: `date -d` is GNU coreutils (present on ubuntu-latest).
+          doctl compute droplet list --tag-name sync-confidence-ci --format ID,Created --no-header | \
+          while read -r id created; do
+            [ -z "$id" ] && continue
+            created_epoch=$(date -d "$created" +%s 2>/dev/null) || continue
+            age=$(( $(date +%s) - created_epoch ))
+            [ "$age" -gt 3600 ] && doctl compute droplet delete "$id" -f
+          done
+          true

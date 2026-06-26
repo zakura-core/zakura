@@ -381,6 +381,7 @@ pub fn create_cached_database_height(
     network: &Network,
     height: Height,
     checkpoint_sync: bool,
+    storage_mode: zebra_state::StorageMode,
     stop_regex: &str,
 ) -> Result<()> {
     eprintln!("creating cached database");
@@ -389,6 +390,7 @@ pub fn create_cached_database_height(
     let mut config = cached_mandatory_checkpoint_test_config(network)?;
     // TODO: add convenience methods?
     config.state.debug_stop_at_height = Some(height.0);
+    config.state.storage_mode = storage_mode;
     config.consensus.checkpoint_sync = checkpoint_sync;
 
     let dir = get_zebra_cached_state_dir();

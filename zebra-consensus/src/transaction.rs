@@ -435,13 +435,7 @@ where
             // The gate activates at the NU6.2 activation height committed in
             // MAINNET/TESTNET_ACTIVATION_HEIGHTS. See
             // `Network::orchard_canonical_proof_size_rule_active`.
-            if network.orchard_canonical_proof_size_rule_active(req.height()) {
-                if let Some(orchard_shielded_data) = tx.orchard_shielded_data() {
-                    if !orchard_shielded_data.proof_size_is_canonical() {
-                        return Err(TransactionError::OrchardProofSize);
-                    }
-                }
-            }
+            check::shielded_proof_size_is_canonical(&tx, req.height(), &network)?;
 
             // Validate the coinbase input consensus rules
             if req.is_mempool() && tx.is_coinbase() {

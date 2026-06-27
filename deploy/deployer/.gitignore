@@ -1,0 +1,5 @@
+# Local build cache (binaries keyed on commit SHA) and fetched logs.
+.build-cache/
+logs/
+# Operator's real fleet config (keep nodes.example.toml tracked).
+nodes.toml

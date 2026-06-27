@@ -137,6 +137,30 @@ fn p2p_protocol_flags_default_on_and_roundtrip() {
 }
 
 #[test]
+fn zakura_dev_network_defaults_off_and_roundtrips() {
+    let _init_guard = zebra_test::init();
+
+    // Absent by default, so nodes join the public Zakura overlay.
+    assert_eq!(Config::default().zakura.dev_network, None);
+
+    let config: Config = toml::from_str(
+        r#"
+        [zakura]
+        dev_network = "evan-breaking-change"
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.zakura.dev_network.as_deref(),
+        Some("evan-breaking-change")
+    );
+
+    let serialized = toml::to_string(&config).unwrap();
+    let deserialized: Config = toml::from_str(&serialized).unwrap();
+    assert_eq!(config, deserialized);
+}
+
+#[test]
 fn p2p_v2_old_enable_config_alias_still_parses() {
     let _init_guard = zebra_test::init();
 

@@ -161,7 +161,13 @@ pub struct ZakuraHandshakeConfig {
     pub zakura_protocol_max: u16,
     /// Local network id.
     pub network_id: ZakuraNetworkId,
-    /// Local genesis block hash.
+    /// Zakura peer-matching chain id.
+    ///
+    /// Normally the local genesis block hash, so peers on the same chain match
+    /// and peers on a different chain reject (`WrongChain`). For a private dev
+    /// cohort it is instead derived from the genesis hash and the cohort tag
+    /// (see [`derive_dev_chain_id`]), which isolates the Zakura overlay without
+    /// touching real block-validation consensus.
     pub chain_id: [u8; 32],
     /// Required peer capabilities.
     pub required_capabilities: u64,
@@ -201,6 +207,26 @@ impl ZakuraHandshakeConfig {
         }
     }
 
+    /// Returns the local Zakura policy for `network`, optionally scoped to a
+    /// private dev-network cohort.
+    ///
+    /// With `dev_network = None` (or an empty tag) this is identical to
+    /// [`for_network`](Self::for_network). With a non-empty tag the node joins a
+    /// private overlay: its [`network_id`](Self::network_id) becomes
+    /// [`ZakuraNetworkId::Configured`] and its [`chain_id`](Self::chain_id) is
+    /// derived from the real genesis hash and the tag, so only same-tag peers
+    /// match. Consensus is unchanged; this only scopes the Zakura v2 overlay.
+    pub fn for_network_with_dev_cohort(network: &Network, dev_network: Option<&str>) -> Self {
+        let mut config = Self::for_network(network);
+
+        if let Some(tag) = dev_network.filter(|tag| !tag.is_empty()) {
+            config.network_id = ZakuraNetworkId::Configured;
+            config.chain_id = derive_dev_chain_id(network.genesis_hash().0, tag);
+        }
+
+        config
+    }
+
     /// Returns the network label used by low-cardinality metrics.
     pub fn network_label(&self) -> &'static str {
         match self.network_id {
@@ -210,6 +236,32 @@ impl ZakuraHandshakeConfig {
             ZakuraNetworkId::Configured => "configured",
         }
     }
+}
+
+/// Derives the Zakura peer-matching chain id for a private dev cohort.
+///
+/// The result binds the real `genesis_hash` and the cohort `tag` under a fixed
+/// personalization, so:
+/// - two nodes with the same tag on the same network produce the same id and match;
+/// - different tags, or a public node using the bare genesis hash, never match
+///   (`WrongChain`).
+///
+/// Domain separation via the personalization guarantees a derived cohort id can
+/// never collide with any real chain's genesis hash, so a dev node can never be
+/// mistaken for a public peer. This id only gates Zakura peer matching; block
+/// validation continues to use the unchanged network parameters.
+pub fn derive_dev_chain_id(genesis_hash: [u8; 32], tag: &str) -> [u8; 32] {
+    let hash = Blake2bParams::new()
+        .hash_length(32)
+        .personal(b"zebra-zk-cohort1")
+        .to_state()
+        .update(&genesis_hash)
+        .update(tag.as_bytes())
+        .finalize();
+
+    let mut out = [0; 32];
+    out.copy_from_slice(hash.as_bytes());
+    out
 }
 
 /// The legacy Zebra nonces as observed locally.
@@ -1888,6 +1940,86 @@ mod tests {
         assert_eq!(
             wrong_nonce.validate(&local, nonces()),
             Err(ZakuraRejectReason::TemporaryUnavailable)
+        );
+    }
+
+    fn cohort_local(tag: &str) -> ZakuraHandshakeConfig {
+        ZakuraHandshakeConfig::for_network_with_dev_cohort(&Network::Mainnet, Some(tag))
+    }
+
+    fn cohort_init(tag: &str) -> P2pV2UpgradeInit {
+        let local = cohort_local(tag);
+        let mut init = init();
+        init.network_id = local.network_id;
+        init.chain_id = local.chain_id;
+        init
+    }
+
+    #[test]
+    fn dev_cohort_overlay_scopes_network_and_chain_id() {
+        let plain = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+
+        // No tag (or an empty tag) is identical to the plain network policy.
+        assert_eq!(
+            ZakuraHandshakeConfig::for_network_with_dev_cohort(&Network::Mainnet, None),
+            plain
+        );
+        assert_eq!(
+            ZakuraHandshakeConfig::for_network_with_dev_cohort(&Network::Mainnet, Some("")),
+            plain
+        );
+
+        // A tag moves the node onto the private overlay without touching consensus.
+        let cohort = cohort_local("evan-breaking-change");
+        assert_eq!(cohort.network_id, ZakuraNetworkId::Configured);
+        assert_ne!(cohort.chain_id, plain.chain_id);
+
+        // Derivation is deterministic and sensitive to the tag.
+        assert_eq!(
+            cohort.chain_id,
+            cohort_local("evan-breaking-change").chain_id
+        );
+        assert_ne!(cohort.chain_id, cohort_local("roman-test").chain_id);
+    }
+
+    #[test]
+    fn derive_dev_chain_id_never_collides_with_genesis() {
+        let genesis = Network::Mainnet.genesis_hash().0;
+        for tag in ["", "a", "evan-breaking-change", "roman-test"] {
+            assert_ne!(derive_dev_chain_id(genesis, tag), genesis);
+        }
+        // The genesis hash is mixed in, so the same tag on different networks differs.
+        let testnet_genesis = Network::new_default_testnet().genesis_hash().0;
+        assert_ne!(
+            derive_dev_chain_id(genesis, "shared"),
+            derive_dev_chain_id(testnet_genesis, "shared"),
+        );
+    }
+
+    #[test]
+    fn dev_cohort_prelude_matches_same_tag_and_rejects_others() {
+        // Same cohort: network id and chain id match, so the prelude validates.
+        assert_eq!(
+            cohort_init("alpha").validate(&cohort_local("alpha"), nonces()),
+            Ok(1)
+        );
+
+        // Different cohort: both are `Configured`, but the chain id differs.
+        assert_eq!(
+            cohort_init("beta").validate(&cohort_local("alpha"), nonces()),
+            Err(ZakuraRejectReason::WrongChain)
+        );
+
+        // A public mainnet peer (network id `Mainnet`) is ignored by a dev node.
+        assert_eq!(
+            init().validate(&cohort_local("alpha"), nonces()),
+            Err(ZakuraRejectReason::WrongNetwork)
+        );
+
+        // And a dev node is ignored by a public mainnet node.
+        assert_eq!(
+            cohort_init("alpha").validate(&local_config(), nonces()),
+            Err(ZakuraRejectReason::WrongNetwork)
         );
     }
 

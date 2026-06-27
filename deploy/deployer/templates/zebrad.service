@@ -1,0 +1,22 @@
+# Rendered by deploy/deployer/deploy.py — installed as
+# /etc/systemd/system/{{SERVICE_NAME}}.service
+[Unit]
+Description=Zebra full node ({{SERVICE_NAME}})
+Documentation=https://github.com/ZcashFoundation/zebra
+After=network-online.target
+Wants=network-online.target
+AssertPathExists={{BIN_PATH}}
+
+[Service]
+Type=simple
+ExecStart={{BIN_PATH}} -c {{CONFIG_PATH}} start
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+# zebrad writes its own structured logs to {{LOG_FILE}} (see [tracing] log_file).
+# Journal captures startup/panic output that precedes the log file opening.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

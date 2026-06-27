@@ -255,6 +255,19 @@ pub struct ZakuraConfig {
     pub header_sync: ZakuraHeaderSyncConfig,
     /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
     pub block_sync: ZakuraBlockSyncConfig,
+    /// Optional private dev-network cohort tag.
+    ///
+    /// When set, this node only forms Zakura (v2) connections with peers
+    /// advertising the same tag: its handshakes and signed discovery records
+    /// carry a cohort-derived chain id, so public mainnet nodes and other
+    /// cohorts reject (and are rejected by) this node at the Zakura layer.
+    ///
+    /// This does NOT change consensus rules. Genesis, network magic, and
+    /// activation heights stay as configured for the network; the tag only
+    /// scopes the Zakura v2 overlay so a team can test breaking changes in
+    /// isolation while still validating the same chain. Has no effect unless
+    /// [`v2_p2p`](crate::config::Config::v2_p2p) is enabled.
+    pub dev_network: Option<String>,
 }
 
 impl Default for ZakuraConfig {
@@ -269,6 +282,7 @@ impl Default for ZakuraConfig {
             trace_dir: None,
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
+            dev_network: None,
         }
     }
 }
@@ -2465,7 +2479,10 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         .map(zebra_jsonl_trace::JsonlTracer::spawn)
         .unwrap_or_else(zebra_jsonl_trace::JsonlTracer::noop);
     let trace = ZakuraTrace::new(tracer, zebra_jsonl_trace::node_id());
-    let handshake_config = ZakuraHandshakeConfig::for_network(&config.network);
+    let handshake_config = ZakuraHandshakeConfig::for_network_with_dev_cohort(
+        &config.network,
+        config.zakura.dev_network.as_deref(),
+    );
     let discovery = super::discovery::build_discovery_handle(
         discovery_secret_key,
         config.zakura.listen_addr.into_iter().collect(),

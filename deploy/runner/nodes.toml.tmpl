@@ -1,0 +1,36 @@
+# Serving-fleet deployer config TEMPLATE.
+#
+# `perf.sh` renders this into a temp nodes.toml (substituting @@TOKENS@@ from
+# cohort.env) and passes it to deploy/deployer/deploy.py. Do not run deploy.py
+# against this file directly — the tokens are not valid TOML until rendered.
+#
+# Tokens: @@COMMIT@@ @@COHORT@@ @@BOOTSTRAP@@ @@LEGACY@@ @@STORAGE@@
+
+[defaults]
+service_name    = "zebrad"
+bin_path        = "/usr/local/bin/zebrad"
+config_path     = "/etc/zebrad/zebrad.toml"
+log_file        = "/var/log/zebrad/zebrad.log"
+state_cache_dir = "/root/.cache/zebra"       # the big-volume snapshot (symlink → /mnt/<host>-data/zebra-cache); holds the near-tip state + iroh identity. Never wipe.
+network         = "Mainnet"
+listen_addr     = "[::]:8233"
+storage_mode    = "@@STORAGE@@"
+v2_p2p          = true
+legacy_p2p      = @@LEGACY@@                  # seed phase: true (sync from public); freeze phase: false
+metrics_endpoint = "127.0.0.1:9100"          # loopback Prometheus; scrape via ssh for cohort/peer counts
+tracing_filter   = "info,zebra_network::zakura=debug,zebra_network::zakura::discovery=debug"
+
+[defaults.zakura]
+listen_addr     = "0.0.0.0:8234"
+dev_network     = "@@COHORT@@"
+bootstrap_peers = @@BOOTSTRAP@@
+
+[[nodes]]
+name       = "serve-a"
+ssh_string = "root@167.99.162.47"
+commit     = "@@COMMIT@@"
+
+[[nodes]]
+name       = "serve-b"
+ssh_string = "root@167.172.201.36"
+commit     = "@@COMMIT@@"

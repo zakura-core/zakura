@@ -32,6 +32,7 @@
     - [Mempool Architecture](dev/diagrams/mempool-architecture.md)
   - [Upgrading the State Database](dev/state-db-upgrades.md)
   - [Pruned Storage Mode](dev/pruned-storage.md)
+  - [Private Zakura Dev Networks](dev/private-zakura-network.md)
   - [Zebra versioning and releases](dev/release-process.md)
   - [Continuous Integration](dev/continuous-integration.md)
   - [Continuous Delivery](dev/continuous-delivery.md)

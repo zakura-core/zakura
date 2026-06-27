@@ -929,6 +929,7 @@ async fn upgrade_to_zakura_handshake<PeerTransport>(
     connection_info: &ConnectionInfo,
     connected_addr: ConnectedAddr,
     network: &Network,
+    dev_network: Option<&str>,
     zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
     address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
 ) -> Result<ZakuraUpgradeOutcome, HandshakeError>
@@ -955,7 +956,7 @@ where
         return Ok(neutral_upgrade_fallback());
     };
 
-    let config = ZakuraHandshakeConfig::for_network(network);
+    let config = ZakuraHandshakeConfig::for_network_with_dev_cohort(network, dev_network);
     let nonces = ZakuraLegacyNonces {
         local_zebra_nonce: connection_info.local.nonce,
         remote_zebra_nonce: connection_info.remote.nonce,
@@ -1410,6 +1411,7 @@ where
                     &connection_info,
                     connected_addr,
                     &config.network,
+                    config.zakura.dev_network.as_deref(),
                     zakura_handshake_connector,
                     &address_book_updater,
                 )

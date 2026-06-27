@@ -1,0 +1,58 @@
+# =============================================================================
+# Canonical bench config — THE SOURCE OF TRUTH the node actually runs with.
+#
+# feed_run_1800.sh copies this file and substitutes four per-run tokens below,
+# then launches zebrad with the result. Edit THIS file to change run config.
+#
+# Tokens (each wrapped in double-at markers in the config lines further down):
+#   FORK    -> hard-link fork of the warm master (per-run cache_dir)
+#   LISTEN  -> legacy P2P listen port (derived from metrics port)
+#   MET     -> Prometheus metrics port
+#   STOP    -> debug_stop_at_height (bounds the bench window)
+# =============================================================================
+
+[network]
+network     = "Mainnet"
+listen_addr = "0.0.0.0:@@LISTEN@@"
+cache_dir   = "@@FORK@@"
+v2_p2p      = true      # Zakura v2 block/header sync + tree_aux → VCT fast path
+legacy_p2p  = false     # pure v2: no legacy peers. Zakura header-sync self-drives block-sync via
+                        # replace_legacy_syncer=true below — the two MUST be set together (without
+                        # replace_legacy_syncer it falls back to legacy obtain_tips and hard-stalls).
+
+[network.zakura]
+# Bind on all interfaces — iroh uses one UDP socket for send+recv, so a loopback
+# bind breaks OUTBOUND to external peers. Bad inbound peers (iroh disco AEAD spam)
+# are cosmetic and silenced via the tracing filter; Zakura v1 has no peer denylist.
+listen_addr     = "0.0.0.0:8234"
+# Private cohort: peer ONLY with our two controlled serving nodes. `perf.sh run`
+# substitutes @@COHORT@@ / @@BOOTSTRAP@@ from deploy/runner/cohort.env (the same
+# tag + peers the serving fleet runs), so this bench node is isolated from the
+# churny public Zakura fleet. With legacy_p2p=false above, the cohort is its only
+# source of peers. To run against the public fleet instead, set CONFIG_SRC to a
+# config with the old curated bootstrap_peers and no dev_network.
+dev_network     = "@@COHORT@@"
+bootstrap_peers = @@BOOTSTRAP@@
+# Throughput-gating knobs left at DEFAULT (levers for the body-fetch bottleneck):
+#   max_blocks_per_response=1, fanout=1, request_timeout=10s
+
+[network.zakura.block_sync]
+replace_legacy_syncer = true   # Zakura fully owns block-body download; the legacy syncer keeps
+                               # doing tip discovery only, so it no longer competes for downloads
+
+[consensus]
+checkpoint_sync = true  # keeps the region checkpoint-verified; on mainnet selects VCT peer-source mode
+
+[metrics]
+endpoint_addr = "127.0.0.1:@@MET@@"
+
+[state]
+cache_dir            = "@@FORK@@"
+storage_mode         = "pruned"
+debug_stop_at_height = @@STOP@@
+
+# [sync] — no overrides; Zebra stock defaults (download=100, checkpoint_verify=1000, full_verify=20).
+
+[tracing]
+# Silence cosmetic iroh disco/AEAD WARN spam from bad inbound peers; real errors still surface.
+filter = "info,zebra_network::zakura=debug,zebra_network::zakura::discovery=debug,zebrad::commands::start::zakura=debug,iroh::magicsock=error,iroh_quinn_udp=error"

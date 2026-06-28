@@ -9,8 +9,9 @@
 //!     blocks still re-sync;
 //!   * the same proof is **rejected** by the post-NU6.2 (fixed) key, so the verifier is not
 //!     "fail-open" — it does not accept whatever it is handed regardless of era; and
-//!   * [`verifier_for`] routes each network upgrade to the service holding the matching key,
-//!     with NU6.2 and every later upgrade going to the fixed-key verifier.
+//!   * [`verifier_for`] routes each network upgrade to the service holding the
+//!     matching circuit era's key (pre-NU6.2 insecure, NU6.2-until-NU6.3 fixed, or
+//!     NU6.3-onward).
 
 use std::sync::Arc;
 
@@ -25,8 +26,8 @@ use zebra_chain::{
 };
 
 use super::{
-    verifier_for, Item, VERIFIER_POST_NU6_2, VERIFIER_PRE_NU6_2, VERIFYING_KEY_POST_NU6_2,
-    VERIFYING_KEY_PRE_NU6_2,
+    verifier_for, Item, VERIFIER_NU6_2, VERIFIER_NU6_3_ONWARD, VERIFIER_PRE_NU6_2,
+    VERIFYING_KEY_NU6_2, VERIFYING_KEY_PRE_NU6_2,
 };
 
 /// Returns one real pre-NU6.2 Orchard bundle and its sighash, extracted from the mainnet test
@@ -82,27 +83,28 @@ fn pre_nu6_2_proof_only_verifies_under_pre_nu6_2_key() {
 
     // Wrong era key: the same proof must be rejected. This is the not-fail-open guarantee.
     assert!(
-        !Item::new(bundle, sighash).verify_single(&VERIFYING_KEY_POST_NU6_2),
+        !Item::new(bundle, sighash).verify_single(&VERIFYING_KEY_NU6_2),
         "a pre-NU6.2 Orchard proof must be REJECTED by the post-NU6.2 (fixed) key; \
          verifying it would mean the era selection is fail-open"
     );
 }
 
-/// [`verifier_for`] routes each upgrade to the service that holds the correct era key.
+/// [`verifier_for`] routes each upgrade to the service that holds the correct
+/// circuit era's key.
 ///
-/// We compare service identity by pointer: `verifier_for` returns a borrow of one of the two
-/// global `Lazy` services, so the pre-NU6.2 upgrades must alias [`VERIFIER_PRE_NU6_2`] and NU6.2+
-/// must alias [`VERIFIER_POST_NU6_2`]. Because the pre/post split is what binds an item to a key,
-/// routing to the wrong service is exactly routing to the wrong key.
+/// We compare service identity by pointer: the routing functions return borrows of global `Lazy`
+/// services, so each expected route must alias the matching service. Because the route is what
+/// binds an item to a key, routing to the wrong service is exactly routing to the wrong key.
 ///
 /// This is an async test because forcing the global `Lazy` verifiers builds their `Batch` layer,
 /// which spawns a worker task and therefore needs a Tokio runtime.
 #[tokio::test(flavor = "multi_thread")]
-async fn verifier_for_routes_each_upgrade_to_the_correct_key() {
-    // Deref each `Lazy` to the inner service it guards, matching what `verifier_for` returns, so
-    // the pointer comparisons below compare the same service type.
+async fn verifier_routes_each_network_upgrade_to_the_correct_key() {
+    // Deref each `Lazy` to the inner service it guards, matching what the routing functions
+    // return, so the pointer comparisons below compare the same service type.
     let pre: &'static super::VerifierService = &VERIFIER_PRE_NU6_2;
-    let post: &'static super::VerifierService = &VERIFIER_POST_NU6_2;
+    let nu6_2: &'static super::VerifierService = &VERIFIER_NU6_2;
+    let nu6_3_onward: &'static super::VerifierService = &VERIFIER_NU6_3_ONWARD;
 
     // Everything before NU6.2 (including upgrades from before Orchard existed) routes to the
     // insecure key, which is the only key any pre-NU6.2 Orchard history verifies under.
@@ -117,16 +119,30 @@ async fn verifier_for_routes_each_upgrade_to_the_correct_key() {
         );
     }
 
-    // NU6.2 and every later upgrade route to the fixed key. Nu6_3 and the future Nu7 guard that
-    // "NU6.2 and later" does not silently fall back to the insecure verifier for later upgrades.
-    for nu in [
-        NetworkUpgrade::Nu6_2,
-        NetworkUpgrade::Nu6_3,
-        NetworkUpgrade::Nu7,
-    ] {
+    // NU6.2 is the only upgrade that uses the fixed key: it is active from the NU6.2 activation
+    // height until NU6.3.
+    assert!(
+        std::ptr::eq(verifier_for(NetworkUpgrade::Nu6_2), nu6_2),
+        "Nu6_2 must route to the NU6.2 (fixed) verifier"
+    );
+
+    // NU6.3 onward routes to the NU6.3 circuit, *including in v5 transactions*. The Orchard-pool
+    // cross-address restriction is enforced for every Orchard Action from NU6.3 onward regardless
+    // of transaction version, "so that it cannot be bypassed by using a version 5 transaction"
+    // (ZIP 229), and that restriction lives only in the NU6.3 circuit. Nu7 guards that later
+    // upgrades do not fall back to the NU6.2 fixed key.
+    for nu in [NetworkUpgrade::Nu6_3, NetworkUpgrade::Nu7] {
         assert!(
-            std::ptr::eq(verifier_for(nu), post),
-            "{nu:?} must route to the post-NU6.2 (fixed) verifier"
+            std::ptr::eq(verifier_for(nu), nu6_3_onward),
+            "{nu:?} must route to the NU6.3-onward verifier even for v5 Orchard bundles"
         );
     }
+
+    // v6 Orchard and Ironwood share the NU6.3 circuit, and a v5 Orchard bundle at NU6.3 must use
+    // that very same key — selecting the verifier is what binds a bundle to a key, so this is the
+    // regression guard against routing v5@NU6.3 to the fixed key.
+    assert!(
+        std::ptr::eq(verifier_for(NetworkUpgrade::Nu6_3), nu6_3_onward),
+        "a v5 Orchard bundle at NU6.3 must use the same key as v6 Orchard and Ironwood"
+    );
 }

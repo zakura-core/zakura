@@ -1516,6 +1516,7 @@ impl Chain {
                 contextually_valid.block.clone(),
                 &sapling_root,
                 &orchard_root,
+                &Default::default(),
             )
             .map_err(Arc::new)?;
 

@@ -531,6 +531,7 @@ impl Block {
                                 Arc::new(block.clone()),
                                 &sapling_tree.root(),
                                 &orchard_tree.root(),
+                                &Default::default(),
                             )
                             .unwrap();
                     } else {
@@ -540,6 +541,7 @@ impl Block {
                                 Arc::new(block.clone()),
                                 &sapling_tree.root(),
                                 &orchard_tree.root(),
+                                &Default::default(),
                             )
                             .unwrap(),
                         );

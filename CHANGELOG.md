@@ -46,6 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
+- Use V3 chain-history entries from NU6.3 onward, including Ironwood note
+  commitment roots and transaction counts.
 - Reject transactions that add net value to the Orchard pool after NU6.3
   activation.
 - Unified the workspace Minimum Supported Rust Version (MSRV) at 1.91, matching

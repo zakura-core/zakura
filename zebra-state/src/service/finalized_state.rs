@@ -647,7 +647,13 @@ impl FinalizedState {
                     let sapling_root = note_commitment_trees.sapling.root();
                     let orchard_root = note_commitment_trees.orchard.root();
                     history_tree_mut
-                        .push(&network, block.clone(), &sapling_root, &orchard_root)
+                        .push(
+                            &network,
+                            block.clone(),
+                            &sapling_root,
+                            &orchard_root,
+                            &Default::default(),
+                        )
                         .map_err(Arc::new)
                         .map_err(ValidateContextError::from)?;
 

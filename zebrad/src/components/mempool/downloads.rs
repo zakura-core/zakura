@@ -432,9 +432,14 @@ where
                         _ => unreachable!("wrong response to transaction request"),
                     };
 
-                    let (tx, advertiser_addr) = tx.available().expect(
-                        "unexpected missing tx status: single tx failures should be errors",
-                    );
+                    let (tx, advertiser_addr) = match tx {
+                        zn::InventoryResponse::Available(tx) => tx,
+                        zn::InventoryResponse::Missing(_) => {
+                            return Err(TransactionDownloadVerifyError::DownloadFailed(
+                                BoxError::from("transaction was missing from peer response").into(),
+                            ));
+                        }
+                    };
 
                     metrics::counter!(
                         "mempool.downloaded.transactions.total",
@@ -783,5 +788,45 @@ mod tests {
             }
         );
         poll_task.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_transaction_response_is_download_failure() {
+        let txid = tx_id(7);
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(move |request| async move {
+                assert!(matches!(request, zn::Request::TransactionsById(_)));
+                Ok(zn::Response::Transactions(vec![
+                    zn::InventoryResponse::Missing(txid),
+                ]))
+            })),
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("missing transaction responses must not be verified");
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
+                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+        );
+
+        downloads
+            .download_if_needed_and_verify(Gossip::Id(txid), None, None)
+            .expect("download is queued");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("missing transaction response should complete")
+            .expect("download stream should yield an item")
+            .expect("missing transaction response should not time out");
+
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.0 == txid
+                    && matches!(error.1, TransactionDownloadVerifyError::DownloadFailed(_))
+        ));
     }
 }

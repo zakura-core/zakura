@@ -145,6 +145,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Treat missing transaction inventory responses during mempool download as a
+  recoverable download failure, avoiding a panic when public peers no longer
+  have a gossiped transaction available.
 - Roll back the Zakura header store together with finalized block data, so
   databases produced by `zebra-rollback-state` can resume Zakura body sync from
   the new body tip instead of stalling behind stale headers and falling back to

@@ -1,0 +1,40 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Generate zebra bench debug config",
+      "type": "shell",
+      "command": "perl -pe 's|\\@\\@FORK\\@\\@|${input:benchCacheDir}|g; s|\\@\\@LISTEN\\@\\@|${input:benchListenPort}|g; s|\\@\\@MET\\@\\@|${input:benchMetricsPort}|g; s|\\@\\@STOP\\@\\@|${input:benchStopHeight}|g' zebra-bench-config.toml > .vscode/zebra-bench-debug.generated.toml",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "benchCacheDir",
+      "type": "promptString",
+      "description": "Bench cache/fork directory for @@FORK@@",
+      "default": "/mnt/roman-dev-2-data/zebra-cache-from-genesis"
+    },
+    {
+      "id": "benchListenPort",
+      "type": "promptString",
+      "description": "P2P listen port for @@LISTEN@@",
+      "default": "18233"
+    },
+    {
+      "id": "benchMetricsPort",
+      "type": "promptString",
+      "description": "Prometheus metrics port for @@MET@@",
+      "default": "9999"
+    },
+    {
+      "id": "benchStopHeight",
+      "type": "promptString",
+      "description": "debug_stop_at_height for @@STOP@@",
+      "default": "1822000"
+    }
+  ]
+}

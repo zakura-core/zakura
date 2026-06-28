@@ -65,7 +65,12 @@ def main():
     sur = per_block(a,b,"sur")   # spent-UTXO reads (∥ raw-tx serialize)
     ar  = per_block(a,b,"ar")    # address-balance reads
     bp  = per_block(a,b,"bp")    # batch build (prepare_block_batch)
-    bc  = per_block(a,b,"bc")    # rocksdb batch write
+    # rocksdb write is recorded once per DiskWriteBatch, so its histogram count is
+    # BATCHES (not blocks) when batch_commit_max>1. Normalize by committed blocks
+    # (dh) so commit_wall/util stay per-block instead of inflating ~K×. For K=1 one
+    # batch == one block, so this equals the old per_block(...,"bc").
+    bc_ds = fnum(b,"bc_sum") - fnum(a,"bc_sum")
+    bc  = (1000.0*bc_ds/dh) if dh > 0 else 0.0   # rocksdb write, ms per committed block
     btx = per_block(a,b,"btx")   # mean tx / block (block_tx_count histogram)
 
     commit_wall = ckc + sur + ar + bp + bc          # writer per-block busy time
@@ -100,6 +105,90 @@ def main():
           f"batch_prep={bp:.2f}  rocksdb_write={bc:.2f}")
     print(f"  write  {mb_per_block:.3f} MB/block  {write_mbps:.1f} MB/s  "
           f"(rocksdb_write = {ms_per_mb:.1f} ms/MB)")
+
+    # Per-apply latency (block_sync_driver): the serial apply-drain wall. verify_commit
+    # is the verifier roundtrip through the single-writer state; commit-DB (cc..bc) is a
+    # subset of it, so (verify_commit - db_total) ≈ verify + async handoff/await.
+    avc = per_block(a, b, "avc")   # verify+commit per apply
+    afq = per_block(a, b, "afq")   # post-commit frontier re-read per apply
+    handoff = avc - db_total
+    print(f"  apply  verify_commit={avc:.2f}  frontier_query={afq:.2f} ms/apply   "
+          f"(commit-DB {db_total:.2f} of verify_commit; verify+handoff ≈ {handoff:.2f})")
+
+    # LEVER 0: which serial stage caps throughput — checkpoint verify or state commit?
+    # verify amortized per committed block (process_checkpoint_range is per-range);
+    # state_commit is per-block (the single-writer await). commit-DB (db_total) is the
+    # RocksDB write inside state_commit; (state_commit - db_total) = poll_ready/queue wait.
+    dvr = fnum(b,"vr_sum") - fnum(a,"vr_sum")
+    verify_pb = (1000.0*dvr/dh) if dh > 0 else 0.0
+    sc = per_block(a, b, "sc")
+    if verify_pb or sc:
+        sink = "VERIFY-bound" if verify_pb > sc else "COMMIT-bound"
+        print(f"  LEVER0 verify={verify_pb:.2f}  state_commit={sc:.2f} ms/blk   "
+              f"(commit-DB {db_total:.2f}, writer-queue ≈ {sc-db_total:.2f})  -> serial stage: {sink}")
+
+    # PROBE 2: localize the ~15ms gap inside the single writer. commit_finalized_total =
+    # the writer's per-block service time; tree_read = history-tree DB read + tree clones.
+    # gap = total - db_total - tree_read (VCT fold + write_block internals + bookkeeping).
+    cft = per_block(a, b, "cft")
+    trd = per_block(a, b, "trd")
+    if cft:
+        gap = cft - db_total - trd
+        print(f"  PROBE2 writer_service={cft:.2f} ms/blk = tree_read {trd:.2f} + commit-DB "
+              f"{db_total:.2f} + other {gap:.2f}   (other = VCT fold / write_block-internals / bookkeeping)")
+
+    # PROBE 3: is the single writer STARVED or SATURATED? Δwi_sum/Δt = fraction of wall
+    # the writer sat idle between commits; writer_park counts 10ms empty-channel polls.
+    dwi = fnum(b,"wi_sum") - fnum(a,"wi_sum")
+    idle_frac = (dwi/dt) if dt > 0 else 0.0
+    wi_pb = per_block(a, b, "wi")
+    park_rate = (fnum(b,"wpark") - fnum(a,"wpark"))/dt if dt > 0 else 0.0
+    if dwi or park_rate:
+        vcts_rate = (fnum(b,"wpvs") - fnum(a,"wpvs"))/dt if dt > 0 else 0.0
+        # Attribute the idle: empty-channel park vs VCT-successor-deferral park.
+        if vcts_rate > park_rate * 2:
+            state = "WAITING ON SUCCESSOR (VCT one-behind commit dependency)"
+        elif idle_frac > 0.5:
+            state = "STARVED on input channel (cadence-bound)"
+        else:
+            state = "SATURATED (commit-bound)"
+        print(f"  PROBE3 writer_idle={idle_frac*100:.0f}% of wall  ({wi_pb:.1f} ms/blk idle vs {cft:.2f} commit)  "
+              f"park_empty={park_rate:.0f}/s  park_successor={vcts_rate:.0f}/s (~{vcts_rate*10:.0f} ms/s)  -> {state}")
+
+    # PROBE 4: verifier->writer delivery side. release rate = blocks/s leaving for the
+    # writer; queued residency = queue depth / release rate; apply_inflight = achieved
+    # concurrency vs the ~400 checkpoint cap.
+    intake_rate  = (fnum(b,"ck_intake")  - fnum(a,"ck_intake"))  / dt if dt > 0 else 0.0
+    release_rate = (fnum(b,"ck_release") - fnum(a,"ck_release")) / dt if dt > 0 else 0.0
+    ck_queued = avg(win, "ck_queued")
+    ap_if = avg(win, "apply_inflight")
+    resid = (ck_queued / release_rate) if release_rate > 0 else 0.0
+    if intake_rate or release_rate:
+        cap = "CONCURRENCY-bound (~400 cap)" if ap_if >= 360 else "SUBMISSION-fed below cap"
+        print(f"  PROBE4 verifier intake={intake_rate:.0f}/s  release={release_rate:.0f}/s  "
+              f"queued~{ck_queued:.0f} (resid ~{resid:.1f}s)  apply_inflight~{ap_if:.0f}  -> {cap}")
+
+    # PROBE 4b: split the apply roundtrip. admit_wait = poll_ready (before the verifier
+    # accepts); call_to_commit = accepted -> committed (~0.5s verifier residency + the
+    # release->commit roundtrip). Whichever dominates says which side of the verifier the
+    # ~34s lives on -> upstream backpressure vs the commit roundtrip (batch-commit lever).
+    aw  = per_block(a, b, "aw")    # admit_wait s/apply (note: seconds, large)
+    c2c = per_block(a, b, "c2c")   # call_to_commit s/apply
+    if aw or c2c:
+        side = ("ADMIT-bound (upstream of commit; batching won't help)" if aw > c2c
+                else "COMMIT-side (release->commit roundtrip; batch-commit is the lever)")
+        print(f"  PROBE4b admit_wait={aw/1000:.1f}s/apply  call_to_commit={c2c/1000:.1f}s/apply  -> {side}")
+
+    # PROBE 5: the NEXT door. state_admit = poll_ready behind the state Buffer;
+    # state_call = the actual commit. If raising VERIFIER_BUFFER_BOUND just moves the
+    # throttle here, state_admit balloons and cinf (commits in flight) piles up.
+    sa  = per_block(a, b, "sa")    # state admit_wait s/apply
+    scl = per_block(a, b, "scl")   # state call (commit) s/apply
+    cinf = avg(win, "cinf")
+    if sa or scl:
+        nxt = ("STATE-ADMIT-bound (throttle moved to the state Buffer)" if sa > scl
+               else "state commit itself (writer) is the cost")
+        print(f"  PROBE5 state_admit={sa:.1f}ms  state_call={scl:.1f}ms/commit  commits_inflight~{cinf:.0f}  -> {nxt}")
 
     print(f"\nZAKURA supply: peers~{peers:.0f}  queue_depth~{qd:.0f}  block_sync_streams~{bss:.0f}")
     print(f"           burst rate={burst:.0f} blk/s during active samples; "

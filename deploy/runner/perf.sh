@@ -158,7 +158,15 @@ cmd_build_local() {
   export CARGO_TARGET_DIR
   note "building instrumented bench binary (commit-metrics) -> $BENCH_BIN"
   ( cd "$REPO" && cargo build --release -p zebrad --features commit-metrics --locked )
-  cp "$CARGO_TARGET_DIR/release/zebrad" "$BENCH_BIN"
+  local bench_dir bench_tmp
+  bench_dir="$(dirname "$BENCH_BIN")"
+  bench_tmp="$(mktemp "${bench_dir}/.$(basename "$BENCH_BIN").XXXXXX")"
+  if install -m 0755 "$CARGO_TARGET_DIR/release/zebrad" "$bench_tmp"; then
+    mv -f "$bench_tmp" "$BENCH_BIN"
+  else
+    rm -f "$bench_tmp"
+    return 1
+  fi
   note "installed $BENCH_BIN"
 }
 

@@ -21,9 +21,10 @@
           "CXXFLAGS": "-include cstdint"
         }
       },
+      "preLaunchTask": "Generate zebra bench debug config",
       "args": [
         "-c",
-        ".vscode/zakura-debug.toml",
+        ".vscode/zebra-bench-debug.generated.toml",
         "start"
       ],
       "cwd": "${workspaceFolder}",

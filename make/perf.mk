@@ -10,6 +10,7 @@
 .PHONY: \
 	perf-build-local \
 	perf-run \
+	perf-run-mainnet \
 	perf-analyze \
 	perf-logs \
 	perf-dashboard \
@@ -20,12 +21,15 @@
 	perf-status
 
 PERF_SH ?= $(CURDIR)/deploy/runner/perf.sh
+FEED_RUN ?= $(CURDIR)/deploy/runner/feed_run.sh
+PERF_MAINNET_CONFIG ?= $(CURDIR)/deploy/runner/zebra-bench-mainnet-config.toml
 
 # perf-run / perf-analyze parameters (override on the command line).
-PERF_LABEL ?= r1
-PERF_STOP  ?= 1900000
-PERF_LO    ?= 1810000
-PERF_HI    ?= 1895000
+PERF_LABEL         ?= r1
+PERF_MAINNET_LABEL ?= r1-mainnet
+PERF_STOP          ?= 1900000
+PERF_LO            ?= 1810000
+PERF_HI            ?= 1895000
 
 # Build the instrumented (commit-metrics) local bench binary -> $BENCH_BIN.
 perf-build-local:
@@ -34,6 +38,10 @@ perf-build-local:
 # Fork the snapshot and run an isolated bench against the cohort, emitting a CSV.
 perf-run:
 	"$(PERF_SH)" run $(PERF_LABEL) $(PERF_STOP)
+
+# Fork the snapshot and run against public Mainnet Zakura bootstrap peers.
+perf-run-mainnet:
+	. "$(CURDIR)/deploy/runner/cohort.env"; CONFIG_SRC="$(PERF_MAINNET_CONFIG)" "$(FEED_RUN)" $(PERF_MAINNET_LABEL) "$$BENCH_BIN" $(PERF_STOP)
 
 # Steady-state bottleneck attribution over the CSV window [PERF_LO, PERF_HI].
 perf-analyze:

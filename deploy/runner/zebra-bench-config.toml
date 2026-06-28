@@ -33,8 +33,12 @@ listen_addr     = "0.0.0.0:8234"
 # config with the old curated bootstrap_peers and no dev_network.
 dev_network     = "@@COHORT@@"
 bootstrap_peers = @@BOOTSTRAP@@
-# Throughput-gating knobs left at DEFAULT (levers for the body-fetch bottleneck):
-#   max_blocks_per_response=1, fanout=1, request_timeout=10s
+# Structured Zakura JSONL trace tables (BLOCK_SYNC_STATE + limiter, commit-state).
+# Disabled when unset; feed_run.sh points @@TRACEDIR@@ at the preserved per-run dir
+# /mnt/roman-dev-2-data/feedrun-<LABEL>-traces/.
+trace_dir       = "@@TRACEDIR@@"
+# Throughput-gating knobs (levers for the body-fetch bottleneck): max_blocks_per_response=1,
+# request_timeout=10s at default; near_floor_fanout enabled below (2 peers over 20 heights).
 
 [network.zakura.block_sync]
 replace_legacy_syncer = true   # Zakura fully owns block-body download; the legacy syncer keeps
@@ -51,8 +55,13 @@ cache_dir            = "@@FORK@@"
 storage_mode         = "pruned"
 debug_stop_at_height = @@STOP@@
 
-# [sync] — no overrides; Zebra stock defaults (download=100, checkpoint_verify=1000, full_verify=20).
+# [sync] — back to defaults. The 2x checkpoint apply-concurrency test (800) was a loss
+# (throughput flat/down, latency 2x, CPU still idle): two ranges serialize, they don't
+# pipeline. The clamp is reverted to 400; next we split verify vs commit to find the
+# serial stage (see zebra.consensus.checkpoint.{verify_range,state_commit}.* below).
 
 [tracing]
-# Silence cosmetic iroh disco/AEAD WARN spam from bad inbound peers; real errors still surface.
-filter = "info,zebra_network::zakura=debug,zebra_network::zakura::discovery=debug,zebrad::commands::start::zakura=debug,iroh::magicsock=error,iroh_quinn_udp=error"
+# Full-pipeline tracing: Zakura block-sync (BLOCK_SYNC_STATE + limiter), checkpoint
+# verifier, and the committer at debug. iroh + byte-budget-guard WARN spam silenced.
+# Output lands in the run's log: /mnt/roman-dev-2-data/feedrun-<LABEL>.log
+filter = "info,zebra_network::zakura=debug,zebra_network::zakura::transport::guard=error,zebrad::commands::start::zakura=debug,iroh=error,iroh::magicsock=error,iroh_quinn_udp=error"

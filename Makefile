@@ -9,6 +9,7 @@ help:
 	@echo "  Perf harness (deterministic isolated-cohort bench):"
 	@echo "  perf-build-local                 Build the instrumented (commit-metrics) bench binary"
 	@echo "  perf-run                         Run an isolated bench against the cohort (PERF_LABEL/PERF_STOP)"
+	@echo "  perf-run-mainnet                 Run a bench against public Mainnet Zakura peers (PERF_MAINNET_LABEL/PERF_STOP)"
 	@echo "  perf-analyze                     Bottleneck attribution over the CSV window (PERF_LABEL/PERF_LO/PERF_HI)"
 	@echo "  perf-dashboard                   Live metrics dashboard for the running bench node"
 	@echo "  perf-verify-isolation            Confirm the bench sees only the two cohort peers"

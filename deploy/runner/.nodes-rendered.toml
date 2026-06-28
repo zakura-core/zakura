@@ -1,0 +1,36 @@
+# Serving-fleet deployer config TEMPLATE.
+#
+# `perf.sh` renders this into a temp nodes.toml (substituting @@TOKENS@@ from
+# cohort.env) and passes it to deploy/deployer/deploy.py. Do not run deploy.py
+# against this file directly — the tokens are not valid TOML until rendered.
+#
+# Tokens: feat/pre-release-main roman-perf-1800 ["912e382c9790d241d1f5f31e38f331932b85b0e8848e35e16f49bf76c3c43674@167.99.162.47:8234","cbd797cb28c5e53dbc19e4d5d6d60e5dcd9b5667808eb5703131c67cd67a30fa@167.172.201.36:8234"] false archive
+
+[defaults]
+service_name    = "zebrad"
+bin_path        = "/usr/local/bin/zebrad"
+config_path     = "/etc/zebrad/zebrad.toml"
+log_file        = "/var/log/zebrad/zebrad.log"
+state_cache_dir = "/root/.cache/zebra"       # the big-volume snapshot (symlink → /mnt/<host>-data/zebra-cache); holds the near-tip state + iroh identity. Never wipe.
+network         = "Mainnet"
+listen_addr     = "[::]:8233"
+storage_mode    = "archive"
+v2_p2p          = true
+legacy_p2p      = false                  # seed phase: true (sync from public); freeze phase: false
+metrics_endpoint = "127.0.0.1:9100"          # loopback Prometheus; scrape via ssh for cohort/peer counts
+tracing_filter   = "info,zebra_network::zakura=debug,zebra_network::zakura::discovery=debug"
+
+[defaults.zakura]
+listen_addr     = "0.0.0.0:8234"
+dev_network     = "roman-perf-1800"
+bootstrap_peers = ["912e382c9790d241d1f5f31e38f331932b85b0e8848e35e16f49bf76c3c43674@167.99.162.47:8234","cbd797cb28c5e53dbc19e4d5d6d60e5dcd9b5667808eb5703131c67cd67a30fa@167.172.201.36:8234"]
+
+[[nodes]]
+name       = "serve-a"
+ssh_string = "root@167.99.162.47"
+commit     = "feat/pre-release-main"
+
+[[nodes]]
+name       = "serve-b"
+ssh_string = "root@167.172.201.36"
+commit     = "feat/pre-release-main"

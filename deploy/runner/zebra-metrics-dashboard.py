@@ -63,6 +63,21 @@ def bare(m, name):
 def total(m, name):
     return sum(v for _, v in m.get(name, [])) if name in m else None
 
+def lbval(m, name, want):
+    """Value of a labeled series whose label string contains `want` (e.g. a
+    `state="outstanding"` floor-gap tick counter)."""
+    for lbl, v in m.get(name, []):
+        if want in lbl:
+            return v
+    return None
+
+def first_present(m, *names):
+    for name in names:
+        value = bare(m, name)
+        if value is not None:
+            return value
+    return None
+
 def quantile(m, name, q):
     needle = f'quantile="{q}"'
     for lbl, v in m.get(name, []):
@@ -94,6 +109,18 @@ PANELS = [
     ("Zakura",     "zk_peers",       "Cohort peers (active)",       "",      "gauge"),
     ("Zakura",     "zk_qdepth",      "Zakura queue depth",          "",      "gauge"),
     ("Zakura",     "zk_block_sync",  "block_sync streams",          "",      "gauge"),
+    # Apply-queue depth + floor-gap attribution: separates HOL download stalls
+    # from the sequencer→committer handoff ("glue") from peer-supply starvation.
+    ("Apply queue","applying",       "Applying (contiguous, cap 400)","",    "gauge"),
+    ("Apply queue","reorder",        "Reorder (out-of-order buffered)","",   "gauge"),
+    ("Apply queue","unsub_applying", "Unsubmitted applying",        "",      "gauge"),
+    ("Floor gap",  "body_lead",      "Body lead (floor−finalized)", "",      "gauge"),
+    ("Floor gap",  "commit_gap",     "Commit gap (floor−verified)", "",      "gauge"),
+    ("Floor gap",  "commit_stall_s", "Commit frontier stall",       "s",     "gauge"),
+    ("Floor gap",  "outstanding",    "Outstanding floor requests",  "",      "gauge"),
+    ("Floor gap",  "fg_slow_s",      "floor: slow-download /s",     "/s",    "rate"),
+    ("Floor gap",  "fg_starve_s",    "floor: peer/slot starve /s",  "/s",    "rate"),
+    ("Floor gap",  "fg_glue_s",      "floor: buffered-unrequested /s","/s",  "rate"),
 ]
 PANEL_KEYS = [k for _, k, *_ in PANELS]
 
@@ -138,6 +165,34 @@ def steady_window(samples):
     trim = len(tail) // 10
     return tail[trim:] if len(tail) - trim >= 3 else tail
 
+APPLY_QUEUE_CAP = 400   # MAX_CHECKPOINT_HEIGHT_GAP: contiguous applying-queue ceiling
+APPLY_FULL      = 360    # "near cap" => bodies downloaded & queued, handoff not draining
+
+def _floor_reason(applying, reorder, outstanding, slow_s, starve_s, glue_s):
+    """Attribute a non-advancing commit floor from apply-queue depth (Evan's test),
+    corroborated by the floor-gap reason rates. Returns (tag, human text).
+
+    apply queue pinned near 400  -> glue/commit-bound (NOT block-sync): blocks are
+      downloaded and contiguously queued, the sequencer→committer handoff isn't draining.
+    apply queue low + reorder high -> head-of-line download stall: the floor body is
+      missing while out-of-order successors pile up in reorder.
+    apply queue low + reorder low  -> supply starvation: the cohort isn't delivering."""
+    a = applying if applying is not None else 0
+    if applying is not None and a >= APPLY_FULL:
+        return ("glue", f"apply queue FULL ({a:.0f}/{APPLY_QUEUE_CAP}) — bodies downloaded & "
+                        f"queued, commit handoff not draining (glue/commit-bound, NOT block-sync)")
+    if reorder is not None and reorder > max(a, 50):
+        return ("hol", f"apply queue LOW ({a:.0f}/{APPLY_QUEUE_CAP}) + reorder {reorder:.0f} "
+                       f"out-of-order — floor body missing, successors stacked (head-of-line)")
+    bits = [b for b in (
+        (f"slow-dl {slow_s:.2f}/s"      if slow_s   else None),
+        (f"peer/slot-starve {starve_s:.2f}/s" if starve_s else None),
+        (f"buffered-unreq {glue_s:.2f}/s" if glue_s else None),
+    ) if b]
+    rtxt = ("; floor-gap " + ", ".join(bits)) if bits else ""
+    return ("supply", f"apply queue LOW ({a:.0f}/{APPLY_QUEUE_CAP}), outstanding="
+                      f"{outstanding if outstanding is not None else '—'} — cohort not supplying the floor{rtxt}")
+
 def classify(samples, ckpt_limit=None, dl_limit=None):
     """Return {verdict, label, confidence, scores, detail, bps} over the steady
     window: COMMIT-BOUND (writer saturated, names the heaviest phase) vs
@@ -157,10 +212,14 @@ def classify(samples, ckpt_limit=None, dl_limit=None):
     phases = {k: v for k, v in phases.items() if v}
     scores = {"commit": round(commit_u, 3)} if commit_u is not None else {}
 
+    # Apply-queue attribution: HOL vs glue/commit vs supply (Evan's 400 test).
+    fr_tag, fr_text = _floor_reason(med("applying"), med("reorder"), med("outstanding"),
+                                    med("fg_slow_s"), med("fg_starve_s"), med("fg_glue_s"))
+
     if bps is None or bps < STALL_BPS:
         return {"verdict": "stalled", "label": "STALLED / STARVED", "confidence": "high",
                 "scores": scores, "bps": (round(bps, 2) if bps is not None else None),
-                "detail": f"no commit progress ({(bps or 0):.2f} blk/s)"}
+                "detail": f"no commit progress ({(bps or 0):.2f} blk/s) — {fr_text}"}
 
     top = max(phases, key=phases.get) if phases else None
     topname = dict(COMMIT_PHASES).get(top, top)
@@ -174,12 +233,15 @@ def classify(samples, ckpt_limit=None, dl_limit=None):
                 "detail": detail, "bps": round(bps, 2)}
 
     if commit_u is not None and cutil <= COMMIT_UTIL_LO:
-        qd = med("zk_qdepth")
-        qtxt = f" (queue_depth~{qd:.0f})" if qd is not None else ""
-        return {"verdict": "supply_bound", "label": "SUPPLY-BOUND (Zakura)",
+        # Writer idle is necessary but NOT sufficient for "supply-bound": a full
+        # apply queue means bodies ARE downloaded and the handoff is the limiter.
+        # Use the apply-queue depth to tell glue/commit from genuine supply/HOL.
+        label = {"glue": "GLUE / HANDOFF-BOUND", "hol": "HEAD-OF-LINE (download)",
+                 "supply": "SUPPLY-BOUND (Zakura)"}.get(fr_tag, "SUPPLY-BOUND (Zakura)")
+        verdict = "commit_bound" if fr_tag == "glue" else "supply_bound"
+        return {"verdict": verdict, "label": label,
                 "confidence": "medium", "scores": scores, "bps": round(bps, 2),
-                "detail": (f"writer only {cutil:.0f}% busy at {bps:.0f} blk/s — the cohort "
-                           f"isn't delivering blocks fast enough{qtxt}")}
+                "detail": f"writer only {cutil:.0f}% busy at {bps:.0f} blk/s — {fr_text}"}
 
     detail = f"writer {cutil:.0f}% busy at {bps:.0f} blk/s" if cutil is not None else f"{bps:.0f} blk/s"
     if top:
@@ -294,9 +356,28 @@ class Collector:
         d["zk_qdepth"]     = bare(m, "zakura_p2p_queue_depth")
         d["zk_block_sync"] = next((v for lbl, v in m.get("zakura_p2p_stream_accepted", [])
                                    if "block_sync" in lbl), None)
+        # Apply-queue depth + floor-gap frontiers (instantaneous gauges).
+        d["applying"]       = bare(m, "sync_block_applying")
+        d["reorder"]        = first_present(m, "sync_block_reorder",
+                                            "sync_block_reorder_buffered_blocks")
+        d["unsub_applying"] = bare(m, "sync_block_unsubmitted_applying")
+        d["commit_gap"]     = bare(m, "sync_block_commit_gap_height")
+        d["commit_stall_s"] = bare(m, "sync_block_commit_frontier_stall_seconds")
+        d["outstanding"]    = bare(m, "sync_block_outstanding")
+        # Body lead/backlog: contiguous downloaded/queued bodies ahead of finalized
+        # state = body floor (download_floor) − finalized tip.
+        _dlf = first_present(m, "sync_block_download_floor_height",
+                             "sync_block_body_download_floor_height")
+        _fin = bare(m, "state_finalized_block_height")
+        d["body_lead"] = (_dlf - _fin) if (_dlf is not None and _fin is not None and _dlf > 0) else None
 
         cur = {
             "h":    bare(m, "state_finalized_block_height"),
+            # Floor-gap state-tick counters (cumulative; rate() ⇒ time-fraction).
+            "fg_slow":   lbval(m, "sync_block_floor_gap_state_ticks", 'state="outstanding"'),
+            "fg_q":      lbval(m, "sync_block_floor_gap_state_ticks", 'state="queued"'),
+            "fg_ns":     lbval(m, "sync_block_floor_gap_state_ticks", 'state="needed_unscheduled"'),
+            "fg_glue":   lbval(m, "sync_block_floor_gap_state_ticks", 'state="in_flight_without_outstanding"'),
             "vf":   bare(m, "state_vct_fast_block_count"),
             "vl":   bare(m, "state_vct_legacy_block_count"),
             "ckc_s":bare(m, "zebra_state_write_checkpoint_compute_duration_seconds_sum"),
@@ -345,6 +426,12 @@ class Collector:
                 d["blocks_per_s"] = rate(p["h"], cur["h"], dt)
             d["vct_fast_s"]     = rate(p["vf"], cur["vf"], dt)
             d["vct_legacy_s"]   = rate(p["vl"], cur["vl"], dt)
+            # Floor-gap reason rates (ticks/s ≈ fraction of stall time in each reason).
+            d["fg_slow_s"]      = rate(p.get("fg_slow"), cur["fg_slow"], dt)
+            d["fg_glue_s"]      = rate(p.get("fg_glue"), cur["fg_glue"], dt)
+            _q  = rate(p.get("fg_q"),  cur["fg_q"],  dt)
+            _ns = rate(p.get("fg_ns"), cur["fg_ns"], dt)
+            d["fg_starve_s"]    = ((_q or 0) + (_ns or 0)) if (_q is not None or _ns is not None) else None
             d["p_checkpoint"]   = avg(p["ckc_s"], cur["ckc_s"], p["ckc_c"], cur["ckc_c"])
             d["p_commit_check"] = avg(p["cc_s"],  cur["cc_s"],  p["cc_c"],  cur["cc_c"])
             d["p_note_tree"]    = avg(p["ut_s"],  cur["ut_s"],  p["ut_c"],  cur["ut_c"])
@@ -352,7 +439,12 @@ class Collector:
             d["p_spent_reads"]  = avg(p["sur_s"], cur["sur_s"], p["sur_c"], cur["sur_c"])
             d["p_addr_reads"]   = avg(p["ar_s"],  cur["ar_s"],  p["ar_c"],  cur["ar_c"])
             d["p_batch_prep"]   = avg(p["bp_s"],  cur["bp_s"],  p["bp_c"],  cur["bp_c"])
-            d["p_rocksdb"]      = avg(p["bc_s"],  cur["bc_s"],  p["bc_c"],  cur["bc_c"])
+            # rocksdb write is recorded once per DiskWriteBatch, so bc_c counts
+            # BATCHES not blocks when batch_commit_max>1. Normalize by a per-block
+            # count (bp_c, recorded once per block) so commit_ms/commit_util stay
+            # per-block instead of inflating ~K× and pinning util at 100%. For K=1
+            # bc_c == bp_c, so this is unchanged.
+            d["p_rocksdb"]      = avg(p["bc_s"],  cur["bc_s"],  p["bp_c"],  cur["bp_c"])
             bpb = avg(p["bb_s"], cur["bb_s"], p["bb_c"], cur["bb_c"], scale=1.0)  # bytes/block
             d["commit_mb"]      = (bpb/1e6) if bpb is not None else None
             wb = rate(p["bb_s"], cur["bb_s"], dt)                                 # bytes/s

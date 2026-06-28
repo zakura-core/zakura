@@ -1,0 +1,66 @@
+# =============================================================================
+# Mainnet bench config - public Zakura bootstrap peers.
+#
+# feed_run.sh copies this file and substitutes the per-run tokens below, then
+# launches zebrad with the result. Use `make perf-run-mainnet` to select it.
+#
+# Tokens (each wrapped in double-at markers in the config lines further down):
+#   FORK     -> hard-link fork of the warm master (per-run cache_dir)
+#   LISTEN   -> legacy P2P listen port (derived from metrics port)
+#   MET      -> Prometheus metrics port
+#   STOP     -> debug_stop_at_height (bounds the bench window)
+#   TRACEDIR -> structured Zakura trace directory
+# =============================================================================
+
+[network]
+network     = "Mainnet"
+listen_addr = "0.0.0.0:@@LISTEN@@"
+cache_dir   = "@@FORK@@"
+v2_p2p      = true      # Zakura v2 block/header sync + tree_aux -> VCT fast path
+legacy_p2p  = false     # pure v2: public Zakura bootstrap peers below are the entrypoint
+
+[network.zakura]
+# Bind on all interfaces - iroh uses one UDP socket for send+recv, so a loopback
+# bind breaks OUTBOUND to external peers.
+listen_addr     = "0.0.0.0:8234"
+# Public mainnet Zakura bootstrap peers. No dev_network is set, so discovery uses
+# the public Mainnet Zakura overlay instead of the private perf cohort.
+bootstrap_peers = [
+    "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234",
+    "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22@143.244.184.176:8234",
+    "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57@159.203.38.10:8234",
+    "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5@64.227.44.93:8234",
+    "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1@161.35.156.226:8234",
+    "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234",
+    "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
+]
+# Structured Zakura JSONL trace tables (BLOCK_SYNC_STATE + limiter, commit-state).
+trace_dir       = "@@TRACEDIR@@"
+# Throughput-gating knobs (levers for the body-fetch bottleneck): max_blocks_per_response=1,
+# request_timeout=10s at default.
+
+[network.zakura.block_sync]
+replace_legacy_syncer = true   # Zakura fully owns block-body download; the legacy syncer keeps
+                               # doing tip discovery only, so it no longer competes for downloads
+
+[consensus]
+checkpoint_sync = true  # keeps the region checkpoint-verified; on mainnet selects VCT peer-source mode
+
+[metrics]
+endpoint_addr = "127.0.0.1:@@MET@@"
+
+[state]
+cache_dir            = "@@FORK@@"
+storage_mode         = "pruned"
+debug_stop_at_height = @@STOP@@
+
+# [sync] - back to defaults. The 2x checkpoint apply-concurrency test (800) was a loss
+# (throughput flat/down, latency 2x, CPU still idle): two ranges serialize, they don't
+# pipeline. The clamp is reverted to 400; next we split verify vs commit to find the
+# serial stage (see zebra.consensus.checkpoint.{verify_range,state_commit}.* below).
+
+[tracing]
+# Full-pipeline tracing: Zakura block-sync (BLOCK_SYNC_STATE + limiter), checkpoint
+# verifier, and the committer at debug. iroh + byte-budget-guard WARN spam silenced.
+# Output lands in the run's log: /mnt/roman-dev-2-data/feedrun-<LABEL>.log
+filter = "info,zebra_network::zakura=debug,zebra_network::zakura::transport::guard=error,zebrad::commands::start::zakura=debug,iroh=error,iroh::magicsock=error,iroh_quinn_udp=error"

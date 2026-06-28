@@ -20,6 +20,7 @@
 #
 # Helpers:
 #   perf.sh build-local      # rebuild the instrumented bench binary (BENCH_BIN)
+#   perf.sh stage-bin <name> # rebuild and copy BENCH_BIN to perf-artifacts/<name>
 #   perf.sh verify-isolation [met]        # confirm the bench node sees only the cohort
 #   perf.sh logs [label]     # follow the bench node log (drift spam filtered; RAW=1 for all)
 set -euo pipefail
@@ -38,11 +39,34 @@ FEED_RUN="$RUNNER_DIR/feed_run.sh"
 ANALYZE="$RUNNER_DIR/feed_analyze.py"
 DASH="$RUNNER_DIR/zebra-metrics-dashboard.py"
 BENCH_CONFIG="$RUNNER_DIR/zebra-bench-config.toml"
+PERF_ARTIFACT_DIR="${PERF_ARTIFACT_DIR:-$REPO/perf-artifacts}"
 ZAKURA_PORT="${ZAKURA_PORT:-8234}"
 LOG_DIR="$RUNNER_DIR/.logs"
 
 die()  { echo "FATAL: $*" >&2; exit 1; }
 note() { echo "[perf] $*" >&2; }
+
+validate_artifact_name() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "missing binary name"
+  case "$name" in
+    */*|.|..) die "binary name must be a file name under perf-artifacts: $name" ;;
+  esac
+}
+
+staged_bench_bin() {
+  local name="$1"
+  validate_artifact_name "$name"
+  printf '%s/%s\n' "$PERF_ARTIFACT_DIR" "$name"
+}
+
+selected_bench_bin() {
+  if [ -n "${PERF_BIN_NAME:-}" ]; then
+    staged_bench_bin "$PERF_BIN_NAME"
+  else
+    printf '%s\n' "$BENCH_BIN"
+  fi
+}
 
 # --- rendering helpers ------------------------------------------------------
 
@@ -131,9 +155,14 @@ cmd_status() {
 cmd_run() {
   local label="${1:?usage: perf.sh run <label> [stop] [met]}"; shift || true
   [ -n "${NODE_A_PEER:-}" ] || die "NODE_*_PEER empty — seed/peers/freeze the cohort first"
+  local bin; bin="$(selected_bench_bin)"
+  if [ -n "${PERF_BIN_NAME:-}" ] && [ ! -x "$bin" ]; then
+    die "staged binary not executable: $bin (run 'make perf-build-stage-bin $PERF_BIN_NAME' first)"
+  fi
   local cfg; cfg="$(render_bench_config)"
   note "bench '$label' isolated to cohort '${COHORT_TAG}' ($(bootstrap_toml))"
-  CONFIG_SRC="$cfg" "$FEED_RUN" "$label" "$BENCH_BIN" "$@"
+  note "using bench binary: $bin"
+  CONFIG_SRC="$cfg" "$FEED_RUN" "$label" "$bin" "$@"
 }
 
 cmd_analyze() {
@@ -168,6 +197,33 @@ cmd_build_local() {
     return 1
   fi
   note "installed $BENCH_BIN"
+}
+
+cmd_stage_bin() {
+  local name="${1:?usage: perf.sh stage-bin <name>}"
+  local staged_bin; staged_bin="$(staged_bench_bin "$name")"
+
+  cmd_build_local
+
+  mkdir -p "$PERF_ARTIFACT_DIR"
+  local staged_tmp
+  staged_tmp="$(mktemp "${PERF_ARTIFACT_DIR}/.${name}.XXXXXX")"
+  if install -m 0755 "$BENCH_BIN" "$staged_tmp"; then
+    mv -f "$staged_tmp" "$staged_bin"
+  else
+    rm -f "$staged_tmp"
+    return 1
+  fi
+
+  note "staged $staged_bin"
+}
+
+cmd_bench_bin() {
+  local bin; bin="$(selected_bench_bin)"
+  if [ -n "${PERF_BIN_NAME:-}" ] && [ ! -x "$bin" ]; then
+    die "staged binary not executable: $bin (run 'make perf-build-stage-bin $PERF_BIN_NAME' first)"
+  fi
+  printf '%s\n' "$bin"
 }
 
 cmd_verify_isolation() {
@@ -214,6 +270,8 @@ case "${1:-}" in
   analyze)          shift; cmd_analyze "$@" ;;
   dashboard)        shift; cmd_dashboard "$@" ;;
   build-local)      shift; cmd_build_local "$@" ;;
+  stage-bin)        shift; cmd_stage_bin "$@" ;;
+  bench-bin)        shift; cmd_bench_bin "$@" ;;
   verify-isolation) shift; cmd_verify_isolation "$@" ;;
   logs)             shift; cmd_logs "$@" ;;
   ""|-h|--help|help) usage ;;

@@ -88,6 +88,15 @@ SNAP_FILE="$(basename "$SNAPSHOT_URL")"
 MASTER="$BENCH_HOME/master-${START_HEIGHT}"
 SAMPLE_INTERVAL=5
 ZEBRAD_BIN=""
+ZAKURA_BOOTSTRAP_PEERS=(
+  "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234"
+  "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22@143.244.184.176:8234"
+  "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57@159.203.38.10:8234"
+  "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5@64.227.44.93:8234"
+  "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1@161.35.156.226:8234"
+  "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234"
+  "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234"
+)
 
 log()  { printf '[bench %(%H:%M:%S)T] %s\n' -1 "$*" >&2; }
 die()  { log "FATAL: $*"; exit 1; }
@@ -377,6 +386,16 @@ run_one() {
         fi
       fi
       echo ''
+      if [[ "$1" == "with_p2p_toggles" && "$should_use_v2_p2p" == "1" ]]; then
+        echo '[network.zakura]'
+        echo 'bootstrap_peers = ['
+        local peer
+        for peer in "${ZAKURA_BOOTSTRAP_PEERS[@]}"; do
+          echo "  \"$peer\","
+        done
+        echo ']'
+        echo ''
+      fi
       echo '[state]'
       echo "cache_dir = \"$fork\""
       echo "debug_stop_at_height = $STOP_HEIGHT"

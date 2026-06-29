@@ -13,6 +13,7 @@
 # Binary source (pick one; BUILD_REF wins):
 #   BUILD_REF             git branch/tag/SHA to build ON THIS HOST, cached by commit
 #   BASELINE_REF          optional second ref to build+run first (A/B speedup)
+#   SKIP_BASELINE         1 = run only the target/primary binary, ignoring any baseline
 #   FORCE_REBUILD         1 = rebuild even if a binary for the commit SHA is cached
 #   RELEASE_TAG           else: download this release tarball (e.g. v5.0.0-test.7)
 #   BASELINE_TAG          optional baseline release tag for A/B (download mode)
@@ -53,6 +54,7 @@ set -euo pipefail
 # SHA), or download a published release tarball (RELEASE_TAG). BUILD_REF wins.
 BUILD_REF="${BUILD_REF:-}"
 BASELINE_REF="${BASELINE_REF:-}"
+SKIP_BASELINE="${SKIP_BASELINE:-0}"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
 RELEASE_TAG="${RELEASE_TAG:-}"
 BASELINE_TAG="${BASELINE_TAG:-}"
@@ -98,6 +100,7 @@ normalize_bool() {
   esac
 }
 
+SKIP_BASELINE="$(normalize_bool "$SKIP_BASELINE")"
 TARGET_SHOULD_USE_V2_P2P="$(normalize_bool "$TARGET_SHOULD_USE_V2_P2P")"
 TARGET_SHOULD_USE_LEGACY_P2P="$(normalize_bool "$TARGET_SHOULD_USE_LEGACY_P2P")"
 BASELINE_SHOULD_USE_V2_P2P="$(normalize_bool "$BASELINE_SHOULD_USE_V2_P2P")"
@@ -544,6 +547,10 @@ elif [[ -n "$RELEASE_TAG" ]]; then
 else
   die "set BUILD_REF (git ref to build on host) or RELEASE_TAG (release to download)"
 fi
+if [[ "$SKIP_BASELINE" == "1" ]]; then
+  [[ -n "$BASELINE_SPEC" ]] && log "skip_baseline=1; ignoring baseline '$BASELINE_SPEC'"
+  BASELINE_SPEC=""
+fi
 log "binary source: $MODE; primary='$PRIMARY_SPEC'${BASELINE_SPEC:+, baseline='$BASELINE_SPEC'}"
 
 ensure_deps
@@ -557,7 +564,11 @@ SUMMARY="${GITHUB_STEP_SUMMARY:-$OUT_DIR/summary.md}"
   echo "- binary source: $MODE \`$PRIMARY_SPEC\`"
   echo "- snapshot start height: **$START_HEIGHT**, stop height: **$STOP_HEIGHT**, feed: \`${FEED_PEER:-DNS seeders}\` (peerset=$PEERSET_SIZE)"
   echo "- sync knobs: checkpoint_verify=$CKPT_LIMIT, download=$DL_LIMIT"
-  echo "- P2P mode: target v2_p2p=$TARGET_SHOULD_USE_V2_P2P legacy_p2p=$TARGET_SHOULD_USE_LEGACY_P2P, baseline v2_p2p=$BASELINE_SHOULD_USE_V2_P2P legacy_p2p=$BASELINE_SHOULD_USE_LEGACY_P2P"
+  if [[ -n "$BASELINE_SPEC" ]]; then
+    echo "- P2P mode: target v2_p2p=$TARGET_SHOULD_USE_V2_P2P legacy_p2p=$TARGET_SHOULD_USE_LEGACY_P2P, baseline v2_p2p=$BASELINE_SHOULD_USE_V2_P2P legacy_p2p=$BASELINE_SHOULD_USE_LEGACY_P2P"
+  else
+    echo "- P2P mode: target v2_p2p=$TARGET_SHOULD_USE_V2_P2P legacy_p2p=$TARGET_SHOULD_USE_LEGACY_P2P, baseline skipped"
+  fi
   echo ""
   echo "| binary | v2_p2p | legacy_p2p | end height | blocks covered | time taken | blocks/s | post-commit blk/s |"
   echo "|--------|-------:|-----------:|-----------:|---------------:|-----------:|---------:|------------------:|"

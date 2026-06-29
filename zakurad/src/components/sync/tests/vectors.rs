@@ -165,9 +165,13 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
             block3_hash, // (discarded - last hash, possibly incorrect)
         ]));
 
-    // State is checked for the first unknown block (block 1)
+    // State is checked for each candidate hash before it is queued.
     state_service
         .expect_request(zs::Request::KnownBlock(block1_hash))
+        .await
+        .respond(zs::Response::KnownBlock(None));
+    state_service
+        .expect_request(zs::Request::KnownBlock(block2_hash))
         .await
         .respond(zs::Response::KnownBlock(None));
 
@@ -250,6 +254,13 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
             block4_hash,
             block5_hash, // (discarded - last hash, possibly incorrect)
         ]));
+
+    for hash in [block3_hash, block4_hash] {
+        state_service
+            .expect_request(zs::Request::KnownBlock(hash))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+    }
 
     // Clear remaining block locator requests
     for _ in 0..(sync::FANOUT - 1) {
@@ -546,11 +557,11 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
 }
 
 /// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips,
-/// with duplicate block hashes.
+/// with unrelated trailing hashes that are discarded.
 ///
 /// This test also makes sure that the syncer downloads blocks in order.
 #[tokio::test]
-async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
+async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
     // Get services
     let (
         chain_sync_future,
@@ -638,16 +649,18 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
         })
         .await
         .respond(zn::Response::BlockHashes(vec![
-            block1_hash,
-            block1_hash,
             block1_hash, // tip
             block2_hash, // expected_next
             block3_hash, // (discarded - last hash, possibly incorrect)
         ]));
 
-    // State is checked for the first unknown block (block 1)
+    // State is checked for each candidate hash before it is queued.
     state_service
         .expect_request(zs::Request::KnownBlock(block1_hash))
+        .await
+        .respond(zs::Response::KnownBlock(None));
+    state_service
+        .expect_request(zs::Request::KnownBlock(block2_hash))
         .await
         .respond(zs::Response::KnownBlock(None));
 
@@ -728,10 +741,15 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
             block2_hash, // tip (discarded - already fetched)
             block3_hash, // expected_next
             block4_hash,
-            block3_hash,
-            block4_hash,
             block5_hash, // (discarded - last hash, possibly incorrect)
         ]));
+
+    for hash in [block3_hash, block4_hash] {
+        state_service
+            .expect_request(zs::Request::KnownBlock(hash))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+    }
 
     // Clear remaining block locator requests
     for _ in 0..(sync::FANOUT - 1) {
@@ -947,9 +965,17 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
             block3_hash, // (discarded - last hash, possibly incorrect)
         ]));
 
-    // State is checked for the first unknown block (block 982k)
+    // State is checked for each candidate hash before it is queued.
     state_service
         .expect_request(zs::Request::KnownBlock(block982k_hash))
+        .await
+        .respond(zs::Response::KnownBlock(None));
+    state_service
+        .expect_request(zs::Request::KnownBlock(block1_hash))
+        .await
+        .respond(zs::Response::KnownBlock(None));
+    state_service
+        .expect_request(zs::Request::KnownBlock(block2_hash))
         .await
         .respond(zs::Response::KnownBlock(None));
 
@@ -1124,9 +1150,13 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
             block3_hash, // (discarded - last hash, possibly incorrect)
         ]));
 
-    // State is checked for the first unknown block (block 1)
+    // State is checked for each candidate hash before it is queued.
     state_service
         .expect_request(zs::Request::KnownBlock(block1_hash))
+        .await
+        .respond(zs::Response::KnownBlock(None));
+    state_service
+        .expect_request(zs::Request::KnownBlock(block2_hash))
         .await
         .respond(zs::Response::KnownBlock(None));
 
@@ -1210,6 +1240,13 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
             block982k_hash,
             block5_hash, // (discarded - last hash, possibly incorrect)
         ]));
+
+    for hash in [block3_hash, block4_hash, block982k_hash] {
+        state_service
+            .expect_request(zs::Request::KnownBlock(hash))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+    }
 
     // Clear remaining block locator requests
     for _ in 0..(sync::FANOUT - 1) {
@@ -1654,7 +1691,7 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
         _sync_status,
         mut block_verifier_router,
         mut peer_set,
-        _state_service,
+        mut state_service,
         _mock_chain_tip_sender,
     ) = setup_chain_sync();
 
@@ -1683,7 +1720,11 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
 
     // `build_extend` owns a clone of the tip network so it can run without borrowing `self`.
     let tip_network = Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT);
-    let extend_handle = tokio::spawn(TestChainSync::build_extend(tip_network, tips));
+    let extend_handle = tokio::spawn(TestChainSync::build_extend(
+        tip_network,
+        state_service.clone(),
+        tips,
+    ));
 
     // One peer extends the tip. The response starts with the expected hash (the match anchor) and
     // ends with a possibly-incorrect trailing hash that the syncer discards.
@@ -1699,6 +1740,13 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
             block4_hash,
             block5_hash, // (discarded - last hash, possibly incorrect)
         ]));
+
+    for hash in [block3_hash, block4_hash] {
+        state_service
+            .expect_request(zs::Request::KnownBlock(hash))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+    }
 
     // The remaining fan-out requests fail and are ignored.
     for _ in 0..(sync::FANOUT - 1) {
@@ -1742,6 +1790,232 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
     // fan-out was sent — no `BlocksByHash`, no verifier requests.
     peer_set.expect_no_requests().await;
     block_verifier_router.expect_no_requests().await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn obtain_tips_ignores_known_hash_after_first_unknown() -> Result<(), crate::BoxError> {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        mut state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let locator = block::Hash::from([0x01; 32]);
+    let unknown = block::Hash::from([0x02; 32]);
+    let known_not_in_locator = block::Hash::from([0x03; 32]);
+    let trailing = block::Hash::from([0x04; 32]);
+
+    let respond_to_requests = async {
+        state_service
+            .expect_request(zs::Request::BlockLocator)
+            .await
+            .respond(zs::Response::BlockLocator(vec![locator]));
+
+        peer_set
+            .expect_request(zn::Request::FindBlocks {
+                known_blocks: vec![locator],
+                stop: None,
+            })
+            .await
+            .respond(zn::Response::BlockHashes(vec![
+                unknown,
+                known_not_in_locator,
+                trailing,
+            ]));
+
+        state_service
+            .expect_request(zs::Request::KnownBlock(unknown))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+        state_service
+            .expect_request(zs::Request::KnownBlock(known_not_in_locator))
+            .await
+            .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
+
+        for _ in 0..(sync::FANOUT - 1) {
+            peer_set
+                .expect_request(zn::Request::FindBlocks {
+                    known_blocks: vec![locator],
+                    stop: None,
+                })
+                .await
+                .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
+        }
+
+        Ok::<_, crate::BoxError>(())
+    };
+
+    let (extra_hashes, responded) = futures::join!(chain_sync.obtain_tips(), respond_to_requests);
+    responded?;
+    let extra_hashes = extra_hashes?;
+    assert!(extra_hashes.is_empty());
+
+    peer_set.expect_no_requests().await;
+    block_verifier_router.expect_no_requests().await;
+    state_service.expect_no_requests().await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn build_extend_ignores_malformed_find_blocks_responses() -> Result<(), crate::BoxError> {
+    let (
+        _chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        mut state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let tip = block::Hash::from([0x10; 32]);
+    let expected_next = block::Hash::from([0x11; 32]);
+    let unknown = block::Hash::from([0x12; 32]);
+    let known_suffix = block::Hash::from([0x13; 32]);
+    let trailing = block::Hash::from([0x14; 32]);
+    let random = block::Hash::from([0x15; 32]);
+
+    let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
+    let extend_handle = tokio::spawn(TestChainSync::build_extend(
+        Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT),
+        state_service.clone(),
+        tips,
+    ));
+
+    peer_set
+        .expect_request(zn::Request::FindBlocks {
+            known_blocks: vec![tip],
+            stop: None,
+        })
+        .await
+        .respond(zn::Response::BlockHashes(vec![
+            expected_next,
+            unknown,
+            known_suffix,
+            trailing,
+        ]));
+    state_service
+        .expect_request(zs::Request::KnownBlock(unknown))
+        .await
+        .respond(zs::Response::KnownBlock(None));
+    state_service
+        .expect_request(zs::Request::KnownBlock(known_suffix))
+        .await
+        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
+
+    peer_set
+        .expect_request(zn::Request::FindBlocks {
+            known_blocks: vec![tip],
+            stop: None,
+        })
+        .await
+        .respond(zn::Response::BlockHashes(vec![
+            expected_next,
+            unknown,
+            unknown,
+            trailing,
+        ]));
+    peer_set
+        .expect_request(zn::Request::FindBlocks {
+            known_blocks: vec![tip],
+            stop: None,
+        })
+        .await
+        .respond(zn::Response::BlockHashes(vec![random]));
+
+    let (download_set, prospective_tips, discovered) = extend_handle
+        .await
+        .expect("build_extend task should not panic")?;
+    assert!(download_set.is_empty());
+    assert!(prospective_tips.is_empty());
+    assert_eq!(discovered, 0);
+
+    peer_set.expect_no_requests().await;
+    block_verifier_router.expect_no_requests().await;
+    state_service.expect_no_requests().await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn build_extend_ignores_known_trailing_find_blocks_hash() -> Result<(), crate::BoxError> {
+    let (
+        _chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        mut state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let tip = block::Hash::from([0x20; 32]);
+    let expected_next = block::Hash::from([0x21; 32]);
+    let unknown_a = block::Hash::from([0x22; 32]);
+    let unknown_b = block::Hash::from([0x23; 32]);
+
+    let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
+    let extend_handle = tokio::spawn(TestChainSync::build_extend(
+        Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT),
+        state_service.clone(),
+        tips,
+    ));
+
+    peer_set
+        .expect_request(zn::Request::FindBlocks {
+            known_blocks: vec![tip],
+            stop: None,
+        })
+        .await
+        .respond(zn::Response::BlockHashes(vec![
+            expected_next,
+            unknown_a,
+            unknown_b,
+            tip, // zcashd can append an unrelated known hash here.
+        ]));
+
+    for hash in [unknown_a, unknown_b] {
+        state_service
+            .expect_request(zs::Request::KnownBlock(hash))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+    }
+
+    for _ in 0..(sync::FANOUT - 1) {
+        peer_set
+            .expect_request(zn::Request::FindBlocks {
+                known_blocks: vec![tip],
+                stop: None,
+            })
+            .await
+            .respond(Err(zn::BoxError::from("synthetic test extend tips error")));
+    }
+
+    let (download_set, prospective_tips, discovered) = extend_handle
+        .await
+        .expect("build_extend task should not panic")?;
+
+    assert_eq!(
+        download_set.into_iter().collect::<Vec<_>>(),
+        vec![unknown_a, unknown_b],
+        "build_extend should keep valid inner hashes and discard the trailing known hash",
+    );
+    assert_eq!(discovered, 2);
+    assert_eq!(
+        prospective_tips,
+        HashSet::from([sync::CheckedTip {
+            tip: unknown_a,
+            expected_next: unknown_b,
+        }]),
+    );
+
+    peer_set.expect_no_requests().await;
+    block_verifier_router.expect_no_requests().await;
+    state_service.expect_no_requests().await;
 
     Ok(())
 }

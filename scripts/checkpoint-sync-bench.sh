@@ -84,6 +84,10 @@ DASHBOARD="${DASHBOARD:-1}"
 DASHBOARD_ARCHIVE="${DASHBOARD_ARCHIVE:-$BENCH_HOME/dashboard/runs}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DASHBOARD_PY="${DASHBOARD_PY:-$SCRIPT_DIR/zebra-metrics-dashboard.py}"
+GITHUB_RUN_URL="${GITHUB_RUN_URL:-}"
+if [[ -z "$GITHUB_RUN_URL" && -n "${GITHUB_RUN_ID:-}" ]]; then
+  GITHUB_RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-$GH_REPO}/actions/runs/$GITHUB_RUN_ID"
+fi
 
 SNAP_FILE="$(basename "$SNAPSHOT_URL")"
 MASTER="$BENCH_HOME/master-${START_HEIGHT}"
@@ -454,6 +458,8 @@ run_one() {
     python3 "$DASHBOARD_PY" --no-serve --record "$rec_dir" \
       --target "127.0.0.1:$METRICS_PORT" --interval 2 \
       --label "$tag" --ckpt-limit "$CKPT_LIMIT" --dl-limit "$DL_LIMIT" \
+      --github-url "$GITHUB_RUN_URL" --github-run-id "${GITHUB_RUN_ID:-}" \
+      --github-repo "${GITHUB_REPOSITORY:-$GH_REPO}" \
       >"$OUT_DIR/dashboard-recorder-$prefix.log" 2>&1 &
     CUR_REC=$!
     log "dashboard recorder pid $CUR_REC -> $rec_dir"
@@ -592,6 +598,9 @@ SUMMARY="${GITHUB_STEP_SUMMARY:-$OUT_DIR/summary.md}"
   echo "- binary source: $MODE \`$PRIMARY_SPEC\`"
   echo "- snapshot start height: **$START_HEIGHT**, stop height: **$STOP_HEIGHT**, feed: \`${FEED_PEER:-DNS seeders}\` (peerset=$PEERSET_SIZE)"
   echo "- sync knobs: checkpoint_verify=$CKPT_LIMIT, download=$DL_LIMIT"
+  if [[ -n "$GITHUB_RUN_URL" ]]; then
+    echo "- GitHub run: [${GITHUB_RUN_ID:-open}]($GITHUB_RUN_URL)"
+  fi
   if [[ -n "$BASELINE_SPEC" ]]; then
     echo "- P2P mode: target v2_p2p=$TARGET_SHOULD_USE_V2_P2P legacy_p2p=$TARGET_SHOULD_USE_LEGACY_P2P, baseline v2_p2p=$BASELINE_SHOULD_USE_V2_P2P legacy_p2p=$BASELINE_SHOULD_USE_LEGACY_P2P"
   else

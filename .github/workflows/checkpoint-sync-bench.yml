@@ -49,7 +49,7 @@ on:
         required: true
         default: "1730000"
       wall_cap_seconds:
-        description: "Hard wall-clock cap for a single run, capped at 2000 seconds"
+        description: "Hard wall-clock cap for a single run, in seconds"
         required: false
         default: "2000"
       feed_peer:
@@ -102,7 +102,7 @@ jobs:
   bench:
     name: "checkpoint sync ${{ inputs.build_ref || inputs.release_tag }}"
     runs-on: [self-hosted, "${{ vars.BENCH_RUNNER_LABEL || 'zakura-bench' }}"]
-    timeout-minutes: 300   # first-ever on-host build is cold; later builds are incremental
+    timeout-minutes: 360   # allow long self-hosted benchmark runs; WALL_CAP controls zebrad runtime
     steps:
       - name: Checkout (for the bench script)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4

@@ -20,7 +20,7 @@
 #
 # Other inputs (environment variables; the workflow sets these from inputs/vars):
 #   STOP_HEIGHT           debug_stop_at_height                (default 1737210, +30k)
-#   WALL_CAP              hard wall-clock cap, seconds         (default 3600)
+#   WALL_CAP              hard wall-clock cap, seconds         (default/max 2000)
 #   FEED_PEER             single pinned peer ip:port           (default 167.99.162.47:8233)
 #   CKPT_LIMIT            checkpoint_verify_concurrency_limit  (default 1500)
 #   DL_LIMIT              download_concurrency_limit           (default 150)
@@ -59,7 +59,8 @@ FORCE_REBUILD="${FORCE_REBUILD:-0}"
 RELEASE_TAG="${RELEASE_TAG:-}"
 BASELINE_TAG="${BASELINE_TAG:-}"
 STOP_HEIGHT="${STOP_HEIGHT:-1737210}"
-WALL_CAP="${WALL_CAP:-3600}"
+MAX_WALL_CAP=2000
+WALL_CAP="${WALL_CAP:-$MAX_WALL_CAP}"
 # default-but-honor-empty: an explicitly empty FEED_PEER means "use DNS seeders"
 FEED_PEER="${FEED_PEER-167.99.162.47:8233}"
 CKPT_LIMIT="${CKPT_LIMIT:-1500}"
@@ -100,6 +101,14 @@ ZAKURA_BOOTSTRAP_PEERS=(
 
 log()  { printf '[bench %(%H:%M:%S)T] %s\n' -1 "$*" >&2; }
 die()  { log "FATAL: $*"; exit 1; }
+
+if ! [[ "$WALL_CAP" =~ ^[0-9]+$ ]]; then
+  die "WALL_CAP must be a non-negative integer number of seconds, got '$WALL_CAP'"
+fi
+if (( WALL_CAP > MAX_WALL_CAP )); then
+  log "WALL_CAP=$WALL_CAP exceeds max ${MAX_WALL_CAP}s; capping"
+  WALL_CAP="$MAX_WALL_CAP"
+fi
 
 normalize_bool() {
   case "${1,,}" in

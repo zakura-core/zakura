@@ -31,15 +31,15 @@ on:
         type: boolean
         required: false
         default: false
+      skip_baseline:
+        description: "Skip baseline and run only the target/primary binary, even if a baseline ref/tag is set"
+        type: boolean
+        required: false
+        default: false
       baseline_ref:
         description: "Optional second ref to build+run first, for a baseline -> primary speedup. Ignored when skip_baseline is true."
         required: false
         default: ""
-      skip_baseline:
-        description: "Run only the target/primary binary, even if a baseline ref/tag is set"
-        type: boolean
-        required: false
-        default: false
       release_tag:
         description: "Alternative to build_ref: download this release tarball instead of building"
         required: false
@@ -49,9 +49,9 @@ on:
         required: true
         default: "1730000"
       wall_cap_seconds:
-        description: "Hard wall-clock cap for a single run"
+        description: "Hard wall-clock cap for a single run, capped at 2000 seconds"
         required: false
-        default: "2400"
+        default: "2000"
       feed_peer:
         description: "Peer to pin (ip:port). Leave blank to use public DNS-seeder peers."
         required: false
@@ -70,12 +70,12 @@ on:
         description: "Run the target/primary binary with Zakura P2P v2 and its block syncer"
         type: boolean
         required: false
-        default: false
+        default: true
       target_should_use_legacy_p2p:
         description: "Run the target/primary binary with legacy TCP P2P enabled"
         type: boolean
         required: false
-        default: true
+        default: false
       baseline_should_use_v2_p2p:
         description: "Run the baseline/base binary with Zakura P2P v2 and its block syncer"
         type: boolean

@@ -25,7 +25,7 @@ on:
       build_ref:
         description: "Git branch/tag/SHA to build on the host (cached by commit SHA). Primary mode."
         required: false
-        default: "ironwood-main"
+        default: "feat/pre-release-main"
       force_rebuild:
         description: "Rebuild even if a binary for this commit SHA is already cached"
         type: boolean
@@ -35,7 +35,7 @@ on:
         description: "Skip baseline and run only the target/primary binary, even if a baseline ref/tag is set"
         type: boolean
         required: false
-        default: false
+        default: true
       baseline_ref:
         description: "Optional second ref to build+run first, for a baseline -> primary speedup. Ignored when skip_baseline is true."
         required: false

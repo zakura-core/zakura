@@ -94,33 +94,21 @@ PANELS = [
     ("Throughput", "height",         "Finalized height",            "",      "gauge"),
     ("Commit",     "commit_ms",      "Commit busy / block",         "ms",    "gauge"),
     ("Commit",     "commit_util",    "Commit utilization",          "%",     "gauge"),
-    ("Commit CPU", "p_checkpoint",   "checkpoint_compute",          "ms",    "gauge"),
-    ("Commit CPU", "p_commit_check", "  commitment_check",          "ms",    "gauge"),
-    ("Commit CPU", "p_note_tree",    "  note_tree (update_trees)",  "ms",    "gauge"),
-    ("Commit CPU", "p_history_push", "  history_push",              "ms",    "gauge"),
-    ("Commit DB",  "p_spent_reads",  "spent_utxo_reads",            "ms",    "gauge"),
-    ("Commit DB",  "p_addr_reads",   "address_reads",               "ms",    "gauge"),
-    ("Commit DB",  "p_batch_prep",   "batch_prep",                  "ms",    "gauge"),
+    ("Commit CPU", "p_auth_root",    "auth_data_root",              "ms",    "gauge"),
+    ("Commit CPU", "p_ordered_out",  "new_ordered_outputs",         "ms",    "gauge"),
+    ("Commit CPU", "p_txid_digest",  "txid_auth_digest",            "ms",    "gauge"),
     ("Commit DB",  "p_rocksdb",      "rocksdb_write",               "ms",    "gauge"),
-    ("Commit DB",  "commit_mb",      "Committed MB / block",        "MB",    "gauge"),
-    ("Commit DB",  "write_mbps",     "Write throughput",            "MB/s",  "rate"),
     ("VCT path",   "vct_fast_s",     "VCT fast commits / s",        "/s",    "rate"),
-    ("VCT path",   "vct_legacy_s",   "VCT legacy commits / s",      "/s",    "rate"),
+    ("VCT path",   "vct_prevalid_s", "VCT prevalidated commits / s", "/s",    "rate"),
     ("Zakura",     "zk_peers",       "Cohort peers (active)",       "",      "gauge"),
     ("Zakura",     "zk_qdepth",      "Zakura queue depth",          "",      "gauge"),
-    ("Zakura",     "zk_block_sync",  "block_sync streams",          "",      "gauge"),
+    ("Zakura",     "zk_block_sync",  "block_sync streams accepted", "",      "gauge"),
     # Apply-queue depth + floor-gap attribution: separates HOL download stalls
     # from the sequencer→committer handoff ("glue") from peer-supply starvation.
-    ("Apply queue","applying",       "Applying (contiguous, cap 400)","",    "gauge"),
-    ("Apply queue","reorder",        "Reorder (out-of-order buffered)","",   "gauge"),
-    ("Apply queue","unsub_applying", "Unsubmitted applying",        "",      "gauge"),
-    ("Floor gap",  "body_lead",      "Body lead (floor−finalized)", "",      "gauge"),
-    ("Floor gap",  "commit_gap",     "Commit gap (floor−verified)", "",      "gauge"),
-    ("Floor gap",  "commit_stall_s", "Commit frontier stall",       "s",     "gauge"),
+    ("Apply queue","applied_s",      "Submitted blocks / s",        "/s",    "rate"),
+    ("Apply queue","applying",       "Applying queue",              "",      "gauge"),
+    ("Apply queue","reorder_mb",     "Reorder buffered",            "MB",    "gauge"),
     ("Floor gap",  "outstanding",    "Outstanding floor requests",  "",      "gauge"),
-    ("Floor gap",  "fg_slow_s",      "floor: slow-download /s",     "/s",    "rate"),
-    ("Floor gap",  "fg_starve_s",    "floor: peer/slot starve /s",  "/s",    "rate"),
-    ("Floor gap",  "fg_glue_s",      "floor: buffered-unrequested /s","/s",  "rate"),
 ]
 PANEL_KEYS = [k for _, k, *_ in PANELS]
 
@@ -139,10 +127,9 @@ COMMIT_UTIL_LO = 45.0   # writer busy <= this % of wall -> supply-bound
 # (key, label) for the sequential per-block commit phases (cc ∥ ut + hp are
 # inside checkpoint_compute; reads + batch build + write are sequential after it).
 COMMIT_PHASES = [
-    ("p_checkpoint",  "checkpoint_compute (note_tree+history)"),
-    ("p_spent_reads", "spent_utxo_reads"),
-    ("p_addr_reads",  "address_reads"),
-    ("p_batch_prep",  "batch_prep"),
+    ("p_auth_root",   "auth_data_root"),
+    ("p_ordered_out", "new_ordered_outputs"),
+    ("p_txid_digest", "txid_auth_digest"),
     ("p_rocksdb",     "rocksdb_write"),
 ]
 
@@ -165,32 +152,31 @@ def steady_window(samples):
     trim = len(tail) // 10
     return tail[trim:] if len(tail) - trim >= 3 else tail
 
-APPLY_QUEUE_CAP = 400   # MAX_CHECKPOINT_HEIGHT_GAP: contiguous applying-queue ceiling
-APPLY_FULL      = 360    # "near cap" => bodies downloaded & queued, handoff not draining
+APPLY_FULL      = 1000   # deep contiguous queue => bodies downloaded & queued, handoff not draining
 
 def _floor_reason(applying, reorder, outstanding, slow_s, starve_s, glue_s):
     """Attribute a non-advancing commit floor from apply-queue depth (Evan's test),
     corroborated by the floor-gap reason rates. Returns (tag, human text).
 
-    apply queue pinned near 400  -> glue/commit-bound (NOT block-sync): blocks are
+    apply queue deeply backed up -> glue/commit-bound (NOT block-sync): blocks are
       downloaded and contiguously queued, the sequencer→committer handoff isn't draining.
     apply queue low + reorder high -> head-of-line download stall: the floor body is
       missing while out-of-order successors pile up in reorder.
     apply queue low + reorder low  -> supply starvation: the cohort isn't delivering."""
     a = applying if applying is not None else 0
     if applying is not None and a >= APPLY_FULL:
-        return ("glue", f"apply queue FULL ({a:.0f}/{APPLY_QUEUE_CAP}) — bodies downloaded & "
+        return ("glue", f"apply queue deep ({a:.0f}) — bodies downloaded & "
                         f"queued, commit handoff not draining (glue/commit-bound, NOT block-sync)")
-    if reorder is not None and reorder > max(a, 50):
-        return ("hol", f"apply queue LOW ({a:.0f}/{APPLY_QUEUE_CAP}) + reorder {reorder:.0f} "
-                       f"out-of-order — floor body missing, successors stacked (head-of-line)")
+    if reorder is not None and reorder > 10:
+        return ("hol", f"apply queue LOW ({a:.0f}) + reorder buffer {reorder:.1f} MB "
+                       f"— floor body missing, successors stacked (head-of-line)")
     bits = [b for b in (
         (f"slow-dl {slow_s:.2f}/s"      if slow_s   else None),
         (f"peer/slot-starve {starve_s:.2f}/s" if starve_s else None),
         (f"buffered-unreq {glue_s:.2f}/s" if glue_s else None),
     ) if b]
     rtxt = ("; floor-gap " + ", ".join(bits)) if bits else ""
-    return ("supply", f"apply queue LOW ({a:.0f}/{APPLY_QUEUE_CAP}), outstanding="
+    return ("supply", f"apply queue LOW ({a:.0f}), outstanding="
                       f"{outstanding if outstanding is not None else '—'} — cohort not supplying the floor{rtxt}")
 
 def classify(samples, ckpt_limit=None, dl_limit=None):
@@ -213,7 +199,7 @@ def classify(samples, ckpt_limit=None, dl_limit=None):
     scores = {"commit": round(commit_u, 3)} if commit_u is not None else {}
 
     # Apply-queue attribution: HOL vs glue/commit vs supply (Evan's 400 test).
-    fr_tag, fr_text = _floor_reason(med("applying"), med("reorder"), med("outstanding"),
+    fr_tag, fr_text = _floor_reason(med("applying"), med("reorder_mb"), med("outstanding"),
                                     med("fg_slow_s"), med("fg_starve_s"), med("fg_glue_s"))
 
     if bps is None or bps < STALL_BPS:
@@ -371,46 +357,20 @@ class Collector:
                                    if "block_sync" in lbl), None)
         # Apply-queue depth + floor-gap frontiers (instantaneous gauges).
         d["applying"]       = bare(m, "sync_block_applying")
-        d["reorder"]        = first_present(m, "sync_block_reorder",
-                                            "sync_block_reorder_buffered_blocks")
-        d["unsub_applying"] = bare(m, "sync_block_unsubmitted_applying")
-        d["commit_gap"]     = bare(m, "sync_block_commit_gap_height")
-        d["commit_stall_s"] = bare(m, "sync_block_commit_frontier_stall_seconds")
+        _reorder_bytes      = bare(m, "sync_block_reorder_buffered_bytes")
+        d["reorder_mb"]     = (_reorder_bytes / 1e6) if _reorder_bytes is not None else None
         d["outstanding"]    = bare(m, "sync_block_outstanding")
-        # Body lead/backlog: contiguous downloaded/queued bodies ahead of finalized
-        # state = body floor (download_floor) − finalized tip.
-        _dlf = first_present(m, "sync_block_download_floor_height",
-                             "sync_block_body_download_floor_height")
-        _fin = bare(m, "state_finalized_block_height")
-        d["body_lead"] = (_dlf - _fin) if (_dlf is not None and _fin is not None and _dlf > 0) else None
 
         cur = {
             "h":    bare(m, "state_finalized_block_height"),
-            # Floor-gap state-tick counters (cumulative; rate() ⇒ time-fraction).
-            "fg_slow":   lbval(m, "sync_block_floor_gap_state_ticks", 'state="outstanding"'),
-            "fg_q":      lbval(m, "sync_block_floor_gap_state_ticks", 'state="queued"'),
-            "fg_ns":     lbval(m, "sync_block_floor_gap_state_ticks", 'state="needed_unscheduled"'),
-            "fg_glue":   lbval(m, "sync_block_floor_gap_state_ticks", 'state="in_flight_without_outstanding"'),
             "vf":   bare(m, "state_vct_fast_block_count"),
-            "vl":   bare(m, "state_vct_legacy_block_count"),
-            "ckc_s":bare(m, "zebra_state_write_checkpoint_compute_duration_seconds_sum"),
-            "ckc_c":bare(m, "zebra_state_write_checkpoint_compute_duration_seconds_count"),
-            "cc_s": bare(m, "zebra_state_write_commitment_check_duration_seconds_sum"),
-            "cc_c": bare(m, "zebra_state_write_commitment_check_duration_seconds_count"),
-            "ut_s": bare(m, "zebra_state_write_update_trees_duration_seconds_sum"),
-            "ut_c": bare(m, "zebra_state_write_update_trees_duration_seconds_count"),
-            "hp_s": bare(m, "zebra_state_commit_history_push_duration_seconds_sum"),
-            "hp_c": bare(m, "zebra_state_commit_history_push_duration_seconds_count"),
-            "sur_s":bare(m, "zebra_state_write_spent_utxo_reads_duration_seconds_sum"),
-            "sur_c":bare(m, "zebra_state_write_spent_utxo_reads_duration_seconds_count"),
-            "ar_s": bare(m, "zebra_state_write_address_reads_duration_seconds_sum"),
-            "ar_c": bare(m, "zebra_state_write_address_reads_duration_seconds_count"),
-            "bp_s": bare(m, "zebra_state_write_batch_prep_duration_seconds_sum"),
-            "bp_c": bare(m, "zebra_state_write_batch_prep_duration_seconds_count"),
+            "vp":   bare(m, "state_vct_prevalidated_block_count"),
+            "sub":  bare(m, "sync_block_submit_sent"),
+            "aroot_s": bare(m, "zebra_state_prepare_auth_data_root_duration_seconds_sum"),
+            "ordered_s": bare(m, "zebra_state_prepare_new_ordered_outputs_duration_seconds_sum"),
+            "txid_s": bare(m, "zebra_state_prepare_txid_auth_digest_duration_seconds_sum"),
             "bc_s": bare(m, "zebra_state_rocksdb_batch_commit_duration_seconds_sum"),
             "bc_c": bare(m, "zebra_state_rocksdb_batch_commit_duration_seconds_count"),
-            "bb_s": bare(m, "zebra_state_write_batch_bytes_sum"),
-            "bb_c": bare(m, "zebra_state_write_batch_bytes_count"),
         }
         # Maintain the trailing height window for smoothed throughput.
         if cur["h"] is not None:
@@ -431,6 +391,19 @@ class Collector:
             if None in (s0, s1, c0, c1) or (c1 - c0) <= 0:
                 return None
             return scale * (s1 - s0) / (c1 - c0)
+        def ms_per_block(s0, s1, h0, h1):
+            if None in (s0, s1, h0, h1) or (h1 - h0) <= 0:
+                return None
+            return 1000.0 * (s1 - s0) / (h1 - h0)
+        def busy_pct(*names):
+            total = 0.0
+            seen = False
+            for name in names:
+                r = rate(p.get(name), cur.get(name), dt)
+                if r is not None:
+                    total += r
+                    seen = True
+            return min(100.0, max(0.0, total * 100.0)) if seen else None
         if self.prev is not None:
             dt = now - self.prev_t
             p = self.prev
@@ -438,40 +411,16 @@ class Collector:
             if d["blocks_per_s"] is None:
                 d["blocks_per_s"] = rate(p["h"], cur["h"], dt)
             d["vct_fast_s"]     = rate(p["vf"], cur["vf"], dt)
-            d["vct_legacy_s"]   = rate(p["vl"], cur["vl"], dt)
-            # Floor-gap reason rates (ticks/s ≈ fraction of stall time in each reason).
-            d["fg_slow_s"]      = rate(p.get("fg_slow"), cur["fg_slow"], dt)
-            d["fg_glue_s"]      = rate(p.get("fg_glue"), cur["fg_glue"], dt)
-            _q  = rate(p.get("fg_q"),  cur["fg_q"],  dt)
-            _ns = rate(p.get("fg_ns"), cur["fg_ns"], dt)
-            d["fg_starve_s"]    = ((_q or 0) + (_ns or 0)) if (_q is not None or _ns is not None) else None
-            d["p_checkpoint"]   = avg(p["ckc_s"], cur["ckc_s"], p["ckc_c"], cur["ckc_c"])
-            d["p_commit_check"] = avg(p["cc_s"],  cur["cc_s"],  p["cc_c"],  cur["cc_c"])
-            d["p_note_tree"]    = avg(p["ut_s"],  cur["ut_s"],  p["ut_c"],  cur["ut_c"])
-            d["p_history_push"] = avg(p["hp_s"],  cur["hp_s"],  p["hp_c"],  cur["hp_c"])
-            d["p_spent_reads"]  = avg(p["sur_s"], cur["sur_s"], p["sur_c"], cur["sur_c"])
-            d["p_addr_reads"]   = avg(p["ar_s"],  cur["ar_s"],  p["ar_c"],  cur["ar_c"])
-            d["p_batch_prep"]   = avg(p["bp_s"],  cur["bp_s"],  p["bp_c"],  cur["bp_c"])
-            # rocksdb write is recorded once per DiskWriteBatch, so bc_c counts
-            # BATCHES not blocks when batch_commit_max>1. Normalize by a per-block
-            # count (bp_c, recorded once per block) so commit_ms/commit_util stay
-            # per-block instead of inflating ~K× and pinning util at 100%. For K=1
-            # bc_c == bp_c, so this is unchanged.
-            d["p_rocksdb"]      = avg(p["bc_s"],  cur["bc_s"],  p["bp_c"],  cur["bp_c"])
-            bpb = avg(p["bb_s"], cur["bb_s"], p["bb_c"], cur["bb_c"], scale=1.0)  # bytes/block
-            d["commit_mb"]      = (bpb/1e6) if bpb is not None else None
-            wb = rate(p["bb_s"], cur["bb_s"], dt)                                 # bytes/s
-            d["write_mbps"]     = (wb/1e6) if wb is not None else None
-            # commit wall/block = the sequential phases (commitment_check ∥ note_tree
-            # + history_push are inside checkpoint_compute, so don't double-count them).
-            parts = [d.get(k) for k in ("p_checkpoint", "p_spent_reads",
-                     "p_addr_reads", "p_batch_prep", "p_rocksdb")]
+            d["vct_prevalid_s"] = rate(p["vp"], cur["vp"], dt)
+            d["applied_s"]      = rate(p["sub"], cur["sub"], dt)
+            d["p_auth_root"]    = ms_per_block(p["aroot_s"], cur["aroot_s"], p["h"], cur["h"])
+            d["p_ordered_out"]  = ms_per_block(p["ordered_s"], cur["ordered_s"], p["h"], cur["h"])
+            d["p_txid_digest"]  = ms_per_block(p["txid_s"], cur["txid_s"], p["h"], cur["h"])
+            d["p_rocksdb"]      = ms_per_block(p["bc_s"], cur["bc_s"], p["h"], cur["h"])
+            parts = [d.get(k) for k in ("p_auth_root", "p_ordered_out", "p_txid_digest", "p_rocksdb")]
             d["commit_ms"] = (sum(x for x in parts if x is not None)
                               if any(x is not None for x in parts) else None)
-            if d["commit_ms"] is not None and d.get("blocks_per_s") is not None:
-                d["commit_util"] = min(100.0, max(0.0, d["commit_ms"] * d["blocks_per_s"] / 10.0))
-            else:
-                d["commit_util"] = None
+            d["commit_util"] = busy_pct("aroot_s", "ordered_s", "txid_s", "bc_s")
         self.prev, self.prev_t = cur, now
         with self.lock:
             self.ts.append(int(now * 1000))
@@ -668,11 +617,15 @@ function setXMode(mode){
  if(last_r)redraw(last_r);
 }
 function setRun(v){curRun=v;tick();}
+function githubRunLabel(r){
+ if(!r||!r.github_url)return '';
+ return r.github_run_id?('GitHub run '+r.github_run_id):'GitHub run';
+}
 function updateRunLink(r){
  const a=document.getElementById('runlink');
  if(r&&r.github_url){
   a.href=r.github_url;
-  a.textContent=r.github_run_id?('GitHub run '+r.github_run_id):'GitHub run';
+  a.textContent=githubRunLabel(r);
   a.style.display='';
  }else{a.removeAttribute('href');a.style.display='none'}
 }
@@ -681,7 +634,10 @@ async function loadRuns(){
  let runs;try{runs=await (await fetch('runs')).json()}catch(e){return}
  if(!runs||!runs.length)return;
  const sel=document.getElementById('run');document.getElementById('runwrap').style.display='';
- sel.innerHTML='<option value=live>● live</option>'+runs.map(r=>`<option value="${r.id}">${r.label}</option>`).join('');
+ sel.innerHTML='<option value=live>● live</option>'+runs.map(r=>{
+  const gh=r.github_run_id?` · GH ${r.github_run_id}`:'';
+  return `<option value="${r.id}">${r.label}${gh}</option>`;
+ }).join('');
  sel.value=curRun;
  if(sel.value!==curRun)sel.value='live';
 }
@@ -749,7 +705,14 @@ function redraw(r){
 async function tick(){
  const url=curRun==='live'?'data':('data?run='+encodeURIComponent(curRun));
  let r;try{r=await (await fetch(url)).json()}catch(e){document.getElementById('status').textContent='dashboard unreachable';return}
- document.getElementById('status').textContent=r.status||'';
+ const status=document.getElementById('status');
+ status.textContent=r.status||'';
+ if(r.github_url){
+  const sep=document.createTextNode(' · ');
+  const a=document.createElement('a');
+  a.href=r.github_url; a.target='_blank'; a.rel='noopener'; a.textContent=githubRunLabel(r);
+  status.appendChild(sep); status.appendChild(a);
+ }
  updateRunLink(r);
  const vd=document.getElementById('verdict');vd.textContent=r.verdict.text;vd.className=r.verdict.level;
  if(!built)build(r.panels);

@@ -359,7 +359,7 @@ impl Version for V3 {
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
     ) -> Self::NodeData {
-        let ironwood_tx_count = ironwood_transactions_count(&block);
+        let ironwood_tx_count = block.ironwood_transactions_count();
         let node_data_v2 =
             V2::block_to_history_node(block, network, sapling_root, orchard_root, ironwood_root);
         let ironwood_root: [u8; 32] = ironwood_root.into();
@@ -370,14 +370,4 @@ impl Version for V3 {
             ironwood_tx: ironwood_tx_count,
         }
     }
-}
-
-fn ironwood_transactions_count(block: &Block) -> u64 {
-    block
-        .transactions
-        .iter()
-        .filter(|tx| tx.has_ironwood_shielded_data())
-        .count()
-        .try_into()
-        .expect("number of transactions must fit u64")
 }

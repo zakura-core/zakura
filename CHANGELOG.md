@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
+  previously routed through `Transaction::to_librustzcash`, which re-serializes
+  and reparses the whole transaction — decompressing every Jubjub and Pallas
+  curve point — purely to feed the same canonical bytes into the BLAKE2b digest
+  tree. A new `zebra-chain` `transaction::zip244` module builds the txid and
+  auth-commitment digests directly from Zebra's already-parsed transaction
+  fields, removing that reparse on the checkpoint path where no point is ever
+  needed. v6 transactions (the unstable `tx_v6` feature) still route through
+  `librustzcash`. The output is byte-identical: a differential property test
+  (`native_zip244_matches_librustzcash`) asserts the native txid and auth digest
+  match the `librustzcash` conversion across thousands of random v5 transactions.
 - Parallelize per-block serialization in the finalized block writer. On heavy
   shielded blocks, serializing the raw transaction bytes (`tx_by_loc`) and
   computing the block size for `BlockInfo` dominate the per-block write cost. Both

@@ -13,6 +13,7 @@ mod serialize;
 mod sighash;
 mod txid;
 mod unmined;
+pub(crate) mod zip244;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 #[allow(clippy::unwrap_in_result)]

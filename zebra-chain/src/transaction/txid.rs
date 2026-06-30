@@ -45,9 +45,15 @@ impl<'a> TxIdBuilder<'a> {
     /// In this case it's the hash of a tree of hashes of specific parts of the
     /// transaction, as specified in ZIP-244 and ZIP-225.
     fn txid_v5(self) -> Option<Hash> {
+        // Compute the v5 ZIP-244 txid natively, directly from the parsed
+        // transaction, avoiding the `librustzcash` reparse (see `super::zip244`).
+        // Non-v5 transactions (e.g. v6) fall back to `librustzcash` below.
+        if let Some(txid) = super::zip244::txid(self.trans) {
+            return Some(txid);
+        }
+
         let nu = self.trans.network_upgrade()?;
 
-        // We compute v5 txid (from ZIP-244) using librustzcash.
         Some(Hash(*self.trans.to_librustzcash(nu).ok()?.txid().as_ref()))
     }
 

@@ -419,6 +419,67 @@ impl ZakuraLegacyProbe {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ZakuraWatchdogAction {
+    ContinueWaiting,
+    WarnOnly,
+    ProbeLegacyPeers,
+    FallbackToLegacy,
+}
+
+/// Classifies one Zakura watchdog poll into the next action the async loop should take.
+///
+/// Updates the supplied stall trackers from the latest verified and header tips. This helper only
+/// decides whether to wait, warn, probe legacy peers, or fall back; callers perform any logging,
+/// network probes, token cancellation, and sync hand-off.
+fn zakura_watchdog_action(
+    tracker: &mut ZakuraStallTracker,
+    legacy_probe: &mut ZakuraLegacyProbe,
+    verified_height: Option<Height>,
+    header_tip_height: Option<Height>,
+    max_idle_polls: u64,
+    legacy_fallback: bool,
+) -> ZakuraWatchdogAction {
+    if zakura_block_sync_stalled(tracker, verified_height, header_tip_height, max_idle_polls) {
+        if legacy_fallback {
+            return ZakuraWatchdogAction::FallbackToLegacy;
+        }
+
+        // Zakura-only nodes keep waiting. Warn once per stall window rather than on every poll.
+        return if tracker.idle_polls.is_multiple_of(max_idle_polls) {
+            ZakuraWatchdogAction::WarnOnly
+        } else {
+            ZakuraWatchdogAction::ContinueWaiting
+        };
+    }
+
+    // The legacy-informed cross-check only exists to trigger the fallback and
+    // issues a `FindBlocks` fanout when it probes, so skip it on Zakura-only nodes.
+    if !legacy_fallback {
+        return ZakuraWatchdogAction::ContinueWaiting;
+    }
+
+    let looks_caught_up = match (header_tip_height, verified_height) {
+        (Some(header), Some(verified)) => header - verified <= ZAKURA_NEAR_TIP_GAP,
+        // No frontier known yet: our local view cannot tell us we are behind.
+        _ => true,
+    };
+
+    if legacy_probe.should_probe(
+        verified_height,
+        looks_caught_up,
+        ZAKURA_LEGACY_PROBE_STALL_POLLS,
+    ) {
+        ZakuraWatchdogAction::ProbeLegacyPeers
+    } else {
+        ZakuraWatchdogAction::ContinueWaiting
+    }
+}
+
+fn legacy_probe_supports_fallback(blocks_ahead: Option<HeightDiff>) -> bool {
+    matches!(blocks_ahead, Some(blocks_ahead) if blocks_ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD)
+}
+
 /// Decides whether Zakura block sync should be considered stalled — so the legacy
 /// [`ChainSync::sync`] body downloader resumes as a fallback — from the latest
 /// verified body tip and the best-header (network frontier) tip. Returns `true`
@@ -496,6 +557,24 @@ where
     match ready.call(zs::ReadRequest::BestHeaderTip).await {
         Ok(zs::ReadResponse::BestHeaderTip(tip)) => tip.map(|(height, _hash)| height),
         _ => None,
+    }
+}
+
+/// Cancels and drains the Zakura sync drivers before the legacy [`ChainSync::sync`] loop resumes.
+///
+/// The cancellation token stops new Zakura sync work. Awaiting the endpoint-owned tasks makes the
+/// hand-off a commit barrier: already-started Zakura block applies finish before legacy can submit
+/// commits through the same verifier and state pipeline. No-op when Zakura networking is absent.
+async fn stop_zakura_sync(
+    zakura_endpoint: Option<&zn::zakura::ZakuraEndpoint>,
+    zakura_shutdown: &Option<tokio_util::sync::CancellationToken>,
+) {
+    if let Some(token) = zakura_shutdown {
+        token.cancel();
+    }
+
+    if let Some(endpoint) = zakura_endpoint {
+        endpoint.shutdown_sync_tasks().await;
     }
 }
 
@@ -906,29 +985,38 @@ where
     }
 
     /// Downloads and verifies genesis, then hands body sync to native Zakura sync
-    /// while watching for progress, falling back to the legacy syncer if Zakura
-    /// makes none.
+    /// while watching for progress, optionally falling back to the legacy syncer if
+    /// Zakura makes none.
     ///
     /// Zakura block sync uses this bootstrap path because header range validation needs the
     /// committed genesis header before native Zakura header/body sync can advance from scratch.
     ///
     /// After genesis, native Zakura sync is expected to drive body downloads. But
-    /// it cannot always: the default config enables both `v2_p2p` and `legacy_p2p`,
-    /// and legacy-only peers (no `NODE_P2P_V2`) still connect, so a node whose
-    /// reachable peers are legacy-only — or one eclipsed by non-upgrading peers —
-    /// would have no usable Zakura body-sync peers. Parking forever there leaves
-    /// the node connected but stuck at genesis. So instead of parking, watch the
-    /// verified tip; if it does not advance for [`ZAKURA_BODY_SYNC_STALL_TIMEOUT`],
-    /// resume the legacy [`ChainSync::sync`] loop as a fallback.
+    /// it cannot always: a node whose reachable peers are legacy-only (no
+    /// `NODE_P2P_V2`) — or one eclipsed by non-upgrading peers — would have no usable
+    /// Zakura body-sync peers, and parking forever there leaves it stuck at genesis.
+    ///
+    /// `legacy_fallback` (set when the node runs both stacks, `v2_p2p && legacy_p2p`)
+    /// controls the recovery path. When `true`, a Zakura stall first cancels
+    /// `zakura_shutdown` — the endpoint shutdown token shared by the Zakura header- and
+    /// block-sync drivers — so they stop before the legacy [`ChainSync::sync`] loop
+    /// resumes, ensuring only one body-sync committer is ever active (two at once break
+    /// the state-commit pipeline's accounting and can deadlock the node). When `false`
+    /// (a Zakura-only node, where falling back to absent legacy peers is pointless),
+    /// the watchdog never switches: it parks and warns (once per stall window) so a
+    /// stalled, eclipsed, or peerless node is visible in the logs.
     ///
     /// `read_state` answers [`ReadRequest::BestHeaderTip`](zs::ReadRequest::BestHeaderTip)
     /// so the watchdog can tell genuine Zakura block-sync progress (the verified tip
     /// closing a real gap to the network frontier) from a peer trickling next-height
     /// blocks over gossip (which bumps the verified tip without body sync running).
-    #[instrument(skip(self, read_state))]
+    #[instrument(skip(self, read_state, zakura_endpoint, zakura_shutdown))]
     pub async fn bootstrap_genesis_then_pause<RS>(
         mut self,
         mut read_state: RS,
+        legacy_fallback: bool,
+        zakura_endpoint: Option<zn::zakura::ZakuraEndpoint>,
+        zakura_shutdown: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(), Report>
     where
         RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
@@ -957,49 +1045,49 @@ where
             let verified_height = self.latest_chain_tip.best_tip_height();
             let header_tip_height = best_header_tip_height(&mut read_state).await;
 
-            if zakura_block_sync_stalled(
+            match zakura_watchdog_action(
                 &mut tracker,
+                &mut legacy_probe,
                 verified_height,
                 header_tip_height,
                 max_idle_polls,
+                legacy_fallback,
             ) {
-                warn!(
-                    verified_tip = ?verified_height,
-                    header_tip = ?header_tip_height,
-                    stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
-                    "Zakura body sync is not closing the gap to the network tip; falling back \
-                     to legacy ChainSync so legacy peers can drive body sync"
-                );
-                return self.sync().await;
-            }
-
-            // Second, legacy-informed trigger. The gap rule above is structurally
-            // blind to a fleet-wide simultaneous restart: every Zakura node freezes
-            // at the same height with `header_tip == verified_tip`, so the gap is
-            // zero and reads as "caught up" forever. When the verified tip is frozen
-            // yet our own view says we are at the frontier, cross-check the legacy
-            // peer set — whose advertised hashes do not depend on (the also-stalled)
-            // Zakura header sync — and fall back if it reports a much higher tip.
-            let looks_caught_up = match (header_tip_height, verified_height) {
-                (Some(header), Some(verified)) => header - verified <= ZAKURA_NEAR_TIP_GAP,
-                // No frontier known yet: our local view cannot tell us we are behind.
-                _ => true,
-            };
-            if legacy_probe.should_probe(
-                verified_height,
-                looks_caught_up,
-                ZAKURA_LEGACY_PROBE_STALL_POLLS,
-            ) {
-                if let Some(blocks_ahead) = self.legacy_peers_blocks_ahead().await {
-                    if blocks_ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD {
+                ZakuraWatchdogAction::ContinueWaiting => continue,
+                ZakuraWatchdogAction::WarnOnly => {
+                    warn!(
+                        verified_tip = ?verified_height,
+                        header_tip = ?header_tip_height,
+                        stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
+                        "Zakura body sync is not closing the gap to the network tip; legacy \
+                         fallback disabled (legacy_p2p is off), continuing to wait for Zakura"
+                    );
+                    continue;
+                }
+                ZakuraWatchdogAction::FallbackToLegacy => {
+                    warn!(
+                        verified_tip = ?verified_height,
+                        header_tip = ?header_tip_height,
+                        stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
+                        "Zakura body sync is not closing the gap to the network tip; stopping \
+                         Zakura sync drivers and falling back to legacy ChainSync so legacy peers \
+                         can drive body sync"
+                    );
+                    stop_zakura_sync(zakura_endpoint.as_ref(), &zakura_shutdown).await;
+                    return self.sync().await;
+                }
+                ZakuraWatchdogAction::ProbeLegacyPeers => {
+                    let blocks_ahead = self.legacy_peers_blocks_ahead().await;
+                    if legacy_probe_supports_fallback(blocks_ahead) {
                         warn!(
                             verified_tip = ?verified_height,
                             header_tip = ?header_tip_height,
                             ?blocks_ahead,
                             "Zakura body sync is frozen while legacy peers advertise a much \
-                             higher tip; falling back to legacy ChainSync so it can drive body \
-                             sync"
+                             higher tip; stopping Zakura sync drivers and falling back to legacy \
+                             ChainSync so it can drive body sync"
                         );
+                        stop_zakura_sync(zakura_endpoint.as_ref(), &zakura_shutdown).await;
                         return self.sync().await;
                     }
                 }

@@ -967,9 +967,21 @@ impl StartCmd {
         }
         let syncer_task_handle = if use_zakura_block_sync(&config.network) {
             info!("Zakura block sync is replacing the legacy ChainSync body downloader");
+            // Only dual-stack nodes (Zakura + legacy peers) fall back to legacy ChainSync on a
+            // Zakura stall; a Zakura-only node has no legacy peers to drive body sync. When the
+            // fallback fires it first cancels the Zakura endpoint shutdown token (stopping the
+            // header- and block-sync drivers) so the two commit pipelines never run at once.
+            let legacy_fallback = config.network.v2_p2p && config.network.legacy_p2p;
             tokio::spawn(
                 syncer
-                    .bootstrap_genesis_then_pause(read_only_state_service.clone())
+                    .bootstrap_genesis_then_pause(
+                        read_only_state_service.clone(),
+                        legacy_fallback,
+                        zakura_endpoint.clone(),
+                        zakura_endpoint
+                            .as_ref()
+                            .and_then(|endpoint| endpoint.header_sync_shutdown()),
+                    )
                     .in_current_span(),
             )
         } else {
@@ -3502,6 +3514,115 @@ mod zakura_header_sync_driver_tests {
         reactor_task.abort();
     }
 
+    #[tokio::test]
+    async fn block_sync_driver_shutdown_drains_in_flight_apply_without_starting_queued_apply() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let startup = block_sync_startup_for_test();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let (commit_tx, mut commit_rx) = mpsc::channel(8);
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let commit_count = Arc::new(AtomicUsize::new(0));
+        let verifier = {
+            let release_first = release_first.clone();
+            let commit_count = commit_count.clone();
+            service_fn(move |request: zebra_consensus::Request| {
+                let commit_tx = commit_tx.clone();
+                let release_first = release_first.clone();
+                let commit_count = commit_count.clone();
+                async move {
+                    match request {
+                        zebra_consensus::Request::Commit(block) => {
+                            let height = block.coinbase_height().expect("test block has height");
+                            commit_count.fetch_add(1, Ordering::SeqCst);
+                            commit_tx
+                                .send(height)
+                                .await
+                                .expect("test commit receiver stays open");
+                            if height == block::Height(1) {
+                                release_first.notified().await;
+                            }
+                            Ok::<_, zebra_consensus::BoxError>(block.hash())
+                        }
+                        request => panic!("unexpected consensus request: {request:?}"),
+                    }
+                }
+            })
+        };
+        let block1_hash = block1.hash();
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => Ok::<_, zebra_state::BoxError>(
+                    zebra_state::ReadResponse::FinalizedTip(Some((block::Height(1), block1_hash))),
+                ),
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                    block::Height(1),
+                    block1_hash,
+                )))),
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height(0),
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            1,
+            1,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            None,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 1,
+                block: block1.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), commit_rx.recv())
+                .await
+                .expect("first commit starts"),
+            Some(block::Height(1))
+        );
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 2,
+                block: block2.clone(),
+            })
+            .await
+            .expect("queued block can be submitted before shutdown");
+        let _ = shutdown_tx.send(());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut driver)
+                .await
+                .is_err(),
+            "shutdown must wait for the already-started apply to finish"
+        );
+        release_first.notify_waiters();
+        driver.await.expect("driver task exits after apply drains");
+        assert_eq!(
+            commit_count.load(Ordering::SeqCst),
+            1,
+            "shutdown must drop queued bodies instead of starting new commits"
+        );
+        reactor_task.abort();
+    }
+
     /// A checkpoint-class commit must wait for the checkpoint verifier to
     /// assemble a full contiguous range and must never be torn down by the
     /// driver timeout, while a full (post-checkpoint) commit still times out.
@@ -3786,16 +3907,27 @@ mod zakura_header_sync_driver_tests {
     #[tokio::test]
     async fn block_sync_pending_checkpoint_apply_does_not_block_control_plane_actions() {
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block_hash = block.hash();
         let (action_tx, action_rx) = mpsc::channel(8);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zebra_network::zakura::spawn_block_sync_reactor(startup);
-        let verifier = service_fn(|request: zebra_consensus::Request| async move {
-            match request {
-                zebra_consensus::Request::Commit(_block) => {
-                    future::pending::<Result<block::Hash, zebra_consensus::BoxError>>().await
+        let (release_commit_tx, release_commit_rx) = tokio::sync::watch::channel(false);
+        let verifier = service_fn(move |request: zebra_consensus::Request| {
+            let mut release_commit_rx = release_commit_rx.clone();
+            async move {
+                match request {
+                    zebra_consensus::Request::Commit(block) => {
+                        while !*release_commit_rx.borrow() {
+                            release_commit_rx
+                                .changed()
+                                .await
+                                .expect("test commit release sender stays open");
+                        }
+                        Ok::<_, zebra_consensus::BoxError>(block.hash())
+                    }
+                    request => panic!("unexpected consensus request: {request:?}"),
                 }
-                request => panic!("unexpected consensus request: {request:?}"),
             }
         });
         let (query_seen_tx, query_seen_rx) = oneshot::channel();
@@ -3818,6 +3950,16 @@ mod zakura_header_sync_driver_tests {
                             zebra_state::ReadResponse::MissingBlockBodies(Vec::new()),
                         )
                     }
+                    zebra_state::ReadRequest::FinalizedTip => {
+                        Ok(zebra_state::ReadResponse::FinalizedTip(Some((
+                            block::Height(1),
+                            block_hash,
+                        ))))
+                    }
+                    zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                        block::Height(1),
+                        block_hash,
+                    )))),
                     request => panic!("unexpected read request: {request:?}"),
                 }
             }
@@ -3859,6 +4001,9 @@ mod zakura_header_sync_driver_tests {
             .expect("driver processes unrelated query while checkpoint apply is pending")
             .expect("read service reports query");
 
+        release_commit_tx
+            .send(true)
+            .expect("test commit release receiver stays open");
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
         reactor_task.abort();
@@ -3867,29 +4012,49 @@ mod zakura_header_sync_driver_tests {
     #[tokio::test]
     async fn block_sync_checkpoint_apply_limit_allows_two_checkpoint_gaps() {
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block_hash = block.hash();
         let two_checkpoint_gaps = zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP.saturating_mul(2);
         let (action_tx, action_rx) = mpsc::channel(two_checkpoint_gaps + 8);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
             zebra_network::zakura::spawn_block_sync_reactor(startup);
         let commit_count = Arc::new(AtomicUsize::new(0));
+        let (release_commits_tx, release_commits_rx) = tokio::sync::watch::channel(false);
         let verifier_count = commit_count.clone();
         let verifier = service_fn(move |request: zebra_consensus::Request| {
             let verifier_count = verifier_count.clone();
+            let mut release_commits_rx = release_commits_rx.clone();
             async move {
                 match request {
-                    zebra_consensus::Request::Commit(_block) => {
+                    zebra_consensus::Request::Commit(block) => {
                         verifier_count.fetch_add(1, Ordering::SeqCst);
-                        future::pending::<Result<block::Hash, zebra_consensus::BoxError>>().await
+                        while !*release_commits_rx.borrow() {
+                            release_commits_rx
+                                .changed()
+                                .await
+                                .expect("test commit release sender stays open");
+                        }
+                        Ok::<_, zebra_consensus::BoxError>(block.hash())
                     }
                     request => panic!("unexpected consensus request: {request:?}"),
                 }
             }
         });
         let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
-            panic!("unexpected read request while checkpoint applies are pending: {request:?}");
-            #[allow(unreachable_code)]
-            Ok::<_, zebra_state::BoxError>(zebra_state::ReadResponse::Tip(None))
+            match request {
+                zebra_state::ReadRequest::FinalizedTip => Ok::<_, zebra_state::BoxError>(
+                    zebra_state::ReadResponse::FinalizedTip(Some((block::Height(1), block_hash))),
+                ),
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                    block::Height(1),
+                    block_hash,
+                )))),
+                request => {
+                    panic!(
+                        "unexpected read request while checkpoint applies are pending: {request:?}"
+                    )
+                }
+            }
         });
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver = tokio::spawn(drive_block_sync_actions(
@@ -3935,6 +4100,9 @@ mod zakura_header_sync_driver_tests {
             "driver must not submit a third checkpoint range before earlier ranges complete"
         );
 
+        release_commits_tx
+            .send(true)
+            .expect("test commit release receivers stay open");
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
         reactor_task.abort();

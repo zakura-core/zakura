@@ -156,6 +156,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Stop the Zakura body-sync watchdog from running two commit pipelines at once.
+  When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
+  body downloader but left the Zakura block- and header-sync drivers running, so
+  both fed the state-commit pipeline concurrently — breaking its accounting and
+  deadlocking the node. The watchdog now cancels the Zakura sync drivers (via the
+  endpoint shutdown token) before handing off to legacy ChainSync. The fallback is
+  also limited to dual-stack nodes (`v2_p2p` and `legacy_p2p` both enabled); a
+  Zakura-only node, which has no legacy peers to fall back to, instead keeps
+  waiting for Zakura and logs a warning once per stall window.
 - Treat missing transaction inventory responses during mempool download as a
   recoverable download failure, avoiding a panic when public peers no longer
   have a gossiped transaction available.

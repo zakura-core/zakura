@@ -143,8 +143,42 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     let mut full_in_flight = 0usize;
     let mut deferred_actions = VecDeque::new();
     let mut checkpoint_frontier_refresh = CheckpointFrontierRefresh::default();
+    let mut shutting_down = false;
 
     loop {
+        if !shutting_down && shutdown.as_mut().now_or_never().is_some() {
+            shutting_down = true;
+            pending_applies.clear();
+            pending_probe_applies.clear();
+            deferred_actions.clear();
+        }
+
+        if shutting_down {
+            if let Some(completed) = in_flight_applies.next().await {
+                handle_completed_block_apply(
+                    completed,
+                    &mut pending_applies,
+                    &mut in_flight_applies,
+                    &mut checkpoint_in_flight,
+                    &mut full_in_flight,
+                    checkpoint_apply_limit,
+                    full_apply_limit,
+                    combined_apply_limit,
+                    latest_chain_tip.clone(),
+                    endpoint.clone(),
+                    read_state.clone(),
+                    block_verifier.clone(),
+                    block_sync.clone(),
+                    trace.clone(),
+                    throughput_probe.clone(),
+                    &mut checkpoint_frontier_refresh,
+                );
+                continue;
+            }
+
+            return;
+        }
+
         if !in_flight_applies.is_empty() {
             if let Some(Some(completed)) = in_flight_applies.next().now_or_never() {
                 handle_completed_block_apply(
@@ -177,7 +211,13 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             action
         } else {
             select! {
-                _ = &mut shutdown => return,
+                _ = &mut shutdown => {
+                    shutting_down = true;
+                    pending_applies.clear();
+                    pending_probe_applies.clear();
+                    deferred_actions.clear();
+                    continue;
+                },
                 completed = in_flight_applies.next(), if !in_flight_applies.is_empty() => {
                     let Some(completed) = completed else {
                         continue;

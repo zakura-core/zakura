@@ -546,6 +546,21 @@ impl ZakuraEndpoint {
             .map(|tasks| tasks.shutdown.clone())
     }
 
+    /// Cancels and waits for endpoint-owned sync/background tasks.
+    ///
+    /// Used by dual-stack fallback before legacy ChainSync starts, so already-started
+    /// Zakura block applies have finished before legacy can submit commits through
+    /// the same verifier and state pipeline.
+    pub async fn shutdown_sync_tasks(&self) {
+        if let Some(tasks) = &self.header_sync_tasks {
+            tasks.shutdown.cancel();
+            let mut tasks = tasks.tasks.lock().await;
+            for task in tasks.drain(..) {
+                let _ = task.await;
+            }
+        }
+    }
+
     /// The endpoint-wide background-task shutdown token, cancelled by
     /// [`ZakuraEndpoint::shutdown`].
     ///

@@ -179,6 +179,7 @@ futures = { workspace = true }
 rayon = { workspace = true }
 tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "tracing", "signal", "process", "io-util"] }
 tokio-stream = { workspace = true, features = ["time"] }
+tokio-util = { workspace = true }
 tower = { workspace = true, features = ["hedge", "limit"] }
 pin-project = { workspace = true }
 

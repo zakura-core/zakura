@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added Ironwood value pool entries to `getblockchaininfo` and verbose
   `getblock` RPC output.
 
+### Changed
+
+- `getblocktemplate` routes post-NU6.3 Orchard receivers in unified miner
+  addresses to Ironwood when the unstable NU6.3 code is compiled in.
+- `getblocktemplate` builds empty templates on PoW-disabled networks when the
+  mempool is inactive.
+
 ## [9.0.0] - 2026-06-02
 
 ### Changed

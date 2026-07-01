@@ -23,7 +23,7 @@ use zebra_chain::{
     orchard,
     parameters::{
         subsidy::{block_subsidy, funding_stream_values, miner_subsidy},
-        Network,
+        Network, NetworkUpgrade,
     },
     primitives::ed25519,
     sapling::ValueCommitment,
@@ -165,6 +165,19 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
+        #[cfg(zcash_unstable = "nu6.3")]
+        let add_ironwood_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+            trace_err!(
+                builder.add_ironwood_output::<String>(
+                    Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
+                    *addr,
+                    miner_reward,
+                    memo.clone(),
+                ),
+                "Ironwood"
+            )
+        };
+
         let add_sapling_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
             trace_err!(
                 builder.add_sapling_output::<String>(
@@ -185,17 +198,34 @@ impl TransactionTemplate<NegativeOrZero> {
         };
 
         match miner_params.addr() {
-            Address::Unified(addr) => addr
-                .orchard()
-                .and_then(|addr| add_orchard_reward(&mut builder, addr))
-                .or_else(|| {
-                    addr.sapling()
-                        .and_then(|addr| add_sapling_reward(&mut builder, addr))
-                })
-                .or_else(|| {
-                    addr.transparent()
-                        .and_then(|addr| add_transparent_reward(&mut builder, addr))
-                }),
+            Address::Unified(addr) => {
+                let upgrade = NetworkUpgrade::current(net, height);
+
+                addr.orchard()
+                    .and_then(|addr| {
+                        if upgrade < NetworkUpgrade::Nu6_3 {
+                            return add_orchard_reward(&mut builder, addr);
+                        }
+
+                        #[cfg(zcash_unstable = "nu6.3")]
+                        if upgrade >= NetworkUpgrade::Nu6_3 {
+                            return add_ironwood_reward(&mut builder, addr);
+                        }
+
+                        #[cfg(not(zcash_unstable = "nu6.3"))]
+                        let _ = addr;
+
+                        None
+                    })
+                    .or_else(|| {
+                        addr.sapling()
+                            .and_then(|addr| add_sapling_reward(&mut builder, addr))
+                    })
+                    .or_else(|| {
+                        addr.transparent()
+                            .and_then(|addr| add_transparent_reward(&mut builder, addr))
+                    })
+            }
 
             Address::Sapling(addr) => add_sapling_reward(&mut builder, addr),
 
@@ -206,7 +236,7 @@ impl TransactionTemplate<NegativeOrZero> {
             ))?,
         }
         .ok_or(TransactionError::CoinbaseConstruction(
-            "Could not construct output with miner reward".to_string(),
+            "Could not construct miner reward output".to_string(),
         ))?;
 
         let mut funding_streams = funding_stream_values(height, net, block_subsidy)?

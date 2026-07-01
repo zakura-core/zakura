@@ -38,7 +38,6 @@ use zebra_chain::{
     },
     transparent::{self, CoinbaseSpendRestriction},
 };
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use zebra_chain::{ironwood, orchard};
 
 use zebra_node_services::mempool;
@@ -129,7 +128,6 @@ fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
     }
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn nu6_3_test_network_and_height() -> (Network, Height) {
     let network = Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
@@ -144,7 +142,6 @@ fn nu6_3_test_network_and_height() -> (Network, Height) {
     (network, Height(1))
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn orchard_fixture() -> orchard::ShieldedData {
     let default_testnet = Network::new_default_testnet();
 
@@ -153,7 +150,6 @@ fn orchard_fixture() -> orchard::ShieldedData {
         .expect("test vectors include a transaction with Orchard shielded data")
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn orchard_shielded_data(value_balance: i64, flags: Flags) -> orchard::ShieldedData {
     let mut shielded_data = orchard_fixture();
     shielded_data.value_balance =
@@ -163,7 +159,6 @@ fn orchard_shielded_data(value_balance: i64, flags: Flags) -> orchard::ShieldedD
     shielded_data
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn ironwood_shielded_data(value_balance: i64, flags: ironwood::Flags) -> ironwood::ShieldedData {
     let mut shielded_data = orchard_fixture();
     shielded_data.value_balance =
@@ -173,7 +168,6 @@ fn ironwood_shielded_data(value_balance: i64, flags: ironwood::Flags) -> ironwoo
     shielded_data
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_pool_flow_transaction(
     orchard_shielded_data: Option<orchard::ShieldedData>,
     ironwood_shielded_data: Option<ironwood::ShieldedData>,
@@ -191,7 +185,6 @@ fn v6_pool_flow_transaction(
     }
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn transparent_output(value: u64) -> transparent::Output {
     transparent::Output {
         value: Amount::<NonNegative>::try_from(value).expect("valid test amount"),
@@ -199,12 +192,10 @@ fn transparent_output(value: u64) -> transparent::Output {
     }
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn empty_utxos() -> HashMap<transparent::OutPoint, transparent::Utxo> {
     HashMap::new()
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
 fn orchard_rejects_net_deposits_after_nu6_3() {
     let (network, height) = nu6_3_test_network_and_height();
@@ -256,7 +247,6 @@ fn orchard_rejects_net_deposits_after_nu6_3() {
     );
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
 fn coinbase_rejects_orchard_shielded_data_after_nu6_3() {
     let (network, height) = nu6_3_test_network_and_height();
@@ -314,7 +304,6 @@ fn coinbase_rejects_orchard_shielded_data_after_nu6_3() {
     );
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
 fn orchard_cross_address_flag_is_disabled_after_nu6_3() {
     let orchard_cross_address = v6_pool_flow_transaction(
@@ -348,7 +337,6 @@ fn orchard_cross_address_flag_is_disabled_after_nu6_3() {
     );
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
 fn ironwood_cross_address_flag_is_optional_after_nu6_3() {
     // After NU6.3 the cross-address bit is OPTIONAL for Ironwood shielded data: a bundle
@@ -396,7 +384,6 @@ fn ironwood_cross_address_flag_is_optional_after_nu6_3() {
     );
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
 fn orchard_to_ironwood_migration_balances() {
     let (network, height) = nu6_3_test_network_and_height();
@@ -430,7 +417,6 @@ fn orchard_to_ironwood_migration_balances() {
     );
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
 fn ironwood_withdraw_balances() {
     let tx = v6_pool_flow_transaction(

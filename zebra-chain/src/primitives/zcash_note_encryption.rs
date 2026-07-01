@@ -47,7 +47,6 @@ pub fn decrypts_successfully(tx: &Transaction, network: &Network, height: Height
         }
     }
 
-    #[cfg(zcash_unstable = "nu6.3")]
     if let Some(bundle) = tx.ironwood_bundle() {
         for act in bundle.actions() {
             if !ironwood_action_decrypts_successfully(act) {
@@ -70,7 +69,6 @@ fn orchard_action_decrypts_successfully<A>(act: &orchard::Action<A>) -> bool {
     .is_some()
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
 fn ironwood_action_decrypts_successfully<A>(act: &orchard::Action<A>) -> bool {
     zcash_note_encryption::try_output_recovery_with_ovk(
         &orchard::note_encryption::IronwoodDomain::for_action(act),
@@ -82,7 +80,6 @@ fn ironwood_action_decrypts_successfully<A>(act: &orchard::Action<A>) -> bool {
     .is_some()
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
 #[cfg(test)]
 mod tests {
     use group::{prime::PrimeCurveAffine, GroupEncoding};
@@ -99,7 +96,6 @@ mod tests {
     use rand_core::OsRng;
     use zcash_note_encryption::Domain;
 
-    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn orchard_and_ironwood_domains_accept_only_their_plaintext_versions() {
         let vector = zebra_test::vectors::ORCHARD_NOTE_ENCRYPTION_ZERO_VECTOR

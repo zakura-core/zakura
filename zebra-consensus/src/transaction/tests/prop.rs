@@ -321,7 +321,6 @@ fn mock_transparent_transaction(
             orchard_shielded_data: None,
             network_upgrade,
         },
-        #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
         6 => Transaction::V6 {
             inputs,
             outputs,
@@ -341,7 +340,7 @@ fn mock_transparent_transaction(
 /// Sanitize a transaction version so that it is supported at the specified `block_height` of the
 /// `network`.
 ///
-/// The `transaction_version` might be reduced if it is not supported by the network upgrade active
+/// The `transaction_version` might be adjusted if it is not supported by the network upgrade active
 /// at the `block_height` of the specified `network`.
 fn sanitize_transaction_version(
     network: &Network,
@@ -350,25 +349,59 @@ fn sanitize_transaction_version(
 ) -> (u8, NetworkUpgrade) {
     let network_upgrade = NetworkUpgrade::current(network, block_height);
 
-    let max_version = {
+    let (min_version, max_version) = {
         use NetworkUpgrade::*;
 
         match network_upgrade {
-            Genesis => 1,
-            BeforeOverwinter => 2,
-            Overwinter => 3,
-            Sapling | Blossom | Heartwood | Canopy => 4,
-            // FIXME: Use 6 for Nu7
-            Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7 => 5,
+            Genesis | BeforeOverwinter | Overwinter => {
+                unreachable!("mock transparent transaction tests only use Sapling-onward heights")
+            }
+            Sapling | Blossom | Heartwood | Canopy => (4, 4),
+            Nu5 | Nu6 | Nu6_1 | Nu6_2 => (4, 5),
+            Nu6_3 => (4, 6),
+            Nu7 => (5, 5),
 
             #[cfg(zcash_unstable = "zfuture")]
-            NetworkUpgrade::ZFuture => u8::MAX,
+            NetworkUpgrade::ZFuture => (5, u8::MAX),
         }
     };
 
-    let sanitized_version = transaction_version.min(max_version);
+    let sanitized_version = transaction_version.clamp(min_version, max_version);
 
     (sanitized_version, network_upgrade)
+}
+
+#[test]
+fn sanitize_transaction_version_handles_v6_at_nu6_3() {
+    let network = zebra_chain::parameters::testnet::Parameters::build()
+        .with_activation_heights(
+            zebra_chain::parameters::testnet::ConfiguredActivationHeights {
+                nu6_3: Some(1),
+                nu7: Some(2),
+                ..Default::default()
+            },
+        )
+        .expect("configured activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured network is valid");
+
+    assert_eq!(
+        sanitize_transaction_version(&network, 4, block::Height(1)),
+        (4, NetworkUpgrade::Nu6_3)
+    );
+    assert_eq!(
+        sanitize_transaction_version(&network, 6, block::Height(1)),
+        (6, NetworkUpgrade::Nu6_3)
+    );
+    assert_eq!(
+        sanitize_transaction_version(&network, 4, block::Height(2)),
+        (5, NetworkUpgrade::Nu7)
+    );
+    assert_eq!(
+        sanitize_transaction_version(&network, 6, block::Height(2)),
+        (5, NetworkUpgrade::Nu7)
+    );
 }
 
 /// Create multiple mock transparent transfers.

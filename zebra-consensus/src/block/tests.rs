@@ -6,7 +6,6 @@ use color_eyre::eyre::{eyre, Report};
 use once_cell::sync::Lazy;
 use tower::{buffer::Buffer, util::BoxService, ServiceExt};
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use zebra_chain::{amount::NegativeAllowed, ironwood};
 use zebra_chain::{
     amount::{DeferredPoolBalanceChange, MAX_MONEY},
@@ -774,7 +773,6 @@ fn orchard_fixture() -> orchard::ShieldedData {
         .expect("test vectors include a transaction with Orchard shielded data")
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
 fn miner_fees_validation_includes_ironwood_balance() {
     let _init_guard = zebra_test::init();
@@ -835,7 +833,6 @@ fn miner_fees_validation_includes_ironwood_balance() {
     );
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn ironwood_shielded_data(value_balance: i64) -> ironwood::ShieldedData {
     let mut shielded_data = orchard_fixture();
 

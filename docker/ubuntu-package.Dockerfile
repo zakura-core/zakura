@@ -6,8 +6,6 @@ FROM ${UBUNTU_IMAGE} AS build
 ARG DEBIAN_FRONTEND=noninteractive
 ARG RUST_VERSION=1.91
 ARG FEATURES="default-release-binaries"
-# Custom rustc cfgs that gate the NU6.3 consensus paths.
-# ARG RUSTFLAGS='--cfg zcash_unstable="nu6.3"'
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \

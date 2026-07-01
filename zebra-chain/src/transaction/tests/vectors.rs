@@ -2,7 +2,7 @@
 
 use arbitrary::v5_transactions;
 use chrono::DateTime;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, WrapErr};
 use lazy_static::lazy_static;
 use rand::{seq::IteratorRandom, thread_rng};
 use std::io::ErrorKind;
@@ -22,9 +22,7 @@ use zebra_test::{
 };
 
 use super::super::*;
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use super::ironwood_v6_tx_hash;
-
 lazy_static! {
     pub static ref EMPTY_V5_TX: Transaction = Transaction::V5 {
         network_upgrade: NetworkUpgrade::Nu5,
@@ -512,14 +510,14 @@ fn zip244_auth_digest() -> Result<()> {
 }
 
 /// Known-answer sanity check for the native ZIP-244 digest path
-/// (`transaction::zip244`): the digests it computes directly from Zebra's
-/// parsed transaction must equal the txid and authorizing-data digest published
-/// in the official ZIP-244 test vectors.
+/// (`transaction::zip244`): for V5, the digests it computes directly from
+/// Zebra's parsed transaction must equal the txid and authorizing-data digest
+/// published in the official ZIP-244 test vectors.
 ///
 /// The `native_zip244_matches_librustzcash` property test proves the native
 /// path agrees with the `librustzcash` conversion it replaces; this test pins
 /// both implementations to the independently-published expected outputs, so a
-/// shared bug in the two computations could not pass silently.
+/// shared bug in the two V5 computations could not pass silently.
 #[test]
 fn native_zip244_matches_test_vectors() -> Result<()> {
     let _init_guard = zebra_test::init();
@@ -533,14 +531,21 @@ fn native_zip244_matches_test_vectors() -> Result<()> {
         )?;
     }
 
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     for test in ironwood_v6_tx_hash::TEST_VECTORS.iter() {
-        assert_native_zip244_matches_test_vector(
-            test.tx,
-            test.txid,
-            test.auth_digest,
-            test.scenario,
-        )?;
+        let mut tx_bytes = test.tx.to_vec();
+        // These vectors were generated before the V6 version group ID and
+        // NU6.3 branch ID were finalized.
+        tx_bytes[4..8].copy_from_slice(&crate::parameters::TX_V6_VERSION_GROUP_ID.to_le_bytes());
+        tx_bytes[8..12].copy_from_slice(
+            &u32::from(
+                NetworkUpgrade::Nu6_3
+                    .branch_id()
+                    .expect("NU6.3 has a consensus branch ID"),
+            )
+            .to_le_bytes(),
+        );
+
+        assert_native_zip244_matches_librustzcash_for_test_vector(&tx_bytes, test.scenario)?;
     }
 
     Ok(())
@@ -552,7 +557,9 @@ fn assert_native_zip244_matches_test_vector(
     expected_auth_digest: [u8; 32],
     vector_name: &str,
 ) -> Result<()> {
-    let tx = tx_bytes.zcash_deserialize_into::<Transaction>()?;
+    let tx = tx_bytes
+        .zcash_deserialize_into::<Transaction>()
+        .wrap_err_with(|| format!("failed to deserialize {vector_name}"))?;
 
     let (txid, auth_digest) = crate::transaction::zip244::txid_and_auth_digest(&tx)
         .expect("test vectors are v5/v6 transactions with native ZIP-244 digests");
@@ -571,6 +578,41 @@ fn assert_native_zip244_matches_test_vector(
     assert_eq!(
         crate::transaction::zip244::auth_digest(&tx).expect("v5/v6"),
         auth_digest
+    );
+
+    Ok(())
+}
+
+fn assert_native_zip244_matches_librustzcash_for_test_vector(
+    tx_bytes: &[u8],
+    vector_name: &str,
+) -> Result<()> {
+    let tx = tx_bytes
+        .zcash_deserialize_into::<Transaction>()
+        .wrap_err_with(|| format!("failed to deserialize {vector_name}"))?;
+
+    let (native_txid, native_auth_digest) = crate::transaction::zip244::txid_and_auth_digest(&tx)
+        .expect("test vectors are v6 transactions with native ZIP-244 digests");
+    let (librustzcash_txid, librustzcash_auth_digest) =
+        crate::primitives::zcash_primitives::txid_and_auth_digest_via_librustzcash(&tx);
+
+    assert_eq!(
+        native_txid, librustzcash_txid,
+        "native txid must match librustzcash for the {vector_name} test vector"
+    );
+    assert_eq!(
+        native_auth_digest, librustzcash_auth_digest,
+        "native auth digest must match librustzcash for the {vector_name} test vector"
+    );
+
+    // The separate native entry points must agree with the combined one.
+    assert_eq!(
+        crate::transaction::zip244::txid(&tx).expect("v6"),
+        native_txid
+    );
+    assert_eq!(
+        crate::transaction::zip244::auth_digest(&tx).expect("v6"),
+        native_auth_digest
     );
 
     Ok(())
@@ -1111,7 +1153,6 @@ fn binding_signatures() {
                             at_least_one_v5_checked = true;
                         }
                     }
-                    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                     Transaction::V6 {
                         sapling_shielded_data,
                         ..
@@ -1171,7 +1212,6 @@ fn test_coinbase_script() -> Result<()> {
 }
 
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_transactions_reject_pre_nu6_3_branch_id() {
     use crate::parameters::TX_V6_VERSION_GROUP_ID;
 
@@ -1216,7 +1256,6 @@ fn v6_transactions_reject_pre_nu6_3_branch_id() {
 }
 
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_txid_commits_to_ironwood_digest() {
     use proptest::{
         prelude::any,
@@ -1280,7 +1319,6 @@ fn v6_txid_commits_to_ironwood_digest() {
 }
 
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
     use proptest::{
         prelude::any,
@@ -1355,7 +1393,6 @@ fn v6_ironwood_anchor_changes_auth_digest_not_txid() {
 }
 
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_padded_orchard_proof_is_rejected_by_librustzcash_conversion() {
     let _init_guard = zebra_test::init();
 
@@ -1411,7 +1448,6 @@ fn v6_padded_orchard_proof_is_rejected_by_librustzcash_conversion() {
 /// so malformed Ironwood proofs must still be caught by the conversion consensus
 /// relies on rather than slipping through.
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_padded_ironwood_proof_is_rejected_by_librustzcash_conversion() {
     let _init_guard = zebra_test::init();
 
@@ -1546,7 +1582,6 @@ fn orchard_rk_identity_point_rejected_during_deserialization() {
 
     Transaction::zcash_deserialize(&v5_tx_bytes[..]).expect_err("V5 rk = identity should fail");
 
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     {
         let Transaction::V5 {
             orchard_shielded_data,
@@ -1942,23 +1977,20 @@ fn sapling_point_encodings_check_rejects_bad_points() {
 
     check_transaction("V5", &make_v5);
 
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-    {
-        let make_v6 = |cv: [u8; 32], epk: [u8; 32]| -> Transaction {
-            Transaction::V6 {
-                network_upgrade: NetworkUpgrade::Nu6_3,
-                lock_time: LockTime::unlocked(),
-                expiry_height: Height(0),
-                inputs: vec![],
-                outputs: vec![],
-                sapling_shielded_data: Some(make_shielded_data(cv, epk)),
-                orchard_shielded_data: None,
-                ironwood_shielded_data: None,
-            }
-        };
+    let make_v6 = |cv: [u8; 32], epk: [u8; 32]| -> Transaction {
+        Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu6_3,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![],
+            outputs: vec![],
+            sapling_shielded_data: Some(make_shielded_data(cv, epk)),
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+        }
+    };
 
-        check_transaction("V6", &make_v6);
-    }
+    check_transaction("V6", &make_v6);
 }
 
 /// The relocated Sapling `cv` / `epk` not-small-order checks accept exactly the

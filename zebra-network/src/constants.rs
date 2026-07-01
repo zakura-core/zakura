@@ -321,10 +321,12 @@ pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize =
 /// messages from each of our peers.
 pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_170; // NU6.3 Mainnet.
-#[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
-const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_150; // NU6.2 (Mainnet + Testnet).
+// TODO: The NU7 protocol version is provisional. Update this constant and the mapping in
+// `Version::min_specified_for_upgrade` once NU7's deployment ZIP is published.
+// Next upgrade values, uncomment on activation:
+//   const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_170; // NU7 Testnet.
+//   const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_180; // NU7 Mainnet.
+const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_160; // NU6.3 (Mainnet + Testnet).
 
 /// The Zcash network protocol version implemented by this crate, and advertised
 /// during connection setup.
@@ -337,7 +339,6 @@ const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_150; // NU6.2 (Mainnet +
 ///
 /// This version of Zebra draws the current network protocol version from
 /// [ZIP-255](https://zips.z.cash/zip-0255).
-// TODO: Update this constant to the correct value after NU6.3 activation (see NU deployment ZIPs),
 pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version =
     Version(CURRENT_NETWORK_PROTOCOL_VERSION_VALUE);
 

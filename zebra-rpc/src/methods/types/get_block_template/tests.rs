@@ -5,9 +5,7 @@ use std::iter;
 use zebra_chain::amount::Amount;
 
 use strum::IntoEnumIterator;
-use zcash_keys::address::Address;
-#[cfg(zcash_unstable = "nu6.3")]
-use zcash_keys::address::UnifiedAddress;
+use zcash_keys::address::{Address, UnifiedAddress};
 
 use zebra_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 
@@ -105,7 +103,6 @@ fn coinbase() -> anyhow::Result<()> {
 ///
 /// Like [`coinbase`], this builds real shielded outputs, so it is ignored to keep normal
 /// debug test runs fast. Run it with `--release` when intentionally checking this path.
-#[cfg(zcash_unstable = "nu6.3")]
 #[test]
 #[ignore]
 fn coinbase_routes_orchard_only_unified_address_by_network_upgrade() {
@@ -178,7 +175,6 @@ fn coinbase_routes_orchard_only_unified_address_by_network_upgrade() {
 ///
 /// Like [`coinbase`], this builds real shielded outputs, so it is ignored to keep normal
 /// debug test runs fast. Run it with `--release` when intentionally checking this path.
-#[cfg(zcash_unstable = "nu6.3")]
 #[test]
 #[ignore]
 fn coinbase_preserves_orchard_priority_by_network_upgrade() {
@@ -262,7 +258,6 @@ fn coinbase_preserves_orchard_priority_by_network_upgrade() {
     );
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
 fn nu6_3_testnet() -> Network {
     testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
@@ -284,7 +279,6 @@ fn nu6_3_testnet() -> Network {
         .expect("configured network is valid")
 }
 
-#[cfg(zcash_unstable = "nu6.3")]
 fn orchard_only_unified_address() -> UnifiedAddress {
     let orchard_spending_key = Option::<orchard::keys::SpendingKey>::from(
         orchard::keys::SpendingKey::from_bytes([0u8; 32]),

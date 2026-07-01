@@ -24,7 +24,6 @@ const EVICTION_MEMORY_TIME: Duration = Duration::from_secs(60 * 60);
 /// Transaction count used in some tests to derive the mempool test size.
 const MEMPOOL_TX_COUNT: usize = 4;
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn ironwood_action() -> zebra_chain::ironwood::Action {
     use proptest::{
         prelude::any,
@@ -39,7 +38,6 @@ fn ironwood_action() -> zebra_chain::ironwood::Action {
         .current()
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn ironwood_v6_tx(
     expiry_height: Height,
     action: zebra_chain::ironwood::Action,
@@ -74,7 +72,6 @@ fn ironwood_v6_tx(
     })
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn verified_ironwood_v6_tx(
     expiry_height: Height,
     action: zebra_chain::ironwood::Action,
@@ -311,7 +308,6 @@ fn mempool_storage_crud_same_effects_mainnet() {
 }
 
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn mempool_removes_ironwood_duplicate_spends() {
     let _init_guard = zebra_test::init();
 
@@ -348,7 +344,6 @@ fn mempool_removes_ironwood_duplicate_spends() {
 }
 
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn mempool_rejects_ironwood_conflict_on_insert() {
     let _init_guard = zebra_test::init();
 

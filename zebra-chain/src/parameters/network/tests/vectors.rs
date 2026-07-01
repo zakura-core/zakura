@@ -28,6 +28,10 @@ fn check_parameters_impl() {
         zp_consensus::NetworkUpgrade::Heartwood,
         zp_consensus::NetworkUpgrade::Canopy,
         zp_consensus::NetworkUpgrade::Nu5,
+        zp_consensus::NetworkUpgrade::Nu6,
+        zp_consensus::NetworkUpgrade::Nu6_1,
+        zp_consensus::NetworkUpgrade::Nu6_2,
+        zp_consensus::NetworkUpgrade::Nu6_3,
     ];
 
     for (network, zp_network) in [
@@ -38,17 +42,15 @@ fn check_parameters_impl() {
         ),
     ] {
         for nu in zp_network_upgrades {
-            let activation_height = network
-                .activation_height(nu)
-                .expect("must have activation height for past network upgrades");
-
             assert_eq!(
-                activation_height,
-                zp_network
-                    .activation_height(nu)
-                    .expect("must have activation height for past network upgrades"),
+                network.activation_height(nu),
+                zp_network.activation_height(nu),
                 "Parameters::activation_heights() outputs must match"
             );
+
+            let Some(activation_height) = network.activation_height(nu) else {
+                continue;
+            };
 
             let activation_height: u32 = activation_height.into();
 

@@ -592,7 +592,6 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
     })
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifier) {
     use proptest::{prelude::any, strategy::ValueTree, test_runner::TestRunner};
     use zebra_chain::{
@@ -1201,7 +1200,6 @@ fn modern_rollback_preserves_empty_ironwood_activation_tree() -> Result<()> {
 }
 
 #[test]
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn rollback_prunes_ironwood_nullifiers_above_target() {
     let _init_guard = zebra_test::init();
 

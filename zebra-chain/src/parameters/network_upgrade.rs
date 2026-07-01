@@ -141,6 +141,7 @@ pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
         (NU6, Nu6),
         (NU6_1, Nu6_1),
         (NU6_2, Nu6_2),
+        (NU6_3, Nu6_3),
     ]
 };
 
@@ -235,17 +236,7 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu6, ConsensusBranchId(0xc8e71055)),
     (Nu6_1, ConsensusBranchId(0x4dec4df0)),
     (Nu6_2, ConsensusBranchId(0x5437f330)),
-    // TODO: set the real NU6.3 (Ironwood) branch id once it is published.
-    // This placeholder matches the placeholder `BranchId::Nu6_3 = 0xffff_ffff`
-    // in our Ironwood librustzcash, so that `Transaction::to_librustzcash`
-    // resolves v6 transactions to the fork's NU6.3 branch id.
-    //
-    // Kept unconditional, like the Nu7 entry below: the finalized-state
-    // history-tree path resolves `Nu6_3.branch_id()` for any network that
-    // configures a NU6.3 activation height, including no-`zcash_unstable` test
-    // builds, where a missing entry makes `branch_id()` return `None` and panics
-    // ("must have branch ID for chain history network upgrades").
-    (Nu6_3, ConsensusBranchId(0xffffffff)),
+    (Nu6_3, ConsensusBranchId(0x37a5165b)),
     // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
     (Nu7, ConsensusBranchId(0xfffffffe)),
     #[cfg(zcash_unstable = "zfuture")]
@@ -540,7 +531,6 @@ impl From<zcash_protocol::consensus::NetworkUpgrade> for NetworkUpgrade {
             zcash_protocol::consensus::NetworkUpgrade::Nu6 => Self::Nu6,
             zcash_protocol::consensus::NetworkUpgrade::Nu6_1 => Self::Nu6_1,
             zcash_protocol::consensus::NetworkUpgrade::Nu6_2 => Self::Nu6_2,
-            #[cfg(zcash_unstable = "nu6.3")]
             zcash_protocol::consensus::NetworkUpgrade::Nu6_3 => Self::Nu6_3,
             #[cfg(zcash_unstable = "nu7")]
             zcash_protocol::consensus::NetworkUpgrade::Nu7 => Self::Nu7,

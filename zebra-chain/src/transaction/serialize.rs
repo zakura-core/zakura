@@ -21,7 +21,6 @@ use crate::{
     },
 };
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use crate::parameters::TX_V6_VERSION_GROUP_ID;
 
 use super::*;
@@ -806,7 +805,6 @@ impl ZcashSerialize for Transaction {
                 )?;
             }
 
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 {
                 network_upgrade,
                 lock_time,
@@ -1165,7 +1163,6 @@ impl ZcashDeserialize for Transaction {
                     orchard_shielded_data,
                 })
             }
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             (6, true) => {
                 // Transaction V6 spec:
                 // https://zips.z.cash/zip-0229

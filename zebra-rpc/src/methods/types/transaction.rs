@@ -153,7 +153,7 @@ impl TransactionTemplate<NegativeOrZero> {
             };
         }
 
-        let add_orchard_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+        let add_orchard_reward = |builder: &mut Builder<_, _>, addr: &_| {
             trace_err!(
                 builder.add_orchard_output::<String>(
                     Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
@@ -165,8 +165,7 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        #[cfg(zcash_unstable = "nu6.3")]
-        let add_ironwood_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+        let add_ironwood_reward = |builder: &mut Builder<_, _>, addr: &_| {
             trace_err!(
                 builder.add_ironwood_output::<String>(
                     Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
@@ -178,7 +177,7 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        let add_sapling_reward = |builder: &mut Builder<'_, _, _>, addr: &_| {
+        let add_sapling_reward = |builder: &mut Builder<_, _>, addr: &_| {
             trace_err!(
                 builder.add_sapling_output::<String>(
                     Some(sapling_crypto::keys::OutgoingViewingKey([0u8; 32])),
@@ -190,7 +189,7 @@ impl TransactionTemplate<NegativeOrZero> {
             )
         };
 
-        let add_transparent_reward = |builder: &mut Builder<'_, _, _>, addr| {
+        let add_transparent_reward = |builder: &mut Builder<_, _>, addr| {
             trace_err!(
                 builder.add_transparent_output(addr, miner_reward),
                 "transparent"
@@ -204,18 +203,10 @@ impl TransactionTemplate<NegativeOrZero> {
                 addr.orchard()
                     .and_then(|addr| {
                         if upgrade < NetworkUpgrade::Nu6_3 {
-                            return add_orchard_reward(&mut builder, addr);
+                            add_orchard_reward(&mut builder, addr)
+                        } else {
+                            add_ironwood_reward(&mut builder, addr)
                         }
-
-                        #[cfg(zcash_unstable = "nu6.3")]
-                        if upgrade >= NetworkUpgrade::Nu6_3 {
-                            return add_ironwood_reward(&mut builder, addr);
-                        }
-
-                        #[cfg(not(zcash_unstable = "nu6.3"))]
-                        let _ = addr;
-
-                        None
                     })
                     .or_else(|| {
                         addr.sapling()

@@ -20,7 +20,6 @@ use crate::{
     transparent, LedgerState,
 };
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 use crate::ironwood;
 
 fn native_zip244_tx_strategy() -> BoxedStrategy<Transaction> {
@@ -47,7 +46,6 @@ fn native_zip244_tx_strategy() -> BoxedStrategy<Transaction> {
     ]
     .boxed();
 
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     {
         prop_oneof![
             v5,
@@ -81,11 +79,6 @@ fn native_zip244_tx_strategy() -> BoxedStrategy<Transaction> {
             ),
         ]
         .boxed()
-    }
-
-    #[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
-    {
-        v5
     }
 }
 
@@ -124,7 +117,6 @@ fn v5_tx_strategy(
         .boxed()
 }
 
-#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn v6_tx_strategy(
     sapling_shielded_data: BoxedStrategy<Option<sapling::ShieldedData<sapling::SharedAnchor>>>,
     orchard_shielded_data: BoxedStrategy<Option<orchard::ShieldedData>>,

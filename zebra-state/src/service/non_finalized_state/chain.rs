@@ -1839,7 +1839,6 @@ impl Chain {
                     orchard_shielded_data,
                     &None::<ironwood::ShieldedData>,
                 ),
-                #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                 V6 {
                     inputs,
                     outputs,
@@ -2049,7 +2048,6 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     orchard_shielded_data,
                     &None::<ironwood::ShieldedData>,
                 ),
-                #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                 V6 {
                     inputs,
                     outputs,

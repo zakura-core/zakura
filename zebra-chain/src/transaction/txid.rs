@@ -28,7 +28,6 @@ impl<'a> TxIdBuilder<'a> {
             | Transaction::V3 { .. }
             | Transaction::V4 { .. } => self.txid_v1_to_v4(),
             Transaction::V5 { .. } => self.txid_v5(),
-            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             Transaction::V6 { .. } => self.txid_v6(),
         }
     }
@@ -58,7 +57,6 @@ impl<'a> TxIdBuilder<'a> {
     }
 
     /// Passthrough to the ZIP-244 txid path for V6 transactions.
-    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn txid_v6(self) -> Option<Hash> {
         self.txid_v5()
     }

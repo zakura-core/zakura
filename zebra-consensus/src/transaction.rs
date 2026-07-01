@@ -1007,7 +1007,7 @@ where
         }
     }
 
-    /// Passthrough to verify_v5_transaction, but for V6 transactions.
+    /// Verify a V6 transaction.
     #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
     fn verify_v6_transaction(
         request: &Request,
@@ -1015,7 +1015,43 @@ where
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction>,
     ) -> Result<AsyncChecks, TransactionError> {
-        Self::verify_v5_transaction(request, network, script_verifier, cached_ffi_transaction)
+        let transaction = request.transaction();
+        let nu = request.upgrade(network);
+
+        Self::verify_v6_transaction_network_upgrade(&transaction, nu)?;
+
+        let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
+        let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
+        let ironwood_bundle = cached_ffi_transaction.sighasher().ironwood_bundle();
+
+        let sighash = cached_ffi_transaction
+            .sighasher()
+            .sighash(HashType::ALL, None);
+
+        Ok(Self::verify_transparent_inputs_and_outputs(
+            request,
+            script_verifier,
+            cached_ffi_transaction,
+        )?
+        .and(Self::verify_sapling_bundle(sapling_bundle, &sighash))
+        .and(Self::verify_orchard_bundle(orchard_bundle, &sighash, nu))
+        .and(Self::verify_orchard_bundle(ironwood_bundle, &sighash, nu)))
+    }
+
+    /// Verifies if a V6 `transaction` is supported by `network_upgrade`.
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    fn verify_v6_transaction_network_upgrade(
+        transaction: &Transaction,
+        network_upgrade: NetworkUpgrade,
+    ) -> Result<(), TransactionError> {
+        if network_upgrade < NetworkUpgrade::Nu6_3 {
+            return Err(TransactionError::UnsupportedByNetworkUpgrade(
+                transaction.version(),
+                network_upgrade,
+            ));
+        }
+
+        Ok(())
     }
 
     /// Verifies if a transaction's transparent inputs are valid using the provided

@@ -14,6 +14,7 @@ use tempfile::TempDir;
 use zebra_chain::{
     amount::{Amount, NonNegative, MAX_MONEY},
     block::{self, Block, Height},
+    ironwood, orchard,
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters as TestnetParameters},
         Network, NetworkKind, NetworkUpgrade,
@@ -591,6 +592,49 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
     })
 }
 
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifier) {
+    use proptest::{prelude::any, strategy::ValueTree, test_runner::TestRunner};
+    use zebra_chain::{
+        at_least_one,
+        orchard::{self, tree},
+        primitives::Halo2Proof,
+    };
+
+    let mut runner = TestRunner::default();
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut runner)
+        .expect("test action strategy creates a value")
+        .current();
+    let nullifier = action.nullifier;
+
+    let ironwood_shielded_data = ironwood::ShieldedData {
+        flags: orchard::Flags::ENABLE_SPENDS,
+        value_balance: Amount::zero(),
+        shared_anchor: tree::Root::default(),
+        proof: Halo2Proof(vec![0; 4992]),
+        actions: at_least_one![ironwood::AuthorizedAction {
+            action,
+            spend_auth_sig: [0u8; 64].into(),
+        }],
+        binding_sig: [0u8; 64].into(),
+    };
+
+    (
+        Arc::new(Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu6_3,
+            lock_time: LockTime::unlocked(),
+            expiry_height,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: Some(ironwood_shielded_data),
+        }),
+        nullifier,
+    )
+}
+
 fn child_block_with_history_commitment(
     parent: &Block,
     transactions: Vec<Arc<Transaction>>,
@@ -1002,10 +1046,11 @@ fn rollback_prunes_subtrees_above_target() {
     let config = config_at(dir.path());
     sync_to(&config, &network, &chain);
 
-    // Insert subtrees straddling the rollback target (height 2): index 0 ends at/below it (kept),
-    // index 1 ends above it (pruned).
+    // Insert subtrees straddling the rollback target (height 2): index 0 ends at or below it,
+    // and index 1 ends above it.
     let sapling_node = sapling_crypto::Node::from_bytes([0; 32]).expect("dummy sapling node");
-    let orchard_node = zebra_chain::orchard::tree::Node::default();
+    let orchard_node = orchard::tree::Node::default();
+    let ironwood_node = ironwood::tree::Node::default();
     {
         let db = open_unchecked_db(&config, &network);
         let mut batch = DiskWriteBatch::new();
@@ -1024,6 +1069,14 @@ fn rollback_prunes_subtrees_above_target() {
         batch.insert_orchard_subtree(
             &db,
             &NoteCommitmentSubtree::new(1u16, Height(3), orchard_node),
+        );
+        batch.insert_ironwood_subtree(
+            &db,
+            &NoteCommitmentSubtree::new(0u16, Height(2), ironwood_node),
+        );
+        batch.insert_ironwood_subtree(
+            &db,
+            &NoteCommitmentSubtree::new(1u16, Height(3), ironwood_node),
         );
         db.write_batch(batch)
             .expect("database accepts the synthetic subtree batch");
@@ -1051,6 +1104,11 @@ fn rollback_prunes_subtrees_above_target() {
         .keys()
         .map(|index| index.0)
         .collect();
+    let ironwood: Vec<u16> = rolled
+        .ironwood_subtree_list_by_index_range(..)
+        .keys()
+        .map(|index| index.0)
+        .collect();
 
     assert_eq!(
         sapling,
@@ -1061,5 +1119,133 @@ fn rollback_prunes_subtrees_above_target() {
         orchard,
         vec![0],
         "orchard subtree above the target is pruned"
+    );
+    assert_eq!(
+        ironwood,
+        vec![0],
+        "ironwood subtree above the target is pruned"
+    );
+}
+
+/// When Ironwood activates, finalized state stores the empty tree and anchor even before any
+/// Ironwood note changes the tree. Rollback should preserve that activation-window empty root.
+#[test]
+fn modern_rollback_preserves_empty_ironwood_activation_tree() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let network = modern_rollback_network();
+    let target_height = NetworkUpgrade::Nu6_3
+        .activation_height(&network)
+        .expect("NU6.3 activation height is configured");
+    let target_index = usize::try_from(target_height.0).expect("test height fits in usize");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), NetworkUpgrade::Nu5, Some(5), true);
+
+    proptest!(
+        ProptestConfig::with_cases(proptest_cases()),
+        |((chain, _count, network, _history_tree) in PreparedChain::default()
+            .with_ledger_strategy(ledger_strategy)
+            .with_valid_commitments()
+            .no_shrink())
+            | {
+            let synced: Vec<SemanticallyVerifiedBlock> = chain.iter().cloned().collect();
+            prop_assume!(synced.len() > target_index + 1);
+
+            let dir = TempDir::new().expect("temp dir");
+            let config = config_at(dir.path());
+            sync_to(&config, &network, &synced);
+
+            {
+                let db = open_unchecked_db(&config, &network);
+                let Some((height, ironwood_tree)) =
+                    db.ironwood_tree_by_height_range(..=target_height).last()
+                else {
+                    prop_assert!(false, "NU6.3 activation stores the empty Ironwood tree");
+                    return Ok(());
+                };
+
+                prop_assert_eq!(height, target_height);
+                prop_assert_eq!(
+                    ironwood_tree.root(),
+                    ironwood::tree::NoteCommitmentTree::default().root(),
+                    "activation Ironwood tree is empty"
+                );
+                prop_assert!(
+                    db.contains_ironwood_anchor(&ironwood_tree.root()),
+                    "activation Ironwood anchor is indexed"
+                );
+            }
+
+            rollback_finalized_state(
+                config.clone(),
+                &network,
+                RollbackFinalizedStateOptions {
+                    target_height,
+                    keep_rolled_back_blocks: false,
+                    max_checkpoint_height: None,
+                },
+            )
+            .expect("rollback succeeds in the empty Ironwood activation window");
+
+            let rolled = open_unchecked_db(&config, &network);
+            prop_assert_eq!(rolled.tip().map(|(height, _hash)| height), Some(target_height));
+            prop_assert_eq!(
+                rolled.ironwood_tree_for_tip().root(),
+                ironwood::tree::NoteCommitmentTree::default().root(),
+                "rollback preserves the empty Ironwood activation tree"
+            );
+        }
+    );
+
+    Ok(())
+}
+
+#[test]
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn rollback_prunes_ironwood_nullifiers_above_target() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let address = Address::from_script_hash(NetworkKind::Mainnet, [0x42; 20]);
+    let dust = Amount::<NonNegative>::try_from(1).expect("1 fits in Amount<NonNegative>");
+
+    let genesis: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("mainnet genesis test vector deserializes");
+    let block1 = child_block(&genesis, vec![coinbase_tx(Height(1), dust, &address)]);
+    let (ironwood_tx, ironwood_nullifier) = ironwood_v6_tx(Height(2));
+    let block2 = child_block(
+        &block1,
+        vec![coinbase_tx(Height(2), dust, &address), ironwood_tx],
+    );
+
+    let chain: Vec<SemanticallyVerifiedBlock> = [genesis, block1, block2]
+        .into_iter()
+        .map(SemanticallyVerifiedBlock::from)
+        .collect();
+
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path());
+    sync_to(&config, &network, &chain);
+
+    assert!(
+        open_unchecked_db(&config, &network).contains_ironwood_nullifier(&ironwood_nullifier),
+        "forward sync indexes the Ironwood nullifier"
+    );
+
+    rollback_finalized_state(
+        config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: Height(1),
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("rollback succeeds");
+
+    assert!(
+        !open_unchecked_db(&config, &network).contains_ironwood_nullifier(&ironwood_nullifier),
+        "rollback prunes Ironwood nullifiers above the target"
     );
 }

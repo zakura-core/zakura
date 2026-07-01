@@ -468,6 +468,7 @@ impl NonFinalizedState {
                 finalized_state.sprout_tree_for_tip(),
                 finalized_state.sapling_tree_for_tip(),
                 finalized_state.orchard_tree_for_tip(),
+                finalized_state.ironwood_tree_for_tip(),
                 finalized_state.history_tree(),
                 finalized_state.finalized_value_pool(),
             );
@@ -527,6 +528,7 @@ impl NonFinalizedState {
             finalized_state.sprout_tree_for_tip(),
             finalized_state.sapling_tree_for_tip(),
             finalized_state.orchard_tree_for_tip(),
+            finalized_state.ironwood_tree_for_tip(),
             finalized_state.history_tree(),
             finalized_state.finalized_value_pool(),
         );
@@ -576,7 +578,7 @@ impl NonFinalizedState {
         )?;
 
         // Reads from disk
-        check::anchors::block_sapling_orchard_anchors_refer_to_final_treestates(
+        check::anchors::block_sapling_orchard_ironwood_anchors_refer_to_final_treestates(
             finalized_state,
             &new_chain,
             &prepared,

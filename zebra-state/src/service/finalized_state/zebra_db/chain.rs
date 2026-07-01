@@ -198,7 +198,7 @@ impl ZebraDb {
 impl DiskWriteBatch {
     // History tree methods
 
-    /// Updates the history tree for the tip, if it is not empty.
+    /// Updates the history tree for the tip.
     ///
     /// The batch must be written to the database by the caller.
     pub fn update_history_tree(&mut self, db: &ZebraDb, tree: &HistoryTree) {
@@ -207,6 +207,9 @@ impl DiskWriteBatch {
         if let Some(tree) = tree.as_ref() {
             // The batch is modified by this method and written by the caller.
             let _ = history_tree_cf.zs_insert(&(), &HistoryTreeParts::from(tree));
+        } else {
+            // The batch is modified by this method and written by the caller.
+            let _ = history_tree_cf.zs_delete(&());
         }
     }
 

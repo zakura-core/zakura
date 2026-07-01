@@ -17,7 +17,7 @@ use zebra_chain::{
     block::{self, Height},
     block_info::BlockInfo,
     history_tree::HistoryTree,
-    orchard,
+    ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
     parameters::Network,
     primitives::Groth16Proof,
@@ -143,6 +143,13 @@ pub struct ChainInner {
     pub(crate) orchard_trees_by_height:
         BTreeMap<block::Height, Arc<orchard::tree::NoteCommitmentTree>>,
 
+    /// The Ironwood note commitment tree for each height.
+    ///
+    /// When a chain is forked from the finalized tip, also contains the finalized tip tree.
+    /// This extra tree is removed when the first non-finalized block is committed.
+    pub(crate) ironwood_trees_by_height:
+        BTreeMap<block::Height, Arc<ironwood::tree::NoteCommitmentTree>>,
+
     // History trees
     //
     /// The ZIP-221 history tree for each height, including all finalized blocks,
@@ -193,6 +200,22 @@ pub struct ChainInner {
     pub(crate) orchard_subtrees:
         BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
 
+    /// A list of Ironwood subtrees completed in the non-finalized state.
+    pub(crate) ironwood_subtrees:
+        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>>,
+
+    /// The Ironwood anchors created by `blocks`.
+    ///
+    /// When a chain is forked from the finalized tip, also contains the finalized tip root.
+    /// This extra root is removed when the first non-finalized block is committed.
+    pub(crate) ironwood_anchors: MultiSet<ironwood::tree::Root>,
+
+    /// The Ironwood anchors created by each block in `blocks`.
+    ///
+    /// When a chain is forked from the finalized tip, also contains the finalized tip root.
+    /// This extra root is removed when the first non-finalized block is committed.
+    pub(crate) ironwood_anchors_by_height: BTreeMap<block::Height, ironwood::tree::Root>,
+
     // Nullifiers
     //
     /// The Sprout nullifiers revealed by `blocks` and, if the `indexer` feature is selected,
@@ -204,6 +227,9 @@ pub struct ChainInner {
     /// The Orchard nullifiers revealed by `blocks` and, if the `indexer` feature is selected,
     /// the id of the transaction that revealed them.
     pub(crate) orchard_nullifiers: HashMap<orchard::Nullifier, SpendingTransactionId>,
+    /// The Ironwood nullifiers revealed by `blocks` and, if the `indexer` feature is selected,
+    /// the id of the transaction that revealed them.
+    pub(crate) ironwood_nullifiers: HashMap<ironwood::Nullifier, SpendingTransactionId>,
 
     // Transparent Transfers
     // TODO: move to the transparent section
@@ -234,12 +260,14 @@ pub struct ChainInner {
 
 impl Chain {
     /// Create a new Chain with the given finalized tip trees and network.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         network: &Network,
         finalized_tip_height: Height,
         sprout_note_commitment_tree: Arc<sprout::tree::NoteCommitmentTree>,
         sapling_note_commitment_tree: Arc<sapling::tree::NoteCommitmentTree>,
         orchard_note_commitment_tree: Arc<orchard::tree::NoteCommitmentTree>,
+        ironwood_note_commitment_tree: Arc<ironwood::tree::NoteCommitmentTree>,
         history_tree: Arc<HistoryTree>,
         finalized_tip_chain_value_pools: ValueBalance<NonNegative>,
     ) -> Self {
@@ -261,9 +289,14 @@ impl Chain {
             orchard_anchors_by_height: Default::default(),
             orchard_trees_by_height: Default::default(),
             orchard_subtrees: Default::default(),
+            ironwood_anchors: MultiSet::new(),
+            ironwood_anchors_by_height: Default::default(),
+            ironwood_trees_by_height: Default::default(),
+            ironwood_subtrees: Default::default(),
             sprout_nullifiers: Default::default(),
             sapling_nullifiers: Default::default(),
             orchard_nullifiers: Default::default(),
+            ironwood_nullifiers: Default::default(),
             partial_transparent_transfers: Default::default(),
             partial_cumulative_work: Default::default(),
             history_trees_by_height: Default::default(),
@@ -280,6 +313,7 @@ impl Chain {
         chain.add_sprout_tree_and_anchor(finalized_tip_height, sprout_note_commitment_tree);
         chain.add_sapling_tree_and_anchor(finalized_tip_height, sapling_note_commitment_tree);
         chain.add_orchard_tree_and_anchor(finalized_tip_height, orchard_note_commitment_tree);
+        chain.add_ironwood_tree_and_anchor(finalized_tip_height, ironwood_note_commitment_tree);
         chain.add_history_tree(finalized_tip_height, history_tree);
 
         chain
@@ -354,6 +388,10 @@ impl Chain {
 
         if treestate.note_commitment_trees.orchard_subtree.is_some() {
             self.orchard_subtrees.pop_first();
+        }
+
+        if treestate.note_commitment_trees.ironwood_subtree.is_some() {
+            self.ironwood_subtrees.pop_first();
         }
 
         // Remove the lowest height block from `self.blocks`.
@@ -988,6 +1026,77 @@ impl Chain {
         }
     }
 
+    /// Returns the Ironwood note commitment tree for the tip.
+    ///
+    /// # Panics
+    ///
+    /// If this chain has no Ironwood trees. (This should be impossible.)
+    pub fn ironwood_note_commitment_tree_for_tip(&self) -> Arc<ironwood::tree::NoteCommitmentTree> {
+        self.ironwood_trees_by_height
+            .last_key_value()
+            .expect("only called while ironwood_trees_by_height is populated")
+            .1
+            .clone()
+    }
+
+    /// Returns the Ironwood [`NoteCommitmentTree`](ironwood::tree::NoteCommitmentTree)
+    /// specified by a [`HashOrHeight`], if it exists in the non-finalized [`Chain`].
+    pub fn ironwood_tree(
+        &self,
+        hash_or_height: HashOrHeight,
+    ) -> Option<Arc<ironwood::tree::NoteCommitmentTree>> {
+        let height =
+            hash_or_height.height_or_else(|hash| self.height_by_hash.get(&hash).cloned())?;
+
+        self.ironwood_trees_by_height
+            .range(..=height)
+            .next_back()
+            .map(|(_height, tree)| tree.clone())
+    }
+
+    /// Returns the Ironwood [`NoteCommitmentSubtree`] that was completed at a
+    /// block with [`HashOrHeight`], if it exists in the non-finalized [`Chain`].
+    pub fn ironwood_subtree(
+        &self,
+        hash_or_height: HashOrHeight,
+    ) -> Option<NoteCommitmentSubtree<ironwood::tree::Node>> {
+        let height =
+            hash_or_height.height_or_else(|hash| self.height_by_hash.get(&hash).cloned())?;
+
+        self.ironwood_subtrees
+            .iter()
+            .find(|(_index, subtree)| subtree.end_height == height)
+            .map(|(index, subtree)| subtree.with_index(*index))
+    }
+
+    /// Returns a list of Ironwood [`NoteCommitmentSubtree`]s in the provided range.
+    ///
+    /// Unlike the finalized state and `ReadRequest::IronwoodSubtrees`, the returned subtrees
+    /// can start after `start_index`. These subtrees are continuous up to the tip.
+    ///
+    /// There is no API for retrieving single subtrees by index, because it can accidentally be
+    /// used to create an inconsistent list of subtrees after concurrent non-finalized and
+    /// finalized updates.
+    pub fn ironwood_subtrees_in_range(
+        &self,
+        range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex>,
+    ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>> {
+        self.ironwood_subtrees
+            .range(range)
+            .map(|(index, subtree)| (*index, *subtree))
+            .collect()
+    }
+
+    /// Returns the Ironwood [`NoteCommitmentSubtree`] if it was completed at the tip height.
+    pub fn ironwood_subtree_for_tip(&self) -> Option<NoteCommitmentSubtree<ironwood::tree::Node>> {
+        if !self.is_empty() {
+            let tip = self.non_finalized_tip_height();
+            self.ironwood_subtree(tip.into())
+        } else {
+            None
+        }
+    }
+
     /// Adds the Orchard `tree` to the tree and anchor indexes at `height`.
     ///
     /// `height` can be either:
@@ -1040,6 +1149,41 @@ impl Chain {
         // Multiple inserts are expected here,
         // because the anchors only change if a block has shielded transactions.
         self.orchard_anchors.insert(anchor);
+    }
+
+    /// Inserts an Ironwood tree and anchor at `height`.
+    ///
+    /// # Panics
+    ///
+    /// - If there's a tree already stored at `height`.
+    /// - If there's an anchor already stored at `height`.
+    fn add_ironwood_tree_and_anchor(
+        &mut self,
+        height: Height,
+        tree: Arc<ironwood::tree::NoteCommitmentTree>,
+    ) {
+        let anchor = tree.root();
+        trace!(?height, ?anchor, "adding ironwood tree");
+
+        if height.is_min()
+            || self
+                .ironwood_tree(height.previous().expect("prev height").into())
+                .is_none_or(|prev_tree| prev_tree != tree)
+        {
+            assert_eq!(
+                self.ironwood_trees_by_height.insert(height, tree),
+                None,
+                "incorrect overwrite of ironwood tree: trees must be reverted then inserted",
+            );
+        }
+
+        assert_eq!(
+            self.ironwood_anchors_by_height.insert(height, anchor),
+            None,
+            "incorrect overwrite of ironwood anchor: anchors must be reverted then inserted",
+        );
+
+        self.ironwood_anchors.insert(anchor);
     }
 
     /// Removes the Orchard tree and anchor indexes at `height`.
@@ -1105,6 +1249,65 @@ impl Chain {
                 .expect("Zebra should never reach the max height in normal operation.");
 
             self.orchard_trees_by_height
+                .entry(next_height)
+                .or_insert_with(|| {
+                    highest_removed_tree.expect("There should be a cached removed tree.")
+                });
+        }
+    }
+
+    /// Removes the Ironwood tree and anchor indexes at `height`.
+    fn remove_ironwood_tree_and_anchor(&mut self, position: RevertPosition, height: Height) {
+        let (removed_heights, highest_removed_tree) = if position == RevertPosition::Root {
+            (
+                // Remove all trees and anchors at or below the removed block.
+                // This makes sure the temporary trees from finalized tip forks are removed.
+                self.ironwood_anchors_by_height
+                    .keys()
+                    .cloned()
+                    .filter(|index_height| *index_height <= height)
+                    .collect(),
+                // Cache the highest (rightmost) tree before its removal.
+                self.ironwood_tree(height.into()),
+            )
+        } else {
+            // Just remove the reverted tip trees and anchors.
+            // We don't need to cache the highest (rightmost) tree.
+            (vec![height], None)
+        };
+
+        for height in &removed_heights {
+            let anchor = self
+                .ironwood_anchors_by_height
+                .remove(height)
+                .expect("Ironwood anchor must be present if block was added to chain");
+
+            self.ironwood_trees_by_height.remove(height);
+
+            trace!(?height, ?position, ?anchor, "removing ironwood tree");
+
+            // Multiple removals are expected here,
+            // because the anchors only change if a block has shielded transactions.
+            assert!(
+                self.ironwood_anchors.remove(&anchor),
+                "Ironwood anchor must be present if block was added to chain"
+            );
+        }
+
+        // # Invariant
+        //
+        // The height following after the removed heights in a non-empty non-finalized state must
+        // always have its tree.
+        //
+        // The loop above can violate the invariant, and if `position` is [`RevertPosition::Root`],
+        // it will always violate the invariant. We restore the invariant by storing the highest
+        // (rightmost) removed tree just above `height` if there is no tree at that height.
+        if !self.is_empty() && height < self.non_finalized_tip_height() {
+            let next_height = height
+                .next()
+                .expect("Zebra should never reach the max height in normal operation.");
+
+            self.ironwood_trees_by_height
                 .entry(next_height)
                 .or_insert_with(|| {
                     highest_removed_tree.expect("There should be a cached removed tree.")
@@ -1182,16 +1385,20 @@ impl Chain {
         let sprout_tree = self.sprout_tree(hash_or_height)?;
         let sapling_tree = self.sapling_tree(hash_or_height)?;
         let orchard_tree = self.orchard_tree(hash_or_height)?;
+        let ironwood_tree = self.ironwood_tree(hash_or_height)?;
         let history_tree = self.history_tree(hash_or_height)?;
         let sapling_subtree = self.sapling_subtree(hash_or_height);
         let orchard_subtree = self.orchard_subtree(hash_or_height);
+        let ironwood_subtree = self.ironwood_subtree(hash_or_height);
 
         Some(Treestate::new(
             sprout_tree,
             sapling_tree,
             orchard_tree,
+            ironwood_tree,
             sapling_subtree,
             orchard_subtree,
+            ironwood_subtree,
             history_tree,
         ))
     }
@@ -1240,7 +1447,7 @@ impl Chain {
             .remove(&block_height)
             .expect("only called while blocks is populated");
 
-        // If the popped block completed a Sapling or Orchard subtree, remove the corresponding
+        // If the popped block completed a Sapling, Orchard, or Ironwood subtree, remove the corresponding
         // subtree from this chain too. Subtrees are inserted by `push` keyed by the highest subtree
         // index, so the last entry's `end_height` matches the popped block iff a subtree was
         // completed at that height.
@@ -1257,6 +1464,13 @@ impl Chain {
             .is_some_and(|(_, subtree)| subtree.end_height == block_height)
         {
             self.orchard_subtrees.pop_last();
+        }
+        if self
+            .ironwood_subtrees
+            .last_key_value()
+            .is_some_and(|(_, subtree)| subtree.end_height == block_height)
+        {
+            self.ironwood_subtrees.pop_last();
         }
 
         assert!(
@@ -1333,6 +1547,7 @@ impl Chain {
             Spend::Sprout(nullifier) => self.sprout_nullifiers.get(nullifier),
             Spend::Sapling(nullifier) => self.sapling_nullifiers.get(nullifier),
             Spend::Orchard(nullifier) => self.orchard_nullifiers.get(nullifier),
+            Spend::Ironwood(nullifier) => self.ironwood_nullifiers.get(nullifier),
         }
         .cloned()
     }
@@ -1469,13 +1684,15 @@ impl Chain {
             sapling_subtree: self.sapling_subtree_for_tip(),
             orchard: self.orchard_note_commitment_tree_for_tip(),
             orchard_subtree: self.orchard_subtree_for_tip(),
+            ironwood: self.ironwood_note_commitment_tree_for_tip(),
+            ironwood_subtree: self.ironwood_subtree_for_tip(),
         };
 
         let mut tree_result = None;
         let mut partial_result = None;
 
         // Run 4 tasks in parallel:
-        // - sprout, sapling, and orchard tree updates and root calculations
+        // - sprout, sapling, orchard, and Ironwood tree updates and root calculations
         // - the rest of the Chain updates
         rayon::in_place_scope_fifo(|scope| {
             // Spawns a separate rayon task for each note commitment tree
@@ -1494,6 +1711,7 @@ impl Chain {
         self.add_sprout_tree_and_anchor(height, nct.sprout);
         self.add_sapling_tree_and_anchor(height, nct.sapling);
         self.add_orchard_tree_and_anchor(height, nct.orchard);
+        self.add_ironwood_tree_and_anchor(height, nct.ironwood);
 
         if let Some(subtree) = nct.sapling_subtree {
             self.sapling_subtrees
@@ -1503,9 +1721,14 @@ impl Chain {
             self.orchard_subtrees
                 .insert(subtree.index, subtree.into_data());
         }
+        if let Some(subtree) = nct.ironwood_subtree {
+            self.ironwood_subtrees
+                .insert(subtree.index, subtree.into_data());
+        }
 
         let sapling_root = self.sapling_note_commitment_tree_for_tip().root();
         let orchard_root = self.orchard_note_commitment_tree_for_tip().root();
+        let ironwood_root = self.ironwood_note_commitment_tree_for_tip().root();
 
         // TODO: update the history trees in a rayon thread, if they show up in CPU profiles
         let mut history_tree = self.history_block_commitment_tree();
@@ -1516,7 +1739,7 @@ impl Chain {
                 contextually_valid.block.clone(),
                 &sapling_root,
                 &orchard_root,
-                &Default::default(),
+                &ironwood_root,
             )
             .map_err(Arc::new)?;
 
@@ -1582,14 +1805,25 @@ impl Chain {
                 sapling_shielded_data_per_spend_anchor,
                 sapling_shielded_data_shared_anchor,
                 orchard_shielded_data,
+                ironwood_shielded_data,
             ) = match transaction.deref() {
+                // The V6 arm that gives this slot its concrete type is cfg-gated.
+                // Keep these `None`s typed so non-V6 builds can infer the tuple type.
                 V4 {
                     inputs,
                     outputs,
                     joinsplit_data,
                     sapling_shielded_data,
                     ..
-                } => (inputs, outputs, joinsplit_data, sapling_shielded_data, &None, &None),
+                } => (
+                    inputs,
+                    outputs,
+                    joinsplit_data,
+                    sapling_shielded_data,
+                    &None,
+                    &None,
+                    &None::<ironwood::ShieldedData>,
+                ),
                 V5 {
                     inputs,
                     outputs,
@@ -1603,6 +1837,7 @@ impl Chain {
                     &None,
                     sapling_shielded_data,
                     orchard_shielded_data,
+                    &None::<ironwood::ShieldedData>,
                 ),
                 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                 V6 {
@@ -1610,6 +1845,7 @@ impl Chain {
                     outputs,
                     sapling_shielded_data,
                     orchard_shielded_data,
+                    ironwood_shielded_data,
                     ..
                 } => (
                     inputs,
@@ -1618,6 +1854,7 @@ impl Chain {
                     &None,
                     sapling_shielded_data,
                     orchard_shielded_data,
+                    ironwood_shielded_data,
                 ),
 
                 V1 { .. } | V2 { .. } | V3 { .. } => unreachable!(
@@ -1628,8 +1865,8 @@ impl Chain {
             // Shielded-data updates run before the transparent updates and
             // the `tx_loc_by_hash` insert so that a duplicate transaction
             // (same hash → same nullifiers) is rejected with a clean
-            // `Duplicate{Sprout|Sapling|Orchard}Nullifier` error by
-            // `add_to_non_finalized_chain_unique` before reaching the
+            // `Duplicate{Sprout|Sapling|Orchard|Ironwood}Nullifier` error by
+            // the nullifier insertion helpers before reaching the
             // defense-in-depth assertions on `tx_loc_by_hash`,
             // `created_utxos`, and `spent_utxos` below.
             {
@@ -1646,6 +1883,7 @@ impl Chain {
                     &transaction_hash,
                 ))?;
                 self.update_chain_tip_with(&(orchard_shielded_data, &transaction_hash))?;
+                self.update_chain_tip_with(&(ironwood_shielded_data.as_ref(), &transaction_hash))?;
             }
 
             // add key `transaction.hash` and value `(height, tx_index)` to `tx_loc_by_hash`
@@ -1777,14 +2015,25 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 sapling_shielded_data_per_spend_anchor,
                 sapling_shielded_data_shared_anchor,
                 orchard_shielded_data,
+                ironwood_shielded_data,
             ) = match transaction.deref() {
+                // The V6 arm that gives this slot its concrete type is cfg-gated.
+                // Keep these `None`s typed so non-V6 builds can infer the tuple type.
                 V4 {
                     inputs,
                     outputs,
                     joinsplit_data,
                     sapling_shielded_data,
                     ..
-                } => (inputs, outputs, joinsplit_data, sapling_shielded_data, &None, &None),
+                } => (
+                    inputs,
+                    outputs,
+                    joinsplit_data,
+                    sapling_shielded_data,
+                    &None,
+                    &None,
+                    &None::<ironwood::ShieldedData>,
+                ),
                 V5 {
                     inputs,
                     outputs,
@@ -1798,6 +2047,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     &None,
                     sapling_shielded_data,
                     orchard_shielded_data,
+                    &None::<ironwood::ShieldedData>,
                 ),
                 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
                 V6 {
@@ -1805,6 +2055,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     outputs,
                     sapling_shielded_data,
                     orchard_shielded_data,
+                    ironwood_shielded_data,
                     ..
                 } => (
                     inputs,
@@ -1813,6 +2064,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     &None,
                     sapling_shielded_data,
                     orchard_shielded_data,
+                    ironwood_shielded_data,
                 ),
 
                 V1 { .. } | V2 { .. } | V3 { .. } => unreachable!(
@@ -1847,12 +2099,17 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 position,
             );
             self.revert_chain_with(&(orchard_shielded_data, transaction_hash), position);
+            self.revert_chain_with(
+                &(ironwood_shielded_data.as_ref(), transaction_hash),
+                position,
+            );
         }
 
         // TODO: move these to the shielded UpdateWith.revert...()?
         self.remove_sprout_tree_and_anchor(position, height);
         self.remove_sapling_tree_and_anchor(position, height);
         self.remove_orchard_tree_and_anchor(position, height);
+        self.remove_ironwood_tree_and_anchor(position, height);
 
         // TODO: move this to the history tree UpdateWith.revert...()?
         self.remove_history_tree(position, height);
@@ -2240,6 +2497,54 @@ impl UpdateWith<(&Option<orchard::ShieldedData>, &SpendingTransactionId)> for Ch
     }
 }
 
+impl UpdateWith<(Option<&ironwood::ShieldedData>, &SpendingTransactionId)> for Chain {
+    #[instrument(skip(self, ironwood_shielded_data))]
+    fn update_chain_tip_with(
+        &mut self,
+        &(ironwood_shielded_data, revealing_tx_id): &(
+            Option<&ironwood::ShieldedData>,
+            &SpendingTransactionId,
+        ),
+    ) -> Result<(), ValidateContextError> {
+        if let Some(ironwood_shielded_data) = ironwood_shielded_data {
+            // We do note commitment tree updates in parallel rayon threads.
+
+            check::nullifier::add_ironwood_to_non_finalized_chain_unique(
+                &mut self.ironwood_nullifiers,
+                ironwood_shielded_data.nullifiers(),
+                *revealing_tx_id,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// # Panics
+    ///
+    /// Panics if any nullifier is missing from the chain when we try to remove it.
+    ///
+    /// See [`check::nullifier::remove_from_non_finalized_chain`] for details.
+    #[instrument(skip(self, ironwood_shielded_data))]
+    fn revert_chain_with(
+        &mut self,
+        &(ironwood_shielded_data, _revealing_tx_id): &(
+            Option<&ironwood::ShieldedData>,
+            &SpendingTransactionId,
+        ),
+        _position: RevertPosition,
+    ) {
+        if let Some(ironwood_shielded_data) = ironwood_shielded_data {
+            // Note commitments are removed from the Chain during a fork,
+            // by removing trees above the fork height from the note commitment index.
+            // This happens when reverting the block itself.
+
+            check::nullifier::remove_from_non_finalized_chain(
+                &mut self.ironwood_nullifiers,
+                ironwood_shielded_data.nullifiers(),
+            );
+        }
+    }
+}
+
 impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
     #[allow(clippy::unwrap_in_result)]
     fn update_chain_tip_with(
@@ -2419,6 +2724,16 @@ impl Chain {
     ) {
         self.inner
             .orchard_subtrees
+            .insert(subtree.index, subtree.into_data());
+    }
+
+    /// Inserts the supplied Ironwood note commitment subtree into the chain.
+    pub(crate) fn insert_ironwood_subtree(
+        &mut self,
+        subtree: NoteCommitmentSubtree<ironwood::tree::Node>,
+    ) {
+        self.inner
+            .ironwood_subtrees
             .insert(subtree.index, subtree.into_data());
     }
 }

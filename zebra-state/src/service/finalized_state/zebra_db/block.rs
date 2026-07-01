@@ -21,7 +21,7 @@ use itertools::Itertools;
 use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
-    orchard,
+    ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
     parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
     sapling,
@@ -365,6 +365,18 @@ impl ZebraDb {
         self.orchard_tree_by_height(&height)
     }
 
+    /// Returns the Ironwood [`note commitment tree`](ironwood::tree::NoteCommitmentTree)
+    /// specified by a hash or height, if it exists in the finalized state.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn ironwood_tree_by_hash_or_height(
+        &self,
+        hash_or_height: HashOrHeight,
+    ) -> Option<Arc<ironwood::tree::NoteCommitmentTree>> {
+        let height = hash_or_height.height_or_else(|hash| self.height(hash))?;
+
+        self.ironwood_tree_by_height(&height)
+    }
+
     // Read tip block methods
 
     /// Returns the hash of the current finalized tip block.
@@ -661,6 +673,7 @@ impl ZebraDb {
             Spend::Sprout(nullifier) => self.sprout_revealing_tx_loc(nullifier)?,
             Spend::Sapling(nullifier) => self.sapling_revealing_tx_loc(nullifier)?,
             Spend::Orchard(nullifier) => self.orchard_revealing_tx_loc(nullifier)?,
+            Spend::Ironwood(nullifier) => self.ironwood_revealing_tx_loc(nullifier)?,
         };
 
         self.transaction_hash(tx_loc)
@@ -1645,6 +1658,7 @@ impl DiskWriteBatch {
     }
 
     /// Prepare a database batch containing a contextually validated header range.
+    #[allow(clippy::unwrap_in_result)]
     pub fn prepare_header_range_batch(
         &mut self,
         zebra_db: &ZebraDb,

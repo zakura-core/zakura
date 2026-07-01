@@ -14,7 +14,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use zebra_chain::{
-    orchard, sapling,
+    ironwood, orchard, sapling,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
 };
 
@@ -110,6 +110,45 @@ where
         range,
         |chain, range| chain.orchard_subtrees_in_range(range),
         |range| db.orchard_subtree_list_by_index_range(range),
+    )
+}
+
+/// Returns the Ironwood
+/// [`NoteCommitmentTree`](ironwood::tree::NoteCommitmentTree) specified by a
+/// hash or height, if it exists in the non-finalized `chain` or finalized `db`.
+pub fn ironwood_tree<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    hash_or_height: HashOrHeight,
+) -> Option<Arc<ironwood::tree::NoteCommitmentTree>>
+where
+    C: AsRef<Chain>,
+{
+    chain
+        .and_then(|chain| chain.as_ref().ironwood_tree(hash_or_height))
+        .or_else(|| db.ironwood_tree_by_hash_or_height(hash_or_height))
+}
+
+/// Returns a list of Ironwood [`NoteCommitmentSubtree`]s with indexes in the
+/// provided range.
+///
+/// If there is no subtree at the first index in the range, the returned list is
+/// empty. Otherwise, subtrees are continuous up to the finalized tip.
+///
+/// See [`subtrees`] for more details.
+pub fn ironwood_subtrees<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex> + Clone,
+) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>>
+where
+    C: AsRef<Chain>,
+{
+    subtrees(
+        chain,
+        range,
+        |chain, range| chain.ironwood_subtrees_in_range(range),
+        |range| db.ironwood_subtree_list_by_index_range(range),
     )
 }
 

@@ -340,4 +340,4 @@ fn check_sapling_anchors() {
     );
 }
 
-// TODO: create a test for orchard anchors
+// TODO: create tests for orchard and ironwood anchors

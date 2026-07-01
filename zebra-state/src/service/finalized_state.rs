@@ -143,6 +143,11 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "orchard_anchors",
     "orchard_note_commitment_tree",
     "orchard_note_commitment_subtree",
+    // Ironwood
+    "ironwood_nullifiers",
+    "ironwood_anchors",
+    "ironwood_note_commitment_tree",
+    "ironwood_note_commitment_subtree",
     // Chain
     "history_tree",
     "tip_chain_value_pool",
@@ -646,13 +651,14 @@ impl FinalizedState {
                     let history_tree_mut = Arc::make_mut(&mut history_tree);
                     let sapling_root = note_commitment_trees.sapling.root();
                     let orchard_root = note_commitment_trees.orchard.root();
+                    let ironwood_root = note_commitment_trees.ironwood.root();
                     history_tree_mut
                         .push(
                             &network,
                             block.clone(),
                             &sapling_root,
                             &orchard_root,
-                            &Default::default(),
+                            &ironwood_root,
                         )
                         .map_err(Arc::new)
                         .map_err(ValidateContextError::from)?;

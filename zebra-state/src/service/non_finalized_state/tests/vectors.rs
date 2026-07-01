@@ -6,7 +6,7 @@ use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
     history_tree::NonEmptyHistoryTree,
-    orchard,
+    ironwood, orchard,
     parameters::{Network, NetworkUpgrade},
     serialization::ZcashDeserializeInto,
     subtree::NoteCommitmentSubtree,
@@ -34,6 +34,7 @@ fn construct_empty() {
         Default::default(),
         Default::default(),
         Default::default(),
+        Default::default(),
         ValueBalance::zero(),
     );
 }
@@ -47,6 +48,7 @@ fn construct_single() -> Result<()> {
     let mut chain = Chain::new(
         &Network::Mainnet,
         Height(0),
+        Default::default(),
         Default::default(),
         Default::default(),
         Default::default(),
@@ -85,6 +87,7 @@ fn construct_many() -> Result<()> {
         Default::default(),
         Default::default(),
         Default::default(),
+        Default::default(),
         ValueBalance::fake_populated_pool(),
     );
 
@@ -112,6 +115,7 @@ fn ord_matches_work() -> Result<()> {
         Default::default(),
         Default::default(),
         Default::default(),
+        Default::default(),
         ValueBalance::fake_populated_pool(),
     );
     lesser_chain = lesser_chain.push(less_block.prepare().test_with_zero_spent_utxos())?;
@@ -119,6 +123,7 @@ fn ord_matches_work() -> Result<()> {
     let mut bigger_chain = Chain::new(
         &Network::Mainnet,
         Height(0),
+        Default::default(),
         Default::default(),
         Default::default(),
         Default::default(),
@@ -658,7 +663,7 @@ fn history_tree_is_updated_for_network_upgrade(
         activation_block.clone(),
         &chain.sapling_note_commitment_tree_for_tip().root(),
         &chain.orchard_note_commitment_tree_for_tip().root(),
-        &Default::default(),
+        &chain.ironwood_note_commitment_tree_for_tip().root(),
     )
     .unwrap();
 
@@ -742,7 +747,7 @@ fn commitment_is_validated_for_network_upgrade(network: Network, network_upgrade
         activation_block.clone(),
         &chain.sapling_note_commitment_tree_for_tip().root(),
         &chain.orchard_note_commitment_tree_for_tip().root(),
-        &Default::default(),
+        &chain.ironwood_note_commitment_tree_for_tip().root(),
     )
     .unwrap();
 
@@ -833,8 +838,8 @@ async fn non_finalized_state_writes_blocks_to_and_restores_blocks_from_backup_ca
 /// Regression test for
 /// [GHSA-2gf8-q9rr-jq3h](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-2gf8-q9rr-jq3h).
 ///
-/// `Chain::pop_tip` used to leave entries in `sapling_subtrees` and `orchard_subtrees`,
-/// so a chain forked below a subtree boundary inherited stale subtrees from the
+/// `Chain::pop_tip` used to leave entries in `sapling_subtrees`, `orchard_subtrees`,
+/// and `ironwood_subtrees`, so a chain forked below a subtree boundary inherited stale subtrees from the
 /// abandoned branch. Forking should drop any subtree whose `end_height` is above the
 /// new tip.
 #[test]
@@ -853,13 +858,14 @@ fn fork_drops_subtrees_above_fork_point() -> Result<()> {
         Default::default(),
         Default::default(),
         Default::default(),
+        Default::default(),
         ValueBalance::fake_populated_pool(),
     );
     chain = chain.push(block1.clone().prepare().test_with_zero_spent_utxos())?;
     chain = chain.push(block2.clone().prepare().test_with_zero_spent_utxos())?;
     chain = chain.push(block3.clone().prepare().test_with_zero_spent_utxos())?;
 
-    // Inject a Sapling and an Orchard subtree whose `end_height` is the chain's tip.
+    // Inject Sapling, Orchard, and Ironwood subtrees whose `end_height` is the chain's tip.
     // The block-push pipeline above doesn't complete subtrees on its own for these
     // fixture blocks, so we install them directly via the test-only helpers.
     let tip_height = block3.coinbase_height().unwrap();
@@ -867,9 +873,12 @@ fn fork_drops_subtrees_above_fork_point() -> Result<()> {
     chain.insert_sapling_subtree(NoteCommitmentSubtree::new(0u16, tip_height, sapling_node));
     let orchard_node = orchard::tree::Node::default();
     chain.insert_orchard_subtree(NoteCommitmentSubtree::new(0u16, tip_height, orchard_node));
+    let ironwood_node = ironwood::tree::Node::default();
+    chain.insert_ironwood_subtree(NoteCommitmentSubtree::new(0u16, tip_height, ironwood_node));
 
     assert_eq!(chain.sapling_subtrees.len(), 1);
     assert_eq!(chain.orchard_subtrees.len(), 1);
+    assert_eq!(chain.ironwood_subtrees.len(), 1);
 
     // Fork at `block1`, so `pop_tip` runs twice (for block3 then block2). The
     // subtree at block3's height must be removed; without the fix, it would survive
@@ -884,6 +893,10 @@ fn fork_drops_subtrees_above_fork_point() -> Result<()> {
     assert!(
         forked.orchard_subtrees.is_empty(),
         "fork should have dropped the Orchard subtree completed above the fork point"
+    );
+    assert!(
+        forked.ironwood_subtrees.is_empty(),
+        "fork should have dropped the Ironwood subtree completed above the fork point"
     );
 
     Ok(())

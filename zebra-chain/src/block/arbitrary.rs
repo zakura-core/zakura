@@ -429,6 +429,7 @@ impl Block {
             let mut chain_value_pools = ValueBalance::zero();
             let mut sapling_tree = sapling::tree::NoteCommitmentTree::default();
             let mut orchard_tree = orchard::tree::NoteCommitmentTree::default();
+            let mut ironwood_tree = ironwood::tree::NoteCommitmentTree::default();
             // The history tree usually takes care of "creating itself". But this
             // only works when blocks are pushed into it starting from genesis
             // (or at least pre-Heartwood, where the tree is not required).
@@ -467,6 +468,10 @@ impl Block {
                             }
                             for orchard_note_commitment in transaction.orchard_note_commitments() {
                                 orchard_tree.append(*orchard_note_commitment).unwrap();
+                            }
+                            for ironwood_note_commitment in transaction.ironwood_note_commitments()
+                            {
+                                ironwood_tree.append(*ironwood_note_commitment).unwrap();
                             }
                         }
                         new_transactions.push(Arc::new(transaction));
@@ -531,7 +536,7 @@ impl Block {
                                 Arc::new(block.clone()),
                                 &sapling_tree.root(),
                                 &orchard_tree.root(),
-                                &Default::default(),
+                                &ironwood_tree.root(),
                             )
                             .unwrap();
                     } else {
@@ -541,7 +546,7 @@ impl Block {
                                 Arc::new(block.clone()),
                                 &sapling_tree.root(),
                                 &orchard_tree.root(),
-                                &Default::default(),
+                                &ironwood_tree.root(),
                             )
                             .unwrap(),
                         );

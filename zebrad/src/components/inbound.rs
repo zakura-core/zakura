@@ -536,10 +536,18 @@ impl Service<zn::Request> for Inbound {
                 })
                     .boxed()
             }
-            zn::Request::PushTransaction(transaction) => {
+            zn::Request::PushTransaction(transaction, advertiser) => {
+                let request = match advertiser {
+                    Some(source) => mempool::Request::QueueFromPeer {
+                        source: mempool_queue_source(source),
+                        transactions: vec![transaction.into()],
+                    },
+                    None => mempool::Request::Queue(vec![transaction.into()]),
+                };
+
                 mempool
                     .clone()
-                    .oneshot(mempool::Request::Queue(vec![transaction.into()]))
+                    .oneshot(request)
                     // The response just indicates if processing was queued or not; ignore it
                     .map_ok(|_resp| zn::Response::Nil)
                     .boxed()
@@ -550,8 +558,8 @@ impl Service<zn::Request> for Inbound {
                 // See `GHSA-4fc2-h7jh-287c`.
                 let request = match advertiser {
                     Some(source) => mempool::Request::QueueFromPeer {
-                        txids: transactions,
                         source: mempool_queue_source(source),
+                        transactions: transactions.into_iter().map(Into::into).collect(),
                     },
                     None => mempool::Request::Queue(
                         transactions.into_iter().map(Into::into).collect(),

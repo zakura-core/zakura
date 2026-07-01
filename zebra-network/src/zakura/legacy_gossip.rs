@@ -306,7 +306,7 @@ impl LegacyRequestFrame {
             }
             Request::MempoolTransactionIds => Ok(Self::MempoolTransactionIds),
             Request::Ping(_) => Ok(Self::Ping),
-            Request::PushTransaction(transaction) => Ok(Self::PushTransaction(transaction)),
+            Request::PushTransaction(transaction, _) => Ok(Self::PushTransaction(transaction)),
             request => Err(LegacyGossipError::UnsupportedRequest(request.command())),
         }
     }
@@ -421,7 +421,7 @@ impl LegacyRequestFrame {
         }
     }
 
-    fn into_service_request(self) -> Option<Request> {
+    fn into_service_request(self, peer_id: ZakuraPeerId) -> Option<Request> {
         match self {
             Self::BlocksByHash(hashes) => Some(Request::BlocksByHash(hashes.into_iter().collect())),
             Self::TransactionsById(ids) => {
@@ -435,7 +435,10 @@ impl LegacyRequestFrame {
             }
             Self::MempoolTransactionIds => Some(Request::MempoolTransactionIds),
             Self::Ping => None,
-            Self::PushTransaction(transaction) => Some(Request::PushTransaction(transaction)),
+            Self::PushTransaction(transaction) => Some(Request::PushTransaction(
+                transaction,
+                Some(PeerSource::Zakura(peer_id)),
+            )),
         }
     }
 
@@ -2566,7 +2569,7 @@ async fn handle_legacy_request<Inbound>(
     let request_id = request.request_id;
     let request_kind = request.frame.kind();
     let mut response_tx = request.response_tx;
-    let Some(legacy_request) = request.frame.into_service_request() else {
+    let Some(legacy_request) = request.frame.into_service_request(peer_id.clone()) else {
         // Inbound legacy Ping is handled locally; the requester measures round-trip time.
         let _ = response_tx.send(Ok(Response::Pong(Duration::ZERO)));
         return;
@@ -3245,7 +3248,7 @@ mod tests {
                             .collect(),
                     )
                 }
-                Request::PushTransaction(transaction) => {
+                Request::PushTransaction(transaction, _) => {
                     if let Err(error) = self.pushed_tx.send(transaction.id) {
                         return std::future::ready(Err(Box::new(error)));
                     }
@@ -3852,7 +3855,7 @@ mod tests {
         assert!(matches!(ping, Response::Pong(_)));
 
         let push_response = adapter
-            .request_from_source(Request::PushTransaction(pushed_transaction), None)
+            .request_from_source(Request::PushTransaction(pushed_transaction, None), None)
             .await?;
         assert_eq!(push_response, Response::Nil);
         assert_eq!(recv_pushed_tx_id(&mut pushed_rx).await?, pushed_id);
@@ -4940,6 +4943,7 @@ mod tests {
                         orchard_shielded_data: None,
                     }
                     .into(),
+                    None,
                 ),
                 "PushTransaction",
             ),
@@ -5524,7 +5528,7 @@ mod tests {
         composite
             .ready()
             .await?
-            .call(Request::PushTransaction(transaction.clone()))
+            .call(Request::PushTransaction(transaction.clone(), None))
             .await?;
         let pushed = pushed_rx
             .recv()

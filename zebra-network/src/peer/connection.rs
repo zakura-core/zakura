@@ -1114,7 +1114,7 @@ where
                     )
             }
 
-            (AwaitingRequest, PushTransaction(transaction)) => {
+            (AwaitingRequest, PushTransaction(transaction, _)) => {
                 self
                     .peer_tx
                     .send(Message::Tx(transaction))
@@ -1279,7 +1279,14 @@ where
 
                 Consumed
             }
-            Message::Tx(ref transaction) => Request::PushTransaction(transaction.clone()).into(),
+            Message::Tx(ref transaction) => Request::PushTransaction(
+                transaction.clone(),
+                self.connection_info
+                    .connected_addr
+                    .get_transient_addr()
+                    .map(Into::into),
+            )
+            .into(),
             Message::Inv(ref items) => match &items[..] {
                 // We don't expect to be advertised multiple blocks at a time,
                 // so we ignore any advertisements of multiple blocks.

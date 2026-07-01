@@ -187,10 +187,15 @@ pub enum Request {
     ///
     /// This is implemented by sending an unsolicited `tx` message.
     ///
+    /// The second field is the source peer that sent us this `tx`:
+    /// `Some(source)` when the push came from a remote peer, and `None` when
+    /// Zebra originates the push itself. Used by the mempool downloader to
+    /// enforce a per-peer queue cap. See `GHSA-4fc2-h7jh-287c`.
+    ///
     /// # Returns
     ///
     /// Returns [`Response::Nil`](super::Response::Nil).
-    PushTransaction(UnminedTx),
+    PushTransaction(UnminedTx, Option<PeerSource>),
 
     /// Advertise a set of unmined transactions to all peers.
     ///
@@ -286,7 +291,7 @@ impl fmt::Display for Request {
                 if stop.is_some() { "Some" } else { "None" },
             ),
 
-            Request::PushTransaction(_) => "PushTransaction".to_string(),
+            Request::PushTransaction(_, _) => "PushTransaction".to_string(),
             Request::AdvertiseTransactionIds(ids, _) => {
                 format!("AdvertiseTransactionIds({})", ids.len())
             }
@@ -313,7 +318,7 @@ impl Request {
             Request::FindBlocks { .. } => "FindBlocks",
             Request::FindHeaders { .. } => "FindHeaders",
 
-            Request::PushTransaction(_) => "PushTransaction",
+            Request::PushTransaction(_, _) => "PushTransaction",
             Request::AdvertiseTransactionIds(_, _) => "AdvertiseTransactionIds",
 
             Request::AdvertiseBlock(_, _) | Request::AdvertiseBlockToAll(_) => "AdvertiseBlock",

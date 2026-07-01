@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `Request::PushTransaction` is now a 2-tuple variant:
+  `PushTransaction(UnminedTx, Option<PeerSource>)`, so inbound peer-pushed
+  transactions can be attributed to the sending peer for mempool admission
+  limits.
 - `zakura::spawn_zakura_endpoint` now takes an inbound-sink factory
   (`impl FnOnce(ZakuraSupervisorHandle) -> Arc<dyn InboundSink>`) so callers can
   install a sink backed by the endpoint's supervisor. Pass a factory returning

@@ -130,7 +130,7 @@ impl ClientTestHarness {
             .try_recv();
 
         match receive_result {
-            Ok(request) => ReceiveRequestAttempt::Request(request),
+            Ok(request) => ReceiveRequestAttempt::Request(Box::new(request)),
             Err(mpsc::TryRecvError::Closed) => ReceiveRequestAttempt::Closed,
             Err(mpsc::TryRecvError::Empty) => ReceiveRequestAttempt::Empty,
         }
@@ -217,7 +217,7 @@ pub(crate) enum ReceiveRequestAttempt {
     Empty,
 
     /// One request was successfully received.
-    Request(ClientRequest),
+    Request(Box<ClientRequest>),
 }
 
 impl ReceiveRequestAttempt {
@@ -236,7 +236,7 @@ impl ReceiveRequestAttempt {
     #[allow(dead_code)]
     pub fn request(self) -> Option<ClientRequest> {
         match self {
-            ReceiveRequestAttempt::Request(request) => Some(request),
+            ReceiveRequestAttempt::Request(request) => Some(*request),
             ReceiveRequestAttempt::Closed | ReceiveRequestAttempt::Empty => None,
         }
     }

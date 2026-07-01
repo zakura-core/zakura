@@ -266,7 +266,9 @@ where
                     // doesn't stay resident in `cancel_handles` after a verification
                     // timeout. Without this, a peer that gets each transaction to
                     // hit `RATE_LIMIT_DELAY` can leak ~2 MB per tx until OOM.
-                    this.cancel_handles.remove(&txid);
+                    if let Some((_, _gossip, Some(source))) = this.cancel_handles.remove(&txid) {
+                        Self::release_peer_slot(this.pending_per_peer, source);
+                    }
                     (Err((txid, elapsed)), None)
                 }
             };

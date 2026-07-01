@@ -16,6 +16,7 @@ use zebra_test::prelude::*;
 
 use crate::{
     arbitrary::Prepare,
+    error::ReconsiderError,
     service::{
         finalized_state::FinalizedState,
         non_finalized_state::{Chain, NonFinalizedState, MIN_DURATION_BETWEEN_BACKUP_UPDATES},
@@ -322,6 +323,71 @@ fn invalidate_block_removes_block_and_descendants_from_chain_for_network(
 }
 
 #[test]
+fn invalidate_root_block_removes_entire_chain() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    for network in Network::iter() {
+        invalidate_root_block_removes_entire_chain_for_network(network)?;
+    }
+
+    Ok(())
+}
+
+fn invalidate_root_block_removes_entire_chain_for_network(network: Network) -> Result<()> {
+    let block1: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
+    let block2 = block1.make_fake_child().set_work(10);
+    let block3 = block2.make_fake_child().set_work(1);
+
+    let mut state = NonFinalizedState::new(&network);
+    let finalized_state = FinalizedState::new(
+        &Config::ephemeral(),
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+
+    let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
+    finalized_state.set_finalized_value_pool(fake_value_pool);
+
+    state.commit_new_chain(block1.clone().prepare(), &finalized_state)?;
+    state.commit_block(block2.clone().prepare(), &finalized_state)?;
+    state.commit_block(block3.clone().prepare(), &finalized_state)?;
+
+    state.invalidate_block(block1.hash())?;
+
+    assert!(
+        state.best_chain().is_none(),
+        "invalidating the non-finalized root should remove the whole chain"
+    );
+
+    let invalidated_blocks = state
+        .invalidated_blocks
+        .get(&block1.coinbase_height().expect("test block has a height"))
+        .expect("invalidated root block should be tracked");
+
+    assert!(
+        invalidated_blocks
+            .iter()
+            .any(|block| block.hash == block1.hash()),
+        "invalidated blocks should contain block1"
+    );
+    assert!(
+        invalidated_blocks
+            .iter()
+            .any(|block| block.hash == block2.hash()),
+        "invalidated blocks should contain block2"
+    );
+    assert!(
+        invalidated_blocks
+            .iter()
+            .any(|block| block.hash == block3.hash()),
+        "invalidated blocks should contain block3"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn reconsider_block_and_reconsider_chain_correctly_reconsiders_blocks_and_descendants() -> Result<()>
 {
     let _init_guard = zebra_test::init();
@@ -399,6 +465,16 @@ fn reconsider_block_inserts_block_and_descendants_into_chain_for_network(
     assert!(
         best_chain.contains_block_hash(block3.hash()),
         "the best chain should again contain block3"
+    );
+
+    let result = state.reconsider_block(block2.hash(), &finalized_state.db);
+
+    assert!(
+        matches!(
+            result,
+            Err(ReconsiderError::MissingInvalidatedBlock(hash)) if hash == block2.hash()
+        ),
+        "reconsidering the same block twice should fail without changing the chain"
     );
 
     Ok(())

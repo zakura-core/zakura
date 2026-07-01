@@ -379,7 +379,9 @@ impl NonFinalizedState {
         };
 
         let invalidated_blocks = if chain.non_finalized_root_hash() == block_hash {
-            self.chain_set.remove(&chain);
+            let chain_tip_hash = chain.non_finalized_tip_hash();
+            self.chain_set
+                .retain(|chain| chain.non_finalized_tip_hash() != chain_tip_hash);
             chain.blocks.values().cloned().collect()
         } else {
             let (new_chain, invalidated_blocks) = chain
@@ -430,7 +432,7 @@ impl NonFinalizedState {
             .iter()
             .find_map(|(height, blocks)| {
                 if blocks.first()?.hash == block_hash {
-                    Some(height)
+                    Some(*height)
                 } else {
                     None
                 }
@@ -439,8 +441,7 @@ impl NonFinalizedState {
 
         let invalidated_blocks = Arc::unwrap_or_clone(
             self.invalidated_blocks
-                .clone()
-                .shift_remove(height)
+                .shift_remove(&height)
                 .ok_or(ReconsiderError::MissingInvalidatedBlock(block_hash))?,
         );
 

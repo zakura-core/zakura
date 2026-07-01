@@ -161,6 +161,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Avoid panics in the block write task when RPC users invalidate a non-finalized
+  root block or reconsider the same invalidated block twice.
 - Stop the Zakura body-sync watchdog from running two commit pipelines at once.
   When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
   body downloader but left the Zakura block- and header-sync drivers running, so

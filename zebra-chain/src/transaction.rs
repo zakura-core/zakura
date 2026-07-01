@@ -871,6 +871,23 @@ impl Transaction {
 
     // sapling
 
+    /// Access shared-anchor Sapling shielded data in this transaction, if it
+    /// has any.
+    fn sapling_shielded_data(&self) -> Option<&sapling::ShieldedData<sapling::SharedAnchor>> {
+        match self {
+            Transaction::V5 {
+                sapling_shielded_data,
+                ..
+            } => sapling_shielded_data.as_ref(),
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+            Transaction::V6 {
+                sapling_shielded_data,
+                ..
+            } => sapling_shielded_data.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Access the deduplicated [`sapling::tree::Root`]s in this transaction,
     /// regardless of version.
     pub fn sapling_anchors(&self) -> Box<dyn Iterator<Item = sapling::tree::Root> + '_> {

@@ -20,8 +20,11 @@ use crate::{
     transparent, LedgerState,
 };
 
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+use crate::ironwood;
+
 fn native_zip244_tx_strategy() -> BoxedStrategy<Transaction> {
-    prop_oneof![
+    let v5 = prop_oneof![
         v5_tx_strategy(Just(None).boxed(), Just(None).boxed()),
         v5_tx_strategy(
             sapling_outputs_only().prop_map(Some).boxed(),
@@ -42,7 +45,48 @@ fn native_zip244_tx_strategy() -> BoxedStrategy<Transaction> {
             orchard_with_multiple_actions().prop_map(Some).boxed(),
         ),
     ]
-    .boxed()
+    .boxed();
+
+    #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+    {
+        prop_oneof![
+            v5,
+            v6_tx_strategy(Just(None).boxed(), Just(None).boxed(), Just(None).boxed()),
+            v6_tx_strategy(
+                sapling_outputs_only().prop_map(Some).boxed(),
+                Just(None).boxed(),
+                Just(None).boxed()
+            ),
+            v6_tx_strategy(
+                sapling_with_spends().prop_map(Some).boxed(),
+                Just(None).boxed(),
+                Just(None).boxed()
+            ),
+            v6_tx_strategy(
+                Just(None).boxed(),
+                any::<orchard::ShieldedData>().prop_map(Some).boxed(),
+                Just(None).boxed()
+            ),
+            v6_tx_strategy(
+                Just(None).boxed(),
+                Just(None).boxed(),
+                any::<ironwood::ShieldedData>().prop_map(Some).boxed()
+            ),
+            v6_tx_strategy(
+                any::<sapling::ShieldedData<sapling::SharedAnchor>>()
+                    .prop_map(Some)
+                    .boxed(),
+                orchard_with_multiple_actions().prop_map(Some).boxed(),
+                any::<ironwood::ShieldedData>().prop_map(Some).boxed(),
+            ),
+        ]
+        .boxed()
+    }
+
+    #[cfg(not(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7")))]
+    {
+        v5
+    }
 }
 
 fn v5_tx_strategy(
@@ -75,6 +119,44 @@ fn v5_tx_strategy(
                 outputs,
                 sapling_shielded_data,
                 orchard_shielded_data,
+            },
+        )
+        .boxed()
+}
+
+#[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+fn v6_tx_strategy(
+    sapling_shielded_data: BoxedStrategy<Option<sapling::ShieldedData<sapling::SharedAnchor>>>,
+    orchard_shielded_data: BoxedStrategy<Option<orchard::ShieldedData>>,
+    ironwood_shielded_data: BoxedStrategy<Option<ironwood::ShieldedData>>,
+) -> BoxedStrategy<Transaction> {
+    (
+        any::<LockTime>(),
+        any::<Height>(),
+        vec(any_with::<transparent::Input>(None), 0..MAX_ARBITRARY_ITEMS),
+        vec(any::<transparent::Output>(), 0..MAX_ARBITRARY_ITEMS),
+        sapling_shielded_data,
+        orchard_shielded_data,
+        ironwood_shielded_data,
+    )
+        .prop_map(
+            |(
+                lock_time,
+                expiry_height,
+                inputs,
+                outputs,
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ironwood_shielded_data,
+            )| Transaction::V6 {
+                network_upgrade: NetworkUpgrade::Nu6_3,
+                lock_time,
+                expiry_height,
+                inputs,
+                outputs,
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ironwood_shielded_data,
             },
         )
         .boxed()
@@ -156,15 +238,16 @@ proptest! {
     /// The native ZIP-244 txid + authorizing-data digest implementation
     /// (`transaction::zip244`) must be byte-for-byte identical to the
     /// `librustzcash` conversion it replaces. This is the consensus-critical
-    /// correctness proof for the native path, exercised across random v5
+    /// correctness proof for the native path, exercised across random v5/v6
     /// transaction shapes: transparent-only, Sapling outputs-only, Sapling
-    /// spends, Orchard, combined Sapling+Orchard, and multiple NU5+ branch ids.
+    /// spends, Orchard, Ironwood, combined shielded bundles, and multiple NU5+
+    /// branch IDs.
     #[test]
     fn native_zip244_matches_librustzcash(tx in native_zip244_tx_strategy()) {
         let _init_guard = zebra_test::init();
 
         let (native_txid, native_auth) = crate::transaction::zip244::txid_and_auth_digest(&tx)
-            .expect("v5 transaction has a native ZIP-244 digest");
+            .expect("v5/v6 transaction has a native ZIP-244 digest");
         let (ref_txid, ref_auth) =
             crate::primitives::zcash_primitives::txid_and_auth_digest_via_librustzcash(&tx);
 
@@ -172,9 +255,9 @@ proptest! {
         prop_assert_eq!(native_auth, ref_auth, "native auth digest must match librustzcash");
 
         // The separate native entry points must agree with the combined one.
-        prop_assert_eq!(crate::transaction::zip244::txid(&tx).expect("v5"), native_txid);
+        prop_assert_eq!(crate::transaction::zip244::txid(&tx).expect("v5/v6"), native_txid);
         prop_assert_eq!(
-            crate::transaction::zip244::auth_digest(&tx).expect("v5"),
+            crate::transaction::zip244::auth_digest(&tx).expect("v5/v6"),
             native_auth
         );
     }

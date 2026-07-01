@@ -4,15 +4,10 @@
 
 use color_eyre::eyre::{eyre, Report};
 use once_cell::sync::Lazy;
-use tower::{buffer::Buffer, util::BoxService};
+use tower::{buffer::Buffer, util::BoxService, ServiceExt};
 
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
-use zebra_chain::{
-    amount::NegativeAllowed,
-    ironwood,
-    parameters::testnet::{ConfiguredActivationHeights, Parameters},
-    transaction::arbitrary::v5_transactions,
-};
+use zebra_chain::{amount::NegativeAllowed, ironwood};
 use zebra_chain::{
     amount::{DeferredPoolBalanceChange, MAX_MONEY},
     block::{
@@ -21,9 +16,18 @@ use zebra_chain::{
         },
         Block, Height,
     },
-    parameters::{subsidy::block_subsidy, NetworkUpgrade},
+    orchard,
+    parameters::{
+        subsidy::block_subsidy,
+        testnet::{ConfiguredActivationHeights, Parameters},
+        NetworkUpgrade,
+    },
+    primitives::Halo2Proof,
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
-    transaction::{arbitrary::transaction_to_fake_v5, LockTime, Transaction},
+    transaction::{
+        arbitrary::{transaction_to_fake_v5, v5_transactions},
+        LockTime, Transaction,
+    },
     work::difficulty::{ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY},
 };
 use zebra_script::Sigops;
@@ -583,6 +587,193 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
     Ok(())
 }
 
+#[derive(Copy, Clone)]
+struct LibrustzcashConversionFailure {
+    name: &'static str,
+    network_upgrade: NetworkUpgrade,
+    rk: Option<[u8; 32]>,
+}
+
+#[tokio::test]
+async fn block_rejects_transactions_failing_librustzcash_conversion() {
+    let _init_guard = zebra_test::init();
+
+    let cases = [
+        LibrustzcashConversionFailure {
+            name: "unrecognized consensus branch ID",
+            network_upgrade: NetworkUpgrade::Nu7,
+            rk: None,
+        },
+        LibrustzcashConversionFailure {
+            name: "incorrect curve point encoding",
+            network_upgrade: NetworkUpgrade::Nu5,
+            rk: Some([0xff; 32]),
+        },
+        LibrustzcashConversionFailure {
+            name: "rk=identity",
+            network_upgrade: NetworkUpgrade::Nu5,
+            rk: Some([0; 32]),
+        },
+    ];
+
+    for case in cases {
+        let network = librustzcash_conversion_test_network(case.network_upgrade);
+        let block = block_with_librustzcash_conversion_failure(case, &network);
+        let state_service = zebra_state::init_test(&network).await;
+        let transaction = transaction::Verifier::new_for_tests(&network, state_service.clone());
+        let transaction = Buffer::new(BoxService::new(transaction), 1);
+        let block_verifier =
+            SemanticBlockVerifier::new(&network, state_service.clone(), transaction);
+
+        let result = block_verifier
+            .oneshot(Request::CheckProposal(Arc::new(block)))
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(VerifyBlockError::Transaction(
+                    TransactionError::UnsupportedByNetworkUpgrade(5, nu),
+                )) if nu == case.network_upgrade
+            ),
+            "{}: expected librustzcash conversion failure, got {result:?}",
+            case.name,
+        );
+    }
+}
+
+fn librustzcash_conversion_test_network(network_upgrade: NetworkUpgrade) -> Network {
+    let genesis_block =
+        Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("genesis block should deserialize");
+    let target_difficulty_limit = genesis_block
+        .header
+        .difficulty_threshold
+        .to_expanded()
+        .expect("genesis difficulty threshold should be valid");
+
+    let activation_heights = match network_upgrade {
+        NetworkUpgrade::Nu5 => ConfiguredActivationHeights {
+            nu5: Some(1),
+            ..Default::default()
+        },
+        NetworkUpgrade::Nu7 => ConfiguredActivationHeights {
+            nu7: Some(1),
+            ..Default::default()
+        },
+        _ => panic!("test cases only use NU5 and NU7"),
+    };
+
+    Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("failed to set test activation heights")
+        .clear_funding_streams()
+        .with_slow_start_interval(Height::MIN)
+        .with_disable_pow(true)
+        .disable_temporary_orchard_disabling_soft_fork()
+        .with_target_difficulty_limit(target_difficulty_limit)
+        .expect("failed to set target difficulty limit")
+        .to_network()
+        .expect("failed to build configured network")
+}
+
+fn block_with_librustzcash_conversion_failure(
+    case: LibrustzcashConversionFailure,
+    network: &Network,
+) -> Block {
+    let height = Height(1);
+    let mut block = Block::zcash_deserialize(&zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+        .expect("genesis block should deserialize");
+
+    block.transactions = vec![
+        Arc::new(v5_coinbase_transaction(
+            case.network_upgrade,
+            height,
+            network,
+        )),
+        Arc::new(failing_librustzcash_v5_transaction(case, height)),
+    ];
+    Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+
+    block
+}
+
+fn v5_coinbase_transaction(
+    network_upgrade: NetworkUpgrade,
+    height: Height,
+    network: &Network,
+) -> Transaction {
+    let mut outputs = vec![transparent::Output {
+        value: block_subsidy(height, network).expect("valid test block subsidy"),
+        lock_script: transparent::Script::new(&[0]),
+    }];
+
+    outputs.extend(
+        network
+            .lockbox_disbursements(height)
+            .into_iter()
+            .map(|(address, value)| transparent::Output {
+                value,
+                lock_script: address.script(),
+            }),
+    );
+
+    Transaction::V5 {
+        network_upgrade,
+        lock_time: LockTime::unlocked(),
+        expiry_height: height,
+        inputs: vec![transparent::Input::Coinbase {
+            height,
+            data: vec![],
+            sequence: u32::MAX,
+        }],
+        outputs,
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    }
+}
+
+fn failing_librustzcash_v5_transaction(
+    case: LibrustzcashConversionFailure,
+    height: Height,
+) -> Transaction {
+    let mut shielded_data = orchard_fixture();
+    shielded_data.flags = orchard::Flags::ENABLE_SPENDS | orchard::Flags::ENABLE_OUTPUTS;
+    shielded_data.value_balance = Amount::zero();
+    shielded_data.proof = Halo2Proof(vec![
+        0;
+        ::orchard::Proof::expected_proof_size(
+            shielded_data.actions.len()
+        )
+    ]);
+
+    if let Some(rk) = case.rk {
+        shielded_data
+            .actions
+            .iter_mut()
+            .next()
+            .expect("Orchard fixture has at least one action")
+            .action
+            .rk = rk.into();
+    }
+
+    Transaction::V5 {
+        network_upgrade: case.network_upgrade,
+        lock_time: LockTime::unlocked(),
+        expiry_height: height,
+        inputs: vec![],
+        outputs: vec![],
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(shielded_data),
+    }
+}
+
+fn orchard_fixture() -> orchard::ShieldedData {
+    v5_transactions(Network::new_default_testnet().block_iter())
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include a transaction with Orchard shielded data")
+}
+
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 #[test]
 fn miner_fees_validation_includes_ironwood_balance() {
@@ -646,9 +837,7 @@ fn miner_fees_validation_includes_ironwood_balance() {
 
 #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
 fn ironwood_shielded_data(value_balance: i64) -> ironwood::ShieldedData {
-    let mut shielded_data = v5_transactions(Network::new_default_testnet().block_iter())
-        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
-        .expect("test vectors include a transaction with Orchard shielded data");
+    let mut shielded_data = orchard_fixture();
 
     shielded_data.value_balance =
         Amount::<NegativeAllowed>::try_from(value_balance).expect("valid test amount");

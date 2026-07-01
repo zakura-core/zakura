@@ -1155,7 +1155,7 @@ impl ZcashDeserialize for Transaction {
                     !ALLOW_CROSS_ADDRESS_BIT,
                 )?;
 
-                let tx = Transaction::V5 {
+                Ok(Transaction::V5 {
                     network_upgrade,
                     lock_time,
                     expiry_height,
@@ -1163,11 +1163,7 @@ impl ZcashDeserialize for Transaction {
                     outputs,
                     sapling_shielded_data,
                     orchard_shielded_data,
-                };
-
-                tx.to_librustzcash(network_upgrade)?;
-
-                Ok(tx)
+                })
             }
             #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
             (6, true) => {

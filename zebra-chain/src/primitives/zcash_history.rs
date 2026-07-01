@@ -68,6 +68,15 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Reconstructs an [`Entry`] from raw serialized bytes written by an earlier database format,
+    /// zero-padding or truncating to the current [`zcash_history::MAX_ENTRY_SIZE`].
+    pub fn from_raw_bytes_padded(bytes: &[u8]) -> Self {
+        let mut inner = [0; zcash_history::MAX_ENTRY_SIZE];
+        let len = bytes.len().min(inner.len());
+        inner[..len].copy_from_slice(&bytes[..len]);
+        Entry { inner }
+    }
+
     /// Create a leaf Entry for the given block, its network, and the root of its
     /// note commitment trees.
     ///

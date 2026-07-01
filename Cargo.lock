@@ -9441,6 +9441,7 @@ dependencies = [
  "sapling-crypto",
  "semver",
  "serde",
+ "serde-big-array",
  "serde_json",
  "spandoc",
  "tempfile",

@@ -18,7 +18,7 @@ use zcash_primitives::transaction::{
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis};
 use zebra_chain::{
-    amount::{self, Amount, NegativeOrZero, NonNegative},
+    amount::{self, Amount, NegativeAllowed, NegativeOrZero, NonNegative},
     block::{self, merkle::AUTH_DIGEST_PLACEHOLDER, Height},
     orchard,
     parameters::{
@@ -202,6 +202,7 @@ impl TransactionTemplate<NegativeOrZero> {
 
                 addr.orchard()
                     .and_then(|addr| {
+                        // Before NU6.3, pay the Orchard receiver via Orchard.
                         if upgrade < NetworkUpgrade::Nu6_3 {
                             add_orchard_reward(&mut builder, addr)
                         } else {
@@ -352,6 +353,12 @@ pub struct TransactionObject {
     /// Orchard actions of the transaction.
     #[serde(rename = "orchard", skip_serializing_if = "Option::is_none")]
     pub(crate) orchard: Option<Orchard>,
+
+    /// Ironwood actions of the transaction, omitted when the transaction has no
+    /// Ironwood shielded data.
+    #[serde(rename = "ironwood", skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub(crate) ironwood: Option<Orchard>,
 
     /// The net value of Sapling Spends minus Outputs in ZEC
     #[serde(rename = "valueBalance", skip_serializing_if = "Option::is_none")]
@@ -670,31 +677,31 @@ pub struct ShieldedOutput {
     proof: [u8; 192],
 }
 
-/// Object with Orchard-specific information.
+/// Object with Orchard or Ironwood action information.
 #[serde_with::serde_as]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct Orchard {
-    /// Array of Orchard actions.
+    /// Array of Orchard or Ironwood actions.
     actions: Vec<OrchardAction>,
-    /// The net value of Orchard Actions in ZEC.
+    /// The net value of Orchard or Ironwood actions in ZEC.
     #[serde(rename = "valueBalance")]
     value_balance: f64,
-    /// The net value of Orchard Actions in zatoshis.
+    /// The net value of Orchard or Ironwood actions in zatoshis.
     #[serde(rename = "valueBalanceZat")]
     value_balance_zat: i64,
     /// The flags.
     #[serde(skip_serializing_if = "Option::is_none")]
     flags: Option<OrchardFlags>,
-    /// A root of the Orchard note commitment tree at some block height in the past
+    /// A root of the Orchard or Ironwood note commitment tree at some block height in the past.
     #[serde_as(as = "Option<serde_with::hex::Hex>")]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[getter(copy)]
     anchor: Option<[u8; 32]>,
-    /// Encoding of aggregated zk-SNARK proofs for Orchard Actions
+    /// Encoding of aggregated zk-SNARK proofs for Orchard or Ironwood actions.
     #[serde_as(as = "Option<serde_with::hex::Hex>")]
     #[serde(skip_serializing_if = "Option::is_none")]
     proof: Option<Vec<u8>>,
-    /// An Orchard binding signature on the SIGHASH transaction hash
+    /// An Orchard or Ironwood binding signature on the SIGHASH transaction hash.
     #[serde(rename = "bindingSig")]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde_as(as = "Option<serde_with::hex::Hex>")]
@@ -702,18 +709,37 @@ pub struct Orchard {
     binding_sig: Option<[u8; 64]>,
 }
 
-/// Object with Orchard-specific information.
+/// Object with Orchard or Ironwood flag information.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct OrchardFlags {
-    /// Whether Orchard outputs are enabled.
+    /// Whether Orchard or Ironwood outputs are enabled.
     #[serde(rename = "enableOutputs")]
     enable_outputs: bool,
-    /// Whether Orchard spends are enabled.
+    /// Whether Orchard or Ironwood spends are enabled.
     #[serde(rename = "enableSpends")]
     enable_spends: bool,
+    /// Whether Ironwood cross-address transfers are enabled.
+    ///
+    /// This field is only serialized for Ironwood bundles.
+    #[serde(
+        rename = "enableCrossAddress",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[getter(copy)]
+    #[new(default)]
+    enable_cross_address: Option<bool>,
 }
 
-/// The Orchard action of a transaction.
+impl OrchardFlags {
+    /// Returns a copy of these flags with the Ironwood cross-address flag set.
+    pub fn with_cross_address(mut self, enable_cross_address: bool) -> Self {
+        self.enable_cross_address = Some(enable_cross_address);
+        self
+    }
+}
+
+/// The Orchard or Ironwood action of a transaction.
 #[allow(clippy::too_many_arguments)]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct OrchardAction {
@@ -743,6 +769,84 @@ pub struct OrchardAction {
     out_ciphertext: [u8; 80],
 }
 
+impl Orchard {
+    fn from_orchard_shielded_data(
+        shielded_data: Option<&orchard::ShieldedData>,
+        value_balance: Amount<NegativeAllowed>,
+    ) -> Self {
+        Self::from_shielded_data(shielded_data, value_balance, false)
+    }
+
+    fn from_ironwood_shielded_data(
+        shielded_data: &orchard::ShieldedData,
+        value_balance: Amount<NegativeAllowed>,
+    ) -> Self {
+        Self::from_shielded_data(Some(shielded_data), value_balance, true)
+    }
+
+    fn from_shielded_data(
+        shielded_data: Option<&orchard::ShieldedData>,
+        value_balance: Amount<NegativeAllowed>,
+        include_cross_address_flag: bool,
+    ) -> Self {
+        Self {
+            actions: shielded_data.map_or_else(Vec::new, |data| {
+                data.actions
+                    .iter()
+                    .map(|authorized_action| {
+                        OrchardAction::from_authorized_action(
+                            &authorized_action.action,
+                            authorized_action.spend_auth_sig.into(),
+                        )
+                    })
+                    .collect()
+            }),
+            value_balance: Zec::from(value_balance).lossy_zec(),
+            value_balance_zat: value_balance.zatoshis(),
+            flags: shielded_data.map(|data| {
+                let flags = OrchardFlags::new(
+                    data.flags.contains(orchard::Flags::ENABLE_OUTPUTS),
+                    data.flags.contains(orchard::Flags::ENABLE_SPENDS),
+                );
+
+                if include_cross_address_flag {
+                    flags.with_cross_address(
+                        data.flags.contains(orchard::Flags::ENABLE_CROSS_ADDRESS),
+                    )
+                } else {
+                    flags
+                }
+            }),
+            anchor: shielded_data.map(|data| data.shared_anchor.bytes_in_display_order()),
+            proof: shielded_data.map(|data| data.proof.bytes_in_display_order()),
+            binding_sig: shielded_data.map(|data| data.binding_sig.into()),
+        }
+    }
+}
+
+impl OrchardAction {
+    fn from_authorized_action(action: &orchard::Action, spend_auth_sig: [u8; 64]) -> Self {
+        let cv: [u8; 32] = action.cv.into();
+        let nullifier: [u8; 32] = action.nullifier.into();
+        let rk: [u8; 32] = action.rk.into();
+        let cm_x: [u8; 32] = action.cm_x.into();
+        let ephemeral_key: [u8; 32] = action.ephemeral_key.into();
+        let enc_ciphertext: [u8; 580] = action.enc_ciphertext.into();
+        let out_ciphertext: [u8; 80] = action.out_ciphertext.into();
+
+        OrchardAction {
+            cv,
+            nullifier,
+            rk,
+            cm_x,
+            ephemeral_key,
+            enc_ciphertext,
+            spend_auth_sig,
+            out_ciphertext,
+        }
+    }
+}
+
 impl Default for TransactionObject {
     fn default() -> Self {
         Self {
@@ -757,6 +861,7 @@ impl Default for TransactionObject {
             shielded_outputs: Vec::new(),
             joinsplits: Vec::new(),
             orchard: None,
+            ironwood: None,
             binding_sig: None,
             joinsplit_pub_key: None,
             joinsplit_sig: None,
@@ -973,62 +1078,15 @@ impl TransactionObject {
                 .collect(),
             value_balance: Some(Zec::from(tx.sapling_value_balance().sapling_amount()).lossy_zec()),
             value_balance_zat: Some(tx.sapling_value_balance().sapling_amount().zatoshis()),
-            orchard: Some(Orchard {
-                actions: tx
-                    .orchard_actions()
-                    .collect::<Vec<_>>()
-                    .iter()
-                    .map(|action| {
-                        let spend_auth_sig: [u8; 64] = tx
-                            .orchard_shielded_data()
-                            .and_then(|shielded_data| {
-                                shielded_data
-                                    .actions
-                                    .iter()
-                                    .find(|authorized_action| authorized_action.action == **action)
-                                    .map(|authorized_action| {
-                                        authorized_action.spend_auth_sig.into()
-                                    })
-                            })
-                            .unwrap_or([0; 64]);
-
-                        let cv: [u8; 32] = action.cv.into();
-                        let nullifier: [u8; 32] = action.nullifier.into();
-                        let rk: [u8; 32] = action.rk.into();
-                        let cm_x: [u8; 32] = action.cm_x.into();
-                        let ephemeral_key: [u8; 32] = action.ephemeral_key.into();
-                        let enc_ciphertext: [u8; 580] = action.enc_ciphertext.into();
-                        let out_ciphertext: [u8; 80] = action.out_ciphertext.into();
-
-                        OrchardAction {
-                            cv,
-                            nullifier,
-                            rk,
-                            cm_x,
-                            ephemeral_key,
-                            enc_ciphertext,
-                            spend_auth_sig,
-                            out_ciphertext,
-                        }
-                    })
-                    .collect(),
-                value_balance: Zec::from(tx.orchard_value_balance().orchard_amount()).lossy_zec(),
-                value_balance_zat: tx.orchard_value_balance().orchard_amount().zatoshis(),
-                flags: tx.orchard_shielded_data().map(|data| {
-                    OrchardFlags::new(
-                        data.flags.contains(orchard::Flags::ENABLE_OUTPUTS),
-                        data.flags.contains(orchard::Flags::ENABLE_SPENDS),
-                    )
-                }),
-                anchor: tx
-                    .orchard_shielded_data()
-                    .map(|data| data.shared_anchor.bytes_in_display_order()),
-                proof: tx
-                    .orchard_shielded_data()
-                    .map(|data| data.proof.bytes_in_display_order()),
-                binding_sig: tx
-                    .orchard_shielded_data()
-                    .map(|data| data.binding_sig.into()),
+            orchard: Some(Orchard::from_orchard_shielded_data(
+                tx.orchard_shielded_data(),
+                tx.orchard_value_balance().orchard_amount(),
+            )),
+            ironwood: tx.ironwood_shielded_data().map(|ironwood_shielded_data| {
+                Orchard::from_ironwood_shielded_data(
+                    ironwood_shielded_data,
+                    tx.ironwood_value_balance().ironwood_amount(),
+                )
             }),
             binding_sig: tx.sapling_binding_sig().map(|raw_sig| raw_sig.into()),
             joinsplit_pub_key: tx.joinsplit_pub_key().map(|raw_key| {
@@ -1057,5 +1115,162 @@ impl TransactionObject {
             block_hash,
             block_time,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::{
+        prelude::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+    use zebra_chain::{
+        at_least_one,
+        block::Height,
+        ironwood::{self, tree},
+        parameters::NetworkUpgrade,
+        primitives::Halo2Proof,
+        transaction::LockTime,
+    };
+
+    use super::*;
+
+    #[test]
+    fn orchard_flags_only_serialize_cross_address_when_set() {
+        let orchard_flags = OrchardFlags::new(true, false);
+        let orchard_flags_json =
+            serde_json::to_value(orchard_flags).expect("Orchard flags should serialize to JSON");
+
+        assert_eq!(orchard_flags_json["enableOutputs"], true);
+        assert_eq!(orchard_flags_json["enableSpends"], false);
+        assert!(
+            orchard_flags_json.get("enableCrossAddress").is_none(),
+            "Orchard flags should not include the Ironwood cross-address flag"
+        );
+
+        let ironwood_flags = OrchardFlags::new(false, true).with_cross_address(false);
+        let ironwood_flags_json =
+            serde_json::to_value(ironwood_flags).expect("Ironwood flags should serialize to JSON");
+
+        assert_eq!(ironwood_flags_json["enableOutputs"], false);
+        assert_eq!(ironwood_flags_json["enableSpends"], true);
+        assert_eq!(ironwood_flags_json["enableCrossAddress"], false);
+    }
+
+    #[test]
+    fn transaction_object_exposes_ironwood_actions_like_orchard() {
+        let _init_guard = zebra_test::init();
+
+        let mut runner = TestRunner::default();
+        let action = any::<ironwood::Action>()
+            .new_tree(&mut runner)
+            .expect("test action strategy creates a value")
+            .current();
+
+        let value_balance: Amount = 123i64.try_into().expect("test amount is valid");
+        let proof = Halo2Proof(vec![1; ::orchard::Proof::expected_proof_size(1)]);
+        let ironwood_shielded_data = ironwood::ShieldedData {
+            flags: ironwood::Flags::ENABLE_SPENDS
+                | ironwood::Flags::ENABLE_OUTPUTS
+                | ironwood::Flags::ENABLE_CROSS_ADDRESS,
+            value_balance,
+            shared_anchor: tree::Root::default(),
+            proof: proof.clone(),
+            actions: at_least_one![ironwood::AuthorizedAction {
+                action,
+                spend_auth_sig: [7u8; 64].into(),
+            }],
+            binding_sig: [9u8; 64].into(),
+        };
+
+        let tx = Arc::new(Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu6_3,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(1),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: Some(ironwood_shielded_data.clone()),
+        });
+
+        let transaction_object = TransactionObject::from_transaction(
+            tx.clone(),
+            None,
+            None,
+            &Network::Mainnet,
+            None,
+            None,
+            None,
+            tx.hash(),
+        );
+
+        let ironwood = transaction_object
+            .ironwood
+            .expect("Ironwood should be present in verbose RPC output");
+        assert_eq!(ironwood.actions.len(), 1);
+        assert_eq!(ironwood.value_balance_zat, value_balance.zatoshis());
+        assert_eq!(ironwood.value_balance, Zec::from(value_balance).lossy_zec());
+        let expected_flags = OrchardFlags::new(true, true).with_cross_address(true);
+        assert_eq!(
+            ironwood.flags.as_ref(),
+            Some(&expected_flags),
+            "Ironwood should include its cross-address flag"
+        );
+        assert_eq!(expected_flags.enable_cross_address(), Some(true));
+        let flags_json = serde_json::to_value(ironwood.flags.as_ref().expect("Ironwood flags"))
+            .expect("Ironwood flags should serialize to JSON");
+        assert_eq!(flags_json["enableCrossAddress"], true);
+        assert_eq!(
+            ironwood.anchor,
+            Some(
+                ironwood_shielded_data
+                    .shared_anchor
+                    .bytes_in_display_order()
+            )
+        );
+        assert_eq!(ironwood.proof, Some(proof.bytes_in_display_order()));
+        assert_eq!(ironwood.binding_sig, Some([9u8; 64]));
+        assert_eq!(ironwood.actions[0].spend_auth_sig, [7u8; 64]);
+    }
+
+    #[test]
+    fn transaction_object_omits_absent_ironwood_actions() {
+        let _init_guard = zebra_test::init();
+
+        let tx = Arc::new(Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu6_3,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(1),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+        });
+
+        let transaction_object = TransactionObject::from_transaction(
+            tx.clone(),
+            None,
+            None,
+            &Network::Mainnet,
+            None,
+            None,
+            None,
+            tx.hash(),
+        );
+
+        assert!(
+            transaction_object.ironwood.is_none(),
+            "Ironwood should be omitted when the transaction has no Ironwood actions"
+        );
+
+        let transaction_json = serde_json::to_value(transaction_object)
+            .expect("verbose transaction object serializes to JSON");
+        assert!(
+            transaction_json.get("ironwood").is_none(),
+            "serialized verbose transaction output should not contain an empty Ironwood object"
+        );
     }
 }

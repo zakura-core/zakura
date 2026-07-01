@@ -28,6 +28,7 @@ pub(crate) fn block_precommit_metrics(block: &Block, hash: block::Hash, height: 
     let sprout_nullifier_count = block.sprout_nullifiers().count();
     let sapling_nullifier_count = block.sapling_nullifiers().count();
     let orchard_nullifier_count = block.orchard_nullifiers().count();
+    let ironwood_nullifier_count = block.ironwood_nullifiers().count();
 
     tracing::debug!(
         ?hash,
@@ -38,6 +39,7 @@ pub(crate) fn block_precommit_metrics(block: &Block, hash: block::Hash, height: 
         sprout_nullifier_count,
         sapling_nullifier_count,
         orchard_nullifier_count,
+        ironwood_nullifier_count,
         "preparing to commit finalized {:?}block",
         if height.is_min() { "genesis " } else { "" }
     );
@@ -54,6 +56,8 @@ pub(crate) fn block_precommit_metrics(block: &Block, hash: block::Hash, height: 
         .increment(sapling_nullifier_count as u64);
     metrics::counter!("state.finalized.cumulative.orchard_nullifiers")
         .increment(orchard_nullifier_count as u64);
+    metrics::counter!("state.finalized.cumulative.ironwood_nullifiers")
+        .increment(ironwood_nullifier_count as u64);
 
     // The outputs from the genesis block can't be spent, so we skip them here.
     if !height.is_min() {

@@ -6,7 +6,7 @@ use zebra_chain::{
     amount::{Amount, NonNegative},
     block::{self, Height},
     block_info::BlockInfo,
-    orchard, sapling, sprout,
+    ironwood, orchard, sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     transaction::{self, Transaction},
     transparent,
@@ -472,6 +472,91 @@ fn roundtrip_orchard_subtree_data() {
     let _init_guard = zebra_test::init();
 
     proptest!(|(mut val in any::<NoteCommitmentSubtreeData<orchard::tree::Node>>())| {
+        val.end_height.0 %= MAX_ON_DISK_HEIGHT.0 + 1;
+        assert_value_properties(val)
+    });
+}
+
+// TODO: test note commitment tree round-trip, after implementing proptest::Arbitrary
+
+// Ironwood
+
+#[test]
+fn serialized_ironwood_nullifier_equal() {
+    let _init_guard = zebra_test::init();
+
+    proptest!(|(val1 in any::<ironwood::Nullifier>(), val2 in any::<ironwood::Nullifier>())| {
+        if val1 == val2 {
+            prop_assert_eq!(
+                val1.as_bytes(),
+                val2.as_bytes(),
+                "struct values were equal, but serialized bytes were not.\n\
+                 Values:\n\
+                 {:?}\n\
+                 {:?}",
+                val1,
+                val2,
+            );
+        } else {
+            prop_assert_ne!(
+                val1.as_bytes(),
+                val2.as_bytes(),
+                "struct values were not equal, but serialized bytes were equal.\n\
+                 Values:\n\
+                 {:?}\n\
+                 {:?}",
+                val1,
+                val2,
+            );
+        }
+    }
+    );
+}
+
+#[test]
+fn serialized_ironwood_tree_root_equal() {
+    let _init_guard = zebra_test::init();
+
+    proptest!(|(val1 in any::<ironwood::tree::Root>(), val2 in any::<ironwood::tree::Root>())| {
+        if val1 == val2 {
+            prop_assert_eq!(
+                val1.as_bytes(),
+                val2.as_bytes(),
+                "struct values were equal, but serialized bytes were not.\n\
+                 Values:\n\
+                 {:?}\n\
+                 {:?}",
+                val1,
+                val2,
+            );
+        } else {
+            prop_assert_ne!(
+                val1.as_bytes(),
+                val2.as_bytes(),
+                "struct values were not equal, but serialized bytes were equal.\n\
+                 Values:\n\
+                 {:?}\n\
+                 {:?}",
+                val1,
+                val2,
+            );
+        }
+    }
+    );
+}
+
+#[test]
+fn roundtrip_ironwood_tree_root() {
+    let _init_guard = zebra_test::init();
+
+    proptest!(|(val in any::<ironwood::tree::Root>())| assert_value_properties(val));
+}
+
+#[test]
+fn roundtrip_ironwood_subtree_data() {
+    let _init_guard = zebra_test::init();
+
+    proptest!(|(mut val in any::<NoteCommitmentSubtreeData<ironwood::tree::Node>>())| {
         val.end_height.0 %= MAX_ON_DISK_HEIGHT.0 + 1;
         assert_value_properties(val)
     });

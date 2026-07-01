@@ -13,9 +13,19 @@ use zebra_chain::{
 
 use crate::{
     constants::{INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_MULTIPLIER},
-    zakura::{DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_ZAKURA_LISTEN_ADDR},
+    zakura::{
+        DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
+        DEFAULT_ZAKURA_LISTEN_ADDR,
+    },
     CacheDir, Config,
 };
+
+fn default_zakura_bootstrap_peers() -> Vec<String> {
+    DEFAULT_ZAKURA_BOOTSTRAP_PEERS
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
 
 #[test]
 fn parse_config_listen_addr() {
@@ -116,7 +126,10 @@ fn p2p_protocol_flags_default_on_and_roundtrip() {
 
     assert!(Config::default().v2_p2p);
     assert!(Config::default().legacy_p2p);
-    assert!(Config::default().zakura.bootstrap_peers.is_empty());
+    assert_eq!(
+        Config::default().zakura.bootstrap_peers,
+        default_zakura_bootstrap_peers()
+    );
 
     let config: Config = toml::from_str(
         r#"
@@ -185,7 +198,10 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
     assert_eq!(config.listen_addr.to_string(), "127.0.0.1:8233");
     assert!(config.v2_p2p);
     assert!(config.legacy_p2p);
-    assert!(config.zakura.bootstrap_peers.is_empty());
+    assert_eq!(
+        config.zakura.bootstrap_peers,
+        default_zakura_bootstrap_peers()
+    );
     assert!(config.zakura.max_connections > 0);
     assert!(config.zakura.max_pending_handshakes > 0);
     assert_eq!(

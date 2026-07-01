@@ -55,6 +55,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Increased Zakura's default connection, handshake, stream-open, and QUIC
+  window limits, and configured default native Zakura bootstrap peers. The
+  larger defaults are intended for the production native-P2P sync path rather
+  than the earlier conservative test-network envelope.
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
 - Use V3 chain-history entries from NU6.3 onward, including Ironwood note

@@ -72,9 +72,18 @@ pub(crate) fn parse_bootstrap_peer(entry: &str) -> Result<NodeAddr, ZakuraHandle
 mod tests {
     use super::*;
 
+    use crate::zakura::DEFAULT_ZAKURA_BOOTSTRAP_PEERS;
+
     #[test]
     fn bootstrap_peer_requires_node_id_and_direct_address() {
         assert!(parse_bootstrap_peer("missing-address").is_err());
         assert!(parse_bootstrap_peer("not-a-node@127.0.0.1:8233").is_err());
+    }
+
+    #[test]
+    fn default_bootstrap_peers_parse() {
+        for peer in DEFAULT_ZAKURA_BOOTSTRAP_PEERS {
+            parse_bootstrap_peer(peer).expect("default Zakura bootstrap peer should parse");
+        }
     }
 }

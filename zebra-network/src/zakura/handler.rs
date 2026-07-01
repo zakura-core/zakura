@@ -67,12 +67,12 @@ use crate::{
 };
 use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
 
-/// Conservative default for total Zakura connections when P2P v2 is enabled.
-pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 32;
-/// Conservative default for simultaneous Zakura control handshakes.
-pub const DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES: usize = 8;
-/// Conservative default for stream-open churn per connection.
-pub const DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND: u32 = 16;
+/// Default total Zakura connections when P2P v2 is enabled.
+pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 256;
+/// Default simultaneous Zakura control handshakes.
+pub const DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES: usize = 32;
+/// Default stream-open churn per connection.
+pub const DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND: u32 = 32;
 /// Per-kind inbound message rate per connection.
 ///
 /// This is a generous universal cap: block-sync legitimately delivers
@@ -86,6 +86,18 @@ pub const DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND: u32 = 2048;
 /// Default native Zakura QUIC listen address.
 pub const DEFAULT_ZAKURA_LISTEN_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8234));
+/// Default native Zakura bootstrap peers.
+pub const DEFAULT_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[
+    "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
+    "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@104.131.184.123:8234",
+    "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234",
+    "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22@143.244.184.176:8234",
+    "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57@159.203.38.10:8234",
+    "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5@64.227.44.93:8234",
+    "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1@161.35.156.226:8234",
+    "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234",
+    "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
+];
 /// Default maximum bytes read before the peer's stream prelude is decoded.
 pub const DEFAULT_ZAKURA_PRELUDE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default timeout for one control-handshake read or write.
@@ -111,11 +123,11 @@ pub const DEFAULT_ZAKURA_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10)
 /// reclaim the slot without disturbing active transfers.
 pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(300);
 /// QUIC stream receive window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 3 * 1024 * 1024;
+pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 /// QUIC connection receive window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
+pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 /// QUIC send window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 /// Initial backoff before re-dialing a configured Zakura bootstrap peer.
 pub const DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Maximum backoff between re-dials of a configured Zakura bootstrap peer.
@@ -273,7 +285,10 @@ pub struct ZakuraConfig {
 impl Default for ZakuraConfig {
     fn default() -> Self {
         Self {
-            bootstrap_peers: Vec::new(),
+            bootstrap_peers: DEFAULT_ZAKURA_BOOTSTRAP_PEERS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             listen_addr: Some(DEFAULT_ZAKURA_LISTEN_ADDR),
             max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS,
             max_pending_handshakes: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
@@ -3408,7 +3423,12 @@ async fn write_outbound_request_frame_inner(
     flags: u16,
     payload: Vec<u8>,
 ) -> Result<Vec<Frame>, OutboundRequestError> {
-    let budget = LegacyResponseBudget::from_request(message_type, &payload, limits)?;
+    // The legacy request stream validates responses with a legacy-message-specific budget.
+    let mut legacy_state = LegacyResponseReadState::new(LegacyResponseBudget::from_request(
+        message_type,
+        &payload,
+        limits,
+    )?);
     let (mut send, mut recv) = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| -> BoxError { "Zakura outbound request stream open timed out".into() })
@@ -3445,11 +3465,10 @@ async fn write_outbound_request_frame_inner(
     let _ = send.finish();
 
     let mut frames = Vec::new();
-    let mut state = LegacyResponseReadState::new(budget);
     loop {
         match read_frame(
             &mut recv,
-            app_frame_cap_for_stream_kind(&limits, stream_kind),
+            inbound_frame_cap_for_stream_kind(&limits, stream_kind),
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
             // the responder streams its frames promptly, so a silent gap before
@@ -3459,11 +3478,11 @@ async fn write_outbound_request_frame_inner(
         .await
         {
             Ok(frame) => {
-                state.validate_frame(request_id, &frame)?;
+                legacy_state.validate_frame(request_id, &frame)?;
                 frames.push(frame);
             }
             Err(ZakuraHandlerError::Closed) => {
-                state.finish()?;
+                legacy_state.finish()?;
                 return Ok(frames);
             }
             Err(ZakuraHandlerError::Timeout(_)) => {
@@ -4065,18 +4084,15 @@ fn app_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u
     .max(1)
 }
 
-/// Frame cap for reading on an admitted inbound stream, never larger than the
+/// Frame cap for reading frames received from a peer, never larger than the
 /// message cap allows.
 ///
-/// On an admitted ordered/request stream a frame payload *is* the message, so
-/// `admit_inbound_message` rejects any payload over `max_message_bytes`. A peer
-/// can negotiate `max_frame_bytes > max_message_bytes` (the two caps are clamped
-/// independently in `ZakuraLocalLimits::clamp`), so the cap handed to
-/// `read_frame` must also be limited to the message size. Otherwise a frame whose
-/// `payload_len` falls between the two limits is allocated and read in full by
-/// `read_frame` before `admit_inbound_message` rejects it as oversize, letting a
-/// peer force per-frame allocation/I/O up to the larger frame cap across many
-/// streams.
+/// On ordered/request streams and requester-side responses, a frame payload *is*
+/// the message. A peer can negotiate `max_frame_bytes > max_message_bytes` (the
+/// two caps are clamped independently in `ZakuraLocalLimits::clamp`), so the cap
+/// handed to `read_frame` must also be limited to the message size. Otherwise a
+/// frame whose `payload_len` falls between the two limits is allocated and read
+/// in full before the later message-level validation rejects or decodes it.
 fn inbound_frame_cap_for_stream_kind(limits: &ZakuraConnectionLimits, stream_kind: u16) -> u32 {
     let frame_header_bytes =
         u32::try_from(FRAME_HEADER_BYTES).expect("frame header byte count fits in u32");

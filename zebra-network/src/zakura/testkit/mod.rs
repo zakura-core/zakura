@@ -32,5 +32,5 @@ pub use pinned::{
 pub use recorder::{InboundRecorder, RecordedInbound};
 pub use trace_capture::TraceCapture;
 pub use trace_reader::{TraceQuery, TraceReader, TraceValue};
-pub use wait::{await_until, WaitError};
+pub use wait::{await_until, WaitError, TEST_NET_TIMEOUT};
 pub use zebra_jsonl_trace::JsonlTracer;

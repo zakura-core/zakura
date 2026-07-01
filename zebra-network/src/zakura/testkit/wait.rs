@@ -4,6 +4,19 @@ use std::{error::Error, fmt, time::Duration};
 
 use tokio::time::timeout;
 
+/// Generous deadline for native peer connection/registration and convergence
+/// waits in Zakura tests.
+///
+/// These tests dial real iroh/QUIC endpoints. Under CPU contention -- for
+/// example the full `cargo nextest` suite running at `num-cpus` parallelism --
+/// a handshake, peer registration, or trace-convergence poll can take several
+/// seconds. A slow connect under load is not a correctness failure, so this
+/// deadline is set well above the observed worst case (a few seconds) rather
+/// than near it: it keeps the suite deterministic without masking genuine
+/// hangs, since `await_until` and `connect_native` return as soon as the
+/// awaited condition holds.
+pub const TEST_NET_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Error returned when an event-driven wait times out.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WaitError {

@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Transaction::V6::ironwood_shielded_data` and Ironwood accessors on
   `Transaction`, including actions, nullifiers, note commitments, flags,
   shielded-data presence, flag sufficiency, and value balance.
+- `Block::ironwood_nullifiers` and `Block::ironwood_note_commitments`.
 - `SigHasher::ironwood_bundle`.
 
 ## [9.0.0] - 2026-06-02

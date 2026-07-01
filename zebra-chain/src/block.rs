@@ -8,7 +8,7 @@ use crate::{
     amount::{DeferredPoolBalanceChange, NegativeAllowed},
     block::merkle::{auth_digest_or_placeholder, AuthDataRoot},
     fmt::DisplayToDebug,
-    orchard,
+    ironwood, orchard,
     parameters::{Network, NetworkUpgrade},
     sapling,
     serialization::TrustedPreallocate,
@@ -161,6 +161,13 @@ impl Block {
             .flat_map(|transaction| transaction.orchard_nullifiers())
     }
 
+    /// Access the [`ironwood::Nullifier`]s from all transactions in this block.
+    pub fn ironwood_nullifiers(&self) -> impl Iterator<Item = &ironwood::Nullifier> {
+        self.transactions
+            .iter()
+            .flat_map(|transaction| transaction.ironwood_nullifiers())
+    }
+
     /// Access the [`sprout::NoteCommitment`]s from all transactions in this block.
     pub fn sprout_note_commitments(&self) -> impl Iterator<Item = &sprout::NoteCommitment> {
         self.transactions
@@ -183,6 +190,13 @@ impl Block {
         self.transactions
             .iter()
             .flat_map(|transaction| transaction.orchard_note_commitments())
+    }
+
+    /// Access the Ironwood note commitments from all transactions in this block.
+    pub fn ironwood_note_commitments(&self) -> impl Iterator<Item = &pallas::Base> {
+        self.transactions
+            .iter()
+            .flat_map(|transaction| transaction.ironwood_note_commitments())
     }
 
     /// Count how many Sapling transactions exist in a block,

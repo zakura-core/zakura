@@ -39,7 +39,8 @@ use zebra_chain::{
 use zebra_consensus::{error::TransactionError, transaction};
 use zebra_network::{self as zn, PeerSocketAddr};
 use zebra_node_services::mempool::{
-    CreatedOrSpent, Gossip, MempoolChange, MempoolTxSubscriber, Request, Response,
+    CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolTxSubscriber, Request,
+    Response,
 };
 use zebra_state as zs;
 use zebra_state::{ChainTipChange, TipAction};
@@ -1007,17 +1008,11 @@ impl Service<Request> for Mempool {
                     Request::TransactionWithDepsByMinedId(_)
                     | Request::AwaitOutput(_)
                     | Request::UnspentOutput(_) => {
-                        return async move {
-                            Err("mempool is not active: wait for Zebra to sync to the tip".into())
-                        }
-                        .boxed()
+                        return async move { Err(MempoolDisabledError.into()) }.boxed()
                     }
 
                     Request::FullTransactions => {
-                        return async move {
-                            Err("mempool is not active: wait for Zebra to sync to the tip".into())
-                        }
-                        .boxed()
+                        return async move { Err(MempoolDisabledError.into()) }.boxed()
                     }
 
                     Request::RejectedTransactionIds(_) => {

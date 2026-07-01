@@ -2,7 +2,7 @@
 //!
 //! A service that manages known unmined Zcash transactions.
 
-use std::{collections::HashSet, net::SocketAddr};
+use std::{collections::HashSet, fmt, net::SocketAddr};
 
 use tokio::sync::oneshot;
 use zebra_chain::{
@@ -24,6 +24,18 @@ pub use self::{
     service_trait::MempoolService,
     transaction_dependencies::TransactionDependencies,
 };
+
+/// The mempool is disabled until Zebra is close to the chain tip.
+#[derive(Debug)]
+pub struct MempoolDisabledError;
+
+impl fmt::Display for MempoolDisabledError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("mempool is not active: wait for Zebra to sync to the tip")
+    }
+}
+
+impl std::error::Error for MempoolDisabledError {}
 
 /// A peer source for per-peer mempool download accounting.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

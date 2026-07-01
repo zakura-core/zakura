@@ -226,6 +226,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Security
 
+- Reject invalid Sapling `cv` and `epk` point encodings during the fast semantic
+  precheck for V6 transactions, matching the existing V4/V5 behavior and keeping
+  small-order Sapling outputs out of the expensive batch verifier.
 - Write RPC authentication cookies through a freshly created private temporary
   file before replacing `.cookie`, so pre-existing permissive cookie files cannot
   expose the generated RPC authentication secret.

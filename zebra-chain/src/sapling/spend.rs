@@ -159,7 +159,7 @@ impl Spend<SharedAnchor> {
 
 impl ZcashSerialize for Spend<PerSpendAnchor> {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        writer.write_all(&self.cv.0.to_bytes())?;
+        writer.write_all(&self.cv.0)?;
         self.per_spend_anchor.zcash_serialize(&mut writer)?;
         writer.write_32_bytes(&self.nullifier.into())?;
         writer.write_all(&<[u8; 32]>::from(self.rk.clone())[..])?;
@@ -191,7 +191,8 @@ impl ZcashDeserialize for Spend<PerSpendAnchor> {
         //
         // https://zips.z.cash/protocol/protocol.pdf#spenddesc
         //
-        // See comments below for each specific type.
+        // Sapling `cv` only stores its bytes here; the point validity check is
+        // deferred to `Transaction::sapling_point_encodings_are_valid`.
         //
         // > LEOS2IP_{256}(anchorSapling), if present, MUST be less than 𝑞_𝕁.
         //
@@ -202,10 +203,9 @@ impl ZcashDeserialize for Spend<PerSpendAnchor> {
         Ok(Spend {
             // Type is `ValueCommit^{Sapling}.Output`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
-            // See [`sapling_crypto::value::ValueCommitment::::zcash_deserialize`].
-            cv: commitment::ValueCommitment(
-                sapling_crypto::value::ValueCommitment::zcash_deserialize(&mut reader)?,
-            ),
+            // Stores the bytes without validating the point; see
+            // [`commitment::ValueCommitment::zcash_deserialize`].
+            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
             // Type is `B^{[ℓ_{Sapling}_{Merkle}]}`, i.e. 32 bytes.
             // But as mentioned above, we validate it further as an integer.
             per_spend_anchor: (&mut reader).zcash_deserialize_into()?,
@@ -240,7 +240,7 @@ impl ZcashDeserialize for Spend<PerSpendAnchor> {
 
 impl ZcashSerialize for SpendPrefixInTransactionV5 {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        writer.write_all(&self.cv.0.to_bytes())?;
+        writer.write_all(&self.cv.0)?;
         writer.write_32_bytes(&self.nullifier.into())?;
         writer.write_all(&<[u8; 32]>::from(self.rk.clone())[..])?;
         Ok(())
@@ -255,11 +255,13 @@ impl ZcashDeserialize for SpendPrefixInTransactionV5 {
         //
         // https://zips.z.cash/protocol/protocol.pdf#spenddesc
         //
-        // See comments below for each specific type.
+        // Sapling `cv` only stores its bytes here; the point validity check is
+        // deferred to `Transaction::sapling_point_encodings_are_valid`.
         Ok(SpendPrefixInTransactionV5 {
             // Type is `ValueCommit^{Sapling}.Output`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
-            // See [`sapling_crypto::value::ValueCommitment::zcash_deserialize`].
+            // Stores the bytes without validating the point; see
+            // [`commitment::ValueCommitment::zcash_deserialize`].
             cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
             // Type is `B^Y^{[ℓ_{PRFnfSapling}/8]}`, i.e. 32 bytes
             nullifier: note::Nullifier::from(reader.read_32_bytes()?),

@@ -1118,6 +1118,33 @@ impl Transaction {
         }
     }
 
+    /// Returns true if every Sapling value commitment and ephemeral public key in
+    /// this transaction is a canonical, non-small-order Jubjub point (or the
+    /// transaction has no Sapling data).
+    ///
+    /// These points are stored as raw bytes with their not-small-order check
+    /// deferred from deserialization, to keep point decompression off the
+    /// checkpoint-sync hot path. The semantic verifier calls this on untrusted
+    /// transactions; the checkpoint verifier trusts block hashes and skips it.
+    pub fn sapling_point_encodings_are_valid(&self) -> bool {
+        match self {
+            Transaction::V4 {
+                sapling_shielded_data: Some(sapling_shielded_data),
+                ..
+            } => sapling_shielded_data.point_encodings_are_valid(),
+            Transaction::V5 {
+                sapling_shielded_data: Some(sapling_shielded_data),
+                ..
+            } => sapling_shielded_data.point_encodings_are_valid(),
+            #[cfg(any(zcash_unstable = "nu6.3", zcash_unstable = "nu7"))]
+            Transaction::V6 {
+                sapling_shielded_data: Some(sapling_shielded_data),
+                ..
+            } => sapling_shielded_data.point_encodings_are_valid(),
+            _ => true,
+        }
+    }
+
     // orchard
 
     /// Access the [`orchard::ShieldedData`] in this transaction,

@@ -176,6 +176,30 @@ pub fn orchard_cross_address_disabled(tx: &Transaction) -> Result<(), Transactio
     Ok(())
 }
 
+/// Checks that Sapling value commitments and ephemeral public keys are canonical,
+/// non-small-order Jubjub points.
+///
+/// # Consensus
+///
+/// > Check that an Output description's cv and epk are not of small order,
+/// > [and] that a Spend description's cv and rk are not of small order.
+///
+/// <https://zips.z.cash/protocol/protocol.pdf#outputdesc>
+/// <https://zips.z.cash/protocol/protocol.pdf#spenddesc>
+///
+/// Deserialization stores Sapling cv and epk as raw bytes and defers their
+/// not-small-order check to keep point decompression off the checkpoint-sync hot
+/// path. The semantic and mempool paths enforce it before any state lookup or
+/// librustzcash conversion so invalid points fail fast. Spend rk is still
+/// validated at deserialization.
+pub fn sapling_point_encodings_are_valid(tx: &Transaction) -> Result<(), TransactionError> {
+    if !tx.sapling_point_encodings_are_valid() {
+        return Err(TransactionError::SmallOrder);
+    }
+
+    Ok(())
+}
+
 /// Checks that shielded proof sizes are canonical when the proof-size rule is active.
 pub fn shielded_proof_size_is_canonical(
     tx: &Transaction,

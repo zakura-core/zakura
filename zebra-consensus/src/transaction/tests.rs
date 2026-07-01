@@ -3048,6 +3048,98 @@ fn v4_with_sapling_outputs_and_no_spends() {
     })
 }
 
+/// A transaction whose Sapling output has an invalid (off-curve) ephemeral key
+/// is rejected by the verifier with `SmallOrder`.
+///
+/// The Sapling `cv`/`epk` not-small-order check is deferred from deserialization
+/// and re-enforced in the verifier's early quick checks via
+/// `Transaction::sapling_point_encodings_are_valid`. This drives the full verifier
+/// end-to-end: the state service is `unreachable!` because the check fires before
+/// any state lookup. It mirrors `v4_with_sapling_outputs_and_no_spends` (which
+/// accepts this shape) with only the ephemeral key corrupted.
+#[test]
+fn sapling_output_with_invalid_ephemeral_key_is_rejected() {
+    let _init_guard = zebra_test::init();
+    zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        let (height, mut transaction) = test_transactions(&network)
+            .rev()
+            .filter(|(_, transaction)| {
+                !transaction.is_coinbase() && transaction.inputs().is_empty()
+            })
+            .find(|(_, transaction)| {
+                transaction.sapling_spends_per_anchor().next().is_none()
+                    && transaction.sapling_outputs().next().is_some()
+            })
+            .expect("a transaction with Sapling outputs and no Sapling spends");
+
+        // Corrupt the first Sapling output's ephemeral key to an off-curve point.
+        corrupt_first_sapling_output_ephemeral_key(
+            Arc::get_mut(&mut transaction).expect("transaction only has one active reference"),
+        );
+
+        // The state service must not be reached: the check fires before any
+        // state lookup.
+        let state_service =
+            service_fn(|_| async { unreachable!("State service should not be called") });
+        let verifier = Verifier::new_for_tests(&network, state_service);
+
+        let result = verifier
+            .oneshot(Request::Block {
+                transaction_hash: transaction.hash(),
+                transaction,
+                known_utxos: Arc::new(HashMap::new()),
+                known_outpoint_hashes: Arc::new(HashSet::new()),
+                height,
+                time: DateTime::<Utc>::MAX_UTC,
+            })
+            .await;
+
+        assert_eq!(
+            result,
+            Err(TransactionError::SmallOrder),
+            "a Sapling output with an off-curve ephemeral key must be rejected with SmallOrder",
+        );
+    });
+}
+
+/// Replaces the first Sapling output's ephemeral key with an off-curve point,
+/// for `sapling_output_with_invalid_ephemeral_key_is_rejected`.
+fn corrupt_first_sapling_output_ephemeral_key(transaction: &mut Transaction) {
+    let bad_epk = sapling::keys::EphemeralPublicKey::try_from([0xffu8; 32])
+        .expect("deserialization defers point validation, so try_from stores the bytes");
+
+    match transaction {
+        Transaction::V4 {
+            sapling_shielded_data: Some(shielded_data),
+            ..
+        } => set_first_sapling_output_ephemeral_key(&mut shielded_data.transfers, bad_epk),
+        Transaction::V5 {
+            sapling_shielded_data: Some(shielded_data),
+            ..
+        } => set_first_sapling_output_ephemeral_key(&mut shielded_data.transfers, bad_epk),
+        _ => panic!("expected a V4 or V5 transaction with Sapling data"),
+    }
+}
+
+fn set_first_sapling_output_ephemeral_key<A: sapling::AnchorVariant + Clone>(
+    transfers: &mut sapling::TransferData<A>,
+    ephemeral_key: sapling::keys::EphemeralPublicKey,
+) {
+    match transfers {
+        sapling::TransferData::JustOutputs { outputs } => {
+            let mut outputs_vec = outputs.as_slice().to_vec();
+            outputs_vec[0].ephemeral_key = ephemeral_key;
+            *outputs = AtLeastOne::from_vec(outputs_vec)
+                .expect("replacing a field keeps at least one output");
+        }
+        sapling::TransferData::SpendsAndMaybeOutputs { maybe_outputs, .. } => {
+            maybe_outputs[0].ephemeral_key = ephemeral_key;
+        }
+    }
+}
+
 /// Test if a V5 transaction with Sapling spends is accepted by the verifier.
 #[tokio::test]
 async fn v5_with_sapling_spends() {

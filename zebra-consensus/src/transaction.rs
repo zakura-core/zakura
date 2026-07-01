@@ -407,6 +407,7 @@ where
             check::has_enough_ironwood_flags(&tx)?;
             check::orchard_cross_address_disabled(&tx)?;
             check::consensus_branch_id(&tx, req.height(), &network)?;
+            check::sapling_point_encodings_are_valid(&tx)?;
 
             // Soft fork: temporarily require transactions to not contain Orchard actions.
             //

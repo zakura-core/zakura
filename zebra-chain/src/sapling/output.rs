@@ -124,7 +124,7 @@ impl OutputInTransactionV4 {
 impl ZcashSerialize for OutputInTransactionV4 {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
         let output = self.0.clone();
-        writer.write_all(&output.cv.0.to_bytes())?;
+        writer.write_all(&output.cv.0)?;
         writer.write_all(&output.cm_u.to_bytes())?;
         output.ephemeral_key.zcash_serialize(&mut writer)?;
         output.enc_ciphertext.zcash_serialize(&mut writer)?;
@@ -146,21 +146,22 @@ impl ZcashDeserialize for OutputInTransactionV4 {
         //
         // https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus
         //
-        // See comments below for each specific type.
+        // Sapling `cv` and `epk` only store their bytes here; the point validity
+        // check is deferred to `Transaction::sapling_point_encodings_are_valid`.
         Ok(OutputInTransactionV4(Output {
             // Type is `ValueCommit^{Sapling}.Output`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
-            // See [`sapling_crypto::value::ValueCommitment::zcash_deserialize`].
-            cv: commitment::ValueCommitment(
-                sapling_crypto::value::ValueCommitment::zcash_deserialize(&mut reader)?,
-            ),
+            // Stores the bytes without validating the point; see
+            // [`commitment::ValueCommitment::zcash_deserialize`].
+            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
             // Type is `B^{[ℓ_{Sapling}_{Merkle}]}`, i.e. 32 bytes.
             // However, the consensus rule above restricts it even more.
             // See [`sapling_crypto::note::ExtractedNoteCommitment::zcash_deserialize`].
             cm_u: sapling_crypto::note::ExtractedNoteCommitment::zcash_deserialize(&mut reader)?,
             // Type is `KA^{Sapling}.Public`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
-            // See [`keys::EphemeralPublicKey::zcash_deserialize`].
+            // Stores the bytes without validating the point; see
+            // [`keys::EphemeralPublicKey::zcash_deserialize`].
             ephemeral_key: keys::EphemeralPublicKey::zcash_deserialize(&mut reader)?,
             // Type is `Sym.C`, i.e. `B^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
@@ -190,7 +191,7 @@ impl ZcashDeserialize for OutputInTransactionV4 {
 
 impl ZcashSerialize for OutputPrefixInTransactionV5 {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        writer.write_all(&self.cv.0.to_bytes())?;
+        writer.write_all(&self.cv.0)?;
         writer.write_all(&self.cm_u.to_bytes())?;
         self.ephemeral_key.zcash_serialize(&mut writer)?;
         self.enc_ciphertext.zcash_serialize(&mut writer)?;
@@ -211,21 +212,22 @@ impl ZcashDeserialize for OutputPrefixInTransactionV5 {
         //
         // https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus
         //
-        // See comments below for each specific type.
+        // Sapling `cv` and `epk` only store their bytes here; the point validity
+        // check is deferred to `Transaction::sapling_point_encodings_are_valid`.
         Ok(OutputPrefixInTransactionV5 {
             // Type is `ValueCommit^{Sapling}.Output`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
-            // See [`sapling_crypto::value::ValueCommitment::zcash_deserialize`].
-            cv: commitment::ValueCommitment(
-                sapling_crypto::value::ValueCommitment::zcash_deserialize(&mut reader)?,
-            ),
+            // Stores the bytes without validating the point; see
+            // [`commitment::ValueCommitment::zcash_deserialize`].
+            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
             // Type is `B^{[ℓ_{Sapling}_{Merkle}]}`, i.e. 32 bytes.
             // However, the consensus rule above restricts it even more.
             // See [`sapling_crypto::note::ExtractedNoteCommitment::zcash_deserialize`].
             cm_u: sapling_crypto::note::ExtractedNoteCommitment::zcash_deserialize(&mut reader)?,
             // Type is `KA^{Sapling}.Public`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
-            // See [`keys::EphemeralPublicKey::zcash_deserialize`].
+            // Stores the bytes without validating the point; see
+            // [`keys::EphemeralPublicKey::zcash_deserialize`].
             ephemeral_key: keys::EphemeralPublicKey::zcash_deserialize(&mut reader)?,
             // Type is `Sym.C`, i.e. `B^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to

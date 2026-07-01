@@ -70,6 +70,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Added Ironwood value pool entries to `getblockchaininfo` and verbose
+  `getblock` RPC output.
 - Report `pruned: true` in `getblockchaininfo` after Zebra has pruned
   historical raw transaction data, matching the node's storage mode instead of
   always reporting archive behavior.

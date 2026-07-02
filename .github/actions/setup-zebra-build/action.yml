@@ -7,6 +7,7 @@ runs:
       if: runner.os == 'Linux'
       shell: bash
       run: |
+        sudo rm -f /etc/apt/sources.list.d/{microsoft-prod,azure-cli}.{list,sources}
         sudo apt-get -qq update
         sudo apt-get -qq install -y --no-install-recommends protobuf-compiler librocksdb-dev
         echo "ROCKSDB_LIB_DIR=/usr/lib/" >> $GITHUB_ENV

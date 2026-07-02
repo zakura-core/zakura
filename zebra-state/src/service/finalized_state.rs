@@ -74,6 +74,7 @@ static COMMIT_COMPUTE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
 
 pub mod column_family;
 
+pub(crate) mod commitment_aux;
 mod disk_db;
 mod disk_format;
 mod zebra_db;
@@ -86,6 +87,8 @@ mod tests;
 
 #[allow(unused_imports)]
 pub use column_family::{TypedColumnFamily, WriteTypedBatch};
+pub(crate) use commitment_aux::serve_block_roots;
+pub use commitment_aux::{produce_final_frontiers_bytes, FinalFrontiersGenerationError};
 #[allow(unused_imports)]
 pub use disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk};
 #[allow(unused_imports)]

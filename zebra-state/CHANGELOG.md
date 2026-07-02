@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entries so they use the Ironwood-capable entry size.
 - Extended value-pool disk serialization with an Ironwood slot after the
   deferred pool, and bumped the state database format version to `27.3.0`.
+- `tree_aux` root serving now stitches the per-height trees below the
+  verified-commitment-trees upgrade height `U` with the
+  `commitment_roots_by_height` serving index at and above `U`, so a node that
+  upgraded mid-chain serves a range crossing `U` as one gap-free batch instead
+  of a short prefix that stalled the fetch client.
+- Added `produce_final_frontiers_bytes` for deriving serialized checkpoint
+  final-frontier fixtures from a finalized database.
 
 ## [8.0.0] - 2026-06-02
 

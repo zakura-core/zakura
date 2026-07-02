@@ -1502,7 +1502,7 @@ where
             .finalized_tip_height()
             .is_some_and(|finalized_tip| height <= finalized_tip)
         {
-            db.finalized_commitment_roots_by_height_range(height..=height)
+            finalized_state::serve_block_roots(db, height..=height)
                 .into_iter()
                 .next()
         } else if let Some(chain) = chain

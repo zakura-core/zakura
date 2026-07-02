@@ -1368,43 +1368,6 @@ mod tests {
         }
     }
 
-    /// `serve_block_roots` reads a request that starts at or above the upgrade height `U` straight
-    /// from the serving index, without touching the per-height trees.
-    #[test]
-    fn serve_block_roots_serves_at_or_above_upgrade_from_index() {
-        let _init_guard = zebra_test::init();
-        let db = ephemeral_mainnet_db();
-
-        // Index covers [4, 6]; the upgrade height is U = 4.
-        let mut batch = DiskWriteBatch::new();
-        batch.update_vct_upgrade_marker(&db, Height(4));
-        for height in 4u32..=6 {
-            batch.insert_commitment_roots_by_height(
-                &db,
-                Height(height),
-                &sapling_root(height.into()),
-                &orchard_root(height.into()),
-                &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-                0,
-                0,
-                0,
-                &zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
-            );
-        }
-        db.write_batch(batch)
-            .expect("seeding the serving index succeeds");
-
-        let served = db.commitment_roots_by_height_range(Height(4)..=Height(6));
-        assert_eq!(
-            served
-                .into_iter()
-                .map(|root| root.height)
-                .collect::<Vec<_>>(),
-            vec![Height(4), Height(5), Height(6)],
-            "a request at or above U is served from the index"
-        );
-    }
-
     /// `delete_zakura_headers_above` must truncate every Zakura header CF above the target,
     /// including the hash→height index, while leaving rows at or below the target intact. This
     /// is the consistency guarantee that lets a rolled-back snapshot re-sync bodies from its tip

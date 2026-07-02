@@ -80,6 +80,7 @@ pub use service::finalized_state::{
     preview_rollback_finalized_state, rollback_finalized_state, RollbackBackupSummary,
     RollbackFinalizedStateError, RollbackFinalizedStateOptions, RollbackFinalizedStateSummary,
 };
+pub use service::finalized_state::{produce_final_frontiers_bytes, FinalFrontiersGenerationError};
 pub use service::{
     finalized_state::{DiskWriteBatch, FromDisk, IntoDisk, WriteDisk, ZebraDb},
     ReadStateService,

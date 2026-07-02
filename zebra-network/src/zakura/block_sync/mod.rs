@@ -52,6 +52,7 @@ mod tests;
 mod wire;
 mod work_queue;
 
+pub use admission::DESERIALIZED_MEM_FACTOR;
 #[cfg(feature = "internal-bench")]
 pub use bench::{
     spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchSequencerHandle, BenchSubmissions,
@@ -59,7 +60,7 @@ pub use bench::{
 };
 pub use config::{
     BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
-    MAX_BS_RESPONSE_BYTES,
+    MAX_BS_RESPONSE_BYTES, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
 };
 pub use error::BlockSyncWireError;
 pub use events::{

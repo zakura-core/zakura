@@ -1055,6 +1055,10 @@ impl<'de> Deserialize<'de> for Config {
         // starting while checkpoint sync stays deadlock-free.
         let mut zakura = zakura;
         zakura.block_sync.clamp_inflight_block_bytes_to_floor();
+        // Likewise clamp the resident look-ahead budget (and its block cap) up to one
+        // checkpoint range, so the resident-memory admission gate cannot deadlock checkpoint
+        // sync when verified_tip is pinned to the previous checkpoint.
+        zakura.block_sync.clamp_reorder_lookahead_to_floor();
         zakura.block_sync.validate().map_err(|error| {
             de::Error::custom(format!("invalid zakura.block_sync config: {error}"))
         })?;

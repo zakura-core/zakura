@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed an out-of-memory crash during Zakura block sync when the header chain
+  runs far ahead of the commit tip. The block-sync applying buffer holds decoded
+  block bodies ahead of the in-order committer; its look-ahead budget counted
+  wire bytes (not the ~4× larger decoded footprint) and the floor-rescue path
+  bypassed the budget entirely and advanced with the _download_ floor, so the
+  buffer grew unbounded (~569k blocks, ~26 GiB RSS) until the kernel killed the
+  node. The budget now bounds estimated resident memory (retained and in-flight
+  wire bytes at the decoded multiple) and gates the floor lane, exempting one
+  checkpoint range above the verified tip (the commit window) so a pinned
+  checkpoint range can always assemble and the committer can always drain the
+  pipeline (no deadlock). Resident memory now plateaus near the configured budget
+  plus at most one worst-case commit window (~3.2 GB), with only bounded transient
+  overshoot from floor-rescue requests.
+
 ### Performance
 
 - Improve Zakura block-sync download scheduling for checkpoint sync. A

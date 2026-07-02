@@ -39,16 +39,26 @@ pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 /// at decode (`MAX_BS_MESSAGE_BYTES > MAX_BLOCK_BYTES`), so the actual size can
 /// never exceed this worst case and the shrink is always non-negative.
 pub const BS_PER_BLOCK_WORST_CASE_BYTES: u64 = block::MAX_BLOCK_BYTES;
-/// Default byte cap for speculative reorder look-ahead above the download floor.
+/// Default cap on the estimated *resident* memory of the look-ahead pipeline.
 ///
-/// The default leaves one advertised response worth of headroom below the global
-/// byte budget. The synchronous floor-pop path is the funding guarantee when
-/// that headroom has been consumed by races or changed configuration.
+/// Denominated in resident bytes, not wire bytes: admission compares it against the
+/// retained and in-flight wire bytes scaled by `DESERIALIZED_MEM_FACTOR` (see
+/// `admission::estimated_resident_pipeline_bytes`), so the default admits roughly a
+/// quarter of its nominal value in wire bytes. The numeric value is kept aligned with
+/// the in-flight wire budget minus one advertised response, which under the resident
+/// interpretation yields a deep (~1.5 GiB wire) look-ahead buffer.
 pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 =
     // `DEFAULT_BS_MAX_RESPONSE_BYTES` is a `u32`, so widening to `u64` is lossless.
     DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES - DEFAULT_BS_MAX_RESPONSE_BYTES as u64;
-/// Default block-count cap for speculative reorder look-ahead bookkeeping.
-pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 4096;
+/// Default block-count safety cap for speculative reorder look-ahead bookkeeping.
+///
+/// Defense-in-depth on the map/bookkeeping size only. The primary bound on buffered bodies
+/// is the resident-memory budget [`DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES`] (compared against
+/// `held_wire * DESERIALIZED_MEM_FACTOR`, see `admission.rs`). This is set well above the
+/// block count that budget admits at realistic body sizes, so the *memory* budget is the
+/// binding cap. The prior 4096 value made the buffer shallow (~one checkpoint range), which
+/// masked the byte budget and could starve the bursty committer.
+pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 262_144;
 /// Minimum submitted block applies required to resolve one checkpoint range.
 ///
 /// The checkpoint verifier resolves a checkpoint window only after the whole
@@ -372,8 +382,14 @@ impl ZakuraBlockSyncConfig {
 
     /// Return the speculative look-ahead byte cap clamped to the global budget.
     pub fn effective_max_reorder_lookahead_bytes(&self) -> u64 {
-        self.max_reorder_lookahead_bytes
-            .min(self.max_inflight_block_bytes)
+        // This is a resident-memory budget: admission counts each pool's wire bytes scaled by
+        // `DESERIALIZED_MEM_FACTOR`. Cap it against the resident equivalent of the in-flight
+        // wire budget, not raw `max_inflight_block_bytes`, so look-ahead depth is not
+        // unnecessarily starved.
+        self.max_reorder_lookahead_bytes.min(
+            self.max_inflight_block_bytes
+                .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR),
+        )
     }
 
     /// Return the floor avoid cooldown clamped to a positive duration.
@@ -471,6 +487,41 @@ impl ZakuraBlockSyncConfig {
                  floor; clamping it up so checkpoint sync cannot deadlock",
             );
             self.max_inflight_block_bytes = BS_CHECKPOINT_RANGE_BYTE_FLOOR;
+        }
+    }
+
+    /// Clamp the resident look-ahead budget up to one worst-case checkpoint range.
+    ///
+    /// This is defense-in-depth for the speculative above-window lane: checkpoint
+    /// sync liveness already comes from the commit-window admission exemption, but
+    /// sub-range byte or block budgets would reject nearly all gated look-ahead work.
+    /// Clamp both floors up to match the range-sized admission model.
+    pub fn clamp_reorder_lookahead_to_floor(&mut self) {
+        let resident_range_floor = BS_CHECKPOINT_RANGE_BYTE_FLOOR
+            .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR);
+        if self.max_reorder_lookahead_bytes > 0
+            && self.max_reorder_lookahead_bytes < resident_range_floor
+        {
+            tracing::warn!(
+                configured_max_reorder_lookahead_bytes = self.max_reorder_lookahead_bytes,
+                resident_checkpoint_range_floor = resident_range_floor,
+                "zakura.block_sync.max_reorder_lookahead_bytes is below the resident \
+                 checkpoint-range floor; clamping it up so checkpoint sync cannot deadlock",
+            );
+            self.max_reorder_lookahead_bytes = resident_range_floor;
+        }
+
+        let block_floor =
+            u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES).unwrap_or(u32::MAX);
+        if self.max_reorder_lookahead_blocks > 0 && self.max_reorder_lookahead_blocks < block_floor
+        {
+            tracing::warn!(
+                configured_max_reorder_lookahead_blocks = self.max_reorder_lookahead_blocks,
+                checkpoint_range_block_floor = block_floor,
+                "zakura.block_sync.max_reorder_lookahead_blocks is below one checkpoint range; \
+                 clamping it up so checkpoint sync cannot deadlock",
+            );
+            self.max_reorder_lookahead_blocks = block_floor;
         }
     }
 

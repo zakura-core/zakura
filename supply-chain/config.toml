@@ -1626,7 +1626,7 @@ version = "1.2.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.quick-xml]]
-version = "0.39.2"
+version = "0.39.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.quickcheck]]

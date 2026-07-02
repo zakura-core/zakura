@@ -21,6 +21,11 @@ pub(crate) struct InvariantReport {
     pub(crate) max_outstanding: u64,
     /// Peak reserved download bytes (memory pressure).
     pub(crate) peak_budget_reserved: u64,
+    /// Peak retained pipeline wire bytes (`sequencer_input + reorder + applying`), the
+    /// wire-byte footprint of bodies actually held in memory. Multiplied by the
+    /// deserialized-memory factor this approximates peak resident cost — unlike
+    /// `peak_budget_reserved`, it excludes reservations for bytes not yet received.
+    pub(crate) peak_retained_pipeline_wire_bytes: u64,
     /// Final reserved download bytes (leak detector once quiesced).
     pub(crate) final_budget_reserved: u64,
     /// Liveness-reaper / protocol-reject disconnects observed.
@@ -65,6 +70,11 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         .rev()
         .find_map(|row| u64_field(row, "budget_reserved"))
         .unwrap_or(0);
+    let peak_retained_pipeline_wire_bytes = state_rows
+        .iter()
+        .filter_map(|row| u64_field(row, "retained_pipeline_wire_bytes"))
+        .max()
+        .unwrap_or(0);
     let protocol_rejects = reader
         .table("block_sync")
         .count("block_peer_protocol_reject");
@@ -101,6 +111,7 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         state_samples: state_rows.len(),
         max_outstanding,
         peak_budget_reserved,
+        peak_retained_pipeline_wire_bytes,
         final_budget_reserved,
         protocol_rejects,
         floor_bypass_requests,

@@ -57,8 +57,13 @@ fn test_sequential_height_check() {
         .expect_err("parent height is way more, should panic");
 }
 
+/// The commitment check *uses* a supplied precomputed auth data root instead of
+/// re-deriving it from the block body (re-deriving would negate the point of
+/// precomputing). A matching value passes; a forged value makes an otherwise-valid
+/// header fail the ZIP-244 commitment check, proving the supplied value is the one
+/// bound into the check.
 #[test]
-fn block_commitment_binds_precomputed_auth_data_root_to_block_body() {
+fn block_commitment_uses_the_precomputed_auth_data_root() {
     let _init_guard = zebra_test::init();
 
     let network = Network::Mainnet;
@@ -117,15 +122,23 @@ fn block_commitment_binds_precomputed_auth_data_root_to_block_body() {
         &history_tree,
         Some(forged_auth_data_root),
     )
-    .expect_err("a forged precomputed auth data root must be rejected");
+    .expect_err("a forged precomputed auth data root must fail the commitment check");
 
+    // The supplied root is trusted, not compared against the body, so the forgery
+    // surfaces as a header-commitment mismatch: the header committed to the real
+    // root, while the check recomputed the commitment from the forged one.
+    let forged_hash_block_commitments = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+        &history_tree
+            .hash()
+            .expect("NU5 parent history tree has a root"),
+        &forged_auth_data_root,
+    );
     assert!(matches!(
         error,
-        ValidateContextError::InvalidBlockCommitment(CommitmentError::InvalidAuthDataRoot {
-            expected,
-            actual,
-        }) if expected == <[u8; 32]>::from(auth_data_root)
-            && actual == <[u8; 32]>::from(forged_auth_data_root)
+        ValidateContextError::InvalidBlockCommitment(
+            CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { actual, expected },
+        ) if actual == block_commitment
+            && expected == <[u8; 32]>::from(forged_hash_block_commitments)
     ));
 }
 

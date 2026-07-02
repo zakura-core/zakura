@@ -140,7 +140,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
                             if matches!(
                                 source.as_ref(),
                                 crate::ValidateContextError::InvalidBlockCommitment(
-                                    zebra_chain::block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
+                                    zebra_chain::block::CommitmentError::InvalidAuthDataRoot { .. }
                                 )
                             )
                     );

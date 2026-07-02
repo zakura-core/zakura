@@ -75,6 +75,7 @@ static COMMIT_COMPUTE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
 pub mod column_family;
 
 pub(crate) mod commitment_aux;
+pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
 mod zebra_db;

@@ -3,12 +3,16 @@
 use chrono::{DateTime, Duration};
 
 use zebra_chain::{
+    block::{merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError},
+    history_tree::HistoryTree,
     parameters::{Network, NetworkUpgrade},
+    sapling,
     serialization::ZcashDeserializeInto,
     work::difficulty::ParameterDifficulty,
 };
 
 use super::super::*;
+use crate::tests::FakeChainHelper;
 
 #[test]
 fn test_orphan_consensus_check() {
@@ -51,6 +55,78 @@ fn test_sequential_height_check() {
         .expect_err("parent height is way more, should panic");
     height_one_more_than_parent_height(block::Height(500000), height)
         .expect_err("parent height is way more, should panic");
+}
+
+#[test]
+fn block_commitment_binds_precomputed_auth_data_root_to_block_body() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let parent_height = 1_687_106;
+    let (blocks, sapling_roots) = network.block_sapling_roots_map();
+
+    let parent = Arc::new(
+        blocks
+            .get(&parent_height)
+            .expect("NU5 parent test vector exists")
+            .zcash_deserialize_into::<Block>()
+            .expect("NU5 parent block deserializes"),
+    );
+    let sapling_root = sapling::tree::Root::try_from(
+        **sapling_roots
+            .get(&parent_height)
+            .expect("NU5 parent Sapling root exists"),
+    )
+    .expect("Sapling root vector is valid");
+    let history_tree = HistoryTree::from_block(
+        &network,
+        parent.clone(),
+        &sapling_root,
+        &Default::default(),
+        &Default::default(),
+    )
+    .expect("NU5 parent builds a history tree");
+
+    let child = parent.make_fake_child();
+    let auth_data_root = child.auth_data_root();
+    let hash_block_commitments = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+        &history_tree
+            .hash()
+            .expect("NU5 parent history tree has a root"),
+        &auth_data_root,
+    );
+    let block_commitment: [u8; 32] = hash_block_commitments.into();
+    let child = child.set_block_commitment(block_commitment);
+
+    block_commitment_is_valid_for_chain_history(
+        child.clone(),
+        &network,
+        &history_tree,
+        Some(auth_data_root),
+    )
+    .expect("a matching precomputed auth data root is accepted");
+
+    let forged_auth_data_root = AuthDataRoot::from([0x42; 32]);
+    assert_ne!(
+        forged_auth_data_root, auth_data_root,
+        "the forged root must differ from the block body root"
+    );
+    let error = block_commitment_is_valid_for_chain_history(
+        child,
+        &network,
+        &history_tree,
+        Some(forged_auth_data_root),
+    )
+    .expect_err("a forged precomputed auth data root must be rejected");
+
+    assert!(matches!(
+        error,
+        ValidateContextError::InvalidBlockCommitment(CommitmentError::InvalidAuthDataRoot {
+            expected,
+            actual,
+        }) if expected == <[u8; 32]>::from(auth_data_root)
+            && actual == <[u8; 32]>::from(forged_auth_data_root)
+    ));
 }
 
 #[test]

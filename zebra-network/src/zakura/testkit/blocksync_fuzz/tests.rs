@@ -358,14 +358,19 @@ async fn fuzz_mixed_block_sizes() {
     )
     .await;
 
-    // The byte cwnd (a similar order of magnitude in both runs — the budget is in bytes,
-    // not requests) maps to far more in-flight *requests* for small bodies than for large:
-    // request depth ∝ 1 / body_size, the headline byte-cwnd property the blocks unit
-    // cannot express. (Here ~8× the body size ⇒ a multiple-× request-depth gap.)
+    // Byte-cwnd growth can differ between runs under slower instrumentation, so compare
+    // request density per cwnd byte rather than absolute request counts. The small-body
+    // run should admit many more single-block requests per byte of cwnd than the
+    // large-body run: request depth ∝ 1 / body_size, the headline byte-cwnd property the
+    // blocks unit cannot express. (Here ~8× the body size ⇒ a clear density gap.)
+    let small_request_density =
+        u128::from(small.peak_cwnd_requests).saturating_mul(u128::from(large.peak_cwnd_bytes));
+    let large_request_density =
+        u128::from(large.peak_cwnd_requests).saturating_mul(u128::from(small.peak_cwnd_bytes));
     assert!(
-        small.peak_cwnd_requests > large.peak_cwnd_requests.saturating_mul(2),
-        "small bodies should admit many more single-block requests in a comparable byte \
-         window (small={} reqs @ {} B cwnd, large={} reqs @ {} B cwnd)",
+        small_request_density > large_request_density.saturating_mul(4),
+        "small bodies should admit many more single-block requests per byte of cwnd \
+         (small={} reqs @ {} B cwnd, large={} reqs @ {} B cwnd)",
         small.peak_cwnd_requests,
         small.peak_cwnd_bytes,
         large.peak_cwnd_requests,

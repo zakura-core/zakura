@@ -78,6 +78,10 @@ pub(crate) mod commitment_aux;
 pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
+// The committer fast path (next increment) constructs and consumes `VctState`; until it
+// lands, the runtime is exercised only by its tests and the frontier-bytes validators.
+#[allow(dead_code)]
+mod vct;
 mod zebra_db;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -97,6 +101,7 @@ pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
 };
+pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError};
 pub use zebra_db::ZebraDb;
 
 #[cfg(any(test, feature = "proptest-impl"))]

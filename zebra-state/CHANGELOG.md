@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of a short prefix that stalled the fetch client.
 - Added `produce_final_frontiers_bytes` for deriving serialized checkpoint
   final-frontier fixtures from a finalized database.
+- Added `validate_final_frontiers_bytes` and `FinalFrontiersValidationError` for
+  checking serialized checkpoint final-frontier bytes against an expected
+  handoff height, and the retryable `ValidateContextError` variants
+  `VctSuppliedRootUnavailable` and `VctSuppliedRootAwaitingSuccessor` (with
+  `vct_retryable_height` / `vct_supplied_root_unavailable_height` accessors on
+  the commit error types). Nothing returns these errors yet; the committer fast
+  path that raises them lands in a follow-up increment.
 
 ## [8.0.0] - 2026-06-02
 

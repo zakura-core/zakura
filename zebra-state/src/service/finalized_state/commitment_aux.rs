@@ -1,6 +1,8 @@
 //! Payload types and the producer/serving half of the verified-commitment-trees
 //! (`docs/design/verified-commitment-trees.md`).
 
+#[cfg(test)]
+use std::collections::HashMap;
 use std::{fmt, sync::Arc};
 
 use thiserror::Error;
@@ -49,9 +51,6 @@ pub enum FinalFrontiersGenerationError {
 }
 
 /// Errors parsing [`FinalFrontiers`] from the embedded/frontier-file byte format.
-// The non-test consumer is the VCT embedded-frontier loader, which lands with the
-// committer fast path in a follow-up increment; the round-trip test exercises it here.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum FinalFrontiersParseError {
     /// The input ended before the 4-byte height field.
@@ -159,9 +158,6 @@ impl FinalFrontiers {
     }
 
     /// Parse the embedded byte format written by [`Self::to_bytes`].
-    // The non-test consumer is the VCT embedded-frontier loader, which lands with the
-    // committer fast path in a follow-up increment; the round-trip test exercises it here.
-    #[allow(dead_code)]
     pub(super) fn from_bytes(bytes: &[u8]) -> Result<Self, FinalFrontiersParseError> {
         let height_bytes = bytes
             .get(0..4)
@@ -250,6 +246,111 @@ impl FinalFrontiers {
                 sprout,
             )),
         })
+    }
+}
+
+/// Source for the VCT fast-sync's verified per-block roots and final frontier.
+pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
+    /// The supplied roots for `height`, if this source has them.
+    fn vct_root(&self, height: block::Height)
+        -> Option<(sapling::tree::Root, orchard::tree::Root)>;
+
+    /// The checkpoint handoff height: the boundary below which the vct path skips
+    /// per-height trees, from the source's final frontier.
+    fn vct_last_checkpoint_height(&self) -> block::Height {
+        self.final_frontiers().height
+    }
+
+    /// The verified final frontiers at the handoff height.
+    ///
+    /// Every source carries one: the fast path only runs on networks with an embedded
+    /// handoff frontier, and test fixtures construct one explicitly.
+    fn final_frontiers(&self) -> &FinalFrontiers;
+
+    /// Discard the supplied root for `height` so a later [`vct_root`](Self::vct_root)
+    /// returns `None` for it.
+    ///
+    /// Called by the committer when a supplied root fails verification: dropping the bad
+    /// root un-poisons the store so a re-fetch from a different peer can replace it, rather
+    /// than the committer re-reading the same rejected root forever. The default is a no-op
+    /// for test-only local sources; the peer source overrides it.
+    fn invalidate(&self, _height: block::Height) {}
+}
+
+/// Test-only local source over a height-keyed roots map.
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct FixtureSource {
+    roots: HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>,
+    frontiers: FinalFrontiers,
+}
+
+#[cfg(test)]
+impl FixtureSource {
+    pub(super) fn new(
+        roots: HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>,
+        frontiers: FinalFrontiers,
+    ) -> Self {
+        FixtureSource { roots, frontiers }
+    }
+}
+
+#[cfg(test)]
+impl CommitmentRootSource for FixtureSource {
+    fn vct_root(
+        &self,
+        height: block::Height,
+    ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
+        self.roots.get(&height.0).copied()
+    }
+    fn final_frontiers(&self) -> &FinalFrontiers {
+        &self.frontiers
+    }
+}
+
+/// A [`CommitmentRootSource`] backed by provisional header-ahead roots in `db`.
+///
+/// Header sync persists peer-supplied roots into `db` ahead of body commit
+/// ([`ZebraDb::insert_zakura_header_commitment_roots`]); the committer reads them per
+/// height through the [`CommitmentRootSource`] seam, and tests fill roots through the
+/// same database write path. The handoff frontier is embedded in the binary, held
+/// immutably here and never fetched over the network — a peer source always has one,
+/// because peer mode is only selected on networks with an embedded frontier. Committed
+/// rows are cleaned up by the database's own retention, not through this seam.
+#[derive(Debug)]
+pub(super) struct PeerSource {
+    db: ZebraDb,
+    frontiers: FinalFrontiers,
+}
+
+impl PeerSource {
+    /// Create a source backed by provisional header-ahead roots in `db`. `frontiers`
+    /// is the embedded handoff frontier for the network.
+    pub(super) fn new(db: ZebraDb, frontiers: FinalFrontiers) -> Self {
+        PeerSource { db, frontiers }
+    }
+}
+
+impl CommitmentRootSource for PeerSource {
+    fn vct_root(
+        &self,
+        height: block::Height,
+    ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
+        self.db
+            .zakura_header_commitment_roots_by_height_range(height..=height)
+            .into_iter()
+            .next()
+            .map(|roots| (roots.sapling_root, roots.orchard_root))
+    }
+    fn final_frontiers(&self) -> &FinalFrontiers {
+        &self.frontiers
+    }
+    fn invalidate(&self, height: block::Height) {
+        // Drop the rejected root so the next read misses; header sync can then deliver a
+        // verifiable replacement for this height from another peer.
+        if let Err(error) = self.db.delete_zakura_header_commitment_roots([height]) {
+            tracing::debug!(?error, ?height, "failed to delete rejected VCT root");
+        }
     }
 }
 
@@ -726,6 +827,107 @@ mod tests {
                 offset: frontiers.to_bytes().len(),
                 trailing_len: 1,
             }
+        );
+    }
+
+    /// The test fixture source looks up produced roots by height and exposes
+    /// the handoff frontier — the consumer view of producer output.
+    #[test]
+    fn fixture_source_round_trips_payload() {
+        let roots = vec![
+            BlockCommitmentRoots {
+                height: block::Height(10),
+                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                sapling_tx: 0,
+                orchard_tx: 0,
+                ironwood_tx: 0,
+                auth_data_root: AuthDataRoot::from([0u8; 32]),
+            },
+            BlockCommitmentRoots {
+                height: block::Height(11),
+                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                sapling_tx: 0,
+                orchard_tx: 0,
+                ironwood_tx: 0,
+                auth_data_root: AuthDataRoot::from([0u8; 32]),
+            },
+        ];
+        let roots = roots
+            .into_iter()
+            .map(|root| (root.height.0, (root.sapling_root, root.orchard_root)))
+            .collect();
+        let frontiers = FinalFrontiers {
+            height: block::Height(11),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            sprout: Arc::new(Default::default()),
+        };
+
+        let source = FixtureSource::new(roots, frontiers);
+
+        assert!(
+            source.vct_root(block::Height(10)).is_some(),
+            "produced root is looked up by height"
+        );
+        assert!(
+            source.vct_root(block::Height(99)).is_none(),
+            "absent height has no root"
+        );
+        assert_eq!(
+            source.vct_last_checkpoint_height(),
+            block::Height(11),
+            "handoff height comes from the supplied frontiers"
+        );
+    }
+
+    /// The peer source reads roots persisted by the header-sync write path, and
+    /// `invalidate` deletes a root so a later read misses it, letting the driver re-fetch
+    /// a verifiable replacement from another peer. This un-poisons the store after a bad
+    /// root is rejected by the committer, so one malicious peer cannot wedge the same
+    /// rejected root in place forever. Exercises the same database rows production uses.
+    #[test]
+    fn peer_source_reads_and_invalidates_header_sync_roots() {
+        let db = ephemeral_mainnet_db();
+        db.insert_zakura_header_commitment_roots([BlockCommitmentRoots {
+            height: block::Height(42),
+            sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+            orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+            ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            sapling_tx: 0,
+            orchard_tx: 0,
+            ironwood_tx: 0,
+            auth_data_root: AuthDataRoot::from([0u8; 32]),
+        }])
+        .expect("writing header-sync roots to an ephemeral database succeeds");
+
+        // The handoff frontier is mandatory for a peer source; its height is above the
+        // roots under test so it does not interact with the lookups.
+        let frontiers = FinalFrontiers {
+            height: block::Height(50),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            sprout: Arc::new(Default::default()),
+        };
+        let source = PeerSource::new(db, frontiers);
+
+        assert!(
+            source.vct_root(block::Height(42)).is_some(),
+            "a header-sync-persisted root is read back by height"
+        );
+        assert!(
+            source.vct_root(block::Height(43)).is_none(),
+            "an absent height has no root"
+        );
+
+        source.invalidate(block::Height(42));
+
+        assert!(
+            source.vct_root(block::Height(42)).is_none(),
+            "an invalidated root is gone, so the next read misses and a re-fetch can replace it"
         );
     }
 }

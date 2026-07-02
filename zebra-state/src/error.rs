@@ -86,6 +86,26 @@ impl CommitBlockError {
         }
     }
 
+    /// Returns the missing VCT supplied-root height for retryable root-fetch stalls.
+    pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
+        match self {
+            CommitBlockError::ValidateContextError(error) => {
+                error.vct_supplied_root_unavailable_height()
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the height for any retryable VCT root stall (absent/evicted root, or one
+    /// not yet verifiable for lack of a buffered successor). See
+    /// [`ValidateContextError::vct_retryable_height`].
+    pub fn vct_retryable_height(&self) -> Option<block::Height> {
+        match self {
+            CommitBlockError::ValidateContextError(error) => error.vct_retryable_height(),
+            _ => None,
+        }
+    }
+
     /// Returns a suggested misbehaviour score increment for a certain error.
     pub fn misbehavior_score(&self) -> u32 {
         0
@@ -148,6 +168,18 @@ impl CommitCheckpointVerifiedError {
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&KnownBlock> {
         self.0.duplicate_location()
+    }
+
+    /// Returns the missing VCT supplied-root height for retryable root-fetch stalls.
+    pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
+        self.0.vct_supplied_root_unavailable_height()
+    }
+
+    /// Returns the height for any retryable VCT root stall (absent/evicted root, or one
+    /// not yet verifiable for lack of a buffered successor). See
+    /// [`ValidateContextError::vct_retryable_height`].
+    pub fn vct_retryable_height(&self) -> Option<block::Height> {
+        self.0.vct_retryable_height()
     }
 }
 
@@ -366,6 +398,23 @@ pub enum ValidateContextError {
     #[error("block parent not found in any chain, or not enough blocks in chain")]
     #[non_exhaustive]
     NotReadyToBeCommitted,
+
+    #[error(
+        "verified-commitment-trees fast path has no valid supplied root for height \
+         {height:?}: the note-commitment frontier is frozen, so this block cannot be \
+         committed until a verifiable root is fetched from a peer (retryable)"
+    )]
+    #[non_exhaustive]
+    VctSuppliedRootUnavailable { height: block::Height },
+
+    #[error(
+        "verified-commitment-trees fast path cannot yet verify the supplied root for height \
+         {height:?}: no successor block is buffered to confirm it against the header chain, and \
+         committing it unverified would persist a root that is only checked one block later \
+         (irreversibly, once on disk). Commit is deferred until the successor arrives (retryable)"
+    )]
+    #[non_exhaustive]
+    VctSuppliedRootAwaitingSuccessor { height: block::Height },
 
     #[error("block height {candidate_height:?} is lower than the current finalized height {finalized_tip_height:?}")]
     #[non_exhaustive]
@@ -597,6 +646,33 @@ pub enum ValidateContextError {
     },
 }
 
+impl ValidateContextError {
+    /// Returns the missing VCT supplied-root height for retryable root-fetch stalls.
+    ///
+    /// This is the subset of [`Self::vct_retryable_height`] that warrants a peer *refetch*:
+    /// the supplied root is absent or was evicted after failing verification, so a different
+    /// peer must supply a replacement. An await-successor stall ([`Self::vct_retryable_height`]
+    /// but not this) already has its root and only waits for the next block to be downloaded.
+    pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
+        match self {
+            ValidateContextError::VctSuppliedRootUnavailable { height } => Some(*height),
+            _ => None,
+        }
+    }
+
+    /// Returns the height for any retryable VCT root stall: either an absent/evicted supplied
+    /// root ([`Self::VctSuppliedRootUnavailable`]) or one not yet verifiable because no successor
+    /// is buffered to confirm it ([`Self::VctSuppliedRootAwaitingSuccessor`]). The write loop
+    /// parks and retries the same block for both; only the former additionally requests a refetch.
+    pub fn vct_retryable_height(&self) -> Option<block::Height> {
+        match self {
+            ValidateContextError::VctSuppliedRootUnavailable { height }
+            | ValidateContextError::VctSuppliedRootAwaitingSuccessor { height } => Some(*height),
+            _ => None,
+        }
+    }
+}
+
 impl From<sprout::tree::NoteCommitmentTreeError> for ValidateContextError {
     fn from(value: sprout::tree::NoteCommitmentTreeError) -> Self {
         ValidateContextError::NoteCommitmentTreeError(value.into())
@@ -656,5 +732,66 @@ mod tests {
             location: KnownBlock::BestChain,
         };
         assert_eq!(dup_err.misbehavior_score(), 0);
+    }
+
+    #[test]
+    fn checkpoint_error_exposes_retryable_vct_root_height() {
+        let height = Height(42);
+        let retryable: CommitCheckpointVerifiedError =
+            ValidateContextError::VctSuppliedRootUnavailable { height }.into();
+        assert_eq!(
+            retryable.vct_supplied_root_unavailable_height(),
+            Some(height),
+            "checkpoint commit errors expose retryable VCT root misses"
+        );
+
+        let non_retryable: CommitCheckpointVerifiedError =
+            ValidateContextError::NonSequentialBlock {
+                candidate_height: Height(5),
+                parent_height: Height(3),
+            }
+            .into();
+        assert_eq!(
+            non_retryable.vct_supplied_root_unavailable_height(),
+            None,
+            "unrelated validation errors are not treated as VCT root misses"
+        );
+        assert_eq!(
+            non_retryable.vct_retryable_height(),
+            None,
+            "unrelated validation errors are not retryable VCT stalls"
+        );
+    }
+
+    /// An await-successor stall is retryable (the write loop parks and re-commits) but is
+    /// *not* a refetch case: the root is present, only its successor is missing. So it must
+    /// surface through `vct_retryable_height` while `vct_supplied_root_unavailable_height`
+    /// (which gates the peer refetch) stays `None` — otherwise the committer would spam
+    /// pointless refetches for a root it already holds.
+    #[test]
+    fn await_successor_is_retryable_but_not_a_refetch() {
+        let height = Height(7);
+        let awaiting: CommitCheckpointVerifiedError =
+            ValidateContextError::VctSuppliedRootAwaitingSuccessor { height }.into();
+
+        assert_eq!(
+            awaiting.vct_retryable_height(),
+            Some(height),
+            "an await-successor stall is retryable",
+        );
+        assert_eq!(
+            awaiting.vct_supplied_root_unavailable_height(),
+            None,
+            "an await-successor stall must not trigger a peer refetch (the root is present)",
+        );
+
+        // The unavailable case is both retryable and a refetch trigger.
+        let unavailable: CommitCheckpointVerifiedError =
+            ValidateContextError::VctSuppliedRootUnavailable { height }.into();
+        assert_eq!(unavailable.vct_retryable_height(), Some(height));
+        assert_eq!(
+            unavailable.vct_supplied_root_unavailable_height(),
+            Some(height)
+        );
     }
 }

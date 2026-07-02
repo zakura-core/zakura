@@ -232,6 +232,7 @@ mod tests {
             (block::Height(2), &BLOCK_MAINNET_2_BYTES[..]),
             (block::Height(3), &BLOCK_MAINNET_3_BYTES[..]),
             (block::Height(4), &BLOCK_MAINNET_4_BYTES[..]),
+            (block::Height(5), &BLOCK_MAINNET_5_BYTES[..]),
         ]
         .into_iter()
         .find_map(|(height, bytes)| {

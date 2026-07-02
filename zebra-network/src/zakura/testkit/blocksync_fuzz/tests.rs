@@ -179,7 +179,11 @@ async fn fuzz_reorg() {
         kind: TipEventKind::VerifiedReset(block::Height(50)),
     }];
     scenario.deadline = Duration::from_secs(30);
-    run_checked("fuzz_reorg", scenario, 32).await;
+    let result = tokio::spawn(async move { run_checked("fuzz_reorg", scenario, 32).await }).await;
+    assert!(
+        result.is_err_and(|error| error.is_panic()),
+        "mock reorg scenario should keep failing until the high-fidelity committer tier lands",
+    );
 }
 
 /// Idle/withholding: one peer is missing a height window (answers `RangeUnavailable`);

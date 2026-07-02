@@ -72,6 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Use network protocol version 170160 as the NU6.3 minimum on Mainnet, Testnet,
+  and Regtest, matching Zebra's advertised current protocol version.
 - A peer upgraded from legacy TCP to Zakura is no longer re-dialed over legacy.
   The upgrade drops the legacy connection, so nothing refreshed the peer's
   `Responded` liveness; once it aged past `MIN_PEER_RECONNECTION_DELAY` the

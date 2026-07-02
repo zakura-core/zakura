@@ -120,16 +120,14 @@ impl Version {
                 170_150
             }
             (Mainnet, Nu6_2) => 170_150,
-            // TODO(NU6.3): these protocol versions are provisional, bumped above Nu6_2's
-            // 170_150. Update them when the real NU6.3 values are specified.
+            // TODO: these NU6.3 (Ironwood) and Nu7 protocol versions are provisional, bumped above
+            // Nu6_2's 170_150. Update them when the real values are specified.
             (Testnet(params), Nu6_3) if params.is_default_testnet() || params.is_regtest() => {
                 170_160
             }
-            (Mainnet, Nu6_3) => 170_170,
-            // TODO(NU7): these protocol versions are provisional, bumped above NU6.3's 170_170.
-            // Update them when the real NU7 values are specified.
-            (Testnet(params), Nu7) if params.is_default_testnet() || params.is_regtest() => 170_180,
-            (Mainnet, Nu7) => 170_190,
+            (Mainnet, Nu6_3) => 170_160,
+            (Testnet(params), Nu7) if params.is_default_testnet() || params.is_regtest() => 170_170,
+            (Mainnet, Nu7) => 170_180,
 
             // It should be fine to reject peers with earlier network protocol versions on custom testnets for now.
             (Testnet(_), _) => CURRENT_NETWORK_PROTOCOL_VERSION.0,
@@ -267,6 +265,24 @@ mod test {
                 );
             }
         }
+    }
+
+    #[test]
+    fn nu63_protocol_versions_match_current_version() {
+        let _init_guard = zebra_test::init();
+
+        assert_eq!(
+            Version::min_specified_for_upgrade(&Mainnet, Nu6_3),
+            CURRENT_NETWORK_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6_3),
+            CURRENT_NETWORK_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            Version::min_specified_for_upgrade(&Network::new_regtest(Default::default()), Nu6_3),
+            CURRENT_NETWORK_PROTOCOL_VERSION
+        );
     }
 
     #[test]

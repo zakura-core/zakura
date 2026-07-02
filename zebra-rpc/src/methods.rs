@@ -1362,27 +1362,24 @@ where
                 zebra_state::ReadResponse::BlockAndSize(block_and_size) => {
                     let (block, size) = block_and_size.ok_or_misc_error("Block not found")?;
                     let block_time = block.header.time;
-                    let transactions =
-                        block
-                            .transactions
-                            .iter()
-                            .map(|tx| {
-                                GetBlockTransaction::Object(Box::new(
-                                    TransactionObject::from_transaction(
-                                        tx.clone(),
-                                        Some(height),
-                                        Some(confirmations.try_into().expect(
-                                            "should be less than max block height, i32::MAX",
-                                        )),
-                                        &network,
-                                        Some(block_time),
-                                        Some(hash),
-                                        Some(true),
-                                        tx.hash(),
-                                    ),
-                                ))
-                            })
-                            .collect();
+                    let transactions = block
+                        .transactions
+                        .iter()
+                        .map(|tx| {
+                            GetBlockTransaction::Object(Box::new(
+                                TransactionObject::from_transaction(
+                                    tx.clone(),
+                                    Some(height),
+                                    Some(confirmations),
+                                    &network,
+                                    Some(block_time),
+                                    Some(hash),
+                                    Some(true),
+                                    tx.hash(),
+                                ),
+                            ))
+                        })
+                        .collect();
                     (transactions, Some(size))
                 }
                 _ => unreachable!("unmatched response to a transaction_ids_for_block request"),
@@ -1842,7 +1839,7 @@ where
                         AnyTx::Mined(mined) if in_best_chain => (
                             mined.tx.clone(),
                             Some(mined.height),
-                            Some(mined.confirmations),
+                            Some(mined.confirmations.into()),
                             Some(mined.block_time),
                         ),
                         _ => {
@@ -1885,7 +1882,7 @@ where
                                 TransactionObject::from_transaction(
                                     tx.tx.clone(),
                                     Some(tx.height),
-                                    Some(tx.confirmations),
+                                    Some(tx.confirmations.into()),
                                     &self.network,
                                     // TODO: Performance gain:
                                     // https://github.com/ZcashFoundation/zebra/pull/9458#discussion_r2059352752

@@ -1,4 +1,4 @@
-use super::{config::*, request::*, work_queue::WorkQueue, *};
+use super::{bbr::BbrState, config::*, request::*, work_queue::WorkQueue, *};
 use crate::zakura::{
     chain_frontier_from_parts, Frontier, FrontierUpdate, ServicePeerDirection, ServicePeerSnapshot,
     ZakuraBlockSyncCandidateState,
@@ -11,10 +11,6 @@ use crate::zakura::{
 /// [`MAX_BS_INFLIGHT_REQUESTS`]).
 // `MAX_BS_INFLIGHT_REQUESTS` is a `u32`, which fits in `usize` on supported targets.
 pub(super) const EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER: usize = MAX_BS_INFLIGHT_REQUESTS as usize;
-/// Minimum additive growth after a successful response.
-const MIN_OUTBOUND_WINDOW_SUCCESS_GROWTH: usize = 64;
-/// Fractional additive-increase divisor after a successful response.
-const OUTBOUND_WINDOW_SUCCESS_GROWTH_DIVISOR: usize = 8;
 
 /// Cached chain frontiers used by the block-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -151,6 +147,8 @@ pub(super) struct RoutineWiring {
     pub(super) received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
     pub(super) sequencer_input: mpsc::Sender<super::sequencer_task::SequencedBody>,
     pub(super) sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) sequencer_control:
+        mpsc::UnboundedSender<super::sequencer_task::SequencerControlInput>,
     pub(super) actions: mpsc::Sender<BlockSyncAction>,
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
     pub(super) view: watch::Receiver<super::sequencer_task::SequencerView>,
@@ -237,7 +235,7 @@ pub(super) struct BlockSyncState {
     /// servable range, dedup/covered are `in_flight`, and the floor is GC only.
     /// `Arc` so the state stays cheaply `Clone` and the queue is shared with the
     /// Sequencer task and the per-peer routines.
-    pub(super) work: Arc<WorkQueue>,
+    pub(super) work_queue: Arc<WorkQueue>,
     pub(super) budget: ByteBudget,
     pub(super) needed_heights: Vec<block::Height>,
     pub(super) status_refresh: RateMeter,
@@ -270,7 +268,7 @@ impl BlockSyncState {
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
-            work: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
+            work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
             needed_heights: Vec::new(),
             status_refresh: RateMeter::new(startup.config.status_refresh_interval),
@@ -297,72 +295,265 @@ impl BlockSyncState {
     }
 }
 
-/// Adaptive per-peer outbound request window + outstanding requests.
-///
-/// Carved out of the old `PeerBlockState` so the window math stays unit-testable
+/// Carved out of `PeerBlockState` so the window math stays unit-testable
 /// while the per-peer download state moves into the spawned
 /// [`PeerRoutine`](super::peer_routine) (per-peer routines). The routine embeds one of these.
 #[derive(Clone, Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
-    pub(super) outbound_request_window: usize,
-    pub(super) timeout_recovery_slots: usize,
     pub(super) outstanding: Vec<OutstandingBlockRange>,
+    /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller. Under
+    /// [`CwndUnit::Bytes`] the cwnd is itself a byte budget sourced from header size
+    /// hints (no fixed per-request byte weight), so there is no `nominal_request_bytes`.
+    bbr: BbrState,
+    /// Whether the cwnd budgets outstanding work in request slots or reserved bytes.
+    cwnd_unit: CwndUnit,
+    /// Deadline by which an active peer must send another accepted full block.
+    pub(super) block_liveness_deadline: Option<Instant>,
+    /// Last time this peer sent an accepted full block body.
+    pub(super) last_block_at: Option<Instant>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum LivenessOutcome {
+    Ok,
+    Disarm,
+    Disconnect,
 }
 
 impl DownloadWindow {
     pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
-        let max_inflight_requests = config.advertised_max_inflight_requests();
         Self {
-            max_inflight_requests,
-            outbound_request_window: usize::try_from(max_inflight_requests)
-                .expect("u32 max inflight requests fits in usize on supported targets"),
-            timeout_recovery_slots: 0,
+            max_inflight_requests: config.advertised_max_inflight_requests(),
             outstanding: Vec::new(),
+            bbr: BbrState::new(config),
+            cwnd_unit: config.bbr_cwnd_unit,
+            block_liveness_deadline: None,
+            last_block_at: None,
         }
+    }
+
+    pub(super) fn delivery_snapshot(&self, now: Instant) -> DeliverySnapshot {
+        self.bbr.delivery_snapshot(now)
+    }
+
+    /// Record a completed request into the BBR estimators (RTprop / BtlBw / delivered)
+    /// and advance the ProbeRtt phase machine. `delivered_bytes` is the request's total
+    /// delivered body bytes — under the single-block-per-request invariant
+    /// (`DEFAULT_BS_BLOCKS_PER_RESPONSE = 1`) this is the completing body's
+    /// `serialized_bytes`. Call after removing the completed request from `outstanding`,
+    /// so the in-flight measure reflects the post-completion queue depth.
+    pub(super) fn record_delivery(
+        &mut self,
+        now: Instant,
+        elapsed: Duration,
+        blocks: u32,
+        delivered_bytes: u64,
+        snapshot: DeliverySnapshot,
+    ) {
+        // The ProbeRtt drain check compares this against `min_cwnd`, so the in-flight
+        // measure MUST be in the cwnd's unit: request count under `Blocks`, reserved
+        // body bytes under `Bytes`. Passing the raw request count under `Bytes` made the
+        // drain check (`count <= min_cwnd_bytes`) trivially true, so the hold timer
+        // started before the byte queue had actually drained and the RTprop sample could
+        // still be contended.
+        let inflight = match self.cwnd_unit {
+            // `outstanding.len()` (a `usize` request count) widens to `u64` losslessly.
+            CwndUnit::Blocks => self.outstanding.len() as u64,
+            CwndUnit::Bytes => self.outstanding_reserved_bytes(),
+        };
+        self.bbr
+            .record_delivery(now, elapsed, blocks, delivered_bytes, inflight, snapshot);
+    }
+
+    /// The effective BBR cwnd as a **request count**, for diagnostics that compare
+    /// against the request-count hard cap (the periodic slot trace, cross-peer floor
+    /// bias). Under `Blocks` this is the cwnd directly; under `Bytes` it is the byte
+    /// cwnd divided by a representative body size, so it reads as "requests this peer's
+    /// byte window admits". The byte cwnd itself is available via
+    /// [`bbr_effective_cwnd_bytes`](Self::bbr_effective_cwnd_bytes).
+    pub(super) fn bbr_effective_cwnd(&self) -> usize {
+        match self.cwnd_unit {
+            CwndUnit::Blocks => self.bbr.effective_cwnd(),
+            CwndUnit::Bytes => {
+                let cwnd_bytes = self.bbr.effective_cwnd() as u64;
+                let rep = self.representative_body_bytes();
+                usize::try_from((cwnd_bytes / rep.max(1)).max(1)).unwrap_or(usize::MAX)
+            }
+        }
+    }
+
+    /// The effective byte cwnd under `Bytes` (`None` under `Blocks`), for tracing.
+    pub(super) fn bbr_effective_cwnd_bytes(&self) -> Option<u64> {
+        matches!(self.cwnd_unit, CwndUnit::Bytes).then(|| self.bbr.effective_cwnd() as u64)
+    }
+
+    /// A representative body size in bytes for converting a byte cwnd into a request
+    /// count: the mean reserved bytes across in-flight requests, falling back to the
+    /// per-block worst case when nothing is outstanding. Used only for diagnostics and
+    /// the floor-bypass byte bonus, never for admission.
+    fn representative_body_bytes(&self) -> u64 {
+        let outstanding = self.outstanding.len() as u64;
+        if outstanding == 0 {
+            return block::MAX_BLOCK_BYTES;
+        }
+        (self.outstanding_reserved_bytes() / outstanding).max(1)
+    }
+
+    /// The current RTprop estimate in milliseconds, for tracing.
+    pub(super) fn bbr_rtprop_ms(&self) -> Option<u64> {
+        self.bbr.rtprop_ms()
+    }
+
+    /// The current BtlBw estimate in milli-blocks/sec (blocks/sec × 1000), for tracing.
+    /// `None` under `Bytes`, where [`bbr_btlbw_bytes_per_sec`](Self::bbr_btlbw_bytes_per_sec)
+    /// is the meaningful rate.
+    pub(super) fn bbr_btlbw_milliblocks(&self) -> Option<u64> {
+        matches!(self.cwnd_unit, CwndUnit::Blocks)
+            .then(|| self.bbr.btlbw_milliblocks_per_sec())
+            .flatten()
+    }
+
+    /// The current BtlBw estimate in bytes/sec under `Bytes` (`None` under `Blocks`).
+    pub(super) fn bbr_btlbw_bytes_per_sec(&self) -> Option<u64> {
+        if !matches!(self.cwnd_unit, CwndUnit::Bytes) {
+            return None;
+        }
+        self.bbr
+            .btlbw_units_per_sec()
+            // A non-negative finite bytes/sec rate rounds into u64 for any real link.
+            .map(|rate| rate.round() as u64)
+    }
+
+    /// Bytes reserved across this peer's in-flight requests, for tracing the byte window
+    /// occupancy.
+    pub(super) fn bbr_inflight_bytes(&self) -> u64 {
+        self.outstanding_reserved_bytes()
+    }
+
+    /// Total delivered through this peer's completed requests, for tracing — blocks
+    /// under `Blocks`, bytes under `Bytes`.
+    pub(super) fn bbr_delivered(&self) -> u64 {
+        self.bbr.delivered()
+    }
+
+    /// The current BBR phase as a numeric code (0 = ProbeBw, 1 = ProbeRtt), for tracing.
+    pub(super) fn bbr_phase_code(&self) -> u64 {
+        self.bbr.phase_code()
+    }
+
+    /// The smoothed request round-trip in milliseconds the delay-gradient tracks.
+    pub(super) fn bbr_smoothed_elapsed_ms(&self) -> Option<u64> {
+        self.bbr.smoothed_elapsed_ms()
+    }
+
+    /// The delay-gradient cwnd ceiling in blocks once it binds (`None` while unbounded).
+    pub(super) fn bbr_delay_cap(&self) -> Option<u64> {
+        self.bbr
+            .delay_cap()
+            .map(|cap| u64::try_from(cap).unwrap_or(u64::MAX))
     }
 
     pub(super) fn available_slots(&self) -> usize {
-        let hard_capacity = self.hard_outbound_capacity();
-        let adaptive_limit = hard_capacity.min(self.outbound_request_window);
-        let adaptive_slots = adaptive_limit.saturating_sub(self.outstanding.len());
-        if adaptive_slots > 0 {
-            return adaptive_slots;
+        self.available_slots_with_bonus(0)
+    }
+
+    /// Available headroom allowing `bonus` extra in-flight requests beyond the BBR cwnd,
+    /// still clamped to the peer's advertised hard cap. `bonus == 0` is the normal
+    /// (above-floor) capacity used by [`available_slots`]; a small positive `bonus` is
+    /// the floor bypass — it lets the lowest missing height be fetched even when the
+    /// peer is saturated at its cwnd, without ever exceeding the advertised inflight.
+    ///
+    /// The return value is non-zero exactly when there is room for at least one more
+    /// request; callers use it as a gate, not an absolute count. Under
+    /// [`CwndUnit::Bytes`] the cwnd is itself a byte budget (`BtlBw_bytes × RTprop ×
+    /// gain`, from header size hints) compared against reserved body bytes, so a peer
+    /// serving large bodies holds fewer in flight and a peer serving small bodies holds
+    /// many — the in-flight *request* count falls out of `cwnd_bytes / body_size`. The
+    /// controller is unit-agnostic; only this comparison differs — the seam that makes
+    /// switching units a small change.
+    pub(super) fn available_slots_with_bonus(&self, bonus: usize) -> usize {
+        // BBR-lite is the sole congestion controller: cap in-flight at the BDP-derived
+        // cwnd so a peer's queue stays at ~one BDP and head-of-line latency tracks
+        // RTprop. The floor bypass adds `bonus` on top.
+        let hard_cap = self.hard_outbound_capacity();
+        match self.cwnd_unit {
+            CwndUnit::Blocks => {
+                let cwnd_slots = self
+                    .bbr
+                    .effective_cwnd()
+                    .saturating_add(bonus)
+                    .min(hard_cap);
+                cwnd_slots.saturating_sub(self.outstanding.len())
+            }
+            CwndUnit::Bytes => {
+                // The peer's advertised request-count cap still binds in byte mode: a peer
+                // serving tiny bodies must never be issued more in-flight *requests* than it
+                // advertised it will service, however much byte headroom the cwnd still
+                // shows. Once the request count reaches the hard cap there is no slot,
+                // regardless of bytes — mirroring the blocks-unit ceiling (review fix F2).
+                let outstanding = self.outstanding.len();
+                if outstanding >= hard_cap {
+                    return 0;
+                }
+                // The cwnd is already a byte budget. The floor bypass grants `bonus`
+                // *representative* bodies of extra byte headroom — sized to the recent
+                // per-request reservation, NOT the 2 MB worst case — so a starved floor
+                // can still be fetched when the byte window is full without ballooning
+                // the in-flight bytes far past the cwnd (which would defeat the byte
+                // denomination's head-of-line bound). The take is still count-capped to
+                // one block and passes the real `ByteBudget` reservation.
+                let reserved = self.outstanding_reserved_bytes();
+                let representative = self.representative_body_bytes();
+                let bonus_bytes = (bonus as u64).saturating_mul(representative);
+                let cwnd_bytes = (self.bbr.effective_cwnd() as u64).saturating_add(bonus_bytes);
+                usize::try_from(cwnd_bytes.saturating_sub(reserved)).unwrap_or(usize::MAX)
+            }
         }
-
-        self.timeout_recovery_slots
-            .min(hard_capacity.saturating_sub(self.outstanding.len()))
     }
 
-    pub(super) fn reduce_outbound_window_after_timeout(&mut self) {
-        self.outbound_request_window = self.outbound_request_window.saturating_div(2).max(1);
-        self.timeout_recovery_slots = self
-            .timeout_recovery_slots
-            .saturating_add(1)
-            .min(self.hard_outbound_capacity());
+    /// Bytes reserved across this peer's in-flight requests (the per-request size
+    /// estimates of heights not yet received). Recomputed on demand — the byte unit is
+    /// experimental; a hot path would maintain a running counter instead.
+    fn outstanding_reserved_bytes(&self) -> u64 {
+        self.outstanding.iter().fold(0u64, |acc, range| {
+            acc.saturating_add(range.reserved_bytes())
+        })
     }
 
-    pub(super) fn increase_outbound_window_after_success(&mut self) {
-        let max_window = self.hard_outbound_capacity();
-        if self.outbound_request_window < max_window {
-            let growth = self
-                .outbound_request_window
-                .checked_div(OUTBOUND_WINDOW_SUCCESS_GROWTH_DIVISOR)
-                .unwrap_or(0)
-                .max(MIN_OUTBOUND_WINDOW_SUCCESS_GROWTH);
-            self.outbound_request_window = self
-                .outbound_request_window
-                .saturating_add(growth)
-                .min(max_window);
+    /// Apply the BBR cwnd dip on a real request timeout (one multiplicative dip,
+    /// bounded by the minimum cwnd).
+    pub(super) fn record_timeout(&mut self) {
+        self.bbr.dip_on_timeout();
+    }
+
+    pub(super) fn arm_liveness(&mut self, now: Instant, timeout: Duration) {
+        if self.block_liveness_deadline.is_none() {
+            self.block_liveness_deadline = Some(now + timeout);
         }
     }
 
-    pub(super) fn record_outbound_request_scheduled(&mut self) {
-        let adaptive_limit = self
-            .hard_outbound_capacity()
-            .min(self.outbound_request_window);
-        if self.outstanding.len() >= adaptive_limit && self.timeout_recovery_slots > 0 {
-            self.timeout_recovery_slots = self.timeout_recovery_slots.saturating_sub(1);
+    pub(super) fn note_block_progress(&mut self, now: Instant, timeout: Duration) {
+        self.last_block_at = Some(now);
+        self.block_liveness_deadline = if self.outstanding.is_empty() {
+            None
+        } else {
+            Some(now + timeout)
+        };
+    }
+
+    pub(super) fn disarm_liveness_if_idle(&mut self) {
+        if self.outstanding.is_empty() {
+            self.block_liveness_deadline = None;
+        }
+    }
+
+    pub(super) fn check_liveness(&self, now: Instant) -> LivenessOutcome {
+        match self.block_liveness_deadline {
+            None => LivenessOutcome::Ok,
+            Some(deadline) if now < deadline => LivenessOutcome::Ok,
+            Some(_) if self.outstanding.is_empty() => LivenessOutcome::Disarm,
+            Some(_) => LivenessOutcome::Disconnect,
         }
     }
 
@@ -397,9 +588,9 @@ pub(super) struct PeerBlockState {
     pub(super) direction: ServicePeerDirection,
     /// Per-peer rate meter for the reactor's `Status` *advertisement* refresh
     /// (serving-tip change broadcast + retry to peers that have not acknowledged
-    /// our Status). The previous `unsolicited` meter was dual-use; its inbound-status
-    /// *reply* half moved to the routine's `status_reply_meter`. This half stays
-    /// reactor-side because the reactor owns serving-tip advertisement.
+    /// our Status). The inbound-status *reply* half lives on the routine's
+    /// `status_reply_meter`; this half stays reactor-side because the reactor owns
+    /// serving-tip advertisement.
     pub(super) refresh_meter: RateMeter,
     pub(super) served_blocks_inflight: u32,
     pub(super) served_block_requests: VecDeque<(block::Height, Instant)>,
@@ -454,23 +645,31 @@ pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
     pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
-    pub(super) received: HashSet<block::Height>,
+    pub(super) delivery_snapshot: DeliverySnapshot,
+    pub(super) delivered_bytes: u64,
+    pub(super) received: ReceivedBlockTracker,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(super) struct DeliverySnapshot {
+    pub(super) delivered: u64,
+    pub(super) delivered_at: Instant,
 }
 
 impl OutstandingBlockRange {
-    /// Worst-case bytes still reserved for this request: the per-block worst case
-    /// for every requested height not yet received. The reservation for a request
-    /// only ever shrinks, so releasing this (on timeout/disconnect/short response)
-    /// never over-releases bytes that were already handed to the reorder buffer.
+    /// Bytes still reserved for this request: the sum of the per-height size
+    /// estimates for every requested height not yet received. Each received body
+    /// shrinks its estimate toward the actual size, so releasing this (on
+    /// timeout/disconnect/short response) never over-releases bytes already handed
+    /// to the reorder buffer.
     pub(super) fn reserved_bytes(&self) -> u64 {
-        let outstanding = self
-            .request
-            .expected_hashes
-            .len()
-            .saturating_sub(self.received.len());
-        // `outstanding` is a count bounded by `MAX_BS_BLOCKS_PER_REQUEST`, so the
-        // product cannot overflow `u64`; `saturating_mul` is belt-and-suspenders.
-        BS_PER_BLOCK_WORST_CASE_BYTES.saturating_mul(outstanding as u64)
+        self.request
+            .expected_blocks
+            .iter()
+            .filter(|expected| !self.has_received(expected.height))
+            .fold(0u64, |acc, expected| {
+                acc.saturating_add(expected.estimated_bytes)
+            })
     }
 
     pub(super) fn estimated_bytes_for_height(&self, height: block::Height) -> Option<u64> {
@@ -478,29 +677,152 @@ impl OutstandingBlockRange {
     }
 
     pub(super) fn has_received(&self, height: block::Height) -> bool {
-        self.received.contains(&height)
+        self.request
+            .offset_for_height(height)
+            .is_some_and(|offset| self.received.contains_offset(offset))
     }
 
     pub(super) fn mark_received(&mut self, height: block::Height) {
-        self.received.insert(height);
+        if let Some(offset) = self.request.offset_for_height(height) {
+            self.received.insert_offset(offset);
+        }
+    }
+
+    pub(super) fn record_body_bytes(&mut self, bytes: u64) {
+        self.delivered_bytes = self.delivered_bytes.saturating_add(bytes);
     }
 
     /// Mark every requested height at or below `tip` as received and return the
-    /// worst-case bytes that those newly-received heights had reserved, so the
-    /// caller releases exactly the reservation those heights still held.
+    /// sum of the per-height size estimates those newly-received heights still
+    /// held, so the caller releases exactly the reservation those heights held.
     pub(super) fn mark_received_through(&mut self, tip: block::Height) -> u64 {
-        let newly_received = self
-            .request
-            .expected_hashes
+        self.request
+            .expected_blocks
             .iter()
-            .filter(|(height, _)| *height <= tip && self.received.insert(*height))
-            .count();
-        // Bounded by `MAX_BS_BLOCKS_PER_REQUEST`; cannot overflow `u64`.
-        BS_PER_BLOCK_WORST_CASE_BYTES.saturating_mul(newly_received as u64)
+            .filter(|expected| {
+                expected.height <= tip
+                    && self
+                        .request
+                        .offset_for_height(expected.height)
+                        .is_some_and(|offset| self.received.insert_offset(offset))
+            })
+            .fold(0u64, |acc, expected| {
+                acc.saturating_add(expected.estimated_bytes)
+            })
     }
 
     pub(super) fn is_complete(&self) -> bool {
-        self.received.len() == self.request.expected_hashes.len()
+        self.received.len() == self.request.expected_blocks.len()
+    }
+}
+
+/// Pure per-height byte-accounting state.
+///
+/// The shared [`ByteBudget`] is just the atomic sink. This ledger owns the
+/// lifecycle arithmetic for one requested height:
+/// `Reserved(estimate) -> Held(actual) -> Released`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum BlockBudgetLedger {
+    Reserved(u64),
+    Held(u64),
+    Released,
+}
+
+impl BlockBudgetLedger {
+    pub(super) fn reserved(estimate: u64) -> Self {
+        Self::Reserved(estimate)
+    }
+
+    pub(super) fn current_charge(self) -> u64 {
+        match self {
+            Self::Reserved(bytes) | Self::Held(bytes) => bytes,
+            Self::Released => 0,
+        }
+    }
+
+    pub(super) fn release_reserved(&mut self) -> u64 {
+        let released = match *self {
+            Self::Reserved(bytes) => bytes,
+            Self::Held(_) | Self::Released => 0,
+        };
+        *self = Self::Released;
+        released
+    }
+
+    pub(super) fn reserved_charge(self) -> u64 {
+        match self {
+            Self::Reserved(bytes) => bytes,
+            Self::Held(_) | Self::Released => 0,
+        }
+    }
+
+    pub(super) fn is_reserved(self) -> bool {
+        matches!(self, Self::Reserved(_))
+    }
+
+    /// Move a reserved height to held bytes and return the signed budget delta.
+    ///
+    /// Positive means charge more bytes; negative means release bytes.
+    pub(super) fn settle(&mut self, actual: u64) -> i128 {
+        match *self {
+            Self::Reserved(reserved) => {
+                *self = Self::Held(actual);
+                i128::from(actual) - i128::from(reserved)
+            }
+            Self::Released => 0,
+            Self::Held(_) => 0,
+        }
+    }
+
+    /// Release the current charge exactly once.
+    pub(super) fn release(&mut self) -> u64 {
+        let charge = self.current_charge();
+        *self = Self::Released;
+        charge
+    }
+}
+
+/// Number of distinct request offsets the [`ReceivedBlockTracker`] bitset can hold —
+/// one per bit of its `u128`.
+const RECEIVED_TRACKER_OFFSET_CAPACITY: u32 = u128::BITS;
+
+// A request range carries one received-offset bit per requested height (offsets
+// `0..count`). If the advertised block-count cap ever exceeded the bitset width,
+// `bit_for_offset` would return `None` for the overflowing heights, so they could
+// never be marked received, `is_complete()` would be unreachable, and the range would
+// wedge (its reservation never released). Couple the two so a future cap bump that
+// outgrows the bitset fails to compile instead of silently wedging.
+const _: () = assert!(MAX_BS_BLOCKS_PER_REQUEST <= RECEIVED_TRACKER_OFFSET_CAPACITY);
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ReceivedBlockTracker {
+    bits: u128,
+    count: usize,
+}
+
+impl ReceivedBlockTracker {
+    pub(super) fn len(&self) -> usize {
+        self.count
+    }
+
+    fn contains_offset(&self, offset: u32) -> bool {
+        Self::bit_for_offset(offset).is_some_and(|bit| self.bits & bit != 0)
+    }
+
+    fn insert_offset(&mut self, offset: u32) -> bool {
+        let Some(bit) = Self::bit_for_offset(offset) else {
+            return false;
+        };
+        if self.bits & bit != 0 {
+            return false;
+        }
+        self.bits |= bit;
+        self.count = self.count.saturating_add(1);
+        true
+    }
+
+    fn bit_for_offset(offset: u32) -> Option<u128> {
+        1u128.checked_shl(offset)
     }
 }
 

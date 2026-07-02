@@ -39,8 +39,8 @@ const MIN_SYNTHETIC_TXS: usize = 1;
 const MAX_SYNTHETIC_TXS: usize = 16;
 
 #[derive(Copy, Clone, Debug, Default)]
-struct SyntheticBlockShape {
-    target_block_bytes: Option<usize>,
+pub(crate) struct SyntheticBlockShape {
+    pub(crate) target_block_bytes: Option<usize>,
 }
 
 impl SyntheticBlockShape {
@@ -58,14 +58,14 @@ impl SyntheticBlockShape {
 }
 
 #[derive(Clone)]
-struct SyntheticBlockCorpus {
+pub(crate) struct SyntheticBlockCorpus {
     blocks: Arc<Vec<Arc<block::Block>>>,
     sizes: Arc<Vec<usize>>,
     by_hash: Arc<HashMap<block::Hash, block::Height>>,
 }
 
 impl SyntheticBlockCorpus {
-    fn generate(count: u32, seed: u64, shape: SyntheticBlockShape) -> Self {
+    pub(crate) fn generate(count: u32, seed: u64, shape: SyntheticBlockShape) -> Self {
         let template = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let fixed_tx_count = shape.fixed_tx_count(&template);
         let mut blocks = Vec::with_capacity(usize::try_from(count).expect("u32 fits usize"));
@@ -96,37 +96,41 @@ impl SyntheticBlockCorpus {
         }
     }
 
-    fn target_height(&self) -> block::Height {
+    pub(crate) fn target_height(&self) -> block::Height {
         block::Height(
             u32::try_from(self.blocks.len()).expect("synthetic corpus length came from u32"),
         )
     }
 
-    fn tip_hash(&self) -> block::Hash {
+    pub(crate) fn tip_hash(&self) -> block::Hash {
         self.block_at(self.target_height())
             .map(|block| block.hash())
             .unwrap_or_else(mainnet_genesis_hash)
     }
 
-    fn block_at(&self, height: block::Height) -> Option<Arc<block::Block>> {
+    pub(crate) fn block_at(&self, height: block::Height) -> Option<Arc<block::Block>> {
         let index = height.0.checked_sub(1)?;
         self.blocks
             .get(usize::try_from(index).expect("u32 fits usize"))
             .cloned()
     }
 
-    fn size_at(&self, height: block::Height) -> Option<usize> {
+    pub(crate) fn size_at(&self, height: block::Height) -> Option<usize> {
         let index = height.0.checked_sub(1)?;
         self.sizes
             .get(usize::try_from(index).expect("u32 fits usize"))
             .copied()
     }
 
-    fn height_for_hash(&self, hash: block::Hash) -> Option<block::Height> {
+    pub(crate) fn height_for_hash(&self, hash: block::Hash) -> Option<block::Height> {
         self.by_hash.get(&hash).copied()
     }
 
-    fn metas_between(&self, start: block::Height, end: block::Height) -> Vec<BlockSyncBlockMeta> {
+    pub(crate) fn metas_between(
+        &self,
+        start: block::Height,
+        end: block::Height,
+    ) -> Vec<BlockSyncBlockMeta> {
         (start.0..=end.0)
             .filter_map(|height| {
                 let height = block::Height(height);
@@ -141,7 +145,7 @@ impl SyntheticBlockCorpus {
             .collect()
     }
 
-    fn blocks_in_range(
+    pub(crate) fn blocks_in_range(
         &self,
         start: block::Height,
         count: u32,
@@ -168,7 +172,7 @@ impl SyntheticBlockCorpus {
 }
 
 #[derive(Clone)]
-struct MockApplyFrontier {
+pub(crate) struct MockApplyFrontier {
     inner: Arc<StdMutex<MockApplyFrontierState>>,
     corpus: SyntheticBlockCorpus,
 }
@@ -180,13 +184,13 @@ struct MockApplyFrontierState {
 }
 
 #[derive(Copy, Clone, Debug)]
-struct MockApplyOutcome {
-    result: BlockApplyResult,
-    frontiers: BlockSyncFrontiers,
+pub(crate) struct MockApplyOutcome {
+    pub(crate) result: BlockApplyResult,
+    pub(crate) frontiers: BlockSyncFrontiers,
 }
 
 impl MockApplyFrontier {
-    fn new(corpus: SyntheticBlockCorpus) -> Self {
+    pub(crate) fn new(corpus: SyntheticBlockCorpus) -> Self {
         Self {
             inner: Arc::new(StdMutex::new(MockApplyFrontierState {
                 frontier: block::Height(0),
@@ -196,7 +200,7 @@ impl MockApplyFrontier {
         }
     }
 
-    fn apply(&self, block: &block::Block) -> MockApplyOutcome {
+    pub(crate) fn apply(&self, block: &block::Block) -> MockApplyOutcome {
         let height = block
             .coinbase_height()
             .expect("synthetic block has a coinbase height");
@@ -229,6 +233,34 @@ impl MockApplyFrontier {
                 verified_block_tip: state.frontier,
                 verified_block_hash: state.frontier_hash,
             },
+        }
+    }
+
+    /// Roll the mock commit frontier back to `height` (a reorg). Only ever lowers the
+    /// frontier: a `height` at or above the current frontier is a no-op, so a reset to
+    /// a height the node has not yet committed cannot punch a gap in the committed
+    /// prefix. After a reset the blocks above `height` are re-accepted as the node
+    /// re-downloads them, modelling re-verification.
+    pub(crate) fn reset_to(&self, height: block::Height) -> BlockSyncFrontiers {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("mock apply frontier mutex is not poisoned");
+        if height < state.frontier {
+            state.frontier = height;
+            state.frontier_hash = if height == block::Height(0) {
+                mainnet_genesis_hash()
+            } else {
+                self.corpus
+                    .block_at(height)
+                    .map(|block| block.hash())
+                    .unwrap_or_else(mainnet_genesis_hash)
+            };
+        }
+        BlockSyncFrontiers {
+            finalized_height: state.frontier,
+            verified_block_tip: state.frontier,
+            verified_block_hash: state.frontier_hash,
         }
     }
 }
@@ -744,7 +776,7 @@ fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
     Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
 }
 
-fn mainnet_genesis_hash() -> block::Hash {
+pub(crate) fn mainnet_genesis_hash() -> block::Hash {
     mainnet_block(&BLOCK_MAINNET_GENESIS_BYTES).hash()
 }
 

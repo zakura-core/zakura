@@ -188,9 +188,7 @@ impl GossipNode {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use super::super::await_until;
+    use super::super::{await_until, TEST_NET_TIMEOUT};
     use super::*;
 
     #[tokio::test]
@@ -209,21 +207,17 @@ mod tests {
         }
 
         // Let every accept side register its inbound connection before flooding.
-        await_until(
-            "every node wired into the line",
-            Duration::from_secs(5),
-            || {
-                // Endpoints 0 and 4 have one neighbour; the rest have two.
-                nodes.iter().enumerate().all(|(index, _)| {
-                    let expected = if index == 0 || index == nodes.len() - 1 {
-                        1
-                    } else {
-                        2
-                    };
-                    conn_count(&nodes[index]) >= expected
-                })
-            },
-        )
+        await_until("every node wired into the line", TEST_NET_TIMEOUT, || {
+            // Endpoints 0 and 4 have one neighbour; the rest have two.
+            nodes.iter().enumerate().all(|(index, _)| {
+                let expected = if index == 0 || index == nodes.len() - 1 {
+                    1
+                } else {
+                    2
+                };
+                conn_count(&nodes[index]) >= expected
+            })
+        })
         .await?;
 
         let payload = b"flood-sub-hello".to_vec();
@@ -234,7 +228,7 @@ mod tests {
             let payload = payload.clone();
             await_until(
                 format!("gossip reaches node {index}"),
-                Duration::from_secs(5),
+                TEST_NET_TIMEOUT,
                 || recorder.contains_payload(GOSSIP_STREAM_KIND, &payload),
             )
             .await?;

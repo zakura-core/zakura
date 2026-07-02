@@ -41,6 +41,10 @@ progress-bar = [
 proptest-impl = ["proptest", "proptest-derive", "zebra-chain/proptest-impl"]
 zakura-testkit = []
 
+# Exposes an offline benchmark helper for the block-sync Sequencer
+# (`zakura::spawn_bench_sequencer`), used by zebra-replay-bench. Not for production.
+internal-bench = []
+
 [dependencies]
 bitflags = { workspace = true }
 blake2b_simd = { workspace = true }

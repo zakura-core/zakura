@@ -528,6 +528,7 @@ impl Drop for ZakuraTestNode {
 
 #[cfg(test)]
 mod tests {
+    use super::super::TEST_NET_TIMEOUT;
     use super::*;
 
     #[tokio::test]
@@ -563,10 +564,10 @@ mod tests {
             .await
             .expect("default test node spawns");
 
-        node.connect_native(&peer1, Duration::from_secs(5))
+        node.connect_native(&peer1, TEST_NET_TIMEOUT)
             .await
             .expect("first same-IP outbound peer registers under per-IP cap 1");
-        let second = node.connect_native(&peer2, Duration::from_secs(5)).await;
+        let second = node.connect_native(&peer2, TEST_NET_TIMEOUT).await;
         assert!(
             second.is_err(),
             "second same-IP outbound dial must be rejected under the production \
@@ -599,10 +600,10 @@ mod tests {
             .await
             .expect("opt-out test node spawns");
 
-        node.connect_native(&peer1, Duration::from_secs(5))
+        node.connect_native(&peer1, TEST_NET_TIMEOUT)
             .await
             .expect("first same-IP peer registers with raised per-IP cap");
-        node.connect_native(&peer2, Duration::from_secs(5))
+        node.connect_native(&peer2, TEST_NET_TIMEOUT)
             .await
             .expect("second same-IP peer registers with raised per-IP cap");
 

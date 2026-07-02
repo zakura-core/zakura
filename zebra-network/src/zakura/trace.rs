@@ -131,10 +131,14 @@ pub mod block_sync_trace {
     pub const SEND_ELAPSED_MS: &str = "send_elapsed_ms";
     /// Commit result label (`committed`, `duplicate`, `rejected`, `timed_out`).
     pub const RESULT: &str = "result";
-    /// Reactor-local verifier submission token.
-    pub const APPLY_TOKEN: &str = "apply_token";
     /// Bounded reason field.
     pub const REASON: &str = "reason";
+    /// Error detail field.
+    pub const ERROR: &str = "error";
+    /// Block apply token field.
+    pub const APPLY_TOKEN: &str = "apply_token";
+    /// Scheduler/query lower bound for block body requests.
+    pub const REQUEST_FLOOR: &str = "request_floor";
     /// Highest contiguous body height already submitted for apply.
     pub const BODY_DOWNLOAD_FLOOR: &str = "body_download_floor";
     /// First height not yet in the contiguous body-download floor.
@@ -218,6 +222,8 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_CONNECTED: &str = "block_peer_connected";
     /// Block-sync peer disconnected from the reactor.
     pub const BLOCK_PEER_DISCONNECTED: &str = "block_peer_disconnected";
+    /// Block-sync peer rejected for a protocol/liveness reason.
+    pub const BLOCK_PEER_PROTOCOL_REJECT: &str = "block_peer_protocol_reject";
     /// Body range request sent to a peer.
     pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
     /// Reactor accepted an inbound event.
@@ -250,6 +256,16 @@ pub mod block_sync_trace {
     pub const BLOCK_WORK_EXTENDED: &str = "block_work_extended";
     /// A peer claimed a contiguous chunk of pending work for issuance.
     pub const BLOCK_WORK_TAKEN: &str = "block_work_taken";
+    /// A `try_fill` pass ended having issued no request: the routine went idle this wake.
+    /// Carries [`FILL_STOP_REASON`] plus the slot/budget/work snapshot so a trace can
+    /// attribute carrier idle ("bubble") time to a cause rather than inferring it.
+    pub const BLOCK_FILL_STOP: &str = "block_fill_stop";
+    /// Why a `try_fill` pass stopped issuing requests (`no_status` / `cwnd_saturated` /
+    /// `no_work` / `lookahead_cap` / `retry_avoid` / `budget` / `outbound_full` /
+    /// `send_error` / `internal`).
+    pub const FILL_STOP_REASON: &str = "fill_stop_reason";
+    /// Requests this `try_fill` pass issued before stopping (0 = a candidate bubble).
+    pub const FILL_SENT: &str = "fill_sent";
     /// Verified body frontier advanced from state.
     pub const BLOCK_FRONTIERS_CHANGED: &str = "block_frontiers_changed";
     /// Chain tip reset rolled the body frontier back.
@@ -390,6 +406,18 @@ pub mod commit_state_trace {
     pub const BEST_HEADER_TIP: &str = "best_header_tip";
     /// Elapsed milliseconds field.
     pub const ELAPSED_MS: &str = "elapsed_ms";
+    /// Diagnostic attribution of why a commit was still pending at the stall deadline
+    /// (see [`COMMIT_STALL_CONTIGUOUS_HEAD`] / [`COMMIT_STALL_BEHIND_PREFIX`]). Purely a
+    /// trace label — it never gates the commit.
+    pub const COMMIT_STALL_REASON: &str = "commit_stall_reason";
+    /// Highest contiguously-committed height the committer had reached at the stall.
+    pub const COMMITTED_MARKER: &str = "committed_marker";
+    /// Highest height the committer had fired a commit for at the stall (submission
+    /// high-water — lets analysis see whether the range above the stalled block was
+    /// even submitted to the verifier yet).
+    pub const FIRED_HIGH_WATER: &str = "fired_high_water";
+    /// Number of fired-but-unresolved commits at the stall (concurrency / batch depth).
+    pub const COMMITS_IN_FLIGHT: &str = "commits_in_flight";
     /// Peer field.
     pub const PEER: &str = "peer";
     /// Queue length field.
@@ -417,6 +445,15 @@ pub mod commit_state_trace {
     pub const COMMIT_START: &str = "commit_start";
     /// Verifier commit exceeded the driver timeout but is still being awaited.
     pub const COMMIT_STALLED: &str = "commit_stalled";
+    /// [`COMMIT_STALL_REASON`] value: the committed tip sat immediately below the stalled
+    /// block, so it was the contiguous head — the gate is downstream of submission (the
+    /// checkpoint batch above it is still filling in the verifier, or verify+persist on
+    /// the head is slow). This is the "make commit faster" signal.
+    pub const COMMIT_STALL_CONTIGUOUS_HEAD: &str = "contiguous_head";
+    /// [`COMMIT_STALL_REASON`] value: a lower contiguous block had not committed yet, so
+    /// the stalled block was blocked behind the un-committed prefix (floor / range
+    /// head-of-line).
+    pub const COMMIT_STALL_BEHIND_PREFIX: &str = "behind_committed_prefix";
     /// Verifier commit finished.
     pub const COMMIT_FINISH: &str = "commit_finish";
     /// Post-commit frontier query started.

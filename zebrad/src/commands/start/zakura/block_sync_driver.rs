@@ -32,7 +32,7 @@ use super::{
 };
 
 pub(crate) const ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration =
-    Duration::from_secs(5);
+    Duration::from_millis(200);
 const ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS: usize = 24;
 pub(crate) const ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW: u32 = 262_144;
 
@@ -586,12 +586,21 @@ pub(crate) fn coalesce_ready_needed_block_queries(
         }
     }
 
-    latest_query.map(
-        |(verified_block_tip, best_header_tip)| BlockSyncAction::QueryNeededBlocks {
+    let latest_query = latest_query.map(|(verified_block_tip, best_header_tip)| {
+        BlockSyncAction::QueryNeededBlocks {
             verified_block_tip,
             best_header_tip,
-        },
-    )
+        }
+    });
+
+    if !deferred_actions.is_empty() {
+        if let Some(query) = latest_query {
+            deferred_actions.push_back(query);
+        }
+        return None;
+    }
+
+    latest_query
 }
 
 pub(crate) fn coalesce_stale_needed_block_queries(

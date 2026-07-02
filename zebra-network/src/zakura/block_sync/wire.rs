@@ -172,19 +172,41 @@ impl BlockSyncMessage {
 
     /// Decode this message from a Zakura frame after checking flags and type agreement.
     pub fn decode_frame(frame: Frame) -> Result<Self, BlockSyncWireError> {
+        Self::decode_frame_with_raw_block_payload(frame).map(|(message, _)| message)
+    }
+
+    /// Decode this message and return the raw frame payload for block bodies.
+    ///
+    /// The returned raw payload includes the stream-6 message type byte. Keeping
+    /// the whole payload lets the decoder move the frame allocation into the
+    /// reorder buffer without copying; consumers skip
+    /// [`BLOCK_SYNC_MESSAGE_TYPE_BYTES`] before deserializing the block body.
+    pub(super) fn decode_frame_with_raw_block_payload(
+        frame: Frame,
+    ) -> Result<(Self, Option<Arc<[u8]>>), BlockSyncWireError> {
         if frame.flags != 0 {
             return Err(BlockSyncWireError::UnsupportedFlags(frame.flags));
         }
-        let message = Self::decode(&frame.payload)?;
         let frame_message_type = u8::try_from(frame.message_type)
             .map_err(|_| BlockSyncWireError::UnknownFrameMessageType(frame.message_type))?;
+
+        // If this is a block message, keep the original raw block payload as well;
+        // it can be stored in compact form in the reorder backlog.
+        let (message, raw_block_payload) = if frame_message_type == MSG_BS_BLOCK {
+            let raw_block_payload = Arc::<[u8]>::from(frame.payload.into_boxed_slice());
+            let message = Self::decode(&raw_block_payload)?;
+            (message, Some(raw_block_payload))
+        } else {
+            (Self::decode(&frame.payload)?, None)
+        };
+
         if frame_message_type != message.message_type() {
             return Err(BlockSyncWireError::MismatchedFrameMessageType {
                 frame: frame.message_type,
                 payload: message.message_type(),
             });
         }
-        Ok(message)
+        Ok((message, raw_block_payload))
     }
 
     /// Exact serialized length of a `Block` body, derived from the frame payload

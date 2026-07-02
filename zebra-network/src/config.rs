@@ -1050,6 +1050,15 @@ impl<'de> Deserialize<'de> for Config {
             non_zero_config_field.filter(|config_value| config_value > &0).unwrap_or(default_config_value)
         });
 
+        // Clamp the in-flight byte budget up to the checkpoint-range floor (with a
+        // warning) rather than rejecting too-small configs, so older configs keep
+        // starting while checkpoint sync stays deadlock-free.
+        let mut zakura = zakura;
+        zakura.block_sync.clamp_inflight_block_bytes_to_floor();
+        zakura.block_sync.validate().map_err(|error| {
+            de::Error::custom(format!("invalid zakura.block_sync config: {error}"))
+        })?;
+
         Ok(Config {
             listen_addr: canonical_socket_addr(listen_addr),
             external_addr: external_socket_addr,

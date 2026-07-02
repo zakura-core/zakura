@@ -736,6 +736,18 @@ mod tests {
                 .finalized_height
         }
 
+        fn has_headers(&self, node: usize, range: impl Iterator<Item = u32>) -> bool {
+            let store = self.nodes[node]
+                .view
+                .store
+                .lock()
+                .expect("test store mutex is not poisoned");
+
+            range
+                .map(block::Height)
+                .all(|height| store.headers.contains_key(&height))
+        }
+
         async fn reject_next_commit(&self, node: usize, kind: HeaderSyncCommitFailureKind) {
             self.nodes[node]
                 .view
@@ -2783,20 +2795,9 @@ mod tests {
         cluster.connect_all().await;
         cluster.wait_for_tip(checkpointed, block::Height(4)).await?;
         await_until(
-            "checkpoint backfill finalized",
+            "checkpoint backfill headers committed",
             Duration::from_secs(5),
-            || {
-                cluster
-                    .nodes
-                    .get(checkpointed)
-                    .expect("node exists")
-                    .view
-                    .store
-                    .lock()
-                    .expect("test store mutex is not poisoned")
-                    .finalized_height
-                    >= block::Height(3)
-            },
+            || cluster.has_headers(checkpointed, 1..=3),
         )
         .await?;
 
@@ -2805,7 +2806,6 @@ mod tests {
         let target_trace = reader.node("02").table("header_sync");
         target_trace.assert_header_range_request(4, 1);
         target_trace.assert_header_range_request(1, 3);
-        target_trace.assert_header_range_commit(1, 3);
         assert_eq!(
             cluster.finalized_height(checkpointed).await,
             block::Height(3)

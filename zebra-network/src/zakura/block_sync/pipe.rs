@@ -16,10 +16,10 @@
 //!    on how far ahead of the committed tip the fetch already is.
 //! 2. [`work_queue`](super::work_queue) — the shared, sorted set of needed heights
 //!    routines pull contiguous chunks from. Dedup / in-flight tracking lives here;
-//!    the committed floor is garbage-collection only, never a fetch throttle.
+//!    the download floor is garbage-collection only, never a fetch throttle.
 //! 3. [`sequencer_task`](super::sequencer_task) — the single commit pipeline.
 //!    Routines forward matched bodies to it; it orders them above the verified
-//!    tip, submits applies, and publishes the committed `SequencerView` watch the
+//!    tip, submits applies, and publishes the `SequencerView` watch the
 //!    routines read for the floor and for reset.
 //! 4. [`peer_registry`](super::peer_registry) — the cross-peer facts the routines
 //!    *write* (servable range, caps, outstanding heights, misbehavior) and the

@@ -169,8 +169,8 @@ pub enum BlockSyncMisbehavior {
 pub(super) enum RoutineToReactor {
     /// A routine received a `Status` and updated its own servable/caps + the
     /// registry. The reactor advertises our `Status` reply and republishes the
-    /// candidate set. `send_reply` is the routine's rate-meter decision (the
-    /// previous `unsolicited.try_take`) for whether a reply is due this time.
+    /// candidate set. `send_reply` is the routine's rate-meter decision for whether
+    /// a reply is due this time.
     StatusReceived {
         /// Peer whose status was applied.
         peer: ZakuraPeerId,

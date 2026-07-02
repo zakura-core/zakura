@@ -15,7 +15,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time,
 };
@@ -30,6 +30,10 @@ use super::{
     Frame, ServicePeerDirection, ServicePeerLimits, ZakuraPeerId, ZakuraTrace,
 };
 
+mod admission;
+mod bbr;
+#[cfg(feature = "internal-bench")]
+mod bench;
 mod config;
 mod error;
 mod events;
@@ -48,7 +52,15 @@ mod tests;
 mod wire;
 mod work_queue;
 
-pub use config::{BlockSyncStatus, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
+#[cfg(feature = "internal-bench")]
+pub use bench::{
+    spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchSequencerHandle, BenchSubmissions,
+    BenchSubmit, SequencerProgress,
+};
+pub use config::{
+    BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+    MAX_BS_RESPONSE_BYTES,
+};
 pub use error::BlockSyncWireError;
 pub use events::{
     BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,

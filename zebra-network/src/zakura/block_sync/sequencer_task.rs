@@ -8,20 +8,85 @@
 //! events over a non-blocking control channel. The reactor learns committed
 //! progress back over a non-blocking `watch` ([`SequencerView`]).
 //!
-//! The logic in each input handler is the **verbatim** logic that used to run
-//! inline in the matching reactor handler (`handle_block`'s body-acceptance tail,
-//! `apply_state_frontiers_changed`'s Sequencer half, `handle_chain_tip_reset`,
-//! `handle_block_apply_finished`); only its location and the budget/work/actions
-//! handles it uses move here. See the  "Sequencer task".
+//! Each input handler owns one stage of the commit pipeline: the body-acceptance
+//! tail (`handle_accept_body`), the verified-tip frontier advance
+//! (`handle_frontier_advance`), the chain-tip reset (`handle_frontier_reset`), and
+//! the apply completion (`handle_apply_finished`). They mutate the `Sequencer`,
+//! byte budget, and work queue directly and emit `SubmitBlock`/`Misbehavior`
+//! actions on the same channel the reactor uses.
 
 use super::{
     events::*,
     reactor::{bs_insert_height, bs_insert_u64},
+    reorder::BufferedBlockBody,
     sequencer::*,
     state::*,
     work_queue::WorkQueue,
     *,
 };
+
+/// Favor the lowest needed height over the speculative high tail.
+///
+/// While the byte budget cannot fund even one worst-case request yet the lowest
+/// needed height (pending or outstanding) sits *below* the highest buffered body,
+/// drop that top body: release its bytes to the budget and return its height to
+/// `pending` (it was held, hence in `work.in_flight` per the `held ⟺ in_flight`
+/// invariant) for later re-fetch. Because another top can always be shed, a low
+/// retry never blocks on budget; the floor can never wedge behind a full buffer,
+/// and under a stall the speculative tail is shed and the chain fills bottom-up,
+/// which also bounds the reorder backlog. The rescue path is purely demand-driven:
+/// it runs inline after each accepted body and synchronously when a floor requester
+/// needs budget through [`SequencerControlInput::FundFloorReservation`]. Returns
+/// whether it shed anything.
+pub(super) fn shed_top_until_available(
+    budget: &mut ByteBudget,
+    work: &WorkQueue,
+    sequencer: &mut Sequencer,
+    target_available: u64,
+) -> bool {
+    let mut shed_any = false;
+    while budget.available() < target_available {
+        let lowest_needed = match (work.min_pending(), work.min_in_flight()) {
+            (Some(pending), Some(in_flight)) => pending.min(in_flight),
+            (Some(pending), None) => pending,
+            (None, Some(in_flight)) => in_flight,
+            (None, None) => break,
+        };
+        let Some(top) = sequencer.reorder_max_height() else {
+            break;
+        };
+        // Only shed a body that sits above a starved lower height: we trade a
+        // far-from-floor body for the ability to fetch a nearer, higher-value one.
+        if lowest_needed >= top {
+            break;
+        }
+        let freed = sequencer.drop_reorder_from(top);
+        if freed == 0 {
+            break;
+        }
+        let released = work.release_and_return_items([top]);
+        debug_assert!(
+            released == 0 || released == freed,
+            "shed reorder release must match the per-height budget ledger when present"
+        );
+        budget.release(if released == 0 { freed } else { released });
+        shed_any = true;
+    }
+    shed_any
+}
+
+pub(super) fn shed_top_for_floor_starvation(
+    budget: &mut ByteBudget,
+    work: &WorkQueue,
+    sequencer: &mut Sequencer,
+) -> bool {
+    shed_top_until_available(
+        budget,
+        work,
+        sequencer,
+        super::config::BS_PER_BLOCK_WORST_CASE_BYTES,
+    )
+}
 
 /// A received body a peer routine matched (or accepted unmatched) and forwards
 /// to the commit pipeline. This is the only bounded Sequencer input: a slow
@@ -31,7 +96,7 @@ use super::{
 pub(super) struct SequencedBody {
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
-    pub(super) block: Arc<block::Block>,
+    pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
     pub(super) peer: ZakuraPeerId,
     pub(super) received_at: Instant,
@@ -43,7 +108,7 @@ pub(super) struct SequencedBody {
 /// budget and verifier slots, and frontier/reset events can release or discard
 /// stale body work. They are locally generated and tiny, so they use a separate
 /// unbounded channel and are prioritized by the Sequencer task.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) enum SequencerControlInput {
     /// A verified-tip advance (frontier growth/commit).
     FrontierAdvance {
@@ -72,16 +137,22 @@ pub(super) enum SequencerControlInput {
         result: BlockApplyResult,
         local_frontier: Option<BlockSyncFrontiers>,
     },
+    /// Synchronously pop the speculative high tail until a floor request can
+    /// reserve `needed_bytes`, then wake the requester to retry the reservation.
+    FundFloorReservation {
+        needed_bytes: u64,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
-/// The committed view the reactor reacts to. A `watch` (latest-wins) send never
+/// The progress view the reactor reacts to. A `watch` (latest-wins) send never
 /// blocks, so the task never blocks on the reactor and the bounded input channel
 /// cannot deadlock against it.
 #[derive(Copy, Clone, Debug)]
 pub(super) struct SequencerView {
     pub(super) verified_tip: block::Height,
     pub(super) verified_hash: block::Hash,
-    pub(super) floor: block::Height,
+    pub(super) download_floor: block::Height,
     pub(super) finalized: block::Height,
     /// Increments only when the task performs a destructive `reset_to`, so the
     /// reactor distinguishes an advance (drop outstanding *through* tip) from a
@@ -89,9 +160,9 @@ pub(super) struct SequencerView {
     pub(super) reset_epoch: u64,
     /// Increments once per processed frontier/reset/apply input (NOT per accepted
     /// body). The reactor runs its heavy serving/producer/schedule reaction only
-    /// when this advances, mirroring the single-task version where a pure body
-    /// buffer/submit reran nothing but the forwarding peer's reschedule, while a
-    /// frontier advance, reset, or apply-finished always reran query/schedule.
+    /// when this advances: a pure body buffer/submit needs nothing but the
+    /// forwarding peer's own reschedule, while a frontier advance, reset, or
+    /// apply-finished must re-query and reschedule.
     pub(super) reaction_epoch: u64,
     pub(super) reorder_len: u64,
     pub(super) applying_len: u64,
@@ -109,7 +180,7 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
     SequencerView {
         verified_tip: frontiers.verified_block_tip,
         verified_hash: frontiers.verified_block_hash,
-        floor: frontiers.verified_block_tip,
+        download_floor: frontiers.verified_block_tip,
         finalized: frontiers.finalized_height,
         reset_epoch: 0,
         reaction_epoch: 0,
@@ -185,35 +256,55 @@ impl SequencerTask {
     }
 
     pub(super) async fn run(mut self) {
+        // Track input closure explicitly so the loop exits once both inputs close:
+        // a `select!` whose arms are all disabled with no `else` panics, so the
+        // top-of-loop guard breaks out before the last open channel is gated off.
+        let mut control_open = true;
+        let mut body_open = true;
         loop {
+            if !control_open && !body_open {
+                break;
+            }
             tokio::select! {
                 biased;
 
-                Some(input) = self.control_input_rx.recv() => {
-                    let needs_reaction = self.handle_control_input(input).await;
-                    if needs_reaction {
-                        self.reaction_epoch = self.reaction_epoch.saturating_add(1);
+                input = self.control_input_rx.recv(), if control_open => {
+                    match input {
+                        Some(input) => {
+                            let needs_reaction = self.handle_control_input(input).await;
+                            if needs_reaction {
+                                self.reaction_epoch = self.reaction_epoch.saturating_add(1);
+                            }
+                            self.publish_view();
+                        }
+                        None => control_open = false,
                     }
-                    self.publish_view();
                 }
 
-                Some(body) = self.body_input_rx.recv() => {
-                    self.release_body_input_bytes(body.bytes);
-                    self.handle_accept_body(body).await;
-                    self.publish_view();
+                body = self.body_input_rx.recv(), if body_open => {
+                    match body {
+                        Some(body) => {
+                            self.release_body_input_bytes(body.bytes);
+                            self.handle_accept_body(body).await;
+                            shed_top_for_floor_starvation(
+                                &mut self.budget,
+                                &self.work,
+                                &mut self.sequencer,
+                            );
+                            self.publish_view();
+                        }
+                        None => body_open = false,
+                    }
                 }
-
-                else => break,
             }
         }
     }
 
     async fn handle_control_input(&mut self, input: SequencerControlInput) -> bool {
-        // Each handler reports whether it did work that the single-task version
-        // would have followed with the reactor's heavy serving/producer/schedule
-        // tail. Bumping `reaction_epoch` only then keeps the reactor from
-        // re-querying/-scheduling on a pure body buffer/submit or a no-op
-        // (stale/duplicate) apply completion.
+        // Each handler reports whether it did work that needs the reactor's heavy
+        // serving/producer/schedule tail. Bumping `reaction_epoch` only then keeps
+        // the reactor from re-querying/-scheduling on a pure body buffer/submit or
+        // a no-op (stale/duplicate) apply completion.
         match input {
             SequencerControlInput::FrontierAdvance {
                 frontiers,
@@ -248,6 +339,19 @@ impl SequencerTask {
                 self.handle_apply_finished(token, height, hash, result, local_frontier)
                     .await
             }
+            SequencerControlInput::FundFloorReservation {
+                needed_bytes,
+                reply,
+            } => {
+                let shed = shed_top_until_available(
+                    &mut self.budget,
+                    &self.work,
+                    &mut self.sequencer,
+                    needed_bytes,
+                );
+                let _ = reply.send(self.budget.available() >= needed_bytes);
+                shed
+            }
         }
     }
 
@@ -259,15 +363,15 @@ impl SequencerTask {
         );
     }
 
-    /// Body-acceptance tail (verbatim from `handle_block` ~885-907 and
-    /// `accept_unmatched_queued_body` ~1170-1183): offer the body, release on
-    /// `Redundant`, then drain ready prefix into applying and submit.
+    /// Body-acceptance tail: offer the body to the reorder buffer, release its
+    /// bytes on a `Redundant` outcome, then drain the ready contiguous prefix into
+    /// applying and submit it.
     async fn handle_accept_body(&mut self, body: SequencedBody) {
         let queued_elapsed = body.received_at.elapsed();
-        let outcome = match self.sequencer.accept_body(
+        let outcome = match self.sequencer.accept_buffered_body(
             body.height,
             body.hash,
-            body.block,
+            body.body,
             body.bytes,
             body.peer,
         ) {
@@ -281,20 +385,19 @@ impl SequencerTask {
         self.release_contiguous_blocks().await;
     }
 
-    /// Sequencer half of `apply_state_frontiers_changed` (verbatim from
-    /// reactor.rs ~447-478, including the stale guard).
+    /// Apply a verified-tip frontier advance: fold finalized height forward, drop
+    /// stale updates, then advance the verified tip and floor and drain the newly
+    /// contiguous prefix.
     async fn handle_frontier_advance(
         &mut self,
         frontiers: BlockSyncFrontiers,
         release_applied: bool,
     ) {
-        // Fold the finalized height forward unconditionally (matches the original's
-        // first line), then drop a stale update. The verified tip is monotonic: an
-        // advance whose target is below our verified tip must be a no-op, never a
-        // regression. This guard is the original `apply_state_frontiers_changed`'s
-        // `verified_block_tip < verified_tip() => return None`; without it the
-        // second growth-reset path (`< floor`, which permits `< verified_tip`) would
-        // call `advance_verified_tip` with a lower tip and regress it.
+        // Fold the finalized height forward unconditionally, then drop a stale
+        // update. The verified tip is monotonic: an advance whose target is below
+        // our verified tip must be a no-op, never a regression. Without this guard
+        // the second growth-reset path (`< floor`, which permits `< verified_tip`)
+        // would call `advance_verified_tip` with a lower tip and regress it.
         self.finalized_height = self.finalized_height.max(frontiers.finalized_height);
         if frontiers.verified_block_tip < self.sequencer.verified_tip() {
             return;
@@ -305,14 +408,16 @@ impl SequencerTask {
             .advance_verified_tip(frontiers.verified_block_tip, release_applied);
         self.budget.release(advance.release_bytes);
         if advance.changed {
-            self.work.advance_floor(frontiers.verified_block_tip);
+            let released = self.work.advance_floor(frontiers.verified_block_tip);
+            self.budget.release(released);
             self.release_contiguous_blocks().await;
         }
     }
 
-    /// The Sequencer/work/budget body of `handle_chain_tip_reset` (verbatim from
-    /// reactor.rs 502-576). The peer-outstanding reads are replaced by the
-    /// precomputed `peer_*` bools.
+    /// Handle a chain-tip reset: classify it as growth (treat as an advance) or a
+    /// destructive reorg (pin tip/floor to the target, clear successor buffers, and
+    /// bump the reset epoch). The peer-outstanding clauses of the decision arrive as
+    /// the precomputed `peer_*` bools, since the reactor owns peer state.
     async fn handle_frontier_reset(
         &mut self,
         frontiers: BlockSyncFrontiers,
@@ -340,8 +445,8 @@ impl SequencerTask {
                 ))
             && reset_tip_matches_local_work
         {
-            // Growth-classified reset: treat as a frontier advance (same as the
-            // reactor's `handle_state_frontiers_changed` path), `release_applied`.
+            // Growth-classified reset: treat it as a frontier advance, releasing
+            // applied bodies.
             self.handle_frontier_advance(frontiers, true).await;
             return;
         }
@@ -383,16 +488,18 @@ impl SequencerTask {
         // Drop every download work item above the reset target (their buffers
         // were cleared by `reset_to`); the reactor's `query_needed_blocks`
         // re-fills.
-        self.work.reset_above(self.sequencer.floor());
+        let released = self.work.reset_above(self.sequencer.floor());
+        self.budget.release(released);
         // A destructive reset: bump the epoch so the reactor drops *all*
         // outstanding requests (not just those through the tip).
         self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
-    /// Verbatim from `handle_block_apply_finished` (1443-1540), minus the
-    /// reactor-side serving/query/schedule/status tail (which the view reaction
-    /// runs). The embedded `local_frontier` advance is folded in as a frontier
-    /// advance with `release_applied: false`.
+    /// Handle a verifier apply completion: release the body's bytes and verifier
+    /// slot, fold in any embedded `local_frontier` as a frontier advance with
+    /// `release_applied: false`, and on a rejection roll the floor back below the
+    /// bad block so its range is re-requestable. Returns whether the reactor needs
+    /// its serving/query/schedule reaction (the view reaction runs that tail).
     async fn handle_apply_finished(
         &mut self,
         token: BlockApplyToken,
@@ -402,8 +509,8 @@ impl SequencerTask {
         local_frontier: Option<BlockSyncFrontiers>,
     ) -> bool {
         // A stale completion (no live applying entry, or token/hash mismatch)
-        // only decrements the submitted-apply record and returns; the single-task
-        // version ran no query/schedule tail here, so it needs no reaction.
+        // only decrements the submitted-apply record and returns; there is no
+        // query/schedule tail here, so it needs no reaction.
         let Some((applying_token, applying_hash)) = self.sequencer.applying_token_hash(height)
         else {
             self.sequencer.decrement_submitted_apply(height, hash);
@@ -416,9 +523,8 @@ impl SequencerTask {
 
         let accepted_local_frontier = if let Some(frontiers) = local_frontier {
             // Fold the `local_frontier` advance in as a frontier advance without
-            // releasing committed applying bodies (`release_applied: false`),
-            // matching the inline `apply_state_frontiers_changed(.., false)` call.
-            // It is accepted only when it is not a stale (older-tip) update.
+            // releasing committed applying bodies (`release_applied: false`). It is
+            // accepted only when it is not a stale (older-tip) update.
             if frontiers.verified_block_tip < self.sequencer.verified_tip() {
                 None
             } else {
@@ -430,9 +536,9 @@ impl SequencerTask {
         };
 
         if matches!(result, BlockApplyResult::Duplicate) && self.sequencer.verified_tip() < height {
-            // Stale duplicate for a height we have not verified to: the single-task
-            // version ran the serving/query tail only when the accepted local
-            // frontier advanced serving (an `old_serving_tip` existed).
+            // Stale duplicate for a height we have not verified to: the reactor
+            // needs the serving/query tail only when the accepted local frontier
+            // actually advanced serving.
             return accepted_local_frontier.is_some();
         }
         let applying = self
@@ -459,7 +565,8 @@ impl SequencerTask {
                 let released = self.sequencer.release_applying_blocks_from(height);
                 self.budget.release(released);
                 self.sequencer.reset_floor_below(height);
-                self.work.reset_above(self.sequencer.floor());
+                let released = self.work.reset_above(self.sequencer.floor());
+                self.budget.release(released);
                 let dropped = self.sequencer.drop_reorder_from(height);
                 self.budget.release(dropped);
                 // A `Rejected` result means consensus found the body invalid.
@@ -487,8 +594,7 @@ impl SequencerTask {
         true
     }
 
-    /// Drain the contiguous reorder prefix into applying and submit (verbatim
-    /// from `release_contiguous_blocks` + `submit_pending_blocks`).
+    /// Drain the contiguous reorder prefix into applying, then submit it.
     async fn release_contiguous_blocks(&mut self) {
         let _ = self.sequencer.drain_ready_into_applying();
         self.submit_pending_blocks().await;
@@ -627,17 +733,33 @@ impl SequencerTask {
 
     fn publish_view(&mut self) {
         self.committed_throughput.sample(Instant::now());
+        let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
+        let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
+        let body_input_bytes = self
+            .body_input_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Cross-layer drift check: the independently-maintained `ByteBudget` total
+        // must equal the sum of the component counters. `work.reserved_bytes()` is
+        // now an O(1) counter, so this runs on every event without a work-queue scan.
+        let expected_budget = self
+            .work
+            .reserved_bytes()
+            .saturating_add(reorder_buffered_bytes)
+            .saturating_add(applying_buffered_bytes)
+            .saturating_add(body_input_bytes);
+        self.budget
+            .audit(expected_budget, "block-sync sequencer view");
         let _ = self.view_tx.send_replace(SequencerView {
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,
-            floor: self.sequencer.floor(),
+            download_floor: self.sequencer.floor(),
             finalized: self.finalized_height,
             reset_epoch: self.reset_epoch,
             reaction_epoch: self.reaction_epoch,
             reorder_len: self.sequencer.reorder_len() as u64,
             applying_len: self.sequencer.applying_len() as u64,
-            reorder_buffered_bytes: self.sequencer.reorder_buffered_bytes(),
-            applying_buffered_bytes: self.sequencer.applying_buffered_bytes(),
+            reorder_buffered_bytes,
+            applying_buffered_bytes,
             unsubmitted_applying_count: self.sequencer.unsubmitted_applying_count() as u64,
             submitted_applying_count: self.sequencer.submitted_applying_count() as u64,
             submitted_applying_bytes: self.sequencer.submitted_applying_bytes(),

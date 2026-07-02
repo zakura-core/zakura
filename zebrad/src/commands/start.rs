@@ -2821,7 +2821,7 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[tokio::test]
-    async fn block_sync_driver_prioritizes_ready_needed_query_over_submit() {
+    async fn block_sync_driver_prioritizes_ready_submit_over_needed_query() {
         let (action_tx, mut action_rx) = mpsc::channel(8);
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         action_tx
@@ -2837,19 +2837,20 @@ mod zakura_header_sync_driver_tests {
             .expect("query action queues");
 
         let mut deferred_actions = VecDeque::new();
-        let action = coalesce_ready_needed_block_queries(&mut action_rx, &mut deferred_actions)
-            .expect("ready query is prioritized");
+        assert!(
+            coalesce_ready_needed_block_queries(&mut action_rx, &mut deferred_actions).is_none()
+        );
 
-        assert!(matches!(
-            action,
-            BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(0),
-                best_header_tip: block::Height(8),
-            }
-        ));
         assert!(matches!(
             deferred_actions.pop_front(),
             Some(BlockSyncAction::SubmitBlock { token: 7, .. })
+        ));
+        assert!(matches!(
+            deferred_actions.pop_front(),
+            Some(BlockSyncAction::QueryNeededBlocks {
+                verified_block_tip: block::Height(0),
+                best_header_tip: block::Height(8),
+            })
         ));
         assert!(deferred_actions.is_empty());
         assert!(action_rx.try_recv().is_err());

@@ -133,6 +133,13 @@ impl FromDisk for HistoryTreeParts {
         let bytes = bytes.as_ref();
         let options = bincode::DefaultOptions::new();
 
+        // Try the current entry width first. Databases written before NU6.3 widened
+        // `zcash_history::Entry` store narrower entries that fail to parse at the current width,
+        // so fall back to the legacy width and zero-pad each entry up to the current width.
+        //
+        // Legacy-width rows can fail the current-width decoder with errors other than
+        // `UnexpectedEof`, because the wider entry can read into the next legacy entry and
+        // interpret arbitrary entry bytes as bincode control bytes.
         options
             .deserialize::<HistoryTreeParts>(bytes)
             .or_else(|_| {

@@ -6,6 +6,32 @@ use super::super::cookie;
 use crate::server::cookie::Cookie;
 
 #[test]
+fn cookie_authenticate_matches_only_exact_cookie() {
+    let _init_guard = zebra_test::init();
+
+    let cookie = Cookie::default();
+    let dir = tempfile::tempdir().unwrap();
+
+    cookie::write_to_disk(&cookie, dir.path(), None).unwrap();
+
+    let cookie_value = fs::read_to_string(dir.path().join(".cookie"))
+        .unwrap()
+        .trim_start_matches("__cookie__:")
+        .to_string();
+
+    assert!(cookie.authenticate(cookie_value.clone()));
+    assert!(!cookie.authenticate(format!("{cookie_value}extra")));
+
+    let mut wrong_same_len = cookie_value.clone();
+    wrong_same_len.replace_range(0..1, "A");
+    if wrong_same_len == cookie_value {
+        wrong_same_len.replace_range(0..1, "B");
+    }
+
+    assert!(!cookie.authenticate(wrong_same_len));
+}
+
+#[test]
 fn cookie_file_has_restrictive_permissions() {
     let _init_guard = zebra_test::init();
 

@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   addresses to Ironwood when the unstable NU6.3 code is compiled in.
 - `getblocktemplate` builds empty templates on PoW-disabled networks when the
   mempool is inactive.
+- RPC authentication cookie checks now compare same-length cookies in constant
+  time.
 - Verbose transaction output omits the `ironwood` bundle unless the transaction
   contains Ironwood shielded data.
 

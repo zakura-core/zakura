@@ -110,6 +110,32 @@ pub struct Config {
     #[serde(skip)]
     pub enable_zakura_header_seed_from_committed_blocks: bool,
 
+    /// Mirror of `consensus.checkpoint_sync`, set by zebrad at startup.
+    ///
+    /// When `true` (the default), a node syncing under checkpoint trust uses the fast
+    /// verified-commitment-trees path below the last checkpoint: per-block Sapling/Orchard
+    /// roots are verified against the committed headers and folded into the anchor set and
+    /// history tree, skipping the per-block frontier recompute. The
+    /// `consensus.vct_fast_sync` setting is mirrored into state to keep checkpoint sync
+    /// enabled while forcing the legacy per-block recompute.
+    ///
+    /// Skipped in serde because it is not an independent state setting — it tracks the
+    /// consensus option, so the generic Zebra state config does not expose a duplicate.
+    #[serde(skip)]
+    pub checkpoint_sync: bool,
+
+    /// Mirror of `consensus.vct_fast_sync`, set by zebrad at startup.
+    ///
+    /// When `true` (the default), checkpoint sync uses the verified-commitment-trees fast path on
+    /// networks with embedded handoff frontiers. Set to `false` to keep `consensus.checkpoint_sync`
+    /// enabled while forcing the legacy per-block Sapling/Orchard tree recompute in both Archive
+    /// and Pruned storage modes.
+    ///
+    /// Skipped in serde because users configure this alongside `consensus.checkpoint_sync`, not
+    /// as an independent state setting.
+    #[serde(skip)]
+    pub vct_fast_sync: bool,
+
     /// Whether to delete the old database directories when present.
     ///
     /// Set to `true` by default. If this is set to `false`,
@@ -402,6 +428,8 @@ impl Default for Config {
             ephemeral: false,
             should_backup_non_finalized_state: true,
             enable_zakura_header_seed_from_committed_blocks: false,
+            checkpoint_sync: true,
+            vct_fast_sync: true,
             delete_old_database: true,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,
@@ -423,6 +451,11 @@ mod tests {
 
     #[test]
     fn storage_mode_deserializes_from_documented_toml() {
+        assert!(
+            Config::default().vct_fast_sync,
+            "VCT fast sync is enabled by default when checkpoint sync and embedded frontiers are available"
+        );
+
         let archive: Config = toml::from_str(r#"storage_mode = "archive""#)
             .expect("archive storage mode deserializes from a string");
         assert_eq!(archive.storage_mode, StorageMode::Archive);
@@ -444,6 +477,12 @@ mod tests {
         assert_eq!(
             pruned_with_retention.storage_mode,
             StorageMode::Pruned(PruningConfig { tx_retention: 6000 })
+        );
+
+        let serialized = toml::to_string(&Config::default()).expect("state config serializes");
+        assert!(
+            !serialized.contains("vct_fast_sync"),
+            "vct_fast_sync is configured under [consensus], not [state]"
         );
     }
 }

@@ -155,8 +155,12 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "history_tree",
     "tip_chain_value_pool",
     BLOCK_INFO,
+    // Verified-commitment-trees serving index
+    COMMITMENT_ROOTS_BY_HEIGHT,
     // Storage policy
     PRUNING_METADATA,
+    VCT_SYNC_METADATA,
+    VCT_UPGRADE_METADATA,
 ];
 
 /// The name of the column family that records pruning progress.
@@ -166,6 +170,25 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
 /// presence of this entry marks the database as pruned, which is a one-way state:
 /// a pruned database cannot be reopened in archive mode.
 pub const PRUNING_METADATA: &str = "pruning_metadata";
+
+/// The name of the column family that marks a verified-commitment-trees
+/// (vct) synced database.
+///
+/// A vct-synced database skips historical per-height note-commitment tree
+/// writes below the checkpoint handoff height. This column family holds a
+/// single entry with that handoff height.
+pub const VCT_SYNC_METADATA: &str = "vct_sync_metadata";
+
+/// The name of the column family that records the verified-commitment-trees
+/// upgrade height.
+///
+/// This height is the first block committed by code that writes the
+/// [`COMMITMENT_ROOTS_BY_HEIGHT`] serving index.
+pub const VCT_UPGRADE_METADATA: &str = "vct_upgrade_metadata";
+
+/// The name of the column family holding per-height Sapling/Orchard
+/// note-commitment roots, keyed by [`block::Height`].
+pub const COMMITMENT_ROOTS_BY_HEIGHT: &str = "commitment_roots_by_height";
 
 /// The finalized part of the chain state, stored in the db.
 ///
@@ -754,6 +777,7 @@ impl FinalizedState {
                 &network,
                 source,
                 retention,
+                None,
             )
         });
 

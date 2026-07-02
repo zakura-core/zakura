@@ -1111,6 +1111,170 @@ fn reopening_pruned_database_in_archive_mode_panics() {
 }
 
 #[test]
+fn reopening_fast_synced_database_in_archive_mode_succeeds() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        ..Config::default()
+    };
+
+    // Commit blocks, write the verified-commitment-trees fast-sync marker, then drop
+    // the handle to release the database lock.
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_sync_marker(&state.db, Height(2));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+
+    // A completed fast-synced database can reopen in archive mode even when the initial-rollout
+    // force-disable knob selects manual recomputation. Fast sync deletes nothing; the missing
+    // historical trees are surfaced at the RPC boundary, not by refusing to reopen.
+    let config = Config {
+        vct_fast_sync: false,
+        ..config
+    };
+    let reopened = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+
+    assert_eq!(
+        reopened.db.vct_synced_below(),
+        Some(Height(2)),
+        "the fast-sync marker is preserved across the archive-mode reopen"
+    );
+}
+
+#[test]
+fn reopening_fast_synced_database_in_pruned_mode_with_vct_disabled_succeeds() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        storage_mode: StorageMode::Pruned(PruningConfig {
+            tx_retention: MIN_PRUNING_RETENTION,
+        }),
+        ..Config::default()
+    };
+
+    // Commit blocks, write a completed fast-sync marker below the tip, then drop the handle to
+    // release the database lock.
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_sync_marker(&state.db, Height(2));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+
+    // Pruning only removes historical raw transaction bytes; it does not make a completed
+    // fast-sync marker unsafe to reopen with VCT force-disabled.
+    let config = Config {
+        vct_fast_sync: false,
+        ..config
+    };
+    let reopened = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+
+    assert_eq!(
+        reopened.db.vct_synced_below(),
+        Some(Height(2)),
+        "the fast-sync marker is preserved across the pruned-mode reopen"
+    );
+}
+
+#[test]
+fn reopening_interrupted_fast_sync_without_a_root_source_succeeds() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    // `checkpoint_sync = false` selects the legacy committer (no VCT state), so nothing can
+    // supply the verified roots an interrupted fast sync needs to resume.
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        checkpoint_sync: false,
+        ..Config::default()
+    };
+
+    // Commit blocks (tip = TEST_BLOCKS), then write a fast-sync marker ABOVE the tip so the
+    // database looks like an interrupted fast sync (frozen frontier, tip below the handoff).
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_sync_marker(&state.db, Height(100));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+
+    // This storage-only PR does not enable the fast path or its resume policy. Reopening preserves
+    // the marker so later fast-sync wiring can decide how to resume or repair.
+    let reopened = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+    assert_eq!(
+        reopened.db.vct_synced_below(),
+        Some(Height(100)),
+        "the interrupted fast-sync marker is preserved across reopen"
+    );
+}
+
+#[test]
+fn reopening_interrupted_fast_sync_with_vct_disabled_succeeds() {
+    let _init_guard = zebra_test::init();
+    let network = Mainnet;
+
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    // Keep checkpoint sync enabled, but force-disable the VCT source. This should be just as
+    // unsafe as disabling checkpoint sync when the database is below a durable fast-sync marker.
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        vct_fast_sync: false,
+        ..Config::default()
+    };
+
+    // Commit blocks (tip = TEST_BLOCKS), then write a fast-sync marker ABOVE the tip so the
+    // database looks like an interrupted fast sync (frozen frontier, tip below the handoff).
+    {
+        let state = new_state_with_blocks(&config, &network);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_sync_marker(&state.db, Height(100));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+
+    // The force-disable knob only affects the future fast-sync source selection. The database still
+    // opens and keeps the marker available for follow-up resume or repair logic.
+    let reopened = FinalizedState::new(
+        &config,
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+    assert_eq!(
+        reopened.db.vct_synced_below(),
+        Some(Height(100)),
+        "the interrupted fast-sync marker is preserved across reopen"
+    );
+}
+
+#[test]
 fn validate_storage_mode_enforces_retention_floor() {
     let pruned = |tx_retention| Config {
         storage_mode: StorageMode::Pruned(PruningConfig { tx_retention }),

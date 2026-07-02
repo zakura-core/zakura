@@ -138,6 +138,13 @@ impl DiskFormatUpgrade for AddSubtrees {
         db: &ZebraDb,
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<Result<(), String>, CancelFormatChange> {
+        // Fast-synced databases deliberately have no per-height note-commitment
+        // trees or subtrees below the checkpoint handoff height, so the subtree
+        // scans below do not apply to them.
+        if db.is_vct_synced() {
+            return Ok(Ok(()));
+        }
+
         // This is redundant in some code paths, but not in others. But it's quick anyway.
         let quick_result = subtree_format_calculation_pre_checks(db);
 
@@ -207,6 +214,12 @@ pub fn subtree_format_calculation_pre_checks(db: &ZebraDb) -> Result<(), String>
     // Pruned databases can intentionally be missing historical raw transaction
     // bytes needed to reconstruct the old blocks used by these vector checks.
     if db.is_pruned() {
+        return Ok(());
+    }
+
+    // Fast-synced databases deliberately have no per-height note-commitment trees
+    // or subtrees below the checkpoint handoff height, so these checks don't apply.
+    if db.is_vct_synced() {
         return Ok(());
     }
 

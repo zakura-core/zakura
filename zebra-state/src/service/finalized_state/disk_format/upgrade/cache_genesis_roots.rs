@@ -74,18 +74,30 @@ pub fn quick_check(db: &ZebraDb) -> Result<(), String> {
         return Ok(());
     }
 
+    // A fast-synced database deliberately has no per-height note-commitment trees
+    // below the checkpoint handoff height, including the genesis trees this check
+    // reads. The genesis-root-caching invariant does not apply to it.
+    if db.is_vct_synced() {
+        return Ok(());
+    }
+
+    // A fast-sync commit can set the VCT marker after the `is_vct_synced()`
+    // check above but before these tree reads. In that case the readers return
+    // `None` for the absent per-height trees, and this genesis-root check no
+    // longer applies. Non-VCT databases still panic on genuinely missing genesis
+    // trees inside the readers.
     let sprout_genesis_tree = sprout::tree::NoteCommitmentTree::default();
-    let sprout_genesis_tree = db
-        .sprout_tree_by_anchor(&sprout_genesis_tree.root())
-        .expect("just checked for genesis block");
+    let Some(sprout_genesis_tree) = db.sprout_tree_by_anchor(&sprout_genesis_tree.root()) else {
+        return Ok(());
+    };
     let sprout_tip_tree = db.sprout_tree_for_tip();
 
-    let sapling_genesis_tree = db
-        .sapling_tree_by_height(&Height(0))
-        .expect("just checked for genesis block");
-    let orchard_genesis_tree = db
-        .orchard_tree_by_height(&Height(0))
-        .expect("just checked for genesis block");
+    let Some(sapling_genesis_tree) = db.sapling_tree_by_height(&Height(0)) else {
+        return Ok(());
+    };
+    let Some(orchard_genesis_tree) = db.orchard_tree_by_height(&Height(0)) else {
+        return Ok(());
+    };
 
     // Check the entire format before returning any errors.
     let sprout_result = sprout_genesis_tree
@@ -127,6 +139,13 @@ pub fn detailed_check(
     db: &ZebraDb,
     cancel_receiver: &Receiver<CancelFormatChange>,
 ) -> Result<Result<(), String>, CancelFormatChange> {
+    // A fast-synced database deliberately has no per-height note-commitment trees
+    // below the checkpoint handoff height, so the per-height tree scans below do
+    // not apply to it.
+    if db.is_vct_synced() {
+        return Ok(Ok(()));
+    }
+
     // This is redundant in some code paths, but not in others. But it's quick anyway.
     // Check the entire format before returning any errors.
     let mut result = quick_check(db);

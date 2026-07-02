@@ -111,8 +111,12 @@ fn format_upgrades(
             "add Zakura header body size hints",
             Version::new(27, 2, 0),
         )),
+        Box::new(no_migration::NoMigration::new(
+            "add verified-commitment-trees metadata, serving index, and history tree repair",
+            Version::new(27, 3, 0),
+        )),
         Box::new(add_ironwood_tree::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 8])
+    ] as [Box<dyn DiskFormatUpgrade>; 9])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -884,4 +888,23 @@ fn zakura_header_body_size_cf_upgrade_is_no_migration() {
         .expect("Zakura header body size upgrade should be present");
 
     assert!(!upgrade.needs_migration());
+}
+
+#[test]
+fn fast_sync_metadata_cf_upgrade_is_no_migration() {
+    let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 2, 0))).collect();
+    let upgrade = upgrades
+        .iter()
+        .find(|upgrade| upgrade.version() == Version::new(27, 3, 0))
+        .expect("verified-commitment-trees metadata upgrade should be present");
+
+    assert!(!upgrade.needs_migration());
+}
+
+#[test]
+fn vct_format_changes_are_consolidated_under_27_3_0() {
+    let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
+
+    assert_eq!(upgrades.len(), 1);
+    assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
 }

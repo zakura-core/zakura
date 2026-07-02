@@ -8,8 +8,8 @@
 use bincode::Options;
 
 use zebra_chain::{
-    block::Height,
-    orchard, sapling, sprout,
+    block::{merkle::AuthDataRoot, Height},
+    ironwood, orchard, sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
 };
 
@@ -84,6 +84,94 @@ impl FromDisk for orchard::tree::Root {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         let array: [u8; 32] = bytes.as_ref().try_into().unwrap();
         array.try_into().expect("finalized data must be valid")
+    }
+}
+
+/// The per-height Sapling and Orchard note-commitment roots, as stored in the
+/// `commitment_roots_by_height` index (keyed by [`Height`]).
+///
+/// Every node persists this 64-byte value for each committed block — including a
+/// verified-commitment-trees fast-synced node, which folds these roots in but writes no
+/// per-height note-commitment trees. It lets such a node still serve the `tree_aux`
+/// `BlockRoots` read from a compact index rather than from the (absent) trees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitmentRootsByHeight {
+    /// The Sapling note-commitment tree root at this height.
+    pub sapling: sapling::tree::Root,
+    /// The Orchard note-commitment tree root at this height.
+    pub orchard: orchard::tree::Root,
+    /// The ZIP-244 authorizing-data root (`hashAuthDataRoot`) of this block's
+    /// transactions. Stored alongside the note-commitment roots so this node can
+    /// serve it as the co-input needed to authenticate the *predecessor's* roots
+    /// against this block's NU5+ header commitment, without re-reading the body.
+    /// Default/zero below NU5.
+    pub auth_data_root: AuthDataRoot,
+    /// The Ironwood note-commitment tree root at this height (empty below Nu7). Stored so a
+    /// fast-synced node can serve it as a ZIP-221 V3 history-leaf input.
+    pub ironwood: ironwood::tree::Root,
+    /// This block's Sapling shielded transaction count — a ZIP-221 history-leaf input the
+    /// header and roots don't provide, stored so it can be served for header-sync verification.
+    pub sapling_tx: u64,
+    /// This block's Orchard shielded transaction count (V2 leaf input, NU5+).
+    pub orchard_tx: u64,
+    /// This block's Ironwood shielded transaction count (V3 leaf input, Nu7+).
+    pub ironwood_tx: u64,
+}
+
+impl IntoDisk for CommitmentRootsByHeight {
+    type Bytes = [u8; 152];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        let mut out = [0u8; 152];
+        out[..32].copy_from_slice(&IntoDisk::as_bytes(&self.sapling));
+        out[32..64].copy_from_slice(&IntoDisk::as_bytes(&self.orchard));
+        out[64..96].copy_from_slice(&<[u8; 32]>::from(self.auth_data_root));
+        out[96..128].copy_from_slice(&IntoDisk::as_bytes(&self.ironwood));
+        out[128..136].copy_from_slice(&self.sapling_tx.to_be_bytes());
+        out[136..144].copy_from_slice(&self.orchard_tx.to_be_bytes());
+        out[144..152].copy_from_slice(&self.ironwood_tx.to_be_bytes());
+        out
+    }
+}
+
+impl FromDisk for CommitmentRootsByHeight {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let bytes = bytes.as_ref();
+        // Backwards compatible with shorter rows written by an earlier pre-release build of
+        // this database version (64 bytes pre-auth-data, 96 bytes pre-ironwood/counts): the
+        // missing fields decode as empty/zero, so the writer falls back to the body-wait path
+        // for those heights until they are re-served with full data. New rows are 152 bytes.
+        let auth_data_root = if bytes.len() >= 96 {
+            let mut auth_data_root = [0u8; 32];
+            auth_data_root.copy_from_slice(&bytes[64..96]);
+            AuthDataRoot::from(auth_data_root)
+        } else {
+            AuthDataRoot::from([0u8; 32])
+        };
+        let (ironwood, sapling_tx, orchard_tx, ironwood_tx) = if bytes.len() >= 152 {
+            (
+                ironwood::tree::Root::from_bytes(&bytes[96..128]),
+                u64::from_be_bytes(bytes[128..136].try_into().expect("8 bytes")),
+                u64::from_be_bytes(bytes[136..144].try_into().expect("8 bytes")),
+                u64::from_be_bytes(bytes[144..152].try_into().expect("8 bytes")),
+            )
+        } else {
+            (
+                ironwood::tree::NoteCommitmentTree::default().root(),
+                0,
+                0,
+                0,
+            )
+        };
+        CommitmentRootsByHeight {
+            sapling: sapling::tree::Root::from_bytes(&bytes[..32]),
+            orchard: orchard::tree::Root::from_bytes(&bytes[32..64]),
+            auth_data_root,
+            ironwood,
+            sapling_tx,
+            orchard_tx,
+            ironwood_tx,
+        }
     }
 }
 

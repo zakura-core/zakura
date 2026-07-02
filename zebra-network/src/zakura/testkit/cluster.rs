@@ -769,16 +769,12 @@ mod tests {
 
         async fn wait_for_body(&self, node: usize, hash: block::Hash) -> Result<(), BoxError> {
             let store = self.nodes[node].view.store.clone();
-            await_until(
-                "header-sync e2e body commit",
-                Duration::from_secs(5),
-                || {
-                    store
-                        .lock()
-                        .expect("test store mutex is not poisoned")
-                        .has_body(hash)
-                },
-            )
+            await_until("header-sync e2e body commit", TEST_NET_TIMEOUT, || {
+                store
+                    .lock()
+                    .expect("test store mutex is not poisoned")
+                    .has_body(hash)
+            })
             .await
             .map_err(Into::into)
         }
@@ -849,8 +845,15 @@ mod tests {
             .map_err(Into::into)
         }
 
-        async fn observed_gaps(&self, node: usize) -> Vec<(block::Height, block::Height)> {
-            self.nodes[node].view.observed_gaps.lock().await.clone()
+        async fn wait_for_observed_gap(&self, node: usize) -> Result<(), BoxError> {
+            let observed_gaps = self.nodes[node].view.observed_gaps.clone();
+            await_until(
+                "header-sync e2e observed body gap",
+                TEST_NET_TIMEOUT,
+                || observed_gaps.try_lock().is_ok_and(|gaps| !gaps.is_empty()),
+            )
+            .await
+            .map_err(Into::into)
         }
 
         async fn shutdown(&mut self) {
@@ -2733,10 +2736,7 @@ mod tests {
                 block::Height(4)
             ]
         );
-        assert!(
-            !cluster.observed_gaps(empty).await.is_empty(),
-            "body-gap watch/API surface must be observable without header-sync body commands"
-        );
+        cluster.wait_for_observed_gap(empty).await?;
 
         for height in 1..=4 {
             cluster

@@ -17,10 +17,12 @@ use std::{
     sync::Arc,
 };
 
+use std::ops::RangeInclusive;
+
 use zebra_chain::{
-    block::Height,
+    block::{merkle::AuthDataRoot, Height},
     ironwood, orchard,
-    parallel::tree::NoteCommitmentTrees,
+    parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
     sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     transaction::Transaction,
@@ -30,8 +32,9 @@ use crate::{
     request::{FinalizedBlock, Treestate},
     service::finalized_state::{
         disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
-        disk_format::RawBytes,
-        zebra_db::ZebraDb,
+        disk_format::{shielded::CommitmentRootsByHeight, RawBytes},
+        zebra_db::{block::VctData, ZebraDb},
+        COMMITMENT_ROOTS_BY_HEIGHT,
     },
     TransactionLocation,
 };
@@ -135,6 +138,83 @@ impl ZebraDb {
         self.db.zs_contains(&orchard_anchors, &orchard_anchor)
     }
 
+    /// Returns the per-block Sapling/Orchard commitment roots stored in the
+    /// `commitment_roots_by_height` serving index for the **contiguous** prefix of `range`
+    /// that is present, in ascending height order (design §4).
+    ///
+    /// Reads stop at the first absent height, so the result is always a gap-free run from
+    /// `range.start()` — exactly what the `tree_aux` `BlockRoots` serve and `fetch_roots`
+    /// client expect. A node populates this index for every block it commits (fast or
+    /// legacy), so a fast-synced node — which holds no per-height trees — can still serve
+    /// roots here. Returns an empty vec for a database written before the index existed
+    /// (e.g. a pre-index archive node), where the caller falls back to `produce_block_roots`.
+    pub fn commitment_roots_by_height_range(
+        &self,
+        range: RangeInclusive<Height>,
+    ) -> Vec<BlockCommitmentRoots> {
+        let cf = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+        let mut roots = Vec::new();
+        for height in (range.start().0..=range.end().0).map(Height) {
+            let Some(value) = self
+                .db
+                .zs_get::<_, _, CommitmentRootsByHeight>(&cf, &height)
+            else {
+                break;
+            };
+            roots.push(BlockCommitmentRoots {
+                height,
+                sapling_root: value.sapling,
+                orchard_root: value.orchard,
+                ironwood_root: value.ironwood,
+                sapling_tx: value.sapling_tx,
+                orchard_tx: value.orchard_tx,
+                ironwood_tx: value.ironwood_tx,
+                auth_data_root: value.auth_data_root,
+            });
+        }
+        roots
+    }
+
+    /// POC: returns `(sapling_count, sapling_digest, orchard_count, orchard_digest)`,
+    /// a deterministic, order-independent digest of the Sapling and Orchard anchor
+    /// sets. Two syncs that produce the same anchor sets produce the same digest,
+    /// even if one took the fast (skip-recompute) path. See
+    /// `docs/design/verified-commitment-trees.md`.
+    pub fn vct_anchor_digest(&self) -> (u64, u64, u64, u64) {
+        use crate::service::finalized_state::IntoDisk;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let sapling_anchors = self.db.cf_handle("sapling_anchors").unwrap();
+        let mut sapling_hasher = DefaultHasher::new();
+        let mut sapling_count = 0u64;
+        for (root, ()) in self
+            .db
+            .zs_forward_range_iter::<_, sapling::tree::Root, (), _>(&sapling_anchors, ..)
+        {
+            IntoDisk::as_bytes(&root).hash(&mut sapling_hasher);
+            sapling_count += 1;
+        }
+
+        let orchard_anchors = self.db.cf_handle("orchard_anchors").unwrap();
+        let mut orchard_hasher = DefaultHasher::new();
+        let mut orchard_count = 0u64;
+        for (root, ()) in self
+            .db
+            .zs_forward_range_iter::<_, orchard::tree::Root, (), _>(&orchard_anchors, ..)
+        {
+            IntoDisk::as_bytes(&root).hash(&mut orchard_hasher);
+            orchard_count += 1;
+        }
+
+        (
+            sapling_count,
+            sapling_hasher.finish(),
+            orchard_count,
+            orchard_hasher.finish(),
+        )
+    }
+
     /// Returns `true` if the finalized state contains `ironwood_anchor`.
     pub fn contains_ironwood_anchor(&self, ironwood_anchor: &ironwood::tree::Root) -> bool {
         let ironwood_anchors = self.db.cf_handle("ironwood_anchors").unwrap();
@@ -179,7 +259,17 @@ impl ZebraDb {
                 .map(|(_key, tree_value): (Height, _)| tree_value);
         }
 
-        sprout_tree.expect("Sprout note commitment tree must exist if there is a finalized tip")
+        sprout_tree.unwrap_or_else(|| {
+            // While a fast sync is in progress (tip below the handoff height), the
+            // sprout tip tree is only written at the handoff; the committer does not
+            // read it before then.
+            assert!(
+                self.finalized_tip_height()
+                    .is_some_and(|tip| self.vct_tree_absent(tip)),
+                "Sprout note commitment tree must exist if there is a finalized tip"
+            );
+            Arc::<sprout::tree::NoteCommitmentTree>::default()
+        })
     }
 
     /// Returns the Sprout note commitment tree matching the given anchor.
@@ -229,8 +319,17 @@ impl ZebraDb {
             None => return Default::default(),
         };
 
-        self.sapling_tree_by_height(&height)
-            .expect("Sapling note commitment tree must exist if there is a finalized tip")
+        self.sapling_tree_by_height(&height).unwrap_or_else(|| {
+            // While a fast sync is in progress the tip is in the absent band and its
+            // frontier is not stored; the committer does not read it (it folds
+            // verified roots). Every other caller reaches here only below the upgrade
+            // height or at/above the handoff, where the tree is present.
+            assert!(
+                self.vct_tree_absent(height),
+                "Sapling note commitment tree must exist if there is a finalized tip"
+            );
+            Default::default()
+        })
     }
 
     /// Returns the Sapling note commitment tree matching the given block height, or `None` if the
@@ -245,6 +344,14 @@ impl ZebraDb {
         // If we're above the tip, searching backwards would always return the tip tree.
         // But the correct answer is "we don't know that tree yet".
         if *height > tip_height {
+            return None;
+        }
+
+        // On a verified-commitment-trees fast-synced database, the per-height trees within the
+        // `[U, H)` absent band were never written. Return `None` rather than letting the backward
+        // search return a stale tree from an earlier height; trees below the upgrade height `U`
+        // (pre-upgrade) and at/above the handoff `H` (semantic sync) are present.
+        if self.vct_tree_absent(*height) {
             return None;
         }
 
@@ -355,8 +462,15 @@ impl ZebraDb {
             None => return Default::default(),
         };
 
-        self.orchard_tree_by_height(&height)
-            .expect("Orchard note commitment tree must exist if there is a finalized tip")
+        self.orchard_tree_by_height(&height).unwrap_or_else(|| {
+            // See `sapling_tree_for_tip`: the fast-sync tip frontier in the absent
+            // band is not stored and not read by the committer.
+            assert!(
+                self.vct_tree_absent(height),
+                "Orchard note commitment tree must exist if there is a finalized tip"
+            );
+            Default::default()
+        })
     }
 
     /// Returns the Orchard note commitment tree matching the given block height,
@@ -371,6 +485,14 @@ impl ZebraDb {
         // If we're above the tip, searching backwards would always return the tip tree.
         // But the correct answer is "we don't know that tree yet".
         if *height > tip_height {
+            return None;
+        }
+
+        // On a verified-commitment-trees fast-synced database, the per-height trees within the
+        // `[U, H)` absent band were never written. Return `None` rather than letting the backward
+        // search return a stale tree from an earlier height; trees below the upgrade height `U`
+        // (pre-upgrade) and at/above the handoff `H` (semantic sync) are present.
+        if self.vct_tree_absent(*height) {
             return None;
         }
 
@@ -653,6 +775,7 @@ impl DiskWriteBatch {
         zebra_db: &ZebraDb,
         finalized: &FinalizedBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
+        vct_data: Option<VctData>,
     ) {
         let FinalizedBlock {
             height,
@@ -663,6 +786,77 @@ impl DiskWriteBatch {
                 },
             ..
         } = finalized;
+
+        // The ZIP-244 auth-data root of this block, stored in the serving index so this
+        // node can hand it to a peer as the co-input needed to authenticate the
+        // *predecessor's* note-commitment roots against this block's NU5+ header
+        // commitment (without the peer re-reading this block's body). Same value the
+        // commitment check above already verified against the header.
+        let auth_data_root = finalized.block.auth_data_root();
+
+        // The per-block shielded transaction counts — the only ZIP-221 history-leaf inputs the
+        // header and roots don't provide — plus the Ironwood note-commitment root, stored in the
+        // serving index so a fast-synced node can serve them for header-sync verification (design
+        // §6). The Ironwood tree does not exist below Nu7, so its root is the empty-tree root for
+        // every currently-committable height (there is no per-height Ironwood tree store yet).
+        let sapling_tx = finalized.block.sapling_transactions_count();
+        let orchard_tx = finalized.block.orchard_transactions_count();
+        let ironwood_tx = finalized.block.ironwood_transactions_count();
+        let ironwood_root = ironwood::tree::NoteCommitmentTree::default().root();
+
+        // Record the upgrade height `U` once, on the first block this binary commits: the lowest
+        // height in the serving index, and the boundary below which roots are served from the
+        // pre-upgrade per-height trees instead. Written on both commit paths so it is set even for
+        // a node that upgrades above the last checkpoint (legacy path only). Set-once: the marker
+        // is never moved, so the boundary stays stable as the chain grows. Commits are sequential,
+        // so the absent check sees the previous block's committed marker, not a half-written batch.
+        if zebra_db.vct_upgrade_height().is_none() {
+            self.update_vct_upgrade_marker(zebra_db, *height);
+        }
+
+        // Mark the database as vct-synced (per-height note-commitment trees absent
+        // below the checkpoint handoff height). Written in the same atomic batch as
+        // every vct commit, so a vct-synced database always carries the marker and
+        // the read/validity guards never see absent trees without it.
+        if let Some(VctData { sync_below, .. }) = vct_data {
+            self.update_vct_sync_marker(zebra_db, sync_below);
+        }
+
+        // POC (verified-commitment-trees) vct path: the committer skipped the
+        // per-block frontier recompute, so `note_commitment_trees` is the frozen
+        // parent frontier. Write only the supplied roots into the anchor set and
+        // the (already-extended) history tree; skip the per-height Sapling/Orchard
+        // tree CFs and subtrees entirely. The Sprout tree is unchanged below any
+        // modern checkpoint, so it is correctly left untouched here.
+        // See docs/design/verified-commitment-trees.md.
+        if let Some(VctData {
+            anchor_roots: (sapling_root, orchard_root),
+            sync_below,
+        }) = vct_data
+        {
+            // Mark the database as vct-synced in the same atomic batch as every
+            // fast commit, so the read/validity guards never see absent trees
+            // without the handoff marker.
+            self.update_vct_sync_marker(zebra_db, sync_below);
+            self.insert_sapling_anchor(zebra_db, &sapling_root);
+            self.insert_orchard_anchor(zebra_db, &orchard_root);
+            // Persist the per-height roots into the serving index even though no per-height
+            // tree is written, so this fast-synced node can still serve `tree_aux` roots
+            // (design §4); otherwise the root-serving fleet collapses as nodes fast-sync.
+            self.insert_commitment_roots_by_height(
+                zebra_db,
+                *height,
+                &sapling_root,
+                &orchard_root,
+                &ironwood_root,
+                sapling_tx,
+                orchard_tx,
+                ironwood_tx,
+                &auth_data_root,
+            );
+            self.update_history_tree(zebra_db, history_tree);
+            return;
+        }
 
         let prev_sprout_tree = prev_note_commitment_trees.as_ref().map_or_else(
             || zebra_db.sprout_tree_for_tip(),
@@ -711,6 +905,22 @@ impl DiskWriteBatch {
                 self.insert_ironwood_subtree(zebra_db, &subtree);
             }
         }
+
+        // Persist the per-height roots into the serving index for *every* committed height
+        // (not just when a tree changed — the index must be gap-free for contiguous serving),
+        // so a legacy/archive node serves `tree_aux` roots from the compact index too, and a
+        // node that later fast-syncs above this height already has the lower range covered.
+        self.insert_commitment_roots_by_height(
+            zebra_db,
+            *height,
+            &note_commitment_trees.sapling.root(),
+            &note_commitment_trees.orchard.root(),
+            &ironwood_root,
+            sapling_tx,
+            orchard_tx,
+            ironwood_tx,
+            &auth_data_root,
+        );
 
         self.update_history_tree(zebra_db, history_tree);
     }
@@ -775,6 +985,89 @@ impl DiskWriteBatch {
 
         self.zs_insert(&sapling_anchors, tree.root(), ());
         self.zs_insert(&sapling_tree_cf, height, tree);
+    }
+
+    /// POC: inserts only the Sapling anchor `root` (value `()`), without writing a
+    /// per-height tree. Used by the verified-commitment-trees fast path, which
+    /// supplies the root directly instead of recomputing the frontier. The anchor
+    /// CF is a set, so re-inserting an unchanged root is idempotent.
+    pub fn insert_sapling_anchor(&mut self, zebra_db: &ZebraDb, root: &sapling::tree::Root) {
+        let sapling_anchors = zebra_db.db.cf_handle("sapling_anchors").unwrap();
+        self.zs_insert(&sapling_anchors, root, ());
+    }
+
+    /// Inserts the per-height Sapling/Orchard commitment roots into the
+    /// `commitment_roots_by_height` serving index (design §4).
+    ///
+    /// Written on every committed block, fast or legacy, so any node — including a
+    /// fast-synced node that holds no per-height trees — can serve the `tree_aux`
+    /// `BlockRoots` read from this compact 64-byte-per-height index. Idempotent
+    /// (re-inserting the same height overwrites with the identical value).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_commitment_roots_by_height(
+        &mut self,
+        zebra_db: &ZebraDb,
+        height: Height,
+        sapling_root: &sapling::tree::Root,
+        orchard_root: &orchard::tree::Root,
+        ironwood_root: &ironwood::tree::Root,
+        sapling_tx: u64,
+        orchard_tx: u64,
+        ironwood_tx: u64,
+        auth_data_root: &AuthDataRoot,
+    ) {
+        let cf = zebra_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+        self.zs_insert(
+            &cf,
+            height,
+            CommitmentRootsByHeight {
+                sapling: *sapling_root,
+                orchard: *orchard_root,
+                ironwood: *ironwood_root,
+                sapling_tx,
+                orchard_tx,
+                ironwood_tx,
+                auth_data_root: *auth_data_root,
+            },
+        );
+    }
+
+    /// Deletes the commitment-roots serving-index entries in `[from, to)`.
+    ///
+    /// Used by the finalized rollback to truncate the index above the rollback target, the
+    /// same way the per-height trees and anchors above the target are removed, so a
+    /// rolled-back database does not retain root entries for heights it no longer holds.
+    pub fn delete_range_commitment_roots_by_height(
+        &mut self,
+        zebra_db: &ZebraDb,
+        from: &Height,
+        to: &Height,
+    ) {
+        let cf = zebra_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+        self.zs_delete_range(&cf, from, to);
+    }
+
+    /// Records the verified-commitment-trees fast-sync marker: per-height
+    /// note-commitment trees are absent below `handoff`. Idempotent (written in the
+    /// same batch as each fast commit).
+    pub fn update_vct_sync_marker(&mut self, zebra_db: &ZebraDb, handoff: Height) {
+        let vct_sync_metadata = zebra_db
+            .db
+            .cf_handle(crate::service::finalized_state::VCT_SYNC_METADATA)
+            .unwrap();
+        self.zs_insert(&vct_sync_metadata, (), handoff);
+    }
+
+    /// Records the verified-commitment-trees upgrade height `U` = `height`, the lowest height this
+    /// binary commits and the lowest height in the serving index. Set once and never moved, so the
+    /// caller must only invoke this when [`vct_upgrade_height`](ZebraDb::vct_upgrade_height) is
+    /// still absent.
+    pub fn update_vct_upgrade_marker(&mut self, zebra_db: &ZebraDb, height: Height) {
+        let vct_upgrade_metadata = zebra_db
+            .db
+            .cf_handle(crate::service::finalized_state::VCT_UPGRADE_METADATA)
+            .unwrap();
+        self.zs_insert(&vct_upgrade_metadata, (), height);
     }
 
     /// Inserts the Sapling note commitment subtree into the batch.
@@ -854,6 +1147,13 @@ impl DiskWriteBatch {
 
         self.zs_insert(&orchard_anchors, tree.root(), ());
         self.zs_insert(&orchard_tree_cf, height, tree);
+    }
+
+    /// POC: inserts only the Orchard anchor `root` (value `()`), without writing a
+    /// per-height tree. The Orchard twin of [`Self::insert_sapling_anchor`].
+    pub fn insert_orchard_anchor(&mut self, zebra_db: &ZebraDb, root: &orchard::tree::Root) {
+        let orchard_anchors = zebra_db.db.cf_handle("orchard_anchors").unwrap();
+        self.zs_insert(&orchard_anchors, root, ());
     }
 
     /// Inserts the Orchard note commitment subtree into the batch.

@@ -52,16 +52,18 @@ mod tests;
 mod wire;
 mod work_queue;
 
-pub use admission::DESERIALIZED_MEM_FACTOR;
+// The remaining consumers of these two internal constants are the same-crate
+// fuzz-testkit test modules; the re-exports only exist for test builds.
+#[cfg(test)]
+pub(crate) use admission::DESERIALIZED_MEM_FACTOR;
 #[cfg(feature = "internal-bench")]
 pub use bench::{
     spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchSequencerHandle, BenchSubmissions,
     BenchSubmit, SequencerProgress,
 };
-pub use config::{
-    BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
-    MAX_BS_RESPONSE_BYTES, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
-};
+#[cfg(test)]
+pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
+pub use config::{BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
 pub use error::BlockSyncWireError;
 pub use events::{
     BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,

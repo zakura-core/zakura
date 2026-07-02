@@ -5,12 +5,11 @@ use proptest::{prop_assert, prop_assert_eq};
 use super::*;
 use super::{
     config::{
-        BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES, DEFAULT_BS_FANOUT,
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES,
         DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
-        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
-        DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_RESPONSE_BYTES,
         DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN, DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS,
-        MAX_BS_RESPONSE_BYTES,
+        MAX_BS_RESPONSE_BYTES, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
     reactor::node_id_from_block_peer_id,
     reorder::*,
@@ -714,10 +713,6 @@ fn block_sync_config_defaults_and_round_trips() {
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES
     );
     assert_eq!(
-        default.max_reorder_lookahead_blocks,
-        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS
-    );
-    assert_eq!(
         default.floor_peer_avoid_cooldown,
         DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN
     );
@@ -744,14 +739,13 @@ fn block_sync_config_defaults_and_round_trips() {
     assert!(default.validate().is_ok());
     assert_eq!(
         default.max_submitted_block_applies,
-        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
+        MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES
     );
     assert_eq!(
         default.submitted_apply_limit(),
-        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
+        MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES
     );
     assert_eq!(default.request_timeout, DEFAULT_BS_REQUEST_TIMEOUT);
-    assert_eq!(default.fanout, DEFAULT_BS_FANOUT);
 
     let encoded = toml::to_string(&default).expect("block-sync config serializes");
     let decoded: ZakuraBlockSyncConfig =
@@ -768,7 +762,7 @@ fn block_sync_config_defaults_and_round_trips() {
     assert_eq!(config.zakura.block_sync.max_submitted_block_applies, 9);
     assert_eq!(
         config.zakura.block_sync.submitted_apply_limit(),
-        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+        MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     );
 }
 
@@ -782,12 +776,6 @@ fn config_validate_rejects_degenerate_values() {
 
     config = ZakuraBlockSyncConfig {
         max_reorder_lookahead_bytes: 0,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    assert!(config.validate().is_err());
-
-    config = ZakuraBlockSyncConfig {
-        max_reorder_lookahead_blocks: 0,
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_err());
@@ -1310,7 +1298,6 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 40_000_000,
         max_reorder_lookahead_bytes: 500,
-        max_reorder_lookahead_blocks: 4,
         ..ZakuraBlockSyncConfig::default()
     };
     let snapshot = super::admission::AdmissionSnapshot {
@@ -1376,7 +1363,6 @@ fn admission_counts_inflight_to_sequencer_bytes() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
-        max_reorder_lookahead_blocks: 10,
         ..ZakuraBlockSyncConfig::default()
     };
     let snapshot = super::admission::AdmissionSnapshot {
@@ -1411,7 +1397,6 @@ fn total_resident_plateaus_under_commit_stall() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
-        max_reorder_lookahead_blocks: 10,
         ..ZakuraBlockSyncConfig::default()
     };
     let snapshot = super::admission::AdmissionSnapshot {
@@ -1446,7 +1431,6 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
-        max_reorder_lookahead_blocks: 10,
         ..ZakuraBlockSyncConfig::default()
     };
     let capped = super::admission::AdmissionSnapshot {
@@ -1499,7 +1483,6 @@ fn outstanding_reservations_are_charged_at_the_resident_multiple() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
-        max_reorder_lookahead_blocks: 100,
         ..ZakuraBlockSyncConfig::default()
     };
     let snapshot = super::admission::AdmissionSnapshot {
@@ -1564,7 +1547,6 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
         // Large enough that the byte (memory) cap, not the block cap, is what bites here.
-        max_reorder_lookahead_blocks: 1_000_000,
         ..ZakuraBlockSyncConfig::default()
     };
     // Commit stalled far below the download floor; applying holds a full budget of bodies:
@@ -1644,7 +1626,6 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
-        max_reorder_lookahead_blocks: 1_000_000,
         ..ZakuraBlockSyncConfig::default()
     };
     // Gate full: 300 wire * 4 = 1_200 resident >= 1_000 budget.
@@ -1719,7 +1700,6 @@ fn commit_window_stays_fundable_at_exact_floor() {
     let mut config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
         max_reorder_lookahead_bytes: 1,
-        max_reorder_lookahead_blocks: 1,
         ..ZakuraBlockSyncConfig::default()
     };
     config.clamp_reorder_lookahead_to_floor();
@@ -1727,8 +1707,8 @@ fn commit_window_stays_fundable_at_exact_floor() {
         .expect("checkpoint range block count fits in u32");
 
     // verified_tip pinned at 0; applying holds all but the last worst-case range block, plus
-    // next-range contamination in reorder and outstanding reservations. Both gates are full:
-    // resident (8 MiB + 800 MB + 4 MB) * 4 >= 3_208_000_000 and blocks 400 + 4 + 2 >= 401.
+    // next-range contamination in reorder and outstanding reservations. The byte gate is
+    // full: resident (8 MiB + 800 MB + 4 MB) * 4 >= 3_208_000_000.
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(range_blocks - 1),
         verified_block_tip: block::Height(0),
@@ -2531,7 +2511,6 @@ async fn reactor_budget_constrained_issuance_rotates_across_peers() {
 #[tokio::test]
 async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
     let mut config = immediate_body_download_config();
-    config.fanout = 1;
     // A request timeout long enough that the opening pass fans both heights out
     // before anything expires, but short enough that the slow peer's unanswered
     // request still times out within the test window.
@@ -2667,7 +2646,6 @@ async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
         TraceCapture::for_test("block_liveness_disconnects_silent_peer_and_traces_reason")
             .expect("trace capture initializes");
     let mut config = immediate_body_download_config();
-    config.fanout = 1;
     config.request_timeout = Duration::from_millis(400);
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
 
@@ -3808,14 +3786,18 @@ proptest::proptest! {
         applying_bytes in 0u64..2_000,
         input_bytes in 0u64..2_000,
         reserved_bytes in 0u64..2_000,
-        reorder_blocks in 0u64..20,
+        // Occasionally saturate the hard block cap so the count-gate arm below
+        // stays non-vacuous (ordinary counts never approach 262,144).
+        reorder_blocks in proptest::prop_oneof![
+            0u64..20,
+            proptest::strategy::Just(super::admission::LOOKAHEAD_BLOCK_HARD_CAP),
+        ],
         applying_blocks in 0u64..20,
         reserved_blocks in 0u64..20,
     ) {
         let config = ZakuraBlockSyncConfig {
             max_inflight_block_bytes: 64_000_000,
             max_reorder_lookahead_bytes: 1_000,
-            max_reorder_lookahead_blocks: 10,
             ..ZakuraBlockSyncConfig::default()
         };
         // The download floor sits far above the commit window (verified_tip 10 + 401 = 411),
@@ -3853,7 +3835,7 @@ proptest::proptest! {
             1_000,
         );
         if estimated_resident >= effective
-            || held_blocks >= u64::from(config.max_reorder_lookahead_blocks)
+            || held_blocks >= super::admission::LOOKAHEAD_BLOCK_HARD_CAP
             || (effective - estimated_resident) / factor == 0
         {
             prop_assert_eq!(above, super::admission::AdmissionOutcome::LookaheadAtCap);
@@ -7234,7 +7216,6 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         .collect();
 
     let mut config = immediate_body_download_config();
-    config.fanout = 1;
     config.max_inflight_block_bytes = u64::MAX;
     config.request_timeout = Duration::from_secs(300);
     config.peer_limits.max_outbound_peers = 1;
@@ -9696,7 +9677,6 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
     // heights from the needed set so the gap gets scheduled.
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
-    config.fanout = 3;
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
     let startup = BlockSyncStartup::new(
@@ -10590,7 +10570,6 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
 async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
-    config.fanout = 2;
     // A long request timeout ensures the timeout-driven retry self-heal cannot mask
     // the wedge within the test window.
     config.request_timeout = Duration::from_secs(300);

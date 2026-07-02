@@ -494,7 +494,6 @@ async fn fuzz_commit_stall_resident_plateau() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64 * 1024 * 1024,
         max_reorder_lookahead_bytes: resident_budget,
-        max_reorder_lookahead_blocks: 100_000,
         max_blocks_per_response: 1,
         ..fuzz_config()
     };
@@ -580,7 +579,6 @@ async fn fuzz_commit_stall_resident_plateau_multiblock() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64 * 1024 * 1024,
         max_reorder_lookahead_bytes: resident_budget,
-        max_reorder_lookahead_blocks: 100_000,
         // Deliberately NOT pinned to 1: fuzz_config()'s 16-block responses exercise
         // window-crossing take geometry.
         ..fuzz_config()

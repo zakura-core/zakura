@@ -50,15 +50,6 @@ pub const BS_PER_BLOCK_WORST_CASE_BYTES: u64 = block::MAX_BLOCK_BYTES;
 pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 =
     // `DEFAULT_BS_MAX_RESPONSE_BYTES` is a `u32`, so widening to `u64` is lossless.
     DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES - DEFAULT_BS_MAX_RESPONSE_BYTES as u64;
-/// Default block-count safety cap for speculative reorder look-ahead bookkeeping.
-///
-/// Defense-in-depth on the map/bookkeeping size only. The primary bound on buffered bodies
-/// is the resident-memory budget [`DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES`] (compared against
-/// `held_wire * DESERIALIZED_MEM_FACTOR`, see `admission.rs`). This is set well above the
-/// block count that budget admits at realistic body sizes, so the *memory* budget is the
-/// binding cap. The prior 4096 value made the buffer shallow (~one checkpoint range), which
-/// masked the byte budget and could starve the bursty committer.
-pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 262_144;
 /// Minimum submitted block applies required to resolve one checkpoint range.
 ///
 /// The checkpoint verifier resolves a checkpoint window only after the whole
@@ -67,8 +58,6 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS: u32 = 262_144;
 /// maximum checkpoint gap plus the boundary block in flight.
 pub const MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES: usize =
     zebra_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
-/// Default maximum submitted block applies awaiting verifier completion.
-pub const DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES: usize = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
 /// The byte budget required to hold one full worst-case checkpoint range in
 /// flight.
 ///
@@ -101,8 +90,6 @@ pub const DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN: Duration = DEFAULT_BS_REQUEST_TI
 pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// Default tolerated size-hint deviation percentage before a peer is reported.
 pub const DEFAULT_BS_SIZE_DEVIATION_TOLERANCE: u32 = 200;
-/// Default legacy range-fanout reservation multiplier.
-pub const DEFAULT_BS_FANOUT: usize = 1;
 /// Maximum peer-advertised aggregate byte target accepted per requested range.
 ///
 /// A range response is sent as one `Block` frame per body, and each body frame
@@ -244,8 +231,6 @@ pub struct ZakuraBlockSyncConfig {
     pub max_inflight_block_bytes: u64,
     /// Maximum speculative body bytes held above the download floor.
     pub max_reorder_lookahead_bytes: u64,
-    /// Maximum speculative body heights tracked above the download floor.
-    pub max_reorder_lookahead_blocks: u32,
     /// How long to avoid reassigning an expired floor height to the same peer.
     #[serde(with = "humantime_serde")]
     pub floor_peer_avoid_cooldown: Duration,
@@ -267,12 +252,6 @@ pub struct ZakuraBlockSyncConfig {
     pub status_refresh_interval: Duration,
     /// Percentage deviation from advertised body-size hints tolerated before soft scoring.
     pub size_deviation_tolerance: u32,
-    /// Legacy range-fanout reservation multiplier.
-    ///
-    /// No active scheduler currently sends the same range to multiple peers; this
-    /// only keeps old configs parsing and sizes the validation floor for one
-    /// worst-case floor request.
-    pub fanout: usize,
     /// Steady-state cwnd as a percent of the measured bandwidth-delay product.
     pub bbr_cwnd_gain_percent: u32,
     /// ProbeBW up-probe pacing gain, percent. Reserved: the ProbeBW gain cycle is not
@@ -332,15 +311,13 @@ impl Default for ZakuraBlockSyncConfig {
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
             max_inflight_block_bytes: DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
             max_reorder_lookahead_bytes: DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
-            max_reorder_lookahead_blocks: DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS,
             floor_peer_avoid_cooldown: DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
-            max_submitted_block_applies: DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+            max_submitted_block_applies: MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
             request_timeout: DEFAULT_BS_REQUEST_TIMEOUT,
             floor_rescue_timeout: DEFAULT_BS_FLOOR_RESCUE_TIMEOUT,
             no_progress_peer_cooldown: DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN,
             status_refresh_interval: DEFAULT_BS_STATUS_REFRESH_INTERVAL,
             size_deviation_tolerance: DEFAULT_BS_SIZE_DEVIATION_TOLERANCE,
-            fanout: DEFAULT_BS_FANOUT,
             bbr_cwnd_gain_percent: DEFAULT_BS_BBR_CWND_GAIN_PERCENT,
             bbr_probe_bw_gain_percent: DEFAULT_BS_BBR_PROBE_BW_GAIN_PERCENT,
             bbr_probe_rtt_interval: DEFAULT_BS_BBR_PROBE_RTT_INTERVAL,
@@ -417,14 +394,9 @@ impl ZakuraBlockSyncConfig {
     }
 
     /// Return the largest byte reservation a single floor request can need.
-    ///
-    /// `fanout` is only a compatibility reservation multiplier; it does not mean
-    /// current scheduling sends the same floor request to multiple peers.
     pub fn floor_request_byte_reservation(&self) -> u64 {
-        let fanout = u64::try_from(self.fanout.max(1)).unwrap_or(u64::MAX);
         let worst_case_blocks = u64::from(self.advertised_max_blocks_per_response())
-            .saturating_mul(BS_PER_BLOCK_WORST_CASE_BYTES)
-            .saturating_mul(fanout);
+            .saturating_mul(BS_PER_BLOCK_WORST_CASE_BYTES);
         u64::from(self.advertised_max_response_bytes()).max(worst_case_blocks)
     }
 
@@ -435,9 +407,6 @@ impl ZakuraBlockSyncConfig {
         }
         if self.max_reorder_lookahead_bytes == 0 {
             return Err("max_reorder_lookahead_bytes must be greater than zero");
-        }
-        if self.max_reorder_lookahead_blocks == 0 {
-            return Err("max_reorder_lookahead_blocks must be greater than zero");
         }
         if self.max_inflight_block_bytes <= self.floor_request_byte_reservation() {
             return Err("max_inflight_block_bytes must exceed one floor request");
@@ -494,8 +463,7 @@ impl ZakuraBlockSyncConfig {
     ///
     /// This is defense-in-depth for the speculative above-window lane: checkpoint
     /// sync liveness already comes from the commit-window admission exemption, but
-    /// sub-range byte or block budgets would reject nearly all gated look-ahead work.
-    /// Clamp both floors up to match the range-sized admission model.
+    /// a sub-range byte budget would reject nearly all gated look-ahead work.
     pub fn clamp_reorder_lookahead_to_floor(&mut self) {
         let resident_range_floor = BS_CHECKPOINT_RANGE_BYTE_FLOOR
             .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR);
@@ -509,19 +477,6 @@ impl ZakuraBlockSyncConfig {
                  checkpoint-range floor; clamping it up so checkpoint sync cannot deadlock",
             );
             self.max_reorder_lookahead_bytes = resident_range_floor;
-        }
-
-        let block_floor =
-            u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES).unwrap_or(u32::MAX);
-        if self.max_reorder_lookahead_blocks > 0 && self.max_reorder_lookahead_blocks < block_floor
-        {
-            tracing::warn!(
-                configured_max_reorder_lookahead_blocks = self.max_reorder_lookahead_blocks,
-                checkpoint_range_block_floor = block_floor,
-                "zakura.block_sync.max_reorder_lookahead_blocks is below one checkpoint range; \
-                 clamping it up so checkpoint sync cannot deadlock",
-            );
-            self.max_reorder_lookahead_blocks = block_floor;
         }
     }
 

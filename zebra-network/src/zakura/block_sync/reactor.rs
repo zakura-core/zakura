@@ -1565,9 +1565,12 @@ impl BlockSyncReactor {
             bs_insert_u64(
                 row,
                 "retained_pipeline_wire_bytes",
-                sequencer_input_queued_bytes
-                    .saturating_add(view.reorder_buffered_bytes)
-                    .saturating_add(view.applying_buffered_bytes),
+                super::admission::RetainedPipelineBytes {
+                    reorder_buffered_bytes: view.reorder_buffered_bytes,
+                    applying_buffered_bytes: view.applying_buffered_bytes,
+                    sequencer_input_queued_bytes,
+                }
+                .wire_bytes(),
             );
             bs_insert_u64(row, bs_trace::PEERS, self.state.peers.len() as u64);
             bs_insert_u64(row, bs_trace::PEERS_WITH_STATUS, peers_with_status as u64);

@@ -2832,6 +2832,26 @@ mod tests {
         assert_eq!(source, 0);
         cluster.start_drivers();
         cluster.connect_all().await;
+
+        // Same CI race as the genesis-convergence test: a status emitted before the
+        // receiver has processed its `PeerConnected` is rejected as unknown-peer
+        // misbehavior, and the source's frontier never changes here, so nothing
+        // re-sends it. Wait for both peers to register, then deliver the source's
+        // status deterministically; a duplicate of the natural status is harmless.
+        let source_handle = cluster.nodes[source].view.handle.clone();
+        let checkpointed_handle = cluster.nodes[checkpointed].view.handle.clone();
+        await_until("header-sync e2e peers registered", TEST_NET_TIMEOUT, || {
+            let source_peers = source_handle.peer_snapshot();
+            let checkpointed_peers = checkpointed_handle.peer_snapshot();
+            source_peers.inbound_peers + source_peers.outbound_peers >= 1
+                && checkpointed_peers.inbound_peers + checkpointed_peers.outbound_peers >= 1
+        })
+        .await?;
+        let source_peer = cluster.nodes[source].view.peer_id.clone();
+        cluster
+            .inject(checkpointed, source_peer, status_for_tip(4, 1000, 10))
+            .await;
+
         cluster.wait_for_tip(checkpointed, block::Height(4)).await?;
         await_until(
             "checkpoint backfill headers committed",

@@ -105,6 +105,8 @@ pub struct BenchSubmissions {
 pub struct BenchCommitter {
     control: mpsc::UnboundedSender<SequencerControlInput>,
     view: watch::Receiver<SequencerView>,
+    /// Bytes currently queued in the sequencer body-input channel
+    body_input_bytes: Arc<AtomicU64>,
     // A clone of the sequencer's trace emitter, so the bench driver can write the
     // periodic `block_sync_state` snapshot rows the full reactor emits in production
     // (the rows the zakura-trace-plots skill consumes).
@@ -184,7 +186,7 @@ pub fn spawn_bench_sequencer(
     BenchSequencerHandle {
         feeder: BenchBodyFeeder {
             body_input: body_input_tx,
-            body_input_bytes,
+            body_input_bytes: body_input_bytes.clone(),
             bench_peer: ZakuraPeerId::new(vec![0xB1; 32]).expect("32-byte bench peer id is valid"),
         },
         submissions: BenchSubmissions {
@@ -193,6 +195,7 @@ pub fn spawn_bench_sequencer(
         committer: BenchCommitter {
             control: control_tx,
             view: view_rx,
+            body_input_bytes,
             trace,
             finalized_height,
             trace_guard,
@@ -300,8 +303,12 @@ impl BenchCommitter {
             bs_insert_u64(
                 row,
                 "retained_pipeline_wire_bytes",
-                view.applying_buffered_bytes
-                    .saturating_add(view.reorder_buffered_bytes),
+                super::admission::RetainedPipelineBytes {
+                    reorder_buffered_bytes: view.reorder_buffered_bytes,
+                    applying_buffered_bytes: view.applying_buffered_bytes,
+                    sequencer_input_queued_bytes: self.body_input_bytes.load(Ordering::Relaxed),
+                }
+                .wire_bytes(),
             );
         });
     }

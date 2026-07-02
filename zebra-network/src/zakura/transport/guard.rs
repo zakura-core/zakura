@@ -164,7 +164,6 @@ impl ByteBudget {
     /// budget registers `subscribe_capacity().notified()` *before* re-reading
     /// `available()`/`try_reserve`, so a concurrent `release`/`shrink` can never
     /// be missed between the check and the wait.
-    #[allow(dead_code)] // consumed by the per-peer download routines in per-peer routines
     pub(crate) fn subscribe_capacity(&self) -> &Notify {
         &self.inner.capacity
     }

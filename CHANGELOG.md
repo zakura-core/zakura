@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Removed
+
+- Removed two Zakura block-sync config fields that never needed operator
+  tuning: `max_reorder_lookahead_blocks` (the defense-in-depth block-count cap
+  is now a fixed internal constant; the resident-memory budget remains the
+  primary bound) and `fanout` (a legacy reservation multiplier with no effect
+  on scheduling). Configs that still set either key will fail to parse and
+  should drop the lines.
+
 ### Fixed
 
 - Fixed an out-of-memory crash during Zakura block sync when the header chain

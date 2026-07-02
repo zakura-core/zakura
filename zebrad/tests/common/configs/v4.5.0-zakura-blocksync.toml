@@ -87,7 +87,6 @@ message_rate_per_second = 128
 stream_open_rate_per_second = 16
 
 [network.zakura.block_sync]
-fanout = 3
 max_blocks_per_response = 16
 max_inflight_block_bytes = 268435456
 max_inflight_requests = 4

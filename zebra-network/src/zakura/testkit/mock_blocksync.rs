@@ -32,7 +32,6 @@ const DEFAULT_SEEDS: usize = 4;
 const DEFAULT_BLOCKS: u32 = 100_000;
 const DEFAULT_MAX_BLOCKS_PER_RESPONSE: u32 = 128;
 const DEFAULT_MAX_INFLIGHT: u16 = 512;
-const DEFAULT_FANOUT: usize = 1;
 const RUN_THROUGHPUT_ENV: &str = "ZAKURA_MOCK_BS_RUN";
 const SYNTHETIC_CORPUS_SEED: u64 = 0x5eed_5eed_b10c_0006;
 const MIN_SYNTHETIC_TXS: usize = 1;
@@ -366,7 +365,6 @@ struct HarnessConfig {
     blocks: u32,
     max_blocks_per_response: u32,
     max_inflight: u16,
-    fanout: usize,
     shape: SyntheticBlockShape,
     trace_dir: Option<PathBuf>,
 }
@@ -382,7 +380,6 @@ impl HarnessConfig {
             )
             .max(1),
             max_inflight: env_u16("ZAKURA_MOCK_BS_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT).max(1),
-            fanout: env_usize("ZAKURA_MOCK_BS_FANOUT", DEFAULT_FANOUT).max(1),
             shape: SyntheticBlockShape::from_env(),
             trace_dir: env::var_os("ZAKURA_MOCK_BS_TRACE_DIR")
                 .filter(|value| !value.is_empty())
@@ -402,7 +399,6 @@ impl HarnessConfig {
                 .max(1),
             request_timeout: Duration::from_secs(60),
             status_refresh_interval: Duration::from_millis(200),
-            fanout: self.fanout,
             peer_limits: ServicePeerLimits {
                 max_inbound_peers: self.seeds.saturating_add(1),
                 max_outbound_peers: self.seeds.saturating_add(1),
@@ -835,12 +831,11 @@ fn print_summary(config: &HarnessConfig, summary: &ThroughputSummary, trace_root
     let mib_per_second = summary.committed_bytes as f64 / (1024.0 * 1024.0) / elapsed_secs;
 
     println!(
-        "zakura mock blocksync: seeds={} blocks={} max_blocks_per_response={} max_inflight={} fanout={} target_block_bytes={}",
+        "zakura mock blocksync: seeds={} blocks={} max_blocks_per_response={} max_inflight={} target_block_bytes={}",
         config.seeds,
         config.blocks,
         config.max_blocks_per_response,
         config.max_inflight,
-        config.fanout,
         config
             .shape
             .target_block_bytes

@@ -119,7 +119,10 @@ Two gates, checked together in `lookahead_over_budget`:
 - **Byte gate:** `estimated_resident ≥ effective_max_reorder_lookahead_bytes`, where
   `effective = min(max_reorder_lookahead_bytes, max_inflight_block_bytes × 4)`.
 - **Block gate (defense in depth):** reorder + applying + reserved block counts
-  `≥ max_reorder_lookahead_blocks`.
+  `≥ LOOKAHEAD_BLOCK_HARD_CAP` (a fixed 262,144 — it binds before the byte gate
+  only for tiny bodies averaging under ~6.1 KB wire, where per-entry bookkeeping
+  overhead dominates; never needed operator tuning, so it is a constant, not a
+  config knob).
 
 This is separate from the **in-flight wire budget** (`max_inflight_block_bytes`,
 default 6 GiB, tracked by `ByteBudget`): that bounds bytes concurrently on the wire;
@@ -189,7 +192,6 @@ borrowed a bypass slot.
 | Knob | Default | Notes |
 | --- | --- | --- |
 | `max_reorder_lookahead_bytes` | ~6.4 GB | **resident-denominated** (compared against wire × 4); effective value capped at `max_inflight_block_bytes × 4`; clamped up to ~3.208 GB |
-| `max_reorder_lookahead_blocks` | 262,144 | defense-in-depth block cap; clamped up to 401 |
 | `max_inflight_block_bytes` | 6 GiB | in-flight wire budget (separate from the resident gate) |
 | `max_blocks_per_response` | 1 | count cap per request (effective = min of both sides' advertisements, hard max 128) |
 | `floor_bypass_slots` | 2 | extra slots past a saturated cwnd, floor lane only |

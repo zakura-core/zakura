@@ -149,6 +149,16 @@ pub(super) fn request_deadline(
 /// memory gate.
 const COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS: u32 = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u32;
 
+/// Hard block-count cap on speculative look-ahead bookkeeping.
+///
+/// Defense-in-depth on the map/bookkeeping size only; the resident-memory
+/// budget is the primary bound on buffered bodies. This cap binds before the
+/// byte gate only when the average retained body is smaller than
+/// `effective_budget / (DESERIALIZED_MEM_FACTOR × 262_144)` wire bytes
+/// (~6.1 KB at the default budget), i.e. for tiny early-chain bodies whose
+/// per-entry bookkeeping overhead the flat resident factor does not model.
+pub(super) const LOOKAHEAD_BLOCK_HARD_CAP: u64 = 262_144;
+
 /// Highest height exempt from look-ahead backpressure: the top of the commit window
 /// ([`COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS`] above the verified tip). Anchored to the
 /// verified tip — which advances only on commit — so the window cannot escalate with
@@ -164,18 +174,47 @@ fn commit_window_high(snapshot: &AdmissionSnapshot) -> block::Height {
     )
 }
 
+/// Wire bytes of block bodies retained by the pipeline: the single formula
+/// behind the `retained_pipeline_wire_bytes` trace field and the resident
+/// estimate, so every emitter and gate agrees on what "retained" means.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct RetainedPipelineBytes {
+    pub(super) reorder_buffered_bytes: u64,
+    pub(super) applying_buffered_bytes: u64,
+    pub(super) sequencer_input_queued_bytes: u64,
+}
+
+impl RetainedPipelineBytes {
+    /// Total wire bytes of retained bodies (the `retained_pipeline_wire_bytes`
+    /// trace field).
+    pub(super) fn wire_bytes(self) -> u64 {
+        self.reorder_buffered_bytes
+            .saturating_add(self.applying_buffered_bytes)
+            .saturating_add(self.sequencer_input_queued_bytes)
+    }
+}
+
+impl AdmissionSnapshot {
+    fn retained(&self) -> RetainedPipelineBytes {
+        RetainedPipelineBytes {
+            reorder_buffered_bytes: self.reorder_buffered_bytes,
+            applying_buffered_bytes: self.applying_buffered_bytes,
+            sequencer_input_queued_bytes: self.sequencer_input_queued_bytes,
+        }
+    }
+}
+
 /// Estimated resident memory of block bodies retained by, or already committed
 /// to enter, the pipeline.
 ///
-/// Charge all pools at decoded cost (`× DESERIALIZED_MEM_FACTOR`).Applying and
+/// Charge all pools at decoded cost (`× DESERIALIZED_MEM_FACTOR`). Applying and
 /// sequencer queues already hold decoded blocks; reorder and reserved bytes may
 /// still be wire/in-flight, but a gap-fill can decode them into applying without
 /// another admission check.
 fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
     snapshot
-        .reorder_buffered_bytes
-        .saturating_add(snapshot.applying_buffered_bytes)
-        .saturating_add(snapshot.sequencer_input_queued_bytes)
+        .retained()
+        .wire_bytes()
         .saturating_add(snapshot.reserved_above_floor_bytes)
         .saturating_mul(DESERIALIZED_MEM_FACTOR)
 }
@@ -190,7 +229,7 @@ fn held_blocks(snapshot: &AdmissionSnapshot) -> u64 {
 /// Whether the resident-memory look-ahead budget (or the block cap) is already full.
 fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSnapshot) -> bool {
     estimated_resident_pipeline_bytes(snapshot) >= config.effective_max_reorder_lookahead_bytes()
-        || held_blocks(snapshot) >= u64::from(config.max_reorder_lookahead_blocks)
+        || held_blocks(snapshot) >= LOOKAHEAD_BLOCK_HARD_CAP
 }
 
 /// Plans one contiguous take starting at `start_height`: the single authority for
@@ -411,25 +450,18 @@ mod tests {
         );
     }
 
-    /// A sub-range configured budget/block cap is clamped up so checkpoint sync cannot wedge.
+    /// A sub-range configured budget is clamped up so checkpoint sync cannot wedge.
     #[test]
     fn clamp_reorder_lookahead_floors_sub_range_configs() {
-        use super::super::config::{
-            BS_CHECKPOINT_RANGE_BYTE_FLOOR, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
-        };
+        use super::super::config::BS_CHECKPOINT_RANGE_BYTE_FLOOR;
         let mut config = ZakuraBlockSyncConfig {
             max_reorder_lookahead_bytes: 1024 * 1024, // 1 MiB resident, far below one range
-            max_reorder_lookahead_blocks: 8,          // far below one range
             ..ZakuraBlockSyncConfig::default()
         };
         config.clamp_reorder_lookahead_to_floor();
         assert!(
             config.max_reorder_lookahead_bytes
                 >= BS_CHECKPOINT_RANGE_BYTE_FLOOR.saturating_mul(DESERIALIZED_MEM_FACTOR)
-        );
-        assert!(
-            config.max_reorder_lookahead_blocks as usize
-                >= MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES
         );
     }
 }

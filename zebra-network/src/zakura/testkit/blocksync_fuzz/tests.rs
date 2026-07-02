@@ -11,8 +11,8 @@ use zebra_chain::block;
 
 use super::{
     assert_core_invariants, fuzz_config, invariant_report, run_scenario, run_trace,
-    CommitBurstStall, CommitProfile, FuzzOutcome, IdleGap, InvariantReport, LatencyDist, PeerSpec,
-    Scenario, ServeProfile, TipEvent, TipEventKind,
+    CommitBurstStall, CommitProfile, Degrade, DegradeMode, FuzzOutcome, IdleGap, InvariantReport,
+    LatencyDist, PeerSpec, Scenario, ServeProfile, TipEvent, TipEventKind,
 };
 use crate::zakura::{
     ZakuraBlockSyncConfig, DESERIALIZED_MEM_FACTOR, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
@@ -44,6 +44,11 @@ async fn run_checked(
         final_budget_reserved = report.final_budget_reserved,
         protocol_rejects = report.protocol_rejects,
         floor_bypass_requests = report.floor_bypass_requests,
+        total_requests = report.total_requests,
+        max_requests_without_block_progress = report.max_requests_without_block_progress,
+        max_unproven_requests_without_block_progress =
+            report.max_unproven_requests_without_block_progress,
+        min_reliability_permille = report.min_reliability_permille,
         "blocksync fuzz scenario complete",
     );
     assert_core_invariants(&scenario, &outcome, &report, outstanding_slack);
@@ -208,6 +213,436 @@ async fn fuzz_idle_peers() {
         vec![withholder, PeerSpec::fast(2, target(blocks))],
     );
     run_checked("fuzz_idle_peers", scenario, 32).await;
+}
+
+/// Silent-dropping carrier: one peer answers normally half the time and **silently
+/// drops** the rest (no response at all), alongside one fast full-range peer. This is
+/// the bbr-committer-6 floor-stall shape — a peer takes a floor-critical request and
+/// never serves it, so the lowest missing height waits on the node's request-timeout /
+/// re-request path before a healthy peer covers it. The contiguous-commit invariant
+/// (`reached_target`) proves a silently-dropping peer never wedges sync, and the
+/// re-request count proves the timeout path was actually exercised (non-vacuous).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_silent_dropping_peer() {
+    let blocks = 300;
+    let config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
+        ..retry_config()
+    };
+    // A flaky carrier: full-range and otherwise fast, but drops half its requests on the
+    // floor — exactly the silent-on-the-floor peer that stalls the contiguous head.
+    let flaky = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            drop_probability: 0.5,
+            ..ServeProfile::fast()
+        },
+    );
+    let mut scenario = Scenario::new(
+        blocks,
+        0x57ea_000d,
+        config,
+        vec![flaky, PeerSpec::fast(2, target(blocks))],
+    );
+    scenario.deadline = Duration::from_secs(60);
+    let (_, report) = run_checked("fuzz_silent_dropping_peer", scenario, 32).await;
+
+    // Non-vacuous: the silent drops forced re-requests, so more requests were issued than
+    // there are blocks (otherwise the dropping peer never held a height we needed).
+    assert!(
+        report.total_requests > usize::try_from(blocks).expect("block count fits usize"),
+        "silent drops must force re-requests: issued {} requests for {} blocks",
+        report.total_requests,
+        blocks,
+    );
+}
+
+/// A dropping carrier that the node cannot route around: a fast peer covers only the
+/// lower half of the chain, so the upper half must come from a peer that silently drops
+/// a third of its requests. Those drops time out and age the carrier's goodput EWMA
+/// below 1.0, which the BBR cwnd formula folds into a smaller expected window — the
+/// end-to-end proof (through the real routine) that the reliability discount engages,
+/// complementing the `bbr::bbr_tests` unit coverage. Sync still completes: the discount
+/// never latches the cwnd at zero, so the carrier keeps redeeming its dropped heights.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_reliability_discounts_dropping_carrier() {
+    let blocks = 120;
+    let half = block::Height(blocks / 2);
+    let dropping = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            drop_probability: 0.3,
+            ..ServeProfile::fast()
+        },
+    );
+    // The fast peer can only serve the lower half, forcing the upper half through the
+    // dropping carrier.
+    let mut fast = PeerSpec::fast(2, half);
+    fast.servable_high = half;
+
+    let mut scenario = Scenario::new(blocks, 0x57ea_00c0, retry_config(), vec![dropping, fast]);
+    scenario.deadline = Duration::from_secs(90);
+    let (_, report) =
+        run_checked("fuzz_reliability_discounts_dropping_carrier", scenario, 32).await;
+
+    assert!(
+        report.min_reliability_permille < 1000,
+        "a request-dropping carrier must lower its measured reliability (the goodput \
+         discount folded into its BBR cwnd), got {}/1000",
+        report.min_reliability_permille,
+    );
+}
+
+/// Fully silent carrier: one peer accepts status and `GetBlocks` but never sends any
+/// block-sync response. The node must cap requests to that peer, disconnect it via
+/// no-progress liveness, then finish through a healthy peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_silent_peer_request_cap() {
+    let blocks = 96;
+    let probe_requests = 1;
+    let request_cap = 8;
+    let config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
+        request_timeout: Duration::from_millis(100),
+        floor_rescue_timeout: Duration::from_millis(25),
+        initial_block_probe_requests: probe_requests,
+        max_requests_without_block_progress: request_cap,
+        ..fuzz_config()
+    };
+
+    let mut silent = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            drop_probability: 1.0,
+            ..ServeProfile::fast()
+        },
+    );
+    silent.max_inflight_requests = 64;
+
+    let mut healthy = PeerSpec::fast(2, target(blocks));
+    healthy.connect_at = Duration::from_millis(700);
+
+    let mut scenario = Scenario::new(blocks, 0x57ea_000e, config, vec![silent, healthy]);
+    scenario.target_block_bytes = Some(16 * 1024);
+    scenario.deadline = Duration::from_secs(10);
+    let (_, report) = run_checked("fuzz_silent_peer_request_cap", scenario, 32).await;
+
+    assert!(
+        report.protocol_rejects >= 1,
+        "the fully silent peer must be disconnected by no-progress liveness",
+    );
+    assert_eq!(
+        report.max_unproven_requests_without_block_progress,
+        u64::from(probe_requests),
+        "the silent peer should receive exactly the configured initial probe budget",
+    );
+}
+
+/// Config for the wedge/slow degradation tests: single-block responses and a short
+/// request timeout, so the liveness window (`request_timeout × BLOCK_PROGRESS_TIMEOUT_
+/// REQUESTS`) elapses well inside the run once a peer stops delivering.
+fn degrade_config() -> ZakuraBlockSyncConfig {
+    ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
+        request_timeout: Duration::from_millis(100),
+        floor_rescue_timeout: Duration::from_millis(25),
+        initial_block_probe_requests: 1,
+        max_requests_without_block_progress: 8,
+        ..fuzz_config()
+    }
+}
+
+/// Requirement — a peer that WEDGES after making progress is disconnected. The carrier
+/// serves normally at first (proving progress, so its no-progress cap opens to the
+/// larger proven budget), then goes silent mid-run. The failure mechanism must still
+/// seal it (reliability ramps toward zero → zero cwnd, no new work) and the liveness
+/// timer must then disconnect it — its early progress must not buy it immunity. A second
+/// peer, connecting after the wedge, finishes the sync, proving the wedge did not stall
+/// the chain.
+///
+/// This is the counterpart to `fuzz_silent_peer_request_cap` (which wedges from the
+/// start, never proving progress): here the peer is *proven* when it wedges, the harder
+/// case the ramp-to-zero seal exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_peer_wedges_after_progress_is_disconnected() {
+    let blocks = 400;
+    // A carrier that serves at a finite rate (so it only gets partway through the chain),
+    // then wedges (drops everything) 250 ms in — long enough to deliver a run of bodies
+    // first, so it is a *proven* peer when it goes silent, with plenty of chain left.
+    let waverer = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            bandwidth_bytes_per_sec: Some(4 * 1024 * 1024),
+            degrade: Some(Degrade {
+                at: Duration::from_millis(250),
+                mode: DegradeMode::GoSilent,
+            }),
+            ..ServeProfile::fast()
+        },
+    );
+    // A healthy peer that joins only after the wedge has been detected and the waverer
+    // disconnected (liveness = request_timeout × 4 = 400 ms, so ~650 ms after the ~250 ms
+    // last body), then finishes the remaining heights.
+    let mut healthy = PeerSpec::fast(2, target(blocks));
+    healthy.connect_at = Duration::from_millis(1_200);
+
+    let mut scenario = Scenario::new(
+        blocks,
+        0x57ea_00f0,
+        degrade_config(),
+        vec![waverer, healthy],
+    );
+    scenario.target_block_bytes = Some(16 * 1024);
+    scenario.deadline = Duration::from_secs(20);
+    let (_, report) = run_checked(
+        "fuzz_peer_wedges_after_progress_is_disconnected",
+        scenario,
+        32,
+    )
+    .await;
+
+    // The wedged (but previously-progressing) peer must be disconnected by liveness.
+    assert!(
+        report.protocol_rejects >= 1,
+        "a peer that wedges after making progress must be disconnected, got {} rejects",
+        report.protocol_rejects,
+    );
+    // It was *proven* when it wedged: its no-progress streak was allowed past the single
+    // initial probe (the proven cap), distinguishing this from the never-proved case.
+    assert!(
+        report.max_requests_without_block_progress >= 2,
+        "the disconnected peer should have been proven (streak past the initial probe), got {}",
+        report.max_requests_without_block_progress,
+    );
+    // The reliability seal engaged (the discount folded the drops in on the way down).
+    assert!(
+        report.min_reliability_permille < 1000,
+        "the wedged peer's reliability must fall as its requests stop delivering, got {}/1000",
+        report.min_reliability_permille,
+    );
+}
+
+/// Requirement — a peer that WEDGES by *no longer reading our stream* (not merely going
+/// silent) must still be disconnected at the liveness deadline. When a peer stops draining
+/// our bounded outbound queue, `outbound_capacity()` falls to zero and stays there. The old
+/// liveness escape (`Disconnect if outbound_capacity() == 0 → extend`) treated that as our
+/// own write congestion and extended the deadline *every* time, indefinitely — so a wedged
+/// peer survived until the ~180 s transport idle timeout while we kept queuing requests it
+/// never read. The bounded grace fixes this: once our outbound has been continuously full
+/// for `request_timeout`, the peer is disconnected at the liveness deadline regardless.
+///
+/// This is the distinct counterpart to `fuzz_peer_wedges_after_progress_is_disconnected`
+/// (which uses `GoSilent`: the peer keeps *reading* and so never fills our outbound, taking
+/// the normal disconnect arm). Here the peer stops reading, so the run exercises the escape
+/// arm specifically. A small transport queue depth makes the outbound fill quickly (the
+/// default 1024 is too large for the node to ever fill given the no-progress cap — which is
+/// exactly why this bug was invisible to the earlier tests).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_peer_that_stops_reading_is_disconnected() {
+    let blocks = 400;
+    // A proven carrier that serves at a finite rate, then stops reading our stream entirely
+    // 250 ms in — a truly stuck connection. By then it has delivered a run of bodies, so it
+    // is *proven* (its no-progress cap is the larger proven budget), the harder case. It is
+    // the only peer: the chain cannot complete once it wedges, and it is not meant to — the
+    // property under test is the disconnect. `fuzz_peer_wedges_after_progress_is_disconnected`
+    // (a `GoSilent` peer that keeps reading) already covers a healthy peer finishing the
+    // chain after a wedge.
+    let wedger = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            bandwidth_bytes_per_sec: Some(4 * 1024 * 1024),
+            degrade: Some(Degrade {
+                at: Duration::from_millis(250),
+                mode: DegradeMode::Wedge,
+            }),
+            ..ServeProfile::fast()
+        },
+    );
+
+    let mut scenario = Scenario::new(blocks, 0x57ea_dead, degrade_config(), vec![wedger]);
+    scenario.target_block_bytes = Some(16 * 1024);
+    // A small per-peer transport queue so the node's outbound to the non-reading peer fills
+    // (and stays full) quickly — the condition that drives `outbound_capacity()` to zero and
+    // exercises the (now-bounded) liveness escape. The default 1024 is far too large for the
+    // node to ever fill given the no-progress cap, which is exactly why this bug was
+    // invisible to the earlier tests.
+    scenario.transport_queue_depth = Some(4);
+    scenario.deadline = Duration::from_secs(5);
+
+    // Run WITHOUT the reach-the-target assertion (a lone wedged peer cannot finish the chain);
+    // assert the disconnect directly from the report.
+    let (mut capture, trace) =
+        run_trace("fuzz_peer_that_stops_reading_is_disconnected").expect("trace capture opens");
+    let _outcome = run_scenario(&scenario, trace)
+        .await
+        .expect("scenario runs without harness error");
+    capture.flush().await;
+    let reader = capture
+        .reader()
+        .expect("trace reader loads the flushed run");
+    let report = invariant_report(&reader);
+    capture.finish().await.expect("capture discards cleanly");
+
+    // The wedged, non-reading peer must be disconnected — even though our outbound to it is
+    // full (its stream unread). With the old unbounded escape this is 0 (extend forever until
+    // the ~180 s transport idle timeout): the teeth of the fix.
+    assert!(
+        report.protocol_rejects >= 1,
+        "a peer that stops reading our stream must still be disconnected at the liveness \
+         deadline, got {} rejects",
+        report.protocol_rejects,
+    );
+    // It was proven when it wedged (streak past the single initial probe), so this is the
+    // harder proven-peer case, not the never-proved one.
+    assert!(
+        report.max_requests_without_block_progress >= 2,
+        "the disconnected peer should have been proven, got {}",
+        report.max_requests_without_block_progress,
+    );
+}
+
+/// Requirement — a peer that becomes RADICALLY SLOWER (but keeps delivering) is kept,
+/// not kicked; its params just adapt. A single full-range carrier serves fast, then
+/// drops to a low finite bandwidth behind a high base RTT partway through. Because it is
+/// the *only* peer, the run reaches the target **iff** the node keeps it: a wrongful
+/// disconnect (mistaking slow-but-delivering for wedged) would stall the sync. The
+/// windowed-estimator freshness fix is what keeps its now-slow deliveries inside the
+/// (bandwidth-aware) request deadline instead of timing out on a stale-fast estimate and
+/// collapsing its reliability.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_peer_slows_radically_is_kept() {
+    let blocks = 120;
+    // Fast at first with a real RTT (so its BDP-derived byte window rises well above the
+    // min-cwnd floor), then radically slower: a 60 ms base RTT and a 512 KiB/s serve —
+    // still delivering, just far weaker. A modest inflight cap keeps the pipeline shallow
+    // so the fast→slow transition drains without a runaway backlog (the controller's job
+    // is to shrink the window, which it does; this keeps the test robust, not flaky).
+    let mut slowing = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            first_block_latency: LatencyDist::Fixed(Duration::from_millis(30)),
+            bandwidth_bytes_per_sec: Some(64 * 1024 * 1024),
+            degrade: Some(Degrade {
+                at: Duration::from_millis(300),
+                mode: DegradeMode::SlowTo {
+                    base_rtt: Duration::from_millis(60),
+                    bandwidth_bytes_per_sec: 512 * 1024,
+                },
+            }),
+            ..ServeProfile::fast()
+        },
+    );
+    slowing.max_inflight_requests = 24;
+
+    // A generous request timeout so the deadline is set by the (bandwidth-aware) transfer
+    // term, not a tight base — the slow-but-honest deliveries must run to completion. Byte
+    // cwnd unit so the window's shrink is observable in `bbr_cwnd_bytes`.
+    let config = ZakuraBlockSyncConfig {
+        bbr_cwnd_unit: crate::zakura::CwndUnit::Bytes,
+        max_blocks_per_response: 1,
+        request_timeout: Duration::from_secs(2),
+        ..fuzz_config()
+    };
+    let mut scenario = Scenario::new(blocks, 0x57ea_00f1, config, vec![slowing]);
+    scenario.target_block_bytes = Some(16 * 1024);
+    scenario.deadline = Duration::from_secs(60);
+    let (_, report) = run_checked("fuzz_peer_slows_radically_is_kept", scenario, 32).await;
+
+    // The lone slow-but-delivering peer must be kept: reaching the target (asserted in
+    // `run_checked`) already proves it, and there must be zero disconnects.
+    assert_eq!(
+        report.protocol_rejects, 0,
+        "a peer that only slowed down (still delivering) must not be disconnected",
+    );
+    // It kept delivering, so it was never sealed off like a dropper: its reliability
+    // recovers to a healthy settled band (late bodies credit back transition timeouts),
+    // well clear of the sealed (~0) range even though a lone slow peer serving its own
+    // contiguous floor carries some steady re-request churn.
+    assert!(
+        report.final_reliability_permille >= 300,
+        "a slow-but-delivering peer's reliability must stay well clear of the sealed range \
+         (settled {}/1000, trough {}/1000)",
+        report.final_reliability_permille,
+        report.min_reliability_permille,
+    );
+    assert!(
+        report.final_reliability_permille > report.min_reliability_permille,
+        "reliability must recover from its transition trough (settled {} vs trough {})",
+        report.final_reliability_permille,
+        report.min_reliability_permille,
+    );
+    // "Params adjust, kept but weaker": its byte window shrank from the fast-phase peak to
+    // a smaller settled value, but stayed positive (it keeps a — weaker — window, not
+    // sealed to zero and cut off).
+    assert!(
+        report.final_cwnd_bytes > 0,
+        "the slowed peer must keep a (weaker) window, not be sealed to zero",
+    );
+    assert!(
+        report.peak_cwnd_bytes > report.final_cwnd_bytes,
+        "the slowed peer's window must adapt downward (peak {} → settled {})",
+        report.peak_cwnd_bytes,
+        report.final_cwnd_bytes,
+    );
+}
+
+/// Finding #4 — a peer that answers `RangeUnavailable` for heights it advertised is
+/// charged a reliability failure for the heights it left undelivered, not just retried.
+/// A withholder advertises the full range but is missing a mid-chain window that no other
+/// peer covers until a covering peer joins later; while the floor sits in that window the
+/// withholder is asked and repeatedly answers `RangeUnavailable`, so its reliability must
+/// fall below 1000. Without the short-response charge those answers would be free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fuzz_range_unavailable_penalizes_reliability() {
+    let blocks = 300;
+    // Long timeouts so *no request ever times out* in this fast-serving run: that isolates
+    // the reliability signal to the short-response (RangeUnavailable) charge alone — a
+    // floor-rescue timeout would otherwise also age reliability and mask it.
+    let config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
+        request_timeout: Duration::from_secs(25),
+        floor_rescue_timeout: Duration::from_secs(25),
+        ..fuzz_config()
+    };
+    // Advertises the full range but is missing (100, 200): it answers RangeUnavailable
+    // there. A low base RTT makes it the *preferred floor server*, so the floor is offered
+    // to it first — guaranteeing it is asked across the withheld window and answers
+    // RangeUnavailable there before the covering peer takes over.
+    let withholder = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            withhold: Some((block::Height(100), block::Height(200))),
+            ..ServeProfile::byte_rate(Duration::from_millis(2), 50 * 1024 * 1024)
+        },
+    );
+    // A full-range covering peer with a higher RTprop (so it backs up the withheld window
+    // rather than pre-empting the floor). It serves everything, so the withheld window is
+    // always covered and the run reaches the target.
+    let coverer = PeerSpec::with_serve(
+        2,
+        target(blocks),
+        ServeProfile::byte_rate(Duration::from_millis(40), 50 * 1024 * 1024),
+    );
+
+    let mut scenario = Scenario::new(blocks, 0x57ea_00f2, config, vec![withholder, coverer]);
+    scenario.target_block_bytes = Some(16 * 1024);
+    scenario.deadline = Duration::from_secs(30);
+    let (_, report) =
+        run_checked("fuzz_range_unavailable_penalizes_reliability", scenario, 32).await;
+
+    assert!(
+        report.min_reliability_permille < 1000,
+        "a peer that answers RangeUnavailable for advertised heights must be charged a \
+         reliability failure, got {}/1000",
+        report.min_reliability_permille,
+    );
 }
 
 /// Churn storm: a stable peer plus several peers connecting and disconnecting on a

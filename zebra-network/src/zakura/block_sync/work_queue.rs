@@ -359,7 +359,14 @@ impl WorkQueue {
         0
     }
 
-    /// Release any live charges for `heights`, exactly once.
+    /// Release *any* live charge (reserved estimate **or** held body bytes) for
+    /// `heights`, exactly once. This is the non-Held-aware release: it hands back
+    /// held-body bytes the Sequencer also owns, so production must never call it
+    /// (see [`release_reserved_heights`](Self::release_reserved_heights) and
+    /// [`release_reserved_and_return_items`](Self::release_reserved_and_return_items)).
+    /// Retained only to exercise the raw ledger arithmetic in unit tests; the
+    /// `#[cfg(test)]` gate is what structurally enforces "prod is Held-aware".
+    #[cfg(test)]
     pub(super) fn release_heights(&self, heights: impl IntoIterator<Item = block::Height>) -> u64 {
         let mut released = 0u64;
         let mut reserved_removed = 0u64;
@@ -374,6 +381,37 @@ impl WorkQueue {
             }
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_removed);
+        released
+    }
+
+    /// Release only the still-reserved size-estimate charges for `heights`,
+    /// exactly once, leaving each height in place.
+    ///
+    /// A height that already settled to `Held(actual)` is owned by the body
+    /// handoff / Sequencer path (it releases those actual bytes on commit), so it
+    /// is skipped here: never released and never double-counted. Mirrors
+    /// [`release_reserved_and_return_items`](Self::release_reserved_and_return_items)
+    /// for callers dropping heights below the floor (GC / stale trim) rather than
+    /// returning them to `pending`. Use instead of [`release_heights`](Self::release_heights)
+    /// on any path a competing peer's late body may have converted to `Held`.
+    pub(super) fn release_reserved_heights(
+        &self,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> u64 {
+        let mut released = 0u64;
+        let mut inner = self.lock();
+        for height in heights {
+            if let Some(item) = inner.in_flight.get_mut(&height) {
+                if item.budget.is_reserved() {
+                    released = released.saturating_add(item.budget.release_reserved());
+                }
+            } else if let Some(item) = inner.pending.get_mut(&height) {
+                if item.budget.is_reserved() {
+                    released = released.saturating_add(item.budget.release_reserved());
+                }
+            }
+        }
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
         released
     }
 
@@ -639,6 +677,14 @@ impl WorkQueue {
 
     pub(super) fn pending_contains(&self, height: block::Height) -> bool {
         self.lock().pending.contains_key(&height)
+    }
+
+    pub(super) fn reserved_in_flight_charge(&self, height: block::Height) -> Option<u64> {
+        self.lock().in_flight.get(&height).and_then(|item| {
+            item.budget
+                .is_reserved()
+                .then(|| item.budget.reserved_charge())
+        })
     }
 
     pub(super) fn in_flight_contains(&self, height: block::Height) -> bool {

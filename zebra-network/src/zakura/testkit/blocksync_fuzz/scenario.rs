@@ -57,6 +57,40 @@ pub(crate) struct IdleGap {
     pub(crate) duration: Duration,
 }
 
+/// A mid-run change to how a peer serves, applied once the peer has been connected for
+/// `at`. Models a peer that was healthy and then degrades partway through a sync — the
+/// two cases the failure mechanism must distinguish: a peer that *wedges* (goes silent,
+/// must be disconnected) versus one that becomes *radically slower* but keeps delivering
+/// (must be kept, only weaker).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Degrade {
+    /// Elapsed time since this peer connected after which `mode` takes effect.
+    pub(crate) at: Duration,
+    pub(crate) mode: DegradeMode,
+}
+
+/// What a [`Degrade`] switches a peer to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DegradeMode {
+    /// Silently drop every subsequent request (the peer keeps *reading* our requests but
+    /// never answers). The node must seal it off and disconnect it via the liveness timer.
+    GoSilent,
+    /// Stop reading our stream entirely and answer nothing — a truly wedged connection.
+    /// Because the peer no longer drains our bounded outbound queue, the node's
+    /// `outbound_capacity()` falls to zero and stays there. This is the case the old
+    /// liveness escape excused indefinitely (extend-while-outbound-full), letting a
+    /// non-reading peer avoid disconnect until the transport idle timeout (~180 s). The
+    /// node must now disconnect it at the liveness deadline regardless of outbound state.
+    Wedge,
+    /// Switch to a finite serve bandwidth (bytes/sec) behind a fixed base RTT: the peer
+    /// keeps delivering but far more slowly. The node must keep it (its cwnd/params just
+    /// shrink), not disconnect it.
+    SlowTo {
+        base_rtt: Duration,
+        bandwidth_bytes_per_sec: u64,
+    },
+}
+
 /// How a synthetic peer answers the node's `GetBlocks`. This is where slow / fast /
 /// idle / withholding / reordering peers are realised; the node's real `PeerRoutine`
 /// reacts to whatever this produces.
@@ -85,6 +119,9 @@ pub(crate) struct ServeProfile {
     pub(crate) withhold: Option<(block::Height, block::Height)>,
     /// Serve the blocks of a response in reverse order, exercising the reorder buffer.
     pub(crate) reorder: bool,
+    /// Optional mid-run degradation (wedge or slow-down) applied once the peer has been
+    /// connected for [`Degrade::at`].
+    pub(crate) degrade: Option<Degrade>,
 }
 
 impl ServeProfile {
@@ -98,6 +135,7 @@ impl ServeProfile {
             drop_probability: 0.0,
             withhold: None,
             reorder: false,
+            degrade: None,
         }
     }
 
@@ -265,6 +303,12 @@ pub(crate) struct Scenario {
     pub(crate) timeline: Vec<TipEvent>,
     /// How the mock commit pipeline drains the applyQ (default: instant).
     pub(crate) commit: CommitProfile,
+    /// Depth of each synthetic peer's bounded transport queue (both directions). `None`
+    /// uses the default (1024). A *small* depth lets a peer that stops reading fill the
+    /// node's outbound queue quickly, exercising the liveness path when
+    /// `outbound_capacity()` is zero — the wedge case the default depth is too large to
+    /// reproduce.
+    pub(crate) transport_queue_depth: Option<usize>,
     /// Wall-clock bound for the run.
     pub(crate) deadline: Duration,
 }
@@ -287,6 +331,7 @@ impl Scenario {
             peers,
             timeline: Vec::new(),
             commit: CommitProfile::default(),
+            transport_queue_depth: None,
             deadline: Duration::from_secs(30),
         }
     }

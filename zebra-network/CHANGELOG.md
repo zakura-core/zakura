@@ -69,6 +69,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Raised `DEFAULT_ZAKURA_QUIC_IDLE_TIMEOUT` from 30s to 150s. The 30s
   application-idle reaper tore down healthy gossip connections between blocks
   (which can be minutes apart) and forced constant re-dials.
+- Zakura block sync now uses a probe-first no-progress policy for peers that
+  are not delivering accepted block bodies. A peer receives only
+  `initial_block_probe_requests` before its first accepted body; after that,
+  `max_requests_without_block_progress` is the hard cap before the no-progress
+  liveness deadline disconnects it. The policy only penalises genuine silence: a
+  useful body accepted through the late/unmatched path still counts as progress
+  (so a slow peer whose probe timed out but that then delivered is kept), a
+  destructive view reset clears the probe streak (so an unproven peer whose only
+  probe was in flight at the reset can probe again rather than wedging), and a
+  would-be liveness disconnect caused by _transient_ local outbound backpressure
+  is briefly deferred (see the bounded grace below).
+- Zakura block-sync BBR now folds per-peer reliability into the cwnd. Vanilla BBR
+  ignores request failures, but a dropped block-sync request is expensive (it can
+  stall the contiguous floor for a whole request-timeout), so the controller tracks
+  each peer's goodput (the fraction of its requests that deliver a body) and
+  discounts its BDP-derived cwnd by it: a carrier that silently drops a share of its
+  requests is expected to hold proportionally less in flight, bounding the requests
+  wasted on it and shifting that share of the work to reliable peers, and self-healing
+  as the peer recovers. Tunable via `bbr_reliability_weight_percent` (`0` = plain BBR,
+  the A/B baseline; `100` = full goodput discount, the default).
+- The reliability discount now **ramps the effective window to zero** for a peer that
+  stops turning requests into bodies (the discount is applied after, not floored at,
+  the minimum window). This is a fast-acting seal — a sealed peer receives no new work,
+  and the generous no-progress liveness timer then decides whether it is actually dead.
+  A peer that is merely _slow but still delivering_ is never sealed: a body that arrives
+  late (after its own request already timed out) credits its reliability back, offsetting
+  the timeout charge, so a sudden-bandwidth-drop peer keeps a reduced-but-nonzero window
+  (kept, weaker) instead of being cut off.
+- Short block-sync responses now count against reliability: the missing heights of a
+  `BlocksDone` that returns fewer bodies than requested, or a `RangeUnavailable`, age
+  the goodput EWMA (without a cwnd dip — a short response is a goodput failure, not a
+  congestion signal), so a peer cannot deliver one body per request to keep its
+  liveness/no-progress accounting reset while dropping the rest of every range.
+- The BBR base-round-trip / delivery-rate windows are now filtered against the current
+  time at read time, not only pruned on insert, so a peer that was fast and then stops
+  completing requests no longer keeps advertising a stale-low round-trip / stale-high
+  rate past the window horizon (which had kept it looking like a fast floor server and
+  tightened its request deadlines).
+- Under the byte cwnd unit, a request's byte reservation is now bounded by the peer's
+  remaining window bytes (window − reserved, plus the bounded floor bypass), so a peer
+  whose window is nearly full can no longer issue a large multi-body request that
+  overshoots it — the byte cwnd is a real admission limit, not just a non-empty gate.
+- The block-sync liveness disconnect is now **bounded**: a peer that stops reading our
+  stream backs our outbound queue up and holds it full, and the previous escape
+  (`outbound_capacity() == 0` → extend the deadline) treated that as our own write
+  congestion and extended _indefinitely_, so a wedged, non-reading peer was never
+  disconnected by the application (it survived until the ~150 s transport idle timeout)
+  while we kept queuing requests it never read. The grace is now granted only while the
+  outbound queue has been continuously full for less than `request_timeout` (genuinely
+  transient local congestion); once it has been full that long — the peer has stopped
+  reading — the peer is disconnected at the liveness deadline regardless of outbound
+  state. A peer that stops responding is now cut off at the timeout, full stop.
+- The block-sync floor bypass (the extra above-window slots that let the lowest missing
+  height keep moving through a saturated carrier) is now scaled by the peer's reliability,
+  so a failing/sealed peer earns **no** bypass. A peer's window limit is no longer
+  bypassed just because a block is near the floor: only a healthy, saturated carrier gets
+  the bypass; once a peer is sealed its floor bonus ramps to zero, so a wedged peer
+  receives no requests of any kind (the seal, the no-progress cap, and the bounded
+  liveness timer then compose to stop and disconnect it).
+- Retuned the Zakura block-sync BBR cold start for a conservative start and a faster
+  ramp, now that the reliability discount and delay-gradient ceiling backstop an
+  over-eager window: lowered `bbr_min_cwnd_bytes` from 4 MiB to ≈2.5 MB (one max block
+  plus headroom), so a just-proven peer rides its own measured BDP up instead of
+  jumping to a multi-megabyte burst, and raised `bbr_cwnd_gain_percent` from 200% to
+  300% so it ramps `1 → 3 → 9 …` per round from that smaller base.
+- Added a periodic per-peer `block_peer_bbr` trace heartbeat (every 10s) carrying the
+  full controller state even while a peer is idle, so oscillation (window ramping up
+  then the reliability discount pulling it back) is visible between deliveries.
 
 ### Fixed
 

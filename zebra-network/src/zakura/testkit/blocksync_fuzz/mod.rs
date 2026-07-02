@@ -123,7 +123,7 @@ pub(crate) async fn run_scenario(
     let peers = Arc::new(SyntheticBlockSyncPeers::new(
         scenario.config.clone(),
         handle.clone(),
-        1024,
+        scenario.transport_queue_depth.unwrap_or(1024),
     ));
     for spec in &scenario.peers {
         tasks.push(peer::spawn_peer_lifecycle(

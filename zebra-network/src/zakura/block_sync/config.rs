@@ -82,6 +82,10 @@ pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DEFAULT_BS_FLOOR_RESCUE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Request-timeout windows allowed before block-progress liveness disconnects.
 const BLOCK_PROGRESS_TIMEOUT_REQUESTS: u32 = 4;
+/// Default `GetBlocks` probes sent to a new peer before it proves block-body progress.
+pub const DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS: u32 = 1;
+/// Maximum `GetBlocks` requests sent to one peer without an accepted block body.
+pub const DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS: u32 = 64;
 /// Default cooldown before a no-progress peer may be admitted again.
 pub const DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN: Duration = Duration::from_secs(180);
 /// Default hard floor-peer avoid cooldown after a watchdog cancellation.
@@ -97,8 +101,10 @@ pub const DEFAULT_BS_SIZE_DEVIATION_TOLERANCE: u32 = 200;
 /// only controls how many bounded body frames a server sends before `BlocksDone`.
 pub const MAX_BS_RESPONSE_BYTES: u32 = DEFAULT_BS_MAX_RESPONSE_BYTES;
 
-/// Default steady-state cwnd gain, as a percent of the bandwidth-delay product.
-pub const DEFAULT_BS_BBR_CWND_GAIN_PERCENT: u32 = 200;
+/// Default steady-state cwnd gain, percent of the bandwidth-delay product. 300% ramps a
+/// proven peer up as `1 → 3 → 9 …`; the reliability discount and delay-gradient ceiling
+/// pull it back if the extra concurrency costs drops or standing queue.
+pub const DEFAULT_BS_BBR_CWND_GAIN_PERCENT: u32 = 300;
 /// Default ProbeBW up-probe pacing gain, percent.
 pub const DEFAULT_BS_BBR_PROBE_BW_GAIN_PERCENT: u32 = 125;
 /// Default ProbeRTT cadence: how often to drain to re-measure the min-RTT.
@@ -114,20 +120,20 @@ pub const DEFAULT_BS_BBR_DELIVERY_RATE_WINDOW: Duration = Duration::from_secs(10
 pub const DEFAULT_BS_BBR_STARTUP_GROWTH_PERCENT: u32 = 200;
 /// Default minimum cwnd in blocks — keeps the pipe primed and lets ProbeRTT send.
 pub const DEFAULT_BS_BBR_MIN_CWND: u32 = 4;
-/// Default minimum cwnd in **bytes** (the floor under [`CwndUnit::Bytes`]).
-///
-/// Under byte denomination the steady cwnd is `BtlBw_bytes × RTprop × gain`. For a
-/// low-latency peer that product is small (a fast link with ~1 ms base RTT needs
-/// little in flight to stay busy), so this floor — not the BDP — is the binding
-/// operating window most of the time. It is sized to keep enough concurrent
-/// single-block requests in flight to actually pipeline a server that has spare
-/// capacity (the trace showed peers 60–86% idle at a pinned cwnd of 4), while the
-/// size-aware delay-gradient still shrinks it back if a real standing queue forms.
-/// **This is the primary live-A/B tuning lever** (`byte-cwnd-1`): raise it to push
-/// more concurrency, lower it if floor head-of-line latency regresses.
-pub const DEFAULT_BS_BBR_MIN_CWND_BYTES: u64 = 4 * 1024 * 1024;
+/// Default minimum cwnd in **bytes**: the [`CwndUnit::Bytes`] floor and the cold-start
+/// window before the first delivery sample. Sized to one max block plus headroom (≈2.5 MB)
+/// so a worst-case body fits, but a just-proven peer then rides its measured BDP up via the
+/// gain instead of bursting to multiple megabytes. Primary live-A/B concurrency lever:
+/// raise to push more in flight, lower if floor head-of-line latency regresses.
+pub const DEFAULT_BS_BBR_MIN_CWND_BYTES: u64 = block::MAX_BLOCK_BYTES + 512 * 1024;
 /// Default delay-gradient down-adjust threshold, percent of RTprop.
 pub const DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT: u32 = 150;
+/// Default weight (`0..=100`) with which measured reliability (fraction of requests that
+/// deliver a body) discounts the BDP-derived cwnd. `100` = full goodput discount (a peer
+/// delivering `r` of its requests holds `r ×` the cwnd); `0` = plain BBR. A dropped
+/// request is expensive — it can stall the floor for a whole request-timeout — so the
+/// cost is folded into the cwnd rather than ignored.
+pub const DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT: u32 = 100;
 /// Default number of slots the floor request may borrow beyond the BBR cwnd, so the
 /// lowest missing height is fetched even when every servable peer is at its cwnd.
 pub const DEFAULT_BS_FLOOR_BYPASS_SLOTS: u32 = 2;
@@ -247,6 +253,14 @@ pub struct ZakuraBlockSyncConfig {
     /// How long to keep a peer disconnected after it makes no accepted block progress.
     #[serde(with = "humantime_serde")]
     pub no_progress_peer_cooldown: Duration,
+    /// `GetBlocks` requests an unproven peer may receive before its first accepted body,
+    /// so a peer that accepts requests but never serves bodies can't spend a full BBR
+    /// cold-start burst.
+    pub initial_block_probe_requests: u32,
+    /// After a peer has proven progress, the cap on requests without an accepted body;
+    /// past it the peer gets no more work until it makes progress or the liveness
+    /// deadline disconnects it.
+    pub max_requests_without_block_progress: u32,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
     #[serde(with = "humantime_serde")]
     pub status_refresh_interval: Duration,
@@ -282,6 +296,10 @@ pub struct ZakuraBlockSyncConfig {
     pub bbr_min_cwnd_bytes: u64,
     /// Delay-gradient down-adjust threshold, percent of RTprop.
     pub bbr_delay_gradient_percent: u32,
+    /// Weight (`0..=100`) with which measured reliability discounts the BDP-derived cwnd:
+    /// `0` = plain BBR, `100` = full goodput discount, so a request-dropping carrier holds
+    /// proportionally less in flight. See [`DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT`].
+    pub bbr_reliability_weight_percent: u32,
     /// Unit the BBR cwnd budgets in-flight work against (`bytes` = header-hinted
     /// reserved body bytes, default; `blocks` = request count, the A/B baseline).
     pub bbr_cwnd_unit: CwndUnit,
@@ -316,6 +334,8 @@ impl Default for ZakuraBlockSyncConfig {
             request_timeout: DEFAULT_BS_REQUEST_TIMEOUT,
             floor_rescue_timeout: DEFAULT_BS_FLOOR_RESCUE_TIMEOUT,
             no_progress_peer_cooldown: DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN,
+            initial_block_probe_requests: DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS,
+            max_requests_without_block_progress: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
             status_refresh_interval: DEFAULT_BS_STATUS_REFRESH_INTERVAL,
             size_deviation_tolerance: DEFAULT_BS_SIZE_DEVIATION_TOLERANCE,
             bbr_cwnd_gain_percent: DEFAULT_BS_BBR_CWND_GAIN_PERCENT,
@@ -328,6 +348,7 @@ impl Default for ZakuraBlockSyncConfig {
             bbr_min_cwnd: DEFAULT_BS_BBR_MIN_CWND,
             bbr_min_cwnd_bytes: DEFAULT_BS_BBR_MIN_CWND_BYTES,
             bbr_delay_gradient_percent: DEFAULT_BS_BBR_DELAY_GRADIENT_PERCENT,
+            bbr_reliability_weight_percent: DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT,
             bbr_cwnd_unit: CwndUnit::Bytes,
             floor_bypass_slots: DEFAULT_BS_FLOOR_BYPASS_SLOTS,
             peer_limits: ServicePeerLimits::default(),
@@ -420,12 +441,21 @@ impl ZakuraBlockSyncConfig {
         if self.bbr_min_cwnd_bytes == 0 {
             return Err("bbr_min_cwnd_bytes must be greater than zero");
         }
+        if self.max_requests_without_block_progress == 0 {
+            return Err("max_requests_without_block_progress must be greater than zero");
+        }
+        if self.initial_block_probe_requests == 0 {
+            return Err("initial_block_probe_requests must be greater than zero");
+        }
         if self.bbr_cwnd_gain_percent < 100
             || self.bbr_probe_bw_gain_percent < 100
             || self.bbr_startup_growth_percent < 100
             || self.bbr_delay_gradient_percent < 100
         {
             return Err("bbr gain/threshold percentages must be at least 100");
+        }
+        if self.bbr_reliability_weight_percent > 100 {
+            return Err("bbr_reliability_weight_percent must be at most 100");
         }
         if self.bbr_probe_rtt_interval <= self.bbr_probe_rtt_duration {
             return Err("bbr_probe_rtt_interval must exceed bbr_probe_rtt_duration");

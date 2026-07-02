@@ -13,6 +13,10 @@ use super::{
 /// with the `request_timeout` base the above-floor deadline tops out near 16 s — the
 /// "a block every ~16 s is fine" tolerance the directive sets for speculative work.
 const ABOVE_FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
+/// Delivery rate assumed for floor rescue before a peer has a fresh byte-rate
+/// sample. This keeps the rescue leash short while allowing a full 2 MB body roughly
+/// two seconds of transfer time.
+const FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 1024 * 1024;
 
 /// Estimated resident-memory multiple of a buffered block body's serialized size.
 ///
@@ -107,9 +111,10 @@ pub(super) fn request_priority(
 
 /// The per-request network deadline (the one sanctioned timer), set by priority:
 ///
-/// - **Floor**: a short fixed leash. On expiry the lowest missing height is rescued
-///   to a faster carrier (returned to the queue + the peer retry-avoided), so the
-///   contiguous floor never waits on a slow peer — and the peer is *not* disconnected.
+/// - **Floor**: a short rescue leash plus the expected transfer time. On expiry the
+///   lowest missing height is rescued to a faster carrier (returned to the queue + the
+///   peer retry-avoided), so the contiguous floor never waits on a slow peer — and the
+///   peer is *not* disconnected.
 /// - **Above-floor**: the base `request_timeout` plus the size-expected transfer time
 ///   (`estimated_bytes / BtlBw`), so a legitimately slow large-body fetch runs to
 ///   completion. These deadlines never gate the floor, so they can afford to be
@@ -124,7 +129,13 @@ pub(super) fn request_deadline(
     btlbw_bytes_per_sec: Option<u64>,
 ) -> Instant {
     match priority {
-        RequestPriority::Floor => queued_at + floor_rescue_timeout,
+        RequestPriority::Floor => {
+            let rate = btlbw_bytes_per_sec
+                .unwrap_or(0)
+                .max(FLOOR_DEADLINE_MIN_BYTES_PER_SEC);
+            let transfer = Duration::from_secs_f64(estimated_bytes as f64 / rate as f64);
+            queued_at + floor_rescue_timeout + transfer
+        }
         RequestPriority::AboveFloor => {
             let rate = btlbw_bytes_per_sec
                 .unwrap_or(0)
@@ -320,7 +331,7 @@ mod tests {
     const RESCUE: Duration = Duration::from_secs(2);
 
     #[test]
-    fn floor_request_uses_the_short_rescue_leash() {
+    fn floor_request_leash_is_size_aware() {
         let now = Instant::now();
         let deadline = request_deadline(
             RequestPriority::Floor,
@@ -330,8 +341,10 @@ mod tests {
             2_000_000,
             None,
         );
-        // The floor is rescued on the fixed leash regardless of size or measured rate.
-        assert_eq!(deadline, now + RESCUE);
+        assert_eq!(
+            deadline,
+            now + RESCUE + Duration::from_secs_f64(2_000_000_f64 / (1024_f64 * 1024_f64))
+        );
     }
 
     #[test]

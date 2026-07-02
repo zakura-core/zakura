@@ -14,11 +14,17 @@ const BBR_DELAY_EWMA_ALPHA: f64 = 0.25;
 /// Multiplicative shrink applied to the delay-gradient ceiling on each delivery whose
 /// smoothed round-trip exceeds `RTprop × delay_gradient` (queue building).
 const BBR_DELAY_CAP_DOWN: f64 = 0.9;
+/// EWMA weight for the per-peer reliability estimate (fraction of issued requests that
+/// yield a body): a completion pulls it toward 1.0, a timeout toward 0.0. Averages over
+/// ~10–20 outcomes so a brief blip does not collapse a peer, sustained dropping does.
+const BBR_RELIABILITY_EWMA_ALPHA: f64 = 0.1;
 
 /// A time-windowed set of `f64` samples supporting `min` (RTprop) and `max` (BtlBw)
-/// filters — the BBR-lite estimators. Samples older than `horizon` are pruned on
-/// insert; the windows are small (seconds of per-request samples) so the linear
-/// scan is cheap and runs once per completed request.
+/// filters — the BBR-lite estimators. Samples older than `horizon` are pruned on insert
+/// **and re-filtered at read time against the caller's `now`**, so a min/max never
+/// reflects a sample past the horizon even during a quiet (no-completion) period — a peer
+/// that went fast then stopped completing must not keep a stale-low RTprop / stale-high
+/// BtlBw. Windows are small (seconds of samples), so the linear scan is cheap.
 #[derive(Clone, Debug)]
 struct WindowedSamples {
     horizon: Duration,
@@ -35,23 +41,35 @@ impl WindowedSamples {
 
     fn observe(&mut self, now: Instant, value: f64) {
         self.samples.push((now, value));
+        self.prune(now);
+    }
+
+    /// Drop samples older than `horizon` relative to `now`. Called on insert; reads
+    /// filter again so a stale extremum is never returned during a quiet bad period.
+    fn prune(&mut self, now: Instant) {
         if let Some(cutoff) = now.checked_sub(self.horizon) {
             self.samples.retain(|(at, _)| *at >= cutoff);
         }
     }
 
-    fn min(&self) -> Option<f64> {
-        self.samples
-            .iter()
-            .map(|(_, value)| *value)
-            .reduce(f64::min)
+    /// Windowed minimum over samples no older than `now - horizon`. Filters by `now`
+    /// rather than trusting the last prune, so a quiet-period read cannot return an
+    /// aged-out sample.
+    fn min(&self, now: Instant) -> Option<f64> {
+        self.fresh_values(now).reduce(f64::min)
     }
 
-    fn max(&self) -> Option<f64> {
+    /// The windowed maximum over samples no older than `now - horizon`. See [`min`].
+    fn max(&self, now: Instant) -> Option<f64> {
+        self.fresh_values(now).reduce(f64::max)
+    }
+
+    fn fresh_values(&self, now: Instant) -> impl Iterator<Item = f64> + '_ {
+        let cutoff = now.checked_sub(self.horizon);
         self.samples
             .iter()
+            .filter(move |(at, _)| cutoff.is_none_or(|c| *at >= c))
             .map(|(_, value)| *value)
-            .reduce(f64::max)
     }
 }
 
@@ -79,6 +97,13 @@ struct BbrParams {
     /// the delay-gradient ceiling ratchets the cwnd down (e.g. 1.5 = shrink once the
     /// recent round-trip runs 50% over the uncontended minimum).
     delay_gradient: f64,
+    /// How strongly a peer's measured reliability (goodput fraction) discounts its
+    /// BDP-derived cwnd, in `[0, 1]`. `0` disables it (plain BBR, the A/B baseline: cwnd
+    /// ignores drops); `1` applies it fully (a peer turning only `r` of its requests into
+    /// bodies holds `r ×` the cwnd). Unlike vanilla BBR (which treats a loss as a rare
+    /// congestion signal), a dropped block-sync request is expensive — it can stall the
+    /// contiguous floor for a whole request-timeout — so the drop cost folds into the cwnd.
+    reliability_weight: f64,
 }
 
 impl BbrParams {
@@ -114,6 +139,9 @@ impl BbrParams {
             probe_rtt_interval: config.bbr_probe_rtt_interval,
             probe_rtt_duration: config.bbr_probe_rtt_duration,
             delay_gradient: f64::from(config.bbr_delay_gradient_percent.max(100)) / 100.0,
+            // Clamp to [0, 1]: the discount is `1 - weight × (1 - reliability)`, so a
+            // weight above 1 could drive the factor negative.
+            reliability_weight: f64::from(config.bbr_reliability_weight_percent.min(100)) / 100.0,
         }
     }
 }
@@ -139,7 +167,7 @@ impl BbrPhase {
     }
 }
 
-fn rounded_usize(value: f64, fallback: usize) -> usize {
+pub(super) fn rounded_usize(value: f64, fallback: usize) -> usize {
     // BBR rates, windows, and gains are non-negative in normal operation. Keep a
     // fallback for NaN/inf or defensive underflow before casting.
     if value.is_finite() && value >= 0.0 {
@@ -207,6 +235,13 @@ pub(super) struct BbrState {
     /// overshoots the sustainable rate (max-rate and min-RTT can come from different
     /// samples under variable queueing), which would otherwise inflate the cwnd.
     delay_cap: usize,
+    /// EWMA of this peer's request goodput (fraction of requests that yield a body).
+    /// Starts optimistic (`1.0`); completions pull it toward 1.0, timeouts toward 0.0.
+    /// `effective_cwnd` discounts the BDP-derived window by this (scaled by
+    /// `reliability_weight`), so a peer dropping a share of its requests holds
+    /// proportionally less in flight — bounding wasted requests and freeing that share
+    /// for reliable carriers, without a hard disconnect.
+    reliability: f64,
 }
 
 impl BbrState {
@@ -224,6 +259,7 @@ impl BbrState {
             probe_rtt_drained_at: None,
             smoothed_elapsed_secs: None,
             delay_cap: usize::MAX,
+            reliability: 1.0,
             params,
         }
     }
@@ -259,7 +295,7 @@ impl BbrState {
         // Floor the delivery-rate interval at the *previous* RTprop min (captured
         // before this sample is observed) so a burst of buffered bodies arriving within
         // one tick cannot inflate the bandwidth estimate.
-        let rate_floor = self.rtprop_secs.min().unwrap_or(rtt_secs).max(1e-4);
+        let rate_floor = self.rtprop_secs.min(now).unwrap_or(rtt_secs).max(1e-4);
 
         // Accumulate the delivered amount in the active unit and push a per-ack rate
         // sample into the BtlBw max-filter (blocks/s under `Blocks`, bytes/s under
@@ -289,11 +325,11 @@ impl BbrState {
         // as a standing queue; under `Blocks` it is the raw round trip (A/B baseline).
         let residual_sample = match self.params.unit {
             CwndUnit::Blocks => rtt_secs,
-            CwndUnit::Bytes => self.size_residual_rtprop(rtt_secs, delivered_bytes),
+            CwndUnit::Bytes => self.size_residual_rtprop(now, rtt_secs, delivered_bytes),
         };
         self.rtprop_residual_secs.observe(now, residual_sample);
 
-        if let Some(target) = self.cwnd_target() {
+        if let Some(target) = self.cwnd_target(now) {
             self.cwnd_cap = target;
         }
         // Delay-gradient runs in ProbeBw only: the drained round-trips ProbeRtt produces
@@ -301,9 +337,38 @@ impl BbrState {
         // still the pre-`advance_phase` value, so a tick that flips into ProbeRtt this
         // call last updated the ceiling under genuine ProbeBw conditions.
         if self.phase == BbrPhase::ProbeBw {
-            self.update_delay_cap(rtt_secs, delivered_bytes);
+            self.update_delay_cap(now, rtt_secs, delivered_bytes);
         }
+        // A completed request is a reliability success.
+        self.observe_reliability(1.0);
         self.advance_phase(now, inflight);
+    }
+
+    /// Fold a request outcome into the reliability EWMA: `1.0` completed, `0.0` timed out.
+    /// Separate from the cwnd dip so the transient congestion response (`dip_on_timeout`)
+    /// and the persistent goodput memory evolve on their own timescales.
+    fn observe_reliability(&mut self, outcome: f64) {
+        self.reliability += BBR_RELIABILITY_EWMA_ALPHA * (outcome - self.reliability);
+    }
+
+    /// Record `count` requests that expired without a body — each a reliability failure.
+    /// The cwnd dip is applied once per batch by [`dip_on_timeout`](Self::dip_on_timeout);
+    /// this only ages the goodput EWMA, so a chronically dropping peer keeps a suppressed
+    /// cwnd even when occasional successes would otherwise fully restore the BDP window.
+    pub(super) fn penalize_reliability(&mut self, count: usize) {
+        for _ in 0..count {
+            self.observe_reliability(0.0);
+        }
+    }
+
+    /// Credit a reliability success **without** touching the RTprop/BtlBw estimators. For
+    /// a late-delivered body whose request already timed out (charged as a failure by
+    /// [`penalize_reliability`]): the peer did deliver, just slowly, so this offsets the
+    /// charge — keeping a merely-slowed peer from being sealed like a genuine dropper
+    /// (which sends no late body). Estimators are untouched: the request's send timestamp
+    /// is gone, so there is no trustworthy interval to sample.
+    pub(super) fn credit_late_success(&mut self) {
+        self.observe_reliability(1.0);
     }
 
     /// Size-residual RTprop sample (`Bytes` unit): subtract the body's transmission
@@ -311,8 +376,8 @@ impl BbrState {
     /// component. Falls back to the raw round trip before any rate is known, and is
     /// clamped to `[ε, elapsed]` (the residual can never exceed the time elapsed, and a
     /// tiny positive floor keeps the byte-BDP well-defined).
-    fn size_residual_rtprop(&self, rtt_secs: f64, delivered_bytes: u64) -> f64 {
-        let btlbw = self.btlbw_per_sec.max().unwrap_or(0.0);
+    fn size_residual_rtprop(&self, now: Instant, rtt_secs: f64, delivered_bytes: u64) -> f64 {
+        let btlbw = self.btlbw_per_sec.max(now).unwrap_or(0.0);
         let residual = if btlbw > 0.0 {
             // `delivered_bytes as f64` is exact for real body sizes.
             rtt_secs - delivered_bytes as f64 / btlbw
@@ -326,7 +391,7 @@ impl BbrState {
     /// smoothed round-trip rises above `RTprop × delay_gradient` the queue is building,
     /// so ratchet the ceiling down from the current operating cwnd; otherwise relax it
     /// back up so a cleared queue lets the cwnd re-probe for bandwidth.
-    fn update_delay_cap(&mut self, rtt_secs: f64, delivered_bytes: u64) {
+    fn update_delay_cap(&mut self, now: Instant, rtt_secs: f64, delivered_bytes: u64) {
         let smoothed = match self.smoothed_elapsed_secs {
             Some(prev) => prev * (1.0 - BBR_DELAY_EWMA_ALPHA) + rtt_secs * BBR_DELAY_EWMA_ALPHA,
             None => rtt_secs,
@@ -337,7 +402,7 @@ impl BbrState {
         // transmission back, so basing it on the raw round trip would double-count it.
         let rtprop = self
             .rtprop_residual_secs
-            .min()
+            .min(now)
             .unwrap_or(rtt_secs)
             .max(1e-4);
         // The expected round trip for a healthy (unqueued) delivery. Under `Bytes` it is
@@ -347,7 +412,7 @@ impl BbrState {
         let expected = match self.params.unit {
             CwndUnit::Blocks => rtprop,
             CwndUnit::Bytes => {
-                let btlbw = self.btlbw_per_sec.max().unwrap_or(0.0);
+                let btlbw = self.btlbw_per_sec.max(now).unwrap_or(0.0);
                 let transmit = if btlbw > 0.0 {
                     delivered_bytes as f64 / btlbw
                 } else {
@@ -405,21 +470,39 @@ impl BbrState {
                 self.phase = BbrPhase::ProbeBw;
                 self.last_probe_rtt_at = Some(now);
                 self.probe_rtt_drained_at = None;
-                if let Some(target) = self.cwnd_target() {
+                if let Some(target) = self.cwnd_target(now) {
                     self.cwnd_cap = target;
                 }
             }
         }
     }
 
-    /// The effective cwnd in blocks currently applied (never below `min_cwnd`). During
-    /// ProbeRtt the cwnd is pinned to `min_cwnd` to drain the queue; in ProbeBw it is the
-    /// BDP-derived cwnd capped by the delay-gradient ceiling.
+    /// The reliability discount factor in `[0, 1]` applied to the BDP/floor base:
+    /// `1 - weight × (1 - reliability)`. `1.0` for a healthy peer (or `weight = 0`),
+    /// ramping toward `0` as goodput collapses — the seal. Exposed so floor-bypass sizing
+    /// shrinks with the same signal as the window (no above-window slots for a failing
+    /// peer). Already in `[0, 1]` (weight and `r` clamped); `max(0.0)` is defensive.
+    pub(super) fn reliability_factor(&self) -> f64 {
+        (1.0 - self.params.reliability_weight * (1.0 - self.reliability)).max(0.0)
+    }
+
     pub(super) fn effective_cwnd(&self) -> usize {
-        match self.phase {
+        // Reliability discount `1 - weight × (1 - r)` scales the base in both phases
+        // (`weight = 0` restores plain BBR). NOT re-floored at `min_cwnd`: it must be able
+        // to seal a bad peer to a zero window (then the liveness timer decides). A slow but
+        // delivering peer keeps `r ≈ 1`, so only its BDP shrinks; a dropping/wedged peer's
+        // `r` collapses and the window follows to zero.
+        let factor = self.reliability_factor();
+        let base = match self.phase {
+            // ProbeRtt drains to the floor for a clean, uncontended RTprop sample.
             BbrPhase::ProbeRtt => self.params.min_cwnd,
+            // ProbeBw: BDP-derived window (capped by the delay ceiling), floored at
+            // `min_cwnd` *before* the discount (a cold-start/healthy floor, not one the
+            // failure mechanism must respect). `delay_cap` is unbounded until the gate binds.
             BbrPhase::ProbeBw => self.cwnd_cap.min(self.delay_cap).max(self.params.min_cwnd),
-        }
+        };
+        // Fallback `0` (not `base`): if the arithmetic is non-finite, seal, don't open.
+        rounded_usize(base as f64 * factor, 0)
     }
 
     /// Apply one multiplicative dip on a real timeout (BBR-style), bounded by the
@@ -439,37 +522,43 @@ impl BbrState {
     }
 
     /// Bandwidth-delay product in the active unit: BtlBw (units/s) × RTprop (s) — blocks
-    /// under `Blocks`, bytes under `Bytes`. `None` until at least one delivery sample
-    /// exists (cold start).
-    fn bdp(&self) -> Option<f64> {
-        match (self.btlbw_per_sec.max(), self.rtprop_secs.min()) {
+    /// under `Blocks`, bytes under `Bytes`. `None` with no in-window sample (cold start,
+    /// or after every sample has aged past the horizon relative to `now`).
+    fn bdp(&self, now: Instant) -> Option<f64> {
+        match (self.btlbw_per_sec.max(now), self.rtprop_secs.min(now)) {
             (Some(rate), Some(rtprop)) => Some(rate * rtprop),
             _ => None,
         }
     }
 
-    /// Target cwnd in the active unit = `max(min_cwnd, BDP × gain)`. `None` until the
-    /// first delivery sample exists, so the cwnd stays at the cold-start value until then.
-    fn cwnd_target(&self) -> Option<usize> {
-        let bdp = self.bdp()?;
+    /// Target cwnd in the active unit = `max(min_cwnd, BDP × gain)`. `None` until a
+    /// delivery sample exists within the window, so the cwnd stays at the cold-start
+    /// value until then.
+    fn cwnd_target(&self, now: Instant) -> Option<usize> {
+        let bdp = self.bdp(now)?;
         let cwnd = rounded_usize(bdp * self.params.cwnd_gain, self.params.min_cwnd);
         Some(cwnd.max(self.params.min_cwnd))
     }
 
-    pub(super) fn rtprop_ms(&self) -> Option<u64> {
-        self.rtprop_secs.min().map(secs_to_ms)
+    pub(super) fn has_fresh_bdp(&self, now: Instant) -> bool {
+        self.bdp(now).is_some()
     }
 
-    /// Raw BtlBw max-filter value in the active unit per second (`None` cold-start).
-    pub(super) fn btlbw_units_per_sec(&self) -> Option<f64> {
-        self.btlbw_per_sec.max()
+    pub(super) fn rtprop_ms(&self, now: Instant) -> Option<u64> {
+        self.rtprop_secs.min(now).map(secs_to_ms)
     }
 
-    pub(super) fn btlbw_milliblocks_per_sec(&self) -> Option<u64> {
+    /// Raw BtlBw max-filter value in the active unit per second (`None` cold-start or
+    /// once every sample has aged past the horizon relative to `now`).
+    pub(super) fn btlbw_units_per_sec(&self, now: Instant) -> Option<f64> {
+        self.btlbw_per_sec.max(now)
+    }
+
+    pub(super) fn btlbw_milliblocks_per_sec(&self, now: Instant) -> Option<u64> {
         // A rounded non-negative rate scaled by 1000 fits u64 for any real rate. Only
         // meaningful under `Blocks`; the byte trace path reports bytes/sec instead.
         self.btlbw_per_sec
-            .max()
+            .max(now)
             .map(|rate| (rate * 1000.0).round() as u64)
     }
 
@@ -491,6 +580,13 @@ impl BbrState {
     /// still unbounded), for tracing.
     pub(super) fn delay_cap(&self) -> Option<usize> {
         (self.delay_cap != usize::MAX).then_some(self.delay_cap)
+    }
+
+    /// Current reliability estimate (goodput fraction) scaled to per-mille (0–1000)
+    /// for the integer JSONL trace. `1000` = every issued request delivered a body.
+    pub(super) fn reliability_permille(&self) -> u64 {
+        // A finite EWMA of values in [0, 1]; clamp defensively before the cast.
+        (self.reliability.clamp(0.0, 1.0) * 1000.0).round() as u64
     }
 }
 
@@ -572,7 +668,7 @@ mod bbr_tests {
         // Sixteen one-block responses completed during the same request interval:
         // BtlBw = 16 / 100 ms, BDP = 16, cwnd gain = 2.
         assert_eq!(bbr.effective_cwnd(), 32);
-        assert_eq!(bbr.btlbw_milliblocks_per_sec(), Some(160_000));
+        assert_eq!(bbr.btlbw_milliblocks_per_sec(t0), Some(160_000));
     }
 
     #[test]
@@ -582,20 +678,15 @@ mod bbr_tests {
 
         // Establish a 100 ms RTprop and 100 blocks/s BtlBw sample.
         record_delivery(&mut bbr, t0, Duration::from_millis(100), 10, 10);
-        assert_eq!(bbr.btlbw_milliblocks_per_sec(), Some(100_000));
+        assert_eq!(bbr.btlbw_milliblocks_per_sec(t0), Some(100_000));
 
         // A later 1 ms request is also the new RTprop, but it must not remove the
         // floor for its own delivery-rate sample. With the old ordering this sample
         // was 10 / 1 ms = 10_000 blocks/s and inflated BtlBw by 100x.
-        record_delivery(
-            &mut bbr,
-            t0 + Duration::from_millis(10),
-            Duration::from_millis(1),
-            10,
-            10,
-        );
-        assert_eq!(bbr.rtprop_ms(), Some(1));
-        assert_eq!(bbr.btlbw_milliblocks_per_sec(), Some(100_000));
+        let t1 = t0 + Duration::from_millis(10);
+        record_delivery(&mut bbr, t1, Duration::from_millis(1), 10, 10);
+        assert_eq!(bbr.rtprop_ms(t1), Some(1));
+        assert_eq!(bbr.btlbw_milliblocks_per_sec(t1), Some(100_000));
     }
 
     #[test]
@@ -639,6 +730,242 @@ mod bbr_tests {
         assert_eq!(bbr.phase, BbrPhase::ProbeBw);
         assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
         assert_eq!(bbr.last_probe_rtt_at, Some(t5));
+    }
+
+    #[test]
+    fn reliability_discounts_cwnd_for_a_request_dropping_peer() {
+        // Dropped requests age the reliability EWMA and discount the cwnd below the BDP
+        // target (the drop cost baked into the formula; plain BBR would keep the target).
+        let cfg = bbr_test_config();
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
+        assert_eq!(bbr.reliability_permille(), 1000);
+
+        // Timed-out requests (BDP target untouched; only reliability ages). This is what
+        // `record_timeout` feeds per timed-out request.
+        bbr.penalize_reliability(20);
+        assert!(
+            bbr.reliability_permille() < 1000,
+            "drops must lower the reliability estimate",
+        );
+        let discounted = bbr.effective_cwnd();
+        assert!(
+            discounted < EXPECTED_CWND,
+            "a dropping peer's cwnd must be discounted below the BDP target, got {discounted}",
+        );
+    }
+
+    #[test]
+    fn reliability_seals_cwnd_to_zero_for_a_wedged_peer() {
+        // Ramp-to-zero: the discount is NOT re-floored at min_cwnd, so sustained failures
+        // drive the window below min_cwnd and to zero (the seal; then the liveness timer
+        // decides). Asserts the window falls below min_cwnd, then reaches 0.
+        let cfg = bbr_test_config();
+        let min_cwnd = usize::try_from(cfg.bbr_min_cwnd).unwrap();
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
+
+        // A moderate run of failures pushes the window below the (old-design) min-cwnd floor.
+        bbr.penalize_reliability(30);
+        assert!(
+            bbr.effective_cwnd() < min_cwnd,
+            "sustained drops must push the window below min_cwnd, got {}",
+            bbr.effective_cwnd(),
+        );
+
+        // A wedged peer (reliability toward zero) is sealed to a zero window.
+        bbr.penalize_reliability(60);
+        assert_eq!(
+            bbr.effective_cwnd(),
+            0,
+            "a wedged peer's window must ramp to zero (the seal), got {}",
+            bbr.effective_cwnd(),
+        );
+    }
+
+    #[test]
+    fn window_record_timeout_shrinks_effective_cwnd() {
+        // DownloadWindow wiring: `record_timeout(n)` dips once and ages reliability by `n`,
+        // shrinking the request-denominated cwnd the fill loop reads off the window.
+        let cfg = bbr_test_config();
+        let mut window = DownloadWindow::new(&cfg);
+        let t0 = Instant::now();
+        let snapshot = window.delivery_snapshot(t0 - CLEAN_ELAPSED);
+        window.record_delivery(t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 0, snapshot);
+        let healthy = window.bbr_effective_cwnd();
+        assert!(healthy > usize::try_from(cfg.bbr_min_cwnd).unwrap());
+
+        window.record_timeout(20);
+        assert!(
+            window.bbr_effective_cwnd() < healthy,
+            "a batch of timed-out requests must shrink the peer's cwnd",
+        );
+    }
+
+    #[test]
+    fn reliability_factor_tracks_the_seal() {
+        // Floor-bypass sizing rides the cwnd's discount: 1.0 healthy, toward 0 as
+        // reliability collapses, so a failing peer earns no above-window floor slots.
+        let cfg = bbr_test_config();
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert!(
+            (bbr.reliability_factor() - 1.0).abs() < 1e-9,
+            "a healthy peer keeps the full factor, got {}",
+            bbr.reliability_factor(),
+        );
+
+        bbr.penalize_reliability(20);
+        let discounted = bbr.reliability_factor();
+        assert!(
+            discounted < 1.0 && discounted > 0.0,
+            "drops discount the factor below 1 (but not yet to zero), got {discounted}",
+        );
+
+        bbr.penalize_reliability(200);
+        assert!(
+            bbr.reliability_factor() < 0.05,
+            "a wedged peer's factor collapses toward zero, got {}",
+            bbr.reliability_factor(),
+        );
+    }
+
+    #[test]
+    fn scaled_floor_bonus_collapses_when_the_peer_is_sealed() {
+        // The floor bonus scales with reliability and reaches zero once the peer is sealed,
+        // so a failing peer gets no above-window slots even for a near-floor block.
+        let cfg = bbr_test_config();
+        let mut window = DownloadWindow::new(&cfg);
+        assert_eq!(
+            window.scaled_floor_bonus(2),
+            2,
+            "a healthy peer keeps the full floor bypass",
+        );
+
+        // A wedged peer: no above-window floor slots at all.
+        window.record_timeout(200);
+        assert_eq!(
+            window.scaled_floor_bonus(2),
+            0,
+            "a sealed peer's floor bypass must be zero",
+        );
+    }
+
+    #[test]
+    fn late_delivery_credit_offsets_a_timeout_charge() {
+        // Slow vs wedged: a timeout charges reliability, but a late body credits it back up
+        // (a genuine dropper sends no late body, so its charge stands and it seals). The
+        // EWMA is not additive-inverse, so the credit only partially offsets the charge;
+        // over a steady slow stream the timeout+credit pairs hold reliability off the seal.
+        let cfg = bbr_test_config();
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        let baseline = bbr.reliability_permille();
+
+        bbr.penalize_reliability(1);
+        let after_timeout = bbr.reliability_permille();
+        assert!(after_timeout < baseline, "a timeout must lower reliability");
+
+        bbr.credit_late_success();
+        assert!(
+            bbr.reliability_permille() > after_timeout,
+            "a late delivery must credit reliability back up from the timeout charge \
+             (was {after_timeout}, now {})",
+            bbr.reliability_permille(),
+        );
+    }
+
+    #[test]
+    fn reliability_weight_zero_restores_plain_bbr() {
+        // With the weight disabled the controller ignores drops (the A/B baseline): the
+        // cwnd stays at the BDP target however unreliable the peer is.
+        let cfg = ZakuraBlockSyncConfig {
+            bbr_reliability_weight_percent: 0,
+            ..bbr_test_config()
+        };
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        assert_eq!(bbr.effective_cwnd(), EXPECTED_CWND);
+
+        bbr.penalize_reliability(50);
+        assert_eq!(
+            bbr.effective_cwnd(),
+            EXPECTED_CWND,
+            "weight 0 = plain BBR: request drops do not shrink the cwnd",
+        );
+    }
+
+    #[test]
+    fn reliability_recovers_with_sustained_success() {
+        // Reliability is a moving average, not a latch: after a *partial* dropping spell
+        // (window shrunk but not sealed to zero) sustained deliveries climb back to the
+        // full cwnd. A full seal is terminal by design — a zero-window peer gets no
+        // requests to complete, so the liveness timer, not BBR, decides its fate.
+        let cfg = bbr_test_config();
+        let mut bbr = BbrState::new(&cfg);
+        let mut now = Instant::now();
+        record_delivery(&mut bbr, now, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+
+        bbr.penalize_reliability(20);
+        let dropped = bbr.effective_cwnd();
+        assert!(dropped < EXPECTED_CWND);
+
+        // Sustained clean deliveries (well inside one ProbeRtt interval) restore it.
+        for _ in 0..60 {
+            now += Duration::from_millis(5);
+            record_delivery(&mut bbr, now, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        }
+        assert_eq!(
+            bbr.phase,
+            BbrPhase::ProbeBw,
+            "stay in ProbeBw for this test"
+        );
+        assert!(
+            bbr.effective_cwnd() > dropped,
+            "sustained success must lift the cwnd back up",
+        );
+        assert_eq!(
+            bbr.effective_cwnd(),
+            EXPECTED_CWND,
+            "a fully-redeemed peer regains the full BDP target",
+        );
+    }
+
+    #[test]
+    fn windowed_estimators_drop_stale_samples_at_read_time() {
+        // Finding #2: min/max filters are evaluated against the caller's `now`, so once
+        // every sample has aged past the 10 s horizon the estimators read `None` even
+        // without a new sample to trigger a prune — no stale-low RTprop / stale-high BtlBw.
+        let cfg = bbr_test_config();
+        let mut bbr = BbrState::new(&cfg);
+        let t0 = Instant::now();
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+
+        // Fresh reads at the delivery time see the sample.
+        assert_eq!(bbr.rtprop_ms(t0), Some(10));
+        assert!(bbr.btlbw_units_per_sec(t0).is_some());
+        assert!(bbr.bdp(t0).is_some());
+
+        // Still fresh just inside the horizon.
+        let inside = t0 + Duration::from_secs(9);
+        assert_eq!(bbr.rtprop_ms(inside), Some(10));
+        assert!(bbr.btlbw_units_per_sec(inside).is_some());
+
+        // Past the 10 s horizon with no new completion: estimators go stale → None, so the
+        // floor-preference comparison treats this peer as the worst server and the
+        // above-floor deadline stops being tightened by a rate it no longer meets.
+        let stale = t0 + Duration::from_secs(11);
+        assert_eq!(bbr.rtprop_ms(stale), None);
+        assert_eq!(bbr.btlbw_units_per_sec(stale), None);
+        assert_eq!(bbr.bdp(stale), None);
     }
 
     #[test]
@@ -870,6 +1197,74 @@ mod bbr_tests {
     }
 
     #[test]
+    fn byte_cwnd_cold_start_is_also_request_count_capped() {
+        let cfg = byte_test_config(400_000, 256);
+        let mut window = DownloadWindow::new(&cfg);
+
+        assert_eq!(window.startup_request_cap, 16);
+        assert!(
+            window.available_slots() > 0,
+            "cold byte window starts with byte headroom"
+        );
+
+        push_outstanding_bytes(&mut window, 16, 10);
+        assert_eq!(
+            window.available_slots(),
+            0,
+            "cold byte mode must not open more than the startup request count"
+        );
+        assert!(
+            window.available_slots_with_bonus(2) > 0,
+            "floor bypass can still borrow its configured cold-start count bonus"
+        );
+        push_outstanding_bytes(&mut window, 2, 10);
+        assert_eq!(window.available_slots_with_bonus(2), 0);
+
+        let now = Instant::now();
+        let snapshot = window.delivery_snapshot(now);
+        window.record_delivery(
+            now + Duration::from_millis(10),
+            Duration::from_millis(10),
+            1,
+            10,
+            snapshot,
+        );
+        assert!(
+            window.available_slots() > 0,
+            "a fresh BDP sample releases the cold request-count gate while byte headroom remains"
+        );
+    }
+
+    #[test]
+    fn cwnd_byte_headroom_tracks_remaining_window_and_is_none_in_blocks_mode() {
+        // Finding #1: byte headroom is the remaining cwnd bytes (cwnd − reserved, plus the
+        // floor bonus), so a partially-filled window can't fund a request larger than what
+        // is left. `None` in blocks mode (the window is a request count, not a byte ceiling).
+        let cfg = byte_test_config(8_000, 256);
+        let mut window = DownloadWindow::new(&cfg);
+        assert_eq!(window.cwnd_byte_headroom(0), Some(8_000));
+
+        // Six 1000 B requests leave 2000 B of window; the bonus adds representative-body
+        // headroom on top.
+        push_outstanding_bytes(&mut window, 6, 1000);
+        assert_eq!(window.cwnd_byte_headroom(0), Some(2_000));
+        assert!(
+            window.cwnd_byte_headroom(1).unwrap() > 2_000,
+            "the floor bonus grants extra byte headroom",
+        );
+
+        // Saturated window: no above-floor headroom, but the floor bonus still funds a
+        // representative body so the contiguous floor keeps moving.
+        push_outstanding_bytes(&mut window, 2, 1000);
+        assert_eq!(window.cwnd_byte_headroom(0), Some(0));
+        assert!(window.cwnd_byte_headroom(1).unwrap() > 0);
+
+        // Blocks mode: no byte ceiling.
+        let blocks = DownloadWindow::new(&bbr_test_config());
+        assert_eq!(blocks.cwnd_byte_headroom(0), None);
+    }
+
+    #[test]
     fn probe_rtt_drain_respects_reserved_bytes_under_byte_unit() {
         // Regression for the unit-inconsistent ProbeRtt drain gate under `CwndUnit::Bytes`.
         // The drain check compares the in-flight measure against `min_cwnd`, which under
@@ -947,7 +1342,7 @@ mod bbr_tests {
         };
         bbr.record_delivery(t0, Duration::from_millis(10), 1, 20_000, 50, snapshot);
         // BtlBw is denominated in bytes/sec now, not blocks/sec.
-        assert_eq!(bbr.btlbw_units_per_sec(), Some(2_000_000.0));
+        assert_eq!(bbr.btlbw_units_per_sec(t0), Some(2_000_000.0));
         // The byte floor binds because BDP×gain (40 KB) < floor (100 KB).
         assert_eq!(bbr.effective_cwnd(), 100_000);
     }
@@ -971,9 +1366,9 @@ mod bbr_tests {
             delivered_at: t0 - Duration::from_millis(20),
         };
         bbr.record_delivery(t0, Duration::from_millis(20), 1, 800_000, 50, snapshot);
-        assert_eq!(bbr.btlbw_units_per_sec(), Some(40_000_000.0));
+        assert_eq!(bbr.btlbw_units_per_sec(t0), Some(40_000_000.0));
         // The residual would have zeroed the BDP; the raw round trip does not.
-        assert_eq!(bbr.size_residual_rtprop(0.02, 800_000), 1e-4);
+        assert_eq!(bbr.size_residual_rtprop(t0, 0.02, 800_000), 1e-4);
         assert_eq!(bbr.effective_cwnd(), 1_600_000);
     }
 
@@ -986,13 +1381,13 @@ mod bbr_tests {
         let mut bbr = BbrState::new(&cfg);
         let now = Instant::now();
         bbr.btlbw_per_sec.observe(now, 1_000_000.0);
-        let residual = bbr.size_residual_rtprop(0.1, 50_000);
+        let residual = bbr.size_residual_rtprop(now, 0.1, 50_000);
         assert!(
             (residual - 0.05).abs() < 1e-9,
             "residual should subtract 50 ms of transmission, got {residual}",
         );
         // 200 KB at 1 MB/s implies 200 ms of transmission > the 100 ms round trip: clamp.
-        assert_eq!(bbr.size_residual_rtprop(0.1, 200_000), 1e-4);
+        assert_eq!(bbr.size_residual_rtprop(now, 0.1, 200_000), 1e-4);
     }
 
     #[test]
@@ -1008,7 +1403,7 @@ mod bbr_tests {
                                                        // The delay gate's base is the *residual* RTprop estimator (10 ms base RTT here).
         bytes.rtprop_residual_secs.observe(now, 0.01);
         // 200 ms round trip carrying a 190 KB body: expected ≈ 10 ms + 190 ms = 200 ms.
-        bytes.update_delay_cap(0.2, 190_000);
+        bytes.update_delay_cap(now, 0.2, 190_000);
         assert!(
             bytes.delay_cap().is_none(),
             "a big block's honest transfer time must not look like a standing queue",
@@ -1018,7 +1413,7 @@ mod bbr_tests {
         let mut blocks = BbrState::new(&blocks_cfg);
         blocks.rtprop_residual_secs.observe(now, 0.01);
         // Same 200 ms round trip, blocks mode: expected = RTprop (10 ms) → ratchets.
-        blocks.update_delay_cap(0.2, 190_000);
+        blocks.update_delay_cap(now, 0.2, 190_000);
         assert!(
             blocks.delay_cap().is_some(),
             "blocks mode treats the inflated round trip as a queue and ratchets down",

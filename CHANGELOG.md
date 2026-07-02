@@ -119,6 +119,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   window limits, and configured default native Zakura bootstrap peers. The
   larger defaults are intended for the production native-P2P sync path rather
   than the earlier conservative test-network envelope.
+- Bound Zakura block-sync requests to non-responsive peers with a probe-first
+  no-progress policy: peers receive only `initial_block_probe_requests` before
+  their first accepted block body, then `max_requests_without_block_progress`
+  becomes the hard cap before liveness disconnects them.
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
 - Use V3 chain-history entries from NU6.3 onward, including Ironwood note

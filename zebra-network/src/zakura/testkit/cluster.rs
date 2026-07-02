@@ -144,7 +144,7 @@ fn contains_peer(peers: &[ZakuraPeerId], expected: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{trace_reader::TraceValue, HostilePeer, WaitError};
+    use super::super::{trace_reader::TraceValue, HostilePeer, WaitError, TEST_NET_TIMEOUT};
     use super::*;
     use crate::{
         zakura::trace::{block_sync_trace as bs_trace, header_sync_trace as hs_trace},
@@ -760,7 +760,7 @@ mod tests {
 
         async fn wait_for_tip(&self, node: usize, height: block::Height) -> Result<(), BoxError> {
             let handle = self.nodes[node].view.handle.clone();
-            await_until("header-sync e2e best tip", Duration::from_secs(5), || {
+            await_until("header-sync e2e best tip", TEST_NET_TIMEOUT, || {
                 handle.best_header_tip().0 >= height
             })
             .await
@@ -2667,7 +2667,17 @@ mod tests {
         cluster.start_drivers();
         cluster.connect_all().await;
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        await_until("header-sync status trace rows", TEST_NET_TIMEOUT, || {
+            capture.reader().is_ok_and(|reader| {
+                let source_trace = reader.node("01").table("header_sync");
+                let target_trace = reader.node("02").table("header_sync");
+
+                source_trace.count(hs_trace::HEADER_STATUS_SENT) >= 1
+                    && target_trace.count(hs_trace::HEADER_STATUS_RECEIVED) >= 1
+            })
+        })
+        .await?;
+
         capture.flush().await;
         let reader = capture.reader()?;
         reader
@@ -3316,39 +3326,10 @@ mod tests {
         let network = e2e_network([4]);
         let anchor = (block::Height(0), mainnet_genesis_hash());
 
-        let mut first = HeaderSyncE2eCluster::new();
-        let seeded = first.spawn_node(
-            1,
-            network.clone(),
-            anchor,
-            E2eHeaderStore::with_headers(4),
-            ZakuraTrace::new(capture.tracer_for_node(1), "01"),
-        )?;
-        let syncing = first.spawn_node(
-            2,
-            network.clone(),
-            anchor,
-            E2eHeaderStore::genesis_only(),
-            ZakuraTrace::new(capture.tracer_for_node(2), "02"),
-        )?;
-        first.start_drivers();
-        first.connect_all().await;
-        first.wait_for_tip(syncing, block::Height(4)).await?;
-        let durable_store = first.nodes[syncing].view.store.clone();
-        first.shutdown().await;
-
-        let restart_store = {
-            let store = durable_store
-                .lock()
-                .expect("test store mutex is not poisoned");
-            E2eHeaderStore {
-                headers: store.headers.clone(),
-                bodies: store.bodies.clone(),
-                finalized_height: store.finalized_height,
-                verified_block_tip: store.verified_block_tip,
-                reject_next_commit: None,
-            }
-        };
+        // The genesis sync path is covered above. Start from its durable header state
+        // so this test only exercises restart reload and scheduler rebuild.
+        let mut restart_store = E2eHeaderStore::with_headers(4);
+        restart_store.finalized_height = block::Height(4);
 
         let mut restarted = HeaderSyncE2eCluster::new();
         restarted.spawn_node(
@@ -3356,14 +3337,14 @@ mod tests {
             network.clone(),
             anchor,
             E2eHeaderStore::with_headers(5),
-            ZakuraTrace::new(capture.tracer_for_node(3), "03"),
+            ZakuraTrace::new(capture.tracer_for_node(1), "01"),
         )?;
         let restarted_idx = restarted.spawn_node(
             2,
             network,
             anchor,
             restart_store,
-            ZakuraTrace::new(capture.tracer_for_node(4), "04"),
+            ZakuraTrace::new(capture.tracer_for_node(2), "02"),
         )?;
         restarted.start_drivers();
         restarted.connect_all().await;
@@ -3374,7 +3355,7 @@ mod tests {
         capture.flush().await;
         let reader = capture.reader()?;
         reader
-            .node("04")
+            .node("02")
             .table("header_sync")
             .assert_header_range_request(5, 1);
         assert_eq!(
@@ -3385,7 +3366,6 @@ mod tests {
                 .0,
             block::Height(5)
         );
-        assert_eq!(seeded, 0);
 
         restarted.shutdown().await;
         assert!(capture.finish().await?.is_none());

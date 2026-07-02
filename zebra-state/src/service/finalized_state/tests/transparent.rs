@@ -128,6 +128,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         new_outputs,
         transaction_hashes,
         deferred_pool_balance_change: None,
+        auth_data_root: None,
     };
     let finalized = FinalizedBlock::from_checkpoint_verified(
         CheckpointVerifiedBlock(semantically_verified),

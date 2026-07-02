@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Precompute checkpoint-zone auth data roots before finalized-state commitment,
+  and reuse the shared txid/auth-digest conversion while preparing semantic block
+  data. This moves ZIP-244 authorizing-data commitment work off the finalized
+  committer's critical path when available, while preserving the existing
+  recompute fallback.
 - Compute the v5 ZIP-244 txid and authorizing-data digest natively. Both
   previously routed through `Transaction::to_librustzcash`, which re-serializes
   and reparses the whole transaction — decompressing every Jubjub and Pallas

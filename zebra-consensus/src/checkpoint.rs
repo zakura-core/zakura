@@ -33,7 +33,7 @@ use zebra_chain::{
     parameters::{
         checkpoint::list::CheckpointList,
         subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
-        Network, GENESIS_PREVIOUS_BLOCK_HASH,
+        Network, NetworkUpgrade, GENESIS_PREVIOUS_BLOCK_HASH,
     },
     work::equihash,
 };
@@ -1100,7 +1100,7 @@ where
             return async { Err(VerifyCheckpointError::Finished) }.boxed();
         }
 
-        let req_block = match self.queue_block(block) {
+        let mut req_block = match self.queue_block(block) {
             Ok(req_block) => req_block,
             Err(e) => return async { Err(e) }.boxed(),
         };
@@ -1134,6 +1134,7 @@ where
         // we don't reject the entire checkpoint.
         // Instead, we reset the verifier to the successfully committed state tip.
         let state_service = self.state_service.clone();
+        let network = self.network.clone();
         let commit_checkpoint_verified = tokio::spawn(async move {
             let hash = req_block
                 .rx
@@ -1141,6 +1142,17 @@ where
                 .map_err(Into::into)
                 .map_err(VerifyCheckpointError::CommitCheckpointVerified)
                 .expect("CheckpointVerifier does not leave dangling receivers")?;
+
+            if req_block.block.auth_data_root.is_none()
+                && NetworkUpgrade::current(&network, req_block.block.height) >= NetworkUpgrade::Nu5
+            {
+                let block = req_block.block.block.clone();
+                if let Ok(auth_data_root) =
+                    tokio::task::spawn_blocking(move || block.auth_data_root()).await
+                {
+                    req_block.block.auth_data_root = Some(auth_data_root);
+                }
+            }
 
             // We use a `ServiceExt::oneshot`, so that every state service
             // `poll_ready` has a corresponding `call`. See #1593.

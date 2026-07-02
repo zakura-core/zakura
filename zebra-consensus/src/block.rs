@@ -360,6 +360,7 @@ where
                 new_outputs,
                 transaction_hashes,
                 deferred_pool_balance_change: Some(deferred_pool_balance_change),
+                auth_data_root: None,
             };
 
             // Return early for proposal requests.

@@ -10,7 +10,11 @@ use std::{
 use tower::{BoxError, Service, ServiceExt};
 use zebra_chain::{
     amount::{DeferredPoolBalanceChange, NegativeAllowed},
-    block::{self, Block, HeightDiff},
+    block::{
+        self,
+        merkle::{AuthDataRoot, AUTH_DIGEST_PLACEHOLDER},
+        Block, HeightDiff,
+    },
     diagnostic::{task::WaitForPanics, CodeTimer},
     history_tree::HistoryTree,
     ironwood, orchard,
@@ -261,6 +265,13 @@ pub struct SemanticallyVerifiedBlock {
     pub transaction_hashes: Arc<[transaction::Hash]>,
     /// This block's deferred pool value balance change.
     pub deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    /// The precomputed ZIP-244 authorizing-data commitment root for this block,
+    /// if it was computed during verification.
+    ///
+    /// The checkpoint verifier can set this ahead of the single-threaded
+    /// finalized committer. `None` means the committer falls back to computing
+    /// it from the block's transactions.
+    pub auth_data_root: Option<AuthDataRoot>,
 }
 
 /// A block ready to be committed directly to the finalized state with
@@ -497,6 +508,7 @@ impl ContextuallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change,
+            auth_data_root: _,
         } = semantically_verified;
 
         // This is redundant for the non-finalized state,
@@ -538,7 +550,21 @@ impl CheckpointVerifiedBlock {
     /// Note: a [`CheckpointVerifiedBlock`] isn't actually finalized
     /// until [`Request::CommitCheckpointVerifiedBlock`] returns success.
     pub fn with_hash(block: Arc<Block>, hash: block::Hash) -> Self {
-        Self(SemanticallyVerifiedBlock::with_hash(block, hash))
+        let height = block
+            .coinbase_height()
+            .expect("checkpoint verified block should have a coinbase height");
+        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
+
+        Self(SemanticallyVerifiedBlock {
+            block,
+            hash,
+            height,
+            new_outputs,
+            transaction_hashes,
+            deferred_pool_balance_change: None,
+            auth_data_root: None,
+        })
     }
 }
 
@@ -548,7 +574,7 @@ impl SemanticallyVerifiedBlock {
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
-        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
         let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
 
         Self {
@@ -558,6 +584,7 @@ impl SemanticallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: None,
+            auth_data_root: Some(auth_data_root),
         }
     }
 
@@ -583,7 +610,7 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
         let height = block
             .coinbase_height()
             .expect("semantically verified block should have a coinbase height");
-        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
         let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
 
         Self {
@@ -593,7 +620,54 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: None,
+            auth_data_root: Some(auth_data_root),
         }
+    }
+}
+
+/// Returns the transaction IDs and ZIP-244 authorizing-data root for `block`.
+fn transaction_hashes_and_auth_data_root(
+    block: &Block,
+) -> (Arc<[transaction::Hash]>, AuthDataRoot) {
+    use rayon::prelude::*;
+
+    let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) = block
+        .transactions
+        .par_iter()
+        .map(|transaction| transaction.txid_and_auth_digest())
+        .unzip();
+
+    let auth_data_root = auth_digests
+        .into_iter()
+        .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
+        .collect();
+
+    (transaction_hashes.into(), auth_data_root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use zebra_chain::serialization::ZcashDeserializeInto;
+
+    #[test]
+    fn transaction_hashes_and_auth_data_root_matches_separate_computation() {
+        let _init_guard = zebra_test::init();
+
+        let block = zebra_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("NU5 mainnet block deserializes");
+
+        let (transaction_hashes, auth_data_root) = transaction_hashes_and_auth_data_root(&block);
+        let expected_transaction_hashes: Vec<_> = block
+            .transactions
+            .iter()
+            .map(|transaction| transaction.hash())
+            .collect();
+
+        assert_eq!(transaction_hashes.as_ref(), expected_transaction_hashes);
+        assert_eq!(auth_data_root, block.auth_data_root());
     }
 }
 
@@ -608,6 +682,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             deferred_pool_balance_change: Some(DeferredPoolBalanceChange::new(
                 valid.chain_value_pool_change.deferred_amount(),
             )),
+            auth_data_root: None,
         }
     }
 }
@@ -621,6 +696,7 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             new_outputs: finalized.new_outputs,
             transaction_hashes: finalized.transaction_hashes,
             deferred_pool_balance_change: finalized.deferred_pool_balance_change,
+            auth_data_root: None,
         }
     }
 }

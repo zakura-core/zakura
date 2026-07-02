@@ -98,6 +98,7 @@ impl ContextuallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: _,
+            auth_data_root: _,
         } = block.into();
 
         Self {

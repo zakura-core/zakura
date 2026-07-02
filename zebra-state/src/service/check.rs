@@ -5,7 +5,9 @@ use std::{borrow::Borrow, sync::Arc};
 use chrono::Duration;
 
 use zebra_chain::{
-    block::{self, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError},
+    block::{
+        self, merkle::AuthDataRoot, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError,
+    },
     history_tree::HistoryTree,
     parameters::{Network, NetworkUpgrade},
     work::difficulty::CompactDifficulty,
@@ -170,6 +172,7 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
     block: Arc<Block>,
     network: &Network,
     history_tree: &HistoryTree,
+    precomputed_auth_data_root: Option<AuthDataRoot>,
 ) -> Result<(), ValidateContextError> {
     match block.commitment(network)? {
         block::Commitment::PreSaplingReserved(_)
@@ -232,7 +235,8 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
                     "the history tree of the previous block must exist \
                  since the current block has a ChainHistoryBlockTxAuthCommitment",
                 );
-            let auth_data_root = block.auth_data_root();
+            let auth_data_root =
+                precomputed_auth_data_root.unwrap_or_else(|| block.auth_data_root());
 
             let hash_block_commitments = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
                 &history_tree_root,

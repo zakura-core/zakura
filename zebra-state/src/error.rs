@@ -189,6 +189,24 @@ pub enum CommitHeaderRangeError {
         body_sizes: usize,
     },
 
+    /// The request supplied a different number of roots than headers.
+    #[error("header range tree-aux root count {roots} does not match header count {headers}")]
+    TreeAuxRootCountMismatch {
+        /// Header count.
+        headers: usize,
+        /// Tree-aux root count.
+        roots: usize,
+    },
+
+    /// A supplied tree-aux root did not match the inferred header height.
+    #[error("header range tree-aux root height {root_height:?} does not match expected height {expected_height:?}")]
+    TreeAuxRootHeightMismatch {
+        /// Expected root height.
+        expected_height: block::Height,
+        /// Actual root height.
+        root_height: block::Height,
+    },
+
     /// The supplied anchor is not known to state.
     #[error("header range anchor {anchor} is not known")]
     UnknownAnchor {

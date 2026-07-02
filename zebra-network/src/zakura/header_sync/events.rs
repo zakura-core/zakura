@@ -256,10 +256,14 @@ pub enum HeaderSyncEvent {
         start_height: block::Height,
         /// Requested header count.
         requested_count: u32,
+        /// Whether the original request wanted all-or-nothing tree-aux roots.
+        want_tree_aux_roots: bool,
         /// Bounded headers returned by state.
         headers: Vec<Arc<block::Header>>,
         /// Advisory serialized body sizes, parallel to `headers`.
         body_sizes: Vec<u32>,
+        /// Per-height commitment roots, parallel to `headers`.
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
     },
 }
 
@@ -286,6 +290,8 @@ pub enum HeaderSyncAction {
         headers: Vec<Arc<block::Header>>,
         /// Advisory serialized body sizes, parallel to `headers`.
         body_sizes: Vec<u32>,
+        /// Per-height commitment roots, parallel to `headers`.
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
         /// Whether the range is expected to be finalized by checkpoint policy.
         finalized: bool,
     },
@@ -299,6 +305,8 @@ pub enum HeaderSyncAction {
         start: block::Height,
         /// Maximum count.
         count: u32,
+        /// Whether the requester wants all-or-nothing tree-aux roots.
+        want_tree_aux_roots: bool,
     },
     /// Ask state for missing block-body gaps.
     QueryMissingBlockBodies {
@@ -407,15 +415,22 @@ pub struct ExpectedHeadersResponse {
     pub start_height: block::Height,
     /// Requested header count.
     pub count: u32,
+    /// Whether this request asked the peer to include all-or-nothing roots.
+    pub want_tree_aux_roots: bool,
 }
 
 impl ExpectedHeadersResponse {
     /// Create a bounded expected response.
-    pub fn new(start_height: block::Height, count: u32) -> Result<Self, HeaderSyncWireError> {
+    pub fn new(
+        start_height: block::Height,
+        count: u32,
+        want_tree_aux_roots: bool,
+    ) -> Result<Self, HeaderSyncWireError> {
         validate_get_headers_count(count)?;
         Ok(Self {
             start_height,
             count,
+            want_tree_aux_roots,
         })
     }
 }

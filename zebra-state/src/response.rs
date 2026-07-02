@@ -311,6 +311,10 @@ pub enum ReadResponse {
     /// pruned historical data.
     IsPruned(bool),
 
+    /// Response to [`ReadRequest::BlockRoots`] with the per-block commitment roots
+    /// this node holds for the requested range, in ascending height order.
+    BlockRoots(Vec<zebra_chain::parallel::commitment_aux::BlockCommitmentRoots>),
+
     /// Response to [`ReadRequest::Tip`] with the current best chain tip.
     Tip(Option<(block::Height, block::Hash)>),
 
@@ -570,6 +574,7 @@ impl TryFrom<ReadResponse> for Response {
 
             ReadResponse::UsageInfo(_)
             | ReadResponse::IsPruned(_)
+            | ReadResponse::BlockRoots(_)
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::BlockInfo(_)
             | ReadResponse::TransactionIdsForBlock(_)

@@ -38,6 +38,8 @@ pub enum TraceValue<'a> {
     Str(&'a str),
     /// An unsigned integer field.
     U64(u64),
+    /// A boolean field.
+    Bool(bool),
     /// A null field.
     Null,
 }
@@ -294,6 +296,7 @@ fn trace_value_matches(actual: Option<&Value>, expected: TraceValue<'_>) -> bool
     match expected {
         TraceValue::Str(expected) => actual.and_then(Value::as_str) == Some(expected),
         TraceValue::U64(expected) => actual.and_then(Value::as_u64) == Some(expected),
+        TraceValue::Bool(expected) => actual.and_then(Value::as_bool) == Some(expected),
         TraceValue::Null => actual.is_some_and(Value::is_null),
     }
 }

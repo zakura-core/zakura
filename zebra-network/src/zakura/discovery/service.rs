@@ -1047,6 +1047,7 @@ mod tests {
                 msg: HeaderSyncMessage::Headers {
                     headers: Vec::new(),
                     body_sizes: Vec::new(),
+                    tree_aux_roots: Vec::new(),
                 },
             })
             .await?;

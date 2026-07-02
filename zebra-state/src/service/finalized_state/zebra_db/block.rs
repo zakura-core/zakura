@@ -22,7 +22,7 @@ use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
     ironwood, orchard,
-    parallel::tree::NoteCommitmentTrees,
+    parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
     parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
     sapling,
     serialization::{CompactSizeMessage, TrustedPreallocate, ZcashSerialize as _},
@@ -61,6 +61,8 @@ const ZAKURA_HEADER_HASH_BY_HEIGHT: &str = "zakura_header_hash_by_height";
 const ZAKURA_HEADER_HEIGHT_BY_HASH: &str = "zakura_header_height_by_hash";
 const ZAKURA_HEADER_BY_HEIGHT: &str = "zakura_header_by_height";
 pub const ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT: &str = "zakura_header_body_size_by_height";
+pub const ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT: &str =
+    "zakura_header_commitment_roots_by_height";
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct AdvertisedBodySize(u32);
@@ -90,6 +92,26 @@ impl FromDisk for AdvertisedBodySize {
             .try_into()
             .expect("advertised body sizes are stored as u32");
         Self(u32::from_be_bytes(bytes))
+    }
+}
+
+impl IntoDisk for BlockCommitmentRoots {
+    type Bytes = Vec<u8>;
+
+    fn as_bytes(&self) -> Self::Bytes {
+        self.zcash_serialize_to_vec()
+            .expect("serializing block commitment roots to a vec does not fail")
+    }
+}
+
+impl FromDisk for BlockCommitmentRoots {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        use zebra_chain::serialization::ZcashDeserializeInto;
+
+        bytes
+            .as_ref()
+            .zcash_deserialize_into()
+            .expect("block commitment roots should deserialize from the format used by IntoDisk")
     }
 }
 
@@ -161,6 +183,68 @@ impl ZebraDb {
         self.db
             .zs_get(&body_size_by_height, &height)
             .map(AdvertisedBodySize::get)
+    }
+
+    /// Returns provisional header-sync commitment roots for a contiguous height range.
+    pub fn zakura_header_commitment_roots_by_height_range(
+        &self,
+        range: impl RangeBounds<block::Height>,
+    ) -> Vec<BlockCommitmentRoots> {
+        let roots_by_height = self
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+            .unwrap();
+
+        self.db
+            .zs_forward_range_iter(&roots_by_height, range)
+            .map(|(_height, roots)| roots)
+            .collect()
+    }
+
+    /// Returns finalized commitment roots for a contiguous height range.
+    ///
+    /// The result stops before the first missing height.
+    pub fn finalized_commitment_roots_by_height_range(
+        &self,
+        range: impl RangeBounds<block::Height>,
+    ) -> Vec<BlockCommitmentRoots> {
+        let mut roots = Vec::new();
+
+        for (height, sapling) in self.sapling_tree_by_height_range(range) {
+            let Some(orchard) = self.orchard_tree_by_height(&height) else {
+                break;
+            };
+
+            let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = self
+                .block(height.into())
+                .map(|block| {
+                    (
+                        block.sapling_transactions_count(),
+                        block.orchard_transactions_count(),
+                        block.ironwood_transactions_count(),
+                        block.auth_data_root(),
+                    )
+                })
+                .unwrap_or((
+                    0,
+                    0,
+                    0,
+                    zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+                ));
+
+            roots.push(BlockCommitmentRoots {
+                height,
+                sapling_root: sapling.root(),
+                orchard_root: orchard.root(),
+                ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
+                sapling_tx,
+                orchard_tx,
+                ironwood_tx,
+                auth_data_root,
+            });
+        }
+
+        roots
     }
 
     /// Returns the finalized hash for a given `block::Height` if it is present.
@@ -1523,6 +1607,9 @@ impl DiskWriteBatch {
         let zakura_hash_by_height = db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
         let zakura_height_by_hash = db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
         let zakura_body_size_by_height = db.cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT).unwrap();
+        let zakura_roots_by_height = db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+            .unwrap();
         let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
 
         let hash = block.hash();
@@ -1563,6 +1650,7 @@ impl DiskWriteBatch {
                     self.zs_delete(&zakura_hash_by_height, old_height);
                     self.zs_delete(&zakura_header_by_height, old_height);
                     self.zs_delete(&zakura_body_size_by_height, old_height);
+                    self.zs_delete(&zakura_roots_by_height, old_height);
                 }
             }
         } else if let Some(old_hash) =
@@ -1604,6 +1692,9 @@ impl DiskWriteBatch {
         let zakura_hash_by_height = db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
         let zakura_height_by_hash = db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
         let zakura_body_size_by_height = db.cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT).unwrap();
+        let zakura_roots_by_height = db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
+            .unwrap();
         let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
 
         let existing_zakura_header: Option<Arc<block::Header>> =
@@ -1642,6 +1733,7 @@ impl DiskWriteBatch {
                     self.zs_delete(&zakura_hash_by_height, descendant);
                     self.zs_delete(&zakura_header_by_height, descendant);
                     self.zs_delete(&zakura_body_size_by_height, descendant);
+                    self.zs_delete(&zakura_roots_by_height, descendant);
                 }
             }
         }
@@ -1653,11 +1745,13 @@ impl DiskWriteBatch {
         self.zs_delete(&zakura_hash_by_height, height);
         self.zs_delete(&zakura_header_by_height, height);
         self.zs_delete(&zakura_body_size_by_height, height);
+        self.zs_delete(&zakura_roots_by_height, height);
 
         Ok(())
     }
 
     /// Prepare a database batch containing a contextually validated header range.
+    #[cfg(test)]
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_header_range_batch(
         &mut self,
@@ -1665,6 +1759,21 @@ impl DiskWriteBatch {
         anchor: block::Hash,
         headers: &[Arc<block::Header>],
         body_sizes: &[u32],
+    ) -> Result<block::Hash, CommitHeaderRangeError> {
+        let roots = inferred_header_range_roots(zebra_db, anchor, headers.len())?;
+        self.prepare_header_range_batch_with_roots(zebra_db, anchor, headers, body_sizes, &roots)
+    }
+
+    /// Prepare a database batch containing a contextually validated header range
+    /// and one provisional tree-aux root per header.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn prepare_header_range_batch_with_roots(
+        &mut self,
+        zebra_db: &ZebraDb,
+        anchor: block::Hash,
+        headers: &[Arc<block::Header>],
+        body_sizes: &[u32],
+        tree_aux_roots: &[BlockCommitmentRoots],
     ) -> Result<block::Hash, CommitHeaderRangeError> {
         if headers.is_empty() {
             return Err(CommitHeaderRangeError::EmptyRange);
@@ -1674,6 +1783,13 @@ impl DiskWriteBatch {
             return Err(CommitHeaderRangeError::BodySizeCountMismatch {
                 headers: headers.len(),
                 body_sizes: body_sizes.len(),
+            });
+        }
+
+        if headers.len() != tree_aux_roots.len() {
+            return Err(CommitHeaderRangeError::TreeAuxRootCountMismatch {
+                headers: headers.len(),
+                roots: tree_aux_roots.len(),
             });
         }
 
@@ -1689,6 +1805,10 @@ impl DiskWriteBatch {
         let body_size_by_height = zebra_db
             .db
             .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+            .unwrap();
+        let roots_by_height = zebra_db
+            .db
+            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
             .unwrap();
 
         let anchor_height = zebra_db
@@ -1724,6 +1844,13 @@ impl DiskWriteBatch {
                 .ok_or(CommitHeaderRangeError::HeightOverflow)?;
             let hash = block::Hash::from(&**header);
             let body_size = body_sizes[index];
+            let roots = &tree_aux_roots[index];
+            if roots.height != height {
+                return Err(CommitHeaderRangeError::TreeAuxRootHeightMismatch {
+                    expected_height: height,
+                    root_height: roots.height,
+                });
+            }
 
             if let Some(expected) = checkpoints.hash(height) {
                 if expected != hash {
@@ -1834,10 +1961,12 @@ impl DiskWriteBatch {
                 self.zs_delete(&hash_by_height, height);
                 self.zs_delete(&header_by_height, height);
                 self.zs_delete(&body_size_by_height, height);
+                self.zs_delete(&roots_by_height, height);
             }
         }
 
-        for (height, hash, header, body_size) in validated_headers {
+        for (index, (height, hash, header, body_size)) in validated_headers.into_iter().enumerate()
+        {
             self.zs_insert(&header_by_height, height, header);
             self.zs_insert(&hash_by_height, height, hash);
             self.zs_insert(&height_by_hash, hash, height);
@@ -1846,6 +1975,7 @@ impl DiskWriteBatch {
             } else {
                 self.zs_delete(&body_size_by_height, height);
             }
+            self.zs_insert(&roots_by_height, height, &tree_aux_roots[index]);
         }
 
         Ok(block::Hash::from(
@@ -1862,4 +1992,35 @@ impl DiskWriteBatch {
         let block_header_by_height = zebra_db.db.cf_handle("block_header_by_height").unwrap();
         self.zs_delete(&block_header_by_height, height);
     }
+}
+
+#[cfg(test)]
+fn inferred_header_range_roots(
+    zebra_db: &ZebraDb,
+    anchor: block::Hash,
+    count: usize,
+) -> Result<Vec<BlockCommitmentRoots>, CommitHeaderRangeError> {
+    let anchor_height = zebra_db
+        .header_height(anchor)
+        .or_else(|| (anchor == zebra_db.network().genesis_hash()).then_some(block::Height(0)))
+        .unwrap_or(block::Height(0));
+
+    (0..count)
+        .map(|index| {
+            let offset =
+                u32::try_from(index + 1).map_err(|_| CommitHeaderRangeError::HeightOverflow)?;
+            let height = (anchor_height + i64::from(offset))
+                .ok_or(CommitHeaderRangeError::HeightOverflow)?;
+            Ok(BlockCommitmentRoots {
+                height,
+                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
+                sapling_tx: 0,
+                orchard_tx: 0,
+                ironwood_tx: 0,
+                auth_data_root: zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+            })
+        })
+        .collect()
 }

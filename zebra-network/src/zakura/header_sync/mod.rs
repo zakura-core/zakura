@@ -21,6 +21,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use zebra_chain::{
     block::{self, BlockTimeError},
+    parallel::commitment_aux::BlockCommitmentRoots,
     parameters::Network,
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
     work::{difficulty::CompactDifficulty, difficulty::ExpandedDifficulty, equihash},

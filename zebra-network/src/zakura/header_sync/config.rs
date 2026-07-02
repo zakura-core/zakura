@@ -131,16 +131,26 @@ pub fn header_sync_header_bytes_for_network(network: &Network) -> usize {
 }
 
 /// Maximum `Headers` count that fits both the stream-5 payload cap and the app frame cap.
-pub fn header_sync_count_by_byte_budget(network: &Network, max_frame_bytes: u32) -> u32 {
+pub fn header_sync_count_by_byte_budget(
+    network: &Network,
+    max_frame_bytes: u32,
+    want_tree_aux_roots: bool,
+) -> u32 {
     let frame_payload_cap = usize::try_from(max_frame_bytes)
         .unwrap_or(usize::MAX)
         .saturating_sub(FRAME_HEADER_BYTES);
     let payload_cap = MAX_HS_MESSAGE_BYTES.min(frame_payload_cap);
-    let header_bytes =
-        header_sync_header_bytes_for_network(network).saturating_add(HEADER_SYNC_BODY_SIZE_BYTES);
-    let count = payload_cap
-        .saturating_sub(HEADER_SYNC_MESSAGE_TYPE_BYTES + HEADER_SYNC_COUNT_BYTES)
-        / header_bytes;
+    let root_bytes = if want_tree_aux_roots {
+        HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES
+    } else {
+        0
+    };
+    let header_bytes = header_sync_header_bytes_for_network(network)
+        .saturating_add(HEADER_SYNC_BODY_SIZE_BYTES)
+        .saturating_add(root_bytes);
+    let count = payload_cap.saturating_sub(
+        HEADER_SYNC_MESSAGE_TYPE_BYTES + HEADER_SYNC_COUNT_BYTES + HEADER_SYNC_HAS_ROOTS_BYTES,
+    ) / header_bytes;
 
     u32::try_from(count)
         .unwrap_or(u32::MAX)
@@ -153,11 +163,16 @@ pub fn clamp_header_sync_request_count(
     peer_max_headers_per_response: u32,
     network: &Network,
     max_frame_bytes: u32,
+    want_tree_aux_roots: bool,
 ) -> u32 {
     desired_count
         .min(clamp_advertised_range(peer_max_headers_per_response))
         .min(MAX_HS_RANGE)
-        .min(header_sync_count_by_byte_budget(network, max_frame_bytes))
+        .min(header_sync_count_by_byte_budget(
+            network,
+            max_frame_bytes,
+            want_tree_aux_roots,
+        ))
         .max(1)
 }
 
@@ -166,23 +181,43 @@ pub fn inbound_get_headers_count_limit(
     config: &ZakuraHeaderSyncConfig,
     network: &Network,
     max_frame_bytes: u32,
+    want_tree_aux_roots: bool,
 ) -> u32 {
     clamp_header_sync_request_count(
         u32::MAX,
         config.advertised_max_headers_per_response(),
         network,
         max_frame_bytes,
+        want_tree_aux_roots,
     )
 }
 
 /// Truncate a served header run so the encoded `Headers` response fits the byte budgets.
+///
+/// All three parallel vectors (`headers`, `body_sizes`, `tree_aux_roots`) are truncated
+/// to the same length so the [`HeaderSyncMessage::Headers`] invariant is preserved.
 pub fn truncate_headers_to_byte_budget(
     mut headers: Vec<Arc<block::Header>>,
+    mut body_sizes: Vec<u32>,
+    mut tree_aux_roots: Vec<BlockCommitmentRoots>,
     network: &Network,
     max_frame_bytes: u32,
-) -> Vec<Arc<block::Header>> {
-    let max_count = usize::try_from(header_sync_count_by_byte_budget(network, max_frame_bytes))
-        .expect("header-sync byte-budget count fits in usize");
+) -> (Vec<Arc<block::Header>>, Vec<u32>, Vec<BlockCommitmentRoots>) {
+    if headers.len() != tree_aux_roots.len() {
+        headers.clear();
+        body_sizes.clear();
+        tree_aux_roots.clear();
+        return (headers, body_sizes, tree_aux_roots);
+    }
+
+    let max_count = usize::try_from(header_sync_count_by_byte_budget(
+        network,
+        max_frame_bytes,
+        true,
+    ))
+    .expect("header-sync byte-budget count fits in usize");
     headers.truncate(max_count);
-    headers
+    body_sizes.truncate(max_count);
+    tree_aux_roots.truncate(max_count);
+    (headers, body_sizes, tree_aux_roots)
 }

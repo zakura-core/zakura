@@ -888,6 +888,10 @@ fn delete_zakura_headers_above(db: &ZebraDb, batch: &mut DiskWriteBatch, target_
         .db
         .cf_handle("zakura_header_body_size_by_height")
         .unwrap();
+    let roots_by_height = db
+        .db
+        .cf_handle("zakura_header_commitment_roots_by_height")
+        .unwrap();
 
     let Some((tip_height, _tip_hash)) = db
         .db
@@ -903,6 +907,7 @@ fn delete_zakura_headers_above(db: &ZebraDb, batch: &mut DiskWriteBatch, target_
         batch.zs_delete(&hash_by_height, height);
         batch.zs_delete(&header_by_height, height);
         batch.zs_delete(&body_size_by_height, height);
+        batch.zs_delete(&roots_by_height, height);
     }
 }
 

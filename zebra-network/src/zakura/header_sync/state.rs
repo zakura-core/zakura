@@ -87,6 +87,7 @@ impl HeaderSyncCore {
             count,
             anchor_hash: self.best_header_hash,
             finalized,
+            want_tree_aux_roots: true,
             priority: RangePriority::Forward,
         });
     }
@@ -116,6 +117,7 @@ impl HeaderSyncCore {
             count,
             anchor_hash: previous_hash,
             finalized: true,
+            want_tree_aux_roots: true,
             priority: RangePriority::Backward,
         });
     }
@@ -335,6 +337,7 @@ pub(super) struct RangeRequest {
     pub(super) count: u32,
     pub(super) anchor_hash: block::Hash,
     pub(super) finalized: bool,
+    pub(super) want_tree_aux_roots: bool,
     pub(super) priority: RangePriority,
 }
 
@@ -354,4 +357,13 @@ impl RangeRequest {
 pub(super) enum RangePriority {
     Forward,
     Backward,
+}
+
+impl RangePriority {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            RangePriority::Forward => "forward",
+            RangePriority::Backward => "backward",
+        }
+    }
 }

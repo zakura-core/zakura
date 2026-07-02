@@ -45,6 +45,37 @@ pub enum HeaderSyncWireError {
         body_sizes: usize,
     },
 
+    /// A locally constructed or inbound `Headers` message did not carry exactly one root per header.
+    #[error("Zakura header-sync Headers tree-aux root count {roots} does not match header count {headers}")]
+    TreeAuxRootCountMismatch {
+        /// Header count.
+        headers: usize,
+        /// Tree-aux root count.
+        roots: usize,
+    },
+
+    /// An inbound `Headers` response carried a root for the wrong height.
+    #[error("Zakura header-sync Headers tree-aux root height {root_height:?} does not match expected height {expected_height:?}")]
+    TreeAuxRootHeightMismatch {
+        /// Expected root height.
+        expected_height: block::Height,
+        /// Actual root height.
+        root_height: block::Height,
+    },
+
+    /// A boolean marker field used a value other than 0 or 1.
+    #[error("Zakura header-sync {field} marker has invalid value {value}")]
+    InvalidBoolMarker {
+        /// Marker field name.
+        field: &'static str,
+        /// Invalid marker value.
+        value: u8,
+    },
+
+    /// A peer returned tree-aux roots for a request that opted out.
+    #[error("Zakura header-sync Headers included tree-aux roots for an opt-out request")]
+    UnrequestedTreeAuxRoots,
+
     /// An inbound `Headers` response did not match an in-flight request.
     #[error("unsolicited Zakura header-sync Headers response")]
     UnsolicitedHeaders,

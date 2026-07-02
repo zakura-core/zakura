@@ -24,7 +24,9 @@ use std::{
 
 use zebra_chain::{block, parallel::tree::NoteCommitmentTrees, parameters::Network};
 use zebra_db::{
-    block::{RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT},
+    block::{
+        RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT, ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT,
+    },
     chain::BLOCK_INFO,
     transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
 };
@@ -119,6 +121,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "zakura_header_height_by_hash",
     "zakura_header_by_height",
     ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+    ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT,
     // Transactions
     "tx_by_loc",
     "hash_by_tx_loc",

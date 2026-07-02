@@ -856,6 +856,11 @@ pub enum Request {
         ///
         /// A `0` value means unknown. These hints are not consensus data.
         body_sizes: Vec<u32>,
+        /// Tree-aux roots, parallel to `headers`.
+        ///
+        /// Every non-empty Zakura header range must provide one root per header.
+        /// Roots are advisory until verified during block commit.
+        tree_aux_roots: Vec<zebra_chain::parallel::commitment_aux::BlockCommitmentRoots>,
     },
 
     /// Computes the depth in the current best chain of the block identified by the given hash.
@@ -1313,6 +1318,16 @@ pub enum ReadRequest {
         count: u32,
     },
 
+    /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
+    /// with the per-block commitment roots for the requested heights, in ascending height
+    /// order. May return fewer than `count` roots if the node does not hold the whole range.
+    BlockRoots {
+        /// First requested height.
+        start_height: block::Height,
+        /// Number of consecutive heights requested.
+        count: u32,
+    },
+
     /// Returns the highest header held on disk.
     BestHeaderTip,
 
@@ -1534,6 +1549,7 @@ impl ReadRequest {
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
+            ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
             ReadRequest::BlockSizeHints { .. } => "block_size_hints",

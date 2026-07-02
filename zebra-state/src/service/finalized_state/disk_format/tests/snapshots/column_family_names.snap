@@ -1,5 +1,6 @@
 ---
 source: zebra-state/src/service/finalized_state/disk_format/tests/snapshot.rs
+assertion_line: 77
 expression: cf_names
 ---
 [
@@ -36,6 +37,7 @@ expression: cf_names
   "utxo_loc_by_transparent_addr_loc",
   "zakura_header_body_size_by_height",
   "zakura_header_by_height",
+  "zakura_header_commitment_roots_by_height",
   "zakura_header_hash_by_height",
   "zakura_header_height_by_hash",
 ]

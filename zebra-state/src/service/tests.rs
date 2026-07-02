@@ -13,7 +13,10 @@ use zebra_chain::{
     block::{self, Block, CountedHeader, Height},
     chain_tip::ChainTip,
     fmt::SummaryDebug,
+    orchard,
+    parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
+    sapling,
     serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction, transparent,
     value_balance::ValueBalance,
@@ -37,6 +40,21 @@ use crate::{
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+fn roots_from_height(start: Height, count: u32) -> Vec<BlockCommitmentRoots> {
+    (0..count)
+        .map(|offset| BlockCommitmentRoots {
+            height: Height(start.0 + offset),
+            sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+            orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+            ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            sapling_tx: 0,
+            orchard_tx: 0,
+            ironwood_tx: 0,
+            auth_data_root: zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+        })
+        .collect()
+}
 
 async fn test_populated_state_responds_correctly(
     mut state: Buffer<BoxService<Request, Response, BoxError>, Request>,
@@ -517,6 +535,7 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
                 anchor: genesis.hash(),
                 headers: vec![block1.header.clone(), block2.header.clone()],
                 body_sizes: vec![999_999, 0],
+                tree_aux_roots: roots_from_height(Height(1), 2),
             })
             .await?,
         Response::Committed(block2_hash),
@@ -703,6 +722,7 @@ async fn commit_header_range_completes_while_in_finalized_write_phase(
             anchor: genesis.hash(),
             headers: vec![block1.header.clone(), block2.header.clone()],
             body_sizes: vec![999_999, 0],
+            tree_aux_roots: roots_from_height(Height(1), 2),
         }),
     )
     .await

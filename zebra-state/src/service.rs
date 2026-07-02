@@ -34,6 +34,7 @@ use tower::buffer::Buffer;
 use zebra_chain::{
     block::{self, CountedHeader, HeightDiff},
     diagnostic::CodeTimer,
+    parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
     serialization::ZcashSerialize,
     subtree::NoteCommitmentSubtreeIndex,
@@ -986,6 +987,7 @@ impl StateService {
         anchor: block::Hash,
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitHeaderRangeError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
 
@@ -999,6 +1001,7 @@ impl StateService {
                 anchor,
                 headers,
                 body_sizes,
+                tree_aux_roots,
                 rsp_tx,
             })
         {
@@ -1237,9 +1240,12 @@ impl Service<Request> for StateService {
                 anchor,
                 headers,
                 body_sizes,
+                tree_aux_roots,
             } => {
                 let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| self.send_header_range(anchor, headers, body_sizes))
+                    span.in_scope(|| {
+                        self.send_header_range(anchor, headers, body_sizes, tree_aux_roots)
+                    })
                 });
 
                 let span = Span::current();
@@ -1474,6 +1480,92 @@ where
     headers
 }
 
+fn block_roots_by_height_range<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    start: block::Height,
+    count: u32,
+) -> Vec<BlockCommitmentRoots>
+where
+    C: AsRef<Chain>,
+{
+    let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
+    let mut roots =
+        Vec::with_capacity(usize::try_from(capped_count).expect("capped root count fits in usize"));
+
+    for offset in 0..capped_count {
+        let Some(height) = start + i64::from(offset) else {
+            break;
+        };
+
+        let root = if db
+            .finalized_tip_height()
+            .is_some_and(|finalized_tip| height <= finalized_tip)
+        {
+            db.finalized_commitment_roots_by_height_range(height..=height)
+                .into_iter()
+                .next()
+        } else if let Some(chain) = chain
+            .as_ref()
+            .map(|chain| chain.as_ref())
+            .filter(|chain| chain.contains_block_height(height))
+        {
+            match (
+                chain.sapling_tree(height.into()),
+                chain.orchard_tree(height.into()),
+            ) {
+                (Some(sapling), Some(orchard)) => {
+                    let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = chain
+                        .block(height.into())
+                        .map(|block| {
+                            (
+                                block.block.sapling_transactions_count(),
+                                block.block.orchard_transactions_count(),
+                                block.block.ironwood_transactions_count(),
+                                block.block.auth_data_root(),
+                            )
+                        })
+                        .unwrap_or((
+                            0,
+                            0,
+                            0,
+                            zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+                        ));
+
+                    Some(BlockCommitmentRoots {
+                        height,
+                        sapling_root: sapling.root(),
+                        orchard_root: orchard.root(),
+                        ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default()
+                            .root(),
+                        sapling_tx,
+                        orchard_tx,
+                        ironwood_tx,
+                        auth_data_root,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            db.zakura_header_commitment_roots_by_height_range(height..=height)
+                .into_iter()
+                .next()
+        };
+
+        let Some(root) = root else {
+            break;
+        };
+
+        if root.height != height {
+            break;
+        }
+
+        roots.push(root);
+    }
+
+    roots
+}
+
 impl Service<ReadRequest> for ReadStateService {
     type Response = ReadResponse;
     type Error = BoxError;
@@ -1706,6 +1798,24 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::HeadersByHeightRange { start, count } => Ok(ReadResponse::Headers(
                 headers_by_height_range(state.latest_best_chain(), &state.db, start, count),
             )),
+
+            ReadRequest::BlockRoots {
+                start_height,
+                count,
+            } => {
+                let roots = if count == 0 {
+                    Vec::new()
+                } else {
+                    block_roots_by_height_range(
+                        state.latest_best_chain(),
+                        &state.db,
+                        start_height,
+                        count,
+                    )
+                };
+
+                Ok(ReadResponse::BlockRoots(roots))
+            }
 
             ReadRequest::BestHeaderTip => {
                 let best_disk_header_tip = state.db.best_header_tip();

@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 use zebra_chain::{
     block::{self},
     chain_tip::ChainTip,
+    parallel::commitment_aux::BlockCommitmentRoots,
 };
 use zebra_network::zakura::{
     commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange, HeaderSyncAction,
@@ -48,6 +49,7 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     };
 
     let verified_block_tip = match read_state
+        .clone()
         .oneshot(zebra_state::ReadRequest::Tip)
         .await
         .map_err(|error| eyre!("{error}"))?
@@ -60,14 +62,115 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
+    let best_header_tip = root_covered_best_header_tip_or_verified(
+        read_state,
+        best_header_tip.unwrap_or(empty_state_tip),
+        verified_block_tip,
+    )
+    .await?;
+
     Ok(ZakuraHeaderSyncDriverStartup {
         frontiers: HeaderSyncFrontiers {
             finalized_height,
             verified_block_tip: verified_block_tip.0,
             verified_block_hash: verified_block_tip.1,
         },
-        best_header_tip: Some(best_header_tip.unwrap_or(empty_state_tip)),
+        best_header_tip: Some(best_header_tip),
         verified_block_tip_hash: verified_block_tip.1,
+    })
+}
+
+async fn root_covered_best_header_tip_or_verified<ReadState>(
+    read_state: ReadState,
+    best_header_tip: (block::Height, block::Hash),
+    verified_block_tip: (block::Height, block::Hash),
+) -> Result<(block::Height, block::Hash), Report>
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    if best_header_tip.0 <= verified_block_tip.0 {
+        return Ok(best_header_tip);
+    }
+
+    let Ok(start_height) = verified_block_tip.0.next() else {
+        return Ok(verified_block_tip);
+    };
+    let best_header_height = best_header_tip.0;
+    let verified_block_height = verified_block_tip.0;
+    let count = best_header_height
+        .0
+        .checked_sub(verified_block_height.0)
+        .ok_or_else(|| eyre!("best header tip is unexpectedly below verified block tip"))?;
+    let roots = match read_state
+        .oneshot(zebra_state::ReadRequest::BlockRoots {
+            start_height,
+            count,
+        })
+        .await
+        .map_err(|error| eyre!("{error}"))?
+    {
+        zebra_state::ReadResponse::BlockRoots(roots) => roots,
+        response => Err(eyre!("unexpected BlockRoots response: {response:?}"))?,
+    };
+
+    if block_roots_cover_range(start_height, count, &roots) {
+        Ok(best_header_tip)
+    } else {
+        Ok(verified_block_tip)
+    }
+}
+
+pub(crate) async fn root_covered_query_best_header_tip<ReadState>(
+    read_state: ReadState,
+    best_header_tip: (block::Height, block::Hash),
+) -> Result<(block::Height, block::Hash), Report>
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let verified_block_tip = match read_state
+        .clone()
+        .oneshot(zebra_state::ReadRequest::Tip)
+        .await
+        .map_err(|error| eyre!("{error}"))?
+    {
+        zebra_state::ReadResponse::Tip(Some(tip)) => tip,
+        zebra_state::ReadResponse::Tip(None) => return Ok(best_header_tip),
+        response => Err(eyre!("unexpected Tip response: {response:?}"))?,
+    };
+
+    root_covered_best_header_tip_or_verified(read_state, best_header_tip, verified_block_tip).await
+}
+
+pub(crate) fn block_roots_cover_range(
+    start_height: block::Height,
+    count: u32,
+    roots: &[BlockCommitmentRoots],
+) -> bool {
+    if roots.len() != usize::try_from(count).unwrap_or(usize::MAX) {
+        return false;
+    }
+
+    roots.iter().enumerate().all(|(offset, roots)| {
+        let Ok(offset) = u32::try_from(offset) else {
+            return false;
+        };
+        start_height
+            .0
+            .checked_add(offset)
+            .is_some_and(|height| roots.height == block::Height(height))
     })
 }
 
@@ -268,7 +371,12 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     }
                 }
             }
-            HeaderSyncAction::QueryHeadersByHeightRange { peer, start, count } => {
+            HeaderSyncAction::QueryHeadersByHeightRange {
+                peer,
+                start,
+                count,
+                want_tree_aux_roots,
+            } => {
                 trace_state_read_start(
                     &trace,
                     "query_headers_by_height_range",
@@ -346,9 +454,82 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 Vec::new()
                             }
                         };
+                        let block_roots = if want_tree_aux_roots {
+                            trace_state_read_start(
+                                &trace,
+                                "block_roots",
+                                Some(&peer),
+                                start,
+                                count,
+                            );
+                            match read_state
+                                .clone()
+                                .oneshot(zebra_state::ReadRequest::BlockRoots {
+                                    start_height: start,
+                                    count,
+                                })
+                                .await
+                            {
+                                Ok(zebra_state::ReadResponse::BlockRoots(roots)) => roots,
+                                Ok(response) => {
+                                    trace_state_read_error(
+                                        &trace,
+                                        "block_roots",
+                                        Some(&peer),
+                                        start,
+                                        count,
+                                        "unexpected_response",
+                                        started,
+                                    );
+                                    warn!(?peer, ?response, "unexpected BlockRoots response");
+                                    Vec::new()
+                                }
+                                Err(error) => {
+                                    trace_state_read_error(
+                                        &trace,
+                                        "block_roots",
+                                        Some(&peer),
+                                        start,
+                                        count,
+                                        &format!("{error}"),
+                                        started,
+                                    );
+                                    warn!(
+                                        ?peer,
+                                        ?error,
+                                        "failed to read Zakura BlockRoots response from state"
+                                    );
+                                    Vec::new()
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let header_heights: Vec<_> =
+                            headers.iter().map(|(height, _, _)| *height).collect();
+                        let tree_aux_roots = if want_tree_aux_roots {
+                            tree_aux_roots_for_served_header_range(
+                                start,
+                                header_heights.iter().copied(),
+                                &block_roots,
+                            )
+                            .unwrap_or_else(|error| {
+                                debug!(
+                                    ?peer,
+                                    ?start,
+                                    requested_count = count,
+                                    ?error,
+                                    "serving header range without tree aux roots"
+                                );
+
+                                Vec::new()
+                            })
+                        } else {
+                            Vec::new()
+                        };
                         let body_sizes = body_sizes_for_served_header_range(
                             start,
-                            headers.iter().map(|(height, _, _)| *height),
+                            header_heights.iter().copied(),
                             &body_size_hints,
                         );
                         let headers = headers
@@ -369,8 +550,10 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 peer,
                                 start_height: start,
                                 requested_count: count,
+                                want_tree_aux_roots,
                                 headers,
                                 body_sizes,
+                                tree_aux_roots,
                             })
                             .await;
                     }
@@ -430,9 +613,11 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 start_height,
                 headers,
                 body_sizes,
+                tree_aux_roots,
                 finalized: _finalized,
             } => {
                 let count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
+                let tree_aux_roots_len = u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX);
                 emit_commit_state(
                     &trace,
                     cs_trace::COMMIT_START,
@@ -442,6 +627,11 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         insert_cs_peer(row, cs_trace::PEER, &peer);
                         insert_cs_height(row, cs_trace::RANGE_START, start_height);
                         insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
+                        insert_cs_u64(
+                            row,
+                            cs_trace::TREE_AUX_ROOTS_LEN,
+                            u64::from(tree_aux_roots_len),
+                        );
                         insert_cs_hash(row, cs_trace::HASH, anchor);
                     },
                 );
@@ -452,6 +642,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         anchor,
                         headers,
                         body_sizes,
+                        tree_aux_roots,
                     })
                     .await
                 {
@@ -465,6 +656,11 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 insert_cs_peer(row, cs_trace::PEER, &peer);
                                 insert_cs_height(row, cs_trace::RANGE_START, start_height);
                                 insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
+                                insert_cs_u64(
+                                    row,
+                                    cs_trace::TREE_AUX_ROOTS_LEN,
+                                    u64::from(tree_aux_roots_len),
+                                );
                                 insert_cs_str(row, cs_trace::RESULT, "committed");
                                 insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
                             },
@@ -584,12 +780,37 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
                     },
                 );
+                let started = Instant::now();
                 match read_state
                     .clone()
                     .oneshot(zebra_state::ReadRequest::BestHeaderTip)
                     .await
                 {
-                    Ok(zebra_state::ReadResponse::BestHeaderTip(Some((tip_height, tip_hash)))) => {
+                    Ok(zebra_state::ReadResponse::BestHeaderTip(Some(best_header_tip))) => {
+                        let (tip_height, tip_hash) = match root_covered_query_best_header_tip(
+                            read_state.clone(),
+                            best_header_tip,
+                        )
+                        .await
+                        {
+                            Ok(tip) => tip,
+                            Err(error) => {
+                                trace_state_read_error(
+                                    &trace,
+                                    "query_best_header_tip_roots",
+                                    None,
+                                    best_header_tip.0,
+                                    1,
+                                    &format!("{error}"),
+                                    started,
+                                );
+                                warn!(
+                                    ?error,
+                                    "failed to apply Zakura root coverage to best header tip"
+                                );
+                                continue;
+                            }
+                        };
                         emit_commit_state(
                             &trace,
                             cs_trace::STATE_READ_SUCCESS,
@@ -731,6 +952,10 @@ pub(crate) fn body_sizes_for_served_header_range(
     header_heights
         .into_iter()
         .map(|height| {
+            if height < start {
+                return 0;
+            }
+
             let Some(offset) = usize::try_from(height - start).ok() else {
                 return 0;
             };
@@ -743,6 +968,61 @@ pub(crate) fn body_sizes_for_served_header_range(
                 .unwrap_or(0)
         })
         .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TreeAuxRootsForServedHeaderRangeError {
+    HeaderBeforeStart {
+        start: block::Height,
+        height: block::Height,
+    },
+    OffsetOutOfRange {
+        start: block::Height,
+        height: block::Height,
+    },
+    MissingRoot {
+        height: block::Height,
+        offset: usize,
+    },
+    RootHeightMismatch {
+        expected_height: block::Height,
+        actual_height: block::Height,
+        offset: usize,
+    },
+}
+
+pub(crate) fn tree_aux_roots_for_served_header_range(
+    start: block::Height,
+    header_heights: impl IntoIterator<Item = block::Height>,
+    block_roots: &[BlockCommitmentRoots],
+) -> Result<Vec<BlockCommitmentRoots>, TreeAuxRootsForServedHeaderRangeError> {
+    let mut roots = Vec::new();
+
+    for height in header_heights {
+        if height < start {
+            return Err(TreeAuxRootsForServedHeaderRangeError::HeaderBeforeStart { start, height });
+        }
+
+        let Some(offset) = usize::try_from(height - start).ok() else {
+            return Err(TreeAuxRootsForServedHeaderRangeError::OffsetOutOfRange { start, height });
+        };
+
+        let Some(root) = block_roots.get(offset) else {
+            return Err(TreeAuxRootsForServedHeaderRangeError::MissingRoot { height, offset });
+        };
+
+        if root.height != height {
+            return Err(TreeAuxRootsForServedHeaderRangeError::RootHeightMismatch {
+                expected_height: height,
+                actual_height: root.height,
+                offset,
+            });
+        }
+
+        roots.push(root.clone());
+    }
+
+    Ok(roots)
 }
 
 async fn log_missing_block_bodies<ReadState>(
@@ -837,6 +1117,9 @@ pub(crate) fn header_range_commit_failure_kind(
         }
         zebra_state::CommitHeaderRangeError::EmptyRange
         | zebra_state::CommitHeaderRangeError::RangeTooLong { .. }
+        | zebra_state::CommitHeaderRangeError::BodySizeCountMismatch { .. }
+        | zebra_state::CommitHeaderRangeError::TreeAuxRootCountMismatch { .. }
+        | zebra_state::CommitHeaderRangeError::TreeAuxRootHeightMismatch { .. }
         | zebra_state::CommitHeaderRangeError::UnknownAnchor { .. }
         | zebra_state::CommitHeaderRangeError::HeightOverflow
         | zebra_state::CommitHeaderRangeError::ImmutableConflict { .. }
@@ -1102,7 +1385,9 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
             HeaderSyncAction::QueryBestHeaderTip => {
                 insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
             }
-            HeaderSyncAction::QueryHeadersByHeightRange { peer, start, count } => {
+            HeaderSyncAction::QueryHeadersByHeightRange {
+                peer, start, count, ..
+            } => {
                 insert_cs_str(row, cs_trace::ACTION, "query_headers_by_height_range");
                 insert_cs_peer(row, cs_trace::PEER, peer);
                 insert_cs_height(row, cs_trace::RANGE_START, *start);

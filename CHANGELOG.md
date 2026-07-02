@@ -77,6 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Added Zakura header-sync commitment roots to ranged header responses. Stream
+  version 5 requests and serves one tree-aux root payload per header, persists
+  received roots with header-only ranges, and caps rootless header tips until
+  matching roots are available.
 - Added Ironwood value pool entries to `getblockchaininfo` and verbose
   `getblock` RPC output.
 - Report `pruned: true` in `getblockchaininfo` after Zebra has pruned

@@ -140,13 +140,15 @@ impl HeaderSyncPeerSession {
         &self,
         start_height: block::Height,
         count: u32,
+        want_tree_aux_roots: bool,
     ) -> Result<(), OrderedSendError> {
-        let expected = ExpectedHeadersResponse::new(start_height, count)
+        let expected = ExpectedHeadersResponse::new(start_height, count, want_tree_aux_roots)
             .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
         if let Some(commands) = &self.inner.commands {
             self.try_send_message(HeaderSyncMessage::GetHeaders {
                 start_height,
                 count,
+                want_tree_aux_roots,
             })?;
             return commands
                 .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
@@ -156,6 +158,7 @@ impl HeaderSyncPeerSession {
         self.try_send_message(HeaderSyncMessage::GetHeaders {
             start_height,
             count,
+            want_tree_aux_roots,
         })
     }
 
@@ -165,18 +168,22 @@ impl HeaderSyncPeerSession {
         headers: Vec<Arc<block::Header>>,
     ) -> Result<(), OrderedSendError> {
         let body_sizes = vec![0; headers.len()];
-        self.try_send_headers_with_sizes(headers, body_sizes)
+        let tree_aux_roots = Vec::new();
+        self.try_send_headers_with_sizes_and_roots(headers, body_sizes, tree_aux_roots)
     }
 
-    /// Send a typed header range response with one advisory body-size hint per header.
-    pub fn try_send_headers_with_sizes(
+    /// Send a typed header range response with one advisory body-size hint and
+    /// tree-aux root payload per header.
+    pub fn try_send_headers_with_sizes_and_roots(
         &self,
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
     ) -> Result<(), OrderedSendError> {
         self.try_send_message(HeaderSyncMessage::Headers {
             headers,
             body_sizes,
+            tree_aux_roots,
         })
     }
 
@@ -238,7 +245,9 @@ pub(crate) async fn drive_header_sync_actions(
                     "Zakura header-sync NewBlock body arrived before block-acceptance hook is wired"
                 );
             }
-            HeaderSyncAction::QueryHeadersByHeightRange { peer, start, count } => {
+            HeaderSyncAction::QueryHeadersByHeightRange {
+                peer, start, count, ..
+            } => {
                 let _ = handle
                     .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                         peer,

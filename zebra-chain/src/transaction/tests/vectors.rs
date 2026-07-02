@@ -1212,7 +1212,7 @@ fn test_coinbase_script() -> Result<()> {
 }
 
 #[test]
-fn v6_transactions_reject_pre_nu6_3_branch_id() {
+fn v6_transactions_accept_nu6_3_and_later_branch_ids() {
     use crate::parameters::TX_V6_VERSION_GROUP_ID;
 
     let _init_guard = zebra_test::init();
@@ -1228,30 +1228,49 @@ fn v6_transactions_reject_pre_nu6_3_branch_id() {
         tx_bytes
     };
 
-    let nu6_3_branch_id = NetworkUpgrade::Nu6_3
-        .branch_id()
-        .expect("NU6.3 has a branch ID");
-
-    let tx = Transaction::zcash_deserialize(&empty_v6_transaction_bytes(nu6_3_branch_id)[..])
-        .expect("V6 transaction with NU6.3 branch ID must deserialize");
-    assert_eq!(tx.version(), 6);
-    assert_eq!(tx.network_upgrade(), Some(NetworkUpgrade::Nu6_3));
+    let empty_v6_transaction = |network_upgrade| Transaction::V6 {
+        network_upgrade,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+    };
 
     for network_upgrade in NetworkUpgrade::iter() {
         let Some(branch_id) = network_upgrade.branch_id() else {
             continue;
         };
-        if network_upgrade == NetworkUpgrade::Nu6_3 {
-            continue;
+
+        let tx_bytes = empty_v6_transaction_bytes(branch_id);
+
+        if network_upgrade < NetworkUpgrade::Nu6_3 {
+            let error = Transaction::zcash_deserialize(&tx_bytes[..])
+                .expect_err("V6 transactions must use a NU6.3 or later branch ID");
+
+            assert!(
+                matches!(error, SerializationError::Parse(message) if message.contains("NU6.3")),
+                "unexpected V6 branch ID parse error for {network_upgrade:?}: {error:?}"
+            );
+
+            let error = empty_v6_transaction(network_upgrade)
+                .zcash_serialize_to_vec()
+                .expect_err("unsupported V6 transaction branch IDs must not serialize");
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(
+                error.to_string().contains("NU6.3"),
+                "unexpected V6 branch ID serialization error for {network_upgrade:?}: {error:?}"
+            );
+        } else {
+            let tx = Transaction::zcash_deserialize(&tx_bytes[..])
+                .expect("V6 transaction with a NU6.3 or later branch ID must deserialize");
+
+            assert_eq!(tx.version(), 6);
+            assert_eq!(tx.network_upgrade(), Some(network_upgrade));
+            assert_eq!(tx.zcash_serialize_to_vec().unwrap(), tx_bytes);
         }
-
-        let error = Transaction::zcash_deserialize(&empty_v6_transaction_bytes(branch_id)[..])
-            .expect_err("V6 transactions must use the NU6.3 branch ID");
-
-        assert!(
-            matches!(error, SerializationError::Parse(message) if message.contains("NU6.3")),
-            "unexpected V6 branch ID parse error for {network_upgrade:?}: {error:?}"
-        );
     }
 }
 

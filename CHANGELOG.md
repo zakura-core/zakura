@@ -100,6 +100,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   commitment roots and transaction counts.
 - Reject transactions that add net value to the Orchard pool after NU6.3
   activation.
+- V6 transactions with supported NU6.3-or-later consensus branch IDs now
+  serialize and deserialize successfully, while unsupported later placeholders
+  are rejected.
 - Route post-NU6.3 coinbase rewards for Orchard receivers in unified miner
   addresses to the Ironwood pool instead of rejecting them or falling back to a
   lower-priority receiver.

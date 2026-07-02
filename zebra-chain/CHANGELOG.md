@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - V5/V6 deserialization no longer runs a `librustzcash` conversion. Transactions
   that fail it (e.g. non-canonical Orchard proofs) now deserialize successfully
   and are rejected during consensus verification instead of at parse time.
+- V6 transactions with supported NU6.3-or-later consensus branch IDs now
+  serialize and deserialize successfully, while unsupported later placeholders
+  are rejected.
 
 ## [9.0.0] - 2026-06-02
 

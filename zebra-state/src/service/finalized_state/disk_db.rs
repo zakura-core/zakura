@@ -943,6 +943,13 @@ impl DiskDb {
     /// <https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ#configuration-and-tuning>
     const MEMTABLE_RAM_CACHE_MEGABYTES: usize = 128;
 
+    /// The maximum total size of RocksDB write-ahead logs.
+    ///
+    /// Once the WAL exceeds this size, RocksDB forces flushes of the column
+    /// families that are pinning the oldest live logs. This bounds restart
+    /// recovery time during heavy sync without disabling WAL durability.
+    const MAX_TOTAL_WAL_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
     /// Build a vector of current column families on the disk and optionally any new column families.
     /// Returns an iterable collection of all column families.
     fn construct_column_families(
@@ -1284,6 +1291,10 @@ impl DiskDb {
         //
         // This improves Zebra's initial sync speed slightly, as of April 2022.
         opts.optimize_level_style_compaction(Self::MEMTABLE_RAM_CACHE_MEGABYTES * ONE_MEGABYTE);
+
+        // Bound WAL growth so heavy sync cannot accumulate tens of GiB of logs
+        // that must be replayed before Zebra can restart.
+        opts.set_max_total_wal_size(Self::MAX_TOTAL_WAL_SIZE_BYTES);
 
         // Increase the process open file limit if needed,
         // then use it to set RocksDB's limit.

@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Added `network.zakura.max_connections_per_ip`, defaulting to 16, so native
+  Zakura admission can allow NATed or co-hosted peers without changing the
+  legacy peer-set per-IP default.
 - `Request::PushTransaction` is now a 2-tuple variant:
   `PushTransaction(UnminedTx, Option<PeerSource>)`, so inbound peer-pushed
   transactions can be attributed to the sending peer for mempool admission

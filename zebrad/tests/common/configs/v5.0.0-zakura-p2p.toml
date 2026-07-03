@@ -93,6 +93,7 @@ bootstrap_peers = [
 ]
 listen_addr = "0.0.0.0:8234"
 max_connections = 256
+max_connections_per_ip = 16
 max_pending_handshakes = 32
 message_rate_per_second = 2048
 stream_open_rate_per_second = 32

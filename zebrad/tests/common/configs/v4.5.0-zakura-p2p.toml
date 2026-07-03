@@ -82,6 +82,7 @@ v2_p2p = true
 [network.zakura]
 bootstrap_peers = []
 max_connections = 32
+max_connections_per_ip = 16
 max_pending_handshakes = 8
 message_rate_per_second = 128
 stream_open_rate_per_second = 16

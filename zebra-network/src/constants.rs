@@ -60,8 +60,9 @@ pub const INBOUND_PEER_LIMIT_MULTIPLIER: usize = 1;
 /// See [`INBOUND_PEER_LIMIT_MULTIPLIER`] for details.
 pub const OUTBOUND_PEER_LIMIT_MULTIPLIER: usize = 3;
 
-/// The default maximum number of peer connections Zebra will keep for a given IP address
-/// before it drops any additional peer connections with that IP.
+/// The default maximum number of legacy TCP peer connections Zebra will keep
+/// for a given IP address before it drops any additional peer connections with
+/// that IP.
 ///
 /// This will be used as `Config.max_connections_per_ip` if no valid value is provided.
 ///

@@ -69,6 +69,8 @@ use crate::{BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
 
 /// Default total Zakura connections when P2P v2 is enabled.
 pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 256;
+/// Default per-IP Zakura connection cap.
+pub const DEFAULT_ZAKURA_MAX_CONNS_PER_IP: usize = 16;
 /// Default simultaneous Zakura control handshakes.
 pub const DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES: usize = 32;
 /// Default stream-open churn per connection.
@@ -252,6 +254,13 @@ pub struct ZakuraConfig {
     pub listen_addr: Option<SocketAddr>,
     /// Total concurrent Zakura connections, inbound plus outbound.
     pub max_connections: usize,
+    /// Maximum established Zakura connections admitted from one source IP.
+    ///
+    /// Zakura allows a small number of same-IP peers by default so NATed nodes
+    /// and co-hosted fleets can connect without hitting the legacy TCP crawler's
+    /// stricter per-IP default. Global caps and outbound peer diversity remain
+    /// the primary eclipse-resistance controls.
+    pub max_connections_per_ip: usize,
     /// Connections concurrently running the control handshake.
     pub max_pending_handshakes: usize,
     /// New streams per second admitted per connection after a valid prelude.
@@ -291,6 +300,7 @@ impl Default for ZakuraConfig {
                 .collect(),
             listen_addr: Some(DEFAULT_ZAKURA_LISTEN_ADDR),
             max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS,
+            max_connections_per_ip: DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
             max_pending_handshakes: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
             message_rate_per_second: DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND,
@@ -298,6 +308,17 @@ impl Default for ZakuraConfig {
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
             dev_network: None,
+        }
+    }
+}
+
+impl ZakuraConfig {
+    /// Return the effective per-IP admission cap, preserving a non-zero limit.
+    pub fn max_connections_per_ip(&self) -> usize {
+        if self.max_connections_per_ip == 0 {
+            DEFAULT_ZAKURA_MAX_CONNS_PER_IP
+        } else {
+            self.max_connections_per_ip
         }
     }
 }
@@ -2512,7 +2533,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     // case does not expose the native P2P_V2_ALPN surface on all interfaces.
     let builder = bind_native_endpoint(builder, config.zakura.listen_addr);
     let endpoint = builder.bind().await?;
-    let supervisor = ZakuraSupervisorHandle::new(config.max_connections_per_ip);
+    let supervisor = ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip());
     let tracer = config
         .zakura
         .trace_dir

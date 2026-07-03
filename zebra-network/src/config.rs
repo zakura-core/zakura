@@ -251,10 +251,12 @@ pub struct Config {
     #[serde(with = "humantime_serde")]
     pub crawl_new_peer_interval: Duration,
 
-    /// The maximum number of peer connections Zebra will keep for a given IP address
-    /// before it drops any additional peer connections with that IP.
+    /// The maximum number of legacy TCP peer connections Zebra will keep for a given IP address
+    /// before it drops any additional legacy peer connections with that IP.
     ///
     /// The default and minimum value are 1.
+    ///
+    /// Zakura uses [`ZakuraConfig::max_connections_per_ip`] for native v2 admission.
     ///
     /// # Security
     ///

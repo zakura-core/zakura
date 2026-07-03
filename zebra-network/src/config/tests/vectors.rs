@@ -15,7 +15,7 @@ use crate::{
     constants::{INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_MULTIPLIER},
     zakura::{
         DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_LISTEN_ADDR,
+        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config,
 };
@@ -203,6 +203,10 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
         default_zakura_bootstrap_peers()
     );
     assert!(config.zakura.max_connections > 0);
+    assert_eq!(
+        config.zakura.max_connections_per_ip,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP
+    );
     assert!(config.zakura.max_pending_handshakes > 0);
     assert_eq!(
         config.zakura.header_sync.max_headers_per_response,
@@ -280,6 +284,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
         [zakura]
         bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
         max_connections = 7
+        max_connections_per_ip = 5
         max_pending_handshakes = 3
         stream_open_rate_per_second = 11
         message_rate_per_second = 13
@@ -304,6 +309,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("[zakura]"));
     assert!(serialized.contains("bootstrap_peers"));
     assert!(serialized.contains("max_connections = 7"));
+    assert!(serialized.contains("max_connections_per_ip = 5"));
     assert!(serialized.contains("trace_dir = \"target/zakura-test-traces\""));
     assert!(serialized.contains("[zakura.header_sync]"));
     assert!(serialized.contains("max_headers_per_response = 333"));
@@ -396,6 +402,10 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     assert!(config.legacy_p2p);
     assert_eq!(config.zakura.bootstrap_peers.len(), 1);
     assert_eq!(config.zakura.max_connections, 4);
+    assert_eq!(
+        config.zakura.max_connections_per_ip,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP
+    );
     assert_eq!(config.zakura.max_pending_handshakes, 2);
     assert_eq!(config.zakura.stream_open_rate_per_second, 3);
     assert_eq!(config.zakura.message_rate_per_second, 5);
@@ -409,6 +419,10 @@ fn default_config_uses_ipv6() {
     assert_eq!(config.listen_addr.to_string(), "[::]:8233");
     assert!(config.listen_addr.is_ipv6());
     assert_eq!(config.zakura.listen_addr, Some(DEFAULT_ZAKURA_LISTEN_ADDR));
+    assert_eq!(
+        config.zakura.max_connections_per_ip,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP
+    );
 }
 
 #[test]

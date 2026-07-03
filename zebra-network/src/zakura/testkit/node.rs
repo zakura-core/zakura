@@ -250,10 +250,11 @@ impl ZakuraTestNodeBuilder {
         limits.max_pending_handshakes = 8;
         limits.max_open_streams = 16;
         limits.max_inbound_queue_depth = 64;
+        let config = Config::default();
         Self {
             seed,
             limits,
-            max_connections_per_ip: Config::default().max_connections_per_ip,
+            max_connections_per_ip: config.zakura.max_connections_per_ip(),
             transport_config: None,
             legacy_upgrade: false,
             tracer: JsonlTracer::noop(),
@@ -286,7 +287,7 @@ impl ZakuraTestNodeBuilder {
 
     /// Override the per-IP connection cap enforced by this node's supervisor.
     ///
-    /// Defaults to the production [`Config::max_connections_per_ip`] (1) so that
+    /// Defaults to the production [`ZakuraConfig`](crate::zakura::ZakuraConfig) cap so that
     /// security and integration tests built on the default node exercise the
     /// real per-IP admission gate instead of silently admitting many same-IP
     /// peers. Multi-peer loopback harnesses — where every node shares
@@ -530,6 +531,7 @@ impl Drop for ZakuraTestNode {
 mod tests {
     use super::super::TEST_NET_TIMEOUT;
     use super::*;
+    use crate::zakura::DEFAULT_ZAKURA_MAX_CONNS_PER_IP;
 
     #[tokio::test]
     async fn legacy_upgrade_builder_fails_loudly() {
@@ -546,38 +548,55 @@ mod tests {
     async fn default_test_node_uses_production_per_ip_cap() {
         // Every loopback test node binds 127.0.0.1, so the supervisor's per-IP
         // cap collapses all peers into one IP bucket. A default test node must
-        // inherit the production per-IP cap (Config::max_connections_per_ip == 1)
-        // so security/integration tests built on it exercise the real per-IP
-        // admission gate. Before the fix the builder seeded the supervisor with
-        // max_connections (16), so a second same-IP peer was wrongly admitted and
-        // per-IP admission bugs could pass silently.
-        let peer1 = ZakuraTestNode::builder(9001)
-            .spawn()
-            .await
-            .expect("first loopback peer spawns");
-        let peer2 = ZakuraTestNode::builder(9002)
-            .spawn()
-            .await
-            .expect("second loopback peer spawns");
-        let node = ZakuraTestNode::builder(9003)
+        // inherit the production Zakura per-IP cap so security/integration tests
+        // built on it exercise the real per-IP admission gate.
+        let mut peers = Vec::new();
+        for index in 0..=DEFAULT_ZAKURA_MAX_CONNS_PER_IP {
+            peers.push(
+                ZakuraTestNode::builder(9001 + index as u64)
+                    .spawn()
+                    .await
+                    .unwrap_or_else(|error| panic!("loopback peer {index} should spawn: {error}")),
+            );
+        }
+
+        let node = ZakuraTestNode::builder(10000)
             .spawn()
             .await
             .expect("default test node spawns");
 
-        node.connect_native(&peer1, TEST_NET_TIMEOUT)
-            .await
-            .expect("first same-IP outbound peer registers under per-IP cap 1");
-        let second = node.connect_native(&peer2, TEST_NET_TIMEOUT).await;
+        for (index, peer) in peers
+            .iter()
+            .take(DEFAULT_ZAKURA_MAX_CONNS_PER_IP)
+            .enumerate()
+        {
+            node.connect_native(peer, TEST_NET_TIMEOUT)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "same-IP outbound peer {} should register under the production \
+                         Zakura per-IP cap: {error}",
+                        index + 1
+                    )
+                });
+        }
+
+        let excess_peer = peers
+            .last()
+            .expect("peers contains one peer over the production per-IP cap");
+        let excess = node.connect_native(excess_peer, TEST_NET_TIMEOUT).await;
         assert!(
-            second.is_err(),
-            "second same-IP outbound dial must be rejected under the production \
-             per-IP cap of 1, but it registered — the test node is not enforcing \
-             production per-IP admission"
+            excess.is_err(),
+            "{}th same-IP outbound dial must be rejected under the production \
+             Zakura per-IP cap, but it registered — the test node is not enforcing \
+             production per-IP admission",
+            DEFAULT_ZAKURA_MAX_CONNS_PER_IP + 1
         );
 
         node.shutdown().await;
-        peer1.shutdown().await;
-        peer2.shutdown().await;
+        for peer in peers {
+            peer.shutdown().await;
+        }
     }
 
     #[tokio::test]

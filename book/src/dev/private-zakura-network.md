@@ -33,6 +33,9 @@ bootstrap_peers = [
   "ed25519nodeid1@10.0.0.1:8234",
   "ed25519nodeid2@10.0.0.2:8234",
 ]
+
+# Optional: tune the default of 16 if more cohort nodes share an egress IP.
+max_connections_per_ip = 16
 ```
 
 ```toml

@@ -1,3 +1,6 @@
+use super::super::trace::{
+    ordered_send_error_label, queue_send_trace as qs_trace, QUEUE_SEND_TABLE,
+};
 use super::{
     config::*, events::*, peer_registry::*, sequencer::*, sequencer_task::*, state::*, wire::*, *,
 };
@@ -1239,11 +1242,27 @@ impl BlockSyncReactor {
             Err(OrderedSendError::Full) => {
                 tracing::debug!(?peer, "Zakura block-sync Status queue is full");
                 self.trace_message_sent(peer, &msg, "full", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &OrderedSendError::Full,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    Some(reason),
+                );
             }
             Err(error) => {
                 tracing::debug!(?peer, ?error, "failed to queue Zakura block-sync Status");
                 self.trace_status_send_failed(peer, reason);
                 self.trace_message_sent(peer, &msg, "error", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &error,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    Some(reason),
+                );
                 session.cancel_token().cancel();
             }
         }
@@ -1270,11 +1289,27 @@ impl BlockSyncReactor {
                 metrics::counter!("sync.block.body.serve_queue_full").increment(1);
                 tracing::debug!(?peer, "Zakura block-sync Block queue is full");
                 self.trace_message_sent(peer, &msg, "full", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &OrderedSendError::Full,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    None,
+                );
                 false
             }
             Err(error) => {
                 tracing::debug!(?peer, ?error, "failed to queue Zakura block-sync Block");
                 self.trace_message_sent(peer, &msg, "error", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &error,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    None,
+                );
                 session.cancel_token().cancel();
                 false
             }
@@ -1304,6 +1339,14 @@ impl BlockSyncReactor {
                 metrics::counter!("sync.block.done.serve_queue_full").increment(1);
                 tracing::debug!(?peer, "Zakura block-sync BlocksDone queue is full");
                 self.trace_message_sent(peer, &msg, "full", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &OrderedSendError::Full,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    None,
+                );
             }
             Err(error) => {
                 tracing::debug!(
@@ -1312,6 +1355,14 @@ impl BlockSyncReactor {
                     "failed to queue Zakura block-sync BlocksDone"
                 );
                 self.trace_message_sent(peer, &msg, "error", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &error,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    None,
+                );
                 session.cancel_token().cancel();
             }
         }
@@ -1336,6 +1387,14 @@ impl BlockSyncReactor {
                 metrics::counter!("sync.block.unavailable.serve_queue_full").increment(1);
                 tracing::debug!(?peer, "Zakura block-sync RangeUnavailable queue is full");
                 self.trace_message_sent(peer, &msg, "full", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &OrderedSendError::Full,
+                    peer_state.session.outbound_capacity(),
+                    peer_state.session.outbound_max_capacity(),
+                    None,
+                );
             }
             Err(error) => {
                 tracing::debug!(
@@ -1344,6 +1403,14 @@ impl BlockSyncReactor {
                     "failed to queue Zakura block-sync RangeUnavailable"
                 );
                 self.trace_message_sent(peer, &msg, "error", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &error,
+                    peer_state.session.outbound_capacity(),
+                    peer_state.session.outbound_max_capacity(),
+                    None,
+                );
                 peer_state.session.cancel_token().cancel();
             }
         }
@@ -1701,6 +1768,38 @@ impl BlockSyncReactor {
         self.emit_trace(bs_trace::BLOCK_STATUS_SEND_FAILED, |row| {
             bs_insert_peer(row, bs_trace::PEER, peer);
             bs_insert_str(row, bs_trace::REASON, reason);
+        });
+    }
+
+    fn trace_queue_send_failed(
+        &self,
+        peer: &ZakuraPeerId,
+        msg: &BlockSyncMessage,
+        error: &OrderedSendError,
+        queue_capacity: usize,
+        queue_max_capacity: usize,
+        reason: Option<&'static str>,
+    ) {
+        self.startup.trace.emit_with(QUEUE_SEND_TABLE, |row| {
+            bs_insert_str(row, qs_trace::EVENT, qs_trace::QUEUE_SEND_FAILED);
+            bs_insert_str(row, qs_trace::SERVICE, "block_sync");
+            bs_insert_str(row, qs_trace::MESSAGE, block_sync_message_label(msg));
+            bs_insert_peer(row, qs_trace::PEER, peer);
+            bs_insert_str(row, qs_trace::ERROR, ordered_send_error_label(error));
+            if let Some(reason) = reason {
+                bs_insert_str(row, qs_trace::REASON, reason);
+            }
+            bs_insert_u64(
+                row,
+                qs_trace::QUEUE_CAPACITY,
+                u64::try_from(queue_capacity).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                qs_trace::QUEUE_MAX_CAPACITY,
+                u64::try_from(queue_max_capacity).unwrap_or(u64::MAX),
+            );
+            trace_block_sync_message_fields(row, msg);
         });
     }
 

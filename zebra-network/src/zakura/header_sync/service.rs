@@ -130,6 +130,16 @@ impl HeaderSyncPeerSession {
         self.inner.cancel_token.clone()
     }
 
+    /// Current free slots in this peer's bounded outbound stream queue.
+    pub fn outbound_capacity(&self) -> usize {
+        self.inner.send.capacity()
+    }
+
+    /// Total slots in this peer's bounded outbound stream queue.
+    pub fn outbound_max_capacity(&self) -> usize {
+        self.inner.send.max_capacity()
+    }
+
     /// Send a typed status advertisement.
     pub fn try_send_status(&self, status: HeaderSyncStatus) -> Result<(), OrderedSendError> {
         self.try_send_message(HeaderSyncMessage::Status(status))

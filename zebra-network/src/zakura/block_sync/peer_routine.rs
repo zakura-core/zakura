@@ -26,6 +26,9 @@ use std::collections::BTreeMap;
 use tokio::sync::{futures::Notified, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
+use super::super::trace::{
+    ordered_send_error_label, queue_send_trace as qs_trace, QUEUE_SEND_TABLE,
+};
 use super::events::RoutineToReactor;
 use super::{
     admission::{
@@ -883,6 +886,10 @@ impl PeerRoutine {
             };
 
             let queued_at = Instant::now();
+            let msg = BlockSyncMessage::GetBlocks {
+                start_height: request.start_height,
+                count: request.count,
+            };
             if let Err(error) = self
                 .session
                 .try_send_get_blocks(request.start_height, request.count)
@@ -894,6 +901,7 @@ impl PeerRoutine {
                     ?error,
                     "failed to queue Zakura block-sync GetBlocks"
                 );
+                self.trace_queue_send_failed(&msg, &error);
                 // Nothing was received, so return every taken height to the queue.
                 // Held-aware: a competing peer's late body may have converted a taken
                 // height during the reserve await; that body is owned by the Sequencer,
@@ -1992,6 +2000,34 @@ impl PeerRoutine {
             bs_insert_u64(row, "budget_available", self.budget.available());
             bs_insert_u64(row, "pending_work", self.work.pending_len() as u64);
             bs_insert_u64(row, "received_status", u64::from(self.received_status));
+        });
+    }
+
+    fn trace_queue_send_failed(&self, msg: &BlockSyncMessage, error: &OrderedSendError) {
+        self.trace.emit_with(QUEUE_SEND_TABLE, |row| {
+            bs_insert_str(row, qs_trace::EVENT, qs_trace::QUEUE_SEND_FAILED);
+            bs_insert_str(row, qs_trace::SERVICE, "block_sync");
+            bs_insert_str(row, qs_trace::MESSAGE, block_sync_message_label(msg));
+            bs_insert_peer(row, qs_trace::PEER, &self.peer);
+            bs_insert_str(row, qs_trace::ERROR, ordered_send_error_label(error));
+            bs_insert_u64(
+                row,
+                qs_trace::QUEUE_CAPACITY,
+                u64::try_from(self.session.outbound_capacity()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                qs_trace::QUEUE_MAX_CAPACITY,
+                u64::try_from(self.session.outbound_max_capacity()).unwrap_or(u64::MAX),
+            );
+            if let BlockSyncMessage::GetBlocks {
+                start_height,
+                count,
+            } = msg
+            {
+                bs_insert_height(row, qs_trace::RANGE_START, *start_height);
+                bs_insert_u64(row, qs_trace::RANGE_COUNT, u64::from(*count));
+            }
         });
     }
 

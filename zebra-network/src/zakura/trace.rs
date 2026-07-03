@@ -92,6 +92,48 @@ pub const COMMIT_STATE_TABLE: ZakuraTraceTable = ZakuraTraceTable {
     file_name: "commit_state.jsonl",
 };
 
+/// Failed non-blocking outbound queue sends for Zakura wire messages.
+pub const QUEUE_SEND_TABLE: ZakuraTraceTable = ZakuraTraceTable {
+    table: "queue_send",
+    file_name: "queue_send.jsonl",
+};
+
+/// Shared queue-send trace event names and field keys.
+pub mod queue_send_trace {
+    /// Trace row event field.
+    pub const EVENT: &str = "event";
+    /// Queue send failure event.
+    pub const QUEUE_SEND_FAILED: &str = "queue_send_failed";
+    /// Service label field (`header_sync`, `block_sync`, etc.).
+    pub const SERVICE: &str = "service";
+    /// Wire message label field (`Status`, `GetBlocks`, etc.).
+    pub const MESSAGE: &str = "message";
+    /// Peer field.
+    pub const PEER: &str = "peer";
+    /// Source peer field for forwarded messages.
+    pub const SOURCE_PEER: &str = "source_peer";
+    /// Destination peer field for forwarded messages.
+    pub const DESTINATION_PEER: &str = "destination_peer";
+    /// Bounded send error label (`full`, `closed`, or `encode`).
+    pub const ERROR: &str = "error";
+    /// Logical send reason field.
+    pub const REASON: &str = "reason";
+    /// Remaining outbound queue slots observed after the failed send.
+    pub const QUEUE_CAPACITY: &str = "queue_capacity";
+    /// Total outbound queue slots.
+    pub const QUEUE_MAX_CAPACITY: &str = "queue_max_capacity";
+    /// Range start height field.
+    pub const RANGE_START: &str = "range_start";
+    /// Range count field.
+    pub const RANGE_COUNT: &str = "range_count";
+    /// Returned response count field.
+    pub const RETURNED: &str = "returned";
+    /// Height field.
+    pub const HEIGHT: &str = "height";
+    /// Hash field.
+    pub const HASH: &str = "hash";
+}
+
 /// Shared block-sync trace event names and field keys.
 ///
 /// The block-sync body pipeline has no `tracing`-macro coverage in release
@@ -743,6 +785,17 @@ pub fn reject_reason_label(reason: ZakuraRejectReason) -> &'static str {
         ZakuraRejectReason::ResourceLimit => "resource_limit",
         ZakuraRejectReason::AlreadyConnected => "already_connected",
         ZakuraRejectReason::TemporaryUnavailable => "temporary_unavailable",
+    }
+}
+
+/// Return a stable, bounded label for non-blocking ordered-stream send errors.
+pub(crate) fn ordered_send_error_label(
+    error: &crate::zakura::transport::OrderedSendError,
+) -> &'static str {
+    match error {
+        crate::zakura::transport::OrderedSendError::Full => "full",
+        crate::zakura::transport::OrderedSendError::Closed => "closed",
+        crate::zakura::transport::OrderedSendError::Encode(_) => "encode",
     }
 }
 

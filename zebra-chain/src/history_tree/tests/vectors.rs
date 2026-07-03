@@ -5,7 +5,7 @@ use crate::{
         Block,
         Commitment::{self, ChainHistoryActivationReserved},
     },
-    history_tree::NonEmptyHistoryTree,
+    history_tree::{HistoryTree, HistoryTreeBlockParts, NonEmptyHistoryTree},
     parameters::{Network, NetworkUpgrade},
     sapling,
     serialization::ZcashDeserializeInto,
@@ -105,6 +105,90 @@ fn push_and_prune_for_network_upgrade(
     // The tree must have been pruned, resulting in a single peak (the parent).
     assert_eq!(tree.peaks().len(), 1);
     assert_eq!(tree.current_height().0, height + 1);
+
+    Ok(())
+}
+
+/// Test that the parts API builds the same tree as the full-block API.
+#[test]
+fn parts_api_matches_block_api() -> Result<()> {
+    for network in Network::iter() {
+        parts_api_matches_block_api_for_network(network)?;
+    }
+
+    Ok(())
+}
+
+fn parts_api_matches_block_api_for_network(network: Network) -> Result<()> {
+    let (blocks, sapling_roots) = network.block_sapling_roots_map();
+    let heartwood_height = NetworkUpgrade::Heartwood
+        .activation_height(&network)
+        .expect("test networks have Heartwood activation")
+        .0;
+
+    let first_block = Arc::new(
+        blocks
+            .get(&heartwood_height)
+            .expect("test vector exists")
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid"),
+    );
+    let first_sapling_root = sapling::tree::Root::try_from(
+        **sapling_roots
+            .get(&heartwood_height)
+            .expect("test vector exists"),
+    )?;
+
+    let second_block = Arc::new(
+        blocks
+            .get(&(heartwood_height + 1))
+            .expect("test vector exists")
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid"),
+    );
+    let second_sapling_root = sapling::tree::Root::try_from(
+        **sapling_roots
+            .get(&(heartwood_height + 1))
+            .expect("test vector exists"),
+    )?;
+
+    let mut block_tree = HistoryTree::from_block(
+        &network,
+        first_block.clone(),
+        &first_sapling_root,
+        &Default::default(),
+        &Default::default(),
+    )?;
+    let mut parts_tree = HistoryTree::from_parts(
+        &network,
+        HistoryTreeBlockParts::from_block(
+            &first_block,
+            &first_sapling_root,
+            &Default::default(),
+            &Default::default(),
+        ),
+    )?;
+
+    assert_eq!(parts_tree.hash(), block_tree.hash());
+
+    block_tree.push(
+        &network,
+        second_block.clone(),
+        &second_sapling_root,
+        &Default::default(),
+        &Default::default(),
+    )?;
+    parts_tree.push_from_parts(
+        &network,
+        HistoryTreeBlockParts::from_block(
+            &second_block,
+            &second_sapling_root,
+            &Default::default(),
+            &Default::default(),
+        ),
+    )?;
+
+    assert_eq!(parts_tree.hash(), block_tree.hash());
 
     Ok(())
 }

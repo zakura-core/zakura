@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Changed `GetBlockTrees::new()` and `GetTreestateResponse::new()` to take
   Ironwood tree data.
+- Changed `config::mining::Config::extra_coinbase_data` to
+  `Option<ExtraCoinbaseData>` (was `Option<String>`), limited to 86 bytes
+  (was 94), and validated on construction.
+- Removed `MinerParamsError::OversizedData`; oversized coinbase data is now
+  rejected by `ExtraCoinbaseDataTooLong` when mining config is parsed or built.
 
 ### Added
 
@@ -18,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `z_gettreestate`, and `z_getsubtreesbyindex`.
 - Added Ironwood value pool entries to `getblockchaininfo` and verbose
   `getblock` RPC output.
+- `config::mining::ExtraCoinbaseData` and
+  `config::mining::ExtraCoinbaseDataTooLong`.
 
 ### Changed
 
@@ -25,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   addresses to Ironwood when the unstable NU6.3 code is compiled in.
 - `getblocktemplate` builds empty templates on PoW-disabled networks when the
   mempool is inactive.
+- `getblocktemplate` prepends a `🌸` marker to the coinbase input of every
+  block it builds.
 - RPC authentication cookie checks now compare same-length cookies in constant
   time.
 - Verbose transaction output omits the `ironwood` bundle unless the transaction

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Zebra now tags the coinbase input of every block it mines with a `🌸`. The
+  `mining.extra_coinbase_data` option is now limited to 86 bytes (was 94);
+  Zebra refuses to start if it is exceeded.
+
 ### Removed
 
 - Removed two Zakura block-sync config fields that never needed operator

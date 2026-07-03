@@ -7,6 +7,7 @@ Contents:
 - [Download Zebra](#download-and-build-zebra)
 - [Configure zebra for mining](#configure-zebra-for-mining)
   - [Miner address](#miner-address)
+  - [Extra coinbase data](#extra-coinbase-data)
   - [RPC section](#rpc-section)
 - [Running zebra](#running-zebra)
 - [Testing the setup](#testing-the-setup)
@@ -48,6 +49,33 @@ miner_address = 't3dvVE3SQEi7kqNzwrfNePxZ1d4hUyztBA1'
 ```
 
 The above address is the ZF Mainnet funding stream address. It is used here purely as an example.
+
+### Extra coinbase data
+
+[#extra-coinbase-data]: #extra-coinbase-data
+
+Zebra prepends a `🌸` marker to the coinbase input of every block it builds.
+Setting `extra_coinbase_data` adds your own tag, such as a pool name, after it,
+separated by `": "`:
+
+```toml
+[mining]
+miner_address = 't3dvVE3SQEi7kqNzwrfNePxZ1d4hUyztBA1'
+extra_coinbase_data = "/MyPoolName/"
+```
+
+How it's used:
+
+- Inserted into the coinbase input script, after the block height, `🌸` marker,
+  and `": "` separator.
+- Limited to 86 bytes. If exceeded, Zebra refuses to start.
+- Optional. If unset, the block still carries the `🌸` marker, just no extra
+  data.
+
+You can confirm the marker is applied by calling `getblocktemplate` and
+checking the `coinbasetxn.data` field (see [Testing the setup](#testing-the-setup)):
+after the height bytes you'll see the `🌸` marker (`f0 9f 8c b8`), then, if
+`extra_coinbase_data` is set, the `": "` separator (`3a 20`) and your text.
 
 ### RPC section
 

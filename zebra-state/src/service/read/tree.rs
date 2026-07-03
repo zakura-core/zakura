@@ -247,5 +247,12 @@ where
 {
     chain
         .and_then(|chain| chain.as_ref().history_tree(hash_or_height))
-        .or_else(|| Some(db.history_tree()))
+        .or_else(|| {
+            let (tip_height, tip_hash) = db.tip()?;
+            match hash_or_height {
+                HashOrHeight::Height(height) if height == tip_height => Some(db.history_tree()),
+                HashOrHeight::Hash(hash) if hash == tip_hash => Some(db.history_tree()),
+                _ => None,
+            }
+        })
 }

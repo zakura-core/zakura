@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `read::history_tree` now returns the finalized history tree only when the
+  requested hash or height exactly matches the finalized tip.
+
 ### Changed
 
 - Bumped the state database format to 28 during upgrade, backfilling empty

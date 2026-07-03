@@ -29,7 +29,7 @@ use crate::{
     init_test,
     service::{
         arbitrary::populated_state, chain_tip::TipAction, headers_by_height_range,
-        non_finalized_state::Chain, StateService,
+        non_finalized_state::Chain, read, StateService,
     },
     tests::{
         setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
@@ -643,6 +643,20 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
             .oneshot(ReadRequest::BestHeaderTip)
             .await?,
         ReadResponse::BestHeaderTip(Some((Height(2), block2_hash))),
+    );
+    assert!(read::tree::history_tree(
+        read_state.latest_best_chain(),
+        &read_state.db,
+        Height(0).into()
+    )
+    .is_some());
+    assert_eq!(
+        read::tree::history_tree(
+            read_state.latest_best_chain(),
+            &read_state.db,
+            Height(1).into()
+        ),
+        None
     );
     assert_eq!(
         read_state

@@ -34,18 +34,14 @@ fn legacy_stalled(
     }
 }
 
-/// A peer trickling next-height blocks over gossip bumps the verified tip without
-/// Zakura block sync running. The old height-only rule treats that as health and
-/// never falls back (the bug); the new rule sees the gap to the network frontier
-/// never closing and falls back.
+/// A peer trickling next-height blocks over gossip bumps the verified tip. The
+/// watchdog treats any verified-tip advance as progress and does not use the
+/// best-header frontier to decide whether Zakura is stalled.
 #[test]
-fn gossip_trickle_does_not_suppress_fallback() {
+fn verified_tip_progress_prevents_fallback() {
     let max_idle_polls = 5;
 
-    // The frontier sits far ahead and advances in lockstep with each gossiped block,
-    // so the gap stays pinned at 1_000: the node is materially behind the whole time.
     let mut verified = 0u32;
-    let mut header = 1_000u32;
 
     let mut legacy_last = Some(Height(verified));
     let mut legacy_idle = 0u64;
@@ -55,30 +51,23 @@ fn gossip_trickle_does_not_suppress_fallback() {
     let mut new_fell_back = false;
     for _ in 0..(max_idle_polls * 4) {
         verified += 1;
-        header += 1;
         legacy_fell_back |= legacy_stalled(
             &mut legacy_last,
             &mut legacy_idle,
             Some(Height(verified)),
             max_idle_polls,
         );
-        new_fell_back |= zakura_block_sync_stalled(
-            &mut tracker,
-            Some(Height(verified)),
-            Some(Height(header)),
-            max_idle_polls,
-        );
+        new_fell_back |=
+            zakura_block_sync_stalled(&mut tracker, Some(Height(verified)), max_idle_polls);
     }
 
     assert!(
         !legacy_fell_back,
-        "the legacy height-only rule never falls back under gossip trickle — this is the \
-         F-88602 bug the new rule must fix"
+        "the legacy height-only rule never falls back while the verified tip advances"
     );
     assert!(
-        new_fell_back,
-        "the watchdog must fall back when the verified tip only moves via gossip and the gap \
-         to the network frontier never closes"
+        !new_fell_back,
+        "the watchdog must not fall back while the verified tip advances"
     );
 }
 
@@ -87,28 +76,22 @@ fn gossip_trickle_does_not_suppress_fallback() {
 #[test]
 fn real_block_sync_progress_keeps_primary_path() {
     let max_idle_polls = 5;
-    let header = 10_000u32;
     let mut tracker = ZakuraStallTracker::new(Some(Height(0)));
 
     let mut verified = 0u32;
     for _ in 0..60 {
         verified = verified.saturating_add(200);
         assert!(
-            !zakura_block_sync_stalled(
-                &mut tracker,
-                Some(Height(verified)),
-                Some(Height(header)),
-                max_idle_polls,
-            ),
+            !zakura_block_sync_stalled(&mut tracker, Some(Height(verified)), max_idle_polls,),
             "healthy bulk sync closing 200 blocks/poll must never fall back"
         );
     }
 }
 
-/// A node caught up to the frontier, with gossip keeping it current one block at a
-/// time, is healthy and must not fall back.
+/// A node advancing one verified block at a time is making progress and must
+/// not fall back.
 #[test]
-fn near_tip_with_gossip_stays_primary() {
+fn one_block_progress_stays_primary() {
     let max_idle_polls = 3;
     let mut tracker = ZakuraStallTracker::new(Some(Height(100)));
 
@@ -116,37 +99,26 @@ fn near_tip_with_gossip_stays_primary() {
     for _ in 0..20 {
         height += 1;
         assert!(
-            !zakura_block_sync_stalled(
-                &mut tracker,
-                Some(Height(height)),
-                Some(Height(height)),
-                max_idle_polls,
-            ),
-            "a node caught up to the frontier must not fall back"
+            !zakura_block_sync_stalled(&mut tracker, Some(Height(height)), max_idle_polls,),
+            "a node advancing one verified block at a time must not fall back"
         );
     }
 }
 
-/// Steady moderate sync that closes fewer than `ZAKURA_BLOCK_SYNC_MIN_CLOSURE`
-/// blocks in a single poll but accumulates across polls must still be credited as
-/// progress. Guards against a naive running-min anchor that would re-baseline every
-/// idle poll and false-positive a working sync.
+/// Steady moderate sync must be credited as progress. This guards against
+/// reintroducing a best-header gap rule that can false-positive while verified
+/// blocks are advancing.
 #[test]
 fn steady_moderate_sync_does_not_false_positive() {
     let max_idle_polls = 5;
-    let header = 100_000u32;
     let mut tracker = ZakuraStallTracker::new(Some(Height(0)));
 
     let mut verified = 0u32;
     let mut fell_back = false;
     for _ in 0..400 {
         verified = verified.saturating_add(50);
-        fell_back |= zakura_block_sync_stalled(
-            &mut tracker,
-            Some(Height(verified)),
-            Some(Height(header.max(verified))),
-            max_idle_polls,
-        );
+        fell_back |=
+            zakura_block_sync_stalled(&mut tracker, Some(Height(verified)), max_idle_polls);
     }
     assert!(
         !fell_back,
@@ -154,40 +126,37 @@ fn steady_moderate_sync_does_not_false_positive() {
     );
 }
 
-/// With no network frontier known yet, the watchdog degrades to the original
-/// "verified tip moved at all" rule so behavior does not regress before header sync
-/// reports a frontier.
+/// The watchdog uses the original "verified tip moved at all" rule.
 #[test]
-fn without_header_tip_uses_legacy_tip_moved_rule() {
+fn uses_legacy_tip_moved_rule() {
     let max_idle_polls = 3;
     let mut tracker = ZakuraStallTracker::new(Some(Height(0)));
 
-    // Tip advancing, no frontier known: treated as progress.
+    // Tip advancing: treated as progress.
     for v in 1..=10u32 {
         assert!(!zakura_block_sync_stalled(
             &mut tracker,
             Some(Height(v)),
-            None,
             max_idle_polls,
         ));
     }
 
-    // Tip frozen, no frontier known: idle accrues and it falls back after the window.
+    // Tip frozen: idle accrues and it falls back after the window.
     let frozen = Some(Height(10));
     let mut fell_back = false;
     for _ in 0..max_idle_polls {
-        fell_back = zakura_block_sync_stalled(&mut tracker, frozen, None, max_idle_polls);
+        fell_back = zakura_block_sync_stalled(&mut tracker, frozen, max_idle_polls);
     }
     assert!(
         fell_back,
-        "with no frontier and a frozen verified tip, the legacy rule still trips the fallback"
+        "with a frozen verified tip, the legacy rule still trips the fallback"
     );
 }
 
-/// The fleet-restart blind spot: every Zakura node restarts together and freezes
-/// at a common height with `header_tip == verified_tip`, so the gap is zero and
-/// the gap-based rule reads "caught up" forever. The legacy-informed probe must
-/// engage once the verified tip stays frozen while the node looks caught up.
+/// The fleet-restart blind spot: every Zakura node restarts together and
+/// freezes at a common height with `header_tip == verified_tip`, so the node
+/// looks caught up. The legacy-informed probe must engage once the verified tip
+/// stays frozen while the node looks caught up.
 #[test]
 fn frozen_with_zero_gap_arms_the_legacy_probe() {
     let min_frozen_polls = 3;
@@ -212,8 +181,8 @@ fn frozen_with_zero_gap_arms_the_legacy_probe() {
     );
 }
 
-/// A node still advancing its verified tip — however slowly — is left to the
-/// gap-based rule and must never arm the legacy probe.
+/// A node still advancing its verified tip — however slowly — must never arm
+/// the legacy probe.
 #[test]
 fn advancing_tip_never_arms_the_legacy_probe() {
     let min_frozen_polls = 3;
@@ -229,9 +198,8 @@ fn advancing_tip_never_arms_the_legacy_probe() {
     }
 }
 
-/// When the header gap is large the gap-based rule already owns the decision, so
-/// `looks_caught_up` is false and the legacy probe must stay off even with a
-/// frozen tip — the two triggers must not overlap.
+/// When the header gap is large, `looks_caught_up` is false and the legacy
+/// probe must stay off even with a frozen tip.
 #[test]
 fn frozen_but_materially_behind_leaves_probe_to_gap_rule() {
     let min_frozen_polls = 3;
@@ -241,7 +209,7 @@ fn frozen_but_materially_behind_leaves_probe_to_gap_rule() {
     for _ in 0..(min_frozen_polls * 4) {
         assert!(
             !probe.should_probe(frozen, false, min_frozen_polls),
-            "a large header gap is the gap-based rule's domain; the legacy probe must stay off"
+            "a large header gap means the legacy probe must stay off"
         );
     }
 }
@@ -255,15 +223,13 @@ async fn stalled_zakura_with_legacy_fallback_cancels_the_shutdown_token() {
     let mut legacy_probe = ZakuraLegacyProbe::new(Some(Height(0)));
 
     let mut action = ZakuraWatchdogAction::ContinueWaiting;
-    let mut verified = 0u32;
     let mut header = 1_000u32;
     for _ in 0..=max_idle_polls {
-        verified += 1;
         header += 1;
         action = zakura_watchdog_action(
             &mut tracker,
             &mut legacy_probe,
-            Some(Height(verified)),
+            Some(Height(0)),
             Some(Height(header)),
             max_idle_polls,
             true,
@@ -273,7 +239,7 @@ async fn stalled_zakura_with_legacy_fallback_cancels_the_shutdown_token() {
     assert_eq!(
         action,
         ZakuraWatchdogAction::FallbackToLegacy,
-        "a material gap that never closes must trigger legacy fallback when it is enabled"
+        "a frozen verified tip must trigger legacy fallback when it is enabled"
     );
     stop_zakura_sync(None, &Some(token)).await;
     assert!(
@@ -291,15 +257,13 @@ fn stalled_zakura_without_legacy_fallback_keeps_waiting() {
     let mut legacy_probe = ZakuraLegacyProbe::new(Some(Height(0)));
 
     let mut saw_warn_only = false;
-    let mut verified = 0u32;
     let mut header = 1_000u32;
     for _ in 0..(max_idle_polls * 2) {
-        verified += 1;
         header += 1;
         let action = zakura_watchdog_action(
             &mut tracker,
             &mut legacy_probe,
-            Some(Height(verified)),
+            Some(Height(0)),
             Some(Height(header)),
             max_idle_polls,
             false,

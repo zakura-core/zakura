@@ -307,21 +307,6 @@ const ZAKURA_BODY_SYNC_STALL_POLL: Duration = Duration::from_secs(10);
 /// the verified tip current is healthy, so the watchdog never falls back.
 const ZAKURA_NEAR_TIP_GAP: HeightDiff = 2;
 
-/// Minimum number of blocks the verified tip must close against the best-header
-/// (network frontier) tip — measured since the last credited progress — to count
-/// as real Zakura block-sync progress while the node is materially behind.
-///
-/// This is what distinguishes a working bulk downloader from a peer trickling
-/// occasional next-height blocks over the gossip path. A healthy Zakura block sync
-/// closes a real gap by hundreds to thousands of blocks per stall window, while a
-/// gossip trickle slow enough to never catch up to the advancing network tip closes
-/// only a handful (mainnet produces roughly one block per 75s, so over a single
-/// [`ZAKURA_BODY_SYNC_STALL_TIMEOUT`] window the chain itself grows by only a few
-/// blocks). Without this floor, one gossiped block per poll would reset the idle
-/// timer forever and hold the fallback off while the node stayed arbitrarily far
-/// behind the network.
-const ZAKURA_BLOCK_SYNC_MIN_CLOSURE: HeightDiff = 64;
-
 /// Consecutive polls the verified tip must stay frozen before
 /// [`ChainSync::bootstrap_genesis_then_pause`] runs its legacy-informed
 /// cross-check probe. Bounds how often the watchdog issues a `FindBlocks`
@@ -336,23 +321,17 @@ const ZAKURA_LEGACY_PROBE_STALL_POLLS: u64 = 3;
 /// This is the "much higher height" signal for the fleet-restart failure mode:
 /// when every Zakura node restarts together it freezes at a common height with
 /// `header_tip == verified_tip`, so the gap to its own frontier is zero and the
-/// gap-based rule reads "caught up" forever. The legacy peers' advertised hashes
-/// do not depend on (the also-stalled) Zakura header sync, so they still expose
-/// the real network tip.
+/// node looks caught up forever. The legacy peers' advertised hashes do not
+/// depend on (the also-stalled) Zakura header sync, so they still expose the
+/// real network tip.
 const ZAKURA_LEGACY_BEHIND_THRESHOLD: HeightDiff = 64;
 
 /// Cross-poll bookkeeping for [`ChainSync::bootstrap_genesis_then_pause`]'s Zakura
 /// body-sync stall watchdog. See [`zakura_block_sync_stalled`].
 #[derive(Clone, Copy, Debug)]
 struct ZakuraStallTracker {
-    /// Verified tip at the last poll. Only used by the degraded rule when no
-    /// best-header frontier is known yet.
+    /// Verified tip at the last poll.
     last_verified_height: Option<Height>,
-
-    /// Gap (best-header tip − verified tip) at the poll that last credited progress.
-    /// Progress is credited again only once the gap closes a further
-    /// [`ZAKURA_BLOCK_SYNC_MIN_CLOSURE`] below this anchor.
-    progress_anchor_gap: Option<HeightDiff>,
 
     /// Consecutive idle polls without credited progress.
     idle_polls: u64,
@@ -362,7 +341,6 @@ impl ZakuraStallTracker {
     fn new(verified_height: Option<Height>) -> Self {
         Self {
             last_verified_height: verified_height,
-            progress_anchor_gap: None,
             idle_polls: 0,
         }
     }
@@ -392,16 +370,15 @@ impl ZakuraLegacyProbe {
     /// cross-check probe should run now.
     ///
     /// The probe runs only when the node *looks* caught up to its own header
-    /// frontier (`looks_caught_up`) — so the gap-based [`zakura_block_sync_stalled`]
-    /// rule will never fall back — yet the verified tip has been frozen for
+    /// frontier (`looks_caught_up`), yet the verified tip has been frozen for
     /// `min_frozen_polls` consecutive polls. Any advance of the verified tip
-    /// resets the freeze counter: a node still making progress, however slow, is
-    /// left to the gap-based rule and is never cross-checked.
+    /// resets the freeze counter: a node still making progress, however slow,
+    /// is never cross-checked.
     ///
-    /// This deliberately covers only the gap-based rule's blind spot (a fleet
-    /// that restarts in lockstep and freezes at a common height with a zero
-    /// header gap). When the header gap is large the gap-based rule already owns
-    /// the decision, so `looks_caught_up` is false and the probe stays off.
+    /// This deliberately covers only the "looks caught up but frozen" blind
+    /// spot: a fleet that restarts in lockstep and freezes at a common height
+    /// with a zero header gap. When the header gap is large,
+    /// `looks_caught_up` is false and the probe stays off.
     fn should_probe(
         &mut self,
         verified_height: Option<Height>,
@@ -440,7 +417,7 @@ fn zakura_watchdog_action(
     max_idle_polls: u64,
     legacy_fallback: bool,
 ) -> ZakuraWatchdogAction {
-    if zakura_block_sync_stalled(tracker, verified_height, header_tip_height, max_idle_polls) {
+    if zakura_block_sync_stalled(tracker, verified_height, max_idle_polls) {
         if legacy_fallback {
             return ZakuraWatchdogAction::FallbackToLegacy;
         }
@@ -480,62 +457,16 @@ fn legacy_probe_supports_fallback(blocks_ahead: Option<HeightDiff>) -> bool {
     matches!(blocks_ahead, Some(blocks_ahead) if blocks_ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD)
 }
 
-/// Decides whether Zakura block sync should be considered stalled — so the legacy
-/// [`ChainSync::sync`] body downloader resumes as a fallback — from the latest
-/// verified body tip and the best-header (network frontier) tip. Returns `true`
-/// once `max_idle_polls` consecutive polls pass without credited progress.
-///
-/// Progress is deliberately **not** "the verified tip moved": inbound gossip blocks
-/// bump the verified tip without Zakura block sync running, so a peer trickling
-/// next-height blocks could otherwise hold the fallback off forever while the node
-/// stays materially behind (the F-88602 finding). Instead, progress is one of:
-///   * the node is within [`ZAKURA_NEAR_TIP_GAP`] of the frontier (caught up —
-///     gossip keeping it current is fine), or
-///   * the gap to the frontier has closed by at least
-///     [`ZAKURA_BLOCK_SYNC_MIN_CLOSURE`] since the last credited progress (only a
-///     working bulk downloader closes a real gap that fast).
-///
-/// When no frontier is known yet (`header_tip_height` is `None`), it degrades to the
-/// original "verified tip advanced at all" rule so behavior does not regress before
-/// header sync reports a frontier.
+/// Decides whether Zakura block sync should be considered stalled — so the
+/// legacy [`ChainSync::sync`] body downloader resumes as a fallback — from the
+/// latest verified body tip. Returns `true` once `max_idle_polls` consecutive
+/// polls pass without the verified tip advancing.
 fn zakura_block_sync_stalled(
     tracker: &mut ZakuraStallTracker,
     verified_height: Option<Height>,
-    header_tip_height: Option<Height>,
     max_idle_polls: u64,
 ) -> bool {
-    // `Height - Height` yields a `HeightDiff` (i64); the best-header tip is never
-    // below the verified tip in practice, but a negative gap is treated as caught up.
-    let gap = match (header_tip_height, verified_height) {
-        (Some(header), Some(verified)) => Some(header - verified),
-        _ => None,
-    };
-
-    let made_progress = match gap {
-        // No frontier known yet: fall back to the legacy "tip moved" rule.
-        None => verified_height > tracker.last_verified_height,
-        // Caught up to the frontier: healthy.
-        Some(gap) if gap <= ZAKURA_NEAR_TIP_GAP => {
-            tracker.progress_anchor_gap = Some(gap);
-            true
-        }
-        // Materially behind: only a substantial closure since the anchor counts. The
-        // anchor moves only when progress is credited (never on idle polls), so a
-        // steady moderate sync still credits across polls, while a slow trickle that
-        // never closes the floor keeps accumulating idle polls toward the fallback.
-        Some(gap) => match tracker.progress_anchor_gap {
-            None => {
-                tracker.progress_anchor_gap = Some(gap);
-                true
-            }
-            Some(anchor) if anchor - gap >= ZAKURA_BLOCK_SYNC_MIN_CLOSURE => {
-                tracker.progress_anchor_gap = Some(gap);
-                true
-            }
-            Some(_) => false,
-        },
-    };
-
+    let made_progress = verified_height > tracker.last_verified_height;
     tracker.last_verified_height = verified_height;
 
     if made_progress {
@@ -1007,9 +938,9 @@ where
     /// stalled, eclipsed, or peerless node is visible in the logs.
     ///
     /// `read_state` answers [`ReadRequest::BestHeaderTip`](zs::ReadRequest::BestHeaderTip)
-    /// so the watchdog can tell genuine Zakura block-sync progress (the verified tip
-    /// closing a real gap to the network frontier) from a peer trickling next-height
-    /// blocks over gossip (which bumps the verified tip without body sync running).
+    /// for the legacy-informed cross-check, which only probes legacy peers when
+    /// the verified tip is frozen and the node looks caught up to its own header
+    /// frontier.
     #[instrument(skip(self, read_state, zakura_endpoint, zakura_shutdown))]
     pub async fn bootstrap_genesis_then_pause<RS>(
         mut self,

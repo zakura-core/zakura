@@ -296,7 +296,7 @@ const GENESIS_TIMEOUT_RETRY: Duration = Duration::from_secs(10);
 /// produces a block roughly every 75 seconds) resets the timer and never falls
 /// back. Falling back when a node is genuinely caught up is harmless — the legacy
 /// syncer simply finds no new blocks and idles.
-const ZAKURA_BODY_SYNC_STALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const ZAKURA_BODY_SYNC_STALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// How often [`ChainSync::bootstrap_genesis_then_pause`] polls the verified tip
 /// while watching for Zakura body-sync progress.

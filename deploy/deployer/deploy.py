@@ -413,7 +413,7 @@ if [ "$NO_RESTART" = "1" ]; then
     exit 0
 fi
 
-start_service() {
+start_service() {{
     systemctl stop "$SERVICE" || true
 
     # Some long-running testnet nodes can survive a plain systemctl restart long
@@ -431,7 +431,7 @@ start_service() {
     pkill -KILL -f "^${{BIN_PATH}}( |$)" >/dev/null 2>&1 || true
 
     systemctl start "$SERVICE"
-}
+}}
 
 if ! start_service; then
     echo "start failed; rolling back to ${{BIN_PATH}}.bak" >&2

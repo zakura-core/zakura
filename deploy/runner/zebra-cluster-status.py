@@ -25,6 +25,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+DEFAULT_UPGRADE_HEIGHT = 4_134_000
+DEFAULT_TARGET_SPACING = 7.5
+HEIGHT_HISTORY_WINDOW = 60 * 60
+MIN_OBSERVED_BLOCKS = 3
+MIN_OBSERVED_SECONDS = 120
+MIN_SECONDS_PER_BLOCK = 1.0
+MAX_SECONDS_PER_BLOCK = 10 * 60.0
+
 SSH_COMMON_OPTS = [
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=15",
@@ -218,13 +226,23 @@ def probe_node(node: Node) -> dict:
 
 
 class ClusterCollector:
-    def __init__(self, nodes: list[Node], interval: float, stale_after: float):
+    def __init__(
+        self,
+        nodes: list[Node],
+        interval: float,
+        stale_after: float,
+        upgrade_height: int,
+        target_spacing: float,
+    ):
         self.nodes = nodes
         self.interval = interval
         self.stale_after = stale_after
+        self.upgrade_height = upgrade_height
+        self.target_spacing = target_spacing
         self.lock = threading.Lock()
         self.last_height: dict[str, int | None] = {node.name: None for node in nodes}
         self.last_advanced_at: dict[str, float | None] = {node.name: None for node in nodes}
+        self.height_history: list[tuple[float, int]] = []
         self.rows: list[dict] = [
             {"name": node.name, "ssh": node.ssh_string, "health": "starting", "healthy": False}
             for node in nodes
@@ -253,6 +271,24 @@ class ClusterCollector:
         with self.lock:
             self.rows = rows
             self.last_poll = now
+            self.record_height_sample(now, rows)
+
+    def record_height_sample(self, now: float, rows: list[dict]) -> None:
+        heights = [row["height"] for row in rows if row.get("height") is not None]
+        if not heights:
+            return
+
+        best_height = max(heights)
+        if self.height_history and best_height < self.height_history[-1][1]:
+            best_height = self.height_history[-1][1]
+        self.height_history.append((now, best_height))
+
+        cutoff = now - HEIGHT_HISTORY_WINDOW
+        self.height_history = [
+            (sample_time, height)
+            for sample_time, height in self.height_history
+            if sample_time >= cutoff
+        ]
 
     def row_for(self, node: Node, probe: dict, now: float) -> dict:
         previous_height = self.last_height.get(node.name)
@@ -316,6 +352,7 @@ class ClusterCollector:
         with self.lock:
             rows = [dict(row) for row in self.rows]
             last_poll = self.last_poll
+            upgrade = self.upgrade_estimate(time.time())
         healthy = sum(1 for row in rows if row.get("healthy"))
         return {
             "generated_at": time.time(),
@@ -323,8 +360,58 @@ class ClusterCollector:
             "stale_after": self.stale_after,
             "healthy": healthy,
             "total": len(rows),
+            "upgrade": upgrade,
             "rows": rows,
         }
+
+    def upgrade_estimate(self, now: float) -> dict:
+        current_height = self.height_history[-1][1] if self.height_history else None
+        blocks_remaining = (
+            max(self.upgrade_height - current_height, 0)
+            if current_height is not None
+            else None
+        )
+        activated = blocks_remaining == 0 if blocks_remaining is not None else False
+
+        seconds_per_block = self.observed_seconds_per_block()
+        source = "observed"
+        if seconds_per_block is None:
+            seconds_per_block = self.target_spacing
+            source = "fallback"
+
+        eta_seconds = None
+        eta_at = None
+        if blocks_remaining is not None:
+            eta_seconds = blocks_remaining * seconds_per_block
+            eta_at = now + eta_seconds
+
+        return {
+            "height": self.upgrade_height,
+            "current_height": current_height,
+            "blocks_remaining": blocks_remaining,
+            "seconds_per_block": seconds_per_block,
+            "eta_seconds": eta_seconds,
+            "eta_at": eta_at,
+            "source": source,
+            "activated": activated,
+        }
+
+    def observed_seconds_per_block(self) -> float | None:
+        if len(self.height_history) < 2:
+            return None
+
+        newest_time, newest_height = self.height_history[-1]
+        for oldest_time, oldest_height in self.height_history:
+            blocks = newest_height - oldest_height
+            seconds = newest_time - oldest_time
+            if blocks < MIN_OBSERVED_BLOCKS or seconds < MIN_OBSERVED_SECONDS:
+                continue
+
+            seconds_per_block = seconds / blocks
+            if MIN_SECONDS_PER_BLOCK <= seconds_per_block <= MAX_SECONDS_PER_BLOCK:
+                return seconds_per_block
+
+        return None
 
 
 def coerce_int(value) -> int | None:
@@ -464,7 +551,7 @@ h2 {
 }
 .grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 16px;
   margin-top: 16px;
 }
@@ -512,6 +599,12 @@ h2 {
   color: var(--ink);
   font-size: 0.95rem;
   overflow-wrap: anywhere;
+}
+.summary-card small {
+  display: block;
+  margin-top: 2px;
+  color: var(--dim);
+  font-size: 0.76rem;
 }
 .table-wrap {
   margin-top: 16px;
@@ -629,6 +722,23 @@ tbody tr:hover td { background: rgba(46, 42, 66, 0.35); }
       <span>Stale window</span>
       <strong id="stale-window">...</strong>
     </article>
+    <article class="summary-card">
+      <span>Upgrade height</span>
+      <strong id="upgrade-height">...</strong>
+    </article>
+    <article class="summary-card">
+      <span>Blocks remaining</span>
+      <strong id="blocks-remaining">...</strong>
+    </article>
+    <article class="summary-card">
+      <span>Upgrade ETA</span>
+      <strong id="upgrade-eta">...</strong>
+    </article>
+    <article class="summary-card">
+      <span>Block time</span>
+      <strong id="block-time">...</strong>
+      <small id="block-time-source">...</small>
+    </article>
   </section>
 
   <section class="panel panel-full" style="margin-top:16px;">
@@ -664,6 +774,24 @@ function age(seconds) {
   if (seconds < 3600) return Math.round(seconds / 60) + 'm ago';
   return Math.round(seconds / 3600) + 'h ago';
 }
+function countdown(seconds) {
+  if (seconds == null) return 'waiting for height';
+  if (seconds <= 0) return 'activated';
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return days + 'd ' + hours + 'h';
+  if (hours > 0) return hours + 'h ' + minutes + 'm';
+  return Math.max(1, minutes) + 'm';
+}
+function formatNumber(value) {
+  return value == null ? '...' : Number(value).toLocaleString();
+}
+function formatBlockTime(seconds) {
+  if (seconds == null) return '...';
+  if (seconds < 10) return Number(seconds).toFixed(1) + 's/block';
+  return Math.round(seconds) + 's/block';
+}
 function shortCommit(commit) { return commit ? commit.slice(0, 12) : 'unknown'; }
 function esc(value) {
   return String(value == null ? '' : value).replace(/[&<>"']/g, (match) => ({
@@ -689,6 +817,15 @@ async function tick() {
   document.getElementById('healthy-count').textContent = data.healthy + ' / ' + data.total;
   document.getElementById('last-poll').textContent = poll;
   document.getElementById('stale-window').textContent = Math.round(data.stale_after) + 's';
+  const upgrade = data.upgrade || {};
+  const etaAt = upgrade.eta_at ? new Date(upgrade.eta_at * 1000).toLocaleString() : 'waiting for block movement';
+  document.getElementById('upgrade-height').textContent = formatNumber(upgrade.height);
+  document.getElementById('blocks-remaining').textContent = upgrade.activated ? 'activated' : formatNumber(upgrade.blocks_remaining);
+  document.getElementById('upgrade-eta').textContent = upgrade.activated ? 'activated' : countdown(upgrade.eta_seconds) + ' / ' + etaAt;
+  document.getElementById('block-time').textContent = formatBlockTime(upgrade.seconds_per_block);
+  document.getElementById('block-time-source').textContent = upgrade.source === 'observed'
+    ? 'recent average'
+    : 'default estimate';
   document.getElementById('summary').textContent = data.healthy + ' / ' + data.total + ' nodes healthy';
   const body = document.getElementById('rows');
   body.innerHTML = data.rows.map((row) => `
@@ -746,10 +883,28 @@ def main() -> None:
         default=300.0,
         help="mark a node stale if height has not advanced in this many seconds",
     )
+    parser.add_argument(
+        "--upgrade-height",
+        type=int,
+        default=DEFAULT_UPGRADE_HEIGHT,
+        help="testnet upgrade activation height to estimate",
+    )
+    parser.add_argument(
+        "--target-spacing",
+        type=float,
+        default=DEFAULT_TARGET_SPACING,
+        help="fallback seconds per block before enough live samples are observed",
+    )
     args = parser.parse_args()
 
     nodes = load_nodes(Path(args.config))
-    COLLECTOR = ClusterCollector(nodes, args.interval, args.stale_after)
+    COLLECTOR = ClusterCollector(
+        nodes,
+        args.interval,
+        args.stale_after,
+        args.upgrade_height,
+        args.target_spacing,
+    )
     threading.Thread(target=COLLECTOR.loop, daemon=True).start()
 
     print(

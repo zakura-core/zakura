@@ -221,7 +221,7 @@ jobs:
           [Service]
           Type=simple
           WorkingDirectory=/opt/zakura-testnet-dashboard
-          ExecStart=/usr/bin/python3 /opt/zakura-testnet-dashboard/zebra-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --interval 10 --stale-after 300
+          ExecStart=/usr/bin/python3 /opt/zakura-testnet-dashboard/zebra-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --interval 10 --stale-after 300 --upgrade-height 4134000 --target-spacing 7.5
           Restart=always
           RestartSec=5
 

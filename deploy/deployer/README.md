@@ -104,7 +104,10 @@ The workflow also refreshes a simple fleet status dashboard on
 
 The dashboard reads the generated deployer node config and polls each node over
 SSH. It shows the running commit from the node log, last restart time, current
-RPC height, and whether the height advanced in the last five minutes.
+RPC height, whether the height advanced in the last five minutes, and an upgrade
+ETA for Ironwood testnet activation height `4134000`. The ETA uses observed
+cluster block movement when enough samples are available, otherwise it falls back
+to `--target-spacing 7.5`.
 
 The workflow also refreshes a static Zakura Ironwood testnet snapshots website on
 `zakura-testnet-1`:
@@ -138,7 +141,9 @@ Manual run from a host with SSH access to every node:
 python3 deploy/runner/zebra-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
-  --port 8090
+  --port 8090 \
+  --upgrade-height 4134000 \
+  --target-spacing 7.5
 ```
 
 ## How the build cache works

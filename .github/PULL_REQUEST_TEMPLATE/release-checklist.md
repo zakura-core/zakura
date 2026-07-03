@@ -8,13 +8,13 @@ assignees: ""
 
 # Prepare for the Release
 
-- [ ] Make sure there has been [at least one successful full sync test in the main branch](https://github.com/ZcashFoundation/zebra/actions/workflows/zfnd-ci-integration-tests-gcp.yml?query=branch%3Amain) since the last state change, or start a manual full sync.
+- [ ] Make sure there has been [at least one successful sync-confidence run on `ironwood-main`](https://github.com/valargroup/zebra/actions/workflows/sync-confidence.yml?query=branch%3Aironwood-main) since the last state change, or start a manual sync-confidence run.
 
 # Checkpoints
 
 For performance and security, we want to update the Zebra checkpoints in every release.
 
-- [ ] You can copy the latest checkpoints from CI by following [the zebra-checkpoints README](https://github.com/ZcashFoundation/zebra/blob/main/zebra-utils/README.md#zebra-checkpoints).
+- [ ] You can copy the latest checkpoints from CI by following [the zebra-checkpoints README](https://github.com/valargroup/zebra/blob/ironwood-main/zebra-utils/README.md#zebra-checkpoints).
 
 # Missed Dependency Updates
 
@@ -24,9 +24,9 @@ This step can be skipped if there is a large pending dependency upgrade. (For ex
 
 Here's how we make sure we got everything:
 
-- [ ] Run `cargo update` on the latest `main` branch, and keep the output
+- [ ] Run `cargo update` on the latest `ironwood-main` branch, and keep the output
 - [ ] Until we bump the workspace MSRV to 1.88 or higher, `home` must be downgraded manually: `cargo update home@0.5.12 --precise 0.5.11`
-- [ ] If needed, [add duplicate dependency exceptions to deny.toml](https://github.com/ZcashFoundation/zebra/blob/main/book/src/dev/continuous-integration.md#fixing-duplicate-dependencies-in-check-denytoml-bans)
+- [ ] If needed, [add duplicate dependency exceptions to deny.toml](https://github.com/valargroup/zebra/blob/ironwood-main/book/src/dev/continuous-integration.md#fixing-duplicate-dependencies-in-check-denytoml-bans)
 - [ ] If needed, remove resolved duplicate dependencies from `deny.toml`
 - [ ] Open a separate PR with the changes
 - [ ] Add the output of `cargo update` to that PR as a comment
@@ -37,15 +37,15 @@ These steps can be done a few days before the release, in the same PR:
 
 ## Change Log
 
-**Important**: Any merge into `main` deletes any edits to the draft changelog.
+**Important**: Any merge into `ironwood-main` deletes any edits to the draft changelog.
 Once you are ready to tag a release, copy the draft changelog into `CHANGELOG.md`.
 
-We use [the Release Drafter workflow](https://github.com/marketplace/actions/release-drafter) to automatically create a [draft changelog](https://github.com/ZcashFoundation/zebra/releases). We follow the [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format.
+We use [the Release Drafter workflow](https://github.com/marketplace/actions/release-drafter) to automatically create a [draft changelog](https://github.com/valargroup/zebra/releases). We follow the [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format.
 
 To create the final change log:
 
 - [ ] Copy the [**latest** draft
-      changelog](https://github.com/ZcashFoundation/zebra/releases) into
+      changelog](https://github.com/valargroup/zebra/releases) into
       `CHANGELOG.md` (there can be multiple draft releases)
 - [ ] Delete any trivial changes
   - [ ] Put the list of deleted changelog entries in a PR comment to make reviewing easier
@@ -75,8 +75,8 @@ fastmod --fixed-strings '1.58' '1.65'
 
 - [ ] Push the updated changelog and README into a new branch
       for example: `bump-v1.0.0` - this needs to be different to the tag name
-- [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/ZcashFoundation/zebra/compare/bump-v1.0.0?expand=1&template=release-checklist.md)).
-- [ ] Freeze the [`batched` queue](https://dashboard.mergify.com/github/ZcashFoundation/repo/zebra/queues) using Mergify.
+- [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/valargroup/zebra/compare/bump-v1.0.0?expand=1&template=release-checklist.md)).
+- [ ] Freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zebra/queues) using Mergify.
 - [ ] Mark all the release PRs as `Critical` priority, so they go in the `urgent` Mergify queue.
 - [ ] Mark all non-release PRs with `do-not-merge`, because Mergify checks approved PRs against every commit, even when a queue is frozen.
 - [ ] Add the `A-release` tag to the release pull request in order for the `check-no-git-dependencies` to run.
@@ -142,7 +142,7 @@ cargo release replace --verbose --execute --allow-branch '*' -p zebrad
 The end of support height is calculated from the current blockchain height:
 
 - [ ] Find where the Zcash blockchain tip is now by using a [Zcash Block Explorer](https://mainnet.zcashexplorer.app/) or other tool.
-- [ ] Replace `ESTIMATED_RELEASE_HEIGHT` in [`end_of_support.rs`](https://github.com/ZcashFoundation/zebra/blob/main/zebrad/src/components/sync/end_of_support.rs) with the height you estimate the release will be tagged.
+- [ ] Replace `ESTIMATED_RELEASE_HEIGHT` in [`end_of_support.rs`](https://github.com/valargroup/zebra/blob/ironwood-main/zebrad/src/components/sync/end_of_support.rs) with the height you estimate the release will be tagged.
 
 <details>
 
@@ -163,10 +163,10 @@ The end of support height is calculated from the current blockchain height:
 ## Create the GitHub Pre-Release
 
 - [ ] Wait for all the release PRs to be merged
-- [ ] Create a new release using the draft release as a base, by clicking the Edit icon in the [draft release](https://github.com/ZcashFoundation/zebra/releases)
+- [ ] Create a new release using the draft release as a base, by clicking the Edit icon in the [draft release](https://github.com/valargroup/zebra/releases)
 - [ ] Set the tag name to the version tag,
       for example: `v1.0.0`
-- [ ] Set the release to target the `main` branch
+- [ ] Set the release to target the `ironwood-main` branch
 - [ ] Set the release title to `Zebra ` followed by the version tag,
       for example: `Zebra 1.0.0`
 - [ ] Replace the prepopulated draft changelog in the release description with the final changelog you created;
@@ -174,17 +174,17 @@ The end of support height is calculated from the current blockchain height:
       and ending just _before_ the title of the previous release.
 - [ ] Mark the release as 'pre-release', until it has been built and tested
 - [ ] Publish the pre-release to GitHub using "Publish Release"
-- [ ] Delete all the [draft releases from the list of releases](https://github.com/ZcashFoundation/zebra/releases)
+- [ ] Delete all the [draft releases from the list of releases](https://github.com/valargroup/zebra/releases)
 
 ## Test the Pre-Release
 
-- [ ] Wait until the Docker binaries have been built on `main`, and the quick tests have passed:
-  - [ ] [zfnd-ci-integration-tests-gcp.yml](https://github.com/ZcashFoundation/zebra/actions/workflows/zfnd-ci-integration-tests-gcp.yml?query=branch%3Amain)
-- [ ] Wait until the [pre-release deployment machines have successfully launched](https://github.com/ZcashFoundation/zebra/actions/workflows/zfnd-deploy-nodes-gcp.yml?query=event%3Arelease)
+- [ ] Wait until the release assets and Docker images have been built:
+  - [ ] [release-binaries.yml](https://github.com/valargroup/zebra/actions/workflows/release-binaries.yml?query=event%3Arelease)
+- [ ] Run [`sync-confidence.yml`](https://github.com/valargroup/zebra/actions/workflows/sync-confidence.yml) manually for the release tag or release branch if sync validation is required after tagging.
 
 ## Publish Release
 
-- [ ] [Publish the release to GitHub](https://github.com/ZcashFoundation/zebra/releases) by disabling 'pre-release', then clicking "Set as the latest release"
+- [ ] [Publish the release to GitHub](https://github.com/valargroup/zebra/releases) by disabling 'pre-release', then clicking "Set as the latest release"
 
 ## Publish Crates
 
@@ -206,14 +206,14 @@ for c in zebra-test tower-fallback zebra-chain tower-batch-control zebra-node-se
 ## Publish Docker Images
 
 - [ ] Confirm the pinned zcashd compat manifest is ready before publishing:
-  - [ ] Update [`zebrad/zcashd-compat-manifest.json`](https://github.com/ZcashFoundation/zebra/blob/main/zebrad/zcashd-compat-manifest.json) to the intended `zcashd` compat release (it is the single source of truth: zebrad embeds it at compile time and CI/Docker builds read it directly).
+  - [ ] Update [`zebrad/zcashd-compat-manifest.json`](https://github.com/valargroup/zebra/blob/ironwood-main/zebrad/zcashd-compat-manifest.json) to the intended `zcashd` compat release (it is the single source of truth: zebrad embeds it at compile time and CI/Docker builds read it directly).
   - [ ] Confirm the manifest contains only the `x86_64-pc-linux-gnu` artifact before publishing zcashd-compat Docker images.
   - [ ] Confirm the workflow logs show the expected `/usr/local/bin/zcashd --version` for the zcashd-compat linux/amd64 image variant.
-- [ ] Wait for the [the Docker images to be published successfully](https://github.com/ZcashFoundation/zebra/actions/workflows/release-binaries.yml?query=event%3Arelease).
+- [ ] Wait for the [the Docker images to be published successfully](https://github.com/valargroup/zebra/actions/workflows/release-binaries.yml?query=event%3Arelease).
 - [ ] Confirm `release-binaries.yml` published `zebrad-<tag>-linux-x86_64.tar.gz`, `zebrad-<tag>-linux-aarch64.tar.gz`, `zebrad-manifest-<tag>.json`, `install-zakura.sh`, `install-zcashd-compat.sh`, and `SHA256SUMS.txt` to the GitHub release.
-- [ ] Wait for the new tag in the [dockerhub zebra space](https://hub.docker.com/r/zfnd/zebra/tags)
-- [ ] Confirm `zfnd/zebra:<version>` includes `linux/amd64` and `linux/arm64`, and `zfnd/zebra-zcashd-compat:<version>` includes only `linux/amd64`.
-- [ ] Un-freeze the [`batched` queue](https://dashboard.mergify.com/github/ZcashFoundation/repo/zebra/queues) using Mergify.
+- [ ] Wait for the new tag in the [Docker Hub zebra space](https://hub.docker.com/r/valaroman/zebra/tags)
+- [ ] Confirm `valaroman/zebra:<version>` includes `linux/amd64` and `linux/arm64`, and `valaroman/zebra:zcashd-compat-<version>` includes only `linux/amd64`.
+- [ ] Un-freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zebra/queues) using Mergify.
 - [ ] Remove `do-not-merge` from the PRs you added it to
 
 ## Release Failures

@@ -130,7 +130,7 @@ exclude-contributors:
 
 # The template for the draft CHANGELOG.
 template: |
-  ## [Zebra $RESOLVED_VERSION](https://github.com/ZcashFoundation/zebra/releases/tag/v$RESOLVED_VERSION) - *TODO*: date
+  ## [Zebra $RESOLVED_VERSION](https://github.com/valargroup/zebra/releases/tag/v$RESOLVED_VERSION) - *TODO*: date
 
   This release *TODO*: a summary of the significant user-visible changes in the release
 

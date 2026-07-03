@@ -335,6 +335,7 @@ impl Service for HeaderSyncService {
         // shared connection that other services (discovery, block-sync) ride on.
         let service_cancel_token = session.cancel_token();
         let connection_cancel_token = peer.cancel_token();
+        let close_cause = peer.close_cause();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let header_sync_session =
             HeaderSyncPeerSession::new_with_commands(&session, peer.direction, commands_tx);
@@ -364,10 +365,12 @@ impl Service for HeaderSyncService {
         // or parked exit leaves the connection alone.
         let pipe_cancel_token = service_cancel_token.clone();
         let protocol_connection_cancel_token = connection_cancel_token.clone();
+        let protocol_close_cause = close_cause.clone();
         let pipe = async move {
             handle_pipe_exit(
                 "header-sync",
                 &protocol_connection_cancel_token,
+                &protocol_close_cause,
                 run_peer(pipe, recv, pipe_cancel_token).await,
             );
         };
@@ -385,7 +388,11 @@ impl Service for HeaderSyncService {
                 teardown_handle.send_lifecycle(HeaderSyncEvent::PeerDisconnected(teardown_peer));
         };
         let panic_connection_cancel_token = connection_cancel_token.clone();
-        let on_panic = move || panic_connection_cancel_token.cancel();
+        let panic_close_cause = close_cause.clone();
+        let on_panic = move || {
+            panic_close_cause.record("service_panic");
+            panic_connection_cancel_token.cancel();
+        };
 
         // Reuse the single supervised launcher; let the returned handle drop to
         // detach the task (the `PipeTeardown` still runs on every exit path).

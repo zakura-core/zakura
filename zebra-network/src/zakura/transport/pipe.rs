@@ -12,7 +12,10 @@
 //! an interpreter that is *executed*. Stages are plain `fn`s; the hot path is a
 //! `match`, not a walk over `PipeShape.edges`.
 
-use std::future::Future;
+use std::{
+    future::Future,
+    sync::{Arc, OnceLock},
+};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +23,42 @@ use tokio_util::sync::CancellationToken;
 use super::{Frame, FramedRecv, SinkReject};
 use crate::zakura::transport::guard::{Admit, SessionGuard};
 use crate::zakura::ZakuraPeerId;
+
+/// Shared first-cause connection close attribution.
+///
+/// A Zakura connection can be cancelled from the supervisor, the transport loop,
+/// or any service task. The final `closed.neutral` trace row is emitted by the
+/// transport loop, so every teardown path records its bounded reason here before
+/// cancelling the shared connection token. The first writer wins.
+#[derive(Clone, Debug)]
+pub(crate) struct CloseCause {
+    reason: Arc<OnceLock<&'static str>>,
+}
+
+impl CloseCause {
+    /// Create an empty close-cause recorder.
+    pub(crate) fn new() -> Self {
+        Self {
+            reason: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Record `reason` if no earlier close cause was recorded.
+    pub(crate) fn record(&self, reason: &'static str) {
+        let _ = self.reason.set(reason);
+    }
+
+    /// Return the recorded reason, or `default` when no local path recorded one.
+    pub(crate) fn get_or(&self, default: &'static str) -> &'static str {
+        self.reason.get().copied().unwrap_or(default)
+    }
+}
+
+impl Default for CloseCause {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Per-stage control flow.
 ///
@@ -411,6 +450,7 @@ pub(crate) fn spawn_supervised_peer_task(
 pub(crate) fn handle_pipe_exit(
     service: &'static str,
     connection_cancel: &CancellationToken,
+    close_cause: &CloseCause,
     result: Result<(), SinkReject>,
 ) {
     match result {
@@ -421,6 +461,7 @@ pub(crate) fn handle_pipe_exit(
                 service,
                 "Zakura stream rejected protocol-invalid frame"
             );
+            close_cause.record("service_protocol_reject");
             connection_cancel.cancel();
         }
         Err(SinkReject::Local(error)) => {
@@ -525,6 +566,39 @@ mod tests {
     fn run_one_rejects_disallowed_type() {
         let mut pipe = Pipe::new(peer_id(), (), (), pass_guard(), noop_entry, &SHAPE);
         assert!(matches!(pipe.run_one(frame(2)), Flow::Reject(_)));
+    }
+
+    #[test]
+    fn close_cause_keeps_first_recorded_reason() {
+        let cause = CloseCause::new();
+
+        cause.record("first");
+        cause.record("second");
+
+        assert_eq!(cause.get_or("fallback"), "first");
+    }
+
+    #[test]
+    fn close_cause_uses_default_without_recorded_reason() {
+        let cause = CloseCause::new();
+
+        assert_eq!(cause.get_or("fallback"), "fallback");
+    }
+
+    #[test]
+    fn protocol_pipe_exit_records_close_cause_and_cancels_connection() {
+        let cancel = CancellationToken::new();
+        let cause = CloseCause::new();
+
+        handle_pipe_exit(
+            "test",
+            &cancel,
+            &cause,
+            Err(SinkReject::protocol("bad frame")),
+        );
+
+        assert!(cancel.is_cancelled());
+        assert_eq!(cause.get_or("fallback"), "service_protocol_reject");
     }
 
     #[tokio::test]

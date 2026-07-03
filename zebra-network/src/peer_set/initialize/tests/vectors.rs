@@ -14,7 +14,7 @@
 //! skip all the network tests by setting the `SKIP_NETWORK_TESTS` environmental variable.
 
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -26,9 +26,6 @@ use tokio::{io::AsyncWriteExt, net::TcpStream, task::JoinHandle};
 use tower::{service_fn, Layer, Service, ServiceExt};
 
 use zebra_chain::{chain_tip::NoChainTip, parameters::Network, serialization::DateTime32};
-
-#[cfg(not(target_os = "windows"))]
-use zebra_test::net::random_known_port;
 
 use crate::{
     address_book_updater::AddressBookUpdater,
@@ -162,7 +159,11 @@ async fn local_listener_fixed_port_localhost_addr_v4() {
     }
 
     for network in Network::iter() {
-        local_listener_port_with(SocketAddr::new(localhost_v4, random_known_port()), network).await;
+        local_listener_port_with(
+            SocketAddr::new(localhost_v4, random_known_listener_port(localhost_v4)),
+            network,
+        )
+        .await;
     }
 }
 
@@ -183,8 +184,24 @@ async fn local_listener_fixed_port_localhost_addr_v6() {
     }
 
     for network in Network::iter() {
-        local_listener_port_with(SocketAddr::new(localhost_v6, random_known_port()), network).await;
+        local_listener_port_with(
+            SocketAddr::new(localhost_v6, random_known_listener_port(localhost_v6)),
+            network,
+        )
+        .await;
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn random_known_listener_port(ip: IpAddr) -> u16 {
+    std::net::TcpListener::bind(SocketAddr::new(
+        ip,
+        zebra_test::net::random_unallocated_port(),
+    ))
+    .expect("test needs an available listener port")
+    .local_addr()
+    .expect("listener has a local address")
+    .port()
 }
 
 /// Test zebra-network with a peer limit of zero peers on mainnet.

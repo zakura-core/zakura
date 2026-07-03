@@ -304,7 +304,7 @@ impl ServiceRegistry {
 
     /// Fan a newly connected peer out to every service enabled by its negotiated capabilities.
     pub fn add_peer(&self, peer: Peer) {
-        let (peer_id, remote_ip, negotiated, direction, mut streams, cancel_token) =
+        let (peer_id, remote_ip, negotiated, direction, mut streams, cancel_token, close_cause) =
             peer.into_parts();
 
         for service in self.services_for_negotiated(negotiated) {
@@ -331,6 +331,7 @@ impl ServiceRegistry {
                 service_streams,
                 cancel_token.clone(),
                 service_cancel_token,
+                close_cause.clone(),
             ));
         }
     }
@@ -340,7 +341,7 @@ impl ServiceRegistry {
     /// Returns the capability mask for services that received a peer session, so
     /// disconnect fanout can be limited to reactors that were actually reached.
     pub fn add_escalated_peer(&self, peer: Peer) -> u64 {
-        let (peer_id, remote_ip, negotiated, direction, mut streams, cancel_token) =
+        let (peer_id, remote_ip, negotiated, direction, mut streams, cancel_token, close_cause) =
             peer.into_parts();
         let mut admitted_capabilities = 0;
 
@@ -374,6 +375,7 @@ impl ServiceRegistry {
                 service_streams,
                 cancel_token.clone(),
                 service_cancel_token,
+                close_cause.clone(),
             ));
         }
 
@@ -449,7 +451,7 @@ mod tests {
         }
 
         fn add_peer(&self, peer: Peer) {
-            let (peer_id, _remote_ip, _negotiated, _direction, streams, _cancel_token) =
+            let (peer_id, _remote_ip, _negotiated, _direction, streams, _cancel_token, _cause) =
                 peer.into_parts();
             self.added
                 .lock()

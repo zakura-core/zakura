@@ -13,6 +13,10 @@ platform = 'cfg(target_os = "windows")'
 
 filter = "not test(=trusted_chain_sync_handles_forks_correctly) and not test(=delete_old_databases)"
 
+[[profile.default.overrides]]
+filter = "package(zebra-network) and (test(header_sync_e2e_status_trace_smoke_uses_real_emitted_rows) or test(header_sync_e2e_restart_reloads_durable_tip_and_rebuilds_scheduler))"
+threads-required = "num-test-threads"
+
 # --- All Tests profile ---
 # CI-friendly test selection.
 #

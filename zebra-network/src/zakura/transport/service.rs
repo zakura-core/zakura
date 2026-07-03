@@ -5,7 +5,7 @@ use std::{collections::HashMap, fmt, future::Future, net::IpAddr, pin::Pin};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::{FramedRecv, FramedSend};
+use super::{CloseCause, FramedRecv, FramedSend};
 use crate::{
     zakura::{ServicePeerDirection, ZakuraPeerId},
     BoxError,
@@ -72,6 +72,7 @@ pub struct Peer {
     streams: HashMap<u16, ServiceStream>,
     cancel_token: CancellationToken,
     service_cancel_token: CancellationToken,
+    close_cause: CloseCause,
 }
 
 impl Peer {
@@ -102,6 +103,26 @@ impl Peer {
         streams: HashMap<u16, (FramedRecv, FramedSend)>,
         cancel_token: CancellationToken,
     ) -> Self {
+        Self::new_with_direction_and_close_cause(
+            id,
+            remote_ip,
+            negotiated,
+            direction,
+            streams,
+            cancel_token,
+            CloseCause::new(),
+        )
+    }
+
+    pub(crate) fn new_with_direction_and_close_cause(
+        id: ZakuraPeerId,
+        remote_ip: Option<IpAddr>,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+        streams: HashMap<u16, (FramedRecv, FramedSend)>,
+        cancel_token: CancellationToken,
+        close_cause: CloseCause,
+    ) -> Self {
         let streams = streams
             .into_iter()
             .map(|(kind, (recv, send))| {
@@ -111,7 +132,15 @@ impl Peer {
                 )
             })
             .collect::<HashMap<_, _>>();
-        Self::new_with_service_streams(id, remote_ip, negotiated, direction, streams, cancel_token)
+        Self::new_with_service_streams(
+            id,
+            remote_ip,
+            negotiated,
+            direction,
+            streams,
+            cancel_token,
+            close_cause,
+        )
     }
 
     pub(crate) fn new_with_service_streams(
@@ -121,6 +150,7 @@ impl Peer {
         direction: ServicePeerDirection,
         streams: HashMap<u16, ServiceStream>,
         cancel_token: CancellationToken,
+        close_cause: CloseCause,
     ) -> Self {
         let service_cancel_token = streams
             .values()
@@ -135,9 +165,11 @@ impl Peer {
             streams,
             cancel_token,
             service_cancel_token,
+            close_cause,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_service_cancel_token(
         id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
@@ -146,6 +178,7 @@ impl Peer {
         streams: HashMap<u16, ServiceStream>,
         cancel_token: CancellationToken,
         service_cancel_token: CancellationToken,
+        close_cause: CloseCause,
     ) -> Self {
         Self {
             id,
@@ -155,6 +188,7 @@ impl Peer {
             streams,
             cancel_token,
             service_cancel_token,
+            close_cause,
         }
     }
 
@@ -181,6 +215,11 @@ impl Peer {
         self.service_cancel_token.clone()
     }
 
+    /// Return the shared first-cause connection close recorder.
+    pub(crate) fn close_cause(&self) -> CloseCause {
+        self.close_cause.clone()
+    }
+
     /// Split this peer into fields so the registry can fan streams out by owner.
     pub(crate) fn into_parts(
         self,
@@ -191,6 +230,7 @@ impl Peer {
         ServicePeerDirection,
         HashMap<u16, ServiceStream>,
         CancellationToken,
+        CloseCause,
     ) {
         (
             self.id,
@@ -199,6 +239,7 @@ impl Peer {
             self.direction,
             self.streams,
             self.cancel_token,
+            self.close_cause,
         )
     }
 }

@@ -176,3 +176,7 @@ zebra-chain/fuzz/artifacts
 zebra-chain/fuzz/corpus
 stako/**/*
 perf-artifacts/**/*
+
+# local VCT fast-sync run artifacts (state cache, config, logs, traces)
+.zebrad-vct-local-cache/
+zebrad-vct-local*

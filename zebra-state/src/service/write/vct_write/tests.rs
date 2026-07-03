@@ -269,11 +269,11 @@ fn on_retryable_error_parks_the_block_for_retry() {
 }
 
 #[test]
-fn on_retryable_error_wait_depends_on_needs_refetch() {
+fn on_retryable_error_wait_depends_on_root_availability() {
     let mut manager = VctWriteManager::default();
 
-    let refetch_wait = manager.on_retryable_error(Height(1), true, queued_block(1));
-    assert_eq!(refetch_wait, VCT_ROOT_RETRY_WAIT);
+    let missing_root_wait = manager.on_retryable_error(Height(1), true, queued_block(1));
+    assert_eq!(missing_root_wait, VCT_ROOT_RETRY_WAIT);
 
     let successor_wait = manager.on_retryable_error(Height(2), false, queued_block(2));
     assert_eq!(successor_wait, VCT_AWAIT_SUCCESSOR_WAIT);

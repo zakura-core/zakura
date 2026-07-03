@@ -1513,8 +1513,9 @@ where
             match (
                 chain.sapling_tree(height.into()),
                 chain.orchard_tree(height.into()),
+                chain.ironwood_tree(height.into()),
             ) {
-                (Some(sapling), Some(orchard)) => {
+                (Some(sapling), Some(orchard), Some(ironwood)) => {
                     let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = chain
                         .block(height.into())
                         .map(|block| {
@@ -1536,8 +1537,7 @@ where
                         height,
                         sapling_root: sapling.root(),
                         orchard_root: orchard.root(),
-                        ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default()
-                            .root(),
+                        ironwood_root: ironwood.root(),
                         sapling_tx,
                         orchard_tx,
                         ironwood_tx,

@@ -1161,13 +1161,15 @@ impl FinalizedState {
 
     /// Reject a supplied fast-path root that failed verification for `height`.
     ///
-    /// Evicts the bad root from the source so a re-fetch can replace it with a verifiable
-    /// one from a different peer, and returns a typed, retryable error. In fast mode the
-    /// note-commitment frontier is frozen, so the committer cannot recompute the root
-    /// locally (that would fold a wrong root into the history MMR); it must refuse and
-    /// leave the database untouched rather than persist or corrupt state. This is what
-    /// keeps a single malicious peer from halting the sync: the bad root is dropped, not
-    /// retried forever, and any honest peer's root verifies.
+    /// Evicts the bad root from the source so it is never re-read, and returns a typed,
+    /// retryable error. In fast mode the note-commitment frontier is frozen, so the
+    /// committer cannot recompute the root locally (that would fold a wrong root into the
+    /// history MMR); it must refuse and leave the database untouched rather than persist
+    /// or corrupt state. Roots are not individually re-requested: the hole is only filled
+    /// if the same header range is re-delivered (for example by another fanout peer's
+    /// in-flight response), otherwise the commit stays parked and the §8 stall
+    /// metrics/logs surface it. A wrong root therefore never corrupts state, at the cost
+    /// of stalling the sync at this height.
     fn vct_reject_supplied_root(
         &self,
         height: block::Height,
@@ -1180,7 +1182,7 @@ impl FinalizedState {
         tracing::warn!(
             ?height,
             ?error,
-            "VCT: supplied commitment root failed verification; evicted for re-fetch"
+            "VCT: supplied commitment root failed verification; evicted so it is never re-read"
         );
         ValidateContextError::VctSuppliedRootUnavailable { height }.into()
     }

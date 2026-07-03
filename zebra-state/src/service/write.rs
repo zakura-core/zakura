@@ -472,16 +472,18 @@ impl WriteBlockWorkerTask {
                 Err((ordered_block, error)) => {
                     // Retryable VCT root stalls (an absent/evicted root, or one not yet
                     // verifiable for lack of a buffered successor) park-and-retry the same
-                    // block in place rather than resetting the queue. An absent root waits
-                    // for header sync to deliver it; an await-successor stall just waits for
-                    // the next block to be downloaded into the look-ahead, so it polls faster.
+                    // block in place rather than resetting the queue. An absent root can only
+                    // be filled by a re-delivery of its header range (roots are not
+                    // individually re-requested), so it polls slowly; an await-successor
+                    // stall just waits for the next block to be downloaded into the
+                    // look-ahead, so it polls faster.
                     if let Some(height) = error.vct_retryable_height() {
-                        let needs_refetch = error.vct_supplied_root_unavailable_height();
+                        let root_unavailable = error.vct_supplied_root_unavailable_height();
 
                         prev_finalized_note_commitment_trees = prev_note_commitment_trees_for_retry;
                         let wait = vct_write_manager.on_retryable_error(
                             height,
-                            needs_refetch.is_some(),
+                            root_unavailable.is_some(),
                             ordered_block,
                         );
                         std::thread::park_timeout(wait);

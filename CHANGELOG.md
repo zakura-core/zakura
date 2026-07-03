@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   `mining.extra_coinbase_data` option is now limited to 86 bytes (was 94);
   Zebra refuses to start if it is exceeded.
 
+### Changed
+
+- Verified-commitment-trees fast sync is now enabled by default when checkpoint
+  sync is enabled. Operators can keep checkpoint sync but opt out of the new
+  path by setting `consensus.vct_fast_sync = false`.
+
 ### Removed
 
 - Removed two Zakura block-sync config fields that never needed operator

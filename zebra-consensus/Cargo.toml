@@ -90,6 +90,7 @@ num-integer = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 spandoc = { workspace = true }
+toml = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 tracing-error = { workspace = true }

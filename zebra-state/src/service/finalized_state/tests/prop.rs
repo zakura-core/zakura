@@ -818,7 +818,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
                 .expect_err("an untrusted tip root with no successor must defer, not commit");
             prop_assert!(
                 error.vct_supplied_root_unavailable_height().is_none(),
-                "deferral is not a refetch case (the root is present): {error:?}"
+                "deferral is not a missing-root case (the root is present): {error:?}"
             );
             prop_assert!(
                 format!("{error:?}").contains("VctSuppliedRootAwaitingSuccessor"),
@@ -993,7 +993,7 @@ fn vct_peer_source_bad_root_refill_commits_same_height() -> Result<()> {
             prop_assert_eq!(
                 error.vct_supplied_root_unavailable_height(),
                 Some(Height(target as u32)),
-                "the bad root is exposed as a retryable refetch for its own height"
+                "the bad root is exposed as a retryable missing root for its own height"
             );
             prop_assert_eq!(
                 fast.db.finalized_tip_height(),

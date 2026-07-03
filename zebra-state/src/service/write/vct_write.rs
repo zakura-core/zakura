@@ -15,7 +15,9 @@ use crate::service::{
     queued_blocks::QueuedCheckpointVerified,
 };
 
-/// Delay between retryable VCT root-miss commit attempts while the peer cache refills.
+/// Delay between retryable VCT root-miss commit attempts. Nothing actively re-requests a
+/// missing root, so this only polls for a re-delivery of the same header range (for example
+/// another fanout peer's response); the slow poll keeps a persistent hole cheap to wait on.
 const VCT_ROOT_RETRY_WAIT: Duration = Duration::from_millis(500);
 
 /// Delay between retryable VCT await-successor commit attempts. Shorter than
@@ -25,10 +27,11 @@ const VCT_AWAIT_SUCCESSOR_WAIT: Duration = Duration::from_millis(20);
 
 /// How long a single checkpoint height may stay stuck on a retryable VCT root stall before
 /// the committer escalates to an error-level log and a `state.vct.root.stalled.height` gauge.
-/// Transient waits (a successor still downloading, a root still in flight) clear well within
-/// this; staying stuck past it means no peer can serve a root the frozen frontier requires,
-/// and — by design — the committer will not recompute against the stale frontier, so the node
-/// cannot advance until a peer supplies it. Surfacing that loudly is the operator's only signal.
+/// Transient waits (a successor still downloading, a fanout re-delivery still in flight)
+/// clear well within this; staying stuck past it means no verifiable root is available for a
+/// height the frozen frontier requires, and — by design — the committer will not recompute
+/// against the stale frontier, so the node cannot advance. Surfacing that loudly is the
+/// operator's only signal.
 const VCT_ROOT_STALL_WARN_AFTER: Duration = Duration::from_secs(30);
 
 /// Look-ahead buffering and root-stall tracking for the checkpoint write
@@ -42,7 +45,7 @@ pub(super) struct VctWriteManager {
     /// One-block look-ahead: the current block's supplied roots are
     /// authenticated by the successor's header commitment.
     lookahead: VecDeque<QueuedCheckpointVerified>,
-    /// A block parked for retry (awaiting a successor, or a re-fetched root)
+    /// A block parked for retry (awaiting a successor, or a missing root)
     /// instead of going through the invalid-block reset path.
     retry: Option<QueuedCheckpointVerified>,
     /// `(height, first-seen)` of the height currently stuck retrying, if any.
@@ -149,16 +152,17 @@ impl VctWriteManager {
     pub(super) fn on_retryable_error(
         &mut self,
         height: Height,
-        needs_refetch: bool,
+        root_unavailable: bool,
         block: QueuedCheckpointVerified,
     ) -> Duration {
         metrics::counter!("state.vct.root.retry.count").increment(1);
 
         // Escalate a stall that persists on the same height past the warn
         // threshold: a transient wait resolves in a few polls and stays
-        // quiet, but a height stuck longer means no peer can serve a root the
-        // frozen frontier requires — the node will not advance (it will not,
-        // by design, recompute against the stale frontier). Surface it loudly.
+        // quiet, but a height stuck longer means no root the frozen frontier
+        // requires is available — roots are not individually re-requested, so
+        // the node will not advance (it will not, by design, recompute against
+        // the stale frontier). Surface it loudly.
         match self.stall {
             Some((stuck, _)) if stuck == height => {}
             _ => {
@@ -173,11 +177,12 @@ impl VctWriteManager {
         {
             tracing::error!(
                 ?height,
-                awaiting_refetch = needs_refetch,
+                root_unavailable,
                 stalled_for = ?VCT_ROOT_STALL_WARN_AFTER,
                 "VCT: checkpoint commit stalled with no verifiable supplied root; \
-                 the node cannot advance until a peer serves this height (it will \
-                 not recompute against the frozen frontier)"
+                 roots are not re-requested, so the node cannot advance without a \
+                 re-delivery of this header range (it will not recompute against \
+                 the frozen frontier)"
             );
             metrics::gauge!("state.vct.root.stalled.height").set(f64::from(height.0));
             self.stall_logged = true;
@@ -186,14 +191,14 @@ impl VctWriteManager {
                 ?height,
                 block_height = ?block.0.height,
                 block_hash = ?block.0.hash,
-                awaiting_refetch = needs_refetch,
+                root_unavailable,
                 "VCT: supplied root not yet verifiable; retrying checkpoint commit in place"
             );
         }
 
         self.retry = Some(block);
 
-        if needs_refetch {
+        if root_unavailable {
             VCT_ROOT_RETRY_WAIT
         } else {
             VCT_AWAIT_SUCCESSOR_WAIT

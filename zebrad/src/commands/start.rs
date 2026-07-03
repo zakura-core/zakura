@@ -206,6 +206,13 @@ impl StartCmd {
     const ZCASHD_COMPAT_SHUTDOWN_TIMEOUT_MARGIN: std::time::Duration =
         std::time::Duration::from_secs(30);
 
+    fn validate_consensus_config(config: &ZebradConfig) -> Result<(), Report> {
+        config
+            .consensus
+            .validate()
+            .map_err(|error| eyre!("invalid consensus configuration: {error}"))
+    }
+
     fn validate_debug_blocksync_throughput_config(config: &ZebradConfig) -> Result<(), Report> {
         let Some(target_height) = config.sync.debug_blocksync_throughput_target_height else {
             return Ok(());
@@ -500,6 +507,7 @@ impl StartCmd {
             config
         };
 
+        Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
 
         if config.zcashd_compat.enabled {
@@ -543,6 +551,10 @@ impl StartCmd {
 
         let mut state_config = config.state.clone();
         state_config.enable_zakura_header_seed_from_committed_blocks = config.network.v2_p2p;
+        // State owns the VCT commit path, but users configure its checkpoint-sync controls
+        // together under `[consensus]`.
+        state_config.checkpoint_sync = config.consensus.checkpoint_sync;
+        state_config.vct_fast_sync = config.consensus.vct_fast_sync_enabled();
 
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
             zebra_state::init(
@@ -1354,6 +1366,8 @@ impl config::Override<ZebradConfig> for StartCmd {
             }
         }
 
+        Self::validate_consensus_config(&config)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
         Self::validate_debug_blocksync_throughput_config(&config)
             .map_err(|err| std::io::Error::other(err.to_string()))?;
 
@@ -1461,6 +1475,43 @@ mod tests {
             ),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn vct_fast_sync_requires_checkpoint_sync_at_startup() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.consensus.checkpoint_sync = false;
+        config.consensus.vct_fast_sync = Some(true);
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("startup should reject explicit VCT fast sync without checkpoint sync");
+
+        assert!(
+            error.to_string().contains(
+                "invalid consensus configuration: consensus.vct_fast_sync = true requires consensus.checkpoint_sync = true"
+            ),
+            "unexpected error: {error}"
+        );
+
+        // A pre-VCT config that only disables checkpoint sync must keep working:
+        // the unset knob is not a contradiction, it just has no effect.
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.consensus.checkpoint_sync = false;
+        config.consensus.vct_fast_sync = None;
+
+        cmd.override_config(config)
+            .expect("checkpoint_sync = false with vct_fast_sync unset is a valid config");
     }
 
     #[test]

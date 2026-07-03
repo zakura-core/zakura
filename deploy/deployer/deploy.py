@@ -46,7 +46,9 @@ DEFAULTS = {
     "state_cache_dir": "/var/lib/zebrad",
     "network": "Mainnet",
     "listen_addr": "[::]:8233",
+    "network_cache_dir": "",
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
+    "rpc_enable_cookie_auth": None,
     "port": None,           # ssh port; None -> ssh default
     # Match zebrad's own defaults so existing fleets render unchanged.
     "storage_mode": "archive",
@@ -81,7 +83,9 @@ class Node:
     state_cache_dir: str
     network: str
     listen_addr: str
+    network_cache_dir: str
     rpc_listen_addr: str
+    rpc_enable_cookie_auth: object
     storage_mode: str
     v2_p2p: bool
     legacy_p2p: bool
@@ -156,7 +160,9 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             state_cache_dir=merged["state_cache_dir"],
             network=merged["network"],
             listen_addr=merged["listen_addr"],
+            network_cache_dir=merged["network_cache_dir"],
             rpc_listen_addr=merged["rpc_listen_addr"],
+            rpc_enable_cookie_auth=merged["rpc_enable_cookie_auth"],
             storage_mode=merged["storage_mode"],
             v2_p2p=merged["v2_p2p"],
             legacy_p2p=merged["legacy_p2p"],
@@ -332,14 +338,23 @@ def render_zakura_block(zakura: object) -> str:
 def render_node_config(node: Node) -> str:
     rpc_block = ""
     if node.rpc_listen_addr:
-        rpc_block = f'listen_addr = "{node.rpc_listen_addr}"'
+        rpc_lines = [f'listen_addr = "{node.rpc_listen_addr}"']
+        if node.rpc_enable_cookie_auth is not None:
+            rpc_lines.append(
+                f"enable_cookie_auth = {'true' if node.rpc_enable_cookie_auth else 'false'}"
+            )
+        rpc_block = "\n".join(rpc_lines)
     else:
         rpc_block = "# listen_addr disabled"
     metrics_block = f'[metrics]\nendpoint_addr = "{node.metrics_endpoint}"\n' if node.metrics_endpoint else ""
     filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zebrad default)"
+    network_cache_line = (
+        f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zebrad default)"
+    )
     return render_template("zebrad.toml", {
         "NETWORK": node.network,
         "LISTEN_ADDR": node.listen_addr,
+        "NETWORK_CACHE_DIR": network_cache_line,
         "STATE_CACHE_DIR": node.state_cache_dir,
         "STORAGE_MODE": node.storage_mode,
         "V2_P2P": "true" if node.v2_p2p else "false",

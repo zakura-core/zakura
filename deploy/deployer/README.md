@@ -83,14 +83,17 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 
 - `ref` — branch, tag, or SHA to build and deploy, default `ironwood-main`.
 - `force_rebuild` — pass `--force` to rebuild the cached binary.
-- `no_restart` — stage binary/config/unit without restarting, default `true`.
+- `no_restart` — stage binary/config/unit without restarting, default `false`.
 - `node` — optional deployer node name; blank deploys the whole fleet.
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`. This branch does not expose
 `consensus.vct_fast_sync` in `zebrad.toml`, so the deployer renders
 `checkpoint_sync = false` in the final node config to force the legacy non-VCT
-path.
+path. It also writes `/etc/zakura/zebrad.toml` and uses each node's existing
+`/mnt/zakura-testnet-*-data/zebra-cache` snapshot directory, so CI restarts the
+current `zebrad.service` against the existing state instead of creating a fresh
+database.
 
 ## How the build cache works
 

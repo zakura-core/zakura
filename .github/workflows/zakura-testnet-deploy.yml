@@ -24,7 +24,7 @@ on:
         description: "Stage binary/config/unit without restarting zebrad"
         type: boolean
         required: false
-        default: true
+        default: false
       node:
         description: "Optional single deployer node name; blank deploys the whole fleet"
         required: false
@@ -114,32 +114,46 @@ jobs:
           [defaults]
           service_name    = "zebrad"
           bin_path        = "/usr/local/bin/zebrad"
-          config_path     = "/etc/zebrad/zebrad.toml"
-          log_file        = "/var/log/zebrad/zebrad.log"
-          state_cache_dir = "/var/lib/zebrad-testnet"
+          config_path     = "/etc/zakura/zebrad.toml"
           network         = "Testnet"
-          listen_addr     = "[::]:18233"
+          listen_addr     = "0.0.0.0:18233"
           rpc_listen_addr = "0.0.0.0:18232"
+          rpc_enable_cookie_auth = false
           storage_mode    = "archive"
           v2_p2p          = true
           legacy_p2p      = true
+          metrics_endpoint = "127.0.0.1:9999"
+          tracing_filter  = "info,zebra_network::zakura=info"
           checkpoint_sync = false
           vct_fast_sync   = false
+
+          [defaults.zakura]
+          listen_addr = "0.0.0.0:8234"
+          bootstrap_peers = []
 
           [[nodes]]
           name       = "zakura-testnet-1"
           ssh_string = "root@167.99.103.111"
           commit     = "${{ inputs.ref }}"
+          network_cache_dir = "/mnt/zakura-testnet-1-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-1-data/zebra-cache"
+          log_file = "/mnt/zakura-testnet-1-data/logs/zebrad.log"
 
           [[nodes]]
           name       = "zakura-testnet-2"
           ssh_string = "root@167.99.110.145"
           commit     = "${{ inputs.ref }}"
+          network_cache_dir = "/mnt/zakura-testnet-2-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-2-data/zebra-cache"
+          log_file = "/mnt/zakura-testnet-2-data/logs/zebrad.log"
 
           [[nodes]]
           name       = "zakura-testnet-3"
           ssh_string = "root@138.68.229.254"
           commit     = "${{ inputs.ref }}"
+          network_cache_dir = "/mnt/zakura-testnet-3-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-3-data/zebra-cache"
+          log_file = "/mnt/zakura-testnet-3-data/logs/zebrad.log"
           EOF
 
       - name: Build deployer binary

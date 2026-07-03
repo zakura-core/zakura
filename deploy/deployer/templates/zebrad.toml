@@ -4,6 +4,7 @@
 [network]
 network = "{{NETWORK}}"
 listen_addr = "{{LISTEN_ADDR}}"
+{{NETWORK_CACHE_DIR}}
 v2_p2p = {{V2_P2P}}
 legacy_p2p = {{LEGACY_P2P}}
 {{ZAKURA_BLOCK}}

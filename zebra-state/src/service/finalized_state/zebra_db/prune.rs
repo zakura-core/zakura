@@ -355,7 +355,7 @@ mod tests {
                 .expect("test data deserializes");
 
             state
-                .commit_finalized_direct(block.into(), None, "offline prune tests")
+                .commit_finalized_direct(block.into(), None, None, "offline prune tests")
                 .expect("test block is valid");
         }
 

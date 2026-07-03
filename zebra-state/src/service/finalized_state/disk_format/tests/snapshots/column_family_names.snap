@@ -40,7 +40,6 @@ expression: cf_names
   "vct_upgrade_metadata",
   "zakura_header_body_size_by_height",
   "zakura_header_by_height",
-  "zakura_header_commitment_roots_by_height",
   "zakura_header_hash_by_height",
   "zakura_header_height_by_hash",
 ]

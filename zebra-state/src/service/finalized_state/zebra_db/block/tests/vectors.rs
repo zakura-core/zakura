@@ -543,7 +543,7 @@ fn committed_body_releases_only_its_height_and_keeps_the_frontier() {
 }
 
 #[test]
-fn write_block_deletes_matching_provisional_zakura_roots() {
+fn write_block_replaces_matching_provisional_zakura_roots_with_verified_row() {
     let _init_guard = zebra_test::init();
     let genesis = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
@@ -562,6 +562,8 @@ fn write_block_deletes_matching_provisional_zakura_roots() {
             .map(ToString::to_string),
         false,
     );
+    // Provisional rows are distinguishable from the verified row the body commit
+    // writes: `root_at` uses a zeroed auth-data root, the commit stores the real one.
     let roots = [root_at(Height(1)), root_at(Height(2))];
 
     write_full_block(&mut state, genesis);
@@ -573,14 +575,91 @@ fn write_block_deletes_matching_provisional_zakura_roots() {
         roots.to_vec()
     );
 
-    write_full_block(&mut state, block1);
+    write_full_block(&mut state, block1.clone());
 
-    assert!(state
-        .zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1))
-        .is_empty());
+    // The body commit replaces the provisional row at its height with the verified
+    // row derived from the committed treestate, and leaves higher provisional rows
+    // untouched.
+    let verified_row = BlockCommitmentRoots {
+        height: Height(1),
+        sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+        ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+        sapling_tx: 0,
+        orchard_tx: 0,
+        ironwood_tx: 0,
+        auth_data_root: block1.auth_data_root(),
+    };
+    assert_eq!(
+        state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1)),
+        vec![verified_row]
+    );
     assert_eq!(
         state.zakura_header_commitment_roots_by_height_range(Height(2)..=Height(2)),
         vec![root_at(Height(2))]
+    );
+}
+
+/// A header range re-delivered over a height whose body is already committed (a
+/// header store behind the body store, or a late range response racing body sync)
+/// must not overwrite the verified serving-index row with peer-supplied roots:
+/// committed roots win on any overlap (design §9).
+#[test]
+fn header_range_roots_do_not_overwrite_committed_serving_index_rows() {
+    let _init_guard = zebra_test::init();
+    let genesis = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("genesis block deserializes");
+    let block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("block 1 deserializes");
+    let mut state = ZebraDb::new(
+        &Config::ephemeral(),
+        STATE_DATABASE_KIND,
+        &state_database_format_version_in_code(),
+        &Mainnet,
+        true,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        false,
+    );
+
+    write_full_block(&mut state, genesis.clone());
+    write_full_block(&mut state, block1.clone());
+
+    let verified_rows = state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1));
+    assert_eq!(
+        verified_rows.len(),
+        1,
+        "the body commit writes the verified serving-index row"
+    );
+
+    // Re-deliver the real header for the committed height, but with garbage roots —
+    // exactly what a malicious serving peer can put in a `Headers` response, since
+    // root bytes are unauthenticated at header-commit time.
+    let mut poisoned = root_at(Height(1));
+    poisoned.sapling_tx = 99;
+    poisoned.auth_data_root = zebra_chain::block::merkle::AuthDataRoot::from([0xAA; 32]);
+
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch_with_roots(
+            &state,
+            genesis.hash(),
+            std::slice::from_ref(&block1.header),
+            &[0],
+            &[poisoned],
+        )
+        .expect("re-delivering the same header over a committed height is accepted");
+    state
+        .write_batch(batch)
+        .expect("header range batch writes successfully");
+
+    assert_eq!(
+        state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1)),
+        verified_rows,
+        "peer-supplied roots must not overwrite the verified committed row"
     );
 }
 
@@ -1310,7 +1389,7 @@ fn write_full_block(state: &mut ZebraDb, block: Arc<Block>) {
             &Mainnet,
             "test",
             RetentionPlan::Store,
-            None,
+            Default::default(),
         )
         .expect("block commit succeeds");
 }

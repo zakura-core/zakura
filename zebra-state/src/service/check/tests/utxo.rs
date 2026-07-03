@@ -185,7 +185,7 @@ proptest! {
         // randomly choose to commit the block to the finalized or non-finalized state
         if use_finalized_state {
             let block1 = CheckpointVerifiedBlock::from(Arc::new(block1));
-            let commit_result = finalized_state.commit_finalized_direct(block1.clone().into(), None, "test");
+            let commit_result = finalized_state.commit_finalized_direct(block1.clone().into(), None, None, "test");
 
             // the block was committed
             prop_assert_eq!(Some((Height(1), block1.hash)), read::best_tip(&non_finalized_state, &finalized_state.db));
@@ -273,7 +273,7 @@ proptest! {
 
         if use_finalized_state_spend {
             let block2 = CheckpointVerifiedBlock::from(Arc::new(block2));
-            let commit_result = finalized_state.commit_finalized_direct(block2.clone().into(),None,  "test");
+            let commit_result = finalized_state.commit_finalized_direct(block2.clone().into(), None, None, "test");
 
             // the block was committed
             prop_assert_eq!(Some((Height(2), block2.hash)), read::best_tip(&non_finalized_state, &finalized_state.db));
@@ -609,7 +609,7 @@ proptest! {
 
         if use_finalized_state_spend {
             let block2 = CheckpointVerifiedBlock::from(block2.clone());
-            let commit_result = finalized_state.commit_finalized_direct(block2.clone().into(), None, "test");
+            let commit_result = finalized_state.commit_finalized_direct(block2.clone().into(), None, None, "test");
 
             // the block was committed
             prop_assert_eq!(Some((Height(2), block2.hash)), read::best_tip(&non_finalized_state, &finalized_state.db));
@@ -878,7 +878,7 @@ fn new_state_with_mainnet_transparent_data(
     if use_finalized_state {
         let block1 = CheckpointVerifiedBlock::from(block1.clone());
         let commit_result =
-            finalized_state.commit_finalized_direct(block1.clone().into(), None, "test");
+            finalized_state.commit_finalized_direct(block1.clone().into(), None, None, "test");
 
         // the block was committed
         assert_eq!(

@@ -46,8 +46,10 @@ use crate::{
             shielded::CommitmentRootsByHeight,
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
+        vct::VctWriteData,
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
+        FromDisk, IntoDisk, RawBytes, COMMITMENT_ROOTS_BY_HEIGHT, PRUNING_METADATA,
+        VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
     },
     HashOrHeight,
 };
@@ -62,25 +64,9 @@ const ZAKURA_HEADER_HASH_BY_HEIGHT: &str = "zakura_header_hash_by_height";
 const ZAKURA_HEADER_HEIGHT_BY_HASH: &str = "zakura_header_height_by_hash";
 const ZAKURA_HEADER_BY_HEIGHT: &str = "zakura_header_by_height";
 pub const ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT: &str = "zakura_header_body_size_by_height";
-pub const ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT: &str =
-    "zakura_header_commitment_roots_by_height";
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct AdvertisedBodySize(u32);
-
-/// Verified-commitment-trees data used only while checkpoint fast-sync skips
-/// per-height Sapling and Orchard tree writes.
-///
-/// Live semantic sync must pass `None` for this data so it keeps writing the
-/// full per-height trees.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VctData {
-    /// Roots to insert into the anchor set instead of writing per-height trees.
-    pub(in super::super) anchor_roots: (sapling::tree::Root, orchard::tree::Root),
-
-    /// Height below which per-height trees are absent in a VCT-synced database.
-    pub(in super::super) sync_below: Height,
-}
 
 impl AdvertisedBodySize {
     fn new(size: u32) -> Option<Self> {
@@ -205,10 +191,7 @@ impl ZebraDb {
         &self,
         range: impl RangeBounds<block::Height>,
     ) -> Vec<BlockCommitmentRoots> {
-        let roots_by_height = self
-            .db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let roots_by_height = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
 
         self.db
             .zs_forward_range_iter::<_, block::Height, CommitmentRootsByHeight, _>(
@@ -640,10 +623,7 @@ impl ZebraDb {
         &self,
         roots: impl IntoIterator<Item = BlockCommitmentRoots>,
     ) -> Result<(), rocksdb::Error> {
-        let cf = self
-            .db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let cf = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         let mut batch = DiskWriteBatch::new();
         for roots in roots {
             batch.zs_insert(
@@ -668,10 +648,7 @@ impl ZebraDb {
         &self,
         heights: impl IntoIterator<Item = Height>,
     ) -> Result<(), rocksdb::Error> {
-        let cf = self
-            .db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let cf = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         let mut batch = DiskWriteBatch::new();
         for height in heights {
             batch.zs_delete(&cf, height);
@@ -1033,6 +1010,7 @@ impl ZebraDb {
     /// - Propagates any errors from computing the block's chain value balance change or
     ///   from applying the change to the chain value balance
     #[allow(clippy::unwrap_in_result)]
+    #[allow(clippy::too_many_arguments)]
     pub(in super::super) fn write_block(
         &mut self,
         finalized: FinalizedBlock,
@@ -1040,7 +1018,7 @@ impl ZebraDb {
         network: &Network,
         source: &str,
         retention: RetentionPlan,
-        vct_data: Option<VctData>,
+        vct_data: VctWriteData,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
@@ -1582,7 +1560,7 @@ impl DiskWriteBatch {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         store_raw_transactions: bool,
         precomputed_raw_txs: Option<Vec<RawBytes>>,
-        vct_data: Option<VctData>,
+        vct_data: VctWriteData,
     ) -> Result<(), CommitCheckpointVerifiedError> {
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
@@ -1591,10 +1569,8 @@ impl DiskWriteBatch {
             store_raw_transactions,
             precomputed_raw_txs,
         )?;
-        let zakura_header_commitment_roots_by_height = zebra_db
-            .db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let zakura_header_commitment_roots_by_height =
+            zebra_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         self.zs_delete(&zakura_header_commitment_roots_by_height, finalized.height);
 
         // The consensus rules are silent on shielded transactions in the genesis block,
@@ -1825,9 +1801,7 @@ impl DiskWriteBatch {
         let zakura_hash_by_height = db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
         let zakura_height_by_hash = db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
         let zakura_body_size_by_height = db.cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT).unwrap();
-        let zakura_roots_by_height = db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let zakura_roots_by_height = db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
 
         let hash = block.hash();
@@ -1910,9 +1884,7 @@ impl DiskWriteBatch {
         let zakura_hash_by_height = db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
         let zakura_height_by_hash = db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
         let zakura_body_size_by_height = db.cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT).unwrap();
-        let zakura_roots_by_height = db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let zakura_roots_by_height = db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
 
         let existing_zakura_header: Option<Arc<block::Header>> =
@@ -2024,10 +1996,7 @@ impl DiskWriteBatch {
             .db
             .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
             .unwrap();
-        let roots_by_height = zebra_db
-            .db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let roots_by_height = zebra_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
 
         let anchor_height = zebra_db
             .header_height(anchor)
@@ -2204,20 +2173,29 @@ impl DiskWriteBatch {
             } else {
                 self.zs_delete(&body_size_by_height, height);
             }
-            let roots = &tree_aux_roots[index];
-            self.zs_insert(
-                &roots_by_height,
-                height,
-                CommitmentRootsByHeight {
-                    sapling: roots.sapling_root,
-                    orchard: roots.orchard_root,
-                    ironwood: roots.ironwood_root,
-                    sapling_tx: roots.sapling_tx,
-                    orchard_tx: roots.orchard_tx,
-                    ironwood_tx: roots.ironwood_tx,
-                    auth_data_root: roots.auth_data_root,
-                },
-            );
+            // A height with a committed body already has a *verified* row in the
+            // serving index, written by the body-commit batch. Peer-supplied roots
+            // are unauthenticated until verify-before-commit, and that verification
+            // only ever runs above the body tip — so a header range re-delivered
+            // over committed heights (a header store behind the body store, or a
+            // late range response racing body sync) must never overwrite the
+            // verified row: committed roots win on any overlap (design §9).
+            if !zebra_db.contains_body_at_height(height) {
+                let roots = &tree_aux_roots[index];
+                self.zs_insert(
+                    &roots_by_height,
+                    height,
+                    CommitmentRootsByHeight {
+                        sapling: roots.sapling_root,
+                        orchard: roots.orchard_root,
+                        ironwood: roots.ironwood_root,
+                        sapling_tx: roots.sapling_tx,
+                        orchard_tx: roots.orchard_tx,
+                        ironwood_tx: roots.ironwood_tx,
+                        auth_data_root: roots.auth_data_root,
+                    },
+                );
+            }
         }
 
         Ok(block::Hash::from(

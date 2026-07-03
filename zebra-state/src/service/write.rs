@@ -16,7 +16,7 @@ use tokio::sync::{
 use tracing::Span;
 use zebra_chain::{
     block::{self, Height},
-    parallel::commitment_aux::BlockCommitmentRoots,
+    parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
 };
 
 use crate::{
@@ -38,6 +38,10 @@ use crate::service::{
     chain_tip::{ChainTipChange, LatestChainTip},
     non_finalized_state::Chain,
 };
+
+mod vct_write;
+
+use vct_write::VctWriteManager;
 
 /// The maximum size of the parent error map.
 ///
@@ -220,7 +224,7 @@ impl From<QueuedSemanticallyVerified> for NonFinalizedWriteMessage {
 /// `finalized_state` or `non_finalized_state` and channels for sending
 /// it blocks.
 #[derive(Clone, Debug)]
-pub(super) struct BlockWriteSender {
+pub struct BlockWriteSender {
     /// A channel to send blocks to the `block_write_task`,
     /// so they can be written to the [`NonFinalizedState`].
     pub non_finalized: Option<tokio::sync::mpsc::UnboundedSender<NonFinalizedWriteMessage>>,
@@ -328,8 +332,12 @@ impl WriteBlockWorkerTask {
             backup_dir_path,
         } = &mut self;
 
-        let mut prev_finalized_note_commitment_trees = None;
+        let mut prev_finalized_note_commitment_trees: Option<NoteCommitmentTrees> = None;
         let mut deferred_non_finalized_messages = VecDeque::new();
+
+        // Look-ahead buffering and root-stall tracking for the VCT fast-sync
+        // checkpoint path. See [`VctWriteManager`].
+        let mut vct_write_manager = VctWriteManager::default();
 
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
@@ -357,13 +365,16 @@ impl WriteBlockWorkerTask {
                 Err(TryRecvError::Disconnected) => {}
             }
 
-            let ordered_block = match finalized_block_write_receiver.try_recv() {
-                Ok(block) => block,
-                Err(TryRecvError::Empty) => {
-                    std::thread::park_timeout(Duration::from_millis(10));
-                    continue;
-                }
-                Err(TryRecvError::Disconnected) => break,
+            let ordered_block = match vct_write_manager.take_ready() {
+                Some(block) => block,
+                None => match finalized_block_write_receiver.try_recv() {
+                    Ok(block) => block,
+                    Err(TryRecvError::Empty) => {
+                        std::thread::park_timeout(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(TryRecvError::Disconnected) => break,
+                },
             };
 
             // TODO: split these checks into separate functions
@@ -394,22 +405,95 @@ impl WriteBlockWorkerTask {
                      Assuming a parent block failed, and dropping this block",
                 );
 
+                // The pipeline is broken; drop any look-ahead so commit resumes
+                // from the real finalized tip.
+                vct_write_manager.reset(finalized_state);
+
                 // We don't want to send a reset here, because it could overwrite a valid sent hash
                 std::mem::drop(ordered_block);
                 continue;
             }
 
-            // Try committing the block
-            match finalized_state
-                .commit_finalized(ordered_block, prev_finalized_note_commitment_trees.take())
+            // Peek the next block so VCT fast commits can verify the current
+            // block's supplied roots against the successor's header.
+            vct_write_manager.fill_successor(finalized_block_write_receiver, &ordered_block);
+
+            // A non-handoff VCT fast block's supplied roots are authenticated by
+            // its successor's header. If the successor is not buffered yet, keep
+            // this block local and wait instead of surfacing a checkpoint commit
+            // error through the invalid-block reset path.
+            if vct_write_manager.is_lookahead_empty()
+                && finalized_state.vct_fast_needs_successor(ordered_block.0.height)
             {
+                tracing::trace!(
+                    height = ?ordered_block.0.height,
+                    hash = ?ordered_block.0.hash,
+                    "VCT: deferring fast checkpoint commit until successor is buffered"
+                );
+                vct_write_manager.defer(ordered_block);
+                std::thread::park_timeout(Duration::from_millis(10));
+                continue;
+            }
+
+            // The buffered VCT successor (if any) lets the committer verify this block's
+            // verified-commitment-trees fixture roots before trusting them: a block's
+            // roots are only committed by the next block's header. Its auth data root
+            // is already precomputed by the checkpoint verifier.
+            let next_vct_block = vct_write_manager.next_vct_block();
+            let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
+            let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
+
+            let next_block_took_vct_path =
+                finalized_state.vct_fast_will_apply(ordered_block.0.height);
+
+            // Try committing the block
+            match finalized_state.commit_finalized(
+                ordered_block,
+                prev_note_commitment_trees,
+                next_vct_block,
+            ) {
                 Ok((finalized, note_commitment_trees)) => {
+                    // Whether this successful commit consumed header-carried
+                    // tree-aux roots to skip the note-commitment frontier rebuild.
+                    if next_block_took_vct_path {
+                        metrics::counter!("state.vct.fast_path.hit").increment(1);
+                    } else {
+                        metrics::counter!("state.vct.fast_path.miss").increment(1);
+                    }
+
+                    // A successful commit clears any VCT root stall: log recovery and reset
+                    // the stalled-height gauge if it had been raised.
+                    vct_write_manager.on_commit_success();
+
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
-                Err(error) => {
+                Err((ordered_block, error)) => {
+                    // Retryable VCT root stalls (an absent/evicted root, or one not yet
+                    // verifiable for lack of a buffered successor) park-and-retry the same
+                    // block in place rather than resetting the queue. An absent root waits
+                    // for header sync to deliver it; an await-successor stall just waits for
+                    // the next block to be downloaded into the look-ahead, so it polls faster.
+                    if let Some(height) = error.vct_retryable_height() {
+                        let needs_refetch = error.vct_supplied_root_unavailable_height();
+
+                        prev_finalized_note_commitment_trees = prev_note_commitment_trees_for_retry;
+                        let wait = vct_write_manager.on_retryable_error(
+                            height,
+                            needs_refetch.is_some(),
+                            ordered_block,
+                        );
+                        std::thread::park_timeout(wait);
+                        continue;
+                    }
+
                     let finalized_tip = finalized_state.db.tip();
+                    let _ = ordered_block.1.send(Err(error.clone()));
+
+                    // The commit failed and the queue is being reset, so clear
+                    // any buffered look-ahead block.
+                    vct_write_manager.reset(finalized_state);
 
                     // The last block in the queue failed, so we can't commit the next block.
                     // Instead, we need to reset the state queue,
@@ -581,10 +665,17 @@ impl WriteBlockWorkerTask {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
                 prev_finalized_note_commitment_trees = finalized_state
-                            .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), "commit contextually-verified request")
-                            .expect(
-                                "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
-                            ).1.into();
+                    .commit_finalized_direct(
+                        contextually_verified_with_trees,
+                        prev_finalized_note_commitment_trees.take(),
+                        None,
+                        "commit contextually-verified request",
+                    )
+                    .expect(
+                        "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
+                    )
+                    .1
+                    .into();
             }
 
             // Update the metrics if semantic and contextual validation passes

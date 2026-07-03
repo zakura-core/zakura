@@ -38,7 +38,6 @@ expression: empty_column_families
   "vct_upgrade_metadata: no entries",
   "zakura_header_body_size_by_height: no entries",
   "zakura_header_by_height: no entries",
-  "zakura_header_commitment_roots_by_height: no entries",
   "zakura_header_hash_by_height: no entries",
   "zakura_header_height_by_hash: no entries",
 ]

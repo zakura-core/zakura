@@ -195,7 +195,7 @@ fn test_block_and_transaction_data_with_network(network: Network) {
             .expect("test data deserializes");
 
         state
-            .commit_finalized_direct(block.into(), None, "snapshot tests")
+            .commit_finalized_direct(block.into(), None, None, "snapshot tests")
             .expect("test block is valid");
 
         let mut settings = insta::Settings::clone_current();

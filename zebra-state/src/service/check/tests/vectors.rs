@@ -136,7 +136,7 @@ fn block_commitment_uses_the_precomputed_auth_data_root() {
     assert!(matches!(
         error,
         ValidateContextError::InvalidBlockCommitment(
-            CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { actual, expected },
+            CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { actual, expected }
         ) if actual == block_commitment
             && expected == <[u8; 32]>::from(forged_hash_block_commitments)
     ));

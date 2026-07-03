@@ -80,7 +80,7 @@ fn sync_to(config: &Config, network: &Network, blocks: &[SemanticallyVerifiedBlo
     for block in blocks {
         let checkpoint_verified = CheckpointVerifiedBlock::from(block.block.clone());
         state
-            .commit_finalized_direct(checkpoint_verified.into(), None, "rollback test")
+            .commit_finalized_direct(checkpoint_verified.into(), None, None, "rollback test")
             .expect("committing a generated block to a fresh state succeeds");
     }
 }

@@ -26,8 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handoff height, and the retryable `ValidateContextError` variants
   `VctSuppliedRootUnavailable` and `VctSuppliedRootAwaitingSuccessor` (with
   `vct_retryable_height` / `vct_supplied_root_unavailable_height` accessors on
-  the commit error types). Nothing returns these errors yet; the committer fast
-  path that raises them lands in a follow-up increment.
+  the commit error types).
+- Verified-commitment-trees fast checkpoint sync is now active in the state
+  layer: below the checkpoint, the committer folds header-sync-supplied
+  Sapling/Orchard roots (verified against the node's own header commitments)
+  into the anchor set and history tree, skipping the per-block note-commitment
+  frontier recompute. At the checkpoint handoff the embedded final frontier is
+  verified against that block's proven root and written as the tip treestate. A
+  root that cannot be obtained or verified defers the commit (retryable) rather
+  than recomputing against the frozen frontier, and a fast-synced database
+  fails closed on reopen if its frozen frontier would be misused. The resulting
+  consensus state is byte-identical to the legacy recompute. Default-on for
+  Mainnet under checkpoint sync; the `consensus.vct_fast_sync` opt-out is wired
+  through zebrad in a follow-up increment.
 
 ## [8.0.0] - 2026-06-02
 

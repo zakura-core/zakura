@@ -202,6 +202,38 @@ jobs:
 
           python3 deploy.py status "${args[@]}"
 
+      - name: Install cluster status dashboard
+        if: always()
+        run: |
+          set -euo pipefail
+
+          dashboard_dir="/opt/zakura-testnet-dashboard"
+          sudo install -d -m 755 "$dashboard_dir"
+          sudo install -m 755 deploy/runner/zebra-cluster-status.py "$dashboard_dir/zebra-cluster-status.py"
+          sudo install -m 644 deploy/deployer/nodes.ci.toml "$dashboard_dir/nodes.toml"
+
+          sudo tee /etc/systemd/system/zakura-testnet-dashboard.service >/dev/null <<'EOF'
+          [Unit]
+          Description=Zakura testnet cluster status dashboard
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/zakura-testnet-dashboard
+          ExecStart=/usr/bin/python3 /opt/zakura-testnet-dashboard/zebra-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --interval 10 --stale-after 300
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-testnet-dashboard.service
+          sudo systemctl restart zakura-testnet-dashboard.service
+          sudo systemctl --no-pager --full status zakura-testnet-dashboard.service || true
+
       - name: Fetch recent logs on failure
         if: failure()
         working-directory: deploy/deployer

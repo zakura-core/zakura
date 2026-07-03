@@ -95,6 +95,26 @@ path. It also writes `/etc/zakura/zebrad.toml` and uses each node's existing
 current `zebrad.service` against the existing state instead of creating a fresh
 database.
 
+The workflow also refreshes a simple fleet status dashboard on
+`zakura-testnet-1`:
+
+- service: `zakura-testnet-dashboard.service`
+- URL: `http://167.99.103.111:8090/`
+- install dir: `/opt/zakura-testnet-dashboard`
+
+The dashboard reads the generated deployer node config and polls each node over
+SSH. It shows the running commit from the node log, last restart time, current
+RPC height, and whether the height advanced in the last five minutes.
+
+Manual run from a host with SSH access to every node:
+
+```bash
+python3 deploy/runner/zebra-cluster-status.py \
+  --config deploy/deployer/nodes.toml \
+  --host 0.0.0.0 \
+  --port 8090
+```
+
 ## How the build cache works
 
 `commit` is resolved to a full SHA (`git rev-parse`). The binary is cached at

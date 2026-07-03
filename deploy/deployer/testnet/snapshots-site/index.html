@@ -783,14 +783,18 @@
         });
       }
 
+      function selectKind(kind) {
+        state.kind = kind;
+        for (const candidate of document.querySelectorAll("[data-kind]")) {
+          const selected = candidate.dataset.kind === kind;
+          candidate.classList.toggle("active", selected);
+          candidate.setAttribute("aria-pressed", selected ? "true" : "false");
+        }
+      }
+
       for (const button of document.querySelectorAll("[data-kind]")) {
         button.addEventListener("click", () => {
-          state.kind = button.dataset.kind;
-          for (const candidate of document.querySelectorAll("[data-kind]")) {
-            const selected = candidate === button;
-            candidate.classList.toggle("active", selected);
-            candidate.setAttribute("aria-pressed", selected ? "true" : "false");
-          }
+          selectKind(button.dataset.kind);
           render();
         });
       }
@@ -807,6 +811,9 @@
         .then((data) => {
           state.baseUrl = data.siteBaseUrl || siteDefaults.baseUrl;
           state.snapshots = enabledSnapshots(data);
+          if (state.snapshots.length && !state.snapshots.some((snapshot) => snapshot.kind === state.kind)) {
+            selectKind(state.snapshots[0].kind);
+          }
           render();
         })
         .catch(() => {

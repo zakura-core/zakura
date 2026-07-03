@@ -17,10 +17,8 @@ storage_mode = "{{STORAGE_MODE}}"
 
 {{METRICS_BLOCK}}
 [consensus]
-# This branch does not expose `consensus.vct_fast_sync`; the deployer renders
-# `checkpoint_sync = false` when its fleet config sets `vct_fast_sync = false`,
-# forcing the legacy non-VCT path.
 checkpoint_sync = {{CHECKPOINT_SYNC}}
+vct_fast_sync = {{VCT_FAST_SYNC}}
 
 [tracing]
 # Deterministic log file: the deploy tool reads exactly this path for

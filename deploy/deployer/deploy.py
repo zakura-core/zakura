@@ -57,9 +57,7 @@ DEFAULTS = {
     "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
     "tracing_filter": "",    # e.g. "info,zebra_network::zakura=debug"; "" uses zebrad default
     "checkpoint_sync": True,
-    # This branch does not expose `consensus.vct_fast_sync` in zebrad.toml.
-    # Setting this false makes the deployer render `checkpoint_sync = false`,
-    # which selects the legacy non-VCT path in zebra-state.
+    # Setting this false keeps checkpoint sync on while selecting the legacy non-VCT path.
     "vct_fast_sync": True,
     # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
     # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
@@ -364,7 +362,8 @@ def render_node_config(node: Node) -> str:
         "TRACING_FILTER": filter_line,
         "LOG_FILE": node.log_file,
         "RPC_BLOCK": rpc_block,
-        "CHECKPOINT_SYNC": "true" if node.checkpoint_sync and node.vct_fast_sync else "false",
+        "CHECKPOINT_SYNC": "true" if node.checkpoint_sync else "false",
+        "VCT_FAST_SYNC": "true" if node.vct_fast_sync else "false",
     })
 
 

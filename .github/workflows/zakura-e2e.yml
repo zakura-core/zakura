@@ -5,30 +5,26 @@ name: Zakura E2E
 # its run conditions are independent of the broad Rust filter used by the unit
 # tests. It runs when:
 #   - a pull request touches Zakura-relevant paths, OR carries the
-#     `run-zakura-e2e` label (gating is done in the `changes` job below, since a
-#     label cannot override a workflow-level `paths:` filter);
-#   - a push touches Zakura-relevant paths;
+#     `run-zakura-e2e` label (gating is done in the `changes` job below);
+#   - a push touches Zakura-relevant paths, for the regular Zakura gate jobs;
+#   - every push to `ironwood-main`, for the block-sync fuzz scenarios;
 #   - the change is in the merge queue (`merge_group` ignores path filters), so a
 #     change that breaks Zakura sync indirectly is still caught before it lands;
 #   - nightly / on demand, for the long four-node modes.
 on:
-  # No `paths:` filter here on purpose — see the `changes` job for PR gating.
+  # No `paths:` filter here on purpose:
+  # - PR/push Zakura gating is handled by the `changes` job.
+  # - block-sync fuzz must run after every merge to `ironwood-main`, even when
+  #   the merged PR did not touch an obviously Zakura-specific path.
   pull_request:
     branches: [ironwood-main, "feat/**", "release/**"]
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
   push:
     branches: [ironwood-main, "feat/**", "release/**"]
-    paths:
-      - "zebra-network/**"
-      - "zebrad/src/components/sync/**"
-      - "zebrad/tests/zakura_regtest_e2e.rs"
-      - "docker/zakura-regtest-e2e/**"
-      - "docker/docker-compose.zakura-regtest-e2e.yml"
-      - ".github/workflows/zakura-e2e.yml"
 
-  # Always run in the merge queue (path filters are ignored for merge_group),
-  # so a change that breaks Zakura sync indirectly is still caught at landing.
+  # Always run in the merge queue, so a change that breaks Zakura sync
+  # indirectly is still caught at landing.
   merge_group:
 
   # Long four-node modes run nightly and on demand.
@@ -53,12 +49,13 @@ env:
   COLORBT_SHOW_HIDDEN: 1
 
 jobs:
-  # Decide whether the e2e should run for a pull request: either a
-  # Zakura-relevant path changed, or the PR carries the `run-zakura-e2e` label.
-  # merge_group / push / schedule are handled directly in the job `if`s below.
+  # Decide whether the regular Zakura e2e/testkit gates should run for a pull
+  # request or push. PRs can also opt in with the `run-zakura-e2e` label.
+  # merge_group / schedule / workflow_dispatch are handled directly in the job
+  # `if`s below.
   changes:
     name: detect zakura-relevant changes
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -71,9 +68,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          changed=$(gh api --paginate \
-            "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-            --jq '.[].path')
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            changed=$(gh api --paginate \
+              "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+              --jq '.[].path')
+          else
+            changed=$(gh api \
+              "repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.sha }}" \
+              --jq '.files[].filename')
+          fi
+
           if printf '%s\n' "$changed" | grep -qE '^(zebra-network/|zebrad/src/components/sync/|zebrad/tests/zakura_regtest_e2e\.rs|docker/zakura-regtest-e2e/|docker/docker-compose\.zakura-regtest-e2e\.yml|\.github/workflows/zakura-e2e\.yml)'; then
             echo "zakura=true" >> "$GITHUB_OUTPUT"
           else
@@ -83,14 +87,14 @@ jobs:
   zakura-regtest-e2e-pr-gate:
     name: Zakura regtest e2e (pr-gate)
     needs: [changes]
-    # Run in the merge queue and on (path-filtered) pushes, and on a pull request
-    # when a Zakura path changed or the `run-zakura-e2e` label is present.
-    # `always()` keeps this evaluable even though `changes` is skipped for non-PR
-    # events (where the merge_group / push clauses decide).
+    # Run in the merge queue, on pushes that touched Zakura paths, and on a pull
+    # request when a Zakura path changed or the `run-zakura-e2e` label is present.
+    # `always()` keeps this evaluable even though `changes` is skipped for
+    # merge_group events.
     if: >-
       always() &&
       (github.event_name == 'merge_group' ||
-       github.event_name == 'push' ||
+       (github.event_name == 'push' && needs.changes.outputs.zakura == 'true') ||
        (github.event_name == 'pull_request' &&
         (needs.changes.outputs.zakura == 'true' ||
          contains(github.event.pull_request.labels.*.name, 'run-zakura-e2e'))))
@@ -147,6 +151,93 @@ jobs:
         with:
           name: zakura-regtest-e2e-pr-gate
           path: ${{ runner.temp }}/zakura-regtest-e2e-traces-pr-gate
+          if-no-files-found: ignore
+
+  zakura-testkit:
+    name: Zakura testkit cluster integration
+    needs: [changes]
+    # Keep the slow in-process Zakura cluster tests out of the broad unit lane,
+    # but still run them for Zakura-relevant PRs, pushes, the merge queue, and
+    # explicit/nightly Zakura coverage.
+    if: >-
+      always() &&
+      (github.event_name == 'merge_group' ||
+       (github.event_name == 'push' && needs.changes.outputs.zakura == 'true') ||
+       github.event_name == 'schedule' ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' &&
+        (needs.changes.outputs.zakura == 'true' ||
+         contains(github.event.pull_request.labels.*.name, 'run-zakura-e2e'))))
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1 # zizmor: ignore[cache-poisoning] -- CI integration job; uploads only diagnostic test traces
+        with:
+          toolchain: stable
+          cache-key: zakura-testkit
+          cache-on-failure: true
+      - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
+        with:
+          tool: cargo-nextest
+      - uses: ./.github/actions/setup-zebra-build
+      - name: Run Zakura testkit cluster profile
+        run: cargo nextest run --profile zakura-integration --locked --features default-release-binaries --no-fail-fast
+        env:
+          ZAKURA_TEST_TRACE: keep
+      - name: Upload Zakura testkit traces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: zakura-testkit-traces
+          path: target/zakura-traces
+          if-no-files-found: ignore
+
+  zakura-blocksync-fuzz:
+    name: Zakura block-sync fuzz scenarios
+    # These are long scenario/fuzz-style simulations, not normal PR unit tests.
+    # Run them after merges to `ironwood-main`, nightly, and on demand so
+    # regressions are still visible without making every PR wait on the flakiest
+    # block-sync scenarios.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/ironwood-main') ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1 # zizmor: ignore[cache-poisoning] -- CI fuzz-scenario job; uploads only diagnostic test traces
+        with:
+          toolchain: stable
+          cache-key: zakura-blocksync-fuzz
+          cache-on-failure: true
+      - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
+        with:
+          tool: cargo-nextest
+      - uses: ./.github/actions/setup-zebra-build
+      - name: Run Zakura block-sync fuzz scenarios
+        run: cargo nextest run --profile zakura-blocksync-fuzz --locked --features default-release-binaries --no-fail-fast
+        env:
+          ZAKURA_TEST_TRACE: keep
+      - name: Upload Zakura block-sync fuzz traces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: zakura-blocksync-fuzz-traces
+          path: target/zakura-traces
           if-no-files-found: ignore
 
   zakura-regtest-e2e:
@@ -210,6 +301,8 @@ jobs:
     needs:
       - changes
       - zakura-regtest-e2e-pr-gate
+      - zakura-testkit
+      - zakura-blocksync-fuzz
       - zakura-regtest-e2e
     timeout-minutes: 30
     steps:
@@ -217,8 +310,9 @@ jobs:
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          # `changes` only runs for pull requests; the two e2e lanes are
-          # event-scoped (pr-gate on PR/push/queue, the mode matrix on
+          # `changes` only runs for pull requests and pushes; the e2e lanes are
+          # event-scoped (pr-gate/testkit on selected PRs, selected pushes, and
+          # queue; fuzz on main pushes/schedule/dispatch; the mode matrix on
           # schedule/dispatch), so whichever doesn't apply is skipped. A genuine
           # failure in any of them still fails this aggregate.
-          allowed-skips: changes, zakura-regtest-e2e-pr-gate, zakura-regtest-e2e
+          allowed-skips: changes, zakura-regtest-e2e-pr-gate, zakura-testkit, zakura-blocksync-fuzz, zakura-regtest-e2e

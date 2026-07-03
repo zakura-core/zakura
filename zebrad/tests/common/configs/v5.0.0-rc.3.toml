@@ -80,20 +80,50 @@ peerset_initial_target_size = 100
 v2_p2p = true
 
 [network.zakura]
-bootstrap_peers = []
+bootstrap_peers = [
+    "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
+    "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@104.131.184.123:8234",
+    "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234",
+    "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22@143.244.184.176:8234",
+    "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57@159.203.38.10:8234",
+    "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5@64.227.44.93:8234",
+    "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1@161.35.156.226:8234",
+    "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234",
+    "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
+]
 listen_addr = "0.0.0.0:8234"
-max_connections = 32
-max_pending_handshakes = 8
+max_connections = 256
+max_pending_handshakes = 32
 message_rate_per_second = 2048
-stream_open_rate_per_second = 16
+stream_open_rate_per_second = 32
 
 [network.zakura.block_sync]
+bbr_cwnd_gain_percent = 300
+bbr_cwnd_unit = "bytes"
+bbr_delay_gradient_percent = 150
+bbr_delivery_rate_window = "10s"
+bbr_min_cwnd = 4
+bbr_min_cwnd_bytes = 2524288
+bbr_probe_bw_gain_percent = 125
+bbr_probe_rtt_duration = "200ms"
+bbr_probe_rtt_interval = "10s"
+bbr_reliability_weight_percent = 100
+bbr_rtprop_window = "10s"
+bbr_startup_growth_percent = 200
+floor_bypass_slots = 2
+floor_peer_avoid_cooldown = "8s"
+floor_rescue_timeout = "2s"
+initial_block_probe_requests = 1
+initial_inflight_requests = 64
 max_blocks_per_response = 1
-max_inflight_block_bytes = 2147483648
-max_inflight_requests = 2048
+max_inflight_block_bytes = 6442450944
+max_inflight_requests = 32000
+max_reorder_lookahead_bytes = 6408896512
+max_requests_without_block_progress = 64
 max_response_bytes = 33554432
-max_submitted_block_applies = 400
-request_timeout = "10s"
+max_submitted_block_applies = 401
+no_progress_peer_cooldown = "3m"
+request_timeout = "8s"
 size_deviation_tolerance = 200
 status_refresh_interval = "30s"
 

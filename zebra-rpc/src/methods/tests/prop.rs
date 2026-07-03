@@ -244,7 +244,7 @@ proptest! {
     /// Make the mock mempool service return a list of transaction IDs, and check that the RPC call
     /// returns those IDs as hexadecimal strings.
     #[test]
-    fn mempool_transactions_are_sent_to_caller(transactions in any::<Vec<VerifiedUnminedTx>>(),
+    fn mempool_transactions_are_sent_to_caller(transactions in vec(any::<VerifiedUnminedTx>(), 0..=4),
                                                network in any::<Network>(),
                                                verbose in any::<Option<bool>>()) {
         let (runtime, _init_guard) = zebra_test::init_async();

@@ -857,8 +857,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn terminate_child_kills_after_grace_period() {
+        use std::process::Stdio;
+
         let mut child = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "trap '' TERM; sleep 60"])
+            .args(["-c", "trap '' TERM; while read _; do :; done"])
+            .stdin(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .expect("sh is available on unix test hosts");

@@ -579,7 +579,7 @@ async fn peer_mempool_full_queue_is_refused_without_disconnect() -> Result<(), c
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     // Get a block that has at least one non coinbase transaction
     let block: Block = zebra_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;

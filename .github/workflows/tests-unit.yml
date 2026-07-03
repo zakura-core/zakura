@@ -51,7 +51,7 @@ env:
 
 jobs:
   unit-tests:
-    name: ${{ matrix.rust-version }} on ${{ matrix.os }}
+    name: ${{ matrix.rust-version }} on ${{ matrix.os }} (shard ${{ matrix.partition }}/3)
     permissions:
       contents: read
       id-token: write
@@ -64,6 +64,10 @@ jobs:
         os: [ubuntu-latest]
         rust-version: [stable]
         features: [default-release-binaries]
+        # Shard the broad suite across 3 runners. Each shard recompiles (the fixed
+        # ~2.5m compile floor every runner pays) but runs only its 1/3 slice of the
+        # tests via nextest `--partition`, so the run phase parallelizes ~3x.
+        partition: [1, 2, 3]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
@@ -83,12 +87,36 @@ jobs:
         run: |
           if [[ "${FULL_COVERAGE}" == "true" ]]; then
             export TEST_LARGE_CHECKPOINTS=1
-            cargo nextest run --profile full-tests --locked --release --features "${{ matrix.features }}" --run-ignored=all
+            cargo nextest run --profile full-tests --locked --release --features "${{ matrix.features }}" --run-ignored=all --partition "hash:${{ matrix.partition }}/3"
           else
-            cargo nextest run --profile all-tests --locked --features "${{ matrix.features }}"
+            cargo nextest run --profile all-tests --locked --features "${{ matrix.features }}" --partition "hash:${{ matrix.partition }}/3"
           fi
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
+
+  zebrad-config:
+    name: zebrad config compatibility
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
+        with:
+          toolchain: stable
+          cache-key: zebrad-config
+          cache-on-failure: true
+      - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
+        with:
+          tool: cargo-nextest
+      - uses: ./.github/actions/setup-zebra-build
+      - name: Check generated zebrad config compatibility
+        run: cargo nextest run --profile zebrad-config --locked --features default-release-binaries --no-fail-fast
 
   check-no-git-dependencies:
     name: Check no git dependencies
@@ -124,6 +152,7 @@ jobs:
     if: always()
     needs:
       - unit-tests
+      - zebrad-config
       - check-no-git-dependencies
     timeout-minutes: 30
     steps:

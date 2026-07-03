@@ -416,6 +416,16 @@ pub enum CommitmentError {
         actual: [u8; 32],
     },
 
+    #[error(
+        "invalid pre-Nu6_3 ironwood root: expected the empty-tree root {:?}, actual: {:?}",
+        hex::encode(expected),
+        hex::encode(actual)
+    )]
+    InvalidPreNu6_3IronwoodRoot {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+
     #[error("missing required block height: block commitments can't be parsed without a block height, block hash: {block_hash:?}")]
     MissingBlockHeight { block_hash: block::Hash },
 

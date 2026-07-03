@@ -15,7 +15,7 @@ use thiserror::Error;
 use zebra_chain::parallel::tree::NoteCommitmentTrees;
 use zebra_chain::{
     block::{self, merkle::AuthDataRoot, Block},
-    orchard,
+    ironwood, orchard,
     parameters::{Network, NetworkUpgrade},
     sapling, sprout,
 };
@@ -169,7 +169,11 @@ impl VctState {
     pub(super) fn vct_roots_at_height(
         &self,
         height: block::Height,
-    ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
+    ) -> Option<(
+        sapling::tree::Root,
+        orchard::tree::Root,
+        ironwood::tree::Root,
+    )> {
         if !self.enabled {
             return None;
         }
@@ -213,7 +217,7 @@ impl VctState {
         self.source.vct_last_checkpoint_height()
     }
 
-    /// The verified `(sapling, orchard, sprout)` frontiers to write as the tip
+    /// The verified `(sapling, orchard, sprout, ironwood)` frontiers to write as the tip
     /// treestate, when `height` is the checkpoint handoff height.
     #[allow(clippy::type_complexity)]
     pub(super) fn final_frontiers_for_last_checkpoint(
@@ -223,6 +227,7 @@ impl VctState {
         Arc<sapling::tree::NoteCommitmentTree>,
         Arc<orchard::tree::NoteCommitmentTree>,
         Arc<sprout::tree::NoteCommitmentTree>,
+        Arc<ironwood::tree::NoteCommitmentTree>,
     )> {
         let frontiers = self.source.final_frontiers();
         (frontiers.height == height).then(|| {
@@ -230,6 +235,7 @@ impl VctState {
                 frontiers.sapling.clone(),
                 frontiers.orchard.clone(),
                 frontiers.sprout.clone(),
+                frontiers.ironwood.clone(),
             )
         })
     }
@@ -381,7 +387,11 @@ impl VctCommitState {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VctWriteData {
     /// When `Some`, skip per-height tree writes and fold these roots into the anchor set.
-    pub anchor_roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+    pub anchor_roots: Option<(
+        sapling::tree::Root,
+        orchard::tree::Root,
+        ironwood::tree::Root,
+    )>,
     /// When `Some(height)`, mark the database as vct-synced below `height`.
     pub sync_below: Option<block::Height>,
 }
@@ -463,6 +473,7 @@ fn final_frontiers_bytes(height: block::Height, trees: &NoteCommitmentTrees) -> 
         sapling: trees.sapling.clone(),
         orchard: trees.orchard.clone(),
         sprout: trees.sprout.clone(),
+        ironwood: trees.ironwood.clone(),
     }
     .to_bytes()
 }
@@ -513,8 +524,13 @@ mod tests {
         let height = NetworkUpgrade::Heartwood
             .activation_height(&network)
             .expect("mainnet has a Heartwood activation height");
-        let root_map =
-            || std::iter::once((height.0, (Default::default(), Default::default()))).collect();
+        let root_map = || {
+            std::iter::once((
+                height.0,
+                (Default::default(), Default::default(), Default::default()),
+            ))
+            .collect()
+        };
         // The handoff is above the height under test, so the handoff exemption
         // does not mask the successor policy.
         let frontiers = || FinalFrontiers {
@@ -522,6 +538,7 @@ mod tests {
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         };
 
         let trusted = VctState::test_with_source(
@@ -554,14 +571,21 @@ mod tests {
         let handoff = block::Height(10);
         let after_handoff = (handoff + 1).expect("test height is valid");
         let roots = std::collections::HashMap::from([
-            (handoff.0, (Default::default(), Default::default())),
-            (after_handoff.0, (Default::default(), Default::default())),
+            (
+                handoff.0,
+                (Default::default(), Default::default(), Default::default()),
+            ),
+            (
+                after_handoff.0,
+                (Default::default(), Default::default(), Default::default()),
+            ),
         ]);
         let frontiers = FinalFrontiers {
             height: handoff,
             sapling: Arc::new(sapling::tree::NoteCommitmentTree::default()),
             orchard: Arc::new(orchard::tree::NoteCommitmentTree::default()),
             sprout: Arc::new(sprout::tree::NoteCommitmentTree::default()),
+            ironwood: Arc::new(ironwood::tree::NoteCommitmentTree::default()),
         };
 
         let bounded = VctState::test_with_source(
@@ -605,6 +629,12 @@ mod tests {
             EXPECTED_MAINNET_FINAL_SPROUT_ROOT,
             "embedded mainnet final Sprout frontier root is pinned"
         );
+        assert_eq!(
+            frontiers.ironwood.root(),
+            ironwood::tree::NoteCommitmentTree::default().root(),
+            "the embedded mainnet-frontier.bin predates Ironwood, so it parses (backward \
+             compatibly) with the Ironwood frontier defaulted to the empty tree"
+        );
     }
 
     #[test]
@@ -631,6 +661,11 @@ mod tests {
             trees.sprout.root(),
             "captured sprout frontier round-trips"
         );
+        assert_eq!(
+            parsed.ironwood.root(),
+            trees.ironwood.root(),
+            "captured ironwood frontier round-trips"
+        );
     }
 
     #[test]
@@ -641,6 +676,7 @@ mod tests {
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         };
 
         let _ = parse_embedded_final_frontiers(&frontiers.to_bytes(), block::Height(2));
@@ -692,6 +728,7 @@ mod tests {
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         }
         .to_bytes()
         .into_iter()
@@ -739,6 +776,7 @@ mod tests {
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         }
         .to_bytes();
 
@@ -767,6 +805,7 @@ mod tests {
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         }
         .to_bytes();
         let path = std::env::temp_dir().join(format!(

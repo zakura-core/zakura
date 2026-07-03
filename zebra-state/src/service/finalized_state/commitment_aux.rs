@@ -8,7 +8,7 @@ use std::{fmt, sync::Arc};
 use thiserror::Error;
 use zebra_chain::{
     block::{self, merkle::AuthDataRoot},
-    orchard, sapling, sprout,
+    ironwood, orchard, sapling, sprout,
 };
 
 use super::{FromDisk, IntoDisk, ZebraDb};
@@ -30,6 +30,10 @@ pub(super) struct FinalFrontiers {
     pub(super) sapling: Arc<sapling::tree::NoteCommitmentTree>,
     pub(super) orchard: Arc<orchard::tree::NoteCommitmentTree>,
     pub(super) sprout: Arc<sprout::tree::NoteCommitmentTree>,
+    /// The Ironwood frontier at the handoff height. Absent from the on-disk byte format
+    /// written before Ironwood existed; [`Self::from_bytes`] defaults it to the empty
+    /// tree when parsing such older bytes.
+    pub(super) ironwood: Arc<ironwood::tree::NoteCommitmentTree>,
 }
 
 /// Errors producing [`FinalFrontiers`] from a finalized database.
@@ -45,6 +49,13 @@ pub enum FinalFrontiersGenerationError {
     /// The database has no Orchard tree at the requested height.
     #[error("missing Orchard final frontier tree at height {height:?}")]
     MissingOrchardTree {
+        /// The requested final frontier height.
+        height: block::Height,
+    },
+
+    /// The database has no Ironwood tree at the requested height.
+    #[error("missing Ironwood final frontier tree at height {height:?}")]
+    MissingIronwoodTree {
         /// The requested final frontier height.
         height: block::Height,
     },
@@ -139,15 +150,16 @@ impl std::error::Error for FinalFrontiersParseError {}
 
 impl FinalFrontiers {
     /// Serialize to the embedded byte format: height (u32 LE), then sapling, orchard,
-    /// and sprout trees, each as `u32`-LE-length-prefixed `IntoDisk` bytes. Used to
-    /// create embedded or test final-frontier fixtures.
+    /// sprout, and ironwood trees, each as `u32`-LE-length-prefixed `IntoDisk` bytes.
+    /// Used to create embedded or test final-frontier fixtures.
     pub(super) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.height.0.to_le_bytes());
-        let blobs: [Vec<u8>; 3] = [
+        let blobs: [Vec<u8>; 4] = [
             IntoDisk::as_bytes(&*self.sapling),
             IntoDisk::as_bytes(&*self.orchard),
             IntoDisk::as_bytes(&*self.sprout),
+            IntoDisk::as_bytes(&*self.ironwood),
         ];
         for blob in blobs {
             let len = u32::try_from(blob.len()).expect("note commitment tree fits in u32 bytes");
@@ -172,9 +184,14 @@ impl FinalFrontiers {
                 })?;
         let height = block::Height(u32::from_le_bytes(height_bytes));
 
-        // Read three `u32`-length-prefixed blobs starting after the height.
-        let mut cursor: usize = 4;
-        let mut next_blob = |tree: &'static str| -> Result<Vec<u8>, FinalFrontiersParseError> {
+        // Read a `u32`-length-prefixed blob starting at `cursor`, returning the blob and
+        // the cursor position just past it. A plain fn (not a closure) so the cursor
+        // threads through by value, and callers can freely inspect it between calls.
+        fn read_blob(
+            bytes: &[u8],
+            cursor: usize,
+            tree: &'static str,
+        ) -> Result<(Vec<u8>, usize), FinalFrontiersParseError> {
             let len_end =
                 cursor
                     .checked_add(4)
@@ -202,7 +219,7 @@ impl FinalFrontiers {
             // Zebra's supported platforms have at least 32-bit `usize`, so every
             // u32 length prefix fits in memory indexes.
             let len = u32::from_le_bytes(len_bytes) as usize;
-            cursor = len_end;
+            let cursor = len_end;
             let blob_end =
                 cursor
                     .checked_add(len)
@@ -220,12 +237,25 @@ impl FinalFrontiers {
                         expected_len: len,
                         remaining: bytes.len().saturating_sub(cursor),
                     })?;
-            cursor = blob_end;
-            Ok(blob.to_vec())
+            Ok((blob.to_vec(), blob_end))
+        }
+
+        // Read three `u32`-length-prefixed blobs starting after the height.
+        let (sapling, cursor) = read_blob(bytes, 4, "sapling")?;
+        let (orchard, cursor) = read_blob(bytes, cursor, "orchard")?;
+        let (sprout, cursor) = read_blob(bytes, cursor, "sprout")?;
+
+        // The Ironwood blob was added after the original 3-blob format shipped (and after
+        // the embedded `vct/mainnet-frontier.bin` was generated). Older bytes end right
+        // after sprout; treat that as "no Ironwood frontier yet" rather than an error, so
+        // the existing embedded file keeps parsing unmodified. Newer bytes carry a 4th
+        // blob, parsed and trailing-byte-checked exactly like the other three.
+        let (ironwood, cursor) = if cursor == bytes.len() {
+            (None, cursor)
+        } else {
+            let (blob, cursor) = read_blob(bytes, cursor, "ironwood")?;
+            (Some(blob), cursor)
         };
-        let sapling = next_blob("sapling")?;
-        let orchard = next_blob("orchard")?;
-        let sprout = next_blob("sprout")?;
 
         if cursor != bytes.len() {
             return Err(FinalFrontiersParseError::TrailingBytes {
@@ -245,6 +275,12 @@ impl FinalFrontiers {
             sprout: Arc::new(<sprout::tree::NoteCommitmentTree as FromDisk>::from_bytes(
                 sprout,
             )),
+            ironwood: Arc::new(match ironwood {
+                Some(ironwood) => {
+                    <ironwood::tree::NoteCommitmentTree as FromDisk>::from_bytes(ironwood)
+                }
+                None => ironwood::tree::NoteCommitmentTree::default(),
+            }),
         })
     }
 }
@@ -252,8 +288,14 @@ impl FinalFrontiers {
 /// Source for the VCT fast-sync's verified per-block roots and final frontier.
 pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
     /// The supplied roots for `height`, if this source has them.
-    fn vct_root(&self, height: block::Height)
-        -> Option<(sapling::tree::Root, orchard::tree::Root)>;
+    fn vct_root(
+        &self,
+        height: block::Height,
+    ) -> Option<(
+        sapling::tree::Root,
+        orchard::tree::Root,
+        ironwood::tree::Root,
+    )>;
 
     /// The checkpoint handoff height: the boundary below which the vct path skips
     /// per-height trees, from the source's final frontier.
@@ -281,14 +323,28 @@ pub(super) trait CommitmentRootSource: std::fmt::Debug + Send + Sync {
 #[cfg(test)]
 #[derive(Debug)]
 pub(super) struct FixtureSource {
-    roots: HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>,
+    roots: HashMap<
+        u32,
+        (
+            sapling::tree::Root,
+            orchard::tree::Root,
+            ironwood::tree::Root,
+        ),
+    >,
     frontiers: FinalFrontiers,
 }
 
 #[cfg(test)]
 impl FixtureSource {
     pub(super) fn new(
-        roots: HashMap<u32, (sapling::tree::Root, orchard::tree::Root)>,
+        roots: HashMap<
+            u32,
+            (
+                sapling::tree::Root,
+                orchard::tree::Root,
+                ironwood::tree::Root,
+            ),
+        >,
         frontiers: FinalFrontiers,
     ) -> Self {
         FixtureSource { roots, frontiers }
@@ -300,7 +356,11 @@ impl CommitmentRootSource for FixtureSource {
     fn vct_root(
         &self,
         height: block::Height,
-    ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
+    ) -> Option<(
+        sapling::tree::Root,
+        orchard::tree::Root,
+        ironwood::tree::Root,
+    )> {
         self.roots.get(&height.0).copied()
     }
     fn final_frontiers(&self) -> &FinalFrontiers {
@@ -335,12 +395,16 @@ impl CommitmentRootSource for PeerSource {
     fn vct_root(
         &self,
         height: block::Height,
-    ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
+    ) -> Option<(
+        sapling::tree::Root,
+        orchard::tree::Root,
+        ironwood::tree::Root,
+    )> {
         self.db
             .zakura_header_commitment_roots_by_height_range(height..=height)
             .into_iter()
             .next()
-            .map(|roots| (roots.sapling_root, roots.orchard_root))
+            .map(|roots| (roots.sapling_root, roots.orchard_root, roots.ironwood_root))
     }
     fn final_frontiers(&self) -> &FinalFrontiers {
         &self.frontiers
@@ -352,6 +416,24 @@ impl CommitmentRootSource for PeerSource {
             tracing::debug!(?error, ?height, "failed to delete rejected VCT root");
         }
     }
+}
+
+/// `tree`'s root, or the empty-tree root when `tree` is `None`.
+///
+/// `db.ironwood_tree_by_height(height)` only returns `None` for a height above the
+/// finalized tip, or within a verified-commitment-trees fast-synced database's `[U, H)`
+/// absent band (see [`ZebraDb::vct_tree_absent`](super::ZebraDb::vct_tree_absent)); it is
+/// not how a pre-Ironwood-upgrade empty root arises — that comes from the tree's own
+/// content, since every database has an Ironwood row from genesis onward (written at
+/// genesis commit, or backfilled by the `add_ironwood_tree` upgrade), and that row is
+/// genuinely the empty tree below the upgrade height. In [`produce_block_roots`] below,
+/// the `None` branch is in practice unreachable: the Sapling/Orchard lookups immediately
+/// above already `break` on the same absent-height conditions before this is called.
+fn ironwood_root_or_empty(
+    tree: Option<Arc<zebra_chain::ironwood::tree::NoteCommitmentTree>>,
+) -> ironwood::tree::Root {
+    tree.map(|tree| tree.root())
+        .unwrap_or_else(|| ironwood::tree::NoteCommitmentTree::default().root())
 }
 
 /// Produce the per-block roots payload for `range` from `db`'s per-height trees.
@@ -371,6 +453,10 @@ pub(crate) fn produce_block_roots(
         ) else {
             break;
         };
+        // Never `None` here in practice: the Sapling/Orchard lookups above already broke
+        // out of the loop for any height this would return `None` for (see
+        // `ironwood_root_or_empty`'s doc comment).
+        let ironwood_root = ironwood_root_or_empty(db.ironwood_tree_by_height(&height));
         // Below the upgrade height the serving index does not exist, so derive the
         // auth-data root and the shielded tx-counts from the locally stored block (this
         // archival node holds the body for these heights). Zero only if the body is somehow
@@ -391,9 +477,7 @@ pub(crate) fn produce_block_roots(
             height,
             sapling_root: sapling.root(),
             orchard_root: orchard.root(),
-            // The Ironwood tree does not exist below Nu7, so its root is the empty-tree root
-            // for every currently-servable height (no per-height Ironwood tree store yet).
-            ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            ironwood_root,
             sapling_tx,
             orchard_tx,
             ironwood_tx,
@@ -452,12 +536,16 @@ pub(super) fn produce_final_frontiers(
     let orchard = db
         .orchard_tree_by_height(&height)
         .ok_or(FinalFrontiersGenerationError::MissingOrchardTree { height })?;
+    let ironwood = db
+        .ironwood_tree_by_height(&height)
+        .ok_or(FinalFrontiersGenerationError::MissingIronwoodTree { height })?;
 
     Ok(FinalFrontiers {
         height,
         sapling,
         orchard,
         sprout: db.sprout_tree_for_tip(),
+        ironwood,
     })
 }
 
@@ -531,6 +619,10 @@ mod tests {
             let height = block::Height(height);
             batch.create_sapling_tree(db, &height, &sapling_tree(u64::from(height.0)));
             batch.create_orchard_tree(db, &height, &orchard_tree(u64::from(height.0)));
+            // A real database always has an Ironwood tree row from genesis onward (written
+            // at genesis commit, or backfilled by the `add_ironwood_tree` upgrade), so mirror
+            // that invariant here with the empty pre-Nu6_3 tree.
+            batch.create_ironwood_tree(db, &height, &ironwood::tree::NoteCommitmentTree::default());
         }
         db.write_batch(batch).expect("seeding trees succeeds");
     }
@@ -620,6 +712,68 @@ mod tests {
             roots,
             vec![expected_tree_roots(1), expected_tree_roots(2)],
             "tree-derived roots stop at the first missing height"
+        );
+    }
+
+    fn non_empty_ironwood_tree(value: u64) -> ironwood::tree::NoteCommitmentTree {
+        let mut tree = ironwood::tree::NoteCommitmentTree::default();
+        tree.append(halo2::pasta::pallas::Base::from(value))
+            .expect("single-note Ironwood tree is not full");
+        tree
+    }
+
+    /// [`ironwood_root_or_empty`] returns the tree's own root when given `Some` tree
+    /// (the caller's `db.ironwood_tree_by_height(height)` lookup), and the empty-tree
+    /// root when given `None` (a height above the finalized tip, or within a fast-synced
+    /// database's absent band — not "no row for this height", which does not occur in
+    /// practice; see the function's doc comment).
+    #[test]
+    fn ironwood_root_or_empty_reads_tree_or_falls_back_to_empty() {
+        let empty_root = ironwood::tree::NoteCommitmentTree::default().root();
+
+        assert_eq!(
+            ironwood_root_or_empty(None),
+            empty_root,
+            "a missing per-height Ironwood tree falls back to the empty-tree root"
+        );
+
+        let non_empty_tree = Arc::new(non_empty_ironwood_tree(1));
+        let non_empty_root = non_empty_tree.root();
+        assert_ne!(
+            non_empty_root, empty_root,
+            "test needs a root distinct from the empty-tree root"
+        );
+        assert_eq!(
+            ironwood_root_or_empty(Some(non_empty_tree)),
+            non_empty_root,
+            "a present per-height Ironwood tree contributes its own root, not the empty one"
+        );
+    }
+
+    /// `produce_block_roots` reads the real per-height Ironwood tree from the database
+    /// when one is present, rather than always defaulting to the empty-tree root.
+    #[test]
+    fn produce_block_roots_reads_real_ironwood_tree_when_present() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+        seed_trees(&db, [1]);
+        let non_empty_ironwood = non_empty_ironwood_tree(7);
+        let non_empty_root = non_empty_ironwood.root();
+        let mut batch = DiskWriteBatch::new();
+        batch.create_ironwood_tree(&db, &block::Height(1), &non_empty_ironwood);
+        db.write_batch(batch)
+            .expect("overwriting the seeded Ironwood tree succeeds");
+        seed_finalized_tip(&db, block::Height(1));
+
+        let roots = produce_block_roots(&db, block::Height(1)..=block::Height(1));
+
+        assert_eq!(
+            roots,
+            vec![BlockCommitmentRoots {
+                ironwood_root: non_empty_root,
+                ..expected_tree_roots(1)
+            }],
+            "produce_block_roots surfaces the real per-height Ironwood root, not the empty one"
         );
     }
 
@@ -716,6 +870,11 @@ mod tests {
         assert_eq!(frontiers.sapling.root(), sapling_tree(2).root());
         assert_eq!(frontiers.orchard.root(), orchard_tree(2).root());
         assert_eq!(frontiers.sprout.root(), sprout.root());
+        assert_eq!(
+            frontiers.ironwood.root(),
+            ironwood::tree::NoteCommitmentTree::default().root(),
+            "the seeded fixture's pre-Nu6_3 Ironwood tree is empty"
+        );
     }
 
     #[test]
@@ -729,6 +888,15 @@ mod tests {
             FinalFrontiersGenerationError::MissingSaplingTree { height },
         );
     }
+
+    // `MissingIronwoodTree` (unlike `MissingSaplingTree`/`MissingOrchardTree`, which are
+    // soft `Option`s) is defense-in-depth: `ZebraDb::ironwood_tree_by_height` panics
+    // rather than returning `None` for a height at or below the finalized tip with no
+    // Ironwood row, because every migrated database has one from genesis onward (written
+    // at commit or backfilled by the `add_ironwood_tree` upgrade). So this error variant
+    // is not reachable through the normal commit path in this test suite; it exists so
+    // `produce_final_frontiers`'s Ironwood read is symmetric with Sapling/Orchard's, not
+    // to be independently exercised here.
 
     #[test]
     fn produce_final_frontiers_bytes_serializes_generated_frontiers() {
@@ -755,11 +923,16 @@ mod tests {
     /// height and tree roots as the originals.
     #[test]
     fn final_frontiers_bytes_round_trips() {
+        let mut ironwood = ironwood::tree::NoteCommitmentTree::default();
+        ironwood
+            .append(halo2::pasta::pallas::Base::from(9u64))
+            .expect("single-note Ironwood tree is not full");
         let frontiers = FinalFrontiers {
             height: block::Height(1_687_200),
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(ironwood),
         };
 
         let parsed =
@@ -780,6 +953,47 @@ mod tests {
             parsed.sprout.root(),
             frontiers.sprout.root(),
             "sprout frontier round-trips"
+        );
+        assert_eq!(
+            parsed.ironwood.root(),
+            frontiers.ironwood.root(),
+            "ironwood frontier round-trips"
+        );
+        assert_ne!(
+            parsed.ironwood.root(),
+            ironwood::tree::NoteCommitmentTree::default().root(),
+            "test needs a non-empty ironwood root to prove it round-trips, not just defaults"
+        );
+    }
+
+    /// Bytes written before the Ironwood blob existed (3 blobs: sapling, orchard, sprout)
+    /// still parse, with `ironwood` defaulting to the empty tree — this is what lets the
+    /// existing embedded `vct/mainnet-frontier.bin` keep loading unmodified.
+    #[test]
+    fn final_frontiers_bytes_parses_pre_ironwood_format_with_empty_default() {
+        let frontiers = FinalFrontiers {
+            height: block::Height(1_687_200),
+            sapling: Arc::new(Default::default()),
+            orchard: Arc::new(Default::default()),
+            sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
+        };
+
+        // Build the pre-Ironwood 3-blob format by hand: the 4-blob writer always emits an
+        // (here empty) Ironwood blob, so strip it back off to simulate an older file.
+        let four_blob_bytes = frontiers.to_bytes();
+        let ironwood_blob_len = 4 + IntoDisk::as_bytes(&*frontiers.ironwood).len() as u32 as usize;
+        let three_blob_bytes =
+            four_blob_bytes[..four_blob_bytes.len() - ironwood_blob_len].to_vec();
+
+        let parsed = FinalFrontiers::from_bytes(&three_blob_bytes)
+            .expect("pre-Ironwood 3-blob bytes should still parse");
+
+        assert_eq!(parsed.height, frontiers.height, "height round-trips");
+        assert_eq!(
+            parsed.ironwood.root(),
+            ironwood::tree::NoteCommitmentTree::default().root(),
+            "a pre-Ironwood frontier defaults to the empty Ironwood tree"
         );
     }
 
@@ -817,6 +1031,7 @@ mod tests {
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         };
         let mut trailing = frontiers.to_bytes();
         trailing.push(0);
@@ -858,13 +1073,19 @@ mod tests {
         ];
         let roots = roots
             .into_iter()
-            .map(|root| (root.height.0, (root.sapling_root, root.orchard_root)))
+            .map(|root| {
+                (
+                    root.height.0,
+                    (root.sapling_root, root.orchard_root, root.ironwood_root),
+                )
+            })
             .collect();
         let frontiers = FinalFrontiers {
             height: block::Height(11),
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         };
 
         let source = FixtureSource::new(roots, frontiers);
@@ -911,6 +1132,7 @@ mod tests {
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         };
         let source = PeerSource::new(db, frontiers);
 

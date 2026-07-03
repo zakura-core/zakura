@@ -224,6 +224,13 @@ impl ZebraDb {
             let Some(orchard) = self.orchard_tree_by_height(&height) else {
                 break;
             };
+            // The `unwrap_or_else` default is never reached in practice: the Sapling/Orchard
+            // lookups above already `break` for any height `ironwood_tree_by_height` would
+            // return `None` for (above the tip, or a fast-synced database's absent band).
+            let ironwood_root = self
+                .ironwood_tree_by_height(&height)
+                .map(|tree| tree.root())
+                .unwrap_or_else(|| ironwood::tree::NoteCommitmentTree::default().root());
 
             let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = self
                 .block(height.into())
@@ -246,7 +253,7 @@ impl ZebraDb {
                 height,
                 sapling_root: sapling.root(),
                 orchard_root: orchard.root(),
-                ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
+                ironwood_root,
                 sapling_tx,
                 orchard_tx,
                 ironwood_tx,

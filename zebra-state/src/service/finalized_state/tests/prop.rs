@@ -31,6 +31,7 @@ type TestRootMap = HashMap<
     (
         zebra_chain::sapling::tree::Root,
         zebra_chain::orchard::tree::Root,
+        zebra_chain::ironwood::tree::Root,
     ),
 >;
 type SaplingTree = Arc<zebra_chain::sapling::tree::NoteCommitmentTree>;
@@ -54,6 +55,7 @@ fn test_handoff_frontiers(height: Height) -> commitment_aux::FinalFrontiers {
         sapling: Arc::new(Default::default()),
         orchard: Arc::new(Default::default()),
         sprout: Arc::new(Default::default()),
+        ironwood: Arc::new(Default::default()),
     }
 }
 
@@ -74,6 +76,7 @@ fn enable_vct_test_fixture_source_with_handoff(
     sapling: SaplingTree,
     orchard: OrchardTree,
     sprout: SproutTree,
+    ironwood: Arc<zebra_chain::ironwood::tree::NoteCommitmentTree>,
 ) {
     state.enable_vct_fast_source(
         Box::new(commitment_aux::FixtureSource::new(
@@ -83,6 +86,7 @@ fn enable_vct_test_fixture_source_with_handoff(
                 sapling,
                 orchard,
                 sprout,
+                ironwood,
             },
         )),
         false,
@@ -386,7 +390,14 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
                     .commit_finalized_direct(cv.into(), None, None, "vct legacy")
                     .unwrap();
                 if i > seed {
-                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                    fixture.insert(
+                        i as u32,
+                        (
+                            trees.sapling.root(),
+                            trees.orchard.root(),
+                            zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                        ),
+                    );
                 }
             }
             let golden_anchors = legacy.db.vct_anchor_digest();
@@ -548,7 +559,14 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
                     .commit_finalized_direct(cv.into(), None, None, "vct hole legacy")
                     .unwrap();
                 if i > seed {
-                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                    fixture.insert(
+                        i as u32,
+                        (
+                            trees.sapling.root(),
+                            trees.orchard.root(),
+                            zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                        ),
+                    );
                 }
             }
 
@@ -647,7 +665,14 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
                     .commit_finalized_direct(cv.into(), None, None, "vct response legacy")
                     .unwrap();
                 if i > seed {
-                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                    fixture.insert(
+                        i as u32,
+                        (
+                            trees.sapling.root(),
+                            trees.orchard.root(),
+                            zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                        ),
+                    );
                 }
             }
 
@@ -1062,7 +1087,14 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
                     .commit_finalized_direct(cv.into(), None, None, "vct reopen legacy")
                     .unwrap();
                 if i > seed {
-                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                    fixture.insert(
+                        i as u32,
+                        (
+                            trees.sapling.root(),
+                            trees.orchard.root(),
+                            zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                        ),
+                    );
                 }
                 if i == last {
                     handoff_trees = Some(trees);
@@ -1093,6 +1125,7 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
                     handoff_trees.sapling.clone(),
                     handoff_trees.orchard.clone(),
                     handoff_trees.sprout.clone(),
+                    handoff_trees.ironwood.clone(),
                 );
                 for i in 0..=stop {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -1132,6 +1165,7 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
                 handoff_trees.sapling.clone(),
                 handoff_trees.orchard.clone(),
                 handoff_trees.sprout.clone(),
+                handoff_trees.ironwood.clone(),
             );
 
             // The very first commit of the new session is the hole. No fast block has run
@@ -1158,6 +1192,7 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
                 handoff_trees.sapling.clone(),
                 handoff_trees.orchard.clone(),
                 handoff_trees.sprout.clone(),
+                handoff_trees.ironwood.clone(),
             );
             let cv = CheckpointVerifiedBlock::from(blocks[hole].block.clone());
             let next = next_vct_block(blocks[hole + 1].block.clone());
@@ -1233,7 +1268,14 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                     .commit_finalized_direct(cv.into(), None, None, "vct legacy")
                     .unwrap();
                 if i > seed {
-                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                    fixture.insert(
+                        i as u32,
+                        (
+                            trees.sapling.root(),
+                            trees.orchard.root(),
+                            zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                        ),
+                    );
                 }
                 if i == last {
                     handoff_trees = Some(trees);
@@ -1254,6 +1296,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 handoff_trees.sapling.clone(),
                 handoff_trees.orchard.clone(),
                 handoff_trees.sprout.clone(),
+                handoff_trees.ironwood.clone(),
             );
             prop_assert!(!fast.vct_fast_needs_successor(handoff), "the trusted handoff frontier authenticates the handoff root without a successor");
             for i in 0..=last {
@@ -1332,6 +1375,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 handoff_trees.sapling.clone(),
                 handoff_trees.orchard.clone(),
                 handoff_trees.sprout.clone(),
+                handoff_trees.ironwood.clone(),
             );
 
             let mut error_height = None;
@@ -1361,6 +1405,65 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                 bad_handoff.db.finalized_tip_height(),
                 Some(Height(last as u32 - 1)),
                 "the refused handoff block left state untouched"
+            );
+
+            // Negative: the handoff's *Ironwood* frontier is authenticated too, not just
+            // Sapling/Orchard. Below Nu6_3 (true for every height in this test's range),
+            // the supplied Ironwood root is pinned to empty and the fixture's roots are
+            // all empty already, so this exercises the frontier comparison itself
+            // (`vct_verify_last_checkpoint_frontier_roots`) rather than the below-Nu6_3
+            // pin: a non-empty Ironwood *frontier* mismatches the (correctly empty)
+            // supplied root, and the handoff must be rejected instead of silently
+            // accepted (which it would have been before the frontier gained an Ironwood
+            // slot: the frontier had no Ironwood field to check against at all).
+            let mut wrong_ironwood_frontier = zebra_chain::ironwood::tree::NoteCommitmentTree::default();
+            wrong_ironwood_frontier
+                .append(halo2::pasta::pallas::Base::from(1u64))
+                .expect("single-note Ironwood tree is not full");
+            prop_assert_ne!(
+                wrong_ironwood_frontier.root(),
+                handoff_trees.ironwood.root(),
+                "test needs an Ironwood frontier distinct from the real (empty) one"
+            );
+
+            let mut bad_ironwood_handoff = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+            enable_vct_test_fixture_source_with_handoff(
+                &mut bad_ironwood_handoff,
+                fixture.clone(),
+                handoff,
+                handoff_trees.sapling.clone(),
+                handoff_trees.orchard.clone(),
+                handoff_trees.sprout.clone(),
+                Arc::new(wrong_ironwood_frontier),
+            );
+
+            let mut ironwood_error_height = None;
+            let mut ironwood_handoff_error = None;
+            for i in 0..=last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = (i < last).then(|| NextVctBlock {
+                    block: blocks[i + 1].block.clone(),
+                    auth_data_root: None,
+                });
+                match bad_ironwood_handoff.commit_finalized_direct(cv.into(), None, next, "vct bad ironwood handoff") {
+                    Ok(_) => {}
+                    Err(error) => {
+                        ironwood_error_height = Some(i);
+                        ironwood_handoff_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            prop_assert_eq!(ironwood_error_height, Some(last), "the bad Ironwood handoff frontier is rejected at the handoff height");
+            let ironwood_handoff_error = ironwood_handoff_error.expect("the bad Ironwood handoff frontier failed");
+            prop_assert!(
+                format!("{ironwood_handoff_error:?}").contains("VctSuppliedRootUnavailable"),
+                "a bad Ironwood handoff frontier returns the retryable VctSuppliedRootUnavailable error, got: {ironwood_handoff_error:?}"
+            );
+            prop_assert_eq!(
+                bad_ironwood_handoff.db.finalized_tip_height(),
+                Some(Height(last as u32 - 1)),
+                "the refused Ironwood handoff block left state untouched"
             );
     });
 
@@ -1421,12 +1524,23 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                     .commit_finalized_direct(cv.into(), None, None, "vct switch legacy")
                     .unwrap();
                 if i > seed && i <= handoff_index {
-                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                    fixture.insert(
+                        i as u32,
+                        (
+                            trees.sapling.root(),
+                            trees.orchard.root(),
+                            zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                        ),
+                    );
                 }
                 if i == handoff_index {
                     handoff_trees = Some(trees);
                 } else if i == handoff_index + 1 {
-                    post_handoff_roots = Some((trees.sapling.root(), trees.orchard.root()));
+                    post_handoff_roots = Some((
+                        trees.sapling.root(),
+                        trees.orchard.root(),
+                        zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                    ));
                 }
             }
             let golden_anchors = legacy.db.vct_anchor_digest();
@@ -1453,6 +1567,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                     handoff_trees.sapling.clone(),
                     handoff_trees.orchard.clone(),
                     handoff_trees.sprout.clone(),
+                    handoff_trees.ironwood.clone(),
                 );
                 for i in 0..=handoff_index {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -1518,7 +1633,11 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             );
             guarded_fixture.insert(
                 (handoff_index + 1) as u32,
-                (Default::default(), post_handoff_roots.1),
+                (
+                    Default::default(),
+                    post_handoff_roots.1,
+                    post_handoff_roots.2,
+                ),
             );
             enable_vct_test_fixture_source_with_handoff(
                 &mut fast_suffix,
@@ -1527,6 +1646,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 handoff_trees.sapling.clone(),
                 handoff_trees.orchard.clone(),
                 handoff_trees.sprout.clone(),
+                handoff_trees.ironwood.clone(),
             );
             for i in (seed + 1)..=post_handoff_tip {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
@@ -1611,7 +1731,14 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                     .commit_finalized_direct(cv.into(), None, None, "vct dedup legacy")
                     .unwrap();
                 if i > seed {
-                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                    fixture.insert(
+                        i as u32,
+                        (
+                            trees.sapling.root(),
+                            trees.orchard.root(),
+                            zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                        ),
+                    );
                 }
             }
 
@@ -1736,7 +1863,14 @@ fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()>
                     .commit_finalized_direct(cv.into(), None, None, "vct clear legacy")
                     .unwrap();
                 if i > seed {
-                    fixture.insert(i as u32, (trees.sapling.root(), trees.orchard.root()));
+                    fixture.insert(
+                        i as u32,
+                        (
+                            trees.sapling.root(),
+                            trees.orchard.root(),
+                            zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                        ),
+                    );
                 }
             }
 
@@ -1864,7 +1998,12 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
             let produced_roots = produced_roots
                 .into_iter()
-                .map(|root| (root.height.0, (root.sapling_root, root.orchard_root)))
+                .map(|root| {
+                    (
+                        root.height.0,
+                        (root.sapling_root, root.orchard_root, root.ironwood_root),
+                    )
+                })
                 .collect();
             fast.enable_vct_fast_source(
                 Box::new(commitment_aux::FixtureSource::new(

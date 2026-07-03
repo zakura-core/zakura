@@ -1207,7 +1207,14 @@ mod tests {
         tree.root()
     }
 
-    /// Fast-path VCT commits write Sapling/Orchard anchors and the compact
+    fn ironwood_root(value: u64) -> zebra_chain::ironwood::tree::Root {
+        let mut tree = zebra_chain::ironwood::tree::NoteCommitmentTree::default();
+        tree.append(halo2::pasta::pallas::Base::from(value))
+            .expect("single-note Ironwood tree is not full");
+        tree.root()
+    }
+
+    /// Fast-path VCT commits write Sapling/Orchard/Ironwood anchors and the compact
     /// `commitment_roots_by_height` index, but skip per-height tree rows. Rollback must
     /// therefore prune stale anchors from the index before truncating it; otherwise anchors
     /// from rolled-back fast commits stay valid for contextual verification.
@@ -1220,12 +1227,16 @@ mod tests {
         let removed_sapling = sapling_root(2);
         let retained_orchard = orchard_root(1);
         let removed_orchard = orchard_root(2);
+        let retained_ironwood = ironwood_root(1);
+        let removed_ironwood = ironwood_root(2);
 
         let mut batch = DiskWriteBatch::new();
         batch.insert_sapling_anchor(&db, &retained_sapling);
         batch.insert_sapling_anchor(&db, &removed_sapling);
         batch.insert_orchard_anchor(&db, &retained_orchard);
         batch.insert_orchard_anchor(&db, &removed_orchard);
+        batch.insert_ironwood_anchor(&db, &retained_ironwood);
+        batch.insert_ironwood_anchor(&db, &removed_ironwood);
 
         // Heights 1 and 2 are retained. Height 3 is rolled back and has a unique stale
         // anchor. Height 4 is also rolled back, but repeats the retained root, so its anchor
@@ -1235,7 +1246,7 @@ mod tests {
             Height(1),
             &retained_sapling,
             &retained_orchard,
-            &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            &retained_ironwood,
             0,
             0,
             0,
@@ -1246,7 +1257,7 @@ mod tests {
             Height(2),
             &retained_sapling,
             &retained_orchard,
-            &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            &retained_ironwood,
             0,
             0,
             0,
@@ -1257,7 +1268,7 @@ mod tests {
             Height(3),
             &removed_sapling,
             &removed_orchard,
-            &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            &removed_ironwood,
             0,
             0,
             0,
@@ -1268,7 +1279,7 @@ mod tests {
             Height(4),
             &retained_sapling,
             &retained_orchard,
-            &zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            &retained_ironwood,
             0,
             0,
             0,
@@ -1297,6 +1308,14 @@ mod tests {
         assert!(
             !db.contains_orchard_anchor(&removed_orchard),
             "rollback removes Orchard anchors introduced only by rolled-back fast commits"
+        );
+        assert!(
+            db.contains_ironwood_anchor(&retained_ironwood),
+            "rollback retains Ironwood anchors still valid at or below the target"
+        );
+        assert!(
+            !db.contains_ironwood_anchor(&removed_ironwood),
+            "rollback removes Ironwood anchors introduced only by rolled-back fast commits"
         );
         assert_eq!(
             db.commitment_roots_by_height_range(Height(1)..=Height(4))
@@ -1362,6 +1381,56 @@ mod tests {
                 "U >= H leaves an empty band, so height {height} is servable"
             );
         }
+    }
+
+    /// `ironwood_tree_by_height` returns `None` in the `[U, H)` absent band, matching its
+    /// Sapling/Orchard siblings — without the guard, the backward search would silently
+    /// return the genesis-backfilled (or pre-upgrade) tree instead.
+    #[test]
+    fn ironwood_tree_by_height_is_guarded_in_the_absent_band() {
+        let _init_guard = zebra_test::init();
+        let db = ephemeral_mainnet_db();
+
+        // Genesis's Ironwood tree row (real databases always have one: written at genesis
+        // commit, or backfilled by the `add_ironwood_tree` upgrade), and a finalized tip at
+        // height 10 so heights up to 10 are within the "known" range `ironwood_tree_by_height`
+        // searches, rather than short-circuiting on "above the tip".
+        let mut batch = DiskWriteBatch::new();
+        batch.create_ironwood_tree(
+            &db,
+            &Height(0),
+            &zebra_chain::ironwood::tree::NoteCommitmentTree::default(),
+        );
+        let hash_by_height = db.db().cf_handle("hash_by_height").unwrap();
+        batch.zs_insert(&hash_by_height, Height(10), block::Hash([10; 32]));
+        db.write_batch(batch)
+            .expect("seeding genesis tree and finalized tip succeeds");
+
+        assert!(
+            db.ironwood_tree_by_height(&Height(0)).is_some(),
+            "before any vct markers, the seeded genesis tree is present"
+        );
+
+        // Upgrade U = 4, handoff H = 10: per-height trees absent exactly in [4, 10). Without
+        // the backward-search guard, a read in this band would silently return the height-0
+        // row above instead of `None`.
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_upgrade_marker(&db, Height(4));
+        batch.update_vct_sync_marker(&db, Height(10));
+        db.write_batch(batch).expect("seeding vct markers succeeds");
+
+        assert!(
+            db.ironwood_tree_by_height(&Height(3)).is_some(),
+            "below U: the pre-upgrade tree is present"
+        );
+        assert!(
+            db.ironwood_tree_by_height(&Height(4)).is_none(),
+            "at U: the tree is absent"
+        );
+        assert!(
+            db.ironwood_tree_by_height(&Height(9)).is_none(),
+            "below H: the tree is absent"
+        );
     }
 
     /// `serve_block_roots` reads a request that starts at or above the upgrade height `U` straight

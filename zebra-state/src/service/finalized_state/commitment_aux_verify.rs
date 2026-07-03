@@ -3,7 +3,7 @@
 //!
 //! This is the "verify" component of the verified-commitment-trees design
 //! (`docs/design/verified-commitment-trees.md`). Given a sequence of per-block
-//! Sapling/Orchard roots (from a fixture today, an untrusted peer later), confirm
+//! Sapling/Orchard/Ironwood roots (from a fixture today, an untrusted peer later), confirm
 //! they reconstruct a history tree consistent with the header commitments.
 
 #![cfg_attr(not(test), allow(dead_code))]
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use zebra_chain::{
     block::{merkle::AuthDataRoot, Block, Height},
     history_tree::HistoryTree,
-    orchard,
+    ironwood, orchard,
     parameters::{Network, NetworkUpgrade},
     sapling,
 };
@@ -26,7 +26,11 @@ use crate::{service::check, ValidateContextError};
 #[derive(Clone, Debug)]
 pub(crate) struct CommitmentRootVerification {
     pub(crate) block: Arc<Block>,
-    pub(crate) roots: Option<(sapling::tree::Root, orchard::tree::Root)>,
+    pub(crate) roots: Option<(
+        sapling::tree::Root,
+        orchard::tree::Root,
+        ironwood::tree::Root,
+    )>,
     pub(crate) precomputed_auth_data_root: Option<AuthDataRoot>,
     pub(crate) skip_parent_check: bool,
 }
@@ -38,12 +42,13 @@ impl CommitmentRootVerification {
         block: Arc<Block>,
         sapling_root: sapling::tree::Root,
         orchard_root: orchard::tree::Root,
+        ironwood_root: ironwood::tree::Root,
         precomputed_auth_data_root: Option<AuthDataRoot>,
         skip_parent_check: bool,
     ) -> Self {
         CommitmentRootVerification {
             block,
-            roots: Some((sapling_root, orchard_root)),
+            roots: Some((sapling_root, orchard_root, ironwood_root)),
             precomputed_auth_data_root,
             skip_parent_check,
         }
@@ -128,8 +133,40 @@ pub(crate) fn verify_supplied_orchard_root_below_nu5(
     Ok(())
 }
 
+/// Verifies a supplied Ironwood root for a pre-Ironwood (pre-`Nu6_3`) block.
+///
+/// `Nu6_3` is the first network upgrade whose `HistoryTree` leaf commits to an
+/// Ironwood root (the `IronwoodOnward`/V3 leaf); below it, no header commits to an
+/// Ironwood root and the Ironwood tree is provably empty (no Ironwood actions are
+/// allowed), so the supplied root must be the empty-tree root.
+pub(crate) fn verify_supplied_ironwood_root_below_nu6_3(
+    network: &Network,
+    height: Height,
+    ironwood_root: &ironwood::tree::Root,
+) -> Result<(), ValidateContextError> {
+    // At/above Nu6_3 the ZIP-221 V3 MMR commits to the Ironwood root, so it is
+    // authenticated there, not here.
+    if let Some(nu6_3_height) = NetworkUpgrade::Nu6_3.activation_height(network) {
+        if height >= nu6_3_height {
+            return Ok(());
+        }
+    }
+
+    let expected = ironwood::tree::NoteCommitmentTree::default().root();
+    if ironwood_root != &expected {
+        return Err(ValidateContextError::InvalidBlockCommitment(
+            CommitmentError::InvalidPreNu6_3IronwoodRoot {
+                expected: <[u8; 32]>::from(expected),
+                actual: <[u8; 32]>::from(*ironwood_root),
+            },
+        ));
+    }
+
+    Ok(())
+}
+
 /// Verifies that `items` (blocks in ascending height order, with supplied
-/// Sapling/Orchard roots when they should be folded in) reconstruct a ZIP-221
+/// Sapling/Orchard/Ironwood roots when they should be folded in) reconstruct a ZIP-221
 /// history MMR consistent with the block header commitments, starting from `tree`
 /// (the parent block's history tree).
 ///
@@ -186,7 +223,7 @@ where
             .map_err(|error| (height, error))?;
         }
 
-        let Some((sapling_root, orchard_root)) = roots else {
+        let Some((sapling_root, orchard_root, ironwood_root)) = roots else {
             continue;
         };
 
@@ -194,19 +231,13 @@ where
             .map_err(|error| (height, error))?;
         verify_supplied_orchard_root_below_nu5(network, height, &orchard_root)
             .map_err(|error| (height, error))?;
+        verify_supplied_ironwood_root_below_nu6_3(network, height, &ironwood_root)
+            .map_err(|error| (height, error))?;
 
         // Fold this block's supplied roots into the running MMR (builds the leaf
         // from the block body tx-counts + the roots).
         history_tree
-            .push(
-                network,
-                block,
-                &sapling_root,
-                &orchard_root,
-                // TODO: add ironwood root
-                // https://linear.app/zcale/issue/ZCA-746/wire-up-ironwood-into-vct
-                &Default::default(),
-            )
+            .push(network, block, &sapling_root, &orchard_root, &ironwood_root)
             .map_err(Arc::new)
             .map_err(ValidateContextError::from)
             .map_err(|error| (height, error))?;
@@ -277,12 +308,23 @@ mod tests {
             .expect("valid root")
     }
 
+    fn empty_ironwood_root() -> ironwood::tree::Root {
+        ironwood::tree::NoteCommitmentTree::default().root()
+    }
+
     fn verification_item(
         block: Arc<Block>,
         sapling_root: sapling::tree::Root,
         orchard_root: orchard::tree::Root,
     ) -> CommitmentRootVerification {
-        CommitmentRootVerification::with_roots(block, sapling_root, orchard_root, None, false)
+        CommitmentRootVerification::with_roots(
+            block,
+            sapling_root,
+            orchard_root,
+            empty_ironwood_root(),
+            None,
+            false,
+        )
     }
 
     #[test]
@@ -290,16 +332,21 @@ mod tests {
         let block = mainnet_block_at(1);
         let sapling_root = sapling::tree::NoteCommitmentTree::default().root();
         let orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+        let ironwood_root = empty_ironwood_root();
 
         let with_roots = CommitmentRootVerification::with_roots(
             block.clone(),
             sapling_root,
             orchard_root,
+            ironwood_root,
             None,
             true,
         );
         assert!(Arc::ptr_eq(&with_roots.block, &block));
-        assert_eq!(with_roots.roots, Some((sapling_root, orchard_root)));
+        assert_eq!(
+            with_roots.roots,
+            Some((sapling_root, orchard_root, ironwood_root))
+        );
         assert_eq!(with_roots.precomputed_auth_data_root, None);
         assert!(with_roots.skip_parent_check);
 
@@ -439,6 +486,85 @@ mod tests {
                 )
             ),
             "rejection uses the dedicated pre-NU5 orchard error, got: {error:?}"
+        );
+    }
+
+    /// A distinct, valid Ironwood root that is *not* the empty-tree root, for the
+    /// negative cases.
+    fn non_empty_ironwood_root() -> ironwood::tree::Root {
+        let empty = empty_ironwood_root();
+        let wrong = ironwood::tree::Root::try_from([0u8; 32])
+            .expect("zero is a valid pallas base field element");
+        assert_ne!(
+            wrong, empty,
+            "the negative cases need a root distinct from the empty-tree root"
+        );
+        wrong
+    }
+
+    /// Below `Nu6_3` the supplied Ironwood root must equal the empty-tree root (no
+    /// header commits to it there), and any other root is rejected. At/above
+    /// `Nu6_3` the MMR authenticates it, so this check accepts unconditionally.
+    #[test]
+    fn pins_ironwood_root_to_empty_below_nu6_3_and_defers_above() {
+        let network = zebra_chain::parameters::Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu6_3: Some(1_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let nu6_3 = Height(1_000);
+        let empty = empty_ironwood_root();
+        let wrong = non_empty_ironwood_root();
+
+        // Below Nu6_3: the empty root is accepted, a non-empty root is rejected.
+        let pre_nu6_3 = Height(nu6_3.0 - 1);
+        verify_supplied_ironwood_root_below_nu6_3(&network, pre_nu6_3, &empty)
+            .expect("the empty-tree root is accepted below Nu6_3");
+        let error = verify_supplied_ironwood_root_below_nu6_3(&network, pre_nu6_3, &wrong)
+            .expect_err("a non-empty ironwood root must be rejected below Nu6_3");
+        assert!(
+            matches!(
+                error,
+                ValidateContextError::InvalidBlockCommitment(
+                    CommitmentError::InvalidPreNu6_3IronwoodRoot { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-Nu6_3 ironwood error, got: {error:?}"
+        );
+
+        // Pre-Sapling/Heartwood (well below Nu6_3) is also pinned to empty.
+        verify_supplied_ironwood_root_below_nu6_3(&network, Height(1), &empty)
+            .expect("the empty-tree root is accepted at low heights");
+        verify_supplied_ironwood_root_below_nu6_3(&network, Height(1), &wrong)
+            .expect_err("a non-empty ironwood root must be rejected at low heights");
+
+        // At and above Nu6_3 the MMR path authenticates the root, so even a
+        // non-empty root is accepted here (it is checked elsewhere).
+        verify_supplied_ironwood_root_below_nu6_3(&network, nu6_3, &wrong)
+            .expect("at Nu6_3 the root is authenticated by the MMR, not pinned here");
+        verify_supplied_ironwood_root_below_nu6_3(&network, Height(nu6_3.0 + 1), &wrong)
+            .expect("above Nu6_3 the root is authenticated by the MMR, not pinned here");
+    }
+
+    #[test]
+    fn pins_ironwood_root_to_empty_when_nu6_3_is_unconfigured() {
+        let empty = empty_ironwood_root();
+        let wrong = non_empty_ironwood_root();
+
+        verify_supplied_ironwood_root_below_nu6_3(&Mainnet, Height(1), &empty)
+            .expect("the empty-tree root is accepted when Nu6_3 is unconfigured");
+        let error = verify_supplied_ironwood_root_below_nu6_3(&Mainnet, Height(1), &wrong)
+            .expect_err("a non-empty ironwood root must be rejected when Nu6_3 is unconfigured");
+        assert!(
+            matches!(
+                error,
+                ValidateContextError::InvalidBlockCommitment(
+                    CommitmentError::InvalidPreNu6_3IronwoodRoot { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-Nu6_3 ironwood error, got: {error:?}"
         );
     }
 

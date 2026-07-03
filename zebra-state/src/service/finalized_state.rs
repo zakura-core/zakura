@@ -718,7 +718,7 @@ impl FinalizedState {
 
                     let mut vct_write = VctWriteData::default();
 
-                    if let Some((sapling_root, orchard_root)) = vct_roots {
+                    if let Some((sapling_root, orchard_root, ironwood_root)) = vct_roots {
                         // The last checkpoint frontiers are the only non-successor authority that
                         // can authenticate this block's own supplied roots before they are
                         // persisted.
@@ -771,6 +771,7 @@ impl FinalizedState {
                                 block.clone(),
                                 sapling_root,
                                 orchard_root,
+                                ironwood_root,
                                 precomputed_auth_data_root,
                                 is_prevalidated,
                             ),
@@ -841,8 +842,12 @@ impl FinalizedState {
                         // below the handoff height).
                         vct_write.sync_below = vct_last_checkpoint_height;
 
-                        if let Some((sapling_frontier, orchard_frontier, sprout_frontier)) =
-                            last_checkpoint_frontiers
+                        if let Some((
+                            sapling_frontier,
+                            orchard_frontier,
+                            sprout_frontier,
+                            ironwood_frontier,
+                        )) = last_checkpoint_frontiers
                         {
                             // Last checkpoint verification: verify the supplied frontiers against
                             // this block's verified roots.
@@ -850,8 +855,10 @@ impl FinalizedState {
                                 height,
                                 &sapling_frontier,
                                 &orchard_frontier,
+                                &ironwood_frontier,
                                 &sapling_root,
                                 &orchard_root,
+                                &ironwood_root,
                             )?;
 
                             // Subtree tips are left `None`: the resuming chain recomputes
@@ -862,7 +869,7 @@ impl FinalizedState {
                                 sapling_subtree: None,
                                 orchard: orchard_frontier,
                                 orchard_subtree: None,
-                                ironwood: Arc::<ironwood::tree::NoteCommitmentTree>::default(),
+                                ironwood: ironwood_frontier,
                                 ironwood_subtree: None,
                             };
 
@@ -871,7 +878,8 @@ impl FinalizedState {
                             // above the handoff resume legacy recompute from a correct frontier.
                             self.vct.stop_vct_sync_at_last_checkpoint();
                         } else {
-                            vct_write.anchor_roots = Some((sapling_root, orchard_root));
+                            vct_write.anchor_roots =
+                                Some((sapling_root, orchard_root, ironwood_root));
 
                             // A non-handoff fast block leaves the note-commitment frontier
                             // frozen (it folds roots instead of advancing the trees), so a
@@ -1126,15 +1134,21 @@ impl FinalizedState {
     }
 
     /// Verify checkpoint handoff frontiers against this block's supplied roots.
+    #[allow(clippy::too_many_arguments)]
     fn vct_verify_last_checkpoint_frontier_roots(
         &mut self,
         height: block::Height,
         sapling_frontier: &sapling::tree::NoteCommitmentTree,
         orchard_frontier: &orchard::tree::NoteCommitmentTree,
+        ironwood_frontier: &ironwood::tree::NoteCommitmentTree,
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
+        ironwood_root: &ironwood::tree::Root,
     ) -> Result<(), CommitCheckpointVerifiedError> {
-        if sapling_frontier.root() != *sapling_root || orchard_frontier.root() != *orchard_root {
+        if sapling_frontier.root() != *sapling_root
+            || orchard_frontier.root() != *orchard_root
+            || ironwood_frontier.root() != *ironwood_root
+        {
             self.vct.clear_prevalidated_next();
             return Err(self.vct_reject_supplied_root(
                 height,

@@ -604,12 +604,20 @@ impl ZebraDb {
             None => return Default::default(),
         };
 
-        self.ironwood_tree_by_height(&height)
-            .expect("Ironwood note commitment tree must exist if there is a finalized tip")
+        self.ironwood_tree_by_height(&height).unwrap_or_else(|| {
+            // See `sapling_tree_for_tip`: the fast-sync tip frontier in the absent
+            // band is not stored and not read by the committer.
+            assert!(
+                self.vct_tree_absent(height),
+                "Ironwood note commitment tree must exist if there is a finalized tip"
+            );
+            Default::default()
+        })
     }
 
     /// Returns the Ironwood note commitment tree matching the given block height,
-    /// or `None` if the height is above the finalized tip.
+    /// or `None` if the height is above the finalized tip, or within a verified-commitment-trees
+    /// fast-synced database's `[U, H)` absent band (see [`Self::vct_tree_absent`]).
     #[allow(clippy::unwrap_in_result)]
     pub fn ironwood_tree_by_height(
         &self,
@@ -617,12 +625,22 @@ impl ZebraDb {
     ) -> Option<Arc<ironwood::tree::NoteCommitmentTree>> {
         let tip_height = self.finalized_tip_height()?;
 
+        // If we're above the tip, searching backwards would always return the tip tree.
+        // But the correct answer is "we don't know that tree yet".
         if *height > tip_height {
+            return None;
+        }
+
+        // VCT fast sync skips per-height trees in `[U, H)`, so don't let the
+        // backward search return an older stored tree for those missing heights.
+        if self.vct_tree_absent(*height) {
             return None;
         }
 
         let ironwood_trees = self.db.cf_handle("ironwood_note_commitment_tree").unwrap();
 
+        // Outside the VCT absent band, Ironwood tree rows must exist by genesis
+        // commit or the `add_ironwood_tree` upgrade.
         let (_first_duplicate_height, tree) = self
             .db
             .zs_prev_key_value_back_from(&ironwood_trees, height)
@@ -796,14 +814,13 @@ impl DiskWriteBatch {
         let auth_data_root = finalized.block.auth_data_root();
 
         // The per-block shielded transaction counts — the only ZIP-221 history-leaf inputs the
-        // header and roots don't provide — plus the Ironwood note-commitment root, stored in the
-        // serving index so a fast-synced node can serve them for header-sync verification (design
-        // §6). The Ironwood tree does not exist below Nu7, so its root is the empty-tree root for
-        // every currently-committable height (there is no per-height Ironwood tree store yet).
+        // header and roots don't provide — stored in the serving index so a fast-synced node
+        // can serve them for header-sync verification (design §6). The Ironwood root itself is
+        // sourced separately per commit path just below: the fast path uses the verified
+        // supplied root, and the legacy path uses the just-computed per-height tree's root.
         let sapling_tx = finalized.block.sapling_transactions_count();
         let orchard_tx = finalized.block.orchard_transactions_count();
         let ironwood_tx = finalized.block.ironwood_transactions_count();
-        let ironwood_root = ironwood::tree::NoteCommitmentTree::default().root();
 
         // Record the upgrade height `U` once, on the first block this binary commits: the lowest
         // height in the serving index, and the boundary below which roots are served from the
@@ -830,9 +847,10 @@ impl DiskWriteBatch {
         // tree CFs and subtrees entirely. The Sprout tree is unchanged below any
         // modern checkpoint, so it is correctly left untouched here.
         // See docs/design/verified-commitment-trees.md.
-        if let Some((sapling_root, orchard_root)) = fast_write.anchor_roots {
+        if let Some((sapling_root, orchard_root, ironwood_root)) = fast_write.anchor_roots {
             self.insert_sapling_anchor(zebra_db, &sapling_root);
             self.insert_orchard_anchor(zebra_db, &orchard_root);
+            self.insert_ironwood_anchor(zebra_db, &ironwood_root);
             // Persist the per-height roots into the serving index even though no per-height
             // tree is written, so this fast-synced node can still serve `tree_aux` roots
             // (design §4); otherwise the root-serving fleet collapses as nodes fast-sync.
@@ -908,7 +926,7 @@ impl DiskWriteBatch {
             *height,
             &note_commitment_trees.sapling.root(),
             &note_commitment_trees.orchard.root(),
-            &ironwood_root,
+            &note_commitment_trees.ironwood.root(),
             sapling_tx,
             orchard_tx,
             ironwood_tx,
@@ -1147,6 +1165,13 @@ impl DiskWriteBatch {
     pub fn insert_orchard_anchor(&mut self, zebra_db: &ZebraDb, root: &orchard::tree::Root) {
         let orchard_anchors = zebra_db.db.cf_handle("orchard_anchors").unwrap();
         self.zs_insert(&orchard_anchors, root, ());
+    }
+
+    /// Inserts only the Ironwood anchor `root` (value `()`), without writing a
+    /// per-height tree. The Ironwood twin of [`Self::insert_orchard_anchor`].
+    pub fn insert_ironwood_anchor(&mut self, zebra_db: &ZebraDb, root: &ironwood::tree::Root) {
+        let ironwood_anchors = zebra_db.db.cf_handle("ironwood_anchors").unwrap();
+        self.zs_insert(&ironwood_anchors, root, ());
     }
 
     /// Inserts the Orchard note commitment subtree into the batch.

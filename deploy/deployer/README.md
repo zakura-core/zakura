@@ -106,6 +106,32 @@ The dashboard reads the generated deployer node config and polls each node over
 SSH. It shows the running commit from the node log, last restart time, current
 RPC height, and whether the height advanced in the last five minutes.
 
+The workflow also refreshes a static Zakura Ironwood testnet snapshots website on
+`zakura-testnet-1`:
+
+- service: `zakura-testnet-snapshots.service`
+- URL: `http://167.99.103.111:8091/`
+- install dir: `/opt/zakura-testnet-snapshots/site`
+- upload dir: `/opt/zakura-testnet-snapshots/site/files`
+- metadata: `/opt/zakura-testnet-snapshots/site/snapshots.json`
+
+The deploy refreshes `index.html` but does not delete uploaded snapshot files or
+overwrite an existing host-side `snapshots.json`. To publish a snapshot manually,
+upload the archive and then edit the metadata on the runner host:
+
+```bash
+scp zakura-ironwood-testnet-archive-YYYYMMDD-height.tar.zst \
+  root@167.99.103.111:/opt/zakura-testnet-snapshots/site/files/
+
+ssh root@167.99.103.111 \
+  '$EDITOR /opt/zakura-testnet-snapshots/site/snapshots.json'
+```
+
+Each enabled metadata entry needs `kind` (`archive` or `pruned`), `group`
+(`daily`, `monthly`, or `historical`), `file`, `published`, and `sha256`.
+Optional display fields include `name`, `size`, `height`, `zebraVersion`, and
+`dbFormat`. Entries with `"enabled": false` are kept as hidden examples.
+
 Manual run from a host with SSH access to every node:
 
 ```bash

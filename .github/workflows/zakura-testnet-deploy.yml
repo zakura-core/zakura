@@ -234,6 +234,42 @@ jobs:
           sudo systemctl restart zakura-testnet-dashboard.service
           sudo systemctl --no-pager --full status zakura-testnet-dashboard.service || true
 
+      - name: Install snapshots website
+        if: always()
+        run: |
+          set -euo pipefail
+
+          site_dir="/opt/zakura-testnet-snapshots/site"
+          sudo install -d -m 755 "$site_dir"
+          sudo install -d -m 755 "$site_dir/files"
+          sudo install -m 644 deploy/deployer/testnet/snapshots-site/index.html "$site_dir/index.html"
+
+          if ! sudo test -f "$site_dir/snapshots.json"; then
+            sudo install -m 644 deploy/deployer/testnet/snapshots-site/snapshots.json "$site_dir/snapshots.json"
+          fi
+
+          sudo tee /etc/systemd/system/zakura-testnet-snapshots.service >/dev/null <<'EOF'
+          [Unit]
+          Description=Zakura testnet snapshots website
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/zakura-testnet-snapshots/site
+          ExecStart=/usr/bin/python3 -m http.server 8091 --bind 0.0.0.0 --directory /opt/zakura-testnet-snapshots/site
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-testnet-snapshots.service
+          sudo systemctl restart zakura-testnet-snapshots.service
+          sudo systemctl --no-pager --full status zakura-testnet-snapshots.service || true
+
       - name: Fetch recent logs on failure
         if: failure()
         working-directory: deploy/deployer

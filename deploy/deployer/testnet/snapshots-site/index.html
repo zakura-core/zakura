@@ -1,0 +1,818 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Zakura Ironwood testnet snapshots">
+    <title>Zakura Ironwood Testnet Snapshots</title>
+    <link rel="icon" href="https://avatars.githubusercontent.com/u/272444516?s=200&v=4" type="image/png">
+    <style>
+      :root {
+        color-scheme: dark;
+        --void: #080610;
+        --base: #0e0c18;
+        --surface: #131120;
+        --overlay: #1a1728;
+        --line: #221f32;
+        --line-hi: #2e2a42;
+        --ink: #e2dff0;
+        --muted: #7a7494;
+        --dim: #3f3a56;
+        --pink: #c2457a;
+        --pink-hi: #e0609a;
+        --pink-soft: rgba(194, 69, 122, 0.10);
+        --code-bg: #09080f;
+        --code-ink: #ccc8e0;
+        --green: #7ecfb0;
+        --r: 14px;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top left, rgba(194, 69, 122, 0.12), transparent 32rem),
+          var(--void);
+        font: 15px/1.65 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+      }
+
+      h1, h2, h3, p { margin: 0; }
+
+      h1 {
+        color: var(--ink);
+        font-size: clamp(1.45rem, 3.5vw, 2.45rem);
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        line-height: 1.1;
+      }
+
+      h2 {
+        color: var(--ink);
+        font-size: 1.05rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      h3 {
+        margin-bottom: 8px;
+        color: var(--muted);
+        font-size: 0.7rem;
+        font-weight: 700;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      a { color: var(--pink-hi); text-decoration: none; }
+      a:hover { color: #f080b8; text-decoration: underline; }
+
+      .shell {
+        width: min(1120px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 36px 0 80px;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 22px 26px;
+        background: var(--surface);
+        border: 1px solid var(--line-hi);
+        border-radius: var(--r);
+        box-shadow:
+          0 0 0 1px rgba(194, 69, 122, 0.08),
+          0 8px 48px rgba(0, 0, 0, 0.55),
+          0 1px 0 rgba(255, 255, 255, 0.03) inset;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        min-width: 0;
+      }
+
+      .brand-icon {
+        width: 46px;
+        height: 46px;
+        border: 2px solid var(--pink);
+        border-radius: 50%;
+        box-shadow: 0 0 0 4px var(--pink-soft), 0 4px 20px rgba(0, 0, 0, 0.5);
+        flex-shrink: 0;
+        object-fit: cover;
+      }
+
+      .brand-wordmark {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        min-width: 0;
+      }
+
+      .eyebrow {
+        color: var(--muted);
+        font-size: 0.72rem;
+        font-weight: 500;
+        letter-spacing: 0.03em;
+      }
+
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        min-height: 32px;
+        padding: 0 14px;
+        border: 1px solid rgba(194, 69, 122, 0.35);
+        border-radius: 999px;
+        background: var(--pink-soft);
+        color: var(--pink-hi);
+        font-size: 0.73rem;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .status::before {
+        content: '';
+        display: block;
+        width: 6px;
+        height: 6px;
+        background: var(--pink-hi);
+        border-radius: 50%;
+        box-shadow: 0 0 8px var(--pink-hi);
+        animation: bloom 2.8s ease-in-out infinite;
+      }
+
+      @keyframes bloom {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.3; transform: scale(0.7); }
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+        margin-top: 16px;
+      }
+
+      .panel {
+        min-width: 0;
+        padding: 24px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--r);
+        overflow: hidden;
+        position: relative;
+        transition: border-color 0.2s;
+      }
+
+      .panel:hover { border-color: var(--line-hi); }
+      .panel-full { grid-column: 1 / -1; }
+      .panel-soft { background: var(--overlay); }
+
+      .panel-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 14px;
+        flex-wrap: wrap;
+      }
+
+      .body-copy {
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+
+      .summary-list {
+        margin: 12px 0 0;
+        padding-left: 18px;
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+
+      .summary-list li + li { margin-top: 8px; }
+      .summary-list strong { color: var(--ink); }
+
+      .snapshot-summary {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+        margin-top: 18px;
+      }
+
+      .summary-card {
+        padding: 12px;
+        background: var(--base);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+
+      .summary-card span {
+        display: block;
+        color: var(--muted);
+        font-size: 0.68rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .summary-card strong {
+        display: block;
+        margin-top: 3px;
+        color: var(--ink);
+        font-size: 0.9rem;
+        overflow-wrap: anywhere;
+      }
+
+      .mode-toggle {
+        display: inline-flex;
+        align-items: center;
+        border: 1px solid var(--line-hi);
+        border-radius: 999px;
+        background: var(--base);
+        padding: 3px;
+        gap: 2px;
+      }
+
+      .mode-toggle button {
+        min-height: 26px;
+        padding: 0 12px;
+        border: 0;
+        border-radius: 999px;
+        background: transparent;
+        color: var(--muted);
+        cursor: pointer;
+        font: inherit;
+        font-size: 0.73rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        transition: color 0.18s, background 0.18s;
+      }
+
+      .mode-toggle button.active {
+        background: var(--pink);
+        color: #fff;
+        box-shadow: 0 2px 10px rgba(194, 69, 122, 0.35);
+      }
+
+      .mode-toggle button:not(.active):hover { color: var(--ink); }
+      .mode-toggle button:focus-visible {
+        outline: 2px solid var(--pink-hi);
+        outline-offset: 2px;
+      }
+
+      .snapshot-list {
+        display: grid;
+        gap: 14px;
+        margin-top: 16px;
+      }
+
+      .snapshot-group + .snapshot-group { margin-top: 22px; }
+
+      .snapshot-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 16px;
+        padding: 14px;
+        background: var(--overlay);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+
+      .snapshot-row:hover { border-color: var(--line-hi); }
+
+      .snapshot-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .snapshot-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 14px;
+        margin-top: 7px;
+        color: var(--muted);
+        font-size: 0.82rem;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        min-height: 22px;
+        padding: 0 9px;
+        border: 1px solid rgba(194, 69, 122, 0.26);
+        border-radius: 999px;
+        background: var(--pink-soft);
+        color: var(--pink-hi);
+        font-size: 0.68rem;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+
+      .actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+
+      .button-link {
+        display: inline-flex;
+        align-items: center;
+        min-height: 32px;
+        padding: 0 12px;
+        border: 1px solid var(--line-hi);
+        border-radius: 8px;
+        background: var(--base);
+        color: var(--ink);
+        font-size: 0.78rem;
+        font-weight: 700;
+      }
+
+      .button-link:hover {
+        background: var(--line-hi);
+        color: var(--ink);
+        text-decoration: none;
+      }
+
+      .code-block {
+        position: relative;
+        margin-top: 10px;
+        background: var(--code-bg);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+      }
+
+      pre {
+        width: calc(100% - 44px);
+        margin: 0;
+        padding: 14px 16px;
+        overflow-x: auto;
+        background: transparent;
+        color: var(--code-ink);
+        white-space: pre;
+      }
+
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+        font-size: 12.5px;
+        line-height: 1.7;
+      }
+
+      .copy {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        z-index: 1;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 26px;
+        padding: 0;
+        border: 1px solid var(--line-hi);
+        border-radius: 7px;
+        background: var(--overlay);
+        color: var(--muted);
+        cursor: pointer;
+        font: inherit;
+        font-size: 11px;
+        font-weight: 700;
+        transition: border-color 0.15s, background 0.15s, color 0.15s;
+      }
+
+      .copy.inline {
+        position: static;
+        width: 30px;
+        background: var(--base);
+      }
+
+      .copy:hover {
+        background: var(--line-hi);
+        color: var(--ink);
+      }
+
+      .copy.done {
+        border-color: var(--line-hi);
+        color: var(--green);
+        background: rgba(126, 207, 176, 0.08);
+      }
+
+      .copy.failed {
+        border-color: #5a2040;
+        color: #d06080;
+        background: rgba(90, 32, 64, 0.2);
+      }
+
+      .copy svg {
+        width: 14px;
+        height: 14px;
+        fill: none;
+        stroke: currentColor;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 2;
+      }
+
+      .note {
+        margin-top: 9px;
+        color: var(--dim);
+        font-size: 0.85rem;
+      }
+
+      .placeholder {
+        margin-top: 10px;
+        padding: 12px 14px;
+        border: 1px dashed var(--line-hi);
+        border-radius: 8px;
+        color: var(--muted);
+        background: var(--base);
+      }
+
+      @media (max-width: 900px) {
+        .grid, .snapshot-summary { grid-template-columns: 1fr; }
+        .snapshot-row { grid-template-columns: 1fr; }
+        .actions { justify-content: flex-start; }
+      }
+
+      @media (max-width: 760px) {
+        .shell {
+          width: min(100% - 20px, 1120px);
+          padding-top: 16px;
+        }
+
+        .topbar {
+          flex-direction: column;
+          align-items: flex-start;
+        }
+
+        .panel { padding: 18px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar" aria-label="Page header">
+        <div class="brand">
+          <img
+            src="https://avatars.githubusercontent.com/u/272444516?s=200&v=4"
+            alt="Valar Group"
+            class="brand-icon"
+            width="44"
+            height="44">
+          <div class="brand-wordmark">
+            <p class="eyebrow">Zakura Ironwood testnet quick-sync</p>
+            <h1>Zakura Snapshots</h1>
+          </div>
+        </div>
+        <div class="status">Testnet</div>
+      </section>
+
+      <section class="grid">
+        <article class="panel panel-full">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Zakura Ironwood testnet</p>
+              <h2>State snapshots for manual restore.</h2>
+            </div>
+            <div class="mode-toggle" aria-label="Snapshot type">
+              <button type="button" class="active" data-kind="archive" aria-pressed="true">Archive</button>
+              <button type="button" data-kind="pruned" aria-pressed="false">Pruned</button>
+            </div>
+          </div>
+          <p class="body-copy">
+            Download a checksum-verified copy of the testnet chain state, extract it into the Zakura cache directory, and bring the node up to the chain tip.
+          </p>
+          <div id="latest-empty" class="placeholder" hidden>
+            No enabled snapshots are listed yet. Upload snapshot files into <code>/opt/zakura-testnet-snapshots/site/files</code> and add entries to <code>/opt/zakura-testnet-snapshots/site/snapshots.json</code>.
+          </div>
+          <div id="latest-panel">
+            <div class="snapshot-summary">
+              <div class="summary-card">
+                <span>Latest snapshot</span>
+                <strong id="latest-name">...</strong>
+              </div>
+              <div class="summary-card">
+                <span>Size</span>
+                <strong id="latest-size">...</strong>
+              </div>
+              <div class="summary-card">
+                <span>Published</span>
+                <strong id="latest-published">...</strong>
+              </div>
+              <div class="summary-card">
+                <span>Height</span>
+                <strong id="latest-height">...</strong>
+              </div>
+            </div>
+            <div class="snapshot-summary">
+              <div class="summary-card">
+                <span>Zebra</span>
+                <strong id="latest-zebra">...</strong>
+              </div>
+              <div class="summary-card">
+                <span>DB format</span>
+                <strong id="latest-db-format">...</strong>
+              </div>
+              <div class="summary-card">
+                <span>sha256</span>
+                <strong id="latest-sha">...</strong>
+              </div>
+              <div class="summary-card">
+                <span>Download</span>
+                <strong><a id="latest-download" href="#">snapshot file</a></strong>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-header">
+            <h2>Run a node</h2>
+          </div>
+          <p class="body-copy">Install Zakura from the ValarGroup release assets, then run it on testnet.</p>
+          <div class="code-block">
+            <pre><code id="run-command">curl -fsSL https://github.com/valargroup/zebra/releases/latest/download/install-zakura.sh | bash</code></pre>
+            <button class="copy" type="button" data-copy="run-command" aria-label="Copy run command" title="Copy"><span class="copy-icon" aria-hidden="true"></span></button>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-header">
+            <h2>Restore</h2>
+          </div>
+          <p class="body-copy">Stop the node, download the selected snapshot, verify it, extract it, and restart.</p>
+          <div class="code-block">
+            <pre><code id="restore-command">Select a snapshot to build the restore command.</code></pre>
+            <button class="copy" type="button" data-copy="restore-command" aria-label="Copy restore command" title="Copy"><span class="copy-icon" aria-hidden="true"></span></button>
+          </div>
+          <p class="note">Commands assume the runner host serves this page on port 8091.</p>
+        </article>
+
+        <article class="panel panel-full">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Available snapshots</p>
+              <h2>Daily, monthly, and historical points.</h2>
+            </div>
+          </div>
+          <div id="snapshot-list" class="snapshot-list"></div>
+        </article>
+      </section>
+    </main>
+
+    <script>
+      const copyIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="1"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+      const checkIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>';
+      const siteDefaults = {
+        baseUrl: "http://167.99.103.111:8091",
+        cacheDir: "/mnt/zakura-testnet-1-data/zebra-cache",
+        archiveName: "state.tar.zst"
+      };
+      const groupLabels = {
+        daily: "daily last uploads",
+        monthly: "monthly anchors",
+        historical: "historical useful points"
+      };
+      let state = {
+        kind: "archive",
+        baseUrl: siteDefaults.baseUrl,
+        snapshots: []
+      };
+
+      function text(value, fallback = "...") {
+        if (value === undefined || value === null || value === "") return fallback;
+        return String(value);
+      }
+
+      function enabledSnapshots(data) {
+        return (data.snapshots || [])
+          .filter((snapshot) => snapshot.enabled !== false)
+          .filter((snapshot) => snapshot.kind && snapshot.file)
+          .sort((a, b) => text(b.published, "").localeCompare(text(a.published, "")));
+      }
+
+      function snapshotUrl(snapshot) {
+        if (snapshot.url) return snapshot.url;
+        return `${state.baseUrl.replace(/\/$/, "")}/files/${encodeURIComponent(snapshot.file)}`;
+      }
+
+      function shellQuote(value) {
+        return `'${String(value).replace(/'/g, "'\\''")}'`;
+      }
+
+      function restoreCommand(snapshot) {
+        if (!snapshot) return "Select a snapshot to build the restore command.";
+        const url = snapshotUrl(snapshot);
+        const fileName = snapshot.file || siteDefaults.archiveName;
+        return [
+          "sudo systemctl stop zebrad",
+          `curl -fL -o ${shellQuote(fileName)} ${shellQuote(url)}`,
+          `echo ${shellQuote(`${text(snapshot.sha256, "replace-with-sha256")}  ${fileName}`)} | sha256sum -c -`,
+          `sudo mkdir -p ${siteDefaults.cacheDir}`,
+          `sudo tar --zstd -xf ${shellQuote(fileName)} -C ${siteDefaults.cacheDir}`,
+          "sudo systemctl start zebrad"
+        ].join("\n");
+      }
+
+      function setLatest(snapshot) {
+        const empty = document.getElementById("latest-empty");
+        const panel = document.getElementById("latest-panel");
+        empty.hidden = Boolean(snapshot);
+        panel.hidden = !snapshot;
+        if (!snapshot) {
+          document.getElementById("restore-command").textContent = restoreCommand(null);
+          return;
+        }
+
+        document.getElementById("latest-name").textContent = text(snapshot.name || snapshot.file);
+        document.getElementById("latest-size").textContent = text(snapshot.size);
+        document.getElementById("latest-published").textContent = text(snapshot.published);
+        document.getElementById("latest-height").textContent = text(snapshot.height);
+        document.getElementById("latest-zebra").textContent = text(snapshot.zebraVersion);
+        document.getElementById("latest-db-format").textContent = text(snapshot.dbFormat);
+        document.getElementById("latest-sha").textContent = text(snapshot.sha256).slice(0, 16) + "...";
+        document.getElementById("latest-download").href = snapshotUrl(snapshot);
+        document.getElementById("restore-command").textContent = restoreCommand(snapshot);
+      }
+
+      function rowFor(snapshot) {
+        const row = document.createElement("article");
+        row.className = "snapshot-row";
+        const body = document.createElement("div");
+        const title = document.createElement("div");
+        title.className = "snapshot-title";
+        const name = document.createElement("strong");
+        name.textContent = text(snapshot.name || snapshot.file);
+        const pill = document.createElement("span");
+        pill.className = "pill";
+        pill.textContent = text(snapshot.kind);
+        title.append(name, pill);
+        const meta = document.createElement("div");
+        meta.className = "snapshot-meta";
+        meta.textContent = [
+          `height ${text(snapshot.height, "unknown")}`,
+          text(snapshot.size, "size unknown"),
+          `published ${text(snapshot.published, "unknown")}`,
+          `db ${text(snapshot.dbFormat, "unknown")}`
+        ].join(" / ");
+        body.append(title, meta);
+
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        const link = document.createElement("a");
+        link.className = "button-link";
+        link.href = snapshotUrl(snapshot);
+        link.textContent = "Download";
+        const copy = document.createElement("button");
+        copy.className = "copy inline";
+        copy.type = "button";
+        copy.dataset.copyText = text(snapshot.sha256, "");
+        copy.setAttribute("aria-label", "Copy sha256");
+        copy.title = "Copy sha256";
+        copy.innerHTML = '<span class="copy-icon" aria-hidden="true"></span>';
+        actions.append(link, copy);
+        row.append(body, actions);
+        attachCopyButton(copy);
+        return row;
+      }
+
+      function renderList(snapshots) {
+        const list = document.getElementById("snapshot-list");
+        list.textContent = "";
+        if (!snapshots.length) {
+          const placeholder = document.createElement("div");
+          placeholder.className = "placeholder";
+          placeholder.textContent = "No enabled snapshots are listed for this mode yet.";
+          list.append(placeholder);
+          return;
+        }
+
+        for (const group of ["daily", "monthly", "historical"]) {
+          const groupSnapshots = snapshots.filter((snapshot) => (snapshot.group || "daily") === group);
+          if (!groupSnapshots.length) continue;
+          const section = document.createElement("section");
+          section.className = "snapshot-group";
+          const heading = document.createElement("h3");
+          heading.textContent = groupLabels[group] || group;
+          section.append(heading, ...groupSnapshots.map(rowFor));
+          list.append(section);
+        }
+      }
+
+      function render() {
+        const filtered = state.snapshots.filter((snapshot) => snapshot.kind === state.kind);
+        setLatest(filtered[0]);
+        renderList(filtered);
+      }
+
+      function copySelectionFrom(element) {
+        if (!element || !window.getSelection) return false;
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        let copied = false;
+        try { copied = document.execCommand("copy"); }
+        finally { selection.removeAllRanges(); }
+        return copied;
+      }
+
+      async function copyText(value, sourceElement) {
+        if (navigator.clipboard && window.isSecureContext) {
+          try { await navigator.clipboard.writeText(value); return true; }
+          catch {}
+        }
+        const textarea = document.createElement("textarea");
+        textarea.value = value;
+        textarea.setAttribute("readonly", "");
+        textarea.style.cssText = "position:fixed;top:-1000px;left:-1000px";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        let copied = false;
+        try { copied = document.execCommand("copy"); }
+        finally { textarea.remove(); }
+        return copied || copySelectionFrom(sourceElement);
+      }
+
+      function attachCopyButton(button) {
+        const icon = button.querySelector(".copy-icon");
+        if (icon) icon.innerHTML = copyIcon;
+        button.addEventListener("click", async () => {
+          const defaultLabel = button.getAttribute("aria-label") || "Copy";
+          const source = button.dataset.copy
+            ? document.getElementById(button.dataset.copy)
+            : null;
+          const value = button.dataset.copyText || (source ? source.textContent.trim() : "");
+          try {
+            if (!value) throw new Error("nothing to copy");
+            const ok = await copyText(value, source);
+            if (!ok) throw new Error("copy failed");
+            if (icon) icon.innerHTML = checkIcon;
+            button.classList.add("done");
+            button.setAttribute("aria-label", "Copied");
+            button.title = "Copied";
+            setTimeout(() => {
+              if (icon) icon.innerHTML = copyIcon;
+              button.classList.remove("done");
+              button.setAttribute("aria-label", defaultLabel);
+              button.title = "Copy";
+            }, 1400);
+          } catch {
+            button.classList.add("failed");
+            button.setAttribute("aria-label", "Copy failed");
+            setTimeout(() => {
+              button.classList.remove("failed");
+              button.setAttribute("aria-label", defaultLabel);
+              button.title = "Copy";
+            }, 1400);
+          }
+        });
+      }
+
+      for (const button of document.querySelectorAll("[data-kind]")) {
+        button.addEventListener("click", () => {
+          state.kind = button.dataset.kind;
+          for (const candidate of document.querySelectorAll("[data-kind]")) {
+            const selected = candidate === button;
+            candidate.classList.toggle("active", selected);
+            candidate.setAttribute("aria-pressed", selected ? "true" : "false");
+          }
+          render();
+        });
+      }
+
+      for (const button of document.querySelectorAll(".copy")) {
+        attachCopyButton(button);
+      }
+
+      fetch("snapshots.json", { cache: "no-store" })
+        .then((response) => {
+          if (!response.ok) throw new Error(`snapshots.json returned ${response.status}`);
+          return response.json();
+        })
+        .then((data) => {
+          state.baseUrl = data.siteBaseUrl || siteDefaults.baseUrl;
+          state.snapshots = enabledSnapshots(data);
+          render();
+        })
+        .catch(() => {
+          state.snapshots = [];
+          render();
+        });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,33 @@
+{
+  "siteBaseUrl": "http://167.99.103.111:8091",
+  "network": "Zakura Ironwood testnet",
+  "updatedAt": "",
+  "snapshots": [
+    {
+      "enabled": false,
+      "name": "Example archive snapshot",
+      "kind": "archive",
+      "group": "daily",
+      "file": "zakura-ironwood-testnet-archive-YYYYMMDD-height.tar.zst",
+      "size": "0 GiB",
+      "published": "YYYY-MM-DD",
+      "height": "0",
+      "zebraVersion": "zebrad 2.x.x",
+      "dbFormat": "0",
+      "sha256": "replace-with-lowercase-sha256"
+    },
+    {
+      "enabled": false,
+      "name": "Example pruned snapshot",
+      "kind": "pruned",
+      "group": "daily",
+      "file": "zakura-ironwood-testnet-pruned-YYYYMMDD-height.tar.zst",
+      "size": "0 GiB",
+      "published": "YYYY-MM-DD",
+      "height": "0",
+      "zebraVersion": "zebrad 2.x.x",
+      "dbFormat": "0",
+      "sha256": "replace-with-lowercase-sha256"
+    }
+  ]
+}

@@ -334,56 +334,379 @@ def coerce_int(value) -> int | None:
         return None
 
 
-PAGE = r"""<!doctype html><html><head><meta charset=utf-8><title>Zebra cluster status</title>
+PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Zakura Ironwood testnet cluster status">
+<title>Zakura cluster status</title>
+<link rel="icon" href="https://avatars.githubusercontent.com/u/272444516?s=200&v=4" type="image/png">
 <style>
-body{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#d7dde5}
-header{padding:14px 18px;background:#161b22;border-bottom:1px solid #30363d}
-h1{font-size:16px;margin:0 0 4px;font-weight:600}.sub{font-size:12px;color:#8b949e}
-main{padding:14px 18px}.summary{margin-bottom:12px;font-size:13px;color:#8b949e}
-table{width:100%;border-collapse:collapse;background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}
-th,td{padding:9px 10px;border-bottom:1px solid #30363d;text-align:left;font-size:13px;vertical-align:top}
-th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;background:#0f141b}
-tr:last-child td{border-bottom:0}.num{text-align:right;font-variant-numeric:tabular-nums}
-.badge{display:inline-block;border-radius:999px;padding:2px 8px;font-size:12px;font-weight:600}
-.healthy{background:#12351f;color:#3fb950}.stale{background:#3a2d12;color:#e3b341}
-.down,.rpc_error{background:#3d1417;color:#ff7b72}.starting{background:#21262d;color:#8b949e}
-.muted{color:#8b949e}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-</style></head><body>
-<header><h1>Zebra cluster status</h1><div class=sub id=status>connecting...</div></header>
-<main><div class=summary id=summary></div><table>
-<thead><tr><th>Node</th><th>Health</th><th>Commit</th><th>Last restarted</th><th class=num>Height</th><th>Last advanced</th><th>Details</th></tr></thead>
-<tbody id=rows></tbody></table></main>
+:root {
+  color-scheme: dark;
+  --void: #080610;
+  --base: #0e0c18;
+  --surface: #131120;
+  --overlay: #1a1728;
+  --line: #221f32;
+  --line-hi: #2e2a42;
+  --ink: #e2dff0;
+  --muted: #7a7494;
+  --dim: #3f3a56;
+  --pink: #c2457a;
+  --pink-hi: #e0609a;
+  --pink-soft: rgba(194, 69, 122, 0.10);
+  --green: #7ecfb0;
+  --yellow: #e3b341;
+  --red: #ff7b72;
+  --r: 14px;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at top left, rgba(194, 69, 122, 0.12), transparent 32rem),
+    var(--void);
+  font: 15px/1.65 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+h1, h2, p { margin: 0; }
+h1 {
+  color: var(--ink);
+  font-size: clamp(1.45rem, 3.5vw, 2.45rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+h2 {
+  color: var(--ink);
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.shell {
+  width: min(1120px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 36px 0 80px;
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 22px 26px;
+  background: var(--surface);
+  border: 1px solid var(--line-hi);
+  border-radius: var(--r);
+  box-shadow:
+    0 0 0 1px rgba(194, 69, 122, 0.08),
+    0 8px 48px rgba(0, 0, 0, 0.55),
+    0 1px 0 rgba(255, 255, 255, 0.03) inset;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+.brand-icon {
+  width: 46px;
+  height: 46px;
+  border: 2px solid var(--pink);
+  border-radius: 50%;
+  box-shadow: 0 0 0 4px var(--pink-soft), 0 4px 20px rgba(0, 0, 0, 0.5);
+  flex-shrink: 0;
+  object-fit: cover;
+}
+.brand-wordmark {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.eyebrow {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+}
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 0 14px;
+  border: 1px solid rgba(194, 69, 122, 0.35);
+  border-radius: 999px;
+  background: var(--pink-soft);
+  color: var(--pink-hi);
+  font-size: 0.73rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.status::before {
+  content: '';
+  display: block;
+  width: 6px;
+  height: 6px;
+  background: var(--pink-hi);
+  border-radius: 50%;
+  box-shadow: 0 0 8px var(--pink-hi);
+  animation: bloom 2.8s ease-in-out infinite;
+}
+@keyframes bloom {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.3; transform: scale(0.7); }
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+.panel {
+  min-width: 0;
+  padding: 24px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  overflow: hidden;
+  position: relative;
+  transition: border-color 0.2s;
+}
+.panel:hover { border-color: var(--line-hi); }
+.panel-full { grid-column: 1 / -1; }
+.panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+.body-copy {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.summary-card {
+  padding: 12px;
+  background: var(--base);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.summary-card span {
+  display: block;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.summary-card strong {
+  display: block;
+  margin-top: 3px;
+  color: var(--ink);
+  font-size: 0.95rem;
+  overflow-wrap: anywhere;
+}
+.table-wrap {
+  margin-top: 16px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--overlay);
+}
+table {
+  width: 100%;
+  min-width: 860px;
+  border-collapse: collapse;
+}
+th, td {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  font-size: 0.86rem;
+  vertical-align: top;
+}
+th {
+  background: var(--base);
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+tr:last-child td { border-bottom: 0; }
+tbody tr:hover td { background: rgba(46, 42, 66, 0.35); }
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 9px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.healthy {
+  border: 1px solid rgba(126, 207, 176, 0.35);
+  background: rgba(126, 207, 176, 0.08);
+  color: var(--green);
+}
+.stale {
+  border: 1px solid rgba(227, 179, 65, 0.35);
+  background: rgba(227, 179, 65, 0.08);
+  color: var(--yellow);
+}
+.down, .rpc_error {
+  border: 1px solid rgba(255, 123, 114, 0.35);
+  background: rgba(255, 123, 114, 0.08);
+  color: var(--red);
+}
+.starting {
+  border: 1px solid var(--line-hi);
+  background: var(--base);
+  color: var(--muted);
+}
+.muted { color: var(--muted); }
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.82rem;
+}
+.details {
+  max-width: 280px;
+  color: var(--muted);
+}
+@media (max-width: 900px) {
+  .grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 760px) {
+  .shell {
+    width: min(100% - 20px, 1120px);
+    padding-top: 16px;
+  }
+  .topbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .panel { padding: 18px; }
+}
+</style>
+</head>
+<body>
+<main class="shell">
+  <section class="topbar" aria-label="Page header">
+    <div class="brand">
+      <img src="https://avatars.githubusercontent.com/u/272444516?s=200&v=4" alt="Valar Group" class="brand-icon" width="44" height="44">
+      <div class="brand-wordmark">
+        <p class="eyebrow">Zakura Ironwood testnet observability</p>
+        <h1>Zakura Cluster Status</h1>
+      </div>
+    </div>
+    <div class="status" id="status">Connecting</div>
+  </section>
+
+  <section class="grid" aria-label="Cluster summary">
+    <article class="summary-card">
+      <span>Healthy nodes</span>
+      <strong id="healthy-count">...</strong>
+    </article>
+    <article class="summary-card">
+      <span>Last poll</span>
+      <strong id="last-poll">...</strong>
+    </article>
+    <article class="summary-card">
+      <span>Stale window</span>
+      <strong id="stale-window">...</strong>
+    </article>
+  </section>
+
+  <section class="panel panel-full" style="margin-top:16px;">
+    <div class="panel-header">
+      <div>
+        <p class="eyebrow">Fleet health</p>
+        <h2>Live node status</h2>
+      </div>
+      <p class="body-copy" id="summary">Waiting for first poll...</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Node</th>
+            <th>Health</th>
+            <th>Commit</th>
+            <th>Last restarted</th>
+            <th class="num">Height</th>
+            <th>Last advanced</th>
+            <th>Details</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
 <script>
-function age(seconds){
- if(seconds==null)return 'never observed';
- if(seconds<60)return Math.round(seconds)+'s ago';
- if(seconds<3600)return Math.round(seconds/60)+'m ago';
- return Math.round(seconds/3600)+'h ago';
+function age(seconds) {
+  if (seconds == null) return 'never observed';
+  if (seconds < 60) return Math.round(seconds) + 's ago';
+  if (seconds < 3600) return Math.round(seconds / 60) + 'm ago';
+  return Math.round(seconds / 3600) + 'h ago';
 }
-function shortCommit(c){return c?c.slice(0,12):'unknown'}
-function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-async function tick(){
- let data;
- try{data=await (await fetch('/data')).json()}catch(e){
-  document.getElementById('status').textContent='dashboard unreachable';return;
- }
- const poll=data.last_poll?new Date(data.last_poll*1000).toLocaleString():'not yet polled';
- document.getElementById('status').textContent='last poll: '+poll+' | stale after '+Math.round(data.stale_after)+'s';
- document.getElementById('summary').textContent=data.healthy+' / '+data.total+' nodes healthy';
- const body=document.getElementById('rows');
- body.innerHTML=data.rows.map(r=>`
-  <tr>
-   <td><div>${esc(r.name)}</div><div class="muted mono">${esc(r.ssh)}</div></td>
-   <td><span class="badge ${esc(r.health)}">${esc(r.health)}</span></td>
-   <td class=mono title="${esc(r.commit)}">${esc(shortCommit(r.commit))}</td>
-   <td>${esc(r.last_restarted||'unknown')}</td>
-   <td class="num mono">${r.height==null?'--':esc(r.height)}</td>
-   <td>${esc(age(r.seconds_since_advanced))}</td>
-   <td>${esc(r.detail||'')}</td>
-  </tr>`).join('');
+function shortCommit(commit) { return commit ? commit.slice(0, 12) : 'unknown'; }
+function esc(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, (match) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[match]));
 }
-tick();setInterval(tick,10000);
-</script></body></html>"""
+async function tick() {
+  let data;
+  try {
+    const response = await fetch('/data', { cache: 'no-store' });
+    data = await response.json();
+  } catch (error) {
+    document.getElementById('status').textContent = 'Unreachable';
+    document.getElementById('summary').textContent = 'Dashboard data endpoint is unreachable.';
+    return;
+  }
+  const poll = data.last_poll ? new Date(data.last_poll * 1000).toLocaleString() : 'not yet polled';
+  document.getElementById('status').textContent = data.healthy === data.total ? 'Healthy' : 'Degraded';
+  document.getElementById('healthy-count').textContent = data.healthy + ' / ' + data.total;
+  document.getElementById('last-poll').textContent = poll;
+  document.getElementById('stale-window').textContent = Math.round(data.stale_after) + 's';
+  document.getElementById('summary').textContent = data.healthy + ' / ' + data.total + ' nodes healthy';
+  const body = document.getElementById('rows');
+  body.innerHTML = data.rows.map((row) => `
+    <tr>
+      <td><div>${esc(row.name)}</div><div class="muted mono">${esc(row.ssh)}</div></td>
+      <td><span class="badge ${esc(row.health)}">${esc(row.health)}</span></td>
+      <td class="mono" title="${esc(row.commit)}">${esc(shortCommit(row.commit))}</td>
+      <td>${esc(row.last_restarted || 'unknown')}</td>
+      <td class="num mono">${row.height == null ? '--' : esc(row.height)}</td>
+      <td>${esc(age(row.seconds_since_advanced))}</td>
+      <td class="details">${esc(row.detail || '')}</td>
+    </tr>`).join('');
+}
+tick();
+setInterval(tick, 10000);
+</script>
+</body>
+</html>"""
 
 
 COLLECTOR: ClusterCollector | None = None

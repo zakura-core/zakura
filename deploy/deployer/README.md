@@ -52,6 +52,46 @@ python3 deploy.py logs fetch  --config nodes.toml --lines 2000    # last N lines
 python3 deploy.py logs follow --config nodes.toml --node node-a   # live tail -F
 ```
 
+## GitHub Actions testnet fleet deploy
+
+`.github/workflows/zakura-testnet-deploy.yml` runs this deployer on a Linux x86_64
+self-hosted runner, expected to be `zakura-testnet-1` with the
+`zakura-testnet-deployer` label. The runner builds the native `zebrad` binary and
+then deploys it to:
+
+- `zakura-testnet-1` — `root@167.99.103.111`
+- `zakura-testnet-2` — `root@167.99.110.145`
+- `zakura-testnet-3` — `root@138.68.229.254`
+
+One-time runner bootstrap from an operator machine with SSH access and CI
+credentials in `~/agents-env`:
+
+```bash
+cd deploy/deployer
+./testnet/bootstrap-zakura-testnet-runner.sh
+```
+
+Useful overrides:
+
+```bash
+ENV_FILE=~/agents-env ./testnet/bootstrap-zakura-testnet-runner.sh
+FORCE_REGISTER=1 ./testnet/bootstrap-zakura-testnet-runner.sh
+RUNNER_SSH=root@167.99.103.111 ./testnet/bootstrap-zakura-testnet-runner.sh
+```
+
+The workflow is manual (`workflow_dispatch`). Inputs:
+
+- `ref` — branch, tag, or SHA to build and deploy, default `ironwood-main`.
+- `force_rebuild` — pass `--force` to rebuild the cached binary.
+- `no_restart` — stage binary/config/unit without restarting, default `true`.
+- `node` — optional deployer node name; blank deploys the whole fleet.
+
+The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
+explicitly sets `vct_fast_sync = false`. This branch does not expose
+`consensus.vct_fast_sync` in `zebrad.toml`, so the deployer renders
+`checkpoint_sync = false` in the final node config to force the legacy non-VCT
+path.
+
 ## How the build cache works
 
 `commit` is resolved to a full SHA (`git rev-parse`). The binary is cached at

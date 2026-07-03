@@ -1,0 +1,211 @@
+name: Deploy Zakura testnet fleet
+
+# Manual fleet deploy for the three Zakura testnet nodes.
+#
+# Runs on a self-hosted Linux x86_64 runner, expected to be installed on
+# zakura-testnet-1 with the `zakura-testnet-deployer` label. The deployer builds
+# a native zebrad binary on that runner, then uses deploy/deployer/deploy.py to
+# scp/install it across the fleet.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git branch, tag, or SHA to build and deploy"
+        required: true
+        type: string
+        default: ironwood-main
+      force_rebuild:
+        description: "Rebuild even if a cached binary for this commit exists"
+        type: boolean
+        required: false
+        default: false
+      no_restart:
+        description: "Stage binary/config/unit without restarting zebrad"
+        type: boolean
+        required: false
+        default: true
+      node:
+        description: "Optional single deployer node name; blank deploys the whole fleet"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zakura-testnet-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: "Deploy Zakura testnet ${{ inputs.ref }}"
+    runs-on: [self-hosted, "${{ vars.ZAKURA_TESTNET_RUNNER_LABEL || 'zakura-testnet-deployer' }}"]
+    timeout-minutes: 180
+    environment: zakura-testnet
+
+    steps:
+      - name: Checkout deploy ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: stable
+          cache-on-failure: true
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            git \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler \
+            python3
+
+      - name: Start SSH agent when deploy key is configured
+        env:
+          ZAKURA_TESTNET_DEPLOY_SSH_KEY: ${{ secrets.ZAKURA_TESTNET_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ZAKURA_TESTNET_DEPLOY_SSH_KEY}" ]; then
+            echo "ZAKURA_TESTNET_DEPLOY_SSH_KEY is not set; using the runner's existing SSH identity."
+            exit 0
+          fi
+
+          ssh_agent_sock="$RUNNER_TEMP/ssh-agent.sock"
+          ssh-agent -a "$ssh_agent_sock" > "$RUNNER_TEMP/ssh-agent.env"
+          SSH_AUTH_SOCK="$ssh_agent_sock" ssh-add - <<< "$ZAKURA_TESTNET_DEPLOY_SSH_KEY"
+          echo "SSH_AUTH_SOCK=$ssh_agent_sock" >> "$GITHUB_ENV"
+
+      - name: Pin fleet host keys
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          : > ~/.ssh/known_hosts
+          for host in 167.99.103.111 167.99.110.145 138.68.229.254; do
+            ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
+          done
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Generate deployer fleet config
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          cat > nodes.ci.toml <<EOF
+          [defaults]
+          service_name    = "zebrad"
+          bin_path        = "/usr/local/bin/zebrad"
+          config_path     = "/etc/zebrad/zebrad.toml"
+          log_file        = "/var/log/zebrad/zebrad.log"
+          state_cache_dir = "/var/lib/zebrad-testnet"
+          network         = "Testnet"
+          listen_addr     = "[::]:18233"
+          rpc_listen_addr = "0.0.0.0:18232"
+          storage_mode    = "archive"
+          v2_p2p          = true
+          legacy_p2p      = true
+          checkpoint_sync = false
+          vct_fast_sync   = false
+
+          [[nodes]]
+          name       = "zakura-testnet-1"
+          ssh_string = "root@167.99.103.111"
+          commit     = "${{ inputs.ref }}"
+
+          [[nodes]]
+          name       = "zakura-testnet-2"
+          ssh_string = "root@167.99.110.145"
+          commit     = "${{ inputs.ref }}"
+
+          [[nodes]]
+          name       = "zakura-testnet-3"
+          ssh_string = "root@138.68.229.254"
+          commit     = "${{ inputs.ref }}"
+          EOF
+
+      - name: Build deployer binary
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml)
+          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            args+=(--force)
+          fi
+          if [ -n "${{ inputs.node }}" ]; then
+            args+=(--node "${{ inputs.node }}")
+          fi
+
+          python3 deploy.py build "${args[@]}"
+
+      - name: Deploy fleet
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml)
+          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            args+=(--force)
+          fi
+          if [ "${{ inputs.no_restart }}" = "true" ]; then
+            args+=(--no-restart)
+          fi
+          if [ -n "${{ inputs.node }}" ]; then
+            args+=(--node "${{ inputs.node }}")
+          fi
+
+          python3 deploy.py deploy "${args[@]}"
+
+      - name: Show fleet status
+        if: always()
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml)
+          if [ -n "${{ inputs.node }}" ]; then
+            args+=(--node "${{ inputs.node }}")
+          fi
+
+          python3 deploy.py status "${args[@]}"
+
+      - name: Fetch recent logs on failure
+        if: failure()
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml --lines 300)
+          if [ -n "${{ inputs.node }}" ]; then
+            args+=(--node "${{ inputs.node }}")
+          fi
+
+          python3 deploy.py logs fetch "${args[@]}" || true
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: zakura-testnet-deploy-logs-${{ github.run_id }}
+          path: deploy/deployer/logs/
+          if-no-files-found: ignore
+          retention-days: 14

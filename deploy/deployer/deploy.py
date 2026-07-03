@@ -413,11 +413,31 @@ if [ "$NO_RESTART" = "1" ]; then
     exit 0
 fi
 
-if ! systemctl restart "$SERVICE"; then
-    echo "restart failed; rolling back to ${{BIN_PATH}}.bak" >&2
+start_service() {
+    systemctl stop "$SERVICE" || true
+
+    # Some long-running testnet nodes can survive a plain systemctl restart long
+    # enough for the deploy to report success while the old process keeps the
+    # state DB open. Bound that window, then kill only processes running this
+    # deployed binary before starting the updated unit.
+    for _ in 1 2 3 4 5; do
+        if ! pgrep -f "^${{BIN_PATH}}( |$)" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    pkill -TERM -f "^${{BIN_PATH}}( |$)" >/dev/null 2>&1 || true
+    sleep 1
+    pkill -KILL -f "^${{BIN_PATH}}( |$)" >/dev/null 2>&1 || true
+
+    systemctl start "$SERVICE"
+}
+
+if ! start_service; then
+    echo "start failed; rolling back to ${{BIN_PATH}}.bak" >&2
     if [ -x "${{BIN_PATH}}.bak" ]; then
         install -m 755 "${{BIN_PATH}}.bak" "$BIN_PATH"
-        systemctl restart "$SERVICE" || true
+        start_service || true
     fi
     exit 1
 fi

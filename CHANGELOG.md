@@ -135,6 +135,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Use network-specific default Zakura bootstrap peers: Mainnet keeps the existing
+  native-P2P bootstrap list, while Testnet defaults to the Zakura testnet fleet.
 - Increased Zakura's default connection, handshake, stream-open, and QUIC
   window limits, and configured default native Zakura bootstrap peers. The
   larger defaults are intended for the production native-P2P sync path rather

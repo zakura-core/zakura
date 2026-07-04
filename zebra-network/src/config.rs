@@ -1056,6 +1056,7 @@ impl<'de> Deserialize<'de> for Config {
         // warning) rather than rejecting too-small configs, so older configs keep
         // starting while checkpoint sync stays deadlock-free.
         let mut zakura = zakura;
+        zakura.apply_network_defaults(&network);
         zakura.block_sync.clamp_inflight_block_bytes_to_floor();
         // Likewise clamp the resident look-ahead budget (and its block cap) up to one
         // checkpoint range, so the resident-memory admission gate cannot deadlock checkpoint

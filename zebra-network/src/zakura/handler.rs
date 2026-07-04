@@ -32,7 +32,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use zebra_chain::{
     block::{self, Block, CountedHeader},
-    parameters::Network,
+    parameters::{Network, NetworkKind},
     serialization::{CompactSizeMessage, ZcashDeserialize, MAX_HEADERS_PER_MESSAGE},
     transaction::Transaction,
 };
@@ -88,8 +88,8 @@ pub const DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND: u32 = 2048;
 /// Default native Zakura QUIC listen address.
 pub const DEFAULT_ZAKURA_LISTEN_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8234));
-/// Default native Zakura bootstrap peers.
-pub const DEFAULT_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[
+/// Default native Zakura bootstrap peers for Mainnet.
+pub const DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[
     "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
     "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@104.131.184.123:8234",
     "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234",
@@ -100,6 +100,16 @@ pub const DEFAULT_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[
     "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234",
     "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
 ];
+/// Default native Zakura bootstrap peers for Testnet.
+pub const DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS: &[&str] = &[
+    "1bf3bca139430ae519d64d04bfbee84333f240234f522c3816c24f5004273c1f@167.99.103.111:8234",
+    "40970c171cf38f6d0374fbdf6a8b945ba4e52741330dd167fd5617d0f33380ee@167.99.110.145:8234",
+    "297fe7914152fbb8aaad7dba550f7d383cdb6d5449f68c4c43b62295bca4678f@138.68.229.254:8234",
+    "2754c0a28df6570b729795b055ad81cf99f6647ad42496ca60cdf907b72a8abc@164.92.209.78:8234",
+    "9a135d8eaf38a693fd008bd12606e480e36bb7112fd9773c7af8f6106c838da3@206.189.148.0:8234",
+];
+/// Default native Zakura bootstrap peers.
+pub const DEFAULT_ZAKURA_BOOTSTRAP_PEERS: &[&str] = DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS;
 /// Default maximum bytes read before the peer's stream prelude is decoded.
 pub const DEFAULT_ZAKURA_PRELUDE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default timeout for one control-handshake read or write.
@@ -321,6 +331,28 @@ impl ZakuraConfig {
             self.max_connections_per_ip
         }
     }
+
+    /// Switch default bootstrap peers to the selected network.
+    ///
+    /// This preserves explicit user overrides, including an empty list, and only
+    /// rewrites the implicit default populated by serde before the network is known.
+    pub fn apply_network_defaults(&mut self, network: &Network) {
+        if self.bootstrap_peers
+            != bootstrap_peers_to_strings(DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS)
+        {
+            return;
+        }
+
+        self.bootstrap_peers = bootstrap_peers_to_strings(match network.kind() {
+            NetworkKind::Mainnet => DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS,
+            NetworkKind::Testnet => DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
+            NetworkKind::Regtest => DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS,
+        });
+    }
+}
+
+fn bootstrap_peers_to_strings(peers: &[&str]) -> Vec<String> {
+    peers.iter().map(ToString::to_string).collect()
 }
 
 /// Hard local ceilings enforced by the Zakura endpoint and handler.

@@ -130,6 +130,9 @@ pub enum ServicePeerDirection {
     Outbound,
 }
 
+/// Monotonically increasing transport connection generation.
+pub type ZakuraConnId = u64;
+
 impl ServicePeerDirection {
     pub(crate) fn trace_label(self) -> &'static str {
         match self {

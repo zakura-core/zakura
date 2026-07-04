@@ -24,7 +24,7 @@ use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
     CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncEvent, HeaderSyncHandle,
     OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServiceAdmissionDecision,
-    ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraPeerId,
+    ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
 };
 
@@ -227,6 +227,7 @@ impl Service for DiscoveryService {
             peer.service_cancel_token(),
         );
         let discovery_session = DiscoveryPeerSession::new(&session, peer.direction);
+        let conn_id = peer.conn_id;
         let service_cancel = discovery_session.cancel_token();
         let connection_cancel = peer.cancel_token();
         let close_cause = peer.close_cause();
@@ -257,6 +258,7 @@ impl Service for DiscoveryService {
             async move {
                 let decision = handle
                     .admit_peer(
+                        conn_id,
                         discovery_session.peer_id().clone(),
                         discovery_session.direction(),
                     )
@@ -278,6 +280,7 @@ impl Service for DiscoveryService {
                     block_sync,
                     peer_node_id,
                     discovery_session,
+                    conn_id,
                     recv,
                     service_cancel,
                     connection_cancel,
@@ -288,11 +291,11 @@ impl Service for DiscoveryService {
         );
     }
 
-    fn remove_peer(&self, peer: &ZakuraPeerId) {
+    fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
         let handle = self.handle.clone();
         let peer = peer.clone();
         tokio::spawn(async move {
-            handle.remove_peer(&peer).await;
+            handle.remove_peer(&peer, conn_id).await;
         });
     }
 }
@@ -303,6 +306,7 @@ struct DiscoveryExchangeStart {
     block_sync: Option<BlockSyncHandle>,
     peer_node_id: NodeId,
     discovery_session: DiscoveryPeerSession,
+    conn_id: ZakuraConnId,
     recv: FramedRecv,
     service_cancel: CancellationToken,
     connection_cancel: CancellationToken,
@@ -317,6 +321,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         block_sync,
         peer_node_id,
         discovery_session,
+        conn_id,
         recv,
         service_cancel,
         connection_cancel,
@@ -390,7 +395,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
                 handle.mark_short_lived_exchange(&peer_node_id).await;
             }
             service_cancel.cancel();
-            handle.remove_peer(&peer_id).await;
+            handle.remove_peer(&peer_id, conn_id).await;
             if exchanged
                 && !peer_has_other_service_owner(
                     source_header_sync.as_ref(),

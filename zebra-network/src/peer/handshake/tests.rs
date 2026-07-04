@@ -195,7 +195,7 @@ impl ZakuraService for DropSink {
 
     fn add_peer(&self, _peer: ZakuraServicePeer) {}
 
-    fn remove_peer(&self, _peer: &ZakuraPeerId) {}
+    fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: crate::zakura::ZakuraConnId) {}
 }
 
 /// Starts a real Zakura endpoint over loopback QUIC for an upgrade test.

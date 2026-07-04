@@ -156,9 +156,10 @@ mod tests {
             HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle,
             HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession, HeaderSyncStartup,
             HeaderSyncStatus, Peer, Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig,
-            ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace, MAX_BS_RESPONSE_BYTES,
-            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-            ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
+            ZakuraConnId, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace,
+            MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
+            ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -306,7 +307,7 @@ mod tests {
             });
         }
 
-        fn remove_peer(&self, peer: &ZakuraPeerId) {
+        fn remove_peer(&self, peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {
             let senders = self.senders.clone();
             let peer = peer.clone();
             tokio::spawn(async move {
@@ -379,7 +380,7 @@ mod tests {
             });
         }
 
-        fn remove_peer(&self, peer: &ZakuraPeerId) {
+        fn remove_peer(&self, peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {
             let _ = self.events.send(TaskExitProbeEvent::Removed(peer.clone()));
         }
     }

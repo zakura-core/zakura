@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{CloseCause, FramedRecv, FramedSend};
 use crate::{
-    zakura::{ServicePeerDirection, ZakuraPeerId},
+    zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId},
     BoxError,
 };
 
@@ -63,6 +63,8 @@ impl ServiceStream {
 pub struct Peer {
     /// Authenticated Zakura peer identity.
     pub id: ZakuraPeerId,
+    /// Supervisor registration generation that owns this service session.
+    pub conn_id: ZakuraConnId,
     /// Remote IP address when the transport knows it.
     pub remote_ip: Option<IpAddr>,
     /// Capabilities accepted by both peers.
@@ -84,7 +86,8 @@ impl Peer {
         streams: HashMap<u16, (FramedRecv, FramedSend)>,
         cancel_token: CancellationToken,
     ) -> Self {
-        Self::new_with_direction(
+        Self::new_with_conn_id_and_direction(
+            0,
             id,
             remote_ip,
             negotiated,
@@ -103,7 +106,29 @@ impl Peer {
         streams: HashMap<u16, (FramedRecv, FramedSend)>,
         cancel_token: CancellationToken,
     ) -> Self {
-        Self::new_with_direction_and_close_cause(
+        Self::new_with_conn_id_and_direction(
+            0,
+            id,
+            remote_ip,
+            negotiated,
+            direction,
+            streams,
+            cancel_token,
+        )
+    }
+
+    /// Build a peer from transport streams, connection id, and direction.
+    pub(crate) fn new_with_conn_id_and_direction(
+        conn_id: ZakuraConnId,
+        id: ZakuraPeerId,
+        remote_ip: Option<IpAddr>,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+        streams: HashMap<u16, (FramedRecv, FramedSend)>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        Self::new_with_conn_id_and_direction_and_close_cause(
+            conn_id,
             id,
             remote_ip,
             negotiated,
@@ -114,7 +139,9 @@ impl Peer {
         )
     }
 
-    pub(crate) fn new_with_direction_and_close_cause(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_conn_id_and_direction_and_close_cause(
+        conn_id: ZakuraConnId,
         id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
         negotiated: u64,
@@ -133,6 +160,7 @@ impl Peer {
             })
             .collect::<HashMap<_, _>>();
         Self::new_with_service_streams(
+            conn_id,
             id,
             remote_ip,
             negotiated,
@@ -143,7 +171,9 @@ impl Peer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_service_streams(
+        conn_id: ZakuraConnId,
         id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
         negotiated: u64,
@@ -158,6 +188,7 @@ impl Peer {
             .map(|stream| stream.cancel_token.clone())
             .unwrap_or_else(|| cancel_token.child_token());
         Self::new_with_service_cancel_token(
+            conn_id,
             id,
             remote_ip,
             negotiated,
@@ -171,6 +202,7 @@ impl Peer {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_service_cancel_token(
+        conn_id: ZakuraConnId,
         id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
         negotiated: u64,
@@ -182,6 +214,7 @@ impl Peer {
     ) -> Self {
         Self {
             id,
+            conn_id,
             remote_ip,
             negotiated,
             direction,
@@ -225,6 +258,7 @@ impl Peer {
         self,
     ) -> (
         ZakuraPeerId,
+        ZakuraConnId,
         Option<IpAddr>,
         u64,
         ServicePeerDirection,
@@ -234,6 +268,7 @@ impl Peer {
     ) {
         (
             self.id,
+            self.conn_id,
             self.remote_ip,
             self.negotiated,
             self.direction,
@@ -275,7 +310,7 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     fn add_peer(&self, peer: Peer);
 
     /// Remove a disconnected peer.
-    fn remove_peer(&self, peer: &ZakuraPeerId);
+    fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId);
 
     /// Deliver one request-response frame to this service.
     fn deliver_frame(

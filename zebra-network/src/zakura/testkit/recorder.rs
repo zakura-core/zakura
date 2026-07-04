@@ -11,7 +11,7 @@ use std::{
 use tracing::debug;
 
 use crate::zakura::{
-    legacy_gossip_streams, Frame, Peer, Service, SinkReject, Stream, ZakuraPeerId,
+    legacy_gossip_streams, Frame, Peer, Service, SinkReject, Stream, ZakuraConnId, ZakuraPeerId,
 };
 
 /// One frame delivered to an [`InboundRecorder`].
@@ -152,7 +152,7 @@ impl Service for InboundRecorder {
         }
     }
 
-    fn remove_peer(&self, _peer: &ZakuraPeerId) {}
+    fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
 
     fn deliver_frame(
         &self,

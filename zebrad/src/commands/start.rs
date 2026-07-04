@@ -2168,7 +2168,12 @@ mod zakura_header_sync_driver_tests {
 
         fn add_peer(&self, _peer: ZakuraPeer) {}
 
-        fn remove_peer(&self, _peer: &zebra_network::zakura::ZakuraPeerId) {}
+        fn remove_peer(
+            &self,
+            _peer: &zebra_network::zakura::ZakuraPeerId,
+            _conn_id: zebra_network::zakura::ZakuraConnId,
+        ) {
+        }
     }
 
     fn block_sync_startup_for_test() -> zebra_network::zakura::BlockSyncStartup {

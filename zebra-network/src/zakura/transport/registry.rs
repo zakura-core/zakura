@@ -8,7 +8,7 @@ use std::{
 use thiserror::Error;
 
 use super::{Frame, Peer, Service, SinkReject, Stream, StreamMode};
-use crate::zakura::{ServicePeerDirection, ZakuraPeerId};
+use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId};
 
 /// Errors returned while building a [`ServiceRegistry`].
 #[derive(Debug, Error)]
@@ -304,8 +304,16 @@ impl ServiceRegistry {
 
     /// Fan a newly connected peer out to every service enabled by its negotiated capabilities.
     pub fn add_peer(&self, peer: Peer) {
-        let (peer_id, remote_ip, negotiated, direction, mut streams, cancel_token, close_cause) =
-            peer.into_parts();
+        let (
+            peer_id,
+            conn_id,
+            remote_ip,
+            negotiated,
+            direction,
+            mut streams,
+            cancel_token,
+            close_cause,
+        ) = peer.into_parts();
 
         for service in self.services_for_negotiated(negotiated) {
             let service_streams: HashMap<_, _> = service
@@ -324,6 +332,7 @@ impl ServiceRegistry {
                 .unwrap_or_else(|| cancel_token.child_token());
 
             service.add_peer(Peer::new_with_service_cancel_token(
+                conn_id,
                 peer_id.clone(),
                 remote_ip,
                 negotiated,
@@ -341,8 +350,16 @@ impl ServiceRegistry {
     /// Returns the capability mask for services that received a peer session, so
     /// disconnect fanout can be limited to reactors that were actually reached.
     pub fn add_escalated_peer(&self, peer: Peer) -> u64 {
-        let (peer_id, remote_ip, negotiated, direction, mut streams, cancel_token, close_cause) =
-            peer.into_parts();
+        let (
+            peer_id,
+            conn_id,
+            remote_ip,
+            negotiated,
+            direction,
+            mut streams,
+            cancel_token,
+            close_cause,
+        ) = peer.into_parts();
         let mut admitted_capabilities = 0;
 
         for service in self.services_for_negotiated(negotiated) {
@@ -368,6 +385,7 @@ impl ServiceRegistry {
                 .unwrap_or_else(|| cancel_token.child_token());
 
             service.add_peer(Peer::new_with_service_cancel_token(
+                conn_id,
                 peer_id.clone(),
                 remote_ip,
                 negotiated,
@@ -383,9 +401,9 @@ impl ServiceRegistry {
     }
 
     /// Fan a disconnected peer out to every service enabled by `negotiated`.
-    pub fn remove_peer(&self, peer_id: &ZakuraPeerId, negotiated: u64) {
+    pub fn remove_peer(&self, peer_id: &ZakuraPeerId, conn_id: ZakuraConnId, negotiated: u64) {
         for service in self.services_for_negotiated(negotiated) {
-            service.remove_peer(peer_id);
+            service.remove_peer(peer_id, conn_id);
         }
     }
 }
@@ -451,8 +469,16 @@ mod tests {
         }
 
         fn add_peer(&self, peer: Peer) {
-            let (peer_id, _remote_ip, _negotiated, _direction, streams, _cancel_token, _cause) =
-                peer.into_parts();
+            let (
+                peer_id,
+                _conn_id,
+                _remote_ip,
+                _negotiated,
+                _direction,
+                streams,
+                _cancel_token,
+                _cause,
+            ) = peer.into_parts();
             self.added
                 .lock()
                 .expect("test service added list should not be poisoned")
@@ -465,7 +491,7 @@ mod tests {
                 .push(stream_kinds);
         }
 
-        fn remove_peer(&self, peer: &ZakuraPeerId) {
+        fn remove_peer(&self, peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {
             self.removed
                 .lock()
                 .expect("test service removed list should not be poisoned")
@@ -620,7 +646,7 @@ mod tests {
             HashMap::new(),
             CancellationToken::new(),
         ));
-        registry.remove_peer(&peer, 0b0011);
+        registry.remove_peer(&peer, 0, 0b0011);
 
         assert_eq!(
             header
@@ -682,7 +708,7 @@ mod tests {
             streams,
             CancellationToken::new(),
         ));
-        registry.remove_peer(&peer, 0b0001);
+        registry.remove_peer(&peer, 0, 0b0001);
 
         assert_eq!(
             header
@@ -744,7 +770,7 @@ mod tests {
             streams,
             CancellationToken::new(),
         ));
-        registry.remove_peer(&peer, remove_mask);
+        registry.remove_peer(&peer, 0, remove_mask);
 
         assert!(header
             .added

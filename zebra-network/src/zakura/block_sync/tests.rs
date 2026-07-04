@@ -4721,7 +4721,7 @@ async fn add_peer_emits_events_and_round_trips_status_over_framed_path() {
         .await
         .expect("inbound status queues");
 
-    service.remove_peer(&peer);
+    service.remove_peer(&peer, 0);
     assert_eq!(service.peer_count(), 0);
     assert!(session.cancel_token().is_cancelled());
 }
@@ -4730,10 +4730,13 @@ async fn add_peer_emits_events_and_round_trips_status_over_framed_path() {
 async fn stale_block_sync_teardown_keeps_replacement_session() {
     let (service, mut events) = BlockSyncService::new_for_test(ZakuraBlockSyncConfig::default());
     let peer = peer(92);
+    let old_conn_id = 1;
+    let new_conn_id = 2;
 
     let (old_inbound_tx, old_inbound_rx) = framed_channel(4);
     let (old_outbound_tx, _old_outbound_rx) = framed_channel(4);
-    service.add_peer(Peer::new_with_direction(
+    service.add_peer(Peer::new_with_conn_id_and_direction(
+        old_conn_id,
         peer.clone(),
         None,
         ZAKURA_CAP_BLOCK_SYNC,
@@ -4748,7 +4751,8 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
 
     let (new_inbound_tx, new_inbound_rx) = framed_channel(4);
     let (new_outbound_tx, _new_outbound_rx) = framed_channel(4);
-    service.add_peer(Peer::new_with_direction(
+    service.add_peer(Peer::new_with_conn_id_and_direction(
+        new_conn_id,
         peer.clone(),
         None,
         ZAKURA_CAP_BLOCK_SYNC,
@@ -4760,6 +4764,29 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
         next_event(&mut events).await,
         BlockSyncEvent::PeerConnected(session) if session.peer_id() == &peer
     ));
+    assert_eq!(service.peer_count(), 1);
+
+    let (_stale_inbound_tx, stale_inbound_rx) = framed_channel(4);
+    let (stale_outbound_tx, _stale_outbound_rx) = framed_channel(4);
+    service.add_peer(Peer::new_with_conn_id_and_direction(
+        old_conn_id,
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        HashMap::from([(
+            ZAKURA_STREAM_BLOCK_SYNC,
+            (stale_inbound_rx, stale_outbound_tx),
+        )]),
+        CancellationToken::new(),
+    ));
+    assert_eq!(
+        service.peer_count(),
+        1,
+        "stale add must not overwrite the replacement block-sync session",
+    );
+
+    service.remove_peer(&peer, old_conn_id);
     assert_eq!(service.peer_count(), 1);
 
     drop(old_inbound_tx);
@@ -4832,7 +4859,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
         BlockSyncEvent::PeerConnected(session) if session.peer_id() == &peer
     ));
 
-    service.remove_peer(&peer);
+    service.remove_peer(&peer, 0);
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(1), lifecycle_rx.recv())
             .await
@@ -6698,7 +6725,7 @@ async fn routine_disconnect_returns_outstanding_and_releases_budget() {
 
     // Disconnect peer A mid-fetch (it never answers). Its routine's `Drop` guard
     // must return height 1 to `pending` and release its reservation.
-    service.remove_peer(&peer_a);
+    service.remove_peer(&peer_a, 0);
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if service.peer_count() == 0 {
@@ -7841,7 +7868,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         "the initial in-flight requests must cover the missing checkpoint hole"
     );
 
-    service.remove_peer(&old_peer);
+    service.remove_peer(&old_peer, 0);
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if handle.peer_snapshot().outbound_peers == 0 && service.peer_count() == 0 {

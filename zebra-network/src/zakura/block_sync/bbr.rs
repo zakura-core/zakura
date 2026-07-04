@@ -24,11 +24,13 @@ const BBR_RELIABILITY_EWMA_ALPHA: f64 = 0.1;
 /// **and re-filtered at read time against the caller's `now`**, so a min/max never
 /// reflects a sample past the horizon even during a quiet (no-completion) period — a peer
 /// that went fast then stopped completing must not keep a stale-low RTprop / stale-high
-/// BtlBw. Windows are small (seconds of samples), so the linear scan is cheap.
+/// BtlBw. Existence checks are O(1) so the fill loop can test cold-start state without
+/// scanning the whole window.
 #[derive(Clone, Debug)]
 struct WindowedSamples {
     horizon: Duration,
     samples: Vec<(Instant, f64)>,
+    newest_at: Option<Instant>,
 }
 
 impl WindowedSamples {
@@ -36,11 +38,13 @@ impl WindowedSamples {
         Self {
             horizon,
             samples: Vec::new(),
+            newest_at: None,
         }
     }
 
     fn observe(&mut self, now: Instant, value: f64) {
         self.samples.push((now, value));
+        self.newest_at = Some(self.newest_at.map_or(now, |newest| newest.max(now)));
         self.prune(now);
     }
 
@@ -62,6 +66,19 @@ impl WindowedSamples {
     /// The windowed maximum over samples no older than `now - horizon`. See [`min`].
     fn max(&self, now: Instant) -> Option<f64> {
         self.fresh_values(now).reduce(f64::max)
+    }
+
+    /// Whether this window has at least one sample no older than `now - horizon`.
+    ///
+    /// `min` and `max` need the full scan to calculate an extremum, but the cold-start
+    /// gate only needs existence. Track the newest sample so that gate stays O(1) in the
+    /// peer fill loop.
+    fn has_fresh_sample(&self, now: Instant) -> bool {
+        let Some(newest_at) = self.newest_at else {
+            return false;
+        };
+        now.checked_sub(self.horizon)
+            .is_none_or(|cutoff| newest_at >= cutoff)
     }
 
     fn fresh_values(&self, now: Instant) -> impl Iterator<Item = f64> + '_ {
@@ -541,7 +558,7 @@ impl BbrState {
     }
 
     pub(super) fn has_fresh_bdp(&self, now: Instant) -> bool {
-        self.bdp(now).is_some()
+        self.btlbw_per_sec.has_fresh_sample(now) && self.rtprop_secs.has_fresh_sample(now)
     }
 
     pub(super) fn rtprop_ms(&self, now: Instant) -> Option<u64> {

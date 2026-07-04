@@ -263,7 +263,7 @@ impl BlockSyncReactor {
         self.query_needed_blocks().await;
         self.publish_metrics();
         self.refresh_throughput();
-        self.trace_sync_state();
+        self.trace_sync_state(true);
         loop {
             // Arm the floor watchdog to the earliest outstanding floor-claim
             // deadline (event-driven, like the per-peer routine's own-timeout
@@ -331,7 +331,7 @@ impl BlockSyncReactor {
                             // last `commit_state` row lags the live metric, and the
                             // e2e oracle reads a stale `applying > 0` "leak" after the
                             // node has actually settled (the live metric reads 0).
-                            self.trace_sync_state();
+                            self.trace_sync_state(false);
                         }
                         Err(_) => break,
                     }
@@ -350,7 +350,7 @@ impl BlockSyncReactor {
                 _ = metrics_ticks.tick() => {
                     self.publish_metrics();
                     self.refresh_throughput();
-                    self.trace_sync_state();
+                    self.trace_sync_state(true);
                 }
                 _ = status_ticks.tick() => self.flush_status_refresh().await,
                 _ = &mut floor_watchdog => {
@@ -1538,26 +1538,20 @@ impl BlockSyncReactor {
         }
     }
 
-    fn trace_sync_state(&self) {
+    fn trace_sync_state(&self, include_diagnostics: bool) {
         if !self.startup.trace.is_enabled() {
             return;
         }
-        let floor_gap = self.floor_gap_diagnostics(Instant::now());
+        let floor_gap = include_diagnostics
+            .then(|| self.floor_gap_diagnostics(Instant::now()))
+            .flatten();
         // The per-peer download window now lives in the routines, mirrored into the
-        // registry slot diagnostics; the periodic row sums them. `outstanding` here
-        // is the registry's outstanding-request count across peers.
-        let slots = self.registry.slot_summary();
-        let outstanding = slots.outstanding_requests;
-        let slot_capacity = slots.capacity;
-        let slot_effective_window = slots.effective_window;
-        let slot_available = slots.available;
-        let slot_saturated_peers = slots.saturated_peers;
-        let counts = self.registry.direction_status_counts();
-        let inbound_peers = counts.inbound;
-        let outbound_peers = counts.outbound;
-        let inbound_peers_with_status = counts.inbound_with_status;
-        let outbound_peers_with_status = counts.outbound_with_status;
-        let peers_with_status = self.registry.peers_with_status();
+        // registry slot diagnostics; the periodic row sums them. Skip these registry
+        // walks on per-commit view changes, where the row is only needed to keep commit
+        // pipeline counters fresh.
+        let slots = include_diagnostics.then(|| self.registry.slot_summary());
+        let counts = include_diagnostics.then(|| self.registry.direction_status_counts());
+        let peers_with_status = include_diagnostics.then(|| self.registry.peers_with_status());
         // The commit-pipeline counters now live on the Sequencer task; read them
         // from the latest published view snapshot.
         let view = self.last_view;
@@ -1577,7 +1571,13 @@ impl BlockSyncReactor {
             bs_insert_u64(row, bs_trace::APPLYING, view.applying_len);
             bs_insert_u64(row, bs_trace::SUBMITTED_APPLIES, submitted_applies);
             bs_insert_u64(row, bs_trace::REORDER, view.reorder_len);
-            bs_insert_u64(row, bs_trace::OUTSTANDING, outstanding as u64);
+            if let Some(slots) = slots {
+                bs_insert_u64(
+                    row,
+                    bs_trace::OUTSTANDING,
+                    slots.outstanding_requests as u64,
+                );
+            }
             if let Some(floor_gap) = floor_gap {
                 bs_insert_height(row, bs_trace::FLOOR_GAP_HEIGHT, floor_gap.height);
                 bs_insert_str(row, bs_trace::FLOOR_GAP_STATE, floor_gap.state);
@@ -1659,27 +1659,31 @@ impl BlockSyncReactor {
                 .wire_bytes(),
             );
             bs_insert_u64(row, bs_trace::PEERS, self.state.peers.len() as u64);
-            bs_insert_u64(row, bs_trace::PEERS_WITH_STATUS, peers_with_status as u64);
+            if let Some(peers_with_status) = peers_with_status {
+                bs_insert_u64(row, bs_trace::PEERS_WITH_STATUS, peers_with_status as u64);
+            }
             // Peers that could be issued work but have no free slots are
             // saturated; the remainder want slots. If those exist and the budget
             // can't fund another worst-case block, the download path is
             // budget-limited (not peer- or work-limited) — the key throughput
             // signal toward the 1–2 Gbps target.
-            let peers_wanting_slots = peers_with_status.saturating_sub(slot_saturated_peers);
-            let download_blocked_on_budget = u64::from(
-                peers_wanting_slots > 0
-                    && self.state.budget.available() < BS_PER_BLOCK_WORST_CASE_BYTES,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::PEERS_WANTING_SLOTS,
-                peers_wanting_slots as u64,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::DOWNLOAD_BLOCKED_ON_BUDGET,
-                download_blocked_on_budget,
-            );
+            if let (Some(slots), Some(peers_with_status)) = (slots, peers_with_status) {
+                let peers_wanting_slots = peers_with_status.saturating_sub(slots.saturated_peers);
+                let download_blocked_on_budget = u64::from(
+                    peers_wanting_slots > 0
+                        && self.state.budget.available() < BS_PER_BLOCK_WORST_CASE_BYTES,
+                );
+                bs_insert_u64(
+                    row,
+                    bs_trace::PEERS_WANTING_SLOTS,
+                    peers_wanting_slots as u64,
+                );
+                bs_insert_u64(
+                    row,
+                    bs_trace::DOWNLOAD_BLOCKED_ON_BUDGET,
+                    download_blocked_on_budget,
+                );
+            }
             bs_insert_u64(
                 row,
                 bs_trace::RECEIVED_BYTES_PER_SEC,
@@ -1700,71 +1704,77 @@ impl BlockSyncReactor {
                 bs_trace::COMMITTED_BLOCKS_PER_SEC,
                 view.committed_blocks_per_sec,
             );
-            bs_insert_u64(row, "inbound_peers", inbound_peers as u64);
-            bs_insert_u64(row, "outbound_peers", outbound_peers as u64);
-            bs_insert_u64(
-                row,
-                "inbound_peers_with_status",
-                inbound_peers_with_status as u64,
-            );
-            bs_insert_u64(
-                row,
-                "outbound_peers_with_status",
-                outbound_peers_with_status as u64,
-            );
-            bs_insert_u64(row, "request_slot_capacity", slot_capacity as u64);
-            bs_insert_u64(
-                row,
-                "request_slot_effective_window",
-                slot_effective_window as u64,
-            );
-            bs_insert_u64(row, "request_slot_available", slot_available as u64);
-            bs_insert_u64(
-                row,
-                "request_slot_saturated_peers",
-                slot_saturated_peers as u64,
-            );
-            // Scheduling visibility: distinguishes "gap not in `needed`"
-            // (state/filter) from "gap in `needed` but never queued" (`ensure`
-            // rejected it) from "queued but never requested" (starvation).
-            if let Some(min) = self.state.needed_heights.first() {
-                bs_insert_height(row, bs_trace::NEEDED_MIN, *min);
+            if let Some(counts) = counts {
+                bs_insert_u64(row, "inbound_peers", counts.inbound as u64);
+                bs_insert_u64(row, "outbound_peers", counts.outbound as u64);
+                bs_insert_u64(
+                    row,
+                    "inbound_peers_with_status",
+                    counts.inbound_with_status as u64,
+                );
+                bs_insert_u64(
+                    row,
+                    "outbound_peers_with_status",
+                    counts.outbound_with_status as u64,
+                );
             }
-            bs_insert_u64(
-                row,
-                bs_trace::NEEDED_COUNT,
-                self.state.needed_heights.len() as u64,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::QUEUE_LEN,
-                self.state.work_queue.pending_run_count() as u64,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::QUEUE_BLOCKS,
-                self.state.work_queue.pending_len() as u64,
-            );
-            if let Some(start) = self.state.work_queue.min_pending() {
-                bs_insert_height(row, bs_trace::QUEUE_MIN_START, start);
+            if let Some(slots) = slots {
+                bs_insert_u64(row, "request_slot_capacity", slots.capacity as u64);
+                bs_insert_u64(
+                    row,
+                    "request_slot_effective_window",
+                    slots.effective_window as u64,
+                );
+                bs_insert_u64(row, "request_slot_available", slots.available as u64);
+                bs_insert_u64(
+                    row,
+                    "request_slot_saturated_peers",
+                    slots.saturated_peers as u64,
+                );
             }
-            bs_insert_u64(
-                row,
-                bs_trace::ASSIGNED_LEN,
-                self.state.work_queue.in_flight_len() as u64,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::LOCAL_BODY_WORK,
-                self.local_body_work_blocks() as u64,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::REFILL_LOW_WATER,
-                self.refill_low_water_blocks() as u64,
-            );
-            if let Some(end) = self.state.work_queue.max_in_flight() {
-                bs_insert_height(row, bs_trace::COVERED_MAX_END, end);
+            if include_diagnostics {
+                // Scheduling visibility: distinguishes "gap not in `needed`"
+                // (state/filter) from "gap in `needed` but never queued" (`ensure`
+                // rejected it) from "queued but never requested" (starvation).
+                if let Some(min) = self.state.needed_heights.first() {
+                    bs_insert_height(row, bs_trace::NEEDED_MIN, *min);
+                }
+                bs_insert_u64(
+                    row,
+                    bs_trace::NEEDED_COUNT,
+                    self.state.needed_heights.len() as u64,
+                );
+                bs_insert_u64(
+                    row,
+                    bs_trace::QUEUE_LEN,
+                    self.state.work_queue.pending_run_count() as u64,
+                );
+                bs_insert_u64(
+                    row,
+                    bs_trace::QUEUE_BLOCKS,
+                    self.state.work_queue.pending_len() as u64,
+                );
+                if let Some(start) = self.state.work_queue.min_pending() {
+                    bs_insert_height(row, bs_trace::QUEUE_MIN_START, start);
+                }
+                bs_insert_u64(
+                    row,
+                    bs_trace::ASSIGNED_LEN,
+                    self.state.work_queue.in_flight_len() as u64,
+                );
+                bs_insert_u64(
+                    row,
+                    bs_trace::LOCAL_BODY_WORK,
+                    self.local_body_work_blocks() as u64,
+                );
+                bs_insert_u64(
+                    row,
+                    bs_trace::REFILL_LOW_WATER,
+                    self.refill_low_water_blocks() as u64,
+                );
+                if let Some(end) = self.state.work_queue.max_in_flight() {
+                    bs_insert_height(row, bs_trace::COVERED_MAX_END, end);
+                }
             }
         });
     }

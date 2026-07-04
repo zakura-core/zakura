@@ -652,8 +652,8 @@ impl PeerRoutine {
             // above-window slots even for a near-floor block.
             let base_floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
             let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
-            let normal_slots = self.window.available_slots();
-            let floor_slots = self.window.available_slots_with_bonus(floor_bonus);
+            let normal_slots = self.window.available_slots_at(now);
+            let floor_slots = self.window.available_slots_with_bonus_at(floor_bonus, now);
             // Break only when even a bypassed floor request has no slot. A cwnd that is
             // saturated for above-floor work (`normal_slots == 0`) still leaves up to
             // `floor_bonus` slots so the lowest missing height keeps moving — unless the
@@ -725,7 +725,7 @@ impl PeerRoutine {
                         AdmissionOutcome::Admit(grant) => {
                             let floor_cwnd_cap = self
                                 .window
-                                .cwnd_byte_headroom(floor_bonus)
+                                .cwnd_byte_headroom_at(floor_bonus, now)
                                 .unwrap_or(u64::MAX);
                             items = self.work.take_in_range_budgeted(
                                 servable_low,
@@ -768,7 +768,10 @@ impl PeerRoutine {
                         // Bound the take by remaining cwnd byte headroom (byte mode, no floor
                         // bonus) so an above-floor request never overshoots the byte window
                         // beyond the one always-taken item.
-                        let above_cwnd_cap = self.window.cwnd_byte_headroom(0).unwrap_or(u64::MAX);
+                        let above_cwnd_cap = self
+                            .window
+                            .cwnd_byte_headroom_at(0, now)
+                            .unwrap_or(u64::MAX);
                         items = self.work.take_in_range_budgeted(
                             servable_low,
                             grant.take_high,
@@ -1985,15 +1988,20 @@ impl PeerRoutine {
         // snapshot reflects a sealed peer's collapsed floor bonus.
         let base_floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
         let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
+        let now = Instant::now();
         self.emit(bs_trace::BLOCK_FILL_STOP, |row| {
             bs_insert_peer(row, bs_trace::PEER, &self.peer);
             bs_insert_str(row, bs_trace::FILL_STOP_REASON, reason);
             bs_insert_u64(row, bs_trace::FILL_SENT, 0);
-            bs_insert_u64(row, "normal_slots", self.window.available_slots() as u64);
+            bs_insert_u64(
+                row,
+                "normal_slots",
+                self.window.available_slots_at(now) as u64,
+            );
             bs_insert_u64(
                 row,
                 "floor_slots",
-                self.window.available_slots_with_bonus(floor_bonus) as u64,
+                self.window.available_slots_with_bonus_at(floor_bonus, now) as u64,
             );
             bs_insert_u64(row, "budget_available", self.budget.available());
             bs_insert_u64(row, "pending_work", self.work.pending_len() as u64);

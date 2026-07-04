@@ -54,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Reduce Zakura block-sync CPU overhead in the BBR-lite fill loop and trace path.
+  The byte-mode cold-start check now tests for fresh BDP samples without scanning
+  the BBR windows, and per-view trace rows skip expensive peer/work-queue
+  diagnostics while still reporting commit pipeline progress.
 - Improve Zakura block-sync download scheduling for checkpoint sync. A
   byte-denominated BBR-lite congestion controller (`block_sync/bbr.rs`) and
   per-peer admission control (`block_sync/admission.rs`) replace the previous

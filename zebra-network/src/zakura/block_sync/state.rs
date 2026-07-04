@@ -489,7 +489,11 @@ impl DownloadWindow {
     }
 
     pub(super) fn available_slots(&self) -> usize {
-        self.available_slots_with_bonus(0)
+        self.available_slots_at(Instant::now())
+    }
+
+    pub(super) fn available_slots_at(&self, now: Instant) -> usize {
+        self.available_slots_with_bonus_at(0, now)
     }
 
     /// Available headroom allowing `bonus` extra in-flight requests beyond the BBR cwnd,
@@ -506,7 +510,7 @@ impl DownloadWindow {
     /// many — the in-flight *request* count falls out of `cwnd_bytes / body_size`. The
     /// controller is unit-agnostic; only this comparison differs — the seam that makes
     /// switching units a small change.
-    pub(super) fn available_slots_with_bonus(&self, bonus: usize) -> usize {
+    pub(super) fn available_slots_with_bonus_at(&self, bonus: usize, now: Instant) -> usize {
         // BBR-lite is the sole congestion controller: cap in-flight at the BDP-derived
         // cwnd so a peer's queue stays at ~one BDP and head-of-line latency tracks
         // RTprop. The floor bypass adds `bonus` on top.
@@ -530,7 +534,7 @@ impl DownloadWindow {
                 if outstanding >= hard_cap {
                     return 0;
                 }
-                if !self.bbr.has_fresh_bdp(Instant::now()) {
+                if !self.bbr.has_fresh_bdp(now) {
                     let startup_cap = self.startup_request_cap.saturating_add(bonus).min(hard_cap);
                     if outstanding >= startup_cap {
                         return 0;
@@ -561,13 +565,23 @@ impl DownloadWindow {
     /// admission limit (outstanding reserved bytes ≤ window) rather than a nonzero gate, so
     /// a small window cannot issue a large multi-body request. The take always admits its
     /// first item for floor progress, so the only permitted overshoot is that single body.
-    pub(super) fn cwnd_byte_headroom(&self, bonus: usize) -> Option<u64> {
+    pub(super) fn cwnd_byte_headroom_at(&self, bonus: usize, now: Instant) -> Option<u64> {
         match self.cwnd_unit {
             CwndUnit::Blocks => None,
             // `available_slots_with_bonus` already returns the remaining byte headroom
             // (cwnd bytes + bonus bodies − reserved) under `Bytes`.
-            CwndUnit::Bytes => Some(self.available_slots_with_bonus(bonus) as u64),
+            CwndUnit::Bytes => Some(self.available_slots_with_bonus_at(bonus, now) as u64),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn available_slots_with_bonus(&self, bonus: usize) -> usize {
+        self.available_slots_with_bonus_at(bonus, Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(super) fn cwnd_byte_headroom(&self, bonus: usize) -> Option<u64> {
+        self.cwnd_byte_headroom_at(bonus, Instant::now())
     }
 
     /// Scale a base floor-bypass slot count by the peer's reliability discount, so the

@@ -148,7 +148,7 @@ pub(super) enum SequencerControlInput {
 /// The progress view the reactor reacts to. A `watch` (latest-wins) send never
 /// blocks, so the task never blocks on the reactor and the bounded input channel
 /// cannot deadlock against it.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub(super) struct SequencerView {
     pub(super) verified_tip: block::Height,
     pub(super) verified_hash: block::Hash,
@@ -749,7 +749,7 @@ impl SequencerTask {
             .saturating_add(body_input_bytes);
         self.budget
             .audit(expected_budget, "block-sync sequencer view");
-        let _ = self.view_tx.send_replace(SequencerView {
+        let next = SequencerView {
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,
             download_floor: self.sequencer.floor(),
@@ -765,6 +765,97 @@ impl SequencerTask {
             submitted_applying_bytes: self.sequencer.submitted_applying_bytes(),
             committed_bytes_per_sec: self.committed_throughput.bytes_per_sec(),
             committed_blocks_per_sec: self.committed_throughput.blocks_per_sec(),
-        });
+        };
+        // Only wake watchers (the reactor + every per-peer routine) when a field
+        // they schedule against actually changed. The two committed_*_per_sec rates
+        // are observability-only; without this guard a no-op control input — e.g. a
+        // `FundFloorReservation` that shed nothing while the byte budget is pinned —
+        // still publishes an otherwise-identical view and re-wakes the requesting
+        // routine's `sequencer_view.changed()` arm into an immediate refill retry.
+        // That is a timer-free reactor<->sequencer<->routine busy-spin: it wastes a
+        // core (and starves progress under CI load) on a real clock and fully wedges
+        // a `start_paused` test clock, which auto-advances only once every task
+        // parks. Keep the stored rates fresh, but notify only on a schedulable change.
+        publish_sequencer_view(&self.view_tx, next);
+    }
+}
+
+fn publish_sequencer_view(view_tx: &watch::Sender<SequencerView>, next: SequencerView) {
+    view_tx.send_if_modified(|current| {
+        let schedulable_changed = view_schedulable_ne(current, &next);
+        *current = next;
+        schedulable_changed
+    });
+}
+
+/// True when two views differ in any field the reactor or per-peer routines
+/// schedule against. Ignores the observability-only committed throughput rates,
+/// which move on nearly every sample and must not, on their own, wake — or under a
+/// paused test clock, spin — the whole fleet of watchers.
+fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
+    let strip_rates = |v: &SequencerView| {
+        let mut v = *v;
+        v.committed_bytes_per_sec = 0;
+        v.committed_blocks_per_sec = 0;
+        v
+    };
+    strip_rates(a) != strip_rates(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_view() -> SequencerView {
+        SequencerView {
+            verified_tip: block::Height(1),
+            verified_hash: block::Hash([1; 32]),
+            download_floor: block::Height(1),
+            finalized: block::Height(1),
+            reset_epoch: 0,
+            reaction_epoch: 0,
+            reorder_len: 0,
+            applying_len: 0,
+            reorder_buffered_bytes: 0,
+            applying_buffered_bytes: 0,
+            unsubmitted_applying_count: 0,
+            submitted_applying_count: 0,
+            submitted_applying_bytes: 0,
+            committed_bytes_per_sec: 0,
+            committed_blocks_per_sec: 0,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sequencer_view_rate_refresh_does_not_wake_watchers() {
+        let initial = test_view();
+        let (view_tx, mut view_rx) = watch::channel(initial);
+
+        let rate_only = SequencerView {
+            committed_bytes_per_sec: 1024,
+            committed_blocks_per_sec: 3,
+            ..initial
+        };
+        publish_sequencer_view(&view_tx, rate_only);
+
+        assert_eq!(*view_rx.borrow(), rate_only);
+        assert!(
+            time::timeout(Duration::from_millis(1), view_rx.changed())
+                .await
+                .is_err(),
+            "throughput-only view refresh must not wake watchers"
+        );
+
+        let schedulable = SequencerView {
+            reaction_epoch: 1,
+            ..rate_only
+        };
+        publish_sequencer_view(&view_tx, schedulable);
+
+        view_rx
+            .changed()
+            .await
+            .expect("sequencer view sender is still live");
+        assert_eq!(*view_rx.borrow(), schedulable);
     }
 }

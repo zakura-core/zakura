@@ -174,7 +174,12 @@ fn best_relevant_chain_and_history_tree(
         db,
         state_tip_before_queries.into(),
     )
-    .expect("tip hash should exist in the chain");
+    .ok_or_else(|| {
+        BoxError::from(
+            "Zebra is committing blocks to the state, \
+             wait until it syncs to the chain tip",
+        )
+    })?;
 
     let state_tip_after_queries =
         read::best_tip(non_finalized_state, db).expect("already checked for an empty tip");

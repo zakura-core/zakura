@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Raised the default Zakura per-IP admission cap from 1 to 16 so NATed or
   co-hosted v2 peers are not rejected while the legacy TCP per-IP default
   remains 1.
+- Fixed a block-sync busy-spin under sustained byte-budget backpressure. The
+  sequencer re-published its progress view (waking the reactor and every per-peer
+  routine) even when no schedulable field had changed, which combined with the
+  per-attempt floor-funding request to spin a routine's refill loop with no timer
+  while the budget was pinned. The sequencer now wakes watchers only when a
+  scheduling-relevant field actually changes.
+- Fixed a transient `getinfo` RPC panic while Zebra is committing early synced
+  blocks and concurrently calculating display-only chain-tip difficulty.
 - Fixed an out-of-memory crash during Zakura block sync when the header chain
   runs far ahead of the commit tip. The block-sync applying buffer holds decoded
   block bodies ahead of the in-order committer; its look-ahead budget counted

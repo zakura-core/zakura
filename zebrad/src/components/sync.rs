@@ -457,6 +457,31 @@ fn legacy_probe_supports_fallback(blocks_ahead: Option<HeightDiff>) -> bool {
     matches!(blocks_ahead, Some(blocks_ahead) if blocks_ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD)
 }
 
+/// Converts Zakura's local body/header gap into the legacy sync-status
+/// "recent length" signal used by mempool and RPC readiness.
+///
+/// When Zakura owns body sync, the legacy [`ChainSync`] loop is paused, so
+/// `recent_syncs` would otherwise stay empty or stale. A zero or small local
+/// header/body gap means the node is close enough to the tip for the existing
+/// [`SyncStatus`] heuristic; a large gap keeps mempool disabled.
+fn zakura_sync_status_length(
+    verified_height: Option<Height>,
+    header_tip_height: Option<Height>,
+) -> Option<usize> {
+    let (Some(verified_height), Some(header_tip_height)) = (verified_height, header_tip_height)
+    else {
+        return None;
+    };
+
+    let gap = header_tip_height - verified_height;
+
+    if gap <= 0 {
+        Some(0)
+    } else {
+        Some(usize::try_from(gap).unwrap_or(usize::MAX))
+    }
+}
+
 /// Decides whether Zakura block sync should be considered stalled — so the
 /// legacy [`ChainSync::sync`] body downloader resumes as a fallback — from the
 /// latest verified body tip. Returns `true` once `max_idle_polls` consecutive
@@ -975,6 +1000,10 @@ where
 
             let verified_height = self.latest_chain_tip.best_tip_height();
             let header_tip_height = best_header_tip_height(&mut read_state).await;
+            if let Some(sync_length) = zakura_sync_status_length(verified_height, header_tip_height)
+            {
+                self.recent_syncs.push_extend_tips_length(sync_length);
+            }
 
             match zakura_watchdog_action(
                 &mut tracker,

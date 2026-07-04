@@ -7,12 +7,12 @@
 
 use tokio_util::sync::CancellationToken;
 
-use zebra_chain::block::Height;
+use zebra_chain::{block::Height, chain_sync_status::ChainSyncStatus};
 
 use super::super::{
     legacy_probe_supports_fallback, stop_zakura_sync, zakura_block_sync_stalled,
-    zakura_watchdog_action, ZakuraLegacyProbe, ZakuraStallTracker, ZakuraWatchdogAction,
-    ZAKURA_LEGACY_BEHIND_THRESHOLD,
+    zakura_sync_status_length, zakura_watchdog_action, SyncStatus, ZakuraLegacyProbe,
+    ZakuraStallTracker, ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
 };
 
 /// The original height-only rule, reproduced here only to demonstrate the F-88602
@@ -334,6 +334,63 @@ fn legacy_probe_below_threshold_keeps_zakura_running() {
     assert!(
         !legacy_probe_supports_fallback(Some(ZAKURA_LEGACY_BEHIND_THRESHOLD - 1)),
         "legacy peers below the behind threshold must not force a fallback"
+    );
+}
+
+#[test]
+fn zakura_sync_status_length_reports_local_header_gap() {
+    assert_eq!(
+        zakura_sync_status_length(Some(Height(100)), Some(Height(100))),
+        Some(0),
+        "a caught-up Zakura body tip should report a close-to-tip sync length"
+    );
+    assert_eq!(
+        zakura_sync_status_length(Some(Height(100)), Some(Height(110))),
+        Some(10),
+        "a small local header/body gap should preserve the existing close-to-tip heuristic"
+    );
+    assert_eq!(
+        zakura_sync_status_length(Some(Height(110)), Some(Height(100))),
+        Some(0),
+        "a stale header-tip read should not make a synced body tip look behind"
+    );
+    assert_eq!(
+        zakura_sync_status_length(None, Some(Height(100))),
+        None,
+        "without a verified body tip, Zakura should not publish a readiness signal"
+    );
+    assert_eq!(
+        zakura_sync_status_length(Some(Height(100)), None),
+        None,
+        "without a header frontier, Zakura should not publish a readiness signal"
+    );
+}
+
+#[test]
+fn zakura_sync_status_lengths_drive_existing_mempool_gate() {
+    let (sync_status, mut recent_syncs) = SyncStatus::new();
+
+    assert!(
+        !sync_status.is_close_to_tip(),
+        "an empty sync-status history starts with mempool disabled"
+    );
+
+    recent_syncs.push_extend_tips_length(
+        zakura_sync_status_length(Some(Height(100)), Some(Height(100)))
+            .expect("caught-up Zakura tips produce a sync status length"),
+    );
+    assert!(
+        sync_status.is_close_to_tip(),
+        "a caught-up Zakura body/header frontier should activate the existing close-to-tip gate"
+    );
+
+    recent_syncs.push_extend_tips_length(
+        zakura_sync_status_length(Some(Height(100)), Some(Height(1_000)))
+            .expect("known Zakura tips produce a sync status length"),
+    );
+    assert!(
+        !sync_status.is_close_to_tip(),
+        "a large Zakura body/header gap should keep the existing close-to-tip gate disabled"
     );
 }
 

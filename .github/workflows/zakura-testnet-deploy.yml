@@ -129,7 +129,13 @@ jobs:
 
           [defaults.zakura]
           listen_addr = "0.0.0.0:8234"
-          bootstrap_peers = []
+          bootstrap_peers = [
+              "1bf3bca139430ae519d64d04bfbee84333f240234f522c3816c24f5004273c1f@167.99.103.111:8234",
+              "40970c171cf38f6d0374fbdf6a8b945ba4e52741330dd167fd5617d0f33380ee@167.99.110.145:8234",
+              "297fe7914152fbb8aaad7dba550f7d383cdb6d5449f68c4c43b62295bca4678f@138.68.229.254:8234",
+              "2754c0a28df6570b729795b055ad81cf99f6647ad42496ca60cdf907b72a8abc@164.92.209.78:8234",
+              "9a135d8eaf38a693fd008bd12606e480e36bb7112fd9773c7af8f6106c838da3@206.189.148.0:8234",
+          ]
 
           [[nodes]]
           name       = "zakura-testnet-1"

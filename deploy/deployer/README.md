@@ -62,6 +62,8 @@ then deploys it to:
 - `zakura-testnet-1` — `root@167.99.103.111`
 - `zakura-testnet-2` — `root@167.99.110.145`
 - `zakura-testnet-3` — `root@138.68.229.254`
+- `zakura-testnet-eu` — `root@164.92.209.78`
+- `zakura-testnet-as` — `root@206.189.148.0`
 
 One-time runner bootstrap from an operator machine with SSH access and CI
 credentials in `~/agents-env`:
@@ -89,7 +91,7 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
 while forcing the legacy non-VCT path. It also writes `/etc/zakura/zebrad.toml`
-and uses each node's existing `/mnt/zakura-testnet-*-data/zebra-cache` snapshot
+and uses each node's existing `/mnt/<node-name>-data/zebra-cache` snapshot
 directory, so CI restarts the current `zebrad.service` against the existing state
 instead of creating a fresh database.
 

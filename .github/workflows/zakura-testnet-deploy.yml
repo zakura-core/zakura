@@ -1,6 +1,6 @@
 name: Deploy Zakura testnet fleet
 
-# Manual fleet deploy for the three Zakura testnet nodes.
+# Manual fleet deploy for the Zakura testnet nodes.
 #
 # Runs on a self-hosted Linux x86_64 runner, expected to be installed on
 # zakura-testnet-1 with the `zakura-testnet-deployer` label. The deployer builds
@@ -100,7 +100,7 @@ jobs:
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           : > ~/.ssh/known_hosts
-          for host in 167.99.103.111 167.99.110.145 138.68.229.254; do
+          for host in 167.99.103.111 167.99.110.145 138.68.229.254 164.92.209.78 206.189.148.0; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -154,6 +154,22 @@ jobs:
           network_cache_dir = "/mnt/zakura-testnet-3-data/zebra-cache"
           state_cache_dir = "/mnt/zakura-testnet-3-data/zebra-cache"
           log_file = "/mnt/zakura-testnet-3-data/logs/zebrad.log"
+
+          [[nodes]]
+          name       = "zakura-testnet-eu"
+          ssh_string = "root@164.92.209.78"
+          commit     = "${{ inputs.ref }}"
+          network_cache_dir = "/mnt/zakura-testnet-eu-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-eu-data/zebra-cache"
+          log_file = "/mnt/zakura-testnet-eu-data/logs/zebrad.log"
+
+          [[nodes]]
+          name       = "zakura-testnet-as"
+          ssh_string = "root@206.189.148.0"
+          commit     = "${{ inputs.ref }}"
+          network_cache_dir = "/mnt/zakura-testnet-as-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-as-data/zebra-cache"
+          log_file = "/mnt/zakura-testnet-as-data/logs/zebrad.log"
           EOF
 
       - name: Build deployer binary

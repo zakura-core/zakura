@@ -116,6 +116,7 @@ impl HeaderSyncReactor {
                 }
                 _ = ticks.tick() => {
                     self.handle_timeouts().await;
+                    self.retry_unsent_statuses();
                 }
             }
         }
@@ -1347,41 +1348,61 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn send_status(&mut self, peer: &ZakuraPeerId) {
+    fn send_status(&mut self, peer: &ZakuraPeerId) -> bool {
         let status = self.local_status();
         // Suppress a status identical to the last one we sent this peer over its
         // current session: it advances nothing and the peer's inbound status
         // rate limiter would treat the redundant message as spam.
-        match self.state.peers.get_mut(peer) {
+        let session = match self.state.peers.get(peer) {
             Some(peer_state) if peer_state.status_differs_from_last_sent(status) => {
-                peer_state.record_sent_status(status);
+                peer_state.session.clone()
             }
             Some(_) => {
                 metrics::counter!("sync.header.peer.status.suppressed_redundant").increment(1);
-                return;
+                return false;
             }
-            None => return,
-        }
-        metrics::counter!("sync.header.peer.status.sent").increment(1);
-        self.trace_status_sent(peer, status);
-        if let Some(peer_state) = self.state.peers.get(peer) {
-            if let Err(error) = peer_state.session.try_send_status(status) {
+            None => return false,
+        };
+        match session.try_send_status(status) {
+            Ok(()) => {
+                if let Some(peer_state) = self.state.peers.get_mut(peer) {
+                    peer_state.record_sent_status(status);
+                }
+                metrics::counter!("sync.header.peer.status.sent").increment(1);
+                self.trace_status_sent(peer, status);
+                #[cfg(test)]
+                let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
+                    peer: peer.clone(),
+                    msg: HeaderSyncMessage::Status(status),
+                });
+                true
+            }
+            Err(error) => {
+                metrics::counter!("sync.header.peer.status.send_failed").increment(1);
                 tracing::debug!(?peer, ?error, "failed to queue Zakura header-sync Status");
                 self.trace_queue_send_failed(
                     peer,
                     "status",
                     &error,
-                    peer_state.session.outbound_capacity(),
-                    peer_state.session.outbound_max_capacity(),
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
                     |_| {},
                 );
+                false
             }
         }
-        #[cfg(test)]
-        let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
-            peer: peer.clone(),
-            msg: HeaderSyncMessage::Status(status),
-        });
+    }
+
+    fn send_status_and_mark_unsolicited(&mut self, peer: &ZakuraPeerId, now: Instant) -> bool {
+        if !self.send_status(peer) {
+            return false;
+        }
+
+        if let Some(peer_state) = self.state.peers.get_mut(peer) {
+            peer_state.meters.unsolicited.mark_taken(now);
+        }
+
+        true
     }
 
     async fn publish_best_tip(&mut self, height: block::Height, hash: block::Hash) {
@@ -1420,13 +1441,31 @@ impl HeaderSyncReactor {
         }
     }
 
+    fn retry_unsent_statuses(&mut self) {
+        let now = Instant::now();
+        let status = self.local_status();
+        let peer_ids: Vec<_> = self
+            .state
+            .peers
+            .iter()
+            .filter(|(_peer_id, peer)| {
+                peer.status_differs_from_last_sent(status) && peer.meters.unsolicited.is_ready(now)
+            })
+            .map(|(peer_id, _peer)| peer_id.clone())
+            .collect();
+
+        for peer in peer_ids {
+            self.send_status_and_mark_unsolicited(&peer, now);
+        }
+    }
+
     async fn broadcast_status_refresh(&mut self) {
         let now = Instant::now();
         let status = self.local_status();
         let peer_ids: Vec<_> = self
             .state
             .peers
-            .iter_mut()
+            .iter()
             .filter_map(|(peer_id, peer)| {
                 // Never re-send a peer a status identical to its last one: the
                 // peer's inbound rate limiter would treat it as spam. A redundant
@@ -1435,34 +1474,15 @@ impl HeaderSyncReactor {
                     metrics::counter!("sync.header.peer.status.suppressed_redundant").increment(1);
                     return None;
                 }
-                if !peer.meters.unsolicited.try_take(now) {
+                if !peer.meters.unsolicited.is_ready(now) {
                     return None;
                 }
-                peer.record_sent_status(status);
                 Some(peer_id.clone())
             })
             .collect();
 
         for peer in peer_ids {
-            let Some(peer_state) = self.state.peers.get(&peer) else {
-                continue;
-            };
-            if let Err(error) = peer_state.session.try_send_status(status) {
-                tracing::debug!(?peer, ?error, "failed to queue Zakura header-sync Status");
-                self.trace_queue_send_failed(
-                    &peer,
-                    "status",
-                    &error,
-                    peer_state.session.outbound_capacity(),
-                    peer_state.session.outbound_max_capacity(),
-                    |row| insert_optional_str(row, qs_trace::REASON, Some("refresh")),
-                );
-            }
-            #[cfg(test)]
-            let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
-                peer,
-                msg: HeaderSyncMessage::Status(status),
-            });
+            self.send_status_and_mark_unsolicited(&peer, now);
         }
     }
 

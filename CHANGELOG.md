@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed Zakura header-sync and block-sync peers getting stuck unable to serve
+  requests when an initial `Status` advertisement was dropped by a full outbound
+  queue. Status send bookkeeping now only records queued frames, header sync
+  retries unsent status advertisements, and block sync replies to the first
+  inbound status so peers converge after dropped connect-time advertisements.
 - Raised the default Zakura per-IP admission cap from 1 to 16 so NATed or
   co-hosted v2 peers are not rejected while the legacy TCP per-IP default
   remains 1.

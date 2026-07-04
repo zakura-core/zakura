@@ -271,11 +271,6 @@ impl PeerRoutine {
         let inbound_status_meter = super::state::RateMeter::new(
             config.status_refresh_interval.min(Duration::from_secs(1)),
         );
-        // Defer the first Status reply: the reactor already sends a connect-status
-        // on `PeerConnected`, so the peer's first inbound `Status` should not also
-        // trigger an immediate reply.
-        let mut status_reply_meter = status_reply_meter;
-        status_reply_meter.mark_taken(Instant::now());
         let max_blocks_per_response = config.advertised_max_blocks_per_response();
         let max_response_bytes = config.advertised_max_response_bytes();
         PeerRoutine {
@@ -520,6 +515,9 @@ impl PeerRoutine {
         if !self.inbound_status_meter.try_take(now) && !grows {
             return;
         }
+        // The reply is best-effort: if both the connect-time Status and this
+        // first reply are dropped by a full outbound queue, recovery depends on
+        // the remote's later Status retry arriving after this meter reopens.
         let send_reply = self.status_reply_meter.try_take(now);
         self.received_status = true;
         self.servable_low = status.servable_low;

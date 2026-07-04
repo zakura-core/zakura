@@ -2495,6 +2495,67 @@ async fn reconnect_resends_initial_status_after_session_reset() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn retries_initial_status_after_full_outbound_queue() {
+    let send_failed_before = metric_value("sync.header.peer.status.send_failed");
+    let network = regtest_network();
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    startup.range_state_actions_enabled = false;
+    startup.request_timeout = std::time::Duration::from_millis(10);
+    startup.status_refresh_interval = std::time::Duration::from_millis(10);
+    let fixture = spawn_test_reactor(startup);
+    let peer_id = peer(74);
+    let (send, mut recv) = crate::zakura::framed_channel(1);
+    send.try_send(
+        HeaderSyncMessage::Status(HeaderSyncStatus::default())
+            .encode_frame()
+            .expect("filler status frame encodes"),
+    )
+    .expect("outbound queue starts full");
+    let cancel = CancellationToken::new();
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        peer_id,
+        ServicePeerDirection::Inbound,
+        send,
+        cancel,
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if fixture.handle.peer_snapshot().inbound_peers == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer is admitted while outbound queue is full");
+
+    let _ = recv.recv().await.expect("filler frame drains");
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
+        .await
+        .expect("status retry arrives")
+        .expect("outbound channel remains open");
+    assert!(matches!(
+        HeaderSyncMessage::decode_frame(frame, HeaderSyncDecodeContext::control())
+            .expect("retry status decodes"),
+        HeaderSyncMessage::Status(_)
+    ));
+    assert!(
+        metric_value("sync.header.peer.status.send_failed") > send_failed_before,
+        "a full outbound queue must increment the header-sync Status send-failure counter"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn reconnect_clears_session_bound_outstanding_ranges() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(

@@ -10285,8 +10285,9 @@ async fn reactor_debounces_status_advertisements_on_serving_tip_change() {
         MAX_BS_RESPONSE_BYTES,
     )
     .await;
-    // `connect_peer_with_status` already read (and asserted) the connect-time
-    // `Status` off this peer's real outbound.
+    // `connect_peer_with_status` already read the connect-time `Status`; the
+    // peer's first inbound `Status` now gets a reply as well.
+    wait_for_outbound_status(&mut outbound_rx).await;
 
     handle
         .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
@@ -10393,7 +10394,70 @@ async fn reactor_retries_status_to_peer_without_status_when_local_status_unchang
 }
 
 #[tokio::test]
-async fn reactor_replies_to_status_after_status_send_allowance_reopens() {
+async fn reactor_replies_to_first_status_when_connect_status_queue_was_full() {
+    let mut config = ZakuraBlockSyncConfig {
+        status_refresh_interval: Duration::from_millis(50),
+        ..immediate_body_download_config()
+    };
+    config.peer_limits.outbound_queue_depth = 1;
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let peer = peer(64);
+    let (inbound_tx, inbound_rx) = framed_channel(8);
+    let (outbound_tx, mut outbound_rx) = framed_channel(1);
+    outbound_tx
+        .try_send(
+            BlockSyncMessage::Status(status())
+                .encode_frame()
+                .expect("filler status frame encodes"),
+        )
+        .expect("outbound queue starts full");
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+
+    service.add_peer(Peer::new_with_direction(
+        peer,
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        CancellationToken::new(),
+    ));
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if handle.peer_snapshot().outbound_peers == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer is admitted while outbound queue is full");
+
+    let _ = outbound_rx.recv().await.expect("filler frame drains");
+    send_inbound(&inbound_tx, BlockSyncMessage::Status(status())).await;
+
+    assert!(matches!(
+        next_outbound_message(&mut outbound_rx).await,
+        BlockSyncMessage::Status(_)
+    ));
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_does_not_ping_pong_rapid_repeated_status() {
     let mut config = ZakuraBlockSyncConfig {
         status_refresh_interval: Duration::from_millis(50),
         ..immediate_body_download_config()
@@ -10412,9 +10476,9 @@ async fn reactor_replies_to_status_after_status_send_allowance_reopens() {
     );
     let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
-    let peer = peer(64);
+    let peer = peer(65);
     let (inbound_tx, inbound_rx) = framed_channel(8);
-    let (outbound_tx, mut outbound_rx) = framed_channel(8);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
     let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
 
     service.add_peer(Peer::new_with_direction(
@@ -10426,33 +10490,17 @@ async fn reactor_replies_to_status_after_status_send_allowance_reopens() {
         CancellationToken::new(),
     ));
 
-    assert!(matches!(
-        next_outbound_message(&mut outbound_rx).await,
-        BlockSyncMessage::Status(_)
-    ));
-    inbound_tx
-        .send(
-            BlockSyncMessage::Status(status())
-                .encode_frame()
-                .expect("inbound status frame encodes"),
-        )
-        .await
-        .expect("inbound status queues");
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    inbound_tx
-        .send(
-            BlockSyncMessage::Status(status())
-                .encode_frame()
-                .expect("inbound status frame encodes"),
-        )
-        .await
-        .expect("second inbound status queues");
+    wait_for_outbound_status(&mut outbound_rx).await;
+    send_inbound(&inbound_tx, BlockSyncMessage::Status(status())).await;
+    wait_for_outbound_status(&mut outbound_rx).await;
 
-    assert!(matches!(
-        next_outbound_message(&mut outbound_rx).await,
-        BlockSyncMessage::Status(_)
-    ));
+    send_inbound(&inbound_tx, BlockSyncMessage::Status(status())).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), outbound_rx.recv())
+            .await
+            .is_err(),
+        "a rapid second inbound Status must not trigger another Status reply"
+    );
 
     reactor_task.abort();
 }

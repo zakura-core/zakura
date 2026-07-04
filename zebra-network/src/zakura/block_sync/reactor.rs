@@ -555,17 +555,13 @@ impl BlockSyncReactor {
         // primitives and its registry generation. The reactor keeps only a thin
         // serving handle (session + serving meters) — it neither spawns the
         // routine nor holds a per-peer inbound channel.
-        let mut peer_state = PeerBlockState::new(session, &self.startup.config);
-        // Consume the status-advertisement refresh allowance: the connect Status
-        // below counts as this peer's first advertisement, so the next periodic
-        // refresh must wait a full interval before re-sending.
-        peer_state.refresh_meter.mark_taken(Instant::now());
+        let peer_state = PeerBlockState::new(session, &self.startup.config);
         self.state.peers.insert(peer.clone(), peer_state);
 
         self.trace_peer_connected(&peer, direction);
         self.publish_peer_snapshot();
         self.publish_candidate_state();
-        self.send_status(&peer, "peer_connected");
+        self.send_status_and_mark_refresh(&peer, "peer_connected", Instant::now());
         // The routine fills its own slots; it begins want-work as soon as it has
         // a status and work.
     }
@@ -912,7 +908,7 @@ impl BlockSyncReactor {
     async fn handle_routine_message(&mut self, message: RoutineToReactor) {
         match message {
             RoutineToReactor::StatusReceived { peer, send_reply } => {
-                self.handle_status_received(peer, send_reply).await;
+                self.handle_status_received(peer, send_reply);
             }
             RoutineToReactor::ServeGetBlocks {
                 peer,
@@ -937,7 +933,7 @@ impl BlockSyncReactor {
     /// registry by the routine, generation-gated). The reactor advertises our
     /// `Status` reply if the routine's rate meter allowed it and republishes the
     /// candidate set.
-    async fn handle_status_received(&mut self, peer: ZakuraPeerId, send_reply: bool) {
+    fn handle_status_received(&mut self, peer: ZakuraPeerId, send_reply: bool) {
         if !self.state.peers.contains_key(&peer) {
             return;
         }
@@ -1226,9 +1222,9 @@ impl BlockSyncReactor {
             .max(max_blocks_per_response)
     }
 
-    fn send_status(&self, peer: &ZakuraPeerId, reason: &'static str) {
+    fn send_status(&self, peer: &ZakuraPeerId, reason: &'static str) -> bool {
         let Some(peer_state) = self.state.peers.get(peer) else {
-            return;
+            return false;
         };
         let status = self.local_status();
         let msg = BlockSyncMessage::Status(status);
@@ -1238,6 +1234,7 @@ impl BlockSyncReactor {
             Ok(()) => {
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
                 self.trace_status_sent(peer, reason, status);
+                true
             }
             Err(OrderedSendError::Full) => {
                 tracing::debug!(?peer, "Zakura block-sync Status queue is full");
@@ -1250,6 +1247,7 @@ impl BlockSyncReactor {
                     session.outbound_max_capacity(),
                     Some(reason),
                 );
+                false
             }
             Err(error) => {
                 tracing::debug!(?peer, ?error, "failed to queue Zakura block-sync Status");
@@ -1264,8 +1262,28 @@ impl BlockSyncReactor {
                     Some(reason),
                 );
                 session.cancel_token().cancel();
+                false
             }
         }
+    }
+
+    fn send_status_and_mark_refresh(
+        &mut self,
+        peer: &ZakuraPeerId,
+        reason: &'static str,
+        now: Instant,
+    ) -> bool {
+        if !self.send_status(peer, reason) {
+            return false;
+        }
+
+        // Consume the status-advertisement refresh allowance only after the
+        // Status enters the peer's outbound queue.
+        if let Some(peer_state) = self.state.peers.get_mut(peer) {
+            peer_state.refresh_meter.mark_taken(now);
+        }
+
+        true
     }
 
     fn send_block(&self, peer: &ZakuraPeerId, block: Arc<block::Block>) -> bool {
@@ -1453,19 +1471,20 @@ impl BlockSyncReactor {
         let peer_ids: Vec<_> = self
             .state
             .peers
-            .iter_mut()
+            .iter()
             .filter_map(|(peer_id, peer)| {
                 // On a real change, advertise to every peer immediately; the
                 // global meter above already debounced the change, so the
                 // per-peer `unsolicited` meter must not also suppress it. We
-                // still consume the per-peer allowance so a same-window retry to
-                // this peer stays spaced. Otherwise the only reason to send is a
-                // retry to a peer that has not acknowledged our Status, which
-                // stays gated solely by that peer's `unsolicited` meter.
-                if status_changed {
-                    peer.refresh_meter.mark_taken(now);
-                    Some(peer_id.clone())
-                } else if unready.contains(peer_id) && peer.refresh_meter.try_take(now) {
+                // still consume the per-peer allowance after the frame queues so
+                // a same-window retry to this peer stays spaced. Otherwise the
+                // only reason to send is a retry to a peer that has not
+                // acknowledged our Status, which stays gated solely by that
+                // peer's `unsolicited` meter.
+                let should_send_status = status_changed
+                    || (unready.contains(peer_id) && peer.refresh_meter.is_ready(now));
+
+                if should_send_status {
                     Some(peer_id.clone())
                 } else {
                     None
@@ -1474,7 +1493,7 @@ impl BlockSyncReactor {
             .collect();
 
         for peer in peer_ids {
-            self.send_status(&peer, "refresh");
+            self.send_status_and_mark_refresh(&peer, "refresh", now);
         }
     }
 

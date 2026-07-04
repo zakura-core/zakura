@@ -1005,6 +1005,10 @@ impl RateMeter {
         true
     }
 
+    pub(super) fn is_ready(&self, now: Instant) -> bool {
+        now >= self.next_allowed
+    }
+
     pub(super) fn mark_taken(&mut self, now: Instant) {
         self.next_allowed = now + self.interval;
     }

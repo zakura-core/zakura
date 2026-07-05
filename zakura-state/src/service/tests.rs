@@ -13,6 +13,7 @@ use zakura_chain::{
     block::{self, Block, CountedHeader, Height},
     chain_tip::ChainTip,
     fmt::SummaryDebug,
+    history_tree::HistoryTree,
     orchard,
     parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
@@ -26,10 +27,17 @@ use zakura_test::{prelude::*, transcript::Transcript};
 
 use crate::{
     arbitrary::Prepare,
+    constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     init_test,
+    request::{FinalizedBlock, Treestate},
     service::{
-        arbitrary::populated_state, chain_tip::TipAction, headers_by_height_range,
-        non_finalized_state::Chain, read, StateService,
+        arbitrary::populated_state,
+        best_header_history_tree,
+        chain_tip::TipAction,
+        finalized_state::{DiskWriteBatch, WriteDisk, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE},
+        headers_by_height_range,
+        non_finalized_state::Chain,
+        read, StateService,
     },
     tests::{
         setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
@@ -54,6 +62,94 @@ fn roots_from_height(start: Height, count: u32) -> Vec<BlockCommitmentRoots> {
             auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
         })
         .collect()
+}
+
+fn root_at(height: Height) -> BlockCommitmentRoots {
+    roots_from_height(height, 1)
+        .into_iter()
+        .next()
+        .expect("one root was requested")
+}
+
+fn mainnet_block(height: u32) -> Arc<Block> {
+    zakura_test::vectors::MAINNET_BLOCKS
+        .get(&height)
+        .expect("mainnet test vector exists")
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("mainnet test vector deserializes")
+}
+
+fn mainnet_state_with_genesis() -> (ZakuraDb, Arc<Block>, Arc<Block>) {
+    let genesis = mainnet_block(0);
+    let block1 = mainnet_block(1);
+    let state = new_ephemeral_db(&Network::Mainnet);
+
+    write_full_block_header_and_transactions(&state, genesis.clone());
+
+    (state, genesis, block1)
+}
+
+fn new_ephemeral_db(network: &Network) -> ZakuraDb {
+    ZakuraDb::new(
+        &Config::ephemeral(),
+        STATE_DATABASE_KIND,
+        &state_database_format_version_in_code(),
+        network,
+        true,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        false,
+    )
+}
+
+fn write_full_block_header_and_transactions(state: &ZakuraDb, block: Arc<Block>) {
+    let checkpoint_verified = CheckpointVerifiedBlock::from(block);
+    let finalized =
+        FinalizedBlock::from_checkpoint_verified(checkpoint_verified, Treestate::default());
+
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_block_header_and_transaction_data_batch(state, &finalized, true, None)
+        .expect("full block header and transaction batch is valid");
+    state.write_batch(batch).expect("full block batch writes");
+}
+
+fn commit_header_range_with_roots(
+    state: &ZakuraDb,
+    anchor: block::Hash,
+    headers: &[Arc<block::Header>],
+    roots: &[BlockCommitmentRoots],
+) -> block::Hash {
+    let mut batch = DiskWriteBatch::new();
+    let body_sizes = vec![0; headers.len()];
+    let committed_hash = batch
+        .prepare_header_range_batch_with_roots(state, anchor, headers, &body_sizes, roots)
+        .expect("header range with roots is valid");
+    state
+        .write_batch(batch)
+        .expect("header range batch writes successfully");
+
+    committed_hash
+}
+
+fn insert_zakura_header(state: &ZakuraDb, height: Height, header: Arc<block::Header>) {
+    let header_by_height = state.db().cf_handle("zakura_header_by_height").unwrap();
+    let hash_by_height = state
+        .db()
+        .cf_handle("zakura_header_hash_by_height")
+        .unwrap();
+    let height_by_hash = state
+        .db()
+        .cf_handle("zakura_header_height_by_hash")
+        .unwrap();
+    let hash = block::Hash::from(header.as_ref());
+    let mut batch = DiskWriteBatch::new();
+
+    batch.zs_insert(&header_by_height, height, &header);
+    batch.zs_insert(&hash_by_height, height, hash);
+    batch.zs_insert(&height_by_hash, hash, height);
+    state.write_batch(batch).expect("test header rows write");
 }
 
 async fn test_populated_state_responds_correctly(
@@ -535,7 +631,7 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
                 anchor: genesis.hash(),
                 headers: vec![block1.header.clone(), block2.header.clone()],
                 body_sizes: vec![999_999, 0],
-                tree_aux_roots: roots_from_height(Height(1), 2),
+                tree_aux_roots: roots_from_height(Height(1), 1),
             })
             .await?,
         Response::Committed(block2_hash),
@@ -787,7 +883,7 @@ async fn commit_header_range_completes_while_in_finalized_write_phase(
             anchor: genesis.hash(),
             headers: vec![block1.header.clone(), block2.header.clone()],
             body_sizes: vec![999_999, 0],
-            tree_aux_roots: roots_from_height(Height(1), 2),
+            tree_aux_roots: roots_from_height(Height(1), 1),
         }),
     )
     .await
@@ -859,6 +955,316 @@ async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<
     );
 
     Ok(())
+}
+
+#[test]
+fn best_header_history_tree_uses_genesis_base_when_no_header_lead() {
+    let _init_guard = zakura_test::init();
+    let (state, genesis, _block1) = mainnet_state_with_genesis();
+
+    let (tree, frontier) = best_header_history_tree(
+        None::<Arc<Chain>>,
+        &state,
+        &Network::Mainnet,
+        Height(0),
+        Height(0),
+    )
+    .expect("genesis-only state has a valid base history tree");
+
+    assert_eq!(frontier, (Height(0), genesis.hash()));
+    assert_eq!(tree.as_ref(), &HistoryTree::default());
+}
+
+#[test]
+fn best_header_history_tree_stops_one_block_before_header_tip() {
+    let _init_guard = zakura_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+    let block2 = mainnet_block(2);
+
+    commit_header_range_with_roots(
+        &state,
+        genesis.hash(),
+        &[block1.header.clone(), block2.header.clone()],
+        &[root_at(Height(1))],
+    );
+
+    let (tree, frontier) = best_header_history_tree(
+        None::<Arc<Chain>>,
+        &state,
+        &Network::Mainnet,
+        Height(0),
+        Height(2),
+    )
+    .expect("contiguous confirmed root reconstructs from genesis");
+
+    assert_eq!(frontier, (Height(1), block1.hash()));
+    assert_ne!(frontier, (Height(2), block2.hash()));
+    assert_eq!(
+        tree.hash(),
+        None,
+        "pre-Heartwood mainnet roots should not create a history tree",
+    );
+}
+
+#[test]
+fn best_header_history_tree_stops_at_first_missing_root_or_header() {
+    let _init_guard = zakura_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+    let block2 = mainnet_block(2);
+    let block3 = mainnet_block(3);
+
+    commit_header_range_with_roots(
+        &state,
+        genesis.hash(),
+        &[
+            block1.header.clone(),
+            block2.header.clone(),
+            block3.header.clone(),
+        ],
+        &[root_at(Height(1)), root_at(Height(2))],
+    );
+    state
+        .delete_zakura_header_commitment_roots([Height(2)])
+        .expect("test root deletion succeeds");
+
+    let (_tree, frontier) = best_header_history_tree(
+        None::<Arc<Chain>>,
+        &state,
+        &Network::Mainnet,
+        Height(0),
+        Height(3),
+    )
+    .expect("reconstruction succeeds up to the contiguous prefix");
+
+    assert_eq!(
+        frontier,
+        (Height(1), block1.hash()),
+        "reconstruction stops at the last contiguous root before the gap",
+    );
+}
+
+#[test]
+fn best_header_history_tree_returns_base_when_no_contiguous_fold_exists() {
+    let _init_guard = zakura_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+    let block2 = mainnet_block(2);
+
+    commit_header_range_with_roots(
+        &state,
+        genesis.hash(),
+        &[block1.header.clone(), block2.header.clone()],
+        &[root_at(Height(1))],
+    );
+    state
+        .delete_zakura_header_commitment_roots([Height(1)])
+        .expect("test root deletion succeeds");
+
+    let (tree, frontier) = best_header_history_tree(
+        None::<Arc<Chain>>,
+        &state,
+        &Network::Mainnet,
+        Height(0),
+        Height(2),
+    )
+    .expect("missing roots above genesis leave the base frontier");
+
+    assert_eq!(frontier, (Height(0), genesis.hash()));
+    assert_eq!(tree.as_ref(), &HistoryTree::default());
+}
+
+#[test]
+fn best_header_history_tree_errors_on_missing_real_base_tree() {
+    let _init_guard = zakura_test::init();
+    let (state, _genesis, block1) = mainnet_state_with_genesis();
+    insert_zakura_header(&state, Height(1), block1.header.clone());
+
+    let error = best_header_history_tree(
+        None::<Arc<Chain>>,
+        &state,
+        &Network::Mainnet,
+        Height(1),
+        Height(1),
+    )
+    .expect_err("a real verified tip without a history tree is inconsistent");
+
+    assert!(
+        error
+            .to_string()
+            .contains("no history tree at verified block tip"),
+        "unexpected error: {error}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn best_header_history_tree_read_request_returns_reconstructed_frontier() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let (mut state_service, read_state, _, _) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
+    let block1 = mainnet_block(1);
+    let block2 = mainnet_block(2);
+    let genesis = mainnet_block(0);
+
+    state_service
+        .ready()
+        .await
+        .expect("state service is ready")
+        .call(Request::CommitCheckpointVerifiedBlock(
+            CheckpointVerifiedBlock::from(genesis.clone()),
+        ))
+        .await
+        .expect("genesis block commits");
+
+    state_service
+        .ready()
+        .await
+        .expect("state service is ready")
+        .call(Request::CommitHeaderRange {
+            anchor: genesis.hash(),
+            headers: vec![block1.header.clone(), block2.header.clone()],
+            body_sizes: vec![0, 0],
+            tree_aux_roots: roots_from_height(Height(1), 1),
+        })
+        .await
+        .expect("header range commits");
+
+    let response = read_state
+        .oneshot(ReadRequest::BestHeaderHistoryTree {
+            verified_block_tip: Height(0),
+            best_header_tip: Height(2),
+        })
+        .await
+        .expect("best header history tree read succeeds");
+
+    let ReadResponse::BestHeaderHistoryTree { tree, frontier } = response else {
+        panic!("unexpected response: {response:?}");
+    };
+
+    assert_eq!(
+        frontier,
+        (Height(1), block1.hash()),
+        "the read service returns the same confirmed frontier as the helper",
+    );
+    assert_eq!(
+        tree.hash(),
+        None,
+        "pre-Heartwood mainnet roots should not create a history tree",
+    );
+}
+
+/// A block-level reorg below the header frontier: when a full block commits a header that conflicts
+/// with the provisional header-sync chain, the conflicting provisional headers *and* their roots are
+/// dropped, so no stale peer-supplied root survives to be folded by history-tree reconstruction.
+#[test]
+fn block_reorg_drops_conflicting_provisional_roots_before_reconstruction() {
+    let _init_guard = zakura_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+    let block2 = mainnet_block(2);
+    let block3 = mainnet_block(3);
+
+    // Header sync races ahead on chain A: provisional headers 1..=3 with the confirmed root prefix
+    // (heights 1..=2; the tip's root is never persisted).
+    commit_header_range_with_roots(
+        &state,
+        genesis.hash(),
+        &[
+            block1.header.clone(),
+            block2.header.clone(),
+            block3.header.clone(),
+        ],
+        &[root_at(Height(1)), root_at(Height(2))],
+    );
+    assert_eq!(
+        state
+            .zakura_header_commitment_roots_by_height_range(Height(1)..=Height(2))
+            .len(),
+        2,
+        "chain A provisional roots are persisted before the reorg",
+    );
+
+    // A full block commits at height 1 with a header that conflicts with chain A (a reorg). The body
+    // commit path must drop chain A's provisional descendants and their roots — nothing carries a
+    // committed body yet, so the whole provisional suffix is reconciled away.
+    // A real height-1 reorg still links to genesis — height 1's only possible
+    // parent — and differs from chain A's block1 elsewhere in the header. Mutating
+    // the parent hash instead would make the seed non-linking, which the header
+    // store's linkage guard (validate-linkage-in-writers) correctly refuses as a
+    // silent no-op that would drop nothing.
+    let mut conflicting_header = *block1.header;
+    conflicting_header.nonce = [0x5a; 32].into();
+    let conflicting_block = Arc::new(Block {
+        header: Arc::new(conflicting_header),
+        transactions: block1.transactions.clone(),
+    });
+    assert_ne!(conflicting_block.header, block1.header);
+
+    state
+        .seed_zakura_header_from_committed_block(Height(1), &conflicting_block)
+        .expect("conflicting body commit reconciles the provisional header store");
+
+    // Chain A's provisional roots at every height are gone: nothing stale survives to be folded.
+    assert!(
+        state
+            .zakura_header_commitment_roots_by_height_range(Height(1)..=Height(3))
+            .is_empty(),
+        "a conflicting commit must drop all chain A provisional roots",
+    );
+
+    // Reconstruction over the reorged state folds nothing stale and returns the verified base.
+    let (tree, frontier) = best_header_history_tree(
+        None::<Arc<Chain>>,
+        &state,
+        &Network::Mainnet,
+        Height(0),
+        Height(1),
+    )
+    .expect("reconstruction succeeds after the reorg");
+    assert_eq!(frontier, (Height(0), genesis.hash()));
+    assert_eq!(tree.as_ref(), &HistoryTree::default());
+}
+
+/// The tightened state invariant is enforced through the real request path: a `CommitHeaderRange`
+/// carrying a full-length roots vector (one per header, *including* the unconfirmed tip) is rejected,
+/// so a future or refactored caller cannot persist the unconfirmed tip root by mistake.
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_header_range_rejects_full_length_roots_through_the_service() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let (mut state_service, _read_state, _, _) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
+    let genesis = mainnet_block(0);
+    let block1 = mainnet_block(1);
+    let block2 = mainnet_block(2);
+
+    state_service
+        .ready()
+        .await
+        .expect("state service is ready")
+        .call(Request::CommitCheckpointVerifiedBlock(
+            CheckpointVerifiedBlock::from(genesis.clone()),
+        ))
+        .await
+        .expect("genesis block commits");
+
+    // Full-length roots: one per header, including the range tip (height 2). Only the confirmed
+    // prefix (height 1) may be persisted, so the boundary must reject this shape outright.
+    let error = state_service
+        .ready()
+        .await
+        .expect("state service is ready")
+        .call(Request::CommitHeaderRange {
+            anchor: genesis.hash(),
+            headers: vec![block1.header.clone(), block2.header.clone()],
+            body_sizes: vec![0, 0],
+            tree_aux_roots: roots_from_height(Height(1), 2),
+        })
+        .await
+        .expect_err("a full-length roots vector must be rejected by the tightened boundary");
+
+    assert!(
+        error.to_string().contains("does not match header count"),
+        "unexpected error: {error}",
+    );
 }
 
 #[test]

@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use zakura_chain::history_tree::HistoryTree;
+
 use super::{error::*, events::*, scheduler::*, validation::*, wire::*, *};
 use crate::zakura::{
     HeaderSyncServiceSummary, ServicePeerDirection, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
@@ -17,20 +21,31 @@ pub(super) struct HeaderSyncCore {
     pub(super) verified_block_hash: block::Hash,
     pub(super) best_header_tip: block::Height,
     pub(super) best_header_hash: block::Hash,
+    pub(super) best_header_parent_hash: Option<block::Hash>,
+    /// History tree positioned at the parent of the next forward range.
+    ///
+    /// Seeded at startup from durable state and repositioned as ranges commit, so peer-supplied
+    /// roots can be folded and authenticated against header commitments. The empty tree is the
+    /// natural pre-Heartwood value.
+    pub(super) best_header_history_tree: Arc<HistoryTree>,
     pub(super) peers: HashMap<ZakuraPeerId, PeerHeaderState>,
     pub(super) parked_peers: HashSet<ZakuraPeerId>,
     pub(super) seen: HeaderHashDedup,
     pub(super) pending_new_blocks: HashSet<block::Hash>,
     pub(super) schedule: RangeScheduler,
-    pub(super) pending_commits: HashMap<PendingCommitKey, RangeRequest>,
+    pub(super) pending_commits: HashMap<PendingCommitKey, PendingHeaderCommit>,
     pub(super) advisory: HashMap<ZakuraPeerId, HeaderSyncAdvisoryPeerState>,
     pub(super) stale_anchor: StaleAnchorFailures,
+    /// True while a `QueryBestHeaderHistoryTree` rebuild is outstanding, so a run of forward ranges
+    /// that all find the tree stale dispatches only one reload.
+    pub(super) rebuild_in_flight: bool,
 }
 
 impl HeaderSyncCore {
     pub(super) fn new(startup: &HeaderSyncStartup) -> Result<Self, HeaderSyncStartError> {
         validate_anchor(&startup.network, startup.anchor)?;
         let (best_header_tip, best_header_hash) = startup.best_header_tip.unwrap_or(startup.anchor);
+        let best_header_history_tree = startup.best_header_history_tree.clone();
 
         Ok(Self {
             anchor: startup.anchor,
@@ -39,6 +54,8 @@ impl HeaderSyncCore {
             verified_block_hash: startup.frontiers.verified_block_hash,
             best_header_tip,
             best_header_hash,
+            best_header_parent_hash: startup.best_header_parent_hash,
+            best_header_history_tree,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
             seen: HeaderHashDedup::default(),
@@ -47,6 +64,7 @@ impl HeaderSyncCore {
             pending_commits: HashMap::new(),
             advisory: HashMap::new(),
             stale_anchor: StaleAnchorFailures::default(),
+            rebuild_in_flight: false,
         })
     }
 
@@ -63,7 +81,42 @@ impl HeaderSyncCore {
         }
 
         let checkpoints = startup.network.checkpoint_list();
-        let Some(start) = next_height(self.best_header_tip) else {
+        // Commitment-root verification, the one-block overlap, and the in-memory header-frontier
+        // history tree only exist up to the last checkpoint — the VCT fast-sync handoff boundary, the
+        // only region where a consumer reads the persisted roots. Crucially the handoff block *at*
+        // `last_checkpoint` reads its own persisted root from the roots CF (`vct_roots_at_height` is
+        // inclusive of `last_checkpoint`); an empty slot there wedges the handoff on the frozen-frontier
+        // safety check. A root at `H` is only confirmed by the header at `H + 1`, so to persist the
+        // confirmed root at `last_checkpoint` the root-carrying regime must run until the frontier
+        // reaches `last_checkpoint + 1`. Above that, header sync runs plain: no roots, no overlap.
+        let last_checkpoint = startup.last_checkpoint_height;
+        // The frontier height at which root work stops: one above the last checkpoint (so the range
+        // that reaches `last_checkpoint` still confirms its root via the `last_checkpoint + 1` header).
+        let root_regime_end = next_height(last_checkpoint).unwrap_or(last_checkpoint);
+        // Header sync persists confirmed roots for `(max(anchor, finalized_height) .. last_checkpoint]`
+        // — the below-checkpoint heights this node forward-syncs (above its anchor) that are not yet
+        // committed. Below the last checkpoint, blocks are checkpoint-verified straight into the
+        // finalized state, so `finalized_height` is the committed floor VCT consumes roots up to. Root
+        // work runs while that region is non-empty and the frontier has not passed the confirming
+        // height (`last_checkpoint + 1`). A node anchored at / already synced through the last
+        // checkpoint (handoff done via the embedded frontier), and a genesis-only checkpoint list
+        // (`max_height == 0`), both have an empty region and run plain.
+        let root_region_floor = self.anchor.0.max(self.finalized_height);
+        let below_root_boundary =
+            root_region_floor < last_checkpoint && self.best_header_tip < root_regime_end;
+        let want_tree_aux_roots = below_root_boundary;
+
+        // Root-carrying ranges leave the best tip's roots unconfirmed, so the next request
+        // redelivers the tip header anchored at its parent. Overlap only applies in the root regime.
+        let overlap_forward_range = below_root_boundary
+            && self
+                .best_header_parent_hash
+                .is_some_and(|_| self.best_header_tip > block::Height(0));
+        let Some(start) = (if overlap_forward_range {
+            Some(self.best_header_tip)
+        } else {
+            next_height(self.best_header_tip)
+        }) else {
             return;
         };
         let mut end = best_peer_tip;
@@ -77,6 +130,13 @@ impl HeaderSyncCore {
                 finalized = true;
             }
         }
+        // Cap the root-carrying range at `last_checkpoint + 1`: the range that reaches the checkpoint
+        // confirms and persists the root at `last_checkpoint` (via the `last_checkpoint + 1` header),
+        // and the following (above-boundary) ranges run plain. The tip root at `last_checkpoint + 1` is
+        // itself left unconfirmed and unpersisted — VCT never reads it.
+        if below_root_boundary {
+            end = end.min(root_regime_end);
+        }
 
         let count = count_between(start, end);
         if count == 0 {
@@ -85,9 +145,14 @@ impl HeaderSyncCore {
         self.schedule.ensure_forward(RangeRequest {
             start_height: start,
             count,
-            anchor_hash: self.best_header_hash,
+            anchor_hash: if overlap_forward_range {
+                self.best_header_parent_hash
+                    .expect("overlapped ranges have a parent hash")
+            } else {
+                self.best_header_hash
+            },
             finalized,
-            want_tree_aux_roots: true,
+            want_tree_aux_roots,
             priority: RangePriority::Forward,
         });
     }
@@ -121,6 +186,15 @@ impl HeaderSyncCore {
             priority: RangePriority::Backward,
         });
     }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingHeaderCommit {
+    pub(super) range: RangeRequest,
+    /// `Some` for aux-validated forward ranges; `None` for checkpoint-authenticated backward
+    /// backfill ranges, which persist no provisional roots and never install a frontier tree.
+    pub(super) verified_roots:
+        Option<zakura_chain::parallel::commitment_aux_verify::VerifiedHeaderCommitmentRoots>,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -55,6 +55,20 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Zebra now tags the coinbase input of every block it mines with a `🌸`. The
   `mining.extra_coinbase_data` option is now limited to 86 bytes (was 94);
   Zebra refuses to start if it is exceeded.
+- Zakura header sync now verifies peer-supplied commitment (tree-aux) roots
+  against block header commitments before persisting them, writing only the
+  header-authenticated confirmed prefix (the range tip's root is confirmed by
+  the next overlapping range). Root verification, the one-block overlap, and the
+  in-memory ZIP-221 history tree are bounded to the verified-commitment-trees
+  fast-sync handoff — the last checkpoint, the only region where the roots are
+  consumed — and run through the last checkpoint inclusive (its root is needed by
+  the handoff block). Above that boundary header sync runs plainly (blocks are
+  fully re-verified). The header frontier keeps tracking the committed chain
+  (checkpoint or legacy sync); the tree grows only as header ranges commit and is
+  rebuilt lazily from durable state on the rare occasion a forward range finds it
+  behind a non-Zakura commit. Serving is unaffected: `BlockRoots` still returns
+  roots derived from real note-commitment trees at any height where the node has
+  them.
 
 ### Changed
 

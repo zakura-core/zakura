@@ -1611,6 +1611,146 @@ where
     roots
 }
 
+/// Reconstructs the ZIP-221 history tree positioned at the *confirmed* header frontier.
+///
+/// The durable history tree at `verified_block_tip` is the base. The per-height roots stored for
+/// `(verified_block_tip, best_header_tip)` are folded onto it in bounded windows — note the range
+/// is **exclusive** of `best_header_tip`. A committed forward range never persists the root of its
+/// own tip block: that root is only authenticated by the *next* range's first header (the one-block
+/// confirmation lag), so the highest durable root is at `best_header_tip - 1`. The returned tree is
+/// therefore positioned at the confirmed frontier (`best_header_tip - 1` when the header tip leads
+/// the verified body tip, otherwise the base).
+///
+/// This mirrors the running reactor, which keeps its in-memory tree one block behind the header tip
+/// and re-validates the tip's root through the overlapping next forward range. A restart that folded
+/// the tip's root here would instead *trust* an unauthenticated peer-supplied root, so we stop one
+/// block short and let the overlap re-validate it.
+///
+/// Errors only if the base history tree at `verified_block_tip` is missing at a real verified tip,
+/// or a fold fails. A missing header/root *above* the base is not an error but the contiguous
+/// frontier, where folding stops.
+///
+/// Alongside the tree, returns the frontier `(height, hash)` the tree is positioned at: the highest
+/// contiguous confirmed header-root height reached (the verified base when nothing folds). The
+/// caller seeds `best_header_parent_hash` and resumes header sync from `frontier + 1` off this one
+/// authoritative value, so a one-block gap in the persisted roots resumes from the gap rather than
+/// capping all the way back to the verified tip.
+fn best_header_history_tree<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    network: &Network,
+    verified_block_tip: block::Height,
+    best_header_tip: block::Height,
+) -> Result<
+    (
+        Arc<zakura_chain::history_tree::HistoryTree>,
+        (block::Height, block::Hash),
+    ),
+    BoxError,
+>
+where
+    C: AsRef<Chain> + Clone,
+{
+    use zakura_chain::{history_tree::HistoryTree, parallel::commitment_aux_verify};
+
+    // Base tree as of the verified block tip. A missing tree is only legitimate for the empty or
+    // genesis state (height 0); at any real verified tip the state always holds a tree (empty
+    // pre-Heartwood, non-empty after), so a `None` there is an inconsistency we must not paper over
+    // with an empty base — that would silently stall (or, once folding starts, panic) verification.
+    let base_tree = match read::tree::history_tree(chain.clone(), db, verified_block_tip.into()) {
+        Some(tree) => tree,
+        None if verified_block_tip == block::Height(0) => Arc::new(HistoryTree::default()),
+        None => {
+            return Err(format!(
+                "cannot rebuild header-tip history tree: no history tree at verified block tip \
+                 {verified_block_tip:?}"
+            )
+            .into())
+        }
+    };
+
+    // Construct the MMR tree up to
+    // this height.
+    let mmr_tree_height_target = if best_header_tip > verified_block_tip {
+        block::Height(best_header_tip.0 - 1)
+    } else {
+        verified_block_tip
+    };
+
+    let mut tree = (*base_tree).clone();
+    let mut next = verified_block_tip
+        .next()
+        .map_err(|_| BoxError::from("verified block tip height overflow"))?;
+
+    // The (height, hash) of the last folded header — the contiguous frontier the tree ends at.
+    // Stays `None` while the tree is still at the base.
+    let mut reconstructed_frontier: Option<(block::Height, block::Hash)> = None;
+
+    while next <= mmr_tree_height_target {
+        // `+ 1` because the range is inclusive of `mmr_tree_height_target`.
+        let remaining = mmr_tree_height_target.0 - next.0 + 1;
+        let count = remaining.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
+
+        let headers = headers_by_height_range(chain.clone(), db, next, count);
+        let roots = block_roots_by_height_range(chain.clone(), db, next, count);
+
+        // Both reads return a contiguous prefix from `next`, so the number of aligned `(header,
+        // root)` pairs is the shorter length. A short read means the persisted roots stop here (a
+        // gap, or simply the frontier): fold what is contiguous and stop — this is not an error.
+        let contiguous = headers.len().min(roots.len());
+        if contiguous > 0 {
+            reconstructed_frontier = headers
+                .get(contiguous - 1)
+                .map(|(height, hash, _header)| (*height, *hash));
+
+            let roots_by_height = headers
+                .iter()
+                .zip(roots.iter())
+                .take(contiguous)
+                .map(|((_height, _hash, header), root)| (header.as_ref(), root));
+
+            tree = commitment_aux_verify::append_confirmed_roots(network, tree, roots_by_height)
+                .map_err(|(height, error)| {
+                    BoxError::from(format!(
+                        "failed to fold header-tip history tree at {height:?}: {error}"
+                    ))
+                })?;
+        }
+
+        // `count` is capped at `MAX_HEADER_SYNC_HEIGHT_RANGE`.
+        if contiguous < count as usize {
+            break;
+        }
+
+        let Some(advanced_blocks) = next.0.checked_add(count) else {
+            break;
+        };
+        next = block::Height(advanced_blocks);
+    }
+
+    // The frontier is the last folded height, or the verified base when nothing folded. The base
+    // always has a durable header hash (the verified tip is committed); genesis is the sole
+    // empty-state case.
+    let frontier = match reconstructed_frontier {
+        Some(frontier) => frontier,
+        None => {
+            let base_hash = read::hash_by_height(chain.clone(), db, verified_block_tip)
+                .or_else(|| {
+                    (verified_block_tip == block::Height(0)).then(|| network.genesis_hash())
+                })
+                .ok_or_else(|| {
+                    BoxError::from(format!(
+                        "cannot rebuild header-tip history tree: no header hash at verified block \
+                         tip {verified_block_tip:?}"
+                    ))
+                })?;
+            (verified_block_tip, base_hash)
+        }
+    };
+
+    Ok((Arc::new(tree), frontier))
+}
+
 impl Service<ReadRequest> for ReadStateService {
     type Response = ReadResponse;
     type Error = BoxError;
@@ -1875,6 +2015,20 @@ impl Service<ReadRequest> for ReadStateService {
                         (None, block_tip) => block_tip,
                     },
                 ))
+            }
+
+            ReadRequest::BestHeaderHistoryTree {
+                verified_block_tip,
+                best_header_tip,
+            } => {
+                let (tree, frontier) = best_header_history_tree(
+                    state.latest_best_chain(),
+                    &state.db,
+                    &state.db.network(),
+                    verified_block_tip,
+                    best_header_tip,
+                )?;
+                Ok(ReadResponse::BestHeaderHistoryTree { tree, frontier })
             }
 
             ReadRequest::MissingBlockBodies { from, limit } => {

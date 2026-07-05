@@ -32,6 +32,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use zakura_chain::{
     block::{self, Block, CountedHeader},
+    history_tree::HistoryTree,
     parameters::{Network, NetworkKind},
     serialization::{CompactSizeMessage, ZcashDeserialize, MAX_HEADERS_PER_MESSAGE},
     transaction::Transaction,
@@ -543,6 +544,13 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub frontiers: HeaderSyncFrontiers,
     /// Durable best header tip loaded from state.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
+    /// Hash of the durable best header tip's parent, if available.
+    pub best_header_parent_hash: Option<block::Hash>,
+    /// History tree positioned at the durable best header tip.
+    ///
+    /// Reconstructed from durable state so post-Heartwood header-sync root verification can start
+    /// immediately; the default (empty) tree is the pre-Heartwood/empty-state value.
+    pub best_header_history_tree: Arc<HistoryTree>,
     /// Hash of `frontiers.verified_block_tip`.
     pub verified_block_tip_hash: block::Hash,
 }
@@ -2776,6 +2784,13 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let best_header_tip = header_sync_driver_startup
         .as_ref()
         .map_or(Some(anchor), |startup| startup.best_header_tip);
+    let best_header_parent_hash = header_sync_driver_startup
+        .as_ref()
+        .and_then(|startup| startup.best_header_parent_hash);
+    let best_header_history_tree = header_sync_driver_startup
+        .as_ref()
+        .map(|startup| startup.best_header_history_tree.clone())
+        .unwrap_or_else(|| Arc::new(HistoryTree::default()));
     let sync_frontier = header_sync_driver_startup.as_ref().map(|driver_startup| {
         let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
         let initial = FrontierUpdate {
@@ -2799,6 +2814,8 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.zakura.header_sync.clone(),
         limits.max_frame_bytes,
     );
+    startup.best_header_parent_hash = best_header_parent_hash;
+    startup.best_header_history_tree = best_header_history_tree;
     startup.status_refresh_interval = config.zakura.header_sync.status_refresh_interval;
     startup.trace = trace.clone();
     startup.frontier_updates = sync_frontier

@@ -397,6 +397,18 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::BestHeaderTip`].
     BestHeaderTip(Option<(block::Height, block::Hash)>),
 
+    /// Response to [`ReadRequest::BestHeaderHistoryTree`].
+    ///
+    /// `tree` is positioned at `frontier`, the highest contiguous confirmed header-root height the
+    /// fold could reach. Callers use `frontier` as the overlap anchor and resume header sync from the
+    /// next height.
+    BestHeaderHistoryTree {
+        /// The reconstructed history tree, positioned at `frontier`.
+        tree: Arc<zebra_chain::history_tree::HistoryTree>,
+        /// The `(height, hash)` the tree is positioned at (the confirmed contiguous frontier).
+        frontier: (block::Height, block::Hash),
+    },
+
     /// Response to [`ReadRequest::MissingBlockBodies`].
     MissingBlockBodies(Vec<block::Height>),
 
@@ -596,6 +608,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::ChainInfo(_)
             | ReadResponse::Headers(_)
             | ReadResponse::BestHeaderTip(_)
+            | ReadResponse::BestHeaderHistoryTree { .. }
             | ReadResponse::MissingBlockBodies(_)
             | ReadResponse::MissingBlockBodyMetadata(_)
             | ReadResponse::BlockSizeHints(_)

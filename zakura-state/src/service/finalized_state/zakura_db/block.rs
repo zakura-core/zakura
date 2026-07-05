@@ -2038,12 +2038,23 @@ impl DiskWriteBatch {
         headers: &[Arc<block::Header>],
         body_sizes: &[u32],
     ) -> Result<block::Hash, CommitHeaderRangeError> {
-        let roots = inferred_header_range_roots(zakura_db, anchor, headers.len())?;
+        // The commit path only accepts the confirmed prefix (one root shorter than the headers, and
+        // none for a single-header range), so infer exactly that many placeholder roots.
+        let roots =
+            inferred_header_range_roots(zakura_db, anchor, headers.len().saturating_sub(1))?;
         self.prepare_header_range_batch_with_roots(zakura_db, anchor, headers, body_sizes, &roots)
     }
 
     /// Prepare a database batch containing a contextually validated header range
-    /// and one provisional tree-aux root per header.
+    /// and the tree-aux roots supplied for it.
+    ///
+    /// `tree_aux_roots` is the caller's confirmed prefix, aligned from the range start. For a
+    /// semantically-validated forward range it is exactly one shorter than `headers` (zero roots
+    /// for a single-header range): the range tip's root is only authenticated by the next range's
+    /// successor header, so it is never confirmed here. Checkpoint-authenticated backfill ranges
+    /// pass an empty vector and persist no roots. Both shapes are enforced, not merely expected, so
+    /// it is structurally impossible to persist the unconfirmed tip root and expose peer-supplied
+    /// data to startup history-tree reconstruction.
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_header_range_batch_with_roots(
         &mut self,
@@ -2064,7 +2075,17 @@ impl DiskWriteBatch {
             });
         }
 
-        if headers.len() != tree_aux_roots.len() {
+        // A semantically-validated header range carries its *confirmed prefix* of roots: header
+        // `H + 1` authenticates the root for `H`, so over `[start..=tip]` the roots confirmed are
+        // `[start..=tip - 1]` and the tip's own root stays unconfirmed until the next overlapping
+        // range delivers its successor header. That prefix is always exactly one shorter than the
+        // headers (zero roots for a single-header range).
+        //
+        // Checkpoint-authenticated backfill ranges (backward ranges) carry no provisional roots at
+        // all, so an empty vector is also accepted. Both accepted shapes keep the trust boundary a
+        // state invariant: the unconfirmed tip root can never be persisted, because a full-length
+        // (or otherwise-longer) vector is still rejected, and an empty vector persists nothing.
+        if !(tree_aux_roots.is_empty() || tree_aux_roots.len() + 1 == headers.len()) {
             return Err(CommitHeaderRangeError::TreeAuxRootCountMismatch {
                 headers: headers.len(),
                 roots: tree_aux_roots.len(),
@@ -2142,8 +2163,6 @@ impl DiskWriteBatch {
                 .ok_or(CommitHeaderRangeError::HeightOverflow)?;
             let hash = block::Hash::from(&**header);
             let body_size = body_sizes[index];
-            let roots = &tree_aux_roots[index];
-
             if header.previous_block_hash != expected_parent {
                 return Err(CommitHeaderRangeError::UnlinkedRange {
                     height,
@@ -2153,11 +2172,15 @@ impl DiskWriteBatch {
             }
             expected_parent = hash;
 
-            if roots.height != height {
-                return Err(CommitHeaderRangeError::TreeAuxRootHeightMismatch {
-                    expected_height: height,
-                    root_height: roots.height,
-                });
+            // The tip's root is omitted from the confirmed prefix, so the last header may have no
+            // matching root. Present roots must align with their header height.
+            if let Some(roots) = tree_aux_roots.get(index) {
+                if roots.height != height {
+                    return Err(CommitHeaderRangeError::TreeAuxRootHeightMismatch {
+                        expected_height: height,
+                        root_height: roots.height,
+                    });
+                }
             }
 
             if let Some(expected) = checkpoints.hash(height) {
@@ -2302,20 +2325,31 @@ impl DiskWriteBatch {
             } else {
                 self.zs_delete(&body_size_by_height, height);
             }
-            let roots = &tree_aux_roots[index];
-            self.zs_insert(
-                &roots_by_height,
-                height,
-                CommitmentRootsByHeight {
-                    sapling: roots.sapling_root,
-                    orchard: roots.orchard_root,
-                    ironwood: roots.ironwood_root,
-                    sapling_tx: roots.sapling_tx,
-                    orchard_tx: roots.orchard_tx,
-                    ironwood_tx: roots.ironwood_tx,
-                    auth_data_root: roots.auth_data_root,
-                },
-            );
+            // A height with a committed body already has a *verified* row in the
+            // serving index, written by the body-commit batch. Peer-supplied roots
+            // are unauthenticated until verify-before-commit, and that verification
+            // only ever runs above the body tip — so a header range re-delivered
+            // over committed heights (a header store behind the body store, or a
+            // late range response racing body sync) must never overwrite the
+            // verified row: committed roots win on any overlap (design §9). The tip's root is absent
+            // from the confirmed prefix (`tree_aux_roots.get` is `None`), so it is never persisted.
+            if let Some(roots) = tree_aux_roots.get(index) {
+                if !zakura_db.contains_body_at_height(height) {
+                    self.zs_insert(
+                        &roots_by_height,
+                        height,
+                        CommitmentRootsByHeight {
+                            sapling: roots.sapling_root,
+                            orchard: roots.orchard_root,
+                            ironwood: roots.ironwood_root,
+                            sapling_tx: roots.sapling_tx,
+                            orchard_tx: roots.orchard_tx,
+                            ironwood_tx: roots.ironwood_tx,
+                            auth_data_root: roots.auth_data_root,
+                        },
+                    );
+                }
+            }
         }
 
         Ok(block::Hash::from(

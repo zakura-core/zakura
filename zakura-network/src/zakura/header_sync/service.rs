@@ -283,7 +283,7 @@ pub(crate) async fn drive_header_sync_actions(
                     "suppressing Zakura header range commit until state driver is wired"
                 );
             }
-            HeaderSyncAction::QueryBestHeaderTip
+            HeaderSyncAction::QueryBestHeaderHistoryTree { .. }
             | HeaderSyncAction::QueryMissingBlockBodies { .. }
             | HeaderSyncAction::BodyGaps { .. }
             | HeaderSyncAction::HeaderAdvanced { .. }

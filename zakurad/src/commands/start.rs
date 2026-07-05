@@ -1482,7 +1482,7 @@ mod zakura_header_sync_driver_tests {
     use tower::{
         service_fn,
         util::{BoxCloneService, BoxService},
-        ServiceExt,
+        Service, ServiceExt,
     };
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
@@ -1495,21 +1495,23 @@ mod zakura_header_sync_driver_tests {
         BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, DEFAULT_HS_RANGE,
     };
     use zakura_network::P2pStack;
-    use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
+    use zakura_test::vectors::{
+        BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_GENESIS_BYTES,
+    };
 
     use super::zakura::{
         abandoned_block_apply_finished_event, apply_block_sync_body, block_apply_class,
-        block_roots_cover_range, block_sync_chain_tip_event, block_sync_missing_body_window,
+        block_sync_chain_tip_event, block_sync_missing_body_window,
         block_sync_needed_blocks_from_state, block_verify_error_is_duplicate,
         body_sizes_for_served_header_range, chain_tip_mirror_frontier_change,
         coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
         commit_block_sync_body, drive_block_sync_actions, drive_zakura_header_sync_actions,
         header_range_commit_error_label, header_range_commit_failure_kind,
         notify_block_sync_header_tip, query_block_sync_frontiers, query_block_sync_needed_blocks,
-        root_covered_query_best_header_tip, tree_aux_roots_for_served_header_range,
-        verified_block_tip_from_state, BlockApplyClass, BlocksyncThroughputProbe,
-        ZakuraHeaderSyncDriverHandles, ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL,
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+        tree_aux_roots_for_served_header_range, verified_block_tip_from_state, BlockApplyClass,
+        BlocksyncThroughputProbe, ZakuraHeaderSyncDriverHandles,
+        ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+        ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
     };
 
     fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
@@ -1853,54 +1855,6 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[test]
-    fn startup_root_backfill_gate_requires_complete_root_coverage() {
-        let start = block::Height(10);
-        let complete_roots = [
-            root_at(block::Height(10)),
-            root_at(block::Height(11)),
-            root_at(block::Height(12)),
-        ];
-        assert!(block_roots_cover_range(start, 3, &complete_roots));
-        assert!(!block_roots_cover_range(start, 3, &complete_roots[..2]));
-
-        let roots_with_gap = [
-            root_at(block::Height(10)),
-            root_at(block::Height(12)),
-            root_at(block::Height(13)),
-        ];
-        assert!(!block_roots_cover_range(start, 3, &roots_with_gap));
-    }
-
-    #[tokio::test]
-    async fn query_best_header_tip_is_capped_when_roots_are_missing() {
-        let verified_tip = (block::Height(0), block::Hash([0; 32]));
-        let durable_header_tip = (block::Height(2), block::Hash([2; 32]));
-        let read_state = service_fn(move |request: zakura_state::ReadRequest| async move {
-            match request {
-                zakura_state::ReadRequest::Tip => Ok::<_, zakura_state::BoxError>(
-                    zakura_state::ReadResponse::Tip(Some(verified_tip)),
-                ),
-                zakura_state::ReadRequest::BlockRoots {
-                    start_height,
-                    count,
-                } => {
-                    assert_eq!(start_height, block::Height(1));
-                    assert_eq!(count, 2);
-                    Ok(zakura_state::ReadResponse::BlockRoots(Vec::new()))
-                }
-                request => panic!("unexpected read request: {request:?}"),
-            }
-        });
-
-        assert_eq!(
-            root_covered_query_best_header_tip(read_state, durable_header_tip)
-                .await
-                .expect("capped query succeeds"),
-            verified_tip
-        );
-    }
-
-    #[test]
     fn block_verify_error_duplicate_classifier_detects_router_and_block_errors() {
         let hash = block::Hash([1; 32]);
         let duplicate_block_error = zakura_consensus::VerifyBlockError::Block {
@@ -2232,6 +2186,74 @@ mod zakura_header_sync_driver_tests {
         reactor_task.abort();
     }
 
+    /// End-to-end restart-resume: with a persisted header lead (bodies still at genesis),
+    /// `zakura_header_sync_driver_startup` reconstructs the history tree at the confirmed frontier
+    /// (`header_tip - 1`), seeds `best_header_parent_hash` with the frontier hash, and resumes header
+    /// sync from `frontier + 1` so the first forward range overlaps and re-validates the still-
+    /// unconfirmed tip root — the exact posture the running reactor keeps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn header_sync_driver_startup_resumes_at_reconstructed_frontier() {
+        let network = zebra_chain::parameters::Network::Mainnet;
+        let (mut state_service, read_state, _, _) = zebra_state::init_test_services(&network).await;
+
+        let genesis = mainnet_block(&BLOCK_MAINNET_GENESIS_BYTES);
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+
+        state_service
+            .ready()
+            .await
+            .expect("state service is ready")
+            .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
+                zebra_state::CheckpointVerifiedBlock::from(genesis.clone()),
+            ))
+            .await
+            .expect("genesis block commits");
+
+        // Persist a header lead: headers 1..=2 with the confirmed prefix (height 1 only; the tip's
+        // root is never persisted). Durable header tip is 2, so the confirmed frontier is 1.
+        state_service
+            .ready()
+            .await
+            .expect("state service is ready")
+            .call(zebra_state::Request::CommitHeaderRange {
+                anchor: genesis.hash(),
+                headers: vec![block1.header.clone(), block2.header.clone()],
+                body_sizes: vec![0, 0],
+                tree_aux_roots: vec![root_at(block::Height(1))],
+            })
+            .await
+            .expect("header range commits");
+
+        let startup = super::zakura::zakura_header_sync_driver_startup(read_state, &network)
+            .await
+            .expect("driver startup reconstructs from durable state");
+
+        // Bodies are still at genesis; the header lead advanced to height 2.
+        assert_eq!(startup.frontiers.verified_block_tip, block::Height(0));
+
+        // Resume at frontier + 1 == 2 (the durable header tip), anchored at the frontier hash
+        // (height 1) so the first forward range overlaps and re-validates the tip's root.
+        assert_eq!(
+            startup.best_header_tip,
+            Some((block::Height(2), block2.hash())),
+            "resume height is frontier + 1, anchored at the durable tip",
+        );
+        assert_eq!(
+            startup.best_header_parent_hash,
+            Some(block1.hash()),
+            "overlap anchor is the confirmed frontier hash (height 1)",
+        );
+
+        // The reconstructed tree sits one block behind the header tip, at the frontier. These are
+        // pre-Heartwood mainnet blocks, so that frontier tree is the empty tree.
+        assert_eq!(
+            startup.best_header_history_tree.as_ref(),
+            &zebra_chain::history_tree::HistoryTree::default(),
+            "reconstructed frontier tree is the pre-Heartwood empty tree",
+        );
+    }
+
     #[tokio::test]
     async fn header_sync_driver_header_advanced_updates_exchange_header_only() {
         let network = zakura_chain::parameters::Network::Mainnet;
@@ -2251,6 +2273,10 @@ mod zakura_header_sync_driver_tests {
                     verified_block_hash: genesis_hash,
                 },
                 best_header_tip: Some((block::Height(0), genesis_hash)),
+                best_header_parent_hash: None,
+                best_header_history_tree: Arc::new(
+                    zebra_chain::history_tree::HistoryTree::default(),
+                ),
                 verified_block_tip_hash: genesis_hash,
             }),
         )
@@ -2359,6 +2385,10 @@ mod zakura_header_sync_driver_tests {
                     verified_block_hash: genesis_hash,
                 },
                 best_header_tip: Some((block::Height(0), genesis_hash)),
+                best_header_parent_hash: None,
+                best_header_history_tree: Arc::new(
+                    zebra_chain::history_tree::HistoryTree::default(),
+                ),
                 verified_block_tip_hash: genesis_hash,
             }),
         )

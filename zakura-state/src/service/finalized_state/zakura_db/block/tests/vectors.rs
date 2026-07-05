@@ -629,6 +629,10 @@ fn header_range_roots_do_not_overwrite_committed_serving_index_rows() {
         false,
     );
 
+    let block2 = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("block 2 deserializes");
+
     write_full_block(&mut state, genesis.clone());
     write_full_block(&mut state, block1.clone());
 
@@ -641,7 +645,9 @@ fn header_range_roots_do_not_overwrite_committed_serving_index_rows() {
 
     // Re-deliver the real header for the committed height, but with garbage roots —
     // exactly what a malicious serving peer can put in a `Headers` response, since
-    // root bytes are unauthenticated at header-commit time.
+    // root bytes are unauthenticated at header-commit time. The committed height must be a confirmed
+    // (non-tip) root of the range, so re-deliver it as the first header of a two-header range whose
+    // confirmed prefix is exactly the poisoned height-1 root.
     let mut poisoned = root_at(Height(1));
     poisoned.sapling_tx = 99;
     poisoned.auth_data_root = zakura_chain::block::merkle::AuthDataRoot::from([0xAA; 32]);
@@ -651,8 +657,8 @@ fn header_range_roots_do_not_overwrite_committed_serving_index_rows() {
         .prepare_header_range_batch_with_roots(
             &state,
             genesis.hash(),
-            std::slice::from_ref(&block1.header),
-            &[0],
+            &[block1.header.clone(), block2.header.clone()],
+            &[0, 0],
             &[poisoned],
         )
         .expect("re-delivering the same header over a committed height is accepted");
@@ -665,6 +671,71 @@ fn header_range_roots_do_not_overwrite_committed_serving_index_rows() {
         verified_rows,
         "peer-supplied roots must not overwrite the verified committed row"
     );
+}
+
+/// A header-range commit persists exactly the confirmed prefix of roots it is given: the range
+/// tip's root is unauthenticated (only confirmed once the next range delivers its successor header),
+/// so the caller omits it and the state must not fabricate or persist one. A tip root left on disk
+/// would be folded, unverified, into the startup history-tree reconstruction.
+#[test]
+fn header_range_commit_persists_only_the_confirmed_root_prefix() {
+    let _init_guard = zakura_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+    let block2 = mainnet_block(2);
+
+    let headers = vec![block1.header.clone(), block2.header.clone()];
+    // Confirmed prefix: one root for the two-header range. The tip (height 2) root is omitted.
+    let confirmed_roots = vec![root_at(Height(1))];
+
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch_with_roots(
+            &state,
+            genesis.hash(),
+            &headers,
+            &[0, 0],
+            &confirmed_roots,
+        )
+        .expect("a confirmed prefix one shorter than the headers is accepted");
+    state
+        .write_batch(batch)
+        .expect("header range batch writes successfully");
+
+    // Both headers are durable and the header tip advances to the range tip...
+    assert_eq!(state.best_header_tip(), Some((Height(2), block2.hash())));
+    // ...but only the confirmed height has a persisted root; the tip root is absent.
+    assert_eq!(
+        state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1)),
+        vec![root_at(Height(1))],
+        "the confirmed height keeps its provisional root",
+    );
+    assert!(
+        state
+            .zakura_header_commitment_roots_by_height_range(Height(2)..=Height(2))
+            .is_empty(),
+        "the unconfirmed range tip must not have a persisted root",
+    );
+
+    // An empty vector is the checkpoint-authenticated backfill shape: it is accepted and persists no
+    // provisional roots, so the trust boundary is never crossed.
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch_with_roots(&state, genesis.hash(), &headers, &[0, 0], &[])
+        .expect("an empty root vector is accepted for checkpoint-authenticated backfill");
+
+    // A full-length vector would include the unauthenticated tip root, so it is rejected.
+    let mut batch = DiskWriteBatch::new();
+    let full_roots = vec![root_at(Height(1)), root_at(Height(2))];
+    assert!(matches!(
+        batch.prepare_header_range_batch_with_roots(
+            &state,
+            genesis.hash(),
+            &headers,
+            &[0, 0],
+            &full_roots,
+        ),
+        Err(CommitHeaderRangeError::TreeAuxRootCountMismatch { .. }),
+    ));
 }
 
 /// Pruning-readiness guard: a committed height whose body is removed (as online

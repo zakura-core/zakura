@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 8b5b37acb73d1b9a201144aef9f359d3be3df29827c8672852dd1e14f5deac26 # shrinks to ops = [Seed { source: Trunk, index: 1 }]
+cc 9ec2c938f871ff32f43babb9935dd93a6067ad2a96b4dfa6ea8d55c1a735eaba # shrinks to ops = [CommitHeaderRange { source: Trunk, offset: 0, len: 1, anchor: Auto }]

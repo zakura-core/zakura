@@ -429,7 +429,17 @@ fn execute_header_range(
     let headers: Vec<Arc<block::Header>> =
         range.rows.iter().map(|fab| fab.header.clone()).collect();
     let body_sizes: Vec<u32> = range.rows.iter().map(|fab| fab.body_size).collect();
-    let roots: Vec<_> = range.rows.iter().map(|fab| fab.roots.clone()).collect();
+    // Header sync delivers only the *confirmed prefix* of roots: the range tip's
+    // root is authenticated by the next overlapping range's successor header, so
+    // it is omitted here (and none is sent for a single-header range). Mirror that
+    // shape so the harness exercises exactly what the production commit path
+    // enforces via `prepare_header_range_batch_with_roots`.
+    let roots: Vec<_> = range
+        .rows
+        .iter()
+        .take(range.rows.len().saturating_sub(1))
+        .map(|fab| fab.roots.clone())
+        .collect();
 
     let mut batch = DiskWriteBatch::new();
     batch.prepare_header_range_batch_with_roots(

@@ -1,4 +1,8 @@
 use super::{error::*, events::*, wire::*, *};
+use zakura_chain::{
+    history_tree::HistoryTree,
+    parallel::commitment_aux_verify::{self, SuppliedRootsError, VerifiedHeaderCommitmentRoots},
+};
 
 pub(super) fn validate_anchor(
     network: &Network,
@@ -191,6 +195,37 @@ pub fn validate_header_range_links(
     }
 
     validate_internal_continuity(headers)
+}
+
+/// Verify supplied roots against the header commitments using `parent_history_tree`.
+pub fn validate_header_aux_commitments(
+    network: &Network,
+    parent_history_tree: &HistoryTree,
+    headers: &[Arc<block::Header>],
+    tree_aux_roots: &[BlockCommitmentRoots],
+) -> Result<VerifiedHeaderCommitmentRoots, HeaderSyncWireError> {
+    validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len())?;
+
+    let items = headers
+        .iter()
+        .zip(tree_aux_roots.iter())
+        .map(|(header, roots)| (header.as_ref(), roots));
+
+    commitment_aux_verify::verify_supplied_roots_from_parts(
+        network,
+        parent_history_tree.clone(),
+        items,
+    )
+    .map_err(|(_height, error)| supplied_roots_error_into_wire(error))
+}
+
+fn supplied_roots_error_into_wire(error: SuppliedRootsError) -> HeaderSyncWireError {
+    match error {
+        SuppliedRootsError::InvalidHeaderCommitment(error) => {
+            HeaderSyncWireError::InvalidHeaderCommitment(error)
+        }
+        SuppliedRootsError::HistoryTree(error) => HeaderSyncWireError::HistoryTree(error),
+    }
 }
 
 /// Run all context-free validation checks for an inbound full-block tip flood.

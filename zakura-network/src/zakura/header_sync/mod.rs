@@ -61,8 +61,8 @@ pub(crate) use service::{
     drive_header_sync_actions, HeaderSyncPassthroughService, HeaderSyncService,
 };
 pub use validation::{
-    validate_header_range_links, validate_headers_stateless, validate_new_block_stateless,
-    HeaderSyncDecodeContext, HeaderSyncValidationContext,
+    validate_header_aux_commitments, validate_header_range_links, validate_headers_stateless,
+    validate_new_block_stateless, HeaderSyncDecodeContext, HeaderSyncValidationContext,
 };
 pub use wire::{
     HeaderSyncMessage, DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, MAX_HS_MESSAGE_BYTES,

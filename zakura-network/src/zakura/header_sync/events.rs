@@ -1,3 +1,9 @@
+use std::sync::Arc;
+
+use zakura_chain::{
+    history_tree::HistoryTree, parallel::commitment_aux_verify::VerifiedHeaderCommitmentRoots,
+};
+
 use super::{config::*, error::*, validation::*, wire::*, *};
 use crate::zakura::{
     FrontierUpdate, HeaderSyncPeerSession, HeaderSyncServiceSummary, ServicePeerSnapshot,
@@ -26,6 +32,20 @@ pub struct HeaderSyncStartup {
     pub frontiers: HeaderSyncFrontiers,
     /// Durable best header tip loaded from storage at startup.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
+    /// Hash of the durable best header tip's parent, if the tip is above genesis.
+    pub best_header_parent_hash: Option<block::Hash>,
+    /// The last checkpoint height — the VCT fast-sync handoff boundary.
+    ///
+    /// Header sync requests, verifies, persists, and tree-tracks peer-supplied commitment roots only
+    /// while the header frontier is below this height (the only region a VCT consumer reads them).
+    /// At/above it the frontier tree is dropped and header sync runs plain. Defaults to
+    /// `network.checkpoint_list().max_height()` (the height the embedded VCT frontier is pinned to).
+    pub last_checkpoint_height: block::Height,
+    /// History tree positioned at the durable best header tip.
+    ///
+    /// Pre-Heartwood or empty state uses the default (empty) tree; post-Heartwood this is the tree
+    /// reconstructed from durable roots so header-sync root verification can start immediately.
+    pub best_header_history_tree: Arc<HistoryTree>,
     /// Shared sync exchange frontier stream.
     pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
     /// Local header-sync v6 advertisement.
@@ -56,11 +76,15 @@ impl HeaderSyncStartup {
         config: ZakuraHeaderSyncConfig,
         max_frame_bytes: u32,
     ) -> Self {
+        let last_checkpoint_height = network.checkpoint_list().max_height();
         Self {
             network,
             anchor,
             frontiers,
             best_header_tip,
+            best_header_parent_hash: None,
+            last_checkpoint_height,
+            best_header_history_tree: Arc::new(HistoryTree::default()),
             frontier_updates: None,
             config,
             max_frame_bytes,
@@ -231,6 +255,21 @@ pub enum HeaderSyncEvent {
     },
     /// State finalized or verified-body frontiers changed.
     StateFrontiersChanged(HeaderSyncFrontiers),
+    /// State returned the history tree rebuilt for the current best header tip.
+    ///
+    /// Answers a [`HeaderSyncAction::QueryBestHeaderHistoryTree`] — the single lazy rebuild triggered
+    /// when a below-checkpoint forward range finds the header-frontier tree behind the committed tip
+    /// (a non-Zakura path committed ahead). The tree is repositioned from durable state.
+    ///
+    /// Always sent once per query — including on a state read error — so the reactor's in-flight
+    /// rebuild guard is always cleared. `history_tree` is `None` when the rebuild failed (the guard is
+    /// cleared and the next forward range re-triggers it), `Some` on success.
+    BestHeaderHistoryTreeLoaded {
+        /// Best header tip the tree is positioned at when this reload was requested.
+        best_header_tip: block::Height,
+        /// History tree reconstructed by state, positioned at `best_header_tip`; `None` on failure.
+        history_tree: Option<Arc<HistoryTree>>,
+    },
     /// State successfully committed a header range.
     HeaderRangeCommitted {
         /// First committed height.
@@ -239,6 +278,8 @@ pub enum HeaderSyncEvent {
         tip_height: block::Height,
         /// New best header tip hash.
         tip_hash: block::Hash,
+        /// Hash of the new best header tip's parent, if known.
+        tip_parent_hash: Option<block::Hash>,
     },
     /// State rejected a previously requested range.
     HeaderRangeCommitFailed {
@@ -328,13 +369,28 @@ pub enum HeaderSyncAction {
         headers: Vec<Arc<block::Header>>,
         /// Advisory serialized body sizes, parallel to `headers`.
         body_sizes: Vec<u32>,
-        /// Per-height commitment roots, parallel to `headers`.
-        tree_aux_roots: Vec<BlockCommitmentRoots>,
+        /// Header-layer verified commitment roots for the confirmed prefix of `headers`.
+        ///
+        /// `Some` only for below-checkpoint forward ranges (the confirmed prefix is persisted).
+        /// `None` for checkpoint-authenticated backward backfill ranges (they fold onto the previous
+        /// checkpoint's tree, not the forward frontier) and for above-checkpoint forward ranges (past
+        /// the VCT handoff boundary, where roots are neither requested nor needed). Both persist no
+        /// roots.
+        verified_roots: Option<Box<VerifiedHeaderCommitmentRoots>>,
         /// Whether the range is expected to be finalized by checkpoint policy.
         finalized: bool,
     },
-    /// Ask state for the durable best header tip.
-    QueryBestHeaderTip,
+    /// Ask state to rebuild the header-frontier history tree at the current best header tip.
+    ///
+    /// The single reload trigger: dispatched when a below-checkpoint forward range finds the tree
+    /// behind the committed tip. State reconstructs from durable roots; `verified_block_tip` is the
+    /// reconstruction base.
+    QueryBestHeaderHistoryTree {
+        /// Verified block tip that is the reconstruction base.
+        verified_block_tip: block::Height,
+        /// Header tip the rebuilt tree must be positioned at.
+        best_header_tip: block::Height,
+    },
     /// Ask state for a bounded contiguous range of headers.
     QueryHeadersByHeightRange {
         /// Peer that requested the range.

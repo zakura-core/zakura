@@ -121,6 +121,23 @@ pub enum HeaderSyncWireError {
     #[error("first Zakura header-sync range header does not link to anchor")]
     FirstHeaderDoesNotLink,
 
+    /// A header commitment did not match its supplied auxiliary data.
+    #[error("invalid Zakura header-sync header commitment: {0}")]
+    InvalidHeaderCommitment(#[from] block::CommitmentError),
+
+    /// The supplied auxiliary roots could not extend the history tree.
+    #[error("invalid Zakura header-sync history tree update: {0}")]
+    HistoryTree(#[from] Arc<zakura_chain::history_tree::HistoryTreeError>),
+
+    /// The parent history tree needed to validate a header range is unavailable.
+    #[error("missing Zakura header-sync parent history tree at height {height:?}, hash {hash:?}")]
+    MissingHeaderHistoryTree {
+        /// Height whose history tree is required.
+        height: block::Height,
+        /// Hash of the required parent header.
+        hash: block::Hash,
+    },
+
     /// Equihash solution size did not match the active network.
     #[error("Zakura header-sync Equihash solution size does not match the active network")]
     WrongEquihashSolutionSize,

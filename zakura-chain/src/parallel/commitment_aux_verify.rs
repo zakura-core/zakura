@@ -16,13 +16,38 @@ use crate::{
     sapling,
 };
 
-/// Result of verifying supplied header-sync commitment roots from header parts.
-#[derive(Clone, Debug)]
-pub struct SuppliedRootsVerification {
+/// Header-sync roots that have been verified against header commitments.
+///
+/// This type is the boundary between untrusted peer-supplied tree-aux data and state
+/// persistence. Its fields are private so callers can only create it by successfully running
+/// [`verify_supplied_roots_from_parts`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedHeaderCommitmentRoots {
+    tree: HistoryTree,
+    confirmed_tip: Option<Height>,
+    confirmed_roots: Vec<BlockCommitmentRoots>,
+}
+
+impl VerifiedHeaderCommitmentRoots {
     /// The history tree after folding only roots confirmed by this delivery.
-    pub tree: HistoryTree,
+    pub fn tree(&self) -> &HistoryTree {
+        &self.tree
+    }
+
     /// Last height whose supplied roots were confirmed and folded.
-    pub confirmed_tip: Option<Height>,
+    pub fn confirmed_tip(&self) -> Option<Height> {
+        self.confirmed_tip
+    }
+
+    /// The confirmed prefix of this delivery's supplied roots.
+    pub fn confirmed_roots(&self) -> &[BlockCommitmentRoots] {
+        &self.confirmed_roots
+    }
+
+    /// Consume this payload and return its verified history tree.
+    pub fn into_tree(self) -> HistoryTree {
+        self.tree
+    }
 }
 
 /// A supplied-root verification failure.
@@ -54,12 +79,13 @@ pub fn verify_supplied_roots_from_parts<'a, I>(
     network: &Network,
     mut tree: HistoryTree,
     items: I,
-) -> Result<SuppliedRootsVerification, (Height, SuppliedRootsError)>
+) -> Result<VerifiedHeaderCommitmentRoots, (Height, SuppliedRootsError)>
 where
     I: IntoIterator<Item = (&'a Header, &'a BlockCommitmentRoots)>,
 {
     let items = items.into_iter().collect::<Vec<_>>();
     let mut confirmed_tip = None;
+    let mut confirmed_roots = Vec::with_capacity(items.len().saturating_sub(1));
 
     for (index, (header, roots)) in items.iter().enumerate() {
         let height = roots.height;
@@ -107,16 +133,56 @@ where
         .map_err(SuppliedRootsError::from)
         .map_err(|error| (height, error))?;
         confirmed_tip = Some(height);
+        confirmed_roots.push((*roots).clone());
     }
 
-    Ok(SuppliedRootsVerification {
+    Ok(VerifiedHeaderCommitmentRoots {
         tree,
         confirmed_tip,
+        confirmed_roots,
     })
 }
 
-/// Header-driven commitment check against `history_tree`, the history tree as
-/// of the parent.
+/// Append already-trusted per-block roots to `tree`, advancing it through every supplied height.
+///
+/// Unlike [`verify_supplied_roots_from_parts`], this performs no header-commitment checks and has
+/// no one-block confirmation lag: the roots are assumed to have been verified when they were
+/// persisted, so the returned tree is positioned at the last supplied height.
+///
+/// `items` are `(header, roots)` in ascending, contiguous height order, each one height above
+/// `tree`'s current tip. Used at startup and after a re-anchor to rebuild the header-frontier
+/// history tree from the roots durably stored between the verified block tip and the header tip.
+pub fn append_confirmed_roots<'a, I>(
+    network: &Network,
+    mut tree: HistoryTree,
+    items: I,
+) -> Result<HistoryTree, (Height, Arc<HistoryTreeError>)>
+where
+    I: IntoIterator<Item = (&'a Header, &'a BlockCommitmentRoots)>,
+{
+    for (header, roots) in items {
+        let height = roots.height;
+        tree.push_from_parts(
+            network,
+            HistoryTreeBlockParts {
+                header,
+                height,
+                sapling_root: &roots.sapling_root,
+                orchard_root: &roots.orchard_root,
+                ironwood_root: &roots.ironwood_root,
+                sapling_tx: roots.sapling_tx,
+                orchard_tx: roots.orchard_tx,
+                ironwood_tx: roots.ironwood_tx,
+            },
+        )
+        .map_err(Arc::new)
+        .map_err(|error| (height, error))?;
+    }
+
+    Ok(tree)
+}
+
+/// Header-driven commitment check against `history_tree`, the history tree as of the parent.
 pub fn header_commitment_is_valid_for_chain_history(
     header: &block::Header,
     height: block::Height,
@@ -541,6 +607,137 @@ mod tests {
             .expect("activation block builds a history tree")
             .hash(),
             "the returned tree is folded through the confirmed root tip"
+        );
+    }
+
+    #[test]
+    fn fold_confirmed_roots_advances_through_the_last_supplied_height_without_lag() {
+        let activation = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("mainnet has Heartwood")
+            .0;
+
+        let act_block = mainnet_block_at(activation);
+        let next_block = mainnet_block_at(activation + 1);
+        let act_root = mainnet_sapling_root_at(activation);
+        let next_root = mainnet_sapling_root_at(activation + 1);
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+
+        let act_roots = roots_from_block(&act_block, act_root, empty_orchard_root);
+        let next_roots = roots_from_block(&next_block, next_root, empty_orchard_root);
+        let items = vec![
+            (act_block.header.as_ref(), &act_roots),
+            (next_block.header.as_ref(), &next_roots),
+        ];
+
+        let tree = append_confirmed_roots(&Mainnet, empty_history_tree(), items)
+            .expect("already-verified roots fold without error");
+
+        // Unlike `verify_supplied_roots_from_parts`, which lags one block (leaving the tree at the
+        // activation height), a direct fold of trusted roots advances the tree through the final
+        // supplied height. This is what lets startup reconstruction land exactly at the header tip.
+        assert_eq!(
+            tree.as_ref()
+                .expect("post-Heartwood tree is non-empty")
+                .current_height(),
+            Height(activation + 1),
+            "the fold positions the tree at the last supplied height, not one behind",
+        );
+
+        // The folded tree matches one built by pushing both blocks in order.
+        let mut expected = HistoryTree::from_block(
+            &Mainnet,
+            act_block,
+            &act_root,
+            &empty_orchard_root,
+            &empty_ironwood_root(),
+        )
+        .expect("activation block builds a history tree");
+        expected
+            .push(
+                &Mainnet,
+                next_block,
+                &next_root,
+                &empty_orchard_root,
+                &empty_ironwood_root(),
+            )
+            .expect("successor block extends the history tree");
+        assert_eq!(
+            tree.hash(),
+            expected.hash(),
+            "the fold reproduces the block-driven history tree",
+        );
+    }
+
+    /// Startup/re-anchor reconstruction resumes the fold from the *non-empty* durable tree at a
+    /// post-Heartwood verified tip, not from an empty tree. This mirrors that: fold one confirmed
+    /// height onto a base tree already positioned at Heartwood activation and assert the result is
+    /// the block-driven tree — the non-empty-base case the state reconstruction relies on.
+    #[test]
+    fn append_confirmed_roots_resumes_from_a_non_empty_base_tree() {
+        let activation = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("mainnet has Heartwood")
+            .0;
+
+        let act_block = mainnet_block_at(activation);
+        let next_block = mainnet_block_at(activation + 1);
+        let act_root = mainnet_sapling_root_at(activation);
+        let next_root = mainnet_sapling_root_at(activation + 1);
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+        let next_roots = roots_from_block(&next_block, next_root, empty_orchard_root);
+
+        // Base: the non-empty durable tree positioned at the Heartwood-activation verified tip.
+        let base = HistoryTree::from_block(
+            &Mainnet,
+            act_block.clone(),
+            &act_root,
+            &empty_orchard_root,
+            &empty_ironwood_root(),
+        )
+        .expect("activation block builds a non-empty history tree");
+        assert!(
+            base.as_ref().is_some(),
+            "the base tree must be non-empty at Heartwood activation",
+        );
+
+        // Reconstruction folds only the next confirmed height onto that non-empty base.
+        let tree = append_confirmed_roots(
+            &Mainnet,
+            base,
+            std::iter::once((next_block.header.as_ref(), &next_roots)),
+        )
+        .expect("folding onto a non-empty base succeeds");
+
+        assert_eq!(
+            tree.as_ref()
+                .expect("post-Heartwood tree is non-empty")
+                .current_height(),
+            Height(activation + 1),
+            "the fold advances the non-empty base to the last supplied height",
+        );
+
+        let mut expected = HistoryTree::from_block(
+            &Mainnet,
+            act_block,
+            &act_root,
+            &empty_orchard_root,
+            &empty_ironwood_root(),
+        )
+        .expect("activation block builds a history tree");
+        expected
+            .push(
+                &Mainnet,
+                next_block,
+                &next_root,
+                &empty_orchard_root,
+                &empty_ironwood_root(),
+            )
+            .expect("successor block extends the history tree");
+        assert_eq!(
+            tree.hash(),
+            expected.hash(),
+            "resuming the fold from a non-empty base reproduces the block-driven tree",
         );
     }
 

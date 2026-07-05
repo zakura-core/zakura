@@ -3,7 +3,7 @@ use std::{future::Future, time::Instant};
 use color_eyre::eyre::{eyre, Report};
 use tokio::{pin, select, sync::mpsc};
 use tower::{Service, ServiceExt};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use zakura_chain::{
     block::{self},
@@ -62,12 +62,74 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
     let verified_block_tip =
         verified_block_tip_from_state(finalized_tip, verified_block_tip, empty_state_tip);
-    let best_header_tip = root_covered_best_header_tip_or_verified(
-        read_state,
-        best_header_tip.unwrap_or(empty_state_tip),
-        verified_block_tip,
-    )
-    .await?;
+    let durable_best_header_tip = best_header_tip.unwrap_or(empty_state_tip);
+
+    // Rebuild the ZIP-221 history tree so post-Heartwood header-sync root verification can resume
+    // immediately after a restart. The read returns the tree positioned at the highest *contiguous*
+    // confirmed header-root frontier, and that frontier's `(height, hash)` — the single authoritative
+    // value we use both to anchor overlap and to pick the resume height.
+    let (best_header_history_tree, (frontier_height, frontier_hash)) = match read_state
+        .clone()
+        .oneshot(zakura_state::ReadRequest::BestHeaderHistoryTree {
+            verified_block_tip: verified_block_tip.0,
+            best_header_tip: durable_best_header_tip.0,
+        })
+        .await
+        .map_err(|error| eyre!("{error}"))?
+    {
+        zakura_state::ReadResponse::BestHeaderHistoryTree { tree, frontier } => (tree, frontier),
+        response => Err(eyre!(
+            "unexpected BestHeaderHistoryTree response: {response:?}"
+        ))?,
+    };
+
+    // Resume one block above the contiguous frontier (where the reconstructed tree sits), anchored at
+    // it, so the first forward range re-validates from there. If the persisted roots have a one-block
+    // gap (a header-tip advance that never overlapped), this resumes from the gap instead of capping
+    // all the way back to the verified tip. With no header lead there is nothing to resume, so the
+    // durable tip is kept and no overlap anchor is set.
+    let (best_header_tip, best_header_parent_hash) =
+        if durable_best_header_tip.0 > verified_block_tip.0 {
+            let resume_height = frontier_height
+                .next()
+                .map_err(|_| eyre!("header frontier height overflow"))?;
+            // The common (no-gap) frontier is one below the durable tip, so its successor is the durable
+            // tip and we already hold that hash; only a gap needs a lookup of the durable resume header.
+            let resume_hash = if resume_height == durable_best_header_tip.0 {
+                durable_best_header_tip.1
+            } else {
+                match read_state
+                    .oneshot(zakura_state::ReadRequest::HeadersByHeightRange {
+                        start: resume_height,
+                        count: 1,
+                    })
+                    .await
+                    .map_err(|error| eyre!("{error}"))?
+                {
+                    zakura_state::ReadResponse::Headers(headers) => headers
+                        .first()
+                        .map(|(_height, hash, _header)| *hash)
+                        .ok_or_else(|| {
+                            eyre!("missing durable header at resume height {resume_height:?}")
+                        })?,
+                    response => Err(eyre!(
+                        "unexpected HeadersByHeightRange response: {response:?}"
+                    ))?,
+                }
+            };
+            ((resume_height, resume_hash), Some(frontier_hash))
+        } else {
+            (durable_best_header_tip, None)
+        };
+
+    info!(
+        verified = ?verified_block_tip.0,
+        durable_header_tip = ?durable_best_header_tip.0,
+        frontier = ?frontier_height,
+        resume_tip = ?best_header_tip.0,
+        overlap = best_header_parent_hash.is_some(),
+        "Zakura header-sync startup: reconstructed history tree at frontier, resuming header sync"
+    );
 
     Ok(ZakuraHeaderSyncDriverStartup {
         frontiers: HeaderSyncFrontiers {
@@ -76,101 +138,9 @@ pub(crate) async fn zakura_header_sync_driver_startup(
             verified_block_hash: verified_block_tip.1,
         },
         best_header_tip: Some(best_header_tip),
+        best_header_parent_hash,
+        best_header_history_tree,
         verified_block_tip_hash: verified_block_tip.1,
-    })
-}
-
-async fn root_covered_best_header_tip_or_verified<ReadState>(
-    read_state: ReadState,
-    best_header_tip: (block::Height, block::Hash),
-    verified_block_tip: (block::Height, block::Hash),
-) -> Result<(block::Height, block::Hash), Report>
-where
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    if best_header_tip.0 <= verified_block_tip.0 {
-        return Ok(best_header_tip);
-    }
-
-    let Ok(start_height) = verified_block_tip.0.next() else {
-        return Ok(verified_block_tip);
-    };
-    let best_header_height = best_header_tip.0;
-    let verified_block_height = verified_block_tip.0;
-    let count = best_header_height
-        .0
-        .checked_sub(verified_block_height.0)
-        .ok_or_else(|| eyre!("best header tip is unexpectedly below verified block tip"))?;
-    let roots = match read_state
-        .oneshot(zakura_state::ReadRequest::BlockRoots {
-            start_height,
-            count,
-        })
-        .await
-        .map_err(|error| eyre!("{error}"))?
-    {
-        zakura_state::ReadResponse::BlockRoots(roots) => roots,
-        response => Err(eyre!("unexpected BlockRoots response: {response:?}"))?,
-    };
-
-    if block_roots_cover_range(start_height, count, &roots) {
-        Ok(best_header_tip)
-    } else {
-        Ok(verified_block_tip)
-    }
-}
-
-pub(crate) async fn root_covered_query_best_header_tip<ReadState>(
-    read_state: ReadState,
-    best_header_tip: (block::Height, block::Hash),
-) -> Result<(block::Height, block::Hash), Report>
-where
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + 'static,
-    ReadState::Future: Send + 'static,
-{
-    let verified_block_tip = match read_state
-        .clone()
-        .oneshot(zakura_state::ReadRequest::Tip)
-        .await
-        .map_err(|error| eyre!("{error}"))?
-    {
-        zakura_state::ReadResponse::Tip(Some(tip)) => tip,
-        zakura_state::ReadResponse::Tip(None) => return Ok(best_header_tip),
-        response => Err(eyre!("unexpected Tip response: {response:?}"))?,
-    };
-
-    root_covered_best_header_tip_or_verified(read_state, best_header_tip, verified_block_tip).await
-}
-
-pub(crate) fn block_roots_cover_range(
-    start_height: block::Height,
-    count: u32,
-    roots: &[BlockCommitmentRoots],
-) -> bool {
-    if roots.len() != usize::try_from(count).unwrap_or(usize::MAX) {
-        return false;
-    }
-
-    roots.iter().enumerate().all(|(offset, roots)| {
-        let Ok(offset) = u32::try_from(offset) else {
-            return false;
-        };
-        start_height
-            .0
-            .checked_add(offset)
-            .is_some_and(|height| roots.height == block::Height(height))
     })
 }
 
@@ -417,7 +387,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     .oneshot(zakura_state::ReadRequest::HeadersByHeightRange { start, count })
                     .await
                 {
-                    Ok(zakura_state::ReadResponse::Headers(headers)) => {
+                    Ok(zakura_state::ReadResponse::Headers(mut headers)) => {
                         emit_commit_state(
                             &trace,
                             cs_trace::STATE_READ_SUCCESS,
@@ -532,6 +502,16 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         } else {
                             Vec::new()
                         };
+                        // The header store leads the roots CF by one block: a committed range's tip
+                        // root is only persisted once the next range confirms it (the one-block
+                        // confirmation lag). When roots are requested, serve only the contiguous
+                        // prefix that has roots so the response never carries a header without its
+                        // root — the requester rejects a root-count mismatch wholesale, which would
+                        // otherwise make us unservable for any range reaching our header tip. The
+                        // requester re-fetches the tip through its own overlapping forward range.
+                        if want_tree_aux_roots && block_roots.len() < headers.len() {
+                            headers.truncate(block_roots.len());
+                        }
                         let header_heights: Vec<_> =
                             headers.iter().map(|(height, _, _)| *height).collect();
                         let tree_aux_roots = if want_tree_aux_roots {
@@ -640,11 +620,20 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 start_height,
                 headers,
                 body_sizes,
-                tree_aux_roots,
+                verified_roots,
                 finalized: _finalized,
             } => {
                 let count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
-                let tree_aux_roots_len = u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX);
+                // Persist only the header-authenticated confirmed prefix. The range tip's root is
+                // unconfirmed until the next overlapping range delivers its successor header, so it
+                // is deliberately excluded here; the state writes exactly what it is given.
+                let committed_roots = verified_roots
+                    .as_deref()
+                    .map_or_else(Vec::new, |verified_roots| {
+                        verified_roots.confirmed_roots().to_vec()
+                    });
+                let tree_aux_roots_len = u32::try_from(committed_roots.len()).unwrap_or(u32::MAX);
+                let tip_parent_hash = header_range_tip_parent_hash(anchor, start_height, &headers);
                 emit_commit_state(
                     &trace,
                     cs_trace::COMMIT_START,
@@ -669,7 +658,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         anchor,
                         headers,
                         body_sizes,
-                        tree_aux_roots,
+                        tree_aux_roots: committed_roots,
                     })
                     .await
                 {
@@ -700,6 +689,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 start_height,
                                 tip_height,
                                 tip_hash,
+                                tip_parent_hash,
                             })
                             .await;
                         trace_header_reactor_event(
@@ -809,98 +799,39 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     }
                 }
             }
-            HeaderSyncAction::QueryBestHeaderTip => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_START,
-                    "header_sync_driver",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
-                    },
-                );
-                let started = Instant::now();
-                match read_state
+            HeaderSyncAction::QueryBestHeaderHistoryTree {
+                verified_block_tip,
+                best_header_tip,
+            } => {
+                // Reconstruct the header-frontier tree at the current frontier from durable roots.
+                // Always report completion back (`Some` on success, `None` on failure) so the reactor
+                // clears its in-flight rebuild guard even when the read errors — otherwise the guard
+                // would wedge and suppress all future rebuilds, stranding the stale tree.
+                let history_tree = match read_state
                     .clone()
-                    .oneshot(zakura_state::ReadRequest::BestHeaderTip)
+                    .oneshot(zakura_state::ReadRequest::BestHeaderHistoryTree {
+                        verified_block_tip,
+                        best_header_tip,
+                    })
                     .await
                 {
-                    Ok(zakura_state::ReadResponse::BestHeaderTip(Some(best_header_tip))) => {
-                        let (tip_height, tip_hash) = match root_covered_query_best_header_tip(
-                            read_state.clone(),
-                            best_header_tip,
-                        )
-                        .await
-                        {
-                            Ok(tip) => tip,
-                            Err(error) => {
-                                trace_state_read_error(
-                                    &trace,
-                                    "query_best_header_tip_roots",
-                                    None,
-                                    best_header_tip.0,
-                                    1,
-                                    &format!("{error}"),
-                                    started,
-                                );
-                                warn!(
-                                    ?error,
-                                    "failed to apply Zakura root coverage to best header tip"
-                                );
-                                continue;
-                            }
-                        };
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::STATE_READ_SUCCESS,
-                            "header_sync_driver",
-                            |row| {
-                                insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
-                                insert_cs_height(row, cs_trace::BEST_HEADER_TIP, tip_height);
-                                insert_cs_hash(row, cs_trace::HASH, tip_hash);
-                            },
-                        );
-                        let _ = handles
-                            .header_sync
-                            .send(HeaderSyncEvent::HeaderRangeCommitted {
-                                start_height: tip_height,
-                                tip_height,
-                                tip_hash,
-                            })
-                            .await;
-                        publish_header_frontier(
-                            &handles.endpoint,
-                            tip_height,
-                            tip_hash,
-                            FrontierChange::HeaderAdvanced,
-                            &trace,
-                        );
-                    }
-                    Ok(zakura_state::ReadResponse::BestHeaderTip(None)) => {}
+                    Ok(zakura_state::ReadResponse::BestHeaderHistoryTree { tree, .. }) => Some(tree),
                     Ok(response) => {
-                        trace_state_read_error(
-                            &trace,
-                            "query_best_header_tip",
-                            None,
-                            block::Height(0),
-                            0,
-                            "unexpected_response",
-                            Instant::now(),
-                        );
-                        warn!(?response, "unexpected BestHeaderTip response")
+                        warn!(?response, "unexpected BestHeaderHistoryTree response");
+                        None
                     }
                     Err(error) => {
-                        trace_state_read_error(
-                            &trace,
-                            "query_best_header_tip",
-                            None,
-                            block::Height(0),
-                            0,
-                            &format!("{error}"),
-                            Instant::now(),
-                        );
-                        warn!(?error, "failed to query Zakura best header tip")
+                        warn!(?error, "failed to rebuild Zakura best header history tree");
+                        None
                     }
-                }
+                };
+                let _ = handles
+                    .header_sync
+                    .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
+                        best_header_tip,
+                        history_tree,
+                    })
+                    .await;
             }
             HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
                 log_missing_block_bodies(read_state.clone(), from, limit, &trace).await;
@@ -1552,9 +1483,6 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                 insert_cs_height(row, cs_trace::RANGE_START, *start_height);
                 insert_cs_u64(row, cs_trace::RANGE_COUNT, headers.len() as u64);
             }
-            HeaderSyncAction::QueryBestHeaderTip => {
-                insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
-            }
             HeaderSyncAction::QueryHeadersByHeightRange {
                 peer, start, count, ..
             } => {
@@ -1562,6 +1490,14 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                 insert_cs_peer(row, cs_trace::PEER, peer);
                 insert_cs_height(row, cs_trace::RANGE_START, *start);
                 insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(*count));
+            }
+            HeaderSyncAction::QueryBestHeaderHistoryTree {
+                verified_block_tip,
+                best_header_tip,
+            } => {
+                insert_cs_str(row, cs_trace::ACTION, "query_best_header_history_tree");
+                insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, *verified_block_tip);
+                insert_cs_height(row, cs_trace::BEST_HEADER_TIP, *best_header_tip);
             }
             HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
                 insert_cs_str(row, cs_trace::ACTION, "query_missing_block_bodies");
@@ -1627,6 +1563,24 @@ fn trace_header_commit_finish(
             insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
         },
     );
+}
+
+fn header_range_tip_parent_hash(
+    anchor: block::Hash,
+    start_height: block::Height,
+    headers: &[std::sync::Arc<block::Header>],
+) -> Option<block::Hash> {
+    if headers.is_empty() {
+        return None;
+    }
+
+    if headers.len() == 1 {
+        return (start_height > block::Height(0)).then_some(anchor);
+    }
+
+    headers
+        .get(headers.len().saturating_sub(2))
+        .map(|header| block::Hash::from(header.as_ref()))
 }
 
 fn trace_header_reactor_event(

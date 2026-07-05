@@ -932,10 +932,15 @@ pub enum Request {
         ///
         /// A `0` value means unknown. These hints are not consensus data.
         body_sizes: Vec<u32>,
-        /// Tree-aux roots, parallel to `headers`.
+        /// The header-authenticated confirmed prefix of the range's tree-aux roots, aligned from the
+        /// first header's height.
         ///
-        /// Every non-empty Zakura header range must provide one root per header.
-        /// Roots are advisory until verified during block commit.
+        /// For a semantically-validated forward range this is exactly one shorter than `headers`:
+        /// the range tip's root is only authenticated once the next range delivers its successor
+        /// header (the one-block confirmation lag), so the caller omits it and the state persists
+        /// exactly the roots it is given. Checkpoint-authenticated backfill ranges carry no roots,
+        /// so an empty vector is also accepted (nothing is persisted). Roots remain advisory
+        /// (superseded by the verified row) until the block body is committed.
         tree_aux_roots: Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>,
     },
 
@@ -1407,6 +1412,23 @@ pub enum ReadRequest {
     /// Returns the highest header held on disk.
     BestHeaderTip,
 
+    /// Reconstructs the ZIP-221 history tree positioned at the confirmed header frontier.
+    ///
+    /// The durable history tree at `verified_block_tip` is the reconstruction base; the per-height
+    /// roots stored for `(verified_block_tip, best_header_tip)` — exclusive of the header tip, whose
+    /// root is never persisted — are folded onto it. These roots were verified when they were
+    /// committed, so the fold is direct (no header re-check), and the returned tree is positioned at
+    /// the confirmed frontier one block behind the header tip.
+    ///
+    /// Returns [`ReadResponse::BestHeaderHistoryTree`](ReadResponse::BestHeaderHistoryTree), which
+    /// also carries the `(height, hash)` the tree is positioned at when a header lead exists.
+    BestHeaderHistoryTree {
+        /// Verified block tip whose durable history tree is the reconstruction base.
+        verified_block_tip: block::Height,
+        /// Header tip; roots are folded up to the block below it (its own root is unpersisted).
+        best_header_tip: block::Height,
+    },
+
     /// Returns header-known, body-missing heights in `(verified_block_tip, best_header_tip]`.
     MissingBlockBodies {
         /// First height to consider.
@@ -1635,6 +1657,7 @@ impl ReadRequest {
             ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
             ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::BestHeaderTip => "best_header_tip",
+            ReadRequest::BestHeaderHistoryTree { .. } => "best_header_history_tree",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
             ReadRequest::MissingBlockBodyMetadata { .. } => "missing_block_body_metadata",
             ReadRequest::BlockSizeHints { .. } => "block_size_hints",

@@ -95,6 +95,7 @@ class OracleOptions:
     handoff_stall_micros: int = RECENT_ACTIVITY_MICROS
     commit_trend_min_ms: int = COMMIT_TREND_MIN_MS
     commit_trend_factor: float = COMMIT_TREND_FACTOR
+    optional_lag_nodes: tuple[str, ...] = ()
 
 
 class NodeTrace:
@@ -460,52 +461,53 @@ def check_block_sync_activity(node: NodeTrace, options: OracleOptions) -> list[F
         and row.event in {"state_read_start", "state_read_success", "state_read_error", "state_read_timeout"}
     ]
 
-    for state in states:
-        best = int_field(state.row, "best_header_tip")
-        verified = int_field(state.row, "verified_block_tip")
-        if best is None or verified is None or best <= verified:
-            continue
+    if node.node not in options.optional_lag_nodes:
+        for state in states:
+            best = int_field(state.row, "best_header_tip")
+            verified = int_field(state.row, "verified_block_tip")
+            if best is None or verified is None or best <= verified:
+                continue
 
-        has_real_activity = has_near_activity(state, real_activity, options)
-        if not has_real_activity:
-            recent_query_count = len(rows_near(state, query_rows, options))
-            invariant = (
-                "lagging_body_sync_not_query_spin"
-                if recent_query_count > 0
-                else "lagging_body_sync_has_real_activity"
-            )
-            failures.append(
-                failure(
-                    node,
-                    invariant,
-                    state,
-                    {
-                        "best_header_tip": best,
-                        "verified_block_tip": verified,
-                        "recent_query_needed_blocks": recent_query_count,
-                        "nearby_real_activity": [compact_row(row) for row in rows_near(state, real_activity, options)[-5:]],
-                    },
+            has_real_activity = has_near_activity(state, real_activity, options)
+            if not has_real_activity:
+                recent_query_count = len(rows_near(state, query_rows, options))
+                invariant = (
+                    "lagging_body_sync_not_query_spin"
+                    if recent_query_count > 0
+                    else "lagging_body_sync_has_real_activity"
                 )
-            )
-            break
+                failures.append(
+                    failure(
+                        node,
+                        invariant,
+                        state,
+                        {
+                            "best_header_tip": best,
+                            "verified_block_tip": verified,
+                            "recent_query_needed_blocks": recent_query_count,
+                            "nearby_real_activity": [compact_row(row) for row in rows_near(state, real_activity, options)[-5:]],
+                        },
+                    )
+                )
+                break
 
-        if body_sync_has_pinned_queue(state) and not has_forward_activity(state, real_activity, options):
-            failures.append(
-                failure(
-                    node,
-                    "block_sync_queue_lag_makes_progress",
-                    state,
-                    {
-                        "best_header_tip": best,
-                        "verified_block_tip": verified,
-                        "needed_count": int_field(state.row, "needed_count"),
-                        "queue_len": int_field(state.row, "queue_len"),
-                        "assigned_len": int_field(state.row, "assigned_len"),
-                        "outstanding": int_field(state.row, "outstanding"),
-                    },
+            if body_sync_has_pinned_queue(state) and not has_forward_activity(state, real_activity, options):
+                failures.append(
+                    failure(
+                        node,
+                        "block_sync_queue_lag_makes_progress",
+                        state,
+                        {
+                            "best_header_tip": best,
+                            "verified_block_tip": verified,
+                            "needed_count": int_field(state.row, "needed_count"),
+                            "queue_len": int_field(state.row, "queue_len"),
+                            "assigned_len": int_field(state.row, "assigned_len"),
+                            "outstanding": int_field(state.row, "outstanding"),
+                        },
+                    )
                 )
-            )
-            break
+                break
 
     final_state = states[-1] if states else None
     if final_state is not None:
@@ -780,7 +782,8 @@ def run_oracle(root: Path, options: OracleOptions = OracleOptions()) -> list[Fai
         failures.extend(check_commit_pairs(node, options))
         failures.extend(check_frontiers(node))
         failures.extend(check_block_sync_activity(node, options))
-        failures.extend(check_header_recovery(node, options))
+        if node.node not in options.optional_lag_nodes:
+            failures.extend(check_header_recovery(node, options))
 
     if options.require_handoff_boundary:
         failures.extend(check_checkpoint_to_full_handoff(nodes, options))
@@ -1294,6 +1297,54 @@ def run_self_test() -> None:
         )
         assert any(f.invariant == "final_block_sync_state_has_no_leaks" for f in run_oracle(root / "bad_leak"))
 
+        optional_lag = root / "optional_lag" / "node4"
+        write_jsonl(
+            optional_lag / "block_sync.jsonl",
+            [
+                {
+                    "ts": 1,
+                    "event": BLOCK_SYNC_STATE,
+                    "verified_block_tip": 65,
+                    "best_header_tip": 163,
+                    "needed_count": 98,
+                    "queue_len": 1,
+                    "assigned_len": 0,
+                    "outstanding": 0,
+                    "budget_reserved": 0,
+                    "reorder": 0,
+                    "applying": 0,
+                }
+            ],
+        )
+        assert any(
+            f.invariant in {"lagging_body_sync_has_real_activity", "block_sync_queue_lag_makes_progress"}
+            for f in run_oracle(root / "optional_lag")
+        )
+        assert not run_oracle(root / "optional_lag", OracleOptions(optional_lag_nodes=("node4",)))
+
+        optional_lag_leak = root / "optional_lag_leak" / "node4"
+        write_jsonl(
+            optional_lag_leak / "block_sync.jsonl",
+            [
+                {
+                    "ts": 1,
+                    "event": BLOCK_SYNC_STATE,
+                    "verified_block_tip": 65,
+                    "best_header_tip": 163,
+                    "needed_count": 98,
+                    "queue_len": 1,
+                    "budget_reserved": 1,
+                    "reorder": 0,
+                    "applying": 0,
+                    "outstanding": 0,
+                }
+            ],
+        )
+        assert any(
+            f.invariant == "final_block_sync_state_has_no_leaks"
+            for f in run_oracle(root / "optional_lag_leak", OracleOptions(optional_lag_nodes=("node4",)))
+        )
+
     print("trace_oracle self-test: PASS")
 
 
@@ -1336,6 +1387,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="require at least one checkpoint commit followed by a higher full-verifier commit",
     )
+    parser.add_argument(
+        "--optional-lag-node",
+        action="append",
+        default=[],
+        help="node name whose body/header lag progress checks are informational only",
+    )
     return parser.parse_args(argv)
 
 
@@ -1358,6 +1415,7 @@ def main(argv: list[str]) -> int:
             handoff_stall_micros=args.handoff_stall_seconds * 1_000_000,
             commit_trend_min_ms=args.commit_trend_min_ms,
             commit_trend_factor=args.commit_trend_factor,
+            optional_lag_nodes=tuple(args.optional_lag_node),
         ),
     )
     if failures:

@@ -292,6 +292,9 @@ run_trace_oracle() {
   if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
     oracle_args+=("--require-handoff-boundary")
   fi
+  if ! strict_upgrade; then
+    oracle_args+=("--optional-lag-node" "node4")
+  fi
   python3 "${SCRIPT_DIR}/trace_oracle.py" "${oracle_args[@]}" "${ZAKURA_E2E_TRACE_DIR}"
 }
 

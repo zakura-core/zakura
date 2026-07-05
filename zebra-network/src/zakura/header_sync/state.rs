@@ -307,6 +307,15 @@ pub(super) struct HeaderSyncPeerMeters {
     pub(super) unsolicited: RateMeter,
     pub(super) inbound_status: RateMeter,
     pub(super) inbound_new_block: RateMeter,
+    /// Gates redundant keepalive status sends.
+    ///
+    /// Floored above the remote's inbound status minimum interval so a
+    /// keepalive can never be classified as status spam even when
+    /// `status_refresh_interval` is configured below that minimum, and starts
+    /// one full interval out so it never lands right after the initial
+    /// connect status (which may already have consumed the remote's
+    /// non-advancing status token).
+    pub(super) keepalive: RateMeter,
 }
 
 impl HeaderSyncPeerMeters {
@@ -315,10 +324,15 @@ impl HeaderSyncPeerMeters {
         inbound_status_min_interval: Duration,
         inbound_new_block_min_interval: Duration,
     ) -> Self {
+        let keepalive_interval =
+            status_refresh_interval.max(inbound_status_min_interval.saturating_mul(2));
+        let mut keepalive = RateMeter::new(keepalive_interval);
+        keepalive.mark_taken(Instant::now());
         Self {
             unsolicited: RateMeter::new(status_refresh_interval),
             inbound_status: RateMeter::new(inbound_status_min_interval),
             inbound_new_block: RateMeter::new(inbound_new_block_min_interval),
+            keepalive,
         }
     }
 }

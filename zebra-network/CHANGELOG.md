@@ -147,6 +147,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Zakura header sync now sends a redundant `Status` as an application-level
+  keepalive on a spam-safe budget (at least twice the inbound status minimum
+  interval), so healthy connections between peers idle at the same tip are no
+  longer closed by the application idle reaper every idle window. Unsent or
+  changed statuses still retry on the fast unsolicited budget. Service park
+  decisions (admission rejections and no-demand ordered streams) are now
+  logged at info and counted in the new `sync.header.peer.parked`,
+  `sync.block.peer.parked`, `zakura.discovery.peer.parked`, and
+  `zakura.p2p.stream.parked.no_demand` metrics.
 - Use network protocol version 170160 as the NU6.3 minimum on Mainnet, Testnet,
   and Regtest, matching Zebra's advertised current protocol version.
 - A peer upgraded from legacy TCP to Zakura is no longer re-dialed over legacy.

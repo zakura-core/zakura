@@ -2145,7 +2145,13 @@ impl ZakuraProtocolHandler {
                                         context.direction,
                                     )
                                 {
-                                    debug!(
+                                    metrics::counter!(
+                                        "zakura.p2p.stream.parked.no_demand",
+                                        "stream_kind" => stream_kind_label(kind),
+                                    )
+                                    .increment(1);
+                                    info!(
+                                        ?peer_id,
                                         stream_kind = kind,
                                         "locally parking ordered service stream because the service has no demand"
                                     );

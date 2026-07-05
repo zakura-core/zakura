@@ -116,7 +116,7 @@ impl HeaderSyncReactor {
                 }
                 _ = ticks.tick() => {
                     self.handle_timeouts().await;
-                    self.retry_unsent_statuses();
+                    self.refresh_statuses();
                 }
             }
         }
@@ -368,7 +368,11 @@ impl HeaderSyncReactor {
         let direction = session.direction();
         let decision = self.admission_decision_for(&peer, direction);
         if decision != ServiceAdmissionDecision::Admit {
-            tracing::debug!(
+            // A parked peer stays connected but never receives a status, which
+            // from its side is indistinguishable from a wedged remote. Keep
+            // this visible at default log levels and in metrics.
+            metrics::counter!("sync.header.peer.parked").increment(1);
+            tracing::info!(
                 ?peer,
                 ?direction,
                 ?decision,
@@ -1349,12 +1353,30 @@ impl HeaderSyncReactor {
     }
 
     fn send_status(&mut self, peer: &ZakuraPeerId) -> bool {
+        self.send_status_inner(peer, false)
+    }
+
+    /// Sends the current status even when identical to the last one sent.
+    ///
+    /// The connection-level freshness reaper only counts inbound application
+    /// messages, so two peers at the same tip would otherwise go mutually
+    /// silent and reap healthy connections every idle window. The periodic
+    /// refresh uses this forced send as an application keepalive: it is gated
+    /// by the peer's unsolicited meter (`status_refresh_interval` spacing),
+    /// which stays far above the remote's inbound status minimum interval, so
+    /// the redundant status is never classified as status spam.
+    fn send_status_keepalive(&mut self, peer: &ZakuraPeerId) -> bool {
+        self.send_status_inner(peer, true)
+    }
+
+    fn send_status_inner(&mut self, peer: &ZakuraPeerId, force: bool) -> bool {
         let status = self.local_status();
         // Suppress a status identical to the last one we sent this peer over its
         // current session: it advances nothing and the peer's inbound status
-        // rate limiter would treat the redundant message as spam.
+        // rate limiter would treat the redundant message as spam. Keepalive
+        // sends are exempt: their meter keeps them above that limit.
         let session = match self.state.peers.get(peer) {
-            Some(peer_state) if peer_state.status_differs_from_last_sent(status) => {
+            Some(peer_state) if force || peer_state.status_differs_from_last_sent(status) => {
                 peer_state.session.clone()
             }
             Some(_) => {
@@ -1441,10 +1463,23 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn retry_unsent_statuses(&mut self) {
+    /// Periodic status refresh, doubling as an application-level keepalive.
+    ///
+    /// Every peer whose unsolicited meter is ready (one `status_refresh_interval`
+    /// since the last unsolicited send) gets the current status even when it is
+    /// unchanged: the connection freshness reaper only counts inbound messages,
+    /// so without this two peers idle at the same tip reap their healthy
+    /// connection every idle window. A failed send does not mark the meter, so
+    /// a peer whose initial status was lost to a dead session is retried on the
+    /// next tick instead of staying connected-but-mute.
+    fn refresh_statuses(&mut self) {
         let now = Instant::now();
         let status = self.local_status();
-        let peer_ids: Vec<_> = self
+
+        // Unsent or changed statuses retry on the fast unsolicited budget, so a
+        // peer whose initial status was lost to a dead session queue recovers on
+        // the next tick instead of staying connected-but-mute.
+        let retry_ids: Vec<_> = self
             .state
             .peers
             .iter()
@@ -1453,9 +1488,29 @@ impl HeaderSyncReactor {
             })
             .map(|(peer_id, _peer)| peer_id.clone())
             .collect();
-
-        for peer in peer_ids {
+        for peer in retry_ids {
             self.send_status_and_mark_unsolicited(&peer, now);
+        }
+
+        // Redundant keepalives run on the slower spam-safe keepalive budget.
+        let keepalive_ids: Vec<_> = self
+            .state
+            .peers
+            .iter()
+            .filter(|(_peer_id, peer)| {
+                !peer.status_differs_from_last_sent(status)
+                    && peer.meters.keepalive.is_ready(now)
+                    && peer.meters.unsolicited.is_ready(now)
+            })
+            .map(|(peer_id, _peer)| peer_id.clone())
+            .collect();
+        for peer in keepalive_ids {
+            if self.send_status_keepalive(&peer) {
+                if let Some(peer_state) = self.state.peers.get_mut(&peer) {
+                    peer_state.meters.keepalive.mark_taken(now);
+                    peer_state.meters.unsolicited.mark_taken(now);
+                }
+            }
         }
     }
 

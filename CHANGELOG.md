@@ -35,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed healthy but quiet Zakura connections being closed by the application
+  idle reaper every idle window. The reaper only counts inbound application
+  messages and the periodic header-sync status refresh suppressed unchanged
+  statuses, so two peers idle at the same tip went mutually silent and reaped
+  their connection each idle timeout, then redialed — constant connection
+  churn between synced peers. Header sync now sends a redundant status as an
+  application keepalive on a spam-safe budget, so healthy connections stay
+  fresh while unused connections are still reaped. Service park decisions
+  (admission rejections and no-demand ordered streams) are now logged at info
+  and counted in metrics, since a parked peer is indistinguishable from a
+  wedged remote from the other side.
 - Moved the auto-generated Zakura iroh node identity key out of Zebra's cache
   tree and into `network.identity_dir` (defaulting to
   `~/.zakura/<network>.zakura-iroh-secret-key`), so cache or state snapshots do

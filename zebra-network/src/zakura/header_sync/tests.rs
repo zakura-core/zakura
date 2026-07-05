@@ -3995,16 +3995,24 @@ async fn unsolicited_headers_are_misbehavior_but_empty_headers_retry() {
         })
         .await
         .unwrap();
-    assert!(
-        matches!(
-            next_non_query_action(&mut fixture.actions).await,
+    // Periodic keepalive Status sends may interleave with the retry; the
+    // property under test is that the range retries without a disconnect.
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
             HeaderSyncAction::SendMessage {
                 msg: HeaderSyncMessage::GetHeaders { .. },
                 ..
-            }
-        ),
-        "empty Headers for an outstanding range should retry without disconnecting"
-    );
+            } => break,
+            HeaderSyncAction::SendMessage {
+                msg: HeaderSyncMessage::Status(_),
+                ..
+            } => continue,
+            action => panic!(
+                "empty Headers for an outstanding range should retry without \
+                 disconnecting, got: {action:?}"
+            ),
+        }
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

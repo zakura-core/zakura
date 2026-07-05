@@ -541,6 +541,13 @@ impl BlockSyncReactor {
             // Reject: cancel the session (which also cancels the already-spawned
             // pipe-routine, whose `Drop` returns any taken work) and drop the
             // routine's registry entry so a parked peer leaves no stale facts.
+            metrics::counter!("sync.block.peer.parked").increment(1);
+            tracing::info!(
+                ?peer,
+                ?direction,
+                ?decision,
+                "locally parking Zakura block-sync service session"
+            );
             self.state.parked_peers.insert(peer.clone());
             session.cancel_token().cancel();
             self.registry.remove(&peer);

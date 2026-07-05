@@ -2,8 +2,8 @@
 """Simple Zebra fleet status dashboard.
 
 Reads a deploy/deployer nodes TOML, polls each node over SSH, and serves a small
-HTML dashboard showing the running commit, restart time, current height, and
-whether the node has advanced recently.
+HTML dashboard showing the running commit, Zakura node ID, restart time, current
+height, latest block hash, and whether the node has advanced recently.
 
 Only the Python stdlib is used.
 """
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import ipaddress
 import json
 import re
 import shlex
@@ -61,6 +62,7 @@ class Node:
     bin_path: str
     log_file: str
     rpc_listen_addr: str
+    node_id: str
     port: object = None
 
     def ssh_cmd(self, *remote: str) -> list[str]:
@@ -76,6 +78,7 @@ def load_nodes(config_path: Path) -> list[Node]:
 
     defaults = dict(DEFAULTS)
     defaults.update(data.get("defaults", {}))
+    node_ids_by_host = zakura_node_ids_by_host(defaults.get("zakura"))
 
     nodes = []
     seen = set()
@@ -98,6 +101,7 @@ def load_nodes(config_path: Path) -> list[Node]:
                 bin_path=merged["bin_path"],
                 log_file=merged["log_file"],
                 rpc_listen_addr=merged["rpc_listen_addr"],
+                node_id=node_ids_by_host.get(ssh_host(merged["ssh_string"]), ""),
                 port=merged["port"],
             )
         )
@@ -105,6 +109,32 @@ def load_nodes(config_path: Path) -> list[Node]:
     if not nodes:
         raise SystemExit(f"no [[nodes]] defined in {config_path}")
     return nodes
+
+
+def ssh_host(ssh_string: str) -> str:
+    destination = ssh_string.rsplit("@", 1)[-1]
+    destination = destination.rsplit(":", 1)[0]
+    return destination.strip("[]")
+
+
+def zakura_node_ids_by_host(zakura: object) -> dict[str, str]:
+    if not isinstance(zakura, dict):
+        return {}
+
+    node_ids = {}
+    for peer in zakura.get("bootstrap_peers", []):
+        if not isinstance(peer, str) or "@" not in peer:
+            continue
+
+        node_id, address = peer.split("@", 1)
+        host = address.rsplit(":", 1)[0].strip("[]")
+        node_ids[host] = node_id
+        try:
+            node_ids[str(ipaddress.ip_address(host))] = node_id
+        except ValueError:
+            pass
+
+    return node_ids
 
 
 def rpc_url_for(listen_addr: str) -> str:
@@ -171,21 +201,31 @@ try:
 except Exception as error:
     out["commit_error"] = str(error)
 
+try:
+    grep = "grep -aoE 'node_id=[^, ]+' {} 2>/dev/null | tail -1".format(
+        shlex.quote(log_file)
+    )
+    proc = run(["bash", "-lc", grep])
+    line = proc.stdout.strip()
+    out["node_id"] = line.split("=", 1)[-1].strip('"') if line else ""
+except Exception as error:
+    out["node_id_error"] = str(error)
+
 if rpc_url:
     try:
-        body = json.dumps({
+        height_body = json.dumps({
             "jsonrpc": "2.0",
             "id": "zebra-cluster-status",
             "method": "getblockcount",
             "params": [],
         }).encode()
-        req = urllib.request.Request(
+        height_req = urllib.request.Request(
             rpc_url,
-            data=body,
+            data=height_body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(height_req, timeout=6) as resp:
             payload = json.loads(resp.read().decode())
         if "error" in payload and payload["error"]:
             out["rpc_error"] = payload["error"]
@@ -193,6 +233,28 @@ if rpc_url:
             out["height"] = payload.get("result")
     except Exception as error:
         out["rpc_error"] = str(error)
+
+    try:
+        hash_body = json.dumps({
+            "jsonrpc": "2.0",
+            "id": "zebra-cluster-status",
+            "method": "getbestblockhash",
+            "params": [],
+        }).encode()
+        hash_req = urllib.request.Request(
+            rpc_url,
+            data=hash_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(hash_req, timeout=6) as resp:
+            payload = json.loads(resp.read().decode())
+        if "error" in payload and payload["error"]:
+            out["block_hash_error"] = payload["error"]
+        else:
+            out["block_hash"] = payload.get("result")
+    except Exception as error:
+        out["block_hash_error"] = str(error)
 else:
     out["rpc_error"] = "RPC disabled in deployer config"
 
@@ -244,7 +306,13 @@ class ClusterCollector:
         self.last_advanced_at: dict[str, float | None] = {node.name: None for node in nodes}
         self.height_history: list[tuple[float, int]] = []
         self.rows: list[dict] = [
-            {"name": node.name, "ssh": node.ssh_string, "health": "starting", "healthy": False}
+            {
+                "name": node.name,
+                "ssh": node.ssh_string,
+                "node_id": node.node_id,
+                "health": "starting",
+                "healthy": False,
+            }
             for node in nodes
         ]
         self.last_poll = None
@@ -338,6 +406,8 @@ class ClusterCollector:
             "health": health,
             "detail": detail,
             "commit": probe.get("commit") or "",
+            "block_hash": probe.get("block_hash") or "",
+            "node_id": node.node_id or probe.get("node_id") or "",
             "version": probe.get("version") or "",
             "last_restarted": probe.get("last_restarted") or "",
             "height": height,
@@ -615,7 +685,7 @@ h2 {
 }
 table {
   width: 100%;
-  min-width: 860px;
+  min-width: 1040px;
   border-collapse: collapse;
 }
 th, td {
@@ -679,6 +749,41 @@ tbody tr:hover td { background: rgba(46, 42, 66, 0.35); }
 .details {
   max-width: 280px;
   color: var(--muted);
+}
+.wide-mono {
+  max-width: 260px;
+  overflow-wrap: anywhere;
+}
+.copyable-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.copy-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+.copy-button:hover {
+  background: var(--pink-soft);
+  color: var(--pink-hi);
+}
+.copy-button svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 @media (max-width: 900px) {
   .grid { grid-template-columns: 1fr; }
@@ -756,6 +861,7 @@ tbody tr:hover td { background: rgba(46, 42, 66, 0.35); }
             <th>Node</th>
             <th>Health</th>
             <th>Commit</th>
+            <th>Latest block commit hash</th>
             <th>Last restarted</th>
             <th class="num">Height</th>
             <th>Last advanced</th>
@@ -792,7 +898,15 @@ function formatBlockTime(seconds) {
   if (seconds < 10) return Number(seconds).toFixed(1) + 's/block';
   return Math.round(seconds) + 's/block';
 }
-function shortCommit(commit) { return commit ? commit.slice(0, 12) : 'unknown'; }
+const copyIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="1"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+const checkIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>';
+function middleHash(value, left = 8, right = 8) {
+  if (!value) return 'unknown';
+  if (value.length <= left + right + 4) return value;
+  return value.slice(0, left) + '....' + value.slice(-right);
+}
+function shortCommit(commit) { return middleHash(commit, 8, 8); }
+function shortHash(hash) { return middleHash(hash, 8, 8); }
 function esc(value) {
   return String(value == null ? '' : value).replace(/[&<>"']/g, (match) => ({
     '&': '&amp;',
@@ -801,6 +915,31 @@ function esc(value) {
     '"': '&quot;',
     "'": '&#39;'
   }[match]));
+}
+async function copyValue(button) {
+  const value = button.dataset.copyValue || '';
+  if (!value) return;
+
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(value);
+  } else {
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.style.cssText = 'position:fixed;top:-1000px;left:-1000px';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    try { document.execCommand('copy'); }
+    finally { textarea.remove(); }
+  }
+
+  button.innerHTML = checkIcon;
+  setTimeout(() => { button.innerHTML = copyIcon; }, 1400);
+}
+function copyButton(value, label) {
+  if (!value) return '';
+  return `<button class="copy-button" type="button" data-copy-value="${esc(value)}" aria-label="${esc(label)}" title="${esc(label)}">${copyIcon}</button>`;
 }
 async function tick() {
   let data;
@@ -830,14 +969,21 @@ async function tick() {
   const body = document.getElementById('rows');
   body.innerHTML = data.rows.map((row) => `
     <tr>
-      <td><div>${esc(row.name)}</div><div class="muted mono">${esc(row.ssh)}</div></td>
+      <td><div>${esc(row.name)}</div><div class="muted mono wide-mono">${esc(row.node_id || 'node ID unknown')}</div></td>
       <td><span class="badge ${esc(row.health)}">${esc(row.health)}</span></td>
-      <td class="mono" title="${esc(row.commit)}">${esc(shortCommit(row.commit))}</td>
+      <td class="mono" title="${esc(row.commit)}"><span class="copyable-value"><span>${esc(shortCommit(row.commit))}</span>${copyButton(row.commit, 'Copy full commit hash')}</span></td>
+      <td class="mono wide-mono" title="${esc(row.block_hash)}"><span class="copyable-value"><span>${esc(shortHash(row.block_hash))}</span>${copyButton(row.block_hash, 'Copy full latest block commit hash')}</span></td>
       <td>${esc(row.last_restarted || 'unknown')}</td>
       <td class="num mono">${row.height == null ? '--' : esc(row.height)}</td>
       <td>${esc(age(row.seconds_since_advanced))}</td>
       <td class="details">${esc(row.detail || '')}</td>
     </tr>`).join('');
+  for (const button of body.querySelectorAll('[data-copy-value]')) {
+    button.addEventListener('click', () => copyValue(button).catch(() => {
+      button.textContent = '!';
+      setTimeout(() => { button.innerHTML = copyIcon; }, 1400);
+    }));
+  }
 }
 tick();
 setInterval(tick, 10000);

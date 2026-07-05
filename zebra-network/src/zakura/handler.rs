@@ -134,6 +134,18 @@ pub const DEFAULT_ZAKURA_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10)
 /// are reaped by QUIC idle cleanup, and duplicate redials after that point can
 /// reclaim the slot without disturbing active transfers.
 pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(300);
+/// Minimum incumbent age before a *same-IP* duplicate may evict the incumbent.
+///
+/// A duplicate arriving from the same remote IP as the incumbent is almost
+/// always a restarted or resyncing peer redialing from its stable address,
+/// whose previous connection lingers as a dead incumbent until QUIC idle
+/// cleanup (~150s) reaps it. Waiting out [`ZAKURA_DUPLICATE_EVICT_MIN_AGE`]
+/// locks that peer out of block sync for that whole window. Use a much smaller
+/// gate for same-IP redials so a restarted peer recovers in seconds, while
+/// still keeping it comfortably above worst-case simultaneous-open race
+/// resolution (milliseconds) so a genuine race keeps the transcript-tiebreak
+/// winner instead of flapping.
+pub const ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(5);
 /// QUIC stream receive window used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 /// QUIC connection receive window used by Zakura endpoints.
@@ -1157,8 +1169,19 @@ impl ZakuraSupervisorHandle {
                 // The newcomer is still closed (its redial reconnects cleanly
                 // once the slot is free), which avoids racing the incumbent's
                 // service-registration teardown.
+                //
+                // A same-IP redial is almost always a restarted peer reclaiming
+                // its own slot, so use a much smaller eviction gate for it: this
+                // is the fast path the per-IP admission exemption above is meant
+                // to enable, so a restarted peer recovers in seconds instead of
+                // being locked out until the incumbent's QUIC idle timeout.
+                let evict_min_age = if same_ip_duplicate_redial {
+                    ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE
+                } else {
+                    ZAKURA_DUPLICATE_EVICT_MIN_AGE
+                };
                 if let Some(entry) = state.active_by_peer.get(&peer_id) {
-                    if entry.registered_at.elapsed() >= ZAKURA_DUPLICATE_EVICT_MIN_AGE
+                    if entry.registered_at.elapsed() >= evict_min_age
                         && !entry.disconnect_token.is_cancelled()
                     {
                         entry.disconnect_token.cancel();
@@ -6300,6 +6323,101 @@ mod tests {
         assert!(
             !newcomer.is_cancelled(),
             "the rejected newcomer's token is never registered, so it is left to redial",
+        );
+
+        Ok(())
+    }
+
+    // A restarted or resyncing peer redials from its stable IP while its previous
+    // connection still lingers as the incumbent. Waiting out the full
+    // `ZAKURA_DUPLICATE_EVICT_MIN_AGE` (300s) locks that peer out of block sync
+    // until the dead connection's QUIC idle timeout reaps it. A same-IP duplicate
+    // therefore evicts the incumbent on the much shorter
+    // `ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE` gate — while still keeping a
+    // just-registered incumbent so simultaneous-open races do not flap, and while
+    // a *different*-IP duplicate keeps the long gate.
+    #[tokio::test(start_paused = true)]
+    async fn same_ip_duplicate_uses_short_eviction_gate() -> Result<(), BoxError> {
+        async fn register_from_ip(
+            supervisor: &ZakuraSupervisorHandle,
+            peer: &ZakuraPeerId,
+            ip: Option<IpAddr>,
+            token: CancellationToken,
+        ) -> ZakuraRegistration {
+            let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+            let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
+            supervisor
+                .register(
+                    test_conn_id(),
+                    peer.clone(),
+                    ip,
+                    [peer.as_bytes()[0]; TRANSCRIPT_HASH_BYTES],
+                    outbound_handle,
+                    token,
+                    ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
+                )
+                .await
+        }
+
+        let supervisor = ZakuraSupervisorHandle::new(4);
+        let ip_a: IpAddr = "203.0.113.10".parse().expect("test ip parses");
+        let peer = test_peer(50);
+
+        // Incumbent registered from ip_a.
+        let incumbent = CancellationToken::new();
+        let registration =
+            register_from_ip(&supervisor, &peer, Some(ip_a), incumbent.clone()).await;
+        assert!(matches!(
+            registration,
+            ZakuraRegistration::Registered { .. }
+        ));
+
+        // A same-IP duplicate below the short gate keeps the incumbent so a genuine
+        // simultaneous-open race (both connections fresh) does not flap.
+        tokio::time::advance(ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE - Duration::from_secs(1)).await;
+        let early = CancellationToken::new();
+        let registration = register_from_ip(&supervisor, &peer, Some(ip_a), early.clone()).await;
+        assert!(matches!(registration, ZakuraRegistration::Duplicate { .. }));
+        assert!(
+            !incumbent.is_cancelled(),
+            "a same-IP duplicate below the short gate keeps the incumbent",
+        );
+
+        // Past the short same-IP gate — but far below the 300s gate — a same-IP
+        // duplicate evicts the stale incumbent so the restarted peer's redial
+        // reclaims the slot in seconds.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let redial = CancellationToken::new();
+        let registration = register_from_ip(&supervisor, &peer, Some(ip_a), redial.clone()).await;
+        assert!(matches!(registration, ZakuraRegistration::Duplicate { .. }));
+        assert!(
+            incumbent.is_cancelled(),
+            "a same-IP duplicate past the short gate evicts the stale incumbent",
+        );
+        assert!(
+            !redial.is_cancelled(),
+            "the rejected newcomer's token is never registered, so it is left to redial",
+        );
+
+        // Contrast: a *different*-IP duplicate keeps the long gate, so at the same
+        // small age it does not evict — only a same-IP redial gets the fast path.
+        let peer2 = test_peer(51);
+        let ip_b: IpAddr = "203.0.113.11".parse().expect("test ip parses");
+        let ip_c: IpAddr = "203.0.113.12".parse().expect("test ip parses");
+        let incumbent2 = CancellationToken::new();
+        let registration =
+            register_from_ip(&supervisor, &peer2, Some(ip_b), incumbent2.clone()).await;
+        assert!(matches!(
+            registration,
+            ZakuraRegistration::Registered { .. }
+        ));
+        tokio::time::advance(ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE + Duration::from_secs(1)).await;
+        let diff_ip = CancellationToken::new();
+        let registration = register_from_ip(&supervisor, &peer2, Some(ip_c), diff_ip.clone()).await;
+        assert!(matches!(registration, ZakuraRegistration::Duplicate { .. }));
+        assert!(
+            !incumbent2.is_cancelled(),
+            "a different-IP duplicate keeps the long gate and does not evict a young incumbent",
         );
 
         Ok(())

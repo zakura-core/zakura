@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed a restarted or resyncing Zakura peer being locked out of block sync for
+  up to ~150s (occasionally longer) when it redialed the fleet from its stable
+  IP. The receiving node kept the peer's previous, now-dead connection as the
+  incumbent and rejected every redial as a duplicate until the incumbent aged
+  past the 300s eviction gate or was reaped by the QUIC idle timeout. A same-IP
+  duplicate (a restarted peer reclaiming its own slot) now evicts the stale
+  incumbent on a short gate so the redial reconnects within seconds, while a
+  just-registered incumbent is still kept so simultaneous-open races do not flap.
 - Fixed Zakura header-sync and block-sync peers getting stuck unable to serve
   requests when an initial `Status` advertisement was dropped by a full outbound
   queue. Status send bookkeeping now only records queued frames, header sync

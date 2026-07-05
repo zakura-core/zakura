@@ -1059,7 +1059,14 @@ impl<'de> Deserialize<'de> for Config {
         zakura.apply_network_defaults(&network);
         let default_zakura_bootstrap_peers =
             ZakuraConfig::default_bootstrap_peers_for_network(&network);
-        if zakura.bootstrap_peers != default_zakura_bootstrap_peers {
+        if zakura.bootstrap_peers.is_empty() {
+            warn!(
+                ?network,
+                "no Zakura bootstrap peers configured; configure zakura.bootstrap_peers or make sure this node receives inbound Zakura connections"
+            );
+        } else if network.kind() != NetworkKind::Regtest
+            && zakura.bootstrap_peers != default_zakura_bootstrap_peers
+        {
             warn!(
                 ?network,
                 configured_zakura_bootstrap_peers = ?zakura.bootstrap_peers,

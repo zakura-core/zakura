@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed Regtest Zakura defaults so they no longer inherit Mainnet bootstrap
+  peers. Regtest nodes now start with an empty Zakura bootstrap peer list and
+  log a separate warning when no Zakura bootstrap peers are configured.
 - Fixed a restarted or resyncing Zakura peer being locked out of block sync for
   up to ~150s (occasionally longer) when it redialed the fleet from its stable
   IP. The receiving node kept the peer's previous, now-dead connection as the

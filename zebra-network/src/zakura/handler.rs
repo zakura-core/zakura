@@ -346,11 +346,15 @@ impl ZakuraConfig {
 
     /// Return the default bootstrap peers for `network`.
     pub fn default_bootstrap_peers_for_network(network: &Network) -> Vec<String> {
-        bootstrap_peers_to_strings(match network.kind() {
-            NetworkKind::Mainnet => DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS,
-            NetworkKind::Testnet => DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
-            NetworkKind::Regtest => DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS,
-        })
+        match network.kind() {
+            NetworkKind::Mainnet => {
+                bootstrap_peers_to_strings(DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS)
+            }
+            NetworkKind::Testnet => {
+                bootstrap_peers_to_strings(DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS)
+            }
+            NetworkKind::Regtest => Vec::new(),
+        }
     }
 
     /// Switch default bootstrap peers to the selected network.

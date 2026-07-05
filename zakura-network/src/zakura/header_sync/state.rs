@@ -81,33 +81,19 @@ impl HeaderSyncCore {
         }
 
         let checkpoints = startup.network.checkpoint_list();
-        // Commitment-root verification, the one-block overlap, and the in-memory header-frontier
-        // history tree only exist up to the last checkpoint — the VCT fast-sync handoff boundary, the
-        // only region where a consumer reads the persisted roots. Crucially the handoff block *at*
-        // `last_checkpoint` reads its own persisted root from the roots CF (`vct_roots_at_height` is
-        // inclusive of `last_checkpoint`); an empty slot there wedges the handoff on the frozen-frontier
-        // safety check. A root at `H` is only confirmed by the header at `H + 1`, so to persist the
-        // confirmed root at `last_checkpoint` the root-carrying regime must run until the frontier
-        // reaches `last_checkpoint + 1`. Above that, header sync runs plain: no roots, no overlap.
+        // Commitment-root work only runs through the VCT fast-sync handoff boundary.
+        // The root at `last_checkpoint` is confirmed by the next header, so root-carrying
+        // ranges stop once the frontier reaches `last_checkpoint + 1`.
         let last_checkpoint = startup.last_checkpoint_height;
-        // The frontier height at which root work stops: one above the last checkpoint (so the range
-        // that reaches `last_checkpoint` still confirms its root via the `last_checkpoint + 1` header).
         let root_regime_end = next_height(last_checkpoint).unwrap_or(last_checkpoint);
-        // Header sync persists confirmed roots for `(max(anchor, finalized_height) .. last_checkpoint]`
-        // — the below-checkpoint heights this node forward-syncs (above its anchor) that are not yet
-        // committed. Below the last checkpoint, blocks are checkpoint-verified straight into the
-        // finalized state, so `finalized_height` is the committed floor VCT consumes roots up to. Root
-        // work runs while that region is non-empty and the frontier has not passed the confirming
-        // height (`last_checkpoint + 1`). A node anchored at / already synced through the last
-        // checkpoint (handoff done via the embedded frontier), and a genesis-only checkpoint list
-        // (`max_height == 0`), both have an empty region and run plain.
+        // Only persist roots for below-checkpoint heights this node forward-syncs but has
+        // not committed yet.
         let root_region_floor = self.anchor.0.max(self.finalized_height);
         let below_root_boundary =
             root_region_floor < last_checkpoint && self.best_header_tip < root_regime_end;
         let want_tree_aux_roots = below_root_boundary;
 
-        // Root-carrying ranges leave the best tip's roots unconfirmed, so the next request
-        // redelivers the tip header anchored at its parent. Overlap only applies in the root regime.
+        // Root-carrying ranges redeliver the tip header so its root can be confirmed.
         let overlap_forward_range = below_root_boundary
             && self
                 .best_header_parent_hash
@@ -130,10 +116,7 @@ impl HeaderSyncCore {
                 finalized = true;
             }
         }
-        // Cap the root-carrying range at `last_checkpoint + 1`: the range that reaches the checkpoint
-        // confirms and persists the root at `last_checkpoint` (via the `last_checkpoint + 1` header),
-        // and the following (above-boundary) ranges run plain. The tip root at `last_checkpoint + 1` is
-        // itself left unconfirmed and unpersisted — VCT never reads it.
+        // Keep root-carrying ranges at or below the confirming header for the last checkpoint.
         if below_root_boundary {
             end = end.min(root_regime_end);
         }

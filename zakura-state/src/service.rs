@@ -1707,10 +1707,12 @@ where
             match read::tree::history_tree(chain.clone(), db, tip.into()) {
                 Some(tree) => tree,
                 None if tip == block::Height(0) => Arc::new(HistoryTree::default()),
-                None => return Err(format!(
+                None => {
+                    return Err(format!(
                     "cannot rebuild header-tip history tree: no history tree at state tip {tip:?}"
                 )
-                .into()),
+                    .into())
+                }
             }
         }
     };

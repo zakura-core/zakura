@@ -4584,7 +4584,10 @@ async fn missing_header_aux_tree_triggers_single_lazy_rebuild() {
             _ => break,
         }
     }
-    assert_eq!(rebuilds, 1, "a stale tree triggers exactly one lazy rebuild");
+    assert_eq!(
+        rebuilds, 1,
+        "a stale tree triggers exactly one lazy rebuild"
+    );
 }
 
 /// A failed rebuild (`BestHeaderHistoryTreeLoaded { history_tree: None }`, e.g. a state read error)
@@ -4724,19 +4727,42 @@ async fn forward_ranges_request_roots_through_the_last_checkpoint() {
     below.last_checkpoint_height = boundary;
     let mut fixture = spawn_test_reactor(below);
     connect_peer(&fixture, peer(70)).await;
-    advertise_tip(&fixture, peer(70), genesis.0, block::Height(20), DEFAULT_HS_RANGE, 1).await;
+    advertise_tip(
+        &fixture,
+        peer(70),
+        genesis.0,
+        block::Height(20),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
     let (start, count, want) = next_forward_get_headers(&mut fixture.actions).await;
     assert_eq!(start, block::Height(1));
     assert!(want, "a below-checkpoint forward range must request roots");
-    assert_eq!(count, 11, "the range is capped one block above the last checkpoint");
+    assert_eq!(
+        count, 11,
+        "the range is capped one block above the last checkpoint"
+    );
 
     // Frontier at the last checkpoint: still in the root regime (this range confirms the root at
     // `last_checkpoint` via the successor header).
-    let mut at = startup_for(network.clone(), genesis, Some((boundary, block::Hash([10; 32]))));
+    let mut at = startup_for(
+        network.clone(),
+        genesis,
+        Some((boundary, block::Hash([10; 32]))),
+    );
     at.last_checkpoint_height = boundary;
     let mut fixture = spawn_test_reactor(at);
     connect_peer(&fixture, peer(71)).await;
-    advertise_tip(&fixture, peer(71), boundary, block::Height(20), DEFAULT_HS_RANGE, 1).await;
+    advertise_tip(
+        &fixture,
+        peer(71),
+        boundary,
+        block::Height(20),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
     let (_start, _count, want) = next_forward_get_headers(&mut fixture.actions).await;
     assert!(
         want,
@@ -4752,10 +4778,21 @@ async fn forward_ranges_request_roots_through_the_last_checkpoint() {
     above.last_checkpoint_height = boundary;
     let mut fixture = spawn_test_reactor(above);
     connect_peer(&fixture, peer(72)).await;
-    advertise_tip(&fixture, peer(72), block::Height(11), block::Height(20), DEFAULT_HS_RANGE, 1).await;
+    advertise_tip(
+        &fixture,
+        peer(72),
+        block::Height(11),
+        block::Height(20),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
     let (start, _count, want) = next_forward_get_headers(&mut fixture.actions).await;
     assert_eq!(start, block::Height(12));
-    assert!(!want, "above the last checkpoint the forward range is plain");
+    assert!(
+        !want,
+        "above the last checkpoint the forward range is plain"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

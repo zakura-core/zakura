@@ -1073,26 +1073,26 @@ fn best_header_history_tree_returns_base_when_no_contiguous_fold_exists() {
 }
 
 #[test]
-fn best_header_history_tree_errors_on_missing_real_base_tree() {
+fn best_header_history_tree_rebases_to_committed_tip_when_verified_tip_has_no_tree() {
     let _init_guard = zakura_test::init();
-    let (state, _genesis, block1) = mainnet_state_with_genesis();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
     insert_zakura_header(&state, Height(1), block1.header.clone());
 
-    let error = best_header_history_tree(
+    // `verified_block_tip` is ahead of the real committed tip (only genesis is committed) and has no
+    // stored history tree. The lazy rebuild re-bases at the committed tip read from the same snapshot
+    // instead of erroring, so it returns the committed base frontier (genesis) rather than papering
+    // over a real tip with an empty tree.
+    let (tree, frontier) = best_header_history_tree(
         None::<Arc<Chain>>,
         &state,
         &Network::Mainnet,
         Height(1),
         Height(1),
     )
-    .expect_err("a real verified tip without a history tree is inconsistent");
+    .expect("rebuild re-bases to the committed tip when the verified tip has no stored tree");
 
-    assert!(
-        error
-            .to_string()
-            .contains("no history tree at verified block tip"),
-        "unexpected error: {error}",
-    );
+    assert_eq!(frontier, (Height(0), genesis.hash()));
+    assert_eq!(tree.as_ref(), &HistoryTree::default());
 }
 
 #[tokio::test(flavor = "multi_thread")]

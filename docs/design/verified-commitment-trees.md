@@ -431,7 +431,7 @@ other peers are already header-authenticated, and so a restart never trusts an u
   `CheckpointList::max_height()`, exactly the VCT fast-sync handoff height (§7). That is the only
   region a consumer reads the persisted roots: above the last checkpoint blocks go through full
   semantic verification and recompute their own trees, so peer roots there have no reader. The regime
-  is **inclusive** of the last checkpoint, because the handoff block *at* `last_checkpoint` reads its
+  is **inclusive** of the last checkpoint, because the handoff block _at_ `last_checkpoint` reads its
   own persisted root from the roots CF (`vct_roots_at_height` is inclusive; an empty slot there wedges
   the handoff on the frozen-frontier safety check, §8.1). A root at `H` is only confirmed by the header
   at `H + 1`, so the root-carrying regime runs until the frontier reaches `last_checkpoint + 1` — that
@@ -449,7 +449,7 @@ other peers are already header-authenticated, and so a restart never trusts an u
   reload action is actually queued — the reactor→driver action channel is a non-blocking `try_send`,
   and arming the guard on a dropped send (full/closed channel) would suppress every future rebuild
   permanently, since the guard clears only when a reload completes; a dropped send instead leaves it
-  clear so the next range retry re-dispatches. And the reconstruction re-bases at the *current*
+  clear so the next range retry re-dispatches. And the reconstruction re-bases at the _current_
   committed tip read from the same state snapshot: the finalized history tree is stored only at the tip
   (there is no per-height finalized history tree), and a concurrent checkpoint/legacy commit can
   advance the finalized tip past the reactor's cached `verified_block_tip` during the round-trip, so

@@ -173,7 +173,19 @@ impl HeaderSyncCore {
 
 #[derive(Clone, Debug)]
 pub(super) struct PendingHeaderCommit {
-    pub(super) range: RangeRequest,
+    /// The full range requested from the peer.
+    ///
+    /// A peer may legally return a short prefix of the requested range. Keep the
+    /// requested range so success, local commit failure, and reanchor cleanup can
+    /// clear or retry the scheduler assignment that was created for the original
+    /// `GetHeaders` request.
+    pub(super) requested_range: RangeRequest,
+    /// The range actually delivered by the peer and handed to the commit path.
+    ///
+    /// Successful commit events are reported for this delivered range, so coverage
+    /// and verified frontier-tree lookup must use this range rather than the
+    /// original request.
+    pub(super) delivered_range: RangeRequest,
     /// `Some` for aux-validated forward ranges; `None` for checkpoint-authenticated backward
     /// backfill ranges, which persist no provisional roots and never install a frontier tree.
     pub(super) verified_roots:

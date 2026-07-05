@@ -162,6 +162,14 @@ impl RangeScheduler {
         self.assigned.remove(&range);
     }
 
+    pub(super) fn retire_request(&mut self, range: RangeRequest) {
+        match range.priority {
+            RangePriority::Forward => self.forward.retain(|queued| *queued != range),
+            RangePriority::Backward => self.backward.retain(|queued| *queued != range),
+        }
+        self.clear_assignment(range);
+    }
+
     pub(super) fn clear_forward(&mut self) {
         self.forward.clear();
         self.assigned

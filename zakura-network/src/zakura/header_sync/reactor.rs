@@ -705,9 +705,17 @@ impl HeaderSyncReactor {
             None,
         );
         let committed_history_tree = self.pending_header_history_tree(start_height, tip_height);
-        self.state
-            .pending_commits
-            .retain(|_, commit| !commit.range.is_within(start_height, tip_height));
+        let mut clear_assignments = Vec::new();
+        self.state.pending_commits.retain(|_, commit| {
+            let delivered = commit.delivered_range.is_within(start_height, tip_height);
+            if delivered {
+                clear_assignments.push(commit.requested_range);
+            }
+            !delivered
+        });
+        for range in clear_assignments {
+            self.state.schedule.retire_request(range);
+        }
         self.state
             .schedule
             .mark_range_covered(start_height, tip_height);
@@ -753,9 +761,9 @@ impl HeaderSyncReactor {
         };
         if let Some(commit) = self.state.pending_commits.remove(&key) {
             if kind == HeaderSyncCommitFailureKind::Local {
-                self.state.schedule.clear_assignment(commit.range);
+                self.state.schedule.clear_assignment(commit.requested_range);
             }
-            self.state.schedule.retry(commit.range);
+            self.state.schedule.retry(commit.requested_range);
         }
         self.schedule().await;
     }
@@ -1371,6 +1379,10 @@ impl HeaderSyncReactor {
             None
         };
 
+        let delivered_range = RangeRequest {
+            count: header_count,
+            ..outstanding.range
+        };
         self.state.pending_commits.insert(
             PendingCommitKey {
                 peer: peer.clone(),
@@ -1378,7 +1390,8 @@ impl HeaderSyncReactor {
                 count: header_count,
             },
             PendingHeaderCommit {
-                range: outstanding.range,
+                requested_range: outstanding.range,
+                delivered_range,
                 verified_roots: verified_roots.clone(),
             },
         );
@@ -1466,7 +1479,8 @@ impl HeaderSyncReactor {
             .pending_commits
             .values()
             .find(|commit| {
-                commit.range.start_height == start_height && commit.range.end_height() == tip_height
+                commit.delivered_range.start_height == start_height
+                    && commit.delivered_range.end_height() == tip_height
             })
             .and_then(|commit| commit.verified_roots.as_ref())
             .map(|verified_roots| Arc::new(verified_roots.tree().clone()))
@@ -1509,7 +1523,7 @@ impl HeaderSyncReactor {
         self.state.schedule.clear_forward();
         self.state
             .pending_commits
-            .retain(|_, commit| commit.range.priority != RangePriority::Forward);
+            .retain(|_, commit| commit.requested_range.priority != RangePriority::Forward);
         self.cancel_forward_outstanding();
         self.publish_best_tip_reanchored(height, hash).await;
     }

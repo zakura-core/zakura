@@ -480,6 +480,78 @@ mod tests {
         }
     }
 
+    /// Regression test (review feedback): tree-aux roots are an optional serving capability —
+    /// a peer legitimately may not have roots for the requested range (it can never serve the
+    /// root for its own header tip). A solicited, otherwise well-formed `Headers` response that
+    /// carries no roots must therefore not be a *fatal protocol reject* that disconnects the
+    /// peer; it should be forwarded (or at worst dropped non-punitively) so the reactor can
+    /// retry the range elsewhere while keeping the session.
+    #[test]
+    fn deliver_rootless_solicited_headers_does_not_disconnect_the_peer() {
+        use zakura_chain::{orchard, sapling, serialization::ZcashDeserializeInto};
+        use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
+
+        let (handle, mut events) = test_handle();
+        let expected =
+            ExpectedHeadersResponse::new(block::Height(1), 1, true).expect("count is valid");
+
+        let block_one: Arc<block::Block> = Arc::new(
+            BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .expect("block 1 vector parses"),
+        );
+        // `encode()` enforces the all-or-nothing root invariant, so build a rooted frame and
+        // strip the roots on the wire: flip `has_roots` to 0 and drop the trailing root bytes.
+        let mut frame = HeaderSyncMessage::Headers {
+            headers: vec![block_one.header.clone()],
+            body_sizes: vec![0],
+            tree_aux_roots: vec![BlockCommitmentRoots {
+                height: block::Height(1),
+                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                sapling_tx: 0,
+                orchard_tx: 0,
+                ironwood_tx: 0,
+                auth_data_root: block::merkle::AuthDataRoot::from([0u8; 32]),
+            }],
+        }
+        .encode_frame()
+        .expect("headers frame encodes");
+        frame.payload[HEADER_SYNC_MESSAGE_TYPE_BYTES + HEADER_SYNC_COUNT_BYTES] = 0;
+        frame
+            .payload
+            .truncate(frame.payload.len() - HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES);
+
+        let flow = deliver(&handle, Some(expected), peer(), frame);
+
+        assert!(
+            !matches!(flow, Flow::Reject(SinkReject::Protocol(_))),
+            "a rootless solicited Headers response must not be a fatal protocol reject \
+             (it disconnects an honest peer that simply has no roots to serve)"
+        );
+        match events.try_recv() {
+            Ok(HeaderSyncEvent::WireMessage {
+                msg:
+                    HeaderSyncMessage::Headers {
+                        headers,
+                        tree_aux_roots,
+                        ..
+                    },
+                ..
+            }) => {
+                assert_eq!(headers.len(), 1);
+                assert!(
+                    tree_aux_roots.is_empty(),
+                    "the rootless response is forwarded as-is for non-punitive handling"
+                );
+            }
+            other => panic!(
+                "expected the rootless solicited response to reach the reactor, got {other:?}"
+            ),
+        }
+    }
+
     /// The peer-local correlation queue is FIFO and is filled by draining ready
     /// commands. This is the invariant `run_peer` relies on: an expectation
     /// recorded by a `RecordExpectedHeaders` command is drained and available to

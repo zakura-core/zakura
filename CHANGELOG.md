@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Moved the auto-generated Zakura iroh node identity key out of Zebra's cache
+  tree and into `network.identity_dir` (defaulting to
+  `~/.zakura/<network>.zakura-iroh-secret-key`), so cache or state snapshots do
+  not clone a node's long-term P2P identity.
 - Fixed Regtest Zakura defaults so they no longer inherit Mainnet bootstrap
   peers. Regtest nodes now start with an empty Zakura bootstrap peer list and
   log a separate warning when no Zakura bootstrap peers are configured.

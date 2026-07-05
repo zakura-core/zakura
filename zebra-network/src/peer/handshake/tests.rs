@@ -23,6 +23,8 @@ use tower::ServiceExt;
 use zebra_chain::{block, chain_tip::NoChainTip};
 use zebra_test::mock_service::{MockService, PanicAssertion};
 
+static TEST_ZAKURA_SECRET_KEY_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
 impl<S, C> Handshake<S, C>
 where
     S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + 'static,
@@ -200,17 +202,18 @@ impl ZakuraService for DropSink {
 
 /// Starts a real Zakura endpoint over loopback QUIC for an upgrade test.
 ///
-/// The cache dir is disabled so each call resolves a fresh ephemeral iroh
-/// identity via `Config::zakura_secret_key`. With the default (enabled) cache
-/// dir, every endpoint would load the *same* persisted key for the default
-/// network and so share one `NodeId`; iroh then refuses the upgrade dial as a
-/// self-connect. Disabling the cache also keeps these tests from writing a
-/// secret-key file into the real user cache directory.
+/// Each endpoint gets an explicit test-only iroh identity so parallel tests do
+/// not share the same persisted `~/.zakura` key or write to the user's real
+/// identity file.
 async fn start_test_zakura_endpoint() -> crate::zakura::ZakuraEndpoint {
-    let config = Config {
-        cache_dir: crate::config::CacheDir::disabled(),
-        ..test_config(true)
-    };
+    let key_index = TEST_ZAKURA_SECRET_KEY_COUNTER.fetch_add(1, Ordering::Relaxed) % 255 + 1;
+    let key_byte = u8::try_from(key_index).expect("key index is in 1..=255 due to modulo");
+    let secret = format!("{key_byte:02x}").repeat(32);
+    let config: Config = toml::from_str(&format!(
+        "v2_p2p = true\nzakura_node_secret_key = '{secret}'"
+    ))
+    .expect("test Zakura config with explicit identity key must parse");
+
     crate::zakura::spawn_zakura_endpoint(&config, |_supervisor, _trace| {
         Arc::new(DropSink) as Arc<dyn ZakuraService>
     })

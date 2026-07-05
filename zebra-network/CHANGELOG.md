@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Added `network.identity_dir` for auto-generated Zakura iroh identity keys,
+  defaulting to `~/.zakura`. This path is independent of the peer cache
+  directory, so cache or state snapshots do not clone a node's long-term P2P
+  identity.
 - Added `network.zakura.max_connections_per_ip`, defaulting to 16, so native
   Zakura admission can allow NATed or co-hosted peers without changing the
   legacy peer-set per-IP default.

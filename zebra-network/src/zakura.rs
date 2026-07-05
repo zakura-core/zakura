@@ -487,7 +487,6 @@ mod tests {
     use std::{
         error::Error,
         net::{Ipv4Addr, SocketAddrV4},
-        path::PathBuf,
     };
 
     use iroh::{
@@ -495,10 +494,9 @@ mod tests {
         protocol::{AcceptError, ProtocolHandler, Router},
         SecretKey, Watcher as _,
     };
-    use zebra_chain::parameters::Network;
 
     use super::*;
-    use crate::CacheDir;
+    use crate::{CacheDir, Config};
 
     #[derive(Debug, Clone)]
     struct SmokeProtocolHandler;
@@ -535,14 +533,30 @@ mod tests {
     }
 
     #[test]
-    fn zakura_secret_key_path_uses_network_cache_dir() {
-        let cache_dir = CacheDir::custom_path("/tmp/zebra-cache");
+    fn zakura_secret_key_path_uses_identity_dir() {
+        let config = Config {
+            cache_dir: CacheDir::custom_path("/tmp/zebra-cache"),
+            identity_dir: "/tmp/zakura-identities".into(),
+            ..Config::default()
+        };
+        let key_file =
+            crate::config::zakura_secret_key_file_path(&config.identity_dir, &config.network);
 
+        assert!(
+            !key_file.starts_with("/tmp/zebra-cache"),
+            "Zakura identity keys must not be stored under the peer cache directory",
+        );
         assert_eq!(
-            cache_dir
-                .zakura_node_secret_key_file_path(&Network::Mainnet)
-                .expect("custom cache path should be enabled"),
-            PathBuf::from("/tmp/zebra-cache/network/mainnet.zakura-iroh-secret-key")
+            key_file
+                .parent()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str()),
+            Some("zakura-identities"),
+            "Zakura identity keys must be stored under network.identity_dir",
+        );
+        assert_eq!(
+            key_file.file_name().and_then(|name| name.to_str()),
+            Some("mainnet.zakura-iroh-secret-key"),
         );
     }
 

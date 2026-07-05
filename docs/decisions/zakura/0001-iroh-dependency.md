@@ -84,14 +84,17 @@ reqwest stack:
 secret-key override. It is deserialized into a redacted config newtype so the
 value does not appear in startup `Debug` logs or generated serialized config.
 If it is unset, later Zakura endpoint construction will generate an ed25519 iroh
-`SecretKey` on first use and persist it beside the network peer cache at:
+`SecretKey` on first use and persist it under `network.identity_dir`, which
+defaults outside Zebra's cache and state directories at:
 
 ```text
-<cache_dir>/network/<network>.zakura-iroh-secret-key
+~/.zakura/<network>.zakura-iroh-secret-key
 ```
 
-This commit only reserves the config and storage path. It does not parse,
-generate, persist, or use the key in production paths.
+This location is intentionally independent from `network.cache_dir`, so state
+or cache snapshots do not clone a node's long-term iroh identity. Operators can
+override it with `network.identity_dir`, but should keep it outside snapshot
+paths.
 
-`CacheDir::zakura_node_secret_key_file_path` is the canonical helper for this
-reserved storage path.
+`network.identity_dir` is the canonical config surface for this reserved
+storage path.

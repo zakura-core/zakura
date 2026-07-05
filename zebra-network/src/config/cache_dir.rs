@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 
 use zebra_chain::{common::default_cache_dir, parameters::Network};
 
+/// The directory, relative to the user's home directory, where Zebra stores
+/// long-term network identity secrets.
+const DEFAULT_NETWORK_IDENTITY_DIR: &str = ".zakura";
+
 /// A cache directory config field.
 ///
 /// This cache directory configuration field is optional.
@@ -65,12 +69,12 @@ impl CacheDir {
         )
     }
 
-    /// Returns the persistent Zakura iroh secret-key file path for `network`, if enabled.
-    pub fn zakura_node_secret_key_file_path(&self, network: &Network) -> Option<PathBuf> {
-        Some(self.cache_dir()?.join("network").join(format!(
-            "{}.zakura-iroh-secret-key",
-            network.lowercase_name()
-        )))
+    /// Returns the default persistent Zakura iroh secret-key file path for `network`.
+    ///
+    /// This path is intentionally independent from the peer cache directory so
+    /// state or cache snapshots do not clone a node's long-term iroh identity.
+    pub fn zakura_node_secret_key_file_path(&self, network: &Network) -> PathBuf {
+        zakura_node_secret_key_file_path(&default_network_identity_dir(), network)
     }
 
     /// Returns the `zebra-network` base cache directory, if enabled.
@@ -86,4 +90,20 @@ impl Default for CacheDir {
     fn default() -> Self {
         Self::default_path()
     }
+}
+
+/// Returns the default directory for network identity secrets.
+pub(crate) fn default_network_identity_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join(DEFAULT_NETWORK_IDENTITY_DIR)
+}
+
+/// Returns the persistent Zakura iroh secret-key file path for `network` under
+/// `identity_dir`.
+pub(crate) fn zakura_node_secret_key_file_path(identity_dir: &Path, network: &Network) -> PathBuf {
+    identity_dir.join(format!(
+        "{}.zakura-iroh-secret-key",
+        network.lowercase_name()
+    ))
 }

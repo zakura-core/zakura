@@ -13,6 +13,7 @@ use zebra_chain::{
 
 use crate::{
     config::zakura_listens_on_loopback_with_non_loopback_bootstrap_peers,
+    config::zakura_secret_key_file_path,
     constants::{INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_MULTIPLIER},
     zakura::{
         DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
@@ -21,6 +22,8 @@ use crate::{
     },
     CacheDir, Config,
 };
+
+use super::super::load_or_generate_zakura_secret_key;
 
 fn default_zakura_bootstrap_peers() -> Vec<String> {
     DEFAULT_ZAKURA_BOOTSTRAP_PEERS
@@ -128,6 +131,35 @@ fn zakura_node_secret_key_is_redacted_from_debug_and_serialization() {
     let serialized = toml::to_string(&config).unwrap();
     assert!(!serialized.contains("zakura_node_secret_key"));
     assert!(!serialized.contains(secret));
+}
+
+#[test]
+fn identity_dir_defaults_and_roundtrips() {
+    let _init_guard = zebra_test::init();
+
+    let default_config = Config::default();
+    assert_eq!(
+        default_config
+            .identity_dir
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some(".zakura"),
+    );
+
+    let config: Config = toml::from_str("identity_dir = '/tmp/zakura-identities'")
+        .expect("identity_dir should parse as a path");
+    assert_eq!(
+        config.identity_dir,
+        std::path::PathBuf::from("/tmp/zakura-identities"),
+    );
+
+    let serialized = toml::to_string(&config).expect("config should serialize");
+    assert!(
+        serialized.contains("identity_dir = \"/tmp/zakura-identities\""),
+        "identity_dir should be included in generated network config",
+    );
+    let deserialized: Config = toml::from_str(&serialized).expect("serialized config should parse");
+    assert_eq!(config, deserialized);
 }
 
 #[test]
@@ -597,32 +629,20 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
     );
 }
 
-/// With `v2_p2p` enabled, default config (no `zakura_node_secret_key`), and a
-/// writable cache dir, the generated Zakura iroh identity must be persisted on
-/// first use and reused on every later startup, so the node's `NodeId` is stable
-/// across restarts.
+/// With no `zakura_node_secret_key` and a writable identity directory, the
+/// generated Zakura iroh identity must be persisted on first use and reused on
+/// every later startup, so the node's `NodeId` is stable across restarts.
 ///
 /// This is the regression test for `claude-ephemeral-node-secret-on-restart`:
 /// before the fix, `Config::zakura_secret_key` generated a fresh ephemeral key on
-/// every call and never wrote the reserved cache-dir key file, so two startups
+/// every call and never wrote the reserved identity key file, so two startups
 /// produced different `NodeId`s and no key file existed.
 #[test]
 fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     let _init_guard = zebra_test::init();
 
-    let cache_dir = tempfile::tempdir().expect("failed to create temp cache dir");
-
-    let config = Config {
-        cache_dir: CacheDir::custom_path(cache_dir.path()),
-        zakura_node_secret_key: None,
-        v2_p2p: true,
-        ..Config::default()
-    };
-
-    let key_file = config
-        .cache_dir
-        .zakura_node_secret_key_file_path(&config.network)
-        .expect("an enabled cache dir must yield a key file path");
+    let key_dir = tempfile::tempdir().expect("failed to create temp key dir");
+    let key_file = key_dir.path().join("mainnet.zakura-iroh-secret-key");
 
     // The key file must not exist before first use.
     assert!(
@@ -631,14 +651,12 @@ fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     );
 
     // First startup: generate and persist a fresh key.
-    let first = config
-        .zakura_secret_key()
-        .expect("default config should resolve a secret key");
+    let first = load_or_generate_zakura_secret_key(&key_file);
 
-    // The reserved cache-dir key file must now exist (atomic create+persist).
+    // The reserved identity key file must now exist (atomic create+persist).
     assert!(
         key_file.exists(),
-        "first startup must persist the generated key to the cache-dir key file",
+        "first startup must persist the generated identity key file",
     );
 
     // On Unix, the long-term private identity file must be owner-only (0o600).
@@ -653,28 +671,18 @@ fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
         assert_eq!(mode, 0o600, "persisted secret key file must be owner-only");
     }
 
-    // Second startup with a fresh `Config` reading the same cache dir (simulating
-    // a process restart) must reuse the persisted key, yielding the same `NodeId`.
-    let restart_config = Config {
-        cache_dir: CacheDir::custom_path(cache_dir.path()),
-        zakura_node_secret_key: None,
-        v2_p2p: true,
-        ..Config::default()
-    };
-    let after_restart = restart_config
-        .zakura_secret_key()
-        .expect("restart should resolve the persisted secret key");
+    // Second startup reading the same key file (simulating a process restart)
+    // must reuse the persisted key, yielding the same `NodeId`.
+    let after_restart = load_or_generate_zakura_secret_key(&key_file);
 
     assert_eq!(
         first.public(),
         after_restart.public(),
-        "node identity must be stable across restarts when persisted to the cache dir",
+        "node identity must be stable across restarts when persisted to the identity file",
     );
 
-    // Calling again on the same config must also be stable.
-    let again = config
-        .zakura_secret_key()
-        .expect("repeat resolution should succeed");
+    // Calling again must also be stable.
+    let again = load_or_generate_zakura_secret_key(&key_file);
     assert_eq!(
         first.public(),
         again.public(),
@@ -683,55 +691,63 @@ fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
 }
 
 /// A configured `zakura_node_secret_key` must always win and is never overwritten
-/// by the cache-dir persistence path; a disabled cache dir falls back to an
-/// ephemeral key without writing any file.
+/// by the automatic persistence path; a disabled cache dir still yields a
+/// persistent Zakura identity path outside the cache directory.
 #[test]
 fn zakura_secret_key_honors_configured_key_and_disabled_cache() {
     let _init_guard = zebra_test::init();
 
-    let cache_dir = tempfile::tempdir().expect("failed to create temp cache dir");
+    let key_dir = tempfile::tempdir().expect("failed to create temp key dir");
+    let key_file = key_dir.path().join("mainnet.zakura-iroh-secret-key");
 
-    // Persist a key first so a key file exists in the cache dir.
-    let persisting = Config {
-        cache_dir: CacheDir::custom_path(cache_dir.path()),
-        zakura_node_secret_key: None,
-        v2_p2p: true,
-        ..Config::default()
-    };
-    let persisted = persisting.zakura_secret_key().expect("persist a key");
+    // Persist a key first so an automatic key exists.
+    let persisted = load_or_generate_zakura_secret_key(&key_file);
 
     // A configured key (64-char lowercase hex of the all-ones secret) must override
-    // the persisted cache-dir key.
+    // the persisted automatic key.
     let configured = "01".repeat(32);
-    let mut with_key: Config = toml::from_str(&format!("zakura_node_secret_key = '{configured}'"))
+    let with_key: Config = toml::from_str(&format!("zakura_node_secret_key = '{configured}'"))
         .expect("valid configured key parses");
-    with_key.cache_dir = CacheDir::custom_path(cache_dir.path());
     let from_config = with_key
         .zakura_secret_key()
         .expect("configured key should resolve");
     assert_ne!(
         from_config.public(),
         persisted.public(),
-        "configured key must override the persisted cache-dir key",
+        "configured key must override the persisted automatic key",
     );
 
-    // A disabled cache dir cannot persist, so it yields an ephemeral key and writes
-    // no file.
+    // A disabled cache dir still has a persistent Zakura identity path, which is
+    // outside the cache directory.
     let disabled = Config {
         cache_dir: CacheDir::disabled(),
         zakura_node_secret_key: None,
         v2_p2p: true,
         ..Config::default()
     };
-    assert!(
-        disabled
-            .cache_dir
-            .zakura_node_secret_key_file_path(&disabled.network)
-            .is_none(),
-        "disabled cache dir must not yield a key file path",
+    let disabled_key_file = disabled.identity_dir.join("mainnet.zakura-iroh-secret-key");
+    assert_eq!(
+        disabled_key_file,
+        zakura_secret_key_file_path(&disabled.identity_dir, &disabled.network),
     );
-    // Resolving still succeeds (ephemeral), and successive calls may differ.
-    disabled
-        .zakura_secret_key()
-        .expect("disabled cache dir should still resolve an ephemeral key");
+    assert_eq!(
+        disabled.cache_dir.peer_cache_file_path(&disabled.network),
+        None,
+        "disabled cache dir must still disable the peer cache",
+    );
+    assert_eq!(
+        disabled_key_file
+            .parent()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str()),
+        Some(".zakura"),
+        "disabled cache dir must still store the Zakura identity outside the peer cache",
+    );
+    assert_eq!(
+        disabled_key_file
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("mainnet.zakura-iroh-secret-key"),
+        "disabled cache dir must still yield a persistent Zakura identity path outside the peer cache",
+    );
 }

@@ -5,7 +5,7 @@ use std::{
     fmt,
     io::{self, ErrorKind},
     net::{IpAddr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -47,6 +47,10 @@ mod cache_dir;
 mod tests;
 
 pub use cache_dir::CacheDir;
+
+pub(crate) use cache_dir::{
+    default_network_identity_dir, zakura_node_secret_key_file_path as zakura_secret_key_file_path,
+};
 
 /// A sensitive iroh secret-key override for Zakura P2P node identity.
 #[derive(Clone, Deserialize, Eq, PartialEq)]
@@ -198,11 +202,22 @@ pub struct Config {
     /// initial peer set and address book.
     pub cache_dir: CacheDir,
 
+    /// The directory for long-term network identity secrets.
+    ///
+    /// The auto-generated Zakura iroh identity key is stored under this
+    /// directory as `<network>.zakura-iroh-secret-key`. Keep this directory
+    /// outside state or cache snapshot paths, or snapshots can clone the node's
+    /// long-term P2P identity.
+    ///
+    /// The default is `~/.zakura`.
+    pub identity_dir: PathBuf,
+
     /// An optional persistent iroh secret key for Zakura P2P identity.
     ///
     /// This is reserved for Zakura endpoint construction. If unset, a future Zakura endpoint
     /// implementation will generate an ed25519 iroh [`SecretKey`] on first use
-    /// and persist it under [`cache_dir`](Self::cache_dir), beside the peer cache.
+    /// and persist it under [`identity_dir`](Self::identity_dir), outside Zebra's
+    /// cache and state directories by default.
     ///
     /// This value is not used by the legacy TCP peer set.
     pub zakura_node_secret_key: Option<ZakuraNodeSecretKey>,
@@ -628,31 +643,28 @@ impl Config {
     /// Resolution order:
     /// 1. If [`zakura_node_secret_key`](Self::zakura_node_secret_key) is configured,
     ///    it is parsed and used verbatim. An unparsable value is a hard error.
-    /// 2. Otherwise, if [`cache_dir`](Self::cache_dir) is enabled, the persisted key
-    ///    file is loaded; when it is missing or unreadable a fresh key is generated
-    ///    and written atomically with owner-only (`0o600`) permissions, so every
-    ///    later startup reuses the same identity.
-    /// 3. If the cache dir is disabled, an ephemeral key is generated for this run.
+    /// 2. Otherwise, the persisted key file under
+    ///    [`identity_dir`](Self::identity_dir) is loaded; when it is missing or
+    ///    unreadable a fresh key is generated and written atomically with
+    ///    owner-only (`0o600`) permissions, so every later startup reuses the
+    ///    same identity.
+    /// 3. If the key cannot be persisted, the freshly generated identity is used
+    ///    ephemerally for this run.
     ///
     /// # Security
     ///
     /// The persisted key file is the node's long-term private identity. It is
-    /// written beside the peer cache and restricted to owner read/write on Unix.
+    /// written outside the cache and state directories and restricted to owner
+    /// read/write on Unix.
     pub fn zakura_secret_key(&self) -> Result<SecretKey, ZakuraSecretKeyError> {
         if let Some(secret) = &self.zakura_node_secret_key {
             return SecretKey::from_str(secret.expose_secret())
                 .map_err(|_| ZakuraSecretKeyError::InvalidConfigured);
         }
 
-        match self
-            .cache_dir
-            .zakura_node_secret_key_file_path(&self.network)
-        {
-            Some(key_file) => Ok(load_or_generate_zakura_secret_key(&key_file)),
-            // The cache dir is disabled, so there is nowhere to persist a stable
-            // key: fall back to an ephemeral identity for this run.
-            None => Ok(SecretKey::generate(OsRng)),
-        }
+        let key_file = zakura_secret_key_file_path(&self.identity_dir, &self.network);
+
+        Ok(load_or_generate_zakura_secret_key(&key_file))
     }
 }
 
@@ -683,8 +695,8 @@ fn load_or_generate_zakura_secret_key(key_file: &Path) -> SecretKey {
     secret_key
 }
 
-/// Atomically writes `secret_key` to `key_file` as lowercase hex and restricts the
-/// file to owner-only access. Persistence failures are logged but not fatal.
+/// Atomically writes `secret_key` to `key_file` as lowercase hex and restricts
+/// the file to owner-only access. Persistence failures are logged but not fatal.
 fn persist_zakura_secret_key(key_file: &Path, secret_key: &SecretKey) {
     let encoded = hex::encode(secret_key.to_bytes());
 
@@ -756,6 +768,7 @@ impl Default for Config {
             initial_mainnet_peers: mainnet_peers,
             initial_testnet_peers: testnet_peers,
             cache_dir: CacheDir::default(),
+            identity_dir: default_network_identity_dir(),
             zakura_node_secret_key: None,
             v2_p2p: true,
             legacy_p2p: true,
@@ -836,6 +849,7 @@ struct DConfig {
     initial_mainnet_peers: IndexSet<String>,
     initial_testnet_peers: IndexSet<String>,
     cache_dir: CacheDir,
+    identity_dir: PathBuf,
     #[serde(default, skip_serializing)]
     zakura_node_secret_key: Option<ZakuraNodeSecretKey>,
     #[serde(alias = "enable_p2p_v2")]
@@ -859,6 +873,7 @@ impl Default for DConfig {
             initial_mainnet_peers: config.initial_mainnet_peers,
             initial_testnet_peers: config.initial_testnet_peers,
             cache_dir: config.cache_dir,
+            identity_dir: config.identity_dir,
             zakura_node_secret_key: config.zakura_node_secret_key,
             v2_p2p: config.v2_p2p,
             legacy_p2p: config.legacy_p2p,
@@ -918,6 +933,7 @@ impl From<Config> for DConfig {
             initial_mainnet_peers,
             initial_testnet_peers,
             cache_dir,
+            identity_dir,
             zakura_node_secret_key,
             v2_p2p,
             legacy_p2p,
@@ -956,6 +972,7 @@ impl From<Config> for DConfig {
             initial_mainnet_peers,
             initial_testnet_peers,
             cache_dir,
+            identity_dir,
             zakura_node_secret_key,
             v2_p2p,
             legacy_p2p,
@@ -980,6 +997,7 @@ impl<'de> Deserialize<'de> for Config {
             initial_mainnet_peers,
             initial_testnet_peers,
             cache_dir,
+            identity_dir,
             zakura_node_secret_key,
             v2_p2p,
             legacy_p2p,
@@ -1101,6 +1119,7 @@ impl<'de> Deserialize<'de> for Config {
             initial_mainnet_peers,
             initial_testnet_peers,
             cache_dir,
+            identity_dir,
             zakura_node_secret_key,
             v2_p2p,
             legacy_p2p,

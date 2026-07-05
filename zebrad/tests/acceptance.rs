@@ -796,7 +796,7 @@ fn last_config_is_stored() -> Result<()> {
     let generated_content =
         fs::read_to_string(generated_config_path).expect("Should have been able to read the file");
 
-    // We need to replace the cache dir path as stored configs has a dummy `cache_dir` string there.
+    // Replace local filesystem paths with dummy strings so stored configs are portable.
     let processed_generated_content = generated_content
         .replace(
             zebra_state::Config::default()
@@ -804,6 +804,13 @@ fn last_config_is_stored() -> Result<()> {
                 .to_str()
                 .expect("a valid cache dir"),
             "cache_dir",
+        )
+        .replace(
+            zebra_network::Config::default()
+                .identity_dir
+                .to_str()
+                .expect("a valid identity dir"),
+            "identity_dir",
         )
         .trim()
         .to_string();
@@ -839,7 +846,8 @@ fn last_config_is_stored() -> Result<()> {
          Or run: \n\
          cargo build --bin zebrad && \n\
          zebrad generate | \n\
-         sed 's/cache_dir = \".*\"/cache_dir = \"cache_dir\"/' > \n\
+         sed 's/cache_dir = \".*\"/cache_dir = \"cache_dir\"/' | \n\
+         sed 's/identity_dir = \".*\"/identity_dir = \"identity_dir\"/' > \n\
          {}",
         expected_config_path.display(),
         expected_config_path.display(),

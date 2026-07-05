@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Verified-commitment-trees fast sync is now enabled by default when checkpoint
   sync is enabled. Operators can keep checkpoint sync but opt out of the new
   path by setting `consensus.vct_fast_sync = false`.
+- Refreshed the default Testnet Zakura bootstrap peer identities
+  (`DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS`) after the Testnet fleet's iroh node
+  keys were rotated. The previous hardcoded node IDs were stale, so a fresh node
+  using the default config could not discover the Testnet fleet over Zakura. The
+  peer IP addresses and Mainnet bootstrap peers are unchanged.
 
 ### Removed
 

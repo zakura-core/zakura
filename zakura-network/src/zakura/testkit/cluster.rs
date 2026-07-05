@@ -1256,39 +1256,6 @@ mod tests {
             .expect("e2e network has enough checkpoint coverage")
     }
 
-    fn e2e_network_with_checkpoint_hash(height: u32, hash: block::Hash) -> Network {
-        let checkpoints = vec![
-            (block::Height(0), mainnet_genesis_hash()),
-            (block::Height(height), hash),
-        ];
-
-        TestnetParameters::build()
-            .with_genesis_hash(mainnet_genesis_hash())
-            .expect("mainnet genesis vector hash parses")
-            .with_activation_heights(ConfiguredActivationHeights {
-                before_overwinter: None,
-                overwinter: Some(1),
-                sapling: Some(1),
-                blossom: Some(1),
-                heartwood: Some(1),
-                canopy: Some(1),
-                nu5: None,
-                nu6: None,
-                nu6_1: None,
-                nu6_2: None,
-                nu6_3: None,
-                nu7: None,
-                #[cfg(zcash_unstable = "zfuture")]
-                zfuture: None,
-            })
-            .expect("height-1 activation set is valid")
-            .with_funding_streams(Vec::new())
-            .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(checkpoints))
-            .expect("e2e checkpoints use valid header hashes")
-            .to_network()
-            .expect("e2e network has enough checkpoint coverage")
-    }
-
     fn checkpoint_network(checkpoint_height: u32) -> (Network, block::Hash) {
         let checkpoint_hash = mainnet_block(block_bytes(checkpoint_height)).hash();
         (e2e_network([checkpoint_height]), checkpoint_hash)
@@ -2881,12 +2848,16 @@ mod tests {
         Ok(())
     }
 
+    /// A checkpoint-anchored node syncs forward past its anchor, and below-anchor backward
+    /// backfill stays explicitly disabled: no `GetHeaders` for the bracket below the anchor is
+    /// ever sent, and the below-anchor headers stay absent (see
+    /// `backward_checkpoint_backfill_is_explicitly_disabled` for the reactor-level regression).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn header_sync_e2e_checkpoint_forward_then_backward_finalizes_backfill(
+    async fn header_sync_e2e_checkpoint_forward_syncs_without_backward_backfill(
     ) -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
-            "header_sync_e2e_checkpoint_forward_then_backward_finalizes_backfill",
+            "header_sync_e2e_checkpoint_forward_syncs_without_backward_backfill",
             false,
         )?;
         let (network, checkpoint_hash) = checkpoint_network(3);
@@ -2929,18 +2900,35 @@ mod tests {
             .await;
 
         cluster.wait_for_tip(checkpointed, block::Height(4)).await?;
-        await_until(
-            "checkpoint backfill headers committed",
-            Duration::from_secs(5),
-            || cluster.has_headers(checkpointed, 1..=3),
-        )
-        .await?;
+
+        // Give the scheduler time to (incorrectly) emit a backward bracket if it were still
+        // enabled, then assert nothing below the anchor was requested or stored.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !cluster.has_headers(checkpointed, 1..=3),
+            "below-anchor headers must not be backfilled while backward backfill is disabled"
+        );
 
         capture.flush().await;
         let reader = capture.reader()?;
         let target_trace = reader.node("02").table("header_sync");
         target_trace.assert_header_range_request(4, 1);
-        target_trace.assert_header_range_request(1, 3);
+        let backward_requests = target_trace
+            .rows()
+            .iter()
+            .filter(|row| {
+                row.get("event").and_then(serde_json::Value::as_str)
+                    == Some(hs_trace::HEADER_GET_HEADERS_SENT)
+                    && row
+                        .get(hs_trace::RANGE_START)
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(1)
+            })
+            .count();
+        assert_eq!(
+            backward_requests, 0,
+            "backward checkpoint backfill is disabled: no below-anchor GetHeaders may be sent"
+        );
         assert_eq!(
             cluster.finalized_height(checkpointed).await,
             block::Height(3)
@@ -3302,44 +3290,10 @@ mod tests {
             .wait_for_misbehavior_reason(bad_daa_victim, HeaderSyncMisbehavior::InvalidRange)
             .await?;
 
-        let bad_checkpoint_backfill = e2e_peer(101);
-        let checkpoint_hash = mainnet_block(&BLOCK_MAINNET_1_BYTES).hash();
-        let checkpoint_network = e2e_network_with_checkpoint_hash(3, checkpoint_hash);
-        let checkpointed = cluster.spawn_node(
-            6,
-            checkpoint_network,
-            (block::Height(3), checkpoint_hash),
-            E2eHeaderStore::with_checkpoint_anchor(3),
-            ZakuraTrace::new(capture.tracer_for_node(6), "06"),
-        )?;
-        cluster.start_drivers();
-        cluster
-            .connect_peer(checkpointed, bad_checkpoint_backfill.clone())
-            .await;
-        cluster
-            .inject(
-                checkpointed,
-                bad_checkpoint_backfill.clone(),
-                status_for_tip(3, 4, 1),
-            )
-            .await;
-        cluster
-            .wait_for_get_headers(checkpointed, &bad_checkpoint_backfill, block::Height(1), 3)
-            .await?;
-        cluster
-            .inject(
-                checkpointed,
-                bad_checkpoint_backfill,
-                headers_message(vec![
-                    mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
-                    mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
-                    mainnet_block(&BLOCK_MAINNET_3_BYTES).header.clone(),
-                ]),
-            )
-            .await;
-        cluster
-            .wait_for_misbehavior_reason(checkpointed, HeaderSyncMisbehavior::InvalidRange)
-            .await?;
+        // Checkpoint-hash-mismatch backfill responses are covered at the reactor level by
+        // `checkpoint_backfill_rejects_checkpoint_hash_mismatch_before_commit` (via the forward
+        // genesis-backfill path); the backward below-anchor bracket that used to drive it here
+        // is explicitly disabled.
 
         let over_cap = e2e_peer(91);
         cluster.connect_peer(victim, over_cap.clone()).await;
@@ -3431,7 +3385,7 @@ mod tests {
         trace.assert_header_violation("status_spam");
         trace.assert_header_violation("new_block_spam");
         trace.assert_header_violation("malformed_message");
-        for node in ["03", "04", "05", "06"] {
+        for node in ["03", "04", "05"] {
             reader
                 .node(node)
                 .table("header_sync")

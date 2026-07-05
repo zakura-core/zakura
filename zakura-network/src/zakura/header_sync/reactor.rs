@@ -1128,12 +1128,44 @@ impl HeaderSyncReactor {
         peer_max_headers_per_response: u32,
         in_flight_count: usize,
     ) {
-        // A root-carrying request must be answered with one root per header; a plain (above-checkpoint)
-        // request must carry no roots (checked separately just below). Only enforce the one-per-header
-        // count when roots were actually requested.
-        if validate_body_sizes_len(headers.len(), body_sizes.len()).is_err()
-            || (outstanding.range.want_tree_aux_roots
-                && validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len()).is_err())
+        if validate_body_sizes_len(headers.len(), body_sizes.len()).is_err() {
+            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage)
+                .await;
+            self.state.schedule.retry(outstanding.range);
+            self.schedule().await;
+            return;
+        }
+
+        // Tree-aux roots are an optional serving capability: a peer may legitimately have no
+        // roots for a root-carrying request (it can never serve the root for its own tip, and
+        // may not persist roots at all). A completely rootless non-empty response is therefore
+        // not misbehavior — the headers are unusable for this root-carrying range, so drop them,
+        // release the request, and retry the range without scoring the peer.
+        if outstanding.range.want_tree_aux_roots && !headers.is_empty() && tree_aux_roots.is_empty()
+        {
+            metrics::counter!("sync.header.response.rootless").increment(1);
+            self.record_advisory_unconfirmed(&peer);
+            self.trace_headers_received(
+                &peer,
+                outstanding.range.start_height,
+                u32::try_from(headers.len()).unwrap_or(u32::MAX),
+                outstanding.expected_max_count,
+                peer_max_headers_per_response,
+                in_flight_count,
+                outstanding.range.want_tree_aux_roots,
+                0,
+            );
+            self.state.schedule.clear_assignment(outstanding.range);
+            self.state.schedule.retry(outstanding.range);
+            self.schedule().await;
+            return;
+        }
+
+        // A root-carrying request must otherwise be answered with one root per header; a plain
+        // (above-checkpoint) request must carry no roots (checked separately just below). Only
+        // enforce the one-per-header count when roots were actually requested.
+        if outstanding.range.want_tree_aux_roots
+            && validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len()).is_err()
         {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage)
                 .await;

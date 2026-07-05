@@ -12,6 +12,10 @@ pub(super) const HEADER_SYNC_ADVISORY_BACKOFF: Duration = Duration::from_secs(60
 pub(super) const HEADER_SYNC_ADVISORY_TTL: Duration = DEFAULT_LIVE_SERVICE_SUMMARY_TTL;
 pub(super) const HEADER_SYNC_STALE_ANCHOR_LINK_FAILURES: u32 = 3;
 pub(super) const HEADER_SYNC_STALE_ANCHOR_DISTINCT_PEERS: usize = 2;
+/// Below-anchor checkpoint backfill is unused by the current sync wiring and cannot verify
+/// roots (backward ranges fold onto the previous checkpoint's tree, which this reactor never
+/// tracks), so it stays disabled. See [`HeaderSyncCore::refresh_backward_range`].
+pub(super) const BACKWARD_CHECKPOINT_BACKFILL_ENABLED: bool = false;
 
 #[derive(Clone, Debug)]
 pub(super) struct HeaderSyncCore {
@@ -141,6 +145,15 @@ impl HeaderSyncCore {
     }
 
     pub(super) fn refresh_backward_range(&mut self, startup: &HeaderSyncStartup) {
+        // Below-anchor checkpoint backfill is explicitly disabled: backward ranges fold onto the
+        // previous checkpoint's tree, which this reactor never tracks, so their roots cannot be
+        // verified, and the current node wiring never consumes backfilled headers. Leaving the
+        // scheduling live would silently emit unsupported below-anchor `GetHeaders` requests.
+        // Re-enable once backfill has a consumer and checkpoint-bracket tree tracking.
+        if !BACKWARD_CHECKPOINT_BACKFILL_ENABLED {
+            return;
+        }
+
         if self.anchor.0 == block::Height(0) {
             return;
         }

@@ -208,8 +208,14 @@ impl HeaderSyncMessage {
                     for _ in 0..count {
                         tree_aux_roots.push(BlockCommitmentRoots::zcash_deserialize(&mut reader)?);
                     }
+                    validate_tree_aux_roots_len(count, tree_aux_roots.len())?;
                 }
-                validate_tree_aux_roots_len(count, tree_aux_roots.len())?;
+                // `has_roots == false` with non-empty headers is legal on the requester side:
+                // roots are an optional serving capability, and a solicited response reaching
+                // this decode is always correlated to an in-flight request (an uncorrelated
+                // `Headers` frame was already rejected as `UnsolicitedHeaders` above). The
+                // reactor decides how to handle a rootless response to a root-carrying
+                // request; it must not be a fatal wire reject that disconnects the peer.
                 if let Some(requested) = context.requested {
                     validate_tree_aux_root_heights(requested.start_height, &tree_aux_roots)?;
                 }

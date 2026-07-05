@@ -1353,19 +1353,31 @@ fn header_aux_validation_rejects_bad_roots_before_state_commit() {
     ));
 }
 
+/// Tree-aux roots are an optional serving capability: a solicited non-empty `Headers`
+/// response without roots must decode (the reactor handles it non-punitively), while the
+/// same rootless frame with no correlated request is still rejected as unsolicited.
 #[test]
-fn decode_rejects_non_empty_headers_without_tree_aux_roots() {
+fn decode_accepts_rootless_non_empty_solicited_headers() {
     let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
     let mut encoded = headers_message(headers).encode().unwrap();
     encoded[HEADER_SYNC_MESSAGE_TYPE_BYTES + HEADER_SYNC_COUNT_BYTES] = 0;
     encoded.truncate(encoded.len() - HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES);
 
+    match HeaderSyncMessage::decode(&encoded, finalized_headers_context(1, 1)) {
+        Ok(HeaderSyncMessage::Headers {
+            headers,
+            tree_aux_roots,
+            ..
+        }) => {
+            assert_eq!(headers.len(), 1);
+            assert!(tree_aux_roots.is_empty());
+        }
+        other => panic!("rootless solicited Headers must decode, got {other:?}"),
+    }
+
     assert!(matches!(
-        HeaderSyncMessage::decode(&encoded, finalized_headers_context(1, 1)),
-        Err(HeaderSyncWireError::TreeAuxRootCountMismatch {
-            headers: 1,
-            roots: 0,
-        })
+        HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control()),
+        Err(HeaderSyncWireError::UnsolicitedHeaders)
     ));
 }
 
@@ -1904,45 +1916,6 @@ async fn scheduler_creates_checkpoint_forward_before_backward_ranges() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_creates_backward_checkpoint_terminating_ranges() {
-    let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
-    let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), checkpoint_hash),
-        Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peer_id = peer(7);
-
-    connect_peer(&fixture, peer_id.clone()).await;
-    advertise_tip(
-        &fixture,
-        peer_id,
-        block::Height(0),
-        block::Height(3),
-        DEFAULT_HS_RANGE,
-        10,
-    )
-    .await;
-
-    loop {
-        if let HeaderSyncAction::SendMessage {
-            msg:
-                HeaderSyncMessage::GetHeaders {
-                    start_height,
-                    count,
-                    want_tree_aux_roots: true,
-                },
-            ..
-        } = next_non_query_action(&mut fixture.actions).await
-        {
-            assert_eq!(start_height, block::Height(1));
-            assert_eq!(count, 3);
-            break;
-        }
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn forward_ranges_below_checkpoint_handoff_request_tree_aux_roots() {
     let network = Parameters::build()
         .with_network_name("HeadersyncRootWindowTest")
@@ -2083,8 +2056,11 @@ async fn incoming_headers_match_outstanding_before_commit() {
     }
 }
 
+/// Tree-aux roots are an optional serving capability, so a rootless non-empty response to a
+/// root-carrying request is not misbehavior: the headers are unusable for the root regime and
+/// must not commit, but the peer keeps its session and the range is retried.
 #[tokio::test(flavor = "current_thread")]
-async fn rootless_non_empty_response_is_malformed() {
+async fn rootless_non_empty_response_retries_without_misbehavior() {
     let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
     let first_checkpoint = block::Height(3);
@@ -2122,12 +2098,21 @@ async fn rootless_non_empty_response_is_malformed() {
         .await
         .unwrap();
 
+    // The range must be retried (a fresh `GetHeaders` for the same start height), with no
+    // commit and no misbehavior along the way.
     loop {
         match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        want_tree_aux_roots: true,
+                        ..
+                    },
+                ..
+            } if start_height == start => break,
             HeaderSyncAction::Misbehavior { peer, reason } => {
-                assert_eq!(peer, peer_id);
-                assert_eq!(reason, HeaderSyncMisbehavior::MalformedMessage);
-                break;
+                panic!("rootless response must not be misbehavior, got {reason:?} from {peer:?}");
             }
             HeaderSyncAction::CommitHeaderRange { .. } => {
                 panic!("a rootless non-empty response must not commit")
@@ -2135,6 +2120,7 @@ async fn rootless_non_empty_response_is_malformed() {
             _ => {}
         }
     }
+    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -5081,77 +5067,17 @@ async fn truncated_finalized_backfill_is_rejected_before_commit() {
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn backward_checkpoint_backfill_accepts_linking_run_as_finalized() {
-    let headers = [
-        mainnet_header(&BLOCK_MAINNET_1_BYTES),
-        mainnet_header(&BLOCK_MAINNET_2_BYTES),
-        mainnet_header(&BLOCK_MAINNET_3_BYTES),
-    ];
-    let checkpoint_hash = block::Hash::from(headers[2].as_ref());
-    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
-    let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), checkpoint_hash),
-        Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peer_id = peer(45);
-
-    connect_peer(&fixture, peer_id.clone()).await;
-    advertise_tip(
-        &fixture,
-        peer_id.clone(),
-        block::Height(0),
-        block::Height(3),
-        DEFAULT_HS_RANGE,
-        1,
-    )
-    .await;
-    loop {
-        if matches!(
-            next_non_query_action(&mut fixture.actions).await,
-            HeaderSyncAction::SendMessage {
-                msg: HeaderSyncMessage::GetHeaders { .. },
-                ..
-            }
-        ) {
-            break;
-        }
-    }
-
-    fixture
-        .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(headers.to_vec()),
-        })
-        .await
-        .unwrap();
-
-    match next_non_query_action(&mut fixture.actions).await {
-        HeaderSyncAction::CommitHeaderRange {
-            peer,
-            start_height,
-            headers,
-            finalized,
-            ..
-        } => {
-            assert_eq!(peer, peer_id);
-            assert_eq!(start_height, block::Height(1));
-            assert_eq!(headers.len(), 3);
-            assert!(finalized);
-        }
-        action => panic!("unexpected action: {action:?}"),
-    }
-}
+// Backward (below-anchor) checkpoint backfill is explicitly disabled (see
+// `backward_checkpoint_backfill_is_explicitly_disabled`), so finalized checkpoint-range
+// validation is exercised through the forward genesis-backfill path below.
 
 #[tokio::test(flavor = "current_thread")]
 async fn checkpoint_backfill_rejects_non_contiguous_run_before_commit() {
-    let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
+    let (network, _checkpoint_hash) = checkpoint_regtest(block::Height(3));
     let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), checkpoint_hash),
-        Some((block::Height(3), checkpoint_hash)),
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
     ));
     let peer_id = peer(10);
 
@@ -5263,10 +5189,12 @@ async fn checkpoint_backfill_rejects_checkpoint_hash_mismatch_before_commit() {
     ];
     let divergent_checkpoint_hash = block::Hash::from(headers[0].as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), divergent_checkpoint_hash);
+    // Forward genesis backfill toward the (divergent) first checkpoint: the linking run's last
+    // header must hash-match the checkpoint or the whole finalized range is rejected.
     let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), divergent_checkpoint_hash),
-        Some((block::Height(3), divergent_checkpoint_hash)),
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
     ));
     let peer_id = peer(46);
 

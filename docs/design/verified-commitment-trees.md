@@ -445,7 +445,16 @@ other peers are already header-authenticated, and so a restart never trusts an u
   reads it, the forward root-verifying request, detects a behind tree (`MissingHeaderHistoryTree`) and
   rebuilds it from durable state (`ReadRequest::BestHeaderHistoryTree`) — a single, guarded reload that
   never fires in the normal header-leading path. This replaces the reorg/gossip/catch-up eager-reload
-  machinery of earlier increments.
+  machinery of earlier increments. Two robustness details: the in-flight guard is armed only once the
+  reload action is actually queued — the reactor→driver action channel is a non-blocking `try_send`,
+  and arming the guard on a dropped send (full/closed channel) would suppress every future rebuild
+  permanently, since the guard clears only when a reload completes; a dropped send instead leaves it
+  clear so the next range retry re-dispatches. And the reconstruction re-bases at the *current*
+  committed tip read from the same state snapshot: the finalized history tree is stored only at the tip
+  (there is no per-height finalized history tree), and a concurrent checkpoint/legacy commit can
+  advance the finalized tip past the reactor's cached `verified_block_tip` during the round-trip, so
+  folding must start from the tip actually present rather than the caller's (possibly lagging) value —
+  otherwise the base read returns `None` and the rebuild degrades to a network-paced no-progress loop.
 - **Verify before persisting.** When a below-checkpoint header range arrives, the reactor folds its
   supplied roots into the running header-frontier history tree and checks each header's commitment
   against it (`verify_supplied_roots_from_parts` in `zakura-chain/src/parallel/commitment_aux_verify.rs`,
@@ -753,6 +762,7 @@ Live commit-path counters distinguish the fast and legacy paths and the failure 
 | `state.vct.fast_path.hit` | a finalized commit consumed header-carried roots to skip the recompute |
 | `state.vct.fast_path.miss` | a finalized commit did not take the fast path |
 | `state.vct.root.stalled.height` (gauge) | a height stuck on a retryable stall past the warn threshold |
+| `sync.header.history_tree.rebuild` | header-frontier history tree lazily rebuilt (§6.4) because a non-Zakura commit ran ahead of it below the checkpoint; **stays 0 in the normal header-leading path**, so a nonzero value flags fallback/catch-up |
 
 The header-sync `headers_received` / `headers_served` / commit-state trace rows also carry
 `want_tree_aux_roots` and `tree_aux_roots_len`, so root delivery is visible per range. The

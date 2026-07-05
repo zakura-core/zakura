@@ -657,7 +657,10 @@ impl HeaderSyncReactor {
     }
 
     async fn handle_state_frontiers_changed(&mut self, frontiers: HeaderSyncFrontiers) {
-        self.state.finalized_height = frontiers.finalized_height;
+        // The finalized height is append-only; clamp against an out-of-order/stale frontier update so
+        // the root-regime floor (which keys off it) can never move backward. The verified block tip is
+        // left free — it can legitimately reorg backward above the checkpoint.
+        self.state.finalized_height = self.state.finalized_height.max(frontiers.finalized_height);
         self.state.verified_block_tip = frontiers.verified_block_tip;
         self.state.verified_block_hash = frontiers.verified_block_hash;
         if self.state.best_header_tip <= self.state.verified_block_tip {
@@ -1322,15 +1325,20 @@ impl HeaderSyncReactor {
                     // sync) committed ahead of the header-commit frontier, so `best_header_tip` was
                     // bumped past where the tree is folded. This is the *only* reload trigger: rebuild
                     // the tree at the current frontier from durable state, then retry the range. In the
-                    // normal Zakura path (header sync leading) this never fires. Guard so a run of
-                    // forward ranges arriving before the rebuild lands dispatches only one reload.
-                    if !self.state.rebuild_in_flight {
-                        self.state.rebuild_in_flight = true;
-                        metrics::counter!("sync.header.history_tree.rebuild").increment(1);
-                        let _ = self.dispatch_action(HeaderSyncAction::QueryBestHeaderHistoryTree {
+                    // normal Zakura path (header sync leading) this never fires. Only arm the in-flight
+                    // guard once the reload action is actually queued — `dispatch_action` is a
+                    // non-blocking `try_send` that drops on a full/closed channel, and arming the guard
+                    // on a dropped send would suppress every future rebuild permanently (the guard is
+                    // only cleared when the reload completes). A dropped send just leaves the guard
+                    // clear so the next retry re-dispatches.
+                    if !self.state.rebuild_in_flight
+                        && self.dispatch_action(HeaderSyncAction::QueryBestHeaderHistoryTree {
                             verified_block_tip: self.state.verified_block_tip,
                             best_header_tip: self.state.best_header_tip,
-                        });
+                        })
+                    {
+                        self.state.rebuild_in_flight = true;
+                        metrics::counter!("sync.header.history_tree.rebuild").increment(1);
                     }
                     self.state.schedule.clear_assignment(outstanding.range);
                     self.state.schedule.retry(outstanding.range);

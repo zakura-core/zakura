@@ -1535,6 +1535,8 @@ where
     C: AsRef<Chain>,
 {
     let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
+    let finalized_tip_height = db.finalized_tip_height();
+    let best_header_tip_height = db.best_header_tip().map(|(height, _hash)| height);
     let mut roots =
         Vec::with_capacity(usize::try_from(capped_count).expect("capped root count fits in usize"));
 
@@ -1543,18 +1545,23 @@ where
             break;
         };
 
-        let root = if db
-            .finalized_tip_height()
-            .is_some_and(|finalized_tip| height <= finalized_tip)
-        {
+        let chain_contains_height = chain
+            .as_ref()
+            .map(|chain| chain.as_ref().contains_block_height(height))
+            .unwrap_or(false);
+
+        let mut root_source = "zakura_header";
+        let root = if finalized_tip_height.is_some_and(|finalized_tip| height <= finalized_tip) {
+            root_source = "finalized";
             finalized_state::serve_block_roots(db, height..=height)
                 .into_iter()
                 .next()
-        } else if let Some(chain) = chain
-            .as_ref()
-            .map(|chain| chain.as_ref())
-            .filter(|chain| chain.contains_block_height(height))
-        {
+        } else if chain_contains_height {
+            root_source = "non_finalized";
+            let chain = chain
+                .as_ref()
+                .map(|chain| chain.as_ref())
+                .expect("chain exists because it contains this block height");
             match (
                 chain.sapling_tree(height.into()),
                 chain.orchard_tree(height.into()),
@@ -1598,10 +1605,36 @@ where
         };
 
         let Some(root) = root else {
+            tracing::warn!(
+                ?start,
+                count,
+                capped_count,
+                ?height,
+                offset,
+                root_source,
+                ?finalized_tip_height,
+                ?best_header_tip_height,
+                chain_contains_height,
+                has_body = db.contains_body_at_height(height),
+                has_header = !db.headers_by_height_range(height, 1).is_empty(),
+                returned_count = roots.len(),
+                "Zakura BlockRoots read stopped at missing commitment root"
+            );
             break;
         };
 
         if root.height != height {
+            tracing::warn!(
+                ?start,
+                count,
+                capped_count,
+                ?height,
+                returned_height = ?root.height,
+                offset,
+                root_source,
+                returned_count = roots.len(),
+                "Zakura BlockRoots read stopped at non-contiguous commitment root"
+            );
             break;
         }
 
@@ -1639,7 +1672,7 @@ fn best_header_history_tree<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     network: &Network,
-    verified_block_tip: block::Height,
+    mut verified_block_tip: block::Height,
     best_header_tip: block::Height,
 ) -> Result<
     (
@@ -1661,11 +1694,24 @@ where
         Some(tree) => tree,
         None if verified_block_tip == block::Height(0) => Arc::new(HistoryTree::default()),
         None => {
-            return Err(format!(
-                "cannot rebuild header-tip history tree: no history tree at verified block tip \
-                 {verified_block_tip:?}"
-            )
-            .into())
+            // The caller's `verified_block_tip` lagged the committed tip: a concurrent checkpoint or
+            // legacy commit advanced the finalized tip during the round-trip (the runtime lazy-rebuild
+            // path), and below the checkpoint the finalized history tree is stored only at the current
+            // tip — there is no per-height finalized history tree. Re-base at this snapshot's tip,
+            // read atomically from the same `chain`/`db`, which is the real committed base; the header
+            // frontier tracks it, so any header lead folds on top from here.
+            let tip = read::tip_height(chain.clone(), db).ok_or_else(|| {
+                BoxError::from("cannot rebuild header-tip history tree: no state tip")
+            })?;
+            verified_block_tip = tip;
+            match read::tree::history_tree(chain.clone(), db, tip.into()) {
+                Some(tree) => tree,
+                None if tip == block::Height(0) => Arc::new(HistoryTree::default()),
+                None => return Err(format!(
+                    "cannot rebuild header-tip history tree: no history tree at state tip {tip:?}"
+                )
+                .into()),
+            }
         }
     };
 
@@ -1998,6 +2044,29 @@ impl Service<ReadRequest> for ReadStateService {
                         count,
                     )
                 };
+
+                let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
+                let capped_count_usize =
+                    usize::try_from(capped_count).expect("capped root count fits in usize");
+                if count > 0 && roots.len() < capped_count_usize {
+                    tracing::warn!(
+                        ?start_height,
+                        count,
+                        capped_count,
+                        returned_count = roots.len(),
+                        last_returned_height = ?roots.last().map(|root| root.height),
+                        "Zakura BlockRoots read returned a short contiguous prefix"
+                    );
+                } else {
+                    tracing::debug!(
+                        ?start_height,
+                        count,
+                        capped_count,
+                        returned_count = roots.len(),
+                        last_returned_height = ?roots.last().map(|root| root.height),
+                        "Zakura BlockRoots read completed"
+                    );
+                }
 
                 Ok(ReadResponse::BlockRoots(roots))
             }

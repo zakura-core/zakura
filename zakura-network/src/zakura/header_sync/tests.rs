@@ -4587,6 +4587,87 @@ async fn missing_header_aux_tree_triggers_single_lazy_rebuild() {
     assert_eq!(rebuilds, 1, "a stale tree triggers exactly one lazy rebuild");
 }
 
+/// A failed rebuild (`BestHeaderHistoryTreeLoaded { history_tree: None }`, e.g. a state read error)
+/// must clear the in-flight guard so a subsequent stale forward range can re-trigger the rebuild — the
+/// guard must never wedge future rebuilds. Regression test for the lazy-rebuild robustness path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_rebuild_clears_guard_and_retriggers() {
+    let block4 = mainnet_header(&BLOCK_MAINNET_4_BYTES);
+    let block4_hash = block::Hash::from(block4.as_ref());
+    let block5 = mainnet_header(&BLOCK_MAINNET_5_BYTES);
+    let block5_hash = block::Hash::from(block5.as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(5), block5_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(4), block4_hash)),
+    ));
+    let peer_id = peer(88);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(5),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    // Drive one stale-tree round, feed a *failed* rebuild, then drive a second stale-tree round.
+    // A second `QueryBestHeaderHistoryTree` must be dispatched — proving the guard was cleared by the
+    // `None` completion rather than wedged.
+    let mut rebuilds = 0;
+    for round in 0..2 {
+        let (_p, start_height, _c) = next_outbound_get_headers(&mut fixture.actions).await;
+        fixture
+            .handle
+            .send(HeaderSyncEvent::WireMessage {
+                peer: peer_id.clone(),
+                msg: finalized_headers_message_from(start_height, vec![block5.clone()]),
+            })
+            .await
+            .unwrap();
+        // Wait for this round's rebuild dispatch.
+        let mut saw = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                fixture.actions.recv(),
+            )
+            .await
+            {
+                Ok(Some(HeaderSyncAction::QueryBestHeaderHistoryTree { .. })) => {
+                    rebuilds += 1;
+                    saw = true;
+                    break;
+                }
+                Ok(Some(HeaderSyncAction::SendMessage {
+                    msg: HeaderSyncMessage::GetHeaders { .. },
+                    ..
+                })) => { /* the retry re-request; ignore until the rebuild dispatch */ }
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(saw, "round {round}: expected a rebuild dispatch");
+        // Fail the rebuild — the guard must clear so the next round can re-trigger.
+        fixture
+            .handle
+            .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
+                best_header_tip: block::Height(4),
+                history_tree: None,
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        rebuilds, 2,
+        "a failed rebuild must clear the guard so the next stale range re-triggers it",
+    );
+}
+
 /// A gossiped `NewBlock` accepted ahead of the header frontier advances the header tip — the frontier
 /// tracks the committed chain. It does not touch the in-memory tree; if this were below the checkpoint
 /// and a later forward range needed the tree, the lazy rebuild would reposition it.

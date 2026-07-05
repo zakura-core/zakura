@@ -1057,6 +1057,16 @@ impl<'de> Deserialize<'de> for Config {
         // starting while checkpoint sync stays deadlock-free.
         let mut zakura = zakura;
         zakura.apply_network_defaults(&network);
+        let default_zakura_bootstrap_peers =
+            ZakuraConfig::default_bootstrap_peers_for_network(&network);
+        if zakura.bootstrap_peers != default_zakura_bootstrap_peers {
+            warn!(
+                ?network,
+                configured_zakura_bootstrap_peers = ?zakura.bootstrap_peers,
+                ?default_zakura_bootstrap_peers,
+                "configured Zakura bootstrap peers differ from the default peers for this network"
+            );
+        }
         zakura.block_sync.clamp_inflight_block_bytes_to_floor();
         // Likewise clamp the resident look-ahead budget (and its block cap) up to one
         // checkpoint range, so the resident-memory admission gate cannot deadlock checkpoint

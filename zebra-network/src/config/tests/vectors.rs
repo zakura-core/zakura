@@ -1,6 +1,6 @@
 //! Fixed test vectors for zebra-network configuration.
 
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use static_assertions::const_assert;
 use zebra_chain::{
@@ -12,6 +12,7 @@ use zebra_chain::{
 };
 
 use crate::{
+    config::zakura_listens_on_loopback_with_non_loopback_bootstrap_peers,
     constants::{INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_MULTIPLIER},
     zakura::{
         DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
@@ -202,6 +203,62 @@ fn explicit_zakura_bootstrap_peers_override_network_defaults() {
     assert_eq!(
         custom_config.zakura.bootstrap_peers,
         vec!["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
+    );
+}
+
+#[test]
+fn zakura_warns_on_loopback_listener_with_public_bootstrap_peers() {
+    let _init_guard = zebra_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        listen_addr = "127.0.0.1:18234"
+        "#,
+    )
+    .unwrap();
+
+    assert!(zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(&config.zakura));
+}
+
+#[test]
+fn zakura_loopback_listener_allows_loopback_bootstrap_peers() {
+    let _init_guard = zebra_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        listen_addr = "127.0.0.1:18234"
+        bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8234"]
+        "#,
+    )
+    .unwrap();
+
+    assert!(!zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(&config.zakura));
+}
+
+#[test]
+fn zakura_public_listener_allows_public_bootstrap_peers() {
+    let _init_guard = zebra_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        listen_addr = "0.0.0.0:18234"
+        "#,
+    )
+    .unwrap();
+
+    assert!(!zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(&config.zakura));
+    assert_eq!(
+        config.zakura.listen_addr,
+        Some("0.0.0.0:18234".parse::<SocketAddr>().unwrap())
     );
 }
 

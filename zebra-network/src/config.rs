@@ -1067,6 +1067,17 @@ impl<'de> Deserialize<'de> for Config {
                 "configured Zakura bootstrap peers differ from the default peers for this network"
             );
         }
+        if zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(&zakura) {
+            warn!(
+                ?network,
+                listen_addr = ?zakura.listen_addr,
+                bootstrap_peers = ?zakura.bootstrap_peers,
+                "configured Zakura listen_addr is loopback-only, but bootstrap peers use \
+                 non-loopback addresses; native Zakura dials may fail with \
+                 `Can't assign requested address`. Use 0.0.0.0:<port> or another routable \
+                 interface address for public Zakura peers"
+            );
+        }
         zakura.block_sync.clamp_inflight_block_bytes_to_floor();
         // Likewise clamp the resident look-ahead budget (and its block cap) up to one
         // checkpoint range, so the resident-memory admission gate cannot deadlock checkpoint
@@ -1092,6 +1103,20 @@ impl<'de> Deserialize<'de> for Config {
             max_connections_per_ip,
         })
     }
+}
+
+fn zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(zakura: &ZakuraConfig) -> bool {
+    let Some(listen_addr) = zakura.listen_addr else {
+        return false;
+    };
+
+    listen_addr.ip().is_loopback()
+        && zakura
+            .bootstrap_peers
+            .iter()
+            .filter_map(|peer| peer.rsplit_once('@'))
+            .filter_map(|(_node_id, addr)| addr.parse::<SocketAddr>().ok())
+            .any(|addr| !addr.ip().is_loopback())
 }
 
 /// Accepts an [`IndexSet`] of initial peers,

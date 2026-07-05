@@ -1220,6 +1220,21 @@ mod tests {
     }
 
     fn e2e_network(checkpoints: impl IntoIterator<Item = u32>) -> Network {
+        e2e_network_with_shielded_activation(checkpoints, 1)
+    }
+
+    /// Builds an e2e testnet whose Sapling..Canopy upgrades activate at `shielded_activation`.
+    ///
+    /// Overwinter stays at height 1 and NU5+ stay inactive. Setting `shielded_activation` above the
+    /// synced range keeps those heights in the pre-Sapling regime, where headers present unverified
+    /// `PreSaplingReserved` commitments — the only regime the empty placeholder tree-aux roots
+    /// served by the test peer can satisfy. `Canopy` must be present and
+    /// `max_checkpoint >= Canopy - 1` for the checkpoint-coverage check, so the highest usable value
+    /// is `max_checkpoint + 1`.
+    fn e2e_network_with_shielded_activation(
+        checkpoints: impl IntoIterator<Item = u32>,
+        shielded_activation: u32,
+    ) -> Network {
         let checkpoints = std::iter::once((block::Height(0), mainnet_genesis_hash()))
             .chain(checkpoints.into_iter().map(|height| {
                 (
@@ -1235,10 +1250,10 @@ mod tests {
             .with_activation_heights(ConfiguredActivationHeights {
                 before_overwinter: None,
                 overwinter: Some(1),
-                sapling: Some(1),
-                blossom: Some(1),
-                heartwood: Some(1),
-                canopy: Some(1),
+                sapling: Some(shielded_activation),
+                blossom: Some(shielded_activation),
+                heartwood: Some(shielded_activation),
+                canopy: Some(shielded_activation),
                 nu5: None,
                 nu6: None,
                 nu6_1: None,
@@ -1248,7 +1263,7 @@ mod tests {
                 #[cfg(zcash_unstable = "zfuture")]
                 zfuture: None,
             })
-            .expect("height-1 activation set is valid")
+            .expect("e2e activation set is valid")
             .with_funding_streams(Vec::new())
             .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(checkpoints))
             .expect("e2e checkpoints use valid header hashes")
@@ -2755,7 +2770,12 @@ mod tests {
             false,
         )?;
         let mut cluster = HeaderSyncE2eCluster::new();
-        let network = e2e_network([4]);
+        // Sapling..Canopy activate at height 5, just above the synced 1..=4 range and exactly at the
+        // checkpoint-coverage bound (Canopy - 1 == the height-4 checkpoint). This keeps heights 1..=4
+        // pre-Sapling, so their `PreSaplingReserved` commitments verify against the empty placeholder
+        // tree-aux roots the test peer serves — otherwise a post-Heartwood schedule reads these real
+        // mainnet vectors as `ChainHistoryRoot` and rejects the placeholder roots.
+        let network = e2e_network_with_shielded_activation([4], 5);
         let anchor = (block::Height(0), mainnet_genesis_hash());
         let source = cluster.spawn_node(
             1,

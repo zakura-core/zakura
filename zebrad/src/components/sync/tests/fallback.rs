@@ -384,13 +384,24 @@ fn zakura_sync_status_lengths_drive_existing_mempool_gate() {
         "a caught-up Zakura body/header frontier should activate the existing close-to-tip gate"
     );
 
+    let (sync_status, mut recent_syncs) = SyncStatus::new();
     recent_syncs.push_extend_tips_length(
-        zakura_sync_status_length(Some(Height(100)), Some(Height(1_000)))
+        zakura_sync_status_length(Some(Height(110)), Some(Height(100)))
+            .expect("local verified tip ahead of headers produces a sync status length"),
+    );
+    assert!(
+        sync_status.is_close_to_tip(),
+        "a locally mined block ahead of the peer header tip should activate the mempool gate"
+    );
+
+    let (sync_status, mut recent_syncs) = SyncStatus::new();
+    recent_syncs.push_extend_tips_length(
+        zakura_sync_status_length(Some(Height(100)), Some(Height(201)))
             .expect("known Zakura tips produce a sync status length"),
     );
     assert!(
         !sync_status.is_close_to_tip(),
-        "a large Zakura body/header gap should keep the existing close-to-tip gate disabled"
+        "a Zakura body/header gap over 100 blocks should keep the existing close-to-tip gate disabled"
     );
 }
 

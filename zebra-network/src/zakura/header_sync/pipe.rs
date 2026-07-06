@@ -1,4 +1,4 @@
-//! header_sync/pipe.rs — the per-peer header-sync pipe (stream 5).
+//! header_sync/pipe.rs - the per-peer header-sync pipe (v6).
 //!
 //! THE PHASE-2 DAG SLICE IS THIS DIAGRAM. The code below is a mechanical
 //! transcription; the [`PIPE_SHAPE`] const is the inspectable, drift-checked
@@ -34,7 +34,7 @@ pub(super) struct HsLocal {
     commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
     /// Pre-decode rate gate for inbound `NewBlock` floods.
     ///
-    /// `NewBlock` is the only stream-5 message that deserializes a full
+    /// `NewBlock` is the only header-sync v6 message that deserializes a full
     /// `Arc<Block>` (up to `MAX_HS_MESSAGE_BYTES`) directly from the wire. The
     /// reactor's semantic `inbound_new_block` meter only fires *after* that
     /// decode, so an authenticated peer could otherwise force one full-block
@@ -45,7 +45,7 @@ pub(super) struct HsLocal {
 }
 
 impl HsLocal {
-    /// Build per-peer local state around this peer's stream-5 session.
+    /// Build per-peer local state around this peer's header-sync v6 session.
     pub(super) fn new(
         commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
         new_block_min_interval: Duration,
@@ -669,7 +669,7 @@ mod tests {
 
         // (b) Phase 2's real runtime fork is still frame-shape based:
         // `Headers` needs peer-local request correlation, while all other
-        // stream-5 messages decode as `Control` and are forwarded to the
+        // Header-sync v6 messages decode as `Control` and are forwarded to the
         // compatibility reactor for semantic dispatch.
         let frame_forks: Vec<&str> = PIPE_SHAPE
             .edges

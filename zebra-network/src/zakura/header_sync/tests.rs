@@ -3794,8 +3794,17 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_disconnect() {
     fixture
         .handle
         .send(HeaderSyncEvent::WireDecodeFailed {
-            peer: peer_id,
+            peer: peer_id.clone(),
             error: Arc::new(HeaderSyncWireError::UnknownMessageType(99)),
+        })
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireProtocolFailure {
+            peer: peer_id,
+            reason: HeaderSyncMisbehavior::MalformedMessage,
+            error: Arc::new(HeaderSyncWireError::TrailingBytes),
         })
         .await
         .unwrap();
@@ -3810,6 +3819,24 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_disconnect() {
     assert!(header_sync.count(hs_trace::HEADER_GET_HEADERS_SENT) >= 1);
     assert!(header_sync.count(hs_trace::HEADER_NEW_BLOCK_DEDUPED) >= 1);
     assert!(header_sync.count(hs_trace::HEADER_PEER_DISCONNECT_REQUESTED) >= 1);
+    header_sync.assert_row(
+        hs_trace::HEADER_EVENT_RECEIVED,
+        &[
+            (hs_trace::KIND, TraceValue::Str("wire_decode_failed")),
+            (
+                hs_trace::ERROR_KIND,
+                TraceValue::Str("unknown_message_type"),
+            ),
+        ],
+    );
+    header_sync.assert_row(
+        hs_trace::HEADER_EVENT_RECEIVED,
+        &[
+            (hs_trace::KIND, TraceValue::Str("wire_protocol_failure")),
+            (hs_trace::REASON, TraceValue::Str("malformed_message")),
+            (hs_trace::ERROR_KIND, TraceValue::Str("trailing_bytes")),
+        ],
+    );
 
     for row in header_sync.rows() {
         assert!(

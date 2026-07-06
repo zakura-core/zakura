@@ -28,7 +28,7 @@ pub struct HeaderSyncStartup {
     pub best_header_tip: Option<(block::Height, block::Hash)>,
     /// Shared sync exchange frontier stream.
     pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
-    /// Local stream-5 advertisement.
+    /// Local header-sync v6 advertisement.
     pub config: ZakuraHeaderSyncConfig,
     /// Negotiated or local application frame cap for header-sync responses.
     pub max_frame_bytes: u32,
@@ -145,7 +145,7 @@ impl HeaderSyncHandle {
 /// Facts accepted by the header-sync reactor.
 #[derive(Clone, Debug)]
 pub enum HeaderSyncEvent {
-    /// A peer became available for stream-5 header sync.
+    /// A peer became available for header-sync v6.
     PeerConnected(HeaderSyncPeerSession),
     /// A peer disconnected; all of its outstanding work is dropped.
     PeerDisconnected(ZakuraPeerId),
@@ -192,21 +192,21 @@ pub enum HeaderSyncEvent {
         /// Rejected block hash.
         hash: block::Hash,
     },
-    /// Inbound stream-5 message from `peer`.
+    /// Inbound header-sync v6 message from `peer`.
     WireMessage {
         /// Serving peer.
         peer: ZakuraPeerId,
-        /// Decoded stream-5 message.
+        /// Decoded header-sync v6 message.
         msg: HeaderSyncMessage,
     },
-    /// Stream-5 frame decoding failed after handler admission.
+    /// Header-sync v6 frame decoding failed after handler admission.
     WireDecodeFailed {
         /// Peer that sent the malformed frame.
         peer: ZakuraPeerId,
         /// Decode/validation error.
         error: Arc<HeaderSyncWireError>,
     },
-    /// Stream-5 protocol failure decoded by the peer-owned session.
+    /// Header-sync v6 protocol failure decoded by the peer-owned session.
     WireProtocolFailure {
         /// Peer that sent the invalid message.
         peer: ZakuraPeerId,
@@ -293,7 +293,7 @@ impl HeaderSyncEvent {
 /// Actions emitted by the header-sync reactor for the eventual node wiring.
 #[derive(Clone, Debug)]
 pub enum HeaderSyncAction {
-    /// Test-only observation of a stream-5 message sent directly through a typed session.
+    /// Test-only observation of a header-sync v6 message sent directly through a typed session.
     #[cfg(test)]
     SendMessage {
         /// Destination peer.
@@ -406,7 +406,7 @@ pub enum HeaderSyncMisbehavior {
     ResponseTooLong,
     /// Peer supplied a range that failed state/contextual commit.
     InvalidRange,
-    /// A stream-5 payload was malformed before semantic handling.
+    /// A header-sync v6 payload was malformed before semantic handling.
     MalformedMessage,
     /// A peer sent semantic `Status` messages faster than the v1 budget.
     StatusSpam,
@@ -416,7 +416,7 @@ pub enum HeaderSyncMisbehavior {
     GetHeadersSpam,
     /// A peer requested more headers than this node advertised it can serve.
     GetHeadersTooLong,
-    /// A stream-5 message came from a peer with no active header-sync state.
+    /// A header-sync v6 message came from a peer with no active header-sync state.
     UnknownPeer,
     /// A full-block tip flood failed stateless validation.
     InvalidNewBlock,

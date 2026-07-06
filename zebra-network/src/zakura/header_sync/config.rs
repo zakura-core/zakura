@@ -118,7 +118,7 @@ impl ZakuraHeaderSyncConfig {
     }
 }
 
-/// Returns the serialized byte length of a stream-5 header on `network`.
+/// Returns the serialized byte length of a header-sync v6 header on `network`.
 pub fn header_sync_header_bytes_for_network(network: &Network) -> usize {
     if network
         .parameters()
@@ -130,7 +130,7 @@ pub fn header_sync_header_bytes_for_network(network: &Network) -> usize {
     }
 }
 
-/// Maximum `Headers` count that fits both the stream-5 payload cap and the app frame cap.
+/// Maximum `Headers` count that fits both the header-sync v6 payload cap and the app frame cap.
 pub fn header_sync_count_by_byte_budget(
     network: &Network,
     max_frame_bytes: u32,

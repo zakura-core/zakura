@@ -1658,16 +1658,30 @@ impl HeaderSyncReactor {
                 insert_peer(row, hs_trace::PEER, peer);
                 trace_header_sync_message_fields(row, msg);
             }
-            HeaderSyncEvent::WireDecodeFailed { peer, .. } => {
+            HeaderSyncEvent::WireDecodeFailed { peer, error } => {
                 insert_optional_str(row, hs_trace::KIND, Some("wire_decode_failed"));
+                insert_optional_str(
+                    row,
+                    hs_trace::ERROR_KIND,
+                    Some(header_sync_wire_error_kind(error)),
+                );
                 insert_peer(row, hs_trace::PEER, peer);
             }
-            HeaderSyncEvent::WireProtocolFailure { peer, reason, .. } => {
+            HeaderSyncEvent::WireProtocolFailure {
+                peer,
+                reason,
+                error,
+            } => {
                 insert_optional_str(row, hs_trace::KIND, Some("wire_protocol_failure"));
                 insert_optional_str(
                     row,
                     hs_trace::REASON,
                     Some(misbehavior_reason_label(*reason)),
+                );
+                insert_optional_str(
+                    row,
+                    hs_trace::ERROR_KIND,
+                    Some(header_sync_wire_error_kind(error)),
                 );
                 insert_peer(row, hs_trace::PEER, peer);
             }

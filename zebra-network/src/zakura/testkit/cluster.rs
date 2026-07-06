@@ -1822,6 +1822,48 @@ mod tests {
         );
 
         hostile.shutdown().await;
+
+        let victim = cluster.node(victim_idx);
+        let recorder = victim.recorder();
+        let hostile = HostilePeer::connect_native_with_capabilities(
+            victim,
+            5,
+            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_LEGACY_GOSSIP,
+        )
+        .await?;
+
+        let old_header_sync_v5 = b"header-sync-kind-5-version-5".to_vec();
+        let current_header_sync_v6 = b"header-sync-kind-5-version-6".to_vec();
+        hostile
+            .send_frame_with_version(ZAKURA_STREAM_HEADER_SYNC, 5, old_header_sync_v5.clone())
+            .await?;
+        hostile
+            .send_frame(ZAKURA_STREAM_HEADER_SYNC, current_header_sync_v6.clone())
+            .await?;
+
+        await_until(
+            "header-sync v6 frame delivered",
+            Duration::from_secs(5),
+            || recorder.contains_payload(ZAKURA_STREAM_HEADER_SYNC, &current_header_sync_v6),
+        )
+        .await?;
+
+        let delivered = recorder.drain();
+        assert!(
+            !delivered
+                .iter()
+                .any(|m| m.frame.payload == old_header_sync_v5),
+            "old header-sync v5 frame must be reset before delivery, got {delivered:?}"
+        );
+        assert!(
+            delivered
+                .iter()
+                .any(|m| m.stream_kind == ZAKURA_STREAM_HEADER_SYNC
+                    && m.frame.payload == current_header_sync_v6),
+            "current header-sync v6 frame must be delivered, got {delivered:?}"
+        );
+
+        hostile.shutdown().await;
         cluster.shutdown().await;
         Ok(())
     }
@@ -1882,7 +1924,7 @@ mod tests {
                 .iter()
                 .any(|m| m.stream_kind == ZAKURA_STREAM_HEADER_SYNC
                     && m.frame.payload == bad_header_sync_payload),
-            "recorder nodes assert transport routing only; production header-sync owners decode stream-5 frames and reject malformed payloads, got {delivered:?}"
+            "recorder nodes assert transport routing only; production header-sync owners decode v6 frames and reject malformed payloads, got {delivered:?}"
         );
         assert!(
             delivered.iter().any(|m| m.frame.payload == after),
@@ -1910,7 +1952,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !recorder.contains_payload(ZAKURA_STREAM_HEADER_SYNC, &rejected_payload),
-            "stream 5 from a zero-capability peer must be rejected before delivery"
+            "header-sync stream kind 5 from a zero-capability peer must be rejected before delivery"
         );
 
         let header_cap_peer =
@@ -2474,7 +2516,7 @@ mod tests {
         cluster.connect_full_mesh(Duration::from_secs(5)).await?;
         cluster.await_all_connected(Duration::from_secs(5)).await?;
         await_until(
-            "native stream-5 status received",
+            "native header-sync v6 status received",
             Duration::from_secs(5),
             || {
                 capture.reader().is_ok_and(|reader| {
@@ -2518,11 +2560,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "flaky in CI; tracked in issue 407"]
-    async fn native_stream5_hostile_bytes_disconnect_with_traceable_reasons() -> Result<(), BoxError>
-    {
+    async fn native_header_sync_hostile_bytes_disconnect_with_traceable_reasons(
+    ) -> Result<(), BoxError> {
         let _guard = zebra_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
-            "native_stream5_hostile_bytes_disconnect_with_traceable_reasons",
+            "native_header_sync_hostile_bytes_disconnect_with_traceable_reasons",
             false,
         )?;
         let victim = header_sync_test_builder(11, e2e_network([1]), &mut capture)
@@ -2595,7 +2637,7 @@ mod tests {
             .oversize_frame_declared_len(ZAKURA_STREAM_HEADER_SYNC)
             .await?;
         await_until(
-            "native stream-5 oversize trace",
+            "native header-sync oversize trace",
             Duration::from_secs(5),
             || {
                 capture.reader().is_ok_and(|reader| {

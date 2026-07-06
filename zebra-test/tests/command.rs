@@ -180,6 +180,56 @@ fn kill_on_timeout_no_output() -> Result<()> {
     Ok(())
 }
 
+/// Test if `wait_with_output_or_timeout` returns output for a command that exits.
+#[test]
+fn wait_with_output_or_timeout_returns_finished_output() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    const TEST_CMD: &str = "echo";
+    if !is_command_available(TEST_CMD, &[]) {
+        return Ok(());
+    }
+
+    let child = tempdir()?
+        .spawn_child_with_command(TEST_CMD, args!["zebra_test_output"])?
+        .with_timeout(Duration::from_secs(2));
+
+    let output = child.wait_with_output_or_timeout(Duration::from_secs(2))?;
+
+    output
+        .assert_success()?
+        .stdout_line_contains("zebra_test_output")?;
+
+    Ok(())
+}
+
+/// Test if `wait_with_output_or_timeout` kills a command that never exits.
+#[test]
+fn wait_with_output_or_timeout_kills_silent_child() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    const TEST_CMD: &str = "sleep";
+    if !is_command_available(TEST_CMD, &["0"]) {
+        return Ok(());
+    }
+
+    let child = tempdir()?
+        .spawn_child_with_command(TEST_CMD, args!["120"])?
+        .with_timeout(Duration::from_secs(2));
+
+    let error = child
+        .wait_with_output_or_timeout(Duration::from_millis(100))
+        .unwrap_err();
+    let error = format!("{error:?}");
+
+    assert!(
+        error.contains("command did not exit within"),
+        "error did not contain timeout message: {error}",
+    );
+
+    Ok(())
+}
+
 /// Make sure failure regexes detect when a child process prints a failure message to stdout,
 /// and fail with a test failure message.
 #[test]

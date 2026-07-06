@@ -5,13 +5,14 @@ pub const ZAKURA_STREAM_HEADER_SYNC: u16 = 5;
 /// Version of the native header-sync stream.
 ///
 /// Version 4 carries one tree-aux root for each non-empty range header.
-/// Version 5 extends each tree-aux root with the full set of per-block ZIP-221 history-leaf
+/// Version 6 extends each tree-aux root with the full set of per-block ZIP-221 history-leaf
 /// inputs a recipient needs to rebuild the leaf and verify the roots against its own header
 /// commitments during header sync, without the block body: the Ironwood note-commitment
 /// root, the three per-pool shielded transaction counts (Sapling/Orchard/Ironwood), and the
 /// block's ZIP-244 `auth_data_root` (the co-input to its NU5+ header commitment). This is a
-/// breaking wire change: a v4 and a v5 node cannot exchange header-sync ranges.
-pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 5;
+/// breaking wire change: earlier version-5 Ironwood builds used a shorter root record and
+/// cannot exchange header-sync ranges with version 6.
+pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 6;
 
 /// Peer status advertisement.
 pub const MSG_HS_STATUS: u8 = 1;
@@ -22,11 +23,11 @@ pub const MSG_HS_HEADERS: u8 = 3;
 /// Flood a newly seen tip block, including its full body.
 pub const MSG_HS_NEW_BLOCK: u8 = 4;
 
-/// Maximum encoded stream-5 message bytes.
+/// Maximum encoded header-sync v6 message bytes.
 pub const MAX_HS_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 /// Default number of headers advertised per response.
 pub const DEFAULT_HS_RANGE: u32 = 1000;
-/// Maximum number of headers ever honored by stream 5.
+/// Maximum number of headers ever honored by header-sync v6.
 pub const MAX_HS_RANGE: u32 = 4000;
 /// Default number of in-flight header requests advertised per peer.
 pub const DEFAULT_HS_MAX_INFLIGHT: u16 = 10;
@@ -65,7 +66,7 @@ const _: () = assert!(
         < MAX_HS_MESSAGE_BYTES
 );
 
-/// Native stream-5 header-sync message.
+/// Native header-sync v6 message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeaderSyncMessage {
     /// Peer tip, anchor, and served-range advertisement.
@@ -99,7 +100,7 @@ pub enum HeaderSyncMessage {
 }
 
 impl HeaderSyncMessage {
-    /// Returns this message's stream-5 discriminator.
+    /// Returns this message's header-sync v6 discriminator.
     pub fn message_type(&self) -> u8 {
         match self {
             Self::Status(_) => MSG_HS_STATUS,
@@ -156,7 +157,7 @@ impl HeaderSyncMessage {
         Ok(bytes)
     }
 
-    /// Decode a stream-5 message using the peer/request bounds in `context`.
+    /// Decode a header-sync v6 message using the peer/request bounds in `context`.
     pub fn decode(
         bytes: &[u8],
         context: HeaderSyncDecodeContext,

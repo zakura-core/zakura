@@ -211,7 +211,7 @@ const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
 const _: () = assert!(DISCOVERY_STREAM_KIND == super::discovery::ZAKURA_STREAM_DISCOVERY);
 const _: () = assert!(HEADER_SYNC_STREAM_KIND == super::header_sync::ZAKURA_STREAM_HEADER_SYNC);
-const _: () = assert!(ZAKURA_STREAM_VERSION_5 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
+const _: () = assert!(ZAKURA_STREAM_VERSION_6 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
 const _: () =
     assert!(LEGACY_REQUEST_BLOCKS_BY_HASH == super::legacy_gossip::MSG_REQUEST_BLOCKS_BY_HASH);
 const _: () = assert!(
@@ -294,7 +294,7 @@ pub struct ZakuraConfig {
     /// When unset, Zakura trace emission is disabled. When set, the native
     /// Zakura endpoint writes the production trace schema into this directory.
     pub trace_dir: Option<PathBuf>,
-    /// Native stream-5 header-sync wire settings.
+    /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
     /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
     pub block_sync: ZakuraBlockSyncConfig,
@@ -4370,10 +4370,10 @@ fn should_run_freshness_reaper(
     ordered_stream_count > 0 || request_response_stream_count == 0
 }
 
-/// The only stream-kind version this v1 handler serves. Every known kind is
-/// at version 1; a peer naming any other version of a known kind is rejected.
+/// The stream-kind versions this handler serves. Most known kinds are at version 1;
+/// header sync is at version 6 after the expanded Ironwood root-record wire break.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
-const ZAKURA_STREAM_VERSION_5: u16 = 5;
+const ZAKURA_STREAM_VERSION_6: u16 = 6;
 
 /// Returns whether the handler can serve a stream with this kind and version.
 ///
@@ -5836,7 +5836,7 @@ mod tests {
             service.deliver_frame(peer.clone(), HEADER_SYNC_STREAM_KIND, valid_status_frame);
         assert!(
             matches!(valid_result, Err(SinkReject::Local(_))),
-            "valid stream-5 frames depend on local reactor queue availability"
+            "valid header-sync v6 frames depend on local reactor queue availability"
         );
 
         let malformed_frame = Frame {
@@ -5848,7 +5848,7 @@ mod tests {
             service.deliver_frame(peer, HEADER_SYNC_STREAM_KIND, malformed_frame);
         assert!(
             matches!(malformed_result, Err(SinkReject::Protocol(_))),
-            "malformed stream-5 frames must disconnect independently of reactor queue availability"
+            "malformed header-sync v6 frames must disconnect independently of reactor queue availability"
         );
 
         Ok(())
@@ -7410,7 +7410,7 @@ mod tests {
                 },
                 Stream {
                     kind: HEADER_SYNC_STREAM_KIND,
-                    version: ZAKURA_STREAM_VERSION_5,
+                    version: ZAKURA_STREAM_VERSION_6,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_HEADER_SYNC,
                     mode: StreamMode::Ordered,
@@ -7430,7 +7430,7 @@ mod tests {
             (LEGACY_GOSSIP_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (LEGACY_REQUEST_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (DISCOVERY_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
-            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_5),
+            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_6),
             (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_VERSION_1),
         ] {
             assert!(
@@ -7449,7 +7449,11 @@ mod tests {
 
         assert!(
             !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
-            "header-sync v1 is intentionally rejected after the clean v2 break"
+            "header-sync v1 is rejected because native header sync uses exact version matching"
+        );
+        assert!(
+            !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, 5),
+            "header-sync v5 is rejected after the expanded Ironwood root-record wire break"
         );
 
         assert_eq!(stream_kind_label(2), "gossip");

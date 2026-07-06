@@ -762,6 +762,49 @@ impl<T> TestChild<T> {
         })
     }
 
+    /// Waits for the child process to exit before `timeout`, then returns its output.
+    ///
+    /// If the process is still running after `timeout`, it is killed and its output is
+    /// attached to the timeout error.
+    #[instrument(skip(self))]
+    pub fn wait_with_output_or_timeout(mut self, timeout: Duration) -> Result<TestOutput<T>> {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let wait_result = self
+                .child
+                .as_mut()
+                .ok_or_else(|| {
+                    eyre!(
+                        "test child was already taken\n\
+                         wait_with_output_or_timeout can only be called once for each child process",
+                    )
+                })?
+                .try_wait();
+
+            match wait_result {
+                Ok(Some(_status)) => return self.wait_with_output(),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) => break,
+                Err(error) => return Err(error).context_from(self.as_mut()),
+            }
+        }
+
+        let timeout = humantime::format_duration(timeout).to_string();
+        let mut error = eyre!("command did not exit within the {timeout} command timeout");
+
+        if let Err(kill_err) = self.kill(true) {
+            error = error.wrap_err(kill_err);
+        }
+
+        match self.wait_with_output() {
+            Ok(output) => Err(error.context_from(&output)),
+            Err(output_err) => Err(error.wrap_err(output_err)),
+        }
+    }
+
     /// Set a timeout for `expect_stdout_line_matches` or `expect_stderr_line_matches`.
     ///
     /// Does not apply to `wait_with_output`.

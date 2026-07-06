@@ -64,7 +64,7 @@ impl ZakuraTestNode {
         self.endpoint.clone()
     }
 
-    /// Active header-sync handle, if this test node was spawned with stream-5
+    /// Active header-sync handle, if this test node was spawned with native
     /// header sync enabled.
     pub fn header_sync(&self) -> Option<HeaderSyncHandle> {
         self.endpoint.header_sync()
@@ -76,7 +76,7 @@ impl ZakuraTestNode {
         self.endpoint.block_sync()
     }
 
-    /// Take the stream-5 header-sync action receiver for an externally driven
+    /// Take the native header-sync action receiver for an externally driven
     /// test node.
     pub async fn take_header_sync_actions(&self) -> Option<mpsc::Receiver<HeaderSyncAction>> {
         self.endpoint.take_header_sync_actions().await
@@ -333,7 +333,7 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
-    /// Enable the production stream-5 header-sync adapter on this test node and
+    /// Enable the production header-sync v6 adapter on this test node and
     /// expose its action receiver for an external test driver.
     pub fn header_sync_driver(
         mut self,
@@ -451,7 +451,7 @@ impl ZakuraTestNodeBuilder {
 
             Some(handle)
         } else {
-            // Recorder-only nodes use the stream-5 passthrough so tests can
+            // Recorder-only nodes use the header-sync passthrough so tests can
             // inspect header-sync frames without spawning the reactor.
             None
         };

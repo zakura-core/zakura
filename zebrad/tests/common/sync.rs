@@ -259,7 +259,7 @@ pub fn sync_until(
             height.0 < 2_000_000,
             "zebrad must exit by itself, so we can collect all the output",
         );
-        let output = child.wait_with_output()?;
+        let output = child.wait_with_output_or_timeout(timeout)?;
 
         output.stdout_line_contains(&network_log)?;
 

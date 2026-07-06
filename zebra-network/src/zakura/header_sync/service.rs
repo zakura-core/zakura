@@ -31,7 +31,7 @@ pub(crate) fn header_sync_streams() -> &'static [Stream] {
     &HEADER_SYNC_SERVICE_STREAMS
 }
 
-/// Cloneable typed stream-5 sender and peer-local response expectations.
+/// Cloneable typed header-sync v6 sender and peer-local response expectations.
 #[derive(Clone, Debug)]
 pub struct HeaderSyncPeerSession {
     peer_id: ZakuraPeerId,
@@ -292,7 +292,7 @@ pub(crate) async fn drive_header_sync_actions(
     }
 }
 
-/// Native stream-5 header-sync service.
+/// Native header-sync v6 service.
 #[derive(Debug)]
 pub(crate) struct HeaderSyncService {
     header_sync: HeaderSyncHandle,
@@ -520,7 +520,7 @@ fn header_sync_guard_max_bytes() -> u32 {
         .expect("MAX_HS_MESSAGE_BYTES is a 2 MiB constant that fits in u32")
 }
 
-/// Testkit/no-reactor mode records stream-5 inbound frames without running header sync.
+/// Testkit/no-reactor mode records header-sync v6 inbound frames without running header sync.
 #[derive(Debug)]
 pub(crate) struct HeaderSyncPassthroughService {
     inner: Arc<dyn Service>,

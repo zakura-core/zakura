@@ -102,9 +102,11 @@ pub type BlockApplyToken = u64;
 pub enum BlockSyncAction {
     /// Ask node wiring to read `missing_block_bodies`, header hashes, and size hints.
     QueryNeededBlocks {
-        /// Current verified body tip.
-        verified_block_tip: block::Height,
-        /// Current best header target.
+        /// First height to consider for the next local work-buffer refill.
+        from: block::Height,
+        /// Maximum number of heights to scan for this refill.
+        limit: u32,
+        /// Current best header target, used for diagnostics and coalescing.
         best_header_tip: block::Height,
     },
     /// Ask node wiring to read committed bodies for an inbound `GetBlocks`.

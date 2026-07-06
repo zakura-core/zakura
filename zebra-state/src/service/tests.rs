@@ -668,6 +668,57 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
             .await?,
         ReadResponse::MissingBlockBodies(vec![Height(1), Height(2)]),
     );
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::MissingBlockBodyMetadata {
+                from: Height(1),
+                limit: 10,
+            })
+            .await?,
+        ReadResponse::MissingBlockBodyMetadata(vec![
+            (Height(1), block1_hash, Some(999_999)),
+            (Height(2), block2_hash, None),
+        ]),
+    );
+    // A `from` at or below the verified body tip (genesis, height 0) is clamped up
+    // to the first missing height, so the already-bodied genesis is never offered
+    // for re-download.
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::MissingBlockBodyMetadata {
+                from: Height(0),
+                limit: 10,
+            })
+            .await?,
+        ReadResponse::MissingBlockBodyMetadata(vec![
+            (Height(1), block1_hash, Some(999_999)),
+            (Height(2), block2_hash, None),
+        ]),
+    );
+    // `limit` bounds the scan window, so a smaller window returns only its prefix.
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::MissingBlockBodyMetadata {
+                from: Height(1),
+                limit: 1,
+            })
+            .await?,
+        ReadResponse::MissingBlockBodyMetadata(vec![(Height(1), block1_hash, Some(999_999))]),
+    );
+    // A `from` above the best header tip has nothing to offer.
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::MissingBlockBodyMetadata {
+                from: Height(3),
+                limit: 10,
+            })
+            .await?,
+        ReadResponse::MissingBlockBodyMetadata(Vec::new()),
+    );
 
     assert_eq!(
         read_state.oneshot(ReadRequest::FinalizedTip).await?,

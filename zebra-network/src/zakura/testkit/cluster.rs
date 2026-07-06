@@ -1099,20 +1099,25 @@ mod tests {
                 };
                 match action {
                     BlockSyncAction::QueryNeededBlocks {
-                        verified_block_tip,
+                        from,
+                        limit,
                         best_header_tip,
                     } => {
-                        let metas = by_height
-                            .range(
-                                verified_block_tip.next().unwrap_or(verified_block_tip)
-                                    ..=best_header_tip,
-                            )
-                            .map(|(height, block)| BlockSyncBlockMeta {
-                                height: *height,
-                                hash: block.hash(),
-                                size: BlockSizeEstimate::Advertised(block_size(block)),
-                            })
-                            .collect();
+                        let metas = if limit == 0 {
+                            Vec::new()
+                        } else {
+                            let end = (from + i64::from(limit.saturating_sub(1)))
+                                .unwrap_or(block::Height::MAX)
+                                .min(best_header_tip);
+                            by_height
+                                .range(from..=end)
+                                .map(|(height, block)| BlockSyncBlockMeta {
+                                    height: *height,
+                                    hash: block.hash(),
+                                    size: BlockSizeEstimate::Advertised(block_size(block)),
+                                })
+                                .collect()
+                        };
                         let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
                     }
                     BlockSyncAction::SubmitBlock { token, block } => {

@@ -398,6 +398,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::MissingBlockBodies`].
     MissingBlockBodies(Vec<block::Height>),
 
+    /// Response to [`ReadRequest::MissingBlockBodyMetadata`].
+    MissingBlockBodyMetadata(Vec<(block::Height, block::Hash, Option<u32>)>),
+
     /// Response to [`ReadRequest::BlockSizeHints`].
     BlockSizeHints(Vec<(block::Height, Option<u32>)>),
 
@@ -592,6 +595,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::Headers(_)
             | ReadResponse::BestHeaderTip(_)
             | ReadResponse::MissingBlockBodies(_)
+            | ReadResponse::MissingBlockBodyMetadata(_)
             | ReadResponse::BlockSizeHints(_)
             | ReadResponse::Blocks(_)
             | ReadResponse::NonFinalizedBlocksListener(_)

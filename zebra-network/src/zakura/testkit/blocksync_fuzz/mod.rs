@@ -229,15 +229,23 @@ fn spawn_action_driver(
             };
             match action {
                 BlockSyncAction::QueryNeededBlocks {
-                    verified_block_tip,
+                    from,
+                    limit,
                     best_header_tip,
                 } => {
-                    let start = verified_block_tip.next().unwrap_or(verified_block_tip);
-                    let end = best_header_tip.min(target);
-                    let metas = if start <= end {
-                        corpus.metas_between(start, end)
-                    } else {
+                    let start = from;
+                    let metas = if limit == 0 {
                         Vec::new()
+                    } else {
+                        let end = (start + i64::from(limit.saturating_sub(1)))
+                            .unwrap_or(block::Height::MAX)
+                            .min(best_header_tip)
+                            .min(target);
+                        if start <= end {
+                            corpus.metas_between(start, end)
+                        } else {
+                            Vec::new()
+                        }
                     };
                     if handle
                         .send(BlockSyncEvent::NeededBlocks(metas))
@@ -329,10 +337,20 @@ fn spawn_timeline_driver(
             elapsed = event.at;
             // Roll the mock committer back first so re-downloaded blocks above the
             // reset re-commit cleanly once the node resets.
-            if let TipEventKind::VerifiedReset(height) = event.kind {
-                apply.reset_to(height);
-            }
-            let current = exchange.current_frontier().frontier;
+            let apply_frontiers = if let TipEventKind::VerifiedReset(height) = event.kind {
+                apply.reset_to(height)
+            } else {
+                apply.frontiers()
+            };
+            let mut current = exchange.current_frontier().frontier;
+            current.finalized = Frontier::new(
+                apply_frontiers.finalized_height,
+                apply_frontiers.verified_block_hash,
+            );
+            current.verified_body = Frontier::new(
+                apply_frontiers.verified_block_tip,
+                apply_frontiers.verified_block_hash,
+            );
             let (frontier, change) = apply_tip_event(&corpus, current, event.kind);
             exchange.publish_frontier(
                 FrontierUpdate { frontier, change },

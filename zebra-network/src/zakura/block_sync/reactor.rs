@@ -24,6 +24,11 @@ const BS_ACTION_SPARE_POOL: usize = 128;
 /// request; the routine never blocks on it (the only blocking routine send is the
 /// Sequencer `AcceptBody`), so a full channel just defers an idempotent ping.
 const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
+
+/// State's header range read cap, mirrored here to keep `zebra-network` from
+/// depending upward on `zebra-state`.
+const NEEDED_BLOCK_REFILL_LIMIT: u32 = 4_000;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct FloorGapDiagnostics {
     height: block::Height,
@@ -226,10 +231,10 @@ pub(super) struct BlockSyncReactor {
     /// download floor, but it is not verified state and must not be used for
     /// serving/status advertisement.
     request_floor: block::Height,
-    /// `(verified_tip, best_header_tip, best_header_hash)` for a dispatched
+    /// `(from, limit, best_header_tip, best_header_hash)` for a dispatched
     /// `QueryNeededBlocks` action whose `NeededBlocks` response has not come
     /// back yet.
-    pending_needed_query: Option<(block::Height, block::Height, block::Hash)>,
+    pending_needed_query: Option<(block::Height, u32, block::Height, block::Hash)>,
     /// Last `reset_epoch` the reactor reacted to, so it can tell an advance from
     /// a destructive reset.
     last_reset_epoch: u64,
@@ -1162,19 +1167,16 @@ impl BlockSyncReactor {
             self.pending_needed_query = None;
             return true;
         }
-        if self
-            .state
-            .work_queue
-            .max_claimed()
-            .is_some_and(|height| height >= self.state.best_header_tip)
-        {
+        let Some(from) = self.next_needed_block_query_start() else {
             return true;
-        }
+        };
         if self.local_body_work_blocks() >= self.refill_low_water_blocks() {
             return true;
         }
+        let limit = self.refill_query_limit_blocks(from);
         let query = (
-            self.request_floor,
+            from,
+            limit,
             self.state.best_header_tip,
             self.state.best_header_hash,
         );
@@ -1182,13 +1184,41 @@ impl BlockSyncReactor {
             return true;
         }
         let dispatched = self.dispatch_action(BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip: self.request_floor,
+            from,
+            limit,
             best_header_tip: self.state.best_header_tip,
         });
         if dispatched {
             self.pending_needed_query = Some(query);
         }
         dispatched
+    }
+
+    fn next_needed_block_query_start(&self) -> Option<block::Height> {
+        let last_claimed = self
+            .state
+            .work_queue
+            .max_claimed()
+            .unwrap_or(self.request_floor);
+
+        if last_claimed >= self.state.best_header_tip {
+            return None;
+        }
+
+        last_claimed.next().ok()
+    }
+
+    fn refill_query_limit_blocks(&self, from: block::Height) -> u32 {
+        let remaining = self
+            .state
+            .best_header_tip
+            .0
+            .saturating_sub(from.0)
+            .saturating_add(1);
+        let fanout_window = self.refill_low_water_blocks().saturating_mul(2).max(1);
+        let fanout_window = u32::try_from(fanout_window).unwrap_or(u32::MAX);
+
+        remaining.min(fanout_window).min(NEEDED_BLOCK_REFILL_LIMIT)
     }
 
     fn local_body_work_blocks(&self) -> usize {
@@ -2180,11 +2210,13 @@ impl BlockSyncReactor {
     fn trace_action_dispatched(&self, action: &BlockSyncAction) {
         self.emit_trace(bs_trace::BLOCK_ACTION_DISPATCHED, |row| match action {
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip,
+                from,
+                limit,
                 best_header_tip,
             } => {
                 bs_insert_str(row, bs_trace::KIND, "query_needed_blocks");
-                bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, *verified_block_tip);
+                bs_insert_height(row, bs_trace::RANGE_START, *from);
+                bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*limit));
                 bs_insert_height(row, bs_trace::BEST_HEADER_TIP, *best_header_tip);
             }
             BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {

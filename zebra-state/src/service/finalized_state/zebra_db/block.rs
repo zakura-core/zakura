@@ -670,7 +670,7 @@ impl ZebraDb {
     // even when its body is absent because it was pruned (those rows are retained
     // by pruning, which only deletes `tx_by_loc`).
 
-    fn header_hash(&self, height: block::Height) -> Option<block::Hash> {
+    pub(crate) fn header_hash(&self, height: block::Height) -> Option<block::Hash> {
         self.hash(height)
             .or_else(|| self.zakura_header_hash(height))
     }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -34,7 +34,10 @@ use super::{
 pub(crate) const ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration =
     Duration::from_millis(200);
 const ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS: usize = 24;
-pub(crate) const ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW: u32 = 262_144;
+
+#[cfg(test)]
+pub(crate) const ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW: u32 =
+    zebra_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BlockApplyClass {
@@ -276,7 +279,8 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 debug!(?peer, ?reason, "recorded Zakura block-sync peer violation");
             }
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip,
+                from,
+                limit,
                 best_header_tip,
             } => {
                 emit_commit_state(
@@ -285,18 +289,13 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     "block_sync_driver",
                     |row| {
                         insert_cs_str(row, cs_trace::ACTION, "query_needed_blocks");
-                        insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, verified_block_tip);
+                        insert_cs_height(row, cs_trace::RANGE_START, from);
+                        insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(limit));
                         insert_cs_height(row, cs_trace::BEST_HEADER_TIP, best_header_tip);
                     },
                 );
                 let started = Instant::now();
-                match query_block_sync_needed_blocks(
-                    read_state.clone(),
-                    verified_block_tip,
-                    best_header_tip,
-                )
-                .await
-                {
+                match query_block_sync_needed_blocks(read_state.clone(), from, limit).await {
                     Ok(blocks) => {
                         emit_commit_state(
                             &trace,
@@ -331,7 +330,8 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                             },
                         );
                         warn!(
-                            ?verified_block_tip,
+                            ?from,
+                            ?limit,
                             ?best_header_tip,
                             ?error,
                             "failed to query Zakura block-sync needed blocks"
@@ -564,10 +564,11 @@ pub(crate) fn coalesce_ready_needed_block_queries(
     while let Some(action) = deferred_actions.pop_front() {
         match action {
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip,
+                from,
+                limit,
                 best_header_tip,
             } => {
-                latest_query = Some((verified_block_tip, best_header_tip));
+                latest_query = Some((from, limit, best_header_tip));
             }
             action => retained.push_back(action),
         }
@@ -577,21 +578,24 @@ pub(crate) fn coalesce_ready_needed_block_queries(
     while let Ok(action) = actions.try_recv() {
         match action {
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip,
+                from,
+                limit,
                 best_header_tip,
             } => {
-                latest_query = Some((verified_block_tip, best_header_tip));
+                latest_query = Some((from, limit, best_header_tip));
             }
             action => deferred_actions.push_back(action),
         }
     }
 
-    let latest_query = latest_query.map(|(verified_block_tip, best_header_tip)| {
-        BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip,
-            best_header_tip,
-        }
-    });
+    let latest_query =
+        latest_query.map(
+            |(from, limit, best_header_tip)| BlockSyncAction::QueryNeededBlocks {
+                from,
+                limit,
+                best_header_tip,
+            },
+        );
 
     if !deferred_actions.is_empty() {
         if let Some(query) = latest_query {
@@ -609,7 +613,8 @@ pub(crate) fn coalesce_stale_needed_block_queries(
     deferred_actions: &mut VecDeque<BlockSyncAction>,
 ) -> BlockSyncAction {
     let BlockSyncAction::QueryNeededBlocks {
-        mut verified_block_tip,
+        mut from,
+        mut limit,
         mut best_header_tip,
     } = action
     else {
@@ -620,10 +625,12 @@ pub(crate) fn coalesce_stale_needed_block_queries(
     while let Ok(action) = actions.try_recv() {
         match action {
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: latest_verified_block_tip,
+                from: latest_from,
+                limit: latest_limit,
                 best_header_tip: latest_best_header_tip,
             } => {
-                verified_block_tip = latest_verified_block_tip;
+                from = latest_from;
+                limit = latest_limit;
                 best_header_tip = latest_best_header_tip;
                 coalesced_count = coalesced_count.saturating_add(1);
             }
@@ -636,7 +643,8 @@ pub(crate) fn coalesce_stale_needed_block_queries(
     }
 
     BlockSyncAction::QueryNeededBlocks {
-        verified_block_tip,
+        from,
+        limit,
         best_header_tip,
     }
 }
@@ -1270,8 +1278,8 @@ fn publish_body_frontier(
 
 pub(crate) async fn query_block_sync_needed_blocks<ReadState>(
     read_state: ReadState,
-    verified_block_tip: block::Height,
-    best_header_tip: block::Height,
+    from: block::Height,
+    limit: u32,
 ) -> Result<Vec<BlockSyncBlockMeta>, zebra_state::BoxError>
 where
     ReadState: Service<
@@ -1283,10 +1291,9 @@ where
         + 'static,
     ReadState::Future: Send + 'static,
 {
-    let Some((from, limit)) = block_sync_missing_body_window(verified_block_tip, best_header_tip)
-    else {
+    if limit == 0 {
         return Ok(Vec::new());
-    };
+    }
 
     let mut needed = Vec::new();
     let mut next_from = from;
@@ -1324,114 +1331,54 @@ where
         + 'static,
     ReadState::Future: Send + 'static,
 {
-    let missing = match tokio::time::timeout(
+    let metadata = match tokio::time::timeout(
         ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        read_state
-            .clone()
-            .oneshot(zebra_state::ReadRequest::MissingBlockBodies { from, limit }),
+        read_state.oneshot(zebra_state::ReadRequest::MissingBlockBodyMetadata { from, limit }),
     )
     .await
     {
-        Ok(Ok(zebra_state::ReadResponse::MissingBlockBodies(heights))) => heights,
+        Ok(Ok(zebra_state::ReadResponse::MissingBlockBodyMetadata(metadata))) => metadata,
         Ok(Ok(response)) => {
-            warn!(?response, "unexpected MissingBlockBodies response");
+            warn!(?response, "unexpected MissingBlockBodyMetadata response");
             return Ok(Vec::new());
         }
         Ok(Err(error)) => return Err(error),
         Err(elapsed) => return Err(Box::new(elapsed)),
     };
 
-    let Some(first) = missing.first().copied() else {
-        return Ok(Vec::new());
-    };
-    let Some(last) = missing.last().copied() else {
-        return Ok(Vec::new());
-    };
-    let span = last.0.saturating_sub(first.0).saturating_add(1);
-
-    let headers = match tokio::time::timeout(
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        read_state
-            .clone()
-            .oneshot(zebra_state::ReadRequest::HeadersByHeightRange {
-                start: first,
-                count: span,
-            }),
-    )
-    .await
-    {
-        Ok(Ok(zebra_state::ReadResponse::Headers(headers))) => headers,
-        Ok(Ok(response)) => {
-            warn!(?response, "unexpected HeadersByHeightRange response");
-            return Ok(Vec::new());
-        }
-        Ok(Err(error)) => return Err(error),
-        Err(elapsed) => return Err(Box::new(elapsed)),
-    };
-
-    let size_hints = match tokio::time::timeout(
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        read_state.oneshot(zebra_state::ReadRequest::BlockSizeHints {
-            from: first,
-            count: span,
-        }),
-    )
-    .await
-    {
-        Ok(Ok(zebra_state::ReadResponse::BlockSizeHints(hints))) => hints,
-        Ok(Ok(response)) => {
-            warn!(?response, "unexpected BlockSizeHints response");
-            Vec::new()
-        }
-        Ok(Err(error)) => return Err(error),
-        Err(elapsed) => return Err(Box::new(elapsed)),
-    };
-
-    Ok(block_sync_needed_blocks_from_state(
-        missing, headers, size_hints,
-    ))
+    Ok(block_sync_needed_blocks_from_state(metadata))
 }
 
+#[cfg(test)]
 pub(crate) fn block_sync_missing_body_window(
-    verified_block_tip: block::Height,
+    from: block::Height,
     best_header_tip: block::Height,
+    limit: u32,
 ) -> Option<(block::Height, u32)> {
-    if best_header_tip <= verified_block_tip {
+    if best_header_tip < from || limit == 0 {
         return None;
     }
 
-    let from = block::Height(verified_block_tip.0.saturating_add(1));
-    let limit = best_header_tip
+    let available = best_header_tip
         .0
-        .saturating_sub(verified_block_tip.0)
+        .saturating_sub(from.0)
+        .saturating_add(1)
         .clamp(1, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW);
-    Some((from, limit))
+    Some((from, available.min(limit)))
 }
 
 pub(crate) fn block_sync_needed_blocks_from_state(
-    missing: Vec<block::Height>,
-    headers: Vec<(block::Height, block::Hash, Arc<block::Header>)>,
-    size_hints: Vec<(block::Height, Option<u32>)>,
+    metadata: Vec<(block::Height, block::Hash, Option<u32>)>,
 ) -> Vec<BlockSyncBlockMeta> {
-    let headers: HashMap<_, _> = headers
+    metadata
         .into_iter()
-        .map(|(height, hash, _header)| (height, hash))
-        .collect();
-    let size_hints: HashMap<_, _> = size_hints.into_iter().collect();
-
-    missing
-        .into_iter()
-        .filter_map(|height| {
-            let hash = *headers.get(&height)?;
-            let size = size_hints
-                .get(&height)
-                .copied()
-                .flatten()
+        .map(|(height, hash, size)| {
+            let size = size
                 .filter(|size| *size > 0)
                 .map(BlockSizeEstimate::Advertised)
                 .unwrap_or(BlockSizeEstimate::Unknown);
 
-            Some(BlockSyncBlockMeta { height, hash, size })
+            BlockSyncBlockMeta { height, hash, size }
         })
         .collect()
 }
@@ -1448,11 +1395,13 @@ fn trace_block_driver_action(trace: &ZakuraTrace, action: &BlockSyncAction) {
                 insert_cs_str(row, cs_trace::REASON, block_sync_misbehavior_label(*reason));
             }
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip,
+                from,
+                limit,
                 best_header_tip,
             } => {
                 insert_cs_str(row, cs_trace::ACTION, "query_needed_blocks");
-                insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, *verified_block_tip);
+                insert_cs_height(row, cs_trace::RANGE_START, *from);
+                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(*limit));
                 insert_cs_height(row, cs_trace::BEST_HEADER_TIP, *best_header_tip);
             }
             BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {

@@ -1480,6 +1480,51 @@ where
     headers
 }
 
+fn missing_block_body_metadata<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    from: block::Height,
+    limit: u32,
+) -> Vec<(block::Height, block::Hash, Option<u32>)>
+where
+    C: AsRef<Chain> + Clone,
+{
+    let verified_block_tip = read::tip_height(chain.clone(), db);
+    let best_header_tip = db
+        .best_header_tip()
+        .map(|(height, _)| height)
+        .max(verified_block_tip);
+    let Some(best_header_tip) = best_header_tip else {
+        return Vec::new();
+    };
+
+    let start = verified_block_tip
+        .and_then(|tip| tip.next().ok())
+        .map_or(from, |first_missing| first_missing.max(from));
+
+    if start > best_header_tip {
+        return Vec::new();
+    }
+
+    let count = limit
+        .min(MAX_HEADER_SYNC_HEIGHT_RANGE)
+        .min(best_header_tip.0.saturating_sub(start.0).saturating_add(1));
+    let size_hints: HashMap<_, _> = read::block_size_hints(chain.clone(), db, start, count)
+        .into_iter()
+        .collect();
+
+    (0..count)
+        .filter_map(|offset| start.0.checked_add(offset).map(block::Height))
+        .filter(|height| !db.contains_body_at_height(*height))
+        .filter_map(|height| {
+            read::hash_by_height(chain.clone(), db, height)
+                .or_else(|| db.header_hash(height))
+                .map(|hash| (height, hash, size_hints.get(&height).copied().flatten()))
+        })
+        .take(usize::try_from(limit).expect("u32 limit fits in usize on supported targets"))
+        .collect()
+}
+
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZebraDb,
@@ -1844,6 +1889,12 @@ impl Service<ReadRequest> for ReadStateService {
                     state
                         .db
                         .missing_block_bodies(verified_block_tip, best_header_tip, from, limit),
+                ))
+            }
+
+            ReadRequest::MissingBlockBodyMetadata { from, limit } => {
+                Ok(ReadResponse::MissingBlockBodyMetadata(
+                    missing_block_body_metadata(state.latest_best_chain(), &state.db, from, limit),
                 ))
             }
 

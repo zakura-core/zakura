@@ -1415,6 +1415,14 @@ pub enum ReadRequest {
         limit: u32,
     },
 
+    /// Returns header-known, body-missing block metadata for block-sync scheduling.
+    MissingBlockBodyMetadata {
+        /// First height to consider.
+        from: block::Height,
+        /// Maximum number of heights to scan.
+        limit: u32,
+    },
+
     /// Returns scheduling-only body-size hints for a contiguous height range.
     ///
     /// Confirmed committed block sizes win over untrusted advertised header
@@ -1628,6 +1636,7 @@ impl ReadRequest {
             ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",
+            ReadRequest::MissingBlockBodyMetadata { .. } => "missing_block_body_metadata",
             ReadRequest::BlockSizeHints { .. } => "block_size_hints",
             ReadRequest::BlocksByHeightRange { .. } => "blocks_by_height_range",
             ReadRequest::SaplingTree { .. } => "sapling_tree",

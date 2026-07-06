@@ -2368,26 +2368,27 @@ mod zakura_header_sync_driver_tests {
     #[test]
     fn block_sync_missing_body_window_stays_inside_body_sync_bound() {
         assert_eq!(
-            block_sync_missing_body_window(block::Height(10), block::Height(10)),
+            block_sync_missing_body_window(block::Height(11), block::Height(10), 10),
             None
         );
         assert_eq!(
-            block_sync_missing_body_window(block::Height(10), block::Height(12)),
+            block_sync_missing_body_window(block::Height(11), block::Height(12), 10),
             Some((block::Height(11), 2))
         );
         assert_eq!(
             block_sync_missing_body_window(
-                block::Height(10),
-                block::Height(10 + ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW + 100)
+                block::Height(11),
+                block::Height(10 + ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW + 100),
+                ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW + 100,
             ),
             Some((block::Height(11), ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW))
         );
         assert_eq!(
-            block_sync_missing_body_window(block::Height(u32::MAX - 1), block::Height(u32::MAX)),
+            block_sync_missing_body_window(block::Height(u32::MAX), block::Height(u32::MAX), 10),
             Some((block::Height(u32::MAX), 1))
         );
         assert_eq!(
-            block_sync_missing_body_window(block::Height(u32::MAX), block::Height(u32::MAX)),
+            block_sync_missing_body_window(block::Height(u32::MAX), block::Height(u32::MAX), 0),
             None
         );
     }
@@ -2396,17 +2397,10 @@ mod zakura_header_sync_driver_tests {
     fn block_sync_needed_blocks_align_missing_hashes_and_size_hints() {
         let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
-        let headers = vec![
-            (block::Height(1), block1.hash(), block1.header.clone()),
-            (block::Height(2), block2.hash(), block2.header.clone()),
-        ];
-        let hints = vec![(block::Height(1), Some(0)), (block::Height(2), Some(42))];
-
-        let needed = block_sync_needed_blocks_from_state(
-            vec![block::Height(1), block::Height(2), block::Height(3)],
-            headers,
-            hints,
-        );
+        let needed = block_sync_needed_blocks_from_state(vec![
+            (block::Height(1), block1.hash(), Some(0)),
+            (block::Height(2), block2.hash(), Some(42)),
+        ]);
 
         assert_eq!(
             needed,
@@ -2428,55 +2422,29 @@ mod zakura_header_sync_driver_tests {
     #[tokio::test]
     async fn block_sync_needed_blocks_chunks_state_range_reads() {
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
-        let header = block.header.clone();
         let hash = block.hash();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let read_state = {
             let requests = Arc::clone(&requests);
             service_fn(move |request| {
                 let requests = Arc::clone(&requests);
-                let header = Arc::clone(&header);
                 async move {
                     match request {
-                        zebra_state::ReadRequest::MissingBlockBodies { from, limit } => {
+                        zebra_state::ReadRequest::MissingBlockBodyMetadata { from, limit } => {
                             requests
                                 .lock()
                                 .expect("request capture mutex is not poisoned")
-                                .push(("missing", from, limit));
-                            let heights = (0..limit)
-                                .filter_map(|offset| from.0.checked_add(offset).map(block::Height))
-                                .collect();
-                            Ok::<_, zebra_state::BoxError>(
-                                zebra_state::ReadResponse::MissingBlockBodies(heights),
-                            )
-                        }
-                        zebra_state::ReadRequest::HeadersByHeightRange { start, count } => {
-                            requests
-                                .lock()
-                                .expect("request capture mutex is not poisoned")
-                                .push(("headers", start, count));
-                            let headers = (0..count)
-                                .filter_map(|offset| {
-                                    start.0.checked_add(offset).map(|height| {
-                                        (block::Height(height), hash, Arc::clone(&header))
-                                    })
-                                })
-                                .collect();
-                            Ok(zebra_state::ReadResponse::Headers(headers))
-                        }
-                        zebra_state::ReadRequest::BlockSizeHints { from, count } => {
-                            requests
-                                .lock()
-                                .expect("request capture mutex is not poisoned")
-                                .push(("hints", from, count));
-                            let hints = (0..count)
+                                .push(("metadata", from, limit));
+                            let metadata = (0..limit)
                                 .filter_map(|offset| {
                                     from.0
                                         .checked_add(offset)
-                                        .map(|height| (block::Height(height), Some(32)))
+                                        .map(|height| (block::Height(height), hash, Some(32)))
                                 })
                                 .collect();
-                            Ok(zebra_state::ReadResponse::BlockSizeHints(hints))
+                            Ok::<_, zebra_state::BoxError>(
+                                zebra_state::ReadResponse::MissingBlockBodyMetadata(metadata),
+                            )
                         }
                         request => panic!("unexpected read request: {request:?}"),
                     }
@@ -2485,10 +2453,9 @@ mod zakura_header_sync_driver_tests {
         };
         let count = zebra_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE + 2;
 
-        let needed =
-            query_block_sync_needed_blocks(read_state, block::Height(0), block::Height(count))
-                .await
-                .expect("mock read state succeeds");
+        let needed = query_block_sync_needed_blocks(read_state, block::Height(1), count)
+            .await
+            .expect("mock read state succeeds");
 
         assert_eq!(
             needed.len(),
@@ -2501,23 +2468,11 @@ mod zakura_header_sync_driver_tests {
                 .as_slice(),
             &[
                 (
-                    "missing",
+                    "metadata",
                     block::Height(1),
                     zebra_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE,
                 ),
-                (
-                    "headers",
-                    block::Height(1),
-                    zebra_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE,
-                ),
-                (
-                    "hints",
-                    block::Height(1),
-                    zebra_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE,
-                ),
-                ("missing", block::Height(4001), 2),
-                ("headers", block::Height(4001), 2),
-                ("hints", block::Height(4001), 2),
+                ("metadata", block::Height(4001), 2),
             ]
         );
     }
@@ -2700,7 +2655,8 @@ mod zakura_header_sync_driver_tests {
                 if matches!(
                     action,
                     BlockSyncAction::QueryNeededBlocks {
-                        verified_block_tip: block::Height(0),
+                        from: block::Height(1),
+                        limit: 3,
                         best_header_tip: block::Height(3),
                     }
                 ) {
@@ -2824,14 +2780,16 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, mut action_rx) = mpsc::channel(8);
         action_tx
             .send(BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(0),
+                from: block::Height(1),
+                limit: 1,
                 best_header_tip: block::Height(1),
             })
             .await
             .expect("first query queues");
         action_tx
             .send(BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(0),
+                from: block::Height(1),
+                limit: 2,
                 best_header_tip: block::Height(2),
             })
             .await
@@ -2847,7 +2805,8 @@ mod zakura_header_sync_driver_tests {
             .expect("non-query action queues");
         action_tx
             .send(BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(0),
+                from: block::Height(3),
+                limit: 6,
                 best_header_tip: block::Height(8),
             })
             .await
@@ -2861,7 +2820,8 @@ mod zakura_header_sync_driver_tests {
         assert!(matches!(
             action,
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(0),
+                from: block::Height(3),
+                limit: 6,
                 best_header_tip: block::Height(8),
             }
         ));
@@ -2886,7 +2846,8 @@ mod zakura_header_sync_driver_tests {
             .expect("submit action queues");
         action_tx
             .send(BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(0),
+                from: block::Height(1),
+                limit: 8,
                 best_header_tip: block::Height(8),
             })
             .await
@@ -2904,7 +2865,8 @@ mod zakura_header_sync_driver_tests {
         assert!(matches!(
             deferred_actions.pop_front(),
             Some(BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(0),
+                from: block::Height(1),
+                limit: 8,
                 best_header_tip: block::Height(8),
             })
         ));
@@ -2921,47 +2883,28 @@ mod zakura_header_sync_driver_tests {
         let (block_sync, _reactor_actions, reactor_task) =
             zebra_network::zakura::spawn_block_sync_reactor(startup);
 
-        let expected_headers = Arc::new(vec![
-            (block::Height(1), block1.hash(), block1.header.clone()),
-            (block::Height(2), block2.hash(), block2.header.clone()),
-        ]);
-        let expected_hints = Arc::new(vec![
-            (block::Height(1), Some(0)),
-            (block::Height(2), Some(42)),
+        let expected_metadata = Arc::new(vec![
+            (block::Height(1), block1.hash(), Some(0)),
+            (block::Height(2), block2.hash(), Some(42)),
         ]);
         let read_requests = Arc::new(Mutex::new(Vec::new()));
         let read_requests_for_service = read_requests.clone();
-        let read_headers = expected_headers.clone();
-        let read_hints = expected_hints.clone();
+        let read_metadata = expected_metadata.clone();
         let block1_hash = block1.hash();
         let read_state = service_fn(move |request: zebra_state::ReadRequest| {
             let read_requests = read_requests_for_service.clone();
-            let read_headers = read_headers.clone();
-            let read_hints = read_hints.clone();
+            let read_metadata = read_metadata.clone();
             async move {
                 read_requests
                     .lock()
                     .expect("test read request log is not poisoned")
                     .push(request.clone());
                 match request {
-                    zebra_state::ReadRequest::MissingBlockBodies { from, limit } => {
+                    zebra_state::ReadRequest::MissingBlockBodyMetadata { from, limit } => {
                         assert_eq!(from, block::Height(1));
                         assert_eq!(limit, 2);
-                        Ok(zebra_state::ReadResponse::MissingBlockBodies(vec![
-                            block::Height(1),
-                            block::Height(2),
-                        ]))
-                    }
-                    zebra_state::ReadRequest::HeadersByHeightRange { start, count } => {
-                        assert_eq!(start, block::Height(1));
-                        assert_eq!(count, 2);
-                        Ok(zebra_state::ReadResponse::Headers((*read_headers).clone()))
-                    }
-                    zebra_state::ReadRequest::BlockSizeHints { from, count } => {
-                        assert_eq!(from, block::Height(1));
-                        assert_eq!(count, 2);
-                        Ok(zebra_state::ReadResponse::BlockSizeHints(
-                            (*read_hints).clone(),
+                        Ok(zebra_state::ReadResponse::MissingBlockBodyMetadata(
+                            (*read_metadata).clone(),
                         ))
                     }
                     zebra_state::ReadRequest::FinalizedTip => {
@@ -3015,7 +2958,8 @@ mod zakura_header_sync_driver_tests {
 
         action_tx
             .send(BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(0),
+                from: block::Height(1),
+                limit: 2,
                 best_header_tip: block::Height(2),
             })
             .await
@@ -3023,11 +2967,10 @@ mod zakura_header_sync_driver_tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if read_requests
+                if !read_requests
                     .lock()
                     .expect("test read request log is not poisoned")
-                    .len()
-                    >= 3
+                    .is_empty()
                 {
                     break;
                 }
@@ -3042,20 +2985,10 @@ mod zakura_header_sync_driver_tests {
                 .lock()
                 .expect("test read request log is not poisoned")
                 .as_slice(),
-            &[
-                zebra_state::ReadRequest::MissingBlockBodies {
-                    from: block::Height(1),
-                    limit: 2,
-                },
-                zebra_state::ReadRequest::HeadersByHeightRange {
-                    start: block::Height(1),
-                    count: 2,
-                },
-                zebra_state::ReadRequest::BlockSizeHints {
-                    from: block::Height(1),
-                    count: 2,
-                },
-            ]
+            &[zebra_state::ReadRequest::MissingBlockBodyMetadata {
+                from: block::Height(1),
+                limit: 2,
+            },]
         );
 
         action_tx
@@ -3118,34 +3051,13 @@ mod zakura_header_sync_driver_tests {
                     .expect("test read request log is not poisoned")
                     .push(request.clone());
                 match request {
-                    zebra_state::ReadRequest::MissingBlockBodies { from, limit } => {
+                    zebra_state::ReadRequest::MissingBlockBodyMetadata { from, limit } => {
                         assert_eq!(from, block::Height(1));
                         assert_eq!(limit, 3);
-                        Ok(zebra_state::ReadResponse::MissingBlockBodies(vec![
-                            block::Height(1),
-                            block::Height(2),
+                        Ok(zebra_state::ReadResponse::MissingBlockBodyMetadata(vec![
+                            (block::Height(1), read_block1.hash(), None),
+                            (block::Height(2), read_block2.hash(), None),
                         ]))
-                    }
-                    zebra_state::ReadRequest::HeadersByHeightRange { start, count } => {
-                        assert_eq!(start, block::Height(1));
-                        assert_eq!(count, 2);
-                        Ok(zebra_state::ReadResponse::Headers(vec![
-                            (
-                                block::Height(1),
-                                read_block1.hash(),
-                                read_block1.header.clone(),
-                            ),
-                            (
-                                block::Height(2),
-                                read_block2.hash(),
-                                read_block2.header.clone(),
-                            ),
-                        ]))
-                    }
-                    zebra_state::ReadRequest::BlockSizeHints { from, count } => {
-                        assert_eq!(from, block::Height(1));
-                        assert_eq!(count, 2);
-                        Ok(zebra_state::ReadResponse::BlockSizeHints(Vec::new()))
                     }
                     request => panic!("unexpected read request in throughput probe: {request:?}"),
                 }
@@ -3197,11 +3109,10 @@ mod zakura_header_sync_driver_tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if read_requests
+                if !read_requests
                     .lock()
                     .expect("test read request log is not poisoned")
-                    .len()
-                    >= 3
+                    .is_empty()
                 {
                     break;
                 }
@@ -3210,6 +3121,16 @@ mod zakura_header_sync_driver_tests {
         })
         .await
         .expect("driver records expected throughput metadata from state");
+        assert_eq!(
+            read_requests
+                .lock()
+                .expect("test read request log is not poisoned")
+                .as_slice(),
+            &[zebra_state::ReadRequest::MissingBlockBodyMetadata {
+                from: block::Height(1),
+                limit: 3,
+            },]
+        );
 
         action_tx
             .send(BlockSyncAction::SubmitBlock {
@@ -3868,7 +3789,8 @@ mod zakura_header_sync_driver_tests {
             matches!(
                 startup_action,
                 BlockSyncAction::QueryNeededBlocks {
-                    verified_block_tip: block::Height(0),
+                    from: block::Height(1),
+                    limit: 10,
                     best_header_tip: block::Height(10),
                 }
             ),
@@ -4105,7 +4027,7 @@ mod zakura_header_sync_driver_tests {
             let query_seen_tx = query_seen_tx.clone();
             async move {
                 match request {
-                    zebra_state::ReadRequest::MissingBlockBodies { from, limit } => {
+                    zebra_state::ReadRequest::MissingBlockBodyMetadata { from, limit } => {
                         assert_eq!(from, block::Height(1));
                         assert_eq!(limit, 1);
                         if let Some(query_seen_tx) = query_seen_tx
@@ -4116,7 +4038,7 @@ mod zakura_header_sync_driver_tests {
                             let _ = query_seen_tx.send(());
                         }
                         Ok::<_, zebra_state::BoxError>(
-                            zebra_state::ReadResponse::MissingBlockBodies(Vec::new()),
+                            zebra_state::ReadResponse::MissingBlockBodyMetadata(Vec::new()),
                         )
                     }
                     zebra_state::ReadRequest::FinalizedTip => {
@@ -4159,7 +4081,8 @@ mod zakura_header_sync_driver_tests {
             .expect("driver action channel stays open");
         action_tx
             .send(BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: block::Height(0),
+                from: block::Height(1),
+                limit: 1,
                 best_header_tip: block::Height(1),
             })
             .await
@@ -4304,7 +4227,8 @@ mod zakura_header_sync_driver_tests {
             matches!(
                 startup_action,
                 BlockSyncAction::QueryNeededBlocks {
-                    verified_block_tip: block::Height(0),
+                    from: block::Height(1),
+                    limit: 10,
                     best_header_tip: block::Height(10),
                 }
             ),
@@ -4395,7 +4319,8 @@ mod zakura_header_sync_driver_tests {
             matches!(
                 action,
                 BlockSyncAction::QueryNeededBlocks {
-                    verified_block_tip: block::Height(1),
+                    from: block::Height(2),
+                    limit: 9,
                     best_header_tip: block::Height(10),
                 }
             ),
@@ -4520,7 +4445,8 @@ mod zakura_header_sync_driver_tests {
             matches!(
                 action,
                 BlockSyncAction::QueryNeededBlocks {
-                    verified_block_tip: block::Height(2),
+                    from: block::Height(3),
+                    limit: 8,
                     best_header_tip: block::Height(10),
                 }
             ),
@@ -4995,7 +4921,8 @@ mod zakura_header_sync_driver_tests {
             matches!(
                 startup_action,
                 BlockSyncAction::QueryNeededBlocks {
-                    verified_block_tip: block::Height(0),
+                    from: block::Height(1),
+                    limit: 20,
                     best_header_tip: block::Height(20),
                 }
             ),
@@ -5114,7 +5041,8 @@ mod zakura_header_sync_driver_tests {
             matches!(
                 restart_action,
                 BlockSyncAction::QueryNeededBlocks {
-                    verified_block_tip: block::Height(10),
+                    from: block::Height(11),
+                    limit: 10,
                     best_header_tip: block::Height(20),
                 }
             ),

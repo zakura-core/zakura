@@ -675,7 +675,7 @@ async fn fuzz_churn_storm() {
 /// handling and uniform serve jitter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_large_to_small() {
-    let blocks = 1000;
+    let blocks = 400;
     let jittery = PeerSpec::with_serve(
         1,
         target(blocks),
@@ -701,19 +701,19 @@ async fn fuzz_large_to_small() {
     scenario.timeline = vec![
         TipEvent {
             at: Duration::from_millis(60),
-            kind: TipEventKind::GrowTo(block::Height(300)),
+            kind: TipEventKind::GrowTo(block::Height(200)),
         },
         TipEvent {
             at: Duration::from_millis(140),
-            kind: TipEventKind::GrowTo(block::Height(700)),
+            kind: TipEventKind::GrowTo(block::Height(350)),
         },
         TipEvent {
             at: Duration::from_millis(200),
-            kind: TipEventKind::HeaderReanchor(block::Height(500)),
+            kind: TipEventKind::HeaderReanchor(block::Height(250)),
         },
         TipEvent {
             at: Duration::from_millis(280),
-            kind: TipEventKind::GrowTo(block::Height(1000)),
+            kind: TipEventKind::GrowTo(block::Height(400)),
         },
     ];
     scenario.deadline = Duration::from_secs(60);

@@ -196,10 +196,15 @@ impl HeaderSyncReactor {
             }
             HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
                 best_header_tip,
+                reanchor,
                 history_tree,
             } => {
-                self.handle_best_header_history_tree_loaded(best_header_tip, history_tree)
-                    .await;
+                self.handle_best_header_history_tree_loaded(
+                    best_header_tip,
+                    reanchor,
+                    history_tree,
+                )
+                .await;
             }
             HeaderSyncEvent::HeaderRangeCommitted {
                 start_height,
@@ -672,21 +677,52 @@ impl HeaderSyncReactor {
     /// Installs a lazily-rebuilt header-frontier history tree (the answer to
     /// `QueryBestHeaderHistoryTree`). Always clears the in-flight guard so a failed rebuild
     /// (`history_tree == None`) does not wedge future rebuilds; installs only on success and only if
-    /// the best header tip has not moved since the query. Reschedules so the forward range that
-    /// triggered the rebuild is re-tried (against the repositioned tree, or re-triggering the rebuild
-    /// if it failed).
+    /// the best header tip has not moved since the query.
+    ///
+    /// When `reanchor` is set the durable header-root frontier folded *below* `best_header_tip - 1`
+    /// (a gap left by a non-Zakura commit racing ahead), so the tree does not reach the current tip's
+    /// parent. Drop the header frontier onto the rebuilt tree — mirroring the startup resume — so the
+    /// next forward range's parent matches the tree; otherwise the range would re-trigger the identical
+    /// deterministic rebuild forever. Reschedules so the triggering range is re-tried (against the
+    /// repositioned tree, or re-triggering the rebuild if it failed).
     async fn handle_best_header_history_tree_loaded(
         &mut self,
         best_header_tip: block::Height,
+        reanchor: Option<HeaderFrontierReanchor>,
         history_tree: Option<Arc<zakura_chain::history_tree::HistoryTree>>,
     ) {
         self.state.rebuild_in_flight = false;
         if let Some(history_tree) = history_tree {
             if best_header_tip == self.state.best_header_tip {
                 self.state.best_header_history_tree = history_tree;
+                if let Some(reanchor) = reanchor {
+                    self.reanchor_header_frontier(reanchor).await;
+                }
             }
         }
         self.schedule().await;
+    }
+
+    /// Reanchors the header frontier down onto a just-rebuilt tree that folded below the current tip.
+    ///
+    /// Discards the forward schedule/commit state stranded above the frontier and repositions the tip
+    /// at `reanchor.tip`, anchored on `reanchor.parent_hash` (where the tree sits), so `schedule`
+    /// re-derives a fresh overlap forward range from the reanchored tip. Analogous to
+    /// [`Self::reanchor_to_verified_block_tip`], but lands on the confirmed header-root frontier rather
+    /// than the verified block tip, keeping the header lead already re-validated below the frontier.
+    async fn reanchor_header_frontier(&mut self, reanchor: HeaderFrontierReanchor) {
+        metrics::counter!("sync.header.history_tree.reanchor").increment(1);
+        self.state.schedule.clear_forward();
+        self.state
+            .pending_commits
+            .retain(|_, commit| commit.requested_range.priority != RangePriority::Forward);
+        self.cancel_forward_outstanding();
+        self.publish_best_tip_reanchored(
+            reanchor.tip,
+            reanchor.tip_hash,
+            Some(reanchor.parent_hash),
+        )
+        .await;
     }
 
     async fn handle_header_range_committed(
@@ -1557,7 +1593,7 @@ impl HeaderSyncReactor {
             .pending_commits
             .retain(|_, commit| commit.requested_range.priority != RangePriority::Forward);
         self.cancel_forward_outstanding();
-        self.publish_best_tip_reanchored(height, hash).await;
+        self.publish_best_tip_reanchored(height, hash, None).await;
     }
 
     async fn handle_timeouts(&mut self) {
@@ -1779,11 +1815,16 @@ impl HeaderSyncReactor {
         self.broadcast_status_refresh().await;
     }
 
-    async fn publish_best_tip_reanchored(&mut self, height: block::Height, hash: block::Hash) {
+    async fn publish_best_tip_reanchored(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        parent_hash: Option<block::Hash>,
+    ) {
         let old = (self.state.best_header_tip, self.state.best_header_hash);
         self.state.best_header_tip = height;
         self.state.best_header_hash = hash;
-        self.state.best_header_parent_hash = None;
+        self.state.best_header_parent_hash = parent_hash;
         metrics::gauge!("sync.header.best_tip.height").set(height.0 as f64);
         self.trace_frontier_reanchored(height, hash);
         let _ = self.tip.send((height, hash));

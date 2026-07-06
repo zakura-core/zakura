@@ -21,6 +21,24 @@ pub struct HeaderSyncFrontiers {
     pub verified_block_hash: block::Hash,
 }
 
+/// Where to reanchor the header frontier after a lazy history-tree rebuild whose durable header-root
+/// frontier folded *below* `best_header_tip - 1` (a gap left by a non-Zakura commit racing ahead).
+///
+/// Mirrors the startup resume: the rebuilt tree sits at `parent_hash` (the confirmed frontier), and
+/// header sync resumes one block above it at `tip`, re-fetching that block so its root re-confirms.
+/// Without this the header tip would stay above the tree and every forward range would re-trigger the
+/// identical rebuild forever.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderFrontierReanchor {
+    /// Height to resume the header frontier at — one above the confirmed frontier (`frontier + 1`).
+    pub tip: block::Height,
+    /// Hash of the resume header at `tip`.
+    pub tip_hash: block::Hash,
+    /// Hash of the confirmed header-root frontier at `tip - 1`; the rebuilt tree sits here, and it is
+    /// the overlap anchor for the resumed forward range.
+    pub parent_hash: block::Hash,
+}
+
 /// Startup inputs for the dependency-neutral header-sync reactor.
 #[derive(Clone, Debug)]
 pub struct HeaderSyncStartup {
@@ -265,9 +283,15 @@ pub enum HeaderSyncEvent {
     /// rebuild guard is always cleared. `history_tree` is `None` when the rebuild failed (the guard is
     /// cleared and the next forward range re-triggers it), `Some` on success.
     BestHeaderHistoryTreeLoaded {
-        /// Best header tip the tree is positioned at when this reload was requested.
+        /// Best header tip the reload was requested against, used as a staleness guard: the tree is
+        /// only installed if the reactor tip has not moved since the query was dispatched.
         best_header_tip: block::Height,
-        /// History tree reconstructed by state, positioned at `best_header_tip`; `None` on failure.
+        /// Where to reanchor the header frontier, or `None` when no reanchor is needed (the tree
+        /// folded to `best_header_tip - 1`, the common no-gap case) or the rebuild failed. `Some` when
+        /// the durable header-root frontier folded *below* `best_header_tip - 1` — a gap left by a
+        /// non-Zakura commit — so the tip must drop onto the rebuilt tree to make progress.
+        reanchor: Option<HeaderFrontierReanchor>,
+        /// History tree reconstructed by state; `None` on failure.
         history_tree: Option<Arc<HistoryTree>>,
     },
     /// State successfully committed a header range.

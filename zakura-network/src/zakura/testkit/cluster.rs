@@ -1019,6 +1019,7 @@ mod tests {
                         .handle
                         .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
                             best_header_tip,
+                            reanchor: None,
                             history_tree: Some(Arc::new(
                                 zakura_chain::history_tree::HistoryTree::default(),
                             )),

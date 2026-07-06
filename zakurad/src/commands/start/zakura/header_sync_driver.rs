@@ -11,9 +11,10 @@ use zakura_chain::{
     parallel::commitment_aux::BlockCommitmentRoots,
 };
 use zakura_network::zakura::{
-    commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange, HeaderSyncAction,
-    HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, ZakuraEndpoint,
-    ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
+    commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange,
+    HeaderFrontierReanchor, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
+    HeaderSyncFrontiers, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup, ZakuraTrace,
+    DEFAULT_HS_RANGE,
 };
 
 #[cfg(test)]
@@ -142,6 +143,58 @@ pub(crate) async fn zakura_header_sync_driver_startup(
         best_header_history_tree,
         verified_block_tip_hash: verified_block_tip.1,
     })
+}
+
+/// Resolves the header-frontier reanchor a runtime lazy rebuild needs when the durable header-root
+/// `frontier` folded *below* `best_header_tip - 1` (a gap left by a non-Zakura commit racing ahead).
+///
+/// Mirrors the startup resume in [`zakura_header_sync_driver_startup`]: resume one block above the
+/// confirmed frontier, anchored on the frontier hash, looking up the resume header's hash. Returns
+/// `Ok(None)` when the frontier already reached `best_header_tip - 1` (the common no-gap rebuild, no
+/// reanchor needed).
+async fn header_frontier_reanchor<ReadState>(
+    read_state: ReadState,
+    best_header_tip: block::Height,
+    frontier: (block::Height, block::Hash),
+) -> Result<Option<HeaderFrontierReanchor>, Report>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Send,
+    ReadState::Future: Send,
+{
+    let (frontier_height, frontier_hash) = frontier;
+    let resume_height = frontier_height
+        .next()
+        .map_err(|_| eyre!("header frontier height overflow"))?;
+    // No gap: the tree folded to `best_header_tip - 1`, so its position already matches the parent of
+    // the next forward range. Nothing to reanchor — the plain tree install suffices.
+    if resume_height >= best_header_tip {
+        return Ok(None);
+    }
+    let tip_hash = match read_state
+        .oneshot(zakura_state::ReadRequest::HeadersByHeightRange {
+            start: resume_height,
+            count: 1,
+        })
+        .await
+        .map_err(|error| eyre!("{error}"))?
+    {
+        zakura_state::ReadResponse::Headers(headers) => headers
+            .first()
+            .map(|(_height, hash, _header)| *hash)
+            .ok_or_else(|| eyre!("missing durable header at resume height {resume_height:?}"))?,
+        response => Err(eyre!(
+            "unexpected HeadersByHeightRange response: {response:?}"
+        ))?,
+    };
+    Ok(Some(HeaderFrontierReanchor {
+        tip: resume_height,
+        tip_hash,
+        parent_hash: frontier_hash,
+    }))
 }
 
 #[derive(Clone)]
@@ -807,7 +860,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 // Always report completion back (`Some` on success, `None` on failure) so the reactor
                 // clears its in-flight rebuild guard even when the read errors — otherwise the guard
                 // would wedge and suppress all future rebuilds, stranding the stale tree.
-                let history_tree = match read_state
+                let (history_tree, reanchor) = match read_state
                     .clone()
                     .oneshot(zakura_state::ReadRequest::BestHeaderHistoryTree {
                         verified_block_tip,
@@ -815,20 +868,41 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     })
                     .await
                 {
-                    Ok(zakura_state::ReadResponse::BestHeaderHistoryTree { tree, .. }) => Some(tree),
+                    Ok(zakura_state::ReadResponse::BestHeaderHistoryTree { tree, frontier }) => {
+                        // The fold can stop below `best_header_tip - 1` when durable roots have a gap
+                        // (a non-Zakura commit raced ahead). In that case the reactor must drop its tip
+                        // onto the rebuilt tree; resolve that reanchor here, where the read access
+                        // lives, mirroring the startup resume. A resolution failure is reported as a
+                        // failed rebuild (both `None`) so the guard clears and the range re-triggers,
+                        // rather than installing a lower tree the stale tip could never match.
+                        match header_frontier_reanchor(
+                            read_state.clone(),
+                            best_header_tip,
+                            frontier,
+                        )
+                        .await
+                        {
+                            Ok(reanchor) => (Some(tree), reanchor),
+                            Err(error) => {
+                                warn!(?error, "failed to resolve Zakura header frontier reanchor");
+                                (None, None)
+                            }
+                        }
+                    }
                     Ok(response) => {
                         warn!(?response, "unexpected BestHeaderHistoryTree response");
-                        None
+                        (None, None)
                     }
                     Err(error) => {
                         warn!(?error, "failed to rebuild Zakura best header history tree");
-                        None
+                        (None, None)
                     }
                 };
                 let _ = handles
                     .header_sync
                     .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
                         best_header_tip,
+                        reanchor,
                         history_tree,
                     })
                     .await;

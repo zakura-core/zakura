@@ -4646,6 +4646,7 @@ async fn failed_rebuild_clears_guard_and_retriggers() {
             .handle
             .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
                 best_header_tip: block::Height(4),
+                reanchor: None,
                 history_tree: None,
             })
             .await
@@ -5910,6 +5911,155 @@ async fn short_served_forward_range_must_install_the_delivered_frontier_tree() {
             _ => {}
         }
     }
+}
+
+/// Regression test for the runtime lazy-rebuild reanchor. A non-Zakura path (checkpoint/legacy sync)
+/// runs the header tip ahead of the folded tree, so the forward range that needs the tree triggers a
+/// `QueryBestHeaderHistoryTree` rebuild. When durable roots have a gap the rebuilt tree lands *below*
+/// `best_header_tip - 1`, so the answer carries a [`HeaderFrontierReanchor`]. The reactor must drop its
+/// tip onto the rebuilt tree (emitting `HeaderReanchored`) and then verify the resumed forward range
+/// against it — instead of keeping the stale higher tip and re-triggering the identical deterministic
+/// rebuild forever (the pre-fix loop, where the frontier was discarded before reaching the reactor).
+#[tokio::test(flavor = "current_thread")]
+async fn lazy_rebuild_reanchors_tip_onto_lower_frontier_tree() {
+    let genesis_hash = regtest_network().genesis_hash();
+
+    // A synthetic post-Heartwood chain 1..=4 with real ZIP-221 commitments, so the resumed range can
+    // fold and verify against the reinstalled tree.
+    let mut tree = HistoryTree::default();
+    let h1 = chain_history_test_header(&BLOCK_MAINNET_1_BYTES, genesis_hash, &tree);
+    let h1_hash = block::Hash::from(h1.as_ref());
+    let network = heartwood_regtest_with_checkpoint(block::Height(1), h1_hash);
+
+    fold_empty_roots(&network, &mut tree, &h1, block::Height(1));
+    let tree_at_1 = tree.clone();
+    let h2 = chain_history_test_header(&BLOCK_MAINNET_2_BYTES, h1_hash, &tree);
+    let h2_hash = block::Hash::from(h2.as_ref());
+    fold_empty_roots(&network, &mut tree, &h2, block::Height(2));
+    let h3 = chain_history_test_header(&BLOCK_MAINNET_3_BYTES, h2_hash, &tree);
+    let h3_hash = block::Hash::from(h3.as_ref());
+    fold_empty_roots(&network, &mut tree, &h3, block::Height(3));
+    let h4 = chain_history_test_header(&BLOCK_MAINNET_4_BYTES, h3_hash, &tree);
+
+    // The header tip sits at 3 (bumped by a non-Zakura commit) but the header-frontier tree is still
+    // the empty startup default — the frontier folded nothing above the verified tip at 1.
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(1), h1_hash),
+        Some((block::Height(3), h3_hash)),
+    ));
+    let peer_id = peer(94);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(4),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    // The forward range above the stale tip is requested and served; aux validation finds the tree
+    // behind the range's parent and dispatches exactly one rebuild against the current tip (3).
+    let (served_peer, start_height, _count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(4));
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: headers_message_from(block::Height(4), vec![h4.clone()]),
+        })
+        .await
+        .unwrap();
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryBestHeaderHistoryTree {
+                best_header_tip, ..
+            } => {
+                assert_eq!(best_header_tip, block::Height(3));
+                break;
+            }
+            HeaderSyncAction::CommitHeaderRange { .. } => {
+                panic!("a stale tree must not commit the range")
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+
+    // Answer the rebuild with a tree that folded only to the confirmed frontier at height 1 — below
+    // `best_header_tip - 1` (2), a durable-root gap — plus the reanchor onto it.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
+            best_header_tip: block::Height(3),
+            reanchor: Some(HeaderFrontierReanchor {
+                tip: block::Height(2),
+                tip_hash: h2_hash,
+                parent_hash: h1_hash,
+            }),
+            history_tree: Some(Arc::new(tree_at_1)),
+        })
+        .await
+        .unwrap();
+
+    // The reactor drops the tip onto the rebuilt tree and resumes the forward range from the reanchor,
+    // verifying it against the reinstalled tree — never a second rebuild.
+    let mut saw_reanchor = false;
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::HeaderReanchored { new, .. } => {
+                assert_eq!(new.0, block::Height(2), "tip reanchored onto the frontier");
+                saw_reanchor = true;
+            }
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        ..
+                    },
+                ..
+            } => {
+                // Ignore the pre-reanchor retry of the stale [4..] range; only serve the range the
+                // reactor resumes from the reanchor at height 2.
+                if start_height != block::Height(2) {
+                    continue;
+                }
+                let headers = [h2.clone(), h3.clone(), h4.clone()];
+                let take = (count as usize).min(headers.len());
+                fixture
+                    .handle
+                    .send(HeaderSyncEvent::WireMessage {
+                        peer: peer_id.clone(),
+                        msg: headers_message_from(block::Height(2), headers[..take].to_vec()),
+                    })
+                    .await
+                    .unwrap();
+            }
+            HeaderSyncAction::CommitHeaderRange { start_height, .. } => {
+                assert_eq!(start_height, block::Height(2));
+                break;
+            }
+            HeaderSyncAction::QueryBestHeaderHistoryTree { .. } => panic!(
+                "the reanchored tree was ignored: the resumed range re-triggered a durable-state \
+                 rebuild instead of verifying against the reinstalled tree"
+            ),
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_reanchor,
+        "the tip must be reanchored down onto the rebuilt frontier tree"
+    );
 }
 
 /// Regression test: backward (below-anchor) checkpoint backfill is unused by the current sync

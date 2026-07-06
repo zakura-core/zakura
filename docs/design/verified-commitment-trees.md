@@ -455,6 +455,13 @@ other peers are already header-authenticated, and so a restart never trusts an u
   advance the finalized tip past the reactor's cached `verified_block_tip` during the round-trip, so
   folding must start from the tip actually present rather than the caller's (possibly lagging) value —
   otherwise the base read returns `None` and the rebuild degrades to a network-paced no-progress loop.
+  And the reload carries the confirmed frontier `(height, hash)` the fold actually reached, not just the
+  tree: when durable roots have a gap the fold stops _below_ `best_header_tip - 1`, so the rebuilt tree
+  never reaches the current tip's parent. The reactor then reanchors its header tip down onto that
+  frontier — resuming one block above it, anchored on the frontier hash, exactly as the startup
+  reconstruction does (`sync.header.history_tree.reanchor`) — instead of keeping the stale higher tip,
+  where every forward range would re-detect the behind tree and re-trigger the identical deterministic
+  rebuild forever.
 - **Verify before persisting.** When a below-checkpoint header range arrives, the reactor folds its
   supplied roots into the running header-frontier history tree and checks each header's commitment
   against it (`verify_supplied_roots_from_parts` in `zakura-chain/src/parallel/commitment_aux_verify.rs`,
@@ -763,6 +770,7 @@ Live commit-path counters distinguish the fast and legacy paths and the failure 
 | `state.vct.fast_path.miss` | a finalized commit did not take the fast path |
 | `state.vct.root.stalled.height` (gauge) | a height stuck on a retryable stall past the warn threshold |
 | `sync.header.history_tree.rebuild` | header-frontier history tree lazily rebuilt (§6.4) because a non-Zakura commit ran ahead of it below the checkpoint; **stays 0 in the normal header-leading path**, so a nonzero value flags fallback/catch-up |
+| `sync.header.history_tree.reanchor` | a lazy rebuild (§6.4) folded to a frontier _below_ `best_header_tip - 1` (durable roots had a gap), so the reactor reanchored its header tip down onto the rebuilt tree; a subset of `rebuild`, and likewise 0 in the normal path |
 
 The header-sync `headers_received` / `headers_served` / commit-state trace rows also carry
 `want_tree_aux_roots` and `tree_aux_roots_len`, so root delivery is visible per range. The

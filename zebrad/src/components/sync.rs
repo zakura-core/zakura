@@ -516,22 +516,26 @@ where
     }
 }
 
-/// Cancels and drains the Zakura sync drivers before the legacy [`ChainSync::sync`] loop resumes.
+/// Records that legacy [`ChainSync::sync`] is resuming as the body-sync driver
+/// while the Zakura reactors stay alive.
 ///
-/// The cancellation token stops new Zakura sync work. Awaiting the endpoint-owned tasks makes the
-/// hand-off a commit barrier: already-started Zakura block applies finish before legacy can submit
-/// commits through the same verifier and state pipeline. No-op when Zakura networking is absent.
-async fn stop_zakura_sync(
-    zakura_endpoint: Option<&zn::zakura::ZakuraEndpoint>,
-    zakura_shutdown: &Option<tokio_util::sync::CancellationToken>,
+/// The Zakura header- and block-sync reactors are deliberately not cancelled:
+/// the fallback node might be the only peer with working legacy ingest, so it
+/// must keep advertising frontiers and serving headers/bodies to Zakura peers.
+async fn engage_legacy_fallback_alongside_zakura(
+    block_sync_handoff: &crate::commands::start::zakura::BlockSyncHandoff,
 ) {
-    if let Some(token) = zakura_shutdown {
-        token.cancel();
-    }
+    metrics::counter!("sync.zakura.legacy_fallback.engaged").increment(1);
+    // Sticky by design: once legacy fallback owns body sync, the node stays in
+    // bridge mode until restart.
+    metrics::gauge!("sync.zakura.legacy_fallback.active").set(1.0);
 
-    if let Some(endpoint) = zakura_endpoint {
-        endpoint.shutdown_sync_tasks().await;
-    }
+    // Commit barrier: two engines driving bulk commits concurrently race in
+    // the applying queue, so stop new Zakura applies and drain in-flight ones
+    // before legacy ChainSync takes the pipeline.
+    block_sync_handoff
+        .yield_to_legacy(std::time::Duration::from_secs(60))
+        .await;
 }
 
 /// Sync configuration section.
@@ -953,11 +957,9 @@ where
     /// Zakura body-sync peers, and parking forever there leaves it stuck at genesis.
     ///
     /// `legacy_fallback` (set when the node runs both stacks, `v2_p2p && legacy_p2p`)
-    /// controls the recovery path. When `true`, a Zakura stall first cancels
-    /// `zakura_shutdown` — the endpoint shutdown token shared by the Zakura header- and
-    /// block-sync drivers — so they stop before the legacy [`ChainSync::sync`] loop
-    /// resumes, ensuring only one body-sync committer is ever active (two at once break
-    /// the state-commit pipeline's accounting and can deadlock the node). When `false`
+    /// controls the recovery path. When `true`, a Zakura stall resumes the legacy
+    /// [`ChainSync::sync`] loop as the body-sync driver while Zakura keeps serving
+    /// peers and following local commits through the chain-tip mirror. When `false`
     /// (a Zakura-only node, where falling back to absent legacy peers is pointless),
     /// the watchdog never switches: it parks and warns (once per stall window) so a
     /// stalled, eclipsed, or peerless node is visible in the logs.
@@ -966,13 +968,12 @@ where
     /// for the legacy-informed cross-check, which only probes legacy peers when
     /// the verified tip is frozen and the node looks caught up to its own header
     /// frontier.
-    #[instrument(skip(self, read_state, zakura_endpoint, zakura_shutdown))]
-    pub async fn bootstrap_genesis_then_pause<RS>(
+    #[instrument(skip(self, read_state, block_sync_handoff))]
+    pub(crate) async fn bootstrap_genesis_then_pause<RS>(
         mut self,
         mut read_state: RS,
         legacy_fallback: bool,
-        zakura_endpoint: Option<zn::zakura::ZakuraEndpoint>,
-        zakura_shutdown: Option<tokio_util::sync::CancellationToken>,
+        block_sync_handoff: std::sync::Arc<crate::commands::start::zakura::BlockSyncHandoff>,
     ) -> Result<(), Report>
     where
         RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
@@ -1029,11 +1030,11 @@ where
                         verified_tip = ?verified_height,
                         header_tip = ?header_tip_height,
                         stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
-                        "Zakura body sync is not closing the gap to the network tip; stopping \
-                         Zakura sync drivers and falling back to legacy ChainSync so legacy peers \
-                         can drive body sync"
+                        "Zakura body sync is not closing the gap to the network tip; resuming \
+                         legacy ChainSync as the body-sync driver while Zakura keeps serving \
+                         peers and following local commits"
                     );
-                    stop_zakura_sync(zakura_endpoint.as_ref(), &zakura_shutdown).await;
+                    engage_legacy_fallback_alongside_zakura(&block_sync_handoff).await;
                     return self.sync().await;
                 }
                 ZakuraWatchdogAction::ProbeLegacyPeers => {
@@ -1049,10 +1050,10 @@ where
                             header_tip = ?header_tip_height,
                             ?blocks_ahead,
                             "Zakura body sync is frozen while legacy peers advertise a much \
-                             higher tip; stopping Zakura sync drivers and falling back to legacy \
-                             ChainSync so it can drive body sync"
+                             higher tip; resuming legacy ChainSync as the body-sync driver \
+                             while Zakura keeps serving peers and following local commits"
                         );
-                        stop_zakura_sync(zakura_endpoint.as_ref(), &zakura_shutdown).await;
+                        engage_legacy_fallback_alongside_zakura(&block_sync_handoff).await;
                         return self.sync().await;
                     }
                 }

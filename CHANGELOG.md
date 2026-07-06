@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed dual-stack Zakura fallback shutting down the Zakura serving layer. When
+  the stall watchdog resumes legacy `ChainSync`, Zakura now keeps its header-
+  and block-sync reactors alive as a serving/advertising bridge while an apply
+  gate drains in-flight Zakura body applies before legacy sync drives commits.
 - Fixed legacy peers being disconnected for returning empty `FindBlocks` or
   `FindHeaders` responses when Zebra is at or near the network tip.
 - Kept an already-active mempool and `getblocktemplate` mining RPCs running

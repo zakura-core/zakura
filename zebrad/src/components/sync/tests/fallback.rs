@@ -1,18 +1,15 @@
 //! Tests for the Zakura body-sync stall watchdog
 //! ([`ChainSync::bootstrap_genesis_then_pause`]).
 //!
-//! These exercise the pure decision function [`zakura_block_sync_stalled`] and the
-//! [`stop_zakura_sync`] hand-off helper directly, so they are deterministic and need
-//! no clock, services, or live `ChainTip`.
-
-use tokio_util::sync::CancellationToken;
+//! These exercise the pure decision function [`zakura_block_sync_stalled`] directly,
+//! so they are deterministic and need no clock, services, or live `ChainTip`.
 
 use zebra_chain::{block::Height, chain_sync_status::ChainSyncStatus};
 
 use super::super::{
-    legacy_probe_supports_fallback, stop_zakura_sync, zakura_block_sync_stalled,
-    zakura_sync_status_length, zakura_watchdog_action, SyncStatus, ZakuraLegacyProbe,
-    ZakuraStallTracker, ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
+    engage_legacy_fallback_alongside_zakura, legacy_probe_supports_fallback,
+    zakura_block_sync_stalled, zakura_sync_status_length, zakura_watchdog_action, SyncStatus,
+    ZakuraLegacyProbe, ZakuraStallTracker, ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
 };
 
 /// The original height-only rule, reproduced here only to demonstrate the F-88602
@@ -214,11 +211,12 @@ fn frozen_but_materially_behind_leaves_probe_to_gap_rule() {
     }
 }
 
-#[tokio::test]
-async fn stalled_zakura_with_legacy_fallback_cancels_the_shutdown_token() {
+/// The fallback decision fires on a frozen verified tip, and the hand-off keeps
+/// the Zakura reactors alive: legacy ChainSync resumes as the body-sync driver
+/// while Zakura quiesces into a serving/advertising bridge.
+#[test]
+fn stalled_zakura_with_legacy_fallback_keeps_zakura_reactors_alive() {
     let max_idle_polls = 3;
-    let token = CancellationToken::new();
-    let driver_view = token.child_token();
     let mut tracker = ZakuraStallTracker::new(Some(Height(0)));
     let mut legacy_probe = ZakuraLegacyProbe::new(Some(Height(0)));
 
@@ -241,18 +239,21 @@ async fn stalled_zakura_with_legacy_fallback_cancels_the_shutdown_token() {
         ZakuraWatchdogAction::FallbackToLegacy,
         "a frozen verified tip must trigger legacy fallback when it is enabled"
     );
-    stop_zakura_sync(None, &Some(token)).await;
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff));
     assert!(
-        driver_view.is_cancelled(),
-        "falling back to legacy must cancel the Zakura sync drivers' shutdown token"
+        handoff.is_yielded_to_legacy(),
+        "fallback must yield Zakura block sync to legacy sync"
+    );
+    assert!(
+        handoff.begin_apply().is_none(),
+        "no new Zakura applies may start after the fallback engages"
     );
 }
 
 #[test]
 fn stalled_zakura_without_legacy_fallback_keeps_waiting() {
     let max_idle_polls = 3;
-    let token = CancellationToken::new();
-    let driver_view = token.child_token();
     let mut tracker = ZakuraStallTracker::new(Some(Height(0)));
     let mut legacy_probe = ZakuraLegacyProbe::new(Some(Height(0)));
 
@@ -281,18 +282,14 @@ fn stalled_zakura_without_legacy_fallback_keeps_waiting() {
         saw_warn_only,
         "Zakura-only stalls should still produce the warn-only watchdog action"
     );
-    assert!(
-        !driver_view.is_cancelled(),
-        "warn-only Zakura stalls must not cancel the Zakura shutdown token"
-    );
 }
 
-#[tokio::test]
-async fn frozen_zero_gap_with_legacy_peers_ahead_cancels_the_shutdown_token() {
+/// A frozen tip that looks caught up cross-checks legacy peers, and a probe at
+/// or above the behind threshold engages fallback without cancelling Zakura.
+#[test]
+fn frozen_zero_gap_with_legacy_peers_ahead_engages_fallback() {
     let max_idle_polls = 5;
     let frozen = Some(Height(1_000));
-    let token = CancellationToken::new();
-    let driver_view = token.child_token();
     let mut tracker = ZakuraStallTracker::new(frozen);
     let mut legacy_probe = ZakuraLegacyProbe::new(frozen);
 
@@ -318,10 +315,11 @@ async fn frozen_zero_gap_with_legacy_peers_ahead_cancels_the_shutdown_token() {
         "legacy peers at or above the behind threshold must trigger fallback"
     );
 
-    stop_zakura_sync(None, &Some(token)).await;
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff));
     assert!(
-        driver_view.is_cancelled(),
-        "legacy-informed fallback must cancel the Zakura sync drivers' shutdown token"
+        handoff.is_yielded_to_legacy(),
+        "fallback must yield Zakura block sync to legacy sync"
     );
 }
 
@@ -405,33 +403,57 @@ fn zakura_sync_status_lengths_drive_existing_mempool_gate() {
     );
 }
 
-/// The point of this test is to lock in the fallback behavior: when Zebra decides to stop using
-/// Zakura sync and fall back to legacy sync, it must signal the running Zakura driver tasks to shut down.
-/// This asserts that the shutdown token is cancelled when the fallback occurs.
-#[tokio::test]
-async fn fallback_cancels_the_zakura_shutdown_token() {
-    let token = CancellationToken::new();
+/// Locks in the fallback behavior: engaging legacy fallback must be a commit
+/// barrier for Zakura body applies, while leaving the reactors alive as a
+/// serving bridge.
+#[tokio::test(start_paused = true)]
+async fn fallback_handoff_drains_applies_without_cancelling_zakura() {
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let permit = handoff.begin_apply().expect("applies run before fallback");
+
+    let drain_handoff = handoff.clone();
+    let drain =
+        tokio::spawn(async move { engage_legacy_fallback_alongside_zakura(&drain_handoff).await });
+
+    tokio::task::yield_now().await;
     assert!(
-        !token.is_cancelled(),
-        "precondition: a fresh token is not cancelled"
+        !drain.is_finished(),
+        "the drain waits for in-flight applies"
+    );
+    assert!(
+        handoff.begin_apply().is_none(),
+        "no new Zakura applies may start once fallback begins"
     );
 
-    // A child token stands in for the drivers' observed shutdown: cancelling the shared token the
-    // watchdog holds must propagate to what the drivers actually await.
-    let driver_view = token.child_token();
-
-    stop_zakura_sync(None, &Some(token)).await;
-
-    assert!(
-        driver_view.is_cancelled(),
-        "falling back to legacy must cancel the Zakura sync drivers' shutdown token"
-    );
+    drop(permit);
+    drain.await.expect("drain task completes");
+    assert!(handoff.is_yielded_to_legacy());
 }
 
-/// On a Zakura-only node there is no endpoint shutdown token, so the hand-off helper must be a
-/// no-op rather than panic.
-#[tokio::test]
-async fn stop_zakura_sync_is_a_noop_without_a_token() {
-    // Must not panic.
-    stop_zakura_sync(None, &None).await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_drain_does_not_lose_concurrent_last_apply_wakeup() {
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let permit = handoff.begin_apply().expect("applies run before fallback");
+
+    let drain_handoff = handoff.clone();
+    let drain = tokio::spawn(async move {
+        drain_handoff
+            .yield_to_legacy(std::time::Duration::from_secs(30))
+            .await;
+    });
+
+    let dropper = tokio::task::spawn_blocking(move || drop(permit));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        dropper.await.expect("dropper task completes");
+        drain.await.expect("drain task completes");
+    })
+    .await
+    .expect("drain must observe the final apply release without waiting for its timeout");
+
+    assert!(handoff.is_yielded_to_legacy());
+    assert!(
+        handoff.begin_apply().is_none(),
+        "no new Zakura applies may start after the concurrent drain"
+    );
 }

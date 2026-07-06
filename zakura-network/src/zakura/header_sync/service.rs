@@ -36,6 +36,12 @@ pub(crate) fn header_sync_streams() -> &'static [Stream] {
 pub struct HeaderSyncPeerSession {
     peer_id: ZakuraPeerId,
     direction: ServicePeerDirection,
+    /// Supervisor registration id of the connection this session rides on.
+    ///
+    /// Used to drop stale `PeerDisconnected` teardown events from a session
+    /// whose connection was displaced by a winning duplicate. Zero for test
+    /// sessions built without a supervisor registration.
+    registration_id: u64,
     inner: Arc<HeaderSyncPeerSessionInner>,
 }
 
@@ -50,15 +56,25 @@ impl HeaderSyncPeerSession {
     fn new_with_commands(
         session: &PeerStreamSession,
         direction: ServicePeerDirection,
+        registration_id: u64,
         commands: mpsc::UnboundedSender<HeaderSyncPeerCommand>,
     ) -> Self {
-        Self::from_parts_with_direction_and_commands(
+        let mut this = Self::from_parts_with_direction_and_commands(
             session.peer_id().clone(),
             direction,
             session.sender(),
             session.cancel_token(),
             Some(commands),
-        )
+        );
+        this.registration_id = registration_id;
+        this
+    }
+
+    /// Set the supervisor registration id of this session's connection.
+    #[cfg(test)]
+    pub(crate) fn with_registration_id(mut self, registration_id: u64) -> Self {
+        self.registration_id = registration_id;
+        self
     }
 
     #[cfg(test)]
@@ -91,6 +107,7 @@ impl HeaderSyncPeerSession {
         Self {
             peer_id,
             direction,
+            registration_id: 0,
             inner: Arc::new(HeaderSyncPeerSessionInner {
                 send,
                 cancel_token,
@@ -110,6 +127,7 @@ impl HeaderSyncPeerSession {
         Self {
             peer_id,
             direction,
+            registration_id: 0,
             inner: Arc::new(HeaderSyncPeerSessionInner {
                 send,
                 cancel_token,
@@ -126,6 +144,11 @@ impl HeaderSyncPeerSession {
     /// Direction of the underlying Zakura connection.
     pub fn direction(&self) -> ServicePeerDirection {
         self.direction
+    }
+
+    /// Supervisor registration id of the connection this session rides on.
+    pub(crate) fn registration_id(&self) -> u64 {
+        self.registration_id
     }
 
     /// Peer disconnect/local shutdown cancellation token.
@@ -344,6 +367,7 @@ impl Service for HeaderSyncService {
         };
 
         let peer_id = peer.id.clone();
+        let registration_id = peer.registration_id;
         let session = PeerStreamSession::new(
             peer_id.clone(),
             ZAKURA_STREAM_HEADER_SYNC,
@@ -361,8 +385,12 @@ impl Service for HeaderSyncService {
         let close_cause = peer.close_cause();
         let conn_id = peer.conn_id;
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let header_sync_session =
-            HeaderSyncPeerSession::new_with_commands(&session, peer.direction, commands_tx);
+        let header_sync_session = HeaderSyncPeerSession::new_with_commands(
+            &session,
+            peer.direction,
+            registration_id,
+            commands_tx,
+        );
 
         {
             let mut peers = self
@@ -447,8 +475,10 @@ impl Service for HeaderSyncService {
                 }
             };
             if should_notify {
-                let _ = teardown_handle
-                    .send_lifecycle(HeaderSyncEvent::PeerDisconnected(teardown_peer));
+                let _ = teardown_handle.send_lifecycle(HeaderSyncEvent::PeerDisconnected {
+                    peer: teardown_peer,
+                    registration_id: Some(registration_id),
+                });
             }
         };
         let panic_connection_cancel_token = connection_cancel_token.clone();
@@ -482,7 +512,10 @@ impl Service for HeaderSyncService {
             record.cancel_token.cancel();
             let _ = self
                 .header_sync
-                .send_lifecycle(HeaderSyncEvent::PeerDisconnected(peer.clone()));
+                .send_lifecycle(HeaderSyncEvent::PeerDisconnected {
+                    peer: peer.clone(),
+                    registration_id: None,
+                });
         }
     }
 

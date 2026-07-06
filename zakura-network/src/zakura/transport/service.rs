@@ -71,6 +71,13 @@ pub struct Peer {
     pub negotiated: u64,
     /// Direction of the underlying authenticated connection.
     pub direction: ServicePeerDirection,
+    /// Supervisor registration id of the connection this peer session rides on.
+    ///
+    /// Duplicate arbitration can replace a peer's registered connection while
+    /// the displaced one is still tearing down; services use this id to ignore
+    /// lifecycle events from sessions that no longer belong to the registered
+    /// connection. Zero for test peers built without a supervisor registration.
+    pub registration_id: u64,
     streams: HashMap<u16, ServiceStream>,
     cancel_token: CancellationToken,
     service_cancel_token: CancellationToken,
@@ -218,11 +225,18 @@ impl Peer {
             remote_ip,
             negotiated,
             direction,
+            registration_id: 0,
             streams,
             cancel_token,
             service_cancel_token,
             close_cause,
         }
+    }
+
+    /// Set the supervisor registration id of this peer's connection.
+    pub(crate) fn with_registration_id(mut self, registration_id: u64) -> Self {
+        self.registration_id = registration_id;
+        self
     }
 
     /// Take ownership of a stream pair for `kind`.

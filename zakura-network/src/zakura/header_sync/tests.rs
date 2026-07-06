@@ -622,12 +622,148 @@ async fn peer_caps_reject_full_without_status_or_misbehavior_and_free_on_remove(
 
     fixture
         .handle
-        .send(HeaderSyncEvent::PeerDisconnected(admitted))
+        .send(HeaderSyncEvent::PeerDisconnected {
+            peer: admitted,
+            registration_id: None,
+        })
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     assert_eq!(fixture.handle.peer_snapshot().inbound_peers, 0);
     assert_eq!(fixture.handle.peer_snapshot().inbound_slots_free, 1);
+}
+
+/// Duplicate arbitration can replace a peer's registered connection while the
+/// displaced connection's header-sync session task is still tearing down. The
+/// displaced session's `PeerDisconnected` (scoped to its registration id) must
+/// not remove the winning connection's admitted session; the winner's own
+/// teardown still must.
+#[tokio::test]
+async fn stale_disconnect_from_displaced_connection_keeps_live_session() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.range_state_actions_enabled = false;
+    let fixture = spawn_test_reactor(startup);
+    let peer_id = peer(33);
+
+    // Session riding the peer's first registered connection.
+    connect_peer_with_registration(&fixture, peer_id.clone(), ServicePeerDirection::Inbound, 1)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(fixture.handle.peer_snapshot().inbound_peers, 1);
+
+    // A winning duplicate connection replaces the registration and its session
+    // supersedes the first one in the reactor.
+    connect_peer_with_registration(&fixture, peer_id.clone(), ServicePeerDirection::Inbound, 2)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(fixture.handle.peer_snapshot().inbound_peers, 1);
+
+    // The displaced connection's teardown arrives late and must be ignored.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerDisconnected {
+            peer: peer_id.clone(),
+            registration_id: Some(1),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(
+        fixture.handle.peer_snapshot().inbound_peers,
+        1,
+        "a stale disconnect from a displaced connection must not remove the live session",
+    );
+
+    // The winning connection's own teardown still removes the peer.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerDisconnected {
+            peer: peer_id.clone(),
+            registration_id: Some(2),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(fixture.handle.peer_snapshot().inbound_peers, 0);
+}
+
+/// The opposite event ordering to
+/// [`stale_disconnect_from_displaced_connection_keeps_live_session`]: the
+/// displaced session's scoped disconnect arrives while its own session is still
+/// admitted (before the winner's `PeerConnected`). The disconnect matches and
+/// removes the old session, and the winner's connect then re-admits the peer,
+/// so the reactor converges to one live session in either ordering.
+#[tokio::test]
+async fn stale_disconnect_before_winner_connect_still_converges() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.range_state_actions_enabled = false;
+    let fixture = spawn_test_reactor(startup);
+    let peer_id = peer(34);
+
+    connect_peer_with_registration(&fixture, peer_id.clone(), ServicePeerDirection::Inbound, 1)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(fixture.handle.peer_snapshot().inbound_peers, 1);
+
+    // The displaced connection's teardown fires while its own session is still
+    // the admitted one, so the id matches and the session is removed.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerDisconnected {
+            peer: peer_id.clone(),
+            registration_id: Some(1),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(fixture.handle.peer_snapshot().inbound_peers, 0);
+
+    // The winning connection's session arrives afterwards and is admitted.
+    connect_peer_with_registration(&fixture, peer_id.clone(), ServicePeerDirection::Inbound, 2)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(
+        fixture.handle.peer_snapshot().inbound_peers,
+        1,
+        "the winner's session is admitted after the old session's removal",
+    );
+}
+
+/// An unscoped disconnect (`registration_id: None`, the registry fanout path)
+/// removes the session regardless of the registration id it rides on, because
+/// the fanout only runs for the currently registered connection.
+#[tokio::test]
+async fn unscoped_disconnect_removes_session_with_any_registration_id() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.range_state_actions_enabled = false;
+    let fixture = spawn_test_reactor(startup);
+    let peer_id = peer(35);
+
+    connect_peer_with_registration(&fixture, peer_id.clone(), ServicePeerDirection::Inbound, 5)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(fixture.handle.peer_snapshot().inbound_peers, 1);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerDisconnected {
+            peer: peer_id,
+            registration_id: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(
+        fixture.handle.peer_snapshot().inbound_peers,
+        0,
+        "an unconditional disconnect removes the session whatever its registration id",
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -780,7 +916,10 @@ async fn advisory_backoff_is_pruned_on_peer_disconnected() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::PeerDisconnected(peer_id.clone()))
+        .send(HeaderSyncEvent::PeerDisconnected {
+            peer: peer_id.clone(),
+            registration_id: None,
+        })
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -977,6 +1116,15 @@ async fn connect_peer_with_direction(
     peer_id: ZakuraPeerId,
     direction: ServicePeerDirection,
 ) -> CancellationToken {
+    connect_peer_with_registration(fixture, peer_id, direction, 0).await
+}
+
+async fn connect_peer_with_registration(
+    fixture: &ReactorFixture,
+    peer_id: ZakuraPeerId,
+    direction: ServicePeerDirection,
+    registration_id: u64,
+) -> CancellationToken {
     let (send, recv) = crate::zakura::framed_channel(32);
     fixture
         .outbound_receivers
@@ -985,7 +1133,8 @@ async fn connect_peer_with_direction(
         .push(recv);
     let cancel = CancellationToken::new();
     let session =
-        HeaderSyncPeerSession::from_parts_with_direction(peer_id, direction, send, cancel.clone());
+        HeaderSyncPeerSession::from_parts_with_direction(peer_id, direction, send, cancel.clone())
+            .with_registration_id(registration_id);
     fixture
         .handle
         .send(HeaderSyncEvent::PeerConnected(session))
@@ -1128,7 +1277,7 @@ async fn stale_header_sync_teardown_keeps_replacement_session() {
     service.remove_peer(&peer_id, new_conn_id);
     assert!(matches!(
         lifecycle.recv().await,
-        Some(HeaderSyncEvent::PeerDisconnected(disconnected)) if disconnected == peer_id
+        Some(HeaderSyncEvent::PeerDisconnected { peer, registration_id: None }) if peer == peer_id
     ));
 }
 
@@ -2331,7 +2480,10 @@ async fn peer_disconnect_removes_outstanding_requests_for_that_peer() {
 
     fixture
         .handle
-        .send(HeaderSyncEvent::PeerDisconnected(peer_id.clone()))
+        .send(HeaderSyncEvent::PeerDisconnected {
+            peer: peer_id.clone(),
+            registration_id: None,
+        })
         .await
         .unwrap();
     fixture

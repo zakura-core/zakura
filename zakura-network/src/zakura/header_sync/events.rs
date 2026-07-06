@@ -190,7 +190,18 @@ pub enum HeaderSyncEvent {
     /// A peer became available for header-sync v6.
     PeerConnected(HeaderSyncPeerSession),
     /// A peer disconnected; all of its outstanding work is dropped.
-    PeerDisconnected(ZakuraPeerId),
+    PeerDisconnected {
+        /// The disconnected peer.
+        peer: ZakuraPeerId,
+        /// Registration id of the connection whose session is tearing down, or
+        /// `None` to disconnect unconditionally.
+        ///
+        /// A `Some` id is ignored when the reactor's admitted session rides on
+        /// a different (newer) connection: duplicate arbitration replaced the
+        /// sender's connection, and its late teardown must not remove the
+        /// replacement session.
+        registration_id: Option<u64>,
+    },
     /// First-party header-sync summary observed over the authenticated discovery stream.
     AdvisoryHeaderSummary {
         /// Peer that supplied its own summary.
@@ -351,7 +362,7 @@ impl HeaderSyncEvent {
     pub(super) fn metrics_label(&self) -> &'static str {
         match self {
             Self::PeerConnected(_) => "peer_connected",
-            Self::PeerDisconnected(_) => "peer_disconnected",
+            Self::PeerDisconnected { .. } => "peer_disconnected",
             Self::AdvisoryHeaderSummary { .. } => "advisory_header_summary",
             Self::FullBlockCommitted { .. } => "full_block_committed",
             Self::NewBlockAccepted { .. } => "new_block_accepted",
@@ -362,6 +373,7 @@ impl HeaderSyncEvent {
             Self::WireDecodeFailed { .. } => "wire_decode_failed",
             Self::WireProtocolFailure { .. } => "wire_protocol_failure",
             Self::StateFrontiersChanged(_) => "state_frontiers_changed",
+            Self::BestHeaderHistoryTreeLoaded { .. } => "best_header_history_tree_loaded",
             Self::HeaderRangeCommitted { .. } => "header_range_committed",
             Self::HeaderRangeCommitFailed { .. } => "header_range_commit_failed",
             Self::HeaderRangeResponseFinished { .. } => "header_range_response_finished",

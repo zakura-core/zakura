@@ -910,17 +910,6 @@ struct ZakuraSupervisorState {
     next_registration_id: ZakuraConnId,
 }
 
-#[derive(Debug)]
-struct ZakuraPeerConnectionEntry {
-    /// Monotonic supervisor registration generation used by services to ignore
-    /// stale add/remove work from a superseded connection.
-    conn_id: ZakuraConnId,
-    outbound_handle: ZakuraPeerHandle,
-    disconnect_token: CancellationToken,
-    registered_at: Instant,
-    remote_ip: Option<IpAddr>,
-}
-
 impl ZakuraSupervisorState {
     fn increment_ip(&mut self, remote_ip: Option<IpAddr>) {
         if let Some(remote_ip) = remote_ip {
@@ -954,6 +943,27 @@ impl ZakuraSupervisorState {
 
     #[cfg(not(debug_assertions))]
     fn debug_assert_accounting(&self) {}
+}
+
+/// One authenticated peer's currently registered connection.
+///
+/// The entry is bound to a per-supervisor monotonic connection generation, so
+/// teardown ([`ZakuraSupervisorHandle::deregister`]) only removes state when the
+/// exiting connection is still the registered one. Without this guard, a
+/// displaced duplicate's late teardown would deregister the live winner.
+#[derive(Debug)]
+struct ZakuraPeerConnectionEntry {
+    /// Monotonic supervisor generation used by services to ignore stale work
+    /// from a superseded connection.
+    conn_id: ZakuraConnId,
+    outbound_handle: ZakuraPeerHandle,
+    disconnect_token: CancellationToken,
+    /// The remote IP this entry incremented in `active_by_ip`, released when
+    /// this exact entry is removed.
+    remote_ip: Option<IpAddr>,
+    /// When this connection registered, used to decide whether a duplicate may
+    /// evict a stale incumbent (see [`ZAKURA_DUPLICATE_EVICT_MIN_AGE`]).
+    registered_at: Instant,
 }
 
 /// Queue-backed outbound send handle for one authenticated Zakura peer.
@@ -1140,32 +1150,31 @@ impl ZakuraSupervisorHandle {
             ZakuraUpgradeOutcome::Upgraded { .. } => {
                 let conn_id = state.next_registration_id;
                 state.next_registration_id += 1;
-                let entry = ZakuraPeerConnectionEntry {
-                    conn_id,
-                    outbound_handle,
-                    disconnect_token,
-                    registered_at: Instant::now(),
-                    remote_ip,
-                };
-                if let Some(old_entry) = state.active_by_peer.insert(peer_id.clone(), entry) {
+                if let Some(old_entry) = state.active_by_peer.remove(&peer_id) {
                     state.decrement_ip(old_entry.remote_ip);
                     old_entry.disconnect_token.cancel();
-                    metrics::counter!("zakura.p2p.conn.duplicate.evicted_upgraded").increment(1);
+                    metrics::counter!("zakura.p2p.conn.duplicate.displaced_incumbent").increment(1);
                 }
                 state.increment_ip(remote_ip);
+                state.active_by_peer.insert(
+                    peer_id.clone(),
+                    ZakuraPeerConnectionEntry {
+                        conn_id,
+                        outbound_handle,
+                        disconnect_token: disconnect_token.clone(),
+                        registered_at: Instant::now(),
+                        remote_ip,
+                    },
+                );
                 state.debug_assert_accounting();
                 let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
                 set_active_connection_gauge(registered_ids.len());
                 self.peer_set_tx.send_replace(registered_ids);
-                let disconnect_token = state
-                    .active_by_peer
-                    .get(&peer_id)
-                    .map(|entry| entry.disconnect_token.clone())
-                    .expect("disconnect token exists because this peer was just registered");
                 ZakuraRegistration::Registered {
                     conn_id,
                     peer_id,
                     remote_ip,
+                    registration_id: conn_id,
                     disconnect_token,
                 }
             }
@@ -1206,15 +1215,21 @@ impl ZakuraSupervisorHandle {
         }
     }
 
-    async fn deregister(&self, peer_id: &ZakuraPeerId, conn_id: ZakuraConnId) {
+    /// Removes a connection's registration, but only when `conn_id` still
+    /// identifies the currently registered connection for this peer.
+    ///
+    /// Returns true when the registration was removed. A displaced connection's
+    /// late teardown returns false and leaves the winning registration (and its
+    /// per-IP slot accounting) untouched.
+    async fn deregister(&self, peer_id: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
         let mut state = self.inner.lock().await;
         let Some(entry) = state.active_by_peer.get(peer_id) else {
             state.debug_assert_accounting();
-            return;
+            return false;
         };
         if entry.conn_id != conn_id {
             state.debug_assert_accounting();
-            return;
+            return false;
         }
         let entry = state
             .active_by_peer
@@ -1226,6 +1241,7 @@ impl ZakuraSupervisorHandle {
         let registered_ids: Vec<_> = state.active_by_peer.keys().cloned().collect();
         set_active_connection_gauge(registered_ids.len());
         self.peer_set_tx.send_replace(registered_ids);
+        true
     }
 
     fn shutdown(&self) {
@@ -1263,6 +1279,7 @@ enum ZakuraRegistration {
         conn_id: ZakuraConnId,
         peer_id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
+        registration_id: u64,
         disconnect_token: CancellationToken,
     },
     Duplicate {
@@ -1427,6 +1444,10 @@ struct RegisteredConnectionServeContext {
     connection_token: CancellationToken,
     close_cause: CloseCause,
     accepted_capabilities: u64,
+    /// Supervisor registration id for this connection; teardown only
+    /// deregisters and fans out service removal while this id is still the
+    /// peer's registered connection.
+    registration_id: u64,
     /// Whether this side dialed the connection. The dialer (initiator) opens all
     /// of its demanded ordered streams as before; the responder additionally
     /// opens only block-sync (the sole symmetric service), keeping the legacy
@@ -1966,8 +1987,8 @@ impl ZakuraProtocolHandler {
             should_run_freshness_reaper(queue_split_stream_count, request_response_stream_count);
 
         if negotiated_ordered_streams.is_empty() {
-            self.registry
-                .add_peer(Peer::new_with_conn_id_and_direction_and_close_cause(
+            self.registry.add_peer(
+                Peer::new_with_conn_id_and_direction_and_close_cause(
                     conn_id,
                     peer_id.clone(),
                     remote_ip,
@@ -1976,7 +1997,9 @@ impl ZakuraProtocolHandler {
                     HashMap::new(),
                     connection_token.clone(),
                     close_cause.clone(),
-                ));
+                )
+                .with_registration_id(context.registration_id),
+            );
             cleanup_guard.add_admitted_capabilities(accepted_capabilities);
         } else if !connection_token.is_cancelled() {
             let mut opened_capabilities = 0;
@@ -2025,18 +2048,19 @@ impl ZakuraProtocolHandler {
                 // Escalation is already narrowed to opened ordered services.
                 // Disconnect fanout still uses the registry's returned admitted
                 // mask, not this peer context.
-                let admitted_capabilities =
-                    self.registry
-                        .add_escalated_peer(Peer::new_with_service_streams(
-                            conn_id,
-                            peer_id.clone(),
-                            remote_ip,
-                            opened_capabilities,
-                            context.direction,
-                            std::mem::take(&mut service_streams),
-                            connection_token.clone(),
-                            close_cause.clone(),
-                        ));
+                let admitted_capabilities = self.registry.add_escalated_peer(
+                    Peer::new_with_service_streams(
+                        conn_id,
+                        peer_id.clone(),
+                        remote_ip,
+                        opened_capabilities,
+                        context.direction,
+                        std::mem::take(&mut service_streams),
+                        connection_token.clone(),
+                        close_cause.clone(),
+                    )
+                    .with_registration_id(context.registration_id),
+                );
                 cleanup_guard.add_admitted_capabilities(admitted_capabilities);
             }
         }
@@ -2197,7 +2221,8 @@ impl ZakuraProtocolHandler {
                                         service_streams,
                                         connection_token.clone(),
                                         close_cause.clone(),
-                                    ),
+                                    )
+                                    .with_registration_id(context.registration_id),
                                 );
                                 cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                             }
@@ -2611,6 +2636,7 @@ impl ZakuraProtocolHandler {
                 conn_id,
                 peer_id,
                 remote_ip,
+                registration_id,
                 disconnect_token,
             } => {
                 metrics::counter!("zakura.p2p.conn.accepted", "role" => context.role).increment(1);
@@ -2641,6 +2667,7 @@ impl ZakuraProtocolHandler {
                         connection_token: disconnect_token,
                         close_cause,
                         accepted_capabilities: context.accepted_capabilities,
+                        registration_id,
                         is_initiator: context.role == "initiator",
                         i_open_collision_winner: context.i_open_collision_winner,
                         direction: context.direction,
@@ -6447,6 +6474,222 @@ mod tests {
             !incumbent2.is_cancelled(),
             "a different-IP duplicate keeps the long gate and does not evict a young incumbent",
         );
+
+        Ok(())
+    }
+
+    async fn register_with_transcript(
+        supervisor: &ZakuraSupervisorHandle,
+        peer: &ZakuraPeerId,
+        ip: IpAddr,
+        transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
+        token: CancellationToken,
+    ) -> ZakuraRegistration {
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let outbound_handle = ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx);
+        supervisor
+            .register(
+                test_conn_id(),
+                peer.clone(),
+                Some(ip),
+                transcript_hash,
+                outbound_handle,
+                token,
+                ZAKURA_CAP_LEGACY_GOSSIP | ZAKURA_CAP_HEADER_SYNC,
+            )
+            .await
+    }
+
+    // A duplicate connection whose transcript hash wins arbitration (`Upgraded`)
+    // replaces the incumbent registration. The displaced incumbent must be
+    // cancelled and release its per-IP slot immediately, and its later teardown
+    // (bound to the old registration id) must not deregister the winner.
+    #[tokio::test]
+    async fn winning_duplicate_displaces_incumbent_and_stale_teardown_is_ignored(
+    ) -> Result<(), BoxError> {
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let ip: IpAddr = "203.0.113.21".parse().expect("test ip parses");
+        let peer = test_peer(21);
+
+        // The incumbent registers with the larger transcript hash, so a
+        // cross-direction duplicate can win arbitration against it.
+        let incumbent_token = CancellationToken::new();
+        let ZakuraRegistration::Registered {
+            registration_id: incumbent_id,
+            ..
+        } = register_with_transcript(&supervisor, &peer, ip, [2; 32], incumbent_token.clone())
+            .await
+        else {
+            panic!("the incumbent registers");
+        };
+
+        // The duplicate with the strictly smaller transcript hash upgrades and
+        // must displace the incumbent: cancel it and take over its per-IP slot.
+        let winner_token = CancellationToken::new();
+        let ZakuraRegistration::Registered {
+            registration_id: winner_id,
+            ..
+        } = register_with_transcript(&supervisor, &peer, ip, [1; 32], winner_token.clone()).await
+        else {
+            panic!("the winning duplicate registers");
+        };
+        assert_ne!(incumbent_id, winner_id);
+        assert!(
+            incumbent_token.is_cancelled(),
+            "the displaced incumbent's connection must be cancelled so it stops serving",
+        );
+        assert!(!winner_token.is_cancelled());
+        assert_eq!(supervisor.registered_ids().await, vec![peer.clone()]);
+        assert!(
+            !supervisor.can_accept_remote_ip_with_in_flight(ip, 0).await,
+            "the winner holds exactly the one per-IP slot at cap 1",
+        );
+
+        // The displaced incumbent's late teardown carries the old registration
+        // id and must leave the winner's registration and per-IP slot intact.
+        assert!(
+            !supervisor.deregister(&peer, incumbent_id).await,
+            "a displaced connection's teardown must not deregister the winner",
+        );
+        assert_eq!(supervisor.registered_ids().await, vec![peer.clone()]);
+        assert!(
+            !supervisor.can_accept_remote_ip_with_in_flight(ip, 0).await,
+            "a stale teardown must not release the winner's per-IP slot",
+        );
+
+        // The winner's own teardown deregisters normally and frees the slot.
+        assert!(supervisor.deregister(&peer, winner_id).await);
+        assert!(supervisor.registered_ids().await.is_empty());
+        assert!(
+            supervisor.can_accept_remote_ip_with_in_flight(ip, 0).await,
+            "the per-IP slot is free once the current registration deregisters",
+        );
+
+        Ok(())
+    }
+
+    // A winning duplicate can arrive from a different IP than the incumbent
+    // (e.g. a redial after the peer's address changed). Displacement must move
+    // the per-IP slot: the incumbent's IP frees immediately, the winner's IP is
+    // charged, and the incumbent's stale teardown must not touch either count.
+    #[tokio::test]
+    async fn winning_duplicate_across_ips_moves_per_ip_slot() -> Result<(), BoxError> {
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let old_ip: IpAddr = "203.0.113.31".parse().expect("test ip parses");
+        let new_ip: IpAddr = "203.0.113.32".parse().expect("test ip parses");
+        let peer = test_peer(31);
+
+        let incumbent_token = CancellationToken::new();
+        let ZakuraRegistration::Registered {
+            registration_id: incumbent_id,
+            ..
+        } = register_with_transcript(&supervisor, &peer, old_ip, [2; 32], incumbent_token.clone())
+            .await
+        else {
+            panic!("the incumbent registers");
+        };
+        assert!(
+            !supervisor
+                .can_accept_remote_ip_with_in_flight(old_ip, 0)
+                .await
+        );
+
+        let winner_token = CancellationToken::new();
+        let ZakuraRegistration::Registered {
+            registration_id: winner_id,
+            ..
+        } = register_with_transcript(&supervisor, &peer, new_ip, [1; 32], winner_token.clone())
+            .await
+        else {
+            panic!("the winning duplicate registers");
+        };
+        assert!(
+            supervisor
+                .can_accept_remote_ip_with_in_flight(old_ip, 0)
+                .await,
+            "displacement must free the incumbent's per-IP slot immediately",
+        );
+        assert!(
+            !supervisor
+                .can_accept_remote_ip_with_in_flight(new_ip, 0)
+                .await,
+            "the winner is charged against its own IP",
+        );
+
+        // The stale teardown carries the incumbent's old IP implicitly through
+        // its registration id; it must not decrement the winner's IP count.
+        assert!(!supervisor.deregister(&peer, incumbent_id).await);
+        assert!(
+            supervisor
+                .can_accept_remote_ip_with_in_flight(old_ip, 0)
+                .await
+        );
+        assert!(
+            !supervisor
+                .can_accept_remote_ip_with_in_flight(new_ip, 0)
+                .await,
+            "a stale teardown must not release the winner's per-IP slot",
+        );
+
+        assert!(supervisor.deregister(&peer, winner_id).await);
+        assert!(
+            supervisor
+                .can_accept_remote_ip_with_in_flight(new_ip, 0)
+                .await
+        );
+
+        Ok(())
+    }
+
+    // After displacement, supervisor-facing APIs must operate on the winner's
+    // entry: `disconnect_peer` cancels the winner's token, and the peer-set
+    // watch publishes no change for a stale teardown.
+    #[tokio::test]
+    async fn supervisor_apis_track_winner_after_displacement() -> Result<(), BoxError> {
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let ip: IpAddr = "203.0.113.41".parse().expect("test ip parses");
+        let peer = test_peer(41);
+        let mut peer_set = supervisor.subscribe();
+
+        let incumbent_token = CancellationToken::new();
+        let ZakuraRegistration::Registered {
+            registration_id: incumbent_id,
+            ..
+        } = register_with_transcript(&supervisor, &peer, ip, [2; 32], incumbent_token.clone())
+            .await
+        else {
+            panic!("the incumbent registers");
+        };
+        let winner_token = CancellationToken::new();
+        let ZakuraRegistration::Registered {
+            registration_id: winner_id,
+            ..
+        } = register_with_transcript(&supervisor, &peer, ip, [1; 32], winner_token.clone()).await
+        else {
+            panic!("the winning duplicate registers");
+        };
+
+        // Mark the registration-time peer-set updates as seen, then verify a
+        // stale teardown publishes nothing: the registered set did not change.
+        peer_set.borrow_and_update();
+        assert!(!supervisor.deregister(&peer, incumbent_id).await);
+        assert!(
+            !peer_set.has_changed()?,
+            "a stale teardown must not publish a peer-set change",
+        );
+
+        // `disconnect_peer` must target the winner's (current) connection.
+        assert!(!winner_token.is_cancelled());
+        assert!(supervisor.disconnect_peer(&peer).await);
+        assert!(
+            winner_token.is_cancelled(),
+            "disconnect_peer cancels the currently registered connection",
+        );
+
+        // The winner's teardown publishes the now-empty peer set.
+        assert!(supervisor.deregister(&peer, winner_id).await);
+        assert!(peer_set.has_changed()?);
+        assert!(peer_set.borrow_and_update().is_empty());
 
         Ok(())
     }

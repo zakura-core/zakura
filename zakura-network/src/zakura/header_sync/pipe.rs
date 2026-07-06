@@ -416,7 +416,10 @@ mod tests {
     fn saturated_events_handle() -> (HeaderSyncHandle, mpsc::Receiver<HeaderSyncEvent>) {
         let (events, events_rx) = mpsc::channel(1);
         events
-            .try_send(HeaderSyncEvent::PeerDisconnected(peer()))
+            .try_send(HeaderSyncEvent::PeerDisconnected {
+                peer: peer(),
+                registration_id: None,
+            })
             .expect("the single events slot is free");
         let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
         let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));

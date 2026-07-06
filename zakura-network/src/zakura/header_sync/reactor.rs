@@ -151,7 +151,10 @@ impl HeaderSyncReactor {
     async fn handle_event_inner(&mut self, event: HeaderSyncEvent) {
         match event {
             HeaderSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
-            HeaderSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),
+            HeaderSyncEvent::PeerDisconnected {
+                peer,
+                registration_id,
+            } => self.handle_peer_disconnected(peer, registration_id),
             HeaderSyncEvent::AdvisoryHeaderSummary { peer, summary } => {
                 self.handle_advisory_header_summary(peer, summary)
             }
@@ -495,7 +498,24 @@ impl HeaderSyncReactor {
         self.schedule().await;
     }
 
-    fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId) {
+    fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId, registration_id: Option<u64>) {
+        // A session-scoped disconnect from a connection that duplicate
+        // arbitration already displaced must not remove the winning
+        // connection's admitted session.
+        if let (Some(event_registration_id), Some(peer_state)) =
+            (registration_id, self.state.peers.get(&peer))
+        {
+            if peer_state.session.registration_id() != event_registration_id {
+                tracing::debug!(
+                    ?peer,
+                    event_registration_id,
+                    current_registration_id = peer_state.session.registration_id(),
+                    "ignoring stale header-sync disconnect from a displaced connection"
+                );
+                return;
+            }
+        }
+
         let was_connected = self.state.peers.remove(&peer).is_some();
         self.state.parked_peers.remove(&peer);
         self.state.advisory.remove(&peer);
@@ -1978,7 +1998,7 @@ impl HeaderSyncReactor {
                 insert_optional_str(row, hs_trace::KIND, Some("peer_connected"));
                 insert_peer(row, hs_trace::PEER, session.peer_id());
             }
-            HeaderSyncEvent::PeerDisconnected(peer) => {
+            HeaderSyncEvent::PeerDisconnected { peer, .. } => {
                 insert_optional_str(row, hs_trace::KIND, Some("peer_disconnected"));
                 insert_peer(row, hs_trace::PEER, peer);
             }

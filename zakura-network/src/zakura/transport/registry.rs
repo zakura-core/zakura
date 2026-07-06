@@ -304,6 +304,7 @@ impl ServiceRegistry {
 
     /// Fan a newly connected peer out to every service enabled by its negotiated capabilities.
     pub fn add_peer(&self, peer: Peer) {
+        let registration_id = peer.registration_id;
         let (
             peer_id,
             conn_id,
@@ -331,17 +332,20 @@ impl ServiceRegistry {
                 .map(|stream| stream.cancel_token.clone())
                 .unwrap_or_else(|| cancel_token.child_token());
 
-            service.add_peer(Peer::new_with_service_cancel_token(
-                conn_id,
-                peer_id.clone(),
-                remote_ip,
-                negotiated,
-                direction,
-                service_streams,
-                cancel_token.clone(),
-                service_cancel_token,
-                close_cause.clone(),
-            ));
+            service.add_peer(
+                Peer::new_with_service_cancel_token(
+                    conn_id,
+                    peer_id.clone(),
+                    remote_ip,
+                    negotiated,
+                    direction,
+                    service_streams,
+                    cancel_token.clone(),
+                    service_cancel_token,
+                    close_cause.clone(),
+                )
+                .with_registration_id(registration_id),
+            );
         }
     }
 
@@ -350,6 +354,7 @@ impl ServiceRegistry {
     /// Returns the capability mask for services that received a peer session, so
     /// disconnect fanout can be limited to reactors that were actually reached.
     pub fn add_escalated_peer(&self, peer: Peer) -> u64 {
+        let registration_id = peer.registration_id;
         let (
             peer_id,
             conn_id,
@@ -384,17 +389,20 @@ impl ServiceRegistry {
                 .map(|stream| stream.cancel_token.clone())
                 .unwrap_or_else(|| cancel_token.child_token());
 
-            service.add_peer(Peer::new_with_service_cancel_token(
-                conn_id,
-                peer_id.clone(),
-                remote_ip,
-                negotiated,
-                direction,
-                service_streams,
-                cancel_token.clone(),
-                service_cancel_token,
-                close_cause.clone(),
-            ));
+            service.add_peer(
+                Peer::new_with_service_cancel_token(
+                    conn_id,
+                    peer_id.clone(),
+                    remote_ip,
+                    negotiated,
+                    direction,
+                    service_streams,
+                    cancel_token.clone(),
+                    service_cancel_token,
+                    close_cause.clone(),
+                )
+                .with_registration_id(registration_id),
+            );
         }
 
         admitted_capabilities
@@ -424,6 +432,7 @@ mod tests {
         wants: Mutex<bool>,
         added: Mutex<Vec<ZakuraPeerId>>,
         added_streams: Mutex<Vec<Vec<u16>>>,
+        added_registration_ids: Mutex<Vec<u64>>,
         removed: Mutex<Vec<ZakuraPeerId>>,
     }
 
@@ -435,6 +444,7 @@ mod tests {
                 wants: Mutex::new(true),
                 added: Mutex::new(Vec::new()),
                 added_streams: Mutex::new(Vec::new()),
+                added_registration_ids: Mutex::new(Vec::new()),
                 removed: Mutex::new(Vec::new()),
             })
         }
@@ -469,6 +479,10 @@ mod tests {
         }
 
         fn add_peer(&self, peer: Peer) {
+            self.added_registration_ids
+                .lock()
+                .expect("test service registration id list should not be poisoned")
+                .push(peer.registration_id);
             let (
                 peer_id,
                 _conn_id,
@@ -798,6 +812,43 @@ mod tests {
                 .expect("test mutex should not be poisoned")
                 .as_slice(),
             &[peer]
+        );
+    }
+
+    // Duplicate arbitration relies on every service seeing the supervisor
+    // registration id of the connection a session rides on, so both fanout
+    // paths must copy it onto the per-service `Peer`.
+    #[test]
+    fn add_peer_and_escalated_peer_propagate_registration_id() {
+        let header = TestService::new("header", vec![stream(5, 0b0001)]);
+        let registry = ServiceRegistry::new(vec![header.clone()]).expect("stream kinds are unique");
+        let peer = ZakuraPeerId::new(vec![13; 32]).expect("32-byte test peer id is valid");
+
+        registry.add_peer(
+            Peer::new(
+                peer.clone(),
+                None,
+                0b0001,
+                HashMap::new(),
+                CancellationToken::new(),
+            )
+            .with_registration_id(7),
+        );
+
+        let (send_5, recv_5) = framed_channel(1);
+        let streams = HashMap::from([(5, (recv_5, send_5))]);
+        registry.add_escalated_peer(
+            Peer::new(peer, None, 0b0001, streams, CancellationToken::new())
+                .with_registration_id(8),
+        );
+
+        assert_eq!(
+            header
+                .added_registration_ids
+                .lock()
+                .expect("test mutex should not be poisoned")
+                .as_slice(),
+            &[7, 8],
         );
     }
 }

@@ -282,7 +282,14 @@ async fn fuzz_reliability_discounts_dropping_carrier() {
     let mut fast = PeerSpec::fast(2, half);
     fast.servable_high = half;
 
-    let mut scenario = Scenario::new(blocks, 0x57ea_00c0, retry_config(), vec![dropping, fast]);
+    let config = ZakuraBlockSyncConfig {
+        // Keep the short floor-rescue leash from `retry_config`, but give CI coverage
+        // builds enough no-progress liveness slack to avoid parking the only upper-half
+        // carrier during a deterministic cluster of drops.
+        request_timeout: Duration::from_secs(4),
+        ..retry_config()
+    };
+    let mut scenario = Scenario::new(blocks, 0x57ea_00c0, config, vec![dropping, fast]);
     scenario.deadline = Duration::from_secs(90);
     let (_, report) =
         run_checked("fuzz_reliability_discounts_dropping_carrier", scenario, 32).await;

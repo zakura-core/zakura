@@ -2214,11 +2214,13 @@ async fn rootless_non_empty_response_retries_without_misbehavior() {
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
     let first_checkpoint = block::Height(3);
     let start = block::Height(4);
-    let mut fixture = spawn_test_reactor(startup_for(
+    let mut startup = startup_for(
         network.clone(),
         (block::Height(0), network.genesis_hash()),
         Some((first_checkpoint, checkpoint_hash)),
-    ));
+    );
+    startup.request_timeout = std::time::Duration::from_millis(20);
+    let mut fixture = spawn_test_reactor(startup);
     let peer_id = peer(8);
 
     connect_peer(&fixture, peer_id.clone()).await;
@@ -2247,7 +2249,17 @@ async fn rootless_non_empty_response_retries_without_misbehavior() {
         .await
         .unwrap();
 
-    // The range must be retried (a fresh `GetHeaders` for the same start height), with no
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(5),
+            next_non_query_action(&mut fixture.actions)
+        )
+        .await
+        .is_err(),
+        "rootless unusable responses must not retry immediately"
+    );
+
+    // The range must be retried after the short unusable-response backoff, with no
     // commit and no misbehavior along the way.
     loop {
         match next_non_query_action(&mut fixture.actions).await {

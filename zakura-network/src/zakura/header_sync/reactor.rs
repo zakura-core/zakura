@@ -1195,8 +1195,8 @@ impl HeaderSyncReactor {
         // Tree-aux roots are an optional serving capability: a peer may legitimately have no
         // roots for a root-carrying request (it can never serve the root for its own tip, and
         // may not persist roots at all). A completely rootless non-empty response is therefore
-        // not misbehavior — the headers are unusable for this root-carrying range, so drop them,
-        // release the request, and retry the range without scoring the peer.
+        // not misbehavior — the headers are unusable for this root-carrying range, so drop them
+        // and retry the range after the same short backoff as an empty response.
         if outstanding.range.want_tree_aux_roots && !headers.is_empty() && tree_aux_roots.is_empty()
         {
             metrics::counter!("sync.header.response.rootless").increment(1);
@@ -1211,9 +1211,7 @@ impl HeaderSyncReactor {
                 outstanding.range.want_tree_aux_roots,
                 0,
             );
-            self.state.schedule.clear_assignment(outstanding.range);
-            self.state.schedule.retry(outstanding.range);
-            self.schedule().await;
+            self.delay_unusable_response_retry(&peer, outstanding);
             return;
         }
 
@@ -1239,7 +1237,6 @@ impl HeaderSyncReactor {
 
         if headers.is_empty() {
             self.record_advisory_unconfirmed(&peer);
-            let deadline = Instant::now() + self.empty_headers_retry_delay();
             self.trace_headers_received(
                 &peer,
                 outstanding.range.start_height,
@@ -1250,13 +1247,7 @@ impl HeaderSyncReactor {
                 outstanding.range.want_tree_aux_roots,
                 u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX),
             );
-            if let Some(peer_state) = self.state.peers.get_mut(&peer) {
-                peer_state.outstanding.push(OutstandingRange {
-                    deadline,
-                    clear_assignment_on_timeout: true,
-                    ..outstanding
-                });
-            }
+            self.delay_unusable_response_retry(&peer, outstanding);
             return;
         }
 
@@ -1641,6 +1632,21 @@ impl HeaderSyncReactor {
 
     fn empty_headers_retry_delay(&self) -> Duration {
         self.startup.request_timeout.min(EMPTY_HEADERS_RETRY_DELAY)
+    }
+
+    fn delay_unusable_response_retry(
+        &mut self,
+        peer: &ZakuraPeerId,
+        outstanding: OutstandingRange,
+    ) {
+        let deadline = Instant::now() + self.empty_headers_retry_delay();
+        if let Some(peer_state) = self.state.peers.get_mut(peer) {
+            peer_state.outstanding.push(OutstandingRange {
+                deadline,
+                clear_assignment_on_timeout: true,
+                ..outstanding
+            });
+        }
     }
 
     async fn schedule(&mut self) {

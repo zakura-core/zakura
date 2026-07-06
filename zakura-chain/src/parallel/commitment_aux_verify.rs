@@ -203,7 +203,7 @@ pub fn header_commitment_is_valid_for_chain_history(
         | Commitment::FinalSaplingRoot(_)
         | Commitment::ChainHistoryActivationReserved => Ok(()),
         Commitment::ChainHistoryRoot(actual_history_tree_root) => {
-            // Heartwood through NU6_2 commits directly to the parent history
+            // Heartwood through Canopy commits directly to the parent history
             // tree root, so the current header confirms the roots that were
             // folded into `history_tree` before this block.
             let history_tree_root = history_tree
@@ -220,7 +220,7 @@ pub fn header_commitment_is_valid_for_chain_history(
             }
         }
         Commitment::ChainHistoryBlockTxAuthCommitment(actual_hash_block_commitments) => {
-            // NU6_3 onward commits to both the parent history tree root and
+            // NU5 onward commits to both the parent history tree root and
             // this block's auth data root. That still preserves the one-block
             // lag for supplied note commitment roots: `history_tree` is the
             // parent tree, while `auth_data_root` belongs to the current

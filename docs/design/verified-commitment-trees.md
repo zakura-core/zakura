@@ -732,9 +732,11 @@ commitment before it influences the anchor set or the history MMR.** Consequence
   verification, the one-block overlap, and the in-memory header-frontier tree now run only while the
   frontier is below the last checkpoint (the VCT handoff height, the only region the roots are
   consumed); at/above it header sync runs plainly (§6.4). Because that region is checkpoint-final and
-  gossip-free, the tree advances only by fold-on-commit and never needs a live reload, so the
-  reorg/gossip/catch-up tree-reload machinery (a `QueryBestHeaderHistoryTree` action, its
-  `BestHeaderHistoryTreeLoaded` reply, and the reactor's reload dispatches) is **removed**. The
+  gossip-free, the normal Zakura path advances the tree by fold-on-commit. The
+  `QueryBestHeaderHistoryTree` / `BestHeaderHistoryTreeLoaded` reload path remains as a guarded
+  fallback when checkpoint, legacy, or gossip-driven commits move the durable body frontier ahead of
+  the header-frontier tree below the checkpoint; it rebuilds from durable roots, reanchors if the
+  rebuilt frontier stops at a gap, and stays idle during ordinary header-leading sync. The
   reanchor/follow-verified-tip scheduling is kept but gated to fire only at/above the checkpoint.
 - **Increment 7 — indexing follower lane (archive only).** Relocate `tx_by_loc` + address
   indexes and the per-height trees + subtree CFs onto an async follower, so archive mode regains

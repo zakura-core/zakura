@@ -66,6 +66,8 @@ pub mod block_iter;
 pub mod chain_tip;
 pub mod watch_receiver;
 
+const BEST_HEADER_HISTORY_TREE_REBUILD_LOG_INTERVAL: u32 = 100_000;
+
 pub mod check;
 
 pub(crate) mod finalized_state;
@@ -1724,6 +1726,23 @@ where
     } else {
         verified_block_tip
     };
+    let total_to_fold = mmr_tree_height_target
+        .0
+        .saturating_sub(verified_block_tip.0);
+    let started_at = Instant::now();
+    let mut next_progress_log = verified_block_tip
+        .0
+        .saturating_add(BEST_HEADER_HISTORY_TREE_REBUILD_LOG_INTERVAL);
+
+    if total_to_fold > 0 {
+        tracing::info!(
+            ?verified_block_tip,
+            ?best_header_tip,
+            target = ?mmr_tree_height_target,
+            total_to_fold,
+            "rebuilding Zakura best header history tree from durable roots"
+        );
+    }
 
     let mut tree = (*base_tree).clone();
     let mut next = verified_block_tip
@@ -1763,6 +1782,28 @@ where
                         "failed to fold header-tip history tree at {height:?}: {error}"
                     ))
                 })?;
+
+            if total_to_fold >= BEST_HEADER_HISTORY_TREE_REBUILD_LOG_INTERVAL {
+                let (frontier_height, _frontier_hash) = reconstructed_frontier
+                    .expect("frontier exists because at least one header was folded");
+                if frontier_height.0 >= next_progress_log
+                    || frontier_height == mmr_tree_height_target
+                {
+                    tracing::info!(
+                        ?verified_block_tip,
+                        ?best_header_tip,
+                        frontier = ?frontier_height,
+                        target = ?mmr_tree_height_target,
+                        folded = frontier_height.0.saturating_sub(verified_block_tip.0),
+                        total_to_fold,
+                        elapsed = ?started_at.elapsed(),
+                        "rebuilding Zakura best header history tree"
+                    );
+                    next_progress_log = frontier_height
+                        .0
+                        .saturating_add(BEST_HEADER_HISTORY_TREE_REBUILD_LOG_INTERVAL);
+                }
+            }
         }
 
         // `count` is capped at `MAX_HEADER_SYNC_HEIGHT_RANGE`.
@@ -1795,6 +1836,20 @@ where
             (verified_block_tip, base_hash)
         }
     };
+
+    if total_to_fold > 0 {
+        tracing::info!(
+            ?verified_block_tip,
+            ?best_header_tip,
+            frontier = ?frontier.0,
+            target = ?mmr_tree_height_target,
+            folded = frontier.0.0.saturating_sub(verified_block_tip.0),
+            total_to_fold,
+            elapsed = ?started_at.elapsed(),
+            complete = frontier.0 == mmr_tree_height_target,
+            "rebuilt Zakura best header history tree from durable roots"
+        );
+    }
 
     Ok((Arc::new(tree), frontier))
 }

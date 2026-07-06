@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `AT_OR_NEAR_TIP_THRESHOLD` and [`ChainTip::is_at_or_near_network_tip()`] for
+  determining whether the node is within 5 blocks of the estimated network tip.
 - `ValueBalance` now has an Ironwood value-pool slot, with
   `from_ironwood_amount`, `ironwood_amount`, and
   `set_ironwood_value_balance` helpers.

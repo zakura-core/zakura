@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed legacy peers being disconnected for returning empty `FindBlocks` or
+  `FindHeaders` responses when Zebra is at or near the network tip.
 - Kept an already-active mempool and `getblocktemplate` mining RPCs running
   when the legacy sync status temporarily reports Zebra is far from the tip.
   Initial mempool activation still waits until Zebra is within 100 blocks of

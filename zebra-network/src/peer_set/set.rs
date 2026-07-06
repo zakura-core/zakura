@@ -943,10 +943,15 @@ where
                 .take_ready_service(&p2c_key)
                 .expect("selected peer must be ready");
 
-            let track_stalls = matches!(
+            let is_find_request = matches!(
                 &req,
                 Request::FindBlocks { .. } | Request::FindHeaders { .. }
             );
+            let track_stalls = is_find_request
+                && !self
+                    .minimum_peer_version
+                    .chain_tip()
+                    .is_at_or_near_network_tip(&self.network);
 
             let fut = svc.call(req);
             self.push_unready(p2c_key, svc);

@@ -29,6 +29,7 @@ use tracing::{span, Level, Span};
 use tracing_futures::Instrument;
 
 use zebra_chain::{
+    block,
     chain_tip::{ChainTip, NoChainTip},
     parameters::Network,
     serialization::{DateTime32, SerializationError},
@@ -741,6 +742,11 @@ where
         }
     };
 
+    let start_height = minimum_peer_version
+        .chain_tip()
+        .best_tip_height()
+        .unwrap_or(block::Height(0));
+
     let our_version = VersionMessage {
         version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         services: our_services,
@@ -750,7 +756,7 @@ where
         address_from: AddrInVersion::new(our_listen_addr, our_services),
         nonce: local_nonce,
         user_agent: user_agent.clone(),
-        start_height: minimum_peer_version.chain_tip_height(),
+        start_height,
         relay,
     };
 

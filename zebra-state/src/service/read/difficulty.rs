@@ -37,6 +37,12 @@ use crate::{
 /// This is a Zebra-specific standard rule.
 pub const EXTRA_TIME_TO_MINE_A_BLOCK: u32 = POST_BLOSSOM_POW_TARGET_SPACING * 2;
 
+fn finalized_state_query_interrupted_error() -> BoxError {
+    "Zebra is committing too many blocks to the state, \
+     wait until it syncs to the chain tip"
+        .into()
+}
+
 /// Returns the [`GetBlockTemplateChainInfo`] for the current best chain.
 ///
 /// # Panics
@@ -174,20 +180,13 @@ fn best_relevant_chain_and_history_tree(
         db,
         state_tip_before_queries.into(),
     )
-    .ok_or_else(|| {
-        BoxError::from(
-            "Zebra is committing blocks to the state, \
-             wait until it syncs to the chain tip",
-        )
-    })?;
+    .ok_or_else(finalized_state_query_interrupted_error)?;
 
     let state_tip_after_queries =
         read::best_tip(non_finalized_state, db).expect("already checked for an empty tip");
 
     if state_tip_before_queries != state_tip_after_queries {
-        return Err("Zebra is committing too many blocks to the state, \
-                    wait until it syncs to the chain tip"
-            .into());
+        return Err(finalized_state_query_interrupted_error());
     }
 
     Ok((

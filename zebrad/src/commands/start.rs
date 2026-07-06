@@ -3809,7 +3809,6 @@ mod zakura_header_sync_driver_tests {
             "post-fallback submissions must not call the verifier"
         );
 
-
         // Inspect Zakura commit-state traces.
         capture.flush().await;
         let reader = capture.reader().unwrap();

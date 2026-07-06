@@ -10,7 +10,7 @@
 //!
 //! Check transparent address indexes, UTXOs, etc.
 
-use std::{iter, path::Path, sync::Arc};
+use std::{iter, sync::Arc};
 
 use super::super::RetentionPlan;
 use zebra_chain::{
@@ -37,6 +37,10 @@ use zebra_chain::{
 };
 use zebra_test::vectors::{MAINNET_BLOCKS, TESTNET_BLOCKS};
 
+use super::common::{
+    commit_header_range, mainnet_block, no_extra_checkpoint_test_network, persistent_config,
+    persistent_state, root_at, state_with_genesis_config, write_full_block_header_and_transactions,
+};
 use crate::{
     constants::{
         state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT,
@@ -1210,47 +1214,6 @@ fn state_with_genesis_and_zakura_seed(network: &Network, genesis: Arc<Block>) ->
     state_with_genesis_config(network, genesis, config)
 }
 
-fn state_with_genesis_config(network: &Network, genesis: Arc<Block>, config: Config) -> ZebraDb {
-    let state = ZebraDb::new(
-        &config,
-        STATE_DATABASE_KIND,
-        &state_database_format_version_in_code(),
-        network,
-        true,
-        STATE_COLUMN_FAMILIES_IN_CODE
-            .iter()
-            .map(ToString::to_string),
-        false,
-    );
-
-    write_full_block_header_and_transactions(&state, genesis.clone());
-
-    state
-}
-
-fn persistent_config(cache_dir: &Path) -> Config {
-    Config {
-        cache_dir: cache_dir.to_owned(),
-        ephemeral: false,
-        debug_skip_non_finalized_state_backup_task: true,
-        ..Config::default()
-    }
-}
-
-fn persistent_state(config: &Config, network: &Network) -> ZebraDb {
-    ZebraDb::new(
-        config,
-        STATE_DATABASE_KIND,
-        &state_database_format_version_in_code(),
-        network,
-        true,
-        STATE_COLUMN_FAMILIES_IN_CODE
-            .iter()
-            .map(ToString::to_string),
-        false,
-    )
-}
-
 fn checkpoint_test_network(genesis_hash: block::Hash, checkpoint_hash: block::Hash) -> Network {
     testnet::Parameters::build()
         .with_network_name("HeaderCheckpointTest")
@@ -1272,34 +1235,6 @@ fn checkpoint_test_network(genesis_hash: block::Hash, checkpoint_hash: block::Ha
         .expect("test checkpoints are valid")
         .to_network()
         .expect("test network is valid")
-}
-
-fn no_extra_checkpoint_test_network(genesis_hash: block::Hash) -> Network {
-    testnet::Parameters::build()
-        .with_network_name("HeaderReorgTest")
-        .expect("test network name is valid")
-        .with_genesis_hash(genesis_hash)
-        .expect("test genesis hash is valid")
-        .with_target_difficulty_limit(Mainnet.target_difficulty_limit())
-        .expect("mainnet difficulty limit is valid for test network")
-        .with_activation_heights(testnet::ConfiguredActivationHeights {
-            canopy: Some(1),
-            ..Default::default()
-        })
-        .expect("test activation heights are valid")
-        .clear_funding_streams()
-        .clear_checkpoints()
-        .expect("genesis-only checkpoints are valid")
-        .to_network()
-        .expect("test network is valid")
-}
-
-fn mainnet_block(height: u32) -> Arc<Block> {
-    MAINNET_BLOCKS
-        .get(&height)
-        .expect("test vector exists")
-        .zcash_deserialize_into::<Arc<Block>>()
-        .expect("mainnet test block deserializes")
 }
 
 fn synthetic_headers_from_state(
@@ -1364,19 +1299,6 @@ fn alternate_header(
     Arc::new(header)
 }
 
-fn root_at(height: Height) -> BlockCommitmentRoots {
-    BlockCommitmentRoots {
-        height,
-        sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
-        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-        ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-        sapling_tx: 0,
-        orchard_tx: 0,
-        ironwood_tx: 0,
-        auth_data_root: zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
-    }
-}
-
 fn write_full_block(state: &mut ZebraDb, block: Arc<Block>) {
     let checkpoint_verified = CheckpointVerifiedBlock::from(block);
     let finalized =
@@ -1392,34 +1314,6 @@ fn write_full_block(state: &mut ZebraDb, block: Arc<Block>) {
             Default::default(),
         )
         .expect("block commit succeeds");
-}
-
-fn commit_header_range(
-    state: &ZebraDb,
-    anchor: block::Hash,
-    headers: &[Arc<block::Header>],
-) -> block::Hash {
-    let mut batch = DiskWriteBatch::new();
-    let body_sizes = vec![0; headers.len()];
-    let committed_hash = batch
-        .prepare_header_range_batch(state, anchor, headers, &body_sizes)
-        .expect("header range is valid");
-    state
-        .write_batch(batch)
-        .expect("header range batch writes successfully");
-    committed_hash
-}
-
-fn write_full_block_header_and_transactions(state: &ZebraDb, block: Arc<Block>) {
-    let checkpoint_verified = CheckpointVerifiedBlock::from(block);
-    let finalized =
-        FinalizedBlock::from_checkpoint_verified(checkpoint_verified, Treestate::default());
-
-    let mut batch = DiskWriteBatch::new();
-    batch
-        .prepare_block_header_and_transaction_data_batch(state, &finalized, true, None)
-        .expect("full block header and transaction batch is valid");
-    state.db.write(batch).expect("full block batch writes");
 }
 
 fn test_block_db_round_trip_with(

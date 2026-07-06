@@ -35,6 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed dual-stack nodes (`v2_p2p` and `legacy_p2p` both enabled) permanently
+  shutting down their own Zakura header- and block-sync drivers when a legacy
+  peer on a foreign fork answered the body-sync stall watchdog's cross-check
+  probe. The probe counted peer-offered block hashes that were missing from
+  our state as "blocks ahead" without checking they extend our chain, so a
+  canonical-network peer connected to a fork node tripped the fallback
+  threshold while the node was exactly at its own network tip. The probe now
+  requests headers and only counts a run that anchors at a block we already
+  have and links parent-to-parent; each probe decision is logged. Also added
+  header-sync reactor liveness metrics (`sync.header.reactor.iterations`,
+  per-event `started`/`finished` counters) and a loud log if the reactor loop
+  ever exits, since a stopped reactor previously left no trace at default log
+  levels.
 - Fixed healthy but quiet Zakura connections being closed by the application
   idle reaper every idle window. The reaper only counts inbound application
   messages and the periodic header-sync status refresh suppressed unchanged

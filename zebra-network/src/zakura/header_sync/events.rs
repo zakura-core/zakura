@@ -267,6 +267,29 @@ pub enum HeaderSyncEvent {
     },
 }
 
+impl HeaderSyncEvent {
+    /// Low-cardinality variant label for reactor liveness metrics.
+    pub(super) fn metrics_label(&self) -> &'static str {
+        match self {
+            Self::PeerConnected(_) => "peer_connected",
+            Self::PeerDisconnected(_) => "peer_disconnected",
+            Self::AdvisoryHeaderSummary { .. } => "advisory_header_summary",
+            Self::FullBlockCommitted { .. } => "full_block_committed",
+            Self::NewBlockAccepted { .. } => "new_block_accepted",
+            Self::NewBlockDuplicate { .. } => "new_block_duplicate",
+            Self::NewBlockRejected { .. } => "new_block_rejected",
+            Self::WireMessage { .. } => "wire_message",
+            Self::WireDecodeFailed { .. } => "wire_decode_failed",
+            Self::WireProtocolFailure { .. } => "wire_protocol_failure",
+            Self::StateFrontiersChanged(_) => "state_frontiers_changed",
+            Self::HeaderRangeCommitted { .. } => "header_range_committed",
+            Self::HeaderRangeCommitFailed { .. } => "header_range_commit_failed",
+            Self::HeaderRangeResponseFinished { .. } => "header_range_response_finished",
+            Self::HeaderRangeResponseReady { .. } => "header_range_response_ready",
+        }
+    }
+}
+
 /// Actions emitted by the header-sync reactor for the eventual node wiring.
 #[derive(Clone, Debug)]
 pub enum HeaderSyncAction {

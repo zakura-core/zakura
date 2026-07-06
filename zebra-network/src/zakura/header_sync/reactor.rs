@@ -79,20 +79,28 @@ impl HeaderSyncReactor {
         }
 
         let mut ticks = time::interval(self.empty_headers_retry_delay());
+        let exit_reason;
         loop {
+            // Liveness watermark: a frozen reactor is otherwise invisible (the
+            // process, transport, and other services keep running). Exposing the
+            // loop count lets an external watcher detect a stall in seconds.
+            metrics::counter!("sync.header.reactor.iterations").increment(1);
             tokio::select! {
                 biased;
                 _ = self.startup.shutdown.cancelled() => {
+                    exit_reason = "shutdown";
                     break;
                 }
                 event = self.lifecycle.recv() => {
                     let Some(event) = event else {
+                        exit_reason = "lifecycle_channel_closed";
                         break;
                     };
                     self.handle_event(event).await;
                 }
                 event = self.events.recv() => {
                     let Some(event) = event else {
+                        exit_reason = "events_channel_closed";
                         break;
                     };
                     self.handle_event(event).await;
@@ -115,15 +123,31 @@ impl HeaderSyncReactor {
                     }
                 }
                 _ = ticks.tick() => {
+                    metrics::counter!("sync.header.reactor.event_started", "kind" => "tick").increment(1);
                     self.handle_timeouts().await;
                     self.refresh_statuses();
+                    metrics::counter!("sync.header.reactor.event_finished", "kind" => "tick").increment(1);
                 }
             }
         }
+        // A reactor exit is fatal to header sync on this node but the process
+        // keeps running, so it must be loud.
+        tracing::warn!(exit_reason, "Zakura header-sync reactor exited");
+        metrics::counter!("sync.header.reactor.exited", "reason" => exit_reason).increment(1);
     }
 
     async fn handle_event(&mut self, event: HeaderSyncEvent) {
         self.trace_event_received(&event);
+        // Started/finished pairs expose which event kind an await inside
+        // `handle_event` is stuck on: after a freeze, exactly one kind shows
+        // started == finished + 1.
+        let kind = event.metrics_label();
+        metrics::counter!("sync.header.reactor.event_started", "kind" => kind).increment(1);
+        self.handle_event_inner(event).await;
+        metrics::counter!("sync.header.reactor.event_finished", "kind" => kind).increment(1);
+    }
+
+    async fn handle_event_inner(&mut self, event: HeaderSyncEvent) {
         match event {
             HeaderSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
             HeaderSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),

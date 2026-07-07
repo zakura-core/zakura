@@ -33,7 +33,7 @@ pub const TEST_ZCASHD_COMPAT: &str = "TEST_ZCASHD_COMPAT";
 // `ZebradConfig` rejects unknown fields. A `ZEBRA_`-prefixed test var would
 // make every spawned zebrad child abort at startup.
 
-/// Optional explicit path to a zcashd binary with zebra-compat support.
+/// Optional explicit path to a P2P-sidecar zcashd binary.
 /// If unset, the managed download is used in regtest mode.
 pub const TEST_ZCASHD_PATH: &str = "TEST_ZCASHD_PATH";
 
@@ -161,8 +161,8 @@ impl ZcashdRpcClient {
 
 /// Polls zcashd's `getblockcount` until it reaches `height`, up to 60 seconds.
 ///
-/// zcashd learns about newly mined blocks from zebrad via a polling worker,
-/// so tests that mine must wait for it to catch up before cross-checking.
+/// zcashd learns about newly mined blocks from zebrad over legacy P2P block
+/// gossip, so tests that mine must wait for it to catch up before cross-checking.
 pub async fn wait_for_zcashd_height(client: &ZcashdRpcClient, height: u64) -> Result<()> {
     let mut last_seen = None;
     for _ in 0..60u32 {
@@ -197,29 +197,6 @@ pub async fn setup_zcashd_compat() -> Result<Option<launch::ZcashdCompatSetup>> 
 
     match config::read_test_network_kind()? {
         NetworkKind::Regtest => launch::spawn_zebrad_with_zcashd_compat().await.map(Some),
-        kind => launch::connect_to_external_zcashd_compat(kind)
-            .await
-            .map(Some),
-    }
-}
-
-/// Sets up the zcashd-compat test environment with managed-regtest options.
-///
-/// Options are only applied in managed regtest mode. External mainnet/testnet
-/// validation connects to existing processes and ignores them.
-pub async fn setup_zcashd_compat_with_options(
-    options: config::ZcashdCompatTestOptions,
-) -> Result<Option<launch::ZcashdCompatSetup>> {
-    if zebra_skip_zcashd_compat_tests() {
-        return Ok(None);
-    }
-
-    use zebra_chain::parameters::NetworkKind;
-
-    match config::read_test_network_kind()? {
-        NetworkKind::Regtest => launch::spawn_zebrad_with_zcashd_compat_with_options(options)
-            .await
-            .map(Some),
         kind => launch::connect_to_external_zcashd_compat(kind)
             .await
             .map(Some),

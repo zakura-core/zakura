@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
@@ -30,16 +31,9 @@ pub struct SupervisorConfig {
     pub zcashd_path: PathBuf,
     /// Datadir for `zcashd`.
     pub zcashd_datadir: PathBuf,
-    /// RPC URL passed to `-zebra-compat-url`.
-    pub rpc_url: String,
-    /// Cookie file path passed to `-zebra-compat-cookiefile`.
-    pub cookie_path: PathBuf,
-    /// Whether supervised zcashd should authenticate to Zebra using the cookie file.
-    pub enable_cookie_auth: bool,
-    /// Optional CA file passed to zcashd for Zebra TLS verification.
-    pub tls_ca_file: Option<PathBuf>,
-    /// Zebra RPC response body limit passed to zcashd for startup validation.
-    pub zebra_rpc_max_response_body_size: usize,
+    /// Zebra's legacy P2P listen address, passed to zcashd as `-connect` so the
+    /// sidecar peers only with the local Zebra node.
+    pub zebra_p2p_addr: SocketAddr,
     /// Any extra user-provided arguments.
     pub extra_args: Vec<String>,
     /// Active Zebra network kind.
@@ -63,9 +57,7 @@ impl SupervisorConfig {
         zcashd_path: PathBuf,
         state_cache_dir: &Path,
         network: NetworkKind,
-        rpc_url: String,
-        cookie_path: PathBuf,
-        zebra_rpc_max_response_body_size: usize,
+        zebra_p2p_addr: SocketAddr,
     ) -> Self {
         let extra_args = zcashd_compat.zcashd_extra_args.clone();
         let zcashd_datadir = resolve_zcashd_datadir_path(
@@ -76,11 +68,7 @@ impl SupervisorConfig {
         Self {
             zcashd_path,
             zcashd_datadir,
-            rpc_url,
-            cookie_path,
-            enable_cookie_auth: zcashd_compat.enable_cookie_auth,
-            tls_ca_file: zcashd_compat.tls_ca_file.clone(),
-            zebra_rpc_max_response_body_size,
+            zebra_p2p_addr,
             extra_args,
             network,
             startup_delay: zcashd_compat.startup_delay,
@@ -93,46 +81,22 @@ impl SupervisorConfig {
 
     /// Builds the zcashd command-line arguments.
     pub fn command_args(&self) -> Vec<String> {
-        let mut args = vec![
-            "-zebra-compat".to_string(),
-            format!("-zebra-compat-url={}", self.rpc_url),
-            format!(
-                "-zebra-compat-zebra-rpc-max-response-body-bytes={}",
-                self.zebra_rpc_max_response_body_size
-            ),
-            format!("-datadir={}", self.zcashd_datadir.to_string_lossy()),
-        ];
-        if self.enable_cookie_auth {
-            args.push(format!(
-                "-zebra-compat-cookiefile={}",
-                self.cookie_path.to_string_lossy()
-            ));
-        } else {
-            args.push("-zebra-compat-no-auth=1".to_string());
-        }
-        if let Some(tls_ca_file) = &self.tls_ca_file {
-            args.push(format!(
-                "-zebra-compat-tls-ca-file={}",
-                tls_ca_file.to_string_lossy()
-            ));
-        }
+        let mut args = vec![format!(
+            "-datadir={}",
+            self.zcashd_datadir.to_string_lossy()
+        )];
 
         match self.network {
             NetworkKind::Mainnet => {}
             NetworkKind::Testnet => args.push("-testnet".to_string()),
-            NetworkKind::Regtest => args.push("-regtest".to_string()),
+            NetworkKind::Regtest => {
+                args.push("-regtest".to_string());
+                // Zebra skips proof-of-work on regtest, so its mined blocks
+                // carry null Equihash solutions that stock zcashd validation
+                // would reject with a peer ban.
+                args.push("-regtestacceptunvalidatedpow".to_string());
+            }
         }
-
-        // In compat mode zebrad owns P2P. zcashd must not listen on the network
-        // port (8233 mainnet / 18233 testnet). Operators often reuse a legacy
-        // full-node zcash.conf with listen=1, and CLI args are parsed before
-        // zcash.conf without being overwritten by it — so pass these explicitly
-        // as defense in depth. zcashd also force-disables P2P boolean flags
-        // when -zebra-compat is set, including later extra_args such as -p2p=1.
-        // Peer-selection extra_args are still rejected by zcashd startup
-        // validation rather than silently taking effect.
-        args.push("-p2p=0".to_string());
-        args.push("-listen=0".to_string());
 
         // Always include -printtoconsole and filter it out from extra_args
         args.push("-printtoconsole".to_string());
@@ -142,8 +106,59 @@ impl SupervisorConfig {
                 .filter(|arg| arg.as_str() != "-printtoconsole")
                 .cloned(),
         );
+
+        // zcashd peers only with the local Zebra node: `-connect` pins the
+        // single outbound peer, and zcashd itself then soft-disables DNS
+        // seeding, inbound listening, and discovery. The explicit flags are
+        // defense in depth against operator zcash.conf values. They come after
+        // extra_args because zcashd takes the *last* occurrence of a
+        // single-valued command-line argument. Multi-valued peer-selection
+        // options (-connect/-addnode/-seednode) accumulate instead, so
+        // [`reject_peer_selection_extra_args`] refuses them at startup.
+        args.push(format!("-connect={}", self.zebra_p2p_addr));
+        args.push("-listen=0".to_string());
+        args.push("-dnsseed=0".to_string());
+        args.push("-listenonion=0".to_string());
+        args.push("-discover=0".to_string());
+
         args
     }
+}
+
+/// zcashd options that add P2P peers and accumulate across the command line,
+/// so the supervisor's own `-connect` cannot override them.
+const PEER_SELECTION_OPTIONS: &[&str] = &["connect", "addnode", "seednode"];
+
+/// Rejects `zcashd_extra_args` entries that would change which peers the
+/// supervised zcashd talks to.
+///
+/// The P2P sidecar must connect only to the local Zebra node. Unlike
+/// single-valued boolean flags, every `-connect`/`-addnode`/`-seednode`
+/// occurrence adds a peer, and negated forms (`-noconnect`) clobber the
+/// supervisor's pinned `-connect`, so both are refused instead of overridden.
+///
+/// # Errors
+///
+/// Returns an error naming the first offending argument.
+pub fn reject_peer_selection_extra_args(extra_args: &[String]) -> Result<(), Report> {
+    for arg in extra_args {
+        let name = arg
+            .trim_start_matches('-')
+            .split('=')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let name = name.strip_prefix("no").unwrap_or(&name);
+
+        if PEER_SELECTION_OPTIONS.contains(&name) {
+            return Err(eyre!(
+                "zcashd_compat.zcashd_extra_args contains {arg:?}: peer-selection options are not \
+                 allowed because the zcashd P2P sidecar must connect only to the local Zebra node"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Runs the zcashd-compat zcashd supervisor until shutdown.
@@ -161,6 +176,7 @@ pub async fn run(
     config: SupervisorConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), Report> {
+    reject_peer_selection_extra_args(&config.extra_args)?;
     ensure_zcashd_datadir(&config.zcashd_datadir, &config.extra_args)?;
     set_supervision_active_metrics();
 
@@ -206,8 +222,7 @@ pub async fn run(
         info!(
             path = %config.zcashd_path.display(),
             datadir = %config.zcashd_datadir.display(),
-            rpc_url = %config.rpc_url,
-            cookie = %config.cookie_path.display(),
+            connect = %config.zebra_p2p_addr,
             "started zcashd-compat zcashd child"
         );
 
@@ -628,89 +643,84 @@ mod tests {
     use zebra_chain::parameters::NetworkKind;
 
     use super::{
-        restart_backoff_delay, should_reset_restart_count, wait_for_delay_or_shutdown,
-        SupervisorConfig,
+        reject_peer_selection_extra_args, restart_backoff_delay, should_reset_restart_count,
+        wait_for_delay_or_shutdown, SupervisorConfig,
     };
 
-    #[test]
-    fn command_args_include_zcashd_compat_flags() {
-        let config = SupervisorConfig {
+    fn test_supervisor_config(extra_args: Vec<String>) -> SupervisorConfig {
+        SupervisorConfig {
             zcashd_path: PathBuf::from("zcashd"),
             zcashd_datadir: PathBuf::from("/tmp/zcashd-compat-datadir"),
-            rpc_url: "http://127.0.0.1:8232".to_string(),
-            cookie_path: PathBuf::from("/tmp/.cookie"),
-            enable_cookie_auth: true,
-            tls_ca_file: None,
-            zebra_rpc_max_response_body_size: 128 * 1024 * 1024,
-            extra_args: vec!["-debug=1".to_string()],
+            zebra_p2p_addr: "127.0.0.1:18233".parse().expect("valid socket address"),
+            extra_args,
             network: NetworkKind::Regtest,
             startup_delay: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(2),
             restart_backoff_max: Duration::from_secs(5 * 60),
             restart_reset_after: Duration::from_secs(60 * 60),
             shutdown_grace_period: Duration::from_secs(300),
-        };
+        }
+    }
+
+    #[test]
+    fn command_args_pin_zcashd_to_zebra_p2p() {
+        let config = test_supervisor_config(vec!["-debug=1".to_string()]);
 
         let args = config.command_args();
 
-        assert!(args.contains(&"-zebra-compat".to_string()));
+        assert!(args.contains(&"-datadir=/tmp/zcashd-compat-datadir".to_string()));
         assert!(args.contains(&"-regtest".to_string()));
-        assert!(args
-            .iter()
-            .any(|a| a.starts_with("-zebra-compat-url=http://127.0.0.1:8232")));
-        assert!(args
-            .iter()
-            .any(|a| a.starts_with("-zebra-compat-cookiefile=/tmp/.cookie")));
-        assert!(args
-            .iter()
-            .any(|a| a == "-zebra-compat-zebra-rpc-max-response-body-bytes=134217728"));
-        assert!(args.contains(&"-p2p=0".to_string()));
+        assert!(args.contains(&"-regtestacceptunvalidatedpow".to_string()));
+        assert!(args.contains(&"-connect=127.0.0.1:18233".to_string()));
         assert!(args.contains(&"-listen=0".to_string()));
+        assert!(args.contains(&"-dnsseed=0".to_string()));
+        assert!(args.contains(&"-listenonion=0".to_string()));
+        assert!(args.contains(&"-discover=0".to_string()));
         assert!(args.contains(&"-printtoconsole".to_string()));
         assert!(args.contains(&"-debug=1".to_string()));
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("-zebra-compat")),
+            "P2P sidecar must not pass RPC-ingest flags: {args:?}"
+        );
 
-        let p2p_idx = args
-            .iter()
-            .position(|a| a == "-p2p=0")
-            .expect("p2p override present");
-        let listen_idx = args
-            .iter()
-            .position(|a| a == "-listen=0")
-            .expect("listen override present");
+        // zcashd takes the last occurrence of a single-valued argument, so the
+        // forced P2P pinning flags must come after operator extra_args.
         let debug_idx = args
             .iter()
             .position(|a| a == "-debug=1")
             .expect("extra arg present");
-        assert!(p2p_idx < debug_idx);
-        assert!(listen_idx < debug_idx);
+        for forced in ["-listen=0", "-dnsseed=0", "-listenonion=0", "-discover=0"] {
+            let forced_idx = args
+                .iter()
+                .position(|a| a == forced)
+                .expect("forced flag present");
+            assert!(
+                forced_idx > debug_idx,
+                "{forced} must come after extra_args"
+            );
+        }
     }
 
     #[test]
-    fn command_args_use_explicit_no_auth_flag_when_cookie_auth_disabled() {
-        let config = SupervisorConfig {
-            zcashd_path: PathBuf::from("zcashd"),
-            zcashd_datadir: PathBuf::from("/tmp/zcashd-compat-datadir"),
-            rpc_url: "https://127.0.0.1:8232".to_string(),
-            cookie_path: PathBuf::from("/tmp/.cookie"),
-            enable_cookie_auth: false,
-            tls_ca_file: Some(PathBuf::from("/tmp/ca.pem")),
-            zebra_rpc_max_response_body_size: 128 * 1024 * 1024,
-            extra_args: Vec::new(),
-            network: NetworkKind::Regtest,
-            startup_delay: Duration::from_secs(1),
-            restart_backoff: Duration::from_secs(2),
-            restart_backoff_max: Duration::from_secs(5 * 60),
-            restart_reset_after: Duration::from_secs(60 * 60),
-            shutdown_grace_period: Duration::from_secs(300),
-        };
+    fn peer_selection_extra_args_are_rejected() {
+        for arg in [
+            "-connect=1.2.3.4:8233",
+            "--connect=1.2.3.4",
+            "-addnode=1.2.3.4",
+            "-seednode=1.2.3.4",
+            "-noconnect",
+            "-CONNECT=1.2.3.4",
+        ] {
+            let _rejected = reject_peer_selection_extra_args(&[arg.to_string()])
+                .expect_err("peer-selection extra args must be rejected");
+        }
 
-        let args = config.command_args();
-
-        assert!(args.contains(&"-zebra-compat-no-auth=1".to_string()));
-        assert!(args.contains(&"-zebra-compat-tls-ca-file=/tmp/ca.pem".to_string()));
-        assert!(!args
-            .iter()
-            .any(|arg| arg.starts_with("-zebra-compat-cookiefile=")));
+        reject_peer_selection_extra_args(&[
+            "-debug=1".to_string(),
+            "-rpcport=18232".to_string(),
+            "-maxconnections=8".to_string(),
+        ])
+        .expect("non-peer-selection extra args are allowed");
     }
 
     #[test]

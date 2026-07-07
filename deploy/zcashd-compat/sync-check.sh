@@ -8,7 +8,7 @@ ZCASHD_RPC_URL="${ZCASHD_RPC_URL:-http://[::1]:8232}"
 ZCASHD_COOKIE_FILE="${ZCASHD_COOKIE_FILE:-/mnt/snapshots/runtime/zcashd/.cookie}"
 
 ZEBRAD_PROCESS_PATTERN="${ZEBRAD_PROCESS_PATTERN:-zebrad .*--zcashd-compat}"
-ZCASHD_PROCESS_PATTERN="${ZCASHD_PROCESS_PATTERN:-zcashd .*-zebra-compat}"
+ZCASHD_PROCESS_PATTERN="${ZCASHD_PROCESS_PATTERN:-zcashd .*-connect}"
 
 HEIGHT_MAX_DRIFT="${HEIGHT_MAX_DRIFT:-10}"
 SYNC_CHECK_TIMEOUT="${SYNC_CHECK_TIMEOUT:-600}"
@@ -43,35 +43,6 @@ print(data["result"])
 '
 }
 
-compat_info_ready() {
-    python3 -c '
-import json
-import sys
-
-data = json.load(sys.stdin)
-if data.get("error") is not None:
-    raise SystemExit("RPC error: {}".format(data["error"]))
-
-result = data["result"]
-zebra = result.get("zebra", {})
-ready = (
-    result.get("service_state") == "ready"
-    and zebra.get("reachable") is True
-    and zebra.get("identity_verified") is True
-)
-
-print(
-    "service_state={service_state} zebra.reachable={reachable} "
-    "zebra.identity_verified={identity_verified}".format(
-        service_state=result.get("service_state"),
-        reachable=zebra.get("reachable"),
-        identity_verified=zebra.get("identity_verified"),
-    )
-)
-raise SystemExit(0 if ready else 1)
-'
-}
-
 require_uint() {
     local name="$1"
     local value="$2"
@@ -85,7 +56,7 @@ require_uint() {
 check_once() {
     local zebra_height
     local zcashd_height
-    local compat_response
+    local zcashd_peers
     local drift
 
     echo "Checking zebrad process..."
@@ -102,13 +73,14 @@ check_once() {
     fi
     echo "zcashd process: OK"
 
-    echo "Checking zcashd zebra-compat status..."
-    if ! compat_response="$(json_rpc "$ZCASHD_RPC_URL" "$ZCASHD_COOKIE_FILE" getzebracompatinfo)"; then
-        echo "zcashd getzebracompatinfo RPC failed"
+    echo "Checking zcashd peer pinning..."
+    if ! zcashd_peers="$(json_rpc "$ZCASHD_RPC_URL" "$ZCASHD_COOKIE_FILE" getconnectioncount | json_result)"; then
+        echo "zcashd getconnectioncount RPC failed"
         return 1
     fi
-    if ! printf '%s' "$compat_response" | compat_info_ready; then
-        echo "zcashd zebra-compat status is not ready"
+    echo "zcashd connections: $zcashd_peers"
+    if [[ "$zcashd_peers" != "1" ]]; then
+        echo "sidecar zcashd must peer with exactly one node (Zebra), got $zcashd_peers"
         return 1
     fi
 

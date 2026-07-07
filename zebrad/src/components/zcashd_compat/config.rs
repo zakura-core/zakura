@@ -59,9 +59,20 @@ pub struct Config {
     #[serde(default, deserialize_with = "deserialize_zcashd_extra_args")]
     pub zcashd_extra_args: Vec<String>,
 
-    /// Dedicated RPC listen address used by `zcashd -zebra-compat`.
+    /// The Zebra legacy P2P address supervised zcashd connects to via `-connect`.
+    ///
+    /// If unset, Zebra derives it from its own bound legacy P2P listener
+    /// (`network.listen_addr`), substituting `127.0.0.1` when the listener is
+    /// bound to an unspecified address. Set this only when zcashd must reach
+    /// Zebra through a different address, such as across containers.
+    pub p2p_connect_addr: Option<SocketAddr>,
+
+    /// Listen address for the dedicated zcashd-compat Zebra RPC listener.
     ///
     /// If unset, zcashd-compat startup defaults it to `127.0.0.1:28232`.
+    ///
+    /// This listener is retained for operator tooling; the P2P sidecar zcashd
+    /// no longer uses it to ingest chain data.
     ///
     /// Backward compatibility: this field also accepts the legacy `rpc_url` key and env var.
     #[serde(
@@ -96,7 +107,10 @@ pub struct Config {
     /// TLS private key for the dedicated zcashd-compat RPC listener.
     pub tls_key_file: Option<PathBuf>,
 
-    /// CA certificate file passed to supervised zcashd so it can verify Zebra's TLS certificate.
+    /// CA certificate file for the dedicated zcashd-compat RPC listener's clients.
+    ///
+    /// Unused by the P2P sidecar: supervised zcashd syncs over P2P and is not
+    /// given this file. The field is kept so existing configs still parse.
     pub tls_ca_file: Option<PathBuf>,
 
     /// Allow a non-loopback zcashd-compat RPC listener without TLS.
@@ -147,6 +161,7 @@ impl Default for Config {
             zcashd_path: None,
             zcashd_datadir: None,
             zcashd_extra_args: Vec::new(),
+            p2p_connect_addr: None,
             listen_addr: None,
             cookie_dir: default_cache_dir(),
             cookie_file_name: default_cookie_file_name(),

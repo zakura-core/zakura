@@ -23,6 +23,10 @@ ZEBRA_STATE_CACHE_DIR ?= /mnt/data/zebra-state
 ZCASHD_DATADIR ?= /mnt/data/zcashd-mainnet
 ZCASHD_CONF ?= $(ZCASHD_DATADIR)/zcash.conf
 ZCASHD_EXTRA_ARGS ?= -printtoconsole
+# Zebra's legacy P2P listener; standalone zcashd pins its single peer to it.
+ZEBRA_P2P_ADDR ?= 127.0.0.1:8233
+# Dedicated zcashd-compat Zebra RPC listener (operator tooling only; the P2P
+# sidecar zcashd does not use it).
 ZCASHD_ZEBRA_RPC_URL ?= http://127.0.0.1:28232
 
 ZEBRA_COOKIE_DIR ?= $(ZEBRA_STATE_CACHE_DIR)
@@ -121,14 +125,16 @@ compat-zebrad-start-unsupervised:
 	"$(ZEBRAD_BIN)" start --zcashd-compat
 
 compat-zcashd-start-standalone:
-	@echo "Starting zcashd -zebra-compat as a standalone process..."
+	@echo "Starting zcashd as a standalone P2P sidecar of Zebra..."
 	"$(ZCASHD_BIN)" \
-		-zebra-compat \
-		-zebra-compat-url="$(ZCASHD_ZEBRA_RPC_URL)" \
-		-zebra-compat-cookiefile="$(ZEBRA_COOKIE_FILE)" \
 		-datadir="$(ZCASHD_DATADIR)" \
 		-conf="$(ZCASHD_CONF)" \
-		$(ZCASHD_EXTRA_ARGS)
+		$(ZCASHD_EXTRA_ARGS) \
+		-connect="$(ZEBRA_P2P_ADDR)" \
+		-listen=0 \
+		-dnsseed=0 \
+		-listenonion=0 \
+		-discover=0
 
 compat-zebrad-status:
 	@echo "Checking zebrad process..."
@@ -151,14 +157,18 @@ compat-zebrad-status:
 
 compat-zcashd-status:
 	@echo "Checking zcashd process..."
-	@if pgrep -f "zcashd.*-zebra-compat" >/dev/null; then \
+	@if pgrep -f "zcashd.*-connect" >/dev/null; then \
 		echo "zcashd process: OK"; \
 	else \
 		echo "zcashd process: NOT RUNNING"; \
 		exit 1; \
 	fi
-	@echo "Checking zcashd zebra-compat status..."
-	@"$(ZCASH_CLI_BIN)" -conf="$(ZCASHD_CONF)" -datadir="$(ZCASHD_DATADIR)" getzebracompatinfo >/dev/null
+	@echo "Checking zcashd peer pinning..."
+	@peers="$$( "$(ZCASH_CLI_BIN)" -conf="$(ZCASHD_CONF)" -datadir="$(ZCASHD_DATADIR)" getconnectioncount )"; \
+		echo "zcashd connections: $$peers (expected: 1, the Zebra node)"; \
+		if [ "$$peers" != "1" ]; then \
+			echo "WARNING: sidecar zcashd should have exactly one peer"; \
+		fi
 	@zcashd_height="$$( "$(ZCASH_CLI_BIN)" -conf="$(ZCASHD_CONF)" -datadir="$(ZCASHD_DATADIR)" getblockcount )"; \
 		echo "zcashd height: $$zcashd_height"
 

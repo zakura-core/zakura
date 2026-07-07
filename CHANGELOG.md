@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Added `network.default_p2p = true`, which follows Zebra's binary P2P defaults
+  during upgrades and ignores `network.legacy_p2p` and `network.v2_p2p`: legacy
+  P2P is on for Mainnet, Testnet, and Regtest; Zakura P2P v2 is off on Mainnet
+  and on for Testnet and Regtest. Set `network.default_p2p = false` only when
+  both stack flags should be fixed manual overrides.
 - Verified-commitment-trees fast sync is now enabled by default when checkpoint
   sync is enabled. Operators can keep checkpoint sync but opt out of the new
   path by setting `consensus.vct_fast_sync = false`.

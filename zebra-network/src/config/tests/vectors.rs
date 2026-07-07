@@ -99,6 +99,8 @@ fn testnet_params_serialization_roundtrip() {
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
+    config.legacy_p2p = true;
+    config.v2_p2p = true;
     config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
@@ -163,29 +165,66 @@ fn identity_dir_defaults_and_roundtrips() {
 }
 
 #[test]
-fn p2p_protocol_flags_default_on_and_roundtrip() {
+fn p2p_protocol_flags_default_by_network_and_roundtrip() {
     let _init_guard = zebra_test::init();
 
-    assert!(Config::default().v2_p2p);
+    assert!(Config::default().default_p2p);
+    assert!(!Config::default().v2_p2p);
     assert!(Config::default().legacy_p2p);
     assert_eq!(
         Config::default().zakura.bootstrap_peers,
         default_zakura_bootstrap_peers()
     );
 
-    let config: Config = toml::from_str(
+    let mainnet_config: Config = toml::from_str("network = 'Mainnet'").unwrap();
+    assert!(!mainnet_config.v2_p2p);
+    assert!(mainnet_config.legacy_p2p);
+
+    let testnet_config: Config = toml::from_str("network = 'Testnet'").unwrap();
+    assert!(testnet_config.default_p2p);
+    assert!(testnet_config.v2_p2p);
+    assert!(testnet_config.legacy_p2p);
+
+    let regtest_config: Config = toml::from_str("network = 'Regtest'").unwrap();
+    assert!(regtest_config.v2_p2p);
+    assert!(regtest_config.legacy_p2p);
+
+    let default_testnet_config: Config = toml::from_str(
         r#"
+        network = 'Testnet'
+        v2_p2p = "default"
+        "#,
+    )
+    .unwrap();
+    assert!(default_testnet_config.v2_p2p);
+
+    let explicit_testnet_config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+        default_p2p = false
         v2_p2p = false
         legacy_p2p = false
         "#,
     )
     .unwrap();
-    assert!(!config.v2_p2p);
-    assert!(!config.legacy_p2p);
+    assert!(!explicit_testnet_config.v2_p2p);
+    assert!(!explicit_testnet_config.legacy_p2p);
+
+    let config: Config = toml::from_str(
+        r#"
+        default_p2p = false
+        v2_p2p = true
+        legacy_p2p = true
+        "#,
+    )
+    .unwrap();
+    assert!(config.v2_p2p);
+    assert!(config.legacy_p2p);
 
     let serialized = toml::to_string(&config).unwrap();
-    assert!(serialized.contains("v2_p2p = false"));
-    assert!(serialized.contains("legacy_p2p = false"));
+    assert!(serialized.contains("default_p2p = false"));
+    assert!(serialized.contains("v2_p2p = true"));
+    assert!(serialized.contains("legacy_p2p = true"));
 
     let deserialized: Config = toml::from_str(&serialized).unwrap();
     assert_eq!(config, deserialized);
@@ -322,10 +361,101 @@ fn zakura_dev_network_defaults_off_and_roundtrips() {
 fn p2p_v2_old_enable_config_alias_still_parses() {
     let _init_guard = zebra_test::init();
 
-    let config: Config = toml::from_str("enable_p2p_v2 = false").unwrap();
+    let config: Config = toml::from_str("default_p2p = false\nenable_p2p_v2 = false").unwrap();
 
+    assert!(!config.default_p2p);
     assert!(!config.v2_p2p);
     assert!(config.legacy_p2p);
+}
+
+#[test]
+fn p2p_v2_default_config_value_follows_network_defaults() {
+    let _init_guard = zebra_test::init();
+
+    let mainnet_config: Config = toml::from_str(
+        r#"
+        network = "Mainnet"
+        v2_p2p = "default"
+        "#,
+    )
+    .unwrap();
+    assert!(!mainnet_config.v2_p2p);
+
+    let testnet_config: Config = toml::from_str(
+        r#"
+        network = "Testnet"
+        v2_p2p = "default"
+        "#,
+    )
+    .unwrap();
+    assert!(testnet_config.v2_p2p);
+
+    let invalid = toml::from_str::<Config>("v2_p2p = 'enabled'")
+        .expect_err("only true, false, and default are valid v2_p2p values");
+    assert!(
+        invalid.to_string().contains("expected true, false, or"),
+        "unexpected invalid v2_p2p error: {invalid}",
+    );
+}
+
+#[test]
+fn default_p2p_overrides_user_p2p_flags_for_upgrades() {
+    let _init_guard = zebra_test::init();
+
+    let mainnet_config: Config = toml::from_str(
+        r#"
+        network = "Mainnet"
+        default_p2p = true
+        legacy_p2p = false
+        v2_p2p = true
+        "#,
+    )
+    .unwrap();
+    assert!(mainnet_config.default_p2p);
+    assert!(mainnet_config.legacy_p2p);
+    assert!(!mainnet_config.v2_p2p);
+
+    let testnet_config: Config = toml::from_str(
+        r#"
+        network = "Testnet"
+        default_p2p = true
+        legacy_p2p = false
+        v2_p2p = false
+        "#,
+    )
+    .unwrap();
+    assert!(testnet_config.legacy_p2p);
+    assert!(testnet_config.v2_p2p);
+
+    let regtest_config: Config = toml::from_str(
+        r#"
+        network = "Regtest"
+        default_p2p = true
+        legacy_p2p = false
+        v2_p2p = false
+        "#,
+    )
+    .unwrap();
+    assert!(regtest_config.legacy_p2p);
+    assert!(regtest_config.v2_p2p);
+}
+
+#[test]
+fn default_p2p_false_preserves_user_p2p_flags() {
+    let _init_guard = zebra_test::init();
+
+    let manual_mainnet_config: Config = toml::from_str(
+        r#"
+        network = "Mainnet"
+        default_p2p = false
+        legacy_p2p = false
+        v2_p2p = true
+        "#,
+    )
+    .unwrap();
+    assert!(!manual_mainnet_config.default_p2p);
+    assert!(!manual_mainnet_config.legacy_p2p);
+    assert!(manual_mainnet_config.v2_p2p);
 }
 
 #[test]
@@ -334,6 +464,7 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
 
     let config: Config = toml::from_str(
         r#"
+        network = "Testnet"
         listen_addr = "127.0.0.1:8233"
         peerset_initial_target_size = 25
         "#,
@@ -345,7 +476,7 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
     assert!(config.legacy_p2p);
     assert_eq!(
         config.zakura.bootstrap_peers,
-        default_zakura_bootstrap_peers()
+        default_testnet_zakura_bootstrap_peers()
     );
     assert!(config.zakura.max_connections > 0);
     assert_eq!(
@@ -423,6 +554,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
     let config: Config = toml::from_str(
         r#"
+        default_p2p = false
         v2_p2p = true
         legacy_p2p = true
 
@@ -449,6 +581,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     .unwrap();
 
     let serialized = toml::to_string(&config).unwrap();
+    assert!(serialized.contains("default_p2p = false"));
     assert!(serialized.contains("v2_p2p = true"));
     assert!(serialized.contains("legacy_p2p = true"));
     assert!(serialized.contains("[zakura]"));
@@ -531,6 +664,7 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
 
     let config: Config = toml::from_str(
         r#"
+        default_p2p = false
         v2_p2p = true
 
         [zakura]
@@ -588,6 +722,8 @@ fn funding_streams_serialization_roundtrip() {
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
+    config.legacy_p2p = true;
+    config.v2_p2p = true;
     config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
@@ -612,6 +748,8 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
+    config.legacy_p2p = true;
+    config.v2_p2p = true;
     config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
@@ -722,6 +860,7 @@ fn zakura_secret_key_honors_configured_key_and_disabled_cache() {
     let disabled = Config {
         cache_dir: CacheDir::disabled(),
         zakura_node_secret_key: None,
+        default_p2p: false,
         v2_p2p: true,
         ..Config::default()
     };

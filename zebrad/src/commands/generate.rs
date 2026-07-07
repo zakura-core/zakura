@@ -73,7 +73,8 @@ impl Runnable for GenerateCmd {
         // this avoids a ValueAfterTable error
         // https://github.com/alexcrichton/toml-rs/issues/145
         let conf = toml::Value::try_from(default_config).unwrap();
-        output += &toml::to_string_pretty(&conf).expect("default config should be serializable");
+        let conf = toml::to_string_pretty(&conf).expect("default config should be serializable");
+        output += &document_network_p2p_config(&conf);
         match self.output_file {
             Some(ref output_file) => {
                 use std::{fs::File, io::Write};
@@ -87,4 +88,74 @@ impl Runnable for GenerateCmd {
             }
         }
     }
+}
+
+fn document_network_p2p_config(config: &str) -> String {
+    let had_trailing_newline = config.ends_with('\n');
+    let mut lines = config.lines().map(ToString::to_string).collect::<Vec<_>>();
+
+    let Some(network_start) = lines.iter().position(|line| line == "[network]") else {
+        return config.to_string();
+    };
+    let mut network_end = lines
+        .iter()
+        .enumerate()
+        .skip(network_start + 1)
+        .find_map(|(index, line)| line.starts_with('[').then_some(index))
+        .unwrap_or(lines.len());
+
+    let Some(v2_p2p_index) = lines[network_start + 1..network_end]
+        .iter()
+        .position(|line| line.starts_with("v2_p2p = "))
+        .map(|index| index + network_start + 1)
+    else {
+        return config.to_string();
+    };
+
+    let Some(default_p2p_index) = lines[network_start + 1..network_end]
+        .iter()
+        .position(|line| line.starts_with("default_p2p = "))
+        .map(|index| index + network_start + 1)
+    else {
+        return config.to_string();
+    };
+
+    let default_p2p_line = lines[default_p2p_index].clone();
+    let v2_p2p_line = lines[v2_p2p_index].clone();
+    let mut p2p_indexes = [default_p2p_index, v2_p2p_index];
+    p2p_indexes.sort();
+
+    for index in p2p_indexes.into_iter().rev() {
+        lines.remove(index);
+        network_end -= 1;
+    }
+
+    let Some(legacy_p2p_index) = lines[network_start + 1..network_end]
+        .iter()
+        .position(|line| line.starts_with("legacy_p2p = "))
+        .map(|index| index + network_start + 1)
+    else {
+        return config.to_string();
+    };
+
+    let comments = [
+        "# P2P stack selection:",
+        "# - default_p2p = true ignores legacy_p2p and v2_p2p, using Zebra's binary defaults.",
+        "# - default_p2p = false makes legacy_p2p and v2_p2p manual overrides.",
+        "# Defaults: Mainnet legacy on/v2 off; Testnet and Regtest legacy on/v2 on.",
+    ]
+    .map(ToString::to_string);
+    let comments_len = comments.len();
+
+    lines.splice(legacy_p2p_index..legacy_p2p_index, comments);
+    let default_p2p_insert_index = legacy_p2p_index + comments_len;
+    lines.insert(default_p2p_insert_index, default_p2p_line);
+    let v2_p2p_insert_index = default_p2p_insert_index + 1;
+    lines.insert(v2_p2p_insert_index, v2_p2p_line);
+
+    let mut output = lines.join("\n");
+    if had_trailing_newline {
+        output.push('\n');
+    }
+    output
 }

@@ -733,6 +733,7 @@ async fn setup(
 
         // Optionally run the Zakura P2P-v2 endpoint alongside the legacy TCP
         // stack so the dual-stack wiring is exercised (coexistence tests).
+        default_p2p: false,
         v2_p2p: enable_v2_p2p,
 
         ..NetworkConfig::default()

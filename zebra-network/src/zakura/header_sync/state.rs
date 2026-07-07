@@ -204,6 +204,7 @@ pub(super) struct PeerHeaderState {
     pub(super) max_headers_per_response: u32,
     pub(super) max_inflight_requests: u16,
     pub(super) received_status: bool,
+    pub(super) last_received_status_at: Option<Instant>,
     /// The most recent status sent to this peer over its current session, if
     /// any. Used to suppress re-sending an identical, non-tip-advancing status,
     /// which the peer's inbound rate limiter would otherwise treat as spam.
@@ -233,6 +234,7 @@ impl PeerHeaderState {
             max_headers_per_response: clamp_advertised_range(local_range),
             max_inflight_requests: local_inflight.clamp(1, LOCAL_MAX_HS_INFLIGHT_PER_PEER),
             received_status: false,
+            last_received_status_at: None,
             last_sent_status: None,
             outstanding: Vec::new(),
             late_covered_responses: 0,

@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed misleading Zakura connectivity telemetry: header-sync now records
+  record-only peer violations as `header_peer_violation_recorded` instead of
+  `header_peer_disconnect_requested`, header-sync exposes the authoritative
+  `zakura.p2p.connected_peers` gauge and freshness-derived
+  `zakura.p2p.healthy_peers` gauge, header- and block-sync expose active
+  reactor connection counts, discovery dials classify already-connected peers
+  separately from genuinely short-lived registrations, and the metrics
+  dashboard now reads the authoritative connected-peer gauge.
 - Zakura header-store consensus reads now verify store invariants as they
   walk: the difficulty-context walk checks that every stored header is the
   block its hash row names and links to the row below it, and the anchor

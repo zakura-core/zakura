@@ -30,6 +30,7 @@ const ZAKURA_DISCOVERY_DIAL_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum DiscoveryDialResult {
     Registered,
+    ConnectedElsewhere,
     ShortLivedRegistered,
     Failed,
     LocalResourceLimit,
@@ -39,6 +40,7 @@ impl DiscoveryDialResult {
     fn label(self) -> &'static str {
         match self {
             Self::Registered => "registered",
+            Self::ConnectedElsewhere => "connected_elsewhere",
             Self::ShortLivedRegistered => "short_lived_registered",
             Self::Failed => "failed",
             Self::LocalResourceLimit => "local_resource_limit",
@@ -261,6 +263,18 @@ async fn run_discovery_dial_once(
         };
     };
     let mut registered = endpoint.supervisor().subscribe();
+    if registered
+        .borrow_and_update()
+        .iter()
+        .any(|id| id == &peer_id)
+    {
+        return DiscoveryDialWorkerResult {
+            node_id,
+            reserved_ips,
+            result: DiscoveryDialResult::ConnectedElsewhere,
+        };
+    }
+
     let dial = tokio::spawn({
         let endpoint = endpoint.clone();
         async move { native_bootstrap_dial(&endpoint, node_addr, &limits).await }
@@ -284,7 +298,7 @@ async fn run_discovery_dial_once(
                     // finishes; discovery success is the peer appearing in the registration watch.
                     Ok(Ok(())) => {
                         if registered.borrow_and_update().iter().any(|id| id == &peer_id) {
-                            DiscoveryDialResult::ShortLivedRegistered
+                            DiscoveryDialResult::ConnectedElsewhere
                         } else {
                             DiscoveryDialResult::Failed
                         }
@@ -337,9 +351,15 @@ async fn wait_for_discovery_registration_to_settle(
         }
 
         tokio::select! {
-            dial_result = &mut *dial => {
-                return match dial_result {
-                    Ok(Ok(())) | Ok(Err(_)) | Err(_) => DiscoveryDialResult::ShortLivedRegistered,
+            _dial_result = &mut *dial => {
+                let still_registered = registered
+                    .borrow_and_update()
+                    .iter()
+                    .any(|id| id == peer_id);
+                return if still_registered {
+                    DiscoveryDialResult::ConnectedElsewhere
+                } else {
+                    DiscoveryDialResult::ShortLivedRegistered
                 };
             }
             changed = registered.changed() => {
@@ -380,6 +400,10 @@ async fn apply_discovery_dial_result(
         DiscoveryDialResult::Registered => {
             discovery.mark_dial_success(node_id).await;
             metrics::counter!("zakura.p2p.discovery.dial.succeeded").increment(1);
+        }
+        DiscoveryDialResult::ConnectedElsewhere => {
+            discovery.mark_dial_success(node_id).await;
+            metrics::counter!("zakura.p2p.discovery.dial.connected_elsewhere").increment(1);
         }
         DiscoveryDialResult::ShortLivedRegistered => {
             discovery.mark_short_lived_exchange(node_id).await;
@@ -423,5 +447,20 @@ mod tests {
 
         registered_tx.send_replace(Vec::new());
         assert_eq!(settled.await, DiscoveryDialResult::ShortLivedRegistered);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_completion_with_live_registration_is_connected_elsewhere() {
+        let peer_id = peer_id(9);
+        let (_registered_tx, mut registered_rx) =
+            tokio::sync::watch::channel(vec![peer_id.clone()]);
+        let dial = tokio::spawn(async { Ok(()) });
+        tokio::pin!(dial);
+
+        assert_eq!(
+            wait_for_discovery_registration_to_settle(&mut registered_rx, &peer_id, &mut dial)
+                .await,
+            DiscoveryDialResult::ConnectedElsewhere
+        );
     }
 }

@@ -270,10 +270,10 @@ impl<'a> TraceQuery<'a> {
         );
     }
 
-    /// Assert a requested disconnect row with its bounded reason label.
-    pub fn assert_header_disconnect(&self, reason: &str) {
+    /// Assert a recorded header-sync peer violation row with its bounded reason label.
+    pub fn assert_header_violation_recorded(&self, reason: &str) {
         self.assert_row(
-            hs_trace::HEADER_PEER_DISCONNECT_REQUESTED,
+            hs_trace::HEADER_PEER_VIOLATION_RECORDED,
             &[(hs_trace::REASON, TraceValue::Str(reason))],
         );
     }
@@ -406,7 +406,7 @@ mod tests {
         fs::create_dir_all(&node_dir).expect("node dir");
         fs::write(
             node_dir.join("header_sync.jsonl"),
-            r#"{"node":"01","event":"header_peer_disconnect_requested","reason":"invalid_range"}"#
+            r#"{"node":"01","event":"header_peer_violation_recorded","reason":"invalid_range"}"#
                 .to_string()
                 + "\n"
                 + r#"{"node":"01","event":"header_new_block_deduped","reason":"seen_cache"}"#
@@ -427,7 +427,7 @@ mod tests {
         header_sync.assert_header_range_response(4, 2);
         header_sync.assert_header_range_commit(4, 2);
         header_sync.assert_header_new_block_deduped("seen_cache");
-        header_sync.assert_header_disconnect("invalid_range");
+        header_sync.assert_header_violation_recorded("invalid_range");
         header_sync.assert_row(
             hs_trace::HEADER_RANGE_COMMITTED,
             &[(hs_trace::REASON, TraceValue::Null)],

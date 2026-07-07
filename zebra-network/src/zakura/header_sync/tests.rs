@@ -8,7 +8,8 @@ use crate::zakura::{
 };
 use chrono::Duration;
 use metrics::{
-    Counter, CounterFn, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    Counter, CounterFn, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString,
+    Unit,
 };
 use rand::rngs::OsRng;
 use std::{
@@ -36,11 +37,21 @@ use zebra_test::vectors::{
 #[derive(Default)]
 struct HeaderSyncMetricsRecorder {
     counters: Mutex<BTreeMap<String, u64>>,
+    gauges: Mutex<BTreeMap<String, f64>>,
 }
 
 struct RecordedCounter {
     name: String,
     recorder: &'static HeaderSyncMetricsRecorder,
+}
+
+struct RecordedGauge {
+    name: String,
+    recorder: &'static HeaderSyncMetricsRecorder,
+}
+
+fn thread_metric_name(name: &str) -> String {
+    format!("{:?}:{name}", std::thread::current().id())
 }
 
 impl CounterFn for RecordedCounter {
@@ -53,6 +64,25 @@ impl CounterFn for RecordedCounter {
     fn absolute(&self, value: u64) {
         let mut counters = self.recorder.counters.lock().expect("metrics mutex ok");
         counters.insert(self.name.clone(), value);
+    }
+}
+
+impl GaugeFn for RecordedGauge {
+    fn increment(&self, value: f64) {
+        let mut gauges = self.recorder.gauges.lock().expect("metrics mutex ok");
+        let gauge = gauges.entry(thread_metric_name(&self.name)).or_default();
+        *gauge += value;
+    }
+
+    fn decrement(&self, value: f64) {
+        let mut gauges = self.recorder.gauges.lock().expect("metrics mutex ok");
+        let gauge = gauges.entry(thread_metric_name(&self.name)).or_default();
+        *gauge -= value;
+    }
+
+    fn set(&self, value: f64) {
+        let mut gauges = self.recorder.gauges.lock().expect("metrics mutex ok");
+        gauges.insert(thread_metric_name(&self.name), value);
     }
 }
 
@@ -70,8 +100,11 @@ impl Recorder for HeaderSyncMetricsRecorder {
         }))
     }
 
-    fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
-        Gauge::noop()
+    fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+        Gauge::from_arc(Arc::new(RecordedGauge {
+            name: key.name().to_string(),
+            recorder: header_sync_metrics_recorder(),
+        }))
     }
 
     fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
@@ -93,6 +126,17 @@ fn metric_value(name: &str) -> u64 {
         .lock()
         .expect("metrics mutex ok")
         .get(name)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn gauge_value(name: &str) -> f64 {
+    let recorder = header_sync_metrics_recorder();
+    recorder
+        .gauges
+        .lock()
+        .expect("metrics mutex ok")
+        .get(&thread_metric_name(name))
         .copied()
         .unwrap_or_default()
 }
@@ -894,6 +938,57 @@ fn header_sync_peer_with_conn(
         ),
         peer_send,
     )
+}
+
+async fn wait_for_gauge(name: &str, expected: f64) {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if gauge_value(name) == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("gauge reaches expected value before timeout");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn header_connectivity_gauges_track_membership_and_status_freshness() {
+    let _ = header_sync_metrics_recorder();
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let fixture = spawn_test_reactor(startup_for(network, anchor, None));
+    let mut peers = fixture.handle.subscribe_peer_snapshot();
+    let peer_id = peer(91);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    peers.changed().await.unwrap();
+    assert_eq!(peers.borrow().inbound_peers, 1);
+    wait_for_gauge("zakura.p2p.connected_peers", 1.0).await;
+    wait_for_gauge("zakura.p2p.healthy_peers", 0.0).await;
+
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+    wait_for_gauge("zakura.p2p.connected_peers", 1.0).await;
+    wait_for_gauge("zakura.p2p.healthy_peers", 1.0).await;
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerDisconnected(peer_id))
+        .await
+        .unwrap();
+    peers.changed().await.unwrap();
+    assert_eq!(peers.borrow().inbound_peers, 0);
+    wait_for_gauge("zakura.p2p.connected_peers", 0.0).await;
+    wait_for_gauge("zakura.p2p.healthy_peers", 0.0).await;
 }
 
 #[tokio::test]
@@ -3829,10 +3924,10 @@ async fn rejected_non_linking_range_traces_link_stage_and_error_kind() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn header_sync_jsonl_trace_captures_status_range_dedup_and_disconnect() {
+async fn header_sync_jsonl_trace_captures_status_range_dedup_and_violation_record() {
     let network = Network::Mainnet;
     let mut capture = TraceCapture::for_test(
-        "header_sync_jsonl_trace_captures_status_range_dedup_and_disconnect",
+        "header_sync_jsonl_trace_captures_status_range_dedup_and_violation_record",
     )
     .unwrap();
     let first_checkpoint = network
@@ -3890,10 +3985,15 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_disconnect() {
     fixture
         .handle
         .send(HeaderSyncEvent::WireProtocolFailure {
-            peer: peer_id,
+            peer: peer_id.clone(),
             reason: HeaderSyncMisbehavior::MalformedMessage,
             error: Arc::new(HeaderSyncWireError::TrailingBytes),
         })
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerDisconnected(peer_id))
         .await
         .unwrap();
 
@@ -3906,7 +4006,15 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_disconnect() {
     assert!(header_sync.count(hs_trace::HEADER_STATUS_RECEIVED) >= 1);
     assert!(header_sync.count(hs_trace::HEADER_GET_HEADERS_SENT) >= 1);
     assert!(header_sync.count(hs_trace::HEADER_NEW_BLOCK_DEDUPED) >= 1);
-    assert!(header_sync.count(hs_trace::HEADER_PEER_DISCONNECT_REQUESTED) >= 1);
+    assert!(header_sync.count(hs_trace::HEADER_PEER_VIOLATION_RECORDED) >= 1);
+    header_sync.assert_row(
+        hs_trace::HEADER_PEER_CONNECTED,
+        &[(hs_trace::ACTIVE_CONNECTIONS, TraceValue::U64(1))],
+    );
+    header_sync.assert_row(
+        hs_trace::HEADER_PEER_DISCONNECTED,
+        &[(hs_trace::ACTIVE_CONNECTIONS, TraceValue::U64(0))],
+    );
     header_sync.assert_row(
         hs_trace::HEADER_EVENT_RECEIVED,
         &[

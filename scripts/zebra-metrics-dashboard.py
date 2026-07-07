@@ -100,7 +100,8 @@ PANELS = [
     ("Commit DB",  "p_rocksdb",      "rocksdb_write",               "ms",    "gauge"),
     ("VCT path",   "vct_fast_s",     "VCT fast commits / s",        "/s",    "rate"),
     ("VCT path",   "vct_prevalid_s", "VCT prevalidated commits / s", "/s",    "rate"),
-    ("Zakura",     "zk_peers",       "Cohort peers (active)",       "",      "gauge"),
+    ("Zakura",     "zk_peers",       "Connected peers",            "",      "gauge"),
+    ("Zakura",     "zk_healthy_peers", "Healthy peers",             "",      "gauge"),
     ("Zakura",     "zk_qdepth",      "Zakura queue depth",          "",      "gauge"),
     ("Zakura",     "zk_block_sync",  "block_sync streams accepted", "",      "gauge"),
     # Apply-queue depth + floor-gap attribution: separates HOL download stalls
@@ -351,7 +352,10 @@ class Collector:
         now = time.time()
         d = {}
         d["height"]        = bare(m, "state_finalized_block_height")
-        d["zk_peers"]      = bare(m, "zakura_p2p_conn_active")
+        d["zk_peers"]      = bare(m, "zakura_p2p_connected_peers")
+        if d["zk_peers"] is None:
+            d["zk_peers"] = bare(m, "zakura_p2p_conn_active")
+        d["zk_healthy_peers"] = bare(m, "zakura_p2p_healthy_peers")
         d["zk_qdepth"]     = bare(m, "zakura_p2p_queue_depth")
         d["zk_block_sync"] = next((v for lbl, v in m.get("zakura_p2p_stream_accepted", [])
                                    if "block_sync" in lbl), None)

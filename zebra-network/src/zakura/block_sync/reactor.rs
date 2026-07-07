@@ -253,6 +253,7 @@ impl BlockSyncReactor {
         let mut header_tip_open = header_tip.is_some();
         let mut frontier_updates = self.startup.frontier_updates.clone();
         let mut frontier_updates_open = frontier_updates.is_some();
+        set_block_reactor_active_connection_gauge(self.state.peers.len());
         // Metrics/trace snapshot cadence only. Per-peer request timeouts are owned
         // by the routines (each sleeps to its own earliest deadline), so this timer
         // no longer drives any timeout; it reuses `request_timeout` purely as a
@@ -569,8 +570,9 @@ impl BlockSyncReactor {
         // routine nor holds a per-peer inbound channel.
         let peer_state = PeerBlockState::new(session, &self.startup.config);
         self.state.peers.insert(peer.clone(), peer_state);
+        set_block_reactor_active_connection_gauge(self.state.peers.len());
 
-        self.trace_peer_connected(&peer, direction);
+        self.trace_peer_connected(&peer, direction, self.state.peers.len());
         self.publish_peer_snapshot();
         self.publish_candidate_state();
         self.send_status_and_mark_refresh(&peer, "peer_connected", Instant::now());
@@ -584,7 +586,12 @@ impl BlockSyncReactor {
         // `work.pending` and releases their budget. The reactor only drops its
         // thin serving handle and the registry entry.
         if self.state.peers.remove(&peer).is_some() {
-            self.trace_peer_disconnected(&peer, self.registry_received_status(&peer));
+            set_block_reactor_active_connection_gauge(self.state.peers.len());
+            self.trace_peer_disconnected(
+                &peer,
+                self.registry_received_status(&peer),
+                self.state.peers.len(),
+            );
         }
         self.registry.remove(&peer);
         self.state.parked_peers.remove(&peer);
@@ -1869,19 +1876,39 @@ impl BlockSyncReactor {
         });
     }
 
-    fn trace_peer_connected(&self, peer: &ZakuraPeerId, direction: ServicePeerDirection) {
+    fn trace_peer_connected(
+        &self,
+        peer: &ZakuraPeerId,
+        direction: ServicePeerDirection,
+        active_connections: usize,
+    ) {
         self.emit_trace(bs_trace::BLOCK_PEER_CONNECTED, |row| {
             bs_insert_peer(row, bs_trace::PEER, peer);
             bs_insert_str(row, "direction", direction.trace_label());
+            bs_insert_u64(
+                row,
+                bs_trace::ACTIVE_CONNECTIONS,
+                u64::try_from(active_connections).unwrap_or(u64::MAX),
+            );
         });
     }
 
-    fn trace_peer_disconnected(&self, peer: &ZakuraPeerId, received_status: bool) {
+    fn trace_peer_disconnected(
+        &self,
+        peer: &ZakuraPeerId,
+        received_status: bool,
+        active_connections: usize,
+    ) {
         self.emit_trace(bs_trace::BLOCK_PEER_DISCONNECTED, |row| {
             bs_insert_peer(row, bs_trace::PEER, peer);
             row.insert(
                 "received_status".to_string(),
                 serde_json::Value::Bool(received_status),
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::ACTIVE_CONNECTIONS,
+                u64::try_from(active_connections).unwrap_or(u64::MAX),
             );
         });
     }
@@ -2389,6 +2416,13 @@ pub(super) fn bs_insert_str(
 
 fn elapsed_ms_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn set_block_reactor_active_connection_gauge(active_connections: usize) {
+    // Active Zakura reactor sessions are bounded by the configured connection
+    // limit, far below f64's exact integer range.
+    metrics::gauge!("zakura.p2p.reactor.active_connections", "reactor" => "block_sync")
+        .set(active_connections as f64);
 }
 
 pub(super) fn tolerated_bytes(reserved_bytes: u64, tolerance_percent: u32) -> u64 {

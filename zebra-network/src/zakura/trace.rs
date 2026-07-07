@@ -233,6 +233,8 @@ pub mod block_sync_trace {
     pub const PEERS_WANTING_SLOTS: &str = "peers_wanting_slots";
     /// Connected block-sync peers.
     pub const PEERS: &str = "peers";
+    /// Active reactor service sessions after this event.
+    pub const ACTIVE_CONNECTIONS: &str = "active_connections";
     /// Connected block-sync peers whose status we have received (schedulable).
     pub const PEERS_WITH_STATUS: &str = "peers_with_status";
     /// Lowest height still in the body-sync `needed` set (the gap to fetch next).
@@ -379,6 +381,8 @@ pub mod header_sync_trace {
     pub const TREE_AUX_ROOTS_LEN: &str = "tree_aux_roots_len";
     /// Destination peer count field.
     pub const DESTINATION_PEER_COUNT: &str = "destination_peer_count";
+    /// Active reactor service sessions after this event.
+    pub const ACTIVE_CONNECTIONS: &str = "active_connections";
     /// Bounded reason field.
     pub const REASON: &str = "reason";
 
@@ -390,6 +394,10 @@ pub mod header_sync_trace {
     pub const HEADER_STATUS_SENT: &str = "header_status_sent";
     /// Peer status received.
     pub const HEADER_STATUS_RECEIVED: &str = "header_status_received";
+    /// Header-sync peer connected to the reactor.
+    pub const HEADER_PEER_CONNECTED: &str = "header_peer_connected";
+    /// Header-sync peer disconnected from the reactor.
+    pub const HEADER_PEER_DISCONNECTED: &str = "header_peer_disconnected";
     /// Header range request sent.
     pub const HEADER_GET_HEADERS_SENT: &str = "header_get_headers_sent";
     /// Header range response received.
@@ -408,8 +416,8 @@ pub mod header_sync_trace {
     pub const HEADER_NEW_BLOCK_DEDUPED: &str = "header_new_block_deduped";
     /// Peer violation observed.
     pub const HEADER_PEER_VIOLATION: &str = "header_peer_violation";
-    /// Peer disconnect requested.
-    pub const HEADER_PEER_DISCONNECT_REQUESTED: &str = "header_peer_disconnect_requested";
+    /// Peer violation recorded without disconnecting the peer.
+    pub const HEADER_PEER_VIOLATION_RECORDED: &str = "header_peer_violation_recorded";
     /// Header frontier advanced.
     pub const HEADER_FRONTIER_ADVANCED: &str = "header_frontier_advanced";
     /// Header frontier re-anchored down to the verified block frontier.

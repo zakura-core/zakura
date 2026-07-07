@@ -69,6 +69,7 @@ impl HeaderSyncReactor {
     async fn run(mut self) {
         let mut frontier_updates = self.startup.frontier_updates.clone();
         let mut frontier_updates_open = frontier_updates.is_some();
+        self.publish_connectivity_metrics();
         if self.startup.range_state_actions_enabled {
             let _ = self.dispatch_action(HeaderSyncAction::QueryBestHeaderTip);
             let _ = self.dispatch_action(HeaderSyncAction::QueryMissingBlockBodies {
@@ -126,6 +127,7 @@ impl HeaderSyncReactor {
                     metrics::counter!("sync.header.reactor.event_started", "kind" => "tick").increment(1);
                     self.handle_timeouts().await;
                     self.refresh_statuses();
+                    self.publish_connectivity_metrics();
                     metrics::counter!("sync.header.reactor.event_finished", "kind" => "tick").increment(1);
                 }
             }
@@ -298,6 +300,25 @@ impl HeaderSyncReactor {
         let _ = self.peers.send(snapshot);
     }
 
+    fn publish_connectivity_metrics(&self) {
+        set_header_connectivity_gauges(
+            self.state.peers.len(),
+            self.healthy_peer_count(Instant::now()),
+        );
+    }
+
+    fn healthy_peer_count(&self, now: Instant) -> usize {
+        let freshness = self.startup.status_refresh_interval.saturating_mul(2);
+        self.state
+            .peers
+            .values()
+            .filter(|peer| {
+                peer.last_received_status_at
+                    .is_some_and(|last| now.duration_since(last) <= freshness)
+            })
+            .count()
+    }
+
     fn publish_candidate_state(&mut self) {
         let now = Instant::now();
         self.state
@@ -427,6 +448,7 @@ impl HeaderSyncReactor {
                 // session-local: responses for the old stream cannot satisfy
                 // work sent on this fresh stream.
                 peer_state.received_status = false;
+                peer_state.last_received_status_at = None;
                 peer_state.reset_sent_status();
                 peer_state.outstanding.clear();
                 peer_state.late_covered_responses = 0;
@@ -448,6 +470,8 @@ impl HeaderSyncReactor {
                     DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
                 )
             });
+        self.publish_connectivity_metrics();
+        self.trace_peer_connected(&peer, direction, self.state.peers.len());
         self.publish_peer_snapshot();
         self.publish_candidate_state();
         self.send_status(&peer);
@@ -455,10 +479,14 @@ impl HeaderSyncReactor {
     }
 
     fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId) {
-        self.state.peers.remove(&peer);
+        let was_connected = self.state.peers.remove(&peer).is_some();
         self.state.parked_peers.remove(&peer);
         self.state.advisory.remove(&peer);
         self.state.schedule.forget_peer(&peer);
+        if was_connected {
+            self.publish_connectivity_metrics();
+            self.trace_peer_disconnected(&peer, self.state.peers.len());
+        }
         self.publish_peer_snapshot();
         self.publish_candidate_state();
     }
@@ -792,9 +820,9 @@ impl HeaderSyncReactor {
                 let Some(peer_state) = self.state.peers.get_mut(&peer) else {
                     return;
                 };
+                let now = Instant::now();
                 let advances_advertised_tip = status.tip_height > peer_state.advertised_tip;
-                let status_token_available =
-                    peer_state.meters.inbound_status.try_take(Instant::now());
+                let status_token_available = peer_state.meters.inbound_status.try_take(now);
                 if !advances_advertised_tip && !status_token_available {
                     self.report_misbehavior(peer, HeaderSyncMisbehavior::StatusSpam)
                         .await;
@@ -809,8 +837,10 @@ impl HeaderSyncReactor {
                     .max_inflight_requests
                     .clamp(1, LOCAL_MAX_HS_INFLIGHT_PER_PEER);
                 peer_state.received_status = true;
+                peer_state.last_received_status_at = Some(now);
                 self.confirm_advisory_status(&peer, status);
                 self.trace_status_received(&peer, status);
+                self.publish_connectivity_metrics();
                 self.schedule().await;
             }
             HeaderSyncMessage::Headers {
@@ -1621,7 +1651,7 @@ impl HeaderSyncReactor {
         // session. Peer scoring no longer drives disconnects.
         metrics::counter!("sync.header.peer.violation").increment(1);
         self.trace_peer_violation(&peer, reason);
-        self.trace_peer_disconnect_requested(&peer, reason);
+        self.trace_peer_violation_recorded(&peer, reason);
         // Best-effort record of the violation for the driver. Never block the
         // reactor waiting for channel capacity.
         let action = HeaderSyncAction::Misbehavior { peer, reason };
@@ -1907,6 +1937,34 @@ impl HeaderSyncReactor {
         });
     }
 
+    fn trace_peer_connected(
+        &self,
+        peer: &ZakuraPeerId,
+        direction: ServicePeerDirection,
+        active_connections: usize,
+    ) {
+        self.emit_trace(hs_trace::HEADER_PEER_CONNECTED, |row| {
+            insert_peer(row, hs_trace::PEER, peer);
+            insert_optional_str(row, "direction", Some(direction.trace_label()));
+            insert_u64(
+                row,
+                hs_trace::ACTIVE_CONNECTIONS,
+                u64::try_from(active_connections).unwrap_or(u64::MAX),
+            );
+        });
+    }
+
+    fn trace_peer_disconnected(&self, peer: &ZakuraPeerId, active_connections: usize) {
+        self.emit_trace(hs_trace::HEADER_PEER_DISCONNECTED, |row| {
+            insert_peer(row, hs_trace::PEER, peer);
+            insert_u64(
+                row,
+                hs_trace::ACTIVE_CONNECTIONS,
+                u64::try_from(active_connections).unwrap_or(u64::MAX),
+            );
+        });
+    }
+
     fn trace_get_headers_sent(
         &self,
         peer: &ZakuraPeerId,
@@ -2090,8 +2148,8 @@ impl HeaderSyncReactor {
         });
     }
 
-    fn trace_peer_disconnect_requested(&self, peer: &ZakuraPeerId, reason: HeaderSyncMisbehavior) {
-        self.emit_trace(hs_trace::HEADER_PEER_DISCONNECT_REQUESTED, |row| {
+    fn trace_peer_violation_recorded(&self, peer: &ZakuraPeerId, reason: HeaderSyncMisbehavior) {
+        self.emit_trace(hs_trace::HEADER_PEER_VIOLATION_RECORDED, |row| {
             insert_peer(row, hs_trace::PEER, peer);
             insert_optional_str(
                 row,
@@ -2213,6 +2271,15 @@ impl HeaderSyncReactor {
             }
         }
     }
+}
+
+fn set_header_connectivity_gauges(connected_peers: usize, healthy_peers: usize) {
+    // Active Zakura reactor sessions are bounded by the configured connection
+    // limit, far below f64's exact integer range.
+    metrics::gauge!("zakura.p2p.reactor.active_connections", "reactor" => "header_sync")
+        .set(connected_peers as f64);
+    metrics::gauge!("zakura.p2p.connected_peers").set(connected_peers as f64);
+    metrics::gauge!("zakura.p2p.healthy_peers").set(healthy_peers as f64);
 }
 
 fn header_sync_wire_error_kind(error: &HeaderSyncWireError) -> &'static str {

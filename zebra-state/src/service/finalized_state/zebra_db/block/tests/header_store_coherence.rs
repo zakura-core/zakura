@@ -32,5 +32,6 @@ mod fabricate;
 mod ops;
 mod oracle;
 mod prop;
+mod reads;
 mod scenarios;
 mod startup_audit;

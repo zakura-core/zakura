@@ -1020,10 +1020,16 @@ fn header_range_commit_rejects_non_current_anchor_hash() {
     let block2 = mainnet_block(2);
     let alternate_block2 = alternate_header(stale_anchor, &block2.header, 1);
 
+    // A hash→height entry whose height→hash row names a different block is a
+    // bijection violation in our own indexes, reported as a local storage
+    // fault rather than an unknown anchor. Either way the stale anchor cannot
+    // be committed on.
     let mut batch = DiskWriteBatch::new();
     assert!(matches!(
         batch.prepare_header_range_batch(&state, stale_anchor, &[alternate_block2], &[0]),
-        Err(CommitHeaderRangeError::UnknownAnchor { anchor }) if anchor == stale_anchor
+        Err(CommitHeaderRangeError::StoreIncoherent(
+            crate::error::StoreIncoherentError::BijectionMismatch { hash, height, stored },
+        )) if hash == stale_anchor && height == Height(1) && stored == Some(block1.hash())
     ));
 
     assert_eq!(state.hash(Height(1)), None);
@@ -1246,7 +1252,9 @@ fn synthetic_headers_from_state(
 ) -> Vec<Arc<block::Header>> {
     let network = state.network();
     let template = mainnet_block(1);
-    let mut context = state.recent_header_context(anchor_height);
+    let mut context = state
+        .recent_header_context(anchor_height)
+        .expect("test store is coherent");
     let mut previous_hash = anchor_hash;
     let mut previous_height = anchor_height;
     let mut nonce_tag = nonce_seed;

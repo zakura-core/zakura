@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Zakura header-store consensus reads now verify store invariants as they
+  walk: the difficulty-context walk checks that every stored header is the
+  block its hash row names and links to the row below it, and the anchor
+  lookup distinguishes a corrupted index round-trip from a genuinely unknown
+  anchor. A corrupted store now surfaces as an explicit local
+  `StoreIncoherent` error (never scored against peers) instead of poisoning
+  difficulty validation and rejecting honest headers with
+  `InvalidDifficultyThreshold`.
 - Fixed three Zakura header-store write paths that could leave the on-disk
   header store internally incoherent after chain forks, causing nodes to
   reject valid headers from honest peers (`InvalidDifficultyThreshold` /

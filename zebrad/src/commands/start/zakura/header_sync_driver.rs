@@ -1129,6 +1129,12 @@ pub(crate) fn header_range_commit_failure_kind(
         // store's own linkage check failing means the local anchor/response pairing
         // went wrong, not that the peer misbehaved.
         | zebra_state::CommitHeaderRangeError::UnlinkedRange { .. }
+        // Store incoherence is by definition a local storage fault: the range was
+        // rejected because our own header rows failed a linkage/bijection check
+        // while reading validation context, not because the peer's range was shown
+        // invalid. Scoring peers for it recreates the disconnect-honest-peers
+        // failure mode.
+        | zebra_state::CommitHeaderRangeError::StoreIncoherent(_)
         | zebra_state::CommitHeaderRangeError::CommitResponseDropped => {
             HeaderSyncCommitFailureKind::Local
         }

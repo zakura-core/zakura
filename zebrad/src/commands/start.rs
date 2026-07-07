@@ -2347,6 +2347,25 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[test]
+    fn store_incoherent_is_local_header_sync_commit_failure() {
+        // A range rejected because our own header rows failed a
+        // linkage/bijection check is a local storage fault; scoring peers for
+        // it recreates the disconnect-honest-peers failure mode.
+        let error = zebra_state::CommitHeaderRangeError::StoreIncoherent(
+            zebra_state::StoreIncoherentError::BrokenLinkage {
+                height: block::Height(2),
+                expected_parent: block::Hash([0; 32]),
+                actual_below: block::Hash([1; 32]),
+            },
+        );
+
+        assert_eq!(
+            header_range_commit_failure_kind(&error),
+            HeaderSyncCommitFailureKind::Local
+        );
+    }
+
+    #[test]
     fn unlinked_range_is_local_header_sync_commit_failure() {
         // The reactor validates every response's linkage against the requested
         // anchor before committing with that anchor, so the store's own

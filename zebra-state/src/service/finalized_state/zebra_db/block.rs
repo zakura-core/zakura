@@ -36,7 +36,7 @@ use crate::{
     constants::{
         MAX_BLOCK_REORG_HEIGHT, MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_PRUNE_HEIGHTS_PER_COMMIT,
     },
-    error::{CommitCheckpointVerifiedError, CommitHeaderRangeError},
+    error::{CommitCheckpointVerifiedError, CommitHeaderRangeError, StoreIncoherentError},
     request::FinalizedBlock,
     service::check,
     service::finalized_state::{
@@ -546,31 +546,85 @@ impl ZebraDb {
     }
 
     /// Returns recent header difficulty/time context in reverse height order,
-    /// starting at `height`.
+    /// starting at `height`, verifying `previous_block_hash` linkage at every
+    /// step of the walk.
+    ///
+    /// Returns an empty context when there is no stored row at `height` (the
+    /// caller decides whether that anchor is unknown), and a shorter-than-span
+    /// context when the walk reaches genesis.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreIncoherentError`] when the walk finds a header row that
+    /// is not the block its hash row names, a row that does not link to the
+    /// row below it, or a gap below a stored row. Feeding such a window into
+    /// difficulty validation would mix rows from more than one branch (or
+    /// shift the adjustment window), producing `InvalidDifficultyThreshold`
+    /// rejections of honest input — the reader surfaces the storage fault
+    /// explicitly instead. The per-row hash check costs one header hash per
+    /// consumed row, negligible next to the validation the window feeds.
     pub fn recent_header_context(
         &self,
         height: block::Height,
-    ) -> Vec<(
-        zebra_chain::work::difficulty::CompactDifficulty,
-        DateTime<Utc>,
-    )> {
+    ) -> Result<
+        Vec<(
+            zebra_chain::work::difficulty::CompactDifficulty,
+            DateTime<Utc>,
+        )>,
+        StoreIncoherentError,
+    > {
         let mut context = Vec::with_capacity(check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN);
-        let mut current_height = Some(height);
 
-        while let Some(height) = current_height {
-            let Some((_hash, header)) = self.header_by_height(height) else {
-                break;
-            };
+        let Some((mut hash, mut header)) = self.header_by_height(height) else {
+            return Ok(context);
+        };
+        let mut height = height;
 
-            context.push((header.difficulty_threshold, header.time));
-            if context.len() == check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN {
-                break;
+        loop {
+            let computed = block::Hash::from(&*header);
+            if computed != hash {
+                return Err(StoreIncoherentError::HeaderHashMismatch {
+                    height,
+                    indexed: hash,
+                    computed,
+                });
             }
 
-            current_height = height.previous().ok();
-        }
+            context.push((header.difficulty_threshold, header.time));
 
-        context
+            if context.len() == check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN {
+                return Ok(context);
+            }
+            let Ok(below) = height.previous() else {
+                // The walk reached genesis: a short context is legitimate, and
+                // the difficulty functions handle it (MedianTime clamps
+                // negative heights to zero).
+                return Ok(context);
+            };
+
+            let Some((below_hash, below_header)) = self.header_by_height(below) else {
+                // Rows must be contiguous from genesis up to the header tip
+                // (full-block rows below the body tip — retained even under
+                // pruning — and zakura rows above it), so a missing row below
+                // a stored one is a gap, not the end of history.
+                return Err(StoreIncoherentError::Gap {
+                    height,
+                    missing: below,
+                });
+            };
+
+            if header.previous_block_hash != below_hash {
+                return Err(StoreIncoherentError::BrokenLinkage {
+                    height,
+                    expected_parent: header.previous_block_hash,
+                    actual_below: below_hash,
+                });
+            }
+
+            height = below;
+            hash = below_hash;
+            header = below_header;
+        }
     }
 
     /// Returns header-known, body-missing heights.
@@ -2037,17 +2091,26 @@ impl DiskWriteBatch {
             .or_else(|| (anchor == zebra_db.network().genesis_hash()).then_some(block::Height(0)))
             .ok_or(CommitHeaderRangeError::UnknownAnchor { anchor })?;
 
-        if anchor != zebra_db.network().genesis_hash()
-            && zebra_db.header_hash(anchor_height) != Some(anchor)
-        {
-            return Err(CommitHeaderRangeError::UnknownAnchor { anchor });
+        // The hash→height index knows the anchor, so a failed height→hash
+        // round-trip is a bijection violation in our own store — a local
+        // storage fault, not an unknown anchor supplied by the caller.
+        if anchor != zebra_db.network().genesis_hash() {
+            let stored = zebra_db.header_hash(anchor_height);
+            if stored != Some(anchor) {
+                return Err(StoreIncoherentError::BijectionMismatch {
+                    hash: anchor,
+                    height: anchor_height,
+                    stored,
+                }
+                .into());
+            }
         }
 
         let finalized_height = zebra_db.finalized_tip_height();
         let best_header_tip = zebra_db.best_header_tip().map(|(height, _)| height);
         let checkpoints = zebra_db.network().checkpoint_list();
 
-        let mut recent_headers = zebra_db.recent_header_context(anchor_height);
+        let mut recent_headers = zebra_db.recent_header_context(anchor_height)?;
         if recent_headers.is_empty() {
             if anchor == zebra_db.network().genesis_hash() && anchor_height == block::Height(0) {
                 return Err(CommitHeaderRangeError::MissingGenesisAnchor { anchor });

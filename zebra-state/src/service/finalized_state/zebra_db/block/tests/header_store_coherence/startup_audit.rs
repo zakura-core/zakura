@@ -34,7 +34,7 @@ use super::{
     fabricate::{Universe, BRANCH_A, FORK_HEIGHT},
 };
 use crate::{
-    error::CommitHeaderRangeError,
+    error::{CommitHeaderRangeError, StoreIncoherentError},
     service::finalized_state::{
         disk_db::{DiskWriteBatch, WriteDisk},
         ZebraDb,
@@ -197,7 +197,10 @@ fn startup_heals_broken_linkage_then_resync_converges() {
     assert_eq!(dump_store(&state), truncated(&original, Height(19)));
     assert_clean(&state);
     assert!(
-        !state.recent_header_context(Height(19)).is_empty(),
+        !state
+            .recent_header_context(Height(19))
+            .expect("the healed store is coherent")
+            .is_empty(),
         "the healed store supplies recent header context"
     );
 
@@ -470,8 +473,11 @@ fn startup_heal_unblocks_linkage_verified_reads() {
         .expect_err("the anchor round-trip fails on the corrupted index");
     assert!(matches!(
         error,
-        CommitHeaderRangeError::UnknownAnchor { anchor: rejected_anchor }
-            if rejected_anchor == anchor
+        CommitHeaderRangeError::StoreIncoherent(StoreIncoherentError::BijectionMismatch {
+            hash,
+            height: Height(30),
+            stored
+        }) if hash == anchor && stored == Some(stray_hash)
     ));
 
     let repair = state

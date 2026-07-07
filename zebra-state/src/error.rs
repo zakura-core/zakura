@@ -195,6 +195,68 @@ impl From<CommitHeaderRangeError> for CommitCheckpointVerifiedError {
     }
 }
 
+/// An internal invariant of the zakura header store was found violated while
+/// reading it.
+///
+/// This is a **local storage fault**, never evidence about a peer: readers
+/// return it instead of feeding rows from more than one branch (or from beside
+/// a gap) into consensus validation, where the corruption would otherwise
+/// surface as a misleading validation failure (`InvalidDifficultyThreshold`,
+/// `UnknownAnchor`) attributed to whoever supplied the input being validated.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StoreIncoherentError {
+    /// The header row at `height` does not link to the stored row below it.
+    #[error(
+        "header store incoherent: header at {height:?} links to {expected_parent} but the stored row below is {actual_below}"
+    )]
+    BrokenLinkage {
+        /// Height of the header whose parent link failed to resolve.
+        height: block::Height,
+        /// The parent hash the header claims (`previous_block_hash`).
+        expected_parent: block::Hash,
+        /// The hash actually stored at `height - 1`.
+        actual_below: block::Hash,
+    },
+
+    /// A header row exists at `height` but the row below it is missing.
+    #[error(
+        "header store incoherent: no stored row at {missing:?} below the header at {height:?}"
+    )]
+    Gap {
+        /// Height of the stored header above the gap.
+        height: block::Height,
+        /// The missing height (`height - 1`).
+        missing: block::Height,
+    },
+
+    /// The header row at `height` is not the block its hash row names.
+    #[error(
+        "header store incoherent: header stored at {height:?} hashes to {computed} but the hash row names {indexed}"
+    )]
+    HeaderHashMismatch {
+        /// Height of the divergent rows.
+        height: block::Height,
+        /// The hash the height→hash index names.
+        indexed: block::Hash,
+        /// The stored header's actual hash.
+        computed: block::Hash,
+    },
+
+    /// The hash→height and height→hash indexes disagree about a hash.
+    #[error(
+        "header store incoherent: hash {hash} is indexed at {height:?} but that height stores {stored:?}"
+    )]
+    BijectionMismatch {
+        /// The hash whose round-trip failed.
+        hash: block::Hash,
+        /// The height the hash→height index reports for it.
+        height: block::Height,
+        /// What the height→hash index stores there instead.
+        stored: Option<block::Hash>,
+    },
+}
+
 /// An error describing why a header-only range could not be committed.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -322,6 +384,15 @@ pub enum CommitHeaderRangeError {
         /// The conflicting height.
         height: block::Height,
     },
+
+    /// The local header store was found internally incoherent while reading
+    /// the context needed to validate the range.
+    ///
+    /// This is a local storage fault, not a peer validation failure: the range
+    /// was rejected because the store cannot supply trustworthy context, not
+    /// because the range itself was shown invalid.
+    #[error("header store incoherent while validating range: {0}")]
+    StoreIncoherent(#[from] StoreIncoherentError),
 
     /// Contextual header validation failed.
     #[error("could not contextually validate header")]

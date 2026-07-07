@@ -2965,6 +2965,141 @@ mod zakura_header_sync_driver_tests {
         endpoint.shutdown().await;
     }
 
+    /// End-to-end driver + reactor: an accepted `NewBlock` that did not land on
+    /// the best chain (state `Depth` = `None`) must not advance the header
+    /// frontier, while a best-chain accept (`Depth` = `Some`) must.
+    #[tokio::test]
+    async fn new_block_non_best_chain_accept_does_not_advance_header_frontier() {
+        let network = zebra_chain::parameters::Network::Mainnet;
+        let genesis_hash = network.genesis_hash();
+        let mut config = zebra_network::Config {
+            network: network.clone(),
+            ..zebra_network::Config::default()
+        };
+        config.zakura.listen_addr = None;
+        let endpoint = zebra_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(
+            &config,
+            |_supervisor, _trace| Arc::new(NoopZakuraService) as Arc<dyn ZakuraService>,
+            Some(ZakuraHeaderSyncDriverStartup {
+                frontiers: HeaderSyncFrontiers {
+                    finalized_height: block::Height(0),
+                    verified_block_tip: block::Height(0),
+                    verified_block_hash: genesis_hash,
+                },
+                best_header_tip: Some((block::Height(0), genesis_hash)),
+                verified_block_tip_hash: genesis_hash,
+            }),
+        )
+        .await
+        .expect("Zakura endpoint starts")
+        .expect("v2_p2p starts an endpoint");
+        let header_sync = endpoint
+            .header_sync()
+            .expect("driver startup starts header sync");
+
+        // Block 2 plays the non-best-chain commit; block 1 plays the best-chain one.
+        let non_best_chain_block = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let non_best_chain_hash = non_best_chain_block.hash();
+        let best_chain_block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let best_chain_hash = best_chain_block.hash();
+
+        let (action_tx, action_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handles = ZakuraHeaderSyncDriverHandles {
+            endpoint: endpoint.clone(),
+            header_sync: header_sync.clone(),
+        };
+        let state = service_fn(|request: zebra_state::Request| async move {
+            panic!("unexpected state request from NewBlockReceived: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zebra_state::BoxError>(zebra_state::Response::Committed(block::Hash([0; 32])))
+        });
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::Depth(hash) if hash == non_best_chain_hash => {
+                    Ok::<_, zebra_state::BoxError>(zebra_state::ReadResponse::Depth(None))
+                }
+                zebra_state::ReadRequest::Depth(hash) if hash == best_chain_hash => {
+                    Ok(zebra_state::ReadResponse::Depth(Some(0)))
+                }
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        // The verifier accepts both blocks; only the state decides which chain
+        // they landed on.
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            match request {
+                zebra_consensus::Request::Commit(block) => {
+                    Ok::<_, zebra_consensus::BoxError>(block.hash())
+                }
+                request => panic!("unexpected verifier request: {request:?}"),
+            }
+        });
+        let driver = tokio::spawn(drive_zakura_header_sync_actions(
+            action_rx,
+            handles,
+            state,
+            read_state,
+            verifier,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let source =
+            zebra_network::zakura::ZakuraPeerId::new(vec![9; 32]).expect("test peer id is valid");
+        action_tx
+            .send(zebra_network::zakura::HeaderSyncAction::NewBlockReceived {
+                peer: source.clone(),
+                height: non_best_chain_block
+                    .coinbase_height()
+                    .expect("test block has height"),
+                hash: non_best_chain_hash,
+                block: non_best_chain_block,
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        // The non-best-chain accept must not move the reactor's best header tip.
+        // Give the driver + reactor time to (incorrectly) advance before
+        // checking; the follow-up best-chain accept below proves liveness.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            header_sync.best_header_tip(),
+            (block::Height(0), genesis_hash),
+            "a non-best-chain NewBlock accept must not advance the header frontier"
+        );
+
+        let best_height = best_chain_block
+            .coinbase_height()
+            .expect("test block has height");
+        action_tx
+            .send(zebra_network::zakura::HeaderSyncAction::NewBlockReceived {
+                peer: source,
+                height: best_height,
+                hash: best_chain_hash,
+                block: best_chain_block,
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if header_sync.best_header_tip() == (best_height, best_chain_hash) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a best-chain NewBlock commit advances the header frontier");
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        endpoint.shutdown().await;
+    }
+
     #[tokio::test]
     async fn block_sync_driver_coalesces_stale_needed_queries() {
         let (action_tx, mut action_rx) = mpsc::channel(8);

@@ -252,32 +252,59 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     .await
                 {
                     Ok(committed_hash) if committed_hash == hash => {
+                        // A contextually valid block also commits when it does
+                        // not land on the best chain, but only a best-chain
+                        // block may advance the header/verified frontiers or be
+                        // forwarded to peers: gossiping non-best-chain blocks
+                        // makes the whole Zakura layer follow a losing branch
+                        // while the node's own chain stays honest, stranding
+                        // zakura-only peers.
+                        let on_best_chain =
+                            new_block_is_on_best_chain(read_state.clone(), hash).await;
+                        let result_label = if on_best_chain {
+                            "accepted"
+                        } else {
+                            "accepted_non_best_chain"
+                        };
                         trace_header_commit_finish(
                             &trace,
                             "new_block",
                             &peer,
                             height,
                             hash,
-                            "accepted",
+                            result_label,
                             started,
                         );
                         trace_header_reactor_event(
                             &trace,
-                            "new_block_accepted",
+                            if on_best_chain {
+                                "new_block_accepted"
+                            } else {
+                                "new_block_accepted_non_best_chain"
+                            },
                             Some(&peer),
                             height,
                             hash,
                             1,
                         );
-                        let _ = handles
-                            .header_sync
-                            .send(HeaderSyncEvent::NewBlockAccepted {
+                        let event = if on_best_chain {
+                            HeaderSyncEvent::NewBlockAccepted {
                                 peer,
                                 height,
                                 hash,
                                 block,
-                            })
-                            .await;
+                            }
+                        } else {
+                            debug!(
+                                ?peer,
+                                ?height,
+                                ?hash,
+                                "Zakura NewBlock did not land on the best chain; \
+                                 not advancing frontiers or forwarding"
+                            );
+                            HeaderSyncEvent::NewBlockAcceptedNonBestChain { peer, height, hash }
+                        };
+                        let _ = handles.header_sync.send(event).await;
                     }
                     Ok(committed_hash) => {
                         trace_header_commit_finish(
@@ -1103,6 +1130,44 @@ async fn log_missing_block_bodies<ReadState>(
                 started,
             );
             warn!(?error, "failed to query Zakura missing block bodies")
+        }
+    }
+}
+
+/// Returns whether a just-committed `NewBlock` landed on the best chain.
+///
+/// `ReadRequest::Depth` returns `Some` only for best-chain blocks, so it
+/// distinguishes a best-chain extension (or a reorg the block just won) from a
+/// side-chain commit. Read failures are treated as *not* best-chain: the
+/// node's own frontier still advances through the chain-tip mirror, so the
+/// only cost of a false negative is skipping one gossip forward, while a
+/// false positive would gossip a possibly losing branch.
+async fn new_block_is_on_best_chain<ReadState>(read_state: ReadState, hash: block::Hash) -> bool
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    match read_state
+        .oneshot(zebra_state::ReadRequest::Depth(hash))
+        .await
+    {
+        Ok(zebra_state::ReadResponse::Depth(depth)) => depth.is_some(),
+        Ok(response) => {
+            warn!(?response, "unexpected Depth response for Zakura NewBlock");
+            false
+        }
+        Err(error) => {
+            warn!(
+                ?hash,
+                ?error,
+                "failed to read Zakura NewBlock depth from state"
+            );
+            false
         }
     }
 }

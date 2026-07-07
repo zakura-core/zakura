@@ -185,6 +185,20 @@ pub enum HeaderSyncEvent {
         /// Duplicate block hash.
         hash: block::Hash,
     },
+    /// The node's block pipeline accepted an inbound `NewBlock` body, but it
+    /// did not land on the best chain. The block is remembered for dedup only:
+    /// a non-best-chain block must not advance the header or verified
+    /// frontiers and must not be forwarded to peers, or the whole Zakura layer
+    /// gossips a losing branch while the node's own chain stays on the best
+    /// one.
+    NewBlockAcceptedNonBestChain {
+        /// Source peer.
+        peer: ZakuraPeerId,
+        /// Accepted non-best-chain block height.
+        height: block::Height,
+        /// Accepted non-best-chain block hash.
+        hash: block::Hash,
+    },
     /// The node's block pipeline rejected an inbound `NewBlock` body.
     NewBlockRejected {
         /// Source peer.
@@ -277,6 +291,7 @@ impl HeaderSyncEvent {
             Self::FullBlockCommitted { .. } => "full_block_committed",
             Self::NewBlockAccepted { .. } => "new_block_accepted",
             Self::NewBlockDuplicate { .. } => "new_block_duplicate",
+            Self::NewBlockAcceptedNonBestChain { .. } => "new_block_accepted_non_best_chain",
             Self::NewBlockRejected { .. } => "new_block_rejected",
             Self::WireMessage { .. } => "wire_message",
             Self::WireDecodeFailed { .. } => "wire_decode_failed",

@@ -74,6 +74,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Fixed a near-tip sync restart loop when a timed-out `AwaitUtxo` lookup in the
   transaction verifier was converted to `InternalDowncastError` instead of a
   missing transparent input.
+- Fixed Zakura nodes gossiping and following non-best-chain blocks. An inbound
+  `NewBlock` that did not land on the best chain (for example a testnet
+  min-difficulty branch) still advanced the node's Zakura header and verified
+  frontiers and was forwarded to peers, so a whole fleet could advertise and
+  propagate a losing branch over Zakura while each node's own chain stayed on
+  the best one — stranding zakura-only peers that followed the gossip. An
+  accepted `NewBlock` is now checked against the best chain before it advances
+  any frontier or is forwarded; non-best-chain accepts are remembered for dedup
+  only and counted in `sync.header.tip.new_block.non_best_chain`.
 - Fixed dual-stack nodes (`v2_p2p` and `legacy_p2p` both enabled) permanently
   shutting down their own Zakura header- and block-sync drivers when a legacy
   peer on a foreign fork answered the body-sync stall watchdog's cross-check

@@ -2903,6 +2903,94 @@ async fn inbound_unseen_valid_new_block_is_seen_and_forwarded_to_eligible_peers(
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn accepted_non_best_chain_new_block_is_deduped_without_advancing_or_forwarding() {
+    let network = Network::Mainnet;
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let hash = block.hash();
+    let height = block.coinbase_height().expect("test block has height");
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut fixture = spawn_test_reactor(startup_for(network.clone(), anchor, None));
+    let mut tip = fixture.handle.subscribe_tip();
+    let source = peer(55);
+    let would_be_destination = peer(56);
+
+    // The destination's advertised tip is below the block height, so a
+    // best-chain accept at this height WOULD forward to it.
+    for peer_id in [source.clone(), would_be_destination.clone()] {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id,
+            block::Height(0),
+            block::Height(0),
+            DEFAULT_HS_RANGE,
+            1,
+        )
+        .await;
+    }
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::NewBlockAcceptedNonBestChain {
+            peer: source.clone(),
+            height,
+            hash,
+        })
+        .await
+        .unwrap();
+
+    // A non-best-chain accept advances no frontier and forwards nothing.
+    while let Ok(Some(action)) = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        fixture.actions.recv(),
+    )
+    .await
+    {
+        if matches!(
+            action,
+            HeaderSyncAction::ForwardNewBlock { .. }
+                | HeaderSyncAction::HeaderAdvanced { .. }
+                | HeaderSyncAction::HeaderReanchored { .. }
+        ) {
+            panic!("non-best-chain accept must not advance frontiers or forward: {action:?}");
+        }
+    }
+    assert_eq!(fixture.handle.best_header_tip(), anchor);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), tip.changed())
+            .await
+            .is_err(),
+        "non-best-chain accept must not publish a new best header tip"
+    );
+
+    // The hash is remembered: a later wire NewBlock for it dedups without
+    // re-entering the block pipeline or scoring the sender.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: source,
+            msg: HeaderSyncMessage::NewBlock(block),
+        })
+        .await
+        .unwrap();
+    while let Ok(Some(action)) = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        fixture.actions.recv(),
+    )
+    .await
+    {
+        if matches!(
+            action,
+            HeaderSyncAction::NewBlockReceived { .. }
+                | HeaderSyncAction::ForwardNewBlock { .. }
+                | HeaderSyncAction::Misbehavior { .. }
+        ) {
+            panic!("seen non-best-chain block must be cheap-deduped without scoring: {action:?}");
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_duplicate_new_block_dedups_pending_acceptance_without_scoring() {
     let network = Network::Mainnet;

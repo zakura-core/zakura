@@ -3,9 +3,9 @@
 //! Mirrors the predicates of `deploy/zcashd-compat/sync-check.sh`:
 //!
 //! - a `zebrad --zcashd-compat` process is running,
-//! - a `zcashd -zebra-compat` process is running,
-//! - `getzebracompatinfo` reports `service_state == "ready"`,
-//!   `zebra.reachable == true`, and `zebra.identity_verified == true`,
+//! - a sidecar `zcashd` process is running,
+//! - `getconnectioncount` on zcashd reports exactly one peer (the Zebra node
+//!   it is pinned to with `-connect`),
 //! - the absolute difference between zebrad and zcashd `getblockcount`
 //!   is within the configured maximum drift.
 
@@ -120,24 +120,29 @@ impl Check for ZcashdCompatSyncCheck {
             return CheckOutcome::fail("zcashd process is not running", details);
         }
 
-        let compat_info = match self.json_rpc(
-            &self.config.zcashd_rpc_url,
-            &self.config.zcashd_cookie_file,
-            "getzebracompatinfo",
-        ) {
-            Ok(result) => result,
+        let zcashd_peers = match self
+            .json_rpc(
+                &self.config.zcashd_rpc_url,
+                &self.config.zcashd_cookie_file,
+                "getconnectioncount",
+            )
+            .and_then(|result| block_count(&result))
+        {
+            Ok(peers) => peers,
             Err(error) => {
-                details.insert("predicate".into(), "getzebracompatinfo_rpc".into());
+                details.insert("predicate".into(), "zcashd_getconnectioncount".into());
                 details.insert("error".into(), error.to_string());
-                return CheckOutcome::fail("zcashd getzebracompatinfo RPC failed", details);
+                return CheckOutcome::fail("zcashd getconnectioncount RPC failed", details);
             }
         };
 
-        if let Err(reason) = compat_ready(&compat_info) {
-            details.insert("predicate".into(), "compat_ready".into());
-            details.insert("compat_status".into(), reason.clone());
+        details.insert("zcashd_connections".into(), zcashd_peers.to_string());
+        if zcashd_peers != 1 {
+            details.insert("predicate".into(), "peer_pinning".into());
             return CheckOutcome::fail(
-                format!("zcashd zebra-compat status is not ready: {reason}"),
+                format!(
+                    "sidecar zcashd must peer with exactly one node (Zebra), got {zcashd_peers}"
+                ),
                 details,
             );
         }
@@ -225,32 +230,6 @@ fn extract_result(body: Value) -> Result<Value, RpcError> {
         .ok_or_else(|| RpcError::UnexpectedResult("missing result field".into()))
 }
 
-/// Checks the `getzebracompatinfo` readiness predicates, returning a
-/// description of the observed state on failure.
-fn compat_ready(result: &Value) -> Result<(), String> {
-    let service_state = result.get("service_state").and_then(Value::as_str);
-    let zebra = result.get("zebra");
-    let reachable = zebra
-        .and_then(|zebra| zebra.get("reachable"))
-        .and_then(Value::as_bool);
-    let identity_verified = zebra
-        .and_then(|zebra| zebra.get("identity_verified"))
-        .and_then(Value::as_bool);
-
-    let ready = service_state == Some("ready")
-        && reachable == Some(true)
-        && identity_verified == Some(true);
-
-    if ready {
-        Ok(())
-    } else {
-        Err(format!(
-            "service_state={service_state:?} zebra.reachable={reachable:?} \
-             zebra.identity_verified={identity_verified:?}"
-        ))
-    }
-}
-
 /// Parses a `getblockcount` result as a block height.
 fn block_count(result: &Value) -> Result<u64, RpcError> {
     result
@@ -281,39 +260,6 @@ mod tests {
             extract_result(body),
             Err(RpcError::UnexpectedResult(_))
         ));
-    }
-
-    #[test]
-    fn compat_ready_accepts_ready_response() {
-        let result = json!({
-            "service_state": "ready",
-            "zebra": {"reachable": true, "identity_verified": true},
-        });
-        assert_eq!(compat_ready(&result), Ok(()));
-    }
-
-    #[test]
-    fn compat_ready_rejects_not_ready_states() {
-        let starting = json!({
-            "service_state": "starting",
-            "zebra": {"reachable": true, "identity_verified": true},
-        });
-        assert!(compat_ready(&starting).is_err());
-
-        let unreachable = json!({
-            "service_state": "ready",
-            "zebra": {"reachable": false, "identity_verified": true},
-        });
-        assert!(compat_ready(&unreachable).is_err());
-
-        let unverified = json!({
-            "service_state": "ready",
-            "zebra": {"reachable": true, "identity_verified": false},
-        });
-        assert!(compat_ready(&unverified).is_err());
-
-        let missing_fields = json!({});
-        assert!(compat_ready(&missing_fields).is_err());
     }
 
     #[test]

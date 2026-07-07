@@ -1,13 +1,17 @@
 name: zcashd-compat Regtest
 
-# Runs the managed zcashd-compat Regtest integration suite after every merge to main.
+# Runs the managed zcashd-compat Regtest integration suite.
 #
-# The test harness spawns a fresh zebrad and zcashd (managed download) on
-# randomised ports, so no external infrastructure is required.
+# The test harness spawns a fresh zebrad and zcashd on randomised ports, so no
+# external infrastructure is required.
+#
+# TEMPORARILY manual-only: the suite now requires a P2P-sidecar zcashd build
+# (miner RPCs removed, -regtestacceptunvalidatedpow support), but the managed
+# download manifest still pins the previous RPC-ingest build. Re-enable the
+# push trigger once a sidecar zcashd release is cut and
+# zebrad/zcashd-compat-manifest.json is bumped. Until then run locally with
+# `make compat-test-regtest TEST_ZCASHD_PATH=/path/to/sidecar/zcashd`.
 on:
-  push:
-    branches: [main]
-
   workflow_dispatch:
 
 concurrency:

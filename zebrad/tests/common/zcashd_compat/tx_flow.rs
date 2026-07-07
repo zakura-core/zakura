@@ -72,7 +72,13 @@ pub async fn transparent_tx_in_mempool() -> Result<()> {
         .await
         .map_err(|e| eyre!("sendtoaddress: {e}"))?;
 
-    // Poll zebrad's mempool until the txid appears (up to 30 s).
+    wait_for_zebra_mempool_tx(&setup, &txid).await?;
+
+    setup.teardown()
+}
+
+/// Polls zebrad's `getrawmempool` until `txid` appears (up to 30 s).
+async fn wait_for_zebra_mempool_tx(setup: &ZcashdCompatSetup, txid: &str) -> Result<()> {
     for attempt in 1..=30u32 {
         let mempool: Vec<String> = setup
             .zebra_client
@@ -80,8 +86,8 @@ pub async fn transparent_tx_in_mempool() -> Result<()> {
             .await
             .map_err(|e| eyre!("getrawmempool: {e}"))?;
 
-        if mempool.contains(&txid) {
-            return setup.teardown();
+        if mempool.iter().any(|entry| entry == txid) {
+            return Ok(());
         }
 
         if attempt == 30 {
@@ -92,7 +98,7 @@ pub async fn transparent_tx_in_mempool() -> Result<()> {
         sleep(Duration::from_secs(1)).await;
     }
 
-    setup.teardown()
+    Ok(())
 }
 
 /// Sends a transparent transaction via zcashd, mines a block, and confirms the
@@ -124,6 +130,11 @@ pub async fn transparent_tx_confirms() -> Result<()> {
         .json_result_from_call("sendtoaddress", &format!(r#"["{addr}", 0.001]"#))
         .await
         .map_err(|e| eyre!("sendtoaddress: {e}"))?;
+
+    // Wait for the transaction to relay from zcashd to zebrad over P2P before
+    // mining: zcashd trickles tx invs to peers, so mining immediately would
+    // build a block that misses the transaction.
+    wait_for_zebra_mempool_tx(&setup, &txid).await?;
 
     // Mine a block to confirm the transaction.
     setup.zebra_client.generate(1).await?;

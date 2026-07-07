@@ -4558,13 +4558,23 @@ async fn zcashd_compat_both_processes_start() -> Result<()> {
     common::zcashd_compat::startup::both_processes_start().await
 }
 
-/// After mining 5 blocks, `getzebracompatinfo` should report `readiness == "ready"`.
+/// The P2P sidecar zcashd follows Zebra's mined tip and peers with Zebra alone.
 ///
-/// See [`common::zcashd_compat::startup::readiness_after_mine`] for details.
+/// See [`common::zcashd_compat::startup::sidecar_follows_tip`] for details.
 #[tokio::test]
 #[ignore]
-async fn zcashd_compat_readiness_after_mine() -> Result<()> {
-    common::zcashd_compat::startup::readiness_after_mine().await
+async fn zcashd_compat_sidecar_follows_tip() -> Result<()> {
+    common::zcashd_compat::startup::sidecar_follows_tip().await
+}
+
+/// Miner-facing RPCs are removed from the sidecar zcashd; Zebra serves templates.
+///
+/// See [`common::zcashd_compat::startup::miner_rpcs_disabled`] for details.
+#[tokio::test]
+#[ignore]
+#[cfg(unix)]
+async fn zcashd_compat_miner_rpcs_disabled() -> Result<()> {
+    common::zcashd_compat::startup::miner_rpcs_disabled().await
 }
 
 /// Verifies that zcashd's RPC endpoint rejects requests with invalid credentials.
@@ -4695,36 +4705,28 @@ async fn zcashd_compat_reorg_equal_work_race() -> Result<()> {
     common::zcashd_compat::reorg::equal_work_race().await
 }
 
-/// See [`common::zcashd_compat::reorg::depth_at_batch_limit`] for details.
+/// See [`common::zcashd_compat::reorg::deep_reorg_depth33`] for details.
 #[tokio::test]
 #[ignore]
 #[cfg(unix)]
-async fn zcashd_compat_reorg_depth_at_batch_limit() -> Result<()> {
-    common::zcashd_compat::reorg::depth_at_batch_limit().await
+async fn zcashd_compat_reorg_deep_depth33() -> Result<()> {
+    common::zcashd_compat::reorg::deep_reorg_depth33().await
 }
 
-/// See [`common::zcashd_compat::reorg::large_batch_depth80`] for details.
+/// See [`common::zcashd_compat::reorg::deep_reorg_depth80`] for details.
 #[tokio::test]
 #[ignore]
 #[cfg(unix)]
-async fn zcashd_compat_reorg_large_batch_depth80() -> Result<()> {
-    common::zcashd_compat::reorg::large_batch_depth80().await
+async fn zcashd_compat_reorg_deep_depth80() -> Result<()> {
+    common::zcashd_compat::reorg::deep_reorg_depth80().await
 }
 
-/// See [`common::zcashd_compat::reorg::over_batch_branch_syncs`] for details.
+/// See [`common::zcashd_compat::reorg::deep_reorg_restart_recovers`] for details.
 #[tokio::test]
 #[ignore]
 #[cfg(unix)]
-async fn zcashd_compat_reorg_over_batch_branch_syncs() -> Result<()> {
-    common::zcashd_compat::reorg::over_batch_branch_syncs().await
-}
-
-/// See [`common::zcashd_compat::reorg::over_batch_branch_restart_recovers`] for details.
-#[tokio::test]
-#[ignore]
-#[cfg(unix)]
-async fn zcashd_compat_reorg_over_batch_branch_restart_recovers() -> Result<()> {
-    common::zcashd_compat::reorg::over_batch_branch_restart_recovers().await
+async fn zcashd_compat_reorg_deep_restart_recovers() -> Result<()> {
+    common::zcashd_compat::reorg::deep_reorg_restart_recovers().await
 }
 
 /// See [`common::zcashd_compat::reorg::restart_after_reorg`] for details.

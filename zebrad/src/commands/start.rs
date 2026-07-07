@@ -2135,12 +2135,12 @@ mod zakura_header_sync_driver_tests {
         body_sizes_for_served_header_range, chain_tip_mirror_frontier_change,
         coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
         commit_block_sync_body, drive_block_sync_actions, drive_zakura_header_sync_actions,
-        header_range_commit_failure_kind, notify_block_sync_header_tip, query_block_sync_frontiers,
-        query_block_sync_needed_blocks, root_covered_query_best_header_tip,
-        tree_aux_roots_for_served_header_range, verified_block_tip_from_state, BlockApplyClass,
-        BlocksyncThroughputProbe, ZakuraHeaderSyncDriverHandles,
-        ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+        header_range_commit_error_label, header_range_commit_failure_kind,
+        notify_block_sync_header_tip, query_block_sync_frontiers, query_block_sync_needed_blocks,
+        root_covered_query_best_header_tip, tree_aux_roots_for_served_header_range,
+        verified_block_tip_from_state, BlockApplyClass, BlocksyncThroughputProbe,
+        ZakuraHeaderSyncDriverHandles, ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL,
+        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
     };
 
     fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
@@ -2343,6 +2343,27 @@ mod zakura_header_sync_driver_tests {
         assert_eq!(
             header_range_commit_failure_kind(&error),
             HeaderSyncCommitFailureKind::Local
+        );
+    }
+
+    #[test]
+    fn header_range_commit_error_labels_preserve_exact_variant() {
+        let unknown_anchor = zebra_state::CommitHeaderRangeError::UnknownAnchor {
+            anchor: block::Hash([0; 32]),
+        };
+        let lower_work = zebra_state::CommitHeaderRangeError::LowerWorkConflict {
+            height: block::Height(1),
+            existing_work: 2,
+            new_work: 1,
+        };
+
+        assert_eq!(
+            header_range_commit_error_label(&unknown_anchor),
+            "unknown_anchor"
+        );
+        assert_eq!(
+            header_range_commit_error_label(&lower_work),
+            "lower_work_conflict"
         );
     }
 

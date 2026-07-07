@@ -436,6 +436,10 @@ pub mod commit_state_trace {
     pub const TREE_AUX_ROOTS_LEN: &str = "tree_aux_roots_len";
     /// Result label field.
     pub const RESULT: &str = "result";
+    /// Stable state error variant label field.
+    pub const ERROR_VARIANT: &str = "error_variant";
+    /// Debug-formatted state error field.
+    pub const ERROR_DEBUG: &str = "error_debug";
     /// Bounded reason field.
     pub const REASON: &str = "reason";
     /// Reactor-local block apply token field.

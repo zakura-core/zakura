@@ -740,6 +740,17 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                     cs_trace::RESULT,
                                     commit_failure_result_label(kind),
                                 );
+                                insert_cs_hash(row, cs_trace::HASH, anchor);
+                                insert_cs_str(
+                                    row,
+                                    cs_trace::ERROR_VARIANT,
+                                    header_range_commit_error_label(error.as_ref()),
+                                );
+                                insert_cs_str(
+                                    row,
+                                    cs_trace::ERROR_DEBUG,
+                                    &header_range_commit_error_debug(error.as_ref()),
+                                );
                                 insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
                             },
                         );
@@ -1131,6 +1142,88 @@ pub(crate) fn header_range_commit_failure_kind(
         }
         _ => HeaderSyncCommitFailureKind::Local,
     }
+}
+
+pub(crate) fn header_range_commit_error_label(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> &'static str {
+    let Some(error) = error.downcast_ref::<zebra_state::CommitHeaderRangeError>() else {
+        return "non_commit_header_range_error";
+    };
+
+    match error {
+        zebra_state::CommitHeaderRangeError::EmptyRange => "empty_range",
+        zebra_state::CommitHeaderRangeError::RangeTooLong { .. } => "range_too_long",
+        zebra_state::CommitHeaderRangeError::BodySizeCountMismatch { .. } => {
+            "body_size_count_mismatch"
+        }
+        zebra_state::CommitHeaderRangeError::TreeAuxRootCountMismatch { .. } => {
+            "tree_aux_root_count_mismatch"
+        }
+        zebra_state::CommitHeaderRangeError::TreeAuxRootHeightMismatch { .. } => {
+            "tree_aux_root_height_mismatch"
+        }
+        zebra_state::CommitHeaderRangeError::UnknownAnchor { .. } => "unknown_anchor",
+        zebra_state::CommitHeaderRangeError::MissingGenesisAnchor { .. } => {
+            "missing_genesis_anchor"
+        }
+        zebra_state::CommitHeaderRangeError::HeightOverflow => "height_overflow",
+        zebra_state::CommitHeaderRangeError::ImmutableConflict { .. } => "immutable_conflict",
+        zebra_state::CommitHeaderRangeError::ReorgTooDeep { .. } => "reorg_too_deep",
+        zebra_state::CommitHeaderRangeError::LowerWorkConflict { .. } => "lower_work_conflict",
+        zebra_state::CommitHeaderRangeError::CheckpointConflict { .. } => "checkpoint_conflict",
+        zebra_state::CommitHeaderRangeError::ConflictingFullBlockHeader { .. } => {
+            "conflicting_full_block_header"
+        }
+        zebra_state::CommitHeaderRangeError::ValidateContextError(error) => {
+            validate_context_error_label(error)
+        }
+        zebra_state::CommitHeaderRangeError::StorageWriteError { .. } => "storage_write_error",
+        zebra_state::CommitHeaderRangeError::SendCommitRequestFailed => {
+            "send_commit_request_failed"
+        }
+        zebra_state::CommitHeaderRangeError::CommitResponseDropped => "commit_response_dropped",
+        _ => "unknown_commit_header_range_error",
+    }
+}
+
+fn validate_context_error_label(error: &zebra_state::ValidateContextError) -> &'static str {
+    match error {
+        zebra_state::ValidateContextError::BlockPreviouslyInvalidated { .. } => {
+            "validate_context_error.block_previously_invalidated"
+        }
+        zebra_state::ValidateContextError::VctSuppliedRootUnavailable { .. } => {
+            "validate_context_error.vct_supplied_root_unavailable"
+        }
+        zebra_state::ValidateContextError::VctSuppliedRootAwaitingSuccessor { .. } => {
+            "validate_context_error.vct_supplied_root_awaiting_successor"
+        }
+        zebra_state::ValidateContextError::OrphanedBlock { .. } => {
+            "validate_context_error.orphaned_block"
+        }
+        zebra_state::ValidateContextError::NonSequentialBlock { .. } => {
+            "validate_context_error.non_sequential_block"
+        }
+        zebra_state::ValidateContextError::TimeTooEarly { .. } => {
+            "validate_context_error.time_too_early"
+        }
+        zebra_state::ValidateContextError::TimeTooLate { .. } => {
+            "validate_context_error.time_too_late"
+        }
+        zebra_state::ValidateContextError::InvalidDifficultyThreshold { .. } => {
+            "validate_context_error.invalid_difficulty_threshold"
+        }
+        _ => "validate_context_error.other",
+    }
+}
+
+fn header_range_commit_error_debug(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> String {
+    error
+        .downcast_ref::<zebra_state::CommitHeaderRangeError>()
+        .map(|error| format!("{error:?}"))
+        .unwrap_or_else(|| error.to_string())
 }
 
 pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(

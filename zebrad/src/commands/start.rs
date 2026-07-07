@@ -173,32 +173,11 @@ fn use_zakura_block_sync(config: &zebra_network::Config) -> bool {
 fn check_tcp_slow_start_after_idle() {}
 
 impl StartCmd {
-    /// Minimum response body size used in zcashd-compat mode.
+    /// Minimum response body size used by the dedicated zcashd-compat RPC listener.
     ///
-    /// zcashd defaults to a 128 MiB response budget. That allows a memory-clamped
-    /// batch of 33 raw blocks, whose worst-case response is 133,082,368 bytes.
-    /// jsonrpsee applies this limit to the whole JSON-RPC batch response.
-    ///
-    /// These `ZCASHD_COMPAT_*` constants mirror zcashd's batch/budget arithmetic
-    /// in `zcash/src/zebra_compat/zebra_client.cpp`
-    /// (`ZebraCompatSyncBatchSizeFromMemoryBudget` / `ZebraRpcMaxResponseBodySize`).
-    /// If the formula or constants change on either side, update both together,
-    /// or startup validation will accept configs the other process rejects.
+    /// The listener keeps a 128 MiB floor so bulk consumers of the retained
+    /// zcashd-compat RPC endpoint do not hit surprise body-size limits.
     const ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE: usize = 128 * 1024 * 1024;
-    /// zcashd's default sync batch size.
-    const ZCASHD_COMPAT_DEFAULT_SYNC_BATCH_SIZE: u64 = 30;
-    /// Default zcashd raw-block sync response budget.
-    const ZCASHD_COMPAT_DEFAULT_SYNC_RESPONSE_BUDGET_MB: u64 = 128;
-    /// MiB in bytes, matching zcashd's `-zebra-compat-sync-response-budget-mb`.
-    const ZCASHD_COMPAT_MIB: u64 = 1024 * 1024;
-    /// zcashd's consensus maximum serialized block size.
-    const ZCASHD_COMPAT_MAX_BLOCK_BYTES: u64 = 2_000_000;
-    /// zcashd's per-block JSON-RPC response overhead allowance.
-    const ZCASHD_COMPAT_JSON_RPC_BLOCK_OVERHEAD_BYTES: u64 = 1024;
-    /// zcashd's whole-batch JSON-RPC response margin.
-    const ZCASHD_COMPAT_RPC_RESPONSE_BODY_MARGIN_BYTES: u64 = 1024 * 1024;
-    /// Conservative response budget needed per raw-block sync batch entry.
-    const ZCASHD_COMPAT_SYNC_RESPONSE_BUDGET_BYTES_PER_BLOCK: u64 = 4 * 1024 * 1024;
     /// Extra time Zebra waits for the zcashd-compat supervisor task beyond the
     /// child's `shutdown_grace_period`. The supervisor's `terminate_child` waits
     /// the full grace period before its SIGKILL last resort, so the outer wait
@@ -285,120 +264,24 @@ impl StartCmd {
         compat_rpc_config
     }
 
-    fn zcashd_compat_extra_arg_u64(
+    /// Returns the Zebra P2P address supervised zcashd should `-connect` to.
+    ///
+    /// Uses `zcashd_compat.p2p_connect_addr` when set, otherwise Zebra's bound
+    /// legacy P2P listener, substituting loopback for unspecified addresses so
+    /// zcashd gets a dialable target on the same host.
+    fn zcashd_compat_p2p_connect_addr(
         config: &ZebradConfig,
-        name: &str,
-    ) -> Result<Option<u64>, Report> {
-        let option_name = format!("-{name}=");
-        let long_option_name = format!("--{name}=");
-        let bare_option_name = format!("-{name}");
-        let bare_long_option_name = format!("--{name}");
-
-        config
-            .zcashd_compat
-            .zcashd_extra_args
-            .iter()
-            .filter_map(|arg| {
-                arg.strip_prefix(&option_name)
-                    .or_else(|| arg.strip_prefix(&long_option_name))
-                    .map(|value| (arg, Some(value)))
-                    .or_else(|| {
-                        (arg == &bare_option_name || arg == &bare_long_option_name)
-                            .then_some((arg, None))
-                    })
-            })
-            .map(|(arg, value)| {
-                let value = value.ok_or_else(|| {
-                    eyre!("zcashd_compat.zcashd_extra_args contains {arg:?} without a value")
-                })?;
-
-                value.parse::<u64>().map_err(|error| {
-                    eyre!(
-                        "zcashd_compat.zcashd_extra_args contains invalid {name} value {value:?}: {error}"
-                    )
-                })
-            })
-            .next_back()
-            .transpose()
-    }
-
-    fn validate_zcashd_compat_sync_batch_response_size(
-        config: &ZebradConfig,
-    ) -> Result<(), Report> {
-        let sync_batch_size =
-            Self::zcashd_compat_extra_arg_u64(config, "zebra-compat-sync-batch-size")?
-                .unwrap_or(Self::ZCASHD_COMPAT_DEFAULT_SYNC_BATCH_SIZE);
-        let sync_response_budget_mb =
-            Self::zcashd_compat_extra_arg_u64(config, "zebra-compat-sync-response-budget-mb")?
-                .unwrap_or(Self::ZCASHD_COMPAT_DEFAULT_SYNC_RESPONSE_BUDGET_MB)
-                .max(1);
-        let sync_response_budget_bytes = sync_response_budget_mb
-            .checked_mul(Self::ZCASHD_COMPAT_MIB)
-            .ok_or_else(|| {
-                eyre!(
-                    "zcashd-compat sync response budget {sync_response_budget_mb} MiB is too large"
-                )
-            })?;
-        let max_batch_size_for_response_budget =
-            if sync_response_budget_bytes <= Self::ZCASHD_COMPAT_RPC_RESPONSE_BODY_MARGIN_BYTES {
-                1
-            } else {
-                (sync_response_budget_bytes - Self::ZCASHD_COMPAT_RPC_RESPONSE_BODY_MARGIN_BYTES)
-                    / (2 * Self::ZCASHD_COMPAT_MAX_BLOCK_BYTES
-                        + Self::ZCASHD_COMPAT_JSON_RPC_BLOCK_OVERHEAD_BYTES)
-            }
-            .max(1);
-        let required_sync_response_budget_bytes =
-            Self::ZCASHD_COMPAT_RPC_RESPONSE_BODY_MARGIN_BYTES
-                .checked_add(
-                    sync_batch_size
-                        .checked_mul(
-                            2 * Self::ZCASHD_COMPAT_MAX_BLOCK_BYTES
-                                + Self::ZCASHD_COMPAT_JSON_RPC_BLOCK_OVERHEAD_BYTES,
-                        )
-                        .ok_or_else(|| {
-                            eyre!("zcashd-compat sync batch size {sync_batch_size} is too large")
-                        })?,
-                )
-                .ok_or_else(|| {
-                    eyre!("zcashd-compat sync batch size {sync_batch_size} is too large")
-                })?;
-        let required_sync_response_budget_mb =
-            required_sync_response_budget_bytes.div_ceil(Self::ZCASHD_COMPAT_MIB);
-        let required_max_response_body_size = sync_batch_size
-            .checked_mul(Self::ZCASHD_COMPAT_SYNC_RESPONSE_BUDGET_BYTES_PER_BLOCK)
-            .ok_or_else(|| eyre!("zcashd-compat sync batch size {sync_batch_size} is too large"))?;
-        let required_max_response_body_size: usize = required_max_response_body_size
-            .try_into()
-            .map_err(|_| eyre!("zcashd-compat sync batch size {sync_batch_size} is too large"))?;
-        let effective_max_response_body_size = config
-            .rpc
-            .max_response_body_size
-            .max(Self::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE);
-
-        let mut errors = Vec::new();
-        if sync_batch_size > max_batch_size_for_response_budget {
-            errors.push(format!(
-                "zcashd-compat sync batch size {sync_batch_size} requires \
-                 zcashd_compat.zcashd_extra_args to include \
-                 -zebra-compat-sync-response-budget-mb={required_sync_response_budget_mb} or higher; \
-                 configured effective value is {sync_response_budget_mb}"
-            ));
+        local_listener: SocketAddr,
+    ) -> SocketAddr {
+        if let Some(addr) = config.zcashd_compat.p2p_connect_addr {
+            return addr;
         }
 
-        if effective_max_response_body_size < required_max_response_body_size {
-            errors.push(format!(
-                "zcashd-compat sync batch size {sync_batch_size} requires \
-                 rpc.max_response_body_size = {required_max_response_body_size} or higher; \
-                 configured effective value is {effective_max_response_body_size}"
-            ));
+        if local_listener.ip().is_unspecified() {
+            SocketAddr::from(([127, 0, 0, 1], local_listener.port()))
+        } else {
+            local_listener
         }
-
-        if !errors.is_empty() {
-            return Err(eyre!("{}", errors.join("\n")));
-        }
-
-        Ok(())
     }
 
     fn validate_zcashd_compat_tls_config(config: &ZebradConfig) -> Result<(), Report> {
@@ -446,16 +329,6 @@ impl StartCmd {
                      or zcashd_compat.unsafe_allow_remote_http=true when a container or private network boundary secures the listener"
                 ));
             }
-        }
-
-        if config.zcashd_compat.enabled
-            && config.zcashd_compat.manage_zcashd
-            && config.zcashd_compat.tls_enabled()
-            && config.zcashd_compat.tls_ca_file.is_none()
-        {
-            return Err(eyre!(
-                "zcashd-compat supervision with TLS requires zcashd_compat.tls_ca_file so zcashd can verify Zebra"
-            ));
         }
 
         Ok(())
@@ -824,19 +697,21 @@ impl StartCmd {
         let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
         let mut zcashd_compat_task_handle = if let Some(resolved_zcashd_path) = resolved_zcashd_path
         {
+            let local_listener = address_book
+                .lock()
+                .expect("unexpected panic in address book mutex guard")
+                .local_listener_socket_addr();
             let supervisor_config = zcashd_compat::SupervisorConfig::new(
                 &config.zcashd_compat,
                 resolved_zcashd_path,
                 &config.state.cache_dir,
                 config.network.network.kind(),
-                Self::zcashd_compat_rpc_url(&config)?,
-                Self::zcashd_compat_cookie_path(&config),
-                Self::zcashd_compat_rpc_config(&config).max_response_body_size,
+                Self::zcashd_compat_p2p_connect_addr(&config, local_listener),
             );
 
             info!(
-                rpc_url = %supervisor_config.rpc_url,
-                cookie_file = %supervisor_config.cookie_path.display(),
+                connect = %supervisor_config.zebra_p2p_addr,
+                compat_rpc_url = %Self::zcashd_compat_rpc_url(&config)?,
                 "zcashd-compat source enabled"
             );
 
@@ -1348,8 +1223,20 @@ impl config::Override<ZebradConfig> for StartCmd {
                 .into());
             }
 
-            Self::validate_zcashd_compat_sync_batch_response_size(&config)
+            if !config.network.legacy_p2p {
+                return Err(std::io::Error::other(
+                    "zcashd-compat P2P sidecar mode requires network.legacy_p2p = true, \
+                     because zcashd syncs from Zebra over the legacy Zcash P2P protocol",
+                )
+                .into());
+            }
+
+            if config.zcashd_compat.manage_zcashd {
+                zcashd_compat::reject_peer_selection_extra_args(
+                    &config.zcashd_compat.zcashd_extra_args,
+                )
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
+            }
 
             if config.zcashd_compat.manage_zcashd {
                 match zcashd_compat::effective_zcashd_source(&config.zcashd_compat) {
@@ -1773,7 +1660,9 @@ mod tests {
     }
 
     #[test]
-    fn zcashd_compat_config_rejects_managed_tls_without_ca_file() {
+    fn zcashd_compat_config_allows_managed_tls_without_ca_file() {
+        // The P2P sidecar zcashd does not talk to the compat RPC listener, so
+        // supervision no longer requires a CA file when the listener uses TLS.
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: false,
@@ -1791,11 +1680,49 @@ mod tests {
         config.zcashd_compat.tls_cert_file = Some(cert_file);
         config.zcashd_compat.tls_key_file = Some(key_file);
 
+        cmd.override_config(config)
+            .expect("managed zcashd-compat should accept a TLS listener without a CA file");
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_disabled_legacy_p2p() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+        config.network.legacy_p2p = false;
+
         let error = cmd
             .override_config(config)
-            .expect_err("managed TLS should require a CA file");
+            .expect_err("the P2P sidecar should require the legacy P2P listener");
         assert!(
-            error.to_string().contains("tls_ca_file"),
+            error.to_string().contains("legacy_p2p"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_peer_selection_extra_args() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Managed;
+        config.zcashd_compat.zcashd_extra_args = vec!["-addnode=1.2.3.4".to_string()];
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("peer-selection extra args should be rejected");
+        assert!(
+            error.to_string().contains("peer-selection"),
             "unexpected error: {error}"
         );
     }
@@ -1845,98 +1772,6 @@ mod tests {
         assert!(
             error.to_string().contains("tls_cert_file")
                 && error.to_string().contains("tls_key_file"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn zcashd_compat_config_rejects_large_sync_batch_without_matching_rpc_response_size() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.zcashd_extra_args =
-            vec!["-zebra-compat-sync-batch-size=80".to_string()];
-
-        let error = cmd
-            .override_config(config)
-            .expect_err("large zcashd sync batches should require a matching RPC response limit");
-
-        assert!(
-            error
-                .to_string()
-                .contains("rpc.max_response_body_size = 335544320"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn zcashd_compat_config_allows_large_sync_batch_with_matching_rpc_response_size() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.zcashd_extra_args = vec![
-            "-zebra-compat-sync-batch-size=80".to_string(),
-            "-zebra-compat-sync-response-budget-mb=320".to_string(),
-        ];
-        config.rpc.max_response_body_size = 320 * 1024 * 1024;
-
-        cmd.override_config(config)
-            .expect("large zcashd sync batches should allow a matching RPC response limit");
-    }
-
-    #[test]
-    fn zcashd_compat_config_rejects_large_sync_batch_without_matching_zcashd_response_budget() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.zcashd_extra_args =
-            vec!["-zebra-compat-sync-batch-size=80".to_string()];
-        config.rpc.max_response_body_size = 320 * 1024 * 1024;
-
-        let error = cmd.override_config(config).expect_err(
-            "large zcashd sync batches should require a matching zcashd response budget",
-        );
-
-        assert!(
-            error
-                .to_string()
-                .contains("-zebra-compat-sync-response-budget-mb=307"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn zcashd_compat_config_rejects_invalid_sync_batch_size() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.zcashd_extra_args =
-            vec!["-zebra-compat-sync-batch-size=eighty".to_string()];
-
-        let error = cmd
-            .override_config(config)
-            .expect_err("invalid zcashd sync batch sizes should be rejected");
-
-        assert!(
-            error
-                .to_string()
-                .contains("invalid zebra-compat-sync-batch-size value"),
             "unexpected error: {error}"
         );
     }

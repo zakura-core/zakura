@@ -1,7 +1,7 @@
 # This workflow automates the creation and updating of draft releases. It compiles PR titles into the draft release notes.
 # https://github.com/valargroup/zebra/releases
 #
-# - Updates the draft release upon each merge into 'ironwood-main'.
+# - Updates the draft release upon each merge into 'main'.
 # - Utilizes the release-drafter GitHub Action to accumulate PR titles since the last release into a draft release note.
 # - Suitable permissions are set for creating releases and handling pull requests.
 #
@@ -10,10 +10,10 @@
 name: Release Drafter
 
 on:
-  # Automatically update the draft release every time a PR merges to `ironwood-main`
+  # Automatically update the draft release every time a PR merges to `main`
   push:
     branches:
-      - ironwood-main
+      - main
   # pull_request event is required only for autolabeler
   pull_request:
     # Only following types are handled by the action
@@ -41,7 +41,7 @@ jobs:
       - uses: release-drafter/release-drafter@c2e2804cc59f45f57076a99af580d0fedb697927 # v7.3.0
         with:
           config-name: release-drafter.yml
-          commitish: ironwood-main
+          commitish: main
           #disable-autolabeler: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

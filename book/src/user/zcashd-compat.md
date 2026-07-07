@@ -117,6 +117,15 @@ zcashd speaks the legacy Zcash P2P protocol. Do not enable state pruning on
 the fronting Zebra — a pruned node does not advertise `NODE_NETWORK` and
 zcashd will not sync from it.
 
+> [!WARNING]
+> When the fronting Zebra runs in Docker with a published P2P port, all
+> connections arriving through `docker-proxy` (including a sidecar zcashd
+> connecting to `127.0.0.1:8233` on the host) share one source IP. Zebra's
+> `network.max_connections_per_ip` defaults to **1**, so the sidecar can lose
+> that single slot to a proxied public peer and silently never connect. Set
+> `ZEBRA_NETWORK__MAX_CONNECTIONS_PER_IP=8` (or similar) on a Dockerised
+> front, or attach the sidecar to the container network directly.
+
 ## Quick start (externally managed)
 
 Run Zebra normally (with `zcashd_compat.enabled = true` if you want the

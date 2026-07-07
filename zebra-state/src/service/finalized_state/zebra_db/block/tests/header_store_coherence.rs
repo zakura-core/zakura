@@ -33,3 +33,4 @@ mod ops;
 mod oracle;
 mod prop;
 mod scenarios;
+mod startup_audit;

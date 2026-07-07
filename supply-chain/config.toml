@@ -468,6 +468,7 @@ criteria = "safe-to-deploy"
 [[exemptions.crossbeam-epoch]]
 version = "0.9.20"
 criteria = "safe-to-deploy"
+notes = "Security patch for RUSTSEC-2026-0204; diff reviewed from 0.9.18."
 
 [[exemptions.crossbeam-utils]]
 version = "0.8.20"

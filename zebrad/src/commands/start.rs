@@ -1631,11 +1631,7 @@ mod zakura_header_sync_driver_tests {
 
     #[test]
     fn zakura_block_sync_replaces_chain_sync_when_v2_p2p_is_enabled() {
-        let mut config = zebra_network::Config {
-            default_p2p: false,
-            v2_p2p: true,
-            ..Default::default()
-        };
+        let mut config = zebra_network::Config::for_test(true);
 
         assert!(use_zakura_block_sync(&config));
 
@@ -2175,9 +2171,7 @@ mod zakura_header_sync_driver_tests {
         let genesis_hash = network.genesis_hash();
         let mut config = zebra_network::Config {
             network: network.clone(),
-            default_p2p: false,
-            v2_p2p: true,
-            ..zebra_network::Config::default()
+            ..zebra_network::Config::for_test(true)
         };
         config.zakura.listen_addr = None;
         let endpoint = zebra_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(
@@ -2285,9 +2279,7 @@ mod zakura_header_sync_driver_tests {
         let genesis_hash = network.genesis_hash();
         let mut config = zebra_network::Config {
             network: network.clone(),
-            default_p2p: false,
-            v2_p2p: true,
-            ..zebra_network::Config::default()
+            ..zebra_network::Config::for_test(true)
         };
         config.zakura.listen_addr = None;
         let endpoint = zebra_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(

@@ -42,11 +42,7 @@ fn peer_addr(port: u16) -> PeerSocketAddr {
 }
 
 fn test_config(v2_p2p: bool) -> Config {
-    Config {
-        default_p2p: false,
-        v2_p2p,
-        ..Config::default()
-    }
+    Config::for_test(v2_p2p)
 }
 
 fn upgraded_outcome() -> ZakuraUpgradeOutcome {

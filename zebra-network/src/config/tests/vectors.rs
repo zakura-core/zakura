@@ -97,10 +97,8 @@ fn testnet_params_serialization_roundtrip() {
             .to_network()
             .expect("failed to build configured network"),
         initial_testnet_peers: [].into(),
-        ..Config::default()
+        ..Config::for_test(true)
     };
-    config.legacy_p2p = true;
-    config.v2_p2p = true;
     config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
@@ -720,10 +718,8 @@ fn funding_streams_serialization_roundtrip() {
             .to_network()
             .expect("failed to build configured network"),
         initial_testnet_peers: [].into(),
-        ..Config::default()
+        ..Config::for_test(true)
     };
-    config.legacy_p2p = true;
-    config.v2_p2p = true;
     config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
@@ -746,10 +742,8 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
             .to_network()
             .expect("failed to build configured network"),
         initial_testnet_peers: [].into(),
-        ..Config::default()
+        ..Config::for_test(true)
     };
-    config.legacy_p2p = true;
-    config.v2_p2p = true;
     config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();

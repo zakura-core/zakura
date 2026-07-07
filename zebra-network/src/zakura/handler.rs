@@ -5507,22 +5507,10 @@ mod tests {
         assert!(should_run_freshness_reaper(0, 0));
     }
 
-    fn v2_enabled_config() -> Config {
-        Config {
-            default_p2p: false,
-            v2_p2p: true,
-            ..Config::default()
-        }
-    }
-
     #[tokio::test]
     async fn v2_p2p_false_leaves_header_sync_disabled() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
-        let config = Config {
-            default_p2p: false,
-            v2_p2p: false,
-            ..Config::default()
-        };
+        let config = Config::for_test(false);
 
         let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
             Arc::new(NoopService) as Arc<dyn Service>
@@ -5536,7 +5524,7 @@ mod tests {
     #[tokio::test]
     async fn v2_p2p_true_starts_header_sync_handle() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
-        let config = v2_enabled_config();
+        let config = Config::for_test(true);
 
         let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
             Arc::new(NoopService) as Arc<dyn Service>
@@ -5552,7 +5540,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_shutdown_stops_header_sync_task() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
-        let config = v2_enabled_config();
+        let config = Config::for_test(true);
         let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
             Arc::new(NoopService) as Arc<dyn Service>
         })
@@ -5588,7 +5576,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_shutdown_stops_maintained_native_dial_loop() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
-        let config = v2_enabled_config();
+        let config = Config::for_test(true);
         let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
             Arc::new(NoopService) as Arc<dyn Service>
         })
@@ -5626,7 +5614,7 @@ mod tests {
     #[tokio::test]
     async fn endpoint_shutdown_stops_discovery_candidate_dialer() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
-        let config = v2_enabled_config();
+        let config = Config::for_test(true);
         let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
             Arc::new(NoopService) as Arc<dyn Service>
         })
@@ -5679,7 +5667,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn failed_legacy_upgrade_does_not_leak_maintained_dial() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
-        let config = v2_enabled_config();
+        let config = Config::for_test(true);
         let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
             Arc::new(NoopService) as Arc<dyn Service>
         })

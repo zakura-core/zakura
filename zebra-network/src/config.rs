@@ -684,6 +684,24 @@ impl Config {
 
         Ok(load_or_generate_zakura_secret_key(&key_file))
     }
+
+    /// Builds a network config for tests with the P2P stack pinned as an explicit
+    /// override (`default_p2p = false`), so [`v2_p2p`](Self::v2_p2p) and
+    /// [`legacy_p2p`](Self::legacy_p2p) are used verbatim instead of being
+    /// re-derived from the network's binary defaults.
+    ///
+    /// The legacy stack is enabled and `v2_p2p` is set to the argument. Override
+    /// other fields with struct-update syntax, e.g.
+    /// `Config { network, ..Config::for_test(true) }`.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn for_test(v2_p2p: bool) -> Config {
+        Config {
+            default_p2p: false,
+            v2_p2p,
+            legacy_p2p: true,
+            ..Config::default()
+        }
+    }
 }
 
 /// Loads a persisted Zakura secret key from `key_file`, or generates, persists, and

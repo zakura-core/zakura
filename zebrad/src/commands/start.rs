@@ -2347,6 +2347,24 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[test]
+    fn unlinked_range_is_local_header_sync_commit_failure() {
+        // The reactor validates every response's linkage against the requested
+        // anchor before committing with that anchor, so the store's own
+        // linkage check failing means local anchor/response pairing broke,
+        // not peer misbehavior.
+        let error = zebra_state::CommitHeaderRangeError::UnlinkedRange {
+            height: block::Height(1),
+            expected_parent: block::Hash([0; 32]),
+            actual_parent: block::Hash([1; 32]),
+        };
+
+        assert_eq!(
+            header_range_commit_failure_kind(&error),
+            HeaderSyncCommitFailureKind::Local
+        );
+    }
+
+    #[test]
     fn header_range_commit_error_labels_preserve_exact_variant() {
         let unknown_anchor = zebra_state::CommitHeaderRangeError::UnknownAnchor {
             anchor: block::Hash([0; 32]),

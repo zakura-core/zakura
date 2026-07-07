@@ -744,7 +744,7 @@ mod tests {
     use crate::{
         arbitrary::Prepare,
         service::{
-            finalized_state::FinalizedState,
+            finalized_state::{DiskWriteBatch, FinalizedState, WriteDisk},
             non_finalized_state::NonFinalizedState,
             write::{
                 seed_zakura_header_from_committed_block,
@@ -780,6 +780,27 @@ mod tests {
             .expect("fake child block has a coinbase height");
 
         let mut non_finalized_state = NonFinalizedState::new(&network);
+
+        // The seed path refuses rows that do not link to the stored header row
+        // below them, and the fake chain's parent block is not otherwise
+        // committed to this state, so store its hash as a provisional Zakura
+        // row (the consensus `hash_by_height` row cannot be written alone: a
+        // finalized tip implies note commitment trees exist).
+        let parent_height = parent
+            .coinbase_height()
+            .expect("test vector block has a coinbase height");
+        let zakura_hash_by_height = finalized_state
+            .db
+            .db()
+            .cf_handle("zakura_header_hash_by_height")
+            .unwrap();
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(&zakura_hash_by_height, parent_height, parent.hash());
+        finalized_state
+            .db
+            .db()
+            .write(batch)
+            .expect("parent hash row writes");
 
         non_finalized_state
             .commit_new_chain(best_block.clone().prepare(), &finalized_state)

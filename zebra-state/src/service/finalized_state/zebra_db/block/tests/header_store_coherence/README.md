@@ -34,65 +34,63 @@ write instead.
 | `audit.rs` | The invariant audit: A1 (bijection, both directions), A2 (linkage walk upward from the finalized tip over the merged header view), A3 (tip integrity, gaps, frontier overlay, aux-row backing), and A4 (the on-disk chain equals the model's expected canonical chain). Also `dump_store`, a comparable snapshot of all five column families used to assert that rejected commits are side-effect free and that reopens preserve the store byte-for-byte. |
 | `oracle.rs` | An in-memory model of the store's _specified_ behavior: a single linked canonical chain, best-cumulative-work selection with strict improvement, total suffix replacement above the first conflicting height, and a sequential body tip. It predicts whether each op must be accepted or rejected. |
 | `ops.rs` | The op alphabet, each op mapped to one real production write-batch shape: `CommitHeaderRange` → `prepare_header_range_batch_with_roots`; `CommitBody` / `Finalize` → `prepare_block_header_and_transaction_data_batch` plus the finalization roots delete (which runs the release path internally); `Seed` → `seed_zakura_header_from_committed_block` (the non-finalized best-chain commit hook); `Reopen` → shutdown and reopen of the persistent store. The `Harness` executes ops, cross-checks the oracle's prediction against the store's response, and audits after every mutation; failures come back as a transcribable `FailureReport` (the executed op prefix plus every violation found). |
-| `scenarios.rs` | Scripted production event shapes (s01–s10): simple reorgs, lower-work rejections and their later reversal, split-range and walk-back deliveries, body commits racing header reorgs, reorgs to a lower height, double reorgs at one fork point, activity across the difficulty-adjustment window edge, restarts at every boundary, and seed/range interplay. Also holds the `corruption_repro_*` tests below. |
-| `prop.rs` | Discovery proptests: random op sequences over the fixed universe, shrunk to minimal counterexamples on any audit failure. Both are `#[ignore]`d because the store has known bugs today; see "Running". |
+| `scenarios.rs` | Scripted production event shapes (s01–s11): simple reorgs, lower-work rejections and their later reversal, split-range and walk-back deliveries, body commits racing header reorgs, reorgs to a lower height, double reorgs at one fork point, activity across the difficulty-adjustment window edge, restarts at every boundary, seed/range interplay, and refused-seed convergence. Also holds the `*_upholds_invariants` regression gates below. |
+| `prop.rs` | The permanent random sweep: random op sequences over the fixed universe, shrunk to minimal counterexamples on any audit failure. |
 
-## Known corruption bugs pinned by this suite
+## Fixed corruption bugs gated by this suite
 
-Each bug is pinned by a pair of tests: `corruption_repro_<name>` **passes
-today** and deterministically demonstrates the violation, and
-`<name>_upholds_invariants` is `#[ignore]`d and asserts the correct behavior.
-When the write path is fixed, the repro fails loudly (forcing re-triage) and
-the twin gets un-ignored as the permanent regression test.
+This suite found and closed three write-path corruption bug classes. Each was
+first pinned by a `corruption_repro_*` test that deterministically demonstrated
+the violation; once the writer was fixed, the repro test was removed and its
+`<name>_upholds_invariants` twin now asserts the fixed behavior over the same
+op sequence as a permanent regression gate:
 
-1. **Unlinked-anchor commit** (`corruption_repro_unlinked_anchor_commit`).
-   `prepare_header_range_batch_with_roots` never checks that
-   `headers[0].previous_block_hash == anchor`, nor any intra-range linkage. A
-   range anchored at a same-height hash of a different branch passes
-   difficulty validation and commits a suffix that does not link to the row
-   below it — an on-disk I2 violation reachable from a single untrusted peer
-   response.
+1. **Unlinked-anchor commit** (`unlinked_anchor_commit_upholds_invariants`).
+   `prepare_header_range_batch_with_roots` used to accept ranges without
+   checking that `headers[0].previous_block_hash == anchor` or any intra-range
+   linkage, so a range anchored at a same-height hash of a different branch
+   could pass difficulty validation and commit a suffix that did not link to
+   the row below it — an on-disk I2 violation reachable from a single
+   untrusted peer response. The writer now rejects such ranges with
+   `CommitHeaderRangeError::UnlinkedRange`.
 2. **Re-delivery over committed bodies**
-   (`corruption_repro_redelivery_over_bodies`). The range insert loop gates
-   only its _roots_ write on `contains_body_at_height`; the
-   header/hash/height/body-size writes are unconditional. A header range
-   re-delivered over heights whose bodies were committed in the meantime
-   re-inserts zakura rows below the body tip, and nothing ever trims them
-   again (the release trim already ran at body-commit time) — a permanent I3
-   frontier-overlay violation.
-3. **Unlinked seed** (`corruption_repro_seed_above_gap`,
-   `corruption_repro_seed_fork_switch`; found by the proptest and shrunk to a
-   single op). `prepare_zakura_header_from_committed_block` writes its row
-   with no linkage or anchor precondition. Seeds fire only at non-finalized
+   (`redelivery_over_bodies_upholds_invariants`). The range insert loop used
+   to gate only its _roots_ write on `contains_body_at_height`, so a header
+   range re-delivered over heights whose bodies were committed in the
+   meantime re-inserted zakura rows below the body tip that nothing ever
+   trims again (the release trim already ran at body-commit time) — a
+   permanent I3 frontier-overlay violation. The gate now covers every zakura
+   row write: heights that already have a committed block are skipped
+   entirely (checked via `contains_height`, so it also holds for pruned
+   heights whose bodies are gone but whose authoritative rows remain).
+3. **Unlinked seed** (`seed_above_gap_upholds_invariants`,
+   `seed_fork_switch_upholds_invariants`; found by the proptest and shrunk to
+   a single op). `prepare_zakura_header_from_committed_block` used to write
+   its row with no linkage precondition. Seeds fire only at non-finalized
    best-_tip_ commits, so any best-tip jump (a fork switch between
    non-finalized chains, or a restart that restores the non-finalized backup)
-   seeds a height whose parent row is missing or belongs to another branch:
-   a gap or broken link on disk, and a generator of poisoned
-   difficulty-adjustment windows.
-
-A discovery sweep of 2048 random sequences with these three shapes excluded
-found no further violation class at that depth.
+   seeded a height whose parent row was missing or belonged to another
+   branch: a gap or broken link on disk, and a generator of poisoned
+   difficulty-adjustment windows. The seed path now refuses a seed that does
+   not link to the stored row below it as a silent no-op — the header store
+   briefly lags the non-finalized chain, and header-range sync converges it
+   (`s11_refused_seed_converges_via_range_delivery`).
 
 ## Running
 
 ```bash
-# The whole suite (scripted scenarios, audits, corruption repros):
+# The whole suite (scripted scenarios, audits, regression gates, random sweep):
 cargo test -p zebra-state --lib header_store_coherence
 
-# Discovery sweep beyond the known bugs (any failure = a NEW violation class):
+# The random sweep at discovery depth (any failure = a NEW violation class):
 PROPTEST_CASES=4096 cargo test -p zebra-state --lib \
-    header_store_coherence::prop::prop_discovery -- --ignored
-
-# The full random sweep (fails today on the known shapes; becomes a permanent
-# regression gate once the write paths are fixed):
-cargo test -p zebra-state --lib \
-    header_store_coherence::prop::prop_random_sequences -- --ignored
+    header_store_coherence::prop
 ```
 
 Shrunk proptest counterexamples should be transcribed into `scenarios.rs` as
-hardcoded `corruption_repro_*`/`#[ignore]` pairs (seed-independent pinning);
-the file under `zebra-state/proptest-regressions/` pins the seeds as a
-backstop and is checked in.
+hardcoded scenarios (seed-independent pinning); the file under
+`zebra-state/proptest-regressions/` pins the seeds as a backstop and is
+checked in.
 
 ## Scope
 

@@ -109,13 +109,16 @@ impl OpOutcome {
 }
 
 /// Why a sequence failed: the executed op prefix (last op is the failing one)
-/// plus everything found after it.
+/// plus everything found after it. All fields are diagnostic payloads rendered
+/// through `Debug` in test failure output.
 #[derive(Debug)]
 pub(crate) struct FailureReport {
-    /// The transcribable op sequence, rendered through `Debug` in reports.
+    /// The transcribable op sequence.
     #[allow(dead_code)]
     pub executed: Vec<Op>,
+    #[allow(dead_code)]
     pub violations: Vec<Violation>,
+    #[allow(dead_code)]
     pub mismatches: Vec<String>,
 }
 
@@ -132,10 +135,6 @@ pub(crate) struct Harness {
     config: Config,
     state: Option<ZebraDb>,
     executed: Vec<Op>,
-    /// Skip the op shapes that trigger the *known* corruption bugs (the
-    /// `corruption_repro_*` scenarios), so proptest discovery can search for
-    /// new violation classes instead of rediscovering the known ones.
-    avoid_known_corruptions: bool,
     _tempdir: tempfile::TempDir,
 }
 
@@ -157,17 +156,8 @@ impl Harness {
             config,
             state: Some(state),
             executed: Vec::new(),
-            avoid_known_corruptions: false,
             _tempdir: tempdir,
         }
-    }
-
-    /// A harness that skips the known corruption shapes (see
-    /// [`Harness::avoid_known_corruptions`]).
-    pub fn new_avoiding_known_corruptions() -> Self {
-        let mut harness = Self::new();
-        harness.avoid_known_corruptions = true;
-        harness
     }
 
     pub fn state(&self) -> &ZebraDb {
@@ -242,32 +232,6 @@ impl Harness {
                 let Some(range) = self.resolve_range(*source, *offset, *len, *anchor) else {
                     return self.finish(OpOutcome::Skipped("range out of bounds"), mismatches);
                 };
-                if self.avoid_known_corruptions {
-                    // Known bug 1: unlinked-anchor ranges are accepted instead
-                    // of rejected (corruption_repro_unlinked_anchor_commit).
-                    if matches!(
-                        self.oracle.predict_header_range(&range),
-                        Prediction::Reject(super::oracle::RejectKind::Malformed)
-                    ) {
-                        return self.finish(
-                            OpOutcome::Skipped("known corruption shape: unlinked anchor"),
-                            mismatches,
-                        );
-                    }
-                    // Known bug 2: accepted re-deliveries touching body-backed
-                    // heights strand zakura rows below the body tip
-                    // (corruption_repro_redelivery_over_bodies).
-                    if range
-                        .rows
-                        .iter()
-                        .any(|row| row.height <= self.oracle.body_tip())
-                    {
-                        return self.finish(
-                            OpOutcome::Skipped("known corruption shape: re-delivery over bodies"),
-                            mismatches,
-                        );
-                    }
-                }
                 match self.oracle.predict_header_range(&range) {
                     Prediction::Skip(reason) => {
                         return self.finish(OpOutcome::Skipped(reason), mismatches)
@@ -337,27 +301,33 @@ impl Harness {
                 let Some(fab) = rows.get(*index).cloned() else {
                     return self.finish(OpOutcome::Skipped("seed index out of bounds"), mismatches);
                 };
-                // Known bug 3: a seed whose parent is not the committed row
-                // below it writes an unlinkable row
-                // (corruption_repro_seed_above_gap / _seed_fork_switch).
-                if self.avoid_known_corruptions && !self.oracle.seed_is_parent_linked(&fab) {
-                    return self.finish(
-                        OpOutcome::Skipped("known corruption shape: unlinked seed"),
-                        mismatches,
-                    );
-                }
                 match self.oracle.predict_seed(&fab) {
                     Prediction::Skip(reason) => {
                         return self.finish(OpOutcome::Skipped(reason), mismatches)
                     }
                     _ => {
+                        // A seed whose parent is not the stored row below it is
+                        // refused by the store as a silent no-op (the header
+                        // store briefly lags the non-finalized chain until a
+                        // linkage-checked header range converges it), so the
+                        // call must succeed without mutating anything.
+                        let parent_linked = self.oracle.seed_is_parent_linked(&fab);
+                        let dump_before = (!parent_linked).then(|| dump_store(self.state()));
                         let block = fabricate_body(&fab);
                         match self
                             .state()
                             .seed_zakura_header_from_committed_block(fab.height, &block)
                         {
                             Ok(()) => {
-                                self.oracle.apply_seed(&fab);
+                                if parent_linked {
+                                    self.oracle.apply_seed(&fab);
+                                } else if dump_store(self.state())
+                                    != dump_before.expect("dumped before an unlinked seed")
+                                {
+                                    mismatches.push(format!(
+                                        "refused unlinked seed mutated the store: {op:?}"
+                                    ));
+                                }
                                 OpOutcome::Accepted
                             }
                             Err(error) => {

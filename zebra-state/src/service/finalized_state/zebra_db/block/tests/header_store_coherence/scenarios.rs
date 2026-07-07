@@ -4,16 +4,14 @@
 //! passing scenario is a regression gate on the whole write sequence, not
 //! just its final assertions.
 //!
-//! The `corruption_repro_*` tests at the bottom deliberately demonstrate
-//! store-invariant violations that exist today: they PASS while the bug
-//! exists and fail loudly once the write path is fixed, forcing re-triage.
-//! Their `#[ignore]`d twins assert the true invariant, to be un-ignored
-//! together with the write-path fix.
+//! The `*_upholds_invariants` tests at the bottom are the permanent
+//! regression gates for the three write-path corruption bugs this suite
+//! originally proved with `corruption_repro_*` twins (removed together with
+//! the write-path fixes; see the module README for the bug histories).
 
 use zebra_chain::block::Height;
 
 use super::{
-    audit::Violation,
     fabricate::{BRANCH_A, BRANCH_B, BRANCH_B_EXT, BRANCH_C, FORK_HEIGHT, TRUNK_LEN},
     ops::{universe, Anchor, Harness, Op, OpOutcome, Source},
 };
@@ -300,7 +298,7 @@ fn s04_body_commit_racing_header_reorg() {
 /// s05: the release path's frontier trim. Sequential body commits release
 /// matching provisional rows one by one; header re-delivery *above* the body
 /// tip is idempotent; restarts change nothing. (Re-delivery *over* body-backed
-/// heights strands rows — that is `corruption_repro_redelivery_over_bodies`.)
+/// heights skips those heights — `redelivery_over_bodies_upholds_invariants`.)
 #[test]
 fn s05_release_trim_then_redelivery() {
     let _init_guard = zebra_test::init();
@@ -541,19 +539,73 @@ fn s10_seed_interplay() {
     );
 }
 
+/// s11: a refused (unlinked) seed converges through header-range sync. The
+/// zakura store follows branch A (seeded at the fork height); the
+/// non-finalized best chain switches to branch B and its new best tip (B's
+/// *second* row) is seeded. The store refuses the unlinked seed as a no-op —
+/// the header store briefly lags the nf chain — and the later linked range
+/// delivery of B converges it onto the new branch.
+#[test]
+fn s11_refused_seed_converges_via_range_delivery() {
+    let _init_guard = zebra_test::init();
+    let mut harness = Harness::new();
+
+    let outcomes = harness
+        .run_all(&[
+            commit_trunk(),
+            Op::Seed {
+                source: Source::Branch(BRANCH_A),
+                index: 0,
+            },
+        ])
+        .expect("setup is clean");
+    outcomes.iter().for_each(assert_accepted);
+    let a_first = &universe().branches[BRANCH_A].headers[0];
+    assert_eq!(
+        harness.state().best_header_tip(),
+        Some((a_first.height, a_first.hash)),
+    );
+
+    // The nf best tip jumps to B[1]; its parent row is not stored, so the
+    // seed is refused without touching the store (checked by the harness).
+    let outcome = harness
+        .run(&Op::Seed {
+            source: Source::Branch(BRANCH_B),
+            index: 1,
+        })
+        .expect("the refused seed leaves the store coherent");
+    assert_accepted(&outcome);
+    assert_eq!(
+        harness.state().best_header_tip(),
+        Some((a_first.height, a_first.hash)),
+        "the refused seed must not move the header tip",
+    );
+
+    // Header sync catches up with the nf chain: B arrives as a linked range
+    // and out-works the stored A suffix, converging the store onto B.
+    let outcome = harness
+        .run(&commit_branch(BRANCH_B))
+        .expect("the converging range delivery is clean");
+    assert_accepted(&outcome);
+    assert_eq!(
+        harness.state().best_header_tip(),
+        Some(branch_tip(BRANCH_B)),
+    );
+}
+
 // ---------------------------------------------------------------------------
-// Corruption reproductions: deterministic sequences that violate the store
-// invariants today. See the module doc for the pass/ignore convention.
+// Regression gates for the three proven write-path corruption bugs. Each was
+// originally pinned by a `corruption_repro_*` test that demonstrated the
+// violation; those were removed with the write-path fixes, and these twins
+// now assert the fixed behavior over the exact same op sequences.
 // ---------------------------------------------------------------------------
 
-/// The unlinked-anchor commit: `prepare_header_range_batch_with_roots` never
-/// checks that `headers[0].previous_block_hash == anchor` (or any intra-range
-/// linkage). A range of branch-A headers anchored at the same-height *trunk*
-/// hash passes contextual difficulty validation — the two fast chains have
-/// identical (time, threshold) sequences — and commits a suffix that does not
-/// link to the row below it: an on-disk I2 violation. Production reach: a
-/// header range is untrusted peer input; nothing upstream of the store
-/// re-checks the anchor linkage.
+/// The unlinked-anchor commit (bug 1): a range of branch-A headers anchored at
+/// the same-height *trunk* hash passes contextual difficulty validation — the
+/// two fast chains have identical (time, threshold) sequences — so before the
+/// linkage check in `prepare_header_range_batch_with_roots`, it committed a
+/// suffix that did not link to the row below it: an on-disk I2 violation
+/// reachable from a single untrusted peer response.
 fn unlinked_anchor_ops() -> Vec<Op> {
     vec![
         commit_trunk(),
@@ -567,58 +619,36 @@ fn unlinked_anchor_ops() -> Vec<Op> {
     ]
 }
 
-/// PASSES while the bug exists (proves the repro); flips when the writer is
-/// fixed, forcing this pair to be re-triaged.
+/// The store rejects unlinked ranges with `UnlinkedRange` and stays coherent.
 #[test]
-fn corruption_repro_unlinked_anchor_commit() {
-    let _init_guard = zebra_test::init();
-    let mut harness = Harness::new();
-
-    let report = harness
-        .run_all(&unlinked_anchor_ops())
-        .expect_err("the unlinked-anchor commit corrupts the store today");
-
-    assert!(
-        report
-            .violations
-            .iter()
-            .any(|violation| matches!(violation, Violation::BrokenLinkage { height, .. } if *height == Height(FORK_HEIGHT + 2))),
-        "expected BrokenLinkage right above the spliced anchor: {report:?}"
-    );
-    assert!(
-        !report.mismatches.is_empty(),
-        "the oracle rejects this range; the store accepted it: {report:?}"
-    );
-}
-
-/// The true invariant. Un-ignore when the write-path fix lands.
-#[test]
-#[ignore = "known zakura header-store corruption: un-ignore with the write-path fix"]
 fn unlinked_anchor_commit_upholds_invariants() {
     let _init_guard = zebra_test::init();
     let mut harness = Harness::new();
-    harness
+    let outcomes = harness
         .run_all(&unlinked_anchor_ops())
         .expect("the store rejects unlinked ranges and stays coherent");
+    assert!(
+        matches!(
+            outcomes[1].header_range_error(),
+            CommitHeaderRangeError::UnlinkedRange { .. }
+        ),
+        "expected UnlinkedRange, got {:?}",
+        outcomes[1]
+    );
 }
 
-/// Re-delivery over committed bodies: the range insert loop
-/// (`prepare_header_range_batch_with_roots`) gates only its *roots* write on
-/// `contains_body_at_height` — the header/hash/height/body-size writes are
-/// unconditional. A header range re-delivered over heights whose bodies have
-/// since been committed (a header store behind the body store, or a late range
-/// response racing body sync — the exact scenario the roots gate's own comment
-/// describes) re-inserts zakura rows *below* the body tip. That breaks the
-/// frontier-overlay invariant ("the Zakura header store only ever holds
-/// heights with no committed body", block.rs release-path doc): the release
-/// trim already ran at body-commit time, so nothing ever removes these rows.
+/// Re-delivery over committed bodies (bug 2): before the committed-height
+/// gate covered the header/hash/height/body-size writes (it originally gated
+/// only the *roots* write), a header range re-delivered over heights whose
+/// bodies had since been committed re-inserted zakura rows *below* the body
+/// tip — rows the release trim (which already ran at body-commit time) never
+/// removes.
 fn redelivery_over_bodies_ops() -> Vec<Op> {
     vec![
         commit_trunk(),
         Op::Finalize { count: 10 },
         // Re-delivery spanning body-backed heights 6..=10 and header-only
-        // heights above. The rows match the canonical chain, so the store
-        // accepts — but the write strands zakura rows under the body tip.
+        // heights above: accepted, but the body-backed heights are skipped.
         Op::CommitHeaderRange {
             source: Source::Trunk,
             offset: 5,
@@ -628,50 +658,21 @@ fn redelivery_over_bodies_ops() -> Vec<Op> {
     ]
 }
 
-/// PASSES while the bug exists (proves the repro); flips when the writer is
-/// fixed, forcing this pair to be re-triaged.
+/// Re-delivery over bodies leaves no zakura rows below the body tip.
 #[test]
-fn corruption_repro_redelivery_over_bodies() {
-    let _init_guard = zebra_test::init();
-    let mut harness = Harness::new();
-
-    let report = harness
-        .run_all(&redelivery_over_bodies_ops())
-        .expect_err("re-delivery over committed bodies strands zakura rows today");
-
-    assert!(
-        report
-            .violations
-            .iter()
-            .any(|violation| matches!(violation, Violation::ZakuraRowAtBodyHeight { height, .. } if *height <= Height(10))),
-        "expected zakura rows stranded at body-backed heights: {report:?}"
-    );
-    assert!(
-        report.mismatches.is_empty(),
-        "acceptance itself is correct chain selection; the write effects are the bug: {report:?}"
-    );
-}
-
-/// The true invariant. Un-ignore when the write-path fix lands.
-#[test]
-#[ignore = "known zakura header-store corruption: un-ignore with the write-path fix"]
 fn redelivery_over_bodies_upholds_invariants() {
     let _init_guard = zebra_test::init();
     let mut harness = Harness::new();
-    harness
+    let outcomes = harness
         .run_all(&redelivery_over_bodies_ops())
         .expect("re-delivery over bodies leaves no zakura rows below the body tip");
+    outcomes.iter().for_each(assert_accepted);
 }
 
-/// Seed above a gap — found by `prop_random_sequences_uphold_invariants` and
-/// shrunk to a single op. The seed path
-/// (`prepare_zakura_header_from_committed_block`) writes header/hash/height
-/// rows at its height with **no linkage or anchor precondition**: seeding a
-/// block whose parent row is absent leaves a row the chain walk cannot reach.
-/// Production shape: seeds fire only at non-finalized best-*tip* commits, so
-/// any nf best-tip jump — a fork switch between nf chains, or a restart that
-/// restores the nf backup and then commits on top — seeds a height whose
-/// parent row was never written.
+/// Seed above a gap (bug 3, minimal shape — found by the discovery proptest
+/// and shrunk to a single op): before the parent-linkage refusal in
+/// `prepare_zakura_header_from_committed_block`, seeding a block whose parent
+/// row is absent left a row the chain walk cannot reach.
 fn seed_above_gap_ops() -> Vec<Op> {
     vec![Op::Seed {
         source: Source::Trunk,
@@ -679,51 +680,30 @@ fn seed_above_gap_ops() -> Vec<Op> {
     }]
 }
 
-/// PASSES while the bug exists (proves the repro); flips when the writer is
-/// fixed, forcing this pair to be re-triaged.
+/// A seed above a gap is refused as a no-op instead of stranding a row.
 #[test]
-fn corruption_repro_seed_above_gap() {
-    let _init_guard = zebra_test::init();
-    let mut harness = Harness::new();
-
-    let report = harness
-        .run_all(&seed_above_gap_ops())
-        .expect_err("seeding above a gap strands an unreachable row today");
-
-    assert!(
-        report
-            .violations
-            .iter()
-            .any(|violation| matches!(violation, Violation::RowAboveLastLinked { height, .. } if *height == Height(2))),
-        "expected the seeded row to be unreachable from the finalized tip: {report:?}"
-    );
-    assert!(
-        report
-            .violations
-            .iter()
-            .any(|violation| matches!(violation, Violation::BestHeaderTipMismatch { .. })),
-        "expected best_header_tip to point above the linked chain: {report:?}"
-    );
-}
-
-/// The true invariant. Un-ignore when the write-path fix lands.
-#[test]
-#[ignore = "known zakura header-store corruption: un-ignore with the write-path fix"]
 fn seed_above_gap_upholds_invariants() {
     let _init_guard = zebra_test::init();
     let mut harness = Harness::new();
     harness
         .run_all(&seed_above_gap_ops())
         .expect("a seed above a gap must not strand an unreachable row");
+
+    let genesis_hash = universe().genesis.hash();
+    assert_eq!(
+        harness.state().best_header_tip(),
+        Some((Height(0), genesis_hash)),
+        "the refused seed must not move the header tip",
+    );
 }
 
-/// Seed fork switch — the production-shaped variant of the seed linkage hole.
-/// The zakura store follows branch A (seeded at the fork height); the
-/// non-finalized best chain switches to branch B and its new best tip (B's
-/// *second* row) is seeded. The seed's non-conflict arm inserts the row
-/// directly — B's parent row was truncated, so the store now holds
-/// `A[0]` at the fork height and `B[1]` right above it: broken linkage on
-/// disk, exactly the poisoned-DAA-window generator from the incident table.
+/// Seed fork switch (bug 3, production shape): the zakura store follows
+/// branch A; the non-finalized best chain switches to branch B and its new
+/// best tip (B's *second* row) is seeded. Before the parent-linkage refusal,
+/// the seed's non-conflict arm inserted the row directly over A's truncated
+/// parent — broken linkage on disk, the poisoned-DAA-window generator from
+/// the production incident table. (`s11` proves the refused seed converges
+/// later through range delivery.)
 fn seed_fork_switch_ops() -> Vec<Op> {
     vec![
         commit_trunk(),
@@ -738,33 +718,19 @@ fn seed_fork_switch_ops() -> Vec<Op> {
     ]
 }
 
-/// PASSES while the bug exists (proves the repro); flips when the writer is
-/// fixed, forcing this pair to be re-triaged.
+/// A fork-switch seed keeps the store linked (the unlinked seed is refused).
 #[test]
-fn corruption_repro_seed_fork_switch() {
-    let _init_guard = zebra_test::init();
-    let mut harness = Harness::new();
-
-    let report = harness
-        .run_all(&seed_fork_switch_ops())
-        .expect_err("a fork-switch seed breaks linkage today");
-
-    assert!(
-        report
-            .violations
-            .iter()
-            .any(|violation| matches!(violation, Violation::BrokenLinkage { height, .. } if *height == Height(FORK_HEIGHT + 2))),
-        "expected broken linkage right above the fork height: {report:?}"
-    );
-}
-
-/// The true invariant. Un-ignore when the write-path fix lands.
-#[test]
-#[ignore = "known zakura header-store corruption: un-ignore with the write-path fix"]
 fn seed_fork_switch_upholds_invariants() {
     let _init_guard = zebra_test::init();
     let mut harness = Harness::new();
     harness
         .run_all(&seed_fork_switch_ops())
         .expect("a fork-switch seed must keep the store linked");
+
+    let a_first = &universe().branches[BRANCH_A].headers[0];
+    assert_eq!(
+        harness.state().best_header_tip(),
+        Some((a_first.height, a_first.hash)),
+        "the store stays on A until a linked delivery of B arrives",
+    );
 }

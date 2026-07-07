@@ -1123,6 +1123,12 @@ pub(crate) fn header_range_commit_failure_kind(
         // fork. Treat it as non-scoring so this stays a liveness/correctness guard,
         // not peer punishment.
         | zebra_state::CommitHeaderRangeError::LowerWorkConflict { .. }
+        // The reactor already validates every peer response against the requested
+        // anchor and for internal continuity (`validate_header_range_links`) and
+        // scores linkage failures there, then commits with that same anchor. So the
+        // store's own linkage check failing means the local anchor/response pairing
+        // went wrong, not that the peer misbehaved.
+        | zebra_state::CommitHeaderRangeError::UnlinkedRange { .. }
         | zebra_state::CommitHeaderRangeError::CommitResponseDropped => {
             HeaderSyncCommitFailureKind::Local
         }

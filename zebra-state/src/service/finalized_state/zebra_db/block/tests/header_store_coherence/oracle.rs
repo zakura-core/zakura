@@ -40,7 +40,7 @@ pub(crate) enum RejectKind {
     /// The conflicting suffix does not carry strictly more work.
     LowerWork,
     /// The range is malformed (wrong anchor linkage or heights); the store is
-    /// expected to reject it through contextual validation.
+    /// expected to reject it through its linkage check (`UnlinkedRange`).
     Malformed,
 }
 
@@ -248,8 +248,10 @@ impl Oracle {
     }
 
     /// Whether a seeded block's parent is the expected canonical row below it.
-    /// Seeds that are not parent-linked are the known seed-path corruption
-    /// shape (they write a row the store cannot link).
+    /// The store refuses seeds that are not parent-linked as silent no-ops
+    /// (writing them would strand a row the chain walk cannot reach); the
+    /// harness uses this to decide whether a successful seed call must have
+    /// mutated the store or left it untouched.
     pub fn seed_is_parent_linked(&self, fab: &FabHeader) -> bool {
         let parent_height = Height(fab.height.0 - 1);
         if parent_height == Height(0) {

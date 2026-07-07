@@ -35,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed three Zakura header-store write paths that could leave the on-disk
+  header store internally incoherent after chain forks, causing nodes to
+  reject valid headers from honest peers (`InvalidDifficultyThreshold` /
+  `UnknownAnchor`) and wedge below the network tip until manual intervention.
+  Header ranges must now link to their anchor and be internally contiguous
+  (rejected with the new `UnlinkedRange` error otherwise, which is classified
+  as a local, non-peer-scoring failure), header ranges re-delivered over
+  heights that already have committed block bodies no longer re-insert
+  provisional header rows below the body tip, and the header row seeded from
+  a committed best-chain block is skipped when it does not link to the stored
+  row below it (header-range sync converges the store instead).
 - Zebra can now audit the Zakura header store when the state database opens and
   self-repair any incoherence (broken linkage, hash↔height index mismatches,
   gaps with stranded rows above them, stale rows at committed heights) by

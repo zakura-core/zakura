@@ -258,6 +258,21 @@ pub enum CommitHeaderRangeError {
     #[error("header height overflow")]
     HeightOverflow,
 
+    /// A header in the range does not link to the anchor or to its predecessor,
+    /// so committing it would break the header store's linkage invariant.
+    #[error(
+        "header at {height:?} links to {actual_parent} instead of its predecessor {expected_parent}"
+    )]
+    UnlinkedRange {
+        /// Height of the first header that fails to link.
+        height: block::Height,
+        /// The hash of the row the header must link to (the anchor, or the
+        /// previous header in the range).
+        expected_parent: block::Hash,
+        /// The header's actual `previous_block_hash`.
+        actual_parent: block::Hash,
+    },
+
     /// A committed immutable header conflicts with the requested header.
     #[error("header at finalized height {height:?} conflicts with an existing header")]
     ImmutableConflict {

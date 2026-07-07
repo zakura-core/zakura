@@ -1799,6 +1799,12 @@ impl DiskWriteBatch {
     /// Full block verification is authoritative for the stored body. If a
     /// provisional Zakura header at this height differs, replace it with the
     /// block-derived header and drop stale provisional descendants.
+    ///
+    /// A block whose parent hash does not match the stored header row below
+    /// `height` is skipped without error: writing it would leave a gap or
+    /// broken link in the header store, so the store instead waits for
+    /// header-range sync to deliver the connecting rows (see the linkage
+    /// refusal below).
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_zakura_header_from_committed_block(
         &mut self,
@@ -1820,6 +1826,25 @@ impl DiskWriteBatch {
         if existing_zakura_header.as_ref() == Some(&block.header)
             && db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &height) == Some(hash)
         {
+            return Ok(());
+        }
+
+        // Seeds can jump to a non-finalized best tip whose parent is not the
+        // stored row below it. Refuse those seeds so the header store stays
+        // linked; header-range sync will later deliver the missing rows.
+        let hash_by_height = db.cf_handle("hash_by_height").unwrap();
+        let parent_hash: Option<block::Hash> = height.previous().ok().and_then(|parent_height| {
+            db.zs_get(&hash_by_height, &parent_height)
+                .or_else(|| db.zs_get(&zakura_hash_by_height, &parent_height))
+        });
+        if parent_hash != Some(block.header.previous_block_hash) {
+            tracing::debug!(
+                ?height,
+                ?hash,
+                parent = ?block.header.previous_block_hash,
+                stored_parent = ?parent_hash,
+                "skipping Zakura header seed that does not link to the stored row below it"
+            );
             return Ok(());
         }
 
@@ -2033,6 +2058,14 @@ impl DiskWriteBatch {
         let mut first_conflicting_height = None;
         let mut validated_headers = Vec::with_capacity(headers.len());
 
+        // Each header must link to the anchor (for the first header) or to its
+        // predecessor in the range. Without this check, a range anchored at the
+        // same-height hash of a *different* branch can pass contextual
+        // difficulty validation and commit a suffix that does not link to the
+        // row below it — an on-disk linkage violation reachable from a single
+        // peer response.
+        let mut expected_parent = anchor;
+
         for (index, header) in headers.iter().enumerate() {
             let offset =
                 u32::try_from(index + 1).map_err(|_| CommitHeaderRangeError::HeightOverflow)?;
@@ -2041,6 +2074,16 @@ impl DiskWriteBatch {
             let hash = block::Hash::from(&**header);
             let body_size = body_sizes[index];
             let roots = &tree_aux_roots[index];
+
+            if header.previous_block_hash != expected_parent {
+                return Err(CommitHeaderRangeError::UnlinkedRange {
+                    height,
+                    expected_parent,
+                    actual_parent: header.previous_block_hash,
+                });
+            }
+            expected_parent = hash;
+
             if roots.height != height {
                 return Err(CommitHeaderRangeError::TreeAuxRootHeightMismatch {
                     expected_height: height,
@@ -2163,6 +2206,14 @@ impl DiskWriteBatch {
 
         for (index, (height, hash, header, body_size)) in validated_headers.into_iter().enumerate()
         {
+            // Finalized block heights already have authoritative block rows and
+            // verified roots, even when pruning has removed their transactions.
+            // Re-delivered headers must not recreate provisional zakura rows
+            // there, because those rows are only trimmed during body commit.
+            if zebra_db.contains_height(height) {
+                continue;
+            }
+
             let same_header = zebra_db.zakura_header_hash(height) == Some(hash);
             let advertised_body_size = match (
                 same_header,
@@ -2182,29 +2233,20 @@ impl DiskWriteBatch {
             } else {
                 self.zs_delete(&body_size_by_height, height);
             }
-            // A height with a committed body already has a *verified* row in the
-            // serving index, written by the body-commit batch. Peer-supplied roots
-            // are unauthenticated until verify-before-commit, and that verification
-            // only ever runs above the body tip — so a header range re-delivered
-            // over committed heights (a header store behind the body store, or a
-            // late range response racing body sync) must never overwrite the
-            // verified row: committed roots win on any overlap (design §9).
-            if !zebra_db.contains_body_at_height(height) {
-                let roots = &tree_aux_roots[index];
-                self.zs_insert(
-                    &roots_by_height,
-                    height,
-                    CommitmentRootsByHeight {
-                        sapling: roots.sapling_root,
-                        orchard: roots.orchard_root,
-                        ironwood: roots.ironwood_root,
-                        sapling_tx: roots.sapling_tx,
-                        orchard_tx: roots.orchard_tx,
-                        ironwood_tx: roots.ironwood_tx,
-                        auth_data_root: roots.auth_data_root,
-                    },
-                );
-            }
+            let roots = &tree_aux_roots[index];
+            self.zs_insert(
+                &roots_by_height,
+                height,
+                CommitmentRootsByHeight {
+                    sapling: roots.sapling_root,
+                    orchard: roots.orchard_root,
+                    ironwood: roots.ironwood_root,
+                    sapling_tx: roots.sapling_tx,
+                    orchard_tx: roots.orchard_tx,
+                    ironwood_tx: roots.ironwood_tx,
+                    auth_data_root: roots.auth_data_root,
+                },
+            );
         }
 
         Ok(block::Hash::from(

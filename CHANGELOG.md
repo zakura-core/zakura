@@ -35,14 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
-- Updated stale Zakura node links in the landing page
-  (`book/valarbook/index.html`) and the installers (`install-zakura.sh`,
-  `install-zcashd-compat.sh`): Zebra snapshot links now point to the canonical
-  `https://zebra.valargroup.dev/`, default Docker images moved from
-  `valaroman/zebra` to `valargroup/zakura` (matching the release workflow),
-  documentation links point to `zakura-core/zakura`, and the printed
-  build-from-source commands clone `zakura-core/zakura` and clone zcashd into
-  the `zcash` directory the health checks expect.
 - Fixed misleading Zakura connectivity telemetry: header-sync now records
   record-only peer violations as `header_peer_violation_recorded` instead of
   `header_peer_disconnect_requested`, header-sync exposes the authoritative

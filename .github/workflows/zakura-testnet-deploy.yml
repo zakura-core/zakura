@@ -114,7 +114,9 @@ jobs:
           cat > nodes.ci.toml <<EOF
           [defaults]
           service_name    = "zakurad"
+          legacy_service_name = "zebrad"
           bin_path        = "/usr/local/bin/zakurad"
+          legacy_bin_path = "/usr/local/bin/zebrad"
           config_path     = "/etc/zakura/zakura.toml"
           network         = "Testnet"
           listen_addr     = "0.0.0.0:18233"
@@ -189,7 +191,9 @@ jobs:
           commit     = "${{ inputs.ref }}"
           deploy_kind = "process"
           service_name = ""
+          legacy_service_name = ""
           bin_path = "/root/unity/zakura/target/release/zakurad"
+          legacy_bin_path = "/root/unity/zakura/target/release/zebrad"
           config_path = "/root/unity/zakura-testnet.toml"
           network_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
@@ -198,6 +202,7 @@ jobs:
           working_dir = "/root/unity/zakura"
           start_command = "target/release/zakurad -c /root/unity/zakura-testnet.toml start"
           process_pattern = "target/release/zakurad -c /root/unity/zakura-testnet.toml start"
+          legacy_process_pattern = "target/release/zebrad -c /root/unity/zakura-testnet.toml start"
           v2_p2p = false
           checkpoint_sync = true
           EOF

@@ -41,7 +41,9 @@ SSH_COMMON_OPTS = [
 DEFAULTS = {
     "deploy_kind": "systemd",
     "service_name": "zakurad",
+    "legacy_service_name": "",
     "bin_path": "/usr/local/bin/zakurad",
+    "legacy_bin_path": "",
     "config_path": "/etc/zakura/zakura.toml",
     "log_file": "/var/log/zakura/zakura.log",
     "state_cache_dir": "/var/lib/zakura",
@@ -69,6 +71,7 @@ DEFAULTS = {
     "working_dir": "",
     "start_command": "",
     "process_pattern": "",
+    "legacy_process_pattern": "",
 }
 
 
@@ -83,7 +86,9 @@ class Node:
     commit: str
     deploy_kind: str
     service_name: str
+    legacy_service_name: str
     bin_path: str
+    legacy_bin_path: str
     config_path: str
     log_file: str
     state_cache_dir: str
@@ -104,6 +109,7 @@ class Node:
     working_dir: str
     start_command: str
     process_pattern: str
+    legacy_process_pattern: str
     port: object = None
     # resolved at runtime
     sha: str = ""
@@ -165,7 +171,9 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             commit=merged["commit"],
             deploy_kind=merged["deploy_kind"],
             service_name=merged["service_name"],
+            legacy_service_name=merged["legacy_service_name"],
             bin_path=merged["bin_path"],
+            legacy_bin_path=merged["legacy_bin_path"],
             config_path=merged["config_path"],
             log_file=merged["log_file"],
             state_cache_dir=merged["state_cache_dir"],
@@ -186,6 +194,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             working_dir=merged["working_dir"],
             start_command=merged["start_command"],
             process_pattern=merged["process_pattern"],
+            legacy_process_pattern=merged["legacy_process_pattern"],
             port=merged["port"],
         ))
 
@@ -403,6 +412,8 @@ set -euo pipefail
 BIN_PATH={bin_path}
 CONFIG_PATH={config_path}
 SERVICE={service}
+LEGACY_SERVICE={legacy_service}
+LEGACY_BIN_PATH={legacy_bin_path}
 LOG_FILE={log_file}
 STATE_DIR={state_dir}
 CACHE_DIR_MIGRATE_FROM={cache_dir_migrate_from}
@@ -424,6 +435,13 @@ rm -f /tmp/zakurad-deploy.new /tmp/zakurad-deploy.service /tmp/zakurad-deploy.to
 systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null 2>&1 || true
 
+stop_legacy_service() {{
+    if [ -n "$LEGACY_SERVICE" ] && [ "$LEGACY_SERVICE" != "$SERVICE" ]; then
+        systemctl stop "$LEGACY_SERVICE" || true
+        systemctl disable "$LEGACY_SERVICE" >/dev/null 2>&1 || true
+    fi
+}}
+
 if [ "$NO_RESTART" = "1" ]; then
     if [ -n "$CACHE_DIR_MIGRATE_FROM" ] && [ ! -e "$STATE_DIR" ] && [ -d "$CACHE_DIR_MIGRATE_FROM" ]; then
         echo "cache migration from $CACHE_DIR_MIGRATE_FROM to $STATE_DIR requires restart" >&2
@@ -436,6 +454,7 @@ fi
 
 if [ -n "$CACHE_DIR_MIGRATE_FROM" ] && [ "$CACHE_DIR_MIGRATE_FROM" != "$STATE_DIR" ]; then
     if [ ! -e "$STATE_DIR" ] && [ -d "$CACHE_DIR_MIGRATE_FROM" ]; then
+        stop_legacy_service
         systemctl stop "$SERVICE" || true
         mkdir -p "$(dirname "$STATE_DIR")"
         mv "$CACHE_DIR_MIGRATE_FROM" "$STATE_DIR"
@@ -447,6 +466,7 @@ fi
 mkdir -p "$STATE_DIR"
 
 start_service() {{
+    stop_legacy_service
     systemctl stop "$SERVICE" || true
 
     # Some long-running testnet nodes can survive a plain systemctl restart long
@@ -460,8 +480,14 @@ start_service() {{
         sleep 1
     done
     pkill -TERM -f "^${{BIN_PATH}}( |$)" >/dev/null 2>&1 || true
+    if [ -n "$LEGACY_BIN_PATH" ] && [ "$LEGACY_BIN_PATH" != "$BIN_PATH" ]; then
+        pkill -TERM -f "^${{LEGACY_BIN_PATH}}( |$)" >/dev/null 2>&1 || true
+    fi
     sleep 1
     pkill -KILL -f "^${{BIN_PATH}}( |$)" >/dev/null 2>&1 || true
+    if [ -n "$LEGACY_BIN_PATH" ] && [ "$LEGACY_BIN_PATH" != "$BIN_PATH" ]; then
+        pkill -KILL -f "^${{LEGACY_BIN_PATH}}( |$)" >/dev/null 2>&1 || true
+    fi
 
     systemctl start "$SERVICE"
 }}
@@ -492,6 +518,7 @@ CACHE_DIR_MIGRATE_FROM={cache_dir_migrate_from}
 WORKING_DIR={working_dir}
 START_COMMAND={start_command}
 PROCESS_PATTERN={process_pattern}
+LEGACY_PROCESS_PATTERN={legacy_process_pattern}
 NO_RESTART={no_restart}
 
 mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")"
@@ -534,6 +561,16 @@ if pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1; then
         sleep 1
     done
     pkill -KILL -f "$PROCESS_PATTERN" >/dev/null 2>&1 || true
+fi
+if [ -n "$LEGACY_PROCESS_PATTERN" ] && [ "$LEGACY_PROCESS_PATTERN" != "$PROCESS_PATTERN" ]; then
+    pkill -TERM -f "$LEGACY_PROCESS_PATTERN" >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if ! pgrep -f "$LEGACY_PROCESS_PATTERN" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    pkill -KILL -f "$LEGACY_PROCESS_PATTERN" >/dev/null 2>&1 || true
 fi
 
 if [ -n "$CACHE_DIR_MIGRATE_FROM" ] && [ "$CACHE_DIR_MIGRATE_FROM" != "$STATE_DIR" ]; then
@@ -627,6 +664,8 @@ def cmd_deploy(args) -> int:
                     bin_path=shlex.quote(node.bin_path),
                     config_path=shlex.quote(node.config_path),
                     service=shlex.quote(node.service_name),
+                    legacy_service=shlex.quote(node.legacy_service_name),
+                    legacy_bin_path=shlex.quote(node.legacy_bin_path),
                     log_file=shlex.quote(node.log_file),
                     state_dir=shlex.quote(node.state_cache_dir),
                     cache_dir_migrate_from=shlex.quote(node.cache_dir_migrate_from),
@@ -642,6 +681,7 @@ def cmd_deploy(args) -> int:
                     working_dir=shlex.quote(node.working_dir),
                     start_command=shlex.quote(node.start_command),
                     process_pattern=shlex.quote(node.process_pattern),
+                    legacy_process_pattern=shlex.quote(node.legacy_process_pattern),
                     no_restart="1" if args.no_restart else "0",
                 )
             proc = ssh_with_stdin(node, script)

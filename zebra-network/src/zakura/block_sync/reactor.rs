@@ -217,7 +217,7 @@ pub(super) struct BlockSyncReactor {
     /// Bounded body channel to the Sequencer task. Only per-peer routines send
     /// downloaded bodies here; the reactor keeps a sender clone for diagnostics.
     sequencer_input: mpsc::Sender<SequencedBody>,
-    /// Serialized bytes currently queued in [`sequencer_input`].
+    /// Serialized bytes currently queued in [`Self::sequencer_input`].
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     /// Non-blocking control channel to the Sequencer task. Frontier and apply
     /// progress must never wait behind downloaded body backlog.

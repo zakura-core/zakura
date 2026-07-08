@@ -148,11 +148,19 @@ fn is_block_frame(frame: &crate::zakura::Frame) -> bool {
 }
 
 fn release_counter_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
-    let _ = counter.fetch_update(
-        std::sync::atomic::Ordering::Relaxed,
-        std::sync::atomic::Ordering::Relaxed,
-        |current| Some(current.saturating_sub(bytes)),
-    );
+    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(bytes);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// Outcome classification for finishing an outstanding request.

@@ -962,7 +962,7 @@ impl ZebraDb {
     /// committed, equal to the lowest height in the `commitment_roots_by_height` serving index.
     ///
     /// Written once on the first committed block and never moved (see
-    /// [`VCT_UPGRADE_METADATA`](crate::service::finalized_state::VCT_UPGRADE_METADATA)). Heights
+    /// [`VCT_UPGRADE_METADATA`]). Heights
     /// below `U` predate this binary, so they hold per-height trees but no index entry; heights at
     /// or above `U` hold an index entry. Returns `None` for a database written before this marker
     /// existed (a pre-index archive database), where every height is served from the trees.

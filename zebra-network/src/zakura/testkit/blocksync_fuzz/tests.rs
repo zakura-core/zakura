@@ -258,38 +258,45 @@ async fn fuzz_silent_dropping_peer() {
     );
 }
 
-/// A dropping carrier that the node cannot route around: a fast peer covers only the
-/// lower half of the chain, so the upper half must come from a peer that silently drops
-/// a third of its requests. Those drops time out and age the carrier's goodput EWMA
-/// below 1.0, which the BBR cwnd formula folds into a smaller expected window — the
-/// end-to-end proof (through the real routine) that the reliability discount engages,
-/// complementing the `bbr::bbr_tests` unit coverage. Sync still completes: the discount
-/// never latches the cwnd at zero, so the carrier keeps redeeming its dropped heights.
+/// Dropping carriers cover the upper half while a fast peer covers only the lower half.
+/// Their silent drops time out and age the carriers' goodput EWMAs below 1.0, which the
+/// BBR cwnd formula folds into smaller expected windows — the end-to-end proof (through
+/// the real routine) that the reliability discount engages, complementing the
+/// `bbr::bbr_tests` unit coverage. Sync still completes: the discount never latches cwnd
+/// at zero, and redundant upper-half coverage keeps clustered drops from wedging CI
+/// coverage runs at the half-chain boundary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_reliability_discounts_dropping_carrier() {
     let blocks = 120;
     let half = block::Height(blocks / 2);
-    let dropping = PeerSpec::with_serve(
-        1,
-        target(blocks),
-        ServeProfile {
-            drop_probability: 0.3,
-            ..ServeProfile::fast()
-        },
-    );
+    let dropping = |id| {
+        PeerSpec::with_serve(
+            id,
+            target(blocks),
+            ServeProfile {
+                drop_probability: 0.3,
+                ..ServeProfile::fast()
+            },
+        )
+    };
     // The fast peer can only serve the lower half, forcing the upper half through the
-    // dropping carrier.
-    let mut fast = PeerSpec::fast(2, half);
+    // dropping carriers.
+    let mut fast = PeerSpec::fast(3, half);
     fast.servable_high = half;
 
     let config = ZakuraBlockSyncConfig {
         // Keep the short floor-rescue leash from `retry_config`, but give CI coverage
-        // builds enough no-progress liveness slack to avoid parking the only upper-half
-        // carrier during a deterministic cluster of drops.
+        // builds enough no-progress liveness slack to avoid parking an upper-half carrier
+        // during a deterministic cluster of drops.
         request_timeout: Duration::from_secs(4),
         ..retry_config()
     };
-    let mut scenario = Scenario::new(blocks, 0x57ea_00c0, config, vec![dropping, fast]);
+    let mut scenario = Scenario::new(
+        blocks,
+        0x57ea_00c0,
+        config,
+        vec![dropping(1), dropping(2), fast],
+    );
     scenario.deadline = Duration::from_secs(90);
     let (_, report) =
         run_checked("fuzz_reliability_discounts_dropping_carrier", scenario, 32).await;

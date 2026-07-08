@@ -205,8 +205,7 @@ impl VctState {
     }
 
     /// Discard the supplied root for `height` after it failed verification, so a re-fetch
-    /// can replace it. See
-    /// [`CommitmentRootSource::invalidate`](super::commitment_aux::CommitmentRootSource::invalidate).
+    /// can replace it. See [`CommitmentRootSource::invalidate`].
     pub(super) fn invalidate_fast_root(&self, height: block::Height) {
         self.source.invalidate(height);
     }
@@ -379,7 +378,7 @@ impl VctCommitState {
 
 /// Fast-path (vct) outputs for the block being committed, passed as one
 /// parameter from the committer down through
-/// [`super::ZebraDb::write_block`] to [`super::ZebraDb::prepare_trees_batch`].
+/// `ZebraDb::write_block` to `ZebraDb::prepare_trees_batch`.
 ///
 /// The fields are independent: a checkpoint-handoff block sets `sync_below`
 /// but leaves `anchor_roots` `None` (it writes the real frontier via the

@@ -1,6 +1,6 @@
-//! Offline benchmark helper for the block-sync [`Sequencer`](super::sequencer::Sequencer).
+//! Offline benchmark helper for the block-sync [`Sequencer`].
 //!
-//! Spawns the **real** [`SequencerTask`](super::sequencer_task::SequencerTask) — the
+//! Spawns the **real** [`SequencerTask`] — the
 //! body reorder + ordered-submit pipeline — with no peers and no reactor, and exposes
 //! a minimal handle (split into parts via [`BenchSequencerHandle::into_parts`]) to
 //! drive it from an offline benchmark:

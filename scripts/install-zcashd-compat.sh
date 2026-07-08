@@ -262,6 +262,7 @@ sanitize_terminal_input() {
 read_prompt() {
   local prompt="$1"
   local var_name="$2"
+  local read_opts=(-r)
 
   if ((PROMPT_FD < 0)); then
     if ((PROMPT_INPUT_ERROR_REPORTED == 0)); then
@@ -271,7 +272,12 @@ read_prompt() {
     return 1
   fi
 
-  read -r -u "$PROMPT_FD" -p "$prompt" "$var_name"
+  # readline editing (backspace/delete, cursor movement) requires -e on a tty.
+  if [[ -t "$PROMPT_FD" ]]; then
+    read_opts=(-e -r)
+  fi
+
+  read "${read_opts[@]}" -u "$PROMPT_FD" -p "$prompt" "$var_name"
 }
 
 prompt_value() {
@@ -652,7 +658,7 @@ recommend_datadir_defaults() {
   # Empty fallback locations share a filesystem, so size them for both datadirs
   # when both prompt defaults are being selected together.
   if ((ZAKURA_STATE_DIR_SET == 0 && ZCASHD_DATADIR_SET == 0)); then
-    SYNTHETIC_INSTALL_MIN_BYTES=$((600 * 1024 * 1024 * 1024))
+    SYNTHETIC_INSTALL_MIN_BYTES=$((550 * 1024 * 1024 * 1024))
   else
     SYNTHETIC_INSTALL_MIN_BYTES=$((300 * 1024 * 1024 * 1024))
   fi
@@ -996,7 +1002,7 @@ collect_disk_checks() {
   read -r zcashd_device zcashd_size <<<"$zcashd_info"
 
   if [[ "$zebra_device" == "$zcashd_device" ]]; then
-    required=$((600 * gib))
+    required=$((550 * gib))
     combined="$zebra_size"
     if ((zebra_size < required)); then
       add_low_spec_error "zakura state + zcashd datadir mount (paths: $ZAKURA_STATE_DIR, $ZCASHD_DATADIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"

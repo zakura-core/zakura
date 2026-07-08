@@ -12,11 +12,11 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to publish assets to (for example v2.6.0)"
+        description: "Release tag to build and publish assets for (for example v0.0.1-alpha.1)"
         required: false
         type: string
       publish_assets_to_release:
-        description: "Upload zakurad assets to the GitHub release tag"
+        description: "Upload zakurad assets to the GitHub release tag (use to repair an existing release)"
         required: false
         type: boolean
         default: false
@@ -56,7 +56,14 @@ jobs:
             checkout_ref="$REF_NAME"
           else
             release_tag="$INPUT_RELEASE_TAG"
-            checkout_ref="$GITHUB_SHA"
+            # workflow_dispatch builds from the release tag so republished assets
+            # match the tagged source tree (older tags may still ship a zebrad
+            # binary, which the packaging step renames to zakurad).
+            if [ -n "$release_tag" ]; then
+              checkout_ref="$release_tag"
+            else
+              checkout_ref="$GITHUB_SHA"
+            fi
           fi
 
           if [ -z "$release_tag" ]; then
@@ -129,19 +136,27 @@ jobs:
             --build-arg "FEATURES=${FEATURES}" \
             --output "type=local,dest=./out" \
             .
-          test -x ./out/usr/local/bin/zakurad
+          if [ -x ./out/usr/local/bin/zakurad ]; then
+            echo "release_binary=zakurad" >> "$GITHUB_ENV"
+          elif [ -x ./out/usr/local/bin/zebrad ]; then
+            echo "release_binary=zebrad" >> "$GITHUB_ENV"
+          else
+            echo "Expected ./out/usr/local/bin/zakurad or ./out/usr/local/bin/zebrad" >&2
+            exit 1
+          fi
 
       - name: Validate binary
-        run: ./out/usr/local/bin/zakurad --version
+        run: ./out/usr/local/bin/${{ env.release_binary }} --version
 
       - name: Package archive and metadata
         env:
           RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+          RELEASE_BINARY: ${{ env.release_binary }}
         run: |
           set -euo pipefail
           mkdir -p ./artifacts/bin ./artifacts/metadata
-          cp ./out/usr/local/bin/zakurad ./artifacts/bin/zakurad
-          cp ./out/usr/local/bin/zakurad ./artifacts/bin/zebrad
+          cp "./out/usr/local/bin/${RELEASE_BINARY}" ./artifacts/bin/zakurad
+          cp "./out/usr/local/bin/${RELEASE_BINARY}" ./artifacts/bin/zebrad
           archive_name="zakurad-${RELEASE_TAG}-${{ matrix.name }}.tar.gz"
           (
             cd ./artifacts
@@ -211,10 +226,13 @@ jobs:
               raise SystemExit("No metadata files found.")
 
           artifacts = []
+          x86_sha256 = ""
           for file_path in metadata_files:
               item = json.loads(Path(file_path).read_text(encoding="utf-8"))
               item["url"] = f"{base_url}/{item['archive']}"
               artifacts.append(item)
+              if item.get("platform_id") == "linux-x86_64":
+                  x86_sha256 = item.get("sha256", "")
 
           manifest = {
               "schema_version": 1,
@@ -227,6 +245,9 @@ jobs:
               json.dumps(manifest, indent=2, sort_keys=True) + "\n",
               encoding="utf-8",
           )
+          if not x86_sha256:
+              raise SystemExit("Missing linux-x86_64 archive sha256 in metadata.")
+          Path("./publish/final/x86_64.sha256").write_text(x86_sha256 + "\n", encoding="utf-8")
           PY
 
           find ./publish -type f -name 'zakurad-*.tar.gz' -exec cp {} ./publish/final/ \;
@@ -239,9 +260,11 @@ jobs:
 
           release_tag = os.environ["RELEASE_TAG"]
           image_version = release_tag.removeprefix("v")
+          x86_sha256 = Path("./publish/final/x86_64.sha256").read_text(encoding="utf-8").strip()
           installers = {
               "install-zcashd-compat.sh": {
                   "ZAKURA_RELEASE_TAG": release_tag,
+                  "ZAKURA_ARCHIVE_SHA256": x86_sha256,
                   "ZAKURA_DOCKER_IMAGE": f"valargroup/zakura:{image_version}",
                   "ZAKURA_COMPAT_DOCKER_IMAGE": f"valargroup/zakura:zcashd-compat-{image_version}",
               },
@@ -315,6 +338,16 @@ jobs:
           RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
         run: |
           set -euo pipefail
+          # Drop stale pre-rename assets so installers only see zakurad archives.
+          legacy_assets=(
+            "zebrad-${RELEASE_TAG}-linux-x86_64.tar.gz"
+            "zebrad-${RELEASE_TAG}-linux-aarch64.tar.gz"
+            "zebrad-manifest-${RELEASE_TAG}.json"
+          )
+          for asset in "${legacy_assets[@]}"; do
+            gh release delete-asset "$RELEASE_TAG" "$asset" --repo "$REPOSITORY" --yes 2>/dev/null || true
+          done
+
           gh release upload "$RELEASE_TAG" \
             ./publish/final/zakurad-*.tar.gz \
             ./publish/final/zakurad-manifest-*.json \

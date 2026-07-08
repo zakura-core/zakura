@@ -20,8 +20,9 @@ use zebra_chain::{
 };
 
 use crate::{
-    request::ContextuallyVerifiedBlock, service::watch_receiver::WatchReceiver, BoxError,
-    CheckpointVerifiedBlock, SemanticallyVerifiedBlock,
+    constants::MAX_BLOCK_REORG_HEIGHT, request::ContextuallyVerifiedBlock,
+    service::watch_receiver::WatchReceiver, BoxError, CheckpointVerifiedBlock,
+    SemanticallyVerifiedBlock,
 };
 
 use TipAction::*;
@@ -558,6 +559,31 @@ impl ChainTipChange {
     /// Sets the `last_change_hash` as the provided hash.
     pub fn mark_last_change_hash(&mut self, hash: block::Hash) {
         self.last_change_hash = Some(hash);
+    }
+
+    /// Returns the height of the best chain tip without consuming a tip change.
+    pub fn best_tip_height(&self) -> Option<block::Height> {
+        self.latest_chain_tip.best_tip_height()
+    }
+
+    /// Estimates the distance from the best chain tip to the network tip.
+    ///
+    /// This estimate uses the best tip timestamp, the local clock, and network
+    /// target spacing. It does not depend on any peer responding to sync
+    /// requests, so it remains useful when peer discovery or block sync is
+    /// starved.
+    pub fn estimate_distance_to_network_chain_tip(
+        &self,
+    ) -> Option<(block::HeightDiff, block::Height)> {
+        self.latest_chain_tip
+            .estimate_distance_to_network_chain_tip(&self.network)
+    }
+
+    /// Returns true when the best chain tip is close enough to the estimated
+    /// network tip for tip-sensitive mempool validation.
+    pub fn is_close_to_network_tip(&self) -> bool {
+        self.estimate_distance_to_network_chain_tip()
+            .is_some_and(|(distance, _height)| distance <= i64::from(MAX_BLOCK_REORG_HEIGHT))
     }
 
     /// Return an action based on `block` and the last change we returned.

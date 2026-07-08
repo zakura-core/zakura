@@ -49,7 +49,7 @@
 
 use std::{collections::HashSet, time::Duration};
 
-use futures::{future, pin_mut, stream::FuturesUnordered, StreamExt};
+use futures::{stream::FuturesUnordered, StreamExt};
 use tokio::{
     sync::watch,
     task::JoinHandle,
@@ -58,7 +58,7 @@ use tokio::{
 use tower::{timeout::Timeout, BoxError, Service, ServiceExt};
 use tracing_futures::Instrument;
 
-use zebra_chain::{block::Height, transaction::UnminedTxId};
+use zebra_chain::{block::Height, chain_sync_status::ChainSyncStatus, transaction::UnminedTxId};
 use zebra_network as zn;
 use zebra_node_services::mempool::Gossip;
 use zebra_state::ChainTipChange;
@@ -138,48 +138,38 @@ where
         tokio::spawn(crawler.run().in_current_span())
     }
 
-    /// Waits until the mempool crawler is enabled by a debug config option.
-    ///
-    /// Returns an error if communication with the state is lost.
-    async fn wait_until_enabled_by_debug(&mut self) -> Result<(), watch::error::RecvError> {
-        // optimise non-debug performance
-        if self.debug_enable_at_height.is_none() {
-            return future::pending().await;
-        }
+    /// Returns true when the crawler has been force-enabled by debug config.
+    fn is_enabled_by_debug(&self) -> bool {
+        self.debug_enable_at_height.is_some_and(|enable_at_height| {
+            self.chain_tip_change
+                .best_tip_height()
+                .is_some_and(|best_tip_height| best_tip_height >= enable_at_height)
+        })
+    }
 
-        let enable_at_height = self
-            .debug_enable_at_height
-            .expect("unexpected debug_enable_at_height: just checked for None");
-
-        loop {
-            let best_tip_height = self
-                .chain_tip_change
-                .wait_for_tip_change()
-                .await?
-                .best_tip_height();
-
-            if best_tip_height >= enable_at_height {
-                return Ok(());
-            }
-        }
+    /// Returns true when the crawler can safely request mempool transaction IDs.
+    fn is_caught_up_to_start(&self) -> bool {
+        self.sync_status.is_close_to_tip() && self.chain_tip_change.is_close_to_network_tip()
     }
 
     /// Waits until the mempool crawler is enabled.
     ///
     /// Returns an error if communication with the syncer or state is lost.
     async fn wait_until_enabled(&mut self) -> Result<(), watch::error::RecvError> {
-        let mut sync_status = self.sync_status.clone();
-        let tip_future = sync_status.wait_until_close_to_tip();
-        let debug_future = self.wait_until_enabled_by_debug();
+        loop {
+            if self.is_enabled_by_debug() || self.is_caught_up_to_start() {
+                return Ok(());
+            }
 
-        pin_mut!(tip_future);
-        pin_mut!(debug_future);
+            let mut sync_status = self.sync_status.clone();
 
-        let (result, _unready_future) = future::select(tip_future, debug_future)
-            .await
-            .factor_first();
-
-        result
+            tokio::select! {
+                result = sync_status.wait_until_close_to_tip() => result?,
+                result = self.chain_tip_change.wait_for_tip_change() => {
+                    result?;
+                }
+            }
+        }
     }
 
     /// Periodically crawl peers for transactions to include in the mempool.

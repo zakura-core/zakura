@@ -7,7 +7,7 @@ use std::{env, fmt, sync::Arc};
 use proptest::{collection::vec, prelude::*};
 use proptest_derive::Arbitrary;
 
-use chrono::Duration;
+use chrono::{Duration, Utc};
 use tokio::time;
 use tower::{buffer::Buffer, util::BoxService};
 
@@ -242,12 +242,87 @@ proptest! {
     }
 }
 
+#[tokio::test]
+async fn mempool_waits_for_estimated_tip_distance_when_sync_lengths_are_small() {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _tx_verifier,
+        mut recent_syncs,
+        mut chain_tip_sender,
+    ) = setup(&network);
+
+    chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(
+        &network,
+        i64::from(zs::MAX_BLOCK_REORG_HEIGHT) + 1,
+        1,
+    )));
+
+    SyncStatus::sync_close_to_tip(&mut recent_syncs);
+    mempool.dummy_call().await;
+
+    assert!(
+        !mempool.is_enabled(),
+        "mempool must stay disabled when the syncer looks caught up but the tip estimate is far"
+    );
+}
+
+#[tokio::test]
+async fn mempool_enables_and_disables_using_estimated_tip_distance_hysteresis() {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _tx_verifier,
+        mut recent_syncs,
+        mut chain_tip_sender,
+    ) = setup(&network);
+
+    chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(&network, 0, 1)));
+
+    SyncStatus::sync_close_to_tip(&mut recent_syncs);
+    mempool.dummy_call().await;
+    assert!(mempool.is_enabled());
+
+    chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(
+        &network,
+        i64::from(zs::MAX_BLOCK_REORG_HEIGHT) + 1,
+        2,
+    )));
+
+    mempool.dummy_call().await;
+    assert!(
+        !mempool.is_enabled(),
+        "mempool must disable after the estimated tip distance exceeds the reorg window"
+    );
+}
+
 fn genesis_chain_tip() -> Option<ChainTipBlock> {
     zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
         .map(CheckpointVerifiedBlock::from)
         .map(ChainTipBlock::from)
         .ok()
+}
+
+fn chain_tip_with_estimated_distance(
+    network: &Network,
+    distance: block::HeightDiff,
+    hash_byte: u8,
+) -> ChainTipBlock {
+    let mut tip = genesis_chain_tip().expect("genesis chain tip should deserialize");
+    tip.height = block::Height(3_000_000 + u32::from(hash_byte));
+    tip.hash = block::Hash([hash_byte; 32]);
+    tip.previous_block_hash = block::Hash([hash_byte.saturating_sub(1); 32]);
+
+    let target_spacing = NetworkUpgrade::target_spacing_for_height(network, tip.height);
+    let distance_i32 = i32::try_from(distance).expect("test distance fits in i32");
+    tip.time = Utc::now() - target_spacing * distance_i32;
+
+    tip
 }
 
 /// Create a new [`Mempool`] instance using mocked services.

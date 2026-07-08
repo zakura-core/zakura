@@ -1,7 +1,8 @@
 //! Randomised property tests for the mempool crawler.
 
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
+use chrono::Utc;
 use proptest::{
     collection::{hash_set, vec},
     prelude::*,
@@ -9,11 +10,14 @@ use proptest::{
 use tokio::{sync::oneshot, time};
 
 use zebra_chain::{
-    chain_sync_status::ChainSyncStatus, parameters::Network, transaction::UnminedTxId,
+    block::{self, Height},
+    chain_sync_status::ChainSyncStatus,
+    parameters::Network,
+    transaction::UnminedTxId,
 };
 use zebra_network as zn;
 use zebra_node_services::mempool::Gossip;
-use zebra_state::ChainTipSender;
+use zebra_state::{ChainTipBlock, ChainTipSender};
 use zebra_test::mock_service::{MockService, PropTestAssertion};
 
 use crate::{
@@ -266,8 +270,9 @@ fn setup_crawler() -> (
     let (sync_status, recent_sync_lengths) = SyncStatus::new();
 
     // the network should be irrelevant here
-    let (chain_tip_sender, _latest_chain_tip, chain_tip_change) =
+    let (mut chain_tip_sender, _latest_chain_tip, chain_tip_change) =
         ChainTipSender::new(None, &Network::Mainnet);
+    chain_tip_sender.set_finalized_tip(Some(current_chain_tip()));
 
     Crawler::spawn(
         &Config::default(),
@@ -284,6 +289,17 @@ fn setup_crawler() -> (
         recent_sync_lengths,
         chain_tip_sender,
     )
+}
+
+fn current_chain_tip() -> ChainTipBlock {
+    ChainTipBlock {
+        hash: block::Hash([1; 32]),
+        height: Height(3_000_000),
+        time: Utc::now(),
+        transactions: Vec::new(),
+        transaction_hashes: Arc::new([]),
+        previous_block_hash: block::Hash([0; 32]),
+    }
 }
 
 /// Intercept a request for mempool transaction IDs and respond with the `transaction_ids` list.

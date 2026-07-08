@@ -12,6 +12,7 @@ use crate::{
 };
 use zebra_chain::{
     amount::{Amount, NonNegative},
+    block::Height,
     parameters::NetworkKind,
     transaction::{Transaction, UnminedTx, VerifiedUnminedTx},
     transparent::{self, Address},
@@ -41,6 +42,10 @@ impl Mempool {
     ///
     /// Requires a chain tip action to enable the mempool before the future resolves.
     pub async fn enable(&mut self, recent_syncs: &mut RecentSyncLengths) {
+        // Most mempool tests use old fixed chain vectors and only need an
+        // active mempool. Keep those tests independent from wall-clock tip
+        // estimates; dedicated tests cover the non-debug activation gate.
+        self.debug_enable_at_height = Some(Height(0));
         // Pretend we're close to tip
         SyncStatus::sync_close_to_tip(recent_syncs);
         // Make a dummy request to poll the mempool and make it enable itself

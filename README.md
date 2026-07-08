@@ -34,7 +34,7 @@ This command will run our latest release, and sync it to the tip:
 docker run -d \
   --name zebra \
   -p 8233:8233 \
-  -v zebrad-cache:/home/zebra/.cache/zebra \
+  -v zebrad-cache:/home/zebra/.cache/zakura \
   zfnd/zebra:latest
 ```
 

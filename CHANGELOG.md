@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   keys were rotated. The previous hardcoded node IDs were stale, so a fresh node
   using the default config could not discover the Testnet fleet over Zakura. The
   peer IP addresses and Mainnet bootstrap peers are unchanged.
+- Changed Zakura's default cache and cookie directories from `zebra` paths to
+  `zakura` paths (for example, Linux defaults now use `~/.cache/zakura` instead
+  of `~/.cache/zebra`). Docker, install scripts, and deployment helpers now use
+  matching Zakura cache paths by default.
 
 ### Removed
 
@@ -322,7 +326,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   key files, including an explicit TLS-only mode that disables cookie auth for
   externally protected deployments.
 - zcashd-compat preflight now validates filesystem permissions for the zcashd
-  datadir, `zcash.conf`, zcashd binary, Zebra state directory, and RPC cookie
+  datadir, `zcash.conf`, zcashd binary, Zakura state directory, and RPC cookie
   directory before creating directories or config files, reporting all problems
   in one aggregated error. Failures can be bypassed with `--unsafe-low-specs`.
 - `zcashd_compat.unsafe_allow_remote_http` allows a non-loopback zcashd-compat

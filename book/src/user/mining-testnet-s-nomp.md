@@ -56,7 +56,7 @@ The `zebra-mining` branch of the ZcashFoundation s-nomp fork includes fixes that
    enable_cookie_auth = false
 
    [state]
-   cache_dir = '/home/ar/.cache/zebra'
+   cache_dir = '/home/ar/.cache/zakura'
    delete_old_database = true
    ephemeral = false
 

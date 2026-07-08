@@ -288,7 +288,7 @@ Zebra stores the current state minor and patch versions in a `version` file in t
 directory. This path varies based on the OS, major state version, network, and config.
 
 For example, the default mainnet state version on Linux is at:
-`~/.cache/zebra/state/v25/mainnet/version`
+`~/.cache/zakura/state/v25/mainnet/version`
 
 To upgrade a cached Zebra state from `v25.0.0` to the latest disk format, delete the version file.
 To upgrade from a specific version `v25.x.y`, edit the file so it contains `x.y`.

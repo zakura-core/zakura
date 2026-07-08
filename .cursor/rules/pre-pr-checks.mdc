@@ -1,5 +1,5 @@
 ---
-description: Require local verification before opening pull requests
+description: Use risk-based local verification before opening pull requests
 alwaysApply: true
 ---
 
@@ -8,8 +8,7 @@ alwaysApply: true
 Before opening or preparing a pull request in this repository:
 
 - Check IDE diagnostics for recently edited files with `ReadLints`.
-- Run `cargo fmt --all -- --check`.
-- Run `cargo clippy --workspace --all-targets -- -D warnings`.
+- Follow the risk-based verification policy in `pr-verification-policy.mdc`.
 
 If any check fails, fix the issue and rerun the failing check before creating the PR.
 

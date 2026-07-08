@@ -229,9 +229,9 @@ ensure_binary() {
   log "fetching release $tag from $GH_REPO ..." >&2
   local dl="$bindir/dl"; rm -rf "$dl"; mkdir -p "$dl"
   gh release download "$tag" -R "$GH_REPO" \
-    -p 'zebrad-*-linux-x86_64.tar.gz' -p 'SHA256SUMS.txt' -D "$dl" \
+    -p 'zakurad-*-linux-x86_64.tar.gz' -p 'zebrad-*-linux-x86_64.tar.gz' -p 'SHA256SUMS.txt' -D "$dl" \
     || die "gh release download failed for $tag"
-  local tgz; tgz="$(find "$dl" -name 'zebrad-*-linux-x86_64.tar.gz' | head -1)"
+  local tgz; tgz="$(find "$dl" \( -name 'zakurad-*-linux-x86_64.tar.gz' -o -name 'zebrad-*-linux-x86_64.tar.gz' \) | head -1)"
   [[ -n "$tgz" ]] || die "no linux-x86_64 tarball asset on release $tag"
   if [[ -f "$dl/SHA256SUMS.txt" ]]; then
     # NB: keep all output on stderr — this function's stdout is captured as the binary path
@@ -239,10 +239,10 @@ ensure_binary() {
       || die "release tarball checksum mismatch for $tag"
   fi
   tar -xzf "$tgz" -C "$dl"
-  local found; found="$(find "$dl" -type f -name zebrad | head -1)"
-  [[ -n "$found" ]] || die "zebrad binary not found in tarball for $tag"
+  local found; found="$(find "$dl" -type f \( -name zakurad -o -name zebrad \) | head -1)"
+  [[ -n "$found" ]] || die "node binary not found in tarball for $tag"
   mv "$found" "$zebrad"; chmod +x "$zebrad"; rm -rf "$dl"
-  log "zebrad $tag: $("$zebrad" --version 2>/dev/null | head -1)" >&2
+  log "node binary $tag: $("$zebrad" --version 2>/dev/null | head -1)" >&2
   ZEBRAD_BIN="$zebrad"
 }
 
@@ -310,8 +310,14 @@ build_from_ref() {
     CARGO_TARGET_DIR="$BUILD_TARGET" CARGO_HOME="$BUILD_CARGO_HOME" CXXFLAGS="-include cstdint" \
     cargo build --release -p zebrad --features "${BUILD_FEATURES:-prometheus,commit-metrics}" --locked >&2 ) \
     || die "cargo build failed for $sha"
-  local built="$BUILD_TARGET/release/zebrad"
-  [[ -x "$built" ]] || die "build produced no zebrad binary for $sha"
+  local built=""
+  for candidate in "$BUILD_TARGET/release/zakurad" "$BUILD_TARGET/release/zebrad"; do
+    if [[ -x "$candidate" ]]; then
+      built="$candidate"
+      break
+    fi
+  done
+  [[ -n "$built" ]] || die "build produced no node binary for $sha"
   ver="$("$built" --version 2>/dev/null | head -1 || true)"
   mkdir -p "$bindir"; cp -f "$built" "$zebrad"; chmod +x "$zebrad"
   # record the commit (authoritative, from git) + the binary hash for cache validation

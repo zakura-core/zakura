@@ -1,0 +1,15 @@
+---
+description: Use risk-based local verification before opening pull requests
+alwaysApply: true
+---
+
+# Pre-PR Checks
+
+Before opening or preparing a pull request in this repository:
+
+- Check IDE diagnostics for recently edited files with `ReadLints`.
+- Follow the risk-based verification policy in `pr-verification-policy.mdc`.
+
+If any check fails, fix the issue and rerun the failing check before creating the PR.
+
+If a check cannot be run because it is too expensive, blocked, or the user explicitly asks to skip it, say so clearly in the PR summary or final response.

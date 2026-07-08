@@ -63,7 +63,7 @@ impl WindowedSamples {
         self.fresh_values(now).reduce(f64::min)
     }
 
-    /// The windowed maximum over samples no older than `now - horizon`. See [`min`].
+    /// The windowed maximum over samples no older than `now - horizon`. See [`Self::min`].
     fn max(&self, now: Instant) -> Option<f64> {
         self.fresh_values(now).reduce(f64::max)
     }
@@ -380,7 +380,7 @@ impl BbrState {
 
     /// Credit a reliability success **without** touching the RTprop/BtlBw estimators. For
     /// a late-delivered body whose request already timed out (charged as a failure by
-    /// [`penalize_reliability`]): the peer did deliver, just slowly, so this offsets the
+    /// [`Self::penalize_reliability`]): the peer did deliver, just slowly, so this offsets the
     /// charge — keeping a merely-slowed peer from being sealed like a genuine dropper
     /// (which sends no late body). Estimators are untouched: the request's send timestamp
     /// is gone, so there is no trustworthy interval to sample.

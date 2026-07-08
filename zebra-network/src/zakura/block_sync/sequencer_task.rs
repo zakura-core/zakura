@@ -356,11 +356,21 @@ impl SequencerTask {
     }
 
     fn release_body_input_bytes(&self, bytes: u64) {
-        let _ = self.body_input_bytes.fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |current| Some(current.saturating_sub(bytes)),
-        );
+        let mut current = self
+            .body_input_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.body_input_bytes.compare_exchange_weak(
+                current,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Body-acceptance tail: offer the body to the reorder buffer, release its

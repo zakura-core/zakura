@@ -498,7 +498,7 @@ impl DownloadWindow {
 
     /// Available headroom allowing `bonus` extra in-flight requests beyond the BBR cwnd,
     /// still clamped to the peer's advertised hard cap. `bonus == 0` is the normal
-    /// (above-floor) capacity used by [`available_slots`]; a small positive `bonus` is
+    /// (above-floor) capacity used by [`Self::available_slots`]; a small positive `bonus` is
     /// the floor bypass — it lets the lowest missing height be fetched even when the
     /// peer is saturated at its cwnd, without ever exceeding the advertised inflight.
     ///
@@ -559,7 +559,7 @@ impl DownloadWindow {
     /// Remaining cwnd **byte** headroom for a take under [`CwndUnit::Bytes`]: byte window
     /// (plus `bonus` representative bodies of floor-bypass headroom) less bytes already
     /// reserved in-flight. `None` under [`CwndUnit::Blocks`], where the window is a request
-    /// count (via [`available_slots_with_bonus`] + per-request cap), not a byte ceiling.
+    /// count (via `available_slots_with_bonus` + per-request cap), not a byte ceiling.
     ///
     /// Used as the byte cap of the work-queue take, this makes the byte cwnd a real
     /// admission limit (outstanding reserved bytes ≤ window) rather than a nonzero gate, so

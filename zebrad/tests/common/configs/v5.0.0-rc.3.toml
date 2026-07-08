@@ -152,7 +152,7 @@ max_pending_escalations = 32
 outbound_queue_depth = 128
 
 [rpc]
-cookie_dir = "/Users/roman/Library/Caches/zakura"
+cookie_dir = "cache_dir"
 cookie_file_name = ".cookie"
 debug_force_finished_sync = false
 enable_cookie_auth = true
@@ -182,7 +182,7 @@ use_color = true
 use_journald = false
 
 [zcashd_compat]
-cookie_dir = "/Users/roman/Library/Caches/zakura"
+cookie_dir = "cache_dir"
 cookie_file_name = ".zcashd-compat.cookie"
 enable_cookie_auth = true
 enabled = false
@@ -195,4 +195,3 @@ startup_delay = "1s"
 unsafe_allow_remote_http = false
 zcashd_extra_args = []
 zcashd_source = "path"
-

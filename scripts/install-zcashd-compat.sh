@@ -11,12 +11,12 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZEBRA_RELEASE_TAG="v5.0.0-test.4"
+ZEBRA_RELEASE_TAG="v0.0.1-alpha.1"
 ZEBRA_ARCHIVE="zebrad-${ZEBRA_RELEASE_TAG}-linux-x86_64.tar.gz"
-ZEBRA_URL="https://github.com/valargroup/zebra/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
+ZEBRA_URL="https://github.com/zakura-core/zakura/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
 ZEBRA_MEMBER="./bin/zebrad"
-ZEBRA_DOCKER_IMAGE="valargroup/zakura:5.0.0-test.4"
-ZEBRA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-5.0.0-test.4"
+ZEBRA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1"
+ZEBRA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.1"
 ZEBRA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
 ZEBRA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zebra"
 ZEBRA_DOCKER_RUNTIME_UID=10001

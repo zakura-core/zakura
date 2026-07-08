@@ -10,11 +10,11 @@ else
 fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-ZEBRA_RELEASE_TAG="v5.0.0-test.4"
+ZEBRA_RELEASE_TAG="v0.0.1-alpha.1"
 ZEBRA_ARCHIVE="zebrad-${ZEBRA_RELEASE_TAG}-linux-x86_64.tar.gz"
-ZEBRA_URL="https://github.com/valargroup/zebra/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
+ZEBRA_URL="https://github.com/zakura-core/zakura/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
 ZEBRA_MEMBER="./bin/zebrad"
-ZEBRA_DOCKER_IMAGE="valargroup/zakura:5.0.0-test.4"
+ZEBRA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1"
 
 MODE=""
 NETWORK="Mainnet"

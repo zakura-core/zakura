@@ -5,7 +5,8 @@ name: Deploy Zakura testnet fleet
 # Runs on a self-hosted Linux x86_64 runner, expected to be installed on
 # zakura-testnet-1 with the `zakura-testnet-deployer` label. The deployer builds
 # a native zebrad binary on that runner, then uses deploy/deployer/deploy.py to
-# scp/install it across the fleet.
+# scp/install it across the fleet. The zcashd-compat Zakura process is deployed
+# as a process-managed node because it shares a host with the sidecar zcashd.
 
 on:
   workflow_dispatch:
@@ -100,7 +101,7 @@ jobs:
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           : > ~/.ssh/known_hosts
-          for host in 167.99.103.111 167.99.110.145 138.68.229.254 164.92.209.78 206.189.148.0; do
+          for host in 167.99.103.111 167.99.110.145 138.68.229.254 164.92.209.78 206.189.148.0 206.189.208.228; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -141,41 +142,58 @@ jobs:
           name       = "zakura-testnet-1"
           ssh_string = "root@167.99.103.111"
           commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
-          state_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
+          network_cache_dir = "/mnt/zakura-testnet-1-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-1-data/zebra-cache"
           log_file = "/mnt/zakura-testnet-1-data/logs/zebrad.log"
 
           [[nodes]]
           name       = "zakura-testnet-2"
           ssh_string = "root@167.99.110.145"
           commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-2-data/zakura-cache"
-          state_cache_dir = "/mnt/zakura-testnet-2-data/zakura-cache"
+          network_cache_dir = "/mnt/zakura-testnet-2-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-2-data/zebra-cache"
           log_file = "/mnt/zakura-testnet-2-data/logs/zebrad.log"
 
           [[nodes]]
           name       = "zakura-testnet-3"
           ssh_string = "root@138.68.229.254"
           commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-3-data/zakura-cache"
-          state_cache_dir = "/mnt/zakura-testnet-3-data/zakura-cache"
+          network_cache_dir = "/mnt/zakura-testnet-3-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-3-data/zebra-cache"
           log_file = "/mnt/zakura-testnet-3-data/logs/zebrad.log"
 
           [[nodes]]
           name       = "zakura-testnet-eu"
           ssh_string = "root@164.92.209.78"
           commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-eu-data/zakura-cache"
-          state_cache_dir = "/mnt/zakura-testnet-eu-data/zakura-cache"
+          network_cache_dir = "/mnt/zakura-testnet-eu-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-eu-data/zebra-cache"
           log_file = "/mnt/zakura-testnet-eu-data/logs/zebrad.log"
 
           [[nodes]]
           name       = "zakura-testnet-as"
           ssh_string = "root@206.189.148.0"
           commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-as-data/zakura-cache"
-          state_cache_dir = "/mnt/zakura-testnet-as-data/zakura-cache"
+          network_cache_dir = "/mnt/zakura-testnet-as-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-as-data/zebra-cache"
           log_file = "/mnt/zakura-testnet-as-data/logs/zebrad.log"
+
+          [[nodes]]
+          name       = "zakura-compat"
+          ssh_string = "root@206.189.208.228"
+          commit     = "${{ inputs.ref }}"
+          deploy_kind = "process"
+          service_name = ""
+          bin_path = "/root/unity/zakura/target/release/zebrad"
+          config_path = "/root/unity/zakura-testnet.toml"
+          network_cache_dir = "/mnt/zakura-testnet-1-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-1-data/zebra-cache"
+          log_file = "/mnt/zakura-testnet-1-data/logs/zebrad.log"
+          working_dir = "/root/unity/zakura"
+          start_command = "target/release/zebrad -c /root/unity/zakura-testnet.toml start"
+          process_pattern = "target/release/zebrad -c /root/unity/zakura-testnet.toml start"
+          v2_p2p = false
+          checkpoint_sync = true
           EOF
 
       - name: Build deployer binary
@@ -211,6 +229,29 @@ jobs:
 
           python3 deploy.py deploy "${args[@]}"
 
+      - name: Verify zcashd-compat sidecar sync
+        if: ${{ !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
+        run: |
+          set -euo pipefail
+
+          scp deploy/zcashd-compat/sync-check.sh root@206.189.208.228:/tmp/zcashd-compat-sync-check.sh
+          ssh root@206.189.208.228 'chmod 755 /tmp/zcashd-compat-sync-check.sh'
+          ssh root@206.189.208.228 '
+            ZEBRA_RPC_URL=http://127.0.0.1:18232
+            ZEBRA_COOKIE_FILE=
+            ZCASHD_RPC_URL=http://127.0.0.1:18231
+            ZCASHD_COOKIE_FILE=
+            ZCASHD_RPC_CONF=/root/unity/zcashd-testnet.toml
+            ZEBRAD_PROCESS_PATTERN="target/release/zebrad -c /root/unity/zakura-testnet.toml start"
+            ZCASHD_PROCESS_PATTERN="zcashd .*zcashd-testnet.toml"
+            HEIGHT_MAX_DRIFT=10
+            SYNC_CHECK_TIMEOUT=600
+            SYNC_CHECK_INTERVAL=15
+            export ZEBRA_RPC_URL ZEBRA_COOKIE_FILE ZCASHD_RPC_URL ZCASHD_COOKIE_FILE ZCASHD_RPC_CONF
+            export ZEBRAD_PROCESS_PATTERN ZCASHD_PROCESS_PATTERN HEIGHT_MAX_DRIFT SYNC_CHECK_TIMEOUT SYNC_CHECK_INTERVAL
+            /tmp/zcashd-compat-sync-check.sh
+          '
+
       - name: Show fleet status
         if: always()
         working-directory: deploy/deployer
@@ -234,15 +275,6 @@ jobs:
           sudo install -m 755 deploy/runner/zebra-cluster-status.py "$dashboard_dir/zebra-cluster-status.py"
           cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
           cat >> "$RUNNER_TEMP/dashboard.nodes.toml" <<'EOF'
-
-          [[nodes]]
-          name       = "zakura-compat"
-          ssh_string = "root@206.189.208.228"
-          service_name = ""
-          bin_path = "/root/unity/zakura/target/release/zebrad"
-          log_file = "/mnt/zakura-testnet-1-data/logs/zebrad.log"
-          rpc_listen_addr = "0.0.0.0:18232"
-          process_pattern = "zebrad -c /root/unity/zakura-testnet.toml start"
 
           [[nodes]]
           name       = "zcashd-compat"

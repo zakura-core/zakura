@@ -64,6 +64,13 @@ then deploys it to:
 - `zakura-testnet-3` — `root@138.68.229.254`
 - `zakura-testnet-eu` — `root@164.92.209.78`
 - `zakura-testnet-as` — `root@206.189.148.0`
+- `zakura-compat` — `root@206.189.208.228`
+
+The first five nodes are systemd-managed `zebrad.service` nodes. `zakura-compat`
+is process-managed because it shares the compat host with a manually supervised
+`zcashd` sidecar; the deployer updates `/root/unity/zakura/target/release/zebrad`,
+rewrites `/root/unity/zakura-testnet.toml`, restarts only the Zakura process, and
+then the workflow verifies the sidecar with `deploy/zcashd-compat/sync-check.sh`.
 
 One-time runner bootstrap from an operator machine with SSH access and CI
 credentials in `~/agents-env`:
@@ -91,9 +98,10 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
 while forcing the legacy non-VCT path. It also writes `/etc/zakura/zebrad.toml`
-and uses each node's existing `/mnt/<node-name>-data/zakura-cache` snapshot
+and uses each node's existing `/mnt/<node-name>-data/zebra-cache` snapshot
 directory, so CI restarts the current `zebrad.service` against the existing state
-instead of creating a fresh database.
+instead of creating a fresh database. The compat Zakura process uses the same
+snapshot layout on its host.
 
 The workflow also refreshes a simple fleet status dashboard on
 `zakura-testnet-1`:

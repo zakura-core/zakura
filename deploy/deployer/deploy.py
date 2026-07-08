@@ -39,6 +39,7 @@ SSH_COMMON_OPTS = [
 ]
 
 DEFAULTS = {
+    "deploy_kind": "systemd",
     "service_name": "zebrad",
     "bin_path": "/usr/local/bin/zebrad",
     "config_path": "/etc/zebrad/zebrad.toml",
@@ -62,6 +63,11 @@ DEFAULTS = {
     # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
     # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
     "zakura": None,
+    # Process deploys are for manually supervised nodes, like the testnet
+    # zcashd-compat Zakura sidecar, where systemd would fight the local runbook.
+    "working_dir": "",
+    "start_command": "",
+    "process_pattern": "",
 }
 
 
@@ -74,6 +80,7 @@ class Node:
     name: str
     ssh_string: str
     commit: str
+    deploy_kind: str
     service_name: str
     bin_path: str
     config_path: str
@@ -92,6 +99,9 @@ class Node:
     checkpoint_sync: bool
     vct_fast_sync: bool
     zakura: object  # dict | None: fleet-wide [network.zakura] settings
+    working_dir: str
+    start_command: str
+    process_pattern: str
     port: object = None
     # resolved at runtime
     sha: str = ""
@@ -151,6 +161,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             name=name,
             ssh_string=merged["ssh_string"],
             commit=merged["commit"],
+            deploy_kind=merged["deploy_kind"],
             service_name=merged["service_name"],
             bin_path=merged["bin_path"],
             config_path=merged["config_path"],
@@ -169,6 +180,9 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             checkpoint_sync=merged["checkpoint_sync"],
             vct_fast_sync=merged["vct_fast_sync"],
             zakura=merged.get("zakura"),
+            working_dir=merged["working_dir"],
+            start_command=merged["start_command"],
+            process_pattern=merged["process_pattern"],
             port=merged["port"],
         ))
 
@@ -447,6 +461,76 @@ systemctl is-active "$SERVICE"
 """
 
 
+PROCESS_INSTALL_SCRIPT = r"""
+set -euo pipefail
+
+BIN_PATH={bin_path}
+CONFIG_PATH={config_path}
+LOG_FILE={log_file}
+WORKING_DIR={working_dir}
+START_COMMAND={start_command}
+PROCESS_PATTERN={process_pattern}
+NO_RESTART={no_restart}
+
+mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")"
+if [ -n "$LOG_FILE" ]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+fi
+if [ -n "$WORKING_DIR" ]; then
+    mkdir -p "$WORKING_DIR"
+fi
+
+install -m 644 /tmp/zebrad-deploy.toml "$CONFIG_PATH"
+
+if [ -x "$BIN_PATH" ]; then
+    cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
+fi
+install -m 755 /tmp/zebrad-deploy.new "$BIN_PATH"
+rm -f /tmp/zebrad-deploy.new /tmp/zebrad-deploy.toml
+
+if [ "$NO_RESTART" = "1" ]; then
+    echo "installed process binary/config (restart skipped)"
+    exit 0
+fi
+
+if [ -z "$START_COMMAND" ] || [ -z "$PROCESS_PATTERN" ]; then
+    echo "process deploy requires start_command and process_pattern" >&2
+    exit 1
+fi
+
+if pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1; then
+    pkill -TERM -f "$PROCESS_PATTERN" >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if ! pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    pkill -KILL -f "$PROCESS_PATTERN" >/dev/null 2>&1 || true
+fi
+
+if [ -n "$WORKING_DIR" ]; then
+    cd "$WORKING_DIR"
+fi
+
+launcher_log="${{LOG_FILE:-/tmp/zebrad-process-deploy}}.launcher"
+nohup bash -lc "$START_COMMAND" >> "$launcher_log" 2>&1 &
+sleep 3
+
+if ! pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1; then
+    echo "process failed to start; rolling back to ${{BIN_PATH}}.bak" >&2
+    if [ -x "${{BIN_PATH}}.bak" ]; then
+        install -m 755 "${{BIN_PATH}}.bak" "$BIN_PATH"
+        nohup bash -lc "$START_COMMAND" >> "$launcher_log" 2>&1 &
+        sleep 3
+    fi
+    pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1
+fi
+
+"$BIN_PATH" --version || true
+"""
+
+
 def ssh_with_stdin(node: Node, script: str) -> subprocess.CompletedProcess:
     """Run an install script on the node via `ssh ... bash -s`, feeding it on stdin."""
     return subprocess.run(node.ssh_cmd("bash", "-s"), input=script, text=True)
@@ -481,28 +565,44 @@ def cmd_deploy(args) -> int:
     def work(node: Node) -> tuple[str, bool, str]:
         binary = by_sha[node.sha]
         try:
+            if node.deploy_kind not in ("systemd", "process"):
+                return (node.name, False, f"unknown deploy_kind: {node.deploy_kind}")
             cfg = render_node_config(node)
-            unit = render_service(node)
             cfg_tmp = BUILD_CACHE_DIR / f".cfg-{node.name}.toml"
-            unit_tmp = BUILD_CACHE_DIR / f".unit-{node.name}.service"
             cfg_tmp.write_text(cfg)
-            unit_tmp.write_text(unit)
             try:
                 run(node.scp_to(str(binary), "/tmp/zebrad-deploy.new"), capture=True)
-                run(node.scp_to(str(unit_tmp), "/tmp/zebrad-deploy.service"), capture=True)
                 run(node.scp_to(str(cfg_tmp), "/tmp/zebrad-deploy.toml"), capture=True)
+                if node.deploy_kind == "systemd":
+                    unit = render_service(node)
+                    unit_tmp = BUILD_CACHE_DIR / f".unit-{node.name}.service"
+                    unit_tmp.write_text(unit)
+                    try:
+                        run(node.scp_to(str(unit_tmp), "/tmp/zebrad-deploy.service"), capture=True)
+                    finally:
+                        unit_tmp.unlink(missing_ok=True)
             finally:
                 cfg_tmp.unlink(missing_ok=True)
-                unit_tmp.unlink(missing_ok=True)
 
-            script = INSTALL_SCRIPT.format(
-                bin_path=shlex.quote(node.bin_path),
-                config_path=shlex.quote(node.config_path),
-                service=shlex.quote(node.service_name),
-                log_file=shlex.quote(node.log_file),
-                state_dir=shlex.quote(node.state_cache_dir),
-                no_restart="1" if args.no_restart else "0",
-            )
+            if node.deploy_kind == "systemd":
+                script = INSTALL_SCRIPT.format(
+                    bin_path=shlex.quote(node.bin_path),
+                    config_path=shlex.quote(node.config_path),
+                    service=shlex.quote(node.service_name),
+                    log_file=shlex.quote(node.log_file),
+                    state_dir=shlex.quote(node.state_cache_dir),
+                    no_restart="1" if args.no_restart else "0",
+                )
+            else:
+                script = PROCESS_INSTALL_SCRIPT.format(
+                    bin_path=shlex.quote(node.bin_path),
+                    config_path=shlex.quote(node.config_path),
+                    log_file=shlex.quote(node.log_file),
+                    working_dir=shlex.quote(node.working_dir),
+                    start_command=shlex.quote(node.start_command),
+                    process_pattern=shlex.quote(node.process_pattern),
+                    no_restart="1" if args.no_restart else "0",
+                )
             proc = ssh_with_stdin(node, script)
             if proc.returncode != 0:
                 return (node.name, False, f"install/restart failed (rc={proc.returncode})")
@@ -583,10 +683,23 @@ def cmd_status(args) -> int:
         # commit, so also read the running build's git commit from the startup
         # diagnostic line in the node's log (`git commit: <sha>`). The configured
         # ref is appended so requested-vs-running is visible at a glance.
-        probe = (
-            f"systemctl is-active {shlex.quote(node.service_name)} 2>/dev/null; "
-            f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1; "
+        if node.service_name:
+            service_probe = f"systemctl is-active {shlex.quote(node.service_name)} 2>/dev/null"
+        elif node.process_pattern:
+            service_probe = (
+                f"pgrep -f {shlex.quote(node.process_pattern)} >/dev/null 2>&1 "
+                "&& printf 'active\\n' || printf 'inactive\\n'"
+            )
+        else:
+            service_probe = "printf 'unknown\\n'"
+        log_probe = (
             f"grep -aoE 'git commit: [0-9a-f]+' {shlex.quote(node.log_file)} 2>/dev/null | tail -1"
+            if node.log_file else "true"
+        )
+        probe = (
+            f"{service_probe}; "
+            f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1; "
+            f"{log_probe}"
         )
         proc = ssh_capture_script(node, probe)
         lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]

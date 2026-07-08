@@ -14,6 +14,10 @@ UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 ZAKURA_RELEASE_TAG="v0.0.1-alpha.1"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
+# sha256 of ZAKURA_ARCHIVE from the release's SHA256SUMS.txt. Pin it once the
+# zakurad-named release artifact is published: an unpinned download in a
+# `curl | bash` installer is a supply-chain hole. Empty = skip verification.
+ZAKURA_ARCHIVE_SHA256=""
 ZAKURA_MEMBER="./bin/zakurad"
 ZAKURA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1@sha256:74f76366eed48bdfb15a3386d033a6e3e2d7481f40cb06c5c6ae3c5e9f77e4b5"
 ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.1@sha256:f3f36dc215a15f3724690529244df8527cc0389ccf4bf9348206cb49388ac8c8"
@@ -36,9 +40,12 @@ ZCASHD_DATADIR="$ZCASHD_DEFAULT_DATADIR"
 INSTALL_DIR="${HOME}/.local/zcashd-compat"
 CACHE_DIR="${HOME}/.cache/zcashd-compat"
 COOKIE_DIR=""
+ZAKURA_P2P_ADDR=""
+COMPAT_LISTEN_ADDR="127.0.0.1:28232"
 ZCASHD_CONF=""
 ZAKURAD_PATH=""
 ZCASHD_PATH=""
+ZCASH_SRC_DIR=""
 ZCASHD_DOCKER_IMAGE=""
 DOWNLOAD_BINARIES=1
 DOWNLOAD_BINARIES_SET=0
@@ -142,6 +149,9 @@ Options:
   --install-dir DIR
   --cache-dir DIR
   --cookie-dir DIR
+  --zakura-p2p-addr HOST:PORT Zakura legacy P2P listener; zcashd is pinned to its port
+                             (default [::]:8233 mainnet, [::]:18233 testnet/regtest)
+  --compat-listen-addr ADDR  Zakura zcashd-compat RPC listener (default 127.0.0.1:28232)
   --zcash-conf FILE
   --zakurad-path PATH
   --zcashd-path PATH
@@ -326,6 +336,54 @@ zcashd_network_datadir() {
   esac
 }
 
+# Value for ZAKURA_NETWORK__NETWORK, as zebra-network deserializes it.
+network_config_value() {
+  case "$(network_name_lowercase)" in
+    mainnet) printf 'Mainnet\n' ;;
+    testnet) printf 'Testnet\n' ;;
+    regtest) printf 'Regtest\n' ;;
+    *) printf '%s\n' "$NETWORK" ;;
+  esac
+}
+
+# zebra-network's Config::default() hardcodes [::]:8233 for every network; the
+# network-aware default_port() only applies when a port-less string is
+# deserialized. So the P2P listener must be set explicitly per network.
+network_default_p2p_port() {
+  case "$(network_name_lowercase)" in
+    mainnet) printf '8233\n' ;;
+    *) printf '18233\n' ;;
+  esac
+}
+
+# Network selection flags the sidecar zcashd needs, matching what Zakura's
+# supervisor passes to its managed child (zcashd_compat/supervisor.rs).
+zcashd_network_args() {
+  case "$(network_name_lowercase)" in
+    testnet) printf -- '-testnet\n' ;;
+    # Zakura skips proof-of-work on regtest, so its blocks carry null Equihash
+    # solutions that stock zcashd validation would reject with a peer ban.
+    regtest) printf -- '-regtest\n-regtestacceptunvalidatedpow\n' ;;
+  esac
+}
+
+p2p_port_from_addr() {
+  printf '%s\n' "${1##*:}"
+}
+
+# zcashd dials Zakura on loopback regardless of the interface Zakura binds.
+zcashd_connect_addr() {
+  printf '127.0.0.1:%s\n' "$(p2p_port_from_addr "$ZAKURA_P2P_ADDR")"
+}
+
+# The P2P pinning flags. zcashd peers *only* with the local Zakura node:
+# -connect selects the single outbound peer, and the rest disable inbound
+# listening, DNS seeding, onion, and discovery. Defense in depth against
+# operator zcash.conf values.
+zcashd_p2p_pinning_args() {
+  printf -- '-connect=%s\n-listen=0\n-dnsseed=0\n-listenonion=0\n-discover=0\n' "$(zcashd_connect_addr)"
+}
+
 path_capacity_bytes() {
   local path="$1"
   local ancestor size
@@ -351,7 +409,7 @@ path_has_min_capacity() {
 
 zebra_state_has_expected_files() {
   local dir="$1"
-  local net_dir matches
+  local net_dir matches match
 
   [[ -d "$dir" ]] || return 1
   net_dir="$(network_name_lowercase)"
@@ -708,6 +766,21 @@ normalize_inputs() {
     "") add_error "mode is required" ;;
     *) add_error "unsupported mode: $MODE" ;;
   esac
+
+  case "$(network_name_lowercase)" in
+    mainnet | testnet | regtest) ;;
+    *) add_error "unsupported network: $NETWORK (expected Mainnet, Testnet, or Regtest)" ;;
+  esac
+
+  if [[ -z "$ZAKURA_P2P_ADDR" ]]; then
+    ZAKURA_P2P_ADDR="[::]:$(network_default_p2p_port)"
+  fi
+  ZAKURA_P2P_ADDR="$(printf '%s' "$ZAKURA_P2P_ADDR" | sanitize_terminal_input)"
+  COMPAT_LISTEN_ADDR="$(printf '%s' "$COMPAT_LISTEN_ADDR" | sanitize_terminal_input)"
+
+  if [[ "$ZAKURA_P2P_ADDR" != *:* || -z "$(p2p_port_from_addr "$ZAKURA_P2P_ADDR")" ]]; then
+    add_error "--zakura-p2p-addr must be HOST:PORT, got: $ZAKURA_P2P_ADDR"
+  fi
 }
 
 command_exists() {
@@ -944,6 +1017,26 @@ collect_disk_checks() {
   fi
 }
 
+# The zcashd repo is `valargroup/zcashd`, so a plain `git clone` lands in
+# `zcashd/`. Older instructions cloned it as `zcash/`. Accept either.
+resolve_zcash_src_dir() {
+  local candidate
+  for candidate in "$UNITY_ROOT/zcashd" "$UNITY_ROOT/zcash"; do
+    if [[ -x "$candidate/zcutil/build.sh" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  for candidate in "$UNITY_ROOT/zcashd" "$UNITY_ROOT/zcash"; do
+    if [[ -d "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf '%s\n' "$UNITY_ROOT/zcashd"
+  return 1
+}
+
 collect_source_checks() {
   if [[ "$MODE" != "build-from-source" ]]; then
     return
@@ -955,14 +1048,16 @@ collect_source_checks() {
     add_error "Zakura source tree is missing Cargo.toml: $REPO_ROOT"
   fi
 
-  if [[ ! -d "$UNITY_ROOT/zcash" ]]; then
-    add_error "zcash source tree is missing: $UNITY_ROOT/zcash"
-  elif [[ ! -x "$UNITY_ROOT/zcash/zcutil/build.sh" ]]; then
-    add_error "zcash build script is missing or not executable: $UNITY_ROOT/zcash/zcutil/build.sh"
+  ZCASH_SRC_DIR="$(resolve_zcash_src_dir)" || true
+
+  if [[ ! -d "$ZCASH_SRC_DIR" ]]; then
+    add_error "zcashd source tree is missing: expected $UNITY_ROOT/zcashd or $UNITY_ROOT/zcash"
+  elif [[ ! -x "$ZCASH_SRC_DIR/zcutil/build.sh" ]]; then
+    add_error "zcashd build script is missing or not executable: $ZCASH_SRC_DIR/zcutil/build.sh"
   fi
 
   ZAKURAD_PATH="${ZAKURAD_PATH:-$REPO_ROOT/target/release/zakurad}"
-  ZCASHD_PATH="${ZCASHD_PATH:-$UNITY_ROOT/zcash/src/zcashd}"
+  ZCASHD_PATH="${ZCASHD_PATH:-$ZCASH_SRC_DIR/src/zcashd}"
 
   if [[ -e "$ZAKURAD_PATH" && ! -x "$ZAKURAD_PATH" ]]; then
     add_error "zakurad binary $ZAKURAD_PATH exists but is not executable by the current user"
@@ -1098,7 +1193,7 @@ prepare_binary_paths() {
     return
   fi
 
-  download_and_extract "zakurad" "$ZAKURA_URL" "" "$ZAKURA_MEMBER" "$ZAKURA_ARCHIVE" "$ZAKURAD_PATH"
+  download_and_extract "zakurad" "$ZAKURA_URL" "$ZAKURA_ARCHIVE_SHA256" "$ZAKURA_MEMBER" "$ZAKURA_ARCHIVE" "$ZAKURAD_PATH"
 
   if [[ "$MODE" == "split-binary" ]]; then
     download_and_extract "zcashd" "$zcashd_url" "$zcashd_sha" "$zcashd_member" "$(basename "$zcashd_url")" "$ZCASHD_PATH"
@@ -1110,6 +1205,48 @@ prepare_binary_paths() {
       [[ -x "$ZCASHD_PATH" ]] || add_error "zcashd binary $ZCASHD_PATH does not exist or is not executable by the current user"
     fi
     finalize_checks
+  fi
+}
+
+# zcashd refuses to start unless its config file exists ("Before starting
+# zcashd, you need to create a configuration file"). A fresh or snapshot-restored
+# datadir has none, so bootstrap a minimal one rather than printing a command
+# that cannot run. Never overwrite an existing file.
+ensure_zcashd_conf() {
+  case "$MODE" in
+    split-binary | build-from-source) ;;
+    *) return ;;
+  esac
+
+  if [[ -e "$ZCASHD_CONF" ]]; then
+    return
+  fi
+
+  if ((DRY_RUN)); then
+    if ((USE_ANSI)); then
+      printf '%s %s\n' "$(style "$CYAN" "[file]")" "$(style "$DIM" "Dry run: would create minimal zcashd config at $ZCASHD_CONF")"
+    else
+      printf 'Dry run: would create minimal zcashd config at %s\n' "$ZCASHD_CONF"
+    fi
+    return
+  fi
+
+  if ! mkdir -p "$(dirname "$ZCASHD_CONF")"; then
+    add_error "failed to create directory for zcashd config: $(dirname "$ZCASHD_CONF")"
+    return
+  fi
+
+  {
+    printf '# Created by install-zcashd-compat.sh for zcashd-compat P2P sidecar mode.\n'
+    printf '# Peer selection is pinned on the zcashd command line; do not add\n'
+    printf '# connect=/addnode=/seednode= here -- they accumulate and cannot be overridden.\n'
+    printf 'i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1\n'
+  } >"$ZCASHD_CONF" || add_error "failed to write zcashd config: $ZCASHD_CONF"
+
+  if ((USE_ANSI)); then
+    printf '%s Created minimal zcashd config at %s\n' "$(style "$GREEN" "[ok]")" "$ZCASHD_CONF"
+  else
+    printf 'Created minimal zcashd config at %s\n' "$ZCASHD_CONF"
   fi
 }
 
@@ -1194,10 +1331,14 @@ prepare_docker_owned_directory() {
   fi
 }
 
-prepare_docker_supervised_mounts() {
-  if [[ "$MODE" != "docker-supervised" ]]; then
-    return
-  fi
+# Both Docker modes bind-mount these directories into containers that run as
+# ZAKURA_DOCKER_RUNTIME_UID:GID, so both need the ownership fixed up -- not just
+# docker-supervised.
+prepare_docker_mounts() {
+  case "$MODE" in
+    docker-supervised | docker-split-containers) ;;
+    *) return ;;
+  esac
 
   prepare_docker_owned_directory "Zakura state directory" "$ZAKURA_STATE_DIR"
   prepare_docker_owned_directory "zcashd datadir" "$ZCASHD_DATADIR"
@@ -1231,28 +1372,57 @@ prepare_docker_images() {
   finalize_checks
 }
 
+# printf '%q' renders [::]:18233 as \[::\]:18233, correct but hostile to
+# copy-paste. Single-quote anything outside a conservative safe set instead.
+quote_env_value() {
+  local value="$1"
+  if [[ "$value" =~ ^[A-Za-z0-9_./:@,=+-]+$ ]]; then
+    printf '%s' "$value"
+  else
+    printf "'%s'" "${value//\'/\'\\\'\'}"
+  fi
+}
+
+# Shared Zakura env block for the binary/source start commands. Trailing
+# backslash but no final newline: callers put this on its own heredoc line.
+print_zakurad_env_lines() {
+  printf 'ZAKURA_NETWORK__NETWORK=%s \\\n' "$(quote_env_value "$(network_config_value)")"
+  printf 'ZAKURA_NETWORK__LISTEN_ADDR=%s \\\n' "$(quote_env_value "$ZAKURA_P2P_ADDR")"
+  printf 'ZAKURA_STATE__CACHE_DIR=%s \\\n' "$(quote_env_value "$ZAKURA_STATE_DIR")"
+  printf 'ZAKURA_ZCASHD_COMPAT__COOKIE_DIR=%s \\\n' "$(quote_env_value "$COOKIE_DIR")"
+  printf 'ZAKURA_ZCASHD_COMPAT__LISTEN_ADDR=%s \\' "$(quote_env_value "$COMPAT_LISTEN_ADDR")"
+}
+
+# Shared zcashd P2P-sidecar flags for the binary/source start commands.
+print_zcashd_flag_lines() {
+  local arg
+  while IFS= read -r arg; do
+    [[ -n "$arg" ]] && printf '  %s \\\n' "$arg"
+  done < <(zcashd_network_args)
+  printf '  -datadir=%s \\\n' "$(shell_quote "$ZCASHD_DATADIR")"
+  printf '  -conf=%s \\\n' "$(shell_quote "$ZCASHD_CONF")"
+  while IFS= read -r arg; do
+    [[ -n "$arg" ]] && printf '  %s \\\n' "$arg"
+  done < <(zcashd_p2p_pinning_args)
+  printf '  -printtoconsole\n'
+}
+
 print_split_binary_commands() {
-  local cookie_file="$COOKIE_DIR/.zcashd-compat.cookie"
   cat <<EOF
 $(style "$GREEN$BOLD" "Start Zakura in terminal 1:")
-ZAKURA_STATE__CACHE_DIR=$(shell_quote "$ZAKURA_STATE_DIR") \\
+$(print_zakurad_env_lines)
 $(shell_quote "$ZAKURAD_PATH") start --zcashd-compat
 
 $(style "$GREEN$BOLD" "Start zcashd in terminal 2:")
 $(shell_quote "$ZCASHD_PATH") \\
-  -zebra-compat \\
-  -zebra-compat-url=http://127.0.0.1:28232 \\
-  -zebra-compat-cookiefile=$(shell_quote "$cookie_file") \\
-  -datadir=$(shell_quote "$ZCASHD_DATADIR") \\
-  -conf=$(shell_quote "$ZCASHD_CONF") \\
-  -printtoconsole
+$(print_zcashd_flag_lines)
 EOF
 }
 
 print_supervised_command() {
   cat <<EOF
 $(style "$GREEN$BOLD" "Start Zakura. In the background, downloads hash-pinned zcashd and kicks it off as a supervised child process.")
-ZAKURA_STATE__CACHE_DIR=$(shell_quote "$ZAKURA_STATE_DIR") \\
+$(print_zakurad_env_lines)
 ZAKURA_ZCASHD_COMPAT__MANAGE_ZCASHD=true \\
 ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=managed \\
 ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR=$(shell_quote "$ZCASHD_DATADIR") \\
@@ -1264,10 +1434,14 @@ print_docker_supervised_command() {
   local image="${ZAKURA_COMPAT_DOCKER_SELECTED:-$ZAKURA_COMPAT_DOCKER_IMAGE}"
   local container_zebra_state_dir="/home/zebra/.cache/zakura"
   local container_zcashd_datadir="/home/zebra/.cache/zcashd"
+  local p2p_port
+  p2p_port="$(p2p_port_from_addr "$ZAKURA_P2P_ADDR")"
   cat <<EOF
 docker run --rm -it \\
   -e ZCASHD_COMPAT_ENABLED=true \\
-  -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:8233' \\
+  -e ZAKURA_NETWORK__NETWORK=$(shell_quote "$(network_config_value)") \\
+  -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:${p2p_port}' \\
+  -e ZAKURA_NETWORK__MAX_CONNECTIONS_PER_IP=8 \\
   -e ZAKURA_STATE__CACHE_DIR=$container_zebra_state_dir \\
   -e ZAKURA_ZCASHD_COMPAT__MANAGE_ZCASHD=true \\
   -e ZAKURA_ZCASHD_COMPAT__COOKIE_DIR=$container_zebra_state_dir \\
@@ -1277,25 +1451,27 @@ docker run --rm -it \\
   -e ZAKURA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \\
   --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=$container_zebra_state_dir \\
   --mount type=bind,src=$(shell_quote "$ZCASHD_DATADIR"),dst=$container_zcashd_datadir \\
-  -p 8233:8233 \\
+  -p ${p2p_port}:${p2p_port} \\
   -p 127.0.0.1:28232:28232 \\
-  -p 127.0.0.1:8232:8232 \\
   $(shell_quote "$image") \\
   zakurad start --zcashd-compat
 EOF
 }
 
 print_docker_split_commands() {
-  local cookie_file="/zakura-state/.zcashd-compat.cookie"
+  local p2p_port arg
+  p2p_port="$(p2p_port_from_addr "$ZAKURA_P2P_ADDR")"
   cat <<EOF
 $(style "$GREEN$BOLD" "Start Zakura container in terminal 1:")
 docker run --rm -it --name zakura-compat \\
-  -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:8233' \\
+  -e ZAKURA_NETWORK__NETWORK=$(shell_quote "$(network_config_value)") \\
+  -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:${p2p_port}' \\
+  -e ZAKURA_NETWORK__MAX_CONNECTIONS_PER_IP=8 \\
   -e ZAKURA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \\
   -e ZAKURA_ZCASHD_COMPAT__LISTEN_ADDR=0.0.0.0:28232 \\
   -e ZAKURA_ZCASHD_COMPAT__UNSAFE_ALLOW_REMOTE_HTTP=true \\
   --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
-  -p 8233:8233 \\
+  -p ${p2p_port}:${p2p_port} \\
   -p 127.0.0.1:28232:28232 \\
   $(shell_quote "$ZAKURA_DOCKER_IMAGE") \\
   zakurad start --zcashd-compat
@@ -1303,13 +1479,11 @@ docker run --rm -it --name zakura-compat \\
 $(style "$GREEN$BOLD" "Start zcashd container in terminal 2:")
 docker run --rm -it --name zakura-compat-zcashd --network host \\
   --mount type=bind,src=$(shell_quote "$ZCASHD_DATADIR"),dst=/home/zcashd/.zcash \\
-  --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=/zakura-state,readonly \\
   $(shell_quote "$ZCASHD_DOCKER_IMAGE") \\
-  -zebra-compat \\
-  -zebra-compat-url=http://127.0.0.1:28232 \\
-  -zebra-compat-cookiefile=$(shell_quote "$cookie_file") \\
+$(while IFS= read -r arg; do [[ -n "$arg" ]] && printf '  %s \\\n' "$arg"; done < <(zcashd_network_args))\
   -datadir=/home/zcashd/.zcash \\
   -conf=/home/zcashd/.zcash/zcash.conf \\
+$(while IFS= read -r arg; do [[ -n "$arg" ]] && printf '  %s \\\n' "$arg"; done < <(zcashd_p2p_pinning_args))\
   -printtoconsole
 EOF
 }
@@ -1317,23 +1491,18 @@ EOF
 print_source_commands() {
   cat <<EOF
 git clone https://github.com/zakura-core/zakura.git
-git clone https://github.com/valargroup/zcashd.git zcash
+git clone https://github.com/valargroup/zcashd.git
 
 cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zakurad
-cd $(shell_quote "$UNITY_ROOT/zcash") && ./zcutil/build.sh -j"\$(nproc)"
+cd $(shell_quote "$ZCASH_SRC_DIR") && ./zcutil/build.sh -j"\$(nproc)"
 
 $(style "$GREEN$BOLD" "Start Zakura in terminal 1:")
-ZAKURA_STATE__CACHE_DIR=$(shell_quote "$ZAKURA_STATE_DIR") \\
+$(print_zakurad_env_lines)
 $(shell_quote "$ZAKURAD_PATH") start --zcashd-compat
 
 $(style "$GREEN$BOLD" "Start zcashd in terminal 2:")
 $(shell_quote "$ZCASHD_PATH") \\
-  -zebra-compat \\
-  -zebra-compat-url=http://127.0.0.1:28232 \\
-  -zebra-compat-cookiefile=$(shell_quote "$COOKIE_DIR/.zcashd-compat.cookie") \\
-  -datadir=$(shell_quote "$ZCASHD_DATADIR") \\
-  -conf=$(shell_quote "$ZCASHD_CONF") \\
-  -printtoconsole
+$(print_zcashd_flag_lines)
 EOF
 }
 
@@ -1401,6 +1570,16 @@ while (($#)); do
     --cookie-dir)
       require_value "$1" "${2:-}"
       COOKIE_DIR="$2"
+      shift 2
+      ;;
+    --zakura-p2p-addr | --zebra-p2p-addr)
+      require_value "$1" "${2:-}"
+      ZAKURA_P2P_ADDR="$2"
+      shift 2
+      ;;
+    --compat-listen-addr)
+      require_value "$1" "${2:-}"
+      COMPAT_LISTEN_ADDR="$2"
       shift 2
       ;;
     --zcash-conf)
@@ -1475,13 +1654,17 @@ data_detection_message
 case "$MODE" in
   split-binary | supervised)
     prepare_binary_paths
+    ensure_zcashd_conf
     ;;
   docker-split-containers | docker-supervised)
-    prepare_docker_supervised_mounts
+    prepare_docker_mounts
     prepare_docker_images
     ;;
   build-from-source)
+    ensure_zcashd_conf
     ;;
 esac
+
+finalize_checks
 
 print_ready_commands

@@ -7,21 +7,21 @@ name: Zakura E2E
 #   - a pull request touches Zakura-relevant paths, OR carries the
 #     `run-zakura-e2e` label (gating is done in the `changes` job below);
 #   - a push touches Zakura-relevant paths, for the regular Zakura gate jobs;
-#   - every push to `ironwood-main`, for the block-sync fuzz scenarios;
+#   - every push to `main`, for the block-sync fuzz scenarios;
 #   - the change is in the merge queue (`merge_group` ignores path filters), so a
 #     change that breaks Zakura sync indirectly is still caught before it lands;
 #   - nightly / on demand, for the long four-node modes.
 on:
   # No `paths:` filter here on purpose:
   # - PR/push Zakura gating is handled by the `changes` job.
-  # - block-sync fuzz must run after every merge to `ironwood-main`, even when
+  # - block-sync fuzz must run after every merge to `main`, even when
   #   the merged PR did not touch an obviously Zakura-specific path.
   pull_request:
-    branches: [ironwood-main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**"]
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
   push:
-    branches: [ironwood-main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**"]
 
   # Always run in the merge queue, so a change that breaks Zakura sync
   # indirectly is still caught at landing.
@@ -202,11 +202,11 @@ jobs:
   zakura-blocksync-fuzz:
     name: Zakura block-sync fuzz scenarios
     # These are long scenario/fuzz-style simulations, not normal PR unit tests.
-    # Run them after merges to `ironwood-main`, nightly, and on demand so
+    # Run them after merges to `main`, nightly, and on demand so
     # regressions are still visible without making every PR wait on the flakiest
     # block-sync scenarios.
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/ironwood-main') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch'
     permissions:

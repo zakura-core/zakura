@@ -2,7 +2,7 @@ name: Test Docker Config
 
 on:
   pull_request:
-    branches: [ironwood-main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**"]
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     paths:
       - "**/*.rs"
@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
 
   push:
-    branches: [ironwood-main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"

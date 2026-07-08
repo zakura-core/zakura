@@ -232,7 +232,31 @@ jobs:
           dashboard_dir="/opt/zakura-testnet-dashboard"
           sudo install -d -m 755 "$dashboard_dir"
           sudo install -m 755 deploy/runner/zebra-cluster-status.py "$dashboard_dir/zebra-cluster-status.py"
-          sudo install -m 644 deploy/deployer/nodes.ci.toml "$dashboard_dir/nodes.toml"
+          cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
+          cat >> "$RUNNER_TEMP/dashboard.nodes.toml" <<'EOF'
+
+          [[nodes]]
+          name       = "zakura-compat"
+          ssh_string = "root@206.189.208.228"
+          service_name = ""
+          bin_path = "/root/unity/zakura/target/release/zebrad"
+          log_file = "/mnt/zakura-testnet-1-data/logs/zebrad.log"
+          rpc_listen_addr = "0.0.0.0:18232"
+          process_pattern = "zebrad -c /root/unity/zakura-testnet.toml start"
+
+          [[nodes]]
+          name       = "zcashd-compat"
+          ssh_string = "root@206.189.208.228"
+          probe_kind = "zcashd"
+          service_name = ""
+          bin_path = "/root/unity/zcash/src/zcashd"
+          log_file = ""
+          rpc_listen_addr = "127.0.0.1:18231"
+          rpc_auth = "zcash_conf"
+          rpc_config_path = "/root/unity/zcashd-testnet.toml"
+          process_pattern = "zcashd -conf=/root/unity/zcashd-testnet.toml"
+          EOF
+          sudo install -m 644 "$RUNNER_TEMP/dashboard.nodes.toml" "$dashboard_dir/nodes.toml"
 
           sudo tee /etc/systemd/system/zakura-testnet-dashboard.service >/dev/null <<'EOF'
           [Unit]

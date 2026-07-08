@@ -57,11 +57,15 @@ pub struct Config {
     pub zebrad_process_pattern: String,
 
     /// `pgrep -f` pattern that must match a running zcashd process.
+    ///
+    /// The P2P sidecar zcashd is pinned to the local Zakura node with `-connect`
+    /// and no longer takes the legacy RPC-ingest `-zebra-compat` flag, so match
+    /// on `-connect` (mirroring `deploy/zcashd-compat/sync-check.sh`).
     #[arg(
         global = true,
         long,
         env = "ZCASHD_PROCESS_PATTERN",
-        default_value = "zcashd .*-zebra-compat"
+        default_value = "zcashd .*-connect"
     )]
     pub zcashd_process_pattern: String,
 
@@ -131,7 +135,7 @@ mod tests {
         assert_eq!(config.zebra_rpc_url, "http://127.0.0.1:8232");
         assert_eq!(config.zcashd_rpc_url, "http://[::1]:8232");
         assert_eq!(config.zebrad_process_pattern, "zebrad .*--zcashd-compat");
-        assert_eq!(config.zcashd_process_pattern, "zcashd .*-zebra-compat");
+        assert_eq!(config.zcashd_process_pattern, "zcashd .*-connect");
         assert_eq!(config.height_max_drift, 10);
         assert_eq!(config.sync_check_timeout, 600);
         assert_eq!(config.sync_check_interval, 15);

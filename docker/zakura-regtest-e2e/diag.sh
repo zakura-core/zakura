@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/../docker-compose.zakura-regtest-e2e.yml"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-export ZEBRAD_BIN="${ZEBRAD_BIN:-${REPO_DIR}/target/debug/zebrad}"
+export ZEBRAD_BIN="${ZEBRAD_BIN:-${REPO_DIR}/target/debug/zakurad}"
 
 rpc() { curl -s --max-time 10 -H 'content-type: application/json' \
   --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":${3:-[]}}" "http://127.0.0.1:$1/"; }

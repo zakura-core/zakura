@@ -338,8 +338,8 @@ impl ZebraCheckpointsTestDirExt for TempDir {
             return zebra_checkpoints;
         };
 
-        // Fall back to assuming zebra-checkpoints is in the same directory as zebrad.
-        let mut zebra_checkpoints_path: PathBuf = env!("CARGO_BIN_EXE_zebrad").into();
+        // Fall back to assuming zebra-checkpoints is in the same directory as zakurad.
+        let mut zebra_checkpoints_path: PathBuf = env!("CARGO_BIN_EXE_zakurad").into();
         assert!(
             zebra_checkpoints_path.pop(),
             "must have at least one path component",

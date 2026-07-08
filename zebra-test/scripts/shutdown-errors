@@ -19,7 +19,7 @@ SHUTDOWN_DELAY_LIMIT=30
 echo "Building Zebra"
 echo
 
-cargo build --bin zebrad || exit $?
+cargo build --bin zakurad || exit $?
 
 EXIT_STATUS=0
 while [ $EXIT_STATUS -eq 0 ] && [ $SHUTDOWN_DELAY -le $SHUTDOWN_DELAY_LIMIT ]; do
@@ -29,17 +29,17 @@ while [ $EXIT_STATUS -eq 0 ] && [ $SHUTDOWN_DELAY -le $SHUTDOWN_DELAY_LIMIT ]; d
 
     # shut down Zebra if this script exits while it's running,
     # but ignore "no such job" errors if Zebra has already exited
-    trap "kill %?zebrad 2> /dev/null" EXIT
+    trap "kill %?zakurad 2> /dev/null" EXIT
 
-    target/debug/zebrad start &
+    target/debug/zakurad start &
     sleep $SHUTDOWN_DELAY
 
     echo
     echo "Killing Zebra after $SHUTDOWN_DELAY seconds"
     echo
 
-    kill %?zebrad
-    wait %?zebrad
+    kill %?zakurad
+    wait %?zakurad
     EXIT_STATUS=$?
 
     # fix up the exit status caused by 'kill'

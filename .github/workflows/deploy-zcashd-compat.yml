@@ -99,7 +99,7 @@ jobs:
 
           ssh_options=(-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
 
-          scp "${ssh_options[@]}" target/release/zebrad "$DEPLOY_USER@$DEPLOY_HOST:/usr/local/bin/zebrad.new"
+          scp "${ssh_options[@]}" target/release/zakurad "$DEPLOY_USER@$DEPLOY_HOST:/usr/local/bin/zebrad.new"
           scp "${ssh_options[@]}" target/release/zebra-watchdog "$DEPLOY_USER@$DEPLOY_HOST:/usr/local/bin/zebra-watchdog.new"
           scp "${ssh_options[@]}" deploy/zcashd-compat/sync-check.sh "$DEPLOY_USER@$DEPLOY_HOST:/tmp/zcashd-compat-sync-check.sh"
           scp "${ssh_options[@]}" deploy/watchdog/systemd/zebra-watchdog.service "$DEPLOY_USER@$DEPLOY_HOST:/tmp/zebra-watchdog.service"

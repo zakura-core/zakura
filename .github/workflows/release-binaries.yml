@@ -129,10 +129,10 @@ jobs:
             --build-arg "FEATURES=${FEATURES}" \
             --output "type=local,dest=./out" \
             .
-          test -x ./out/usr/local/bin/zebrad
+          test -x ./out/usr/local/bin/zakurad
 
       - name: Validate binary
-        run: ./out/usr/local/bin/zebrad --version
+        run: ./out/usr/local/bin/zakurad --version
 
       - name: Package archive and metadata
         env:
@@ -140,7 +140,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ./artifacts/bin ./artifacts/metadata
-          cp ./out/usr/local/bin/zebrad ./artifacts/bin/zebrad
+          cp ./out/usr/local/bin/zakurad ./artifacts/bin/zebrad
           archive_name="zebrad-${RELEASE_TAG}-${{ matrix.name }}.tar.gz"
           (
             cd ./artifacts

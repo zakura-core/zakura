@@ -961,11 +961,11 @@ collect_source_checks() {
     add_error "zcash build script is missing or not executable: $UNITY_ROOT/zcash/zcutil/build.sh"
   fi
 
-  ZEBRAD_PATH="${ZEBRAD_PATH:-$REPO_ROOT/target/release/zebrad}"
+  ZEBRAD_PATH="${ZEBRAD_PATH:-$REPO_ROOT/target/release/zakurad}"
   ZCASHD_PATH="${ZCASHD_PATH:-$UNITY_ROOT/zcash/src/zcashd}"
 
   if [[ -e "$ZEBRAD_PATH" && ! -x "$ZEBRAD_PATH" ]]; then
-    add_error "zebrad binary $ZEBRAD_PATH exists but is not executable by the current user"
+    add_error "zakurad binary $ZEBRAD_PATH exists but is not executable by the current user"
   fi
 
   if [[ -e "$ZCASHD_PATH" && ! -x "$ZCASHD_PATH" ]]; then
@@ -1319,7 +1319,7 @@ print_source_commands() {
 git clone https://github.com/valargroup/zebra.git
 git clone https://github.com/valargroup/zcashd.git
 
-cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zebrad
+cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zakurad
 cd $(shell_quote "$UNITY_ROOT/zcash") && ./zcutil/build.sh -j"\$(nproc)"
 
 $(style "$GREEN$BOLD" "Start Zebra in terminal 1:")

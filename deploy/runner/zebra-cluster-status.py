@@ -42,6 +42,7 @@ SSH_COMMON_OPTS = [
 ]
 
 DEFAULTS = {
+    "probe_kind": "zebra",
     "service_name": "zebrad",
     "bin_path": "/usr/local/bin/zebrad",
     "config_path": "/etc/zebrad/zebrad.toml",
@@ -50,6 +51,11 @@ DEFAULTS = {
     "network": "Mainnet",
     "listen_addr": "[::]:8233",
     "rpc_listen_addr": "",
+    "rpc_auth": "",
+    "rpc_config_path": "",
+    "rpc_user": "",
+    "rpc_password": "",
+    "process_pattern": "",
     "port": None,
 }
 
@@ -58,10 +64,16 @@ DEFAULTS = {
 class Node:
     name: str
     ssh_string: str
+    probe_kind: str
     service_name: str
     bin_path: str
     log_file: str
     rpc_listen_addr: str
+    rpc_auth: str
+    rpc_config_path: str
+    rpc_user: str
+    rpc_password: str
+    process_pattern: str
     node_id: str
     port: object = None
 
@@ -97,10 +109,16 @@ def load_nodes(config_path: Path) -> list[Node]:
             Node(
                 name=name,
                 ssh_string=merged["ssh_string"],
+                probe_kind=merged["probe_kind"],
                 service_name=merged["service_name"],
                 bin_path=merged["bin_path"],
                 log_file=merged["log_file"],
                 rpc_listen_addr=merged["rpc_listen_addr"],
+                rpc_auth=merged["rpc_auth"],
+                rpc_config_path=merged["rpc_config_path"],
+                rpc_user=merged["rpc_user"],
+                rpc_password=merged["rpc_password"],
+                process_pattern=merged["process_pattern"],
                 node_id=node_ids_by_host.get(ssh_host(merged["ssh_string"]), ""),
                 port=merged["port"],
             )
@@ -147,40 +165,106 @@ def rpc_url_for(listen_addr: str) -> str:
 
 
 REMOTE_PROBE = r"""
+import base64
 import json
+import re
 import shlex
 import subprocess
 import sys
 import urllib.request
 
-service, bin_path, log_file, rpc_url = sys.argv[1:5]
+(
+    service,
+    bin_path,
+    log_file,
+    rpc_url,
+    probe_kind,
+    process_pattern,
+    rpc_auth,
+    rpc_user,
+    rpc_password,
+    rpc_config_path,
+) = sys.argv[1:11]
 
 out = {
     "service": service,
     "bin_path": bin_path,
     "log_file": log_file,
     "rpc_url": rpc_url,
+    "probe_kind": probe_kind,
 }
 
 def run(cmd, timeout=6):
     return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
 
-try:
-    proc = run(["systemctl", "show", service, "--no-pager",
-                "-p", "ActiveState",
-                "-p", "ActiveEnterTimestamp",
-                "-p", "ExecMainStartTimestamp"])
-    props = {}
-    for line in proc.stdout.splitlines():
-        if "=" in line:
+def process_is_running(pattern):
+    if not pattern:
+        return None
+    proc = run(["pgrep", "-f", pattern])
+    return proc.returncode == 0
+
+def parse_zcash_conf(path):
+    values = {}
+    if not path:
+        return values
+    with open(path, encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
             key, value = line.split("=", 1)
-            props[key] = value
-    out["active_state"] = props.get("ActiveState") or "unknown"
-    out["last_restarted"] = (
-        props.get("ExecMainStartTimestamp")
-        or props.get("ActiveEnterTimestamp")
-        or ""
-    )
+            values[key.strip()] = value.strip()
+    return values
+
+def rpc_headers():
+    headers = {"Content-Type": "application/json"}
+    user = rpc_user
+    password = rpc_password
+    if rpc_auth == "zcash_conf":
+        try:
+            config = parse_zcash_conf(rpc_config_path)
+            user = config.get("rpcuser", user)
+            password = config.get("rpcpassword", password)
+        except Exception as error:
+            out["rpc_auth_error"] = str(error)
+    if rpc_auth in ("basic", "zcash_conf") and user and password:
+        token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        headers["Authorization"] = f"Basic {token}"
+    return headers
+
+try:
+    running = process_is_running(process_pattern)
+    if running is not None:
+        out["process_running"] = running
+except Exception as error:
+    out["process_error"] = str(error)
+
+try:
+    if service:
+        proc = run(["systemctl", "show", service, "--no-pager",
+                    "-p", "ActiveState",
+                    "-p", "ActiveEnterTimestamp",
+                    "-p", "ExecMainStartTimestamp"])
+        props = {}
+        for line in proc.stdout.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                props[key] = value
+        out["active_state"] = props.get("ActiveState") or "unknown"
+        out["last_restarted"] = (
+            props.get("ExecMainStartTimestamp")
+            or props.get("ActiveEnterTimestamp")
+            or ""
+        )
+    elif out.get("process_running") is True:
+        out["active_state"] = "active"
+        out["last_restarted"] = ""
+    elif out.get("process_running") is False:
+        out["active_state"] = "inactive"
+        out["last_restarted"] = ""
+    else:
+        out["active_state"] = "unknown"
+        out["last_restarted"] = ""
 except Exception as error:
     out["active_state"] = "unknown"
     out["systemd_error"] = str(error)
@@ -192,26 +276,33 @@ except Exception as error:
     out["version_error"] = str(error)
 
 try:
-    grep = "grep -aoE 'git commit: [0-9a-f]+' {} 2>/dev/null | tail -1".format(
-        shlex.quote(log_file)
-    )
-    proc = run(["bash", "-lc", grep])
-    line = proc.stdout.strip()
-    out["commit"] = line.rsplit(" ", 1)[-1] if line else ""
+    if log_file:
+        grep = "grep -aoE 'git commit: [0-9a-f]+' {} 2>/dev/null | tail -1".format(
+            shlex.quote(log_file)
+        )
+        proc = run(["bash", "-lc", grep])
+        line = proc.stdout.strip()
+        out["commit"] = line.rsplit(" ", 1)[-1] if line else ""
+    if not out.get("commit") and out.get("version"):
+        match = re.search(r"\b([0-9a-f]{7,40})(?:-dirty)?\b", out["version"])
+        if match:
+            out["commit"] = match.group(1)
 except Exception as error:
     out["commit_error"] = str(error)
 
 try:
-    grep = "grep -aoE 'node_id=[^, ]+' {} 2>/dev/null | tail -1".format(
-        shlex.quote(log_file)
-    )
-    proc = run(["bash", "-lc", grep])
-    line = proc.stdout.strip()
-    out["node_id"] = line.split("=", 1)[-1].strip('"') if line else ""
+    if log_file:
+        grep = "grep -aoE 'node_id=[^, ]+' {} 2>/dev/null | tail -1".format(
+            shlex.quote(log_file)
+        )
+        proc = run(["bash", "-lc", grep])
+        line = proc.stdout.strip()
+        out["node_id"] = line.split("=", 1)[-1].strip('"') if line else ""
 except Exception as error:
     out["node_id_error"] = str(error)
 
 if rpc_url:
+    headers = rpc_headers()
     try:
         height_body = json.dumps({
             "jsonrpc": "2.0",
@@ -222,7 +313,7 @@ if rpc_url:
         height_req = urllib.request.Request(
             rpc_url,
             data=height_body,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(height_req, timeout=6) as resp:
@@ -244,7 +335,7 @@ if rpc_url:
         hash_req = urllib.request.Request(
             rpc_url,
             data=hash_body,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(hash_req, timeout=6) as resp:
@@ -273,7 +364,13 @@ def probe_node(node: Node) -> dict:
         f"{shlex.quote(node.service_name)} "
         f"{shlex.quote(node.bin_path)} "
         f"{shlex.quote(node.log_file)} "
-        f"{shlex.quote(rpc_url)} <<'PY'\n"
+        f"{shlex.quote(rpc_url)} "
+        f"{shlex.quote(node.probe_kind)} "
+        f"{shlex.quote(node.process_pattern)} "
+        f"{shlex.quote(node.rpc_auth)} "
+        f"{shlex.quote(node.rpc_user)} "
+        f"{shlex.quote(node.rpc_password)} "
+        f"{shlex.quote(node.rpc_config_path)} <<'PY'\n"
         f"{REMOTE_PROBE}\n"
         "PY\n"
     )
@@ -364,7 +461,9 @@ class ClusterCollector:
 
         advanced = False
         if height is not None:
-            if previous_height is not None and height > previous_height:
+            if previous_height is None and self.last_advanced_at.get(node.name) is None:
+                self.last_advanced_at[node.name] = now
+            elif previous_height is not None and height > previous_height:
                 self.last_advanced_at[node.name] = now
                 advanced = True
             self.last_height[node.name] = height
@@ -375,7 +474,8 @@ class ClusterCollector:
         )
 
         active_state = probe.get("active_state") or "unknown"
-        service_active = active_state == "active"
+        process_running = probe.get("process_running")
+        service_active = active_state == "active" and process_running is not False
         rpc_ok = height is not None and not probe.get("rpc_error")
         recent = (
             seconds_since_advanced is not None
@@ -386,6 +486,9 @@ class ClusterCollector:
         if probe.get("error"):
             health = "down"
             detail = probe["error"]
+        elif process_running is False:
+            health = "down"
+            detail = f"process not found: {node.process_pattern}"
         elif not service_active:
             health = "down"
             detail = f"systemd state: {active_state}"

@@ -48,6 +48,7 @@ DEFAULTS = {
     "network": "Mainnet",
     "listen_addr": "[::]:8233",
     "network_cache_dir": "",
+    "cache_dir_migrate_from": "",
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
     "rpc_enable_cookie_auth": None,
     "port": None,           # ssh port; None -> ssh default
@@ -89,6 +90,7 @@ class Node:
     network: str
     listen_addr: str
     network_cache_dir: str
+    cache_dir_migrate_from: str
     rpc_listen_addr: str
     rpc_enable_cookie_auth: object
     storage_mode: str
@@ -170,6 +172,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             network=merged["network"],
             listen_addr=merged["listen_addr"],
             network_cache_dir=merged["network_cache_dir"],
+            cache_dir_migrate_from=merged["cache_dir_migrate_from"],
             rpc_listen_addr=merged["rpc_listen_addr"],
             rpc_enable_cookie_auth=merged["rpc_enable_cookie_auth"],
             storage_mode=merged["storage_mode"],
@@ -402,10 +405,10 @@ CONFIG_PATH={config_path}
 SERVICE={service}
 LOG_FILE={log_file}
 STATE_DIR={state_dir}
+CACHE_DIR_MIGRATE_FROM={cache_dir_migrate_from}
 NO_RESTART={no_restart}
 
-mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")" \
-         "$(dirname "$LOG_FILE")" "$STATE_DIR"
+mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")" "$(dirname "$LOG_FILE")"
 
 # Stage uploaded artifacts (uploaded to /tmp by the deploy step).
 install -m 644 /tmp/zebrad-deploy.service "/etc/systemd/system/${{SERVICE}}.service"
@@ -422,9 +425,26 @@ systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null 2>&1 || true
 
 if [ "$NO_RESTART" = "1" ]; then
+    if [ -n "$CACHE_DIR_MIGRATE_FROM" ] && [ ! -e "$STATE_DIR" ] && [ -d "$CACHE_DIR_MIGRATE_FROM" ]; then
+        echo "cache migration from $CACHE_DIR_MIGRATE_FROM to $STATE_DIR requires restart" >&2
+        exit 1
+    fi
+    mkdir -p "$STATE_DIR"
     echo "installed (restart skipped)"
     exit 0
 fi
+
+if [ -n "$CACHE_DIR_MIGRATE_FROM" ] && [ "$CACHE_DIR_MIGRATE_FROM" != "$STATE_DIR" ]; then
+    if [ ! -e "$STATE_DIR" ] && [ -d "$CACHE_DIR_MIGRATE_FROM" ]; then
+        systemctl stop "$SERVICE" || true
+        mkdir -p "$(dirname "$STATE_DIR")"
+        mv "$CACHE_DIR_MIGRATE_FROM" "$STATE_DIR"
+        echo "migrated cache dir: $CACHE_DIR_MIGRATE_FROM -> $STATE_DIR"
+    elif [ -e "$STATE_DIR" ]; then
+        echo "cache dir already present: $STATE_DIR"
+    fi
+fi
+mkdir -p "$STATE_DIR"
 
 start_service() {{
     systemctl stop "$SERVICE" || true
@@ -467,6 +487,8 @@ set -euo pipefail
 BIN_PATH={bin_path}
 CONFIG_PATH={config_path}
 LOG_FILE={log_file}
+STATE_DIR={state_dir}
+CACHE_DIR_MIGRATE_FROM={cache_dir_migrate_from}
 WORKING_DIR={working_dir}
 START_COMMAND={start_command}
 PROCESS_PATTERN={process_pattern}
@@ -489,6 +511,11 @@ install -m 755 /tmp/zebrad-deploy.new "$BIN_PATH"
 rm -f /tmp/zebrad-deploy.new /tmp/zebrad-deploy.toml
 
 if [ "$NO_RESTART" = "1" ]; then
+    if [ -n "$CACHE_DIR_MIGRATE_FROM" ] && [ ! -e "$STATE_DIR" ] && [ -d "$CACHE_DIR_MIGRATE_FROM" ]; then
+        echo "cache migration from $CACHE_DIR_MIGRATE_FROM to $STATE_DIR requires restart" >&2
+        exit 1
+    fi
+    mkdir -p "$STATE_DIR"
     echo "installed process binary/config (restart skipped)"
     exit 0
 fi
@@ -508,6 +535,17 @@ if pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1; then
     done
     pkill -KILL -f "$PROCESS_PATTERN" >/dev/null 2>&1 || true
 fi
+
+if [ -n "$CACHE_DIR_MIGRATE_FROM" ] && [ "$CACHE_DIR_MIGRATE_FROM" != "$STATE_DIR" ]; then
+    if [ ! -e "$STATE_DIR" ] && [ -d "$CACHE_DIR_MIGRATE_FROM" ]; then
+        mkdir -p "$(dirname "$STATE_DIR")"
+        mv "$CACHE_DIR_MIGRATE_FROM" "$STATE_DIR"
+        echo "migrated cache dir: $CACHE_DIR_MIGRATE_FROM -> $STATE_DIR"
+    elif [ -e "$STATE_DIR" ]; then
+        echo "cache dir already present: $STATE_DIR"
+    fi
+fi
+mkdir -p "$STATE_DIR"
 
 if [ -n "$WORKING_DIR" ]; then
     cd "$WORKING_DIR"
@@ -591,6 +629,7 @@ def cmd_deploy(args) -> int:
                     service=shlex.quote(node.service_name),
                     log_file=shlex.quote(node.log_file),
                     state_dir=shlex.quote(node.state_cache_dir),
+                    cache_dir_migrate_from=shlex.quote(node.cache_dir_migrate_from),
                     no_restart="1" if args.no_restart else "0",
                 )
             else:
@@ -598,6 +637,8 @@ def cmd_deploy(args) -> int:
                     bin_path=shlex.quote(node.bin_path),
                     config_path=shlex.quote(node.config_path),
                     log_file=shlex.quote(node.log_file),
+                    state_dir=shlex.quote(node.state_cache_dir),
+                    cache_dir_migrate_from=shlex.quote(node.cache_dir_migrate_from),
                     working_dir=shlex.quote(node.working_dir),
                     start_command=shlex.quote(node.start_command),
                     process_pattern=shlex.quote(node.process_pattern),

@@ -98,10 +98,12 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
 while forcing the legacy non-VCT path. It also writes `/etc/zakura/zebrad.toml`
-and uses each node's existing `/mnt/<node-name>-data/zebra-cache` snapshot
+and uses each node's existing `/mnt/<node-name>-data/zakura-cache` snapshot
 directory, so CI restarts the current `zebrad.service` against the existing state
-instead of creating a fresh database. The compat Zakura process uses the same
-snapshot layout on its host.
+instead of creating a fresh database. If an older `/mnt/<node-name>-data/zebra-cache`
+directory exists and the `zakura-cache` target does not, the deployer stops that
+node and moves the directory before starting with the new config. The compat
+Zakura process uses the same snapshot layout on its host.
 
 The workflow also refreshes a simple fleet status dashboard on
 `zakura-testnet-1`:

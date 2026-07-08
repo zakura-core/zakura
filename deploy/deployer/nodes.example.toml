@@ -9,6 +9,7 @@ bin_path        = "/usr/local/bin/zebrad"
 config_path     = "/etc/zebrad/zebrad.toml"
 log_file        = "/var/log/zebrad/zebrad.log"   # deterministic log path
 state_cache_dir = "/var/lib/zebrad"
+cache_dir_migrate_from = ""                    # optional old cache dir to move during restart deploys
 network         = "Mainnet"
 listen_addr     = "[::]:8233"
 rpc_listen_addr = ""                        # empty = RPC disabled; e.g. "0.0.0.0:8232"

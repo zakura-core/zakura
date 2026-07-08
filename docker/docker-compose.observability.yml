@@ -19,7 +19,7 @@ services:
         # OpenTelemetry tracing is included transitively in default-release-binaries.
         FEATURES: "default-release-binaries"
     volumes:
-      - zebrad-cache:/home/zebra/.cache/zebra
+      - zebrad-cache:/home/zebra/.cache/zakura
     tty: true
     environment:
       # Prometheus metrics endpoint

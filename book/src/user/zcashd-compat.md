@@ -28,7 +28,7 @@ connect=<zebra-host>:8233   # one outbound peer: Zebra
 listen=0                    # no inbound P2P
 ```
 
-`-connect` makes zcashd peer with the given address and *only* that address:
+`-connect` makes zcashd peer with the given address and _only_ that address:
 zcashd itself then disables DNS seeding, inbound listening, and peer
 discovery. zcashd syncs blocks and relays transactions over the standard
 Zcash P2P protocol, with Zebra as its entire network.
@@ -100,7 +100,7 @@ On start, Zebra:
    backoff, and shuts it down gracefully (SIGTERM, then a configurable grace
    period) when Zebra stops.
 
-The forced peer-pinning arguments are placed *after* `zcashd_extra_args`
+The forced peer-pinning arguments are placed _after_ `zcashd_extra_args`
 because zcashd takes the last occurrence of a single-valued command-line
 argument. Peer-selection options (`-connect`, `-addnode`, `-seednode`) in
 `zcashd_extra_args` are rejected at startup: the sidecar must peer with Zebra
@@ -204,7 +204,7 @@ continue from its current height. The chainstate and block files are the
 stock zcashd format; no conversion is needed.
 
 zcashd still performs its own full validation of every block Zebra relays —
-the sidecar removes zcashd's *network exposure*, not its consensus checks.
+the sidecar removes zcashd's _network exposure_, not its consensus checks.
 
 ## Configuration reference
 

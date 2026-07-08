@@ -25,7 +25,7 @@ pub struct Config {
         global = true,
         long,
         env = "ZEBRA_COOKIE_FILE",
-        default_value = "/root/.cache/zebra/.cookie"
+        default_value = "/root/.cache/zakura/.cookie"
     )]
     pub zebra_cookie_file: PathBuf,
 

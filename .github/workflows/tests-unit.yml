@@ -2,7 +2,7 @@ name: Unit Tests
 
 on:
   pull_request:
-    branches: [ironwood-main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**"]
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     paths:
       - "**/*.rs"
@@ -12,7 +12,7 @@ on:
       - .github/workflows/tests-unit.yml
 
   push:
-    branches: [ironwood-main]
+    branches: [main]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"

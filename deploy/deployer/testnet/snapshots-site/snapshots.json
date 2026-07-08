@@ -1,8 +1,47 @@
 {
-  "siteBaseUrl": "http://167.99.103.111:8091",
+  "siteBaseUrl": "https://ironwood.zakura.valargroup.dev",
   "network": "Zakura Ironwood testnet",
-  "updatedAt": "",
+  "updatedAt": "2026-07-08T08:08:49Z",
   "snapshots": [
+    {
+      "enabled": true,
+      "name": "Zakura Ironwood Testnet Archive Before Activation",
+      "kind": "archive",
+      "group": "daily",
+      "file": "zakura-ironwood-testnet-archive-20260704-4130396.tar.zst",
+      "size": "8.3 GiB",
+      "published": "2026-07-04",
+      "height": "4130396",
+      "zebraVersion": "zebrad 5.0.0-rc.3",
+      "dbFormat": "28.0.0",
+      "sha256": "f4e659c5aaa8857e2b397d3ba92bf68f5e238ba77d73a709c63beffc8da6366f"
+    },
+    {
+      "enabled": true,
+      "name": "ZCashd Pre-Ironwood Testnet Before Activation",
+      "kind": "archive",
+      "group": "daily",
+      "file": "zcashd-pre-ironwood-h4129124-20260708T074153Z.tar.zst",
+      "size": "16.1 GiB",
+      "published": "2026-07-08",
+      "height": "4129124",
+      "zebraVersion": "zcashd",
+      "dbFormat": "pre-Ironwood",
+      "sha256": "559c2995ee244452d7bfd2dddfabe574cd4c98d03c22e35ee34c58c71b5b38a4"
+    },
+    {
+      "enabled": true,
+      "name": "Zakura Ironwood Testnet Pruned Before Activation",
+      "kind": "pruned",
+      "group": "daily",
+      "file": "zakura-ironwood-testnet-pruned-20260703-4128095.tar.zst",
+      "size": "8.3 GiB",
+      "published": "2026-07-03",
+      "height": "4128095",
+      "zebraVersion": "zebrad 5.0.0-rc.3",
+      "dbFormat": "28.0.0",
+      "sha256": "93add7c12c52f02943d68378bc341803619e99a02c71f34450eb820ed84cac6b"
+    },
     {
       "enabled": false,
       "name": "Example archive snapshot",

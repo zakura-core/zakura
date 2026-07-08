@@ -129,10 +129,10 @@ jobs:
             --build-arg "FEATURES=${FEATURES}" \
             --output "type=local,dest=./out" \
             .
-          test -x ./out/usr/local/bin/zebrad
+          test -x ./out/usr/local/bin/zakurad
 
       - name: Validate binary
-        run: ./out/usr/local/bin/zebrad --version
+        run: ./out/usr/local/bin/zakurad --version
 
       - name: Package archive and metadata
         env:
@@ -140,7 +140,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ./artifacts/bin ./artifacts/metadata
-          cp ./out/usr/local/bin/zebrad ./artifacts/bin/zebrad
+          cp ./out/usr/local/bin/zakurad ./artifacts/bin/zebrad
           archive_name="zebrad-${RELEASE_TAG}-${{ matrix.name }}.tar.gz"
           (
             cd ./artifacts
@@ -240,8 +240,8 @@ jobs:
           installers = {
               "install-zcashd-compat.sh": {
                   "ZEBRA_RELEASE_TAG": release_tag,
-                  "ZEBRA_DOCKER_IMAGE": f"valaroman/zebra:{image_version}",
-                  "ZEBRA_COMPAT_DOCKER_IMAGE": f"valaroman/zebra:zcashd-compat-{image_version}",
+                  "ZEBRA_DOCKER_IMAGE": f"valargroup/zakura:{image_version}",
+                  "ZEBRA_COMPAT_DOCKER_IMAGE": f"valargroup/zakura:zcashd-compat-{image_version}",
               },
               "install-zakura.sh": {
                   "ZEBRA_RELEASE_TAG": release_tag,
@@ -354,14 +354,14 @@ jobs:
         if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker_to_dockerhub
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 #v4.1.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: valargroup
+          password: ${{ secrets.DOCKERHUB_TOKEN_VALARGROUP }}
 
       - name: Build runtime image
         if: github.event_name != 'release' && !startsWith(github.ref, 'refs/tags/v') && !inputs.publish_docker_to_dockerhub
         env:
           FEATURES: ${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
-          IMAGE_TAG: valaroman/zebra:release-ci-${{ matrix.name }}
+          IMAGE_TAG: valargroup/zakura:release-ci-${{ matrix.name }}
         run: |
           set -euo pipefail
           docker buildx build \
@@ -388,7 +388,7 @@ jobs:
             --target runtime \
             --file ./docker/Dockerfile \
             --build-arg "FEATURES=${FEATURES}" \
-            --tag "valaroman/zebra:${image_version}-${DOCKER_TAG_SUFFIX}" \
+            --tag "valargroup/zakura:${image_version}-${DOCKER_TAG_SUFFIX}" \
             --push \
             .
 
@@ -401,8 +401,8 @@ jobs:
       - name: Login to DockerHub
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 #v4.1.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: valargroup
+          password: ${{ secrets.DOCKERHUB_TOKEN_VALARGROUP }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd #v4.0.0
@@ -414,17 +414,17 @@ jobs:
         run: |
           set -euo pipefail
           image_version="${RELEASE_TAG#v}"
-          tags=(-t "valaroman/zebra:${image_version}")
+          tags=(-t "valargroup/zakura:${image_version}")
           if [ "$EVENT_NAME" = "release" ]; then
-            tags+=(-t "valaroman/zebra:latest")
+            tags+=(-t "valargroup/zakura:latest")
           fi
 
           docker buildx imagetools create \
             "${tags[@]}" \
-            "valaroman/zebra:${image_version}-amd64" \
-            "valaroman/zebra:${image_version}-arm64"
+            "valargroup/zakura:${image_version}-amd64" \
+            "valargroup/zakura:${image_version}-arm64"
 
-          docker buildx imagetools inspect "valaroman/zebra:${image_version}" \
+          docker buildx imagetools inspect "valargroup/zakura:${image_version}" \
             --format '{{json .Manifest}}' \
             | jq -e '
                 [ .manifests[].platform | "\(.os)/\(.architecture)" ] as $platforms
@@ -459,8 +459,8 @@ jobs:
         if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker_to_dockerhub
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 #v4.1.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: valargroup
+          password: ${{ secrets.DOCKERHUB_TOKEN_VALARGROUP }}
 
       - name: Prepare zcashd compat build context
         env:
@@ -475,7 +475,7 @@ jobs:
         if: github.event_name != 'release' && !startsWith(github.ref, 'refs/tags/v') && !inputs.publish_docker_to_dockerhub
         env:
           FEATURES: ${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
-          IMAGE_TAG: valaroman/zebra:zcashd-compat-release-ci-${{ matrix.name }}
+          IMAGE_TAG: valargroup/zakura:zcashd-compat-release-ci-${{ matrix.name }}
         run: |
           set -euo pipefail
           docker buildx build \
@@ -504,7 +504,7 @@ jobs:
             --file ./docker/Dockerfile \
             --build-context "zcashd_compat=${RUNNER_TEMP}/zcashd-compat-context" \
             --build-arg "FEATURES=${FEATURES}" \
-            --tag "valaroman/zebra:zcashd-compat-${image_version}-${DOCKER_TAG_SUFFIX}" \
+            --tag "valargroup/zakura:zcashd-compat-${image_version}-${DOCKER_TAG_SUFFIX}" \
             --push \
             .
 
@@ -517,8 +517,8 @@ jobs:
       - name: Login to DockerHub
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 #v4.1.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: valargroup
+          password: ${{ secrets.DOCKERHUB_TOKEN_VALARGROUP }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd #v4.0.0
@@ -530,16 +530,16 @@ jobs:
         run: |
           set -euo pipefail
           image_version="${RELEASE_TAG#v}"
-          tags=(-t "valaroman/zebra:zcashd-compat-${image_version}")
+          tags=(-t "valargroup/zakura:zcashd-compat-${image_version}")
           if [ "$EVENT_NAME" = "release" ]; then
-            tags+=(-t "valaroman/zebra:zcashd-compat-latest")
+            tags+=(-t "valargroup/zakura:zcashd-compat-latest")
           fi
 
           docker buildx imagetools create \
             "${tags[@]}" \
-            "valaroman/zebra:zcashd-compat-${image_version}-amd64"
+            "valargroup/zakura:zcashd-compat-${image_version}-amd64"
 
-          docker buildx imagetools inspect "valaroman/zebra:zcashd-compat-${image_version}" \
+          docker buildx imagetools inspect "valargroup/zakura:zcashd-compat-${image_version}" \
             --format '{{json .Manifest}}' \
             | jq -e '
                 [ .manifests[].platform | "\(.os)/\(.architecture)" ] as $platforms

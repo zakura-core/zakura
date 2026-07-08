@@ -10,15 +10,15 @@ else
 fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-ZEBRA_RELEASE_TAG="v5.0.0-test.4"
+ZEBRA_RELEASE_TAG="v0.0.1-alpha.1"
 ZEBRA_ARCHIVE="zebrad-${ZEBRA_RELEASE_TAG}-linux-x86_64.tar.gz"
-ZEBRA_URL="https://github.com/valargroup/zebra/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
+ZEBRA_URL="https://github.com/zakura-core/zakura/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
 ZEBRA_MEMBER="./bin/zebrad"
 ZEBRA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1@sha256:74f76366eed48bdfb15a3386d033a6e3e2d7481f40cb06c5c6ae3c5e9f77e4b5"
 
 MODE=""
 NETWORK="Mainnet"
-ZEBRA_STATE_DIR="/mnt/data/zebra-state"
+ZEBRA_STATE_DIR="/mnt/data/zakura-state"
 INSTALL_DIR="${HOME}/.local/zakura"
 CACHE_DIR="${HOME}/.cache/zakura"
 ZEBRAD_PATH=""
@@ -115,7 +115,7 @@ Modes:
 Options:
   --mode MODE
   --network NETWORK
-  --zebra-state-dir DIR
+  --zakura-state-dir DIR
   --install-dir DIR
   --cache-dir DIR
   --zebrad-path PATH
@@ -357,7 +357,7 @@ normalize_inputs() {
     fi
   fi
 
-  ZEBRA_STATE_DIR="$(prompt_value "Zebra state directory" "$ZEBRA_STATE_DIR")"
+  ZEBRA_STATE_DIR="$(prompt_value "Zakura state directory" "$ZEBRA_STATE_DIR")"
   INSTALL_DIR="$(prompt_value "Install directory" "$INSTALL_DIR")"
   CACHE_DIR="$(prompt_value "Download/cache directory" "$CACHE_DIR")"
 
@@ -451,7 +451,7 @@ check_writable_target() {
 }
 
 collect_permission_checks() {
-  check_writable_target "zebra state directory" "$ZEBRA_STATE_DIR"
+  check_writable_target "zakura state directory" "$ZEBRA_STATE_DIR"
 
   if [[ "$MODE" == "native" ]]; then
     check_writable_target "install directory" "$INSTALL_DIR"
@@ -562,13 +562,13 @@ collect_disk_checks() {
   required=$((300 * gib))
 
   if ! zebra_info="$(disk_device_and_size "$ZEBRA_STATE_DIR")"; then
-    add_error "failed to inspect filesystem for zebra state path: $ZEBRA_STATE_DIR"
+    add_error "failed to inspect filesystem for zakura state path: $ZEBRA_STATE_DIR"
     return
   fi
 
   read -r zebra_device zebra_size <<<"$zebra_info"
   if ((zebra_size < required)); then
-    add_low_spec_error "zebra state mount (path: $ZEBRA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
+    add_low_spec_error "zakura state mount (path: $ZEBRA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
   fi
 
   _="$zebra_device"
@@ -585,10 +585,10 @@ collect_source_checks() {
     add_error "Zebra source tree is missing Cargo.toml: $REPO_ROOT"
   fi
 
-  ZEBRAD_PATH="${ZEBRAD_PATH:-$REPO_ROOT/target/release/zebrad}"
+  ZEBRAD_PATH="${ZEBRAD_PATH:-$REPO_ROOT/target/release/zakurad}"
 
   if [[ -e "$ZEBRAD_PATH" && ! -x "$ZEBRAD_PATH" ]]; then
-    add_error "zebrad binary $ZEBRAD_PATH exists but is not executable by the current user"
+    add_error "zakurad binary $ZEBRAD_PATH exists but is not executable by the current user"
   fi
 }
 
@@ -688,7 +688,7 @@ data_detection_message() {
       printf 'Please download the Zebra snapshot from the location below if you want a faster sync\n'
     fi
   fi
-  printf '\nhttps://zebra.valargroup.org/\n\n'
+  printf '\nhttps://zebra.valargroup.dev/\n\n'
 }
 
 docker_image_available_or_pull() {
@@ -733,8 +733,8 @@ print_docker_command() {
 docker run --rm -it --name zakura-zebrad \\
   -e ZEBRA_NETWORK__NETWORK=$(shell_quote "$NETWORK") \\
   -e ZEBRA_NETWORK__LISTEN_ADDR='[::]:$port' \\
-  -e ZEBRA_STATE__CACHE_DIR=/home/zebra/.cache/zebra \\
-  --mount type=bind,src=$(shell_quote "$ZEBRA_STATE_DIR"),dst=/home/zebra/.cache/zebra \\
+  -e ZEBRA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \\
+  --mount type=bind,src=$(shell_quote "$ZEBRA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
   -p $port:$port \\
   $(shell_quote "$ZEBRA_DOCKER_IMAGE") \\
   zebrad start
@@ -743,9 +743,9 @@ EOF
 
 print_source_commands() {
   cat <<EOF
-git clone https://github.com/valargroup/zebra.git
+git clone https://github.com/zakura-core/zakura.git
 
-cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zebrad
+cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zakurad
 
 $(style "$GREEN$BOLD" "Start Zebra:")
 ZEBRA_STATE__CACHE_DIR=$(shell_quote "$ZEBRA_STATE_DIR") \\
@@ -782,7 +782,7 @@ while (($#)); do
       NETWORK="$2"
       shift 2
       ;;
-    --zebra-state-dir)
+    --zakura-state-dir | --zebra-state-dir)
       require_value "$1" "${2:-}"
       ZEBRA_STATE_DIR="$2"
       shift 2

@@ -11,7 +11,7 @@ To get Zebra quickly up and running, you can use an off-the-rack image from
 docker run -d \
   --name zebra \
   -p 8233:8233 \
-  -v zebrad-cache:/home/zebra/.cache/zebra \
+  -v zebrad-cache:/home/zebra/.cache/zakura \
   zfnd/zebra
 ```
 
@@ -95,11 +95,11 @@ Zebra's RPC server is disabled by default. Enable and configure it via the TOML 
 
 By default, Zebra uses cookie-based authentication for RPC requests (`enable_cookie_auth = true`). When enabled, Zebra generates a unique, random cookie file required for client authentication.
 
-- **Cookie Location:** By default, the cookie is stored at `<cache_dir>/.cookie`, where `<cache_dir>` is Zebra's cache directory (for the `zebra` user in the container this is typically `/home/zebra/.cache/zebra/.cookie`).
+- **Cookie Location:** By default, the cookie is stored at `<cache_dir>/.cookie`, where `<cache_dir>` is Zebra's cache directory (for the `zebra` user in the container this is typically `/home/zebra/.cache/zakura/.cookie`).
 - **Viewing the Cookie:** If the container is running and RPC is enabled with authentication, you can view the cookie content using:
 
   ```bash
-  docker exec <container_name> cat /home/zebra/.cache/zebra/.cookie
+  docker exec <container_name> cat /home/zebra/.cache/zakura/.cookie
   ```
 
   (Replace `<container_name>` with your container's name, typically `zebra` if using the default `docker-compose.yml`). Your RPC client will need this value.

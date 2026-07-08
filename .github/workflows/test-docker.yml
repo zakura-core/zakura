@@ -2,7 +2,7 @@ name: Test Docker Config
 
 on:
   pull_request:
-    branches: [ironwood-main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**"]
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     paths:
       - "**/*.rs"
@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
 
   push:
-    branches: [ironwood-main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -167,8 +167,8 @@ jobs:
           # Custom directory tests
           - id: custom-dirs-conf
             name: Custom cache and cookie directories
-            env_vars: -e ZEBRA_STATE__CACHE_DIR=/tmp/zebra-cache
-            grep_patterns: -e "Opened Zebra state cache at /tmp/zebra-cache"
+            env_vars: -e ZEBRA_STATE__CACHE_DIR=/tmp/zakura-cache
+            grep_patterns: -e "Opened Zebra state cache at /tmp/zakura-cache"
 
           # Feature-based configurations
           - id: prometheus-feature
@@ -219,7 +219,7 @@ jobs:
           fi
 
           # For long-running commands (zebrad start), run detached and follow logs
-          docker run ${{ matrix.env_vars }} --detach --name ${{ matrix.id }} -t zebrad-test:${{ github.sha }} zebrad start
+          docker run ${{ matrix.env_vars }} --detach --name ${{ matrix.id }} -t zebrad-test:${{ github.sha }} zakurad start
           # Use a subshell to handle the broken pipe error gracefully
           (
             trap "" PIPE;

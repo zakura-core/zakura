@@ -11,8 +11,8 @@ set -eo pipefail
 # Default cache directories for Zebra components.
 # These use the config-rs ZEBRA_SECTION__KEY format and will be picked up
 # by zebrad's configuration system automatically.
-: "${ZEBRA_STATE__CACHE_DIR:=${HOME}/.cache/zebra}"
-: "${ZEBRA_RPC__COOKIE_DIR:=${HOME}/.cache/zebra}"
+: "${ZEBRA_STATE__CACHE_DIR:=${HOME}/.cache/zakura}"
+: "${ZEBRA_RPC__COOKIE_DIR:=${HOME}/.cache/zakura}"
 
 # Leave zcashd-compat disabled unless the container runtime explicitly opts in.
 # Compat images can set ZCASHD_COMPAT_ENABLED=true to use a vendored
@@ -86,19 +86,20 @@ if [[ -n ${CONFIG_FILE_PATH} && -f ${CONFIG_FILE_PATH} ]]; then
 fi
 
 # Main Script Logic
-# - If "$1" is "--", "-", or "zebrad", run `zebrad` with the remaining params.
+# - If "$1" is "--", "-", "zakurad", or "zebrad" (legacy alias), run `zakurad`
+#   with the remaining params.
 # - If "$1" is "test", handle test execution
 # - Otherwise run "$@" directly.
 case "$1" in
---* | -* | zebrad)
+--* | -* | zakurad | zebrad)
   shift
-  exec_as_user zebrad "${CONFIG_ARGS[@]}" "$@"
+  exec_as_user zakurad "${CONFIG_ARGS[@]}" "$@"
   ;;
 test)
   shift
-  if [[ "$1" == "zebrad" ]]; then
+  if [[ "$1" == "zakurad" || "$1" == "zebrad" ]]; then
     shift
-    exec_as_user zebrad "${CONFIG_ARGS[@]}" "$@"
+    exec_as_user zakurad "${CONFIG_ARGS[@]}" "$@"
   elif [[ -n "${NEXTEST_PROFILE}" ]]; then
     # All test filtering and scoping logic is handled by .config/nextest.toml
     echo "Running tests with nextest profile: ${NEXTEST_PROFILE}"

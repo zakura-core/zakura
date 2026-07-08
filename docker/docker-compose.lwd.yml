@@ -10,7 +10,7 @@ services:
           cpus: "4"
           memory: 16G
     volumes:
-      - zebrad-cache:/home/zebra/.cache/zebra
+      - zebrad-cache:/home/zebra/.cache/zakura
     tty: true
     environment:
       - ZEBRA_RPC__LISTEN_ADDR=0.0.0.0:8232

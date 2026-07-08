@@ -270,7 +270,7 @@ def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
         # Respect CARGO_TARGET_DIR (set per-worktree or shared) when locating the
         # output, falling back to the in-worktree target dir.
         target_dir = os.environ.get("CARGO_TARGET_DIR")
-        built = (Path(target_dir) if target_dir else work / "target") / "release" / "zebrad"
+        built = (Path(target_dir) if target_dir else work / "target") / "release" / "zakurad"
         if not built.is_file():
             raise DeployError(f"expected binary not found after build: {built}")
         tmp = target.with_suffix(".tmp")

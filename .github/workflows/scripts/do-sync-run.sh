@@ -24,7 +24,7 @@ for _ in $(seq 1 120); do pgrep -x apt-get >/dev/null || break; sleep 5; done
 apt-get -o DPkg::Lock::Timeout=600 update -qq
 apt-get -o DPkg::Lock::Timeout=600 install -y -qq s3cmd zstd
 
-STATE_DIR=/mnt/zebra-state
+STATE_DIR=/mnt/zakura-state
 OBJECT="s3://${SPACES_BUCKET}/sync-confidence/state/v${STATE_VERSION}/mainnet/${STATE_KEY}.tar.zst"
 
 # Configure s3cmd for Spaces (S3-compatible).

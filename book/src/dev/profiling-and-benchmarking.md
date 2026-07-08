@@ -40,7 +40,7 @@ max_connections_per_ip = 1000
 network = "Mainnet"
 
 [state]
-# cache_dir = "/path/to/.cache/zebra-synced"
+# cache_dir = "/path/to/.cache/zakura-synced"
 delete_old_database = true
 ephemeral = false
 
@@ -89,7 +89,7 @@ network = "Mainnet"
 peerset_initial_target_size = 1
 
 [state]
-# cache_dir = "/path/to/.cache/zebra-isolated"
+# cache_dir = "/path/to/.cache/zakura-isolated"
 delete_old_database = true
 ephemeral = true
 debug_stop_at_height = 10_000

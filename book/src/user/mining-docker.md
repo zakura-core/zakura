@@ -12,7 +12,7 @@ docker run -d --name zebra_local \
   -e ZEBRA_RPC__LISTEN_ADDR=0.0.0.0:8232 \
   -p 8233:8233 \
   -p 8232:8232 \
-  -v zebrad-cache:/home/zebra/.cache/zebra \
+  -v zebrad-cache:/home/zebra/.cache/zakura \
   zfnd/zebra:latest
 ```
 
@@ -48,7 +48,7 @@ docker run -d --name zebra_local \
   -e ZEBRA_RPC__LISTEN_ADDR=0.0.0.0:18232 \
   -p 18233:18233 \
   -p 18232:18232 \
-  -v zebrad-cache:/home/zebra/.cache/zebra \
+  -v zebrad-cache:/home/zebra/.cache/zakura \
   zfnd/zebra:latest
 ```
 
@@ -61,10 +61,10 @@ conversely, a Testnet address would prevent Zebra from starting on Mainnet.
 To connect to the RPC port, you will need the contents of the [cookie
 file](https://zebra.zfnd.org/user/mining.html?highlight=cookie#testing-the-setup)
 Zebra uses for authentication. By default, it is stored at
-`/home/zebra/.cache/zebra/.cookie`. You can print its contents by running
+`/home/zebra/.cache/zakura/.cookie`. You can print its contents by running
 
 ```bash
-docker exec -it zebra_local cat /home/zebra/.cache/zebra/.cookie
+docker exec -it zebra_local cat /home/zebra/.cache/zakura/.cookie
 ```
 
 If you want to avoid authentication, you can turn it off by setting

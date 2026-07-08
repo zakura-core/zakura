@@ -6,7 +6,7 @@ on:
   # night, and on demand. Pushes to short-lived dev branches no longer trigger
   # it (it is not a merge gate).
   push:
-    branches: [ironwood-main, "release/**"]
+    branches: [main, "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"

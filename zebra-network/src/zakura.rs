@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn zakura_secret_key_path_uses_identity_dir() {
         let config = Config {
-            cache_dir: CacheDir::custom_path("/tmp/zebra-cache"),
+            cache_dir: CacheDir::custom_path("/tmp/zakura-cache"),
             identity_dir: "/tmp/zakura-identities".into(),
             ..Config::default()
         };
@@ -543,7 +543,7 @@ mod tests {
             crate::config::zakura_secret_key_file_path(&config.identity_dir, &config.network);
 
         assert!(
-            !key_file.starts_with("/tmp/zebra-cache"),
+            !key_file.starts_with("/tmp/zakura-cache"),
             "Zakura identity keys must not be stored under the peer cache directory",
         );
         assert_eq!(

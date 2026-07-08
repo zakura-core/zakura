@@ -10,6 +10,8 @@ config_path     = "/etc/zakura/zakura.toml"
 log_file        = "/var/log/zakura/zakura.log"   # deterministic log path
 state_cache_dir = "/var/lib/zakura"
 cache_dir_migrate_from = ""                    # optional old cache dir to move during restart deploys
+# manage_config = true                       # false = only swap the binary + restart the existing
+#                                            # service, leaving config/unit/cache untouched (systemd only)
 network         = "Mainnet"
 listen_addr     = "[::]:8233"
 # identity_dir  = "/root/.zakura"           # empty = zakurad default; pins the iroh node_id

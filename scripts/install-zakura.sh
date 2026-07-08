@@ -14,7 +14,7 @@ ZEBRA_RELEASE_TAG="v5.0.0-test.4"
 ZEBRA_ARCHIVE="zebrad-${ZEBRA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZEBRA_URL="https://github.com/valargroup/zebra/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
 ZEBRA_MEMBER="./bin/zebrad"
-ZEBRA_DOCKER_IMAGE="valaroman/zebra:5.0.0-test.4"
+ZEBRA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1@sha256:74f76366eed48bdfb15a3386d033a6e3e2d7481f40cb06c5c6ae3c5e9f77e4b5"
 
 MODE=""
 NETWORK="Mainnet"

@@ -245,7 +245,7 @@ jobs:
               },
               "install-zakura.sh": {
                   "ZEBRA_RELEASE_TAG": release_tag,
-                  "ZEBRA_DOCKER_IMAGE": f"valaroman/zebra:{image_version}",
+                  "ZEBRA_DOCKER_IMAGE": f"valargroup/zakura:{image_version}",
               },
           }
           for filename, replacements in installers.items():

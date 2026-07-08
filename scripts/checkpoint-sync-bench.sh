@@ -72,7 +72,7 @@ BASELINE_SHOULD_USE_LEGACY_P2P="${BASELINE_SHOULD_USE_LEGACY_P2P:-1}"
 START_HEIGHT="${START_HEIGHT:-1707210}"
 SNAPSHOT_URL="${SNAPSHOT_URL:-https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
 SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769}"
-SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-https://zebra-snapshots.nyc3.cdn.digitaloceanspaces.com/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
+SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-https://zebra.valargroup.dev/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
 BENCH_HOME="${BENCH_HOME:-/opt/zebra-bench}"
 GH_REPO="${GH_REPO:-valargroup/zebra}"
 OUT_DIR="${OUT_DIR:-$PWD/bench-out}"
@@ -192,7 +192,7 @@ ensure_snapshot() {
   for url in "$SNAPSHOT_URL" "$SNAPSHOT_MIRROR"; do
     [[ -n "$url" ]] || continue
     log "source: $url"
-    if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 "$url" \
+    if curl --http1.1 -fL --retry 3 --retry-delay 5 --connect-timeout 30 "$url" \
          | tee >(sha256sum | awk '{print $1}' > "$sumf") \
          | zstd -dc --long=31 | tar -x -C "$tmp"; then
       ok=1; break
@@ -229,9 +229,9 @@ ensure_binary() {
   log "fetching release $tag from $GH_REPO ..." >&2
   local dl="$bindir/dl"; rm -rf "$dl"; mkdir -p "$dl"
   gh release download "$tag" -R "$GH_REPO" \
-    -p 'zebrad-*-linux-x86_64.tar.gz' -p 'SHA256SUMS.txt' -D "$dl" \
+    -p 'zakurad-*-linux-x86_64.tar.gz' -p 'zebrad-*-linux-x86_64.tar.gz' -p 'SHA256SUMS.txt' -D "$dl" \
     || die "gh release download failed for $tag"
-  local tgz; tgz="$(find "$dl" -name 'zebrad-*-linux-x86_64.tar.gz' | head -1)"
+  local tgz; tgz="$(find "$dl" \( -name 'zakurad-*-linux-x86_64.tar.gz' -o -name 'zebrad-*-linux-x86_64.tar.gz' \) | head -1)"
   [[ -n "$tgz" ]] || die "no linux-x86_64 tarball asset on release $tag"
   if [[ -f "$dl/SHA256SUMS.txt" ]]; then
     # NB: keep all output on stderr — this function's stdout is captured as the binary path
@@ -239,10 +239,10 @@ ensure_binary() {
       || die "release tarball checksum mismatch for $tag"
   fi
   tar -xzf "$tgz" -C "$dl"
-  local found; found="$(find "$dl" -type f -name zebrad | head -1)"
-  [[ -n "$found" ]] || die "zebrad binary not found in tarball for $tag"
+  local found; found="$(find "$dl" -type f \( -name zakurad -o -name zebrad \) | head -1)"
+  [[ -n "$found" ]] || die "node binary not found in tarball for $tag"
   mv "$found" "$zebrad"; chmod +x "$zebrad"; rm -rf "$dl"
-  log "zebrad $tag: $("$zebrad" --version 2>/dev/null | head -1)" >&2
+  log "node binary $tag: $("$zebrad" --version 2>/dev/null | head -1)" >&2
   ZEBRAD_BIN="$zebrad"
 }
 
@@ -310,8 +310,14 @@ build_from_ref() {
     CARGO_TARGET_DIR="$BUILD_TARGET" CARGO_HOME="$BUILD_CARGO_HOME" CXXFLAGS="-include cstdint" \
     cargo build --release -p zebrad --features "${BUILD_FEATURES:-prometheus,commit-metrics}" --locked >&2 ) \
     || die "cargo build failed for $sha"
-  local built="$BUILD_TARGET/release/zebrad"
-  [[ -x "$built" ]] || die "build produced no zebrad binary for $sha"
+  local built=""
+  for candidate in "$BUILD_TARGET/release/zakurad" "$BUILD_TARGET/release/zebrad"; do
+    if [[ -x "$candidate" ]]; then
+      built="$candidate"
+      break
+    fi
+  done
+  [[ -n "$built" ]] || die "build produced no node binary for $sha"
   ver="$("$built" --version 2>/dev/null | head -1 || true)"
   mkdir -p "$bindir"; cp -f "$built" "$zebrad"; chmod +x "$zebrad"
   # record the commit (authoritative, from git) + the binary hash for cache validation

@@ -106,12 +106,19 @@ impl ByteBudget {
         if bytes == 0 {
             return;
         }
-        let _ =
-            self.inner
-                .reserved_bytes
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
-                    Some(reserved.saturating_sub(bytes))
-                });
+        let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
+        loop {
+            let next = reserved.saturating_sub(bytes);
+            match self.inner.reserved_bytes.compare_exchange_weak(
+                reserved,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => reserved = observed,
+            }
+        }
         self.inner.capacity.notify_waiters();
     }
 
@@ -125,12 +132,19 @@ impl ByteBudget {
         if bytes == 0 {
             return;
         }
-        self.inner
-            .reserved_bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
-                Some(reserved.saturating_add(bytes))
-            })
-            .ok();
+        let mut reserved = self.inner.reserved_bytes.load(Ordering::Acquire);
+        loop {
+            let next = reserved.saturating_add(bytes);
+            match self.inner.reserved_bytes.compare_exchange_weak(
+                reserved,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => reserved = observed,
+            }
+        }
     }
 
     /// Settle an estimated reservation to the actual bytes now held.

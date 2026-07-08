@@ -29,8 +29,11 @@ mod tests;
 
 use ZebradCmd::*;
 
-/// Zebrad Configuration Filename
-pub const CONFIG_FILE: &str = "zebrad.toml";
+/// Zakura configuration filename.
+pub const CONFIG_FILE: &str = "zakura.toml";
+
+/// Legacy Zebra configuration filename.
+const LEGACY_CONFIG_FILE: &str = "zebrad.toml";
 
 /// Zebrad Subcommands
 #[derive(Command, Debug, clap::Subcommand)]
@@ -39,7 +42,7 @@ pub enum ZebradCmd {
     // TODO: hide this command from users in release builds (#3279)
     CopyState(CopyStateCmd),
 
-    /// Generate a default `zebrad.toml` configuration
+    /// Generate a default `zakura.toml` configuration
     Generate(GenerateCmd),
 
     /// Prune Zebra's finalized raw transaction data on disk
@@ -136,9 +139,23 @@ impl Configurable<ZebradConfig> for ZebradCmd {
     fn config_path(&self) -> Option<PathBuf> {
         let if_exists = |f: PathBuf| if f.exists() { Some(f) } else { None };
 
-        dirs::preference_dir()
-            .map(|path| path.join(CONFIG_FILE))
-            .and_then(if_exists)
+        dirs::preference_dir().and_then(|path| {
+            let config_path = path.join(CONFIG_FILE);
+            if let Some(config_path) = if_exists(config_path) {
+                return Some(config_path);
+            }
+
+            let legacy_config_path = path.join(LEGACY_CONFIG_FILE);
+            if let Some(legacy_config_path) = if_exists(legacy_config_path) {
+                tracing::warn!(
+                    config_file = ?legacy_config_path,
+                    "zebrad.toml is deprecated; rename this config file to zakura.toml"
+                );
+                return Some(legacy_config_path);
+            }
+
+            None
+        })
 
         // Note: Changes in how configuration is loaded may need usage
         // edits in generate.rs

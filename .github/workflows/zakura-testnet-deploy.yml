@@ -4,7 +4,7 @@ name: Deploy Zakura testnet fleet
 #
 # Runs on a self-hosted Linux x86_64 runner, expected to be installed on
 # zakura-testnet-1 with the `zakura-testnet-deployer` label. The deployer builds
-# a native zebrad binary on that runner, then uses deploy/deployer/deploy.py to
+# a native zakurad binary on that runner, then uses deploy/deployer/deploy.py to
 # scp/install it across the fleet. The zcashd-compat Zakura process is deployed
 # as a process-managed node because it shares a host with the sidecar zcashd.
 
@@ -22,7 +22,7 @@ on:
         required: false
         default: false
       no_restart:
-        description: "Stage binary/config/unit without restarting zebrad"
+        description: "Stage binary/config/unit without restarting zakurad"
         type: boolean
         required: false
         default: false
@@ -113,9 +113,9 @@ jobs:
 
           cat > nodes.ci.toml <<EOF
           [defaults]
-          service_name    = "zebrad"
-          bin_path        = "/usr/local/bin/zebrad"
-          config_path     = "/etc/zakura/zebrad.toml"
+          service_name    = "zakurad"
+          bin_path        = "/usr/local/bin/zakurad"
+          config_path     = "/etc/zakura/zakura.toml"
           network         = "Testnet"
           listen_addr     = "0.0.0.0:18233"
           rpc_listen_addr = "0.0.0.0:18232"
@@ -145,7 +145,7 @@ jobs:
           network_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
           cache_dir_migrate_from = "/mnt/zakura-testnet-1-data/zebra-cache"
-          log_file = "/mnt/zakura-testnet-1-data/logs/zebrad.log"
+          log_file = "/mnt/zakura-testnet-1-data/logs/zakura.log"
 
           [[nodes]]
           name       = "zakura-testnet-2"
@@ -154,7 +154,7 @@ jobs:
           network_cache_dir = "/mnt/zakura-testnet-2-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-2-data/zakura-cache"
           cache_dir_migrate_from = "/mnt/zakura-testnet-2-data/zebra-cache"
-          log_file = "/mnt/zakura-testnet-2-data/logs/zebrad.log"
+          log_file = "/mnt/zakura-testnet-2-data/logs/zakura.log"
 
           [[nodes]]
           name       = "zakura-testnet-3"
@@ -163,7 +163,7 @@ jobs:
           network_cache_dir = "/mnt/zakura-testnet-3-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-3-data/zakura-cache"
           cache_dir_migrate_from = "/mnt/zakura-testnet-3-data/zebra-cache"
-          log_file = "/mnt/zakura-testnet-3-data/logs/zebrad.log"
+          log_file = "/mnt/zakura-testnet-3-data/logs/zakura.log"
 
           [[nodes]]
           name       = "zakura-testnet-eu"
@@ -172,7 +172,7 @@ jobs:
           network_cache_dir = "/mnt/zakura-testnet-eu-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-eu-data/zakura-cache"
           cache_dir_migrate_from = "/mnt/zakura-testnet-eu-data/zebra-cache"
-          log_file = "/mnt/zakura-testnet-eu-data/logs/zebrad.log"
+          log_file = "/mnt/zakura-testnet-eu-data/logs/zakura.log"
 
           [[nodes]]
           name       = "zakura-testnet-as"
@@ -181,7 +181,7 @@ jobs:
           network_cache_dir = "/mnt/zakura-testnet-as-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-as-data/zakura-cache"
           cache_dir_migrate_from = "/mnt/zakura-testnet-as-data/zebra-cache"
-          log_file = "/mnt/zakura-testnet-as-data/logs/zebrad.log"
+          log_file = "/mnt/zakura-testnet-as-data/logs/zakura.log"
 
           [[nodes]]
           name       = "zakura-compat"
@@ -189,15 +189,15 @@ jobs:
           commit     = "${{ inputs.ref }}"
           deploy_kind = "process"
           service_name = ""
-          bin_path = "/root/unity/zakura/target/release/zebrad"
+          bin_path = "/root/unity/zakura/target/release/zakurad"
           config_path = "/root/unity/zakura-testnet.toml"
           network_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
           cache_dir_migrate_from = "/mnt/zakura-testnet-1-data/zebra-cache"
-          log_file = "/mnt/zakura-testnet-1-data/logs/zebrad.log"
+          log_file = "/mnt/zakura-testnet-1-data/logs/zakura.log"
           working_dir = "/root/unity/zakura"
-          start_command = "target/release/zebrad -c /root/unity/zakura-testnet.toml start"
-          process_pattern = "target/release/zebrad -c /root/unity/zakura-testnet.toml start"
+          start_command = "target/release/zakurad -c /root/unity/zakura-testnet.toml start"
+          process_pattern = "target/release/zakurad -c /root/unity/zakura-testnet.toml start"
           v2_p2p = false
           checkpoint_sync = true
           EOF
@@ -248,7 +248,7 @@ jobs:
             ZCASHD_RPC_URL=http://127.0.0.1:18231
             ZCASHD_COOKIE_FILE=
             ZCASHD_RPC_CONF=/root/unity/zcashd-testnet.toml
-            ZEBRAD_PROCESS_PATTERN="target/release/zebrad -c /root/unity/zakura-testnet.toml start"
+            ZEBRAD_PROCESS_PATTERN="target/release/zakurad -c /root/unity/zakura-testnet.toml start"
             ZCASHD_PROCESS_PATTERN="zcashd .*zcashd-testnet.toml"
             HEIGHT_MAX_DRIFT=10
             SYNC_CHECK_TIMEOUT=600

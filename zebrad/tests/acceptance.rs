@@ -276,7 +276,7 @@ fn generate_args() -> Result<()> {
     output.assert_failure()?;
 
     // Add a config file name to tempdir path
-    let generated_config_path = testdir.path().join("zebrad.toml");
+    let generated_config_path = testdir.path().join("zakura.toml");
 
     // Valid
     let child =
@@ -542,7 +542,7 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
                 cache_dir_check,
                 ignored_cache_dir.read_dir().unwrap().collect::<Vec<_>>()
             );
-            (["state", "zebrad.toml"].iter(), ["network"].iter())
+            (["state", "zakura.toml"].iter(), ["network"].iter())
         }
 
         // we didn't create the state directory, so it should not exist
@@ -560,7 +560,7 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
                 ignored_cache_dir.read_dir().unwrap().collect::<Vec<_>>()
             );
 
-            (["zebrad.toml"].iter(), ["network"].iter())
+            (["zakura.toml"].iter(), ["network"].iter())
         }
     };
 
@@ -714,7 +714,7 @@ fn valid_generated_config(command: &str, expect_stdout_line_contains: &str) -> R
     let testdir = &testdir;
 
     // Add a config file name to tempdir path
-    let generated_config_path = testdir.path().join("zebrad.toml");
+    let generated_config_path = testdir.path().join("zakura.toml");
 
     tracing::info!(?generated_config_path, "generating valid config");
 
@@ -770,7 +770,7 @@ fn last_config_is_stored() -> Result<()> {
     let testdir = testdir()?;
 
     // Add a config file name to tempdir path
-    let generated_config_path = testdir.path().join("zebrad.toml");
+    let generated_config_path = testdir.path().join("zakura.toml");
 
     tracing::info!(?generated_config_path, "generated current config");
 
@@ -868,7 +868,7 @@ fn invalid_generated_config() -> Result<()> {
     let testdir = &testdir()?;
 
     // Add a config file name to tempdir path.
-    let config_path = testdir.path().join("zebrad.toml");
+    let config_path = testdir.path().join("zakura.toml");
 
     tracing::info!(
         ?config_path,
@@ -944,7 +944,7 @@ fn invalid_generated_config() -> Result<()> {
     Ok(())
 }
 
-/// Test all versions of `zebrad.toml` we have stored can be parsed by the latest `zebrad`.
+/// Test all stored config versions can be parsed by the latest `zakurad`.
 #[tracing::instrument]
 #[test]
 fn stored_configs_parsed_correctly() -> Result<()> {
@@ -988,7 +988,7 @@ fn stored_configs_parsed_correctly() -> Result<()> {
     Ok(())
 }
 
-/// Test all versions of `zebrad.toml` we have stored can be parsed by the latest `zebrad`.
+/// Test all stored configs can be upgraded by the latest `zakurad`.
 #[tracing::instrument]
 fn stored_configs_work() -> Result<()> {
     let old_configs_dir = configs_dir();

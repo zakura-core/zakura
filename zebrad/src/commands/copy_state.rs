@@ -75,7 +75,7 @@ pub struct CopyStateCmd {
     target_config_path: Option<PathBuf>,
 
     /// Filter strings which override the config file and defaults
-    #[clap(help = "tracing filters which override the zebrad.toml config")]
+    #[clap(help = "tracing filters which override the zakura.toml config")]
     filters: Vec<String>,
 }
 
@@ -87,14 +87,17 @@ impl CopyStateCmd {
 
         // Load the target config if a target config path was provided, or use an ephemeral config otherwise.
         //
-        // Use the `ZEBRA_TARGET_` environment prefix for target overrides to avoid
-        // conflicting with the source/base config (`ZEBRA_...`).
-        // Example: `ZEBRA_TARGET_STATE__CACHE_DIR=/dst/cache`.
+        // Use the `ZAKURA_TARGET_` environment prefix for target overrides to avoid
+        // conflicting with the source/base config (`ZAKURA_...`).
+        // Example: `ZAKURA_TARGET_STATE__CACHE_DIR=/dst/cache`.
         let target_config = self
             .target_config_path
             .as_ref()
             .map(|path| {
-                crate::config::ZebradConfig::load_with_env(Some(path.clone()), "ZEBRA_TARGET")
+                crate::config::ZebradConfig::load_with_env_prefixes(
+                    Some(path.clone()),
+                    &["ZEBRA_TARGET", "ZAKURA_TARGET"],
+                )
             })
             .transpose()?
             .map(|app_config| app_config.state)

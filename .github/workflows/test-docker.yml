@@ -137,7 +137,7 @@ jobs:
 
           - id: testnet-conf
             name: Testnet config
-            env_vars: -e ZEBRA_NETWORK__NETWORK=Testnet
+            env_vars: -e ZAKURA_NETWORK__NETWORK=Testnet
             grep_patterns: -e "resolved seed peer IP addresses.*testnet"
 
           # Only runs when using the image is built with the `tests` target, because the `runtime` target
@@ -150,30 +150,30 @@ jobs:
           # RPC configuration tests
           - id: rpc-conf
             name: RPC config
-            env_vars: -e ZEBRA_RPC__LISTEN_ADDR=0.0.0.0:8232
+            env_vars: -e ZAKURA_RPC__LISTEN_ADDR=0.0.0.0:8232
             grep_patterns: -e "Opened RPC endpoint at.*0.0.0.0:8232"
 
           - id: rpc-custom-conf
             name: RPC with custom port
-            env_vars: -e ZEBRA_RPC__LISTEN_ADDR=127.0.0.1:28232
+            env_vars: -e ZAKURA_RPC__LISTEN_ADDR=127.0.0.1:28232
             grep_patterns: -e "Opened RPC endpoint at.*127.0.0.1:28232"
 
           # Custom directory tests
           - id: rpc-cookie-conf
             name: RPC with custom cookie dir
-            env_vars: -e ZEBRA_RPC__LISTEN_ADDR=0.0.0.0:8232 -e ZEBRA_RPC__ENABLE_COOKIE_AUTH=true -e ZEBRA_RPC__COOKIE_DIR=/home/zebra/.config/cookie
+            env_vars: -e ZAKURA_RPC__LISTEN_ADDR=0.0.0.0:8232 -e ZAKURA_RPC__ENABLE_COOKIE_AUTH=true -e ZAKURA_RPC__COOKIE_DIR=/home/zebra/.config/cookie
             grep_patterns: -e "RPC auth cookie written to disk"
 
           # Custom directory tests
           - id: custom-dirs-conf
             name: Custom cache and cookie directories
-            env_vars: -e ZEBRA_STATE__CACHE_DIR=/tmp/zakura-cache
+            env_vars: -e ZAKURA_STATE__CACHE_DIR=/tmp/zakura-cache
             grep_patterns: -e "Opened Zebra state cache at /tmp/zakura-cache"
 
           # Feature-based configurations
           - id: prometheus-feature
             name: Prometheus metrics
-            env_vars: -e FEATURES=prometheus -e ZEBRA_METRICS__ENDPOINT_ADDR=0.0.0.0:9999
+            env_vars: -e FEATURES=prometheus -e ZAKURA_METRICS__ENDPOINT_ADDR=0.0.0.0:9999
             grep_patterns: -e "0.0.0.0:9999"
 
     steps:

@@ -175,9 +175,9 @@ pub struct InnerConfig {
     ///
     /// By default, logs are sent to the terminal standard output.
     /// But if the `progress_bar` config is activated, logs are sent to the standard log file path:
-    /// - Linux: `$XDG_STATE_HOME/zebrad.log` or `$HOME/.local/state/zebrad.log`
-    /// - macOS: `$HOME/Library/Application Support/zebrad.log`
-    /// - Windows: `%LOCALAPPDATA%\zebrad.log` or `C:\Users\%USERNAME%\AppData\Local\zebrad.log`
+    /// - Linux: `$XDG_STATE_HOME/zakura.log` or `$HOME/.local/state/zakura.log`
+    /// - macOS: `$HOME/Library/Application Support/zakura.log`
+    /// - Windows: `%LOCALAPPDATA%\zakura.log` or `C:\Users\%USERNAME%\AppData\Local\zakura.log`
     ///
     /// # Security
     ///
@@ -207,7 +207,7 @@ pub struct InnerConfig {
 
     /// Service name reported to OpenTelemetry collector.
     ///
-    /// Defaults to `"zebra"` if not specified.
+    /// Defaults to `"zakura"` if not specified.
     ///
     /// Can also be set via `OTEL_SERVICE_NAME` environment variable.
     pub opentelemetry_service_name: Option<String>,
@@ -325,5 +325,5 @@ fn disk_default_log_file(
 fn default_log_file() -> Option<PathBuf> {
     dirs::state_dir()
         .or_else(dirs::data_local_dir)
-        .map(|dir| dir.join("zebrad.log"))
+        .map(|dir| dir.join("zakura.log"))
 }

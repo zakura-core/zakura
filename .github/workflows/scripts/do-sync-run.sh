@@ -57,7 +57,7 @@ for kv in "${KVS[@]}"; do ENV_FLAGS+=( -e "${kv}" ); done
 docker run --rm \
   -e NEXTEST_PROFILE="${NEXTEST_PROFILE}" \
   -e FEATURES="${FEATURES}" \
-  -e ZEBRA_STATE__CACHE_DIR=/state \
+  -e ZAKURA_STATE__CACHE_DIR=/state \
   "${ENV_FLAGS[@]}" \
   -v "${STATE_DIR}:/state" \
   "${IMAGE_REF}"

@@ -1,7 +1,7 @@
 services:
-  zebra:
-    container_name: zebra
-    image: zfnd/zebra
+  zakura:
+    container_name: zakura
+    image: valargroup/zakura
     platform: linux/amd64
     restart: unless-stopped
     deploy:
@@ -12,14 +12,14 @@ services:
     env_file:
       - .env
     volumes:
-      - zebrad-cache:/home/zebra/.cache/zakura
-    # Having `tty` set to true makes Zebra use colored logs.
+      - zakura-cache:/home/zebra/.cache/zakura
+    # Having `tty` set to true makes Zakura use colored logs.
     tty: true
     # ! Comment out the `configs` mapping below to use the environment variables in the
     # ! `.env` file, instead of the default configuration file.
     configs:
-      - source: zebra-config
-        target: /home/zebra/.config/zebrad.toml
+      - source: zakura-config
+        target: /home/zebra/.config/zakura.toml
 
     # P2P port for inbound peer connections (recommended).
     ports:
@@ -34,11 +34,11 @@ services:
     #   - "8080:8080"   # Health endpoints (/healthy, /ready)
 
 configs:
-  zebra-config:
+  zakura-config:
     #! To customize the default configuration, edit this file before starting
     #! the container.
     file: ./default-zebra-config.toml
 
 volumes:
-  zebrad-cache:
+  zakura-cache:
     driver: local

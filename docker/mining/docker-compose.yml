@@ -1,17 +1,17 @@
 services:
-  zebra:
+  zakura:
     build:
       context: ../..
       dockerfile: docker/Dockerfile
-    container_name: zebra
+    container_name: zakura
     environment:
-      - ZEBRA_NETWORK__NETWORK=${NETWORK:-Testnet}
-      - ZEBRA_RPC__LISTEN_ADDR=0.0.0.0:${RPC_PORT:-18232}
-      - ZEBRA_RPC__ENABLE_COOKIE_AUTH=false
-      - ZEBRA_SYNC__PARALLEL_CPU_THREADS=12
-      - ZEBRA_MINING__MINER_ADDRESS=${MINER_ADDRESS:?MINER_ADDRESS is required}
-      - ZEBRA_MINING__MINER_DATA=${MINER_DATA:-}
-      - ZEBRA_MINING__MINER_MEMO=${MINER_MEMO:-}
+      - ZAKURA_NETWORK__NETWORK=${NETWORK:-Testnet}
+      - ZAKURA_RPC__LISTEN_ADDR=0.0.0.0:${RPC_PORT:-18232}
+      - ZAKURA_RPC__ENABLE_COOKIE_AUTH=false
+      - ZAKURA_SYNC__PARALLEL_CPU_THREADS=12
+      - ZAKURA_MINING__MINER_ADDRESS=${MINER_ADDRESS:?MINER_ADDRESS is required}
+      - ZAKURA_MINING__MINER_DATA=${MINER_DATA:-}
+      - ZAKURA_MINING__MINER_MEMO=${MINER_MEMO:-}
     volumes:
       - zebra-data:/home/zebra/.cache/zakura
     ports:
@@ -40,7 +40,7 @@ services:
       dockerfile: Dockerfile.arch
     container_name: s-nomp
     environment:
-      - ZEBRA_HOST=zebra
+      - ZEBRA_HOST=zakura
       - ZEBRA_RPC_PORT=${RPC_PORT:-18232}
       - REDIS_HOST=redis
       - STRATUM_PORT=${STRATUM_PORT:-3333}
@@ -50,7 +50,7 @@ services:
       - "${STRATUM_PORT:-3333}:${STRATUM_PORT:-3333}"
       - "8080:8080"
     depends_on:
-      zebra:
+      zakura:
         condition: service_healthy
       redis:
         condition: service_started

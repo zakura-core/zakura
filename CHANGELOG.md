@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   `zakura` paths (for example, Linux defaults now use `~/.cache/zakura` instead
   of `~/.cache/zebra`). Docker, install scripts, and deployment helpers now use
   matching Zakura cache paths by default.
+- Renamed operator-facing defaults from `zebrad.toml`, `zebrad.log`, and
+  `ZEBRA_*` to `zakura.toml`, `zakura.log`, and `ZAKURA_*`. Legacy config
+  filenames, environment prefixes, and binary aliases remain accepted with
+  deprecation warnings for compatibility.
 
 ### Removed
 

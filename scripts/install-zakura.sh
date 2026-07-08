@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install or prepare commands for zakura's standalone Zebra operating modes.
+# Install or prepare commands for Zakura's standalone operating modes.
 set -euo pipefail
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
@@ -10,18 +10,18 @@ else
 fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-ZEBRA_RELEASE_TAG="v0.0.1-alpha.1"
-ZEBRA_ARCHIVE="zebrad-${ZEBRA_RELEASE_TAG}-linux-x86_64.tar.gz"
-ZEBRA_URL="https://github.com/zakura-core/zakura/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
-ZEBRA_MEMBER="./bin/zebrad"
-ZEBRA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1@sha256:74f76366eed48bdfb15a3386d033a6e3e2d7481f40cb06c5c6ae3c5e9f77e4b5"
+ZAKURA_RELEASE_TAG="v0.0.1-alpha.1"
+ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
+ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
+ZAKURA_MEMBER="./bin/zakurad"
+ZAKURA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1@sha256:74f76366eed48bdfb15a3386d033a6e3e2d7481f40cb06c5c6ae3c5e9f77e4b5"
 
 MODE=""
 NETWORK="Mainnet"
-ZEBRA_STATE_DIR="/mnt/data/zakura-state"
+ZAKURA_STATE_DIR="/mnt/data/zakura-state"
 INSTALL_DIR="${HOME}/.local/zakura"
 CACHE_DIR="${HOME}/.cache/zakura"
-ZEBRAD_PATH=""
+ZAKURAD_PATH=""
 DOWNLOAD_BINARIES=1
 DOWNLOAD_BINARIES_SET=0
 DRY_RUN=0
@@ -108,8 +108,8 @@ Usage: install-zakura.sh [options]
 Interactive by default. Use flags for repeatable, non-interactive runs.
 
 Modes:
-  native             Download zebrad and print a native start command
-  docker             Pull the Zebra image and print a docker run command
+  native             Download zakurad and print a native start command
+  docker             Pull the Zakura image and print a docker run command
   build-from-source  Validate source tree paths, print build/start commands
 
 Options:
@@ -118,7 +118,7 @@ Options:
   --zakura-state-dir DIR
   --install-dir DIR
   --cache-dir DIR
-  --zebrad-path PATH
+  --zakurad-path PATH
   --download-binaries yes|no
   --dry-run                  Do not download archives or pull Docker images
   --unsafe-low-specs         Report hardware/disk failures as warnings
@@ -296,20 +296,20 @@ prompt_mode() {
   if ((USE_ANSI)); then
     printf '\n%s\n' "$(style "$BOLD" "Choose a zakura mode:")"
     printf '  %b1)%b %bnative%b\n' "$CYAN$BOLD" "$RESET" "$GREEN$BOLD" "$RESET"
-    printf '     %bDownload and start zebrad directly on the host.%b\n' "$DIM" "$RESET"
+    printf '     %bDownload and start zakurad directly on the host.%b\n' "$DIM" "$RESET"
     printf '  %b2)%b %bdocker%b\n' "$CYAN$BOLD" "$RESET" "$GREEN$BOLD" "$RESET"
-    printf '     %bRun zebrad in the standard Zebra Docker image.%b\n' "$DIM" "$RESET"
+    printf '     %bRun zakurad in the standard Zakura Docker image.%b\n' "$DIM" "$RESET"
     printf '  %b3)%b %bbuild-from-source%b\n' "$CYAN$BOLD" "$RESET" "$GREEN$BOLD" "$RESET"
-    printf '     %bBuild zebrad from this source tree and start it normally.%b\n' "$DIM" "$RESET"
+    printf '     %bBuild zakurad from this source tree and start it normally.%b\n' "$DIM" "$RESET"
   else
     cat <<'EOF'
 Choose a zakura mode:
   1) native
-     Download and start zebrad directly on the host.
+     Download and start zakurad directly on the host.
   2) docker
-     Run zebrad in the standard Zebra Docker image.
+     Run zakurad in the standard Zakura Docker image.
   3) build-from-source
-     Build zebrad from this source tree and start it normally.
+     Build zakurad from this source tree and start it normally.
 EOF
   fi
   printf '\n'
@@ -349,7 +349,7 @@ normalize_inputs() {
 
   if [[ "$MODE" == "native" ]]; then
     if ((DOWNLOAD_BINARIES_SET == 0)); then
-      case "$(prompt_yes_no "Download Zebra release binary now?" "yes")" in
+      case "$(prompt_yes_no "Download Zakura release binary now?" "yes")" in
         yes | y | Y | YES | Yes) DOWNLOAD_BINARIES=1 ;;
         no | n | N | NO | No) DOWNLOAD_BINARIES=0 ;;
         *) add_error "binary download answer must be yes or no" ;;
@@ -357,16 +357,16 @@ normalize_inputs() {
     fi
   fi
 
-  ZEBRA_STATE_DIR="$(prompt_value "Zakura state directory" "$ZEBRA_STATE_DIR")"
+  ZAKURA_STATE_DIR="$(prompt_value "Zakura state directory" "$ZAKURA_STATE_DIR")"
   INSTALL_DIR="$(prompt_value "Install directory" "$INSTALL_DIR")"
   CACHE_DIR="$(prompt_value "Download/cache directory" "$CACHE_DIR")"
 
-  ZEBRA_STATE_DIR="$(printf '%s' "$ZEBRA_STATE_DIR" | sanitize_terminal_input)"
+  ZAKURA_STATE_DIR="$(printf '%s' "$ZAKURA_STATE_DIR" | sanitize_terminal_input)"
   INSTALL_DIR="$(printf '%s' "$INSTALL_DIR" | sanitize_terminal_input)"
   CACHE_DIR="$(printf '%s' "$CACHE_DIR" | sanitize_terminal_input)"
-  ZEBRAD_PATH="$(printf '%s' "$ZEBRAD_PATH" | sanitize_terminal_input)"
+  ZAKURAD_PATH="$(printf '%s' "$ZAKURAD_PATH" | sanitize_terminal_input)"
 
-  ZEBRA_STATE_DIR="$(abs_path "$ZEBRA_STATE_DIR")"
+  ZAKURA_STATE_DIR="$(abs_path "$ZAKURA_STATE_DIR")"
   INSTALL_DIR="$(abs_path "$INSTALL_DIR")"
   CACHE_DIR="$(abs_path "$CACHE_DIR")"
 
@@ -451,7 +451,7 @@ check_writable_target() {
 }
 
 collect_permission_checks() {
-  check_writable_target "zakura state directory" "$ZEBRA_STATE_DIR"
+  check_writable_target "zakura state directory" "$ZAKURA_STATE_DIR"
 
   if [[ "$MODE" == "native" ]]; then
     check_writable_target "install directory" "$INSTALL_DIR"
@@ -561,14 +561,14 @@ collect_disk_checks() {
   gib=$((1024 * 1024 * 1024))
   required=$((300 * gib))
 
-  if ! zebra_info="$(disk_device_and_size "$ZEBRA_STATE_DIR")"; then
-    add_error "failed to inspect filesystem for zakura state path: $ZEBRA_STATE_DIR"
+  if ! zebra_info="$(disk_device_and_size "$ZAKURA_STATE_DIR")"; then
+    add_error "failed to inspect filesystem for zakura state path: $ZAKURA_STATE_DIR"
     return
   fi
 
   read -r zebra_device zebra_size <<<"$zebra_info"
   if ((zebra_size < required)); then
-    add_low_spec_error "zakura state mount (path: $ZEBRA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
+    add_low_spec_error "zakura state mount (path: $ZAKURA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
   fi
 
   _="$zebra_device"
@@ -580,15 +580,15 @@ collect_source_checks() {
   fi
 
   if [[ ! -d "$REPO_ROOT" ]]; then
-    add_error "Zebra source tree is missing: $REPO_ROOT"
+    add_error "Zakura source tree is missing: $REPO_ROOT"
   elif [[ ! -f "$REPO_ROOT/Cargo.toml" ]]; then
-    add_error "Zebra source tree is missing Cargo.toml: $REPO_ROOT"
+    add_error "Zakura source tree is missing Cargo.toml: $REPO_ROOT"
   fi
 
-  ZEBRAD_PATH="${ZEBRAD_PATH:-$REPO_ROOT/target/release/zakurad}"
+  ZAKURAD_PATH="${ZAKURAD_PATH:-$REPO_ROOT/target/release/zakurad}"
 
-  if [[ -e "$ZEBRAD_PATH" && ! -x "$ZEBRAD_PATH" ]]; then
-    add_error "zakurad binary $ZEBRAD_PATH exists but is not executable by the current user"
+  if [[ -e "$ZAKURAD_PATH" && ! -x "$ZAKURAD_PATH" ]]; then
+    add_error "zakurad binary $ZAKURAD_PATH exists but is not executable by the current user"
   fi
 }
 
@@ -646,26 +646,26 @@ download_and_extract() {
 }
 
 prepare_binary_path() {
-  ZEBRAD_PATH="${ZEBRAD_PATH:-$INSTALL_DIR/zebrad/bin/zebrad}"
+  ZAKURAD_PATH="${ZAKURAD_PATH:-$INSTALL_DIR/zakura/bin/zakurad}"
 
   if ((DOWNLOAD_BINARIES == 0)); then
     if ((USE_ANSI)); then
-      printf '%s Skipping binary downloads. You must provision the right Zebra version yourself.\n' "$(style "$YELLOW" "[!]")"
+      printf '%s Skipping binary downloads. You must provision the right Zakura version yourself.\n' "$(style "$YELLOW" "[!]")"
     else
-      printf 'Skipping binary downloads. You must provision the right Zebra version yourself.\n'
+      printf 'Skipping binary downloads. You must provision the right Zakura version yourself.\n'
     fi
-    printf '\nDownload Zebra:\n%s\n\n' "$ZEBRA_URL"
+    printf '\nDownload Zakura:\n%s\n\n' "$ZAKURA_URL"
     if ((!DRY_RUN)); then
-      [[ -x "$ZEBRAD_PATH" ]] || add_error "zebrad binary $ZEBRAD_PATH does not exist or is not executable by the current user"
+      [[ -x "$ZAKURAD_PATH" ]] || add_error "zakurad binary $ZAKURAD_PATH does not exist or is not executable by the current user"
       finalize_checks
     fi
     return
   fi
 
-  download_and_extract "zebrad" "$ZEBRA_URL" "$ZEBRA_MEMBER" "$ZEBRA_ARCHIVE" "$ZEBRAD_PATH"
+  download_and_extract "zakurad" "$ZAKURA_URL" "$ZAKURA_MEMBER" "$ZAKURA_ARCHIVE" "$ZAKURAD_PATH"
 
   if ((!DRY_RUN)); then
-    [[ -x "$ZEBRAD_PATH" ]] || add_error "zebrad binary $ZEBRAD_PATH does not exist or is not executable by the current user"
+    [[ -x "$ZAKURAD_PATH" ]] || add_error "zakurad binary $ZAKURAD_PATH does not exist or is not executable by the current user"
     finalize_checks
   fi
 }
@@ -675,20 +675,20 @@ data_detection_message() {
     print_section "[*]" "Snapshot data"
   fi
 
-  if [[ -d "$ZEBRA_STATE_DIR" && -n "$(find "$ZEBRA_STATE_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+  if [[ -d "$ZAKURA_STATE_DIR" && -n "$(find "$ZAKURA_STATE_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     if ((USE_ANSI)); then
-      printf '%s You already have Zebra data configured but feel free to redownload a fresh snapshot\n' "$(style "$GREEN" "[ok]")"
+      printf '%s You already have Zakura data configured but feel free to redownload a fresh snapshot\n' "$(style "$GREEN" "[ok]")"
     else
-      printf 'You already have Zebra data configured but feel free to redownload a fresh snapshot\n'
+      printf 'You already have Zakura data configured but feel free to redownload a fresh snapshot\n'
     fi
   else
     if ((USE_ANSI)); then
-      printf '%s Please download the Zebra snapshot from the location below if you want a faster sync\n' "$(style "$CYAN" "[down]")"
+      printf '%s Please download the Zakura snapshot from the location below if you want a faster sync\n' "$(style "$CYAN" "[down]")"
     else
-      printf 'Please download the Zebra snapshot from the location below if you want a faster sync\n'
+      printf 'Please download the Zakura snapshot from the location below if you want a faster sync\n'
     fi
   fi
-  printf '\nhttps://zebra.valargroup.dev/\n\n'
+  printf '\nhttps://zakura.valargroup.dev/\n\n'
 }
 
 docker_image_available_or_pull() {
@@ -711,17 +711,17 @@ docker_image_available_or_pull() {
 }
 
 prepare_docker_image() {
-  docker_image_available_or_pull "$ZEBRA_DOCKER_IMAGE" ||
-    add_error "Docker image is missing or could not be pulled: $ZEBRA_DOCKER_IMAGE"
+  docker_image_available_or_pull "$ZAKURA_DOCKER_IMAGE" ||
+    add_error "Docker image is missing or could not be pulled: $ZAKURA_DOCKER_IMAGE"
 
   finalize_checks
 }
 
 print_native_command() {
   cat <<EOF
-$(style "$GREEN$BOLD" "Start Zebra:")
-ZEBRA_STATE__CACHE_DIR=$(shell_quote "$ZEBRA_STATE_DIR") \\
-$(shell_quote "$ZEBRAD_PATH") start
+$(style "$GREEN$BOLD" "Start Zakura:")
+ZAKURA_STATE__CACHE_DIR=$(shell_quote "$ZAKURA_STATE_DIR") \\
+$(shell_quote "$ZAKURAD_PATH") start
 EOF
 }
 
@@ -730,14 +730,14 @@ print_docker_command() {
   port="$(p2p_port)"
 
   cat <<EOF
-docker run --rm -it --name zakura-zebrad \\
-  -e ZEBRA_NETWORK__NETWORK=$(shell_quote "$NETWORK") \\
-  -e ZEBRA_NETWORK__LISTEN_ADDR='[::]:$port' \\
-  -e ZEBRA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \\
-  --mount type=bind,src=$(shell_quote "$ZEBRA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
+docker run --rm -it --name zakura \\
+  -e ZAKURA_NETWORK__NETWORK=$(shell_quote "$NETWORK") \\
+  -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:$port' \\
+  -e ZAKURA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \\
+  --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
   -p $port:$port \\
-  $(shell_quote "$ZEBRA_DOCKER_IMAGE") \\
-  zebrad start
+  $(shell_quote "$ZAKURA_DOCKER_IMAGE") \\
+  zakurad start
 EOF
 }
 
@@ -747,9 +747,9 @@ git clone https://github.com/zakura-core/zakura.git
 
 cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zakurad
 
-$(style "$GREEN$BOLD" "Start Zebra:")
-ZEBRA_STATE__CACHE_DIR=$(shell_quote "$ZEBRA_STATE_DIR") \\
-$(shell_quote "$ZEBRAD_PATH") start
+$(style "$GREEN$BOLD" "Start Zakura:")
+ZAKURA_STATE__CACHE_DIR=$(shell_quote "$ZAKURA_STATE_DIR") \\
+$(shell_quote "$ZAKURAD_PATH") start
 EOF
 }
 
@@ -784,7 +784,7 @@ while (($#)); do
       ;;
     --zakura-state-dir | --zebra-state-dir)
       require_value "$1" "${2:-}"
-      ZEBRA_STATE_DIR="$2"
+      ZAKURA_STATE_DIR="$2"
       shift 2
       ;;
     --install-dir)
@@ -797,9 +797,9 @@ while (($#)); do
       CACHE_DIR="$2"
       shift 2
       ;;
-    --zebrad-path)
+    --zakurad-path | --zebrad-path)
       require_value "$1" "${2:-}"
-      ZEBRAD_PATH="$2"
+      ZAKURAD_PATH="$2"
       shift 2
       ;;
     --download-binaries)

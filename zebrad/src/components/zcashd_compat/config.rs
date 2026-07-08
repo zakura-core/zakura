@@ -48,7 +48,7 @@ pub struct Config {
     /// This can be provided as:
     /// - a TOML array: `zcashd_extra_args = ["-debug=1"]`
     /// - a JSON array string (useful for environment variable overrides):
-    ///   `ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-debug=1"]'`
+    ///   `ZAKURA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-debug=1"]'`
     ///
     /// Zebra passes these arguments through unchanged. For first-start bootstrap,
     /// Zebra only infers path overrides from the first valid `-conf=/path` or

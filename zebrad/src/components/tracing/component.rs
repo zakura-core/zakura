@@ -274,7 +274,7 @@ impl Tracing {
         // OpenTelemetry layer - zero overhead when config.opentelemetry_endpoint is None
         #[cfg(feature = "opentelemetry")]
         let (otel_layer, otel_provider, otel_resolved_config) = {
-            // Check standard OTEL_* env vars as fallback (lower precedence than config/ZEBRA_*)
+            // Check standard OTEL_* env vars as fallback (lower precedence than config/ZAKURA_*)
             let endpoint = config
                 .opentelemetry_endpoint
                 .clone()
@@ -292,7 +292,7 @@ impl Tracing {
             // Capture resolved values for logging
             let resolved_config = (
                 endpoint.clone(),
-                service_name.clone().unwrap_or_else(|| "zebra".to_string()),
+                service_name.clone().unwrap_or_else(|| "zakura".to_string()),
                 sample_percent.unwrap_or(100),
             );
 
@@ -398,7 +398,7 @@ impl Tracing {
             info!(?progress_bar_config, "activated progress bars");
         } else {
             info!(
-                "set 'tracing.progress_bar =\"summary\"' in zebrad.toml to activate progress bars"
+                "set 'tracing.progress_bar =\"summary\"' in zakura.toml to activate progress bars"
             );
         }
 

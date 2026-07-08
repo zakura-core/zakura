@@ -35,7 +35,7 @@ pub type OtelError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// # Arguments
 ///
 /// * `endpoint` - OTLP HTTP endpoint URL (e.g., "http://localhost:4318")
-/// * `service_name` - Service name for traces (defaults to "zebra")
+/// * `service_name` - Service name for traces (defaults to "zakura")
 /// * `sample_percent` - Sampling percentage between 0 and 100 (defaults to 100)
 ///
 /// # Errors
@@ -63,7 +63,7 @@ where
         format!("{}/v1/traces", endpoint.trim_end_matches('/'))
     };
 
-    let service_name = service_name.unwrap_or("zebra");
+    let service_name = service_name.unwrap_or("zakura");
     // Convert percentage (0-100) to rate (0.0-1.0), clamped to valid range
     let sample_rate = f64::from(sample_percent.unwrap_or(100).min(100)) / 100.0;
 

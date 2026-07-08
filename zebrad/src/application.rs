@@ -159,7 +159,7 @@ pub fn release_version() -> Version {
 /// [BIP 14]: https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki
 pub fn user_agent() -> String {
     let release_version = release_version();
-    format!("/Zebra:{release_version}/")
+    format!("/Zakura:{release_version}/")
 }
 
 /// Zebrad Application
@@ -249,10 +249,10 @@ impl Application for ZebradApp {
             Err(_e) if command.cmd().should_ignore_load_config_error() => Default::default(),
             Err(e) => {
                 status_err!(
-                    "Zebra could not load the provided configuration file and/or environment variables.\
+                    "Zakura could not load the provided configuration file and/or environment variables.\
                      This might mean you are using a deprecated format of the file, or are attempting to
                      configure deprecated or unknown fields via environment variables.\
-                     You can generate a valid config by running \"zebrad generate\", \
+                     You can generate a valid config by running \"zakurad generate\", \
                      and diff it against yours to examine any format inconsistencies."
                 );
                 // Convert config::ConfigError to FrameworkError using a generic IO error

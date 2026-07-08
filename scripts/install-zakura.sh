@@ -232,6 +232,7 @@ read_prompt() {
   local prompt="$1"
   local __replyvar="$2"
   local reply
+  local read_opts=(-r)
 
   if ((PROMPT_FD == -1)); then
     if ((PROMPT_INPUT_ERROR_REPORTED == 0)); then
@@ -242,12 +243,15 @@ read_prompt() {
     return 1
   fi
 
+  # readline editing (backspace/delete, cursor movement) requires -e on a tty.
+  if [[ -t "$PROMPT_FD" ]]; then
+    read_opts=(-e -r)
+  fi
+
   if ((PROMPT_FD == 0)); then
-    printf '%s' "$prompt"
-    IFS= read -r reply || return 1
+    read "${read_opts[@]}" -p "$prompt" reply || return 1
   else
-    printf '%s' "$prompt" > /dev/tty
-    IFS= read -r -u "$PROMPT_FD" reply || return 1
+    read "${read_opts[@]}" -u "$PROMPT_FD" -p "$prompt" reply || return 1
   fi
 
   printf -v "$__replyvar" '%s' "$reply"

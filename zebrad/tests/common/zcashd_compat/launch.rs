@@ -144,7 +144,7 @@ pub async fn spawn_zebrad_with_zcashd_compat() -> Result<ZcashdCompatSetup> {
     let zebra_compat_rpc_addr = compat_cfg.zebra_compat_rpc_addr;
     let zcashd_own_rpc_addr = compat_cfg.zcashd_own_rpc_addr;
 
-    // `--unsafe-low-specs` skips the hardware preflight minimums (600 GiB disk
+    // `--unsafe-low-specs` skips the hardware preflight minimums (550 GiB disk
     // etc.), which regtest doesn't need and CI runners don't have.
     let mut zebrad = dir.with_config(&mut zebrad_config)?.spawn_child(args![
         "start",

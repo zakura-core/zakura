@@ -1220,7 +1220,7 @@ prepare_docker_images() {
         add_error "Docker image is missing or could not be pulled: $ZEBRA_DOCKER_IMAGE"
 
       if [[ -z "$ZCASHD_DOCKER_IMAGE" ]]; then
-        ZCASHD_DOCKER_IMAGE="valaroman/zcashd:v6.2.1-alpha.9.1@sha256:77f7a000c47248aef00a7f7b14b45ae49aa98f8c9d86c86767714ff76034698c"
+        ZCASHD_DOCKER_IMAGE="valargroup/zcashd:v0.0.1-compat-alpha.3@sha256:a0043bd3b81944e4701a04ec9444a834963c7fac5505f2efdb85e3b9b3e4f678"
       fi
 
       docker_image_available_or_pull "$ZCASHD_DOCKER_IMAGE" ||

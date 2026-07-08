@@ -106,11 +106,12 @@ impl ByteBudget {
         if bytes == 0 {
             return;
         }
-        let _ = self.inner.reserved_bytes.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |reserved| Some(reserved.saturating_sub(bytes)),
-        );
+        let _ =
+            self.inner
+                .reserved_bytes
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                    Some(reserved.saturating_sub(bytes))
+                });
         self.inner.capacity.notify_waiters();
     }
 
@@ -126,7 +127,7 @@ impl ByteBudget {
         }
         self.inner
             .reserved_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
                 Some(reserved.saturating_add(bytes))
             })
             .ok();

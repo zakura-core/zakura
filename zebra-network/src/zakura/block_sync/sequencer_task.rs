@@ -356,7 +356,7 @@ impl SequencerTask {
     }
 
     fn release_body_input_bytes(&self, bytes: u64) {
-        let _ = self.body_input_bytes.fetch_update(
+        let _ = self.body_input_bytes.try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |current| Some(current.saturating_sub(bytes)),

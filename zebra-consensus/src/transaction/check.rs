@@ -182,7 +182,7 @@ pub fn orchard_cross_address_disabled(tx: &Transaction) -> Result<(), Transactio
 /// # Consensus
 ///
 /// > Check that an Output description's cv and epk are not of small order,
-/// > [and] that a Spend description's cv and rk are not of small order.
+/// > \[and\] that a Spend description's cv and rk are not of small order.
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#outputdesc>
 /// <https://zips.z.cash/protocol/protocol.pdf#spenddesc>

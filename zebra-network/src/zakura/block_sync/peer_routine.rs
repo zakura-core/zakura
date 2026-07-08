@@ -148,7 +148,7 @@ fn is_block_frame(frame: &crate::zakura::Frame) -> bool {
 }
 
 fn release_counter_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
-    let _ = counter.fetch_update(
+    let _ = counter.try_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |current| Some(current.saturating_sub(bytes)),

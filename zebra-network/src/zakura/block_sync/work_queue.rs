@@ -10,7 +10,7 @@
 //!   `pending → in_flight` (so one taken chunk maps to one `BlockRangeRequest`),
 //!   bounded only by the caller's servable range and a count cap — never by how
 //!   far above the download floor the heights already are;
-//! - only [`return_items`](WorkQueue::return_items) (timeout/disconnect retry) and
+//! - only `return_items` (timeout/disconnect retry) and
 //!   [`reset_above`](WorkQueue::reset_above) move `in_flight → pending`;
 //! - [`advance_floor`](WorkQueue::advance_floor) is garbage collection only — the
 //!   download floor never throttles the fetch decision.
@@ -271,7 +271,7 @@ impl WorkQueue {
         }
     }
 
-    /// Like [`return_items`](Self::return_items) but **does not** notify waiters.
+    /// Like `return_items` but **does not** notify waiters.
     ///
     /// Used by a peer routine to put back a chunk it took but chose not to issue
     /// (e.g. the heights are in its own short retry-avoid window after it just
@@ -291,7 +291,7 @@ impl WorkQueue {
     /// Mark already-taken heights as owning an estimated byte reservation.
     ///
     /// Returns the sum marked. The caller must have already admitted the same
-    /// byte total through [`ByteBudget`](crate::zakura::transport::guard::ByteBudget).
+    /// byte total through [`ByteBudget`](crate::zakura::transport::ByteBudget).
     pub(super) fn mark_reserved(&self, heights: impl IntoIterator<Item = block::Height>) -> u64 {
         let mut marked = 0u64;
         let mut inner = self.lock();
@@ -392,7 +392,7 @@ impl WorkQueue {
     /// is skipped here: never released and never double-counted. Mirrors
     /// [`release_reserved_and_return_items`](Self::release_reserved_and_return_items)
     /// for callers dropping heights below the floor (GC / stale trim) rather than
-    /// returning them to `pending`. Use instead of [`release_heights`](Self::release_heights)
+    /// returning them to `pending`. Use instead of `release_heights`
     /// on any path a competing peer's late body may have converted to `Held`.
     pub(super) fn release_reserved_heights(
         &self,
@@ -591,7 +591,7 @@ impl WorkQueue {
     ///
     /// O(1): returns the incrementally-maintained counter (see
     /// [`WorkQueueInner::reserved_bytes`]). This is on the sequencer's hot path via
-    /// `publish_view`, so it must not scan the maps. [`reserved_bytes_scanned`] is
+    /// `publish_view`, so it must not scan the maps. `reserved_bytes_scanned` is
     /// the O(n) ground-truth recomputation used by the audit / tests to catch drift.
     pub(super) fn reserved_bytes(&self) -> u64 {
         self.lock().reserved_bytes

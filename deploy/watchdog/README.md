@@ -48,7 +48,7 @@ The initial registry contains a single check:
 Mirrors the predicates of the legacy `deploy/zcashd-compat/sync-check.sh`:
 
 1. a `zebrad .*--zcashd-compat` process is running (`pgrep -f`),
-2. a `zcashd .*-zebra-compat` process is running (`pgrep -f`),
+2. a `zcashd .*-connect` process is running (`pgrep -f`),
 3. zcashd `getzebracompatinfo` reports `service_state == "ready"`,
    `zebra.reachable == true`, and `zebra.identity_verified == true`,
 4. `abs(zebra getblockcount - zcashd getblockcount) <= HEIGHT_MAX_DRIFT`.
@@ -79,7 +79,7 @@ environment variable names match the legacy sync-check script and the
 | `ZCASHD_RPC_URL`          | `--zcashd-rpc-url`          | `http://[::1]:8232`                   | zcashd JSON-RPC endpoint |
 | `ZCASHD_COOKIE_FILE`      | `--zcashd-cookie-file`      | `/mnt/snapshots/runtime/zcashd/.cookie` | zcashd RPC cookie file |
 | `ZEBRAD_PROCESS_PATTERN`  | `--zebrad-process-pattern`  | `zebrad .*--zcashd-compat`            | `pgrep -f` pattern for zebrad |
-| `ZCASHD_PROCESS_PATTERN`  | `--zcashd-process-pattern`  | `zcashd .*-zebra-compat`              | `pgrep -f` pattern for zcashd |
+| `ZCASHD_PROCESS_PATTERN`  | `--zcashd-process-pattern`  | `zcashd .*-connect`              | `pgrep -f` pattern for zcashd |
 | `HEIGHT_MAX_DRIFT`        | `--height-max-drift`        | `10`                                  | Max allowed height drift |
 | `SYNC_CHECK_TIMEOUT`      | `--sync-check-timeout`      | `600`                                 | One-shot `check` total timeout (seconds) |
 | `SYNC_CHECK_INTERVAL`     | `--sync-check-interval`     | `15`                                  | One-shot `check` retry interval (seconds) |

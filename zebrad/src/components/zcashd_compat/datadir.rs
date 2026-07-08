@@ -31,8 +31,10 @@ const ZCASH_CONF_FILENAME: &str = "zcash.conf";
 /// Minimal config that lets zcashd start in zcashd-compat mode on first use.
 pub const BOOTSTRAP_ZCASH_CONF: &str = "\
 i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
-# zcashd-compat: P2P is disabled; chain data comes from zebrad RPC.
-# Do not add bind=, connect=, addnode=, or listen=1 here.
+# zcashd-compat P2P sidecar: zcashd peers only with the local Zakura node.
+# Peer selection is pinned on the zcashd command line (-connect/-listen=0);
+# do not add bind=, connect=, addnode=, or listen=1 here -- these accumulate
+# and cannot be overridden by the supervisor's flags.
 ";
 
 const DEPRECATION_ACK: &str = "i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025";

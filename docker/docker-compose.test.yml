@@ -6,7 +6,7 @@ services:
       dockerfile: docker/Dockerfile
       target: tests
     volumes:
-      - zebrad-cache:/home/zebra/.cache/zebra
+      - zebrad-cache:/home/zebra/.cache/zakura
       - lwd-cache:/home/zebra/.cache/lwd
     env_file:
       - test.env

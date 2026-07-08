@@ -18,7 +18,7 @@ ZEBRA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1"
 
 MODE=""
 NETWORK="Mainnet"
-ZEBRA_STATE_DIR="/mnt/data/zebra-state"
+ZEBRA_STATE_DIR="/mnt/data/zakura-state"
 INSTALL_DIR="${HOME}/.local/zakura"
 CACHE_DIR="${HOME}/.cache/zakura"
 ZEBRAD_PATH=""
@@ -115,7 +115,7 @@ Modes:
 Options:
   --mode MODE
   --network NETWORK
-  --zebra-state-dir DIR
+  --zakura-state-dir DIR
   --install-dir DIR
   --cache-dir DIR
   --zebrad-path PATH
@@ -357,7 +357,7 @@ normalize_inputs() {
     fi
   fi
 
-  ZEBRA_STATE_DIR="$(prompt_value "Zebra state directory" "$ZEBRA_STATE_DIR")"
+  ZEBRA_STATE_DIR="$(prompt_value "Zakura state directory" "$ZEBRA_STATE_DIR")"
   INSTALL_DIR="$(prompt_value "Install directory" "$INSTALL_DIR")"
   CACHE_DIR="$(prompt_value "Download/cache directory" "$CACHE_DIR")"
 
@@ -451,7 +451,7 @@ check_writable_target() {
 }
 
 collect_permission_checks() {
-  check_writable_target "zebra state directory" "$ZEBRA_STATE_DIR"
+  check_writable_target "zakura state directory" "$ZEBRA_STATE_DIR"
 
   if [[ "$MODE" == "native" ]]; then
     check_writable_target "install directory" "$INSTALL_DIR"
@@ -562,13 +562,13 @@ collect_disk_checks() {
   required=$((300 * gib))
 
   if ! zebra_info="$(disk_device_and_size "$ZEBRA_STATE_DIR")"; then
-    add_error "failed to inspect filesystem for zebra state path: $ZEBRA_STATE_DIR"
+    add_error "failed to inspect filesystem for zakura state path: $ZEBRA_STATE_DIR"
     return
   fi
 
   read -r zebra_device zebra_size <<<"$zebra_info"
   if ((zebra_size < required)); then
-    add_low_spec_error "zebra state mount (path: $ZEBRA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
+    add_low_spec_error "zakura state mount (path: $ZEBRA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
   fi
 
   _="$zebra_device"
@@ -733,8 +733,8 @@ print_docker_command() {
 docker run --rm -it --name zakura-zebrad \\
   -e ZEBRA_NETWORK__NETWORK=$(shell_quote "$NETWORK") \\
   -e ZEBRA_NETWORK__LISTEN_ADDR='[::]:$port' \\
-  -e ZEBRA_STATE__CACHE_DIR=/home/zebra/.cache/zebra \\
-  --mount type=bind,src=$(shell_quote "$ZEBRA_STATE_DIR"),dst=/home/zebra/.cache/zebra \\
+  -e ZEBRA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \\
+  --mount type=bind,src=$(shell_quote "$ZEBRA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
   -p $port:$port \\
   $(shell_quote "$ZEBRA_DOCKER_IMAGE") \\
   zebrad start
@@ -782,7 +782,7 @@ while (($#)); do
       NETWORK="$2"
       shift 2
       ;;
-    --zebra-state-dir)
+    --zakura-state-dir | --zebra-state-dir)
       require_value "$1" "${2:-}"
       ZEBRA_STATE_DIR="$2"
       shift 2

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ZEBRA_RPC_URL="${ZEBRA_RPC_URL:-http://127.0.0.1:8232}"
-ZEBRA_COOKIE_FILE="${ZEBRA_COOKIE_FILE:-/root/.cache/zebra/.cookie}"
+ZEBRA_COOKIE_FILE="${ZEBRA_COOKIE_FILE:-/root/.cache/zakura/.cookie}"
 ZCASHD_RPC_URL="${ZCASHD_RPC_URL:-http://[::1]:8232}"
 ZCASHD_COOKIE_FILE="${ZCASHD_COOKIE_FILE:-/mnt/snapshots/runtime/zcashd/.cookie}"
 

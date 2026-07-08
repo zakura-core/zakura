@@ -9,11 +9,11 @@ use std::{
 
 use tempfile::PersistError;
 
-/// Returns Zebra's default cache directory path.
+/// Returns Zakura's default cache directory path.
 pub fn default_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap().join("cache"))
-        .join("zebra")
+        .join("zakura")
 }
 
 /// Accepts a target file path and a byte-slice.

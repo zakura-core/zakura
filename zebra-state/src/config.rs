@@ -52,10 +52,10 @@ pub struct Config {
     ///
     /// |Platform | Value                                           | Example                              |
     /// | ------- | ----------------------------------------------- | ------------------------------------ |
-    /// | Linux   | `$XDG_CACHE_HOME/zebra` or `$HOME/.cache/zebra` | `/home/alice/.cache/zebra`           |
-    /// | macOS   | `$HOME/Library/Caches/zebra`                    | `/Users/Alice/Library/Caches/zebra`  |
-    /// | Windows | `{FOLDERID_LocalAppData}\zebra`                 | `C:\Users\Alice\AppData\Local\zebra` |
-    /// | Other   | `std::env::current_dir()/cache/zebra`           | `/cache/zebra`                       |
+    /// | Linux   | `$XDG_CACHE_HOME/zakura` or `$HOME/.cache/zakura` | `/home/alice/.cache/zakura`           |
+    /// | macOS   | `$HOME/Library/Caches/zakura`                    | `/Users/Alice/Library/Caches/zakura`  |
+    /// | Windows | `{FOLDERID_LocalAppData}\zakura`                 | `C:\Users\Alice\AppData\Local\zakura` |
+    /// | Other   | `std::env::current_dir()/cache/zakura`           | `/cache/zakura`                       |
     ///
     /// # Security
     ///

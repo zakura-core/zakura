@@ -11,8 +11,8 @@ set -eo pipefail
 # Default cache directories for Zebra components.
 # These use the config-rs ZEBRA_SECTION__KEY format and will be picked up
 # by zebrad's configuration system automatically.
-: "${ZEBRA_STATE__CACHE_DIR:=${HOME}/.cache/zebra}"
-: "${ZEBRA_RPC__COOKIE_DIR:=${HOME}/.cache/zebra}"
+: "${ZEBRA_STATE__CACHE_DIR:=${HOME}/.cache/zakura}"
+: "${ZEBRA_RPC__COOKIE_DIR:=${HOME}/.cache/zakura}"
 
 # Leave zcashd-compat disabled unless the container runtime explicitly opts in.
 # Compat images can set ZCASHD_COMPAT_ENABLED=true to use a vendored

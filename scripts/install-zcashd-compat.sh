@@ -18,7 +18,7 @@ ZEBRA_MEMBER="./bin/zebrad"
 ZEBRA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1"
 ZEBRA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.1"
 ZEBRA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
-ZEBRA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zebra"
+ZEBRA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
 ZEBRA_DOCKER_RUNTIME_UID=10001
 ZEBRA_DOCKER_RUNTIME_GID=10001
 
@@ -137,7 +137,7 @@ Modes:
 Options:
   --mode MODE
   --network NETWORK
-  --zebra-state-dir DIR
+  --zakura-state-dir DIR
   --zcashd-datadir DIR
   --install-dir DIR
   --cache-dir DIR
@@ -505,8 +505,8 @@ search_zebra_state_candidates() {
   local root candidate
 
   search_named_candidates "$min_bytes" zebra_state_has_expected_files \
-    ".cache/zebra" "zebra" "zebra-state" "data/zebra" "data/zebra-state" \
-    "mnt/data/zebra" "mnt/data/zebra-state"
+    ".cache/zakura" "zakura" "zakura-state" "data/zakura" "data/zakura-state" \
+    "mnt/data/zakura" "mnt/data/zakura-state"
 
   command_exists find || return 0
   while IFS= read -r root; do
@@ -515,7 +515,7 @@ search_zebra_state_candidates() {
 
     while IFS= read -r candidate; do
       maybe_select_better_candidate "$candidate" "$min_bytes" zebra_state_has_expected_files
-    done < <(find "$root" -xdev -maxdepth 5 -type d \( -name zebra -o -name zebra-state \) -print 2>/dev/null)
+    done < <(find "$root" -xdev -maxdepth 5 -type d \( -name zakura -o -name zakura-state \) -print 2>/dev/null)
   done < <(candidate_search_roots)
 }
 
@@ -556,7 +556,7 @@ recommend_zebra_state_dir() {
 
   if ! path_has_min_capacity "$binary_default" "$min_bytes"; then
     if install_root="$(recommend_install_root "$synthetic_min_bytes")"; then
-      printf '%s/.cache/zebra\n' "$install_root"
+      printf '%s/.cache/zakura\n' "$install_root"
       return
     fi
   fi
@@ -676,7 +676,7 @@ normalize_inputs() {
 
   recommend_datadir_defaults
 
-  ZEBRA_STATE_DIR="$(prompt_value "Zebra state directory" "$ZEBRA_STATE_DIR")"
+  ZEBRA_STATE_DIR="$(prompt_value "Zakura state directory" "$ZEBRA_STATE_DIR")"
   ZCASHD_DATADIR="$(prompt_value "zcashd datadir" "$ZCASHD_DATADIR")"
   INSTALL_DIR="$(prompt_value "Install directory" "$INSTALL_DIR")"
 
@@ -784,7 +784,7 @@ check_writable_target() {
 }
 
 collect_permission_checks() {
-  check_writable_target "zebra state directory" "$ZEBRA_STATE_DIR"
+  check_writable_target "zakura state directory" "$ZEBRA_STATE_DIR"
   check_writable_target "zcashd datadir" "$ZCASHD_DATADIR"
   check_writable_target "install directory" "$INSTALL_DIR"
   check_writable_target "download/cache directory" "$CACHE_DIR"
@@ -910,7 +910,7 @@ collect_disk_checks() {
   recommended="$tib"
 
   if ! zebra_info="$(disk_device_and_size "$ZEBRA_STATE_DIR")"; then
-    add_error "failed to inspect filesystem for zebra state path: $ZEBRA_STATE_DIR"
+    add_error "failed to inspect filesystem for zakura state path: $ZEBRA_STATE_DIR"
     return
   fi
 
@@ -926,13 +926,13 @@ collect_disk_checks() {
     required=$((600 * gib))
     combined="$zebra_size"
     if ((zebra_size < required)); then
-      add_low_spec_error "zebra state + zcashd datadir mount (paths: $ZEBRA_STATE_DIR, $ZCASHD_DATADIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
+      add_low_spec_error "zakura state + zcashd datadir mount (paths: $ZEBRA_STATE_DIR, $ZCASHD_DATADIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
     fi
   else
     required=$((300 * gib))
     combined=$((zebra_size + zcashd_size))
     if ((zebra_size < required)); then
-      add_low_spec_error "zebra state mount (paths: $ZEBRA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
+      add_low_spec_error "zakura state mount (paths: $ZEBRA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
     fi
     if ((zcashd_size < required)); then
       add_low_spec_error "zcashd datadir mount (paths: $ZCASHD_DATADIR) has provisioned capacity $(human_gib "$zcashd_size"), minimum required is $(human_gib "$required")"
@@ -1199,7 +1199,7 @@ prepare_docker_supervised_mounts() {
     return
   fi
 
-  prepare_docker_owned_directory "Zebra state directory" "$ZEBRA_STATE_DIR"
+  prepare_docker_owned_directory "Zakura state directory" "$ZEBRA_STATE_DIR"
   prepare_docker_owned_directory "zcashd datadir" "$ZCASHD_DATADIR"
   finalize_checks
 }
@@ -1262,7 +1262,7 @@ EOF
 
 print_docker_supervised_command() {
   local image="${ZEBRA_COMPAT_DOCKER_SELECTED:-$ZEBRA_COMPAT_DOCKER_IMAGE}"
-  local container_zebra_state_dir="/home/zebra/.cache/zebra"
+  local container_zebra_state_dir="/home/zebra/.cache/zakura"
   local container_zcashd_datadir="/home/zebra/.cache/zcashd"
   cat <<EOF
 docker run --rm -it \\
@@ -1286,24 +1286,24 @@ EOF
 }
 
 print_docker_split_commands() {
-  local cookie_file="/zebra-state/.zcashd-compat.cookie"
+  local cookie_file="/zakura-state/.zcashd-compat.cookie"
   cat <<EOF
 $(style "$GREEN$BOLD" "Start Zebra container in terminal 1:")
-docker run --rm -it --name zebra-compat-zebrad \\
+docker run --rm -it --name zakura-compat-zebrad \\
   -e ZEBRA_NETWORK__LISTEN_ADDR='[::]:8233' \\
-  -e ZEBRA_STATE__CACHE_DIR=/home/zebra/.cache/zebra \\
+  -e ZEBRA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \\
   -e ZEBRA_ZCASHD_COMPAT__LISTEN_ADDR=0.0.0.0:28232 \\
   -e ZEBRA_ZCASHD_COMPAT__UNSAFE_ALLOW_REMOTE_HTTP=true \\
-  --mount type=bind,src=$(shell_quote "$ZEBRA_STATE_DIR"),dst=/home/zebra/.cache/zebra \\
+  --mount type=bind,src=$(shell_quote "$ZEBRA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
   -p 8233:8233 \\
   -p 127.0.0.1:28232:28232 \\
   $(shell_quote "$ZEBRA_DOCKER_IMAGE") \\
   zebrad start --zcashd-compat
 
 $(style "$GREEN$BOLD" "Start zcashd container in terminal 2:")
-docker run --rm -it --name zebra-compat-zcashd --network host \\
+docker run --rm -it --name zakura-compat-zcashd --network host \\
   --mount type=bind,src=$(shell_quote "$ZCASHD_DATADIR"),dst=/home/zcashd/.zcash \\
-  --mount type=bind,src=$(shell_quote "$ZEBRA_STATE_DIR"),dst=/zebra-state,readonly \\
+  --mount type=bind,src=$(shell_quote "$ZEBRA_STATE_DIR"),dst=/zakura-state,readonly \\
   $(shell_quote "$ZCASHD_DOCKER_IMAGE") \\
   -zebra-compat \\
   -zebra-compat-url=http://127.0.0.1:28232 \\
@@ -1376,7 +1376,7 @@ while (($#)); do
       NETWORK="$2"
       shift 2
       ;;
-    --zebra-state-dir)
+    --zakura-state-dir | --zebra-state-dir)
       require_value "$1" "${2:-}"
       ZEBRA_STATE_DIR="$2"
       ZEBRA_STATE_DIR_SET=1

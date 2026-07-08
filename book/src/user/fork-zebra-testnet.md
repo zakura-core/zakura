@@ -38,7 +38,7 @@ network = "Testnet"
 
 [state]
 debug_stop_at_height = 2599958
-cache_dir = "/home/user/.cache/zebra"
+cache_dir = "/home/user/.cache/zakura"
 ```
 
 Generate a Zebra config file:
@@ -53,7 +53,7 @@ Start Zebra with the modified config:
 zebrad -c myconf.toml start
 ```
 
-Wait for the sync to complete (this may take up to 24 hours, depending on testnet conditions), resulting in a state up to the desired block in `~/cache/zebra`.
+Wait for the sync to complete (this may take up to 24 hours, depending on testnet conditions), resulting in a state up to the desired block in `~/.cache/zakura`.
 
 ## Code changes
 
@@ -115,7 +115,7 @@ network = "Testnet"
 listen_addr = "0.0.0.0:18232"
 
 [state]
-cache_dir = "/home/oxarbitrage/.cache/zebra"
+cache_dir = "/home/oxarbitrage/.cache/zakura"
 ```
 
 - `debug_enable_at_height= 0` enables the mempool independently of the tip height.

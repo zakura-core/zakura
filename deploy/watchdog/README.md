@@ -75,7 +75,7 @@ environment variable names match the legacy sync-check script and the
 | Environment variable      | Flag                        | Default                               | Purpose |
 | ------------------------- | --------------------------- | ------------------------------------- | ------- |
 | `ZEBRA_RPC_URL`           | `--zebra-rpc-url`           | `http://127.0.0.1:8232`               | Zebra JSON-RPC endpoint |
-| `ZEBRA_COOKIE_FILE`       | `--zebra-cookie-file`       | `/root/.cache/zebra/.cookie`          | Zebra RPC cookie file |
+| `ZEBRA_COOKIE_FILE`       | `--zebra-cookie-file`       | `/root/.cache/zakura/.cookie`         | Zebra RPC cookie file |
 | `ZCASHD_RPC_URL`          | `--zcashd-rpc-url`          | `http://[::1]:8232`                   | zcashd JSON-RPC endpoint |
 | `ZCASHD_COOKIE_FILE`      | `--zcashd-cookie-file`      | `/mnt/snapshots/runtime/zcashd/.cookie` | zcashd RPC cookie file |
 | `ZEBRAD_PROCESS_PATTERN`  | `--zebrad-process-pattern`  | `zebrad .*--zcashd-compat`            | `pgrep -f` pattern for zebrad |
@@ -184,7 +184,7 @@ Or against custom endpoints:
 ```bash
 zebra-watchdog check \
   --zebra-rpc-url http://127.0.0.1:8232 \
-  --zebra-cookie-file /root/.cache/zebra/.cookie \
+  --zebra-cookie-file /root/.cache/zakura/.cookie \
   --height-max-drift 10
 ```
 

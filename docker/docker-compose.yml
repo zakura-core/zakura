@@ -12,7 +12,7 @@ services:
     env_file:
       - .env
     volumes:
-      - zebrad-cache:/home/zebra/.cache/zebra
+      - zebrad-cache:/home/zebra/.cache/zakura
     # Having `tty` set to true makes Zebra use colored logs.
     tty: true
     # ! Comment out the `configs` mapping below to use the environment variables in the

@@ -118,7 +118,7 @@ enum PermissionRole {
 impl PermissionRole {
     fn label(self) -> &'static str {
         match self {
-            PermissionRole::ZebraState => "zebra state directory",
+            PermissionRole::ZebraState => "zakura state directory",
             PermissionRole::ZcashdDatadir => "zcashd datadir",
             PermissionRole::ZcashdConf => "zcashd config directory",
             PermissionRole::ManagedZcashdCache => "managed zcashd cache directory",
@@ -1061,7 +1061,7 @@ mod tests {
         result.expect("permission checks should complete");
         assert_eq!(summary.errors.len(), 1, "errors: {:?}", summary.errors);
         assert!(
-            summary.errors[0].contains("zebra state directory")
+            summary.errors[0].contains("zakura state directory")
                 && summary.errors[0].contains("rpc cookie directory"),
             "expected shared-role error: {:?}",
             summary.errors
@@ -1204,7 +1204,7 @@ mod tests {
         std_fs::create_dir(&protected).expect("protected dir should be created");
 
         let mut config = permission_test_config(&temp_dir);
-        config.state.cache_dir = protected.join("zebra-cache");
+        config.state.cache_dir = protected.join("zakura-cache");
         config.zcashd_compat.zcashd_datadir = Some(temp_dir.path().join("zcashd-datadir"));
         config.zcashd_compat.zcashd_source = ConfigZcashdBinarySource::Managed;
         config.zcashd_compat.zcashd_path = None;
@@ -1276,7 +1276,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn permission_test_config(temp_dir: &TempDir) -> ZebradConfig {
         let mut config = ZebradConfig::default();
-        config.state.cache_dir = temp_dir.path().join("zebra-cache");
+        config.state.cache_dir = temp_dir.path().join("zakura-cache");
         config.zcashd_compat.manage_zcashd = true;
         config.zcashd_compat.zcashd_source = ConfigZcashdBinarySource::Path;
         config.zcashd_compat.cookie_dir = temp_dir.path().join("cookie-dir");

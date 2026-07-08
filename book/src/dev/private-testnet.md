@@ -51,7 +51,7 @@ participants must enable mining also. It's not a huge deal to keep the DNS
 seeders; the blockchain will fork when the activation happens and only the
 participants will stay connected. On the other hand, if you want to ensure you
 won't connect to anyone else, set `cache_dir = false` in the `[network]` section
-and delete the peers file (`~/.cache/zebra/network/unknowntestnet.peers`).
+and delete the peers file (`~/.cache/zakura/network/unknowntestnet.peers`).
 
 ### Run Nodes
 
@@ -77,7 +77,7 @@ Relevant information about Zebra for the testing process.
 
 It seems Zebra is not very reliable at returning its currently connected peers;
 you can use `getpeerinfo` RPC as above or check the peers file
-(`~/.cache/zebra/network/unknowntestnet.peers`) if `cache_dir = true` in the
+(`~/.cache/zakura/network/unknowntestnet.peers`) if `cache_dir = true` in the
 `[network]` section. You might want to sort this out before the next private
 testnet test.
 

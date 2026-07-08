@@ -16,7 +16,7 @@
       "id": "benchCacheDir",
       "type": "promptString",
       "description": "Bench cache/fork directory for @@FORK@@",
-      "default": "/mnt/roman-dev-2-data/zebra-cache-from-genesis"
+      "default": "/mnt/roman-dev-2-data/zakura-cache-from-genesis"
     },
     {
       "id": "benchListenPort",

@@ -9,6 +9,7 @@ bin_path        = "/usr/local/bin/zebrad"
 config_path     = "/etc/zebrad/zebrad.toml"
 log_file        = "/var/log/zebrad/zebrad.log"   # deterministic log path
 state_cache_dir = "/var/lib/zebrad"
+cache_dir_migrate_from = ""                    # optional old cache dir to move during restart deploys
 network         = "Mainnet"
 listen_addr     = "[::]:8233"
 rpc_listen_addr = ""                        # empty = RPC disabled; e.g. "0.0.0.0:8232"
@@ -34,3 +35,17 @@ commit     = "evan/perf-note-commit-tree"   # branch, tag, or full/short SHA
 name       = "node-b"
 ssh_string = "root@167.172.201.36"
 commit     = "evan/perf-note-commit-tree"
+
+# Process-managed nodes skip systemd unit installation. Use this only when a
+# host is intentionally managed by a local runbook.
+# [[nodes]]
+# name = "process-node"
+# ssh_string = "root@203.0.113.10"
+# commit = "main"
+# deploy_kind = "process"
+# service_name = ""
+# bin_path = "/root/app/target/release/zebrad"
+# config_path = "/root/app/node.toml"
+# working_dir = "/root/app"
+# start_command = "target/release/zebrad -c /root/app/node.toml start"
+# process_pattern = "target/release/zebrad -c /root/app/node.toml start"

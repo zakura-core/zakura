@@ -11,21 +11,21 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZEBRA_RELEASE_TAG="v5.0.0-test.4"
+ZEBRA_RELEASE_TAG="v0.0.1-alpha.1"
 ZEBRA_ARCHIVE="zebrad-${ZEBRA_RELEASE_TAG}-linux-x86_64.tar.gz"
-ZEBRA_URL="https://github.com/valargroup/zebra/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
+ZEBRA_URL="https://github.com/zakura-core/zakura/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
 ZEBRA_MEMBER="./bin/zebrad"
-ZEBRA_DOCKER_IMAGE="valaroman/zebra:5.0.0-test.4"
-ZEBRA_COMPAT_DOCKER_IMAGE="valaroman/zebra:zcashd-compat-5.0.0-test.4"
-ZEBRA_COMPAT_DOCKER_FALLBACK_IMAGE="valaroman/zebra:zcashd-compat-latest"
+ZEBRA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1"
+ZEBRA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.1"
+ZEBRA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
 ZEBRA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zebra"
 ZEBRA_DOCKER_RUNTIME_UID=10001
 ZEBRA_DOCKER_RUNTIME_GID=10001
 
 MANIFEST_PATH="$REPO_ROOT/zebrad/zcashd-compat-manifest.json"
 TARGET_TRIPLE="x86_64-pc-linux-gnu"
-ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v6.2.1-alpha.9/zcashd-zebra-compat-v6.2.1-alpha.9-linux-x86_64.tar.gz"
-ZCASHD_RUNTIME_ARCHIVE_SHA256="5f899869a0e5fdb8d5179e291d764f37b9e4e6db04163a07fc2439806c8f0097"
+ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v0.0.1-compat-alpha.2/zcashd-zebra-compat-v0.0.1-compat-alpha.2-linux-x86_64.tar.gz"
+ZCASHD_RUNTIME_ARCHIVE_SHA256="b504a508467bf0a7d8b251009e0f9bd1637107eeeb97d5a9dd9ba47336f16a90"
 ZCASHD_RUNTIME_ARCHIVE_MEMBER_BINARY_PATH="./bin/zcashd"
 
 MODE=""
@@ -1133,7 +1133,7 @@ data_detection_message() {
     fi
   fi
   printf '\nhttps://zcashd.valargroup.org/\n'
-  printf '\nhttps://zebra.valargroup.org/\n'
+  printf '\nhttps://zebra.valargroup.dev/\n'
   printf '\n'
 }
 
@@ -1220,7 +1220,7 @@ prepare_docker_images() {
         add_error "Docker image is missing or could not be pulled: $ZEBRA_DOCKER_IMAGE"
 
       if [[ -z "$ZCASHD_DOCKER_IMAGE" ]]; then
-        ZCASHD_DOCKER_IMAGE="valaroman/zcashd:v6.2.1-alpha.9.1@sha256:77f7a000c47248aef00a7f7b14b45ae49aa98f8c9d86c86767714ff76034698c"
+        ZCASHD_DOCKER_IMAGE="valargroup/zcashd:v0.0.1-compat-alpha.2@sha256:5693dad0d403609a5d0ebdfdaed6a853546e4ffecd1264334495a079f2c6033f"
       fi
 
       docker_image_available_or_pull "$ZCASHD_DOCKER_IMAGE" ||
@@ -1316,8 +1316,8 @@ EOF
 
 print_source_commands() {
   cat <<EOF
-git clone https://github.com/valargroup/zebra.git
-git clone https://github.com/valargroup/zcashd.git
+git clone https://github.com/zakura-core/zakura.git
+git clone https://github.com/valargroup/zcashd.git zcash
 
 cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zebrad
 cd $(shell_quote "$UNITY_ROOT/zcash") && ./zcutil/build.sh -j"\$(nproc)"

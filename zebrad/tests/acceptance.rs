@@ -248,7 +248,7 @@ fn generate_no_args() -> Result<()> {
     let output = output.assert_success()?;
 
     // First line
-    output.stdout_line_contains("# Default configuration for zebrad")?;
+    output.stdout_line_contains("# Default configuration for zakurad")?;
 
     Ok(())
 }
@@ -1714,9 +1714,9 @@ async fn rpc_endpoint(parallel_cpu_threads: bool) -> Result<()> {
     let build = parsed["result"]["build"].as_str().unwrap();
     assert!(build.len() > 4, "Got {build}");
 
-    // Check that the `subversion` field has "Zebra" in it.
+    // Check that the `subversion` field has "Zakura" in it.
     let subversion = parsed["result"]["subversion"].as_str().unwrap();
-    assert!(subversion.contains("Zebra"), "Got {subversion}");
+    assert!(subversion.contains("Zakura"), "Got {subversion}");
 
     child.kill(false)?;
 

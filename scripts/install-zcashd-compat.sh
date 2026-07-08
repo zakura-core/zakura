@@ -1407,6 +1407,22 @@ print_zcashd_flag_lines() {
   printf '  -printtoconsole\n'
 }
 
+# zcashd container flag block (fixed in-container datadir/conf paths). Emits one
+# flag per line so no command-substitution/heredoc line-join can splice two
+# flags together with an escaped space.
+print_docker_zcashd_flag_lines() {
+  local arg
+  while IFS= read -r arg; do
+    [[ -n "$arg" ]] && printf '  %s \\\n' "$arg"
+  done < <(zcashd_network_args)
+  printf '  -datadir=/home/zcashd/.zcash \\\n'
+  printf '  -conf=/home/zcashd/.zcash/zcash.conf \\\n'
+  while IFS= read -r arg; do
+    [[ -n "$arg" ]] && printf '  %s \\\n' "$arg"
+  done < <(zcashd_p2p_pinning_args)
+  printf '  -printtoconsole\n'
+}
+
 print_split_binary_commands() {
   cat <<EOF
 $(style "$GREEN$BOLD" "Start Zakura in terminal 1:")
@@ -1480,11 +1496,7 @@ $(style "$GREEN$BOLD" "Start zcashd container in terminal 2:")
 docker run --rm -it --name zakura-compat-zcashd --network host \\
   --mount type=bind,src=$(shell_quote "$ZCASHD_DATADIR"),dst=/home/zcashd/.zcash \\
   $(shell_quote "$ZCASHD_DOCKER_IMAGE") \\
-$(while IFS= read -r arg; do [[ -n "$arg" ]] && printf '  %s \\\n' "$arg"; done < <(zcashd_network_args))\
-  -datadir=/home/zcashd/.zcash \\
-  -conf=/home/zcashd/.zcash/zcash.conf \\
-$(while IFS= read -r arg; do [[ -n "$arg" ]] && printf '  %s \\\n' "$arg"; done < <(zcashd_p2p_pinning_args))\
-  -printtoconsole
+$(print_docker_zcashd_flag_lines)
 EOF
 }
 

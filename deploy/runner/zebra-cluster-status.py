@@ -538,6 +538,11 @@ class ClusterCollector:
         }
 
     def upgrade_estimate(self, now: float) -> dict:
+        # A non-positive upgrade height means there is no pending activation to
+        # count down to (e.g. mainnet); the dashboard hides the upgrade cards.
+        if self.upgrade_height <= 0:
+            return {"enabled": False}
+
         current_height = self.height_history[-1][1] if self.height_history else None
         blocks_remaining = (
             max(self.upgrade_height - current_height, 0)
@@ -559,6 +564,7 @@ class ClusterCollector:
             eta_at = now + eta_seconds
 
         return {
+            "enabled": True,
             "height": self.upgrade_height,
             "current_height": current_height,
             "blocks_remaining": blocks_remaining,
@@ -930,19 +936,19 @@ tbody tr:hover td { background: rgba(46, 42, 66, 0.35); }
       <span>Stale window</span>
       <strong id="stale-window">...</strong>
     </article>
-    <article class="summary-card">
+    <article class="summary-card upgrade-card">
       <span>Upgrade height</span>
       <strong id="upgrade-height">...</strong>
     </article>
-    <article class="summary-card">
+    <article class="summary-card upgrade-card">
       <span>Blocks remaining</span>
       <strong id="blocks-remaining">...</strong>
     </article>
-    <article class="summary-card">
+    <article class="summary-card upgrade-card">
       <span>Upgrade ETA</span>
       <strong id="upgrade-eta">...</strong>
     </article>
-    <article class="summary-card">
+    <article class="summary-card upgrade-card">
       <span>Block time</span>
       <strong id="block-time">...</strong>
       <small id="block-time-source">...</small>
@@ -1060,14 +1066,20 @@ async function tick() {
   document.getElementById('last-poll').textContent = poll;
   document.getElementById('stale-window').textContent = Math.round(data.stale_after) + 's';
   const upgrade = data.upgrade || {};
-  const etaAt = upgrade.eta_at ? new Date(upgrade.eta_at * 1000).toLocaleString() : 'waiting for block movement';
-  document.getElementById('upgrade-height').textContent = formatNumber(upgrade.height);
-  document.getElementById('blocks-remaining').textContent = upgrade.activated ? 'activated' : formatNumber(upgrade.blocks_remaining);
-  document.getElementById('upgrade-eta').textContent = upgrade.activated ? 'activated' : countdown(upgrade.eta_seconds) + ' / ' + etaAt;
-  document.getElementById('block-time').textContent = formatBlockTime(upgrade.seconds_per_block);
-  document.getElementById('block-time-source').textContent = upgrade.source === 'observed'
-    ? 'recent average'
-    : 'default estimate';
+  const upgradeEnabled = upgrade.enabled !== false;
+  document.querySelectorAll('.upgrade-card').forEach((card) => {
+    card.style.display = upgradeEnabled ? '' : 'none';
+  });
+  if (upgradeEnabled) {
+    const etaAt = upgrade.eta_at ? new Date(upgrade.eta_at * 1000).toLocaleString() : 'waiting for block movement';
+    document.getElementById('upgrade-height').textContent = formatNumber(upgrade.height);
+    document.getElementById('blocks-remaining').textContent = upgrade.activated ? 'activated' : formatNumber(upgrade.blocks_remaining);
+    document.getElementById('upgrade-eta').textContent = upgrade.activated ? 'activated' : countdown(upgrade.eta_seconds) + ' / ' + etaAt;
+    document.getElementById('block-time').textContent = formatBlockTime(upgrade.seconds_per_block);
+    document.getElementById('block-time-source').textContent = upgrade.source === 'observed'
+      ? 'recent average'
+      : 'default estimate';
+  }
   document.getElementById('summary').textContent = data.healthy + ' / ' + data.total + ' nodes healthy';
   const body = document.getElementById('rows');
   body.innerHTML = data.rows.map((row) => `
@@ -1136,7 +1148,7 @@ def main() -> None:
         "--upgrade-height",
         type=int,
         default=DEFAULT_UPGRADE_HEIGHT,
-        help="testnet upgrade activation height to estimate",
+        help="upgrade activation height to estimate; 0 hides the upgrade cards (e.g. mainnet)",
     )
     parser.add_argument(
         "--target-spacing",

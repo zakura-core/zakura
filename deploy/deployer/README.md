@@ -156,6 +156,77 @@ python3 deploy/runner/zebra-cluster-status.py \
   --target-spacing 7.5
 ```
 
+## GitHub Actions mainnet fleet deploy
+
+`.github/workflows/zakura-mainnet-deploy.yml` runs the same deployer for the
+mainnet fleet on a Linux x86_64 self-hosted runner, expected to be `us-east-0`
+with the `zakura-mainnet-deployer` label. It builds the native `zakurad` binary
+and deploys it to:
+
+- `asia-0` — `root@165.22.54.66`
+- `us-0` — `root@104.131.184.123`
+- `us-east-0` — `root@159.65.183.89`
+- `us-west-0` — `root@143.244.184.176`
+- `canada-0` — `root@159.203.38.10`
+- `europe-west-0` — `root@64.227.44.93`
+- `europe-central-0` — `root@161.35.156.226`
+- `asia-south-0` — `root@139.59.64.115`
+- `asia-pacific-0` — `root@168.144.173.250`
+
+All nine are systemd-managed `zakurad.service` nodes. One-time runner bootstrap
+from an operator machine with SSH access and CI credentials in `~/agents-env`:
+
+```bash
+cd deploy/deployer
+./mainnet/bootstrap-zakura-mainnet-runner.sh
+```
+
+The workflow is manual (`workflow_dispatch`) with the same inputs as testnet
+(`ref` defaults to `main`, plus `force_rebuild`, `no_restart`, `node`). Its
+generated CI config uses Mainnet ports, public RPC at `0.0.0.0:8232`, and pins
+`identity_dir = "/root/.zakura"` so each node keeps its iroh node id (those node
+ids are the built-in mainnet Zakura bootstrap peers). It writes
+`/etc/zakura/zakura.toml` and points `state_cache_dir`/`network_cache_dir` at
+`/root/.cache/zakura` — the location the hand-provisioned nodes already use — so
+CI restarts against the existing database instead of resyncing. As on testnet, a
+`cache_dir_migrate_from = "/root/.cache/zebra"` is set: if an older pre-rename
+`zebra` cache exists and the `zakura` target does not, the deployer stops the
+node and moves the directory before starting. **Confirm each node's live
+`[state] cache_dir` before the first restart** — a mismatched path resyncs an
+archive node.
+
+> One-time migration: the nodes were hand-provisioned with a `zebrad.service`
+> unit and `/usr/local/bin/zebrad`, plus a vestigial `10-vct-legacy.conf` drop-in
+> (`VCT_LEGACY=1`, unread by zakurad). Because the deployer installs the
+> standardized `zakurad.service` and does not touch the old unit, disable and
+> remove it on each node before the first restart deploy, or the old process
+> keeps the state DB locked:
+>
+> ```bash
+> systemctl disable --now zebrad
+> rm -f /etc/systemd/system/zebrad.service \
+>       /etc/systemd/system/zebrad.service.d/10-vct-legacy.conf
+> systemctl daemon-reload
+> ```
+
+The workflow refreshes a fleet status dashboard on `us-east-0`:
+
+- service: `zakura-mainnet-dashboard.service`
+- URL: `http://159.65.183.89:8090/`
+- install dir: `/opt/zakura-mainnet-dashboard`
+
+It is the same `zebra-cluster-status.py` as testnet, launched with
+`--upgrade-height 0`, which hides the upgrade-ETA cards (mainnet has no pending
+Zakura activation to count down to). Manual run:
+
+```bash
+python3 deploy/runner/zebra-cluster-status.py \
+  --config deploy/deployer/nodes.toml \
+  --host 0.0.0.0 \
+  --port 8090 \
+  --upgrade-height 0
+```
+
 ## How the build cache works
 
 `commit` is resolved to a full SHA (`git rev-parse`). The binary is cached at

@@ -12,6 +12,7 @@ state_cache_dir = "/var/lib/zakura"
 cache_dir_migrate_from = ""                    # optional old cache dir to move during restart deploys
 network         = "Mainnet"
 listen_addr     = "[::]:8233"
+# identity_dir  = "/root/.zakura"           # empty = zakurad default; pins the iroh node_id
 rpc_listen_addr = ""                        # empty = RPC disabled; e.g. "0.0.0.0:8232"
 storage_mode    = "archive"                 # "archive" serves all history; "pruned" does not
 v2_p2p          = true                       # run the Zakura v2 overlay

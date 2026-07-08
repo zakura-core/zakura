@@ -1,0 +1,317 @@
+name: Deploy Zakura mainnet fleet
+
+# Manual fleet deploy for the Zakura mainnet nodes.
+#
+# Runs on a self-hosted Linux x86_64 runner, expected to be installed on
+# us-east-0 (159.65.183.89) with the `zakura-mainnet-deployer` label (see
+# deploy/deployer/mainnet/bootstrap-zakura-mainnet-runner.sh). The deployer
+# builds a native zakurad binary on that runner, then uses deploy/deployer/
+# deploy.py to scp/install it across the fleet.
+#
+# ONE-TIME MIGRATION — the mainnet nodes were hand-provisioned with a
+# `zebrad.service` unit and a /usr/local/bin/zebrad binary. This deployer
+# installs the standardized `zakurad.service` + /usr/local/bin/zakurad, and does
+# not touch the old unit, so before the first restart deploy each node needs:
+#     systemctl disable --now zebrad
+#     rm -f /etc/systemd/system/zebrad.service \
+#           /etc/systemd/system/zebrad.service.d/10-vct-legacy.conf
+#     systemctl daemon-reload
+# Otherwise the old zebrad process keeps the state DB locked and zakurad cannot
+# start. See deploy/deployer/README.md.
+#
+# DO NOT RESYNC — the cache paths below point at the location the nodes already
+# use (/root/.cache/zakura, the zakurad default for HOME=/root), identity_dir is
+# pinned to /root/.zakura so each node keeps its iroh node id, and
+# cache_dir_migrate_from moves a pre-rename /root/.cache/zebra dir into place on
+# first restart if the zakura target does not yet exist. Confirm each node's live
+# `[state] cache_dir` before the first restart; a mismatched path resyncs an
+# archive node from genesis.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git branch, tag, or SHA to build and deploy"
+        required: true
+        type: string
+        default: main
+      force_rebuild:
+        description: "Rebuild even if a cached binary for this commit exists"
+        type: boolean
+        required: false
+        default: false
+      no_restart:
+        description: "Stage binary/config/unit without restarting zakurad"
+        type: boolean
+        required: false
+        default: false
+      node:
+        description: "Optional single deployer node name; blank deploys the whole fleet"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zakura-mainnet-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: "Deploy Zakura mainnet ${{ inputs.ref }}"
+    runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
+    timeout-minutes: 180
+    environment: zakura-mainnet
+
+    steps:
+      - name: Checkout deploy ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: stable
+          cache-on-failure: true
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            git \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler \
+            python3
+
+      - name: Start SSH agent when deploy key is configured
+        env:
+          ZAKURA_MAINNET_DEPLOY_SSH_KEY: ${{ secrets.ZAKURA_MAINNET_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ZAKURA_MAINNET_DEPLOY_SSH_KEY}" ]; then
+            echo "ZAKURA_MAINNET_DEPLOY_SSH_KEY is not set; using the runner's existing SSH identity."
+            exit 0
+          fi
+
+          ssh_agent_sock="$RUNNER_TEMP/ssh-agent.sock"
+          ssh-agent -a "$ssh_agent_sock" > "$RUNNER_TEMP/ssh-agent.env"
+          SSH_AUTH_SOCK="$ssh_agent_sock" ssh-add - <<< "$ZAKURA_MAINNET_DEPLOY_SSH_KEY"
+          echo "SSH_AUTH_SOCK=$ssh_agent_sock" >> "$GITHUB_ENV"
+
+      - name: Pin fleet host keys
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          : > ~/.ssh/known_hosts
+          for host in \
+            165.22.54.66 \
+            104.131.184.123 \
+            159.65.183.89 \
+            143.244.184.176 \
+            159.203.38.10 \
+            64.227.44.93 \
+            161.35.156.226 \
+            139.59.64.115 \
+            168.144.173.250; do
+            ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
+          done
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Generate deployer fleet config
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          cat > nodes.ci.toml <<EOF
+          [defaults]
+          service_name    = "zakurad"
+          bin_path        = "/usr/local/bin/zakurad"
+          config_path     = "/etc/zakura/zakura.toml"
+          network         = "Mainnet"
+          listen_addr     = "[::]:8233"
+          rpc_listen_addr = "0.0.0.0:8232"
+          rpc_enable_cookie_auth = false
+          storage_mode    = "archive"
+          v2_p2p          = true
+          legacy_p2p      = true
+          metrics_endpoint = "127.0.0.1:9999"
+          tracing_filter  = "info,zebra_network::zakura=info"
+          # Mainnet keeps checkpoint sync + the VCT fast-sync path (zakurad defaults).
+          checkpoint_sync = true
+          vct_fast_sync   = true
+          # Reuse the paths the hand-provisioned nodes already use so no node resyncs.
+          identity_dir    = "/root/.zakura"
+          state_cache_dir = "/root/.cache/zakura"
+          network_cache_dir = "/root/.cache/zakura"
+          # Move a pre-rename cache into place on first restart if it exists and the
+          # zakura target does not (mirrors the testnet zebra->zakura migration).
+          cache_dir_migrate_from = "/root/.cache/zebra"
+          log_file        = "/root/logs/zakura.log"
+
+          # The built-in mainnet Zakura bootstrap peers (zebra-network/src/zakura/
+          # handler.rs) are already correct, so we only pin the listen address.
+          [defaults.zakura]
+          listen_addr = "0.0.0.0:8234"
+
+          [[nodes]]
+          name       = "asia-0"
+          ssh_string = "root@165.22.54.66"
+          commit     = "${{ inputs.ref }}"
+
+          [[nodes]]
+          name       = "us-0"
+          ssh_string = "root@104.131.184.123"
+          commit     = "${{ inputs.ref }}"
+
+          [[nodes]]
+          name       = "us-east-0"
+          ssh_string = "root@159.65.183.89"
+          commit     = "${{ inputs.ref }}"
+
+          [[nodes]]
+          name       = "us-west-0"
+          ssh_string = "root@143.244.184.176"
+          commit     = "${{ inputs.ref }}"
+
+          [[nodes]]
+          name       = "canada-0"
+          ssh_string = "root@159.203.38.10"
+          commit     = "${{ inputs.ref }}"
+
+          [[nodes]]
+          name       = "europe-west-0"
+          ssh_string = "root@64.227.44.93"
+          commit     = "${{ inputs.ref }}"
+
+          [[nodes]]
+          name       = "europe-central-0"
+          ssh_string = "root@161.35.156.226"
+          commit     = "${{ inputs.ref }}"
+
+          [[nodes]]
+          name       = "asia-south-0"
+          ssh_string = "root@139.59.64.115"
+          commit     = "${{ inputs.ref }}"
+
+          [[nodes]]
+          name       = "asia-pacific-0"
+          ssh_string = "root@168.144.173.250"
+          commit     = "${{ inputs.ref }}"
+          EOF
+
+      - name: Build deployer binary
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml)
+          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            args+=(--force)
+          fi
+          if [ -n "${{ inputs.node }}" ]; then
+            args+=(--node "${{ inputs.node }}")
+          fi
+
+          python3 deploy.py build "${args[@]}"
+
+      - name: Deploy fleet
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml)
+          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            args+=(--force)
+          fi
+          if [ "${{ inputs.no_restart }}" = "true" ]; then
+            args+=(--no-restart)
+          fi
+          if [ -n "${{ inputs.node }}" ]; then
+            args+=(--node "${{ inputs.node }}")
+          fi
+
+          python3 deploy.py deploy "${args[@]}"
+
+      - name: Show fleet status
+        if: always()
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml)
+          if [ -n "${{ inputs.node }}" ]; then
+            args+=(--node "${{ inputs.node }}")
+          fi
+
+          python3 deploy.py status "${args[@]}"
+
+      - name: Install cluster status dashboard
+        if: always()
+        run: |
+          set -euo pipefail
+
+          dashboard_dir="/opt/zakura-mainnet-dashboard"
+          sudo install -d -m 755 "$dashboard_dir"
+          sudo install -m 755 deploy/runner/zebra-cluster-status.py "$dashboard_dir/zebra-cluster-status.py"
+          sudo install -m 644 deploy/deployer/nodes.ci.toml "$dashboard_dir/nodes.toml"
+
+          sudo tee /etc/systemd/system/zakura-mainnet-dashboard.service >/dev/null <<'EOF'
+          [Unit]
+          Description=Zakura mainnet cluster status dashboard
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/zakura-mainnet-dashboard
+          ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zebra-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --interval 10 --stale-after 300 --upgrade-height 0
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-mainnet-dashboard.service
+          sudo systemctl restart zakura-mainnet-dashboard.service
+          sudo systemctl --no-pager --full status zakura-mainnet-dashboard.service || true
+
+      - name: Fetch recent logs on failure
+        if: failure()
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml --lines 300)
+          if [ -n "${{ inputs.node }}" ]; then
+            args+=(--node "${{ inputs.node }}")
+          fi
+
+          python3 deploy.py logs fetch "${args[@]}" || true
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: zakura-mainnet-deploy-logs-${{ github.run_id }}
+          path: deploy/deployer/logs/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -47,6 +47,7 @@ DEFAULTS = {
     "state_cache_dir": "/var/lib/zakura",
     "network": "Mainnet",
     "listen_addr": "[::]:8233",
+    "identity_dir": "",     # e.g. "/root/.zakura" -> pins the iroh node_id; "" uses zakurad default
     "network_cache_dir": "",
     "cache_dir_migrate_from": "",
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
@@ -89,6 +90,7 @@ class Node:
     state_cache_dir: str
     network: str
     listen_addr: str
+    identity_dir: str
     network_cache_dir: str
     cache_dir_migrate_from: str
     rpc_listen_addr: str
@@ -171,6 +173,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             state_cache_dir=merged["state_cache_dir"],
             network=merged["network"],
             listen_addr=merged["listen_addr"],
+            identity_dir=merged["identity_dir"],
             network_cache_dir=merged["network_cache_dir"],
             cache_dir_migrate_from=merged["cache_dir_migrate_from"],
             rpc_listen_addr=merged["rpc_listen_addr"],
@@ -366,9 +369,13 @@ def render_node_config(node: Node) -> str:
     network_cache_line = (
         f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zakurad default)"
     )
+    identity_dir_line = (
+        f'identity_dir = "{node.identity_dir}"' if node.identity_dir else "# identity_dir unset (zakurad default)"
+    )
     return render_template("zakura.toml", {
         "NETWORK": node.network,
         "LISTEN_ADDR": node.listen_addr,
+        "IDENTITY_DIR": identity_dir_line,
         "NETWORK_CACHE_DIR": network_cache_line,
         "STATE_CACHE_DIR": node.state_cache_dir,
         "STORAGE_MODE": node.storage_mode,

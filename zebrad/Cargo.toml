@@ -22,9 +22,9 @@ rust-version = "1.91"
 
 # Settings that impact runtime behaviour
 
-# make `cargo run` use `zebrad` by default
+# make `cargo run` use `zakurad` by default
 # when run in the workspace directory
-default-run = "zebrad"
+default-run = "zakurad"
 
 # `cargo release` settings
 [package.metadata.release]
@@ -135,7 +135,7 @@ lightwalletd-grpc-tests = ["tonic-prost-build"]
 #
 # To activate this feature, run:
 # ```sh
-# RUSTFLAGS="--cfg tokio_unstable" cargo build --no-default-features --features="tokio-console" --bin zebrad
+# RUSTFLAGS="--cfg tokio_unstable" cargo build --no-default-features --features="tokio-console" --bin zakurad
 # ```
 #
 # The console-subscriber is incompatible with the tracing/max_level_* features.

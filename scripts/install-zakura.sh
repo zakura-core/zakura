@@ -585,10 +585,10 @@ collect_source_checks() {
     add_error "Zebra source tree is missing Cargo.toml: $REPO_ROOT"
   fi
 
-  ZEBRAD_PATH="${ZEBRAD_PATH:-$REPO_ROOT/target/release/zebrad}"
+  ZEBRAD_PATH="${ZEBRAD_PATH:-$REPO_ROOT/target/release/zakurad}"
 
   if [[ -e "$ZEBRAD_PATH" && ! -x "$ZEBRAD_PATH" ]]; then
-    add_error "zebrad binary $ZEBRAD_PATH exists but is not executable by the current user"
+    add_error "zakurad binary $ZEBRAD_PATH exists but is not executable by the current user"
   fi
 }
 
@@ -745,7 +745,7 @@ print_source_commands() {
   cat <<EOF
 git clone https://github.com/zakura-core/zakura.git
 
-cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zebrad
+cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zakurad
 
 $(style "$GREEN$BOLD" "Start Zebra:")
 ZEBRA_STATE__CACHE_DIR=$(shell_quote "$ZEBRA_STATE_DIR") \\

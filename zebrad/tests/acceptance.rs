@@ -844,8 +844,8 @@ fn last_config_is_stored() -> Result<()> {
          {} \n\
          \n\
          Or run: \n\
-         cargo build --bin zebrad && \n\
-         zebrad generate | \n\
+         cargo build --bin zakurad && \n\
+         zakurad generate | \n\
          sed 's/cache_dir = \".*\"/cache_dir = \"cache_dir\"/' | \n\
          sed 's/identity_dir = \".*\"/identity_dir = \"identity_dir\"/' > \n\
          {}",

@@ -13,7 +13,7 @@
 	compat-test-mainnet \
 	compat-test-testnet
 
-ZEBRAD_BIN ?= $(CURDIR)/target/release/zebrad
+ZEBRAD_BIN ?= $(CURDIR)/target/release/zakurad
 ZCASHD_BIN ?= /root/unity/zcash/src/zcashd
 ZCASH_CLI_BIN ?= /root/unity/zcash/src/zcash-cli
 
@@ -92,7 +92,7 @@ compat-docker-start:
 		-p 8233:8233 \
 		-p 127.0.0.1:8232:8232 \
 		"$(ZEBRA_DOCKER_IMAGE)" \
-		zebrad start --zcashd-compat
+		zakurad start --zcashd-compat
 
 compat-zebrad-start-supervised-managed:
 	@echo "Starting zebrad in zcashd-compat mode with managed zcashd download..."
@@ -138,7 +138,7 @@ compat-zcashd-start-standalone:
 
 compat-zebrad-status:
 	@echo "Checking zebrad process..."
-	@if pgrep -f "zebrad start --zcashd-compat" >/dev/null; then \
+	@if pgrep -f "zakurad start --zcashd-compat" >/dev/null; then \
 		echo "zebrad process: OK"; \
 	else \
 		echo "zebrad process: NOT RUNNING"; \

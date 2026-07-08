@@ -149,11 +149,11 @@ command -v docker >/dev/null || fail "docker is required"
 command -v jq >/dev/null || fail "jq is required to parse RPC responses"
 command -v python3 >/dev/null || fail "python3 is required to run the trace oracle"
 
-# Ensure a host-built zebrad binary exists; build it (debug) if not.
-ZEBRAD_BIN="${ZEBRAD_BIN:-${REPO_DIR}/target/debug/zebrad}"
+# Ensure a host-built zakurad binary exists; build it (debug) if not.
+ZEBRAD_BIN="${ZEBRAD_BIN:-${REPO_DIR}/target/debug/zakurad}"
 if [[ ! -x "${ZEBRAD_BIN}" ]]; then
-  log "building host zebrad (debug) — no in-container build"
-  ( cd "${REPO_DIR}" && CXXFLAGS="-include cstdint" cargo build -p zebrad --bin zebrad )
+  log "building host zakurad (debug) — no in-container build"
+  ( cd "${REPO_DIR}" && CXXFLAGS="-include cstdint" cargo build -p zebrad --bin zakurad )
 fi
 [[ -x "${ZEBRAD_BIN}" ]] || fail "zebrad binary not found at ${ZEBRAD_BIN}"
 export ZEBRAD_BIN

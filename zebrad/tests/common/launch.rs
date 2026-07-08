@@ -140,7 +140,7 @@ where
 
         args.merge_with(extra_args);
 
-        self.spawn_child_with_command(env!("CARGO_BIN_EXE_zebrad"), args)
+        self.spawn_child_with_command(env!("CARGO_BIN_EXE_zakurad"), args)
     }
 
     fn with_config(self, config: &mut ZebradConfig) -> Result<Self> {

@@ -35,9 +35,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/workspace/target \
 #     RUSTFLAGS="${RUSTFLAGS}" \
-    cargo build --locked --release --features "${FEATURES}" --package zebrad --bin zebrad && \
-    install -D target/release/zebrad /out/zebrad
+    cargo build --locked --release --features "${FEATURES}" --package zebrad --bin zakurad && \
+    install -D target/release/zakurad /out/zakurad
 
 FROM scratch AS artifact
 
-COPY --from=build /out/zebrad /zebrad
+COPY --from=build /out/zakurad /zakurad

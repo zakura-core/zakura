@@ -658,7 +658,7 @@ fn version_args() -> Result<()> {
 fn config_tests() -> Result<()> {
     valid_generated_config("start", "Starting zebrad")?;
 
-    // Check what happens when Zebra parses an invalid config
+    // Check what happens when Zakura parses an invalid config
     invalid_generated_config()?;
 
     // Check that we have a current version of the config stored
@@ -859,7 +859,7 @@ fn current_version_config_path() -> PathBuf {
     configs_dir().join(format!("v{}.toml", env!("CARGO_PKG_VERSION")))
 }
 
-/// Checks that Zebra prints an informative message when it cannot parse the
+/// Checks that Zakura prints an informative message when it cannot parse the
 /// config file.
 #[tracing::instrument]
 fn invalid_generated_config() -> Result<()> {
@@ -887,7 +887,7 @@ fn invalid_generated_config() -> Result<()> {
         "generated config file not found"
     );
 
-    // Load the valid config file that Zebra generated.
+    // Load the valid config file that Zakura generated.
     let mut config_file = fs::read_to_string(config_path.to_str().unwrap()).unwrap();
 
     // Let's now alter the config file so that it contains a deprecated format
@@ -911,34 +911,34 @@ fn invalid_generated_config() -> Result<()> {
 
     tracing::info!(?config_path, "writing invalid config");
 
-    // Write the altered config file so that Zebra can pick it up.
+    // Write the altered config file so that Zakura can pick it up.
     fs::write(config_path.to_str().unwrap(), config_file.as_bytes())
         .expect("Could not write the altered config file.");
 
     tracing::info!(?config_path, "testing invalid config parsing");
 
-    // Run Zebra in a temp dir so that it loads the config.
+    // Run Zakura in a temp dir so that it loads the config.
     let mut child = testdir.spawn_child(args!["start"])?;
 
     // Return an error if Zebra is running for more than two seconds.
     //
-    // Since the config is invalid, Zebra should terminate instantly after its
-    // start. Two seconds should be sufficient for Zebra to read the config file
+    // Since the config is invalid, Zakura should terminate instantly after its
+    // start. Two seconds should be sufficient for Zakura to read the config file
     // and terminate.
     std::thread::sleep(Duration::from_secs(2));
     if child.is_running() {
         // We're going to error anyway, so return an error that makes sense to the developer.
         child.kill(true)?;
         return Err(eyre!(
-            "Zebra should have exited after reading the invalid config"
+            "Zakura should have exited after reading the invalid config"
         ));
     }
 
     let output = child.wait_with_output()?;
 
-    // Check that Zebra produced an informative message.
+    // Check that Zakura produced an informative message.
     output.stderr_contains(
-        "Zebra could not load the provided configuration file and/or environment variables",
+        "Zakura could not load the provided configuration file and/or environment variables",
     )?;
 
     Ok(())

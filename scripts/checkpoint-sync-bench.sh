@@ -72,7 +72,7 @@ BASELINE_SHOULD_USE_LEGACY_P2P="${BASELINE_SHOULD_USE_LEGACY_P2P:-1}"
 START_HEIGHT="${START_HEIGHT:-1707210}"
 SNAPSHOT_URL="${SNAPSHOT_URL:-https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
 SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769}"
-SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-https://zebra-snapshots.nyc3.cdn.digitaloceanspaces.com/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
+SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-https://zebra.valargroup.dev/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
 BENCH_HOME="${BENCH_HOME:-/opt/zebra-bench}"
 GH_REPO="${GH_REPO:-valargroup/zebra}"
 OUT_DIR="${OUT_DIR:-$PWD/bench-out}"
@@ -192,7 +192,7 @@ ensure_snapshot() {
   for url in "$SNAPSHOT_URL" "$SNAPSHOT_MIRROR"; do
     [[ -n "$url" ]] || continue
     log "source: $url"
-    if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 "$url" \
+    if curl --http1.1 -fL --retry 3 --retry-delay 5 --connect-timeout 30 "$url" \
          | tee >(sha256sum | awk '{print $1}' > "$sumf") \
          | zstd -dc --long=31 | tar -x -C "$tmp"; then
       ok=1; break

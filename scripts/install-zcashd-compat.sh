@@ -15,9 +15,9 @@ ZEBRA_RELEASE_TAG="v5.0.0-test.4"
 ZEBRA_ARCHIVE="zebrad-${ZEBRA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZEBRA_URL="https://github.com/valargroup/zebra/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
 ZEBRA_MEMBER="./bin/zebrad"
-ZEBRA_DOCKER_IMAGE="valaroman/zebra:5.0.0-test.4"
-ZEBRA_COMPAT_DOCKER_IMAGE="valaroman/zebra:zcashd-compat-5.0.0-test.4"
-ZEBRA_COMPAT_DOCKER_FALLBACK_IMAGE="valaroman/zebra:zcashd-compat-latest"
+ZEBRA_DOCKER_IMAGE="valargroup/zakura:5.0.0-test.4"
+ZEBRA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-5.0.0-test.4"
+ZEBRA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
 ZEBRA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zebra"
 ZEBRA_DOCKER_RUNTIME_UID=10001
 ZEBRA_DOCKER_RUNTIME_GID=10001
@@ -1133,7 +1133,7 @@ data_detection_message() {
     fi
   fi
   printf '\nhttps://zcashd.valargroup.org/\n'
-  printf '\nhttps://zebra.valargroup.org/\n'
+  printf '\nhttps://zebra.valargroup.dev/\n'
   printf '\n'
 }
 
@@ -1316,8 +1316,8 @@ EOF
 
 print_source_commands() {
   cat <<EOF
-git clone https://github.com/valargroup/zebra.git
-git clone https://github.com/valargroup/zcashd.git
+git clone https://github.com/zakura-core/zakura.git
+git clone https://github.com/valargroup/zcashd.git zcash
 
 cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zebrad
 cd $(shell_quote "$UNITY_ROOT/zcash") && ./zcutil/build.sh -j"\$(nproc)"

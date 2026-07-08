@@ -14,7 +14,7 @@ ZEBRA_RELEASE_TAG="v5.0.0-test.4"
 ZEBRA_ARCHIVE="zebrad-${ZEBRA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZEBRA_URL="https://github.com/valargroup/zebra/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
 ZEBRA_MEMBER="./bin/zebrad"
-ZEBRA_DOCKER_IMAGE="valaroman/zebra:5.0.0-test.4"
+ZEBRA_DOCKER_IMAGE="valargroup/zakura:5.0.0-test.4"
 
 MODE=""
 NETWORK="Mainnet"
@@ -688,7 +688,7 @@ data_detection_message() {
       printf 'Please download the Zebra snapshot from the location below if you want a faster sync\n'
     fi
   fi
-  printf '\nhttps://zebra.valargroup.org/\n\n'
+  printf '\nhttps://zebra.valargroup.dev/\n\n'
 }
 
 docker_image_available_or_pull() {
@@ -743,7 +743,7 @@ EOF
 
 print_source_commands() {
   cat <<EOF
-git clone https://github.com/valargroup/zebra.git
+git clone https://github.com/zakura-core/zakura.git
 
 cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zebrad
 

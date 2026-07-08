@@ -1,6 +1,6 @@
 # Lightweight Zakura dual-stack regtest e2e — a smoke test, deliberately small.
 #
-# Three zebrad nodes on a fresh Regtest chain. The key cost-saving choice: there
+# Three zakurad nodes on a fresh Regtest chain. The key cost-saving choice: there
 # is NO in-container compilation. Each node runs the HOST-built `zakurad` binary
 # bind-mounted into a stock `debian:trixie-slim` (which already ships glibc 2.41,
 # libstdc++, and libgcc — everything the binary needs). The previous e2e did a
@@ -9,7 +9,7 @@
 # Build the binary once on the host, then bring the cluster up:
 #
 #   cargo build -p zebrad --bin zakurad         # debug is fine for regtest
-#   ZEBRAD_BIN=$(pwd)/target/debug/zakurad \
+#   ZAKURAD_BIN=$(pwd)/target/debug/zakurad \
 #     docker compose -f docker/docker-compose.zakura-regtest-e2e.yml up -d
 #
 # Or just run docker/zakura-regtest-e2e/run.sh, which does all of the above and
@@ -40,10 +40,10 @@ services:
   zakura-node-1:
     <<: *zakura-node
     container_name: zakura-node-1
-    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zebrad/node1.toml", "start"]
+    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zakura/node1.toml", "start"]
     volumes:
-      - ${ZEBRAD_BIN:-../target/debug/zakurad}:/usr/local/bin/zakurad:ro
-      - ${ZAKURA_NODE1_CONFIG:-./zakura-regtest-e2e/node1.toml}:/etc/zebrad/node1.toml:ro
+      - ${ZAKURAD_BIN:-../target/debug/zakurad}:/usr/local/bin/zakurad:ro
+      - ${ZAKURA_NODE1_CONFIG:-./zakura-regtest-e2e/node1.toml}:/etc/zakura/node1.toml:ro
       - ${ZAKURA_E2E_TRACE_DIR:-/tmp/zakura-regtest-e2e-traces}:/traces
 
   zakura-node-2:
@@ -51,10 +51,10 @@ services:
     container_name: zakura-node-2
     depends_on:
       - zakura-node-1
-    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zebrad/node2.toml", "start"]
+    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zakura/node2.toml", "start"]
     volumes:
-      - ${ZEBRAD_BIN:-../target/debug/zakurad}:/usr/local/bin/zakurad:ro
-      - ${ZAKURA_NODE2_CONFIG:-./zakura-regtest-e2e/node2.toml}:/etc/zebrad/node2.toml:ro
+      - ${ZAKURAD_BIN:-../target/debug/zakurad}:/usr/local/bin/zakurad:ro
+      - ${ZAKURA_NODE2_CONFIG:-./zakura-regtest-e2e/node2.toml}:/etc/zakura/node2.toml:ro
       - ${ZAKURA_E2E_TRACE_DIR:-/tmp/zakura-regtest-e2e-traces}:/traces
 
   zakura-node-3:
@@ -62,10 +62,10 @@ services:
     container_name: zakura-node-3
     depends_on:
       - zakura-node-1
-    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zebrad/node3.toml", "start"]
+    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zakura/node3.toml", "start"]
     volumes:
-      - ${ZEBRAD_BIN:-../target/debug/zakurad}:/usr/local/bin/zakurad:ro
-      - ${ZAKURA_NODE3_CONFIG:-./zakura-regtest-e2e/node3.toml}:/etc/zebrad/node3.toml:ro
+      - ${ZAKURAD_BIN:-../target/debug/zakurad}:/usr/local/bin/zakurad:ro
+      - ${ZAKURA_NODE3_CONFIG:-./zakura-regtest-e2e/node3.toml}:/etc/zakura/node3.toml:ro
       - ${ZAKURA_E2E_TRACE_DIR:-/tmp/zakura-regtest-e2e-traces}:/traces
 
   zakura-node-4:
@@ -73,8 +73,8 @@ services:
     container_name: zakura-node-4
     depends_on:
       - zakura-node-1
-    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zebrad/node4.toml", "start"]
+    entrypoint: ["/usr/local/bin/zakurad", "--config", "/etc/zakura/node4.toml", "start"]
     volumes:
-      - ${ZEBRAD_BIN:-../target/debug/zakurad}:/usr/local/bin/zakurad:ro
-      - ${ZAKURA_NODE4_CONFIG:-./zakura-regtest-e2e/node4.toml}:/etc/zebrad/node4.toml:ro
+      - ${ZAKURAD_BIN:-../target/debug/zakurad}:/usr/local/bin/zakurad:ro
+      - ${ZAKURA_NODE4_CONFIG:-./zakura-regtest-e2e/node4.toml}:/etc/zakura/node4.toml:ro
       - ${ZAKURA_E2E_TRACE_DIR:-/tmp/zakura-regtest-e2e-traces}:/traces

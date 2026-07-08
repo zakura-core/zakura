@@ -1,10 +1,10 @@
-//! `generate` subcommand - generates a default `zebrad.toml` config.
+//! `generate` subcommand - generates a default `zakura.toml` config.
 
 use crate::config::ZebradConfig;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
 
-/// Generate a default `zebrad.toml` configuration
+/// Generate a default `zakura.toml` configuration
 #[derive(Command, Debug, Default, Parser)]
 pub struct GenerateCmd {
     /// The file to write the generated config to.
@@ -23,14 +23,14 @@ impl Runnable for GenerateCmd {
     #[allow(clippy::print_stdout)]
     fn run(&self) {
         let default_config = ZebradConfig::default();
-        let mut output = r"# Default configuration for zebrad.
+        let mut output = r"# Default configuration for zakurad.
 #
 # This file can be used as a skeleton for custom configs.
 #
 # Unspecified fields use default values. Optional fields are Some(field) if the
 # field is present and None if it is absent.
 #
-# This file is generated as an example using zebrad's current defaults.
+# This file is generated as an example using zakurad's current defaults.
 # You should set only the config options you want to keep, and delete the rest.
 # Only a subset of fields are present in the skeleton, since optional values
 # whose default is None are omitted.
@@ -41,29 +41,31 @@ impl Runnable for GenerateCmd {
 #
 # CONFIGURATION SOURCES (in order of precedence, highest to lowest):
 #
-# 1. Environment variables with ZEBRA_ prefix (highest precedence)
-#    - Format: ZEBRA_SECTION__KEY (double underscore for nested keys)
+# 1. Environment variables with ZAKURA_ prefix (highest precedence)
+#    - Format: ZAKURA_SECTION__KEY (double underscore for nested keys)
 #    - Examples:
-#      - ZEBRA_NETWORK__NETWORK=Testnet
-#      - ZEBRA_RPC__LISTEN_ADDR=127.0.0.1:8232
-#      - ZEBRA_STATE__CACHE_DIR=/path/to/cache
-#      - ZEBRA_TRACING__FILTER=debug
-#      - ZEBRA_METRICS__ENDPOINT_ADDR=0.0.0.0:9999
+#      - ZAKURA_NETWORK__NETWORK=Testnet
+#      - ZAKURA_RPC__LISTEN_ADDR=127.0.0.1:8232
+#      - ZAKURA_STATE__CACHE_DIR=/path/to/cache
+#      - ZAKURA_TRACING__FILTER=debug
+#      - ZAKURA_METRICS__ENDPOINT_ADDR=0.0.0.0:9999
+#
+#    Deprecated ZEBRA_ environment variables are still accepted as a lower-precedence fallback.
 #
 # 2. Configuration file (TOML format)
-#    - At the path specified via -c flag, e.g. `zebrad -c myconfig.toml start`, or
+#    - At the path specified via -c flag, e.g. `zakurad -c myconfig.toml start`, or
 #    - At the default path in the user's preference directory (platform-dependent, see below)
 #
 # 3. Hard-coded defaults (lowest precedence)
 #
-# The user's preference directory and the default path to the `zebrad` config are platform dependent,
+# The user's preference directory and the default path to the `zakurad` config are platform dependent,
 # based on `dirs::preference_dir`, see https://docs.rs/dirs/latest/dirs/fn.preference_dir.html :
 #
 # | Platform | Value                                 | Example                                        |
 # | -------- | ------------------------------------- | ---------------------------------------------- |
-# | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/zebrad.toml`              |
-# | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/zebrad.toml` |
-# | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\zebrad.toml`     |
+# | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/zakura.toml`              |
+# | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/zakura.toml` |
+# | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\zakura.toml`     |
 
 "
         .to_owned();

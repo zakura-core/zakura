@@ -103,7 +103,7 @@ jobs:
     with:
       state_key: pre-nu62
       nextest_profile: sync-range-pre-nu62
-      test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
+      test_variables: "ZAKURA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
       # Stable ironwood-main image on schedule / build_image=false; the freshly-built sha
       # image on a build_image dispatch.
       image_ref: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.build_image)) && format('ghcr.io/{0}-tests:ironwood-main', github.repository) || needs.build.outputs.image_ref }}
@@ -123,7 +123,7 @@ jobs:
     with:
       state_key: post-nu62
       nextest_profile: sync-range-post-nu62
-      test_variables: "ZEBRA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
+      test_variables: "ZAKURA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
       image_ref: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.build_image)) && format('ghcr.io/{0}-tests:ironwood-main', github.repository) || needs.build.outputs.image_ref }}
       droplet_size: g-8vcpu-32gb
 

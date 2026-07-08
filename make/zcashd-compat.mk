@@ -1,11 +1,11 @@
 .PHONY: \
 	compat-docker-build \
 	compat-docker-start \
-	compat-zebrad-start-supervised-managed \
-	compat-zebrad-start-supervised \
-	compat-zebrad-start-unsupervised \
+	compat-zakurad-start-supervised-managed \
+	compat-zakurad-start-supervised \
+	compat-zakurad-start-unsupervised \
 	compat-zcashd-start-standalone \
-	compat-zebrad-status \
+	compat-zakurad-status \
 	compat-zcashd-status \
 	compat-status-sync \
 	compat-test-regtest \
@@ -13,27 +13,27 @@
 	compat-test-mainnet \
 	compat-test-testnet
 
-ZEBRAD_BIN ?= $(CURDIR)/target/release/zakurad
+ZAKURAD_BIN ?= $(CURDIR)/target/release/zakurad
 ZCASHD_BIN ?= /root/unity/zcash/src/zcashd
 ZCASH_CLI_BIN ?= /root/unity/zcash/src/zcash-cli
 
 # TODO: make more general
 NETWORK ?= Mainnet
-ZEBRA_STATE_CACHE_DIR ?= /mnt/data/zakura-state
+ZAKURA_STATE_CACHE_DIR ?= /mnt/data/zakura-state
 ZCASHD_DATADIR ?= /mnt/data/zcashd-mainnet
 ZCASHD_CONF ?= $(ZCASHD_DATADIR)/zcash.conf
 ZCASHD_EXTRA_ARGS ?= -printtoconsole
-# Zebra's legacy P2P listener; standalone zcashd pins its single peer to it.
-ZEBRA_P2P_ADDR ?= 127.0.0.1:8233
-# Dedicated zcashd-compat Zebra RPC listener (operator tooling only; the P2P
+# Zakura's legacy P2P listener; standalone zcashd pins its single peer to it.
+ZAKURA_P2P_ADDR ?= 127.0.0.1:8233
+# Dedicated zcashd-compat Zakura RPC listener (operator tooling only; the P2P
 # sidecar zcashd does not use it).
-ZCASHD_ZEBRA_RPC_URL ?= http://127.0.0.1:28232
+ZCASHD_ZAKURA_RPC_URL ?= http://127.0.0.1:28232
 
-ZEBRA_COOKIE_DIR ?= $(ZEBRA_STATE_CACHE_DIR)
-ZEBRA_COOKIE_FILE ?= $(ZEBRA_COOKIE_DIR)/.zcashd-compat.cookie
+ZAKURA_COOKIE_DIR ?= $(ZAKURA_STATE_CACHE_DIR)
+ZAKURA_COOKIE_FILE ?= $(ZAKURA_COOKIE_DIR)/.zcashd-compat.cookie
 HEIGHT_MAX_DRIFT ?= 10
 
-ZEBRA_DOCKER_IMAGE ?= zebra:zcashd-compat
+ZAKURA_DOCKER_IMAGE ?= zakura:zcashd-compat
 ZCASHD_COMPAT_MANIFEST ?= $(CURDIR)/zebrad/zcashd-compat-manifest.json
 ZCASHD_COMPAT_TARGET_TRIPLE ?= x86_64-pc-linux-gnu
 ZCASHD_COMPAT_RELEASE_TAG ?= $(shell jq -er '.release_tag' $(ZCASHD_COMPAT_MANIFEST))
@@ -73,87 +73,87 @@ compat-docker-build: compat-zcashd-prepare
 	fi; \
 	docker build -f ./docker/Dockerfile --target runtime-zcashd-compat \
 		--build-context "zcashd_compat=$$context_dir" \
-		--tag "$(ZEBRA_DOCKER_IMAGE)" .
+		--tag "$(ZAKURA_DOCKER_IMAGE)" .
 
-# The Zebra compat listener is internal to the supervised zcashd process in this
+# The Zakura compat listener is internal to the supervised zcashd process in this
 # container, so keep it on container loopback and publish only zcashd's RPC port.
 compat-docker-start:
 	@echo "Starting Docker zcashd-compat container..."
 	docker run --rm -it \
 		-e ZCASHD_COMPAT_ENABLED=true \
-		-e ZEBRA_NETWORK__NETWORK="$(NETWORK)" \
-		-e ZEBRA_NETWORK__LISTEN_ADDR="[::]:8233" \
-		-e ZEBRA_STATE__CACHE_DIR="/home/zebra/.cache/zakura" \
-		-e ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR="/home/zebra/.cache/zcashd" \
-		-e ZEBRA_ZCASHD_COMPAT__LISTEN_ADDR="127.0.0.1:28232" \
-		-e ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \
-		--mount type=bind,src="$(ZEBRA_STATE_CACHE_DIR)",dst="/home/zebra/.cache/zakura" \
+		-e ZAKURA_NETWORK__NETWORK="$(NETWORK)" \
+		-e ZAKURA_NETWORK__LISTEN_ADDR="[::]:8233" \
+		-e ZAKURA_STATE__CACHE_DIR="/home/zebra/.cache/zakura" \
+		-e ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR="/home/zebra/.cache/zcashd" \
+		-e ZAKURA_ZCASHD_COMPAT__LISTEN_ADDR="127.0.0.1:28232" \
+		-e ZAKURA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \
+		--mount type=bind,src="$(ZAKURA_STATE_CACHE_DIR)",dst="/home/zebra/.cache/zakura" \
 		--mount type=bind,src="$(ZCASHD_DATADIR)",dst="/home/zebra/.cache/zcashd" \
 		-p 8233:8233 \
 		-p 127.0.0.1:8232:8232 \
-		"$(ZEBRA_DOCKER_IMAGE)" \
+		"$(ZAKURA_DOCKER_IMAGE)" \
 		zakurad start --zcashd-compat
 
-compat-zebrad-start-supervised-managed:
-	@echo "Starting zebrad in zcashd-compat mode with managed zcashd download..."
-	ZEBRA_NETWORK__NETWORK="$(NETWORK)" \
-	ZEBRA_STATE__CACHE_DIR="$(ZEBRA_STATE_CACHE_DIR)" \
-	ZEBRA_ZCASHD_COMPAT__COOKIE_DIR="$(ZEBRA_COOKIE_DIR)" \
-	ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE=managed \
-	ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR="$(ZCASHD_DATADIR)" \
-	"$(ZEBRAD_BIN)" start --zcashd-compat
+compat-zakurad-start-supervised-managed:
+	@echo "Starting zakurad in zcashd-compat mode with managed zcashd download..."
+	ZAKURA_NETWORK__NETWORK="$(NETWORK)" \
+	ZAKURA_STATE__CACHE_DIR="$(ZAKURA_STATE_CACHE_DIR)" \
+	ZAKURA_ZCASHD_COMPAT__COOKIE_DIR="$(ZAKURA_COOKIE_DIR)" \
+	ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=managed \
+	ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR="$(ZCASHD_DATADIR)" \
+	"$(ZAKURAD_BIN)" start --zcashd-compat
 
-compat-zebrad-start-supervised:
-	@echo "Starting zebrad in zcashd-compat mode with supervision enabled..."
-	ZEBRA_NETWORK__NETWORK="$(NETWORK)" \
-	ZEBRA_STATE__CACHE_DIR="$(ZEBRA_STATE_CACHE_DIR)" \
-	ZEBRA_ZCASHD_COMPAT__COOKIE_DIR="$(ZEBRA_COOKIE_DIR)" \
-	ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE=path \
-	ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH="$(ZCASHD_BIN)" \
-	ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR="$(ZCASHD_DATADIR)" \
-	"$(ZEBRAD_BIN)" start --zcashd-compat
+compat-zakurad-start-supervised:
+	@echo "Starting zakurad in zcashd-compat mode with supervision enabled..."
+	ZAKURA_NETWORK__NETWORK="$(NETWORK)" \
+	ZAKURA_STATE__CACHE_DIR="$(ZAKURA_STATE_CACHE_DIR)" \
+	ZAKURA_ZCASHD_COMPAT__COOKIE_DIR="$(ZAKURA_COOKIE_DIR)" \
+	ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=path \
+	ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH="$(ZCASHD_BIN)" \
+	ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR="$(ZCASHD_DATADIR)" \
+	"$(ZAKURAD_BIN)" start --zcashd-compat
 
-compat-zebrad-start-unsupervised:
-	@echo "Starting zebrad in zcashd-compat mode with supervision disabled..."
-	ZEBRA_NETWORK__NETWORK="$(NETWORK)" \
-	ZEBRA_STATE__CACHE_DIR="$(ZEBRA_STATE_CACHE_DIR)" \
-	ZEBRA_ZCASHD_COMPAT__COOKIE_DIR="$(ZEBRA_COOKIE_DIR)" \
-	ZEBRA_ZCASHD_COMPAT__MANAGE_ZCASHD=false \
-	ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE=path \
-	ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH="$(ZCASHD_BIN)" \
-	ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR="$(ZCASHD_DATADIR)" \
-	"$(ZEBRAD_BIN)" start --zcashd-compat
+compat-zakurad-start-unsupervised:
+	@echo "Starting zakurad in zcashd-compat mode with supervision disabled..."
+	ZAKURA_NETWORK__NETWORK="$(NETWORK)" \
+	ZAKURA_STATE__CACHE_DIR="$(ZAKURA_STATE_CACHE_DIR)" \
+	ZAKURA_ZCASHD_COMPAT__COOKIE_DIR="$(ZAKURA_COOKIE_DIR)" \
+	ZAKURA_ZCASHD_COMPAT__MANAGE_ZCASHD=false \
+	ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=path \
+	ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH="$(ZCASHD_BIN)" \
+	ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR="$(ZCASHD_DATADIR)" \
+	"$(ZAKURAD_BIN)" start --zcashd-compat
 
 compat-zcashd-start-standalone:
-	@echo "Starting zcashd as a standalone P2P sidecar of Zebra..."
+	@echo "Starting zcashd as a standalone P2P sidecar of Zakura..."
 	"$(ZCASHD_BIN)" \
 		-datadir="$(ZCASHD_DATADIR)" \
 		-conf="$(ZCASHD_CONF)" \
 		$(ZCASHD_EXTRA_ARGS) \
-		-connect="$(ZEBRA_P2P_ADDR)" \
+		-connect="$(ZAKURA_P2P_ADDR)" \
 		-listen=0 \
 		-dnsseed=0 \
 		-listenonion=0 \
 		-discover=0
 
-compat-zebrad-status:
-	@echo "Checking zebrad process..."
+compat-zakurad-status:
+	@echo "Checking zakurad process..."
 	@if pgrep -f "zakurad start --zcashd-compat" >/dev/null; then \
-		echo "zebrad process: OK"; \
+		echo "zakurad process: OK"; \
 	else \
-		echo "zebrad process: NOT RUNNING"; \
+		echo "zakurad process: NOT RUNNING"; \
 		exit 1; \
 	fi
-	@echo "Checking Zebra RPC getblockcount..."
-	@if [ ! -f "$(ZEBRA_COOKIE_FILE)" ]; then \
-		echo "Zebra cookie file missing: $(ZEBRA_COOKIE_FILE)"; \
+	@echo "Checking Zakura RPC getblockcount..."
+	@if [ ! -f "$(ZAKURA_COOKIE_FILE)" ]; then \
+		echo "Zakura cookie file missing: $(ZAKURA_COOKIE_FILE)"; \
 		exit 1; \
 	fi
-	@zebra_height="$$(curl -sS --fail --user "$$(cat "$(ZEBRA_COOKIE_FILE)")" \
+	@zebra_height="$$(curl -sS --fail --user "$$(cat "$(ZAKURA_COOKIE_FILE)")" \
 		-H 'Content-Type: application/json' \
 		--data '{"jsonrpc":"1.0","id":"make","method":"getblockcount","params":[]}' \
-		"$(ZCASHD_ZEBRA_RPC_URL)" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"])')"; \
-		echo "zebrad RPC height: $$zebra_height"
+		"$(ZCASHD_ZAKURA_RPC_URL)" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"])')"; \
+		echo "zakurad RPC height: $$zebra_height"
 
 compat-zcashd-status:
 	@echo "Checking zcashd process..."
@@ -165,7 +165,7 @@ compat-zcashd-status:
 	fi
 	@echo "Checking zcashd peer pinning..."
 	@peers="$$( "$(ZCASH_CLI_BIN)" -conf="$(ZCASHD_CONF)" -datadir="$(ZCASHD_DATADIR)" getconnectioncount )"; \
-		echo "zcashd connections: $$peers (expected: 1, the Zebra node)"; \
+		echo "zcashd connections: $$peers (expected: 1, the Zakura node)"; \
 		if [ "$$peers" != "1" ]; then \
 			echo "WARNING: sidecar zcashd should have exactly one peer"; \
 		fi
@@ -173,16 +173,16 @@ compat-zcashd-status:
 		echo "zcashd height: $$zcashd_height"
 
 compat-status-sync:
-	@$(MAKE) compat-zebrad-status
+	@$(MAKE) compat-zakurad-status
 	@$(MAKE) compat-zcashd-status
-	@zebra_height="$$(curl -sS --fail --user "$$(cat "$(ZEBRA_COOKIE_FILE)")" \
+	@zebra_height="$$(curl -sS --fail --user "$$(cat "$(ZAKURA_COOKIE_FILE)")" \
 		-H 'Content-Type: application/json' \
 		--data '{"jsonrpc":"1.0","id":"make","method":"getblockcount","params":[]}' \
-		"$(ZCASHD_ZEBRA_RPC_URL)" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"])')"; \
+		"$(ZCASHD_ZAKURA_RPC_URL)" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"])')"; \
 		zcashd_height="$$( "$(ZCASH_CLI_BIN)" -conf="$(ZCASHD_CONF)" -datadir="$(ZCASHD_DATADIR)" getblockcount )"; \
 		drift=$$(( zebra_height - zcashd_height )); \
 		if [ $$drift -lt 0 ]; then drift=$$(( -drift )); fi; \
-		echo "zebrad height: $$zebra_height"; \
+		echo "zakurad height: $$zebra_height"; \
 		echo "zcashd height: $$zcashd_height"; \
 		echo "height drift: $$drift (max allowed: $(HEIGHT_MAX_DRIFT))"; \
 		if [ $$drift -gt "$(HEIGHT_MAX_DRIFT)" ]; then \

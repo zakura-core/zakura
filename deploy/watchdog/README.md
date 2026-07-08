@@ -163,7 +163,7 @@ deploys the watchdog alongside `zebrad`:
    watchdog service so the running sidecar observes the marker,
 5. verifies the deployment with `/tmp/zcashd-compat-sync-check.sh`;
    on failure the workflow restores
-   `/usr/local/bin/zebrad.bak` and fails,
+   `/usr/local/bin/zakurad.bak` and fails,
 6. on success, installs/refreshes the `zebra-watchdog` systemd unit and
    restarts the continuous watchdog service.
 

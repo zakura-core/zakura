@@ -119,7 +119,7 @@ use crate::components;
 #[derive(Command, Debug, Default, clap::Parser)]
 pub struct StartCmd {
     /// Filter strings which override the config file and defaults
-    #[clap(help = "tracing filters which override the zebrad.toml config")]
+    #[clap(help = "tracing filters which override the zakura.toml config")]
     filters: Vec<String>,
 
     /// Enable zcashd-compat mode and apply zcashd-compat RPC guardrails.

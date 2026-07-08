@@ -66,9 +66,9 @@ then deploys it to:
 - `zakura-testnet-as` — `root@206.189.148.0`
 - `zakura-compat` — `root@206.189.208.228`
 
-The first five nodes are systemd-managed `zebrad.service` nodes. `zakura-compat`
+The first five nodes are systemd-managed `zakurad.service` nodes. `zakura-compat`
 is process-managed because it shares the compat host with a manually supervised
-`zcashd` sidecar; the deployer updates `/root/unity/zakura/target/release/zebrad`,
+`zcashd` sidecar; the deployer updates `/root/unity/zakura/target/release/zakurad`,
 rewrites `/root/unity/zakura-testnet.toml`, restarts only the Zakura process, and
 then the workflow verifies the sidecar with `deploy/zcashd-compat/sync-check.sh`.
 
@@ -97,9 +97,9 @@ The workflow is manual (`workflow_dispatch`). Inputs:
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
-while forcing the legacy non-VCT path. It also writes `/etc/zakura/zebrad.toml`
+while forcing the legacy non-VCT path. It also writes `/etc/zakura/zakura.toml`
 and uses each node's existing `/mnt/<node-name>-data/zakura-cache` snapshot
-directory, so CI restarts the current `zebrad.service` against the existing state
+directory, so CI restarts the current `zakurad.service` against the existing state
 instead of creating a fresh database. If an older `/mnt/<node-name>-data/zebra-cache`
 directory exists and the `zakura-cache` target does not, the deployer stops that
 node and moves the directory before starting with the new config. The compat
@@ -159,18 +159,18 @@ python3 deploy/runner/zebra-cluster-status.py \
 ## How the build cache works
 
 `commit` is resolved to a full SHA (`git rev-parse`). The binary is cached at
-`.build-cache/zebrad-<sha>`. A cached binary is reused only if its embedded
-`zebrad --version` matches the SHA, otherwise it is rebuilt. Two nodes on the same
+`.build-cache/zakurad-<sha>`. A cached binary is reused only if its embedded
+`zakurad --version` matches the SHA, otherwise it is rebuilt. Two nodes on the same
 commit build once. Each build happens in a throwaway detached `git worktree`, so
 your dirty working tree is never touched. Use `--force` to rebuild unconditionally.
 
 ## What gets installed on a node
 
-- Binary at `bin_path` (default `/usr/local/bin/zebrad`), previous kept as `.bak`.
-- Rendered config at `config_path` (default `/etc/zebrad/zebrad.toml`) with
+- Binary at `bin_path` (default `/usr/local/bin/zakurad`), previous kept as `.bak`.
+- Rendered config at `config_path` (default `/etc/zakura/zakura.toml`) with
   `[tracing] log_file` pointed at `log_file`.
 - Unit at `/etc/systemd/system/<service_name>.service` running
-  `zebrad -c <config_path> start` with `Restart=always`.
+  `zakurad -c <config_path> start` with `Restart=always`.
 
 The deterministic `log_file` is the single source of truth shared by the running
 node (writer) and `logs fetch`/`logs follow` (reader).

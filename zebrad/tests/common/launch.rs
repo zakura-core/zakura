@@ -125,7 +125,7 @@ where
     #[allow(clippy::unwrap_in_result)]
     fn spawn_child(self, extra_args: Arguments) -> Result<TestChild<Self>> {
         let dir = self.as_ref();
-        let default_config_path = dir.join("zebrad.toml");
+        let default_config_path = dir.join("zakura.toml");
         let mut args = Arguments::new();
 
         if default_config_path.exists() {
@@ -158,7 +158,7 @@ where
 
         // Remove any existing config before writing a new one
         let dir = self.as_ref();
-        let config_file = dir.join("zebrad.toml");
+        let config_file = dir.join("zakura.toml");
         match fs::remove_file(config_file) {
             Ok(()) => {}
             // If the config file doesn't exist, that's ok
@@ -200,7 +200,7 @@ where
             fs::create_dir_all(dir)?;
         }
 
-        let config_file = dir.join("zebrad.toml");
+        let config_file = dir.join("zakura.toml");
         fs::File::create(config_file)?.write_all(toml::to_string(&config)?.as_bytes())?;
 
         Ok(self)

@@ -98,7 +98,7 @@ impl From<Config> for InnerConfig {
     }
 }
 
-/// Inner consensus configuration for backwards compatibility with older `zebrad.toml` files,
+/// Inner consensus configuration for backwards compatibility with older `zakura.toml` files,
 /// which contain fields that have been removed.
 ///
 /// Rust API callers should use [`Config`].

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install or prepare commands for Zebra's zcashd-compat operating modes.
+# Install or prepare commands for Zakura's zcashd-compat operating modes.
 set -euo pipefail
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
@@ -11,16 +11,16 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZEBRA_RELEASE_TAG="v0.0.1-alpha.1"
-ZEBRA_ARCHIVE="zebrad-${ZEBRA_RELEASE_TAG}-linux-x86_64.tar.gz"
-ZEBRA_URL="https://github.com/zakura-core/zakura/releases/download/${ZEBRA_RELEASE_TAG}/${ZEBRA_ARCHIVE}"
-ZEBRA_MEMBER="./bin/zebrad"
-ZEBRA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1@sha256:74f76366eed48bdfb15a3386d033a6e3e2d7481f40cb06c5c6ae3c5e9f77e4b5"
-ZEBRA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.1@sha256:f3f36dc215a15f3724690529244df8527cc0389ccf4bf9348206cb49388ac8c8"
-ZEBRA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
-ZEBRA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
-ZEBRA_DOCKER_RUNTIME_UID=10001
-ZEBRA_DOCKER_RUNTIME_GID=10001
+ZAKURA_RELEASE_TAG="v0.0.1-alpha.1"
+ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
+ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
+ZAKURA_MEMBER="./bin/zakurad"
+ZAKURA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1@sha256:74f76366eed48bdfb15a3386d033a6e3e2d7481f40cb06c5c6ae3c5e9f77e4b5"
+ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.1@sha256:f3f36dc215a15f3724690529244df8527cc0389ccf4bf9348206cb49388ac8c8"
+ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
+ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
+ZAKURA_DOCKER_RUNTIME_UID=10001
+ZAKURA_DOCKER_RUNTIME_GID=10001
 
 MANIFEST_PATH="$REPO_ROOT/zebrad/zcashd-compat-manifest.json"
 TARGET_TRIPLE="x86_64-pc-linux-gnu"
@@ -31,18 +31,18 @@ ZCASHD_RUNTIME_ARCHIVE_MEMBER_BINARY_PATH="./bin/zcashd"
 MODE=""
 NETWORK="Mainnet"
 ZCASHD_DEFAULT_DATADIR="${HOME}/.zcash"
-ZEBRA_STATE_DIR="$ZEBRA_DEFAULT_CACHE_DIR"
+ZAKURA_STATE_DIR="$ZAKURA_DEFAULT_CACHE_DIR"
 ZCASHD_DATADIR="$ZCASHD_DEFAULT_DATADIR"
 INSTALL_DIR="${HOME}/.local/zcashd-compat"
 CACHE_DIR="${HOME}/.cache/zcashd-compat"
 COOKIE_DIR=""
 ZCASHD_CONF=""
-ZEBRAD_PATH=""
+ZAKURAD_PATH=""
 ZCASHD_PATH=""
 ZCASHD_DOCKER_IMAGE=""
 DOWNLOAD_BINARIES=1
 DOWNLOAD_BINARIES_SET=0
-ZEBRA_STATE_DIR_SET=0
+ZAKURA_STATE_DIR_SET=0
 ZCASHD_DATADIR_SET=0
 DRY_RUN=0
 NON_INTERACTIVE=0
@@ -128,8 +128,8 @@ Usage: install-zcashd-compat.sh [options]
 Interactive by default. Use flags for repeatable, non-interactive runs.
 
 Modes:
-  split-binary               Download zebrad and zcashd, print separate commands
-  supervised                 Download zebrad and zcashd, print Zebra-supervised command
+  split-binary               Download zakurad and zcashd, print separate commands
+  supervised                 Download zakurad and zcashd, print Zakura-supervised command
   docker-split-containers    Pull images, print separate docker run commands
   docker-supervised          Pull compat image, print single supervised docker run command
   build-from-source          Validate source tree paths, print build/start commands
@@ -143,7 +143,7 @@ Options:
   --cache-dir DIR
   --cookie-dir DIR
   --zcash-conf FILE
-  --zebrad-path PATH
+  --zakurad-path PATH
   --zcashd-path PATH
   --zcashd-docker-image IMAGE
   --download-binaries yes|no
@@ -593,14 +593,14 @@ recommend_zcashd_datadir() {
 recommend_datadir_defaults() {
   # Empty fallback locations share a filesystem, so size them for both datadirs
   # when both prompt defaults are being selected together.
-  if ((ZEBRA_STATE_DIR_SET == 0 && ZCASHD_DATADIR_SET == 0)); then
+  if ((ZAKURA_STATE_DIR_SET == 0 && ZCASHD_DATADIR_SET == 0)); then
     SYNTHETIC_INSTALL_MIN_BYTES=$((600 * 1024 * 1024 * 1024))
   else
     SYNTHETIC_INSTALL_MIN_BYTES=$((300 * 1024 * 1024 * 1024))
   fi
 
-  if ((ZEBRA_STATE_DIR_SET == 0)); then
-    ZEBRA_STATE_DIR="$(recommend_zebra_state_dir "$ZEBRA_DEFAULT_CACHE_DIR")"
+  if ((ZAKURA_STATE_DIR_SET == 0)); then
+    ZAKURA_STATE_DIR="$(recommend_zebra_state_dir "$ZAKURA_DEFAULT_CACHE_DIR")"
   fi
 
   if ((ZCASHD_DATADIR_SET == 0)); then
@@ -625,9 +625,9 @@ prompt_mode() {
   if ((USE_ANSI)); then
     printf '\n%s\n' "$(style "$BOLD" "Choose a zcashd-compat mode:")"
     printf '  %b1)%b %bsplit-binary%b\n' "$CYAN$BOLD" "$RESET" "$GREEN$BOLD" "$RESET"
-    printf '     %bStart Zebra and zcashd as two separate processes.%b\n' "$DIM" "$RESET"
+    printf '     %bStart Zakura and zcashd as two separate processes.%b\n' "$DIM" "$RESET"
     printf '  %b2)%b %bsupervised%b\n' "$CYAN$BOLD" "$RESET" "$GREEN$BOLD" "$RESET"
-    printf '     %bStart Zebra, which downloads hash-pinned zcashd and spins it up as a supervised child process.%b\n' "$DIM" "$RESET"
+    printf '     %bStart Zakura, which downloads hash-pinned zcashd and spins it up as a supervised child process.%b\n' "$DIM" "$RESET"
     printf '  %b3)%b %bdocker-split-containers%b\n' "$CYAN$BOLD" "$RESET" "$GREEN$BOLD" "$RESET"
     printf '     %bsplit-binary, but in Docker.%b\n' "$DIM" "$RESET"
     printf '  %b4)%b %bdocker-supervised%b\n' "$CYAN$BOLD" "$RESET" "$GREEN$BOLD" "$RESET"
@@ -638,9 +638,9 @@ prompt_mode() {
     cat <<'EOF'
 Choose a zcashd-compat mode:
   1) split-binary
-     Start Zebra and zcashd as two separate processes.
+     Start Zakura and zcashd as two separate processes.
   2) supervised
-     Start Zebra, which downloads hash-pinned zcashd and spins it up as a supervised child process.
+     Start Zakura, which downloads hash-pinned zcashd and spins it up as a supervised child process.
   3) docker-split-containers
      split-binary, but in Docker.
   4) docker-supervised
@@ -666,7 +666,7 @@ normalize_inputs() {
 
   if [[ "$MODE" == "split-binary" || "$MODE" == "supervised" ]]; then
     if ((DOWNLOAD_BINARIES_SET == 0)); then
-      case "$(prompt_yes_no "Download Zebra/zcashd release binaries now?" "yes")" in
+      case "$(prompt_yes_no "Download Zakura/zcashd release binaries now?" "yes")" in
         yes | y | Y | YES | Yes) DOWNLOAD_BINARIES=1 ;;
         no | n | N | NO | No) DOWNLOAD_BINARIES=0 ;;
         *) add_error "binary download answer must be yes or no" ;;
@@ -676,7 +676,7 @@ normalize_inputs() {
 
   recommend_datadir_defaults
 
-  ZEBRA_STATE_DIR="$(prompt_value "Zakura state directory" "$ZEBRA_STATE_DIR")"
+  ZAKURA_STATE_DIR="$(prompt_value "Zakura state directory" "$ZAKURA_STATE_DIR")"
   ZCASHD_DATADIR="$(prompt_value "zcashd datadir" "$ZCASHD_DATADIR")"
   INSTALL_DIR="$(prompt_value "Install directory" "$INSTALL_DIR")"
 
@@ -684,19 +684,19 @@ normalize_inputs() {
     ZCASHD_CONF="$ZCASHD_DATADIR/zcash.conf"
   fi
 
-  ZEBRA_STATE_DIR="$(printf '%s' "$ZEBRA_STATE_DIR" | sanitize_terminal_input)"
+  ZAKURA_STATE_DIR="$(printf '%s' "$ZAKURA_STATE_DIR" | sanitize_terminal_input)"
   ZCASHD_DATADIR="$(printf '%s' "$ZCASHD_DATADIR" | sanitize_terminal_input)"
   INSTALL_DIR="$(printf '%s' "$INSTALL_DIR" | sanitize_terminal_input)"
   CACHE_DIR="$(printf '%s' "$CACHE_DIR" | sanitize_terminal_input)"
   if [[ -z "$COOKIE_DIR" ]]; then
-    COOKIE_DIR="$ZEBRA_STATE_DIR"
+    COOKIE_DIR="$ZAKURA_STATE_DIR"
   fi
   COOKIE_DIR="$(printf '%s' "$COOKIE_DIR" | sanitize_terminal_input)"
   ZCASHD_CONF="$(printf '%s' "$ZCASHD_CONF" | sanitize_terminal_input)"
-  ZEBRAD_PATH="$(printf '%s' "$ZEBRAD_PATH" | sanitize_terminal_input)"
+  ZAKURAD_PATH="$(printf '%s' "$ZAKURAD_PATH" | sanitize_terminal_input)"
   ZCASHD_PATH="$(printf '%s' "$ZCASHD_PATH" | sanitize_terminal_input)"
 
-  ZEBRA_STATE_DIR="$(abs_path "$ZEBRA_STATE_DIR")"
+  ZAKURA_STATE_DIR="$(abs_path "$ZAKURA_STATE_DIR")"
   ZCASHD_DATADIR="$(abs_path "$ZCASHD_DATADIR")"
   INSTALL_DIR="$(abs_path "$INSTALL_DIR")"
   CACHE_DIR="$(abs_path "$CACHE_DIR")"
@@ -784,7 +784,7 @@ check_writable_target() {
 }
 
 collect_permission_checks() {
-  check_writable_target "zakura state directory" "$ZEBRA_STATE_DIR"
+  check_writable_target "zakura state directory" "$ZAKURA_STATE_DIR"
   check_writable_target "zcashd datadir" "$ZCASHD_DATADIR"
   check_writable_target "install directory" "$INSTALL_DIR"
   check_writable_target "download/cache directory" "$CACHE_DIR"
@@ -909,8 +909,8 @@ collect_disk_checks() {
   tib=$((1024 * gib))
   recommended="$tib"
 
-  if ! zebra_info="$(disk_device_and_size "$ZEBRA_STATE_DIR")"; then
-    add_error "failed to inspect filesystem for zakura state path: $ZEBRA_STATE_DIR"
+  if ! zebra_info="$(disk_device_and_size "$ZAKURA_STATE_DIR")"; then
+    add_error "failed to inspect filesystem for zakura state path: $ZAKURA_STATE_DIR"
     return
   fi
 
@@ -926,13 +926,13 @@ collect_disk_checks() {
     required=$((600 * gib))
     combined="$zebra_size"
     if ((zebra_size < required)); then
-      add_low_spec_error "zakura state + zcashd datadir mount (paths: $ZEBRA_STATE_DIR, $ZCASHD_DATADIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
+      add_low_spec_error "zakura state + zcashd datadir mount (paths: $ZAKURA_STATE_DIR, $ZCASHD_DATADIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
     fi
   else
     required=$((300 * gib))
     combined=$((zebra_size + zcashd_size))
     if ((zebra_size < required)); then
-      add_low_spec_error "zakura state mount (paths: $ZEBRA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
+      add_low_spec_error "zakura state mount (paths: $ZAKURA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
     fi
     if ((zcashd_size < required)); then
       add_low_spec_error "zcashd datadir mount (paths: $ZCASHD_DATADIR) has provisioned capacity $(human_gib "$zcashd_size"), minimum required is $(human_gib "$required")"
@@ -950,9 +950,9 @@ collect_source_checks() {
   fi
 
   if [[ ! -d "$REPO_ROOT" ]]; then
-    add_error "Zebra source tree is missing: $REPO_ROOT"
+    add_error "Zakura source tree is missing: $REPO_ROOT"
   elif [[ ! -f "$REPO_ROOT/Cargo.toml" ]]; then
-    add_error "Zebra source tree is missing Cargo.toml: $REPO_ROOT"
+    add_error "Zakura source tree is missing Cargo.toml: $REPO_ROOT"
   fi
 
   if [[ ! -d "$UNITY_ROOT/zcash" ]]; then
@@ -961,11 +961,11 @@ collect_source_checks() {
     add_error "zcash build script is missing or not executable: $UNITY_ROOT/zcash/zcutil/build.sh"
   fi
 
-  ZEBRAD_PATH="${ZEBRAD_PATH:-$REPO_ROOT/target/release/zakurad}"
+  ZAKURAD_PATH="${ZAKURAD_PATH:-$REPO_ROOT/target/release/zakurad}"
   ZCASHD_PATH="${ZCASHD_PATH:-$UNITY_ROOT/zcash/src/zcashd}"
 
-  if [[ -e "$ZEBRAD_PATH" && ! -x "$ZEBRAD_PATH" ]]; then
-    add_error "zakurad binary $ZEBRAD_PATH exists but is not executable by the current user"
+  if [[ -e "$ZAKURAD_PATH" && ! -x "$ZAKURAD_PATH" ]]; then
+    add_error "zakurad binary $ZAKURAD_PATH exists but is not executable by the current user"
   fi
 
   if [[ -e "$ZCASHD_PATH" && ! -x "$ZCASHD_PATH" ]]; then
@@ -1065,7 +1065,7 @@ download_and_extract() {
 prepare_binary_paths() {
   local zcashd_url zcashd_sha zcashd_member
 
-  ZEBRAD_PATH="${ZEBRAD_PATH:-$INSTALL_DIR/zebrad/bin/zebrad}"
+  ZAKURAD_PATH="${ZAKURAD_PATH:-$INSTALL_DIR/zakura/bin/zakurad}"
 
   if [[ "$MODE" == "split-binary" ]]; then
     ZCASHD_PATH="${ZCASHD_PATH:-$INSTALL_DIR/zcashd/bin/zcashd}"
@@ -1077,19 +1077,19 @@ prepare_binary_paths() {
 
   if ((DOWNLOAD_BINARIES == 0)); then
     if ((USE_ANSI)); then
-      printf '%s Skipping binary downloads. You must provision the right Zebra and zcashd versions yourself.\n' "$(style "$YELLOW" "[!]")"
+      printf '%s Skipping binary downloads. You must provision the right Zakura and zcashd versions yourself.\n' "$(style "$YELLOW" "[!]")"
     else
-      printf 'Skipping binary downloads. You must provision the right Zebra and zcashd versions yourself.\n'
+      printf 'Skipping binary downloads. You must provision the right Zakura and zcashd versions yourself.\n'
     fi
-    printf '\nDownload Zebra:\n%s\n' "$ZEBRA_URL"
+    printf '\nDownload Zakura:\n%s\n' "$ZAKURA_URL"
     if [[ "$MODE" == "split-binary" ]]; then
       printf '\nDownload zcashd:\n%s\n' "$zcashd_url"
     else
-      printf '\nZebra supervised mode will use its hash-pinned managed zcashd download at startup.\n'
+      printf '\nZakura supervised mode will use its hash-pinned managed zcashd download at startup.\n'
     fi
     printf '\n'
     if ((!DRY_RUN)); then
-      [[ -x "$ZEBRAD_PATH" ]] || add_error "zebrad binary $ZEBRAD_PATH does not exist or is not executable by the current user"
+      [[ -x "$ZAKURAD_PATH" ]] || add_error "zakurad binary $ZAKURAD_PATH does not exist or is not executable by the current user"
       if [[ "$MODE" == "split-binary" ]]; then
         [[ -x "$ZCASHD_PATH" ]] || add_error "zcashd binary $ZCASHD_PATH does not exist or is not executable by the current user"
       fi
@@ -1098,14 +1098,14 @@ prepare_binary_paths() {
     return
   fi
 
-  download_and_extract "zebrad" "$ZEBRA_URL" "" "$ZEBRA_MEMBER" "$ZEBRA_ARCHIVE" "$ZEBRAD_PATH"
+  download_and_extract "zakurad" "$ZAKURA_URL" "" "$ZAKURA_MEMBER" "$ZAKURA_ARCHIVE" "$ZAKURAD_PATH"
 
   if [[ "$MODE" == "split-binary" ]]; then
     download_and_extract "zcashd" "$zcashd_url" "$zcashd_sha" "$zcashd_member" "$(basename "$zcashd_url")" "$ZCASHD_PATH"
   fi
 
   if ((!DRY_RUN)); then
-    [[ -x "$ZEBRAD_PATH" ]] || add_error "zebrad binary $ZEBRAD_PATH does not exist or is not executable by the current user"
+    [[ -x "$ZAKURAD_PATH" ]] || add_error "zakurad binary $ZAKURAD_PATH does not exist or is not executable by the current user"
     if [[ "$MODE" == "split-binary" ]]; then
       [[ -x "$ZCASHD_PATH" ]] || add_error "zcashd binary $ZCASHD_PATH does not exist or is not executable by the current user"
     fi
@@ -1118,7 +1118,7 @@ data_detection_message() {
     print_section "[*]" "Snapshot data"
   fi
 
-  if [[ -d "$ZEBRA_STATE_DIR" && -n "$(find "$ZEBRA_STATE_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] ||
+  if [[ -d "$ZAKURA_STATE_DIR" && -n "$(find "$ZAKURA_STATE_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] ||
      [[ -d "$ZCASHD_DATADIR" && -n "$(find "$ZCASHD_DATADIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     if ((USE_ANSI)); then
       printf '%s You already have data configured but feel free to redownload a fresh snapshot\n' "$(style "$GREEN" "[ok]")"
@@ -1133,7 +1133,7 @@ data_detection_message() {
     fi
   fi
   printf '\nhttps://zcashd.valargroup.org/\n'
-  printf '\nhttps://zebra.valargroup.dev/\n'
+  printf '\nhttps://zakura.valargroup.dev/\n'
   printf '\n'
 }
 
@@ -1173,7 +1173,7 @@ run_privileged_or_current_user() {
 prepare_docker_owned_directory() {
   local label="$1"
   local dir="$2"
-  local owner="${ZEBRA_DOCKER_RUNTIME_UID}:${ZEBRA_DOCKER_RUNTIME_GID}"
+  local owner="${ZAKURA_DOCKER_RUNTIME_UID}:${ZAKURA_DOCKER_RUNTIME_GID}"
 
   if ((DRY_RUN)); then
     if ((USE_ANSI)); then
@@ -1199,7 +1199,7 @@ prepare_docker_supervised_mounts() {
     return
   fi
 
-  prepare_docker_owned_directory "Zakura state directory" "$ZEBRA_STATE_DIR"
+  prepare_docker_owned_directory "Zakura state directory" "$ZAKURA_STATE_DIR"
   prepare_docker_owned_directory "zcashd datadir" "$ZCASHD_DATADIR"
   finalize_checks
 }
@@ -1207,17 +1207,17 @@ prepare_docker_supervised_mounts() {
 prepare_docker_images() {
   case "$MODE" in
     docker-supervised)
-      if docker_image_available_or_pull "$ZEBRA_COMPAT_DOCKER_IMAGE"; then
-        ZEBRA_COMPAT_DOCKER_SELECTED="$ZEBRA_COMPAT_DOCKER_IMAGE"
-      elif docker_image_available_or_pull "$ZEBRA_COMPAT_DOCKER_FALLBACK_IMAGE"; then
-        ZEBRA_COMPAT_DOCKER_SELECTED="$ZEBRA_COMPAT_DOCKER_FALLBACK_IMAGE"
+      if docker_image_available_or_pull "$ZAKURA_COMPAT_DOCKER_IMAGE"; then
+        ZAKURA_COMPAT_DOCKER_SELECTED="$ZAKURA_COMPAT_DOCKER_IMAGE"
+      elif docker_image_available_or_pull "$ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE"; then
+        ZAKURA_COMPAT_DOCKER_SELECTED="$ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE"
       else
-        add_error "Docker image is missing or could not be pulled: $ZEBRA_COMPAT_DOCKER_IMAGE; fallback also failed: $ZEBRA_COMPAT_DOCKER_FALLBACK_IMAGE"
+        add_error "Docker image is missing or could not be pulled: $ZAKURA_COMPAT_DOCKER_IMAGE; fallback also failed: $ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE"
       fi
       ;;
     docker-split-containers)
-      docker_image_available_or_pull "$ZEBRA_DOCKER_IMAGE" ||
-        add_error "Docker image is missing or could not be pulled: $ZEBRA_DOCKER_IMAGE"
+      docker_image_available_or_pull "$ZAKURA_DOCKER_IMAGE" ||
+        add_error "Docker image is missing or could not be pulled: $ZAKURA_DOCKER_IMAGE"
 
       if [[ -z "$ZCASHD_DOCKER_IMAGE" ]]; then
         ZCASHD_DOCKER_IMAGE="valargroup/zcashd:v0.0.1-compat-alpha.3@sha256:d9c80e8469f99406cc7e51238ae67708421d739a7446f52f941a7ea44b3af354"
@@ -1234,9 +1234,9 @@ prepare_docker_images() {
 print_split_binary_commands() {
   local cookie_file="$COOKIE_DIR/.zcashd-compat.cookie"
   cat <<EOF
-$(style "$GREEN$BOLD" "Start Zebra in terminal 1:")
-ZEBRA_STATE__CACHE_DIR=$(shell_quote "$ZEBRA_STATE_DIR") \\
-$(shell_quote "$ZEBRAD_PATH") start --zcashd-compat
+$(style "$GREEN$BOLD" "Start Zakura in terminal 1:")
+ZAKURA_STATE__CACHE_DIR=$(shell_quote "$ZAKURA_STATE_DIR") \\
+$(shell_quote "$ZAKURAD_PATH") start --zcashd-compat
 
 $(style "$GREEN$BOLD" "Start zcashd in terminal 2:")
 $(shell_quote "$ZCASHD_PATH") \\
@@ -1251,59 +1251,59 @@ EOF
 
 print_supervised_command() {
   cat <<EOF
-$(style "$GREEN$BOLD" "Start Zebra. In the background, downloads hash-pinned zcashd and kicks it off as a supervised child process.")
-ZEBRA_STATE__CACHE_DIR=$(shell_quote "$ZEBRA_STATE_DIR") \\
-ZEBRA_ZCASHD_COMPAT__MANAGE_ZCASHD=true \\
-ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE=managed \\
-ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR=$(shell_quote "$ZCASHD_DATADIR") \\
-$(shell_quote "$ZEBRAD_PATH") start --zcashd-compat
+$(style "$GREEN$BOLD" "Start Zakura. In the background, downloads hash-pinned zcashd and kicks it off as a supervised child process.")
+ZAKURA_STATE__CACHE_DIR=$(shell_quote "$ZAKURA_STATE_DIR") \\
+ZAKURA_ZCASHD_COMPAT__MANAGE_ZCASHD=true \\
+ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=managed \\
+ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR=$(shell_quote "$ZCASHD_DATADIR") \\
+$(shell_quote "$ZAKURAD_PATH") start --zcashd-compat
 EOF
 }
 
 print_docker_supervised_command() {
-  local image="${ZEBRA_COMPAT_DOCKER_SELECTED:-$ZEBRA_COMPAT_DOCKER_IMAGE}"
+  local image="${ZAKURA_COMPAT_DOCKER_SELECTED:-$ZAKURA_COMPAT_DOCKER_IMAGE}"
   local container_zebra_state_dir="/home/zebra/.cache/zakura"
   local container_zcashd_datadir="/home/zebra/.cache/zcashd"
   cat <<EOF
 docker run --rm -it \\
   -e ZCASHD_COMPAT_ENABLED=true \\
-  -e ZEBRA_NETWORK__LISTEN_ADDR='[::]:8233' \\
-  -e ZEBRA_STATE__CACHE_DIR=$container_zebra_state_dir \\
-  -e ZEBRA_ZCASHD_COMPAT__MANAGE_ZCASHD=true \\
-  -e ZEBRA_ZCASHD_COMPAT__COOKIE_DIR=$container_zebra_state_dir \\
-  -e ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR=$container_zcashd_datadir \\
-  -e ZEBRA_ZCASHD_COMPAT__LISTEN_ADDR=0.0.0.0:28232 \\
-  -e ZEBRA_ZCASHD_COMPAT__UNSAFE_ALLOW_REMOTE_HTTP=true \\
-  -e ZEBRA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \\
-  --mount type=bind,src=$(shell_quote "$ZEBRA_STATE_DIR"),dst=$container_zebra_state_dir \\
+  -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:8233' \\
+  -e ZAKURA_STATE__CACHE_DIR=$container_zebra_state_dir \\
+  -e ZAKURA_ZCASHD_COMPAT__MANAGE_ZCASHD=true \\
+  -e ZAKURA_ZCASHD_COMPAT__COOKIE_DIR=$container_zebra_state_dir \\
+  -e ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR=$container_zcashd_datadir \\
+  -e ZAKURA_ZCASHD_COMPAT__LISTEN_ADDR=0.0.0.0:28232 \\
+  -e ZAKURA_ZCASHD_COMPAT__UNSAFE_ALLOW_REMOTE_HTTP=true \\
+  -e ZAKURA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \\
+  --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=$container_zebra_state_dir \\
   --mount type=bind,src=$(shell_quote "$ZCASHD_DATADIR"),dst=$container_zcashd_datadir \\
   -p 8233:8233 \\
   -p 127.0.0.1:28232:28232 \\
   -p 127.0.0.1:8232:8232 \\
   $(shell_quote "$image") \\
-  zebrad start --zcashd-compat
+  zakurad start --zcashd-compat
 EOF
 }
 
 print_docker_split_commands() {
   local cookie_file="/zakura-state/.zcashd-compat.cookie"
   cat <<EOF
-$(style "$GREEN$BOLD" "Start Zebra container in terminal 1:")
-docker run --rm -it --name zakura-compat-zebrad \\
-  -e ZEBRA_NETWORK__LISTEN_ADDR='[::]:8233' \\
-  -e ZEBRA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \\
-  -e ZEBRA_ZCASHD_COMPAT__LISTEN_ADDR=0.0.0.0:28232 \\
-  -e ZEBRA_ZCASHD_COMPAT__UNSAFE_ALLOW_REMOTE_HTTP=true \\
-  --mount type=bind,src=$(shell_quote "$ZEBRA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
+$(style "$GREEN$BOLD" "Start Zakura container in terminal 1:")
+docker run --rm -it --name zakura-compat \\
+  -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:8233' \\
+  -e ZAKURA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \\
+  -e ZAKURA_ZCASHD_COMPAT__LISTEN_ADDR=0.0.0.0:28232 \\
+  -e ZAKURA_ZCASHD_COMPAT__UNSAFE_ALLOW_REMOTE_HTTP=true \\
+  --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
   -p 8233:8233 \\
   -p 127.0.0.1:28232:28232 \\
-  $(shell_quote "$ZEBRA_DOCKER_IMAGE") \\
-  zebrad start --zcashd-compat
+  $(shell_quote "$ZAKURA_DOCKER_IMAGE") \\
+  zakurad start --zcashd-compat
 
 $(style "$GREEN$BOLD" "Start zcashd container in terminal 2:")
 docker run --rm -it --name zakura-compat-zcashd --network host \\
   --mount type=bind,src=$(shell_quote "$ZCASHD_DATADIR"),dst=/home/zcashd/.zcash \\
-  --mount type=bind,src=$(shell_quote "$ZEBRA_STATE_DIR"),dst=/zakura-state,readonly \\
+  --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=/zakura-state,readonly \\
   $(shell_quote "$ZCASHD_DOCKER_IMAGE") \\
   -zebra-compat \\
   -zebra-compat-url=http://127.0.0.1:28232 \\
@@ -1322,9 +1322,9 @@ git clone https://github.com/valargroup/zcashd.git zcash
 cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zakurad
 cd $(shell_quote "$UNITY_ROOT/zcash") && ./zcutil/build.sh -j"\$(nproc)"
 
-$(style "$GREEN$BOLD" "Start Zebra in terminal 1:")
-ZEBRA_STATE__CACHE_DIR=$(shell_quote "$ZEBRA_STATE_DIR") \\
-$(shell_quote "$ZEBRAD_PATH") start --zcashd-compat
+$(style "$GREEN$BOLD" "Start Zakura in terminal 1:")
+ZAKURA_STATE__CACHE_DIR=$(shell_quote "$ZAKURA_STATE_DIR") \\
+$(shell_quote "$ZAKURAD_PATH") start --zcashd-compat
 
 $(style "$GREEN$BOLD" "Start zcashd in terminal 2:")
 $(shell_quote "$ZCASHD_PATH") \\
@@ -1357,9 +1357,9 @@ print_ready_commands() {
 
   case "$MODE" in
     docker-supervised | docker-split-containers)
-      printf '\n%s ZEBRA_ZCASHD_COMPAT__UNSAFE_ALLOW_REMOTE_HTTP=true is set because the compat RPC is published on 0.0.0.0 over plain HTTP,\n' "$(style "$YELLOW" "[!]")"
+      printf '\n%s ZAKURA_ZCASHD_COMPAT__UNSAFE_ALLOW_REMOTE_HTTP=true is set because the compat RPC is published on 0.0.0.0 over plain HTTP,\n' "$(style "$YELLOW" "[!]")"
       printf '    so the cookie crosses the network in cleartext and is safe behind the local container/private-network boundary.\n'
-      printf '    To remove it, enable TLS via ZEBRA_ZCASHD_COMPAT__TLS_CERT_FILE/_TLS_KEY_FILE/_TLS_CA_FILE.\n'
+      printf '    To remove it, enable TLS via ZAKURA_ZCASHD_COMPAT__TLS_CERT_FILE/_TLS_KEY_FILE/_TLS_CA_FILE.\n'
       ;;
   esac
 }
@@ -1378,8 +1378,8 @@ while (($#)); do
       ;;
     --zakura-state-dir | --zebra-state-dir)
       require_value "$1" "${2:-}"
-      ZEBRA_STATE_DIR="$2"
-      ZEBRA_STATE_DIR_SET=1
+      ZAKURA_STATE_DIR="$2"
+      ZAKURA_STATE_DIR_SET=1
       shift 2
       ;;
     --zcashd-datadir)
@@ -1408,9 +1408,9 @@ while (($#)); do
       ZCASHD_CONF="$2"
       shift 2
       ;;
-    --zebrad-path)
+    --zakurad-path | --zebrad-path)
       require_value "$1" "${2:-}"
-      ZEBRAD_PATH="$2"
+      ZAKURAD_PATH="$2"
       shift 2
       ;;
     --zcashd-path)

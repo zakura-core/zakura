@@ -3,10 +3,10 @@
 # checkpoint-sync-bench.sh — repeatable checkpoint-zone sync benchmark.
 #
 # Downloads a pre-synced ~1.7M mainnet state snapshot once, hard-link-forks it per
-# run (cp -al), runs a prebuilt release zebrad forward through the checkpoint zone
+# run (cp -al), runs a prebuilt release zakurad forward through the checkpoint zone
 # pinned to a single peer, and prints: time taken, blocks covered, blocks/s.
 #
-# No build: the zebrad binary comes from a published GitHub release tarball.
+# No build: the zakurad binary comes from a published GitHub release tarball.
 # Designed to run on the roman-zakura-3 self-hosted runner, but it is self-contained
 # and can be run by hand on any Linux box with enough disk.
 #
@@ -41,7 +41,7 @@
 #   BUILD_FEATURES        cargo features for host builds (default prometheus,commit-metrics)
 #
 # Ports default high and auto-skip busy ones so the bench can coexist with another
-# zebrad already running on the host (which typically holds 8233 / 9999).
+# zakurad already running on the host (which typically holds 8233 / 9999).
 #
 # Observability: each run records a Prometheus time series via scripts/zebra-metrics-dashboard.py
 # into DASHBOARD_ARCHIVE, classifies it into a commit/download/verify bottleneck verdict
@@ -91,7 +91,7 @@ fi
 SNAP_FILE="$(basename "$SNAPSHOT_URL")"
 MASTER="$BENCH_HOME/master-${START_HEIGHT}"
 SAMPLE_INTERVAL=5
-ZEBRAD_BIN=""
+ZAKURAD_BIN=""
 ZAKURA_BOOTSTRAP_PEERS=(
   "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234"
   "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22@143.244.184.176:8234"
@@ -124,7 +124,7 @@ BASELINE_SHOULD_USE_V2_P2P="$(normalize_bool "$BASELINE_SHOULD_USE_V2_P2P")"
 BASELINE_SHOULD_USE_LEGACY_P2P="$(normalize_bool "$BASELINE_SHOULD_USE_LEGACY_P2P")"
 
 # Always tear down a launched node + its fork, even on FATAL/interrupt, so a failed
-# run never leaves an orphan zebrad thrashing the box or a fork eating disk.
+# run never leaves an orphan zakurad thrashing the box or a fork eating disk.
 CUR_PID=""; CUR_FORK=""; CUR_REC=""
 cleanup() {
   [[ -n "$CUR_REC" ]] && kill "$CUR_REC" 2>/dev/null
@@ -219,12 +219,12 @@ ensure_snapshot() {
 }
 
 # ---- 2. release binary (download once per tag, cached) -----------------------
-# sets ZEBRAD_BIN to the zebrad binary path for $1=tag (returns via global, not
+# sets ZAKURAD_BIN to the zakurad binary path for $1=tag (returns via global, not
 # stdout, so no subcommand chatter can ever pollute the path)
 ensure_binary() {
-  local tag="$1" bindir="$BENCH_HOME/bins/$1" zebrad
-  zebrad="$bindir/zebrad"
-  if [[ -x "$zebrad" ]]; then ZEBRAD_BIN="$zebrad"; return; fi
+  local tag="$1" bindir="$BENCH_HOME/bins/$1" zakurad
+  zakurad="$bindir/zakurad"
+  if [[ -x "$zakurad" ]]; then ZAKURAD_BIN="$zakurad"; return; fi
   mkdir -p "$bindir"
   log "fetching release $tag from $GH_REPO ..." >&2
   local dl="$bindir/dl"; rm -rf "$dl"; mkdir -p "$dl"
@@ -241,9 +241,9 @@ ensure_binary() {
   tar -xzf "$tgz" -C "$dl"
   local found; found="$(find "$dl" -type f \( -name zakurad -o -name zebrad \) | head -1)"
   [[ -n "$found" ]] || die "node binary not found in tarball for $tag"
-  mv "$found" "$zebrad"; chmod +x "$zebrad"; rm -rf "$dl"
-  log "node binary $tag: $("$zebrad" --version 2>/dev/null | head -1)" >&2
-  ZEBRAD_BIN="$zebrad"
+  mv "$found" "$zakurad"; chmod +x "$zakurad"; rm -rf "$dl"
+  log "node binary $tag: $("$zakurad" --version 2>/dev/null | head -1)" >&2
+  ZAKURAD_BIN="$zakurad"
 }
 
 # ---- 2b. build a git ref on this host, cached by commit SHA -------------------
@@ -254,17 +254,17 @@ BUILD_TARGET="$BENCH_HOME/build-target"
 BUILD_CARGO_HOME="$BENCH_HOME/cargo-home"
 
 # validate a cached binary really is the one we built for $2=sha: integrity (sha256
-# matches the stored value) AND provenance (zebrad --version embeds the git short sha).
+# matches the stored value) AND provenance (zakurad --version embeds the git short sha).
 validate_cached_binary() {
-  local zebrad="$1" sha="$2" meta="$3" want got ver
-  [[ -x "$zebrad" && -f "$meta" ]] || { log "cache miss: missing binary/meta for $sha"; return 1; }
+  local zakurad="$1" sha="$2" meta="$3" want got ver
+  [[ -x "$zakurad" && -f "$meta" ]] || { log "cache miss: missing binary/meta for $sha"; return 1; }
   # integrity: byte-identical to the binary we built and recorded for this commit.
   # This is the strong check — it ties the cached file to this exact commit's build.
   want="$(awk -F= '/^bin_sha256=/{print $2}' "$meta")"
-  got="$(sha256sum "$zebrad" | awk '{print $1}')"
+  got="$(sha256sum "$zakurad" | awk '{print $1}')"
   [[ -n "$want" && "$want" == "$got" ]] || { log "cache invalid: binary sha256 mismatch for $sha"; return 1; }
   # runnable: it actually executes and reports a version
-  ver="$("$zebrad" --version 2>/dev/null | head -1 || true)"
+  ver="$("$zakurad" --version 2>/dev/null | head -1 || true)"
   [[ -n "$ver" ]] || { log "cache invalid: $sha binary will not run --version"; return 1; }
   log "cache hit: validated prebuilt binary for $sha (sha256 ok, --version='$ver')"
   return 0
@@ -286,20 +286,20 @@ ensure_source() {
   git -C "$BUILD_SRC" fetch --tags --force origin >&2 || die "git fetch failed"
 }
 
-# build $1=ref; sets ZEBRAD_BIN. Skips the build (with revalidation) on a SHA cache hit.
+# build $1=ref; sets ZAKURAD_BIN. Skips the build (with revalidation) on a SHA cache hit.
 build_from_ref() {
-  local ref="$1" sha full ver bindir zebrad meta
+  local ref="$1" sha full ver bindir zakurad meta
   ensure_source
   # resolve ref (branch/tag/sha) to a commit; prefer the remote branch
   full="$(git -C "$BUILD_SRC" rev-parse --verify --quiet "origin/$ref^{commit}" \
         || git -C "$BUILD_SRC" rev-parse --verify --quiet "$ref^{commit}")" \
         || die "cannot resolve ref '$ref' to a commit"
   sha="${full:0:9}"
-  bindir="$BENCH_HOME/bins/$sha"; zebrad="$bindir/zebrad"; meta="$bindir/meta"
+  bindir="$BENCH_HOME/bins/$sha"; zakurad="$bindir/zakurad"; meta="$bindir/meta"
   log "ref '$ref' -> commit $sha"
 
-  if [[ "$FORCE_REBUILD" != "1" ]] && validate_cached_binary "$zebrad" "$sha" "$meta"; then
-    ZEBRAD_BIN="$zebrad"; return
+  if [[ "$FORCE_REBUILD" != "1" ]] && validate_cached_binary "$zakurad" "$sha" "$meta"; then
+    ZAKURAD_BIN="$zakurad"; return
   fi
 
   log "building $sha on host (incremental; first build is slow) ..." >&2
@@ -319,21 +319,21 @@ build_from_ref() {
   done
   [[ -n "$built" ]] || die "build produced no node binary for $sha"
   ver="$("$built" --version 2>/dev/null | head -1 || true)"
-  mkdir -p "$bindir"; cp -f "$built" "$zebrad"; chmod +x "$zebrad"
+  mkdir -p "$bindir"; cp -f "$built" "$zakurad"; chmod +x "$zakurad"
   # record the commit (authoritative, from git) + the binary hash for cache validation
   { echo "commit=$full"; echo "ref=$ref"; echo "version=$ver";
-    echo "bin_sha256=$(sha256sum "$zebrad" | awk '{print $1}')"; } > "$meta"
+    echo "bin_sha256=$(sha256sum "$zakurad" | awk '{print $1}')"; } > "$meta"
   log "built and cached $sha ($ver)" >&2
-  ZEBRAD_BIN="$zebrad"
+  ZAKURAD_BIN="$zakurad"
 }
 
-# pick build-vs-download for a given spec ($1=ref-or-tag); sets ZEBRAD_BIN
+# pick build-vs-download for a given spec ($1=ref-or-tag); sets ZAKURAD_BIN
 resolve_binary() {
   if [[ -n "$BUILD_REF" ]]; then build_from_ref "$1"; else ensure_binary "$1"; fi
 }
 
 # ---- height scraping ---------------------------------------------------------
-# Prometheus first, trying several metric names across zebrad versions (the
+# Prometheus first, trying several metric names across zakurad versions (the
 # checkpoint verifier exports checkpoint_verified_height; newer builds also export
 # a finalized-height gauge). Falls back to a *specific* committed/finalized/verified
 # log line — never a bare Height(N), which also appears for network-tip/target heights.
@@ -394,7 +394,7 @@ run_one() {
   if [[ "$should_use_v2_p2p" != "1" && "$should_use_legacy_p2p" != "1" ]]; then
     die "$prefix run requested v2_p2p=0 and legacy_p2p=0; enable at least one P2P stack"
   fi
-  resolve_binary "$tag"; local zebrad="$ZEBRAD_BIN"
+  resolve_binary "$tag"; local zakurad="$ZAKURAD_BIN"
   local run_id="${prefix}-$$-$(date +%s)"
   local fork="$BENCH_HOME/forks/$run_id"
   local logf="/dev/shm/zebra-bench-$run_id.log"
@@ -459,9 +459,9 @@ run_one() {
   }
 
   local pid t0 mode="with_p2p_toggles"
-  log "starting zebrad ($tag), v2_p2p=$should_use_v2_p2p, legacy_p2p=$should_use_legacy_p2p, stop_height=$STOP_HEIGHT, peer=${FEED_PEER:-DNS-seeders}, peerset=$PEERSET_SIZE, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
+  log "starting zakurad ($tag), v2_p2p=$should_use_v2_p2p, legacy_p2p=$should_use_legacy_p2p, stop_height=$STOP_HEIGHT, peer=${FEED_PEER:-DNS-seeders}, peerset=$PEERSET_SIZE, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
   write_config "$mode"
-  "$zebrad" -c "$cfg" start >"$logf" 2>&1 &
+  "$zakurad" -c "$cfg" start >"$logf" 2>&1 &
   pid=$!; CUR_PID="$pid"; t0=$(date +%s); sleep 3
   if ! kill -0 "$pid" 2>/dev/null; then
     # version-skew fallback: older tags lack v2_p2p/legacy_p2p -> deny_unknown_fields.
@@ -471,12 +471,12 @@ run_one() {
       fi
       log "config rejected (likely pre-Zakura tag); retrying without v2_p2p/legacy_p2p"
       write_config "without_p2p_toggles"
-      "$zebrad" -c "$cfg" start >"$logf" 2>&1 &
+      "$zakurad" -c "$cfg" start >"$logf" 2>&1 &
       pid=$!; CUR_PID="$pid"; t0=$(date +%s); sleep 3
     fi
   fi
   if ! kill -0 "$pid" 2>/dev/null; then
-    log "zebrad died on startup; last log lines:"; tail -20 "$logf" >&2
+    log "zakurad died on startup; last log lines:"; tail -20 "$logf" >&2
     die "startup failure for $tag"
   fi
 
@@ -514,7 +514,7 @@ run_one() {
       break
     fi
     if (( elapsed >= WALL_CAP )); then
-      log "wall cap ${WALL_CAP}s reached; stopping zebrad"
+      log "wall cap ${WALL_CAP}s reached; stopping zakurad"
       kill "$pid" 2>/dev/null || true; sleep 5; kill -9 "$pid" 2>/dev/null || true
       break
     fi
@@ -525,12 +525,12 @@ run_one() {
   # stop the recorder (node is gone / about to be); give it a moment to flush jsonl
   if [[ -n "$CUR_REC" ]]; then kill "$CUR_REC" 2>/dev/null || true; wait "$CUR_REC" 2>/dev/null || true; CUR_REC=""; fi
 
-  # a clean exit means zebrad committed through debug_stop_at_height; otherwise the
+  # a clean exit means zakurad committed through debug_stop_at_height; otherwise the
   # last sane in-loop sample stands (wall-capped). The metrics endpoint is gone after
   # exit, so do NOT re-scrape here (it would fall back to log parsing).
   if (( clean_stop )); then
     end_height="$STOP_HEIGHT"
-    log "zebrad exited cleanly at stop height $STOP_HEIGHT (+$((t_end - t0))s)"
+    log "zakurad exited cleanly at stop height $STOP_HEIGHT (+$((t_end - t0))s)"
   else
     log "wall-capped at height $end_height (+$((t_end - t0))s)"
   fi

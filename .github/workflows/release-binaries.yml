@@ -1,4 +1,4 @@
-# This workflow builds and publishes zebrad release assets and Docker images
+# This workflow builds and publishes zakurad release assets and Docker images
 # when a release is published.
 name: Release binaries
 
@@ -16,7 +16,7 @@ on:
         required: false
         type: string
       publish_assets_to_release:
-        description: "Upload zebrad assets to the GitHub release tag"
+        description: "Upload zakurad assets to the GitHub release tag"
         required: false
         type: boolean
         default: false
@@ -88,8 +88,8 @@ jobs:
             --write-github-output \
             --require-targets x86_64-pc-linux-gnu
 
-  build-zebrad-assets:
-    name: Build zebrad assets (${{ matrix.name }})
+  build-zakurad-assets:
+    name: Build zakurad assets (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     needs: [resolve-release]
     strategy:
@@ -140,14 +140,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ./artifacts/bin ./artifacts/metadata
+          cp ./out/usr/local/bin/zakurad ./artifacts/bin/zakurad
           cp ./out/usr/local/bin/zakurad ./artifacts/bin/zebrad
-          archive_name="zebrad-${RELEASE_TAG}-${{ matrix.name }}.tar.gz"
+          archive_name="zakurad-${RELEASE_TAG}-${{ matrix.name }}.tar.gz"
           (
             cd ./artifacts
             tar --sort=name \
               --mtime='UTC 2020-01-01' \
               --owner=0 --group=0 --numeric-owner \
-              -czf "$archive_name" ./bin/zebrad
+              -czf "$archive_name" ./bin/zakurad ./bin/zebrad
           )
           archive_sha256="$(sha256sum "./artifacts/${archive_name}" | awk '{print $1}')"
           archive_size="$(stat --printf='%s' "./artifacts/${archive_name}")"
@@ -158,19 +159,20 @@ jobs:
             "archive": "${archive_name}",
             "sha256": "${archive_sha256}",
             "size": ${archive_size},
-            "archive_member_binary_path": "./bin/zebrad"
+            "archive_member_binary_path": "./bin/zakurad",
+            "legacy_archive_member_binary_path": "./bin/zebrad"
           }
           EOF
 
       - name: Upload matrix artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:
-          name: zebrad-assets-${{ matrix.name }}
+          name: zakurad-assets-${{ matrix.name }}
           path: ./artifacts
 
-  publish-zebrad-assets:
-    name: Publish zebrad assets
-    needs: [resolve-release, build-zebrad-assets]
+  publish-zakurad-assets:
+    name: Publish zakurad assets
+    needs: [resolve-release, build-zakurad-assets]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -185,7 +187,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
         with:
           path: ./publish
-          pattern: zebrad-assets-*
+          pattern: zakurad-assets-*
           merge-multiple: true
 
       - name: Build manifest and checksums
@@ -221,13 +223,13 @@ jobs:
               "artifacts": artifacts,
           }
           Path("./publish/final").mkdir(parents=True, exist_ok=True)
-          Path(f"./publish/final/zebrad-manifest-{release_tag}.json").write_text(
+          Path(f"./publish/final/zakurad-manifest-{release_tag}.json").write_text(
               json.dumps(manifest, indent=2, sort_keys=True) + "\n",
               encoding="utf-8",
           )
           PY
 
-          find ./publish -type f -name 'zebrad-*.tar.gz' -exec cp {} ./publish/final/ \;
+          find ./publish -type f -name 'zakurad-*.tar.gz' -exec cp {} ./publish/final/ \;
           cp ./scripts/install-zcashd-compat.sh ./publish/final/
           cp ./scripts/install-zakura.sh ./publish/final/
           RELEASE_TAG="$RELEASE_TAG" python3 - <<'PY'
@@ -239,13 +241,13 @@ jobs:
           image_version = release_tag.removeprefix("v")
           installers = {
               "install-zcashd-compat.sh": {
-                  "ZEBRA_RELEASE_TAG": release_tag,
-                  "ZEBRA_DOCKER_IMAGE": f"valargroup/zakura:{image_version}",
-                  "ZEBRA_COMPAT_DOCKER_IMAGE": f"valargroup/zakura:zcashd-compat-{image_version}",
+                  "ZAKURA_RELEASE_TAG": release_tag,
+                  "ZAKURA_DOCKER_IMAGE": f"valargroup/zakura:{image_version}",
+                  "ZAKURA_COMPAT_DOCKER_IMAGE": f"valargroup/zakura:zcashd-compat-{image_version}",
               },
               "install-zakura.sh": {
-                  "ZEBRA_RELEASE_TAG": release_tag,
-                  "ZEBRA_DOCKER_IMAGE": f"valargroup/zakura:{image_version}",
+                  "ZAKURA_RELEASE_TAG": release_tag,
+                  "ZAKURA_DOCKER_IMAGE": f"valargroup/zakura:{image_version}",
               },
           }
           for filename, replacements in installers.items():
@@ -314,8 +316,8 @@ jobs:
         run: |
           set -euo pipefail
           gh release upload "$RELEASE_TAG" \
-            ./publish/final/zebrad-*.tar.gz \
-            ./publish/final/zebrad-manifest-*.json \
+            ./publish/final/zakurad-*.tar.gz \
+            ./publish/final/zakurad-manifest-*.json \
             ./publish/final/install-zcashd-compat.sh \
             ./publish/final/install-zakura.sh \
             ./publish/final/SHA256SUMS.txt \
@@ -553,8 +555,8 @@ jobs:
     needs:
       - resolve-release
       - resolve-zcashd-compat-manifest
-      - build-zebrad-assets
-      - publish-zebrad-assets
+      - build-zakurad-assets
+      - publish-zakurad-assets
       - build
       - publish-docker-manifest
       - build-zcashd-compat
@@ -565,4 +567,4 @@ jobs:
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          allowed-skips: publish-zebrad-assets,publish-docker-manifest
+          allowed-skips: publish-zakurad-assets,publish-docker-manifest

@@ -218,6 +218,10 @@ criteria = "safe-to-deploy"
 version = "1.1.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.bitvec]]
+version = "1.1.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.blake2b_simd]]
 version = "1.0.4"
 criteria = "safe-to-deploy"
@@ -262,6 +266,10 @@ criteria = "safe-to-deploy"
 version = "1.12.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.bytes]]
+version = "1.12.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.bzip2-sys]]
 version = "0.1.13+1.0.8"
 criteria = "safe-to-deploy"
@@ -296,6 +304,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.chacha20poly1305]]
 version = "0.10.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.chrono]]
+version = "0.4.45"
 criteria = "safe-to-deploy"
 
 [[exemptions.chrono]]
@@ -356,6 +368,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.compression-core]]
 version = "0.4.32"
+criteria = "safe-to-deploy"
+
+[[exemptions.config]]
+version = "0.15.25"
 criteria = "safe-to-deploy"
 
 [[exemptions.config]]
@@ -459,6 +475,10 @@ criteria = "safe-to-run"
 
 [[exemptions.critical-section]]
 version = "1.2.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.crossbeam-channel]]
+version = "0.5.16"
 criteria = "safe-to-deploy"
 
 [[exemptions.crossbeam-channel]]
@@ -908,6 +928,10 @@ criteria = "safe-to-deploy"
 version = "2.4.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.humantime]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.humantime-serde]]
 version = "1.1.1"
 criteria = "safe-to-deploy"
@@ -974,6 +998,14 @@ criteria = "safe-to-deploy"
 
 [[exemptions.inferno]]
 version = "0.12.7"
+criteria = "safe-to-deploy"
+
+[[exemptions.inferno]]
+version = "0.12.7"
+criteria = "safe-to-deploy"
+
+[[exemptions.insta]]
+version = "1.48.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.insta]]
@@ -1080,11 +1112,23 @@ criteria = "safe-to-deploy"
 version = "0.24.11"
 criteria = "safe-to-deploy"
 
+[[exemptions.jsonrpsee]]
+version = "0.24.11"
+criteria = "safe-to-deploy"
+
+[[exemptions.jsonrpsee-core]]
+version = "0.24.11"
+criteria = "safe-to-deploy"
+
 [[exemptions.jsonrpsee-core]]
 version = "0.24.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.jsonrpsee-proc-macros]]
+version = "0.24.11"
+criteria = "safe-to-deploy"
+
+[[exemptions.jsonrpsee-server]]
 version = "0.24.11"
 criteria = "safe-to-deploy"
 
@@ -1158,6 +1202,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.lock_api]]
 version = "0.4.14"
+criteria = "safe-to-deploy"
+
+[[exemptions.log]]
+version = "0.4.33"
 criteria = "safe-to-deploy"
 
 [[exemptions.log]]
@@ -1598,8 +1646,16 @@ criteria = "safe-to-deploy"
 version = "0.14.4"
 criteria = "safe-to-deploy"
 
+[[exemptions.prost]]
+version = "0.14.4"
+criteria = "safe-to-deploy"
+
 [[exemptions.prost-build]]
 version = "0.14.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.prost-derive]]
+version = "0.14.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.prost-derive]]
@@ -1624,6 +1680,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.quick-error]]
 version = "1.2.3"
+criteria = "safe-to-deploy"
+
+[[exemptions.quick-xml]]
+version = "0.41.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.quick-xml]]
@@ -1722,12 +1782,20 @@ criteria = "safe-to-deploy"
 version = "1.12.4"
 criteria = "safe-to-deploy"
 
+[[exemptions.regex]]
+version = "1.12.4"
+criteria = "safe-to-deploy"
+
 [[exemptions.regex-automata]]
 version = "0.4.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.regex-lite]]
 version = "0.1.9"
+criteria = "safe-to-deploy"
+
+[[exemptions.regex-syntax]]
+version = "0.8.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.regex-syntax]]
@@ -1796,6 +1864,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.rustix]]
 version = "1.1.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.rustls]]
+version = "0.23.41"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls]]
@@ -1986,6 +2058,14 @@ criteria = "safe-to-deploy"
 version = "3.21.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.serde_with]]
+version = "3.21.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.serde_with_macros]]
+version = "3.21.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.serde_with_macros]]
 version = "3.21.0"
 criteria = "safe-to-deploy"
@@ -2092,6 +2172,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.symlink]]
 version = "0.1.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.syn]]
+version = "2.0.118"
 criteria = "safe-to-deploy"
 
 [[exemptions.syn]]
@@ -2428,6 +2512,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.webpki-roots]]
 version = "1.0.7"
+criteria = "safe-to-deploy"
+
+[[exemptions.which]]
+version = "8.0.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.which]]

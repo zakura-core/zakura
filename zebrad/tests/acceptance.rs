@@ -248,7 +248,7 @@ fn generate_no_args() -> Result<()> {
     let output = output.assert_success()?;
 
     // First line
-    output.stdout_line_contains("# Default configuration for zebrad")?;
+    output.stdout_line_contains("# Default configuration for zakurad")?;
 
     Ok(())
 }
@@ -276,7 +276,7 @@ fn generate_args() -> Result<()> {
     output.assert_failure()?;
 
     // Add a config file name to tempdir path
-    let generated_config_path = testdir.path().join("zebrad.toml");
+    let generated_config_path = testdir.path().join("zakura.toml");
 
     // Valid
     let child =
@@ -542,7 +542,7 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
                 cache_dir_check,
                 ignored_cache_dir.read_dir().unwrap().collect::<Vec<_>>()
             );
-            (["state", "zebrad.toml"].iter(), ["network"].iter())
+            (["state", "zakura.toml"].iter(), ["network"].iter())
         }
 
         // we didn't create the state directory, so it should not exist
@@ -560,7 +560,7 @@ fn ephemeral(cache_dir_config: EphemeralConfig, cache_dir_check: EphemeralCheck)
                 ignored_cache_dir.read_dir().unwrap().collect::<Vec<_>>()
             );
 
-            (["zebrad.toml"].iter(), ["network"].iter())
+            (["zakura.toml"].iter(), ["network"].iter())
         }
     };
 
@@ -658,7 +658,7 @@ fn version_args() -> Result<()> {
 fn config_tests() -> Result<()> {
     valid_generated_config("start", "Starting zebrad")?;
 
-    // Check what happens when Zebra parses an invalid config
+    // Check what happens when Zakura parses an invalid config
     invalid_generated_config()?;
 
     // Check that we have a current version of the config stored
@@ -714,7 +714,7 @@ fn valid_generated_config(command: &str, expect_stdout_line_contains: &str) -> R
     let testdir = &testdir;
 
     // Add a config file name to tempdir path
-    let generated_config_path = testdir.path().join("zebrad.toml");
+    let generated_config_path = testdir.path().join("zakura.toml");
 
     tracing::info!(?generated_config_path, "generating valid config");
 
@@ -770,7 +770,7 @@ fn last_config_is_stored() -> Result<()> {
     let testdir = testdir()?;
 
     // Add a config file name to tempdir path
-    let generated_config_path = testdir.path().join("zebrad.toml");
+    let generated_config_path = testdir.path().join("zakura.toml");
 
     tracing::info!(?generated_config_path, "generated current config");
 
@@ -859,7 +859,7 @@ fn current_version_config_path() -> PathBuf {
     configs_dir().join(format!("v{}.toml", env!("CARGO_PKG_VERSION")))
 }
 
-/// Checks that Zebra prints an informative message when it cannot parse the
+/// Checks that Zakura prints an informative message when it cannot parse the
 /// config file.
 #[tracing::instrument]
 fn invalid_generated_config() -> Result<()> {
@@ -868,7 +868,7 @@ fn invalid_generated_config() -> Result<()> {
     let testdir = &testdir()?;
 
     // Add a config file name to tempdir path.
-    let config_path = testdir.path().join("zebrad.toml");
+    let config_path = testdir.path().join("zakura.toml");
 
     tracing::info!(
         ?config_path,
@@ -887,7 +887,7 @@ fn invalid_generated_config() -> Result<()> {
         "generated config file not found"
     );
 
-    // Load the valid config file that Zebra generated.
+    // Load the valid config file that Zakura generated.
     let mut config_file = fs::read_to_string(config_path.to_str().unwrap()).unwrap();
 
     // Let's now alter the config file so that it contains a deprecated format
@@ -911,40 +911,40 @@ fn invalid_generated_config() -> Result<()> {
 
     tracing::info!(?config_path, "writing invalid config");
 
-    // Write the altered config file so that Zebra can pick it up.
+    // Write the altered config file so that Zakura can pick it up.
     fs::write(config_path.to_str().unwrap(), config_file.as_bytes())
         .expect("Could not write the altered config file.");
 
     tracing::info!(?config_path, "testing invalid config parsing");
 
-    // Run Zebra in a temp dir so that it loads the config.
+    // Run Zakura in a temp dir so that it loads the config.
     let mut child = testdir.spawn_child(args!["start"])?;
 
     // Return an error if Zebra is running for more than two seconds.
     //
-    // Since the config is invalid, Zebra should terminate instantly after its
-    // start. Two seconds should be sufficient for Zebra to read the config file
+    // Since the config is invalid, Zakura should terminate instantly after its
+    // start. Two seconds should be sufficient for Zakura to read the config file
     // and terminate.
     std::thread::sleep(Duration::from_secs(2));
     if child.is_running() {
         // We're going to error anyway, so return an error that makes sense to the developer.
         child.kill(true)?;
         return Err(eyre!(
-            "Zebra should have exited after reading the invalid config"
+            "Zakura should have exited after reading the invalid config"
         ));
     }
 
     let output = child.wait_with_output()?;
 
-    // Check that Zebra produced an informative message.
+    // Check that Zakura produced an informative message.
     output.stderr_contains(
-        "Zebra could not load the provided configuration file and/or environment variables",
+        "Zakura could not load the provided configuration file and/or environment variables",
     )?;
 
     Ok(())
 }
 
-/// Test all versions of `zebrad.toml` we have stored can be parsed by the latest `zebrad`.
+/// Test all stored config versions can be parsed by the latest `zakurad`.
 #[tracing::instrument]
 #[test]
 fn stored_configs_parsed_correctly() -> Result<()> {
@@ -988,7 +988,7 @@ fn stored_configs_parsed_correctly() -> Result<()> {
     Ok(())
 }
 
-/// Test all versions of `zebrad.toml` we have stored can be parsed by the latest `zebrad`.
+/// Test all stored configs can be upgraded by the latest `zakurad`.
 #[tracing::instrument]
 fn stored_configs_work() -> Result<()> {
     let old_configs_dir = configs_dir();
@@ -1714,9 +1714,9 @@ async fn rpc_endpoint(parallel_cpu_threads: bool) -> Result<()> {
     let build = parsed["result"]["build"].as_str().unwrap();
     assert!(build.len() > 4, "Got {build}");
 
-    // Check that the `subversion` field has "Zebra" in it.
+    // Check that the `subversion` field has "Zakura" in it.
     let subversion = parsed["result"]["subversion"].as_str().unwrap();
-    assert!(subversion.contains("Zebra"), "Got {subversion}");
+    assert!(subversion.contains("Zakura"), "Got {subversion}");
 
     child.kill(false)?;
 

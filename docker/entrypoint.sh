@@ -1,28 +1,29 @@
 #!/usr/bin/env bash
 
-# Entrypoint for running Zebra in Docker.
+# Entrypoint for running Zakura in Docker.
 #
-# This script handles privilege dropping and launches zebrad or tests.
+# This script handles privilege dropping and launches zakurad or tests.
 # Configuration is managed by config-rs using defaults, optional TOML, and
-# environment variables prefixed with ZEBRA_.
+# environment variables prefixed with ZAKURA_.
 
 set -eo pipefail
 
-# Default cache directories for Zebra components.
-# These use the config-rs ZEBRA_SECTION__KEY format and will be picked up
-# by zebrad's configuration system automatically.
-: "${ZEBRA_STATE__CACHE_DIR:=${HOME}/.cache/zakura}"
-: "${ZEBRA_RPC__COOKIE_DIR:=${HOME}/.cache/zakura}"
+# Default cache directories for Zakura components.
+# These use the config-rs ZAKURA_SECTION__KEY format and will be picked up
+# by zakurad's configuration system automatically.
+: "${ZAKURA_STATE__CACHE_DIR:=${ZEBRA_STATE__CACHE_DIR:-${HOME}/.cache/zakura}}"
+: "${ZAKURA_RPC__COOKIE_DIR:=${ZEBRA_RPC__COOKIE_DIR:-${HOME}/.cache/zakura}}"
+export ZAKURA_STATE__CACHE_DIR ZAKURA_RPC__COOKIE_DIR
 
 # Leave zcashd-compat disabled unless the container runtime explicitly opts in.
 # Compat images can set ZCASHD_COMPAT_ENABLED=true to use a vendored
-# /usr/local/bin/zcashd, while still allowing ZEBRA_ZCASHD_COMPAT__* overrides.
+# /usr/local/bin/zcashd, while still allowing ZAKURA_ZCASHD_COMPAT__* overrides.
 case "${ZCASHD_COMPAT_ENABLED:-}" in
 true | TRUE | 1 | yes | YES | on | ON)
-  export ZEBRA_ZCASHD_COMPAT__ENABLED="${ZEBRA_ZCASHD_COMPAT__ENABLED:-true}"
+  export ZAKURA_ZCASHD_COMPAT__ENABLED="${ZAKURA_ZCASHD_COMPAT__ENABLED:-${ZEBRA_ZCASHD_COMPAT__ENABLED:-true}}"
   if [[ -x /usr/local/bin/zcashd ]]; then
-    export ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE="${ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE:-path}"
-    export ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH="${ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH:-/usr/local/bin/zcashd}"
+    export ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE="${ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE:-${ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE:-path}}"
+    export ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH="${ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH:-${ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH:-/usr/local/bin/zcashd}}"
   fi
   ;;
 false | FALSE | 0 | no | NO | off | OFF | "")
@@ -69,16 +70,22 @@ create_owned_directory() {
   fi
 }
 
-# Create and own cache and config directories based on ZEBRA_* environment variables
-[[ -n ${ZEBRA_STATE__CACHE_DIR} ]] && create_owned_directory "${ZEBRA_STATE__CACHE_DIR}"
-[[ -n ${ZEBRA_RPC__COOKIE_DIR} ]] && create_owned_directory "${ZEBRA_RPC__COOKIE_DIR}"
+# Create and own cache and config directories based on ZAKURA_* environment variables.
+[[ -n ${ZAKURA_STATE__CACHE_DIR} ]] && create_owned_directory "${ZAKURA_STATE__CACHE_DIR}"
+[[ -n ${ZAKURA_RPC__COOKIE_DIR} ]] && create_owned_directory "${ZAKURA_RPC__COOKIE_DIR}"
+[[ -n ${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR:-} ]] && create_owned_directory "${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR}"
+[[ -n ${ZAKURA_TRACING__LOG_FILE:-} ]] && create_owned_directory "$(dirname "${ZAKURA_TRACING__LOG_FILE}")"
+
+# Legacy ZEBRA_* variables remain accepted by the config loader.
+[[ -n ${ZEBRA_STATE__CACHE_DIR:-} ]] && create_owned_directory "${ZEBRA_STATE__CACHE_DIR}"
+[[ -n ${ZEBRA_RPC__COOKIE_DIR:-} ]] && create_owned_directory "${ZEBRA_RPC__COOKIE_DIR}"
 [[ -n ${ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR:-} ]] && create_owned_directory "${ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR}"
-[[ -n ${ZEBRA_TRACING__LOG_FILE} ]] && create_owned_directory "$(dirname "${ZEBRA_TRACING__LOG_FILE}")"
+[[ -n ${ZEBRA_TRACING__LOG_FILE:-} ]] && create_owned_directory "$(dirname "${ZEBRA_TRACING__LOG_FILE}")"
 
 # --- Optional config file support ---
-# If provided, pass a config file path through to zebrad via CONFIG_FILE_PATH.
+# If provided, pass a config file path through to zakurad via CONFIG_FILE_PATH.
 
-# If the user provided a config file path we pass it to zebrad.
+# If the user provided a config file path we pass it to zakurad.
 CONFIG_ARGS=()
 if [[ -n ${CONFIG_FILE_PATH} && -f ${CONFIG_FILE_PATH} ]]; then
     echo "INFO: Using config file at ${CONFIG_FILE_PATH}"

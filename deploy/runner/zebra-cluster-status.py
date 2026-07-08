@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simple Zebra fleet status dashboard.
+"""Simple Zakura fleet status dashboard.
 
 Reads a deploy/deployer nodes TOML, polls each node over SSH, and serves a small
 HTML dashboard showing the running commit, Zakura node ID, restart time, current
@@ -43,11 +43,11 @@ SSH_COMMON_OPTS = [
 
 DEFAULTS = {
     "probe_kind": "zebra",
-    "service_name": "zebrad",
-    "bin_path": "/usr/local/bin/zebrad",
-    "config_path": "/etc/zebrad/zebrad.toml",
-    "log_file": "/var/log/zebrad/zebrad.log",
-    "state_cache_dir": "/var/lib/zebrad",
+    "service_name": "zakurad",
+    "bin_path": "/usr/local/bin/zakurad",
+    "config_path": "/etc/zakura/zakura.toml",
+    "log_file": "/var/log/zakura/zakura.log",
+    "state_cache_dir": "/var/lib/zakura",
     "network": "Mainnet",
     "listen_addr": "[::]:8233",
     "rpc_listen_addr": "",

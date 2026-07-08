@@ -1,4 +1,4 @@
-# Zebra sync perf runbook — deterministic isolated env
+# Zakura sync perf runbook — deterministic isolated env
 
 Measure/debug local sync performance from the 1.8M snapshot, reproducibly. The
 bench node syncs a fixed range (≈1.80M→1.83M) peering **only** with two frozen
@@ -6,9 +6,9 @@ serving nodes we control, over a private Zakura cohort (the `dev_network`
 feature, PR #262), so other engineers churning the public fleet can't perturb a
 run. Background: `book/src/dev/private-zakura-network.md`.
 
-Everything lives in `/root/zebra/deploy/runner/` (untracked local tooling).
+Everything lives in `/root/zakura/deploy/runner/` (untracked local tooling).
 `perf.sh` is the entry point — it wraps the deployer and the run/analyze scripts.
-Repo-relative paths below are from the repo root `/root/zebra/`.
+Repo-relative paths below are from the repo root `/root/zakura/`.
 
 ## Layout
 
@@ -45,7 +45,7 @@ it**, or the captured peer ids change.
 
 The deployer renders the cohort config itself: `deploy/deployer/deploy.py` reads a
 fleet-wide `[defaults.zakura]` table plus `storage_mode` / `v2_p2p` /
-`legacy_p2p`, so there is no hand-editing of `/etc/zebrad` on the nodes.
+`legacy_p2p`, so there is no hand-editing of `/etc/zakura` on the nodes.
 
 ## Run loop (the repeatable part)
 
@@ -77,7 +77,7 @@ fleet-wide `[defaults.zakura]` table plus `storage_mode` / `v2_p2p` /
 - `[network.zakura.block_sync] replace_legacy_syncer=true` — Zakura owns block
   download; the legacy syncer does tip discovery only.
 - `[consensus] checkpoint_sync=true` — selects the VCT peer-source fast path.
-- Binary: release + `commit-metrics` → `/root/wal-bench/zebrad-notecommit-instr`
+- Binary: release + `commit-metrics` → `/root/wal-bench/zakurad-notecommit-instr`
   (built by `perf.sh build-local`).
 
 ## Snapshot

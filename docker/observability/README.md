@@ -98,14 +98,14 @@ Configure alert destinations in [alertmanager/alertmanager.yml](alertmanager/ale
 
 ### Environment Variables
 
-Zebra accepts these environment variables for observability:
+Zakura accepts these environment variables for observability:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ZEBRA_METRICS__ENDPOINT_ADDR` | - | Prometheus metrics endpoint (e.g., `0.0.0.0:9999`) |
-| `ZEBRA_RPC__LISTEN_ADDR` | - | RPC endpoint for JSON-RPC requests |
+| `ZAKURA_METRICS__ENDPOINT_ADDR` | - | Prometheus metrics endpoint (e.g., `0.0.0.0:9999`) |
+| `ZAKURA_RPC__LISTEN_ADDR` | - | RPC endpoint for JSON-RPC requests |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | - | Jaeger OTLP endpoint (e.g., `http://jaeger:4318`) |
-| `OTEL_SERVICE_NAME` | `zebra` | Service name in traces |
+| `OTEL_SERVICE_NAME` | `zakura` | Service name in traces |
 | `OTEL_TRACES_SAMPLER_ARG` | `100` | Sampling percentage (0-100)* |
 
 ### Trace Sampling

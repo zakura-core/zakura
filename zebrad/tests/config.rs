@@ -1,7 +1,7 @@
 //! Integration tests for config loading via config-rs.
 //!
 //! Verifies layered configuration (defaults, TOML file, env) and
-//! `ZEBRA_`-prefixed environment variable mappings used in Docker or
+//! `ZAKURA_`-prefixed environment variable mappings used in Docker or
 //! other environments.
 
 #![allow(clippy::unwrap_in_result)]
@@ -10,23 +10,26 @@ use std::{env, fs, io::Write, path::PathBuf, sync::Mutex};
 
 use tempfile::{Builder, TempDir};
 use zebra_network::zakura::{DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP};
-use zebrad::components::zcashd_compat::ConfigZcashdBinarySource;
+use zebrad::components::{
+    tracing::{Config as TracingConfig, InnerConfig as TracingInnerConfig, ProgressConfig},
+    zcashd_compat::ConfigZcashdBinarySource,
+};
 use zebrad::config::ZebradConfig;
 
-// Prefix used for environment variables mapped to config values in tests.
-const ZEBRA_ENV_PREFIX: &str = "ZEBRA_";
+// Prefixes used for environment variables mapped to config values in tests.
+const CONFIG_ENV_PREFIXES: [&str; 2] = ["ZEBRA_", "ZAKURA_"];
 
 // Global mutex to ensure tests run sequentially to avoid env var races
 static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
-/// Helper to isolate and manage ZEBRA_* environment variables in tests.
+/// Helper to isolate and manage config environment variables in tests.
 struct EnvGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
     original_vars: Vec<(String, String)>,
 }
 
 impl EnvGuard {
-    /// Acquire the global lock and clear all ZEBRA_* env vars, saving originals.
+    /// Acquire the global lock and clear all config env vars, saving originals.
     fn new() -> Self {
         // If a test panics, the mutex guard is dropped, but the mutex remains poisoned.
         // We can recover from the poison error and get the lock, because we're going
@@ -34,7 +37,11 @@ impl EnvGuard {
         let guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
         let original_vars: Vec<(String, String)> = env::vars()
-            .filter(|(key, _val)| key.starts_with(ZEBRA_ENV_PREFIX))
+            .filter(|(key, _val)| {
+                CONFIG_ENV_PREFIXES
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+            })
             .collect();
 
         for (key, _) in &original_vars {
@@ -47,7 +54,7 @@ impl EnvGuard {
         }
     }
 
-    /// Set a ZEBRA_* environment variable for this test.
+    /// Set a config environment variable for this test.
     fn set_var(&self, key: &str, value: &str) {
         env::set_var(key, value);
     }
@@ -55,9 +62,13 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // Clear any ZEBRA_* set during the test
+        // Clear any config env vars set during the test.
         let current_vars: Vec<String> = env::vars()
-            .filter(|(key, _)| key.starts_with(ZEBRA_ENV_PREFIX))
+            .filter(|(key, _)| {
+                CONFIG_ENV_PREFIXES
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+            })
             .map(|(key, _)| key)
             .collect();
         for key in current_vars {
@@ -90,6 +101,23 @@ fn config_load_defaults() {
     );
     assert_eq!(config.rpc.listen_addr, None); // RPC disabled by default
     assert_eq!(config.metrics.endpoint_addr, None); // Metrics disabled by default
+}
+
+#[test]
+fn tracing_progress_bar_uses_zakura_log_file_by_default() {
+    let tracing_config = TracingConfig::from(TracingInnerConfig {
+        progress_bar: Some(ProgressConfig::Summary),
+        ..TracingInnerConfig::default()
+    });
+
+    assert_eq!(
+        tracing_config
+            .log_file
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str()),
+        Some("zakura.log")
+    );
 }
 
 #[test]
@@ -139,8 +167,8 @@ fn config_nonexistent_file_errors() {
 fn config_env_override_defaults() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_NETWORK__NETWORK", "Testnet");
-    env.set_var("ZEBRA_RPC__LISTEN_ADDR", "127.0.0.1:8232");
+    env.set_var("ZAKURA_NETWORK__NETWORK", "Testnet");
+    env.set_var("ZAKURA_RPC__LISTEN_ADDR", "127.0.0.1:8232");
 
     let config = ZebradConfig::load(None).expect("load config with env vars");
 
@@ -168,8 +196,8 @@ listen_addr = "127.0.0.1:8233"
 
     fs::write(&config_path, test_config).expect("write test config");
 
-    env.set_var("ZEBRA_NETWORK__NETWORK", "Testnet");
-    env.set_var("ZEBRA_RPC__LISTEN_ADDR", "127.0.0.1:8232");
+    env.set_var("ZAKURA_NETWORK__NETWORK", "Testnet");
+    env.set_var("ZAKURA_RPC__LISTEN_ADDR", "127.0.0.1:8232");
 
     let config = ZebradConfig::load(Some(config_path)).expect("load config");
 
@@ -210,7 +238,7 @@ fn config_invalid_env_values_error() {
 fn config_nested_env_vars() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_TRACING__FILTER", "debug");
+    env.set_var("ZAKURA_TRACING__FILTER", "debug");
 
     let config = ZebradConfig::load(None).expect("load config with nested env vars");
 
@@ -335,12 +363,26 @@ fn config_zebra_metrics_endpoint_addr_env() {
 fn config_zebra_tracing_log_file_env() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_TRACING__LOG_FILE", "/test/zebra.log");
+    env.set_var("ZAKURA_TRACING__LOG_FILE", "/test/zakura.log");
 
-    let config = ZebradConfig::load(None).expect("load config with ZEBRA_TRACING__LOG_FILE");
+    let config = ZebradConfig::load(None).expect("load config with ZAKURA_TRACING__LOG_FILE");
     assert_eq!(
         config.tracing.log_file.as_ref().unwrap(),
-        &PathBuf::from("/test/zebra.log")
+        &PathBuf::from("/test/zakura.log")
+    );
+}
+
+#[test]
+fn config_zakura_env_overrides_legacy_zebra_env() {
+    let env = EnvGuard::new();
+
+    env.set_var("ZEBRA_RPC__LISTEN_ADDR", "127.0.0.1:18232");
+    env.set_var("ZAKURA_RPC__LISTEN_ADDR", "127.0.0.1:8232");
+
+    let config = ZebradConfig::load(None).expect("load config with both env prefixes");
+    assert_eq!(
+        config.rpc.listen_addr.unwrap().to_string(),
+        "127.0.0.1:8232"
     );
 }
 

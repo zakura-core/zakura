@@ -7,10 +7,10 @@
 # Tokens: feat/pre-release-main roman-perf-1800 ["912e382c9790d241d1f5f31e38f331932b85b0e8848e35e16f49bf76c3c43674@167.99.162.47:8234","cbd797cb28c5e53dbc19e4d5d6d60e5dcd9b5667808eb5703131c67cd67a30fa@167.172.201.36:8234"] false archive
 
 [defaults]
-service_name    = "zebrad"
-bin_path        = "/usr/local/bin/zebrad"
-config_path     = "/etc/zebrad/zebrad.toml"
-log_file        = "/var/log/zebrad/zebrad.log"
+service_name    = "zakurad"
+bin_path        = "/usr/local/bin/zakurad"
+config_path     = "/etc/zakura/zakura.toml"
+log_file        = "/var/log/zakura/zakura.log"
 state_cache_dir = "/root/.cache/zakura"      # the big-volume snapshot (symlink -> /mnt/<host>-data/zakura-cache); holds the near-tip state + iroh identity. Never wipe.
 network         = "Mainnet"
 listen_addr     = "[::]:8233"

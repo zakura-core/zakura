@@ -47,10 +47,10 @@
 //!
 //! ## Configuration
 //!
-//! The command below places the generated `zebrad.toml` config file in the default preferences directory of Linux:
+//! The command below places the generated `zakura.toml` config file in the default preferences directory of Linux:
 //!
 //! ```console
-//! zebrad generate -o ~/.config/zebrad.toml
+//! zakurad generate -o ~/.config/zakura.toml
 //! ```
 //!
 //! See [`config::ZebradConfig`] for other OSes default locations or more information about how to configure Zebra.

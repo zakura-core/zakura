@@ -4,11 +4,11 @@
 # Run: python3 deploy.py deploy --config nodes.toml
 
 [defaults]
-service_name    = "zebrad"                  # systemd unit name on the node
-bin_path        = "/usr/local/bin/zebrad"
-config_path     = "/etc/zebrad/zebrad.toml"
-log_file        = "/var/log/zebrad/zebrad.log"   # deterministic log path
-state_cache_dir = "/var/lib/zebrad"
+service_name    = "zakurad"                 # systemd unit name on the node
+bin_path        = "/usr/local/bin/zakurad"
+config_path     = "/etc/zakura/zakura.toml"
+log_file        = "/var/log/zakura/zakura.log"   # deterministic log path
+state_cache_dir = "/var/lib/zakura"
 cache_dir_migrate_from = ""                    # optional old cache dir to move during restart deploys
 network         = "Mainnet"
 listen_addr     = "[::]:8233"
@@ -44,8 +44,8 @@ commit     = "evan/perf-note-commit-tree"
 # commit = "main"
 # deploy_kind = "process"
 # service_name = ""
-# bin_path = "/root/app/target/release/zebrad"
+# bin_path = "/root/app/target/release/zakurad"
 # config_path = "/root/app/node.toml"
 # working_dir = "/root/app"
-# start_command = "target/release/zebrad -c /root/app/node.toml start"
-# process_pattern = "target/release/zebrad -c /root/app/node.toml start"
+# start_command = "target/release/zakurad -c /root/app/node.toml start"
+# process_pattern = "target/release/zakurad -c /root/app/node.toml start"

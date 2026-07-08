@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Deploy zebrad to a fleet of nodes and collect their logs.
+"""Deploy zakurad to a fleet of nodes and collect their logs.
 
 Stdlib only (Python 3.11+ for tomllib). No third-party dependencies.
 
 The tool reads a node config (name / ssh_string / commit per node), builds the
-zebrad binary from each node's commit (reusing a cache keyed on the resolved
+zakurad binary from each node's commit (reusing a cache keyed on the resolved
 commit SHA), distributes the binary, installs+restarts a systemd service that
 logs to a deterministic file, and pulls those logs back on demand.
 
@@ -40,11 +40,11 @@ SSH_COMMON_OPTS = [
 
 DEFAULTS = {
     "deploy_kind": "systemd",
-    "service_name": "zebrad",
-    "bin_path": "/usr/local/bin/zebrad",
-    "config_path": "/etc/zebrad/zebrad.toml",
-    "log_file": "/var/log/zebrad/zebrad.log",
-    "state_cache_dir": "/var/lib/zebrad",
+    "service_name": "zakurad",
+    "bin_path": "/usr/local/bin/zakurad",
+    "config_path": "/etc/zakura/zakura.toml",
+    "log_file": "/var/log/zakura/zakura.log",
+    "state_cache_dir": "/var/lib/zakura",
     "network": "Mainnet",
     "listen_addr": "[::]:8233",
     "network_cache_dir": "",
@@ -52,12 +52,12 @@ DEFAULTS = {
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
     "rpc_enable_cookie_auth": None,
     "port": None,           # ssh port; None -> ssh default
-    # Match zebrad's own defaults so existing fleets render unchanged.
+    # Match zakurad's own defaults so existing fleets render unchanged.
     "storage_mode": "archive",
     "v2_p2p": True,
     "legacy_p2p": True,
     "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
-    "tracing_filter": "",    # e.g. "info,zebra_network::zakura=debug"; "" uses zebrad default
+    "tracing_filter": "",    # e.g. "info,zebra_network::zakura=debug"; "" uses zakurad default
     "checkpoint_sync": True,
     # Setting this false keeps checkpoint sync on while selecting the legacy non-VCT path.
     "vct_fast_sync": True,
@@ -246,11 +246,11 @@ def resolve_sha(root: Path, commit: str) -> str:
 
 
 def cached_binary(sha: str) -> Path:
-    return BUILD_CACHE_DIR / f"zebrad-{sha}"
+    return BUILD_CACHE_DIR / f"zakurad-{sha}"
 
 
 def binary_is_runnable(binary: Path) -> bool:
-    """Sanity-check that a cached binary is a valid, runnable zebrad.
+    """Sanity-check that a cached binary is a valid, runnable zakurad.
 
     We can't verify the commit from `--version` (it prints clean semver without
     the git SHA), so the cache key (the SHA-named filename) is what ties a cached
@@ -264,7 +264,7 @@ def binary_is_runnable(binary: Path) -> bool:
 
 
 def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
-    """Build zebrad at `sha` into the cache, or reuse an existing cached build."""
+    """Build zakurad at `sha` into the cache, or reuse an existing cached build."""
     BUILD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     target = cached_binary(sha)
     if target.exists() and not force:
@@ -362,11 +362,11 @@ def render_node_config(node: Node) -> str:
     else:
         rpc_block = "# listen_addr disabled"
     metrics_block = f'[metrics]\nendpoint_addr = "{node.metrics_endpoint}"\n' if node.metrics_endpoint else ""
-    filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zebrad default)"
+    filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zakurad default)"
     network_cache_line = (
-        f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zebrad default)"
+        f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zakurad default)"
     )
-    return render_template("zebrad.toml", {
+    return render_template("zakura.toml", {
         "NETWORK": node.network,
         "LISTEN_ADDR": node.listen_addr,
         "NETWORK_CACHE_DIR": network_cache_line,
@@ -385,7 +385,7 @@ def render_node_config(node: Node) -> str:
 
 
 def render_service(node: Node) -> str:
-    return render_template("zebrad.service", {
+    return render_template("zakurad.service", {
         "SERVICE_NAME": node.service_name,
         "BIN_PATH": node.bin_path,
         "CONFIG_PATH": node.config_path,
@@ -411,15 +411,15 @@ NO_RESTART={no_restart}
 mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")" "$(dirname "$LOG_FILE")"
 
 # Stage uploaded artifacts (uploaded to /tmp by the deploy step).
-install -m 644 /tmp/zebrad-deploy.service "/etc/systemd/system/${{SERVICE}}.service"
-install -m 644 /tmp/zebrad-deploy.toml "$CONFIG_PATH"
+install -m 644 /tmp/zakurad-deploy.service "/etc/systemd/system/${{SERVICE}}.service"
+install -m 644 /tmp/zakurad-deploy.toml "$CONFIG_PATH"
 
 # Back up the currently installed binary before replacing it.
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
 fi
-install -m 755 /tmp/zebrad-deploy.new "$BIN_PATH"
-rm -f /tmp/zebrad-deploy.new /tmp/zebrad-deploy.service /tmp/zebrad-deploy.toml
+install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
+rm -f /tmp/zakurad-deploy.new /tmp/zakurad-deploy.service /tmp/zakurad-deploy.toml
 
 systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null 2>&1 || true
@@ -502,13 +502,13 @@ if [ -n "$WORKING_DIR" ]; then
     mkdir -p "$WORKING_DIR"
 fi
 
-install -m 644 /tmp/zebrad-deploy.toml "$CONFIG_PATH"
+install -m 644 /tmp/zakurad-deploy.toml "$CONFIG_PATH"
 
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
 fi
-install -m 755 /tmp/zebrad-deploy.new "$BIN_PATH"
-rm -f /tmp/zebrad-deploy.new /tmp/zebrad-deploy.toml
+install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
+rm -f /tmp/zakurad-deploy.new /tmp/zakurad-deploy.toml
 
 if [ "$NO_RESTART" = "1" ]; then
     if [ -n "$CACHE_DIR_MIGRATE_FROM" ] && [ ! -e "$STATE_DIR" ] && [ -d "$CACHE_DIR_MIGRATE_FROM" ]; then
@@ -551,7 +551,7 @@ if [ -n "$WORKING_DIR" ]; then
     cd "$WORKING_DIR"
 fi
 
-launcher_log="${{LOG_FILE:-/tmp/zebrad-process-deploy}}.launcher"
+launcher_log="${{LOG_FILE:-/tmp/zakurad-process-deploy}}.launcher"
 nohup bash -lc "$START_COMMAND" >> "$launcher_log" 2>&1 &
 sleep 3
 
@@ -609,14 +609,14 @@ def cmd_deploy(args) -> int:
             cfg_tmp = BUILD_CACHE_DIR / f".cfg-{node.name}.toml"
             cfg_tmp.write_text(cfg)
             try:
-                run(node.scp_to(str(binary), "/tmp/zebrad-deploy.new"), capture=True)
-                run(node.scp_to(str(cfg_tmp), "/tmp/zebrad-deploy.toml"), capture=True)
+                run(node.scp_to(str(binary), "/tmp/zakurad-deploy.new"), capture=True)
+                run(node.scp_to(str(cfg_tmp), "/tmp/zakurad-deploy.toml"), capture=True)
                 if node.deploy_kind == "systemd":
                     unit = render_service(node)
                     unit_tmp = BUILD_CACHE_DIR / f".unit-{node.name}.service"
                     unit_tmp.write_text(unit)
                     try:
-                        run(node.scp_to(str(unit_tmp), "/tmp/zebrad-deploy.service"), capture=True)
+                        run(node.scp_to(str(unit_tmp), "/tmp/zakurad-deploy.service"), capture=True)
                     finally:
                         unit_tmp.unlink(missing_ok=True)
             finally:
@@ -720,7 +720,7 @@ def cmd_status(args) -> int:
     nodes = load_nodes(Path(args.config), args.node)
 
     def work(node: Node) -> tuple[str, str]:
-        # `zebrad --version` prints clean semver (e.g. "zebrad 5.0.0-rc.3") with no
+        # `zakurad --version` prints clean semver (e.g. "zakurad 5.0.0-rc.3") with no
         # commit, so also read the running build's git commit from the startup
         # diagnostic line in the node's log (`git commit: <sha>`). The configured
         # ref is appended so requested-vs-running is visible at a glance.
@@ -763,7 +763,7 @@ def cmd_status(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="deploy.py",
-        description="Build, deploy, and collect logs for a zebrad node fleet.",
+        description="Build, deploy, and collect logs for a Zakura node fleet.",
     )
     sub = p.add_subparsers(dest="command", required=True)
 

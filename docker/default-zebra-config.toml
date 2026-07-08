@@ -50,7 +50,7 @@ use_color = true
 # Logging to a file is disabled by default. To enable it, uncomment the line
 # below and alternatively set your own path.
 
-# log_file = "/home/zebra/.local/state/zebrad.log"
+# log_file = "/home/zebra/.local/state/zakura.log"
 
 # Sending tracing events to systemd-journald is disabled by default. To enable
 # it, uncomment the line below.

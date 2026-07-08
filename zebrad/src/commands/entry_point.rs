@@ -40,7 +40,7 @@ pub struct EntryPoint {
 
     /// Filter strings which override the config file and defaults
     // This can be applied to the default start command if no subcommand is provided.
-    #[clap(long, help = "tracing filters which override the zebrad.toml config")]
+    #[clap(long, help = "tracing filters which override the zakura.toml config")]
     filters: Vec<String>,
 }
 

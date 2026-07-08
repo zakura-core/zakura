@@ -31,9 +31,9 @@
 #      nothing, so this exercises the production Mainnet-from-0 / catch-up path,
 #   8. a non-finalized reorg converges with no block-sync byte-budget leak.
 #
-# No image is built: each container runs the HOST-built zebrad binary
+# No image is built: each container runs the HOST-built zakurad binary
 # bind-mounted into debian:trixie-slim. If the binary is missing it is built
-# here (debug; fine for regtest). Override with ZEBRAD_BIN=/path/to/zebrad.
+# here (debug; fine for regtest). Override with ZAKURAD_BIN=/path/to/zakurad.
 #
 # Usage: docker/zakura-regtest-e2e/run.sh
 set -euo pipefail
@@ -150,13 +150,13 @@ command -v jq >/dev/null || fail "jq is required to parse RPC responses"
 command -v python3 >/dev/null || fail "python3 is required to run the trace oracle"
 
 # Ensure a host-built zakurad binary exists; build it (debug) if not.
-ZEBRAD_BIN="${ZEBRAD_BIN:-${REPO_DIR}/target/debug/zakurad}"
-if [[ ! -x "${ZEBRAD_BIN}" ]]; then
+ZAKURAD_BIN="${ZAKURAD_BIN:-${REPO_DIR}/target/debug/zakurad}"
+if [[ ! -x "${ZAKURAD_BIN}" ]]; then
   log "building host zakurad (debug) — no in-container build"
   ( cd "${REPO_DIR}" && CXXFLAGS="-include cstdint" cargo build -p zebrad --bin zakurad )
 fi
-[[ -x "${ZEBRAD_BIN}" ]] || fail "zebrad binary not found at ${ZEBRAD_BIN}"
-export ZEBRAD_BIN
+[[ -x "${ZAKURAD_BIN}" ]] || fail "zakurad binary not found at ${ZAKURAD_BIN}"
+export ZAKURAD_BIN
 ZAKURA_E2E_TRACE_DIR="${ZAKURA_E2E_TRACE_DIR:-/tmp/zakura-regtest-e2e-traces-${RUN_LABEL}}"
 export ZAKURA_E2E_TRACE_DIR
 mkdir -p \
@@ -194,7 +194,7 @@ export ZAKURA_NODE3_CONFIG="${CONFIG_DIR}/node3.toml"
 export ZAKURA_NODE4_CONFIG="${CONFIG_DIR}/node4.toml"
 
 log "run mode: ${ZAKURA_E2E_MODE} (${RUN_LABEL})"
-log "using zebrad binary: ${ZEBRAD_BIN}"
+log "using zakurad binary: ${ZAKURAD_BIN}"
 log "writing Zakura traces under: ${ZAKURA_E2E_TRACE_DIR}"
 
 ORACLE_RAN=0

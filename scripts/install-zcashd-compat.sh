@@ -1213,8 +1213,12 @@ prepare_binary_paths() {
 # datadir has none, so bootstrap a minimal one rather than printing a command
 # that cannot run. Never overwrite an existing file.
 ensure_zcashd_conf() {
+  # split-binary/build-from-source run zcashd directly; docker-split-containers
+  # runs a standalone zcashd container (nobody bootstraps its conf, unlike
+  # docker-supervised where the in-container Zakura node creates it). All three
+  # need a zcash.conf to exist, or zcashd refuses to start.
   case "$MODE" in
-    split-binary | build-from-source) ;;
+    split-binary | build-from-source | docker-split-containers) ;;
     *) return ;;
   esac
 
@@ -1668,7 +1672,14 @@ case "$MODE" in
     prepare_binary_paths
     ensure_zcashd_conf
     ;;
-  docker-split-containers | docker-supervised)
+  docker-split-containers)
+    # Bootstrap the standalone zcashd container's conf before prepare_docker_mounts
+    # so its recursive chown to the container runtime user covers the new file.
+    ensure_zcashd_conf
+    prepare_docker_mounts
+    prepare_docker_images
+    ;;
+  docker-supervised)
     prepare_docker_mounts
     prepare_docker_images
     ;;

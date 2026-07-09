@@ -51,9 +51,7 @@ fn apply_mined_block_mark(
     mined_block_channel_empty: bool,
     hash: block::Hash,
 ) {
-    if mined_block_channel_empty
-        && chain_state.latest_chain_tip().best_tip_hash() == Some(hash)
-    {
+    if mined_block_channel_empty && chain_state.latest_chain_tip().best_tip_hash() == Some(hash) {
         chain_state.mark_last_change_hash(hash);
     }
 }

@@ -1,0 +1,98 @@
+name: Rollback Zakura mainnet node
+
+# Emergency rollback for a single mainnet node: capture diagnostics, then restore
+# the previous binary from <bin_path>.bak (kept by the deploy workflow) and
+# restart the existing service. Runs on the zakura-mainnet-deployer runner and
+# SSHes to the target with the runner's identity.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_target:
+        description: "root@<ip> of the node to roll back"
+        required: true
+        type: string
+        default: root@159.65.183.89
+      service:
+        description: "systemd service to restart"
+        required: false
+        type: string
+        default: zebrad
+      bin_path:
+        description: "binary path (its .bak is restored)"
+        required: false
+        type: string
+        default: /usr/local/bin/zebrad
+      restore_bak:
+        description: "Restore <bin_path>.bak (uncheck to only capture diagnostics)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zakura-mainnet-deploy
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: "Rollback ${{ inputs.ssh_target }}"
+    runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
+    timeout-minutes: 20
+    environment: zakura-mainnet
+
+    steps:
+      - name: Start SSH agent when deploy key is configured
+        env:
+          ZAKURA_MAINNET_DEPLOY_SSH_KEY: ${{ secrets.ZAKURA_MAINNET_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ZAKURA_MAINNET_DEPLOY_SSH_KEY}" ]; then
+            echo "using the runner's existing SSH identity."
+            exit 0
+          fi
+          ssh_agent_sock="$RUNNER_TEMP/ssh-agent.sock"
+          ssh-agent -a "$ssh_agent_sock" > "$RUNNER_TEMP/ssh-agent.env"
+          SSH_AUTH_SOCK="$ssh_agent_sock" ssh-add - <<< "$ZAKURA_MAINNET_DEPLOY_SSH_KEY"
+          echo "SSH_AUTH_SOCK=$ssh_agent_sock" >> "$GITHUB_ENV"
+
+      - name: Pin host key
+        run: |
+          set -euo pipefail
+          host="$(echo '${{ inputs.ssh_target }}' | sed 's/.*@//')"
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts 2>/dev/null || true
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Capture diagnostics
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o ConnectTimeout=20 '${{ inputs.ssh_target }}' \
+            "SERVICE='${{ inputs.service }}' BIN='${{ inputs.bin_path }}' bash -s" <<'EOF'
+          set -uo pipefail
+          echo "=== uptime / load ==="; uptime
+          echo "=== service ==="; systemctl show -p ActiveState -p SubState -p MainPID -p ActiveEnterTimestamp --value "$SERVICE"
+          echo "=== binaries ==="; ls -l "$BIN" "${BIN}.bak" 2>&1
+          echo "=== version ==="; "$BIN" --version 2>&1 | head -1
+          echo "=== recent journal ==="; journalctl -u "$SERVICE" -n 40 --no-pager 2>/dev/null | tail -40
+          echo "=== tail node log ==="; tail -n 60 /root/logs/zebrad.log 2>/dev/null
+          EOF
+
+      - name: Restore previous binary and restart
+        if: ${{ inputs.restore_bak }}
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o ConnectTimeout=20 '${{ inputs.ssh_target }}' \
+            "SERVICE='${{ inputs.service }}' BIN='${{ inputs.bin_path }}' bash -s" <<'EOF'
+          set -euo pipefail
+          if [ ! -x "${BIN}.bak" ]; then echo "no ${BIN}.bak to restore" >&2; exit 1; fi
+          systemctl stop "$SERVICE" || true
+          for _ in 1 2 3 4 5 6 7 8 9 10; do systemctl is-active --quiet "$SERVICE" || break; sleep 1; done
+          install -m 755 "${BIN}.bak" "$BIN"
+          systemctl start "$SERVICE"
+          sleep 3
+          systemctl is-active "$SERVICE"
+          echo "restored ${BIN}.bak; running:"; "$BIN" --version 2>&1 | head -1
+          EOF

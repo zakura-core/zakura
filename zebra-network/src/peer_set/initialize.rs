@@ -117,6 +117,7 @@ where
         latest_chain_tip,
         user_agent,
         advertised_services,
+        Vec::new(),
         None,
     )
     .await;
@@ -131,6 +132,7 @@ pub async fn init_with_zakura_header_sync<S, C>(
     latest_chain_tip: C,
     user_agent: String,
     advertised_services: PeerServices,
+    block_gossip_peer_ips: Vec<IpAddr>,
     header_sync_driver_startup: Option<crate::zakura::ZakuraHeaderSyncDriverStartup>,
 ) -> (
     Buffer<BoxService<Request, Response, BoxError>, Request>,
@@ -284,6 +286,7 @@ where
     // Connect the rx end to a PeerSet, wrapping new peers in load instruments.
     let peer_set = PeerSet::new(
         &config,
+        block_gossip_peer_ips,
         discovered_peers,
         demand_tx.clone(),
         handle_rx,

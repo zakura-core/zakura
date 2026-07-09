@@ -422,6 +422,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   for the supervisor task before abandoning it. An interrupted shutdown was
   able to silently discard hours of ingested chainstate and force a long
   replay on the next start.
+- Always include configured `zcashd_compat.block_gossip_peer_ips` in block
+  inventory gossip, preventing pinned zcashd-compat peers from stalling when
+  normal fractional peer sampling misses them.
 - Make `zebra-rollback-state` rollback existing v5 databases without replaying
   note commitment trees from genesis for modern rollback targets whose removed
   blocks did not change the Sprout tree. If rolled-back blocks contain Sprout

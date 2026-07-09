@@ -75,7 +75,11 @@
 
 pub(crate) mod zakura;
 
-use std::{net::SocketAddr, path::Path, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::Path,
+    sync::Arc,
+};
 
 use abscissa_core::{config, Command, FrameworkError};
 use color_eyre::eyre::{eyre, Report};
@@ -245,6 +249,13 @@ impl StartCmd {
         }
     }
 
+    fn zcashd_compat_default_block_gossip_peer_ips() -> Vec<IpAddr> {
+        vec![
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ]
+    }
+
     /// Returns the supervisor shutdown timeout when zcashd-compat `zcashd` supervision is active.
     ///
     /// This is the configured `shutdown_grace_period` plus a fixed margin, so the
@@ -277,6 +288,22 @@ impl StartCmd {
             })
         } else {
             config
+        };
+
+        if !config.zcashd_compat.enabled && !config.zcashd_compat.block_gossip_peer_ips.is_empty() {
+            return Err(eyre!(
+                "zcashd_compat.block_gossip_peer_ips requires zcashd_compat.enabled = true"
+            ));
+        }
+
+        let zcashd_compat_block_gossip_peer_ips = if config.zcashd_compat.enabled {
+            if config.zcashd_compat.block_gossip_peer_ips.is_empty() {
+                Self::zcashd_compat_default_block_gossip_peer_ips()
+            } else {
+                config.zcashd_compat.block_gossip_peer_ips.clone()
+            }
+        } else {
+            Vec::new()
         };
 
         Self::validate_consensus_config(&config)?;
@@ -418,6 +445,7 @@ impl StartCmd {
                 latest_chain_tip.clone(),
                 user_agent(),
                 advertised_services,
+                zcashd_compat_block_gossip_peer_ips,
                 zakura_header_sync_driver_startup,
             )
             .await;
@@ -1071,6 +1099,13 @@ impl config::Override<ZebradConfig> for StartCmd {
             config.zcashd_compat.enabled = true;
         }
 
+        if !config.zcashd_compat.enabled && !config.zcashd_compat.block_gossip_peer_ips.is_empty() {
+            return Err(std::io::Error::other(
+                "zcashd_compat.block_gossip_peer_ips requires zcashd_compat.enabled = true",
+            )
+            .into());
+        }
+
         if config.zcashd_compat.enabled {
             if !config.network.legacy_p2p {
                 return Err(std::io::Error::other(
@@ -1215,6 +1250,29 @@ mod tests {
 
         cmd.override_config(config)
             .expect("checkpoint_sync = false with vct_fast_sync unset is a valid config");
+    }
+
+    #[test]
+    fn block_gossip_peer_ips_require_zcashd_compat() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.block_gossip_peer_ips =
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("block gossip peers should require zcashd-compat");
+
+        assert!(
+            error
+                .to_string()
+                .contains("zcashd_compat.block_gossip_peer_ips requires"),
+            "error should explain the zcashd-compat requirement: {error}"
+        );
     }
 
     #[test]

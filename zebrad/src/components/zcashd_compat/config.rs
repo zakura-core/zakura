@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
@@ -67,6 +71,13 @@ pub struct Config {
     /// Zebra through a different address, such as across containers.
     pub p2p_connect_addr: Option<SocketAddr>,
 
+    /// Inbound sidecar peer IPs that must always receive block inventory broadcasts.
+    ///
+    /// If empty while zcashd-compat is enabled, Zebra defaults this list to
+    /// loopback addresses. This setting is rejected when zcashd-compat is
+    /// disabled.
+    pub block_gossip_peer_ips: Vec<IpAddr>,
+
     /// Delay before the first `zcashd` spawn attempt.
     #[serde(with = "humantime_serde")]
     pub startup_delay: Duration,
@@ -107,6 +118,7 @@ impl Default for Config {
             zcashd_datadir: None,
             zcashd_extra_args: Vec::new(),
             p2p_connect_addr: None,
+            block_gossip_peer_ips: Vec::new(),
             startup_delay: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(2),
             restart_backoff_max: Duration::from_secs(5 * 60),
@@ -142,6 +154,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
     use super::{Config, ZcashdBinarySource};
 
     #[test]
@@ -197,6 +211,21 @@ mod tests {
         assert_eq!(
             config.restart_backoff_max,
             std::time::Duration::from_secs(10 * 60)
+        );
+    }
+
+    #[test]
+    fn deserialize_block_gossip_peer_ips() {
+        let config: Config = toml::from_str(
+            r#"
+            block_gossip_peer_ips = ["127.0.0.1"]
+            "#,
+        )
+        .expect("sidecar block gossip peer IPs should deserialize");
+
+        assert_eq!(
+            config.block_gossip_peer_ips,
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
         );
     }
 

@@ -156,6 +156,67 @@ async fn mined_block_marks_tip_after_successful_broadcast() {
     peer_set.expect_no_requests().await;
 }
 
+/// A successful mined-block broadcast still suppresses the committed-tip fallback for that hash
+/// even when another mined-block notification is already queued.
+#[tokio::test(flavor = "multi_thread")]
+async fn mined_block_mark_survives_pending_submit_queue() {
+    let GossipTestSetup {
+        mut peer_set,
+        submitblock_sender,
+        mut state_service,
+        gossip_task_handle: _gossip_task_handle,
+    } = setup_gossip_test().await;
+
+    let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let height = block_two.coinbase_height().unwrap();
+    let hash = block_two.hash();
+
+    state_service
+        .ready()
+        .await
+        .unwrap()
+        .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
+            block_two.clone().into(),
+        ))
+        .await
+        .unwrap();
+
+    // First mined notification — start AdvertiseBlockToAll but hold the response open.
+    submitblock_sender
+        .send((hash, height))
+        .await
+        .expect("mined block notification should be accepted");
+
+    let first_broadcast = peer_set
+        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .await;
+
+    // Queue a second notification while the first broadcast is still in flight so the
+    // submit-block channel is nonempty when the first mark arrives.
+    submitblock_sender
+        .send((hash, height))
+        .await
+        .expect("second mined block notification should be accepted");
+
+    first_broadcast.respond(Response::Nil);
+
+    // Second mined path also fires AdvertiseBlockToAll for the queued notification.
+    peer_set
+        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .await
+        .respond(Response::Nil);
+
+    // Allow spawned broadcast tasks to deliver marks.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Without unconditional marking, the first mark would be dropped while the queue was
+    // nonempty and the committed-tip path could still AdvertiseBlock(hash).
+    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+    peer_set.expect_no_requests().await;
+}
+
 /// If a mined block broadcast times out, the committed tip gossip path should still advertise the
 /// hash as a fallback.
 #[tokio::test(flavor = "multi_thread")]

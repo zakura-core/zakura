@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, watch};
 use tower::{timeout::Timeout, Service, ServiceExt};
 use tracing::Instrument;
 
-use zakura_chain::{block, chain_tip::ChainTip};
+use zakura_chain::block;
 use zakura_network as zn;
 use zakura_state::ChainTipChange;
 
@@ -40,20 +40,6 @@ pub enum BlockGossipError {
 
     #[error("permanent peer set failure")]
     PeerSetReadiness(zn::BoxError),
-}
-
-/// Mark the chain tip hash as gossiped after a successful mined block broadcast.
-///
-/// This suppresses the committed tip gossip path for the same hash, but only
-/// after the all-peers broadcast completes successfully.
-fn apply_mined_block_mark(
-    chain_state: &mut ChainTipChange,
-    mined_block_channel_empty: bool,
-    hash: block::Hash,
-) {
-    if mined_block_channel_empty && chain_state.latest_chain_tip().best_tip_hash() == Some(hash) {
-        chain_state.mark_last_change_hash(hash);
-    }
 }
 
 /// Run continuously, gossiping newly verified [`block::Hash`]es to peers.
@@ -89,14 +75,11 @@ where
         mpsc::channel(MINED_BLOCK_MARK_CHANNEL_CAPACITY);
 
     loop {
+        // Apply marks from completed mined-block broadcasts. A successful
+        // AdvertiseBlockToAll means peers were already told about this hash, so
+        // always record it — even if another mined submission is still queued.
         while let Ok(hash) = mined_block_mark_receiver.try_recv() {
-            apply_mined_block_mark(
-                &mut chain_state,
-                mined_block_receiver
-                    .as_ref()
-                    .is_none_or(mpsc::Receiver::is_empty),
-                hash,
-            );
+            chain_state.mark_last_change_hash(hash);
         }
 
         // TODO: Refactor this into a struct and move the contents of this loop into its own method.
@@ -106,7 +89,7 @@ where
         // TODO: Move the contents of this async block to its own method
         let tip_change_close_to_network_tip_fut = async move {
             /// A brief duration to wait after a tip change for a new message in the mined block channel.
-            // TODO: Add a test to check that Zebra does not advertise mined blocks to peers twice.
+            // TODO: Add a test to check that Zakura does not advertise mined blocks to peers twice.
             const WAIT_FOR_BLOCK_SUBMISSION_DELAY: Duration = Duration::from_micros(100);
 
             // wait for at least the network timeout between gossips
@@ -154,11 +137,7 @@ where
                     },
 
                     Some(mark_hash) = mined_block_mark_receiver.recv() => {
-                        apply_mined_block_mark(
-                            &mut chain_state,
-                            mined_block_receiver.is_empty(),
-                            mark_hash,
-                        );
+                        chain_state.mark_last_change_hash(mark_hash);
                         continue;
                     },
                 }
@@ -169,7 +148,7 @@ where
                     },
 
                     Some(mark_hash) = mined_block_mark_receiver.recv() => {
-                        apply_mined_block_mark(&mut chain_state, true, mark_hash);
+                        chain_state.mark_last_change_hash(mark_hash);
                         continue;
                     },
                 }

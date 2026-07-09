@@ -40,6 +40,10 @@ SSH_COMMON_OPTS = [
 
 DEFAULTS = {
     "deploy_kind": "systemd",
+    # When false (systemd deploys only): leave the node's config, unit, and state
+    # cache untouched — just swap the binary and restart the existing service.
+    # For fleets provisioned outside the deployer with hand-tuned configs.
+    "manage_config": True,
     "service_name": "zakurad",
     "bin_path": "/usr/local/bin/zakurad",
     "config_path": "/etc/zakura/zakura.toml",
@@ -83,6 +87,7 @@ class Node:
     ssh_string: str
     commit: str
     deploy_kind: str
+    manage_config: bool
     service_name: str
     bin_path: str
     config_path: str
@@ -142,6 +147,18 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
     with config_path.open("rb") as fh:
         data = tomllib.load(fh)
 
+    # Reject unknown keys so an intent like `manage_config = false` can never be
+    # silently dropped by an older deploy.py — that once turned a preserve-config
+    # deploy into a destructive one. `name`/`ssh_string`/`commit` are per-node only.
+    known_default_keys = set(DEFAULTS)
+    known_node_keys = known_default_keys | {"name", "ssh_string", "commit"}
+    unknown_defaults = set(data.get("defaults", {})) - known_default_keys
+    if unknown_defaults:
+        raise DeployError(
+            f"unknown key(s) in [defaults]: {', '.join(sorted(unknown_defaults))} "
+            f"(this deploy.py may be older than the config)"
+        )
+
     defaults = dict(DEFAULTS)
     defaults.update(data.get("defaults", {}))
 
@@ -155,6 +172,13 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
         for required in ("name", "ssh_string", "commit"):
             if required not in raw:
                 raise DeployError(f"node missing required field '{required}': {raw}")
+        unknown_node = set(raw) - known_node_keys
+        if unknown_node:
+            raise DeployError(
+                f"unknown key(s) in [[nodes]] {raw.get('name', '?')}: "
+                f"{', '.join(sorted(unknown_node))} "
+                f"(this deploy.py may be older than the config)"
+            )
         name = raw["name"]
         if name in seen:
             raise DeployError(f"duplicate node name: {name}")
@@ -166,6 +190,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             ssh_string=merged["ssh_string"],
             commit=merged["commit"],
             deploy_kind=merged["deploy_kind"],
+            manage_config=merged["manage_config"],
             service_name=merged["service_name"],
             bin_path=merged["bin_path"],
             config_path=merged["config_path"],
@@ -576,6 +601,55 @@ fi
 """
 
 
+# Binary-only deploy (manage_config = false): swap the binary in place and
+# restart the existing service, leaving the node's config, unit, and state cache
+# untouched. Used for fleets provisioned outside the deployer.
+BINARY_ONLY_INSTALL_SCRIPT = r"""
+set -euo pipefail
+
+BIN_PATH={bin_path}
+SERVICE={service}
+NO_RESTART={no_restart}
+
+mkdir -p "$(dirname "$BIN_PATH")"
+
+if [ -x "$BIN_PATH" ]; then
+    cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
+fi
+install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
+rm -f /tmp/zakurad-deploy.new
+
+if [ "$NO_RESTART" = "1" ]; then
+    echo "installed binary (restart skipped)"
+    exit 0
+fi
+
+restart_service() {{
+    systemctl stop "$SERVICE" || true
+    # Wait for the old process to release the state DB before starting again.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        systemctl is-active --quiet "$SERVICE" || break
+        sleep 1
+    done
+    systemctl start "$SERVICE"
+    sleep 3
+    systemctl is-active --quiet "$SERVICE"
+}}
+
+if ! restart_service; then
+    echo "service unhealthy after deploy; rolling back to ${{BIN_PATH}}.bak" >&2
+    if [ -x "${{BIN_PATH}}.bak" ]; then
+        install -m 755 "${{BIN_PATH}}.bak" "$BIN_PATH"
+        restart_service || true
+    fi
+    exit 1
+fi
+
+systemctl is-active "$SERVICE"
+"$BIN_PATH" --version || true
+"""
+
+
 def ssh_with_stdin(node: Node, script: str) -> subprocess.CompletedProcess:
     """Run an install script on the node via `ssh ... bash -s`, feeding it on stdin."""
     return subprocess.run(node.ssh_cmd("bash", "-s"), input=script, text=True)
@@ -612,6 +686,24 @@ def cmd_deploy(args) -> int:
         try:
             if node.deploy_kind not in ("systemd", "process"):
                 return (node.name, False, f"unknown deploy_kind: {node.deploy_kind}")
+
+            # Binary-only: don't render or ship a config/unit; just swap the
+            # binary and restart the existing service. Only meaningful for
+            # systemd nodes (the restart target is service_name).
+            if not node.manage_config:
+                if node.deploy_kind != "systemd":
+                    return (node.name, False, "manage_config=false requires deploy_kind=systemd")
+                run(node.scp_to(str(binary), "/tmp/zakurad-deploy.new"), capture=True)
+                script = BINARY_ONLY_INSTALL_SCRIPT.format(
+                    bin_path=shlex.quote(node.bin_path),
+                    service=shlex.quote(node.service_name),
+                    no_restart="1" if args.no_restart else "0",
+                )
+                proc = ssh_with_stdin(node, script)
+                if proc.returncode != 0:
+                    return (node.name, False, f"install/restart failed (rc={proc.returncode})")
+                return (node.name, True, f"deployed {node.sha[:9]} (binary-only)")
+
             cfg = render_node_config(node)
             cfg_tmp = BUILD_CACHE_DIR / f".cfg-{node.name}.toml"
             cfg_tmp.write_text(cfg)

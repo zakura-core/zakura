@@ -173,8 +173,9 @@ and deploys it to:
 - `asia-south-0` — `root@139.59.64.115`
 - `asia-pacific-0` — `root@168.144.173.250`
 
-All nine are systemd-managed `zakurad.service` nodes. One-time runner bootstrap
-from an operator machine with SSH access and CI credentials in `~/agents-env`:
+All nine run a hand-provisioned `zebrad` systemd service. One-time runner
+bootstrap from an operator machine with SSH access and CI credentials in
+`~/agents-env`:
 
 ```bash
 cd deploy/deployer
@@ -182,32 +183,21 @@ cd deploy/deployer
 ```
 
 The workflow is manual (`workflow_dispatch`) with the same inputs as testnet
-(`ref` defaults to `main`, plus `force_rebuild`, `no_restart`, `node`). Its
-generated CI config uses Mainnet ports, public RPC at `0.0.0.0:8232`, and pins
-`identity_dir = "/root/.zakura"` so each node keeps its iroh node id (those node
-ids are the built-in mainnet Zakura bootstrap peers). It writes
-`/etc/zakura/zakura.toml` and points `state_cache_dir`/`network_cache_dir` at
-`/root/.cache/zakura` — the location the hand-provisioned nodes already use — so
-CI restarts against the existing database instead of resyncing. As on testnet, a
-`cache_dir_migrate_from = "/root/.cache/zebra"` is set: if an older pre-rename
-`zebra` cache exists and the `zakura` target does not, the deployer stops the
-node and moves the directory before starting. **Confirm each node's live
-`[state] cache_dir` before the first restart** — a mismatched path resyncs an
-archive node.
+(`ref` defaults to `main`, plus `force_rebuild`, `no_restart`, `node`).
 
-> One-time migration: the nodes were hand-provisioned with a `zebrad.service`
-> unit and `/usr/local/bin/zebrad`, plus a vestigial `10-vct-legacy.conf` drop-in
-> (`VCT_LEGACY=1`, unread by zakurad). Because the deployer installs the
-> standardized `zakurad.service` and does not touch the old unit, disable and
-> remove it on each node before the first restart deploy, or the old process
-> keeps the state DB locked:
->
-> ```bash
-> systemctl disable --now zebrad
-> rm -f /etc/systemd/system/zebrad.service \
->       /etc/systemd/system/zebrad.service.d/10-vct-legacy.conf
-> systemctl daemon-reload
-> ```
+**Binary-only deploy (`manage_config = false`).** The mainnet nodes were
+provisioned by hand with rich, per-node configs — `external_addr`, custom peers,
+mempool/sync tuning, and an inline `zakura_node_secret_key` that pins each node's
+iroh identity (the node ids hardcoded as bootstrap peers in
+`zebra-network/src/zakura/handler.rs`) — and their state DB lives at
+`/root/.cache/zebra`. Rendering the deployer's managed config over that would
+change every node id and drop the tuning. So the generated CI config sets
+`manage_config = false`: the deployer swaps `/usr/local/bin/zebrad` and restarts
+the existing `zebrad` service, leaving the config, unit, and cache untouched. The
+`rpc_listen_addr` / `log_file` / `[defaults.zakura] bootstrap_peers` in that
+config are read-only inputs for the dashboard's SSH probe, not deployed to nodes.
+Reproducing these configs in the deployer's managed model is separate future
+work.
 
 The workflow refreshes a fleet status dashboard on `us-east-0`:
 

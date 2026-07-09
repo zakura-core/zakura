@@ -8,24 +8,14 @@ name: Deploy Zakura mainnet fleet
 # builds a native zakurad binary on that runner, then uses deploy/deployer/
 # deploy.py to scp/install it across the fleet.
 #
-# ONE-TIME MIGRATION — the mainnet nodes were hand-provisioned with a
-# `zebrad.service` unit and a /usr/local/bin/zebrad binary. This deployer
-# installs the standardized `zakurad.service` + /usr/local/bin/zakurad, and does
-# not touch the old unit, so before the first restart deploy each node needs:
-#     systemctl disable --now zebrad
-#     rm -f /etc/systemd/system/zebrad.service \
-#           /etc/systemd/system/zebrad.service.d/10-vct-legacy.conf
-#     systemctl daemon-reload
-# Otherwise the old zebrad process keeps the state DB locked and zakurad cannot
-# start. See deploy/deployer/README.md.
-#
-# DO NOT RESYNC — the cache paths below point at the location the nodes already
-# use (/root/.cache/zakura, the zakurad default for HOME=/root), identity_dir is
-# pinned to /root/.zakura so each node keeps its iroh node id, and
-# cache_dir_migrate_from moves a pre-rename /root/.cache/zebra dir into place on
-# first restart if the zakura target does not yet exist. Confirm each node's live
-# `[state] cache_dir` before the first restart; a mismatched path resyncs an
-# archive node from genesis.
+# BINARY-ONLY DEPLOY. The mainnet nodes were provisioned by hand with rich,
+# per-node configs (external_addr, an inline zakura_node_secret_key that pins
+# each node's iroh identity, custom peers, and mempool/sync tuning) and their
+# state DB at /root/.cache/zebra. To avoid changing node identities or resyncing,
+# this deploy sets manage_config = false: it only swaps /usr/local/bin/zebrad and
+# restarts the existing `zebrad` service, leaving the config, unit, and cache
+# untouched. Rebuilding those configs into the deployer's managed model is
+# separate future work.
 
 on:
   workflow_dispatch:
@@ -41,7 +31,7 @@ on:
         required: false
         default: false
       no_restart:
-        description: "Stage binary/config/unit without restarting zakurad"
+        description: "Stage the binary without restarting the node"
         type: boolean
         required: false
         default: false
@@ -71,6 +61,19 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.ref }}
+
+      - name: Verify deployer supports binary-only mode
+        # The checked-out deploy.py comes from `inputs.ref`; this fleet's config
+        # sets `manage_config = false`. If the checked-out deploy.py predates that
+        # support it would silently run a destructive config-managed deploy, so
+        # fail fast instead. deploy.py also now rejects unknown config keys.
+        run: |
+          set -euo pipefail
+          if ! grep -q 'manage_config' deploy/deployer/deploy.py; then
+            echo "::error::deploy.py at ref '${{ inputs.ref }}' lacks manage_config support." \
+                 "Deploy from a ref whose deploy.py supports binary-only mode."
+            exit 1
+          fi
 
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
@@ -141,34 +144,32 @@ jobs:
 
           cat > nodes.ci.toml <<EOF
           [defaults]
-          service_name    = "zakurad"
-          bin_path        = "/usr/local/bin/zakurad"
-          config_path     = "/etc/zakura/zakura.toml"
+          # Binary-only: swap the binary and restart the existing service; leave
+          # the hand-tuned config, unit, and /root/.cache/zebra state untouched.
+          deploy_kind     = "systemd"
+          manage_config   = false
+          service_name    = "zebrad"
+          bin_path        = "/usr/local/bin/zebrad"
           network         = "Mainnet"
-          listen_addr     = "[::]:8233"
+          # Read-only fields below: consumed by the status dashboard's SSH probe,
+          # not written to any node (manage_config = false).
           rpc_listen_addr = "0.0.0.0:8232"
-          rpc_enable_cookie_auth = false
-          storage_mode    = "archive"
-          v2_p2p          = true
-          legacy_p2p      = true
-          metrics_endpoint = "127.0.0.1:9999"
-          tracing_filter  = "info,zebra_network::zakura=info"
-          # Mainnet keeps checkpoint sync + the VCT fast-sync path (zakurad defaults).
-          checkpoint_sync = true
-          vct_fast_sync   = true
-          # Reuse the paths the hand-provisioned nodes already use so no node resyncs.
-          identity_dir    = "/root/.zakura"
-          state_cache_dir = "/root/.cache/zakura"
-          network_cache_dir = "/root/.cache/zakura"
-          # Move a pre-rename cache into place on first restart if it exists and the
-          # zakura target does not (mirrors the testnet zebra->zakura migration).
-          cache_dir_migrate_from = "/root/.cache/zebra"
-          log_file        = "/root/logs/zakura.log"
+          log_file        = "/root/logs/zebrad.log"
 
-          # The built-in mainnet Zakura bootstrap peers (zebra-network/src/zakura/
-          # handler.rs) are already correct, so we only pin the listen address.
+          # Public mainnet node ids (zebra-network/src/zakura/handler.rs). Used by
+          # the dashboard to label each host; not deployed to the nodes.
           [defaults.zakura]
-          listen_addr = "0.0.0.0:8234"
+          bootstrap_peers = [
+              "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
+              "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@104.131.184.123:8234",
+              "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234",
+              "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22@143.244.184.176:8234",
+              "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57@159.203.38.10:8234",
+              "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5@64.227.44.93:8234",
+              "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1@161.35.156.226:8234",
+              "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234",
+              "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
+          ]
 
           [[nodes]]
           name       = "asia-0"

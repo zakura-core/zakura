@@ -1,7 +1,7 @@
 # zcashd-compat Mode (`zakurad start --zcashd-compat`)
 
 zcashd-compat mode is for operators — typically exchanges and custodial
-services — that want to migrate to Zakura while keeping the `zcashd` wallet and
+services whi want to migrate to Zakura while keeping the `zcashd` wallet and
 RPC surface their integration already depends on. Zakura faces the Zcash P2P
 network and is the consensus node; `zcashd` runs as a **P2P sidecar** that
 makes a single outbound peer connection to the local Zakura node and listens
@@ -100,12 +100,32 @@ SHA256. It differs from stock `zcash/zcash` in three ways:
    itself down at its deprecation height; the sidecar build logs a warning
    and keeps serving its wallet/RPC surface. Consensus safety comes from
    Zakura, which fully validates every block before relaying it to zcashd.
-3. **`-regtestacceptunvalidatedpow` (regtest only)** lets zcashd follow a
-   Zakura regtest chain, whose mined blocks carry null Equihash solutions.
-   It is rejected on any other network.
 
 Everything else — wallet, chainstate format, RPC semantics, ZMQ — is stock
 zcashd.
+
+## Running externally managed
+
+Run Zakura normally (with `zcashd_compat.enabled = true` if you want
+preflight checks and the RPC guardrails), then run zcashd yourself:
+
+```console
+zcashd -datadir=/var/lib/zcashd \
+       -connect=127.0.0.1:8233 -listen=0 -dnsseed=0 -listenonion=0 -discover=0 \
+       -printtoconsole
+```
+
+Or put the equivalent in `zcash.conf`:
+
+```text
+connect=127.0.0.1:8233
+listen=0
+i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
+```
+
+`make compat-zcashd-start-standalone` (see `make/zcashd-compat.mk`) wraps
+this command, and `make compat-zakurad-start-unsupervised` starts the
+matching front node.
 
 ## Running supervised
 
@@ -180,29 +200,6 @@ pruning on the fronting Zakura — a pruned node does not advertise
 > `ZAKURA_NETWORK__MAX_CONNECTIONS_PER_IP=8` (or similar) on a Dockerised
 > front — the installer's Docker modes do this for you — or attach the
 > sidecar to the container network directly.
-
-## Running externally managed
-
-Run Zakura normally (with `zcashd_compat.enabled = true` if you want
-preflight checks and the RPC guardrails), then run zcashd yourself:
-
-```console
-zcashd -datadir=/var/lib/zcashd \
-       -connect=127.0.0.1:8233 -listen=0 -dnsseed=0 -listenonion=0 -discover=0 \
-       -printtoconsole
-```
-
-Or put the equivalent in `zcash.conf`:
-
-```text
-connect=127.0.0.1:8233
-listen=0
-i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
-```
-
-`make compat-zcashd-start-standalone` (see `make/zcashd-compat.mk`) wraps
-this command, and `make compat-zakurad-start-unsupervised` starts the
-matching front node.
 
 ### Verify the integration
 
@@ -329,36 +326,3 @@ If the Zakura state and zcashd datadir share one mount, that mount needs the
 sum of both minimums (550 GiB on mainnet). The installer runs the same checks
 before anything is downloaded.
 
-## Monitoring and lifecycle
-
-- The supervisor exports `zcashd_compat.supervisor.active` / `.disabled` /
-  `.exhausted` gauges.
-- zcashd's stdout/stderr are forwarded into Zakura's logs under the
-  `zcashd_compat.zcashd` target.
-- On Zakura shutdown the supervisor sends zcashd SIGTERM and waits
-  `shutdown_grace_period` before force-killing, so zcashd can flush its
-  chainstate and wallet.
-- `make compat-status-sync` / `deploy/zcashd-compat/sync-check.sh` check both
-  processes, peer pinning (`getconnectioncount == 1`), and height drift.
-
-## Testing
-
-The integration suite runs zakurad + a supervised regtest zcashd end to end:
-
-```console
-make compat-test-regtest TEST_ZCASHD_PATH=/path/to/sidecar/zcashd
-```
-
-If `TEST_ZCASHD_PATH` is unset, the harness uses the embedded hash-pinned
-zcashd download. It covers startup, tip following over P2P, deep reorgs,
-restarts, transaction flow from zcashd's wallet through Zakura's mempool, and
-the miner-RPC removal. `make compat-test-soak` runs a longer regtest soak,
-and `make compat-test-mainnet` / `compat-test-testnet` run the read-only
-subset against a live deployment.
-
-## Upstream network upgrades
-
-The sidecar zcashd must keep up with Zcash network upgrades: when a network
-upgrade activates, zakurad requires peers to advertise that upgrade's minimum
-protocol version, and an out-of-date zcashd will be disconnected. Plan to
-deploy the updated sidecar build before each activation height.

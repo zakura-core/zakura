@@ -11,7 +11,7 @@ Your systems keep talking to `zcashd` exactly as before:
 
 | Provided by `zcashd`, unchanged          | Moved to Zakura                             |
 |------------------------------------------|---------------------------------------------|
-| Wallet behavior and wallet RPC methods   | Public P2P networking and peer selection    |
+| Wallet RPC methods (transparent + Sapling) | Public P2P networking and peer selection    |
 | Local block files, chainstate, indexes   | Network-facing block and transaction relay  |
 | ZMQ notifications                        | Block templates for miners                  |
 | Local RPC response semantics             | DNS seeding and peer discovery              |
@@ -101,8 +101,10 @@ SHA256. It differs from stock `zcash/zcash` in three ways:
    and keeps serving its wallet/RPC surface. Consensus safety comes from
    Zakura, which fully validates every block before relaying it to zcashd.
 
-Everything else — wallet, chainstate format, RPC semantics, ZMQ — is stock
-zcashd.
+Everything else — chainstate format, RPC semantics, ZMQ — matches stock
+zcashd. The wallet carries the Ironwood/Orchard shielded-pool limits from the
+sidecar baseline (see [Wallet shielded-pool support (Orchard &
+Ironwood)](#wallet-shielded-pool-support-orchard--ironwood)).
 
 ## Running externally managed
 
@@ -248,6 +250,55 @@ special build is needed. See [Mining](mining.md) for details. The sidecar
 zcashd returns `Method not found` for all template and submission RPCs, so a
 misconfigured miner fails loudly instead of building on a lagging view.
 
+## Wallet shielded-pool support (Orchard & Ironwood)
+
+Orchard and Ironwood are shielded pools, exercised through the unified `z_*` wallet RPCs
+(`z_sendmany`, and the rest). Those RPCs remain registered and callable. However, disabled. This is not the same mechanism as the removed miner RPCs:
+
+| | Miner RPCs (`getblocktemplate`, …) | Orchard / Ironwood |
+| --- | --- | --- |
+| Mechanism | Method not registered | Method registered; operation rejected at prep time |
+| Error | `-32601` Method not found | `RPC_INVALID_PARAMETER` (`-8`) with a descope message |
+| Scope | Always | Height-gated on NU6.3 activation |
+
+These limits are a property of the sidecar `zcashd` build itself (the
+Ironwood baseline), not the P2P sidecar layer. They apply identically whether
+zcashd is externally managed or supervised.
+
+- **Ironwood (the NU6.3 pool):** permanently unsupported. The zcashd wallet
+  never supports Ironwood — this is a permanent descope, not a "not yet
+  available" gate.
+- **Orchard:** rejected from NU6.3 onward. Once NU6.3 is active for the next
+  block, any Orchard involvement — spends of existing Orchard notes, Orchard
+  payments, or Orchard change — fails at transaction-preparation time. Before
+  NU6.3 activation, Orchard sends still work.
+- **Transparent and Sapling:** unaffected. Existing transparent and Sapling
+  wallet flows keep working.
+
+When a restricted operation is attempted, zcashd returns `RPC_INVALID_PARAMETER`
+(`-8`) with this message:
+
+```text
+zcashd does not support the Ironwood pool, and Orchard payments (including
+spends of existing Orchard notes) are unsupported from NU6.3. Use transparent
+or Sapling funds with zcashd, or a Z3-stack wallet for shielded payments.
+```
+
+For continued Orchard or Ironwood shielded support, migrate wallet flows to a
+[Z3-stack wallet](https://github.com/zcash/wallet) ([Zallet](https://github.com/zcash/wallet),
+[Zaino](https://github.com/zingolabs/zaino), or
+[librustzcash](https://github.com/zcash/librustzcash)). This aligns with the
+broader zcashd retirement path implied by the sidecar build's disabled
+end-of-support halt.
+
+> [!WARNING]
+> Exchange and custodial integrations that rely on Orchard sends from the
+> zcashd wallet must migrate those flows before NU6.3 activation on their
+> network. After activation, Orchard operations fail at prep time with the
+> message above — not with `Method not found`. Plan the migration alongside
+> other network-upgrade readiness work (for example, deploying an updated
+> sidecar build before each activation height).
+
 ## Initial sync and existing datadirs
 
 The sidecar syncs the whole chain through its single Zakura peer. That works,
@@ -325,4 +376,3 @@ recommended tiers.
 If the Zakura state and zcashd datadir share one mount, that mount needs the
 sum of both minimums (550 GiB on mainnet). The installer runs the same checks
 before anything is downloaded.
-

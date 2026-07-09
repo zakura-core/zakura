@@ -24,9 +24,6 @@ use crate::common::{
     launch::{ZebradTestDirExt, LAUNCH_DELAY},
 };
 
-/// Zcashd-compat cookie file name written by zebrad.
-const ZEBRA_COMPAT_COOKIE_FILE_NAME: &str = ".zcashd-compat.cookie";
-
 /// How long to poll zcashd's own RPC before giving up.
 const ZCASHD_RPC_POLL_ATTEMPTS: u32 = 60;
 const ZCASHD_RPC_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -46,8 +43,6 @@ pub struct ZcashdCompatSetup {
     /// Zebrad main RPC address.
     #[allow(dead_code)]
     pub zebra_rpc_addr: SocketAddr,
-    /// Zebrad zcashd-compat RPC address (cookie-authenticated; used in auth tests).
-    pub zebra_compat_rpc_addr: SocketAddr,
 }
 
 impl ZcashdCompatSetup {
@@ -135,13 +130,12 @@ pub async fn spawn_zebrad_with_zcashd_compat() -> Result<ZcashdCompatSetup> {
     let _init_guard = zebra_test::init();
 
     let dir = testdir()?;
-    let cookie_dir = dir.path().to_path_buf();
+    let work_dir = dir.path().to_path_buf();
 
-    let compat_cfg: ZcashdCompatConfig = build_zcashd_compat_config(cookie_dir.clone())?;
+    let compat_cfg: ZcashdCompatConfig = build_zcashd_compat_config(work_dir)?;
     let mut zebrad_config = compat_cfg.zebrad_config;
 
     let zebra_rpc_addr = compat_cfg.zebra_rpc_addr;
-    let zebra_compat_rpc_addr = compat_cfg.zebra_compat_rpc_addr;
     let zcashd_own_rpc_addr = compat_cfg.zcashd_own_rpc_addr;
 
     // `--unsafe-low-specs` skips the hardware preflight minimums (550 GiB disk
@@ -152,18 +146,10 @@ pub async fn spawn_zebrad_with_zcashd_compat() -> Result<ZcashdCompatSetup> {
         "--unsafe-low-specs"
     ])?;
 
-    // Main RPC logs first; zcashd-compat RPC logs second.
-    // We pre-chose both ports via random_known_port(), so we only need to wait
-    // for the log lines to confirm zebrad is ready — we don't parse the addresses.
-    let _ = read_listen_addr_from_logs(&mut zebrad, OPENED_RPC_ENDPOINT_MSG)?;
     let _ = read_listen_addr_from_logs(&mut zebrad, OPENED_RPC_ENDPOINT_MSG)?;
 
     // Extra stability margin before poking zcashd
     sleep(LAUNCH_DELAY).await;
-
-    // Zcashd-compat cookie is written by the zcashd-compat RPC server at startup
-    let cookie_path = cookie_dir.join(ZEBRA_COMPAT_COOKIE_FILE_NAME);
-    wait_for_cookie_file(&cookie_path).await?;
 
     let zebra_client = RpcRequestClient::new(zebra_rpc_addr);
     let zcashd_client = ZcashdRpcClient::new(
@@ -181,7 +167,6 @@ pub async fn spawn_zebrad_with_zcashd_compat() -> Result<ZcashdCompatSetup> {
         zcashd_client,
         network: Network::new_regtest(Default::default()),
         zebra_rpc_addr,
-        zebra_compat_rpc_addr,
     })
 }
 
@@ -225,10 +210,6 @@ pub async fn connect_to_external_zcashd_compat(kind: NetworkKind) -> Result<Zcas
         }
     };
 
-    // In external mode there is no zcashd-compat RPC addr in our control;
-    // use the zebrad main RPC addr as a stand-in (auth tests skip on external).
-    let zebra_compat_rpc_addr = zebra_rpc_addr;
-
     Ok(ZcashdCompatSetup {
         managed: None,
         zcashd_datadir: None,
@@ -236,7 +217,6 @@ pub async fn connect_to_external_zcashd_compat(kind: NetworkKind) -> Result<Zcas
         zcashd_client,
         network,
         zebra_rpc_addr,
-        zebra_compat_rpc_addr,
     })
 }
 
@@ -261,23 +241,6 @@ pub async fn wait_for_zcashd_rpc(client: &ZcashdRpcClient) -> Result<()> {
             ));
         }
         sleep(ZCASHD_RPC_POLL_INTERVAL).await;
-    }
-    Ok(())
-}
-
-/// Waits for the zcashd-compat cookie file to appear on disk (up to 30 s).
-async fn wait_for_cookie_file(path: &std::path::Path) -> Result<()> {
-    for attempt in 1..=30u32 {
-        if path.exists() {
-            return Ok(());
-        }
-        if attempt == 30 {
-            return Err(eyre!(
-                "zcashd-compat cookie file never appeared at {}",
-                path.display()
-            ));
-        }
-        sleep(Duration::from_secs(1)).await;
     }
     Ok(())
 }

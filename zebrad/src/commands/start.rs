@@ -173,11 +173,6 @@ fn use_zakura_block_sync(config: &zebra_network::Config) -> bool {
 fn check_tcp_slow_start_after_idle() {}
 
 impl StartCmd {
-    /// Minimum response body size used by the dedicated zcashd-compat RPC listener.
-    ///
-    /// The listener keeps a 128 MiB floor so bulk consumers of the retained
-    /// zcashd-compat RPC endpoint do not hit surprise body-size limits.
-    const ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE: usize = 128 * 1024 * 1024;
     /// Extra time Zebra waits for the zcashd-compat supervisor task beyond the
     /// child's `shutdown_grace_period`. The supervisor's `terminate_child` waits
     /// the full grace period before its SIGKILL last resort, so the outer wait
@@ -230,40 +225,6 @@ impl StartCmd {
         );
     }
 
-    /// Default zcashd-compat RPC listen address when `--zcashd-compat` is enabled.
-    fn zcashd_compat_default_rpc_listen_addr() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 28232))
-    }
-
-    fn zcashd_compat_cookie_path(config: &ZebradConfig) -> std::path::PathBuf {
-        config
-            .zcashd_compat
-            .cookie_dir
-            .join(&config.zcashd_compat.cookie_file_name)
-    }
-
-    fn zcashd_compat_rpc_config(config: &ZebradConfig) -> zebra_rpc::config::rpc::Config {
-        let mut compat_rpc_config = config.rpc.clone();
-        compat_rpc_config.listen_addr = config.zcashd_compat.listen_addr;
-        compat_rpc_config.enable_cookie_auth = config.zcashd_compat.enable_cookie_auth;
-        compat_rpc_config.cookie_dir = config.zcashd_compat.cookie_dir.clone();
-        compat_rpc_config.cookie_file_name = config.zcashd_compat.cookie_file_name.clone();
-        compat_rpc_config.tls = match (
-            &config.zcashd_compat.tls_cert_file,
-            &config.zcashd_compat.tls_key_file,
-        ) {
-            (Some(cert_file), Some(key_file)) => Some(zebra_rpc::config::rpc::TlsConfig {
-                cert_file: cert_file.clone(),
-                key_file: key_file.clone(),
-            }),
-            _ => None,
-        };
-        compat_rpc_config.max_response_body_size = compat_rpc_config
-            .max_response_body_size
-            .max(Self::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE);
-        compat_rpc_config
-    }
-
     /// Returns the Zebra P2P address supervised zcashd should `-connect` to.
     ///
     /// Uses `zcashd_compat.p2p_connect_addr` when set, otherwise Zebra's bound
@@ -282,68 +243,6 @@ impl StartCmd {
         } else {
             local_listener
         }
-    }
-
-    fn validate_zcashd_compat_tls_config(config: &ZebradConfig) -> Result<(), Report> {
-        if config.zcashd_compat.tls_cert_file.is_some()
-            != config.zcashd_compat.tls_key_file.is_some()
-        {
-            return Err(eyre!(
-                "zcashd-compat TLS requires both zcashd_compat.tls_cert_file and zcashd_compat.tls_key_file"
-            ));
-        }
-
-        if config.zcashd_compat.tls_ca_file.is_some() && !config.zcashd_compat.tls_enabled() {
-            return Err(eyre!(
-                "zcashd_compat.tls_ca_file requires zcashd-compat TLS with both zcashd_compat.tls_cert_file and zcashd_compat.tls_key_file"
-            ));
-        }
-
-        for (name, path) in [
-            (
-                "zcashd_compat.tls_cert_file",
-                &config.zcashd_compat.tls_cert_file,
-            ),
-            (
-                "zcashd_compat.tls_key_file",
-                &config.zcashd_compat.tls_key_file,
-            ),
-            (
-                "zcashd_compat.tls_ca_file",
-                &config.zcashd_compat.tls_ca_file,
-            ),
-        ] {
-            if let Some(path) = path {
-                std::fs::File::open(path)
-                    .map_err(|error| eyre!("could not read {name}={}: {error}", path.display()))?;
-            }
-        }
-
-        if let Some(listen_addr) = config.zcashd_compat.listen_addr {
-            if !listen_addr.ip().is_loopback()
-                && !config.zcashd_compat.tls_enabled()
-                && !config.zcashd_compat.unsafe_allow_remote_http
-            {
-                return Err(eyre!(
-                    "zcashd_compat.listen_addr={listen_addr} is non-loopback and requires TLS with both zcashd_compat.tls_cert_file and zcashd_compat.tls_key_file, \
-                     or zcashd_compat.unsafe_allow_remote_http=true when a container or private network boundary secures the listener"
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn zcashd_compat_rpc_url(config: &ZebradConfig) -> Result<String, Report> {
-        let listen_addr = config.zcashd_compat.listen_addr.ok_or_else(|| {
-            eyre!("zcashd-compat mode requires zcashd_compat.listen_addr to be set")
-        })?;
-        let scheme = if config.zcashd_compat.tls_enabled() {
-            "https"
-        } else {
-            "http"
-        };
-        Ok(format!("{scheme}://{listen_addr}"))
     }
 
     /// Returns the supervisor shutdown timeout when zcashd-compat `zcashd` supervision is active.
@@ -684,14 +583,6 @@ impl StartCmd {
             tokio::spawn(std::future::pending().in_current_span())
         };
 
-        let zcashd_compat_rpc_task_handle = if config.zcashd_compat.enabled {
-            RpcServer::start(rpc_impl.clone(), Self::zcashd_compat_rpc_config(&config))
-                .await
-                .expect("zcashd-compat RPC server should start")
-        } else {
-            tokio::spawn(std::future::pending().in_current_span())
-        };
-
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
         let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
@@ -711,7 +602,6 @@ impl StartCmd {
 
             info!(
                 connect = %supervisor_config.zebra_p2p_addr,
-                compat_rpc_url = %Self::zcashd_compat_rpc_url(&config)?,
                 "zcashd-compat source enabled"
             );
 
@@ -722,11 +612,7 @@ impl StartCmd {
         } else {
             if config.zcashd_compat.enabled {
                 zcashd_compat::set_supervision_config_disabled_metrics();
-                info!(
-                    rpc_url = %Self::zcashd_compat_rpc_url(&config)?,
-                    cookie_file = %Self::zcashd_compat_cookie_path(&config).display(),
-                    "zcashd-compat source enabled: zcashd supervision disabled"
-                );
+                info!("zcashd-compat source enabled: zcashd supervision disabled");
             }
 
             tokio::spawn(std::future::pending().in_current_span())
@@ -899,7 +785,6 @@ impl StartCmd {
 
         // ongoing tasks
         pin!(rpc_task_handle);
-        pin!(zcashd_compat_rpc_task_handle);
         pin!(indexer_rpc_task_handle);
         pin!(syncer_task_handle);
         pin!(block_gossip_task_handle);
@@ -935,13 +820,6 @@ impl StartCmd {
                     let rpc_server_result = rpc_join_result
                         .expect("unexpected panic in the rpc task");
                     info!(?rpc_server_result, "rpc task exited");
-                    Ok(())
-                }
-
-                zcashd_compat_rpc_join_result = &mut zcashd_compat_rpc_task_handle => {
-                    let compat_rpc_server_result = zcashd_compat_rpc_join_result
-                        .expect("unexpected panic in the zcashd-compat rpc task");
-                    info!(?compat_rpc_server_result, "zcashd-compat rpc task exited");
                     Ok(())
                 }
 
@@ -1055,7 +933,6 @@ impl StartCmd {
 
         // ongoing tasks
         rpc_task_handle.abort();
-        zcashd_compat_rpc_task_handle.abort();
         rpc_tx_queue_handle.abort();
         health_task_handle.abort();
         syncer_task_handle.abort();
@@ -1195,34 +1072,6 @@ impl config::Override<ZebradConfig> for StartCmd {
         }
 
         if config.zcashd_compat.enabled {
-            if config.zcashd_compat.listen_addr.is_none() {
-                config.zcashd_compat.listen_addr =
-                    Some(Self::zcashd_compat_default_rpc_listen_addr());
-            }
-
-            if let (Some(rpc_listen_addr), Some(compat_listen_addr)) =
-                (config.rpc.listen_addr, config.zcashd_compat.listen_addr)
-            {
-                if rpc_listen_addr == compat_listen_addr {
-                    return Err(std::io::Error::other(format!(
-                        "zcashd-compat mode requires different RPC listen addresses: \
-                         rpc.listen_addr={rpc_listen_addr} conflicts with \
-                         zcashd_compat.listen_addr={compat_listen_addr}"
-                    ))
-                    .into());
-                }
-            }
-
-            Self::validate_zcashd_compat_tls_config(&config)
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
-
-            if !config.zcashd_compat.enable_cookie_auth && !config.zcashd_compat.tls_enabled() {
-                return Err(std::io::Error::other(
-                    "zcashd_compat.enable_cookie_auth=false requires TLS on the zcashd-compat RPC listener",
-                )
-                .into());
-            }
-
             if !config.network.legacy_p2p {
                 return Err(std::io::Error::other(
                     "zcashd-compat P2P sidecar mode requires network.legacy_p2p = true, \
@@ -1274,7 +1123,7 @@ mod tests {
     use crate::config::ZebradConfig;
 
     #[test]
-    fn zcashd_compat_flag_applies_rpc_guardrails() {
+    fn zcashd_compat_flag_enables_mode() {
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: true,
@@ -1282,22 +1131,16 @@ mod tests {
         };
         let mut config = ZebradConfig::default();
         config.zcashd_compat.manage_zcashd = false;
-        config.rpc.listen_addr = None;
 
         let config = cmd
             .override_config(config)
             .expect("zcashd-compat override config should succeed");
 
         assert!(config.zcashd_compat.enabled);
-        assert_eq!(
-            config.zcashd_compat.listen_addr,
-            Some(StartCmd::zcashd_compat_default_rpc_listen_addr())
-        );
-        assert_eq!(config.rpc.listen_addr, None);
     }
 
     #[test]
-    fn zcashd_compat_config_applies_rpc_guardrails() {
+    fn zcashd_compat_config_enables_mode() {
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: false,
@@ -1306,41 +1149,12 @@ mod tests {
         let mut config = ZebradConfig::default();
         config.zcashd_compat.enabled = true;
         config.zcashd_compat.manage_zcashd = false;
-        config.rpc.listen_addr = None;
 
         let config = cmd
             .override_config(config)
             .expect("zcashd-compat override config should succeed");
 
         assert!(config.zcashd_compat.enabled);
-        assert_eq!(
-            config.zcashd_compat.listen_addr,
-            Some(StartCmd::zcashd_compat_default_rpc_listen_addr())
-        );
-        assert_eq!(config.rpc.listen_addr, None);
-    }
-
-    #[test]
-    fn zcashd_compat_flag_rejects_conflicting_rpc_listen_addr() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: true,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZebradConfig::default();
-        config.rpc.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
-        config.zcashd_compat.manage_zcashd = false;
-
-        let error = cmd
-            .override_config(config)
-            .expect_err("zcashd-compat should reject overlapping RPC listen addresses");
-
-        assert!(
-            error
-                .to_string()
-                .contains("requires different RPC listen addresses"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]
@@ -1404,287 +1218,6 @@ mod tests {
     }
 
     #[test]
-    fn zcashd_compat_config_rejects_conflicting_rpc_listen_addr() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.manage_zcashd = false;
-        config.rpc.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
-        config.zcashd_compat.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
-
-        let error = cmd
-            .override_config(config)
-            .expect_err("zcashd-compat should reject overlapping configured RPC listen addresses");
-
-        assert!(
-            error
-                .to_string()
-                .contains("requires different RPC listen addresses"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn zcashd_compat_rpc_config_uses_dedicated_cookie_and_min_response_size() {
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
-        config.zcashd_compat.cookie_dir = "/tmp/zcashd-compat-cookie-dir".into();
-        config.zcashd_compat.cookie_file_name = ".zcashd-compat.cookie".to_string();
-        config.rpc.cookie_dir = "/tmp/standard-rpc-cookie-dir".into();
-        config.rpc.cookie_file_name = ".cookie".to_string();
-        config.rpc.max_response_body_size = 1024;
-
-        let compat_rpc_config = StartCmd::zcashd_compat_rpc_config(&config);
-        assert_eq!(
-            compat_rpc_config.listen_addr,
-            config.zcashd_compat.listen_addr
-        );
-        assert_eq!(
-            compat_rpc_config.cookie_dir,
-            config.zcashd_compat.cookie_dir
-        );
-        assert_eq!(
-            compat_rpc_config.cookie_file_name,
-            config.zcashd_compat.cookie_file_name
-        );
-        assert!(compat_rpc_config.enable_cookie_auth);
-        assert_eq!(
-            compat_rpc_config.max_response_body_size,
-            StartCmd::ZCASHD_COMPAT_MIN_MAX_RESPONSE_BODY_SIZE
-        );
-    }
-
-    #[test]
-    fn zcashd_compat_rpc_config_can_disable_cookie_auth() {
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
-        config.zcashd_compat.enable_cookie_auth = false;
-
-        let compat_rpc_config = StartCmd::zcashd_compat_rpc_config(&config);
-
-        assert!(!compat_rpc_config.enable_cookie_auth);
-    }
-
-    #[test]
-    fn zcashd_compat_rpc_url_uses_https_when_tls_enabled() {
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.listen_addr = Some(StartCmd::zcashd_compat_default_rpc_listen_addr());
-        config.zcashd_compat.tls_cert_file = Some("/tmp/zebra.crt".into());
-        config.zcashd_compat.tls_key_file = Some("/tmp/zebra.key".into());
-
-        let rpc_url =
-            StartCmd::zcashd_compat_rpc_url(&config).expect("zcashd-compat RPC URL should format");
-
-        assert!(rpc_url.starts_with("https://"));
-    }
-
-    #[test]
-    fn zcashd_compat_config_rejects_non_loopback_listen_addr_without_tls() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.manage_zcashd = false;
-        config.zcashd_compat.listen_addr = Some(([192, 0, 2, 1], 28232).into());
-
-        let error = cmd
-            .override_config(config)
-            .expect_err("non-loopback zcashd-compat RPC should require TLS");
-
-        assert!(
-            error
-                .to_string()
-                .contains("listen_addr=192.0.2.1:28232 is non-loopback and requires TLS"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn zcashd_compat_config_allows_loopback_listen_addr_without_tls() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.manage_zcashd = false;
-        config.zcashd_compat.listen_addr = Some(([127, 0, 0, 1], 28232).into());
-
-        cmd.override_config(config)
-            .expect("loopback zcashd-compat RPC should allow plain HTTP");
-    }
-
-    #[test]
-    fn zcashd_compat_config_allows_non_loopback_listen_addr_with_tls() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let cert_file = tempdir.path().join("zebra.crt");
-        let key_file = tempdir.path().join("zebra.key");
-        std::fs::write(&cert_file, "placeholder cert").expect("cert file should be writable");
-        std::fs::write(&key_file, "placeholder key").expect("key file should be writable");
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.manage_zcashd = false;
-        config.zcashd_compat.listen_addr = Some(([192, 0, 2, 1], 28232).into());
-        config.zcashd_compat.tls_cert_file = Some(cert_file);
-        config.zcashd_compat.tls_key_file = Some(key_file);
-
-        cmd.override_config(config)
-            .expect("non-loopback zcashd-compat RPC should be allowed with TLS");
-    }
-
-    #[test]
-    fn zcashd_compat_config_allows_non_loopback_listen_addr_with_unsafe_override() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.manage_zcashd = false;
-        config.zcashd_compat.listen_addr = Some(([192, 0, 2, 1], 28232).into());
-        config.zcashd_compat.unsafe_allow_remote_http = true;
-
-        cmd.override_config(config).expect(
-            "non-loopback zcashd-compat RPC should be allowed with the explicit unsafe override",
-        );
-    }
-
-    #[test]
-    fn zcashd_compat_config_rejects_no_cookie_auth_without_tls() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.manage_zcashd = false;
-        config.zcashd_compat.enable_cookie_auth = false;
-
-        let error = cmd
-            .override_config(config)
-            .expect_err("no-cookie zcashd-compat RPC should require TLS");
-
-        assert!(
-            error
-                .to_string()
-                .contains("enable_cookie_auth=false requires TLS"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn zcashd_compat_config_allows_no_cookie_auth_with_tls() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let cert_file = tempdir.path().join("zebra.crt");
-        let key_file = tempdir.path().join("zebra.key");
-        std::fs::write(&cert_file, "placeholder cert").expect("cert file should be writable");
-        std::fs::write(&key_file, "placeholder key").expect("key file should be writable");
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.manage_zcashd = false;
-        config.zcashd_compat.enable_cookie_auth = false;
-        config.zcashd_compat.tls_cert_file = Some(cert_file);
-        config.zcashd_compat.tls_key_file = Some(key_file);
-
-        cmd.override_config(config)
-            .expect("no-cookie zcashd-compat RPC should be allowed with TLS");
-    }
-
-    #[test]
-    fn zcashd_compat_config_rejects_missing_tls_files() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.manage_zcashd = false;
-        config.zcashd_compat.tls_cert_file = Some("/tmp/zebra-missing.crt".into());
-        config.zcashd_compat.tls_key_file = Some("/tmp/zebra-missing.key".into());
-
-        let error = cmd
-            .override_config(config)
-            .expect_err("missing TLS files should be rejected");
-        assert!(
-            error.to_string().contains("could not read"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn zcashd_compat_config_rejects_tls_ca_without_tls_listener() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let ca_file = tempdir.path().join("ca.pem");
-        std::fs::write(&ca_file, "placeholder ca").expect("CA file should be writable");
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.manage_zcashd = false;
-        config.zcashd_compat.tls_ca_file = Some(ca_file);
-
-        let error = cmd
-            .override_config(config)
-            .expect_err("CA file should require an enabled TLS listener");
-        assert!(
-            error.to_string().contains("tls_ca_file requires"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn zcashd_compat_config_allows_managed_tls_without_ca_file() {
-        // The P2P sidecar zcashd does not talk to the compat RPC listener, so
-        // supervision no longer requires a CA file when the listener uses TLS.
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let cert_file = tempdir.path().join("zebra.crt");
-        let key_file = tempdir.path().join("zebra.key");
-        std::fs::write(&cert_file, "placeholder cert").expect("cert file should be writable");
-        std::fs::write(&key_file, "placeholder key").expect("key file should be writable");
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.manage_zcashd = true;
-        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Managed;
-        config.zcashd_compat.tls_cert_file = Some(cert_file);
-        config.zcashd_compat.tls_key_file = Some(key_file);
-
-        cmd.override_config(config)
-            .expect("managed zcashd-compat should accept a TLS listener without a CA file");
-    }
-
-    #[test]
     fn zcashd_compat_config_rejects_disabled_legacy_p2p() {
         let cmd = StartCmd {
             filters: Vec::new(),
@@ -1724,69 +1257,6 @@ mod tests {
         assert!(
             error.to_string().contains("peer-selection"),
             "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn zcashd_compat_config_allows_managed_tls_with_ca_file() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let cert_file = tempdir.path().join("zebra.crt");
-        let key_file = tempdir.path().join("zebra.key");
-        let ca_file = tempdir.path().join("ca.pem");
-        std::fs::write(&cert_file, "placeholder cert").expect("cert file should be writable");
-        std::fs::write(&key_file, "placeholder key").expect("key file should be writable");
-        std::fs::write(&ca_file, "placeholder ca").expect("CA file should be writable");
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.manage_zcashd = true;
-        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Managed;
-        config.zcashd_compat.tls_cert_file = Some(cert_file);
-        config.zcashd_compat.tls_key_file = Some(key_file);
-        config.zcashd_compat.tls_ca_file = Some(ca_file);
-
-        cmd.override_config(config)
-            .expect("managed zcashd-compat RPC should accept TLS with a CA file");
-    }
-
-    #[test]
-    fn zcashd_compat_config_rejects_incomplete_tls_pair() {
-        let cmd = StartCmd {
-            filters: Vec::new(),
-            zcashd_compat: false,
-            unsafe_low_specs: false,
-        };
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.enabled = true;
-        config.zcashd_compat.manage_zcashd = false;
-        config.zcashd_compat.tls_cert_file = Some("/tmp/zebra.crt".into());
-
-        let error = cmd
-            .override_config(config)
-            .expect_err("TLS should require both cert and key files");
-
-        assert!(
-            error.to_string().contains("tls_cert_file")
-                && error.to_string().contains("tls_key_file"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn zcashd_compat_cookie_path_uses_compat_cookie_dir() {
-        let mut config = ZebradConfig::default();
-        config.zcashd_compat.cookie_dir = "/tmp/zcashd-compat-cookie-dir".into();
-        config.zcashd_compat.cookie_file_name = ".zcashd-compat.cookie".to_string();
-        config.rpc.cookie_dir = "/tmp/standard-rpc-cookie-dir".into();
-        config.rpc.cookie_file_name = ".cookie".to_string();
-
-        assert_eq!(
-            StartCmd::zcashd_compat_cookie_path(&config),
-            std::path::PathBuf::from("/tmp/zcashd-compat-cookie-dir/.zcashd-compat.cookie")
         );
     }
 

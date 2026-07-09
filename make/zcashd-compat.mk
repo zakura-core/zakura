@@ -25,12 +25,9 @@ ZCASHD_CONF ?= $(ZCASHD_DATADIR)/zcash.conf
 ZCASHD_EXTRA_ARGS ?= -printtoconsole
 # Zakura's legacy P2P listener; standalone zcashd pins its single peer to it.
 ZAKURA_P2P_ADDR ?= 127.0.0.1:8233
-# Dedicated zcashd-compat Zakura RPC listener (operator tooling only; the P2P
-# sidecar zcashd does not use it).
-ZCASHD_ZAKURA_RPC_URL ?= http://127.0.0.1:28232
-
-ZAKURA_COOKIE_DIR ?= $(ZAKURA_STATE_CACHE_DIR)
-ZAKURA_COOKIE_FILE ?= $(ZAKURA_COOKIE_DIR)/.zcashd-compat.cookie
+# Optional Zakura standard RPC endpoint for height drift checks in compat-status-sync.
+ZAKURA_RPC_URL ?= http://127.0.0.1:8232
+ZAKURA_COOKIE_FILE ?= $(ZAKURA_STATE_CACHE_DIR)/.cookie
 HEIGHT_MAX_DRIFT ?= 10
 
 ZAKURA_DOCKER_IMAGE ?= zakura:zcashd-compat
@@ -75,8 +72,6 @@ compat-docker-build: compat-zcashd-prepare
 		--build-context "zcashd_compat=$$context_dir" \
 		--tag "$(ZAKURA_DOCKER_IMAGE)" .
 
-# The Zakura compat listener is internal to the supervised zcashd process in this
-# container, so keep it on container loopback and publish only zcashd's RPC port.
 compat-docker-start:
 	@echo "Starting Docker zcashd-compat container..."
 	docker run --rm -it \
@@ -85,7 +80,6 @@ compat-docker-start:
 		-e ZAKURA_NETWORK__LISTEN_ADDR="[::]:8233" \
 		-e ZAKURA_STATE__CACHE_DIR="/home/zebra/.cache/zakura" \
 		-e ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR="/home/zebra/.cache/zcashd" \
-		-e ZAKURA_ZCASHD_COMPAT__LISTEN_ADDR="127.0.0.1:28232" \
 		-e ZAKURA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \
 		--mount type=bind,src="$(ZAKURA_STATE_CACHE_DIR)",dst="/home/zebra/.cache/zakura" \
 		--mount type=bind,src="$(ZCASHD_DATADIR)",dst="/home/zebra/.cache/zcashd" \
@@ -98,7 +92,6 @@ compat-zakurad-start-supervised-managed:
 	@echo "Starting zakurad in zcashd-compat mode with managed zcashd download..."
 	ZAKURA_NETWORK__NETWORK="$(NETWORK)" \
 	ZAKURA_STATE__CACHE_DIR="$(ZAKURA_STATE_CACHE_DIR)" \
-	ZAKURA_ZCASHD_COMPAT__COOKIE_DIR="$(ZAKURA_COOKIE_DIR)" \
 	ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=managed \
 	ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR="$(ZCASHD_DATADIR)" \
 	"$(ZAKURAD_BIN)" start --zcashd-compat
@@ -107,7 +100,6 @@ compat-zakurad-start-supervised:
 	@echo "Starting zakurad in zcashd-compat mode with supervision enabled..."
 	ZAKURA_NETWORK__NETWORK="$(NETWORK)" \
 	ZAKURA_STATE__CACHE_DIR="$(ZAKURA_STATE_CACHE_DIR)" \
-	ZAKURA_ZCASHD_COMPAT__COOKIE_DIR="$(ZAKURA_COOKIE_DIR)" \
 	ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=path \
 	ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH="$(ZCASHD_BIN)" \
 	ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR="$(ZCASHD_DATADIR)" \
@@ -117,7 +109,6 @@ compat-zakurad-start-unsupervised:
 	@echo "Starting zakurad in zcashd-compat mode with supervision disabled..."
 	ZAKURA_NETWORK__NETWORK="$(NETWORK)" \
 	ZAKURA_STATE__CACHE_DIR="$(ZAKURA_STATE_CACHE_DIR)" \
-	ZAKURA_ZCASHD_COMPAT__COOKIE_DIR="$(ZAKURA_COOKIE_DIR)" \
 	ZAKURA_ZCASHD_COMPAT__MANAGE_ZCASHD=false \
 	ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=path \
 	ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH="$(ZCASHD_BIN)" \
@@ -144,16 +135,6 @@ compat-zakurad-status:
 		echo "zakurad process: NOT RUNNING"; \
 		exit 1; \
 	fi
-	@echo "Checking Zakura RPC getblockcount..."
-	@if [ ! -f "$(ZAKURA_COOKIE_FILE)" ]; then \
-		echo "Zakura cookie file missing: $(ZAKURA_COOKIE_FILE)"; \
-		exit 1; \
-	fi
-	@zebra_height="$$(curl -sS --fail --user "$$(cat "$(ZAKURA_COOKIE_FILE)")" \
-		-H 'Content-Type: application/json' \
-		--data '{"jsonrpc":"1.0","id":"make","method":"getblockcount","params":[]}' \
-		"$(ZCASHD_ZAKURA_RPC_URL)" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"])')"; \
-		echo "zakurad RPC height: $$zebra_height"
 
 compat-zcashd-status:
 	@echo "Checking zcashd process..."
@@ -175,10 +156,15 @@ compat-zcashd-status:
 compat-status-sync:
 	@$(MAKE) compat-zakurad-status
 	@$(MAKE) compat-zcashd-status
+	@if [ ! -f "$(ZAKURA_COOKIE_FILE)" ]; then \
+		echo "Skipping Zakura height drift check: cookie file missing at $(ZAKURA_COOKIE_FILE)"; \
+		echo "Enable rpc.listen_addr and use deploy/zcashd-compat/sync-check.sh for full drift checks."; \
+		exit 0; \
+	fi
 	@zebra_height="$$(curl -sS --fail --user "$$(cat "$(ZAKURA_COOKIE_FILE)")" \
 		-H 'Content-Type: application/json' \
 		--data '{"jsonrpc":"1.0","id":"make","method":"getblockcount","params":[]}' \
-		"$(ZCASHD_ZAKURA_RPC_URL)" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"])')"; \
+		"$(ZAKURA_RPC_URL)" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"])')"; \
 		zcashd_height="$$( "$(ZCASH_CLI_BIN)" -conf="$(ZCASHD_CONF)" -datadir="$(ZCASHD_DATADIR)" getblockcount )"; \
 		drift=$$(( zebra_height - zcashd_height )); \
 		if [ $$drift -lt 0 ]; then drift=$$(( -drift )); fi; \

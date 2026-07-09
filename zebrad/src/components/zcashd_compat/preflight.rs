@@ -111,7 +111,6 @@ enum PermissionRole {
     ZcashdDatadir,
     ZcashdConf,
     ManagedZcashdCache,
-    RpcCookieDir,
 }
 
 #[cfg(target_os = "linux")]
@@ -122,7 +121,6 @@ impl PermissionRole {
             PermissionRole::ZcashdDatadir => "zcashd datadir",
             PermissionRole::ZcashdConf => "zcashd config directory",
             PermissionRole::ManagedZcashdCache => "managed zcashd cache directory",
-            PermissionRole::RpcCookieDir => "rpc cookie directory",
         }
     }
 }
@@ -221,13 +219,6 @@ fn check_permissions(
         role: PermissionRole::ZebraState,
         target_path: config.state.cache_dir.clone(),
     }];
-
-    if config.zcashd_compat.enable_cookie_auth {
-        requirements.push(WriteRequirement {
-            role: PermissionRole::RpcCookieDir,
-            target_path: config.zcashd_compat.cookie_dir.clone(),
-        });
-    }
 
     if config.zcashd_compat.manage_zcashd {
         requirements.push(WriteRequirement {
@@ -979,32 +970,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn no_cookie_auth_skips_cookie_dir_permission_check() {
-        let temp_dir = TempDir::new().expect("tempdir should be created");
-        let mut config = permission_test_config(&temp_dir);
-        config.zcashd_compat.enable_cookie_auth = false;
-        config.zcashd_compat.cookie_dir = PathBuf::from("/proc/zebra-cookie-dir");
-        let mut summary = PreflightSummary::default();
-
-        check_permissions(
-            &mut summary,
-            &config,
-            &permission_test_zcashd_datadir(&config),
-        )
-        .expect("permission checks should succeed even if no-auth cookie dir is unusable");
-
-        assert!(
-            summary
-                .errors
-                .iter()
-                .all(|error| !error.contains("rpc cookie directory")),
-            "no-auth preflight should not check cookie directory: {:?}",
-            summary.errors
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     fn reports_unwritable_datadir_ancestor() {
         if running_as_root() {
             return;
@@ -1051,7 +1016,6 @@ mod tests {
         let mut config = ZebradConfig::default();
         config.state.cache_dir = shared.clone();
         config.zcashd_compat.manage_zcashd = false;
-        config.zcashd_compat.cookie_dir = shared.clone();
 
         set_mode(&shared, 0o555);
         let mut summary = PreflightSummary::default();
@@ -1061,9 +1025,8 @@ mod tests {
         result.expect("permission checks should complete");
         assert_eq!(summary.errors.len(), 1, "errors: {:?}", summary.errors);
         assert!(
-            summary.errors[0].contains("zakura state directory")
-                && summary.errors[0].contains("rpc cookie directory"),
-            "expected shared-role error: {:?}",
+            summary.errors[0].contains("zakura state directory"),
+            "expected state-dir error: {:?}",
             summary.errors
         );
     }
@@ -1279,7 +1242,6 @@ mod tests {
         config.state.cache_dir = temp_dir.path().join("zakura-cache");
         config.zcashd_compat.manage_zcashd = true;
         config.zcashd_compat.zcashd_source = ConfigZcashdBinarySource::Path;
-        config.zcashd_compat.cookie_dir = temp_dir.path().join("cookie-dir");
         config.zcashd_compat.zcashd_datadir = Some(temp_dir.path().join("zcashd-datadir"));
 
         let zcashd_path = temp_dir.path().join("zcashd");

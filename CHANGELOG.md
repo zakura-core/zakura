@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- Removed the deprecated zcashd-compat dedicated RPC listener (`:28232`) and its
+  cookie/TLS configuration. The P2P sidecar syncs over legacy Zcash P2P only;
+  use the standard `rpc.listen_addr` endpoint for operator JSON-RPC queries.
+
 ### Added
 
 - Zebra now tags the coinbase input of every block it mines with a `🌸`. The

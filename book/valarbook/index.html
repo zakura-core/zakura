@@ -561,7 +561,7 @@
                 <h2>Integration Summary</h2>
               </div>
               <p class="body-copy">
-                Zakura is responsible for consensus and P2P. zcashd is kept for wallet and zcashd-compatible RPC surfaces, and ingests chain and mempool data from Zakura over authenticated RPC. By default, operators run Zakura and zcashd as separate processes; supervised mode can be enabled when Zakura should manage the zcashd child process. The primary purpose of this integration is to allow exchanges to smoothly migrate to a Zakura node without disrupting their existing zcashd setup.
+                Zakura is responsible for consensus and P2P. zcashd is kept for wallet and zcashd-compatible RPC surfaces, and syncs chain data from Zakura over legacy Zcash P2P. By default, operators run Zakura and zcashd as separate processes; supervised mode can be enabled when Zakura should manage the zcashd child process. The primary purpose of this integration is to allow exchanges to smoothly migrate to a Zakura node without disrupting their existing zcashd setup.
               </p>
               <ul class="summary-list">
                 <li><strong>Trust boundary:</strong> zcashd trusts the configured Zakura node for block source and transaction forwarding.</li>
@@ -599,7 +599,7 @@
                 <p class="body-copy">Snapshots:</p>
                 <ul class="summary-list">
                   <li><a href="https://zakura.valargroup.dev/">Zakura</a></li>
-                  <li><a href="https://zcashd.valargroup.org/">Zcashd</a></li>
+                  <li><a href="https://zcashd.valargroup.dev/">Zcashd</a></li>
                 </ul>
               </div>
             </article>

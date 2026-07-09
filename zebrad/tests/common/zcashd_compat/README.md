@@ -151,7 +151,6 @@ error (misconfiguration, not a skip).
 |---|---|---|---|
 | `zcashd_compat_both_processes_start` | startup | Full check — asserts `chain == "regtest"` | Full check — asserts `chain == "main"/"test"` |
 | `zcashd_compat_readiness_after_mine` | startup | Mines 5 blocks, asserts `readiness == "ready"` | Checks readiness without mining; asserts not `"failed"` |
-| `zcashd_compat_rpc_requires_auth` | startup | Full check — unauthenticated request must fail | Full check |
 | `zcashd_compat_height_and_hash_agree` | chain | Mines 5, asserts count == 5 on both sides | Cross-checks current tip (no mining) |
 | `zcashd_compat_getblock_hash_consistent` | chain | Mines 3, checks heights 1–3 | Checks last 3 blocks at current tip |
 | `zcashd_compat_wallet_address_generation` | wallet | Full check (t-addr + z-addr) | Full check |
@@ -206,7 +205,7 @@ zebrad/tests/common/
     │                          read_test_network_kind()
     ├── launch.rs              ZcashdCompatSetup, spawn_zebrad_with_zcashd_compat(),
     │                          connect_to_external_zcashd_compat(), wait_for_zcashd_rpc()
-    ├── startup.rs             both_processes_start, readiness_after_mine, rpc_requires_auth
+    ├── startup.rs             both_processes_start, readiness_after_mine, sidecar_follows_tip, miner_rpcs_disabled
     ├── chain.rs               height_and_hash_agree, getblock_hash_consistent
     ├── wallet.rs              address_generation, initial_balance_zero,
     │                          getwalletinfo_fields_present

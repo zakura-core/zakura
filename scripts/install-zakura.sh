@@ -10,11 +10,11 @@ else
 fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-ZAKURA_RELEASE_TAG="v0.0.1-alpha.1"
+ZAKURA_RELEASE_TAG="v0.0.1-alpha.3"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
 ZAKURA_MEMBER="./bin/zakurad"
-ZAKURA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1@sha256:74f76366eed48bdfb15a3386d033a6e3e2d7481f40cb06c5c6ae3c5e9f77e4b5"
+ZAKURA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.3"
 
 MODE=""
 NETWORK="Mainnet"

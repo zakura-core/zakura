@@ -4577,15 +4577,6 @@ async fn zcashd_compat_miner_rpcs_disabled() -> Result<()> {
     common::zcashd_compat::startup::miner_rpcs_disabled().await
 }
 
-/// Verifies that zcashd's RPC endpoint rejects requests with invalid credentials.
-///
-/// See [`common::zcashd_compat::startup::rpc_requires_auth`] for details.
-#[tokio::test]
-#[ignore]
-async fn zcashd_compat_rpc_requires_auth() -> Result<()> {
-    common::zcashd_compat::startup::rpc_requires_auth().await
-}
-
 /// Verifies that zebrad and zcashd agree on block count and best block hash.
 ///
 /// See [`common::zcashd_compat::chain::height_and_hash_agree`] for details.

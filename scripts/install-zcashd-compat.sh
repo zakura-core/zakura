@@ -11,16 +11,16 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZAKURA_RELEASE_TAG="v0.0.1-alpha.1"
+ZAKURA_RELEASE_TAG="v0.0.1-alpha.3"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
 # sha256 of ZAKURA_ARCHIVE from the release's SHA256SUMS.txt. Pin it once the
 # zakurad-named release artifact is published: an unpinned download in a
 # `curl | bash` installer is a supply-chain hole. Empty = skip verification.
-ZAKURA_ARCHIVE_SHA256=""
+ZAKURA_ARCHIVE_SHA256="ddee615b96e5d6bd3668eefc8a8eeec038b43293c52682dc8e68403c032df1a9"
 ZAKURA_MEMBER="./bin/zakurad"
-ZAKURA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.1@sha256:74f76366eed48bdfb15a3386d033a6e3e2d7481f40cb06c5c6ae3c5e9f77e4b5"
-ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.1@sha256:f3f36dc215a15f3724690529244df8527cc0389ccf4bf9348206cb49388ac8c8"
+ZAKURA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.3"
+ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.3"
 ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
 ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
 ZAKURA_DOCKER_RUNTIME_UID=10001
@@ -39,9 +39,7 @@ ZAKURA_STATE_DIR="$ZAKURA_DEFAULT_CACHE_DIR"
 ZCASHD_DATADIR="$ZCASHD_DEFAULT_DATADIR"
 INSTALL_DIR="${HOME}/.local/zcashd-compat"
 CACHE_DIR="${HOME}/.cache/zcashd-compat"
-COOKIE_DIR=""
 ZAKURA_P2P_ADDR=""
-COMPAT_LISTEN_ADDR="127.0.0.1:28232"
 ZCASHD_CONF=""
 ZAKURAD_PATH=""
 ZCASHD_PATH=""
@@ -148,10 +146,8 @@ Options:
   --zcashd-datadir DIR
   --install-dir DIR
   --cache-dir DIR
-  --cookie-dir DIR
   --zakura-p2p-addr HOST:PORT Zakura legacy P2P listener; zcashd is pinned to its port
                              (default [::]:8233 mainnet, [::]:18233 testnet/regtest)
-  --compat-listen-addr ADDR  Zakura zcashd-compat RPC listener (default 127.0.0.1:28232)
   --zcash-conf FILE
   --zakurad-path PATH
   --zcashd-path PATH
@@ -752,10 +748,6 @@ normalize_inputs() {
   ZCASHD_DATADIR="$(printf '%s' "$ZCASHD_DATADIR" | sanitize_terminal_input)"
   INSTALL_DIR="$(printf '%s' "$INSTALL_DIR" | sanitize_terminal_input)"
   CACHE_DIR="$(printf '%s' "$CACHE_DIR" | sanitize_terminal_input)"
-  if [[ -z "$COOKIE_DIR" ]]; then
-    COOKIE_DIR="$ZAKURA_STATE_DIR"
-  fi
-  COOKIE_DIR="$(printf '%s' "$COOKIE_DIR" | sanitize_terminal_input)"
   ZCASHD_CONF="$(printf '%s' "$ZCASHD_CONF" | sanitize_terminal_input)"
   ZAKURAD_PATH="$(printf '%s' "$ZAKURAD_PATH" | sanitize_terminal_input)"
   ZCASHD_PATH="$(printf '%s' "$ZCASHD_PATH" | sanitize_terminal_input)"
@@ -764,7 +756,6 @@ normalize_inputs() {
   ZCASHD_DATADIR="$(abs_path "$ZCASHD_DATADIR")"
   INSTALL_DIR="$(abs_path "$INSTALL_DIR")"
   CACHE_DIR="$(abs_path "$CACHE_DIR")"
-  COOKIE_DIR="$(abs_path "$COOKIE_DIR")"
   ZCASHD_CONF="$(abs_path "$ZCASHD_CONF")"
 
   case "$MODE" in
@@ -782,7 +773,6 @@ normalize_inputs() {
     ZAKURA_P2P_ADDR="[::]:$(network_default_p2p_port)"
   fi
   ZAKURA_P2P_ADDR="$(printf '%s' "$ZAKURA_P2P_ADDR" | sanitize_terminal_input)"
-  COMPAT_LISTEN_ADDR="$(printf '%s' "$COMPAT_LISTEN_ADDR" | sanitize_terminal_input)"
 
   if [[ "$ZAKURA_P2P_ADDR" != *:* || -z "$(p2p_port_from_addr "$ZAKURA_P2P_ADDR")" ]]; then
     add_error "--zakura-p2p-addr must be HOST:PORT, got: $ZAKURA_P2P_ADDR"
@@ -867,7 +857,6 @@ collect_permission_checks() {
   check_writable_target "zcashd datadir" "$ZCASHD_DATADIR"
   check_writable_target "install directory" "$INSTALL_DIR"
   check_writable_target "download/cache directory" "$CACHE_DIR"
-  check_writable_target "rpc cookie directory" "$COOKIE_DIR"
 
   if [[ -e "$ZCASHD_CONF" || -L "$ZCASHD_CONF" ]]; then
     if [[ -L "$ZCASHD_CONF" && ! -e "$ZCASHD_CONF" ]]; then
@@ -1279,7 +1268,7 @@ data_detection_message() {
       printf 'Please download the snapshot from the locations\n'
     fi
   fi
-  printf '\nhttps://zcashd.valargroup.org/\n'
+  printf '\nhttps://zcashd.valargroup.dev/\n'
   printf '\nhttps://zakura.valargroup.dev/\n'
   printf '\n'
 }
@@ -1398,9 +1387,7 @@ quote_env_value() {
 print_zakurad_env_lines() {
   printf 'ZAKURA_NETWORK__NETWORK=%s \\\n' "$(quote_env_value "$(network_config_value)")"
   printf 'ZAKURA_NETWORK__LISTEN_ADDR=%s \\\n' "$(quote_env_value "$ZAKURA_P2P_ADDR")"
-  printf 'ZAKURA_STATE__CACHE_DIR=%s \\\n' "$(quote_env_value "$ZAKURA_STATE_DIR")"
-  printf 'ZAKURA_ZCASHD_COMPAT__COOKIE_DIR=%s \\\n' "$(quote_env_value "$COOKIE_DIR")"
-  printf 'ZAKURA_ZCASHD_COMPAT__LISTEN_ADDR=%s \\' "$(quote_env_value "$COMPAT_LISTEN_ADDR")"
+  printf 'ZAKURA_STATE__CACHE_DIR=%s \\' "$(quote_env_value "$ZAKURA_STATE_DIR")"
 }
 
 # Shared zcashd P2P-sidecar flags for the binary/source start commands.
@@ -1470,15 +1457,11 @@ docker run --rm -it \\
   -e ZAKURA_NETWORK__MAX_CONNECTIONS_PER_IP=8 \\
   -e ZAKURA_STATE__CACHE_DIR=$container_zebra_state_dir \\
   -e ZAKURA_ZCASHD_COMPAT__MANAGE_ZCASHD=true \\
-  -e ZAKURA_ZCASHD_COMPAT__COOKIE_DIR=$container_zebra_state_dir \\
   -e ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR=$container_zcashd_datadir \\
-  -e ZAKURA_ZCASHD_COMPAT__LISTEN_ADDR=0.0.0.0:28232 \\
-  -e ZAKURA_ZCASHD_COMPAT__UNSAFE_ALLOW_REMOTE_HTTP=true \\
   -e ZAKURA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \\
   --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=$container_zebra_state_dir \\
   --mount type=bind,src=$(shell_quote "$ZCASHD_DATADIR"),dst=$container_zcashd_datadir \\
   -p ${p2p_port}:${p2p_port} \\
-  -p 127.0.0.1:28232:28232 \\
   $(shell_quote "$image") \\
   zakurad start --zcashd-compat
 EOF
@@ -1494,11 +1477,8 @@ docker run --rm -it --name zakura-compat \\
   -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:${p2p_port}' \\
   -e ZAKURA_NETWORK__MAX_CONNECTIONS_PER_IP=8 \\
   -e ZAKURA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \\
-  -e ZAKURA_ZCASHD_COMPAT__LISTEN_ADDR=0.0.0.0:28232 \\
-  -e ZAKURA_ZCASHD_COMPAT__UNSAFE_ALLOW_REMOTE_HTTP=true \\
   --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
   -p ${p2p_port}:${p2p_port} \\
-  -p 127.0.0.1:28232:28232 \\
   $(shell_quote "$ZAKURA_DOCKER_IMAGE") \\
   zakurad start --zcashd-compat
 
@@ -1545,14 +1525,6 @@ print_ready_commands() {
   esac
 
   print_command_block_end
-
-  case "$MODE" in
-    docker-supervised | docker-split-containers)
-      printf '\n%s ZAKURA_ZCASHD_COMPAT__UNSAFE_ALLOW_REMOTE_HTTP=true is set because the compat RPC is published on 0.0.0.0 over plain HTTP,\n' "$(style "$YELLOW" "[!]")"
-      printf '    so the cookie crosses the network in cleartext and is safe behind the local container/private-network boundary.\n'
-      printf '    To remove it, enable TLS via ZAKURA_ZCASHD_COMPAT__TLS_CERT_FILE/_TLS_KEY_FILE/_TLS_CA_FILE.\n'
-      ;;
-  esac
 }
 
 while (($#)); do
@@ -1589,19 +1561,9 @@ while (($#)); do
       CACHE_DIR="$2"
       shift 2
       ;;
-    --cookie-dir)
-      require_value "$1" "${2:-}"
-      COOKIE_DIR="$2"
-      shift 2
-      ;;
     --zakura-p2p-addr | --zebra-p2p-addr)
       require_value "$1" "${2:-}"
       ZAKURA_P2P_ADDR="$2"
-      shift 2
-      ;;
-    --compat-listen-addr)
-      require_value "$1" "${2:-}"
-      COMPAT_LISTEN_ADDR="$2"
       shift 2
       ;;
     --zcash-conf)

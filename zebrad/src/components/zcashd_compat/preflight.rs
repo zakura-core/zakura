@@ -44,9 +44,9 @@ const MIN_RAM_BYTES: u64 = 16 * GIB;
 const RECOMMENDED_RAM_BYTES: u64 = 32 * GIB;
 
 #[cfg(target_os = "linux")]
-const MIN_ZEBRA_PROVISIONED_BYTES: u64 = 300 * GIB;
+const MIN_ZEBRA_PROVISIONED_BYTES: u64 = 275 * GIB;
 #[cfg(target_os = "linux")]
-const MIN_ZCASHD_PROVISIONED_BYTES: u64 = 300 * GIB;
+const MIN_ZCASHD_PROVISIONED_BYTES: u64 = 275 * GIB;
 #[cfg(target_os = "linux")]
 const RECOMMENDED_COMBINED_TOTAL_BYTES: u64 = TIB;
 

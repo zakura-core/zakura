@@ -735,7 +735,7 @@ compat_search_zcashd_datadir_candidates() {
 
 compat_recommend_zebra_state_dir() {
   local binary_default="$1"
-  local min_bytes=$((300 * 1024 * 1024 * 1024))
+  local min_bytes=$((275 * 1024 * 1024 * 1024))
   local synthetic_min_bytes="${SYNTHETIC_INSTALL_MIN_BYTES:-$min_bytes}"
   local install_root
   BEST_CANDIDATE=""
@@ -761,7 +761,7 @@ compat_recommend_zebra_state_dir() {
 
 compat_recommend_zcashd_datadir() {
   local binary_default="$1"
-  local min_bytes=$((300 * 1024 * 1024 * 1024))
+  local min_bytes=$((275 * 1024 * 1024 * 1024))
   local synthetic_min_bytes="${SYNTHETIC_INSTALL_MIN_BYTES:-$min_bytes}"
   local install_root
   BEST_CANDIDATE=""
@@ -789,9 +789,9 @@ compat_recommend_datadir_defaults() {
   # Empty fallback locations share a filesystem, so size them for both datadirs
   # when both prompt defaults are being selected together.
   if ((ZAKURA_STATE_DIR_SET == 0 && ZCASHD_DATADIR_SET == 0)); then
-    SYNTHETIC_INSTALL_MIN_BYTES=$((550 * 1024 * 1024 * 1024))
+    SYNTHETIC_INSTALL_MIN_BYTES=$((275 * 2 * 1024 * 1024 * 1024))
   else
-    SYNTHETIC_INSTALL_MIN_BYTES=$((300 * 1024 * 1024 * 1024))
+    SYNTHETIC_INSTALL_MIN_BYTES=$((275 * 1024 * 1024 * 1024))
   fi
 
   if ((ZAKURA_STATE_DIR_SET == 0)); then
@@ -1456,13 +1456,13 @@ compat_collect_disk_checks() {
   read -r zcashd_device zcashd_size <<<"$zcashd_info"
 
   if [[ "$zebra_device" == "$zcashd_device" ]]; then
-    required=$((550 * gib))
+    required=$((275 * 2 * gib))
     combined="$zebra_size"
     if ((zebra_size < required)); then
       add_low_spec_error "zakura state + zcashd datadir mount (paths: $ZAKURA_STATE_DIR, $ZCASHD_DATADIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
     fi
   else
-    required=$((300 * gib))
+    required=$((275 * gib))
     combined=$((zebra_size + zcashd_size))
     if ((zebra_size < required)); then
       add_low_spec_error "zakura state mount (paths: $ZAKURA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
@@ -2164,7 +2164,7 @@ default_collect_disk_checks() {
   local gib required
 
   gib=$((1024 * 1024 * 1024))
-  required=$((300 * gib))
+  required=$((275 * gib))
 
   if ! zebra_info="$(disk_device_and_size "$ZAKURA_STATE_DIR")"; then
     add_error "failed to inspect filesystem for zakura state path: $ZAKURA_STATE_DIR"

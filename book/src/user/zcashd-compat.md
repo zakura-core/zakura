@@ -1,7 +1,7 @@
 # zcashd-compat Mode (`zakurad start --zcashd-compat`)
 
 zcashd-compat mode is for operators — typically exchanges and custodial
-services — that want to migrate to Zakura while keeping the `zcashd` wallet and
+services whi want to migrate to Zakura while keeping the `zcashd` wallet and
 RPC surface their integration already depends on. Zakura faces the Zcash P2P
 network and is the consensus node; `zcashd` runs as a **P2P sidecar** that
 makes a single outbound peer connection to the local Zakura node and listens
@@ -11,7 +11,7 @@ Your systems keep talking to `zcashd` exactly as before:
 
 | Provided by `zcashd`, unchanged          | Moved to Zakura                             |
 |------------------------------------------|---------------------------------------------|
-| Wallet behavior and wallet RPC methods   | Public P2P networking and peer selection    |
+| Wallet RPC methods (transparent + Sapling) | Public P2P networking and peer selection    |
 | Local block files, chainstate, indexes   | Network-facing block and transaction relay  |
 | ZMQ notifications                        | Block templates for miners                  |
 | Local RPC response semantics             | DNS seeding and peer discovery              |
@@ -100,12 +100,34 @@ SHA256. It differs from stock `zcash/zcash` in three ways:
    itself down at its deprecation height; the sidecar build logs a warning
    and keeps serving its wallet/RPC surface. Consensus safety comes from
    Zakura, which fully validates every block before relaying it to zcashd.
-3. **`-regtestacceptunvalidatedpow` (regtest only)** lets zcashd follow a
-   Zakura regtest chain, whose mined blocks carry null Equihash solutions.
-   It is rejected on any other network.
 
-Everything else — wallet, chainstate format, RPC semantics, ZMQ — is stock
-zcashd.
+Everything else — chainstate format, RPC semantics, ZMQ — matches stock
+zcashd. The wallet carries the Ironwood/Orchard shielded-pool limits from the
+sidecar baseline (see [Wallet shielded-pool support (Orchard &
+Ironwood)](#wallet-shielded-pool-support-orchard--ironwood)).
+
+## Running externally managed
+
+Run Zakura normally (with `zcashd_compat.enabled = true` if you want
+preflight checks and the RPC guardrails), then run zcashd yourself:
+
+```console
+zcashd -datadir=/var/lib/zcashd \
+       -connect=127.0.0.1:8233 -listen=0 -dnsseed=0 -listenonion=0 -discover=0 \
+       -printtoconsole
+```
+
+Or put the equivalent in `zcash.conf`:
+
+```text
+connect=127.0.0.1:8233
+listen=0
+i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
+```
+
+`make compat-zcashd-start-standalone` (see `make/zcashd-compat.mk`) wraps
+this command, and `make compat-zakurad-start-unsupervised` starts the
+matching front node.
 
 ## Running supervised
 
@@ -181,29 +203,6 @@ pruning on the fronting Zakura — a pruned node does not advertise
 > front — the installer's Docker modes do this for you — or attach the
 > sidecar to the container network directly.
 
-## Running externally managed
-
-Run Zakura normally (with `zcashd_compat.enabled = true` if you want
-preflight checks and the RPC guardrails), then run zcashd yourself:
-
-```console
-zcashd -datadir=/var/lib/zcashd \
-       -connect=127.0.0.1:8233 -listen=0 -dnsseed=0 -listenonion=0 -discover=0 \
-       -printtoconsole
-```
-
-Or put the equivalent in `zcash.conf`:
-
-```text
-connect=127.0.0.1:8233
-listen=0
-i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
-```
-
-`make compat-zcashd-start-standalone` (see `make/zcashd-compat.mk`) wraps
-this command, and `make compat-zakurad-start-unsupervised` starts the
-matching front node.
-
 ### Verify the integration
 
 Confirm zcashd is talking only to Zakura and exposes no P2P or mining
@@ -250,6 +249,55 @@ Zakura's `getblocktemplate` and `submitblock` are always compiled in; no
 special build is needed. See [Mining](mining.md) for details. The sidecar
 zcashd returns `Method not found` for all template and submission RPCs, so a
 misconfigured miner fails loudly instead of building on a lagging view.
+
+## Wallet shielded-pool support (Orchard & Ironwood)
+
+Orchard and Ironwood are shielded pools, exercised through the unified `z_*` wallet RPCs
+(`z_sendmany`, and the rest). Those RPCs remain registered and callable. However, disabled. This is not the same mechanism as the removed miner RPCs:
+
+| | Miner RPCs (`getblocktemplate`, …) | Orchard / Ironwood |
+| --- | --- | --- |
+| Mechanism | Method not registered | Method registered; operation rejected at prep time |
+| Error | `-32601` Method not found | `RPC_INVALID_PARAMETER` (`-8`) with a descope message |
+| Scope | Always | Height-gated on NU6.3 activation |
+
+These limits are a property of the sidecar `zcashd` build itself (the
+Ironwood baseline), not the P2P sidecar layer. They apply identically whether
+zcashd is externally managed or supervised.
+
+- **Ironwood (the NU6.3 pool):** permanently unsupported. The zcashd wallet
+  never supports Ironwood — this is a permanent descope, not a "not yet
+  available" gate.
+- **Orchard:** rejected from NU6.3 onward. Once NU6.3 is active for the next
+  block, any Orchard involvement — spends of existing Orchard notes, Orchard
+  payments, or Orchard change — fails at transaction-preparation time. Before
+  NU6.3 activation, Orchard sends still work.
+- **Transparent and Sapling:** unaffected. Existing transparent and Sapling
+  wallet flows keep working.
+
+When a restricted operation is attempted, zcashd returns `RPC_INVALID_PARAMETER`
+(`-8`) with this message:
+
+```text
+zcashd does not support the Ironwood pool, and Orchard payments (including
+spends of existing Orchard notes) are unsupported from NU6.3. Use transparent
+or Sapling funds with zcashd, or a Z3-stack wallet for shielded payments.
+```
+
+For continued Orchard or Ironwood shielded support, migrate wallet flows to a
+[Z3-stack wallet](https://github.com/zcash/wallet) ([Zallet](https://github.com/zcash/wallet),
+[Zaino](https://github.com/zingolabs/zaino), or
+[librustzcash](https://github.com/zcash/librustzcash)). This aligns with the
+broader zcashd retirement path implied by the sidecar build's disabled
+end-of-support halt.
+
+> [!WARNING]
+> Exchange and custodial integrations that rely on Orchard sends from the
+> zcashd wallet must migrate those flows before NU6.3 activation on their
+> network. After activation, Orchard operations fail at prep time with the
+> message above — not with `Method not found`. Plan the migration alongside
+> other network-upgrade readiness work (for example, deploying an updated
+> sidecar build before each activation height).
 
 ## Initial sync and existing datadirs
 
@@ -328,37 +376,3 @@ recommended tiers.
 If the Zakura state and zcashd datadir share one mount, that mount needs the
 sum of both minimums (550 GiB on mainnet). The installer runs the same checks
 before anything is downloaded.
-
-## Monitoring and lifecycle
-
-- The supervisor exports `zcashd_compat.supervisor.active` / `.disabled` /
-  `.exhausted` gauges.
-- zcashd's stdout/stderr are forwarded into Zakura's logs under the
-  `zcashd_compat.zcashd` target.
-- On Zakura shutdown the supervisor sends zcashd SIGTERM and waits
-  `shutdown_grace_period` before force-killing, so zcashd can flush its
-  chainstate and wallet.
-- `make compat-status-sync` / `deploy/zcashd-compat/sync-check.sh` check both
-  processes, peer pinning (`getconnectioncount == 1`), and height drift.
-
-## Testing
-
-The integration suite runs zakurad + a supervised regtest zcashd end to end:
-
-```console
-make compat-test-regtest TEST_ZCASHD_PATH=/path/to/sidecar/zcashd
-```
-
-If `TEST_ZCASHD_PATH` is unset, the harness uses the embedded hash-pinned
-zcashd download. It covers startup, tip following over P2P, deep reorgs,
-restarts, transaction flow from zcashd's wallet through Zakura's mempool, and
-the miner-RPC removal. `make compat-test-soak` runs a longer regtest soak,
-and `make compat-test-mainnet` / `compat-test-testnet` run the read-only
-subset against a live deployment.
-
-## Upstream network upgrades
-
-The sidecar zcashd must keep up with Zcash network upgrades: when a network
-upgrade activates, zakurad requires peers to advertise that upgrade's minimum
-protocol version, and an out-of-date zcashd will be disconnected. Plan to
-deploy the updated sidecar build before each activation height.

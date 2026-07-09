@@ -78,6 +78,22 @@ if [[ ! -t 0 ]]; then
   fi
 fi
 
+ensure_cargo_env() {
+  if [[ -f "${HOME}/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    . "${HOME}/.cargo/env"
+  elif [[ -d "${HOME}/.cargo/bin" ]]; then
+    case ":${PATH}:" in
+      *":${HOME}/.cargo/bin:"*) ;;
+      *) export PATH="${HOME}/.cargo/bin:${PATH}" ;;
+    esac
+  fi
+}
+
+# Non-login shells (including `curl | bash`) often skip ~/.profile, so cargo may
+# be installed but invisible until we source rustup's env or prepend ~/.cargo/bin.
+ensure_cargo_env
+
 USE_ANSI=0
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   USE_ANSI=1
@@ -959,6 +975,14 @@ mark_missing_tool() {
 report_missing_tool() {
   local tool="$1"
 
+  if [[ "$tool" == "cargo" ]]; then
+    ensure_cargo_env
+  fi
+
+  if command_exists "$tool"; then
+    return
+  fi
+
   mark_missing_tool "$tool"
   add_error "required tool is missing from PATH: $tool"
 }
@@ -988,13 +1012,6 @@ run_privileged() {
   else
     printf 'installer needs root or sudo to install system packages\n' >&2
     return 1
-  fi
-}
-
-ensure_cargo_env() {
-  if [[ -f "${HOME}/.cargo/env" ]]; then
-    # shellcheck disable=SC1091
-    . "${HOME}/.cargo/env"
   fi
 }
 
@@ -1139,11 +1156,19 @@ print_missing_build_dependency_instructions() {
   for tool in "${MISSING_TOOLS[@]}"; do
     case "$tool" in
       cargo)
-        cat <<'EOF'
+        if [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
+          cat <<'EOF'
+cargo is installed but not on PATH in this shell. Load it with:
+  source "$HOME/.cargo/env"
+Then re-run this installer script.
+EOF
+        else
+          cat <<'EOF'
 Install Rust (cargo):
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
   source "$HOME/.cargo/env"
 EOF
+        fi
         ;;
       make)
         cat <<'EOF'

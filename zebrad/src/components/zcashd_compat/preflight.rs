@@ -17,6 +17,8 @@ use nix::unistd::{access, AccessFlags};
 use std::os::unix::fs::MetadataExt;
 #[cfg(target_os = "linux")]
 use tracing::warn;
+#[cfg(target_os = "linux")]
+use zebra_chain::parameters::{Network, NetworkKind};
 
 #[cfg(target_os = "linux")]
 use super::{
@@ -44,11 +46,18 @@ const MIN_RAM_BYTES: u64 = 16 * GIB;
 const RECOMMENDED_RAM_BYTES: u64 = 32 * GIB;
 
 #[cfg(target_os = "linux")]
-const MIN_ZEBRA_PROVISIONED_BYTES: u64 = 300 * GIB;
+const MAINNET_MIN_ZEBRA_PROVISIONED_BYTES: u64 = 275 * GIB;
 #[cfg(target_os = "linux")]
-const MIN_ZCASHD_PROVISIONED_BYTES: u64 = 300 * GIB;
+const MAINNET_MIN_ZCASHD_PROVISIONED_BYTES: u64 = 275 * GIB;
 #[cfg(target_os = "linux")]
-const RECOMMENDED_COMBINED_TOTAL_BYTES: u64 = TIB;
+const MAINNET_RECOMMENDED_COMBINED_TOTAL_BYTES: u64 = TIB;
+
+#[cfg(target_os = "linux")]
+const TESTNET_MIN_ZEBRA_PROVISIONED_BYTES: u64 = 30 * GIB;
+#[cfg(target_os = "linux")]
+const TESTNET_MIN_ZCASHD_PROVISIONED_BYTES: u64 = 30 * GIB;
+#[cfg(target_os = "linux")]
+const TESTNET_RECOMMENDED_COMBINED_TOTAL_BYTES: u64 = 100 * GIB;
 
 /// Runs zcashd-compat hardware preflight checks.
 ///
@@ -102,6 +111,14 @@ struct PathRequirement {
     role: DiskRole,
     target_path: PathBuf,
     min_provisioned_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct DiskThresholds {
+    min_zebra_bytes: u64,
+    min_zcashd_bytes: u64,
+    recommended_combined_bytes: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -169,7 +186,12 @@ fn run_linux_preflight(config: &ZebradConfig, unsafe_low_specs: bool) -> Result<
     check_permissions(&mut summary, config, &zcashd_datadir)?;
     check_cpu(&mut summary)?;
     check_memory(&mut summary)?;
-    check_disk(&mut summary, &config.state.cache_dir, &zcashd_datadir)?;
+    check_disk(
+        &mut summary,
+        &config.network.network,
+        &config.state.cache_dir,
+        &zcashd_datadir,
+    )?;
 
     for warning in finalize_preflight(summary, unsafe_low_specs)? {
         warn!("{warning}");
@@ -182,6 +204,22 @@ fn run_linux_preflight(config: &ZebradConfig, unsafe_low_specs: bool) -> Result<
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn disk_thresholds(network: &Network) -> DiskThresholds {
+    match network.kind() {
+        NetworkKind::Mainnet => DiskThresholds {
+            min_zebra_bytes: MAINNET_MIN_ZEBRA_PROVISIONED_BYTES,
+            min_zcashd_bytes: MAINNET_MIN_ZCASHD_PROVISIONED_BYTES,
+            recommended_combined_bytes: MAINNET_RECOMMENDED_COMBINED_TOTAL_BYTES,
+        },
+        NetworkKind::Testnet | NetworkKind::Regtest => DiskThresholds {
+            min_zebra_bytes: TESTNET_MIN_ZEBRA_PROVISIONED_BYTES,
+            min_zcashd_bytes: TESTNET_MIN_ZCASHD_PROVISIONED_BYTES,
+            recommended_combined_bytes: TESTNET_RECOMMENDED_COMBINED_TOTAL_BYTES,
+        },
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -477,24 +515,30 @@ fn check_memory(summary: &mut PreflightSummary) -> Result<(), Report> {
 #[cfg(target_os = "linux")]
 fn check_disk(
     summary: &mut PreflightSummary,
+    network: &Network,
     zebra_cache_dir: &Path,
     zcashd_datadir: &Path,
 ) -> Result<(), Report> {
+    let thresholds = disk_thresholds(network);
     let requirements = vec![
         PathRequirement {
             role: DiskRole::ZebraState,
             target_path: zebra_cache_dir.to_path_buf(),
-            min_provisioned_bytes: MIN_ZEBRA_PROVISIONED_BYTES,
+            min_provisioned_bytes: thresholds.min_zebra_bytes,
         },
         PathRequirement {
             role: DiskRole::ZcashdData,
             target_path: zcashd_datadir.to_path_buf(),
-            min_provisioned_bytes: MIN_ZCASHD_PROVISIONED_BYTES,
+            min_provisioned_bytes: thresholds.min_zcashd_bytes,
         },
     ];
 
     let grouped_filesystems = grouped_requirements_by_filesystem(&requirements)?;
-    evaluate_disk_thresholds(summary, &grouped_filesystems);
+    evaluate_disk_thresholds(
+        summary,
+        &grouped_filesystems,
+        thresholds.recommended_combined_bytes,
+    );
 
     Ok(())
 }
@@ -503,6 +547,7 @@ fn check_disk(
 fn evaluate_disk_thresholds(
     summary: &mut PreflightSummary,
     grouped_filesystems: &HashMap<u64, FilesystemRequirements>,
+    recommended_combined_bytes: u64,
 ) {
     let combined_provisioned_capacity = grouped_filesystems
         .values()
@@ -521,11 +566,11 @@ fn evaluate_disk_thresholds(
         }
     }
 
-    if combined_provisioned_capacity < RECOMMENDED_COMBINED_TOTAL_BYTES {
+    if combined_provisioned_capacity < recommended_combined_bytes {
         summary.warnings.push(format!(
             "combined zcashd-compat filesystem capacity is {}, recommended is {}",
             human_gib(combined_provisioned_capacity),
-            human_gib(RECOMMENDED_COMBINED_TOTAL_BYTES)
+            human_gib(recommended_combined_bytes)
         ));
     }
 }
@@ -806,17 +851,43 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn disk_thresholds_mainnet_returns_existing_limits() {
+        assert_eq!(
+            disk_thresholds(&Network::Mainnet),
+            DiskThresholds {
+                min_zebra_bytes: 275 * GIB,
+                min_zcashd_bytes: 275 * GIB,
+                recommended_combined_bytes: TIB,
+            }
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disk_thresholds_testnet_returns_lower_limits() {
+        assert_eq!(
+            disk_thresholds(&Network::new_default_testnet()),
+            DiskThresholds {
+                min_zebra_bytes: 30 * GIB,
+                min_zcashd_bytes: 30 * GIB,
+                recommended_combined_bytes: 100 * GIB,
+            }
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn merges_provisioned_requirement_when_paths_share_filesystem() {
         let requirements = vec![
             PathRequirement {
                 role: DiskRole::ZebraState,
                 target_path: PathBuf::from("/tmp"),
-                min_provisioned_bytes: MIN_ZEBRA_PROVISIONED_BYTES,
+                min_provisioned_bytes: MAINNET_MIN_ZEBRA_PROVISIONED_BYTES,
             },
             PathRequirement {
                 role: DiskRole::ZcashdData,
                 target_path: PathBuf::from("/tmp"),
-                min_provisioned_bytes: MIN_ZCASHD_PROVISIONED_BYTES,
+                min_provisioned_bytes: MAINNET_MIN_ZCASHD_PROVISIONED_BYTES,
             },
         ];
 
@@ -826,7 +897,7 @@ mod tests {
 
         assert_eq!(
             filesystem.min_provisioned_sum_bytes,
-            MIN_ZEBRA_PROVISIONED_BYTES + MIN_ZCASHD_PROVISIONED_BYTES
+            MAINNET_MIN_ZEBRA_PROVISIONED_BYTES + MAINNET_MIN_ZCASHD_PROVISIONED_BYTES
         );
     }
 
@@ -897,13 +968,17 @@ mod tests {
             FilesystemRequirements {
                 roles: vec![DiskRole::ZebraState, DiskRole::ZcashdData],
                 target_paths: vec!["/zebra".into(), "/zcashd".into()],
-                min_provisioned_sum_bytes: MIN_ZEBRA_PROVISIONED_BYTES
-                    + MIN_ZCASHD_PROVISIONED_BYTES,
+                min_provisioned_sum_bytes: MAINNET_MIN_ZEBRA_PROVISIONED_BYTES
+                    + MAINNET_MIN_ZCASHD_PROVISIONED_BYTES,
                 provisioned_bytes: 400 * GIB,
             },
         );
 
-        evaluate_disk_thresholds(&mut summary, &grouped);
+        evaluate_disk_thresholds(
+            &mut summary,
+            &grouped,
+            MAINNET_RECOMMENDED_COMBINED_TOTAL_BYTES,
+        );
 
         assert_eq!(summary.errors.len(), 1);
         assert!(
@@ -913,6 +988,73 @@ mod tests {
                 .any(|error| error.contains("provisioned capacity")),
             "expected provisioned capacity error: {:?}",
             summary.errors
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn evaluate_disk_thresholds_testnet_fails_below_60_gib_combined() {
+        let mut summary = PreflightSummary::default();
+        let mut grouped = HashMap::new();
+        grouped.insert(
+            1,
+            FilesystemRequirements {
+                roles: vec![DiskRole::ZebraState, DiskRole::ZcashdData],
+                target_paths: vec!["/zebra".into(), "/zcashd".into()],
+                min_provisioned_sum_bytes: TESTNET_MIN_ZEBRA_PROVISIONED_BYTES
+                    + TESTNET_MIN_ZCASHD_PROVISIONED_BYTES,
+                provisioned_bytes: 50 * GIB,
+            },
+        );
+
+        evaluate_disk_thresholds(
+            &mut summary,
+            &grouped,
+            TESTNET_RECOMMENDED_COMBINED_TOTAL_BYTES,
+        );
+
+        assert_eq!(summary.errors.len(), 1);
+        assert!(
+            summary
+                .errors
+                .iter()
+                .any(|error| error.contains("minimum required is 60.0 GiB")),
+            "expected testnet minimum error: {:?}",
+            summary.errors
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn evaluate_disk_thresholds_testnet_warns_between_60_and_100_gib() {
+        let mut summary = PreflightSummary::default();
+        let mut grouped = HashMap::new();
+        grouped.insert(
+            1,
+            FilesystemRequirements {
+                roles: vec![DiskRole::ZebraState, DiskRole::ZcashdData],
+                target_paths: vec!["/zebra".into(), "/zcashd".into()],
+                min_provisioned_sum_bytes: TESTNET_MIN_ZEBRA_PROVISIONED_BYTES
+                    + TESTNET_MIN_ZCASHD_PROVISIONED_BYTES,
+                provisioned_bytes: 80 * GIB,
+            },
+        );
+
+        evaluate_disk_thresholds(
+            &mut summary,
+            &grouped,
+            TESTNET_RECOMMENDED_COMBINED_TOTAL_BYTES,
+        );
+
+        assert_eq!(summary.errors, Vec::<String>::new());
+        assert_eq!(summary.warnings.len(), 1);
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("recommended is 100.0 GiB")),
+            "expected testnet recommendation warning: {:?}",
+            summary.warnings
         );
     }
 

@@ -78,6 +78,22 @@ if [[ ! -t 0 ]]; then
   fi
 fi
 
+ensure_cargo_env() {
+  if [[ -f "${HOME}/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    . "${HOME}/.cargo/env"
+  elif [[ -d "${HOME}/.cargo/bin" ]]; then
+    case ":${PATH}:" in
+      *":${HOME}/.cargo/bin:"*) ;;
+      *) export PATH="${HOME}/.cargo/bin:${PATH}" ;;
+    esac
+  fi
+}
+
+# Non-login shells (including `curl | bash`) often skip ~/.profile, so cargo may
+# be installed but invisible until we source rustup's env or prepend ~/.cargo/bin.
+ensure_cargo_env
+
 USE_ANSI=0
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   USE_ANSI=1
@@ -180,6 +196,7 @@ Options:
   --download-binaries yes|no
   --dry-run                  Do not download archives or pull Docker images
   --unsafe-low-specs         Report hardware/disk failures as warnings
+  --self-test-disk-limits    Verify network-aware disk limit helpers
   -y, --yes, --non-interactive
   -h, --help
 EOF
@@ -505,6 +522,78 @@ compat_zcashd_p2p_pinning_args() {
   printf -- '-connect=%s\n-listen=0\n-dnsseed=0\n-listenonion=0\n-discover=0\n' "$(compat_zcashd_connect_addr)"
 }
 
+disk_per_datadir_min_bytes() {
+  local gib=$((1024 * 1024 * 1024))
+
+  case "$(compat_network_name_lowercase)" in
+    mainnet) printf '%s\n' $((275 * gib)) ;;
+    *) printf '%s\n' $((30 * gib)) ;;
+  esac
+}
+
+disk_shared_min_bytes() {
+  local min_bytes
+  min_bytes="$(disk_per_datadir_min_bytes)"
+  printf '%s\n' $((2 * min_bytes))
+}
+
+disk_recommended_combined_bytes() {
+  local gib=$((1024 * 1024 * 1024))
+
+  case "$(compat_network_name_lowercase)" in
+    mainnet) printf '%s\n' $((1024 * gib)) ;;
+    *) printf '%s\n' $((100 * gib)) ;;
+  esac
+}
+
+disk_standalone_min_bytes() {
+  local gib=$((1024 * 1024 * 1024))
+
+  case "$(compat_network_name_lowercase)" in
+    mainnet) printf '%s\n' $((275 * gib)) ;;
+    *) printf '%s\n' $((60 * gib)) ;;
+  esac
+}
+
+self_test_disk_limit() {
+  local network="$1"
+  local helper="$2"
+  local expected_gib="$3"
+  local gib expected actual
+
+  gib=$((1024 * 1024 * 1024))
+  expected=$((expected_gib * gib))
+  NETWORK="$network"
+  actual="$("$helper")"
+
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'disk limit self-test failed: %s %s expected %s bytes, got %s bytes\n' "$network" "$helper" "$expected" "$actual" >&2
+    return 1
+  fi
+}
+
+self_test_disk_limits() {
+  local original_network="$NETWORK"
+
+  self_test_disk_limit Mainnet disk_per_datadir_min_bytes 275
+  self_test_disk_limit Mainnet disk_shared_min_bytes 550
+  self_test_disk_limit Mainnet disk_recommended_combined_bytes 1024
+  self_test_disk_limit Mainnet disk_standalone_min_bytes 275
+
+  self_test_disk_limit Testnet disk_per_datadir_min_bytes 30
+  self_test_disk_limit Testnet disk_shared_min_bytes 60
+  self_test_disk_limit Testnet disk_recommended_combined_bytes 100
+  self_test_disk_limit Testnet disk_standalone_min_bytes 60
+
+  self_test_disk_limit Regtest disk_per_datadir_min_bytes 30
+  self_test_disk_limit Regtest disk_shared_min_bytes 60
+  self_test_disk_limit Regtest disk_recommended_combined_bytes 100
+  self_test_disk_limit Regtest disk_standalone_min_bytes 60
+
+  NETWORK="$original_network"
+  printf 'disk limit self-test passed\n'
+}
+
 compat_path_capacity_bytes() {
   local path="$1"
   local ancestor size
@@ -719,7 +808,8 @@ compat_search_zcashd_datadir_candidates() {
 
 compat_recommend_zebra_state_dir() {
   local binary_default="$1"
-  local min_bytes=$((300 * 1024 * 1024 * 1024))
+  local min_bytes
+  min_bytes="$(disk_per_datadir_min_bytes)"
   local synthetic_min_bytes="${SYNTHETIC_INSTALL_MIN_BYTES:-$min_bytes}"
   local install_root
   BEST_CANDIDATE=""
@@ -745,7 +835,8 @@ compat_recommend_zebra_state_dir() {
 
 compat_recommend_zcashd_datadir() {
   local binary_default="$1"
-  local min_bytes=$((300 * 1024 * 1024 * 1024))
+  local min_bytes
+  min_bytes="$(disk_per_datadir_min_bytes)"
   local synthetic_min_bytes="${SYNTHETIC_INSTALL_MIN_BYTES:-$min_bytes}"
   local install_root
   BEST_CANDIDATE=""
@@ -773,9 +864,9 @@ compat_recommend_datadir_defaults() {
   # Empty fallback locations share a filesystem, so size them for both datadirs
   # when both prompt defaults are being selected together.
   if ((ZAKURA_STATE_DIR_SET == 0 && ZCASHD_DATADIR_SET == 0)); then
-    SYNTHETIC_INSTALL_MIN_BYTES=$((550 * 1024 * 1024 * 1024))
+    SYNTHETIC_INSTALL_MIN_BYTES="$(disk_shared_min_bytes)"
   else
-    SYNTHETIC_INSTALL_MIN_BYTES=$((300 * 1024 * 1024 * 1024))
+    SYNTHETIC_INSTALL_MIN_BYTES="$(disk_per_datadir_min_bytes)"
   fi
 
   if ((ZAKURA_STATE_DIR_SET == 0)); then
@@ -959,6 +1050,14 @@ mark_missing_tool() {
 report_missing_tool() {
   local tool="$1"
 
+  if [[ "$tool" == "cargo" ]]; then
+    ensure_cargo_env
+  fi
+
+  if command_exists "$tool"; then
+    return
+  fi
+
   mark_missing_tool "$tool"
   add_error "required tool is missing from PATH: $tool"
 }
@@ -988,13 +1087,6 @@ run_privileged() {
   else
     printf 'installer needs root or sudo to install system packages\n' >&2
     return 1
-  fi
-}
-
-ensure_cargo_env() {
-  if [[ -f "${HOME}/.cargo/env" ]]; then
-    # shellcheck disable=SC1091
-    . "${HOME}/.cargo/env"
   fi
 }
 
@@ -1139,11 +1231,19 @@ print_missing_build_dependency_instructions() {
   for tool in "${MISSING_TOOLS[@]}"; do
     case "$tool" in
       cargo)
-        cat <<'EOF'
+        if [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
+          cat <<'EOF'
+cargo is installed but not on PATH in this shell. Load it with:
+  source "$HOME/.cargo/env"
+Then re-run this installer script.
+EOF
+        else
+          cat <<'EOF'
 Install Rust (cargo):
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
   source "$HOME/.cargo/env"
 EOF
+        fi
         ;;
       make)
         cat <<'EOF'
@@ -1411,11 +1511,9 @@ disk_device_and_size() {
 
 compat_collect_disk_checks() {
   local zebra_info zcashd_info zebra_device zebra_size zcashd_device zcashd_size
-  local gib tib required combined recommended
+  local required combined recommended
 
-  gib=$((1024 * 1024 * 1024))
-  tib=$((1024 * gib))
-  recommended="$tib"
+  recommended="$(disk_recommended_combined_bytes)"
 
   if ! zebra_info="$(disk_device_and_size "$ZAKURA_STATE_DIR")"; then
     add_error "failed to inspect filesystem for zakura state path: $ZAKURA_STATE_DIR"
@@ -1431,13 +1529,13 @@ compat_collect_disk_checks() {
   read -r zcashd_device zcashd_size <<<"$zcashd_info"
 
   if [[ "$zebra_device" == "$zcashd_device" ]]; then
-    required=$((550 * gib))
+    required="$(disk_shared_min_bytes)"
     combined="$zebra_size"
     if ((zebra_size < required)); then
       add_low_spec_error "zakura state + zcashd datadir mount (paths: $ZAKURA_STATE_DIR, $ZCASHD_DATADIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
     fi
   else
-    required=$((300 * gib))
+    required="$(disk_per_datadir_min_bytes)"
     combined=$((zebra_size + zcashd_size))
     if ((zebra_size < required)); then
       add_low_spec_error "zakura state mount (paths: $ZAKURA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
@@ -2136,10 +2234,9 @@ default_collect_memory_checks() {
 
 default_collect_disk_checks() {
   local zebra_info zebra_device zebra_size
-  local gib required
+  local required
 
-  gib=$((1024 * 1024 * 1024))
-  required=$((300 * gib))
+  required="$(disk_standalone_min_bytes)"
 
   if ! zebra_info="$(disk_device_and_size "$ZAKURA_STATE_DIR")"; then
     add_error "failed to inspect filesystem for zakura state path: $ZAKURA_STATE_DIR"
@@ -2384,6 +2481,10 @@ while (($#)); do
     --unsafe-low-specs)
       UNSAFE_LOW_SPECS=1
       shift
+      ;;
+    --self-test-disk-limits)
+      self_test_disk_limits
+      exit 0
       ;;
     -y | --yes | --non-interactive)
       NON_INTERACTIVE=1

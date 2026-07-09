@@ -1,0 +1,36 @@
+# Local Zakura dev config template.
+#
+# Rendered by `make zakura-dev-init` into:
+#   ${ZAKURA_DEV_HOME}/zakura.toml
+#
+# Tokens wrapped in @@ are substituted by make/zakura-dev.mk.
+
+[network]
+network = "@@NETWORK@@"
+listen_addr = "0.0.0.0:8233"
+cache_dir = "@@CACHE_DIR@@"
+identity_dir = "@@IDENTITY_DIR@@"
+v2_p2p = true
+legacy_p2p = false
+
+[network.zakura]
+# Bind on all interfaces: iroh uses one UDP socket for send+recv, so a loopback
+# bind breaks outbound connections to external peers.
+listen_addr = "0.0.0.0:8234"
+# Selected by `NETWORK` in make/zakura-dev.mk.
+bootstrap_peers = [
+@@BOOTSTRAP_PEERS@@
+]
+
+[network.zakura.block_sync]
+# In v2-only mode, Zakura owns block-body download while the legacy syncer only
+# handles tip discovery.
+replace_legacy_syncer = true
+
+[consensus]
+checkpoint_sync = true
+vct_fast_sync = true
+
+[state]
+cache_dir = "@@CACHE_DIR@@"
+storage_mode = "pruned"

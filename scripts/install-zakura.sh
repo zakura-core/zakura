@@ -68,6 +68,9 @@ LOW_SPEC_ERRORS=()
 WARNINGS=()
 PROMPT_FD=0
 PROMPT_INPUT_ERROR_REPORTED=0
+MISSING_TOOLS=()
+MISSING_ZCASHD_SOURCE=0
+FINALIZE_RECOVERY_ATTEMPTED=0
 
 if [[ ! -t 0 ]]; then
   if ! { exec {PROMPT_FD}</dev/tty; } 2>/dev/null; then
@@ -224,16 +227,22 @@ finalize_checks() {
   fi
 
   if ((${#ERRORS[@]} > 0)); then
+    if offer_missing_build_dependency_recovery; then
+      finalize_checks
+      return
+    fi
+
     if ((USE_ANSI)); then
       local marker
       marker="$(style "$RED$BOLD" "[x]")"
       printf '\n%s %s\n' "$marker" "$(style "$RED$BOLD" "Installer validation failed:")" >&2
       print_list "$RED" "${ERRORS[@]}" >&2
       exit 1
-    fi
+    else
       printf '\nInstaller validation failed:\n' >&2
       print_list "$YELLOW" "${ERRORS[@]}" >&2
       exit 1
+    fi
   fi
 
   if ((${#WARNINGS[@]} > 0)); then
@@ -925,6 +934,295 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+reset_missing_dependency_tracking() {
+  MISSING_TOOLS=()
+  MISSING_ZCASHD_SOURCE=0
+}
+
+mark_missing_tool() {
+  local tool="$1"
+  local existing
+
+  if [[ "$MODE" != "build-from-source" ]]; then
+    return
+  fi
+
+  for existing in "${MISSING_TOOLS[@]}"; do
+    if [[ "$existing" == "$tool" ]]; then
+      return
+    fi
+  done
+
+  MISSING_TOOLS+=("$tool")
+}
+
+report_missing_tool() {
+  local tool="$1"
+
+  mark_missing_tool "$tool"
+  add_error "required tool is missing from PATH: $tool"
+}
+
+has_recoverable_missing_build_deps() {
+  [[ "$MODE" == "build-from-source" ]] || return 1
+  ((${#MISSING_TOOLS[@]} > 0)) || ((MISSING_ZCASHD_SOURCE))
+}
+
+detect_package_manager() {
+  if command_exists apt-get; then
+    printf 'apt\n'
+  elif command_exists dnf; then
+    printf 'dnf\n'
+  elif command_exists yum; then
+    printf 'yum\n'
+  else
+    printf 'unknown\n'
+  fi
+}
+
+run_privileged() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  elif command_exists sudo; then
+    sudo "$@"
+  else
+    printf 'installer needs root or sudo to install system packages\n' >&2
+    return 1
+  fi
+}
+
+ensure_cargo_env() {
+  if [[ -f "${HOME}/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    . "${HOME}/.cargo/env"
+  fi
+}
+
+install_rustup() {
+  if command_exists cargo; then
+    return 0
+  fi
+
+  if ! command_exists curl; then
+    printf 'curl is required to install Rust automatically; install curl first\n' >&2
+    return 1
+  fi
+
+  if ((USE_ANSI)); then
+    printf '%s Installing Rust via rustup...\n' "$(style "$CYAN" "[down]")"
+  else
+    printf 'Installing Rust via rustup...\n'
+  fi
+
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable
+  ensure_cargo_env
+  command_exists cargo
+}
+
+install_make() {
+  if command_exists make; then
+    return 0
+  fi
+
+  local pm
+  pm="$(detect_package_manager)"
+
+  if ((USE_ANSI)); then
+    printf '%s Installing build tools (make, gcc, ...)...\n' "$(style "$CYAN" "[down]")"
+  else
+    printf 'Installing build tools (make, gcc, ...)...\n'
+  fi
+
+  case "$pm" in
+    apt)
+      run_privileged apt-get update
+      run_privileged apt-get install -y build-essential
+      ;;
+    dnf | yum)
+      run_privileged "$pm" install -y make gcc gcc-c++
+      ;;
+    *)
+      printf 'could not detect a supported package manager; install make manually\n' >&2
+      return 1
+      ;;
+  esac
+
+  command_exists make
+}
+
+install_git() {
+  if command_exists git; then
+    return 0
+  fi
+
+  local pm
+  pm="$(detect_package_manager)"
+
+  if ((USE_ANSI)); then
+    printf '%s Installing git...\n' "$(style "$CYAN" "[down]")"
+  else
+    printf 'Installing git...\n'
+  fi
+
+  case "$pm" in
+    apt)
+      run_privileged apt-get update
+      run_privileged apt-get install -y git
+      ;;
+    dnf | yum)
+      run_privileged "$pm" install -y git
+      ;;
+    *)
+      printf 'could not detect a supported package manager; install git manually\n' >&2
+      return 1
+      ;;
+  esac
+
+  command_exists git
+}
+
+install_zcashd_source() {
+  local dest="$UNITY_ROOT/zcashd"
+
+  if [[ -x "$dest/zcutil/build.sh" ]]; then
+    return 0
+  fi
+
+  if ! command_exists git; then
+    install_git || return 1
+  fi
+
+  if ((USE_ANSI)); then
+    printf '%s Cloning sidecar zcashd source into %s...\n' "$(style "$CYAN" "[down]")" "$dest"
+  else
+    printf 'Cloning sidecar zcashd source into %s...\n' "$dest"
+  fi
+
+  git clone --branch feat/p2p-sidecar -- https://github.com/valargroup/zcashd.git "$dest"
+  [[ -x "$dest/zcutil/build.sh" ]]
+}
+
+install_missing_build_dependencies() {
+  local tool failed=0
+
+  for tool in "${MISSING_TOOLS[@]}"; do
+    case "$tool" in
+      cargo)
+        install_rustup || failed=1
+        ;;
+      make)
+        install_make || failed=1
+        ;;
+      git)
+        install_git || failed=1
+        ;;
+    esac
+  done
+
+  if ((MISSING_ZCASHD_SOURCE)); then
+    install_zcashd_source || failed=1
+  fi
+
+  ((failed == 0))
+}
+
+print_missing_build_dependency_instructions() {
+  local tool
+
+  if ((USE_ANSI)); then
+    print_section "[!]" "Missing build dependencies — install manually or choose automatic install"
+  else
+    printf '\nMissing build dependencies — install manually or choose automatic install\n\n'
+  fi
+
+  for tool in "${MISSING_TOOLS[@]}"; do
+    case "$tool" in
+      cargo)
+        cat <<'EOF'
+Install Rust (cargo):
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+  source "$HOME/.cargo/env"
+EOF
+        ;;
+      make)
+        cat <<'EOF'
+Install build tools (make, gcc, ...):
+  # Debian/Ubuntu:
+  sudo apt-get update && sudo apt-get install -y build-essential
+  # Fedora/RHEL:
+  sudo dnf install -y make gcc gcc-c++
+EOF
+        ;;
+      git)
+        cat <<'EOF'
+Install git:
+  sudo apt-get install -y git   # Debian/Ubuntu
+  sudo dnf install -y git       # Fedora/RHEL
+EOF
+        ;;
+    esac
+  done
+
+  if ((MISSING_ZCASHD_SOURCE)); then
+    cat <<EOF
+Clone sidecar zcashd source:
+  git clone --branch feat/p2p-sidecar https://github.com/valargroup/zcashd.git $(shell_quote "$UNITY_ROOT/zcashd")
+EOF
+  fi
+
+  if [[ "$INSTALL_PROFILE" == "zcashd-compat" ]]; then
+    cat <<'EOF'
+
+Alternatively, re-run this installer and choose a binary mode (supervised or split-binary)
+to download prebuilt zakurad and zcashd instead of building from source.
+EOF
+  fi
+
+  printf '\nAfter installing manually, re-run this installer script.\n\n'
+}
+
+rerun_validation_checks() {
+  ERRORS=()
+  reset_missing_dependency_tracking
+
+  case "$INSTALL_PROFILE" in
+    default) default_collect_checks ;;
+    zcashd-compat) compat_collect_checks ;;
+  esac
+}
+
+offer_missing_build_dependency_recovery() {
+  has_recoverable_missing_build_deps || return 1
+
+  print_missing_build_dependency_instructions
+
+  if ((NON_INTERACTIVE || DRY_RUN || FINALIZE_RECOVERY_ATTEMPTED)); then
+    return 1
+  fi
+
+  FINALIZE_RECOVERY_ATTEMPTED=1
+
+  local reply
+  reply="$(prompt_yes_no "Install missing build dependencies automatically?" "no")"
+  case "${reply,,}" in
+    y | yes)
+      if install_missing_build_dependencies; then
+        ensure_cargo_env
+        rerun_validation_checks
+        return 0
+      fi
+      if ((USE_ANSI)); then
+        printf '%s Automatic install failed; use the manual commands above.\n' "$(style "$YELLOW" "[!]")"
+      else
+        printf 'Automatic install failed; use the manual commands above.\n'
+      fi
+      ;;
+  esac
+
+  return 1
+}
+
 compat_collect_tool_checks() {
   local tools=()
 
@@ -936,14 +1234,14 @@ compat_collect_tool_checks() {
       tools=(docker)
       ;;
     build-from-source)
-      tools=(cargo make)
+      tools=(cargo make git)
       ;;
   esac
 
   local tool
   for tool in "${tools[@]}"; do
     if ! command_exists "$tool"; then
-      add_error "required tool is missing from PATH: $tool"
+      report_missing_tool "$tool"
     fi
   done
 
@@ -1188,6 +1486,7 @@ compat_collect_source_checks() {
   ZCASH_SRC_DIR="$(resolve_zcash_src_dir)" || true
 
   if [[ ! -d "$ZCASH_SRC_DIR" ]]; then
+    MISSING_ZCASHD_SOURCE=1
     add_error "zcashd source tree is missing: expected $UNITY_ROOT/zcashd or $UNITY_ROOT/zcash"
   elif [[ ! -x "$ZCASH_SRC_DIR/zcutil/build.sh" ]]; then
     add_error "zcashd build script is missing or not executable: $ZCASH_SRC_DIR/zcutil/build.sh"
@@ -1206,6 +1505,7 @@ compat_collect_source_checks() {
 }
 
 compat_collect_checks() {
+  reset_missing_dependency_tracking
   compat_collect_platform_checks
   compat_collect_tool_checks
   compat_collect_permission_checks
@@ -1784,7 +2084,7 @@ default_collect_tool_checks() {
   local tool
   for tool in "${tools[@]}"; do
     if ! command_exists "$tool"; then
-      add_error "required tool is missing from PATH: $tool"
+      report_missing_tool "$tool"
     fi
   done
 
@@ -1873,6 +2173,7 @@ default_collect_source_checks() {
 }
 
 default_collect_checks() {
+  reset_missing_dependency_tracking
   default_collect_platform_checks
   default_collect_tool_checks
   default_collect_permission_checks

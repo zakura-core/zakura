@@ -524,12 +524,18 @@ class ClusterCollector:
         active_state = probe.get("active_state") or "unknown"
         process_running = probe.get("process_running")
         service_active = active_state == "active" and process_running is not False
+        rpc_disabled = (
+            not node.rpc_listen_addr
+            or probe.get("rpc_error") == "RPC disabled in deployer config"
+        )
         rpc_ok = height is not None and not probe.get("rpc_error")
         recent = (
             seconds_since_advanced is not None
             and seconds_since_advanced <= self.stale_after
         )
-        healthy = service_active and rpc_ok and recent
+        # Nodes with RPC intentionally disabled (e.g. zakura-compat front) are
+        # healthy when the process/service is up; height comes from the sidecar row.
+        healthy = service_active and (rpc_disabled or (rpc_ok and recent))
 
         if probe.get("error"):
             health = "down"
@@ -540,6 +546,9 @@ class ClusterCollector:
         elif not service_active:
             health = "down"
             detail = f"systemd state: {active_state}"
+        elif rpc_disabled:
+            health = "healthy"
+            detail = "service active (RPC probe disabled)"
         elif not rpc_ok:
             health = "rpc_error"
             detail = str(probe.get("rpc_error") or "RPC height unavailable")

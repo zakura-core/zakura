@@ -11,16 +11,16 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZAKURA_RELEASE_TAG="v0.0.1-alpha.3"
+ZAKURA_RELEASE_TAG="v0.0.1-alpha.5"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
 # sha256 of ZAKURA_ARCHIVE from the release's SHA256SUMS.txt. Pin it once the
 # zakurad-named release artifact is published: an unpinned download in a
 # `curl | bash` installer is a supply-chain hole. Empty = skip verification.
-ZAKURA_ARCHIVE_SHA256="ddee615b96e5d6bd3668eefc8a8eeec038b43293c52682dc8e68403c032df1a9"
+ZAKURA_ARCHIVE_SHA256=""
 ZAKURA_MEMBER="./bin/zakurad"
-ZAKURA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.3"
-ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.3"
+ZAKURA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.5"
+ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.5"
 ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
 ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
 ZAKURA_DOCKER_RUNTIME_UID=10001
@@ -139,6 +139,14 @@ print_section() {
     printf '%s\n' "$(style "$DIM" "----------------------------------------")"
   else
     printf '\n%s\n' "$title"
+  fi
+}
+
+print_release_target() {
+  if ((USE_ANSI)); then
+    printf '\n%s Zakura release %s\n' "$(style "$BLUE" "[info]")" "$(style "$BOLD" "$ZAKURA_RELEASE_TAG")"
+  else
+    printf '\nZakura release %s\n' "$ZAKURA_RELEASE_TAG"
   fi
 }
 
@@ -2504,6 +2512,7 @@ done
 
 resolve_install_profile
 finalize_checks
+print_release_target
 
 case "$INSTALL_PROFILE" in
   default)

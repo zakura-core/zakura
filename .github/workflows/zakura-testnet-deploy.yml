@@ -277,7 +277,7 @@ jobs:
           python3 deploy.py status "${args[@]}"
 
       - name: Install cluster status dashboard
-        if: always()
+        if: ${{ always() && inputs.node == '' }}
         run: |
           set -euo pipefail
 

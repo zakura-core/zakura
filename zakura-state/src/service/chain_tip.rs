@@ -560,6 +560,23 @@ impl ChainTipChange {
         self.last_change_hash = Some(hash);
     }
 
+    /// Returns the most recent block hash provided by this instance.
+    pub fn last_change_hash(&self) -> Option<block::Hash> {
+        self.last_change_hash
+    }
+
+    /// Clone this monitor for another async task in the same long-running service.
+    ///
+    /// Unlike [`Clone::clone`], this preserves [`Self::last_change_hash`], so callers can
+    /// suppress duplicate gossip across multiple spawned futures.
+    pub fn clone_for_task(&self) -> Self {
+        Self {
+            latest_chain_tip: self.latest_chain_tip.clone(),
+            last_change_hash: self.last_change_hash,
+            network: self.network.clone(),
+        }
+    }
+
     /// Return an action based on `block` and the last change we returned.
     fn action(&self, block: ChainTipBlock) -> TipAction {
         // check for an edge case that's dealt with by other code

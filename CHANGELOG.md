@@ -109,6 +109,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   post-reset producer refill no longer skips when peer-registry outstanding is
   still briefly inflated, so downloads resume instead of leaving an empty work
   queue (`max_outstanding = 0`).
+- Fixed mined block gossip suppressing the committed-tip fallback before
+  `AdvertiseBlockToAll` completed. The gossip task now marks a submitted block
+  hash as seen only after the all-peers broadcast returns successfully within
+  the broadcast timeout, and preserves that mark across spawned tip-change
+  futures. If the mined broadcast times out, the committed-tip path still sends
+  `AdvertiseBlock` as a fallback.
 - Fixed misleading Zakura connectivity telemetry: header-sync now records
   record-only peer violations as `header_peer_violation_recorded` instead of
   `header_peer_disconnect_requested`, header-sync exposes the authoritative

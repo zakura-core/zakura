@@ -55,6 +55,14 @@ jobs:
     timeout-minutes: 180
     environment: zakura-mainnet
 
+    # Persist Cargo build artifacts across runs, outside the checked-out workspace
+    # (which actions/checkout wipes). deploy.py builds each commit in a throwaway
+    # git worktree and honors CARGO_TARGET_DIR, so an unchanged commit relinks in
+    # seconds instead of a ~18-minute cold rebuild — essential for one-node-at-a-
+    # time fleet rollouts that all build the same tag.
+    env:
+      CARGO_TARGET_DIR: /root/.cache/zakura-deployer-target
+
     steps:
       - name: Checkout deploy ref
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4

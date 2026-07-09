@@ -196,6 +196,7 @@ Options:
   --download-binaries yes|no
   --dry-run                  Do not download archives or pull Docker images
   --unsafe-low-specs         Report hardware/disk failures as warnings
+  --self-test-disk-limits    Verify network-aware disk limit helpers
   -y, --yes, --non-interactive
   -h, --help
 EOF
@@ -521,6 +522,78 @@ compat_zcashd_p2p_pinning_args() {
   printf -- '-connect=%s\n-listen=0\n-dnsseed=0\n-listenonion=0\n-discover=0\n' "$(compat_zcashd_connect_addr)"
 }
 
+disk_per_datadir_min_bytes() {
+  local gib=$((1024 * 1024 * 1024))
+
+  case "$(compat_network_name_lowercase)" in
+    mainnet) printf '%s\n' $((275 * gib)) ;;
+    *) printf '%s\n' $((30 * gib)) ;;
+  esac
+}
+
+disk_shared_min_bytes() {
+  local min_bytes
+  min_bytes="$(disk_per_datadir_min_bytes)"
+  printf '%s\n' $((2 * min_bytes))
+}
+
+disk_recommended_combined_bytes() {
+  local gib=$((1024 * 1024 * 1024))
+
+  case "$(compat_network_name_lowercase)" in
+    mainnet) printf '%s\n' $((1024 * gib)) ;;
+    *) printf '%s\n' $((100 * gib)) ;;
+  esac
+}
+
+disk_standalone_min_bytes() {
+  local gib=$((1024 * 1024 * 1024))
+
+  case "$(compat_network_name_lowercase)" in
+    mainnet) printf '%s\n' $((275 * gib)) ;;
+    *) printf '%s\n' $((60 * gib)) ;;
+  esac
+}
+
+self_test_disk_limit() {
+  local network="$1"
+  local helper="$2"
+  local expected_gib="$3"
+  local gib expected actual
+
+  gib=$((1024 * 1024 * 1024))
+  expected=$((expected_gib * gib))
+  NETWORK="$network"
+  actual="$("$helper")"
+
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'disk limit self-test failed: %s %s expected %s bytes, got %s bytes\n' "$network" "$helper" "$expected" "$actual" >&2
+    return 1
+  fi
+}
+
+self_test_disk_limits() {
+  local original_network="$NETWORK"
+
+  self_test_disk_limit Mainnet disk_per_datadir_min_bytes 275
+  self_test_disk_limit Mainnet disk_shared_min_bytes 550
+  self_test_disk_limit Mainnet disk_recommended_combined_bytes 1024
+  self_test_disk_limit Mainnet disk_standalone_min_bytes 275
+
+  self_test_disk_limit Testnet disk_per_datadir_min_bytes 30
+  self_test_disk_limit Testnet disk_shared_min_bytes 60
+  self_test_disk_limit Testnet disk_recommended_combined_bytes 100
+  self_test_disk_limit Testnet disk_standalone_min_bytes 60
+
+  self_test_disk_limit Regtest disk_per_datadir_min_bytes 30
+  self_test_disk_limit Regtest disk_shared_min_bytes 60
+  self_test_disk_limit Regtest disk_recommended_combined_bytes 100
+  self_test_disk_limit Regtest disk_standalone_min_bytes 60
+
+  NETWORK="$original_network"
+  printf 'disk limit self-test passed\n'
+}
+
 compat_path_capacity_bytes() {
   local path="$1"
   local ancestor size
@@ -735,7 +808,8 @@ compat_search_zcashd_datadir_candidates() {
 
 compat_recommend_zebra_state_dir() {
   local binary_default="$1"
-  local min_bytes=$((275 * 1024 * 1024 * 1024))
+  local min_bytes
+  min_bytes="$(disk_per_datadir_min_bytes)"
   local synthetic_min_bytes="${SYNTHETIC_INSTALL_MIN_BYTES:-$min_bytes}"
   local install_root
   BEST_CANDIDATE=""
@@ -761,7 +835,8 @@ compat_recommend_zebra_state_dir() {
 
 compat_recommend_zcashd_datadir() {
   local binary_default="$1"
-  local min_bytes=$((275 * 1024 * 1024 * 1024))
+  local min_bytes
+  min_bytes="$(disk_per_datadir_min_bytes)"
   local synthetic_min_bytes="${SYNTHETIC_INSTALL_MIN_BYTES:-$min_bytes}"
   local install_root
   BEST_CANDIDATE=""
@@ -789,9 +864,9 @@ compat_recommend_datadir_defaults() {
   # Empty fallback locations share a filesystem, so size them for both datadirs
   # when both prompt defaults are being selected together.
   if ((ZAKURA_STATE_DIR_SET == 0 && ZCASHD_DATADIR_SET == 0)); then
-    SYNTHETIC_INSTALL_MIN_BYTES=$((275 * 2 * 1024 * 1024 * 1024))
+    SYNTHETIC_INSTALL_MIN_BYTES="$(disk_shared_min_bytes)"
   else
-    SYNTHETIC_INSTALL_MIN_BYTES=$((275 * 1024 * 1024 * 1024))
+    SYNTHETIC_INSTALL_MIN_BYTES="$(disk_per_datadir_min_bytes)"
   fi
 
   if ((ZAKURA_STATE_DIR_SET == 0)); then
@@ -1436,11 +1511,9 @@ disk_device_and_size() {
 
 compat_collect_disk_checks() {
   local zebra_info zcashd_info zebra_device zebra_size zcashd_device zcashd_size
-  local gib tib required combined recommended
+  local required combined recommended
 
-  gib=$((1024 * 1024 * 1024))
-  tib=$((1024 * gib))
-  recommended="$tib"
+  recommended="$(disk_recommended_combined_bytes)"
 
   if ! zebra_info="$(disk_device_and_size "$ZAKURA_STATE_DIR")"; then
     add_error "failed to inspect filesystem for zakura state path: $ZAKURA_STATE_DIR"
@@ -1456,13 +1529,13 @@ compat_collect_disk_checks() {
   read -r zcashd_device zcashd_size <<<"$zcashd_info"
 
   if [[ "$zebra_device" == "$zcashd_device" ]]; then
-    required=$((275 * 2 * gib))
+    required="$(disk_shared_min_bytes)"
     combined="$zebra_size"
     if ((zebra_size < required)); then
       add_low_spec_error "zakura state + zcashd datadir mount (paths: $ZAKURA_STATE_DIR, $ZCASHD_DATADIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
     fi
   else
-    required=$((275 * gib))
+    required="$(disk_per_datadir_min_bytes)"
     combined=$((zebra_size + zcashd_size))
     if ((zebra_size < required)); then
       add_low_spec_error "zakura state mount (paths: $ZAKURA_STATE_DIR) has provisioned capacity $(human_gib "$zebra_size"), minimum required is $(human_gib "$required")"
@@ -2161,10 +2234,9 @@ default_collect_memory_checks() {
 
 default_collect_disk_checks() {
   local zebra_info zebra_device zebra_size
-  local gib required
+  local required
 
-  gib=$((1024 * 1024 * 1024))
-  required=$((275 * gib))
+  required="$(disk_standalone_min_bytes)"
 
   if ! zebra_info="$(disk_device_and_size "$ZAKURA_STATE_DIR")"; then
     add_error "failed to inspect filesystem for zakura state path: $ZAKURA_STATE_DIR"
@@ -2409,6 +2481,10 @@ while (($#)); do
     --unsafe-low-specs)
       UNSAFE_LOW_SPECS=1
       shift
+      ;;
+    --self-test-disk-limits)
+      self_test_disk_limits
+      exit 0
       ;;
     -y | --yes | --non-interactive)
       NON_INTERACTIVE=1

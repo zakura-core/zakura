@@ -1,27 +1,15 @@
 # This workflow automates the creation and updating of draft releases. It compiles PR titles into the draft release notes.
 # https://github.com/valargroup/zebra/releases
 #
-# - Updates the draft release upon each merge into 'main'.
+# - Updates the draft release when triggered manually via workflow_dispatch.
 # - Utilizes the release-drafter GitHub Action to accumulate PR titles since the last release into a draft release note.
-# - Suitable permissions are set for creating releases and handling pull requests.
+# - Suitable permissions are set for creating releases and reading pull requests.
 #
 # Workflow is based on:
 # https://github.com/marketplace/actions/release-drafter#usage
 name: Release Drafter
 
 on:
-  # Automatically update the draft release every time a PR merges to `main`
-  push:
-    branches:
-      - main
-  # pull_request event is required only for autolabeler
-  pull_request:
-    # Only following types are handled by the action
-    types: [opened, reopened, synchronize]
-  # pull_request_target event is required for autolabeler to support PRs from forks
-  pull_request_target:
-    #types: [opened, reopened, synchronize]
-  # Manually update the draft release without waiting for a PR to merge
   workflow_dispatch:
 
 permissions:

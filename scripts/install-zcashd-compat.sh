@@ -47,6 +47,7 @@ ZCASH_SRC_DIR=""
 ZCASHD_DOCKER_IMAGE=""
 DOWNLOAD_BINARIES=1
 DOWNLOAD_BINARIES_SET=0
+NETWORK_SET=0
 ZAKURA_STATE_DIR_SET=0
 ZCASHD_DATADIR_SET=0
 DRY_RUN=0
@@ -721,8 +722,40 @@ EOF
   esac
 }
 
+prompt_network() {
+  local reply
+
+  if ((NETWORK_SET)); then
+    return
+  fi
+
+  if ((NON_INTERACTIVE)); then
+    return
+  fi
+
+  if ((USE_ANSI)); then
+    printf '\n%s\n' "$(style "$BOLD" "Choose a network:")"
+    printf '  %b1)%b %bMainnet%b\n' "$CYAN$BOLD" "$RESET" "$GREEN$BOLD" "$RESET"
+    printf '  %b2)%b %bTestnet%b\n' "$CYAN$BOLD" "$RESET" "$GREEN$BOLD" "$RESET"
+  else
+    cat <<'EOF'
+Choose a network:
+  1) Mainnet
+  2) Testnet
+EOF
+  fi
+  printf '\n'
+  read_prompt "Network [Mainnet]: " reply || reply=""
+  case "${reply:-1}" in
+    1 | Mainnet | mainnet) NETWORK="Mainnet" ;;
+    2 | Testnet | testnet) NETWORK="Testnet" ;;
+    *) add_error "network must be 1 (Mainnet) or 2 (Testnet)" ;;
+  esac
+}
+
 normalize_inputs() {
   prompt_mode
+  prompt_network
 
   if [[ "$MODE" == "split-binary" || "$MODE" == "supervised" ]]; then
     if ((DOWNLOAD_BINARIES_SET == 0)); then
@@ -1537,6 +1570,7 @@ while (($#)); do
     --network)
       require_value "$1" "${2:-}"
       NETWORK="$2"
+      NETWORK_SET=1
       shift 2
       ;;
     --zakura-state-dir | --zebra-state-dir)

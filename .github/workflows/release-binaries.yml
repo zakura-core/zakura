@@ -251,7 +251,6 @@ jobs:
           PY
 
           find ./publish -type f -name 'zakurad-*.tar.gz' -exec cp {} ./publish/final/ \;
-          cp ./scripts/install-zcashd-compat.sh ./publish/final/
           cp ./scripts/install-zakura.sh ./publish/final/
           RELEASE_TAG="$RELEASE_TAG" python3 - <<'PY'
           import os
@@ -262,15 +261,11 @@ jobs:
           image_version = release_tag.removeprefix("v")
           x86_sha256 = Path("./publish/final/x86_64.sha256").read_text(encoding="utf-8").strip()
           installers = {
-              "install-zcashd-compat.sh": {
+              "install-zakura.sh": {
                   "ZAKURA_RELEASE_TAG": release_tag,
                   "ZAKURA_ARCHIVE_SHA256": x86_sha256,
                   "ZAKURA_DOCKER_IMAGE": f"valargroup/zakura:{image_version}",
                   "ZAKURA_COMPAT_DOCKER_IMAGE": f"valargroup/zakura:zcashd-compat-{image_version}",
-              },
-              "install-zakura.sh": {
-                  "ZAKURA_RELEASE_TAG": release_tag,
-                  "ZAKURA_DOCKER_IMAGE": f"valargroup/zakura:{image_version}",
               },
           }
           for filename, replacements in installers.items():
@@ -351,7 +346,6 @@ jobs:
           gh release upload "$RELEASE_TAG" \
             ./publish/final/zakurad-*.tar.gz \
             ./publish/final/zakurad-manifest-*.json \
-            ./publish/final/install-zcashd-compat.sh \
             ./publish/final/install-zakura.sh \
             ./publish/final/SHA256SUMS.txt \
             --repo "$REPOSITORY" \

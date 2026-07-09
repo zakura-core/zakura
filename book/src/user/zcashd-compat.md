@@ -128,8 +128,8 @@ zcashd will not sync from it.
 
 ## Quick start (externally managed)
 
-Run Zebra normally (with `zcashd_compat.enabled = true` if you want the
-dedicated compat RPC listener and preflight checks), then run zcashd yourself:
+Run Zebra normally (with `zcashd_compat.enabled = true` if you want preflight
+checks), then run zcashd yourself:
 
 ```console
 zcashd -datadir=/var/lib/zcashd \
@@ -216,7 +216,7 @@ enabled = true
 # Spawn and supervise zcashd (true) or run it yourself (false, default).
 manage_zcashd = true
 
-# "path" (use zcashd_path) or "managed" (SHA256-pinned download).
+# "path" (use zcashd_path) or "embedded" (SHA256-pinned download from embedded manifest).
 zcashd_source = "path"
 zcashd_path = "/usr/local/bin/zcashd"
 
@@ -242,21 +242,10 @@ All values can also be set through environment variables, e.g.
 `ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH=/usr/local/bin/zcashd`.
 
 > [!WARNING]
-> Until the managed-download manifest is updated for the sidecar build,
-> `zcashd_source = "managed"` downloads the previous RPC-ingest zcashd, which
+> Until the embedded-download manifest is updated for the sidecar build,
+> `zcashd_source = "embedded"` downloads the previous RPC-ingest zcashd, which
 > still contains the upstream end-of-support halt and miner RPCs. Use
 > `zcashd_source = "path"` with a sidecar build for now.
-
-### Legacy dedicated RPC listener (deprecated)
-
-Earlier zcashd-compat versions ingested chain data from Zebra over a
-dedicated, cookie-authenticated Zebra RPC listener (default
-`127.0.0.1:28232`, configured by `listen_addr`, `cookie_dir`,
-`cookie_file_name`, `enable_cookie_auth`, `tls_cert_file`, `tls_key_file`,
-`unsafe_allow_remote_http`). The P2P sidecar does not use it. The listener is
-still started for operator tooling that queries Zebra through it, and the
-config keys still parse, but they are deprecated and will be removed. The
-`tls_ca_file` key is no longer used at all.
 
 ## Hardware preflight (Linux)
 

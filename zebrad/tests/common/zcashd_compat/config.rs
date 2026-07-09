@@ -21,8 +21,6 @@ pub struct ZcashdCompatConfig {
     pub zcashd_datadir: PathBuf,
     /// Zebrad's main (unauthenticated) RPC listen address.
     pub zebra_rpc_addr: SocketAddr,
-    /// Zebrad's zcashd-compat (cookie-authenticated) RPC listen address.
-    pub zebra_compat_rpc_addr: SocketAddr,
     /// Zcashd's own RPC listen address (user/pass authenticated).
     pub zcashd_own_rpc_addr: SocketAddr,
 }
@@ -40,10 +38,10 @@ pub const MINER_PRIV_WIF: &str = "cMahea7zqjxrtgAbB7LSGbcQUr1uX1ojuat9jZodMN87Jc
 
 /// Builds a regtest zebrad config wired for zcashd-compat testing.
 ///
-/// `cookie_dir` must be the directory where zebrad will write the zcashd-compat
-/// cookie file.  In managed-spawn mode this is the testdir (kept alive by the
+/// `work_dir` is the test scratch directory used for the supervised zcashd
+/// datadir. In managed-spawn mode this is the testdir (kept alive by the
 /// `TestChild`).
-pub fn build_zcashd_compat_config(cookie_dir: PathBuf) -> Result<ZcashdCompatConfig> {
+pub fn build_zcashd_compat_config(work_dir: PathBuf) -> Result<ZcashdCompatConfig> {
     let net = Network::new_regtest(
         ConfiguredActivationHeights {
             nu5: Some(1),
@@ -53,11 +51,9 @@ pub fn build_zcashd_compat_config(cookie_dir: PathBuf) -> Result<ZcashdCompatCon
     );
 
     let zebra_rpc_port = random_known_port();
-    let zcashd_compat_port = random_known_port();
     let zcashd_own_rpc_port = random_known_port();
 
     let zebra_rpc_addr: SocketAddr = format!("127.0.0.1:{zebra_rpc_port}").parse()?;
-    let zebra_compat_rpc_addr: SocketAddr = format!("127.0.0.1:{zcashd_compat_port}").parse()?;
     let zcashd_own_rpc_addr: SocketAddr = format!("127.0.0.1:{zcashd_own_rpc_port}").parse()?;
 
     let mut config = default_test_config(&net).with(MinerAddressType::Transparent);
@@ -81,18 +77,16 @@ pub fn build_zcashd_compat_config(cookie_dir: PathBuf) -> Result<ZcashdCompatCon
     config.zcashd_compat.enabled = true;
     config.zcashd_compat.manage_zcashd = true;
     config.zcashd_compat.zcashd_source =
-        zebrad::components::zcashd_compat::ConfigZcashdBinarySource::Managed;
-    config.zcashd_compat.listen_addr = Some(zebra_compat_rpc_addr);
-    config.zcashd_compat.cookie_dir = cookie_dir.clone();
+        zebrad::components::zcashd_compat::ConfigZcashdBinarySource::Embedded;
     // Skip startup delay in tests — supervisor spawns zcashd immediately
     config.zcashd_compat.startup_delay = Duration::ZERO;
 
     // Use a fresh datadir inside the testdir. The supervisor bootstraps the
     // datadir and minimal `zcash.conf` before spawning zcashd.
-    let zcashd_datadir = cookie_dir.join("zcashd-datadir");
+    let zcashd_datadir = work_dir.join("zcashd-datadir");
     config.zcashd_compat.zcashd_datadir = Some(zcashd_datadir.clone());
 
-    // Use an explicit zcashd path if provided, else managed download.
+    // Use an explicit zcashd path if provided, else embedded download.
     // An empty value counts as unset (the make targets always export the var).
     if let Some(path) = std::env::var_os(TEST_ZCASHD_PATH).filter(|path| !path.is_empty()) {
         config.zcashd_compat.zcashd_source =
@@ -127,7 +121,6 @@ pub fn build_zcashd_compat_config(cookie_dir: PathBuf) -> Result<ZcashdCompatCon
         zebrad_config: config,
         zcashd_datadir,
         zebra_rpc_addr,
-        zebra_compat_rpc_addr,
         zcashd_own_rpc_addr,
     })
 }

@@ -561,7 +561,7 @@
                 <h2>Integration Summary</h2>
               </div>
               <p class="body-copy">
-                Zakura is responsible for consensus and P2P. zcashd is kept for wallet and zcashd-compatible RPC surfaces, and ingests chain and mempool data from Zakura over authenticated RPC. By default, operators run Zakura and zcashd as separate processes; supervised mode can be enabled when Zakura should manage the zcashd child process. The primary purpose of this integration is to allow exchanges to smoothly migrate to a Zakura node without disrupting their existing zcashd setup.
+                Zakura is responsible for consensus and P2P. zcashd is kept for wallet and zcashd-compatible RPC surfaces, and syncs chain data from Zakura over legacy Zcash P2P. By default, operators run Zakura and zcashd as separate processes; supervised mode can be enabled when Zakura should manage the zcashd child process. The primary purpose of this integration is to allow exchanges to smoothly migrate to a Zakura node without disrupting their existing zcashd setup.
               </p>
               <ul class="summary-list">
                 <li><strong>Trust boundary:</strong> zcashd trusts the configured Zakura node for block source and transaction forwarding.</li>
@@ -599,7 +599,7 @@
                 <p class="body-copy">Snapshots:</p>
                 <ul class="summary-list">
                   <li><a href="https://zakura.valargroup.dev/">Zakura</a></li>
-                  <li><a href="https://zcashd.valargroup.org/">Zcashd</a></li>
+                  <li><a href="https://zcashd.valargroup.dev/">Zcashd</a></li>
                 </ul>
               </div>
             </article>
@@ -614,13 +614,13 @@
                   <div class="join-step-body">
                     <h3>Run Installer</h3>
                     <p class="body-copy">
-                      Download and run the installer from the latest Zakura GitHub release. It guides the setup flow and uses the release-published zcashd-compat assets.
+                      Download and run the installer from the latest Zakura GitHub release, then choose “With Zcashd compatibility” when prompted. It guides the setup flow and uses the release-published zcashd-compat assets.
                     </p>
                     <div class="code-block">
-                      <pre><code id="install-zcashd-compat" class="language-bash">curl -fsSL https://github.com/valargroup/zebra/releases/latest/download/install-zcashd-compat.sh | bash</code></pre>
+                      <pre><code id="install-zakura-compat" class="language-bash">curl -fsSL https://github.com/valargroup/zebra/releases/latest/download/install-zakura.sh | bash</code></pre>
                       <button class="copy"
                               type="button"
-                              data-copy="install-zcashd-compat"
+                              data-copy="install-zakura-compat"
                               aria-label="Copy zcashd-compat installer command"
                               title="Copy">
                         <span class="copy-icon" aria-hidden="true"></span>
@@ -628,7 +628,7 @@
                       </button>
                     </div>
                     <p class="note">
-                      The installer is uploaded as a release asset and included in the release <code>SHA256SUMS.txt</code> alongside the zcashd-compat artifacts.
+                      The shared installer is uploaded as a release asset and included in the release <code>SHA256SUMS.txt</code> alongside the zcashd-compat artifacts.
                     </p>
                   </div>
                 </li>

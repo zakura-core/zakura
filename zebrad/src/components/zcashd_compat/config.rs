@@ -1,7 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
-use zebra_chain::common::default_cache_dir;
 
 /// Source selector for supervised `zcashd` execution.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, Default)]
@@ -10,8 +9,8 @@ pub enum ZcashdBinarySource {
     /// Resolve `zcashd` from a local executable path.
     #[default]
     Path,
-    /// Resolve `zcashd` from Zebra's embedded managed release manifest.
-    Managed,
+    /// Resolve `zcashd` from Zebra's embedded release manifest.
+    Embedded,
 }
 
 /// Configuration for Zebra zcashd-compat mode.
@@ -20,7 +19,8 @@ pub enum ZcashdBinarySource {
 pub struct Config {
     /// Enables zcashd-compat mode.
     ///
-    /// zcashd-compat mode configures Zebra RPC defaults for a local `zcashd -zebra-compat` process.
+    /// zcashd-compat mode supervises or validates a P2P sidecar `zcashd` process
+    /// that syncs chain data from Zebra over the legacy Zcash P2P protocol.
     pub enabled: bool,
 
     /// Whether Zebra should spawn and supervise a `zcashd -zebra-compat` child process.
@@ -35,7 +35,7 @@ pub struct Config {
 
     /// Optional explicit path to a local `zcashd` binary with zcashd-compat support.
     ///
-    /// When set, Zebra uses this path directly and skips managed downloads.
+    /// When set, Zebra uses this path directly and skips embedded downloads.
     pub zcashd_path: Option<PathBuf>,
 
     /// Optional `zcashd` datadir path.
@@ -66,61 +66,6 @@ pub struct Config {
     /// bound to an unspecified address. Set this only when zcashd must reach
     /// Zebra through a different address, such as across containers.
     pub p2p_connect_addr: Option<SocketAddr>,
-
-    /// Listen address for the dedicated zcashd-compat Zebra RPC listener.
-    ///
-    /// If unset, zcashd-compat startup defaults it to `127.0.0.1:28232`.
-    ///
-    /// This listener is retained for operator tooling; the P2P sidecar zcashd
-    /// no longer uses it to ingest chain data.
-    ///
-    /// Backward compatibility: this field also accepts the legacy `rpc_url` key and env var.
-    #[serde(
-        default,
-        alias = "rpc_url",
-        deserialize_with = "deserialize_listen_addr_or_rpc_url"
-    )]
-    pub listen_addr: Option<SocketAddr>,
-
-    /// The directory where Zebra stores zcashd-compat RPC cookies.
-    ///
-    /// By default this reuses Zebra's standard cache directory.
-    pub cookie_dir: PathBuf,
-
-    /// The zcashd-compat RPC cookie file name.
-    ///
-    /// This is separate from the standard RPC cookie filename to avoid
-    /// conflicts when both RPC servers share the same `cookie_dir`.
-    #[serde(default = "default_cookie_file_name")]
-    pub cookie_file_name: String,
-
-    /// Enable cookie-based authentication on the dedicated zcashd-compat RPC listener.
-    ///
-    /// This defaults to true. Disabling it is only allowed when the zcashd-compat
-    /// listener is configured for TLS, so external access control can protect the
-    /// unauthenticated HTTPS endpoint.
-    pub enable_cookie_auth: bool,
-
-    /// TLS certificate chain for the dedicated zcashd-compat RPC listener.
-    pub tls_cert_file: Option<PathBuf>,
-
-    /// TLS private key for the dedicated zcashd-compat RPC listener.
-    pub tls_key_file: Option<PathBuf>,
-
-    /// CA certificate file for the dedicated zcashd-compat RPC listener's clients.
-    ///
-    /// Unused by the P2P sidecar: supervised zcashd syncs over P2P and is not
-    /// given this file. The field is kept so existing configs still parse.
-    pub tls_ca_file: Option<PathBuf>,
-
-    /// Allow a non-loopback zcashd-compat RPC listener without TLS.
-    ///
-    /// By default, non-loopback `listen_addr` values require TLS because cookie
-    /// credentials would otherwise cross the network in cleartext. Set this only
-    /// when another layer secures the listener, such as a container or private
-    /// network boundary. This mirrors zcashd's `-zebra-compat-allow-remote-http`
-    /// client-side escape hatch.
-    pub unsafe_allow_remote_http: bool,
 
     /// Delay before the first `zcashd` spawn attempt.
     #[serde(with = "humantime_serde")]
@@ -162,14 +107,6 @@ impl Default for Config {
             zcashd_datadir: None,
             zcashd_extra_args: Vec::new(),
             p2p_connect_addr: None,
-            listen_addr: None,
-            cookie_dir: default_cache_dir(),
-            cookie_file_name: default_cookie_file_name(),
-            enable_cookie_auth: true,
-            tls_cert_file: None,
-            tls_key_file: None,
-            tls_ca_file: None,
-            unsafe_allow_remote_http: false,
             startup_delay: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(2),
             restart_backoff_max: Duration::from_secs(5 * 60),
@@ -177,58 +114,6 @@ impl Default for Config {
             shutdown_grace_period: Duration::from_secs(300),
         }
     }
-}
-
-impl Config {
-    /// Returns true when the dedicated zcashd-compat RPC listener should use TLS.
-    pub fn tls_enabled(&self) -> bool {
-        self.tls_cert_file.is_some() || self.tls_key_file.is_some()
-    }
-}
-
-fn default_cookie_file_name() -> String {
-    ".zcashd-compat.cookie".to_string()
-}
-
-/// Deserializes the compat listen address from either `listen_addr` (`127.0.0.1:28232`)
-/// or legacy `rpc_url` (`http://127.0.0.1:28232`) formats.
-fn deserialize_listen_addr_or_rpc_url<'de, D>(
-    deserializer: D,
-) -> Result<Option<SocketAddr>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum ListenAddrValue {
-        SocketAddr(SocketAddr),
-        String(String),
-    }
-
-    let value = Option::<ListenAddrValue>::deserialize(deserializer)?;
-    value
-        .map(|value| match value {
-            ListenAddrValue::SocketAddr(addr) => Ok(addr),
-            ListenAddrValue::String(raw) => {
-                if let Ok(addr) = raw.parse::<SocketAddr>() {
-                    return Ok(addr);
-                }
-
-                let stripped = raw
-                    .strip_prefix("http://")
-                    .or_else(|| raw.strip_prefix("https://"))
-                    .unwrap_or(&raw)
-                    .trim_end_matches('/');
-
-                stripped.parse::<SocketAddr>().map_err(|error| {
-                    D::Error::custom(format!(
-                        "listen_addr / rpc_url must be a socket address like \
-                         127.0.0.1:28232 or URL like http://127.0.0.1:28232, got {raw:?}: {error}"
-                    ))
-                })
-            }
-        })
-        .transpose()
 }
 
 /// Deserializes `zcashd_extra_args` from either a sequence or a JSON-array string.
@@ -257,8 +142,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-
     use super::{Config, ZcashdBinarySource};
 
     #[test]
@@ -267,11 +150,6 @@ mod tests {
         assert!(!config.manage_zcashd);
         assert_eq!(config.zcashd_source, ZcashdBinarySource::Path);
         assert_eq!(config.zcashd_path, None);
-        assert_eq!(config.listen_addr, None);
-        assert_eq!(config.cookie_dir, super::default_cache_dir());
-        assert_eq!(config.cookie_file_name, super::default_cookie_file_name());
-        assert!(config.enable_cookie_auth);
-        assert!(!config.tls_enabled());
         assert_eq!(
             config.restart_reset_after,
             std::time::Duration::from_secs(60 * 60)
@@ -320,56 +198,6 @@ mod tests {
             config.restart_backoff_max,
             std::time::Duration::from_secs(10 * 60)
         );
-    }
-
-    #[test]
-    fn deserialize_defaults_cookie_file_name_when_missing() {
-        let config: Config = toml::from_str(
-            r#"
-            cookie_dir = "/tmp/zcashd-compat-cookie-dir"
-            "#,
-        )
-        .expect("partial zcashd-compat config should deserialize");
-
-        assert_eq!(
-            config.cookie_file_name,
-            super::default_cookie_file_name(),
-            "missing cookie file names should use the default value"
-        );
-    }
-
-    #[test]
-    fn deserialize_legacy_rpc_url_into_listen_addr() {
-        let config: Config = toml::from_str(
-            r#"
-            rpc_url = "http://127.0.0.1:28232"
-            "#,
-        )
-        .expect("legacy rpc_url should deserialize");
-
-        assert_eq!(
-            config.listen_addr,
-            Some(SocketAddr::from(([127, 0, 0, 1], 28232)))
-        );
-    }
-
-    #[test]
-    fn deserialize_tls_and_cookie_auth_settings() {
-        let config: Config = toml::from_str(
-            r#"
-            enable_cookie_auth = false
-            tls_cert_file = "/tmp/zebra.crt"
-            tls_key_file = "/tmp/zebra.key"
-            tls_ca_file = "/tmp/ca.pem"
-            "#,
-        )
-        .expect("TLS zcashd-compat config should deserialize");
-
-        assert!(!config.enable_cookie_auth);
-        assert!(config.tls_enabled());
-        assert_eq!(config.tls_cert_file, Some("/tmp/zebra.crt".into()));
-        assert_eq!(config.tls_key_file, Some("/tmp/zebra.key".into()));
-        assert_eq!(config.tls_ca_file, Some("/tmp/ca.pem".into()));
     }
 
     #[test]

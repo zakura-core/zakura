@@ -263,50 +263,14 @@ fn config_zcashd_compat_source_and_path_env() {
 }
 
 #[test]
-fn config_zcashd_compat_managed_source_env() {
+fn config_zcashd_compat_embedded_source_env() {
     let env = EnvGuard::new();
-    env.set_var("ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE", "managed");
+    env.set_var("ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE", "embedded");
 
-    let config = ZebradConfig::load(None).expect("load config with managed source");
+    let config = ZebradConfig::load(None).expect("load config with embedded source");
     assert_eq!(
         config.zcashd_compat.zcashd_source,
-        ConfigZcashdBinarySource::Managed
-    );
-}
-
-#[test]
-fn config_zcashd_compat_rpc_listener_env() {
-    let env = EnvGuard::new();
-    env.set_var("ZEBRA_ZCASHD_COMPAT__LISTEN_ADDR", "127.0.0.1:28232");
-    env.set_var(
-        "ZEBRA_ZCASHD_COMPAT__COOKIE_DIR",
-        "/tmp/zcashd-compat-cookies",
-    );
-
-    let config = ZebradConfig::load(None).expect("load config with zcashd-compat rpc env vars");
-    assert_eq!(
-        config.zcashd_compat.listen_addr.unwrap().to_string(),
-        "127.0.0.1:28232"
-    );
-    assert_eq!(
-        config.zcashd_compat.cookie_dir,
-        PathBuf::from("/tmp/zcashd-compat-cookies")
-    );
-    assert_eq!(
-        config.zcashd_compat.cookie_file_name,
-        ".zcashd-compat.cookie"
-    );
-}
-
-#[test]
-fn config_zcashd_compat_legacy_rpc_url_env() {
-    let env = EnvGuard::new();
-    env.set_var("ZEBRA_ZCASHD_COMPAT__RPC_URL", "http://127.0.0.1:28232");
-
-    let config = ZebradConfig::load(None).expect("load config with legacy zcashd-compat rpc_url");
-    assert_eq!(
-        config.zcashd_compat.listen_addr.unwrap().to_string(),
-        "127.0.0.1:28232"
+        ConfigZcashdBinarySource::Embedded
     );
 }
 

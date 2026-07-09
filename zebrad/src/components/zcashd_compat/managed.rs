@@ -31,8 +31,8 @@ const INSTALL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(250);
 pub enum ZcashdBinarySource {
     /// Explicit local executable path.
     Path(PathBuf),
-    /// Managed release download and cache.
-    Managed,
+    /// Embedded release download and cache.
+    Embedded,
 }
 
 /// Returns the current platform target triple used for managed release lookups.
@@ -54,7 +54,7 @@ pub fn effective_zcashd_source(config: &Config) -> Result<ZcashdBinarySource, Re
     }
 
     match config.zcashd_source {
-        ConfigZcashdBinarySource::Managed => Ok(ZcashdBinarySource::Managed),
+        ConfigZcashdBinarySource::Embedded => Ok(ZcashdBinarySource::Embedded),
         ConfigZcashdBinarySource::Path => Err(eyre!(
             "zcashd_compat.zcashd_source=path requires zcashd_compat.zcashd_path to be set"
         )),
@@ -76,7 +76,7 @@ pub fn resolve_zcashd_binary_path(
             }
             Ok(path)
         }
-        ZcashdBinarySource::Managed => resolve_managed_zcashd_binary(state_cache_dir),
+        ZcashdBinarySource::Embedded => resolve_managed_zcashd_binary(state_cache_dir),
     }
 }
 
@@ -541,9 +541,9 @@ mod tests {
     };
 
     #[test]
-    fn explicit_zcashd_path_overrides_managed_source() {
+    fn explicit_zcashd_path_overrides_embedded_source() {
         let config = Config {
-            zcashd_source: ConfigZcashdBinarySource::Managed,
+            zcashd_source: ConfigZcashdBinarySource::Embedded,
             zcashd_path: Some("/usr/local/bin/zcashd".into()),
             ..Default::default()
         };

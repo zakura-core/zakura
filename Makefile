@@ -2,9 +2,15 @@
 
 include make/zcashd-compat.mk
 include make/perf.mk
+include make/zakura-dev.mk
 
 help:
 	@echo "Available targets:"
+	@echo ""
+	@echo "  Dev Zakura (local node):"
+	@echo "  zakura-build-dev                 Build debug zakurad"
+	@echo "  zakura-dev-init                  Create ~/.local/zakura-dev config + dirs"
+	@echo "  zakura-start-dev                 Start local dev node (pruned, VCT, v2-only)"
 	@echo ""
 	@echo "  Perf harness (deterministic isolated-cohort bench):"
 	@echo "  perf-build-local                 Build the instrumented (commit-metrics) bench binary"

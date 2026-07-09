@@ -216,7 +216,7 @@ enabled = true
 # Spawn and supervise zcashd (true) or run it yourself (false, default).
 manage_zcashd = true
 
-# "path" (use zcashd_path) or "managed" (SHA256-pinned download).
+# "path" (use zcashd_path) or "embedded" (SHA256-pinned download from embedded manifest).
 zcashd_source = "path"
 zcashd_path = "/usr/local/bin/zcashd"
 
@@ -242,8 +242,8 @@ All values can also be set through environment variables, e.g.
 `ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH=/usr/local/bin/zcashd`.
 
 > [!WARNING]
-> Until the managed-download manifest is updated for the sidecar build,
-> `zcashd_source = "managed"` downloads the previous RPC-ingest zcashd, which
+> Until the embedded-download manifest is updated for the sidecar build,
+> `zcashd_source = "embedded"` downloads the previous RPC-ingest zcashd, which
 > still contains the upstream end-of-support halt and miner RPCs. Use
 > `zcashd_source = "path"` with a sidecar build for now.
 

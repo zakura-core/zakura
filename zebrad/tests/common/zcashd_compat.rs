@@ -34,7 +34,7 @@ pub const TEST_ZCASHD_COMPAT: &str = "TEST_ZCASHD_COMPAT";
 // make every spawned zebrad child abort at startup.
 
 /// Optional explicit path to a P2P-sidecar zcashd binary.
-/// If unset, the managed download is used in regtest mode.
+/// If unset, the embedded download is used in regtest mode.
 pub const TEST_ZCASHD_PATH: &str = "TEST_ZCASHD_PATH";
 
 /// Network for external mode: `Mainnet` or `Testnet`.

@@ -9,8 +9,8 @@ pub enum ZcashdBinarySource {
     /// Resolve `zcashd` from a local executable path.
     #[default]
     Path,
-    /// Resolve `zcashd` from Zebra's embedded managed release manifest.
-    Managed,
+    /// Resolve `zcashd` from Zebra's embedded release manifest.
+    Embedded,
 }
 
 /// Configuration for Zebra zcashd-compat mode.
@@ -35,7 +35,7 @@ pub struct Config {
 
     /// Optional explicit path to a local `zcashd` binary with zcashd-compat support.
     ///
-    /// When set, Zebra uses this path directly and skips managed downloads.
+    /// When set, Zebra uses this path directly and skips embedded downloads.
     pub zcashd_path: Option<PathBuf>,
 
     /// Optional `zcashd` datadir path.

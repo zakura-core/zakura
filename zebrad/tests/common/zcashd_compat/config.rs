@@ -77,7 +77,7 @@ pub fn build_zcashd_compat_config(work_dir: PathBuf) -> Result<ZcashdCompatConfi
     config.zcashd_compat.enabled = true;
     config.zcashd_compat.manage_zcashd = true;
     config.zcashd_compat.zcashd_source =
-        zebrad::components::zcashd_compat::ConfigZcashdBinarySource::Managed;
+        zebrad::components::zcashd_compat::ConfigZcashdBinarySource::Embedded;
     // Skip startup delay in tests — supervisor spawns zcashd immediately
     config.zcashd_compat.startup_delay = Duration::ZERO;
 
@@ -86,7 +86,7 @@ pub fn build_zcashd_compat_config(work_dir: PathBuf) -> Result<ZcashdCompatConfi
     let zcashd_datadir = work_dir.join("zcashd-datadir");
     config.zcashd_compat.zcashd_datadir = Some(zcashd_datadir.clone());
 
-    // Use an explicit zcashd path if provided, else managed download.
+    // Use an explicit zcashd path if provided, else embedded download.
     // An empty value counts as unset (the make targets always export the var).
     if let Some(path) = std::env::var_os(TEST_ZCASHD_PATH).filter(|path| !path.is_empty()) {
         config.zcashd_compat.zcashd_source =

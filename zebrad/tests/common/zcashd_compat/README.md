@@ -14,7 +14,7 @@ everything down.  No external infrastructure is required.
 
 ```
 TEST_ZCASHD_COMPAT=1                          (required)
-TEST_ZCASHD_PATH=/path/to/zcashd        (optional — uses managed download if unset)
+TEST_ZCASHD_PATH=/path/to/zcashd        (optional — uses embedded download if unset)
 ```
 
 Run:
@@ -135,7 +135,7 @@ error (misconfiguration, not a skip).
 | Variable | Required | Purpose |
 |---|---|---|
 | `TEST_ZCASHD_COMPAT` | Always | Enable the suite (set to any non-empty value) |
-| `TEST_ZCASHD_PATH` | No | Path to a zcashd binary; uses managed download if absent |
+| `TEST_ZCASHD_PATH` | No | Path to a zcashd binary; uses embedded download if absent |
 | `TEST_ZCASHD_COMPAT_NETWORK` | External only | `Mainnet` or `Testnet`; absent = Regtest/managed |
 | `TEST_ZEBRAD_RPC_ADDR` | External only | zebrad main RPC (`host:port`) |
 | `TEST_ZCASHD_RPC_ADDR` | External only | zcashd own RPC (`host:port`) |

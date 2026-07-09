@@ -1208,7 +1208,7 @@ prepare_binary_paths() {
     if [[ "$MODE" == "split-binary" ]]; then
       printf '\nDownload zcashd:\n%s\n' "$zcashd_url"
     else
-      printf '\nZakura supervised mode will use its hash-pinned managed zcashd download at startup.\n'
+      printf '\nZakura supervised mode will use its hash-pinned embedded zcashd download at startup.\n'
     fi
     printf '\n'
     if ((!DRY_RUN)); then
@@ -1470,7 +1470,7 @@ print_supervised_command() {
 $(style "$GREEN$BOLD" "Start Zakura. In the background, downloads hash-pinned zcashd and kicks it off as a supervised child process.")
 $(print_zakurad_env_lines)
 ZAKURA_ZCASHD_COMPAT__MANAGE_ZCASHD=true \\
-ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=managed \\
+ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=embedded \\
 ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR=$(shell_quote "$ZCASHD_DATADIR") \\
 $(shell_quote "$ZAKURAD_PATH") start --zcashd-compat
 EOF

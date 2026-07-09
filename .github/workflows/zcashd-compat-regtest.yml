@@ -53,6 +53,6 @@ jobs:
 
       - uses: ./.github/actions/setup-zebra-build
 
-      # Uses the managed zcashd download (TEST_ZCASHD_PATH unset).
+      # Uses the embedded zcashd download (TEST_ZCASHD_PATH unset).
       - name: Run zcashd-compat regtest suite
         run: make compat-test-regtest

@@ -89,10 +89,10 @@ compat-docker-start:
 		zakurad start --zcashd-compat
 
 compat-zakurad-start-supervised-managed:
-	@echo "Starting zakurad in zcashd-compat mode with managed zcashd download..."
+	@echo "Starting zakurad in zcashd-compat mode with embedded zcashd download..."
 	ZAKURA_NETWORK__NETWORK="$(NETWORK)" \
 	ZAKURA_STATE__CACHE_DIR="$(ZAKURA_STATE_CACHE_DIR)" \
-	ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=managed \
+	ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=embedded \
 	ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR="$(ZCASHD_DATADIR)" \
 	"$(ZAKURAD_BIN)" start --zcashd-compat
 
@@ -179,7 +179,7 @@ compat-status-sync:
 # ─── Integration test targets ─────────────────────────────────────────────────
 
 # Optional: path to a local zcashd binary for regtest tests.
-# If unset, the managed download embedded in the zebrad binary is used.
+# If unset, the embedded zcashd download in the zebrad binary is used.
 # Override with: make compat-test-regtest TEST_ZCASHD_PATH=/path/to/zcashd
 TEST_ZCASHD_PATH ?=
 TEST_ZCASHD_COMPAT_REORG_ITERATIONS ?= 500
@@ -197,7 +197,7 @@ TEST_ZCASHD_RPC_PASSWORD ?=
 # environment.  zebrad and zcashd are spawned automatically by the test harness.
 #
 # Prerequisites: a zcashd binary (set TEST_ZCASHD_PATH) or let the
-#   managed download provide one.
+#   embedded download provide one.
 # When to use: CI smoke-testing and developer local verification after code changes.
 compat-test-regtest:
 	TEST_ZCASHD_COMPAT=1 \

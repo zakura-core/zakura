@@ -120,7 +120,7 @@ impl PermissionRole {
             PermissionRole::ZebraState => "zakura state directory",
             PermissionRole::ZcashdDatadir => "zcashd datadir",
             PermissionRole::ZcashdConf => "zcashd config directory",
-            PermissionRole::ManagedZcashdCache => "managed zcashd cache directory",
+            PermissionRole::ManagedZcashdCache => "embedded zcashd cache directory",
         }
     }
 }
@@ -328,7 +328,7 @@ fn check_zcashd_binary(
                 ));
             }
         }
-        Ok(ZcashdBinarySource::Managed) => {
+        Ok(ZcashdBinarySource::Embedded) => {
             let Some(binary_path) = managed_zcashd_binary_path(state_cache_dir) else {
                 return;
             };
@@ -1153,7 +1153,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn managed_source_checks_cache_dir_writability() {
+    fn embedded_source_checks_cache_dir_writability() {
         if running_as_root() {
             return;
         }
@@ -1169,7 +1169,7 @@ mod tests {
         let mut config = permission_test_config(&temp_dir);
         config.state.cache_dir = protected.join("zakura-cache");
         config.zcashd_compat.zcashd_datadir = Some(temp_dir.path().join("zcashd-datadir"));
-        config.zcashd_compat.zcashd_source = ConfigZcashdBinarySource::Managed;
+        config.zcashd_compat.zcashd_source = ConfigZcashdBinarySource::Embedded;
         config.zcashd_compat.zcashd_path = None;
 
         set_mode(&protected, 0o555);
@@ -1184,17 +1184,17 @@ mod tests {
         result.expect("permission checks should complete");
         assert!(
             summary.errors.iter().any(|error| {
-                error.contains("managed zcashd cache directory")
+                error.contains("embedded zcashd cache directory")
                     && error.contains("nearest existing ancestor")
             }),
-            "expected managed cache writability error: {:?}",
+            "expected embedded cache writability error: {:?}",
             summary.errors
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn stale_managed_cache_checks_cache_dir_writability() {
+    fn stale_embedded_cache_checks_cache_dir_writability() {
         if running_as_root() {
             return;
         }
@@ -1205,7 +1205,7 @@ mod tests {
 
         let temp_dir = TempDir::new().expect("tempdir should be created");
         let mut config = permission_test_config(&temp_dir);
-        config.zcashd_compat.zcashd_source = ConfigZcashdBinarySource::Managed;
+        config.zcashd_compat.zcashd_source = ConfigZcashdBinarySource::Embedded;
         config.zcashd_compat.zcashd_path = None;
 
         let binary_path =
@@ -1229,9 +1229,9 @@ mod tests {
         result.expect("permission checks should complete");
         assert!(
             summary.errors.iter().any(|error| {
-                error.contains("managed zcashd cache directory") && error.contains("not writable")
+                error.contains("embedded zcashd cache directory") && error.contains("not writable")
             }),
-            "expected stale managed cache writability error: {:?}",
+            "expected stale embedded cache writability error: {:?}",
             summary.errors
         );
     }

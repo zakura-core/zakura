@@ -263,14 +263,14 @@ fn config_zcashd_compat_source_and_path_env() {
 }
 
 #[test]
-fn config_zcashd_compat_managed_source_env() {
+fn config_zcashd_compat_embedded_source_env() {
     let env = EnvGuard::new();
-    env.set_var("ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE", "managed");
+    env.set_var("ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE", "embedded");
 
-    let config = ZebradConfig::load(None).expect("load config with managed source");
+    let config = ZebradConfig::load(None).expect("load config with embedded source");
     assert_eq!(
         config.zcashd_compat.zcashd_source,
-        ConfigZcashdBinarySource::Managed
+        ConfigZcashdBinarySource::Embedded
     );
 }
 

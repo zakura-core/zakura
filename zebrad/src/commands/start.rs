@@ -1248,7 +1248,7 @@ mod tests {
         let mut config = ZebradConfig::default();
         config.zcashd_compat.enabled = true;
         config.zcashd_compat.manage_zcashd = true;
-        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Managed;
+        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Embedded;
         config.zcashd_compat.zcashd_extra_args = vec!["-addnode=1.2.3.4".to_string()];
 
         let error = cmd
@@ -1305,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn zcashd_compat_managed_source_allows_missing_local_path() {
+    fn zcashd_compat_embedded_source_allows_missing_local_path() {
         let cmd = StartCmd {
             filters: Vec::new(),
             zcashd_compat: true,
@@ -1313,11 +1313,11 @@ mod tests {
         };
         let mut config = ZebradConfig::default();
         config.zcashd_compat.manage_zcashd = true;
-        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Managed;
+        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Embedded;
         config.zcashd_compat.zcashd_path = None;
 
         cmd.override_config(config)
-            .expect("managed source should be validated at runtime, not override-time");
+            .expect("embedded source should be validated at runtime, not override-time");
     }
 
     #[test]

@@ -227,6 +227,51 @@ python3 deploy/runner/zebra-cluster-status.py \
   --upgrade-height 0
 ```
 
+The mainnet workflow also installs a Slack watchdog on `us-east-0`:
+
+- service: `zakura-fleet-watchdog.service`
+- install dir: `/opt/zakura-fleet-watchdog`
+- state file: `/var/lib/zakura-fleet-watchdog/state.json`
+- env file: `/etc/zakura-fleet-watchdog/env`
+- suppression file: `/run/zakura-fleet-watchdog/deploy-suppressed-until`
+
+The watchdog polls the mainnet dashboard locally at
+`http://127.0.0.1:8090/data` and the testnet dashboard at
+`http://167.99.103.111:8090/data`. It posts transition alerts to Slack
+`#gh-alerts` via either `SLACK_BOT_TOKEN` plus channel ID `C0BCQ7PP32A`, or an
+incoming webhook in `SLACK_WEB_HOOK` / `SLACK_WEBHOOK_URL`. A node alert fires
+when either of these conditions stays true for at least 10 minutes:
+
+- `health` is `down` or `rpc_error`
+- `seconds_since_advanced` is at least 600 seconds
+
+Down alerts take precedence over stalled alerts, so a node only produces one
+active alert at a time. The watchdog also alerts if a dashboard endpoint is
+unreachable for at least 10 minutes, and posts one recovery message when a node
+or dashboard recovers. Persistent failures do not post on every poll cycle.
+
+Restart deploys write a 20-minute suppression marker before touching the fleet.
+The mainnet workflow writes it locally on `us-east-0`; the testnet workflow
+refreshes it on `us-east-0` over SSH on a best-effort basis. While the marker is
+in the future, new failure alerts are logged but not posted to Slack.
+
+Manual dry run from `us-east-0`:
+
+```bash
+python3 /opt/zakura-fleet-watchdog/zebra-cluster-watchdog.py \
+  --config /opt/zakura-fleet-watchdog/fleets.toml \
+  --state-file /tmp/zakura-fleet-watchdog-state.json \
+  --once \
+  --dry-run
+```
+
+Local status checks:
+
+```bash
+systemctl status zakura-fleet-watchdog
+journalctl -u zakura-fleet-watchdog -f
+```
+
 ## How the build cache works
 
 `commit` is resolved to a full SHA (`git rev-parse`). The binary is cached at

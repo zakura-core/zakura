@@ -1,0 +1,9 @@
+[[fleets]]
+name = "testnet"
+url = "http://167.99.103.111:8090/data"
+dashboard_url = "http://167.99.103.111:8090/"
+
+[[fleets]]
+name = "mainnet"
+url = "http://127.0.0.1:8090/data"
+dashboard_url = "http://159.65.183.89:8090/"

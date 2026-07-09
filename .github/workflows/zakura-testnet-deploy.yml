@@ -101,7 +101,14 @@ jobs:
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           : > ~/.ssh/known_hosts
-          for host in 167.99.103.111 167.99.110.145 138.68.229.254 164.92.209.78 206.189.148.0 206.189.208.228; do
+          for host in \
+            167.99.103.111 \
+            167.99.110.145 \
+            138.68.229.254 \
+            164.92.209.78 \
+            206.189.148.0 \
+            206.189.208.228 \
+            159.65.183.89; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -216,6 +223,17 @@ jobs:
           fi
 
           python3 deploy.py build "${args[@]}"
+
+      - name: Suppress fleet watchdog alerts during deploy
+        if: ${{ !inputs.no_restart }}
+        run: |
+          set -euo pipefail
+
+          ssh_options=(-o BatchMode=yes -o ConnectTimeout=15)
+          if ! ssh "${ssh_options[@]}" root@159.65.183.89 \
+            'install -d -m 755 /run/zakura-fleet-watchdog && printf "%s\n" "$(( $(date +%s) + 1200 ))" > /run/zakura-fleet-watchdog/deploy-suppressed-until'; then
+            echo "warning: could not refresh fleet watchdog suppression on us-east-0"
+          fi
 
       - name: Deploy fleet
         working-directory: deploy/deployer

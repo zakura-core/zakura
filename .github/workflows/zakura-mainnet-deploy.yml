@@ -231,6 +231,15 @@ jobs:
 
           python3 deploy.py build "${args[@]}"
 
+      - name: Suppress fleet watchdog alerts during deploy
+        if: ${{ !inputs.no_restart }}
+        run: |
+          set -euo pipefail
+
+          sudo install -d -m 755 /run/zakura-fleet-watchdog
+          printf '%s\n' "$(( $(date +%s) + 1200 ))" \
+            | sudo tee /run/zakura-fleet-watchdog/deploy-suppressed-until >/dev/null
+
       - name: Deploy fleet
         working-directory: deploy/deployer
         run: |
@@ -293,6 +302,40 @@ jobs:
           sudo systemctl enable zakura-mainnet-dashboard.service
           sudo systemctl restart zakura-mainnet-dashboard.service
           sudo systemctl --no-pager --full status zakura-mainnet-dashboard.service || true
+
+      - name: Install fleet watchdog
+        if: always()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+        run: |
+          set -euo pipefail
+
+          watchdog_dir="/opt/zakura-fleet-watchdog"
+          sudo install -d -m 755 "$watchdog_dir"
+          sudo install -d -m 755 /var/lib/zakura-fleet-watchdog
+          sudo install -d -m 755 /etc/zakura-fleet-watchdog
+          sudo install -m 755 deploy/runner/zebra-cluster-watchdog.py "$watchdog_dir/zebra-cluster-watchdog.py"
+          sudo install -m 644 deploy/runner/fleet-watchdog.toml "$watchdog_dir/fleets.toml"
+          sudo install -m 644 deploy/runner/zakura-fleet-watchdog.service /etc/systemd/system/zakura-fleet-watchdog.service
+
+          tmp_env="$(mktemp)"
+          if [ -n "${SLACK_BOT_TOKEN}" ]; then
+            printf 'SLACK_BOT_TOKEN=%s\n' "${SLACK_BOT_TOKEN}" > "$tmp_env"
+          elif [ -n "${SLACK_WEB_HOOK}" ]; then
+            printf 'SLACK_WEB_HOOK=%s\n' "${SLACK_WEB_HOOK}" > "$tmp_env"
+          elif sudo test -f /etc/zakura-fleet-watchdog/env; then
+            sudo cp /etc/zakura-fleet-watchdog/env "$tmp_env"
+          else
+            : > "$tmp_env"
+          fi
+          sudo install -m 600 "$tmp_env" /etc/zakura-fleet-watchdog/env
+          rm -f "$tmp_env"
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-fleet-watchdog.service
+          sudo systemctl restart zakura-fleet-watchdog.service
+          sudo systemctl --no-pager --full status zakura-fleet-watchdog.service || true
 
       - name: Fetch recent logs on failure
         if: failure()

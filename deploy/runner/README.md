@@ -36,7 +36,7 @@ threshold, then recovery. Persistent failures do not post every poll.
 
 Slack delivery supports either:
 
-- `SLACK_BOT_TOKEN` with channel ID `C0BCQ7PP32A`
+- `SLACK_BOT_TOKEN` with channel ID `C0BG341Q9TQ` (`#zakura-alerts`)
 - an incoming webhook in `SLACK_WEB_HOOK`, `SLACK_WEBHOOK_URL`, or
   `SLACK_WEBHOOK`
 

@@ -228,7 +228,7 @@ The mainnet workflow also installs a Slack watchdog on `us-east-0`:
 The watchdog polls the mainnet dashboard locally at
 `http://127.0.0.1:8090/data` and the testnet dashboard at
 `http://167.99.103.111:8090/data`. It posts transition alerts to Slack
-`#gh-alerts` via either `SLACK_BOT_TOKEN` plus channel ID `C0BCQ7PP32A`, or an
+`#zakura-alerts` via either `SLACK_BOT_TOKEN` plus channel ID `C0BG341Q9TQ`, or an
 incoming webhook in `SLACK_WEB_HOOK` / `SLACK_WEBHOOK_URL`. A node alert fires
 when either of these conditions stays true for at least 10 minutes:
 

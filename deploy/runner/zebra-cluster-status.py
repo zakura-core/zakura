@@ -158,10 +158,16 @@ def zakura_node_ids_by_host(zakura: object) -> dict[str, str]:
 def rpc_url_for(listen_addr: str) -> str:
     if not listen_addr:
         return ""
-    match = re.search(r":(\d+)$", listen_addr)
-    if not match:
-        return ""
-    return f"http://127.0.0.1:{match.group(1)}/"
+    if listen_addr.startswith("[") and "]:" in listen_addr:
+        host, _, port = listen_addr.partition("]:")
+        port = port.lstrip(":")
+        if not port:
+            return ""
+        return f"http://{host}]:{port}/"
+    if ":" in listen_addr:
+        host, port = listen_addr.rsplit(":", 1)
+        return f"http://{host}:{port}/"
+    return ""
 
 
 REMOTE_PROBE = r"""
@@ -203,6 +209,20 @@ def process_is_running(pattern):
     proc = run(["pgrep", "-f", pattern])
     return proc.returncode == 0
 
+def process_start_time(pattern):
+    if not pattern:
+        return ""
+    proc = run(["pgrep", "-f", pattern])
+    if proc.returncode != 0:
+        return ""
+    pid = proc.stdout.strip().splitlines()[0].strip()
+    if not pid.isdigit():
+        return ""
+    ps_proc = run(["ps", "-o", "lstart=", "-p", pid])
+    if ps_proc.returncode != 0:
+        return ""
+    return ps_proc.stdout.strip()
+
 def parse_zcash_conf(path):
     values = {}
     if not path:
@@ -227,7 +247,17 @@ def rpc_headers():
             password = config.get("rpcpassword", password)
         except Exception as error:
             out["rpc_auth_error"] = str(error)
-    if rpc_auth in ("basic", "zcash_conf") and user and password:
+    elif rpc_auth == "cookie":
+        try:
+            with open(rpc_config_path, encoding="utf-8") as fh:
+                token = fh.read().strip()
+            if ":" in token:
+                user, password = token.split(":", 1)
+            else:
+                user, password = token, ""
+        except Exception as error:
+            out["rpc_auth_error"] = str(error)
+    if rpc_auth in ("basic", "zcash_conf", "cookie") and user and password:
         token = base64.b64encode(f"{user}:{password}".encode()).decode()
         headers["Authorization"] = f"Basic {token}"
     return headers
@@ -258,7 +288,7 @@ try:
         )
     elif out.get("process_running") is True:
         out["active_state"] = "active"
-        out["last_restarted"] = ""
+        out["last_restarted"] = process_start_time(process_pattern)
     elif out.get("process_running") is False:
         out["active_state"] = "inactive"
         out["last_restarted"] = ""
@@ -283,6 +313,15 @@ try:
         proc = run(["bash", "-lc", grep])
         line = proc.stdout.strip()
         out["commit"] = line.rsplit(" ", 1)[-1] if line else ""
+    if not out.get("commit") and service:
+        proc = run([
+            "journalctl", "-u", service, "-g", "git commit:",
+            "-n", "1", "--no-pager", "-o", "cat",
+        ])
+        if proc.returncode == 0:
+            match = re.search(r"git commit: ([0-9a-f]+)", proc.stdout)
+            if match:
+                out["commit"] = match.group(1)
     if not out.get("commit") and out.get("version"):
         match = re.search(r"\b([0-9a-f]{7,40})(?:-dirty)?\b", out["version"])
         if match:
@@ -298,6 +337,15 @@ try:
         proc = run(["bash", "-lc", grep])
         line = proc.stdout.strip()
         out["node_id"] = line.split("=", 1)[-1].strip('"') if line else ""
+    if not out.get("node_id") and service:
+        proc = run([
+            "journalctl", "-u", service, "-g", "node_id=",
+            "-n", "1", "--no-pager", "-o", "cat",
+        ])
+        if proc.returncode == 0:
+            match = re.search(r"node_id=([^, ]+)", proc.stdout)
+            if match:
+                out["node_id"] = match.group(1).strip('"')
 except Exception as error:
     out["node_id_error"] = str(error)
 

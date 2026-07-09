@@ -1302,7 +1302,7 @@ data_detection_message() {
     fi
   fi
   printf '\nhttps://zcashd.valargroup.dev/\n'
-  printf '\nhttps://zakura.valargroup.dev/\n'
+  printf '\nhttps://zakura.com/snapshots\n'
   printf '\n'
 }
 

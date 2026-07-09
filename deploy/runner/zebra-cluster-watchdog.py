@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_SLACK_CHANNEL = "C0BCQ7PP32A"
+DEFAULT_SLACK_CHANNEL = "C0BG341Q9TQ"
 DOWN_HEALTH = {"down", "rpc_error"}
 STATE_VERSION = 1
 
@@ -144,41 +144,41 @@ def post_slack(text: str, args: argparse.Namespace) -> bool:
         print(f"dry-run Slack message:\n{text}\n")
         return True
 
+    if token:
+        payload = json.dumps({"channel": args.slack_channel, "text": text}).encode("utf-8")
+        request = urllib.request.Request(
+            "https://slack.com/api/chat.postMessage",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=args.slack_timeout) as response:
+                body = response.read()
+        except (OSError, urllib.error.URLError) as error:
+            print(f"Slack post failed: {error}", file=sys.stderr)
+            return False
+
+        try:
+            decoded = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError as error:
+            print(f"Slack returned invalid JSON: {error}", file=sys.stderr)
+            return False
+
+        if not decoded.get("ok"):
+            print(f"Slack post failed: {decoded}", file=sys.stderr)
+            return False
+
+        return True
+
     if webhook:
         return post_slack_webhook(webhook, text, args)
 
-    if not token:
-        print(f"Slack credential not set; would post:\n{text}\n")
-        return True
-
-    payload = json.dumps({"channel": args.slack_channel, "text": text}).encode("utf-8")
-    request = urllib.request.Request(
-        "https://slack.com/api/chat.postMessage",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=utf-8",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=args.slack_timeout) as response:
-            body = response.read()
-    except (OSError, urllib.error.URLError) as error:
-        print(f"Slack post failed: {error}", file=sys.stderr)
-        return False
-
-    try:
-        decoded = json.loads(body.decode("utf-8"))
-    except json.JSONDecodeError as error:
-        print(f"Slack returned invalid JSON: {error}", file=sys.stderr)
-        return False
-
-    if not decoded.get("ok"):
-        print(f"Slack post failed: {decoded}", file=sys.stderr)
-        return False
-
+    print(f"Slack credential not set; would post:\n{text}\n")
     return True
 
 

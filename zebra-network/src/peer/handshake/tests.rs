@@ -17,6 +17,7 @@ use crate::{
         Peer as ZakuraServicePeer, Service as ZakuraService, Stream, ZakuraPeerId,
         ZakuraUpgradeOutcome,
     },
+    P2pStack,
 };
 use tokio::io::duplex;
 use tower::ServiceExt;
@@ -41,8 +42,8 @@ fn peer_addr(port: u16) -> PeerSocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port)).into()
 }
 
-fn test_config(v2_p2p: bool) -> Config {
-    Config::for_test(v2_p2p)
+fn test_config(p2p_stack: P2pStack) -> Config {
+    Config::for_test(p2p_stack)
 }
 
 fn upgraded_outcome() -> ZakuraUpgradeOutcome {
@@ -207,7 +208,7 @@ async fn start_test_zakura_endpoint() -> crate::zakura::ZakuraEndpoint {
     let key_byte = u8::try_from(key_index).expect("key index is in 1..=255 due to modulo");
     let secret = format!("{key_byte:02x}").repeat(32);
     let config: Config = toml::from_str(&format!(
-        "default_p2p = false\nv2_p2p = true\nzakura_node_secret_key = '{secret}'"
+        "p2p_stack = 'dual'\nzakura_node_secret_key = '{secret}'"
     ))
     .expect("test Zakura config with explicit identity key must parse");
 
@@ -236,12 +237,12 @@ async fn mutual_p2p_v2_legacy_upgrade_forms_zakura_connection() {
     let mut remote_counter = ActiveConnectionCounter::new_counter();
 
     let local_handshake = test_handshake_with_connector(
-        test_config(true),
+        test_config(P2pStack::Dual),
         address_book_tx.clone(),
         local_endpoint.connector(),
     );
     let remote_handshake = test_handshake_with_connector(
-        test_config(true),
+        test_config(P2pStack::Dual),
         address_book_tx,
         remote_endpoint.connector(),
     );
@@ -310,7 +311,7 @@ async fn responder_upgrade_keeps_legacy_when_native_dial_never_registers() {
     let responder_endpoint = start_test_zakura_endpoint().await;
     let connector = responder_endpoint.connector();
 
-    let network = test_config(true).network;
+    let network = test_config(P2pStack::Dual).network;
     let config = ZakuraHandshakeConfig::for_network(&network);
 
     // The legacy `version` nonces the responder observed for this peer.
@@ -428,7 +429,7 @@ async fn responder_upgrade_keeps_legacy_when_native_dial_never_registers() {
 async fn responder_upgrade_disconnects_on_malformed_prelude() {
     let _init_guard = zebra_test::init();
 
-    let network = test_config(true).network;
+    let network = test_config(P2pStack::Dual).network;
     let config = ZakuraHandshakeConfig::for_network(&network);
     let nonces = ZakuraLegacyNonces {
         local_zebra_nonce: Nonce(0x1111_1111_1111_1111),
@@ -500,7 +501,7 @@ async fn responder_upgrade_disconnects_on_malformed_prelude() {
 async fn initiator_upgrade_disconnects_on_malformed_prelude() {
     let _init_guard = zebra_test::init();
 
-    let network = test_config(true).network;
+    let network = test_config(P2pStack::Dual).network;
     let config = ZakuraHandshakeConfig::for_network(&network);
     let nonces = ZakuraLegacyNonces {
         local_zebra_nonce: Nonce(0x3333_3333_3333_3333),
@@ -565,13 +566,13 @@ async fn p2p_v2_service_bit_advertisement_follows_config() {
     let _init_guard = zebra_test::init();
 
     assert!(!configured_advertised_services(
-        &test_config(false),
+        &test_config(P2pStack::Zebra),
         PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2,
     )
     .contains(PeerServices::NODE_P2P_V2));
 
     let (disabled_peer_seen_by_enabled, enabled_peer_seen_by_disabled) =
-        negotiate_test_pair(test_config(true), test_config(false)).await;
+        negotiate_test_pair(test_config(P2pStack::Dual), test_config(P2pStack::Zebra)).await;
 
     assert!(!disabled_peer_seen_by_enabled
         .remote
@@ -624,8 +625,7 @@ fn zakura_upgrade_errors_are_neutral_disconnects() {
 fn p2p_v2_upgrade_uses_main_version_services_only() {
     let _init_guard = zebra_test::init();
 
-    let mut config = test_config(true);
-    config.v2_p2p = true;
+    let config = test_config(P2pStack::Dual);
 
     let addr = peer_addr(18233);
     let inconsistent_remote = VersionMessage {
@@ -677,15 +677,15 @@ fn p2p_v2_upgrade_requires_local_enable_and_remote_service_bit() {
     };
 
     assert!(!should_attempt_zakura_upgrade(
-        &test_config(false),
+        &test_config(P2pStack::Zebra),
         &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2),
     ));
     assert!(!should_attempt_zakura_upgrade(
-        &test_config(true),
+        &test_config(P2pStack::Dual),
         &connection_info(PeerServices::NODE_NETWORK),
     ));
     assert!(should_attempt_zakura_upgrade(
-        &test_config(true),
+        &test_config(P2pStack::Dual),
         &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2),
     ));
 }
@@ -703,13 +703,13 @@ async fn remote_p2p_v2_with_local_disabled_continues_legacy() {
     let mut remote_counter = ActiveConnectionCounter::new_counter();
 
     let local_handshake = test_handshake(
-        test_config(false),
+        test_config(P2pStack::Zebra),
         address_book_tx.clone(),
         local_calls.clone(),
         upgraded_outcome(),
     );
     let remote_handshake = test_handshake(
-        test_config(true),
+        test_config(P2pStack::Dual),
         address_book_tx,
         remote_calls.clone(),
         upgraded_outcome(),
@@ -746,10 +746,12 @@ async fn mutual_p2p_v2_without_connector_fails_closed() {
     let mut local_counter = ActiveConnectionCounter::new_counter();
     let mut remote_counter = ActiveConnectionCounter::new_counter();
 
-    let local_handshake =
-        test_handshake_without_zakura_connector(test_config(true), address_book_tx.clone());
+    let local_handshake = test_handshake_without_zakura_connector(
+        test_config(P2pStack::Dual),
+        address_book_tx.clone(),
+    );
     let remote_handshake =
-        test_handshake_without_zakura_connector(test_config(true), address_book_tx);
+        test_handshake_without_zakura_connector(test_config(P2pStack::Dual), address_book_tx);
 
     let local_task = tokio::spawn(local_handshake.oneshot(HandshakeRequest {
         data_stream: local_stream,
@@ -800,13 +802,13 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
     let mut remote_counter = ActiveConnectionCounter::new_counter();
 
     let local_handshake = test_handshake(
-        test_config(true),
+        test_config(P2pStack::Dual),
         address_book_tx.clone(),
         local_calls.clone(),
         upgraded_outcome(),
     );
     let remote_handshake = test_handshake(
-        test_config(true),
+        test_config(P2pStack::Dual),
         address_book_tx,
         remote_calls.clone(),
         upgraded_outcome(),

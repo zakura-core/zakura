@@ -97,61 +97,32 @@ fn document_network_p2p_config(config: &str) -> String {
     let Some(network_start) = lines.iter().position(|line| line == "[network]") else {
         return config.to_string();
     };
-    let mut network_end = lines
+    let network_end = lines
         .iter()
         .enumerate()
         .skip(network_start + 1)
         .find_map(|(index, line)| line.starts_with('[').then_some(index))
         .unwrap_or(lines.len());
 
-    let Some(v2_p2p_index) = lines[network_start + 1..network_end]
+    let Some(p2p_stack_index) = lines[network_start + 1..network_end]
         .iter()
-        .position(|line| line.starts_with("v2_p2p = "))
-        .map(|index| index + network_start + 1)
-    else {
-        return config.to_string();
-    };
-
-    let Some(default_p2p_index) = lines[network_start + 1..network_end]
-        .iter()
-        .position(|line| line.starts_with("default_p2p = "))
-        .map(|index| index + network_start + 1)
-    else {
-        return config.to_string();
-    };
-
-    let default_p2p_line = lines[default_p2p_index].clone();
-    let v2_p2p_line = lines[v2_p2p_index].clone();
-    let mut p2p_indexes = [default_p2p_index, v2_p2p_index];
-    p2p_indexes.sort();
-
-    for index in p2p_indexes.into_iter().rev() {
-        lines.remove(index);
-        network_end -= 1;
-    }
-
-    let Some(legacy_p2p_index) = lines[network_start + 1..network_end]
-        .iter()
-        .position(|line| line.starts_with("legacy_p2p = "))
+        .position(|line| line.starts_with("p2p_stack = "))
         .map(|index| index + network_start + 1)
     else {
         return config.to_string();
     };
 
     let comments = [
-        "# P2P stack selection:",
-        "# - default_p2p = true ignores legacy_p2p and v2_p2p, using Zebra's binary defaults.",
-        "# - default_p2p = false makes legacy_p2p and v2_p2p manual overrides.",
-        "# Defaults: Mainnet legacy on/v2 off; Testnet and Regtest legacy on/v2 on.",
+        "# The peer-to-peer stack to run:",
+        "# - \"zebra\" (aka \"v1\", \"legacy\"): the legacy TCP Zcash P2P stack only.",
+        "# - \"zakura\" (aka \"v2\"): the native Zakura P2P v2 stack only.",
+        "# - \"dual\" (aka \"combined\"): both stacks, with legacy fallback.",
+        "# - \"default\": Zebra's default for this network, which can change between",
+        "#   releases. Currently \"zebra\" on Mainnet, and \"dual\" everywhere else.",
     ]
     .map(ToString::to_string);
-    let comments_len = comments.len();
 
-    lines.splice(legacy_p2p_index..legacy_p2p_index, comments);
-    let default_p2p_insert_index = legacy_p2p_index + comments_len;
-    lines.insert(default_p2p_insert_index, default_p2p_line);
-    let v2_p2p_insert_index = default_p2p_insert_index + 1;
-    lines.insert(v2_p2p_insert_index, v2_p2p_line);
+    lines.splice(p2p_stack_index..p2p_stack_index, comments);
 
     let mut output = lines.join("\n");
     if had_trailing_newline {

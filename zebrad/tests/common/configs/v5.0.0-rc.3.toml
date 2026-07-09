@@ -75,16 +75,16 @@ initial_testnet_peers = [
     "dnsseed.testnet.z.cash:18233",
     "testnet.seeder.zfnd.org:18233",
 ]
-# P2P stack selection:
-# - default_p2p = true ignores legacy_p2p and v2_p2p, using Zebra's binary defaults.
-# - default_p2p = false makes legacy_p2p and v2_p2p manual overrides.
-# Defaults: Mainnet legacy on/v2 off; Testnet and Regtest legacy on/v2 on.
-default_p2p = true
-v2_p2p = false
-legacy_p2p = true
 listen_addr = "[::]:8233"
 max_connections_per_ip = 1
 network = "Mainnet"
+# The peer-to-peer stack to run:
+# - "zebra" (aka "v1", "legacy"): the legacy TCP Zcash P2P stack only.
+# - "zakura" (aka "v2"): the native Zakura P2P v2 stack only.
+# - "dual" (aka "combined"): both stacks, with legacy fallback.
+# - "default": Zebra's default for this network, which can change between
+#   releases. Currently "zebra" on Mainnet, and "dual" everywhere else.
+p2p_stack = "default"
 peerset_initial_target_size = 100
 
 [network.zakura]

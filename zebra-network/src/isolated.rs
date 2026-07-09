@@ -11,7 +11,7 @@ use zebra_chain::{chain_tip::NoChainTip, parameters::Network};
 use crate::{
     peer::{self, Client, ConnectedAddr, HandshakeRequest},
     peer_set::ActiveConnectionCounter,
-    BoxError, Config, PeerSocketAddr, Request, Response,
+    BoxError, Config, P2pStack, PeerSocketAddr, Request, Response,
 };
 
 // Wait until `arti-client`'s dependency `x25519-dalek v1.2.0` is updated to a higher version. (#5492)
@@ -86,8 +86,9 @@ where
 {
     let config = Config {
         network: network.clone(),
-        default_p2p: false,
-        v2_p2p: false,
+        // Isolated connections are legacy-only: they must not advertise the Zakura P2P v2
+        // service bit, or attempt an upgrade that would deanonymise the caller.
+        p2p_stack: P2pStack::Zebra,
         ..Config::default()
     };
 

@@ -186,12 +186,10 @@ when Zakura listens on an unspecified address. Set
 `zcashd_compat.p2p_connect_addr` when zcashd must reach Zakura through a
 different address (for example across containers).
 
-zcashd-compat mode requires `network.legacy_p2p = true` (the default):
-zcashd speaks the legacy Zcash P2P protocol, and startup fails if the legacy
-listener is disabled. This is independent of Zakura's native P2P endpoint
-(`network.v2_p2p`), which can stay enabled alongside it. Do not enable state
-pruning on the fronting Zakura — a pruned node does not advertise
-`NODE_NETWORK` and zcashd will not sync from it.
+zcashd-compat mode requires the legacy Zcash P2P stack, because zcashd speaks the
+legacy Zcash P2P protocol. Every `network.p2p_stack` value runs it except
+`"zakura"`. Do not enable state pruning on the fronting Zakura — a pruned node does
+not advertise `NODE_NETWORK` and zcashd will not sync from it.
 
 > [!WARNING]
 > When the fronting Zakura runs in Docker with a published P2P port, all

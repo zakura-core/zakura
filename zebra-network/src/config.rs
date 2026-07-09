@@ -101,6 +101,64 @@ pub enum ZakuraSecretKeyError {
 /// or failed DNS attempt.
 const MAX_SINGLE_SEED_PEER_DNS_RETRIES: usize = 0;
 
+/// The peer-to-peer stack Zebra runs, selected by `network.p2p_stack` in `zebrad.toml`.
+///
+/// Each stack has one canonical name and, for readability, some aliases. Only the canonical
+/// name is written back out when a config is serialized.
+///
+/// [`P2pStack::Default`] is a placeholder for the configured network's binary default; it is
+/// turned into one of the three real stacks by [`P2pStack::resolve`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum P2pStack {
+    /// Follow the configured network's binary default, which can change between releases.
+    #[default]
+    Default,
+
+    /// The legacy TCP Zcash P2P stack only.
+    #[serde(alias = "v1", alias = "legacy")]
+    Zebra,
+
+    /// The native Zakura P2P v2 stack only.
+    #[serde(alias = "v2")]
+    Zakura,
+
+    /// Both stacks: mutually capable peers are upgraded to Zakura P2P v2, and the legacy
+    /// stack stays available for peers that can't upgrade.
+    #[serde(alias = "combined")]
+    Dual,
+}
+
+impl P2pStack {
+    /// Resolves [`P2pStack::Default`] to the binary default for `network`, and returns every
+    /// other stack unchanged.
+    ///
+    /// Mainnet defaults to [`P2pStack::Zebra`] until Zakura P2P v2 is proven there. Every other
+    /// network defaults to [`P2pStack::Dual`], so Zakura P2P v2 gets exercised while legacy
+    /// peers stay reachable.
+    pub fn resolve(self, network: &Network) -> P2pStack {
+        match self {
+            P2pStack::Default if matches!(network, Network::Mainnet) => P2pStack::Zebra,
+            P2pStack::Default => P2pStack::Dual,
+            resolved => resolved,
+        }
+    }
+
+    /// Returns `true` if this stack runs the legacy TCP Zcash P2P listener, dialer, and crawler.
+    ///
+    /// [`P2pStack::Default`] runs neither stack: resolve it with [`P2pStack::resolve`] first.
+    fn runs_legacy(self) -> bool {
+        matches!(self, P2pStack::Zebra | P2pStack::Dual)
+    }
+
+    /// Returns `true` if this stack runs the native Zakura P2P v2 endpoint.
+    ///
+    /// [`P2pStack::Default`] runs neither stack: resolve it with [`P2pStack::resolve`] first.
+    fn runs_zakura(self) -> bool {
+        matches!(self, P2pStack::Zakura | P2pStack::Dual)
+    }
+}
+
 /// Configuration for networking code.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, default, into = "DConfig")]
@@ -222,46 +280,25 @@ pub struct Config {
     /// This value is not used by the legacy TCP peer set.
     pub zakura_node_secret_key: Option<ZakuraNodeSecretKey>,
 
-    /// Follow Zebra's default P2P stack selection for the configured network.
+    /// The peer-to-peer stack Zebra runs.
     ///
-    /// This is enabled by default so Zebra can change network defaults during upgrades. When this
-    /// is `true`, Zebra ignores [`legacy_p2p`](Self::legacy_p2p) and
-    /// [`v2_p2p`](Self::v2_p2p) in `zebrad.toml`, and uses the selected network's binary defaults
-    /// instead.
+    /// | `zebrad.toml` value | Aliases | Stack |
+    /// |---|---|---|
+    /// | `"default"` | | The configured network's binary default |
+    /// | `"zebra"` | `"v1"`, `"legacy"` | The legacy TCP Zcash P2P stack only |
+    /// | `"zakura"` | `"v2"` | The native Zakura P2P v2 stack only |
+    /// | `"dual"` | `"combined"` | Both stacks, with legacy fallback |
     ///
-    /// The current defaults are: legacy P2P on for Mainnet, Testnet, and Regtest; Zakura P2P v2
-    /// off on Mainnet; and Zakura P2P v2 on for Testnet and Regtest.
-    ///
-    /// Set `default_p2p = false` only when you want [`legacy_p2p`](Self::legacy_p2p) and
-    /// [`v2_p2p`](Self::v2_p2p) to be fixed manual overrides.
-    pub default_p2p: bool,
-
-    /// Enable the experimental Zakura P2P v2 endpoint, capability advertisement, and upgrade hook.
-    ///
-    /// When enabled, Zebra starts a native Zakura endpoint, advertises the P2P v2 service bit during
-    /// the legacy Zcash handshake, and routes mutually capable peers to the Zakura upgrade hook
-    /// before constructing a legacy peer connection if [`legacy_p2p`](Self::legacy_p2p) is also
-    /// enabled.
-    ///
-    /// In `zebrad.toml`, this setting is used only when [`default_p2p`](Self::default_p2p) is
-    /// `false`.
-    ///
-    /// Until the Zakura supervisor and endpoint connector support legacy upgrades, mutually
-    /// capable peers continue on the legacy Zebra path after a temporary Zakura upgrade rejection.
-    pub v2_p2p: bool,
-
-    /// Enable the legacy TCP Zcash P2P listener, initial peer dialing, and peer crawler.
-    ///
-    /// In `zebrad.toml`, this setting is used only when [`default_p2p`](Self::default_p2p) is
-    /// `false`. Disable it to run only the native Zakura P2P v2 endpoint when
-    /// [`v2_p2p`](Self::v2_p2p) is enabled.
-    pub legacy_p2p: bool,
+    /// Leave this at `"default"` so Zebra can change the per-network default during upgrades.
+    /// See [`P2pStack::resolve`] for the current defaults, and [`legacy_p2p`](Self::legacy_p2p)
+    /// and [`v2_p2p`](Self::v2_p2p) for the resolved stack.
+    pub p2p_stack: P2pStack,
 
     /// Native Zakura endpoint, connection, and bootstrap settings.
     ///
-    /// When `v2_p2p` is false, these settings are parsed but no iroh endpoint is started. The total
-    /// intended connection budget is roughly `peerset_initial_target_size + zakura.max_connections`;
-    /// tune both together.
+    /// When [`v2_p2p`](Self::v2_p2p) is false, these settings are parsed but no iroh endpoint is
+    /// started. The total intended connection budget is roughly
+    /// `peerset_initial_target_size + zakura.max_connections`; tune both together.
     pub zakura: ZakuraConfig,
 
     /// The initial target size for the peer set.
@@ -685,20 +722,39 @@ impl Config {
         Ok(load_or_generate_zakura_secret_key(&key_file))
     }
 
-    /// Builds a network config for tests with the P2P stack pinned as an explicit
-    /// override (`default_p2p = false`), so [`v2_p2p`](Self::v2_p2p) and
-    /// [`legacy_p2p`](Self::legacy_p2p) are used verbatim instead of being
-    /// re-derived from the network's binary defaults.
+    /// Returns `true` if Zebra should run the legacy TCP Zcash P2P listener, initial peer
+    /// dialing, and peer crawler on the configured network.
+    pub fn legacy_p2p(&self) -> bool {
+        self.p2p_stack.resolve(&self.network).runs_legacy()
+    }
+
+    /// Returns `true` if Zebra should run the native Zakura P2P v2 endpoint on the configured
+    /// network, advertise the P2P v2 service bit during the legacy Zcash handshake, and route
+    /// mutually capable peers to the Zakura upgrade hook.
+    pub fn v2_p2p(&self) -> bool {
+        self.p2p_stack.resolve(&self.network).runs_zakura()
+    }
+
+    /// Builds a network config for tests with [`p2p_stack`](Self::p2p_stack) pinned to
+    /// `p2p_stack`, so the stack is never re-derived from the network's binary defaults.
     ///
-    /// The legacy stack is enabled and `v2_p2p` is set to the argument. Override
-    /// other fields with struct-update syntax, e.g.
-    /// `Config { network, ..Config::for_test(true) }`.
+    /// Override other fields with struct-update syntax, e.g.
+    /// `Config { network, ..Config::for_test(P2pStack::Dual) }`.
+    ///
+    /// # Panics
+    ///
+    /// If `p2p_stack` is [`P2pStack::Default`]: a test that doesn't pin its stack silently
+    /// changes behaviour when the per-network defaults change.
     #[cfg(any(test, feature = "proptest-impl"))]
-    pub fn for_test(v2_p2p: bool) -> Config {
+    pub fn for_test(p2p_stack: P2pStack) -> Config {
+        assert_ne!(
+            p2p_stack,
+            P2pStack::Default,
+            "tests must pin an explicit P2P stack",
+        );
+
         Config {
-            default_p2p: false,
-            v2_p2p,
-            legacy_p2p: true,
+            p2p_stack,
             ..Config::default()
         }
     }
@@ -806,9 +862,7 @@ impl Default for Config {
             cache_dir: CacheDir::default(),
             identity_dir: default_network_identity_dir(),
             zakura_node_secret_key: None,
-            default_p2p: true,
-            v2_p2p: default_v2_p2p_for_network(&Network::Mainnet),
-            legacy_p2p: true,
+            p2p_stack: P2pStack::Default,
             zakura: ZakuraConfig::default(),
             crawl_new_peer_interval: DEFAULT_CRAWL_NEW_PEER_INTERVAL,
 
@@ -825,78 +879,42 @@ impl Default for Config {
     }
 }
 
-fn default_v2_p2p_for_network(network: &Network) -> bool {
-    !matches!(network, Network::Mainnet)
-}
+/// Maps the deprecated `legacy_p2p` and `v2_p2p` booleans onto a [`P2pStack`], so configs
+/// written for older releases keep loading under `deny_unknown_fields`.
+///
+/// Setting `p2p_stack` alongside either deprecated field is rejected rather than resolved by
+/// precedence: the two spellings can disagree, and silently picking a winner would start a
+/// stack the operator didn't ask for.
+///
+/// A deprecated field that is absent falls back to the default it had in the releases that
+/// understood these fields, which is `true` for both.
+fn p2p_stack_from_config<'de, D>(
+    p2p_stack: Option<P2pStack>,
+    legacy_p2p: Option<bool>,
+    v2_p2p: Option<bool>,
+) -> Result<P2pStack, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match (p2p_stack, legacy_p2p, v2_p2p) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(de::Error::custom(
+            "network.p2p_stack can't be combined with the deprecated network.legacy_p2p or \
+             network.v2_p2p settings; use network.p2p_stack on its own",
+        )),
 
-fn default_p2p_for_network(network: &Network) -> (bool, bool) {
-    let legacy_p2p = true;
-    let v2_p2p = default_v2_p2p_for_network(network);
+        (Some(p2p_stack), None, None) => Ok(p2p_stack),
 
-    (legacy_p2p, v2_p2p)
-}
+        (None, None, None) => Ok(P2pStack::Default),
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum V2P2pPreference {
-    #[default]
-    Default,
-    Explicit(bool),
-}
-
-impl V2P2pPreference {
-    fn resolve(self, network: &Network) -> bool {
-        match self {
-            V2P2pPreference::Default => default_v2_p2p_for_network(network),
-            V2P2pPreference::Explicit(v2_p2p) => v2_p2p,
-        }
-    }
-}
-
-impl Serialize for V2P2pPreference {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            V2P2pPreference::Default => serializer.serialize_str("default"),
-            V2P2pPreference::Explicit(v2_p2p) => serializer.serialize_bool(*v2_p2p),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for V2P2pPreference {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct V2P2pPreferenceVisitor;
-
-        impl de::Visitor<'_> for V2P2pPreferenceVisitor {
-            type Value = V2P2pPreference;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("true, false, or \"default\"")
-            }
-
-            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(V2P2pPreference::Explicit(value))
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                match value {
-                    "default" => Ok(V2P2pPreference::Default),
-                    _ => Err(E::invalid_value(de::Unexpected::Str(value), &self)),
-                }
-            }
-        }
-
-        deserializer.deserialize_any(V2P2pPreferenceVisitor)
+        (None, legacy_p2p, v2_p2p) => match (legacy_p2p.unwrap_or(true), v2_p2p.unwrap_or(true)) {
+            (true, true) => Ok(P2pStack::Dual),
+            (true, false) => Ok(P2pStack::Zebra),
+            (false, true) => Ok(P2pStack::Zakura),
+            (false, false) => Err(de::Error::custom(
+                "network.legacy_p2p and network.v2_p2p are both false, which disables all \
+                 peer-to-peer networking; set network.p2p_stack instead",
+            )),
+        },
     }
 }
 
@@ -964,10 +982,15 @@ struct DConfig {
     identity_dir: PathBuf,
     #[serde(default, skip_serializing)]
     zakura_node_secret_key: Option<ZakuraNodeSecretKey>,
-    default_p2p: bool,
-    #[serde(default, alias = "enable_p2p_v2")]
-    v2_p2p: V2P2pPreference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    p2p_stack: Option<P2pStack>,
+    /// Deprecated, superseded by `p2p_stack`. Accepted so configs written for older releases
+    /// keep loading, and never written back out.
+    #[serde(default, skip_serializing)]
     legacy_p2p: Option<bool>,
+    /// Deprecated, superseded by `p2p_stack`. See `legacy_p2p`.
+    #[serde(default, alias = "enable_p2p_v2", skip_serializing)]
+    v2_p2p: Option<bool>,
     zakura: ZakuraConfig,
     peerset_initial_target_size: usize,
     #[serde(alias = "new_peer_interval", with = "humantime_serde")]
@@ -988,9 +1011,9 @@ impl Default for DConfig {
             cache_dir: config.cache_dir,
             identity_dir: config.identity_dir,
             zakura_node_secret_key: config.zakura_node_secret_key,
-            default_p2p: true,
-            v2_p2p: V2P2pPreference::Explicit(config.v2_p2p),
+            p2p_stack: Some(config.p2p_stack),
             legacy_p2p: None,
+            v2_p2p: None,
             zakura: config.zakura,
             peerset_initial_target_size: config.peerset_initial_target_size,
             crawl_new_peer_interval: config.crawl_new_peer_interval,
@@ -1049,9 +1072,7 @@ impl From<Config> for DConfig {
             cache_dir,
             identity_dir,
             zakura_node_secret_key,
-            default_p2p,
-            v2_p2p,
-            legacy_p2p,
+            p2p_stack,
             zakura,
             peerset_initial_target_size,
             crawl_new_peer_interval,
@@ -1078,7 +1099,6 @@ impl From<Config> for DConfig {
 
             other_kind => DNetwork::DefaultForKind(other_kind),
         };
-        let v2_p2p = V2P2pPreference::Explicit(v2_p2p);
 
         DConfig {
             listen_addr: listen_addr.to_string(),
@@ -1090,9 +1110,9 @@ impl From<Config> for DConfig {
             cache_dir,
             identity_dir,
             zakura_node_secret_key,
-            default_p2p,
-            v2_p2p,
-            legacy_p2p: Some(legacy_p2p),
+            p2p_stack: Some(p2p_stack),
+            legacy_p2p: None,
+            v2_p2p: None,
             zakura,
             peerset_initial_target_size,
             crawl_new_peer_interval,
@@ -1116,14 +1136,16 @@ impl<'de> Deserialize<'de> for Config {
             cache_dir,
             identity_dir,
             zakura_node_secret_key,
-            default_p2p,
-            v2_p2p,
+            p2p_stack,
             legacy_p2p,
+            v2_p2p,
             zakura,
             peerset_initial_target_size,
             crawl_new_peer_interval,
             max_connections_per_ip,
         } = DConfig::deserialize(deserializer)?;
+
+        let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
 
         let network = match (dnetwork, testnet_parameters) {
             (DNetwork::ConfiguredTestnet(params), _) => {
@@ -1145,12 +1167,6 @@ impl<'de> Deserialize<'de> for Config {
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
                 Network::new_regtest(Default::default())
             }
-        };
-
-        let (legacy_p2p, v2_p2p) = if default_p2p {
-            default_p2p_for_network(&network)
-        } else {
-            (legacy_p2p.unwrap_or(true), v2_p2p.resolve(&network))
         };
 
         let listen_addr = match listen_addr.parse::<SocketAddr>().or_else(|_| format!("{listen_addr}:{}", network.default_port()).parse()) {
@@ -1245,9 +1261,7 @@ impl<'de> Deserialize<'de> for Config {
             cache_dir,
             identity_dir,
             zakura_node_secret_key,
-            default_p2p,
-            v2_p2p,
-            legacy_p2p,
+            p2p_stack,
             zakura,
             peerset_initial_target_size,
             crawl_new_peer_interval,

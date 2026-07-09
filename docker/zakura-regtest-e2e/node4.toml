@@ -9,8 +9,7 @@
 [network]
 network = "Regtest"
 listen_addr = "127.0.0.1:18533"
-v2_p2p = true
-legacy_p2p = true
+p2p_stack = "dual"
 cache_dir = false
 initial_testnet_peers = ["127.0.0.1:18233"]
 # Host networking puts every node on 127.0.0.1; raise the per-IP cap above 1.

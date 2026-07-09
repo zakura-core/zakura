@@ -21,11 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
-- Added `network.default_p2p = true`, which follows Zebra's binary P2P defaults
-  during upgrades and ignores `network.legacy_p2p` and `network.v2_p2p`: legacy
-  P2P is on for Mainnet, Testnet, and Regtest; Zakura P2P v2 is off on Mainnet
-  and on for Testnet and Regtest. Set `network.default_p2p = false` only when
-  both stack flags should be fixed manual overrides.
+- Replaced the `network.legacy_p2p` and `network.v2_p2p` booleans with a single
+  `network.p2p_stack` setting, which selects `"zebra"` (aliases `"v1"`,
+  `"legacy"`) for the legacy TCP Zcash P2P stack, `"zakura"` (alias `"v2"`) for
+  the native Zakura P2P v2 stack, or `"dual"` (alias `"combined"`) for both.
+  It defaults to `"default"`, which follows Zebra's binary default for the
+  configured network so it can change during upgrades: currently `"zebra"` on
+  Mainnet, and `"dual"` on Testnet and Regtest.
+  The old booleans are deprecated but still parsed, so existing configs keep
+  working. Setting them alongside `network.p2p_stack` is an error, and setting
+  both to `false` — which used to start a node with no peer-to-peer networking
+  at all — is now rejected.
 - Verified-commitment-trees fast sync is now enabled by default when checkpoint
   sync is enabled. Operators can keep checkpoint sync but opt out of the new
   path by setting `consensus.vct_fast_sync = false`.

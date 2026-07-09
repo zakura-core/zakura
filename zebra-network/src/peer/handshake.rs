@@ -598,7 +598,7 @@ where
 fn configured_advertised_services(config: &Config, mut services: PeerServices) -> PeerServices {
     services.remove(PeerServices::NODE_P2P_V2);
 
-    if config.v2_p2p {
+    if config.v2_p2p() {
         services |= PeerServices::NODE_P2P_V2;
     }
 
@@ -607,7 +607,7 @@ fn configured_advertised_services(config: &Config, mut services: PeerServices) -
 
 /// Return the user-agent Zebra should advertise for this handshake.
 fn configured_user_agent(config: &Config, user_agent: String) -> String {
-    if !config.v2_p2p {
+    if !config.v2_p2p() {
         return user_agent;
     }
 
@@ -623,7 +623,7 @@ fn configured_user_agent(config: &Config, user_agent: String) -> String {
 
 /// Returns true when the legacy handshake should try to route this peer to Zakura P2P v2.
 fn should_attempt_zakura_upgrade(config: &Config, connection_info: &ConnectionInfo) -> bool {
-    config.v2_p2p
+    config.v2_p2p()
         && connection_info
             .remote
             .services

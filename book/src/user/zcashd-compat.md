@@ -1,15 +1,15 @@
-# zcashd-compat Mode (`zebrad start --zcashd-compat`)
+# zcashd-compat Mode (`zakurad start --zcashd-compat`)
 
 zcashd-compat mode is for operators — typically exchanges and custodial
-services — that want to migrate to Zebra while keeping the `zcashd` wallet and
-RPC surface their integration already depends on. Zebra faces the Zcash P2P
+services — that want to migrate to Zakura while keeping the `zcashd` wallet and
+RPC surface their integration already depends on. Zakura faces the Zcash P2P
 network and is the consensus node; `zcashd` runs as a **P2P sidecar** that
-makes a single outbound peer connection to the local Zebra node and listens
+makes a single outbound peer connection to the local Zakura node and listens
 for nothing. zcashd never touches the public network directly.
 
 Your systems keep talking to `zcashd` exactly as before:
 
-| Provided by `zcashd`, unchanged          | Moved to Zebra                              |
+| Provided by `zcashd`, unchanged          | Moved to Zakura                             |
 |------------------------------------------|---------------------------------------------|
 | Wallet behavior and wallet RPC methods   | Public P2P networking and peer selection    |
 | Local block files, chainstate, indexes   | Network-facing block and transaction relay  |
@@ -17,57 +17,100 @@ Your systems keep talking to `zcashd` exactly as before:
 | Local RPC response semantics             | DNS seeding and peer discovery              |
 
 ```text
-Zcash network ═P2P (8233)═▶ zebrad ◀═P2P, internal only═ zcashd ◀─wallet RPC, ZMQ─ your systems
-                            (front)   connect=zebra:8233   (sidecar)
+Zcash network ═P2P (8233)═▶ zakurad ◀═P2P, internal only═ zcashd ◀─wallet RPC, ZMQ─ your systems
+                            (front)   connect=zakura:8233  (sidecar)
 ```
 
 The whole topology is two lines of zcashd configuration:
 
 ```text
-connect=<zebra-host>:8233   # one outbound peer: Zebra
+connect=<zakura-host>:8233  # one outbound peer: Zakura
 listen=0                    # no inbound P2P
 ```
 
 `-connect` makes zcashd peer with the given address and _only_ that address:
 zcashd itself then disables DNS seeding, inbound listening, and peer
 discovery. zcashd syncs blocks and relays transactions over the standard
-Zcash P2P protocol, with Zebra as its entire network.
+Zcash P2P protocol, with Zakura as its entire network.
 
 There are two ways to run the pair:
 
 - **Externally managed (default):** you run `zcashd` yourself with
-  `connect=`/`listen=0` pointed at Zebra's P2P listener.
-- **Supervised:** Zebra spawns and manages `zcashd` itself when
+  `connect=`/`listen=0` pointed at Zakura's legacy P2P listener.
+- **Supervised:** Zakura spawns and manages `zcashd` itself when
   `[zcashd_compat].manage_zcashd = true`, passing the peer-pinning arguments
   automatically.
+
+## Quick start: the installer
+
+The recommended way to set up either variant is the interactive installer:
+
+```console
+curl -fsSL https://github.com/valargroup/zebra/releases/latest/download/install-zakura.sh | bash
+```
+
+Choose **2) With Zcashd compatibility** at the first prompt, then one of the
+zcashd-compat modes:
+
+| Mode                      | What it does                                                             |
+|---------------------------|--------------------------------------------------------------------------|
+| `split-binary` (default)  | Downloads `zakurad` and the sidecar `zcashd`; prints two start commands  |
+| `supervised`              | Downloads `zakurad`; Zakura downloads hash-pinned `zcashd` at startup and supervises it |
+| `docker-split-containers` | Pulls the Zakura and zcashd images; prints two `docker run` commands     |
+| `docker-supervised`       | Pulls the compat image; prints one supervised `docker run` command       |
+| `build-from-source`       | Validates source trees and toolchains; prints build and start commands   |
+
+The installer:
+
+1. runs the same hardware preflight as `zakurad` itself (see
+   [Hardware preflight](#hardware-preflight-linux)); `--unsafe-low-specs`
+   downgrades failures to warnings for test rigs;
+2. detects existing Zakura state directories and zcashd datadirs on mounted
+   filesystems and offers them as defaults, so a migration continues from
+   your synced data;
+3. downloads SHA256-pinned release binaries (or pulls pinned Docker images);
+4. bootstraps a minimal `zcash.conf` (including the zcashd deprecation
+   acknowledgement) if none exists;
+5. prints ready-to-copy start commands for the mode you chose.
+
+Every prompt has a matching flag for unattended runs, e.g.:
+
+```console
+install-zakura.sh --install-profile zcashd-compat --mode supervised \
+  --network Mainnet --zcashd-datadir /var/lib/zcashd --non-interactive
+```
+
+See `install-zakura.sh --help` for the full list, including `--dry-run`.
 
 ## The sidecar zcashd build
 
 Use the sidecar `zcashd` build from
 [valargroup/zcashd](https://github.com/valargroup/zcashd) (branch
-`feat/p2p-sidecar`). It differs from stock `zcash/zcash` in three ways:
+`feat/p2p-sidecar`; releases are tagged like `v0.0.1-compat-alpha.3`). The
+installer and Zakura's embedded download both pin its release archives by
+SHA256. It differs from stock `zcash/zcash` in three ways:
 
 1. **Miner RPCs are removed.** `getblocktemplate`, `submitblock`,
    `getgenerate`, `setgenerate`, and `generate` are not registered and return
-   JSON-RPC `Method not found` (-32601). Zebra is the canonical source of
-   block templates (see [Mining](#mining-zebra-is-canonical)). Read-only
+   JSON-RPC `Method not found` (-32601). Zakura is the canonical source of
+   block templates (see [Mining](#mining-zakura-is-canonical)). Read-only
    mining info RPCs (`getmininginfo`, `getnetworksolps`, `getblocksubsidy`,
    `prioritisetransaction`) remain.
 2. **The upstream end-of-support halt is disabled.** Stock zcashd shuts
    itself down at its deprecation height; the sidecar build logs a warning
    and keeps serving its wallet/RPC surface. Consensus safety comes from
-   Zebra, which fully validates every block before relaying it to zcashd.
+   Zakura, which fully validates every block before relaying it to zcashd.
 3. **`-regtestacceptunvalidatedpow` (regtest only)** lets zcashd follow a
-   Zebra regtest chain, whose mined blocks carry null Equihash solutions.
+   Zakura regtest chain, whose mined blocks carry null Equihash solutions.
    It is rejected on any other network.
 
 Everything else — wallet, chainstate format, RPC semantics, ZMQ — is stock
 zcashd.
 
-## Quick start (supervised)
+## Running supervised
 
 ```console
-zebrad start --zcashd-compat
+zakurad start --zcashd-compat
 ```
 
 with a config like:
@@ -76,60 +119,72 @@ with a config like:
 [zcashd_compat]
 enabled = true
 manage_zcashd = true
-zcashd_source = "path"
-zcashd_path = "/usr/local/bin/zcashd"
+zcashd_source = "embedded"
 zcashd_datadir = "/var/lib/zcashd"
 zcashd_extra_args = ["-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1"]
 ```
 
-On start, Zebra:
+(`zcashd_source = "embedded"` downloads the SHA256-pinned sidecar build from
+Zakura's embedded release manifest; use `zcashd_source = "path"` plus
+`zcashd_path` to run a binary you provide.)
+
+On start, Zakura:
 
 1. runs Linux hardware and filesystem preflight checks (see
    [Hardware preflight](#hardware-preflight-linux); `--unsafe-low-specs`
    skips the minimums for test rigs);
-2. bootstraps the zcashd datadir and a minimal `zcash.conf` (including the
+2. resolves the zcashd binary (embedded download or local path) and
+   bootstraps the zcashd datadir and a minimal `zcash.conf` (including the
    zcashd deprecation acknowledgement) if none exists;
-3. spawns `zcashd` pinned to Zebra's own P2P listener:
+3. spawns `zcashd` pinned to Zakura's own legacy P2P listener:
 
    ```text
-   zcashd -datadir=... -printtoconsole <your extra args> \
-          -connect=<zebra p2p addr> -listen=0 -dnsseed=0 -listenonion=0 -discover=0
+   zcashd -datadir=... [-testnet | -regtest -regtestacceptunvalidatedpow] \
+          -printtoconsole <your extra args> \
+          -connect=<zakura p2p addr> -listen=0 -dnsseed=0 -listenonion=0 -discover=0
    ```
+
+   The network-selection flags follow Zakura's own configured network, and
+   `-printtoconsole` is always included so zcashd's output lands in Zakura's
+   logs.
 
 4. supervises it: restarts on unexpected exit with capped exponential
    backoff, and shuts it down gracefully (SIGTERM, then a configurable grace
-   period) when Zebra stops.
+   period) when Zakura stops.
 
 The forced peer-pinning arguments are placed _after_ `zcashd_extra_args`
 because zcashd takes the last occurrence of a single-valued command-line
 argument. Peer-selection options (`-connect`, `-addnode`, `-seednode`) in
-`zcashd_extra_args` are rejected at startup: the sidecar must peer with Zebra
-alone.
+`zcashd_extra_args` are rejected at startup: the sidecar must peer with
+Zakura alone.
 
-By default the supervisor derives the `-connect` address from Zebra's own
+By default the supervisor derives the `-connect` address from Zakura's own
 bound legacy P2P listener (`network.listen_addr`), substituting `127.0.0.1`
-when Zebra listens on an unspecified address. Set
-`zcashd_compat.p2p_connect_addr` when zcashd must reach Zebra through a
+when Zakura listens on an unspecified address. Set
+`zcashd_compat.p2p_connect_addr` when zcashd must reach Zakura through a
 different address (for example across containers).
 
 zcashd-compat mode requires `network.legacy_p2p = true` (the default):
-zcashd speaks the legacy Zcash P2P protocol. Do not enable state pruning on
-the fronting Zebra — a pruned node does not advertise `NODE_NETWORK` and
-zcashd will not sync from it.
+zcashd speaks the legacy Zcash P2P protocol, and startup fails if the legacy
+listener is disabled. This is independent of Zakura's native P2P endpoint
+(`network.v2_p2p`), which can stay enabled alongside it. Do not enable state
+pruning on the fronting Zakura — a pruned node does not advertise
+`NODE_NETWORK` and zcashd will not sync from it.
 
 > [!WARNING]
-> When the fronting Zebra runs in Docker with a published P2P port, all
+> When the fronting Zakura runs in Docker with a published P2P port, all
 > connections arriving through `docker-proxy` (including a sidecar zcashd
-> connecting to `127.0.0.1:8233` on the host) share one source IP. Zebra's
+> connecting to `127.0.0.1:8233` on the host) share one source IP. Zakura's
 > `network.max_connections_per_ip` defaults to **1**, so the sidecar can lose
 > that single slot to a proxied public peer and silently never connect. Set
-> `ZEBRA_NETWORK__MAX_CONNECTIONS_PER_IP=8` (or similar) on a Dockerised
-> front, or attach the sidecar to the container network directly.
+> `ZAKURA_NETWORK__MAX_CONNECTIONS_PER_IP=8` (or similar) on a Dockerised
+> front — the installer's Docker modes do this for you — or attach the
+> sidecar to the container network directly.
 
-## Quick start (externally managed)
+## Running externally managed
 
-Run Zebra normally (with `zcashd_compat.enabled = true` if you want preflight
-checks), then run zcashd yourself:
+Run Zakura normally (with `zcashd_compat.enabled = true` if you want
+preflight checks and the RPC guardrails), then run zcashd yourself:
 
 ```console
 zcashd -datadir=/var/lib/zcashd \
@@ -146,24 +201,26 @@ i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
 ```
 
 `make compat-zcashd-start-standalone` (see `make/zcashd-compat.mk`) wraps
-this command.
+this command, and `make compat-zakurad-start-unsupervised` starts the
+matching front node.
 
 ### Verify the integration
 
-Confirm zcashd is talking only to Zebra and exposes no P2P or mining surface:
+Confirm zcashd is talking only to Zakura and exposes no P2P or mining
+surface:
 
 ```console
 $ zcash-cli getpeerinfo
-# -> exactly ONE peer: the Zebra node ("subver": "/Zebra:.../", "inbound": false)
+# -> exactly ONE peer: the Zakura node ("subver": "/Zakura:.../", "inbound": false)
 
 $ zcash-cli getconnectioncount
 1
 
 $ zcash-cli getblocktemplate
-error code: -32601  # Method not found: miners must use Zebra
+error code: -32601  # Method not found: miners must use Zakura
 
 $ ss -tlnp | grep 8233
-# -> only zebrad listening; zcashd has no P2P listener
+# -> only zakurad listening; zcashd has no P2P listener
 ```
 
 Then confirm the tips converge: heights track each other and
@@ -176,10 +233,10 @@ the process/peer-pinning/height-drift checks, and the deploy watchdog's
 The shield (single peer, no listener, no miner RPCs) is in effect immediately
 on startup; you do not need a fully synced chain to verify it.
 
-## Mining: Zebra is canonical
+## Mining: Zakura is canonical
 
-Miners and pools must request block templates from **Zebra's** RPC, not
-zcashd's. Enable Zebra's RPC listener and set a miner address:
+Miners and pools must request block templates from **Zakura's** RPC, not
+zcashd's. Enable Zakura's RPC listener and set a miner address:
 
 ```toml
 [rpc]
@@ -189,21 +246,24 @@ listen_addr = "127.0.0.1:8232"
 miner_address = "t1YourTransparentOrShieldedAddress"
 ```
 
-Zebra's `getblocktemplate` and `submitblock` are always compiled in; no
-special build is needed. See [Mining Zcash with
-Zebra](https://zebra.zfnd.org/user/mining.html) for details. The sidecar
+Zakura's `getblocktemplate` and `submitblock` are always compiled in; no
+special build is needed. See [Mining](mining.md) for details. The sidecar
 zcashd returns `Method not found` for all template and submission RPCs, so a
 misconfigured miner fails loudly instead of building on a lagging view.
 
 ## Initial sync and existing datadirs
 
-The sidecar syncs the whole chain through its single Zebra peer. That works,
+The sidecar syncs the whole chain through its single Zakura peer. That works,
 but initial block download through one peer is slow — for production
 migrations, **bring your existing synced zcashd datadir** and let the sidecar
 continue from its current height. The chainstate and block files are the
-stock zcashd format; no conversion is needed.
+stock zcashd format; no conversion is needed. The installer searches mounted
+filesystems for existing Zakura state directories and zcashd datadirs and
+offers them as defaults; snapshots for both nodes are available from the
+locations it prints (currently <https://zcashd.valargroup.dev/> and
+<https://zakura.com/snapshots>).
 
-zcashd still performs its own full validation of every block Zebra relays —
+zcashd still performs its own full validation of every block Zakura relays —
 the sidecar removes zcashd's _network exposure_, not its consensus checks.
 
 ## Configuration reference
@@ -216,9 +276,11 @@ enabled = true
 # Spawn and supervise zcashd (true) or run it yourself (false, default).
 manage_zcashd = true
 
-# "path" (use zcashd_path) or "embedded" (SHA256-pinned download from embedded manifest).
-zcashd_source = "path"
-zcashd_path = "/usr/local/bin/zcashd"
+# "path" (default; use zcashd_path) or "embedded" (SHA256-pinned sidecar
+# download from the embedded release manifest). An explicit zcashd_path
+# always wins over this setting.
+zcashd_source = "embedded"
+# zcashd_path = "/usr/local/bin/zcashd"
 
 # zcashd datadir; defaults to a subdirectory of state.cache_dir.
 zcashd_datadir = "/var/lib/zcashd"
@@ -226,7 +288,7 @@ zcashd_datadir = "/var/lib/zcashd"
 # Extra zcashd arguments. Peer-selection options are rejected.
 zcashd_extra_args = ["-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1"]
 
-# Zebra P2P address zcashd connects to. Defaults to Zebra's own bound
+# Zakura P2P address zcashd connects to. Defaults to Zakura's own bound
 # legacy listener (loopback-substituted). Set for cross-container setups.
 # p2p_connect_addr = "10.0.0.2:8233"
 
@@ -238,30 +300,42 @@ restart_reset_after = "1h"
 shutdown_grace_period = "5m"
 ```
 
-All values can also be set through environment variables, e.g.
-`ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH=/usr/local/bin/zcashd`.
+All values can also be set through environment variables with the `ZAKURA_`
+prefix, e.g. `ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH=/usr/local/bin/zcashd`. (The
+old `ZEBRA_` prefix still works but is deprecated and logs a warning.)
+Because environment values cannot express TOML arrays, `zcashd_extra_args`
+also accepts a JSON array string:
 
-> [!WARNING]
-> Until the embedded-download manifest is updated for the sidecar build,
-> `zcashd_source = "embedded"` downloads the previous RPC-ingest zcashd, which
-> still contains the upstream end-of-support halt and miner RPCs. Use
-> `zcashd_source = "path"` with a sidecar build for now.
+```console
+ZAKURA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]'
+```
 
 ## Hardware preflight (Linux)
 
-When `zcashd_compat.enabled` is set, Zebra checks at startup that the host
-meets the minimum hardware requirements for running both nodes (CPU cores,
-memory, and free disk per mount). Startup fails below the minimums;
-`--unsafe-low-specs` overrides the failure for test environments. Warnings
-(not failures) are printed between the minimum and recommended tiers.
+When `zcashd_compat.enabled` is set, Zakura checks at startup that the host
+meets the minimum hardware requirements for running both nodes. Startup fails
+below the minimums; `--unsafe-low-specs` overrides the failure for test
+environments. Warnings (not failures) are printed between the minimum and
+recommended tiers.
+
+| Resource            | Minimum                        | Recommended        |
+|---------------------|--------------------------------|--------------------|
+| Logical CPUs        | 4                              | 8                  |
+| Memory              | 16 GiB                         | 32 GiB             |
+| Disk (mainnet)      | 275 GiB per datadir mount      | 1 TiB combined     |
+| Disk (testnet)      | 30 GiB per datadir mount       | 100 GiB combined   |
+
+If the Zakura state and zcashd datadir share one mount, that mount needs the
+sum of both minimums (550 GiB on mainnet). The installer runs the same checks
+before anything is downloaded.
 
 ## Monitoring and lifecycle
 
 - The supervisor exports `zcashd_compat.supervisor.active` / `.disabled` /
   `.exhausted` gauges.
-- zcashd's stdout/stderr are forwarded into Zebra's logs under the
+- zcashd's stdout/stderr are forwarded into Zakura's logs under the
   `zcashd_compat.zcashd` target.
-- On Zebra shutdown the supervisor sends zcashd SIGTERM and waits
+- On Zakura shutdown the supervisor sends zcashd SIGTERM and waits
   `shutdown_grace_period` before force-killing, so zcashd can flush its
   chainstate and wallet.
 - `make compat-status-sync` / `deploy/zcashd-compat/sync-check.sh` check both
@@ -269,20 +343,22 @@ memory, and free disk per mount). Startup fails below the minimums;
 
 ## Testing
 
-The integration suite runs zebrad + a supervised regtest zcashd end to end:
+The integration suite runs zakurad + a supervised regtest zcashd end to end:
 
 ```console
 make compat-test-regtest TEST_ZCASHD_PATH=/path/to/sidecar/zcashd
 ```
 
-It covers startup, tip following over P2P, deep reorgs, restarts,
-transaction flow from zcashd's wallet through Zebra's mempool, and the
-miner-RPC removal. `make compat-test-mainnet` / `compat-test-testnet` run the
-read-only subset against a live deployment.
+If `TEST_ZCASHD_PATH` is unset, the harness uses the embedded hash-pinned
+zcashd download. It covers startup, tip following over P2P, deep reorgs,
+restarts, transaction flow from zcashd's wallet through Zakura's mempool, and
+the miner-RPC removal. `make compat-test-soak` runs a longer regtest soak,
+and `make compat-test-mainnet` / `compat-test-testnet` run the read-only
+subset against a live deployment.
 
 ## Upstream network upgrades
 
 The sidecar zcashd must keep up with Zcash network upgrades: when a network
-upgrade activates, zebrad requires peers to advertise that upgrade's minimum
+upgrade activates, zakurad requires peers to advertise that upgrade's minimum
 protocol version, and an out-of-date zcashd will be disconnected. Plan to
 deploy the updated sidecar build before each activation height.

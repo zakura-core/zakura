@@ -62,6 +62,19 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.ref }}
 
+      - name: Verify deployer supports binary-only mode
+        # The checked-out deploy.py comes from `inputs.ref`; this fleet's config
+        # sets `manage_config = false`. If the checked-out deploy.py predates that
+        # support it would silently run a destructive config-managed deploy, so
+        # fail fast instead. deploy.py also now rejects unknown config keys.
+        run: |
+          set -euo pipefail
+          if ! grep -q 'manage_config' deploy/deployer/deploy.py; then
+            echo "::error::deploy.py at ref '${{ inputs.ref }}' lacks manage_config support." \
+                 "Deploy from a ref whose deploy.py supports binary-only mode."
+            exit 1
+          fi
+
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:

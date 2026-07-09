@@ -147,6 +147,18 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
     with config_path.open("rb") as fh:
         data = tomllib.load(fh)
 
+    # Reject unknown keys so an intent like `manage_config = false` can never be
+    # silently dropped by an older deploy.py — that once turned a preserve-config
+    # deploy into a destructive one. `name`/`ssh_string`/`commit` are per-node only.
+    known_default_keys = set(DEFAULTS)
+    known_node_keys = known_default_keys | {"name", "ssh_string", "commit"}
+    unknown_defaults = set(data.get("defaults", {})) - known_default_keys
+    if unknown_defaults:
+        raise DeployError(
+            f"unknown key(s) in [defaults]: {', '.join(sorted(unknown_defaults))} "
+            f"(this deploy.py may be older than the config)"
+        )
+
     defaults = dict(DEFAULTS)
     defaults.update(data.get("defaults", {}))
 
@@ -160,6 +172,13 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
         for required in ("name", "ssh_string", "commit"):
             if required not in raw:
                 raise DeployError(f"node missing required field '{required}': {raw}")
+        unknown_node = set(raw) - known_node_keys
+        if unknown_node:
+            raise DeployError(
+                f"unknown key(s) in [[nodes]] {raw.get('name', '?')}: "
+                f"{', '.join(sorted(unknown_node))} "
+                f"(this deploy.py may be older than the config)"
+            )
         name = raw["name"]
         if name in seen:
             raise DeployError(f"duplicate node name: {name}")

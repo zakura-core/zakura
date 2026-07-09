@@ -231,7 +231,11 @@ jobs:
           commit     = "${{ inputs.ref }}"
           service_name = "zebrad-compat"
           log_file   = ""
-          rpc_listen_addr = ""
+          # Dashboard-only probe of zebrad's local RPC (same pattern as other
+          # mainnet nodes). Does not configure zcashd RPC ingest.
+          rpc_listen_addr = "127.0.0.1:8232"
+          rpc_auth   = "cookie"
+          rpc_config_path = "/root/.cache/zebra/.cookie"
           EOF
 
       - name: Build deployer binary

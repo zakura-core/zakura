@@ -10853,6 +10853,62 @@ async fn reactor_exchange_reanchor_lowers_only_best_header_target() {
     reactor_task.abort();
 }
 
+/// A header reanchor that lands while downloads are in flight must still re-query
+/// after the destructive `reset_above`. Regression for the CI stall in
+/// `fuzz_large_to_small`: the post-reset producer used to skip refill when the
+/// registry still mirrored pre-reset outstanding, leaving an empty work queue.
+#[tokio::test]
+async fn reactor_exchange_reanchor_requeries_while_downloads_in_flight() {
+    let blocks = mainnet_blocks_1_to_3();
+    let mut config = immediate_body_download_config();
+    config.max_inflight_block_bytes =
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+    config.request_timeout = Duration::from_secs(300);
+
+    let initial = test_frontier_update(0, 0, 3, FrontierChange::Snapshot);
+    let (exchange, startup) = exchange_block_sync_startup(initial, config.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        67,
+        block::Height(3),
+        blocks[2].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(
+            blocks.iter().map(block_meta).collect(),
+        ))
+        .await
+        .expect("needed metadata queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 3)
+    );
+
+    // Reanchor the header tip below the in-flight range while the GetBlocks is
+    // still outstanding. The forced post-reset producer query must fire even if
+    // the registry still briefly counts those outstanding heights.
+    exchange.publish_frontier(
+        test_frontier_update(0, 0, 1, FrontierChange::HeaderReanchored),
+        "test",
+    );
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
+
+    exchange.publish_frontier(
+        test_frontier_update(0, 0, 3, FrontierChange::HeaderAdvanced),
+        "test",
+    );
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
+
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
     let blocks = mainnet_blocks_1_to_3();

@@ -587,6 +587,13 @@ impl PeerRoutine {
         // liveness deadline) so an unproven peer whose only probe was in flight at the
         // reset can probe again instead of wedging at its cap.
         self.window.note_view_reset();
+        // Ping the producer immediately: `reset_above` emptied `pending`, and the
+        // reactor's post-reset query may have run while our (now cleared) outstanding
+        // still inflated the low-water gate. Without this ping a routine that then
+        // sleeps on an empty deadline set would leave the pipeline dry.
+        let _ = self
+            .routine_to_reactor
+            .try_send(RoutineToReactor::RequeryNeeded);
         // The want-work loop re-fans from the queue at the top of the next
         // iteration (the `reset_above` + producer re-query repopulate `pending`).
     }

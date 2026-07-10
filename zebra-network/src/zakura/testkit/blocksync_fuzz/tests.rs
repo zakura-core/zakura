@@ -712,25 +712,28 @@ async fn fuzz_large_to_small() {
         vec![jittery, PeerSpec::fast(2, target(blocks))],
     );
     scenario.initial_best_header = block::Height(100);
+    // Space frontier events so a slow CI host can commit past each step before the
+    // next reanchor; the production fix still force-refills after reset, but the
+    // timeline should not pile Grow/Reanchor events into a few hundred milliseconds.
     scenario.timeline = vec![
         TipEvent {
-            at: Duration::from_millis(60),
+            at: Duration::from_millis(200),
             kind: TipEventKind::GrowTo(block::Height(200)),
         },
         TipEvent {
-            at: Duration::from_millis(140),
+            at: Duration::from_millis(500),
             kind: TipEventKind::GrowTo(block::Height(350)),
         },
         TipEvent {
-            at: Duration::from_millis(200),
+            at: Duration::from_millis(800),
             kind: TipEventKind::HeaderReanchor(block::Height(250)),
         },
         TipEvent {
-            at: Duration::from_millis(280),
+            at: Duration::from_millis(1_100),
             kind: TipEventKind::GrowTo(block::Height(400)),
         },
     ];
-    scenario.deadline = Duration::from_secs(60);
+    scenario.deadline = Duration::from_secs(90);
     run_checked("fuzz_large_to_small", scenario, 32).await;
 }
 

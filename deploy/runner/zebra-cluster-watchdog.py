@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_SLACK_CHANNEL = "C0BG341Q9TQ"
 DOWN_HEALTH = {"down", "rpc_error"}
 STATE_VERSION = 1
 
@@ -133,53 +132,35 @@ def suppression_until(path: Path) -> float | None:
         return None
 
 
-def post_slack(text: str, args: argparse.Namespace) -> bool:
-    token = os.environ.get("SLACK_BOT_TOKEN", "")
-    webhook = (
-        os.environ.get("SLACK_WEBHOOK_URL", "")
-        or os.environ.get("SLACK_WEB_HOOK", "")
+def slack_webhook_url() -> str:
+    """Return the configured incoming webhook URL for #zakura-alerts.
+
+    Bot tokens are intentionally unsupported: a token without channel
+    membership fails with `not_in_channel` and previously masked webhook
+    misconfiguration.
+    """
+    return (
+        os.environ.get("SLACK_WEB_HOOK", "")
+        or os.environ.get("SLACK_WEBHOOK_URL", "")
         or os.environ.get("SLACK_WEBHOOK", "")
     )
+
+
+def post_slack(text: str, args: argparse.Namespace) -> bool:
+    webhook = slack_webhook_url()
     if args.dry_run:
         print(f"dry-run Slack message:\n{text}\n")
         return True
 
-    if token:
-        payload = json.dumps({"channel": args.slack_channel, "text": text}).encode("utf-8")
-        request = urllib.request.Request(
-            "https://slack.com/api/chat.postMessage",
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json; charset=utf-8",
-            },
-            method="POST",
+    if not webhook:
+        print(
+            "SLACK_WEB_HOOK (or SLACK_WEBHOOK_URL / SLACK_WEBHOOK) is not set; "
+            f"cannot post:\n{text}\n",
+            file=sys.stderr,
         )
+        return False
 
-        try:
-            with urllib.request.urlopen(request, timeout=args.slack_timeout) as response:
-                body = response.read()
-        except (OSError, urllib.error.URLError) as error:
-            print(f"Slack post failed: {error}", file=sys.stderr)
-            return False
-
-        try:
-            decoded = json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError as error:
-            print(f"Slack returned invalid JSON: {error}", file=sys.stderr)
-            return False
-
-        if not decoded.get("ok"):
-            print(f"Slack post failed: {decoded}", file=sys.stderr)
-            return False
-
-        return True
-
-    if webhook:
-        return post_slack_webhook(webhook, text, args)
-
-    print(f"Slack credential not set; would post:\n{text}\n")
-    return True
+    return post_slack_webhook(webhook, text, args)
 
 
 def post_slack_webhook(webhook: str, text: str, args: argparse.Namespace) -> bool:
@@ -494,12 +475,7 @@ def parse_args() -> argparse.Namespace:
         "--slack-timeout",
         type=float,
         default=20.0,
-        help="Slack API request timeout seconds",
-    )
-    parser.add_argument(
-        "--slack-channel",
-        default=os.environ.get("SLACK_CHANNEL_ID", DEFAULT_SLACK_CHANNEL),
-        help="Slack channel ID for alerts",
+        help="Slack webhook request timeout seconds",
     )
     parser.add_argument("--once", action="store_true", help="poll once, update state, and exit")
     parser.add_argument("--dry-run", action="store_true", help="log Slack messages instead")

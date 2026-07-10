@@ -34,15 +34,14 @@ Down alerts take precedence over stalled alerts, so each node has at most one
 active alert. The watchdog posts only on transitions: first failure after the
 threshold, then recovery. Persistent failures do not post every poll.
 
-Slack delivery supports either:
+Slack delivery is **webhook-only**. Set:
 
-- `SLACK_BOT_TOKEN` with channel ID `C0BG341Q9TQ` (`#zakura-alerts`)
-- an incoming webhook in `SLACK_WEB_HOOK`, `SLACK_WEBHOOK_URL`, or
-  `SLACK_WEBHOOK`
+- `SLACK_WEB_HOOK`
 
 Do not commit real Slack credentials. Install them on the runner in
-`/etc/zakura-fleet-watchdog/env` with mode `600`, or provide the corresponding
-GitHub Actions environment secret so the deploy workflow writes the env file.
+`/etc/zakura-fleet-watchdog/env` with mode `600`, or provide the
+`SLACK_WEB_HOOK` GitHub Actions environment secret so the deploy workflow
+writes the env file.
 
 Manual checks on `us-east-0`:
 

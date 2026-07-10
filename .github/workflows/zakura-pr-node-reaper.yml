@@ -71,13 +71,17 @@ jobs:
           reap_tag zakura-image-bake $(( 6 * 3600 ))
 
       - name: Reap detached state volumes
+        env:
+          MAX_AGE_HOURS: ${{ inputs.max_age_hours || '24' }}
         run: |
           set -euo pipefail
           # Give volumes from the droplet sweep above a moment to detach.
           sleep 30
           # Detached zakura-pr-* volumes are always garbage in this system:
           # live runs keep theirs attached, and 2h clears the create->attach
-          # window with a wide margin.
+          # window with a wide margin. A dispatch with a lower max_age_hours
+          # (an emergency sweep) lowers this TTL with it.
+          VOL_TTL=$(( MAX_AGE_HOURS * 3600 < 2 * 3600 ? MAX_AGE_HOURS * 3600 : 2 * 3600 ))
           doctl compute volume list --format ID,Name,CreatedAt,DropletIDs --no-header | \
           while read -r id name created droplets; do
             [ -z "$id" ] && continue
@@ -85,7 +89,7 @@ jobs:
             case "$droplets" in *[0-9]*) continue ;; esac
             created_epoch=$(date -d "$created" +%s 2>/dev/null) || continue
             age=$(( $(date +%s) - created_epoch ))
-            if [ "$age" -gt $(( 2 * 3600 )) ]; then
+            if [ "$age" -gt "$VOL_TTL" ]; then
               echo "deleting detached volume $name (id $id, age ${age}s)"
               doctl compute volume delete "$id" -f || true
             fi

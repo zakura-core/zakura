@@ -12,6 +12,12 @@ name: PR node
 # teardown_after_run=true).
 
 on:
+  # TEMP(feat/pr-node): registers this workflow for dispatch while the file is
+  # not yet on the default branch; remove before merge. The push run fails fast
+  # in input validation (no pr_number/ref), which is expected.
+  push:
+    branches: [feat/pr-node]
+    paths: [.github/workflows/zakura-pr-node.yml]
   workflow_dispatch:
     inputs:
       pr_number:

@@ -9,6 +9,11 @@ name: PR node image bake
 # PR-node runs sync the remaining gap during their hour.
 
 on:
+  # TEMP(feat/pr-node): registers this workflow for dispatch while the file is
+  # not yet on the default branch; remove before merge.
+  push:
+    branches: [feat/pr-node]
+    paths: [.github/workflows/zakura-pr-node-bake.yml]
   workflow_dispatch:
     inputs:
       droplet_size:

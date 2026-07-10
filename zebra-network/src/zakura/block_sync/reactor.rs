@@ -822,6 +822,10 @@ impl BlockSyncReactor {
             // below; the routines self-reset off the view.
             self.last_reset_epoch = view.reset_epoch;
             self.trace_chain_tip_reset(view.verified_tip);
+            // Drop any in-flight producer query: its `(from, limit, tip)` was
+            // computed against the pre-reset frontier and must not suppress the
+            // post-reset refill via the pending-query dedupe.
+            self.pending_needed_query = None;
         } else if tip_advanced {
             // A non-destructive frontier advance does NOT respawn and does NOT
             // proactively drop outstanding through the tip: a still-open request
@@ -835,7 +839,13 @@ impl BlockSyncReactor {
 
         self.queue_status_refresh_if_changed(old_serving_tip);
         self.flush_status_refresh().await;
-        self.query_needed_blocks().await;
+        // After a destructive reset the WorkQueue is empty above the new floor, but
+        // peer routines clear their registry outstanding asynchronously. A plain
+        // low-water-gated query can see the pre-reset outstanding sum, decide the
+        // pipeline is "full", and skip the refill — leaving `pending` empty and
+        // `max_outstanding = 0` until an external wake. Force the post-reset
+        // producer query so header reanchors / tip resets cannot stall that way.
+        self.query_needed_blocks_with_options(reset_advanced).await;
     }
 
     async fn handle_needed_blocks(&mut self, blocks: Vec<BlockSyncBlockMeta>) {
@@ -1167,6 +1177,13 @@ impl BlockSyncReactor {
     }
 
     async fn query_needed_blocks(&mut self) -> bool {
+        self.query_needed_blocks_with_options(false).await
+    }
+
+    /// Producer refill. When `force` is set (destructive reset), skip the
+    /// low-water gate so a still-uncleared registry outstanding snapshot cannot
+    /// suppress the post-`reset_above` re-query.
+    async fn query_needed_blocks_with_options(&mut self, force: bool) -> bool {
         if !self.startup.state_queries_enabled {
             return false;
         }
@@ -1177,7 +1194,7 @@ impl BlockSyncReactor {
         let Some(from) = self.next_needed_block_query_start() else {
             return true;
         };
-        if self.local_body_work_blocks() >= self.refill_low_water_blocks() {
+        if !force && self.local_body_work_blocks() >= self.refill_low_water_blocks() {
             return true;
         }
         let limit = self.refill_query_limit_blocks(from);

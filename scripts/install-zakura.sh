@@ -11,7 +11,7 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZAKURA_RELEASE_TAG="v0.0.1-alpha.6"
+ZAKURA_RELEASE_TAG="v1.0.0-rc0"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
 # sha256 of ZAKURA_ARCHIVE from the release's SHA256SUMS.txt. Pin it once the
@@ -19,8 +19,8 @@ ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_REL
 # `curl | bash` installer is a supply-chain hole. Empty = skip verification.
 ZAKURA_ARCHIVE_SHA256=""
 ZAKURA_MEMBER="./bin/zakurad"
-ZAKURA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.6"
-ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.6"
+ZAKURA_DOCKER_IMAGE="valargroup/zakura:1.0.0-rc0"
+ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-1.0.0-rc0"
 ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
 ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
 # Persistent Zakura iroh identity (NodeId secret). Kept outside the state cache so
@@ -33,9 +33,10 @@ ZAKURA_DOCKER_IDENTITY_DIR="/home/zebra/.zakura"
 
 MANIFEST_PATH="$REPO_ROOT/zebrad/zcashd-compat-manifest.json"
 TARGET_TRIPLE="x86_64-pc-linux-gnu"
-ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v0.0.1-compat-alpha.4/zcashd-zebra-compat-v0.0.1-compat-alpha.4-linux-x86_64.tar.gz"
+ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v1.0.0-compat-rc0/zcashd-zebra-compat-v1.0.0-compat-rc0-linux-x86_64.tar.gz"
 ZCASHD_RUNTIME_ARCHIVE_SHA256="892c749bc629dc408598b33994b8b0d8e3e90ad5c8f755b214dce5b850083f12"
 ZCASHD_RUNTIME_ARCHIVE_MEMBER_BINARY_PATH="./bin/zcashd"
+ZCASHD_DEFAULT_DOCKER_IMAGE="valargroup/zcashd:v1.0.0-compat-rc0"
 
 INSTALL_PROFILE=""
 INSTALL_PROFILE_SET=0
@@ -1921,7 +1922,7 @@ compat_prepare_docker_images() {
         add_error "Docker image is missing or could not be pulled: $ZAKURA_DOCKER_IMAGE"
 
       if [[ -z "$ZCASHD_DOCKER_IMAGE" ]]; then
-        ZCASHD_DOCKER_IMAGE="valargroup/zcashd:v0.0.1-compat-alpha.4@sha256:b1e8ee69aecde0ce9cb1ee6e10e37ed9036332d85f0f60f4ce04ba5f152cc704"
+        ZCASHD_DOCKER_IMAGE="$ZCASHD_DEFAULT_DOCKER_IMAGE"
       fi
 
       docker_image_available_or_pull "$ZCASHD_DOCKER_IMAGE" ||

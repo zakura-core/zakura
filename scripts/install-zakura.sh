@@ -2040,7 +2040,9 @@ EOF
 }
 
 compat_print_docker_split_commands() {
-  local p2p_port arg
+  local container_zebra_state_dir="/home/zebra/.cache/zakura"
+  local container_zcashd_datadir="/home/zebra/.cache/zcashd"
+  local p2p_port
   p2p_port="$(compat_p2p_port_from_addr "$ZAKURA_P2P_ADDR")"
   cat <<EOF
 $(style "$GREEN$BOLD" "Start Zakura container in terminal 1:")
@@ -2049,9 +2051,12 @@ docker run --rm -it --name zakura-compat --network host \\
   -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:${p2p_port}' \\
   -e ZAKURA_NETWORK__MAX_CONNECTIONS_PER_IP=8 \\
   -e ZAKURA_NETWORK__IDENTITY_DIR=$ZAKURA_DOCKER_IDENTITY_DIR \\
-  -e ZAKURA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \\
-  --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
+  -e ZAKURA_STATE__CACHE_DIR=$container_zebra_state_dir \\
+  -e ZAKURA_ZCASHD_COMPAT__MANAGE_ZCASHD=false \\
+  -e ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR=$container_zcashd_datadir \\
+  --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=$container_zebra_state_dir \\
   --mount type=bind,src=$(shell_quote "$ZAKURA_IDENTITY_DIR"),dst=$ZAKURA_DOCKER_IDENTITY_DIR \\
+  --mount type=bind,src=$(shell_quote "$ZCASHD_DATADIR"),dst=$container_zcashd_datadir \\
   $(shell_quote "$ZAKURA_DOCKER_IMAGE") \\
   zakurad start --zcashd-compat
 

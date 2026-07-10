@@ -3,6 +3,7 @@
 include make/zcashd-compat.mk
 include make/perf.mk
 include make/zakura-dev.mk
+include make/release.mk
 
 help:
 	@echo "Available targets:"
@@ -38,3 +39,6 @@ help:
 	@echo "  compat-test-regtest              Run full zcashd-compat test suite (regtest, spawns processes)"
 	@echo "  compat-test-mainnet              Run read-only zcashd-compat tests against live mainnet"
 	@echo "  compat-test-testnet              Run read-only zcashd-compat tests against live testnet"
+	@echo ""
+	@echo "  Release:"
+	@echo "  sign-release TAG=vX.Y.Z          Sign a release's SHA256SUMS.txt with the maintainer minisign key (see VERIFY.md)"

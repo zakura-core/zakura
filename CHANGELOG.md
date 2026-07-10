@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Set the NU6.3 (Ironwood) network upgrade activation height on Mainnet to
+  `3_428_143`, matching `zcash_protocol`'s Mainnet parameters. NU6.3 was already
+  scheduled on Testnet (`4_134_000`); this schedules it on Mainnet as well.
 - Zebra now tags the coinbase input of every block it mines with a `🌸`. The
   `mining.extra_coinbase_data` option is now limited to 86 bytes (was 94);
   Zebra refuses to start if it is exceeded.

@@ -358,7 +358,7 @@ mod tests {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0
                 .lock()
-                .expect("log buffer lock should not be poisoned")
+                .map_err(|_| io::Error::other("log buffer lock should not be poisoned"))?
                 .extend_from_slice(buf);
             Ok(buf.len())
         }

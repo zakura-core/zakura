@@ -90,13 +90,18 @@ Use the sidecar `zcashd` build from
 installer and Zakura's embedded download both pin its release archives by
 SHA256. It differs from stock `zcash/zcash` in three ways:
 
-1. **Miner RPCs are removed.** `getblocktemplate`, `submitblock`,
+1. **P2P sidecar mode is hard-locked.** The binary refuses to start unless
+   exactly one `-connect=<zakura-address>` peer is configured. It never opens a
+   P2P listener, refuses peer-expanding options such as `addnode`, `seednode`,
+   `bind`, and `whitebind`, and does not register the `addnode` RPC. This makes
+   Zakura the only possible P2P peer.
+2. **Miner RPCs are removed.** `getblocktemplate`, `submitblock`,
    `getgenerate`, `setgenerate`, and `generate` are not registered and return
    JSON-RPC `Method not found` (-32601). Zakura is the canonical source of
    block templates (see [Mining](#mining-zakura-is-canonical)). Read-only
    mining info RPCs (`getmininginfo`, `getnetworksolps`, `getblocksubsidy`,
    `prioritisetransaction`) remain.
-2. **The upstream end-of-support halt is disabled.** Stock zcashd shuts
+3. **The upstream end-of-support halt is disabled.** Stock zcashd shuts
    itself down at its deprecation height; the sidecar build logs a warning
    and keeps serving its wallet/RPC surface. Consensus safety comes from
    Zakura, which fully validates every block before relaying it to zcashd.
@@ -200,12 +205,10 @@ manage_zcashd = false
 block_gossip_peer_ips = ["127.0.0.1"]
 ```
 
-zcashd-compat mode requires `network.legacy_p2p = true` (the default):
-zcashd speaks the legacy Zcash P2P protocol, and startup fails if the legacy
-listener is disabled. This is independent of Zakura's native P2P endpoint
-(`network.v2_p2p`), which can stay enabled alongside it. Do not enable state
-pruning on the fronting Zakura — a pruned node does not advertise
-`NODE_NETWORK` and zcashd will not sync from it.
+zcashd-compat mode requires the legacy Zcash P2P stack, because zcashd speaks the
+legacy Zcash P2P protocol. Every `network.p2p_stack` value runs it except
+`"zakura"`. Do not enable state pruning on the fronting Zakura — a pruned node does
+not advertise `NODE_NETWORK` and zcashd will not sync from it.
 
 > [!WARNING]
 > When the fronting Zakura runs in Docker with a published P2P port, all

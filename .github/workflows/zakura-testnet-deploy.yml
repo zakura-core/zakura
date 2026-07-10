@@ -310,7 +310,7 @@ jobs:
           rpc_listen_addr = "127.0.0.1:18231"
           rpc_auth = "zcash_conf"
           rpc_config_path = "/root/unity/zcashd-testnet.toml"
-          process_pattern = "zcashd -conf=/root/unity/zcashd-testnet.toml"
+          process_pattern = "zcashd.*zcashd-testnet.toml"
           EOF
           sudo install -m 644 "$RUNNER_TEMP/dashboard.nodes.toml" "$dashboard_dir/nodes.toml"
 

@@ -140,7 +140,8 @@ jobs:
             64.227.44.93 \
             161.35.156.226 \
             139.59.64.115 \
-            168.144.173.250; do
+            168.144.173.250 \
+            159.203.113.196; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -223,6 +224,18 @@ jobs:
           name       = "asia-pacific-0"
           ssh_string = "root@168.144.173.250"
           commit     = "${{ inputs.ref }}"
+
+          [[nodes]]
+          name       = "zakura-compat"
+          ssh_string = "root@159.203.113.196"
+          commit     = "${{ inputs.ref }}"
+          service_name = "zebrad-compat"
+          log_file   = ""
+          # Dashboard-only probe of zebrad's local RPC (same pattern as other
+          # mainnet nodes). Does not configure zcashd RPC ingest.
+          rpc_listen_addr = "127.0.0.1:8232"
+          rpc_auth   = "cookie"
+          rpc_config_path = "/root/.cache/zebra/.cookie"
           EOF
 
       - name: Build deployer binary
@@ -288,7 +301,22 @@ jobs:
           dashboard_dir="/opt/zakura-mainnet-dashboard"
           sudo install -d -m 755 "$dashboard_dir"
           sudo install -m 755 deploy/runner/zebra-cluster-status.py "$dashboard_dir/zebra-cluster-status.py"
-          sudo install -m 644 deploy/deployer/nodes.ci.toml "$dashboard_dir/nodes.toml"
+          cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
+          cat >> "$RUNNER_TEMP/dashboard.nodes.toml" <<'EOF'
+
+          [[nodes]]
+          name       = "zcashd-compat"
+          ssh_string = "root@159.203.113.196"
+          probe_kind = "zcashd"
+          service_name = ""
+          bin_path = "/mnt/snapshots/import-zebra/zcashd-compat/bin/v6.2.1-alpha.7/x86_64-pc-linux-gnu/zcashd"
+          log_file = ""
+          rpc_listen_addr = "[::1]:8232"
+          rpc_auth = "cookie"
+          rpc_config_path = "/mnt/snapshots/runtime/zcashd/.cookie"
+          process_pattern = "zcashd .*-zebra-compat"
+          EOF
+          sudo install -m 644 "$RUNNER_TEMP/dashboard.nodes.toml" "$dashboard_dir/nodes.toml"
 
           sudo tee /etc/systemd/system/zakura-mainnet-dashboard.service >/dev/null <<'EOF'
           [Unit]

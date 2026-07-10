@@ -14,9 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `zebra_network::zakura`, a default-off iroh scaffold that exposes a
   relay/discovery-off endpoint builder and reserves the persistent Zakura iroh
   node secret-key path and config field.
-- Added `PeerServices::NODE_P2P_V2`, the default-on `v2_p2p` and `legacy_p2p`
-  network configs, and a neutral legacy-handshake upgrade hook for mutually
-  capable Zakura peers.
+- Added `PeerServices::NODE_P2P_V2`, the `Config::p2p_stack` network config and
+  its `P2pStack` enum, and a neutral legacy-handshake upgrade hook for mutually
+  capable Zakura peers. `Config::legacy_p2p()` and `Config::v2_p2p()` resolve
+  `p2p_stack` against the configured network; `Config::for_test` now takes a
+  `P2pStack` instead of a `bool`.
 - Added bounded Zakura P2P v2 upgrade prelude and control-handshake wire types,
   including transcript binding, native-vs-upgraded control validation, and
   duplicate-peer handling scaffolding.

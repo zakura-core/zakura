@@ -73,7 +73,8 @@ impl Runnable for GenerateCmd {
         // this avoids a ValueAfterTable error
         // https://github.com/alexcrichton/toml-rs/issues/145
         let conf = toml::Value::try_from(default_config).unwrap();
-        output += &toml::to_string_pretty(&conf).expect("default config should be serializable");
+        let conf = toml::to_string_pretty(&conf).expect("default config should be serializable");
+        output += &document_network_p2p_config(&conf);
         match self.output_file {
             Some(ref output_file) => {
                 use std::{fs::File, io::Write};
@@ -87,4 +88,45 @@ impl Runnable for GenerateCmd {
             }
         }
     }
+}
+
+fn document_network_p2p_config(config: &str) -> String {
+    let had_trailing_newline = config.ends_with('\n');
+    let mut lines = config.lines().map(ToString::to_string).collect::<Vec<_>>();
+
+    let Some(network_start) = lines.iter().position(|line| line == "[network]") else {
+        return config.to_string();
+    };
+    let network_end = lines
+        .iter()
+        .enumerate()
+        .skip(network_start + 1)
+        .find_map(|(index, line)| line.starts_with('[').then_some(index))
+        .unwrap_or(lines.len());
+
+    let Some(p2p_stack_index) = lines[network_start + 1..network_end]
+        .iter()
+        .position(|line| line.starts_with("p2p_stack = "))
+        .map(|index| index + network_start + 1)
+    else {
+        return config.to_string();
+    };
+
+    let comments = [
+        "# The peer-to-peer stack to run:",
+        "# - \"zebra\" (aka \"v1\", \"legacy\"): the legacy TCP Zcash P2P stack only.",
+        "# - \"zakura\" (aka \"v2\"): the native Zakura P2P v2 stack only.",
+        "# - \"dual\" (aka \"combined\"): both stacks, with legacy fallback.",
+        "# - \"default\": Zebra's default for this network, which can change between",
+        "#   releases. Currently \"zebra\" on Mainnet, and \"dual\" everywhere else.",
+    ]
+    .map(ToString::to_string);
+
+    lines.splice(p2p_stack_index..p2p_stack_index, comments);
+
+    let mut output = lines.join("\n");
+    if had_trailing_newline {
+        output.push('\n');
+    }
+    output
 }

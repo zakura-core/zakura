@@ -621,8 +621,9 @@ pub struct Config {
     /// commit, and Zebra exits successfully when the synthetic verified body tip
     /// reaches this height.
     ///
-    /// This mode requires `network.v2_p2p = true`, is intentionally hidden from
-    /// generated configs, and is only for throughput debugging.
+    /// This mode requires the Zakura P2P v2 stack (`network.p2p_stack` set to
+    /// `"zakura"` or `"dual"`), is intentionally hidden from generated configs, and is
+    /// only for throughput debugging.
     #[serde(skip_serializing)]
     pub debug_blocksync_throughput_target_height: Option<u32>,
 }

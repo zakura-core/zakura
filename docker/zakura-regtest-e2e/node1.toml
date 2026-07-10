@@ -7,8 +7,7 @@
 network = "Regtest"
 listen_addr = "127.0.0.1:18233"
 # Dual stack: legacy TCP listener AND the Zakura QUIC endpoint.
-v2_p2p = true
-legacy_p2p = true
+p2p_stack = "dual"
 # No peer disk cache; this node is the bootstrap seed.
 cache_dir = false
 initial_testnet_peers = []

@@ -46,7 +46,7 @@ git -C /root/zakura remote set-url origin "https://github.com/${GH_REPO}.git"
 cd /root/zakura
 export CARGO_TARGET_DIR=/root/cargo-target
 cargo build --release --locked -p zebrad
-/root/cargo-target/release/zebrad --version
+/root/cargo-target/release/zakurad --version
 
 # --------------------------------------------------------------------------- #
 # Loopback SSH identity: deploy.py drives the node over root@localhost

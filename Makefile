@@ -8,7 +8,7 @@ help:
 	@echo "Available targets:"
 	@echo ""
 	@echo "  Dev Zakura (local node):"
-	@echo "  zakura-build-dev                 Build debug zakurad"
+	@echo "  zakura-build-dev                 Build release zakurad"
 	@echo "  zakura-dev-init                  Create ~/.local/zakura-dev config + dirs"
 	@echo "  zakura-start-dev                 Start local dev node (pruned, VCT, v2-only)"
 	@echo ""

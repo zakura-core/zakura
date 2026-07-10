@@ -9,14 +9,14 @@ ZAKURA_DEV_IDENTITY ?= $(ZAKURA_DEV_HOME)/identity
 ZAKURA_DEV_CONFIG ?= $(ZAKURA_DEV_HOME)/zakura.toml
 ZAKURA_DEV_CONFIG_TEMPLATE ?= $(CURDIR)/make/zakura-dev.toml
 
-ZAKURA_DEV_ZAKURAD_BIN ?= $(CURDIR)/target/debug/zakurad
+ZAKURA_DEV_ZAKURAD_BIN ?= $(CURDIR)/target/release/zakurad
 ifneq ($(filter command line environment override,$(origin ZAKURAD_BIN)),)
 ZAKURA_DEV_ZAKURAD_BIN := $(ZAKURAD_BIN)
 endif
 NETWORK ?= Mainnet
 
 zakura-build-dev:
-	cargo build --bin zakurad
+	cargo build --release --bin zakurad
 
 zakura-dev-init:
 	@set -eu; \

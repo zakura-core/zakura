@@ -190,7 +190,7 @@ cmd_build_local() {
   local bench_dir bench_tmp
   bench_dir="$(dirname "$BENCH_BIN")"
   bench_tmp="$(mktemp "${bench_dir}/.$(basename "$BENCH_BIN").XXXXXX")"
-  if install -m 0755 "$CARGO_TARGET_DIR/release/zebrad" "$bench_tmp"; then
+  if install -m 0755 "$CARGO_TARGET_DIR/release/zakurad" "$bench_tmp"; then
     mv -f "$bench_tmp" "$BENCH_BIN"
   else
     rm -f "$bench_tmp"

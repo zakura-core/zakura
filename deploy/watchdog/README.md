@@ -1,4 +1,4 @@
-# Zebra Watchdog (`zebra-watchdog`)
+# Zakura Watchdog (`zakura-watchdog`)
 
 A standalone Rust watchdog sidecar that queries the local Zebra services and
 reports their status. It is deployed alongside `zebrad` as its own systemd
@@ -6,10 +6,10 @@ service and reports check failures and recoveries to [Sentry](https://sentry.io)
 
 It has two run modes:
 
-- `zebra-watchdog check` — one-shot deploy verification with a retry loop, a
+- `zakura-watchdog check` — one-shot deploy verification with a retry loop, a
   drop-in replacement for `deploy/zcashd-compat/sync-check.sh`. Exits `0` when
   all checks pass within the timeout, non-zero otherwise.
-- `zebra-watchdog run` — continuous operation under systemd. Runs all checks
+- `zakura-watchdog run` — continuous operation under systemd. Runs all checks
   on an interval forever and reports failure/recovery transitions to Sentry.
   If a deployment suppression marker is active, checks keep running but failure
   alerts are suppressed until the marker expires.
@@ -18,9 +18,9 @@ It has two run modes:
 
 ```text
 deploy/watchdog/
-  Cargo.toml                       workspace member, binary: zebra-watchdog
-  sync-check.sh                    thin deploy-time wrapper around `zebra-watchdog check`
-  systemd/zebra-watchdog.service   systemd unit for continuous operation
+  Cargo.toml                       workspace member, binary: zakura-watchdog
+  sync-check.sh                    thin deploy-time wrapper around `zakura-watchdog check`
+  systemd/zakura-watchdog.service  systemd unit for continuous operation
   src/
     main.rs                        CLI (check/run), tracing + Sentry init
     config.rs                      env/CLI configuration
@@ -83,7 +83,7 @@ environment variable names match the legacy sync-check script.
 | `SYNC_CHECK_TIMEOUT`      | `--sync-check-timeout`      | `600`                                 | One-shot `check` total timeout (seconds) |
 | `SYNC_CHECK_INTERVAL`     | `--sync-check-interval`     | `15`                                  | One-shot `check` retry interval (seconds) |
 | `WATCHDOG_INTERVAL`       | `--watchdog-interval`       | `60`                                  | Continuous `run` cycle interval (seconds) |
-| `WATCHDOG_DEPLOYMENT_SUPPRESSION_FILE` | `--deployment-suppression-file` | `/run/zebra-watchdog/deployment-suppressed-until` | Unix timestamp file for deployment alert suppression |
+| `WATCHDOG_DEPLOYMENT_SUPPRESSION_FILE` | `--deployment-suppression-file` | `/run/zakura-watchdog/deployment-suppressed-until` | Unix timestamp file for deployment alert suppression |
 | `WATCHDOG_MAX_DEPLOYMENT_SUPPRESSION` | `--max-deployment-suppression` | `1200`                                | Maximum accepted deployment suppression window (seconds) |
 | `WATCHDOG_RPC_TIMEOUT`    | `--rpc-timeout`             | `30`                                  | Per-RPC-request timeout (seconds) |
 
@@ -99,7 +99,7 @@ the watchdog logs locally (stdout/journald) and is otherwise fully functional.
 | -------------------- | ------- |
 | `SENTRY_DSN`         | Enables Sentry reporting (the DSN is not a secret, but treat the env file as operator config) |
 | `SENTRY_ENVIRONMENT` | Optional environment name (for example `zcashd-compat-mainnet`) |
-| `SENTRY_RELEASE`     | Optional release override; defaults to `zebra-watchdog@<crate version>` |
+| `SENTRY_RELEASE`     | Optional release override; defaults to `zakura-watchdog@<crate version>` |
 
 Reporting behavior is designed to avoid event spam:
 
@@ -120,29 +120,29 @@ Reporting behavior is designed to avoid event spam:
 
 ## Systemd deployment
 
-The unit file is [`systemd/zebra-watchdog.service`](systemd/zebra-watchdog.service).
+The unit file is [`systemd/zakura-watchdog.service`](systemd/zakura-watchdog.service).
 Manual installation on a host:
 
 ```bash
-# Install the binary (built with: cargo build --release --locked -p zebra-watchdog)
-install -m 755 target/release/zebra-watchdog /usr/local/bin/zebra-watchdog
+# Install the binary (built with: cargo build --release --locked -p zakura-watchdog)
+install -m 755 target/release/zakura-watchdog /usr/local/bin/zakura-watchdog
 
 # Optional: configure Sentry and overrides
-mkdir -p /etc/zebra-watchdog
-cat > /etc/zebra-watchdog/env <<'ENV'
+mkdir -p /etc/zakura-watchdog
+cat > /etc/zakura-watchdog/env <<'ENV'
 SENTRY_DSN=https://<key>@<org>.ingest.sentry.io/<project>
 SENTRY_ENVIRONMENT=zcashd-compat-mainnet
 ENV
-chmod 600 /etc/zebra-watchdog/env
+chmod 600 /etc/zakura-watchdog/env
 
 # Install and start the service
-cp deploy/watchdog/systemd/zebra-watchdog.service /etc/systemd/system/
+cp deploy/watchdog/systemd/zakura-watchdog.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now zebra-watchdog
+systemctl enable --now zakura-watchdog
 
 # Inspect
-systemctl status zebra-watchdog
-journalctl -u zebra-watchdog -f
+systemctl status zakura-watchdog
+journalctl -u zakura-watchdog -f
 ```
 
 The environment file is optional (`EnvironmentFile=-`): the service starts and
@@ -155,13 +155,13 @@ Run an equivalent watchdog verification manually on the host:
 
 ```bash
 HEIGHT_MAX_DRIFT=10 SYNC_CHECK_TIMEOUT=1800 SYNC_CHECK_INTERVAL=15 \
-  zebra-watchdog check
+  zakura-watchdog check
 ```
 
 Or against custom endpoints:
 
 ```bash
-zebra-watchdog check \
+zakura-watchdog check \
   --zebra-rpc-url http://127.0.0.1:8232 \
   --zebra-cookie-file /root/.cache/zakura/.cookie \
   --height-max-drift 10
@@ -171,12 +171,12 @@ zebra-watchdog check \
 
 ```bash
 # Type-check, lint, and test
-cargo check -p zebra-watchdog --locked
-cargo clippy -p zebra-watchdog --all-targets -- -D warnings
-cargo test -p zebra-watchdog
+cargo check -p zakura-watchdog --locked
+cargo clippy -p zakura-watchdog --all-targets -- -D warnings
+cargo test -p zakura-watchdog
 
 # Build the release binary
-cargo build --release --locked -p zebra-watchdog
+cargo build --release --locked -p zakura-watchdog
 ```
 
 Unit tests cover configuration defaults/overrides, JSON-RPC response parsing,

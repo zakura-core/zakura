@@ -111,9 +111,9 @@ jobs:
       - uses: ./.github/actions/setup-zebra-build
       # Build every workspace binary (and, transitively, every library) on the
       # MSRV toolchain in a single warm target dir instead of a per-binary
-      # matrix. `zebra-watchdog` is excluded: it depends on `sentry`, which
+      # matrix. `zakura-watchdog` is excluded: it depends on `sentry`, which
       # requires a newer rustc than the workspace library MSRV.
-      - run: cargo build --workspace --bins --exclude zebra-watchdog
+      - run: cargo build --workspace --bins --exclude zakura-watchdog
 
   docs:
     name: docs
@@ -199,7 +199,7 @@ jobs:
           toolchain: stable
           cache-on-failure: true
       - name: Ensure no arbitrary or proptest dependency on default build
-        run: cargo tree --package zebrad -e=features,no-dev | grep -Eq "arbitrary|proptest" && exit 1 || exit 0
+        run: cargo tree --package zakura -e=features,no-dev | grep -Eq "arbitrary|proptest" && exit 1 || exit 0
 
   # NOTE: the old `features` job (`cargo hack check --all`) is subsumed by the
   # `cargo hack check --workspace` pass in `test-crates.yml`.

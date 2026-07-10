@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Thin wrapper around `zebra-watchdog check` for deploy-time verification.
+# Thin wrapper around `zakura-watchdog check` for deploy-time verification.
 #
 # The watchdog reads the same environment variables as the legacy
 # deploy/zcashd-compat/sync-check.sh script (ZEBRA_RPC_URL,
@@ -10,10 +10,10 @@
 
 set -euo pipefail
 
-WATCHDOG_BIN="${WATCHDOG_BIN:-/usr/local/bin/zebra-watchdog}"
+WATCHDOG_BIN="${WATCHDOG_BIN:-/usr/local/bin/zakura-watchdog}"
 
 if [[ ! -x "$WATCHDOG_BIN" ]]; then
-    echo "zebra-watchdog binary missing or not executable: $WATCHDOG_BIN" >&2
+    echo "zakura-watchdog binary missing or not executable: $WATCHDOG_BIN" >&2
     exit 2
 fi
 

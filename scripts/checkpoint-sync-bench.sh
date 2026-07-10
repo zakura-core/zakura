@@ -345,7 +345,7 @@ build_from_ref() {
   # the dashboard needs for the commit-bottleneck signal. Override for refs predating it.
   ( cd "$BUILD_SRC" && \
     CARGO_TARGET_DIR="$BUILD_TARGET" CARGO_HOME="$BUILD_CARGO_HOME" CXXFLAGS="-include cstdint" \
-    cargo build --release -p zebrad --features "${BUILD_FEATURES:-prometheus,commit-metrics}" --locked >&2 ) \
+    cargo build --release -p zakura --features "${BUILD_FEATURES:-prometheus,commit-metrics}" --locked >&2 ) \
     || die "cargo build failed for $sha"
   local built=""
   for candidate in "$BUILD_TARGET/release/zakurad" "$BUILD_TARGET/release/zebrad"; do

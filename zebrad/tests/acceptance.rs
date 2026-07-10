@@ -1524,7 +1524,7 @@ async fn metrics_endpoint() -> Result<()> {
     let output = output.assert_failure()?;
 
     output.any_output_line_contains(
-        "# TYPE zebrad_build_info counter",
+        "# TYPE zakura_build_info counter",
         &body,
         "metrics exporter response",
         "the metrics response header",
@@ -3562,7 +3562,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
 /// Test successful block template submission as a block proposal or submission on a custom Testnet.
 ///
 /// This test can be run locally with:
-/// `cargo test --package zebrad --test acceptance -- nu6_funding_streams_and_coinbase_balance --exact --show-output`
+/// `cargo test --package zakura --test acceptance -- nu6_funding_streams_and_coinbase_balance --exact --show-output`
 #[tokio::test(flavor = "multi_thread")]
 async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
     use zebra_chain::{

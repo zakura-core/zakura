@@ -81,7 +81,9 @@ jobs:
           file: ./docker/Dockerfile
           target: tests
           platforms: linux/amd64
-          build-args: FEATURES=default-release-binaries
+          build-args: |
+            FEATURES=default-release-binaries
+            SHORT_SHA=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           push: true
           cache-from: type=gha

@@ -8,7 +8,7 @@
 #
 # Build the binary once on the host, then bring the cluster up:
 #
-#   cargo build -p zebrad --bin zakurad         # debug is fine for regtest
+#   cargo build -p zakura --bin zakurad         # debug is fine for regtest
 #   ZAKURAD_BIN=$(pwd)/target/debug/zakurad \
 #     docker compose -f docker/docker-compose.zakura-regtest-e2e.yml up -d
 #

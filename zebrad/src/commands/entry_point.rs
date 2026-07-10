@@ -13,8 +13,9 @@ use super::ZebradCmd;
 /// Handles obtaining toplevel help as well as verbosity settings.
 #[derive(Debug, clap::Parser)]
 #[clap(
-    version = clap::crate_version!(),
-    author="Zcash Foundation <zebra@zfnd.org>",
+    name = "zakurad",
+    version = crate::application::clap_build_version(),
+    author = "Valar Group",
     help_template = "\
 {name} {version}\n
 {author}\n

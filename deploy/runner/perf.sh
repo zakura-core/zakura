@@ -186,7 +186,7 @@ cmd_build_local() {
   : "${CARGO_TARGET_DIR:=/mnt/roman-dev-2-data/cargo-target-vct}"
   export CARGO_TARGET_DIR
   note "building instrumented bench binary (commit-metrics) -> $BENCH_BIN"
-  ( cd "$REPO" && cargo build --release -p zebrad --features commit-metrics --locked )
+  ( cd "$REPO" && cargo build --release -p zakura --features commit-metrics --locked )
   local bench_dir bench_tmp
   bench_dir="$(dirname "$BENCH_BIN")"
   bench_tmp="$(mktemp "${bench_dir}/.$(basename "$BENCH_BIN").XXXXXX")"

@@ -205,7 +205,7 @@ pub fn init_sentry() -> Option<sentry::ClientInitGuard> {
     std::env::var_os("SENTRY_DSN")?;
 
     let release = std::env::var("SENTRY_RELEASE")
-        .unwrap_or_else(|_| format!("zebra-watchdog@{}", env!("CARGO_PKG_VERSION")));
+        .unwrap_or_else(|_| format!("zakura-watchdog@{}", env!("CARGO_PKG_VERSION")));
 
     let guard = sentry::init(sentry::ClientOptions {
         release: Some(release.into()),
@@ -214,7 +214,7 @@ pub fn init_sentry() -> Option<sentry::ClientInitGuard> {
     });
 
     sentry::configure_scope(|scope| {
-        scope.set_tag("service", "zebra-watchdog");
+        scope.set_tag("service", "zakura-watchdog");
     });
 
     Some(guard)

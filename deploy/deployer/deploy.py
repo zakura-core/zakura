@@ -359,8 +359,8 @@ def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
     print(f"[build] checking out {sha[:9]} into {work.name}")
     run(["git", "worktree", "add", "--detach", str(work), sha], cwd=root)
     try:
-        print(f"[build] cargo build --release -p zebrad ({sha[:9]}) ...")
-        run(["cargo", "build", "--release", "--locked", "-p", "zebrad"], cwd=work)
+        print(f"[build] cargo build --release -p zakura ({sha[:9]}) ...")
+        run(["cargo", "build", "--release", "--locked", "-p", "zakura"], cwd=work)
         # Respect CARGO_TARGET_DIR (set per-worktree or shared) when locating the
         # output, falling back to the in-worktree target dir.
         target_dir = os.environ.get("CARGO_TARGET_DIR")

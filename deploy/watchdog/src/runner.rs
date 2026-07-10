@@ -159,7 +159,7 @@ mod tests {
             config: Config,
         }
 
-        let mut config = TestCli::try_parse_from(["zebra-watchdog"])
+        let mut config = TestCli::try_parse_from(["zakura-watchdog"])
             .expect("defaults parse")
             .config;
         config.sync_check_timeout = timeout;
@@ -168,7 +168,7 @@ mod tests {
     }
 
     fn test_suppression_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("zebra-watchdog-{name}-{}", process::id()))
+        std::env::temp_dir().join(format!("zakura-watchdog-{name}-{}", process::id()))
     }
 
     fn now_epoch_seconds() -> u64 {

@@ -90,7 +90,7 @@ pub struct Config {
         long,
         global = true,
         env = "WATCHDOG_DEPLOYMENT_SUPPRESSION_FILE",
-        default_value = "/run/zebra-watchdog/deployment-suppressed-until"
+        default_value = "/run/zakura-watchdog/deployment-suppressed-until"
     )]
     pub deployment_suppression_file: PathBuf,
 
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn defaults_match_sync_check_script() {
-        let cli = TestCli::try_parse_from(["zebra-watchdog"]).expect("defaults parse");
+        let cli = TestCli::try_parse_from(["zakura-watchdog"]).expect("defaults parse");
         let config = cli.config;
 
         assert_eq!(config.zebra_rpc_url, "http://127.0.0.1:8232");
@@ -142,7 +142,7 @@ mod tests {
         assert_eq!(config.watchdog_interval, 60);
         assert_eq!(
             config.deployment_suppression_file,
-            PathBuf::from("/run/zebra-watchdog/deployment-suppressed-until")
+            PathBuf::from("/run/zakura-watchdog/deployment-suppressed-until")
         );
         assert_eq!(config.max_deployment_suppression, 1200);
     }
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn cli_flags_override_defaults() {
         let cli = TestCli::try_parse_from([
-            "zebra-watchdog",
+            "zakura-watchdog",
             "--zebra-rpc-url",
             "http://127.0.0.1:18232",
             "--height-max-drift",
@@ -158,7 +158,7 @@ mod tests {
             "--watchdog-interval",
             "5",
             "--deployment-suppression-file",
-            "/tmp/zebra-watchdog-test-suppression",
+            "/tmp/zakura-watchdog-test-suppression",
             "--max-deployment-suppression",
             "30",
         ])
@@ -170,7 +170,7 @@ mod tests {
         assert_eq!(config.watchdog_interval, 5);
         assert_eq!(
             config.deployment_suppression_file,
-            PathBuf::from("/tmp/zebra-watchdog-test-suppression")
+            PathBuf::from("/tmp/zakura-watchdog-test-suppression")
         );
         assert_eq!(config.max_deployment_suppression, 30);
     }

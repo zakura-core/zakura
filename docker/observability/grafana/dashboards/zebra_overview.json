@@ -59,7 +59,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
-          "expr": "zebrad_build_info",
+          "expr": "zakura_build_info",
           "format": "table",
           "instant": true,
           "refId": "A"

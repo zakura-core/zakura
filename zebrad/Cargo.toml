@@ -1,7 +1,7 @@
 [package]
 # Crate metadata
-name = "zebrad"
-version = "5.0.0-rc.3"
+name = "zakura"
+version = "1.0.0-rc0"
 authors.workspace = true
 description = "The Zcash Foundation's independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true
@@ -25,6 +25,9 @@ rust-version = "1.91"
 # make `cargo run` use `zakurad` by default
 # when run in the workspace directory
 default-run = "zakurad"
+
+[lib]
+name = "zebrad"
 
 # `cargo release` settings
 [package.metadata.release]

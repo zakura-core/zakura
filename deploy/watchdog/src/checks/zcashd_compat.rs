@@ -90,7 +90,7 @@ impl ZcashdCompatSyncCheck {
             .basic_auth(user, Some(password))
             .json(&json!({
                 "jsonrpc": "1.0",
-                "id": "zebra-watchdog",
+                "id": "zakura-watchdog",
                 "method": method,
                 "params": [],
             }))
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn extract_result_returns_result_field() {
-        let body = json!({"result": 42, "error": null, "id": "zebra-watchdog"});
+        let body = json!({"result": 42, "error": null, "id": "zakura-watchdog"});
         assert_eq!(extract_result(body).expect("result extracted"), json!(42));
     }
 

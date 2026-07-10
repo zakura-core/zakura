@@ -808,5 +808,5 @@ The focused local checks are:
 ```text
 cargo test -p zebra-state final_frontier
 cargo test -p zebra-utils --features zebra-checkpoints
-cargo test -p zebrad --features zebra-checkpoints checkpoints
+cargo test -p zakura --features zebra-checkpoints checkpoints
 ```

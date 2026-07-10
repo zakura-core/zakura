@@ -3,7 +3,13 @@
 //! This is the code that starts `zebrad`, and launches its tasks and services.
 //! See [the crate docs](crate) and [the start docs](crate::commands::start) for more details.
 
-use std::{env, fmt::Write as _, io::Write as _, process, sync::Arc};
+use std::{
+    env,
+    fmt::Write as _,
+    io::Write as _,
+    process,
+    sync::{Arc, OnceLock},
+};
 
 use abscissa_core::{
     application::{self, AppCell},
@@ -42,9 +48,9 @@ lazy_static::lazy_static! {
     pub static ref LAST_WARN_ERROR_LOG_SENDER: watch::Sender<Option<(String, tracing::Level, chrono::DateTime<chrono::Utc>)>> = watch::Sender::new(None);
 }
 
-/// Returns the `zebrad` version for this build, in SemVer 2.0 format.
+/// Returns the `zakurad` version for this build, in SemVer 2.0 format.
 ///
-/// Includes `git describe` build metatata if available:
+/// Includes build metadata identifying the source commit when available:
 /// - the number of commits since the last version tag, and
 /// - the git commit.
 ///
@@ -61,10 +67,32 @@ pub fn build_version() -> Version {
         )
     });
 
-    vergen_build_version().unwrap_or(fallback_version)
+    let mut version = vergen_build_version().unwrap_or(fallback_version);
+
+    // Docker builds do not include `.git`, so use the explicitly supplied
+    // commit when `git describe` could not add build metadata.
+    if version.build == BuildMetadata::EMPTY {
+        if let Some(git_commit) = ZebradApp::git_commit() {
+            let short_commit: String = git_commit.chars().take(12).collect();
+            if let Ok(build) = BuildMetadata::new(&format!("g{short_commit}")) {
+                version.build = build;
+            }
+        }
+    }
+
+    version
 }
 
-/// Returns the `zebrad` version from this build, if available from `vergen`.
+/// Returns the build version in the static form required by `clap`.
+pub fn clap_build_version() -> &'static str {
+    static BUILD_VERSION: OnceLock<String> = OnceLock::new();
+
+    BUILD_VERSION
+        .get_or_init(|| build_version().to_string())
+        .as_str()
+}
+
+/// Returns the `zakurad` version from this build, if available from `vergen`.
 fn vergen_build_version() -> Option<Version> {
     // VERGEN_GIT_DESCRIBE should be in the format:
     // - v1.0.0-rc.9-6-g319b01bb84

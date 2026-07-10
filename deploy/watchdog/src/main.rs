@@ -1,6 +1,6 @@
-//! Standalone watchdog sidecar for Zebra services.
+//! Standalone watchdog sidecar for Zakura services.
 //!
-//! Queries the local Zebra and zcashd-compat services and reports their
+//! Queries the local Zakura and zcashd-compat services and reports their
 //! status. Runs either as a one-shot deploy verification (`check`) or as a
 //! continuous systemd service (`run`) that reports failure and recovery
 //! transitions to Sentry.
@@ -16,10 +16,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use config::Config;
 use reporting::Reporter;
 
-/// Watchdog sidecar for Zebra services: checks service health and reports
+/// Watchdog sidecar for Zakura services: checks service health and reports
 /// statuses to Sentry.
 #[derive(Parser, Debug)]
-#[command(name = "zebra-watchdog", version)]
+#[command(name = "zakura-watchdog", version)]
 struct Cli {
     /// The run mode.
     #[command(subcommand)]

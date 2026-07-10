@@ -94,8 +94,8 @@ jobs:
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
 
-  zebrad-config:
-    name: zebrad config compatibility
+  zakura-config:
+    name: zakura config compatibility
     permissions:
       contents: read
       id-token: write
@@ -109,14 +109,14 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
         with:
           toolchain: stable
-          cache-key: zebrad-config
+          cache-key: zakura-config
           cache-on-failure: true
       - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zebra-build
-      - name: Check generated zebrad config compatibility
-        run: cargo nextest run --profile zebrad-config --locked --features default-release-binaries --no-fail-fast
+      - name: Check generated zakurad config compatibility
+        run: cargo nextest run --profile zakura-config --locked --features default-release-binaries --no-fail-fast
 
   check-no-git-dependencies:
     name: Check no git dependencies
@@ -152,7 +152,7 @@ jobs:
     if: always()
     needs:
       - unit-tests
-      - zebrad-config
+      - zakura-config
       - check-no-git-dependencies
     timeout-minutes: 30
     steps:

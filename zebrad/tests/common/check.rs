@@ -23,7 +23,7 @@ pub enum EphemeralCheck {
     MissingDirectory,
 }
 
-/// Is `s` a valid `zebrad` version string?
+/// Is `s` a valid `zakurad` version string?
 ///
 /// Trims whitespace before parsing the version.
 ///
@@ -31,5 +31,5 @@ pub enum EphemeralCheck {
 /// line that contains the version. In particular, this check will fail if `s`
 /// includes any terminal formatting.
 pub fn is_zebrad_version(s: &str) -> bool {
-    semver::Version::parse(s.replace("zebrad", "").trim()).is_ok()
+    semver::Version::parse(s.replace("zakurad", "").trim()).is_ok()
 }

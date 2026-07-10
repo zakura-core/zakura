@@ -132,13 +132,13 @@ jobs:
       - name: Build Zakura e2e (debug)
         run: |
           unset ROCKSDB_LIB_DIR
-          cargo test -p zebrad --test zakura_regtest_e2e --no-run
+          cargo test -p zakura --test zakura_regtest_e2e --no-run
         env:
           CXXFLAGS: "-include cstdint"
       - name: Run Zakura regtest PR gate
         run: |
           unset ROCKSDB_LIB_DIR
-          cargo test -p zebrad --test zakura_regtest_e2e -- --ignored --nocapture
+          cargo test -p zakura --test zakura_regtest_e2e -- --ignored --nocapture
         env:
           CXXFLAGS: "-include cstdint"
           ZAKURA_REGTEST_E2E: "1"
@@ -273,13 +273,13 @@ jobs:
       - name: Build Zakura e2e (debug)
         run: |
           unset ROCKSDB_LIB_DIR
-          cargo test -p zebrad --test zakura_regtest_e2e --no-run
+          cargo test -p zakura --test zakura_regtest_e2e --no-run
         env:
           CXXFLAGS: "-include cstdint"
       - name: Run Zakura regtest dual-stack e2e
         run: |
           unset ROCKSDB_LIB_DIR
-          cargo test -p zebrad --test zakura_regtest_e2e -- --ignored --nocapture
+          cargo test -p zakura --test zakura_regtest_e2e -- --ignored --nocapture
         env:
           CXXFLAGS: "-include cstdint"
           ZAKURA_REGTEST_E2E: "1"

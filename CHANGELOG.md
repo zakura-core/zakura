@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Corrected Zakura's release identity and build provenance. `zakurad --version`
+  now reports the `1.0.0-rc0` release with source-commit build metadata, and
+  Docker images expose OCI version, revision, source, and title labels. The
+  Cargo packages are now named `zakura` and `zakura-watchdog`; the watchdog
+  binary, systemd unit, runtime paths, and Sentry identity use
+  `zakura-watchdog`.
 - zcashd-compat no longer adds or requires the obsolete zcashd deprecation
   acknowledgement in `zcash.conf`.
 - Removed the deprecated zcashd-compat dedicated RPC listener (`:28232`) and its

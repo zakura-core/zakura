@@ -80,14 +80,14 @@ bootstrap_toml() {
   fi
 }
 
-# Render nodes.toml.tmpl -> a temp deployer config. Args: legacy(true|false)
+# Render nodes.toml.tmpl -> a temp deployer config. Args: p2p_stack (dual|zakura|...)
 render_nodes() {
-  local legacy="$1" out
+  local p2p_stack="$1" out
   out="$(mktemp /tmp/perf-nodes.XXXXXX.toml)"
   sed -e "s#@@COMMIT@@#${SERVE_COMMIT}#g" \
       -e "s#@@COHORT@@#${COHORT_TAG}#g" \
       -e "s#@@BOOTSTRAP@@#$(bootstrap_toml)#g" \
-      -e "s#@@LEGACY@@#${legacy}#g" \
+      -e "s#@@P2P_STACK@@#${p2p_stack}#g" \
       -e "s#@@STORAGE@@#archive#g" \
       "$NODES_TMPL" > "$out"
   echo "$out"
@@ -108,15 +108,15 @@ deployer() { python3 "$DEPLOYER" "$@"; }
 # --- subcommands ------------------------------------------------------------
 
 cmd_seed_serving() {
-  note "deploying serving nodes with legacy_p2p=true (sync from public mainnet to >= ${SEED_HEIGHT})"
-  local nodes; nodes="$(render_nodes true)"
+  note "deploying serving nodes with p2p_stack=dual (sync from public mainnet to >= ${SEED_HEIGHT})"
+  local nodes; nodes="$(render_nodes dual)"
   deployer deploy --config "$nodes"
   note "seeding. Poll with: $0 status   (wait until both heights >= ${SEED_HEIGHT})"
 }
 
 cmd_peers() {
   mkdir -p "$LOG_DIR"
-  local nodes; nodes="$(render_nodes true)"
+  local nodes; nodes="$(render_nodes dual)"
   note "fetching node logs to read each Zakura identity"
   deployer logs fetch --config "$nodes" --out-dir "$LOG_DIR"
 
@@ -125,7 +125,7 @@ cmd_peers() {
           | grep -oE 'node_id=[0-9a-f]+' | tail -1 | cut -d= -f2 || true)"
   id_b="$(grep -h 'Zakura P2P endpoint ready' "$LOG_DIR/serve-b.log" 2>/dev/null \
           | grep -oE 'node_id=[0-9a-f]+' | tail -1 | cut -d= -f2 || true)"
-  [ -n "$id_a" ] || die "could not read serve-a node_id (is v2_p2p up? check $LOG_DIR/serve-a.log)"
+  [ -n "$id_a" ] || die "could not read serve-a node_id (is Zakura P2P up? check $LOG_DIR/serve-a.log)"
   [ -n "$id_b" ] || die "could not read serve-b node_id (check $LOG_DIR/serve-b.log)"
 
   local peer_a="${id_a}@${NODE_A_IP}:${ZAKURA_PORT}"
@@ -141,14 +141,14 @@ cmd_peers() {
 cmd_freeze_serving() {
   [ -n "${NODE_A_PEER:-}" ] && [ -n "${NODE_B_PEER:-}" ] \
     || die "NODE_*_PEER empty — run '$0 peers' first"
-  note "redeploying serving nodes with legacy_p2p=false (freeze) — they now serve a static range"
-  local nodes; nodes="$(render_nodes false)"
+  note "redeploying serving nodes with p2p_stack=zakura (freeze) — they now serve a static range"
+  local nodes; nodes="$(render_nodes zakura)"
   deployer deploy --config "$nodes"
   note "frozen. Serving cohort '${COHORT_TAG}' to the bench node only."
 }
 
 cmd_status() {
-  local nodes; nodes="$(render_nodes false)"
+  local nodes; nodes="$(render_nodes zakura)"
   deployer status --config "$nodes"
 }
 

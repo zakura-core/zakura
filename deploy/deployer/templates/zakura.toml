@@ -6,8 +6,7 @@ network = "{{NETWORK}}"
 listen_addr = "{{LISTEN_ADDR}}"
 {{IDENTITY_DIR}}
 {{NETWORK_CACHE_DIR}}
-v2_p2p = {{V2_P2P}}
-legacy_p2p = {{LEGACY_P2P}}
+p2p_stack = "{{P2P_STACK}}"
 {{ZAKURA_BLOCK}}
 [state]
 cache_dir = "{{STATE_CACHE_DIR}}"

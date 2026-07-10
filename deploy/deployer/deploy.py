@@ -59,8 +59,8 @@ DEFAULTS = {
     "port": None,           # ssh port; None -> ssh default
     # Match zakurad's own defaults so existing fleets render unchanged.
     "storage_mode": "archive",
-    "v2_p2p": True,
-    "legacy_p2p": True,
+    # One of: default | zebra | zakura | dual (aliases: v1/legacy, v2, combined).
+    "p2p_stack": "dual",
     "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
     "tracing_filter": "",    # e.g. "info,zebra_network::zakura=debug"; "" uses zakurad default
     "checkpoint_sync": True,
@@ -101,8 +101,7 @@ class Node:
     rpc_listen_addr: str
     rpc_enable_cookie_auth: object
     storage_mode: str
-    v2_p2p: bool
-    legacy_p2p: bool
+    p2p_stack: str
     metrics_endpoint: str
     tracing_filter: str
     checkpoint_sync: bool
@@ -141,6 +140,36 @@ class Node:
 # Config loading
 # --------------------------------------------------------------------------- #
 
+# Canonical names accepted by zakurad's network.p2p_stack (plus the aliases the
+# binary also accepts). Deployer configs should use a canonical name.
+P2P_STACK_VALUES = {
+    "default",
+    "zebra", "v1", "legacy",
+    "zakura", "v2",
+    "dual", "combined",
+}
+# Deprecated deployer keys from before network.p2p_stack; reject with a pointer.
+DEPRECATED_P2P_KEYS = {"v2_p2p", "legacy_p2p", "enable_p2p_v2", "default_p2p"}
+
+
+def normalize_p2p_stack(value: object, *, where: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise DeployError(f"{where}: p2p_stack must be a non-empty string")
+    stack = value.strip().lower()
+    if stack not in P2P_STACK_VALUES:
+        raise DeployError(
+            f"{where}: unknown p2p_stack {value!r}; "
+            f"expected one of: default, zebra, zakura, dual"
+        )
+    # Prefer canonical names in rendered node configs.
+    return {
+        "v1": "zebra",
+        "legacy": "zebra",
+        "v2": "zakura",
+        "combined": "dual",
+    }.get(stack, stack)
+
+
 def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
     if not config_path.is_file():
         raise DeployError(f"config not found: {config_path}")
@@ -152,7 +181,15 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
     # deploy into a destructive one. `name`/`ssh_string`/`commit` are per-node only.
     known_default_keys = set(DEFAULTS)
     known_node_keys = known_default_keys | {"name", "ssh_string", "commit"}
-    unknown_defaults = set(data.get("defaults", {})) - known_default_keys
+    defaults_raw = data.get("defaults", {})
+    deprecated_defaults = set(defaults_raw) & DEPRECATED_P2P_KEYS
+    if deprecated_defaults:
+        raise DeployError(
+            f"deprecated key(s) in [defaults]: {', '.join(sorted(deprecated_defaults))}; "
+            f"use p2p_stack = \"dual\"|\"zebra\"|\"zakura\"|\"default\" instead "
+            f"(see network.p2p_stack / PR #21)"
+        )
+    unknown_defaults = set(defaults_raw) - known_default_keys
     if unknown_defaults:
         raise DeployError(
             f"unknown key(s) in [defaults]: {', '.join(sorted(unknown_defaults))} "
@@ -160,7 +197,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
         )
 
     defaults = dict(DEFAULTS)
-    defaults.update(data.get("defaults", {}))
+    defaults.update(defaults_raw)
 
     raw_nodes = data.get("nodes", [])
     if not raw_nodes:
@@ -172,6 +209,12 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
         for required in ("name", "ssh_string", "commit"):
             if required not in raw:
                 raise DeployError(f"node missing required field '{required}': {raw}")
+        deprecated_node = set(raw) & DEPRECATED_P2P_KEYS
+        if deprecated_node:
+            raise DeployError(
+                f"deprecated key(s) in [[nodes]] {raw.get('name', '?')}: "
+                f"{', '.join(sorted(deprecated_node))}; use p2p_stack instead"
+            )
         unknown_node = set(raw) - known_node_keys
         if unknown_node:
             raise DeployError(
@@ -204,8 +247,9 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             rpc_listen_addr=merged["rpc_listen_addr"],
             rpc_enable_cookie_auth=merged["rpc_enable_cookie_auth"],
             storage_mode=merged["storage_mode"],
-            v2_p2p=merged["v2_p2p"],
-            legacy_p2p=merged["legacy_p2p"],
+            p2p_stack=normalize_p2p_stack(
+                merged["p2p_stack"], where=f"[[nodes]] {name}"
+            ),
             metrics_endpoint=merged["metrics_endpoint"],
             tracing_filter=merged["tracing_filter"],
             checkpoint_sync=merged["checkpoint_sync"],
@@ -404,8 +448,7 @@ def render_node_config(node: Node) -> str:
         "NETWORK_CACHE_DIR": network_cache_line,
         "STATE_CACHE_DIR": node.state_cache_dir,
         "STORAGE_MODE": node.storage_mode,
-        "V2_P2P": "true" if node.v2_p2p else "false",
-        "LEGACY_P2P": "true" if node.legacy_p2p else "false",
+        "P2P_STACK": node.p2p_stack,
         "ZAKURA_BLOCK": render_zakura_block(node.zakura),
         "METRICS_BLOCK": metrics_block,
         "TRACING_FILTER": filter_line,

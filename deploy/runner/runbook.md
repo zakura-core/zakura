@@ -32,10 +32,12 @@ branch containing #262), then:
 
 ```bash
 cd deploy/runner
-./perf.sh seed-serving     # deploy both nodes (legacy_p2p=true) → sync from public mainnet
+# deploy both nodes (p2p_stack=dual) → sync from public mainnet
+./perf.sh seed-serving
 ./perf.sh status           # repeat until both heights >= SEED_HEIGHT
 ./perf.sh peers            # capture each node_id@ip:8234 from logs into cohort.env
-./perf.sh freeze-serving   # redeploy legacy_p2p=false → static cohort servers
+# redeploy p2p_stack=zakura → static cohort servers
+./perf.sh freeze-serving
 ```
 
 Frozen = seeded once past the bench range, then cut off from public so the nodes
@@ -43,9 +45,10 @@ serve a byte-identical range every run (no public dependency, no self-sync
 jitter). Each node's iroh identity persists in its state cache dir — **never wipe
 it**, or the captured peer ids change.
 
-The deployer renders the cohort config itself: `deploy/deployer/deploy.py` reads a
-fleet-wide `[defaults.zakura]` table plus `storage_mode` / `v2_p2p` /
-`legacy_p2p`, so there is no hand-editing of `/etc/zakura` on the nodes.
+The deployer renders the cohort config itself:
+`deploy/deployer/deploy.py` reads a fleet-wide `[defaults.zakura]` table plus
+`storage_mode` / `p2p_stack`, so there is no hand-editing of `/etc/zakura` on
+the nodes.
 
 ## Run loop (the repeatable part)
 
@@ -69,8 +72,8 @@ fleet-wide `[defaults.zakura]` table plus `storage_mode` / `v2_p2p` /
 
 ## Bench config knobs that matter (`zebra-bench-config.toml`)
 
-- `[network]` `v2_p2p=true`, `legacy_p2p=false` — v2-only, so the bench node's
-  only peers are the cohort.
+- `[network]` `p2p_stack="zakura"` — Zakura-only, so the bench node's only
+  peers are the cohort.
 - `[network.zakura]` `listen_addr="0.0.0.0:8234"` — **not loopback** (iroh uses one
   UDP socket for send+recv, so a loopback bind breaks outbound). `dev_network` and
   `bootstrap_peers` are token-filled by `perf.sh` from `cohort.env`.

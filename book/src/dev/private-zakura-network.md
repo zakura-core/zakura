@@ -14,7 +14,8 @@ magic, and activation heights), so it validates exactly what production does.
 
 This only scopes the **Zakura v2 overlay**. A dev node may still maintain legacy
 TCP connections to public peers; the isolation applies to the v2 stack that is
-under test. The tag has no effect unless `v2_p2p` is enabled.
+under test. The tag has no effect unless Zakura P2P is enabled
+(`p2p_stack = "zakura"` or `"dual"`).
 
 ## Configuration
 
@@ -40,8 +41,8 @@ max_connections_per_ip = 16
 
 ```toml
 [network]
-# Keep v2 enabled so the Zakura overlay runs.
-v2_p2p = true
+# Keep Zakura P2P enabled so the overlay runs.
+p2p_stack = "dual"
 ```
 
 ## How it works

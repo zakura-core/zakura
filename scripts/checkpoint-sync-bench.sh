@@ -24,10 +24,9 @@
 #   FEED_PEER             single pinned peer ip:port           (default 167.99.162.47:8233)
 #   CKPT_LIMIT            checkpoint_verify_concurrency_limit  (default 1500)
 #   DL_LIMIT              download_concurrency_limit           (default 150)
-#   TARGET_SHOULD_USE_V2_P2P    1 = target uses Zakura P2P v2 + block syncer    (default 0)
-#   TARGET_SHOULD_USE_LEGACY_P2P 1 = target uses legacy TCP P2P                (default 1)
-#   BASELINE_SHOULD_USE_V2_P2P  1 = baseline uses Zakura P2P v2 + block syncer  (default 0)
-#   BASELINE_SHOULD_USE_LEGACY_P2P 1 = baseline uses legacy TCP P2P            (default 1)
+#   TARGET_P2P_STACK            zebra | zakura | dual (aliases: v1/legacy, v2, combined)
+#                               default: zakura. Older TARGET_SHOULD_USE_* bools still work.
+#   BASELINE_P2P_STACK          same as TARGET_P2P_STACK for the baseline run (default: zebra)
 #   SNAPSHOT_URL          primary snapshot .tar.zst URL
 #   SNAPSHOT_SHA256       expected sha256 of the .tar.zst
 #   START_HEIGHT          snapshot tip height                  (default 1707210)
@@ -65,10 +64,13 @@ FEED_PEER="${FEED_PEER-167.99.162.47:8233}"
 CKPT_LIMIT="${CKPT_LIMIT:-1500}"
 DL_LIMIT="${DL_LIMIT:-150}"
 PEERSET_SIZE="${PEERSET_SIZE:-1}"   # 1 = strict single pinned peer; raise to allow DNS-seeder fallback
-TARGET_SHOULD_USE_V2_P2P="${TARGET_SHOULD_USE_V2_P2P:-0}"
-TARGET_SHOULD_USE_LEGACY_P2P="${TARGET_SHOULD_USE_LEGACY_P2P:-1}"
-BASELINE_SHOULD_USE_V2_P2P="${BASELINE_SHOULD_USE_V2_P2P:-0}"
-BASELINE_SHOULD_USE_LEGACY_P2P="${BASELINE_SHOULD_USE_LEGACY_P2P:-1}"
+TARGET_P2P_STACK="${TARGET_P2P_STACK:-}"
+BASELINE_P2P_STACK="${BASELINE_P2P_STACK:-}"
+# Deprecated bool inputs (pre-p2p_stack); honored only when the new vars are unset.
+TARGET_SHOULD_USE_V2_P2P="${TARGET_SHOULD_USE_V2_P2P:-}"
+TARGET_SHOULD_USE_LEGACY_P2P="${TARGET_SHOULD_USE_LEGACY_P2P:-}"
+BASELINE_SHOULD_USE_V2_P2P="${BASELINE_SHOULD_USE_V2_P2P:-}"
+BASELINE_SHOULD_USE_LEGACY_P2P="${BASELINE_SHOULD_USE_LEGACY_P2P:-}"
 START_HEIGHT="${START_HEIGHT:-1707210}"
 SNAPSHOT_URL="${SNAPSHOT_URL:-https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
 SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769}"
@@ -118,10 +120,45 @@ normalize_bool() {
 }
 
 SKIP_BASELINE="$(normalize_bool "$SKIP_BASELINE")"
-TARGET_SHOULD_USE_V2_P2P="$(normalize_bool "$TARGET_SHOULD_USE_V2_P2P")"
-TARGET_SHOULD_USE_LEGACY_P2P="$(normalize_bool "$TARGET_SHOULD_USE_LEGACY_P2P")"
-BASELINE_SHOULD_USE_V2_P2P="$(normalize_bool "$BASELINE_SHOULD_USE_V2_P2P")"
-BASELINE_SHOULD_USE_LEGACY_P2P="$(normalize_bool "$BASELINE_SHOULD_USE_LEGACY_P2P")"
+
+# Map a stack name (or deprecated v2/legacy bool pair) onto a canonical p2p_stack.
+normalize_p2p_stack() {
+  local raw="${1:-}"
+  case "${raw,,}" in
+    "" ) echo "" ;;
+    default) echo "default" ;;
+    zebra|v1|legacy) echo "zebra" ;;
+    zakura|v2) echo "zakura" ;;
+    dual|combined) echo "dual" ;;
+    *) die "invalid p2p_stack '$raw' (use zebra, zakura, dual, or default)" ;;
+  esac
+}
+
+# Resolve TARGET/BASELINE stack from the new string input, else the deprecated bools.
+stack_from_bools() {
+  local v2="$1" legacy="$2" default_stack="$3"
+  if [[ -z "$v2" && -z "$legacy" ]]; then
+    echo "$default_stack"
+    return
+  fi
+  v2="$(normalize_bool "${v2:-0}")"
+  legacy="$(normalize_bool "${legacy:-1}")"
+  case "$v2$legacy" in
+    11) echo "dual" ;;
+    10) echo "zakura" ;;
+    01) echo "zebra" ;;
+    *) die "invalid P2P bools v2=$v2 legacy=$legacy (enable at least one stack)" ;;
+  esac
+}
+
+TARGET_P2P_STACK="$(normalize_p2p_stack "$TARGET_P2P_STACK")"
+BASELINE_P2P_STACK="$(normalize_p2p_stack "$BASELINE_P2P_STACK")"
+if [[ -z "$TARGET_P2P_STACK" ]]; then
+  TARGET_P2P_STACK="$(stack_from_bools "$TARGET_SHOULD_USE_V2_P2P" "$TARGET_SHOULD_USE_LEGACY_P2P" "zakura")"
+fi
+if [[ -z "$BASELINE_P2P_STACK" ]]; then
+  BASELINE_P2P_STACK="$(stack_from_bools "$BASELINE_SHOULD_USE_V2_P2P" "$BASELINE_SHOULD_USE_LEGACY_P2P" "zebra")"
+fi
 
 # Always tear down a launched node + its fork, even on FATAL/interrupt, so a failed
 # run never leaves an orphan zakurad thrashing the box or a fork eating disk.
@@ -386,14 +423,19 @@ PY
 }
 
 # ---- 3-7. one benchmark run for a given tag ----------------------------------
-# usage: run_one TAG OUTPREFIX SHOULD_USE_V2_P2P SHOULD_USE_LEGACY_P2P ; sets RESULT_* globals
+# usage: run_one TAG OUTPREFIX P2P_STACK ; sets RESULT_* globals
 run_one() {
   local tag="$1" prefix="$2"
-  local should_use_v2_p2p="$3"
-  local should_use_legacy_p2p="$4"
-  if [[ "$should_use_v2_p2p" != "1" && "$should_use_legacy_p2p" != "1" ]]; then
-    die "$prefix run requested v2_p2p=0 and legacy_p2p=0; enable at least one P2P stack"
-  fi
+  local p2p_stack
+  p2p_stack="$(normalize_p2p_stack "$3")"
+  [[ -n "$p2p_stack" && "$p2p_stack" != "default" ]] \
+    || die "$prefix run needs an explicit p2p_stack (zebra|zakura|dual), got '${3:-}'"
+  local runs_zakura=0 runs_legacy=0
+  case "$p2p_stack" in
+    zebra) runs_legacy=1 ;;
+    zakura) runs_zakura=1 ;;
+    dual) runs_zakura=1; runs_legacy=1 ;;
+  esac
   resolve_binary "$tag"; local zakurad="$ZAKURAD_BIN"
   local run_id="${prefix}-$$-$(date +%s)"
   local fork="$BENCH_HOME/forks/$run_id"
@@ -407,7 +449,9 @@ run_one() {
   find "$fork" -name LOCK -delete 2>/dev/null || true
   rm -rf "$trace_dir"; mkdir -p "$trace_dir"
 
-  # $1 = write the P2P toggles (present only on v5.0.0+ "Zakura" releases)
+  # $1 = p2p_stack | deprecated_bools | none
+  # Modern binaries want network.p2p_stack. Mid-era Zakura tags only know the
+  # deprecated v2_p2p/legacy_p2p bools. Pre-Zakura tags reject both.
   write_config() {
     {
       echo '[network]'
@@ -417,20 +461,25 @@ run_one() {
       # pin a single peer when given; otherwise fall back to the default DNS seeders
       [[ -n "$FEED_PEER" ]] && echo "initial_mainnet_peers = [\"$FEED_PEER\"]"
       echo "peerset_initial_target_size = $PEERSET_SIZE"
-      if [[ "$1" == "with_p2p_toggles" ]]; then
-        if [[ "$should_use_legacy_p2p" == "1" ]]; then
-          echo 'legacy_p2p = true'
-        else
-          echo 'legacy_p2p = false'
-        fi
-        if [[ "$should_use_v2_p2p" == "1" ]]; then
-          echo 'v2_p2p = true'   # enables Zakura P2P v2 and the Zakura block syncer
-        else
-          echo 'v2_p2p = false'  # legacy ChainSync body downloader
-        fi
-      fi
+      case "$1" in
+        p2p_stack)
+          echo "p2p_stack = \"$p2p_stack\""
+          ;;
+        deprecated_bools)
+          if [[ "$runs_legacy" == "1" ]]; then
+            echo 'legacy_p2p = true'
+          else
+            echo 'legacy_p2p = false'
+          fi
+          if [[ "$runs_zakura" == "1" ]]; then
+            echo 'v2_p2p = true'
+          else
+            echo 'v2_p2p = false'
+          fi
+          ;;
+      esac
       echo ''
-      if [[ "$1" == "with_p2p_toggles" && "$should_use_v2_p2p" == "1" ]]; then
+      if [[ "$1" != "none" && "$runs_zakura" == "1" ]]; then
         echo '[network.zakura]'
         echo "trace_dir = \"$trace_dir\""
         echo 'bootstrap_peers = ['
@@ -458,19 +507,29 @@ run_one() {
     } > "$cfg"
   }
 
-  local pid t0 mode="with_p2p_toggles"
-  log "starting zakurad ($tag), v2_p2p=$should_use_v2_p2p, legacy_p2p=$should_use_legacy_p2p, stop_height=$STOP_HEIGHT, peer=${FEED_PEER:-DNS-seeders}, peerset=$PEERSET_SIZE, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
+  local pid t0 mode="p2p_stack"
+  log "starting zakurad ($tag), p2p_stack=$p2p_stack, stop_height=$STOP_HEIGHT, peer=${FEED_PEER:-DNS-seeders}, peerset=$PEERSET_SIZE, cap=${WALL_CAP}s, metrics=:$METRICS_PORT, listen=:$LISTEN_PORT"
   write_config "$mode"
   "$zakurad" -c "$cfg" start >"$logf" 2>&1 &
   pid=$!; CUR_PID="$pid"; t0=$(date +%s); sleep 3
   if ! kill -0 "$pid" 2>/dev/null; then
-    # version-skew fallback: older tags lack v2_p2p/legacy_p2p -> deny_unknown_fields.
+    # version-skew fallbacks: mid-era tags lack p2p_stack; pre-Zakura tags lack both.
+    if grep -qiE 'unknown field|p2p_stack|deny_unknown|error parsing config|failed to parse' "$logf"; then
+      log "config rejected p2p_stack (likely pre-PR#21 tag); retrying with deprecated v2_p2p/legacy_p2p"
+      mode="deprecated_bools"
+      write_config "$mode"
+      "$zakurad" -c "$cfg" start >"$logf" 2>&1 &
+      pid=$!; CUR_PID="$pid"; t0=$(date +%s); sleep 3
+    fi
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
     if grep -qiE 'unknown field|v2_p2p|legacy_p2p|deny_unknown|error parsing config|failed to parse' "$logf"; then
-      if [[ "$should_use_v2_p2p" == "1" || "$should_use_legacy_p2p" != "1" ]]; then
-        die "requested v2_p2p=$should_use_v2_p2p legacy_p2p=$should_use_legacy_p2p for $tag, but this binary rejected the v2_p2p/legacy_p2p config fields"
+      if [[ "$runs_zakura" == "1" || "$runs_legacy" != "1" ]]; then
+        die "requested p2p_stack=$p2p_stack for $tag, but this binary rejected the P2P config fields"
       fi
-      log "config rejected (likely pre-Zakura tag); retrying without v2_p2p/legacy_p2p"
-      write_config "without_p2p_toggles"
+      log "config rejected (likely pre-Zakura tag); retrying without P2P stack fields"
+      mode="none"
+      write_config "$mode"
       "$zakurad" -c "$cfg" start >"$logf" 2>&1 &
       pid=$!; CUR_PID="$pid"; t0=$(date +%s); sleep 3
     fi
@@ -540,7 +599,7 @@ run_one() {
   errs="$(grep -iE 'panic|ERROR committing|resetting state queue' "$logf" 2>/dev/null \
             | grep -viE 'zebra_network|peer' | head -3 || true)"
   cp "$logf" "$OUT_DIR/node-$prefix.log" 2>/dev/null || true
-  [[ "$should_use_v2_p2p" == "1" ]] && zip_trace_dir "$trace_dir" "$OUT_DIR/zakura-traces-$prefix.zip"
+  [[ "$runs_zakura" == "1" ]] && zip_trace_dir "$trace_dir" "$OUT_DIR/zakura-traces-$prefix.zip"
 
   local blocks=$((end_height - START_HEIGHT))
   local total=$((t_end - t0))
@@ -553,10 +612,6 @@ run_one() {
   pbps="$(awk -v b="$blocks" -v t="$post"  'BEGIN{printf "%.2f", b/t}')"
   (( end_height < STOP_HEIGHT )) && stalled="yes (capped before stop_height)"
 
-  rm -rf "$fork" "$cfg"   # reclaim divergent SSTs; keep csv/log artifacts
-  CUR_PID=""; CUR_FORK=""
-
-  # Bottleneck verdict: classify the recorded series into commit / download / verify.
   # The archive keeps the canonical run; copy the series + verdict into the artifact dir.
   RESULT_VERDICT=""; RESULT_VERDICT_MD=""
   if [[ -n "$rec_dir" && -f "$rec_dir/samples.jsonl" ]]; then
@@ -575,9 +630,9 @@ run_one() {
   RESULT_TAG="$tag"; RESULT_START="$START_HEIGHT"; RESULT_END="$end_height"
   RESULT_BLOCKS="$blocks"; RESULT_TIME="$total"; RESULT_POST="$post"
   RESULT_BPS="$bps"; RESULT_PBPS="$pbps"; RESULT_STALLED="$stalled"; RESULT_ERRS="$errs"
-  RESULT_V2_P2P="$should_use_v2_p2p"
-  RESULT_LEGACY_P2P="$should_use_legacy_p2p"
+  RESULT_P2P_STACK="$p2p_stack"
 }
+
 
 print_one() {
   local title="$1"
@@ -585,8 +640,7 @@ print_one() {
 
 === checkpoint-sync benchmark ${title} ===
 release:        $RESULT_TAG
-v2_p2p:         $RESULT_V2_P2P
-legacy_p2p:     $RESULT_LEGACY_P2P
+p2p_stack:      $RESULT_P2P_STACK
 feed:           ${FEED_PEER:-DNS seeders (public mainnet)}  (peerset=$PEERSET_SIZE)
 start height:   $RESULT_START
 end height:     $RESULT_END
@@ -600,8 +654,8 @@ EOF
 }
 
 summary_row() { # markdown row -> step summary
-  printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' \
-    "$1" "$RESULT_V2_P2P" "$RESULT_LEGACY_P2P" "$RESULT_END" "$RESULT_BLOCKS" "${RESULT_TIME}s" "$RESULT_BPS" "$RESULT_PBPS"
+  printf '| %s | %s | %s | %s | %s | %s | %s |\n' \
+    "$1" "$RESULT_P2P_STACK" "$RESULT_END" "$RESULT_BLOCKS" "${RESULT_TIME}s" "$RESULT_BPS" "$RESULT_PBPS"
 }
 
 # ---- main --------------------------------------------------------------------
@@ -635,13 +689,13 @@ SUMMARY="${GITHUB_STEP_SUMMARY:-$OUT_DIR/summary.md}"
     echo "- GitHub run: [${GITHUB_RUN_ID:-open}]($GITHUB_RUN_URL)"
   fi
   if [[ -n "$BASELINE_SPEC" ]]; then
-    echo "- P2P mode: target v2_p2p=$TARGET_SHOULD_USE_V2_P2P legacy_p2p=$TARGET_SHOULD_USE_LEGACY_P2P, baseline v2_p2p=$BASELINE_SHOULD_USE_V2_P2P legacy_p2p=$BASELINE_SHOULD_USE_LEGACY_P2P"
+    echo "- P2P mode: target p2p_stack=$TARGET_P2P_STACK, baseline p2p_stack=$BASELINE_P2P_STACK"
   else
-    echo "- P2P mode: target v2_p2p=$TARGET_SHOULD_USE_V2_P2P legacy_p2p=$TARGET_SHOULD_USE_LEGACY_P2P, baseline skipped"
+    echo "- P2P mode: target p2p_stack=$TARGET_P2P_STACK, baseline skipped"
   fi
   echo ""
-  echo "| binary | v2_p2p | legacy_p2p | end height | blocks covered | time taken | blocks/s | post-commit blk/s |"
-  echo "|--------|-------:|-----------:|-----------:|---------------:|-----------:|---------:|------------------:|"
+  echo "| binary | p2p_stack | end height | blocks covered | time taken | blocks/s | post-commit blk/s |"
+  echo "|--------|----------:|-----------:|---------------:|-----------:|---------:|------------------:|"
 } >> "$SUMMARY"
 
 # append a recorded run's bottleneck-verdict banner below the throughput table
@@ -649,16 +703,16 @@ append_verdict() { [[ -n "$1" && -f "$1" ]] && { echo ""; cat "$1"; } >> "$SUMMA
 
 if [[ -n "$BASELINE_SPEC" ]]; then
   log "A/B mode: baseline='$BASELINE_SPEC' vs primary='$PRIMARY_SPEC'"
-  run_one "$BASELINE_SPEC" "baseline" "$BASELINE_SHOULD_USE_V2_P2P" "$BASELINE_SHOULD_USE_LEGACY_P2P"; print_one "(baseline)"; summary_row "$BASELINE_SPEC (baseline)" >> "$SUMMARY"
+  run_one "$BASELINE_SPEC" "baseline" "$BASELINE_P2P_STACK"; print_one "(baseline)"; summary_row "$BASELINE_SPEC (baseline)" >> "$SUMMARY"
   B_BPS="$RESULT_BPS"; B_VERDICT_MD="$RESULT_VERDICT_MD"
-  run_one "$PRIMARY_SPEC" "primary" "$TARGET_SHOULD_USE_V2_P2P" "$TARGET_SHOULD_USE_LEGACY_P2P";  print_one "(primary)";  summary_row "$PRIMARY_SPEC (primary)"  >> "$SUMMARY"
+  run_one "$PRIMARY_SPEC" "primary" "$TARGET_P2P_STACK";  print_one "(primary)";  summary_row "$PRIMARY_SPEC (primary)"  >> "$SUMMARY"
   R_BPS="$RESULT_BPS"; R_VERDICT_MD="$RESULT_VERDICT_MD"
   SPEEDUP="$(awk -v r="$R_BPS" -v b="$B_BPS" 'BEGIN{ if (b>0) printf "%.2f", r/b; else print "n/a" }')"
   { echo ""; echo "**Speedup:** ${B_BPS} → ${R_BPS} blocks/s = **${SPEEDUP}×**"; } >> "$SUMMARY"
   printf '\n=== A/B: %s -> %s = %s× faster ===\n' "$B_BPS" "$R_BPS" "$SPEEDUP"
   append_verdict "$B_VERDICT_MD"; append_verdict "$R_VERDICT_MD"
 else
-  run_one "$PRIMARY_SPEC" "primary" "$TARGET_SHOULD_USE_V2_P2P" "$TARGET_SHOULD_USE_LEGACY_P2P"; print_one ""; summary_row "$PRIMARY_SPEC" >> "$SUMMARY"
+  run_one "$PRIMARY_SPEC" "primary" "$TARGET_P2P_STACK"; print_one ""; summary_row "$PRIMARY_SPEC" >> "$SUMMARY"
   append_verdict "$RESULT_VERDICT_MD"
 fi
 

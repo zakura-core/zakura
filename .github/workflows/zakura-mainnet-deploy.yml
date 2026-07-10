@@ -16,6 +16,10 @@ name: Deploy Zakura mainnet fleet
 # restarts the existing `zebrad` service, leaving the config, unit, and cache
 # untouched. Rebuilding those configs into the deployer's managed model is
 # separate future work.
+#
+# After PR #21, hand configs should use network.p2p_stack (zebra|zakura|dual|
+# default) rather than the deprecated v2_p2p/legacy_p2p bools. This workflow does
+# not rewrite node configs; p2p_stack below is dashboard/metadata only.
 
 on:
   workflow_dispatch:
@@ -160,6 +164,9 @@ jobs:
           service_name    = "zebrad"
           bin_path        = "/usr/local/bin/zebrad"
           network         = "Mainnet"
+          # Dashboard/metadata only (manage_config = false does not render this).
+          # Mainnet binary default is zebra; dual/zakura must be set on-node.
+          p2p_stack       = "default"
           # Read-only fields below: consumed by the status dashboard's SSH probe,
           # not written to any node (manage_config = false).
           rpc_listen_addr = "0.0.0.0:8232"

@@ -128,8 +128,7 @@ jobs:
           rpc_listen_addr = "0.0.0.0:18232"
           rpc_enable_cookie_auth = false
           storage_mode    = "archive"
-          v2_p2p          = true
-          legacy_p2p      = true
+          p2p_stack       = "dual"
           metrics_endpoint = "127.0.0.1:9999"
           tracing_filter  = "info,zebra_network::zakura=info"
           checkpoint_sync = false
@@ -205,7 +204,7 @@ jobs:
           working_dir = "/root/unity/zakura"
           start_command = "target/release/zakurad -c /root/unity/zakura-testnet.toml start"
           process_pattern = "target/release/zakurad -c /root/unity/zakura-testnet.toml start"
-          v2_p2p = false
+          p2p_stack = "zebra"
           checkpoint_sync = true
           EOF
 

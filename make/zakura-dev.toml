@@ -10,8 +10,7 @@ network = "@@NETWORK@@"
 listen_addr = "0.0.0.0:8233"
 cache_dir = "@@CACHE_DIR@@"
 identity_dir = "@@IDENTITY_DIR@@"
-v2_p2p = true
-legacy_p2p = false
+p2p_stack = "zakura"
 
 [network.zakura]
 # Bind on all interfaces: iroh uses one UDP socket for send+recv, so a loopback
@@ -23,7 +22,7 @@ bootstrap_peers = [
 ]
 
 [network.zakura.block_sync]
-# In v2-only mode, Zakura owns block-body download while the legacy syncer only
+# In zakura-only mode, Zakura owns block-body download while the legacy syncer only
 # handles tip discovery.
 replace_legacy_syncer = true
 

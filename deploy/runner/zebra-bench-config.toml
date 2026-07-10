@@ -15,10 +15,9 @@
 network     = "Mainnet"
 listen_addr = "0.0.0.0:@@LISTEN@@"
 cache_dir   = "@@FORK@@"
-v2_p2p      = true      # Zakura v2 block/header sync + tree_aux → VCT fast path
-legacy_p2p  = false     # pure v2: no legacy peers. Zakura header-sync self-drives block-sync via
-                        # replace_legacy_syncer=true below — the two MUST be set together (without
-                        # replace_legacy_syncer it falls back to legacy obtain_tips and hard-stalls).
+p2p_stack   = "zakura"  # pure Zakura P2P v2: block/header sync + tree_aux → VCT fast path
+                        # (with replace_legacy_syncer=true below — the two MUST be set together;
+                        # without replace_legacy_syncer it falls back to legacy obtain_tips and hard-stalls).
 
 [network.zakura]
 # Bind on all interfaces — iroh uses one UDP socket for send+recv, so a loopback
@@ -28,7 +27,7 @@ listen_addr     = "0.0.0.0:8234"
 # Private cohort: peer ONLY with our two controlled serving nodes. `perf.sh run`
 # substitutes @@COHORT@@ / @@BOOTSTRAP@@ from deploy/runner/cohort.env (the same
 # tag + peers the serving fleet runs), so this bench node is isolated from the
-# churny public Zakura fleet. With legacy_p2p=false above, the cohort is its only
+# churny public Zakura fleet. With p2p_stack=zakura above, the cohort is its only
 # source of peers. To run against the public fleet instead, set CONFIG_SRC to a
 # config with the old curated bootstrap_peers and no dev_network.
 dev_network     = "@@COHORT@@"

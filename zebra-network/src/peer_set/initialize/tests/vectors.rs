@@ -22,7 +22,11 @@ use std::{
 use chrono::Utc;
 use futures::{channel::mpsc, FutureExt, StreamExt};
 use indexmap::IndexSet;
-use tokio::{io::AsyncWriteExt, net::TcpStream, task::JoinHandle};
+use tokio::{
+    io::AsyncWriteExt,
+    net::{TcpSocket, TcpStream},
+    task::JoinHandle,
+};
 use tower::{service_fn, Layer, Service, ServiceExt};
 
 use zebra_chain::{chain_tip::NoChainTip, parameters::Network, serialization::DateTime32};
@@ -32,14 +36,14 @@ use crate::{
     config::CacheDir,
     constants, init,
     meta_addr::{MetaAddr, PeerAddrState},
-    peer::{self, ClientTestHarness, HandshakeRequest, OutboundConnectorRequest},
+    peer::{self, ClientTestHarness, ConnectedAddr, HandshakeRequest, OutboundConnectorRequest},
     peer_set::{
         initialize::{
             accept_inbound_connections, add_initial_peers, crawl_and_dial, open_listener,
             DiscoveredPeer,
         },
         set::MorePeers,
-        ActiveConnectionCounter, CandidateSet,
+        ActiveConnectionCounter, CandidateSet, ConnectionTracker,
     },
     protocol::types::PeerServices,
     AddressBook, BoxError, Config, PeerSocketAddr, Request, Response,
@@ -65,6 +69,9 @@ const PEER_CACHE_UPDATER_TEST_DURATION: Duration = Duration::from_secs(25);
 ///
 /// Using a very short time can make the listener not run at all.
 const LISTENER_TEST_DURATION: Duration = Duration::from_secs(10);
+
+/// The amount of time to run zcashd-compat listener tests.
+const ZCASHD_COMPAT_LISTENER_TEST_DURATION: Duration = Duration::from_millis(500);
 
 /// The amount of time to make the inbound connection acceptor wait between peer connections.
 const MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS: Duration = Duration::from_millis(25);
@@ -946,6 +953,109 @@ async fn listener_peer_limit_one_handshake_ok_stay_open() {
     );
 }
 
+/// Test the listener reserves one inbound slot for a configured zcashd-compat peer,
+/// matching native and IPv4-mapped address representations canonically.
+#[tokio::test]
+async fn listener_reserves_one_zcashd_compat_inbound_slot() {
+    let _init_guard = zebra_test::init();
+
+    // This test requires an IPv4 network stack with 127.0.0.1 as localhost.
+    if zebra_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    let public_ip = Ipv4Addr::LOCALHOST;
+    let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
+    let (peer_tracker_tx, mut peer_tracker_rx) = mpsc::unbounded();
+
+    let success_stay_open_inbound_handshaker =
+        service_fn(move |req: HandshakeRequest<TcpStream>| {
+            let peer_tracker_tx = peer_tracker_tx.clone();
+            async move {
+                let HandshakeRequest {
+                    data_stream: tcp_stream,
+                    connected_addr,
+                    connection_tracker,
+                } = req;
+
+                let ConnectedAddr::InboundDirect { addr } = connected_addr else {
+                    unreachable!("inbound listener handshakes use inbound direct addresses");
+                };
+
+                let (fake_client, _harness) = ClientTestHarness::build()
+                    .with_connected_addr(connected_addr)
+                    .finish();
+
+                peer_tracker_tx
+                    .unbounded_send((addr.ip(), tcp_stream, connection_tracker))
+                    .expect("unexpected error sending to unbounded channel");
+
+                Ok(fake_client)
+            }
+        });
+
+    let mut config = Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        peerset_initial_target_size: 2,
+        max_connections_per_ip: usize::MAX,
+        ..Config::default()
+    };
+    let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
+    config.listen_addr = listen_addr;
+
+    let (peerset_tx, mut peerset_rx) = mpsc::channel::<DiscoveredPeer>(4);
+    let (_bans_tx, bans_rx) = tokio::sync::watch::channel(Default::default());
+
+    let listen_fut = accept_inbound_connections(
+        config.clone(),
+        tcp_listener,
+        MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
+        success_stay_open_inbound_handshaker,
+        peerset_tx,
+        bans_rx,
+        vec![IpAddr::V6(zcashd_compat_ip.to_ipv6_mapped())],
+    );
+    let listen_task_handle = tokio::spawn(listen_fut);
+
+    let public_connection = connect_from(public_ip, listen_addr).await;
+    let rejected_public_connection = connect_from(public_ip, listen_addr).await;
+    let zcashd_compat_connection = connect_from(zcashd_compat_ip, listen_addr).await;
+    let rejected_zcashd_compat_connection = connect_from(zcashd_compat_ip, listen_addr).await;
+
+    tokio::time::sleep(ZCASHD_COMPAT_LISTENER_TEST_DURATION).await;
+
+    listen_task_handle.abort();
+    tokio::task::yield_now().await;
+    assert_listener_task_cancelled(listen_task_handle);
+
+    let accepted_ips = drain_accepted_inbound_ips(&mut peer_tracker_rx);
+    let peer_change_count = drain_discovered_peers(&mut peerset_rx);
+
+    assert_eq!(
+        peer_change_count,
+        config.peerset_inbound_connection_limit(),
+        "accepted connections must stay within the total inbound limit"
+    );
+    assert_eq!(
+        accepted_ips.iter().filter(|ip| **ip == public_ip).count(),
+        1,
+        "ordinary inbound peers should only use the public slot"
+    );
+    assert_eq!(
+        accepted_ips
+            .iter()
+            .filter(|ip| **ip == zcashd_compat_ip)
+            .count(),
+        1,
+        "the canonically matched zcashd-compat peer should use the reserved slot"
+    );
+
+    std::mem::drop(public_connection);
+    std::mem::drop(rejected_public_connection);
+    std::mem::drop(zcashd_compat_connection);
+    std::mem::drop(rejected_zcashd_compat_connection);
+}
+
 /// Test the listener with the default inbound peer limit, and a handshaker that always errors.
 #[tokio::test]
 async fn listener_peer_limit_default_handshake_error() {
@@ -1650,6 +1760,53 @@ where
     (config, peerset_rx)
 }
 
+async fn connect_from(source_ip: Ipv4Addr, listen_addr: SocketAddr) -> TcpStream {
+    let socket = TcpSocket::new_v4().expect("test should create an IPv4 TCP socket");
+    socket
+        .bind(SocketAddr::new(source_ip.into(), 0))
+        .expect("test should bind to a loopback source address");
+    socket
+        .connect(listen_addr)
+        .await
+        .expect("test should connect to the inbound listener")
+}
+
+fn drain_accepted_inbound_ips(
+    peer_tracker_rx: &mut mpsc::UnboundedReceiver<(IpAddr, TcpStream, ConnectionTracker)>,
+) -> Vec<Ipv4Addr> {
+    let mut accepted_ips = Vec::new();
+
+    while let Ok((ip, peer_connection, peer_tracker)) = peer_tracker_rx.try_recv() {
+        let IpAddr::V4(ip) = ip else {
+            panic!("zcashd-compat listener tests only use IPv4 peers");
+        };
+
+        accepted_ips.push(ip);
+        std::mem::drop(peer_connection);
+        std::mem::drop(peer_tracker);
+    }
+
+    accepted_ips
+}
+
+fn drain_discovered_peers(peerset_rx: &mut mpsc::Receiver<DiscoveredPeer>) -> usize {
+    let mut peer_count = 0;
+
+    while peerset_rx.try_recv().is_ok() {
+        peer_count += 1;
+    }
+
+    peer_count
+}
+
+fn assert_listener_task_cancelled(listen_task_handle: JoinHandle<Result<(), BoxError>>) {
+    let listen_result = listen_task_handle.now_or_never();
+    assert!(
+        listen_result.is_none() || matches!(listen_result, Some(Err(ref e)) if e.is_cancelled()),
+        "unexpected error or panic in inbound peer listener task: {listen_result:?}",
+    );
+}
+
 /// Run an inbound peer listener with `peerset_initial_target_size` and `handshaker`.
 ///
 /// Binds the local listener to an unused localhost port.
@@ -1701,6 +1858,7 @@ where
         listen_handshaker,
         peerset_tx.clone(),
         bans_rx,
+        Vec::new(),
     );
     let listen_task_handle = tokio::spawn(listen_fut);
 

@@ -60,6 +60,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed two zcashd-compat sidecar stalls under production connection patterns.
+  Sidecar IP matching now treats native IPv4 and IPv4-mapped IPv6 addresses as
+  the same peer, so the configured sidecar is always included in block inventory
+  gossip. The legacy listener also reserves one inbound slot for the sidecar and
+  exempts its reconnects from the ordinary recent-IP throttle, preventing public
+  peers from filling every slot while zcashd loads its block index. Accepted
+  socket addresses, ban checks, and the total inbound connection limit retain
+  their existing behavior.
+- Fixed the mainnet status dashboard's Zakura trace path.
 - Fixed a Zakura block-sync stall after header reanchors / tip resets: the
   post-reset producer refill no longer skips when peer-registry outstanding is
   still briefly inflated, so downloads resume instead of leaving an empty work

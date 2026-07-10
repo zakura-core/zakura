@@ -295,9 +295,10 @@ proptest! {
     }
 }
 
-/// Production testnet nodes often have dozens of legacy peers plus one local zcashd
-/// sidecar. Fractional `AdvertiseBlock` gossip can miss the sidecar for many blocks
-/// in a row, so block gossip always includes configured sidecar peers.
+/// Production nodes often accept an IPv4 zcashd sidecar through an IPv6 dual-stack
+/// listener, which reports its address as IPv4-mapped IPv6. Fractional
+/// `AdvertiseBlock` gossip can miss an unrecognized sidecar for many blocks in a
+/// row, so canonical address matching must always include it.
 #[test]
 fn sidecar_peer_always_receives_block_gossip() {
     const TOTAL_PEERS: usize = 59;
@@ -319,11 +320,11 @@ fn sidecar_peer_always_receives_block_gossip() {
         ..TOTAL_PEERS)
         .map(|index| {
             let ip = if index == SIDECAR_INDEX {
-                Ipv4Addr::LOCALHOST
+                IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped())
             } else {
-                Ipv4Addr::new(10, 0, 0, index as u8)
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, index as u8))
             };
-            let peer_address: PeerSocketAddr = SocketAddr::new(ip.into(), index as u16 + 1).into();
+            let peer_address: PeerSocketAddr = SocketAddr::new(ip, index as u16 + 1).into();
             let (client, harness) = ClientTestHarness::build()
                 .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
                 .with_connected_addr(ConnectedAddr::new_inbound_direct(peer_address))

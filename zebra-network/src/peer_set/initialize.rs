@@ -44,7 +44,7 @@ use crate::{
     },
     peer_cache_updater::peer_cache_updater,
     peer_set::{set::MorePeers, ActiveConnectionCounter, CandidateSet, ConnectionTracker, PeerSet},
-    protocol::external::types::PeerServices,
+    protocol::external::{canonical_socket_addr, types::PeerServices},
     AddressBook, BoxError, Config, PeerSocketAddr, Request, Response,
 };
 
@@ -286,7 +286,7 @@ where
     // Connect the rx end to a PeerSet, wrapping new peers in load instruments.
     let peer_set = PeerSet::new(
         &config,
-        block_gossip_peer_ips,
+        block_gossip_peer_ips.clone(),
         discovered_peers,
         demand_tx.clone(),
         handle_rx,
@@ -315,6 +315,7 @@ where
             listen_handshaker,
             peerset_tx.clone(),
             bans_receiver,
+            block_gossip_peer_ips,
         );
         task_handles.push(tokio::spawn(listen_fut.in_current_span()));
 
@@ -718,6 +719,7 @@ async fn accept_inbound_connections<S>(
     handshaker: S,
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
     bans_receiver: watch::Receiver<Arc<IndexMap<IpAddr, std::time::Instant>>>,
+    zcashd_compat_peer_ips: Vec<IpAddr>,
 ) -> Result<(), BoxError>
 where
     S: Service<peer::HandshakeRequest<TcpStream>, Response = peer::Client, Error = BoxError>
@@ -731,6 +733,18 @@ where
         config.peerset_inbound_connection_limit(),
         "Inbound Connections",
     );
+    let mut active_zcashd_compat_connections =
+        ActiveConnectionCounter::new_counter_with(1, "zcashd-compat Inbound Connection");
+    let zcashd_compat_peer_ips: HashSet<_> = zcashd_compat_peer_ips
+        .into_iter()
+        .map(|ip| canonical_socket_addr(SocketAddr::new(ip, 0)).ip())
+        .collect();
+    let zcashd_compat_reserved_slots = usize::from(
+        !zcashd_compat_peer_ips.is_empty() && config.peerset_inbound_connection_limit() > 0,
+    );
+    let public_inbound_connection_limit = config
+        .peerset_inbound_connection_limit()
+        .saturating_sub(zcashd_compat_reserved_slots);
 
     let mut handshakes: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send>>> =
         FuturesUnordered::new();
@@ -760,8 +774,30 @@ where
                 continue;
             }
 
-            if active_inbound_connections.update_count()
-                >= config.peerset_inbound_connection_limit()
+            let active_public_inbound_connections = active_inbound_connections.update_count();
+            let active_zcashd_compat_inbound_connections =
+                active_zcashd_compat_connections.update_count();
+            let active_total_inbound_connections =
+                active_public_inbound_connections + active_zcashd_compat_inbound_connections;
+            let canonical_ip = canonical_socket_addr(addr.remove_socket_addr_privacy()).ip();
+            let is_zcashd_compat_peer = zcashd_compat_peer_ips.contains(&canonical_ip);
+            let connection_tracker = if is_zcashd_compat_peer {
+                if active_zcashd_compat_inbound_connections >= zcashd_compat_reserved_slots
+                    || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
+                {
+                    // Too many zcashd-compat or total open inbound connections already.
+                    // Close the connection.
+                    std::mem::drop(tcp_stream);
+                    // Allow invalid connections to be cleared quickly,
+                    // but still put a limit on our CPU and network usage from failed connections.
+                    tokio::time::sleep(constants::MIN_INBOUND_PEER_FAILED_CONNECTION_INTERVAL)
+                        .await;
+                    continue;
+                }
+
+                active_zcashd_compat_connections.track_connection()
+            } else if active_public_inbound_connections >= public_inbound_connection_limit
+                || active_total_inbound_connections >= config.peerset_inbound_connection_limit()
                 || recent_inbound_connections.is_past_limit_or_add(addr.ip())
             {
                 // Too many open inbound connections or pending handshakes already.
@@ -771,13 +807,12 @@ where
                 // but still put a limit on our CPU and network usage from failed connections.
                 tokio::time::sleep(constants::MIN_INBOUND_PEER_FAILED_CONNECTION_INTERVAL).await;
                 continue;
-            }
-
-            // The peer already opened a connection to us.
-            // So we want to increment the connection count as soon as possible.
-            let connection_tracker = active_inbound_connections.track_connection();
+            } else {
+                active_inbound_connections.track_connection()
+            };
             debug!(
-                inbound_connections = ?active_inbound_connections.update_count(),
+                inbound_connections = ?active_total_inbound_connections,
+                ?is_zcashd_compat_peer,
                 "handshaking on an open inbound peer connection"
             );
 

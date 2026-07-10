@@ -71,7 +71,13 @@ The installer:
 3. downloads SHA256-pinned release binaries (or pulls pinned Docker images);
 4. bootstraps a minimal `zcash.conf` (including the zcashd deprecation
    acknowledgement) if none exists;
-5. prints ready-to-copy start commands for the mode you chose.
+5. for Docker modes, bind-mounts both the Zakura state cache and the
+   persistent iroh identity directory (`~/.zakura` by default, override with
+   `--zakura-identity-dir`) so NodeId secrets survive `--rm` containers,
+   and runs Zakura with `--network host` so the native QUIC/iroh endpoint
+   (`8234/udp`) and legacy Zcash TCP P2P listener bind on the host's real
+   addresses (bridge NAT would advertise an unreachable `172.17.0.x`);
+6. prints ready-to-copy start commands for the mode you chose.
 
 Every prompt has a matching flag for unattended runs, e.g.:
 

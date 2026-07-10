@@ -11,7 +11,7 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZAKURA_RELEASE_TAG="v0.0.1-alpha.5"
+ZAKURA_RELEASE_TAG="v0.0.1-alpha.6"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
 # sha256 of ZAKURA_ARCHIVE from the release's SHA256SUMS.txt. Pin it once the
@@ -19,12 +19,17 @@ ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_REL
 # `curl | bash` installer is a supply-chain hole. Empty = skip verification.
 ZAKURA_ARCHIVE_SHA256=""
 ZAKURA_MEMBER="./bin/zakurad"
-ZAKURA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.5"
-ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.5"
+ZAKURA_DOCKER_IMAGE="valargroup/zakura:0.0.1-alpha.6"
+ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-0.0.1-alpha.6"
 ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
 ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
+# Persistent Zakura iroh identity (NodeId secret). Kept outside the state cache so
+# snapshots do not clone a node's long-term identity. Matches zebra-network's
+# default `network.identity_dir` (~/.zakura).
+ZAKURA_DEFAULT_IDENTITY_DIR="${HOME}/.zakura"
 ZAKURA_DOCKER_RUNTIME_UID=10001
 ZAKURA_DOCKER_RUNTIME_GID=10001
+ZAKURA_DOCKER_IDENTITY_DIR="/home/zebra/.zakura"
 
 MANIFEST_PATH="$REPO_ROOT/zebrad/zcashd-compat-manifest.json"
 TARGET_TRIPLE="x86_64-pc-linux-gnu"
@@ -43,6 +48,7 @@ ZAKURA_STANDALONE_CACHE_DIR="${HOME}/.cache/zakura"
 ZAKURA_COMPAT_INSTALL_DIR="${HOME}/.local/zcashd-compat"
 ZAKURA_COMPAT_CACHE_DIR="${HOME}/.cache/zcashd-compat"
 ZAKURA_STATE_DIR="$ZAKURA_STANDALONE_STATE_DIR"
+ZAKURA_IDENTITY_DIR="$ZAKURA_DEFAULT_IDENTITY_DIR"
 ZCASHD_DATADIR="$ZCASHD_DEFAULT_DATADIR"
 INSTALL_DIR="$ZAKURA_STANDALONE_INSTALL_DIR"
 CACHE_DIR="$ZAKURA_STANDALONE_CACHE_DIR"
@@ -56,6 +62,7 @@ DOWNLOAD_BINARIES=1
 DOWNLOAD_BINARIES_SET=0
 NETWORK_SET=0
 ZAKURA_STATE_DIR_SET=0
+ZAKURA_IDENTITY_DIR_SET=0
 ZCASHD_DATADIR_SET=0
 INSTALL_DIR_SET=0
 CACHE_DIR_SET=0
@@ -192,6 +199,7 @@ Options:
   --mode MODE
   --network NETWORK
   --zakura-state-dir DIR
+  --zakura-identity-dir DIR  Persistent Zakura iroh identity directory (default ~/.zakura)
   --zcashd-datadir DIR
   --install-dir DIR
   --cache-dir DIR
@@ -987,6 +995,7 @@ compat_normalize_inputs() {
   compat_recommend_datadir_defaults
 
   ZAKURA_STATE_DIR="$(prompt_value "Zakura state directory" "$ZAKURA_STATE_DIR")"
+  ZAKURA_IDENTITY_DIR="$(prompt_value "Zakura identity directory" "$ZAKURA_IDENTITY_DIR")"
   ZCASHD_DATADIR="$(prompt_value "zcashd datadir" "$ZCASHD_DATADIR")"
   INSTALL_DIR="$(prompt_value "Install directory" "$INSTALL_DIR")"
 
@@ -995,6 +1004,7 @@ compat_normalize_inputs() {
   fi
 
   ZAKURA_STATE_DIR="$(printf '%s' "$ZAKURA_STATE_DIR" | sanitize_terminal_input)"
+  ZAKURA_IDENTITY_DIR="$(printf '%s' "$ZAKURA_IDENTITY_DIR" | sanitize_terminal_input)"
   ZCASHD_DATADIR="$(printf '%s' "$ZCASHD_DATADIR" | sanitize_terminal_input)"
   INSTALL_DIR="$(printf '%s' "$INSTALL_DIR" | sanitize_terminal_input)"
   CACHE_DIR="$(printf '%s' "$CACHE_DIR" | sanitize_terminal_input)"
@@ -1003,6 +1013,7 @@ compat_normalize_inputs() {
   ZCASHD_PATH="$(printf '%s' "$ZCASHD_PATH" | sanitize_terminal_input)"
 
   ZAKURA_STATE_DIR="$(abs_path "$ZAKURA_STATE_DIR")"
+  ZAKURA_IDENTITY_DIR="$(abs_path "$ZAKURA_IDENTITY_DIR")"
   ZCASHD_DATADIR="$(abs_path "$ZCASHD_DATADIR")"
   INSTALL_DIR="$(abs_path "$INSTALL_DIR")"
   CACHE_DIR="$(abs_path "$CACHE_DIR")"
@@ -1402,6 +1413,7 @@ check_writable_target() {
 
 compat_collect_permission_checks() {
   check_writable_target "zakura state directory" "$ZAKURA_STATE_DIR"
+  check_writable_target "zakura identity directory" "$ZAKURA_IDENTITY_DIR"
   check_writable_target "zcashd datadir" "$ZCASHD_DATADIR"
   check_writable_target "install directory" "$INSTALL_DIR"
   check_writable_target "download/cache directory" "$CACHE_DIR"
@@ -1888,6 +1900,7 @@ compat_prepare_docker_mounts() {
   esac
 
   compat_prepare_docker_owned_directory "Zakura state directory" "$ZAKURA_STATE_DIR"
+  compat_prepare_docker_owned_directory "Zakura identity directory" "$ZAKURA_IDENTITY_DIR"
   compat_prepare_docker_owned_directory "zcashd datadir" "$ZCASHD_DATADIR"
   finalize_checks
 }
@@ -1930,11 +1943,19 @@ quote_env_value() {
   fi
 }
 
+# Zakura Docker containers use host networking so the native QUIC/iroh endpoint
+# binds and advertises the host's real addresses (not the Docker bridge IP
+# 172.17.0.x). Bridge NAT + `-p 8234:8234/udp` still leaves peers dialing an
+# unreachable private address and produces noisy iroh disco AEAD failures.
+# Host networking also covers the legacy Zcash TCP P2P listener, so `-p` is
+# unnecessary. Linux-only (this installer already requires Linux).
+
 # Shared Zakura env block for the binary/source start commands. Trailing
 # backslash but no final newline: callers put this on its own heredoc line.
 compat_print_zakurad_env_lines() {
   printf 'ZAKURA_NETWORK__NETWORK=%s \\\n' "$(quote_env_value "$(compat_network_config_value)")"
   printf 'ZAKURA_NETWORK__LISTEN_ADDR=%s \\\n' "$(quote_env_value "$ZAKURA_P2P_ADDR")"
+  printf 'ZAKURA_NETWORK__IDENTITY_DIR=%s \\\n' "$(quote_env_value "$ZAKURA_IDENTITY_DIR")"
   printf 'ZAKURA_STATE__CACHE_DIR=%s \\' "$(quote_env_value "$ZAKURA_STATE_DIR")"
 }
 
@@ -1994,22 +2015,24 @@ EOF
 compat_print_docker_supervised_command() {
   local image="${ZAKURA_COMPAT_DOCKER_SELECTED:-$ZAKURA_COMPAT_DOCKER_IMAGE}"
   local container_zebra_state_dir="/home/zebra/.cache/zakura"
+  local container_zakura_identity_dir="$ZAKURA_DOCKER_IDENTITY_DIR"
   local container_zcashd_datadir="/home/zebra/.cache/zcashd"
   local p2p_port
   p2p_port="$(compat_p2p_port_from_addr "$ZAKURA_P2P_ADDR")"
   cat <<EOF
-docker run --rm -it \\
+docker run --rm -it --network host \\
   -e ZCASHD_COMPAT_ENABLED=true \\
   -e ZAKURA_NETWORK__NETWORK=$(shell_quote "$(compat_network_config_value)") \\
   -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:${p2p_port}' \\
   -e ZAKURA_NETWORK__MAX_CONNECTIONS_PER_IP=8 \\
+  -e ZAKURA_NETWORK__IDENTITY_DIR=$container_zakura_identity_dir \\
   -e ZAKURA_STATE__CACHE_DIR=$container_zebra_state_dir \\
   -e ZAKURA_ZCASHD_COMPAT__MANAGE_ZCASHD=true \\
   -e ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR=$container_zcashd_datadir \\
   -e ZAKURA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \\
   --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=$container_zebra_state_dir \\
+  --mount type=bind,src=$(shell_quote "$ZAKURA_IDENTITY_DIR"),dst=$container_zakura_identity_dir \\
   --mount type=bind,src=$(shell_quote "$ZCASHD_DATADIR"),dst=$container_zcashd_datadir \\
-  -p ${p2p_port}:${p2p_port} \\
   $(shell_quote "$image") \\
   zakurad start --zcashd-compat
 EOF
@@ -2020,13 +2043,14 @@ compat_print_docker_split_commands() {
   p2p_port="$(compat_p2p_port_from_addr "$ZAKURA_P2P_ADDR")"
   cat <<EOF
 $(style "$GREEN$BOLD" "Start Zakura container in terminal 1:")
-docker run --rm -it --name zakura-compat \\
+docker run --rm -it --name zakura-compat --network host \\
   -e ZAKURA_NETWORK__NETWORK=$(shell_quote "$(compat_network_config_value)") \\
   -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:${p2p_port}' \\
   -e ZAKURA_NETWORK__MAX_CONNECTIONS_PER_IP=8 \\
+  -e ZAKURA_NETWORK__IDENTITY_DIR=$ZAKURA_DOCKER_IDENTITY_DIR \\
   -e ZAKURA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \\
   --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
-  -p ${p2p_port}:${p2p_port} \\
+  --mount type=bind,src=$(shell_quote "$ZAKURA_IDENTITY_DIR"),dst=$ZAKURA_DOCKER_IDENTITY_DIR \\
   $(shell_quote "$ZAKURA_DOCKER_IMAGE") \\
   zakurad start --zcashd-compat
 
@@ -2153,15 +2177,18 @@ default_normalize_inputs() {
   fi
 
   ZAKURA_STATE_DIR="$(prompt_value "Zakura state directory" "$ZAKURA_STATE_DIR")"
+  ZAKURA_IDENTITY_DIR="$(prompt_value "Zakura identity directory" "$ZAKURA_IDENTITY_DIR")"
   INSTALL_DIR="$(prompt_value "Install directory" "$INSTALL_DIR")"
   CACHE_DIR="$(prompt_value "Download/cache directory" "$CACHE_DIR")"
 
   ZAKURA_STATE_DIR="$(printf '%s' "$ZAKURA_STATE_DIR" | sanitize_terminal_input)"
+  ZAKURA_IDENTITY_DIR="$(printf '%s' "$ZAKURA_IDENTITY_DIR" | sanitize_terminal_input)"
   INSTALL_DIR="$(printf '%s' "$INSTALL_DIR" | sanitize_terminal_input)"
   CACHE_DIR="$(printf '%s' "$CACHE_DIR" | sanitize_terminal_input)"
   ZAKURAD_PATH="$(printf '%s' "$ZAKURAD_PATH" | sanitize_terminal_input)"
 
   ZAKURA_STATE_DIR="$(abs_path "$ZAKURA_STATE_DIR")"
+  ZAKURA_IDENTITY_DIR="$(abs_path "$ZAKURA_IDENTITY_DIR")"
   INSTALL_DIR="$(abs_path "$INSTALL_DIR")"
   CACHE_DIR="$(abs_path "$CACHE_DIR")"
 
@@ -2203,6 +2230,7 @@ default_collect_tool_checks() {
 
 default_collect_permission_checks() {
   check_writable_target "zakura state directory" "$ZAKURA_STATE_DIR"
+  check_writable_target "zakura identity directory" "$ZAKURA_IDENTITY_DIR"
 
   if [[ "$MODE" == "native" ]]; then
     check_writable_target "install directory" "$INSTALL_DIR"
@@ -2341,9 +2369,20 @@ default_prepare_docker_image() {
   finalize_checks
 }
 
+default_prepare_docker_mounts() {
+  if [[ "$MODE" != "docker" ]]; then
+    return
+  fi
+
+  compat_prepare_docker_owned_directory "Zakura state directory" "$ZAKURA_STATE_DIR"
+  compat_prepare_docker_owned_directory "Zakura identity directory" "$ZAKURA_IDENTITY_DIR"
+  finalize_checks
+}
+
 default_print_native_command() {
   cat <<EOF
 $(style "$GREEN$BOLD" "Start Zakura:")
+ZAKURA_NETWORK__IDENTITY_DIR=$(shell_quote "$ZAKURA_IDENTITY_DIR") \\
 ZAKURA_STATE__CACHE_DIR=$(shell_quote "$ZAKURA_STATE_DIR") \\
 $(shell_quote "$ZAKURAD_PATH") start
 EOF
@@ -2354,12 +2393,13 @@ default_print_docker_command() {
   port="$(default_p2p_port)"
 
   cat <<EOF
-docker run --rm -it --name zakura \\
+docker run --rm -it --name zakura --network host \\
   -e ZAKURA_NETWORK__NETWORK=$(shell_quote "$NETWORK") \\
   -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:$port' \\
+  -e ZAKURA_NETWORK__IDENTITY_DIR=$ZAKURA_DOCKER_IDENTITY_DIR \\
   -e ZAKURA_STATE__CACHE_DIR=/home/zebra/.cache/zakura \\
   --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
-  -p $port:$port \\
+  --mount type=bind,src=$(shell_quote "$ZAKURA_IDENTITY_DIR"),dst=$ZAKURA_DOCKER_IDENTITY_DIR \\
   $(shell_quote "$ZAKURA_DOCKER_IMAGE") \\
   zakurad start
 EOF
@@ -2372,6 +2412,7 @@ git clone https://github.com/zakura-core/zakura.git
 cd $(shell_quote "$REPO_ROOT") && cargo build --release --bin zakurad
 
 $(style "$GREEN$BOLD" "Start Zakura:")
+ZAKURA_NETWORK__IDENTITY_DIR=$(shell_quote "$ZAKURA_IDENTITY_DIR") \\
 ZAKURA_STATE__CACHE_DIR=$(shell_quote "$ZAKURA_STATE_DIR") \\
 $(shell_quote "$ZAKURAD_PATH") start
 EOF
@@ -2417,6 +2458,12 @@ while (($#)); do
       require_value "$1" "${2:-}"
       ZAKURA_STATE_DIR="$2"
       ZAKURA_STATE_DIR_SET=1
+      shift 2
+      ;;
+    --zakura-identity-dir)
+      require_value "$1" "${2:-}"
+      ZAKURA_IDENTITY_DIR="$2"
+      ZAKURA_IDENTITY_DIR_SET=1
       shift 2
       ;;
     --zcashd-datadir)
@@ -2526,6 +2573,7 @@ case "$INSTALL_PROFILE" in
         default_prepare_binary_path
         ;;
       docker)
+        default_prepare_docker_mounts
         default_prepare_docker_image
         ;;
       build-from-source)

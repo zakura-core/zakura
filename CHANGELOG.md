@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Security
+
+- Fixed a remotely triggerable panic in the `getblock` RPC with verbosity 2 on a
+  side-chain block (GHSA-x6v8-c2xp-928m). Transaction `confirmations` are now a
+  signed `i64`, matching zcashd, so the `-1` sentinel returned for side-chain
+  blocks no longer overflows the previous `u32` conversion and aborts the node.
+  Backported from upstream Zebra PR #10889.
+
+### Fixed
+
+- Added a default 180-second request timeout to `RpcRequestClient`, so RPC calls
+  no longer hang indefinitely when a server accepts the connection but never
+  sends a response. A new `new_with_timeout` constructor lets callers with
+  legitimately long-running calls (such as `generate`) opt into a longer bound.
+  Backported from upstream Zebra PR #10468.
+
 ### Changed
 
 - Removed the deprecated zcashd-compat dedicated RPC listener (`:28232`) and its

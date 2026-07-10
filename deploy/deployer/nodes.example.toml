@@ -17,8 +17,7 @@ listen_addr     = "[::]:8233"
 # identity_dir  = "/root/.zakura"           # empty = zakurad default; pins the iroh node_id
 rpc_listen_addr = ""                        # empty = RPC disabled; e.g. "0.0.0.0:8232"
 storage_mode    = "archive"                 # "archive" serves all history; "pruned" does not
-v2_p2p          = true                       # run the Zakura v2 overlay
-legacy_p2p      = true                       # keep legacy TCP P2P (set false to isolate to v2)
+p2p_stack       = "dual"                     # zebra | zakura | dual | default
 # port          = 22                        # optional non-default ssh port
 
 # Optional fleet-wide Zakura settings, rendered into [network.zakura] on every

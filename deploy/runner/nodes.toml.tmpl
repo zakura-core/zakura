@@ -4,7 +4,7 @@
 # cohort.env) and passes it to deploy/deployer/deploy.py. Do not run deploy.py
 # against this file directly — the tokens are not valid TOML until rendered.
 #
-# Tokens: @@COMMIT@@ @@COHORT@@ @@BOOTSTRAP@@ @@LEGACY@@ @@STORAGE@@
+# Tokens: @@COMMIT@@ @@COHORT@@ @@BOOTSTRAP@@ @@P2P_STACK@@ @@STORAGE@@
 
 [defaults]
 service_name    = "zakurad"
@@ -15,8 +15,7 @@ state_cache_dir = "/root/.cache/zakura"      # the big-volume snapshot (symlink 
 network         = "Mainnet"
 listen_addr     = "[::]:8233"
 storage_mode    = "@@STORAGE@@"
-v2_p2p          = true
-legacy_p2p      = @@LEGACY@@                  # seed phase: true (sync from public); freeze phase: false
+p2p_stack       = "@@P2P_STACK@@"            # seed phase: dual (sync from public); freeze phase: zakura
 metrics_endpoint = "127.0.0.1:9100"          # loopback Prometheus; scrape via ssh for cohort/peer counts
 tracing_filter   = "info,zebra_network::zakura=debug,zebra_network::zakura::discovery=debug"
 

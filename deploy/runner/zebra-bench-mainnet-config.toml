@@ -16,8 +16,7 @@
 network     = "Mainnet"
 listen_addr = "0.0.0.0:@@LISTEN@@"
 cache_dir   = "@@FORK@@"
-v2_p2p      = true      # Zakura v2 block/header sync + tree_aux -> VCT fast path
-legacy_p2p  = false     # pure v2: public Zakura bootstrap peers below are the entrypoint
+p2p_stack   = "zakura"  # pure Zakura P2P v2: block/header sync + tree_aux -> VCT fast path
 
 [network.zakura]
 # Bind on all interfaces - iroh uses one UDP socket for send+recv, so a loopback

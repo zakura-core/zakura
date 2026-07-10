@@ -66,26 +66,14 @@ on:
       download_concurrency_limit:
         required: false
         default: "150"
-      target_should_use_v2_p2p:
-        description: "Run the target/primary binary with Zakura P2P v2 and its block syncer"
-        type: boolean
+      target_p2p_stack:
+        description: "Target/primary P2P stack: zebra | zakura | dual (aliases: v1/legacy, v2, combined)"
         required: false
-        default: true
-      target_should_use_legacy_p2p:
-        description: "Run the target/primary binary with legacy TCP P2P enabled"
-        type: boolean
+        default: "zakura"
+      baseline_p2p_stack:
+        description: "Baseline/base P2P stack: zebra | zakura | dual (aliases: v1/legacy, v2, combined)"
         required: false
-        default: false
-      baseline_should_use_v2_p2p:
-        description: "Run the baseline/base binary with Zakura P2P v2 and its block syncer"
-        type: boolean
-        required: false
-        default: false
-      baseline_should_use_legacy_p2p:
-        description: "Run the baseline/base binary with legacy TCP P2P enabled"
-        type: boolean
-        required: false
-        default: true
+        default: "zebra"
       baseline_tag:
         description: "Optional (download mode): baseline release tag for a speedup comparison. Ignored when skip_baseline is true."
         required: false
@@ -125,10 +113,8 @@ jobs:
           PEERSET_SIZE: ${{ inputs.peerset_size }}
           CKPT_LIMIT: ${{ inputs.checkpoint_verify_concurrency_limit }}
           DL_LIMIT: ${{ inputs.download_concurrency_limit }}
-          TARGET_SHOULD_USE_V2_P2P: ${{ inputs.target_should_use_v2_p2p && '1' || '0' }}
-          TARGET_SHOULD_USE_LEGACY_P2P: ${{ inputs.target_should_use_legacy_p2p && '1' || '0' }}
-          BASELINE_SHOULD_USE_V2_P2P: ${{ inputs.baseline_should_use_v2_p2p && '1' || '0' }}
-          BASELINE_SHOULD_USE_LEGACY_P2P: ${{ inputs.baseline_should_use_legacy_p2p && '1' || '0' }}
+          TARGET_P2P_STACK: ${{ inputs.target_p2p_stack }}
+          BASELINE_P2P_STACK: ${{ inputs.baseline_p2p_stack }}
           SNAPSHOT_URL: ${{ vars.BENCH_SNAPSHOT_URL || 'https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst' }}
           SNAPSHOT_SHA256: ${{ vars.BENCH_SNAPSHOT_SHA256 || '19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769' }}
           START_HEIGHT: ${{ vars.BENCH_SNAPSHOT_START_HEIGHT || '1707210' }}

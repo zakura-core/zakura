@@ -104,10 +104,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   gate drains in-flight Zakura body applies before legacy sync drives commits.
 - Fixed legacy peers being disconnected for returning empty `FindBlocks` or
   `FindHeaders` responses when Zebra is at or near the network tip.
-- Kept an already-active mempool and `getblocktemplate` mining RPCs running
-  when the legacy sync status temporarily reports Zebra is far from the tip.
-  Initial mempool activation still waits until Zebra is within 100 blocks of
-  the tip.
+- Mempool activation and crawling now require both near-tip sync throughput and
+  a local-clock estimate within the rollback window. An already-active mempool
+  only disables after the estimate exceeds the rollback window, and
+  mempool transaction verification failures are only scored against peers while
+  Zebra is current enough to trust its validation context.
 - Fixed a near-tip sync restart loop when a timed-out `AwaitUtxo` lookup in the
   transaction verifier was converted to `InternalDowncastError` instead of a
   missing transparent input.

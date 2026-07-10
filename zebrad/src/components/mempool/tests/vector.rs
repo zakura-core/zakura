@@ -457,15 +457,14 @@ async fn mempool_service_stays_enabled_when_legacy_sync_status_falls_behind() ->
     Ok(())
 }
 
-/// Check that a disabled mempool does not consume the latest tip action until
-/// legacy sync status says Zebra is close enough to activate it.
+/// Check that a disabled mempool does not activate until both sync status and
+/// estimated tip distance say Zebra is close enough.
 ///
-/// Regression test: `poll_ready()` used to call `last_tip_change()` before
-/// checking the initial-activation gate. If Zebra was still far from tip, that
-/// consumed the only available tip action and left the disabled mempool unable
-/// to activate when sync status later caught up without another tip change.
+/// Regression test: a peer-starved syncer can report zero new downloads and
+/// therefore look close to tip by throughput alone, even when the local chain
+/// tip timestamp proves the node is far behind the network.
 #[tokio::test]
-async fn disabled_mempool_keeps_tip_action_until_legacy_sync_catches_up() -> Result<(), Report> {
+async fn disabled_mempool_waits_for_sync_status_and_tip_distance() -> Result<(), Report> {
     let network = Network::Mainnet;
 
     let (
@@ -486,11 +485,12 @@ async fn disabled_mempool_keeps_tip_action_until_legacy_sync_catches_up() -> Res
     service.dummy_call().await;
     assert!(!service.is_enabled());
 
-    // Now catch up without committing another block. The same tip action should
-    // still be available for initial activation.
+    // Now make legacy sync throughput look caught up without committing another
+    // block. The genesis tip is still far from the estimated network tip, so the
+    // mempool must remain disabled.
     SyncStatus::sync_close_to_tip(&mut recent_syncs);
     service.dummy_call().await;
-    assert!(service.is_enabled());
+    assert!(!service.is_enabled());
 
     Ok(())
 }

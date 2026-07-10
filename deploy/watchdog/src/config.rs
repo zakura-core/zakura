@@ -1,8 +1,8 @@
 //! Watchdog configuration, sourced from CLI flags and environment variables.
 //!
 //! Environment variable names intentionally match the ones used by
-//! `deploy/zcashd-compat/sync-check.sh` and the `deploy-zcashd-compat.yml`
-//! workflow, so the watchdog is a drop-in replacement for the shell check.
+//! `deploy/zcashd-compat/sync-check.sh`, so the watchdog is a drop-in
+//! replacement for the shell check.
 
 use std::path::PathBuf;
 

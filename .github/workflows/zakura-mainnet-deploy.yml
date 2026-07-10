@@ -170,7 +170,7 @@ jobs:
           # Read-only fields below: consumed by the status dashboard's SSH probe,
           # not written to any node (manage_config = false).
           rpc_listen_addr = "0.0.0.0:8232"
-          log_file        = "/root/logs/zebrad.log"
+          log_file        = "/root/logs/zakura-tracing.log"
 
           # Public mainnet node ids (zebra-network/src/zakura/handler.rs). Used by
           # the dashboard to label each host; not deployed to the nodes.

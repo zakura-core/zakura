@@ -69,8 +69,7 @@ transitions.
 ## Configuration
 
 All settings can be provided as CLI flags or environment variables. The
-environment variable names match the legacy sync-check script and the
-`deploy-zcashd-compat.yml` workflow.
+environment variable names match the legacy sync-check script.
 
 | Environment variable      | Flag                        | Default                               | Purpose |
 | ------------------------- | --------------------------- | ------------------------------------- | ------- |
@@ -149,26 +148,6 @@ journalctl -u zebra-watchdog -f
 The environment file is optional (`EnvironmentFile=-`): the service starts and
 logs locally without it. It is operator-managed and is not overwritten by
 deployments.
-
-## Deploy workflow integration
-
-[`.github/workflows/deploy-zcashd-compat.yml`](../../.github/workflows/deploy-zcashd-compat.yml)
-deploys the watchdog alongside `zebrad`:
-
-1. builds `zebrad` and `zebra-watchdog` (`cargo build --release --locked -p zebrad -p zebra-watchdog`),
-2. uploads both binaries, the legacy zcashd-compat sync checker, and the systemd unit,
-3. installs both binaries and restarts `zebrad-compat`
-   (only `zebrad` keeps a `.bak` rollback copy),
-4. writes a 20-minute deployment suppression marker and restarts any existing
-   watchdog service so the running sidecar observes the marker,
-5. verifies the deployment with `/tmp/zcashd-compat-sync-check.sh`;
-   on failure the workflow restores
-   `/usr/local/bin/zakurad.bak` and fails,
-6. on success, installs/refreshes the `zebra-watchdog` systemd unit and
-   restarts the continuous watchdog service.
-
-Rollback ownership stays with the workflow: the deploy sync checker only reports
-pass/fail through its exit code.
 
 ### Manual one-shot check
 

@@ -4,9 +4,8 @@ A small, dependency-free operator tool to build `zebrad` from a per-node commit,
 distribute it to a fleet over SSH, run it as a systemd service that logs to a
 deterministic file, and pull those logs back by node name.
 
-It reuses the build → scp → install-with-`.bak`-backup → `systemctl restart` →
-rollback pattern from `.github/workflows/deploy-zcashd-compat.yml`, generalized to
-a dynamic multi-node config.
+It uses a build → scp → install-with-`.bak`-backup → `systemctl restart` →
+rollback pattern generalized to a dynamic multi-node config.
 
 ## Requirements
 

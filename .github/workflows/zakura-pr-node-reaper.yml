@@ -11,12 +11,6 @@ name: PR node reaper
 #     the newest 2 each
 
 on:
-  # TEMP(feat/pr-node): registers this workflow for dispatch while the file is
-  # not yet on the default branch; remove before merge. The push run performs a
-  # normal (harmless, idempotent) sweep.
-  push:
-    branches: [feat/pr-node]
-    paths: [.github/workflows/zakura-pr-node-reaper.yml]
   workflow_dispatch:
     inputs:
       max_age_hours:

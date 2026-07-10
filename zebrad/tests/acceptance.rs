@@ -1524,7 +1524,7 @@ async fn metrics_endpoint() -> Result<()> {
     let output = output.assert_failure()?;
 
     output.any_output_line_contains(
-        "# TYPE zebrad_build_info counter",
+        "# TYPE zakura_build_info counter",
         &body,
         "metrics exporter response",
         "the metrics response header",

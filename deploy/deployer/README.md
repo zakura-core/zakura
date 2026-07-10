@@ -264,6 +264,15 @@ systemctl status zakura-fleet-watchdog
 journalctl -u zakura-fleet-watchdog -f
 ```
 
+## Ephemeral PR test nodes
+
+`.github/workflows/zakura-pr-node.yml` reuses this deployer on a throwaway
+DigitalOcean droplet to test a single PR against a real node for ~1 hour: the
+droplet image bakes a repo clone, a warm `CARGO_TARGET_DIR`, and a
+`root@localhost` SSH identity, so the workflow just writes a one-node config and
+runs `deploy.py build` / `deploy` / `status` on the droplet itself. See
+`docs/pr-node-do-setup.md`.
+
 ## How the build cache works
 
 `commit` is resolved to a full SHA (`git rev-parse`). The binary is cached at

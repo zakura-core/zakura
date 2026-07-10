@@ -1,0 +1,105 @@
+name: PR node reaper
+
+# Hourly cleanup backstop for the ephemeral PR-node fleet (zakura-pr-node.yml /
+# zakura-pr-node-bake.yml). Run droplets are intentionally kept alive after
+# their run for SSH inspection; this deletes them (and every other leaked
+# resource) on a TTL so nothing accrues cost indefinitely:
+#   - zakura-pr-node droplets older than max_age_hours (default 24h)
+#   - zakura-image-bake droplets older than 6h (failed bakes)
+#   - detached zakura-pr-* volumes older than 2h (run/bake leftovers)
+#   - zakura-pr-node-* images and zakura-pr-state-* volume snapshots beyond
+#     the newest 2 each
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_age_hours:
+        description: "Delete run droplets older than this many hours"
+        required: false
+        default: "24"
+  schedule:
+    - cron: "17 * * * *" # hourly
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zakura-pr-node-reaper
+  cancel-in-progress: false
+
+jobs:
+  reap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install doctl
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          DOCTL_VERSION=1.120.0
+          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
+          sudo install /tmp/doctl /usr/local/bin/doctl
+          doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
+
+      - name: Reap expired droplets
+        env:
+          MAX_AGE_HOURS: ${{ inputs.max_age_hours || '24' }}
+        run: |
+          set -euo pipefail
+          reap_tag() {
+            local tag="$1" max_age_secs="$2"
+            # NOTE: `date -d` is GNU coreutils (present on ubuntu-latest).
+            doctl compute droplet list --tag-name "$tag" --format ID,Name,Created --no-header | \
+            while read -r id name created; do
+              [ -z "$id" ] && continue
+              created_epoch=$(date -d "$created" +%s 2>/dev/null) || continue
+              age=$(( $(date +%s) - created_epoch ))
+              if [ "$age" -gt "$max_age_secs" ]; then
+                echo "deleting droplet $name (id $id, age ${age}s)"
+                doctl compute droplet delete "$id" -f || true
+              fi
+            done
+          }
+          reap_tag zakura-pr-node    $(( MAX_AGE_HOURS * 3600 ))
+          reap_tag zakura-image-bake $(( 6 * 3600 ))
+
+      - name: Reap detached state volumes
+        run: |
+          set -euo pipefail
+          # Give volumes from the droplet sweep above a moment to detach.
+          sleep 30
+          # Detached zakura-pr-* volumes are always garbage in this system:
+          # live runs keep theirs attached, and 2h clears the create->attach
+          # window with a wide margin.
+          doctl compute volume list --format ID,Name,CreatedAt,DropletIDs --no-header | \
+          while read -r id name created droplets; do
+            [ -z "$id" ] && continue
+            case "$name" in zakura-pr-*) ;; *) continue ;; esac
+            case "$droplets" in *[0-9]*) continue ;; esac
+            created_epoch=$(date -d "$created" +%s 2>/dev/null) || continue
+            age=$(( $(date +%s) - created_epoch ))
+            if [ "$age" -gt $(( 2 * 3600 )) ]; then
+              echo "deleting detached volume $name (id $id, age ${age}s)"
+              doctl compute volume delete "$id" -f || true
+            fi
+          done
+
+      - name: Prune old images and volume snapshots
+        run: |
+          set -euo pipefail
+          doctl compute image list-user --format ID,Name --no-header | \
+            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | head -n -2 | \
+            while read -r name id; do
+              echo "deleting image $name (id $id)"
+              doctl compute image delete "$id" -f || true
+            done
+          for NET in mainnet testnet; do
+            doctl compute snapshot list --resource volume --format ID,Name --no-header | \
+              awk -v pre="zakura-pr-state-${NET}-" 'index($2, pre) == 1 {print $2, $1}' | \
+              sort | head -n -2 | \
+              while read -r name id; do
+                echo "deleting volume snapshot $name (id $id)"
+                doctl compute snapshot delete "$id" -f || true
+              done
+          done

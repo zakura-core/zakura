@@ -1,0 +1,354 @@
+name: PR node
+
+# Ephemeral 1-hour real-node test for a PR (or any ref) on DigitalOcean.
+#
+# Boots a droplet from the pre-baked PR-node image (deps + warm cargo cache,
+# see zakura-pr-node-bake.yml), attaches a clone of the chosen chain-state
+# volume snapshot, builds zakurad from the PR branch incrementally, runs it for
+# `duration_minutes`, and posts a metrics summary as a PR comment.
+#
+# The droplet is kept alive afterwards for SSH inspection and is deleted by
+# zakura-pr-node-reaper.yml within 24h (or immediately with
+# teardown_after_run=true).
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to test (exactly one of pr_number / ref)"
+        required: false
+      ref:
+        description: "Branch, tag, or SHA to test (exactly one of pr_number / ref)"
+        required: false
+      snapshot_mode:
+        description: "Chain state to start from"
+        type: choice
+        options: [tip, sandblast, genesis]
+        default: tip
+      network:
+        description: "Network (sandblast is mainnet-only)"
+        type: choice
+        options: [mainnet, testnet]
+        default: mainnet
+      duration_minutes:
+        description: "How long to monitor the running node"
+        required: false
+        default: "60"
+      droplet_size:
+        description: "Droplet size (disk must be >= the baked image's disk)"
+        required: false
+        default: c-8
+      teardown_after_run:
+        description: "Delete the droplet immediately after the run"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: zakura-pr-node-${{ inputs.pr_number || inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    # duration_minutes (<=60 typically) + incremental build + provisioning overhead.
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs and resolve target
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REF: ${{ inputs.ref }}
+          MODE: ${{ inputs.snapshot_mode }}
+          NETWORK: ${{ inputs.network }}
+        run: |
+          set -euo pipefail
+          if [ "${MODE}" = "sandblast" ] && [ "${NETWORK}" != "mainnet" ]; then
+            echo "snapshot_mode=sandblast is mainnet-only (the spam region is a mainnet range)" >&2
+            exit 1
+          fi
+          if { [ -n "${PR_NUMBER}" ] && [ -n "${REF}" ]; } || { [ -z "${PR_NUMBER}" ] && [ -z "${REF}" ]; }; then
+            echo "provide exactly one of pr_number / ref" >&2
+            exit 1
+          fi
+          if [ -n "${PR_NUMBER}" ]; then
+            SHA=$(gh pr view "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json headRefOid --jq .headRefOid)
+            REFSPEC="refs/pull/${PR_NUMBER}/head"
+            PR="${PR_NUMBER}"
+            SLUG="pr${PR_NUMBER}"
+          else
+            SHA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${REF}" --jq .sha)
+            if [ "${REF}" = "${SHA}" ]; then
+              REFSPEC="${SHA}"
+            else
+              REFSPEC="${REF}"
+            fi
+            # Best-effort: post the summary to an open PR whose head is this ref.
+            PR=$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${REF}" --state open \
+                   --json number --jq '.[0].number // empty' 2>/dev/null || true)
+            SLUG=$(echo "${REF}" | tr -c 'a-zA-Z0-9' '-' | tr -s '-' | sed 's/^-//; s/-$//' | cut -c1-24)
+          fi
+          echo "Testing ${SHA} (${REFSPEC}), PR: ${PR:-none}"
+          {
+            echo "sha=${SHA}"
+            echo "refspec=${REFSPEC}"
+            echo "pr=${PR}"
+            echo "slug=${SLUG}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install doctl
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          DOCTL_VERSION=1.120.0
+          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
+          sudo install /tmp/doctl /usr/local/bin/doctl
+          doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
+
+      - name: Write SSH key
+        env:
+          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+        run: |
+          install -m 600 /dev/null /tmp/do_ssh
+          printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
+
+      - name: Pick baked image and state snapshot
+        id: baked
+        env:
+          MODE: ${{ inputs.snapshot_mode }}
+          NETWORK: ${{ inputs.network }}
+        run: |
+          set -euo pipefail
+          IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
+            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | tail -1 | awk '{print $2}')
+          if [ -z "${IMAGE}" ]; then
+            echo "no zakura-pr-node-* image found; run the 'PR node image bake' workflow first" >&2
+            exit 1
+          fi
+          echo "image_id=${IMAGE}" >> "$GITHUB_OUTPUT"
+          if [ "${MODE}" = "genesis" ]; then
+            echo "vol_snap_id=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          SNAP=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
+            awk -v pre="zakura-pr-state-${NETWORK}-" 'index($2, pre) == 1 {print $2, $1}' | \
+            sort | tail -1 | awk '{print $2}')
+          if [ -z "${SNAP}" ]; then
+            echo "no zakura-pr-state-${NETWORK}-* volume snapshot found; run the bake workflow first" >&2
+            exit 1
+          fi
+          echo "vol_snap_id=${SNAP}" >> "$GITHUB_OUTPUT"
+
+      - name: Create droplet (+ state volume)
+        id: droplet
+        env:
+          MODE: ${{ inputs.snapshot_mode }}
+          DROPLET_SIZE: ${{ inputs.droplet_size || 'c-8' }}
+          SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+          IMAGE_ID: ${{ steps.baked.outputs.image_id }}
+          VOL_SNAP_ID: ${{ steps.baked.outputs.vol_snap_id }}
+          SLUG: ${{ steps.target.outputs.slug }}
+        run: |
+          set -euo pipefail
+          VOLUME_ARGS=()
+          VOLUME_NAME=""
+          VOLUME_ID=""
+          if [ "${MODE}" != "genesis" ]; then
+            VOLUME_NAME="zakura-pr-vol-${GITHUB_RUN_ID}"
+            SIZE=$(doctl compute snapshot get "${VOL_SNAP_ID}" --format MinDiskSize --no-header)
+            VOLUME_ID=$(doctl compute volume create "${VOLUME_NAME}" \
+              --region nyc3 --snapshot "${VOL_SNAP_ID}" --size "${SIZE}GiB" \
+              --format ID --no-header)
+            VOLUME_ARGS=(--volumes "${VOLUME_ID}")
+          fi
+          NAME="zakura-pr-${SLUG}-${GITHUB_RUN_ID}"
+          doctl compute droplet create "$NAME" \
+            --region nyc3 \
+            --size "${DROPLET_SIZE}" \
+            --image "${IMAGE_ID}" \
+            --ssh-keys "${SSH_FINGERPRINT}" \
+            "${VOLUME_ARGS[@]}" \
+            --tag-name zakura-pr-node \
+            --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
+          {
+            echo "id=$(awk '{print $1}' /tmp/droplet.txt)"
+            echo "ip=$(awk '{print $2}' /tmp/droplet.txt)"
+            echo "volume_name=${VOLUME_NAME}"
+            echo "volume_id=${VOLUME_ID}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH
+        id: sshwait
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i /tmp/do_ssh "root@${IP}" true 2>/dev/null; then
+              echo "SSH up"; exit 0
+            fi
+            sleep 10
+          done
+          echo "SSH did not come up in time"; exit 1
+
+      - name: Build, deploy, and monitor the node
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+          GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODE: ${{ inputs.snapshot_mode }}
+          NETWORK: ${{ inputs.network }}
+          SHA: ${{ steps.target.outputs.sha }}
+          REFSPEC: ${{ steps.target.outputs.refspec }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes || '60' }}
+          VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
+        run: |
+          set -euo pipefail
+          umask 077
+          {
+            printf 'GH_REPO=%q\n'           "${GITHUB_REPOSITORY}"
+            printf 'GH_CLONE_TOKEN=%q\n'    "${GH_CLONE_TOKEN}"
+            printf 'MODE=%q\n'              "${MODE}"
+            printf 'NETWORK=%q\n'           "${NETWORK}"
+            printf 'SHA=%q\n'               "${SHA}"
+            printf 'REFSPEC=%q\n'           "${REFSPEC}"
+            printf 'DURATION_MINUTES=%q\n'  "${DURATION_MINUTES}"
+            printf 'VOLUME_NAME=%q\n'       "${VOLUME_NAME}"
+          } > /tmp/run.env
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            /tmp/run.env \
+            .github/workflows/scripts/pr-node-run.sh \
+            .github/workflows/scripts/pr-node-monitor.py \
+            "root@${IP}:/root/"
+          # Keepalives: the monitored hour is long and low-output.
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \
+            'set -euo pipefail; set -a; . /root/run.env; set +a; bash /root/pr-node-run.sh'
+
+      - name: Collect run outputs
+        if: always() && steps.droplet.outputs.ip != ''
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+        run: |
+          set +e
+          mkdir -p /tmp/out
+          scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            "root@${IP}:/root/out/*" /tmp/out/
+          ls -la /tmp/out
+          true
+
+      - name: Write step summary
+        if: always() && steps.droplet.outputs.ip != ''
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+          TEARDOWN: ${{ inputs.teardown_after_run }}
+        run: |
+          set -euo pipefail
+          {
+            if [ -f /tmp/out/summary.md ]; then
+              cat /tmp/out/summary.md
+            else
+              printf '## Zakura PR node run\n\nNo summary was produced — see the job log.\n'
+            fi
+            echo ""
+            if [ "${TEARDOWN}" = "true" ]; then
+              echo "_Droplet deleted after the run (teardown_after_run=true)._"
+            else
+              echo "**Inspect the node:** \`ssh root@${IP}\` (deleted by the reaper ~24h after creation)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post PR comment
+        if: always() && steps.target.outputs.pr != '' && steps.droplet.outputs.ip != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR: ${{ steps.target.outputs.pr }}
+          MODE: ${{ inputs.snapshot_mode }}
+          NETWORK: ${{ inputs.network }}
+          IP: ${{ steps.droplet.outputs.ip }}
+          TEARDOWN: ${{ inputs.teardown_after_run }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = `<!-- zakura-pr-node:${process.env.MODE}:${process.env.NETWORK} -->`;
+            let summary;
+            try {
+              summary = fs.readFileSync('/tmp/out/summary.md', 'utf8');
+            } catch {
+              summary = '## Zakura PR node run\n\nNo summary was produced — see the workflow log.';
+            }
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const footer = process.env.TEARDOWN === 'true'
+              ? '_Droplet deleted after the run._'
+              : `**Inspect the node:** \`ssh root@${process.env.IP}\` (deleted by the reaper ~24h after creation).`;
+            const body = `${marker}\n${summary}\n\n${footer}\n\n[Workflow run](${runUrl})`;
+            const issue_number = Number(process.env.PR);
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.startsWith(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body,
+              });
+            }
+
+      - name: Upload artifacts
+        if: always() && steps.droplet.outputs.ip != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: zakura-pr-node-${{ github.run_id }}
+          path: /tmp/out/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Teardown (immediate or on unreachable droplet)
+        if: always()
+        env:
+          DROPLET_ID: ${{ steps.droplet.outputs.id }}
+          VOLUME_ID: ${{ steps.droplet.outputs.volume_id }}
+          TEARDOWN: ${{ inputs.teardown_after_run }}
+          SSH_FAILED: ${{ steps.sshwait.outcome == 'failure' }}
+        run: |
+          set +e
+          # A droplet we can never SSH into is useless to keep for inspection.
+          if [ "${TEARDOWN}" != "true" ] && [ "${SSH_FAILED}" != "true" ]; then
+            echo "Droplet kept for inspection; the reaper deletes it ~24h after creation."
+            exit 0
+          fi
+          if [ -n "${DROPLET_ID}" ]; then
+            for _ in 1 2 3; do
+              doctl compute droplet delete "${DROPLET_ID}" -f && break
+              sleep 5
+            done
+          fi
+          if [ -n "${VOLUME_ID}" ]; then
+            # The volume detaches asynchronously after the droplet delete.
+            for _ in $(seq 1 12); do
+              doctl compute volume delete "${VOLUME_ID}" -f && break
+              sleep 10
+            done
+          fi
+          true

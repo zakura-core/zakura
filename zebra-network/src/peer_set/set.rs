@@ -984,6 +984,7 @@ where
                 Request::FindBlocks { .. } | Request::FindHeaders { .. }
             );
             let track_stalls = is_find_request
+                && !self.is_zcashd_compat_peer(&svc)
                 && !self
                     .minimum_peer_version
                     .chain_tip()

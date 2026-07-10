@@ -90,13 +90,18 @@ Use the sidecar `zcashd` build from
 installer and Zakura's embedded download both pin its release archives by
 SHA256. It differs from stock `zcash/zcash` in three ways:
 
-1. **Miner RPCs are removed.** `getblocktemplate`, `submitblock`,
+1. **P2P sidecar mode is hard-locked.** The binary refuses to start unless
+   exactly one `-connect=<zakura-address>` peer is configured. It never opens a
+   P2P listener, refuses peer-expanding options such as `addnode`, `seednode`,
+   `bind`, and `whitebind`, and does not register the `addnode` RPC. This makes
+   Zakura the only possible P2P peer.
+2. **Miner RPCs are removed.** `getblocktemplate`, `submitblock`,
    `getgenerate`, `setgenerate`, and `generate` are not registered and return
    JSON-RPC `Method not found` (-32601). Zakura is the canonical source of
    block templates (see [Mining](#mining-zakura-is-canonical)). Read-only
    mining info RPCs (`getmininginfo`, `getnetworksolps`, `getblocksubsidy`,
    `prioritisetransaction`) remain.
-2. **The upstream end-of-support halt is disabled.** Stock zcashd shuts
+3. **The upstream end-of-support halt is disabled.** Stock zcashd shuts
    itself down at its deprecation height; the sidecar build logs a warning
    and keeps serving its wallet/RPC surface. Consensus safety comes from
    Zakura, which fully validates every block before relaying it to zcashd.

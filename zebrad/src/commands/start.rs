@@ -166,7 +166,7 @@ fn check_tcp_slow_start_after_idle() {
 }
 
 fn use_zakura_block_sync(config: &zebra_network::Config) -> bool {
-    config.v2_p2p
+    config.v2_p2p()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -192,9 +192,10 @@ impl StartCmd {
             return Ok(());
         };
 
-        if !config.network.v2_p2p {
+        if !config.network.v2_p2p() {
             return Err(eyre!(
-                "sync.debug_blocksync_throughput_target_height requires network.v2_p2p = true"
+                "sync.debug_blocksync_throughput_target_height requires the Zakura P2P v2 \
+                 stack; set network.p2p_stack to \"zakura\" or \"dual\""
             ));
         }
 
@@ -322,7 +323,7 @@ impl StartCmd {
         info!("opening database, this may take a few minutes");
 
         let mut state_config = config.state.clone();
-        state_config.enable_zakura_header_seed_from_committed_blocks = config.network.v2_p2p;
+        state_config.enable_zakura_header_seed_from_committed_blocks = config.network.v2_p2p();
         // State owns the VCT commit path, but users configure its checkpoint-sync controls
         // together under `[consensus]`.
         state_config.checkpoint_sync = config.consensus.checkpoint_sync;
@@ -370,7 +371,7 @@ impl StartCmd {
             .buffer(Self::state_buffer_bound())
             .service(state_service);
 
-        let zakura_header_sync_driver_startup = if config.network.v2_p2p {
+        let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
             Some(
                 zakura_header_sync_driver_startup(
                     read_only_state_service.clone(),
@@ -749,7 +750,7 @@ impl StartCmd {
             // Zakura stall; a Zakura-only node has no legacy peers to drive body sync. The
             // fallback resumes legacy ChainSync as the body-sync driver while the Zakura
             // reactors stay alive as a serving/advertising bridge for zakura-only peers.
-            let legacy_fallback = config.network.v2_p2p && config.network.legacy_p2p;
+            let legacy_fallback = config.network.v2_p2p() && config.network.legacy_p2p();
             tokio::spawn(
                 syncer
                     .bootstrap_genesis_then_pause(
@@ -1072,10 +1073,11 @@ impl config::Override<ZebradConfig> for StartCmd {
         }
 
         if config.zcashd_compat.enabled {
-            if !config.network.legacy_p2p {
+            if !config.network.legacy_p2p() {
                 return Err(std::io::Error::other(
-                    "zcashd-compat P2P sidecar mode requires network.legacy_p2p = true, \
-                     because zcashd syncs from Zebra over the legacy Zcash P2P protocol",
+                    "zcashd-compat P2P sidecar mode requires the legacy Zcash P2P stack, \
+                     because zcashd syncs from Zebra over it; set network.p2p_stack to \
+                     \"zebra\" or \"dual\"",
                 )
                 .into());
             }
@@ -1121,6 +1123,7 @@ mod tests {
     use super::StartCmd;
     use crate::components::zcashd_compat;
     use crate::config::ZebradConfig;
+    use zebra_network::P2pStack;
 
     #[test]
     fn zcashd_compat_flag_enables_mode() {
@@ -1165,7 +1168,7 @@ mod tests {
             unsafe_low_specs: false,
         };
         let mut config = ZebradConfig::default();
-        config.network.v2_p2p = false;
+        config.network.p2p_stack = P2pStack::Zebra;
         config.sync.debug_blocksync_throughput_target_height = Some(100);
 
         let error = cmd
@@ -1174,7 +1177,7 @@ mod tests {
 
         assert!(
             error.to_string().contains(
-                "sync.debug_blocksync_throughput_target_height requires network.v2_p2p = true"
+                "sync.debug_blocksync_throughput_target_height requires the Zakura P2P v2 stack"
             ),
             "unexpected error: {error}"
         );
@@ -1227,13 +1230,15 @@ mod tests {
         let mut config = ZebradConfig::default();
         config.zcashd_compat.enabled = true;
         config.zcashd_compat.manage_zcashd = false;
-        config.network.legacy_p2p = false;
+        config.network.p2p_stack = P2pStack::Zakura;
 
         let error = cmd
             .override_config(config)
             .expect_err("the P2P sidecar should require the legacy P2P listener");
         assert!(
-            error.to_string().contains("legacy_p2p"),
+            error
+                .to_string()
+                .contains("requires the legacy Zcash P2P stack"),
             "unexpected error: {error}"
         );
     }
@@ -1431,6 +1436,7 @@ mod zakura_header_sync_driver_tests {
         Service as ZakuraService, Stream as ZakuraStream, ZakuraHeaderSyncDriverStartup,
         BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, DEFAULT_HS_RANGE,
     };
+    use zebra_network::P2pStack;
     use zebra_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
 
     use super::zakura::{
@@ -1631,11 +1637,11 @@ mod zakura_header_sync_driver_tests {
 
     #[test]
     fn zakura_block_sync_replaces_chain_sync_when_v2_p2p_is_enabled() {
-        let mut config = zebra_network::Config::default();
+        let mut config = zebra_network::Config::for_test(P2pStack::Dual);
 
         assert!(use_zakura_block_sync(&config));
 
-        config.v2_p2p = false;
+        config.p2p_stack = P2pStack::Zebra;
         assert!(!use_zakura_block_sync(&config));
     }
 
@@ -2171,7 +2177,7 @@ mod zakura_header_sync_driver_tests {
         let genesis_hash = network.genesis_hash();
         let mut config = zebra_network::Config {
             network: network.clone(),
-            ..zebra_network::Config::default()
+            ..zebra_network::Config::for_test(P2pStack::Dual)
         };
         config.zakura.listen_addr = None;
         let endpoint = zebra_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(
@@ -2279,7 +2285,7 @@ mod zakura_header_sync_driver_tests {
         let genesis_hash = network.genesis_hash();
         let mut config = zebra_network::Config {
             network: network.clone(),
-            ..zebra_network::Config::default()
+            ..zebra_network::Config::for_test(P2pStack::Dual)
         };
         config.zakura.listen_addr = None;
         let endpoint = zebra_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(

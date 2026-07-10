@@ -20,7 +20,7 @@ use crate::{
         DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR,
         DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
-    CacheDir, Config,
+    CacheDir, Config, P2pStack,
 };
 
 use super::super::load_or_generate_zakura_secret_key;
@@ -97,7 +97,7 @@ fn testnet_params_serialization_roundtrip() {
             .to_network()
             .expect("failed to build configured network"),
         initial_testnet_peers: [].into(),
-        ..Config::default()
+        ..Config::for_test(P2pStack::Dual)
     };
     config.zakura.apply_network_defaults(&config.network);
 
@@ -163,32 +163,74 @@ fn identity_dir_defaults_and_roundtrips() {
 }
 
 #[test]
-fn p2p_protocol_flags_default_on_and_roundtrip() {
+fn p2p_stack_defaults_by_network_and_roundtrips() {
     let _init_guard = zebra_test::init();
 
-    assert!(Config::default().v2_p2p);
-    assert!(Config::default().legacy_p2p);
+    // An unset `p2p_stack` follows the network's binary default: Mainnet is legacy-only,
+    // every other network runs both stacks.
+    assert_eq!(Config::default().p2p_stack, P2pStack::Default);
+    assert!(Config::default().legacy_p2p());
+    assert!(!Config::default().v2_p2p());
     assert_eq!(
         Config::default().zakura.bootstrap_peers,
         default_zakura_bootstrap_peers()
     );
 
-    let config: Config = toml::from_str(
-        r#"
-        v2_p2p = false
-        legacy_p2p = false
-        "#,
-    )
-    .unwrap();
-    assert!(!config.v2_p2p);
-    assert!(!config.legacy_p2p);
+    for (network, stack) in [
+        ("Mainnet", P2pStack::Zebra),
+        ("Testnet", P2pStack::Dual),
+        ("Regtest", P2pStack::Dual),
+    ] {
+        let config: Config = toml::from_str(&format!("network = '{network}'")).unwrap();
 
-    let serialized = toml::to_string(&config).unwrap();
-    assert!(serialized.contains("v2_p2p = false"));
-    assert!(serialized.contains("legacy_p2p = false"));
+        assert_eq!(config.p2p_stack, P2pStack::Default);
+        assert_eq!(config.p2p_stack.resolve(&config.network), stack);
+        assert_eq!(config.legacy_p2p(), stack != P2pStack::Zakura);
+        assert_eq!(config.v2_p2p(), stack != P2pStack::Zebra);
+    }
 
-    let deserialized: Config = toml::from_str(&serialized).unwrap();
-    assert_eq!(config, deserialized);
+    // Overriding `network` with struct-update syntax resolves against the new network, so a
+    // struct-built config and the equivalent `zebrad.toml` always agree.
+    let testnet = Config {
+        network: Network::new_default_testnet(),
+        ..Config::default()
+    };
+    assert!(testnet.legacy_p2p());
+    assert!(testnet.v2_p2p());
+
+    // An explicit stack overrides the network default in both directions.
+    let mainnet_dual: Config = toml::from_str("network = 'Mainnet'\np2p_stack = 'dual'").unwrap();
+    assert!(mainnet_dual.legacy_p2p());
+    assert!(mainnet_dual.v2_p2p());
+
+    let testnet_zebra: Config = toml::from_str("network = 'Testnet'\np2p_stack = 'zebra'").unwrap();
+    assert!(testnet_zebra.legacy_p2p());
+    assert!(!testnet_zebra.v2_p2p());
+
+    // Every stack round-trips through its canonical name, and the deprecated flags are
+    // never written back out.
+    for stack in [
+        P2pStack::Default,
+        P2pStack::Zebra,
+        P2pStack::Zakura,
+        P2pStack::Dual,
+    ] {
+        let config = Config {
+            p2p_stack: stack,
+            ..Config::default()
+        };
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(!serialized.contains("legacy_p2p"));
+        assert!(!serialized.contains("v2_p2p"));
+
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(config, deserialized);
+        assert_eq!(deserialized.p2p_stack, stack);
+    }
+
+    let serialized = toml::to_string(&Config::default()).unwrap();
+    assert!(serialized.contains("p2p_stack = \"default\""));
 }
 
 #[test]
@@ -319,13 +361,94 @@ fn zakura_dev_network_defaults_off_and_roundtrips() {
 }
 
 #[test]
-fn p2p_v2_old_enable_config_alias_still_parses() {
+fn p2p_stack_aliases_parse_to_the_canonical_stack() {
     let _init_guard = zebra_test::init();
 
-    let config: Config = toml::from_str("enable_p2p_v2 = false").unwrap();
+    for (value, stack) in [
+        ("default", P2pStack::Default),
+        ("zebra", P2pStack::Zebra),
+        ("v1", P2pStack::Zebra),
+        ("legacy", P2pStack::Zebra),
+        ("zakura", P2pStack::Zakura),
+        ("v2", P2pStack::Zakura),
+        ("dual", P2pStack::Dual),
+        ("combined", P2pStack::Dual),
+    ] {
+        let config: Config = toml::from_str(&format!("p2p_stack = '{value}'"))
+            .unwrap_or_else(|error| panic!("p2p_stack = '{value}' should parse: {error}"));
 
-    assert!(!config.v2_p2p);
-    assert!(config.legacy_p2p);
+        assert_eq!(config.p2p_stack, stack, "p2p_stack = '{value}'");
+    }
+}
+
+#[test]
+fn p2p_stack_rejects_unknown_values() {
+    let _init_guard = zebra_test::init();
+
+    let error = toml::from_str::<Config>("p2p_stack = 'enabled'")
+        .expect_err("'enabled' is not a P2P stack");
+
+    assert!(
+        error.to_string().contains("unknown variant"),
+        "unexpected p2p_stack error: {error}",
+    );
+}
+
+#[test]
+fn deprecated_p2p_flags_map_onto_p2p_stack() {
+    let _init_guard = zebra_test::init();
+
+    // Both flags absent means the config predates them, so it follows the network default.
+    let config: Config = toml::from_str("network = 'Mainnet'").unwrap();
+    assert_eq!(config.p2p_stack, P2pStack::Default);
+
+    // A flag that is absent falls back to the `true` default it had in the releases that
+    // understood these flags.
+    for (toml, stack) in [
+        ("legacy_p2p = true\nv2_p2p = true", P2pStack::Dual),
+        ("legacy_p2p = true\nv2_p2p = false", P2pStack::Zebra),
+        ("legacy_p2p = false\nv2_p2p = true", P2pStack::Zakura),
+        ("enable_p2p_v2 = false", P2pStack::Zebra),
+        ("legacy_p2p = false", P2pStack::Zakura),
+        ("v2_p2p = true", P2pStack::Dual),
+    ] {
+        let config: Config =
+            toml::from_str(toml).unwrap_or_else(|error| panic!("{toml:?} should parse: {error}"));
+
+        assert_eq!(config.p2p_stack, stack, "{toml:?}");
+    }
+}
+
+#[test]
+fn deprecated_p2p_flags_reject_disabling_all_networking() {
+    let _init_guard = zebra_test::init();
+
+    let error = toml::from_str::<Config>("legacy_p2p = false\nv2_p2p = false")
+        .expect_err("a node with no P2P stack can't sync");
+
+    assert!(
+        error.to_string().contains("disables all"),
+        "unexpected both-flags-false error: {error}",
+    );
+}
+
+#[test]
+fn deprecated_p2p_flags_conflict_with_p2p_stack() {
+    let _init_guard = zebra_test::init();
+
+    for toml in [
+        "p2p_stack = 'dual'\nlegacy_p2p = true",
+        "p2p_stack = 'dual'\nv2_p2p = true",
+        "p2p_stack = 'zebra'\nenable_p2p_v2 = false",
+    ] {
+        let error = toml::from_str::<Config>(toml)
+            .expect_err("p2p_stack and the deprecated flags can disagree, so both is an error");
+
+        assert!(
+            error.to_string().contains("can't be combined"),
+            "unexpected conflict error for {toml:?}: {error}",
+        );
+    }
 }
 
 #[test]
@@ -334,6 +457,7 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
 
     let config: Config = toml::from_str(
         r#"
+        network = "Testnet"
         listen_addr = "127.0.0.1:8233"
         peerset_initial_target_size = 25
         "#,
@@ -341,11 +465,11 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
     .unwrap();
 
     assert_eq!(config.listen_addr.to_string(), "127.0.0.1:8233");
-    assert!(config.v2_p2p);
-    assert!(config.legacy_p2p);
+    assert!(config.v2_p2p());
+    assert!(config.legacy_p2p());
     assert_eq!(
         config.zakura.bootstrap_peers,
-        default_zakura_bootstrap_peers()
+        default_testnet_zakura_bootstrap_peers()
     );
     assert!(config.zakura.max_connections > 0);
     assert_eq!(
@@ -423,8 +547,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
     let config: Config = toml::from_str(
         r#"
-        v2_p2p = true
-        legacy_p2p = true
+        p2p_stack = "dual"
 
         [zakura]
         bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
@@ -449,8 +572,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     .unwrap();
 
     let serialized = toml::to_string(&config).unwrap();
-    assert!(serialized.contains("v2_p2p = true"));
-    assert!(serialized.contains("legacy_p2p = true"));
+    assert!(serialized.contains("p2p_stack = \"dual\""));
     assert!(serialized.contains("[zakura]"));
     assert!(serialized.contains("bootstrap_peers"));
     assert!(serialized.contains("max_connections = 7"));
@@ -531,7 +653,7 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
 
     let config: Config = toml::from_str(
         r#"
-        v2_p2p = true
+        p2p_stack = "dual"
 
         [zakura]
         bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
@@ -543,8 +665,8 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     )
     .unwrap();
 
-    assert!(config.v2_p2p);
-    assert!(config.legacy_p2p);
+    assert!(config.v2_p2p());
+    assert!(config.legacy_p2p());
     assert_eq!(config.zakura.bootstrap_peers.len(), 1);
     assert_eq!(config.zakura.max_connections, 4);
     assert_eq!(
@@ -586,7 +708,7 @@ fn funding_streams_serialization_roundtrip() {
             .to_network()
             .expect("failed to build configured network"),
         initial_testnet_peers: [].into(),
-        ..Config::default()
+        ..Config::for_test(P2pStack::Dual)
     };
     config.zakura.apply_network_defaults(&config.network);
 
@@ -610,7 +732,7 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
             .to_network()
             .expect("failed to build configured network"),
         initial_testnet_peers: [].into(),
-        ..Config::default()
+        ..Config::for_test(P2pStack::Dual)
     };
     config.zakura.apply_network_defaults(&config.network);
 
@@ -722,7 +844,7 @@ fn zakura_secret_key_honors_configured_key_and_disabled_cache() {
     let disabled = Config {
         cache_dir: CacheDir::disabled(),
         zakura_node_secret_key: None,
-        v2_p2p: true,
+        p2p_stack: P2pStack::Dual,
         ..Config::default()
     };
     let disabled_key_file = disabled.identity_dir.join("mainnet.zakura-iroh-secret-key");

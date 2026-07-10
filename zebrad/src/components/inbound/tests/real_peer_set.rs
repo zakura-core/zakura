@@ -21,7 +21,7 @@ use zebra_consensus::{error::TransactionError, router::RouterError, transaction}
 use zebra_network::{
     canonical_peer_addr, connect_isolated_tcp_direct_with_inbound,
     types::{InventoryHash, PeerServices},
-    CacheDir, Config as NetworkConfig, InventoryResponse, PeerError, Request, Response,
+    CacheDir, Config as NetworkConfig, InventoryResponse, P2pStack, PeerError, Request, Response,
     SharedPeerError,
 };
 use zebra_node_services::mempool;
@@ -62,7 +62,7 @@ async fn inbound_peers_empty_address_book() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         listen_addr,
-    ) = setup(None, false).await;
+    ) = setup(None, P2pStack::Zebra).await;
 
     // yield and sleep until the address book lock is released.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -151,7 +151,7 @@ async fn dual_stack_node_coexists_with_legacy_tcp_peer() -> Result<(), crate::Bo
         tx_gossip_task_handle,
         // real open socket addresses
         listen_addr,
-    ) = setup(Some(Response::Peers(Vec::new())), true).await;
+    ) = setup(Some(Response::Peers(Vec::new())), P2pStack::Dual).await;
 
     // yield and sleep until the address book lock is released.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -215,7 +215,7 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(None, false).await;
+    ) = setup(None, P2pStack::Zebra).await;
 
     let test_block = block::Hash([0x11; 32]);
 
@@ -298,7 +298,7 @@ async fn inbound_tx_empty_state_notfound() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(None, false).await;
+    ) = setup(None, P2pStack::Zebra).await;
 
     let test_tx = UnminedTxId::from_legacy_id(TxHash([0x22; 32]));
     let test_wtx: UnminedTxId = WtxId {
@@ -430,7 +430,7 @@ async fn outbound_tx_unrelated_response_notfound() -> Result<(), crate::BoxError
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(Some(unrelated_response), false).await;
+    ) = setup(Some(unrelated_response), P2pStack::Zebra).await;
 
     let test_tx5 = UnminedTxId::from_legacy_id(TxHash([0x55; 32]));
     let test_wtx67: UnminedTxId = WtxId {
@@ -579,7 +579,7 @@ async fn outbound_tx_partial_response_notfound() -> Result<(), crate::BoxError> 
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(Some(repeated_response), false).await;
+    ) = setup(Some(repeated_response), P2pStack::Zebra).await;
 
     let missing_tx_id = UnminedTxId::from_legacy_id(TxHash([0x22; 32]));
 
@@ -671,7 +671,7 @@ async fn outbound_tx_partial_response_notfound() -> Result<(), crate::BoxError> 
 /// Uses fake verifiers, and does not run a block syncer task.
 async fn setup(
     isolated_peer_response: Option<Response>,
-    enable_v2_p2p: bool,
+    p2p_stack: P2pStack,
 ) -> (
     // real services
     // connected peer which responds with isolated_peer_response
@@ -733,7 +733,7 @@ async fn setup(
 
         // Optionally run the Zakura P2P-v2 endpoint alongside the legacy TCP
         // stack so the dual-stack wiring is exercised (coexistence tests).
-        v2_p2p: enable_v2_p2p,
+        p2p_stack,
 
         ..NetworkConfig::default()
     };

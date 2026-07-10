@@ -143,7 +143,7 @@ where
     S::Future: Send + 'static,
     C: ChainTip + Clone + Send + Sync + 'static,
 {
-    let (tcp_listener, listen_addr) = if config.legacy_p2p {
+    let (tcp_listener, listen_addr) = if config.legacy_p2p() {
         let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
         (Some(tcp_listener), listen_addr)
     } else {
@@ -409,7 +409,7 @@ where
             let dual_stack = crate::zakura::ZakuraDualStackService::new_with_trace(
                 peer_set,
                 supervisor,
-                config.legacy_p2p,
+                config.legacy_p2p(),
                 trace,
             );
             Buffer::new(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE)

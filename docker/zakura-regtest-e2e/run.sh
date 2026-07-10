@@ -5,9 +5,9 @@
 # Topology (all on 127.0.0.1 via host networking):
 #   node1  dual-stack seed (legacy TCP + Zakura)  rpc 18232  metrics 19001
 #          fixed iroh identity, stable Zakura QUIC port 18234
-#   node2  PURE Zakura-only (legacy_p2p = false)  rpc 18332  metrics 19002
+#   node2  PURE Zakura-only (p2p_stack = zakura)   rpc 18332  metrics 19002
 #          joins solely by dialing node1's Zakura bootstrap_peers entry
-#   node3  legacy-only (v2_p2p = false)           rpc 18432  metrics 19003  -> node1
+#   node3  legacy-only (p2p_stack = zebra)        rpc 18432  metrics 19003  -> node1
 #   node4  dual-stack (legacy TCP + Zakura)       rpc 18532  metrics 19004  -> node1
 #          dials node1 over legacy TCP, then upgrades to Zakura
 #
@@ -637,7 +637,7 @@ done
 [[ "${n3}" -ge 1 ]] || fail "legacy-only node3 never peered with node1 over legacy TCP"
 snapshot_timeline "legacy-peers-ready"
 
-log "asserting pure-Zakura node2 has no legacy peers (legacy_p2p = false)"
+log "asserting pure-Zakura node2 has no legacy peers (p2p_stack = zakura)"
 # node2 has no legacy stack at all, so it must never have a legacy TCP peer; its
 # only connectivity is the Zakura bootstrap dial to node1.
 n2_legacy=$(peer_count 18332)

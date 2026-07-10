@@ -1627,7 +1627,7 @@ enum DualStackRoute {
 /// returned by [`crate::init`] when `v2_p2p` is enabled, so the syncer, mempool,
 /// and inbound downloads transparently gossip and fetch over Zakura too.
 ///
-/// Routing (with `legacy_enabled` = `config.legacy_p2p`):
+/// Routing (with `legacy_enabled` = `config.legacy_p2p()`):
 /// - Advertisements fan out concurrently to the legacy peer set (when
 ///   `legacy_enabled`) and the Zakura gossip adapter. Advertise is
 ///   fire-and-forget, so per-path errors are logged and swallowed and the

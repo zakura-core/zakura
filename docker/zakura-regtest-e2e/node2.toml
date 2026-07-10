@@ -16,12 +16,11 @@ network = "Regtest"
 # stalling the kind-6 catch-up. With a stable identity the restart is a normal
 # same-peer reconnect that node1's duplicate-eviction path clears in seconds.
 zakura_node_secret_key = "0202020202020202020202020202020202020202020202020202020202020202"
-# Inert with legacy_p2p = false (no TCP listener is opened), but the field is
+# Inert under the zakura-only stack (no TCP listener is opened), but the field is
 # required, so keep it on a distinct loopback port for clarity.
 listen_addr = "127.0.0.1:18333"
-v2_p2p = true
 # No legacy stack: no TCP listener, no outbound crawler, no legacy peers.
-legacy_p2p = false
+p2p_stack = "zakura"
 cache_dir = false
 # Pure Zakura: discover nothing over legacy; only the Zakura bootstrap peer below.
 initial_testnet_peers = []

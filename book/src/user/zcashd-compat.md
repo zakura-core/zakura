@@ -211,6 +211,13 @@ manage_zcashd = false
 block_gossip_peer_ips = ["127.0.0.1"]
 ```
 
+Zakura also reserves one bounded inbound legacy P2P slot for the configured
+sidecar IP list. That reserved connection bypasses the normal per-IP
+handshake/recent-connection limit, but it still counts toward the total inbound
+connection limit and still has to pass IP bans, handshake validation, and peer
+protocol checks. The reservation is shared by all configured sidecar IPs, so
+extra simultaneous sidecar-like connections are rejected.
+
 zcashd-compat mode requires the legacy Zcash P2P stack, because zcashd speaks the
 legacy Zcash P2P protocol. Every `network.p2p_stack` value runs it except
 `"zakura"`. Do not enable state pruning on the fronting Zakura — a pruned node does
@@ -219,12 +226,10 @@ not advertise `NODE_NETWORK` and zcashd will not sync from it.
 > [!WARNING]
 > When the fronting Zakura runs in Docker with a published P2P port, all
 > connections arriving through `docker-proxy` (including a sidecar zcashd
-> connecting to `127.0.0.1:8233` on the host) share one source IP. Zakura's
-> `network.max_connections_per_ip` defaults to **1**, so the sidecar can lose
-> that single slot to a proxied public peer and silently never connect. Set
-> `ZAKURA_NETWORK__MAX_CONNECTIONS_PER_IP=8` (or similar) on a Dockerised
-> front — the installer's Docker modes do this for you — or attach the
-> sidecar to the container network directly.
+> connecting to `127.0.0.1:8233` on the host) share one source IP. Zakura
+> identifies zcashd-compat sidecars by configured inbound source IP before the
+> handshake, not by a cryptographic process identity. Only configure
+> `block_gossip_peer_ips` for local or private addresses you control.
 
 ### Verify the integration
 

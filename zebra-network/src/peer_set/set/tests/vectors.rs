@@ -2,9 +2,9 @@
 
 use std::{cmp::max, collections::HashSet, iter, net::SocketAddr, sync::Arc, time::Duration};
 
-use futures::FutureExt as _;
+use futures::{stream, FutureExt as _, StreamExt};
 use tokio::time::timeout;
-use tower::{Service, ServiceExt};
+use tower::{discover::Change, Service, ServiceExt};
 
 use zebra_chain::{
     block,
@@ -13,10 +13,12 @@ use zebra_chain::{
 
 use crate::{
     constants::DEFAULT_MAX_CONNS_PER_IP,
-    peer::{ClientRequest, MinimumPeerVersion},
+    peer::{
+        ClientRequest, ClientTestHarness, ConnectedAddr, LoadTrackedClient, MinimumPeerVersion,
+    },
     peer_set::{inventory_registry::InventoryStatus, stall_tracker::FIND_RESPONSE_STALL_THRESHOLD},
     protocol::external::{types::Version, InventoryHash},
-    PeerSocketAddr, Request, Response, SharedPeerError,
+    BoxError, PeerSocketAddr, Request, Response, SharedPeerError,
 };
 use indexmap::IndexMap;
 use tokio::sync::watch;
@@ -225,6 +227,84 @@ fn peer_set_rejects_connections_past_per_ip_limit() {
         assert_eq!(
             peer_ready.ready_services.len(),
             crate::constants::DEFAULT_MAX_CONNS_PER_IP
+        );
+    });
+}
+
+#[test]
+fn peer_set_allows_one_zcashd_compat_peer_past_per_ip_limit() {
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let shared_ip = "127.0.0.1".parse().unwrap();
+    let outbound_peer_address: PeerSocketAddr = SocketAddr::new(shared_ip, 1).into();
+    let sidecar_peer_address: PeerSocketAddr = SocketAddr::new(shared_ip, 2).into();
+    let duplicate_sidecar_peer_address: PeerSocketAddr = SocketAddr::new(shared_ip, 3).into();
+
+    let (runtime, _init_guard) = zebra_test::init_async();
+    let _guard = runtime.enter();
+    tokio::time::pause();
+
+    let (outbound_peer, _outbound_handle) = ClientTestHarness::build()
+        .with_version(peer_version)
+        .with_connected_addr(ConnectedAddr::new_outbound_direct(outbound_peer_address))
+        .finish();
+    let (sidecar_peer, _sidecar_handle) = ClientTestHarness::build()
+        .with_version(peer_version)
+        .with_connected_addr(ConnectedAddr::new_inbound_direct(sidecar_peer_address))
+        .finish();
+    let (duplicate_sidecar_peer, _duplicate_sidecar_handle) = ClientTestHarness::build()
+        .with_version(peer_version)
+        .with_connected_addr(ConnectedAddr::new_inbound_direct(
+            duplicate_sidecar_peer_address,
+        ))
+        .finish();
+
+    let discovered_peers: Vec<Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>> = vec![
+        Ok(Change::Insert(outbound_peer_address, outbound_peer.into())),
+        Ok(Change::Insert(sidecar_peer_address, sidecar_peer.into())),
+        Ok(Change::Insert(
+            duplicate_sidecar_peer_address,
+            duplicate_sidecar_peer.into(),
+        )),
+    ];
+    let discovered_peers = stream::iter(discovered_peers).chain(stream::pending());
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_block_gossip_peer_ips(vec![shared_ip])
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version.clone())
+            .max_conns_per_ip(1)
+            .build();
+
+        let peer_ready = peer_set
+            .ready()
+            .await
+            .expect("peer set service is always ready");
+
+        assert_eq!(
+            peer_ready.ready_services.len(),
+            2,
+            "peer set should keep one existing same-IP peer and one zcashd-compat sidecar"
+        );
+        assert!(
+            peer_ready
+                .ready_services
+                .contains_key(&outbound_peer_address),
+            "existing same-IP outbound peer should remain connected"
+        );
+        assert!(
+            peer_ready
+                .ready_services
+                .contains_key(&sidecar_peer_address),
+            "one zcashd-compat sidecar should bypass the per-IP peer-set limit"
+        );
+        assert!(
+            !peer_ready
+                .ready_services
+                .contains_key(&duplicate_sidecar_peer_address),
+            "a second zcashd-compat sidecar should be dropped"
         );
     });
 }

@@ -247,6 +247,9 @@ where
     /// Inbound peer IPs that must always receive block inventory broadcasts.
     block_gossip_peer_ips: HashSet<IpAddr>,
 
+    /// Peer-set keys for the single configured zcashd-compat sidecar connection.
+    zcashd_compat_peer_keys: HashSet<D::Key>,
+
     // Peer Tracking: Busy Peers
     //
     /// Connected peers that are handling a Zebra request,
@@ -372,6 +375,7 @@ where
             inventory_registry: InventoryRegistry::new(inv_stream),
             queued_broadcast_all: None,
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
+            zcashd_compat_peer_keys: HashSet::new(),
 
             // Busy peers
             unready_services: FuturesUnordered::new(),
@@ -571,6 +575,7 @@ where
                         warn!(?key, "service is banned, dropping service");
                         std::mem::drop(svc);
                         let cancel = self.cancel_handles.remove(&key);
+                        self.zcashd_compat_peer_keys.remove(&key);
                         debug_assert!(
                             cancel.is_some(),
                             "missing cancel handle for banned unready peer"
@@ -594,6 +599,9 @@ where
                         duplicate_connection = self.cancel_handles.contains_key(&key),
                         "service was canceled, dropping service"
                     );
+                    if !self.cancel_handles.contains_key(&key) {
+                        self.zcashd_compat_peer_keys.remove(&key);
+                    }
                 }
                 Some(Err((key, UnreadyError::CancelHandleDropped(_)))) => {
                     // Similarly, services with dropped cancel handes can have duplicates.
@@ -602,6 +610,9 @@ where
                         duplicate_connection = self.cancel_handles.contains_key(&key),
                         "cancel handle was dropped, dropping service"
                     );
+                    if !self.cancel_handles.contains_key(&key) {
+                        self.zcashd_compat_peer_keys.remove(&key);
+                    }
                 }
 
                 // Unready -> Errored
@@ -609,6 +620,7 @@ where
                     debug!(%error, "service failed while unready, dropping service");
 
                     let cancel = self.cancel_handles.remove(&key);
+                    self.zcashd_compat_peer_keys.remove(&key);
                     assert!(cancel.is_some(), "missing cancel handle");
                 }
             }
@@ -650,6 +662,7 @@ where
                 Ok(()) => {
                     if self.bans_receiver.borrow().contains_key(&key.ip()) {
                         debug!(?key, "service ip is banned, dropping service");
+                        self.zcashd_compat_peer_keys.remove(&key);
                         std::mem::drop(svc);
                         continue;
                     }
@@ -662,6 +675,7 @@ where
                     debug!(%error, "service failed while ready, dropping service");
 
                     // Ready services can just be dropped, they don't need any cleanup.
+                    self.zcashd_compat_peer_keys.remove(&key);
                     std::mem::drop(svc);
                 }
             }
@@ -687,6 +701,11 @@ where
             .chain(self.cancel_handles.keys())
             .filter(|addr| addr.ip() == ip)
             .count()
+    }
+
+    /// Returns the number of configured zcashd-compat peer connections.
+    fn num_zcashd_compat_peers(&self) -> usize {
+        self.zcashd_compat_peer_keys.len()
     }
 
     /// Returns `true` if Zebra is already connected to the IP and port in `addr`.
@@ -742,13 +761,31 @@ where
                         continue;
                     }
 
+                    let is_zcashd_compat_peer = self.is_zcashd_compat_peer(&svc);
+
                     // # Security
                     //
-                    // drop the new peer if there are already `max_conns_per_ip` peers with
-                    // the same IP address in the peer set.
-                    if self.num_peers_with_ip(key.ip()) >= self.max_conns_per_ip {
+                    // Drop extra configured sidecar peers. The listener reserves one
+                    // zcashd-compat slot, shared across all configured sidecar IPs.
+                    if is_zcashd_compat_peer && self.num_zcashd_compat_peers() >= 1 {
                         std::mem::drop(svc);
                         continue;
+                    }
+
+                    // # Security
+                    //
+                    // Drop the new peer if there are already `max_conns_per_ip` peers with
+                    // the same IP address in the peer set. The single configured sidecar peer is
+                    // admitted through the listener's reserved compat slot instead.
+                    if !is_zcashd_compat_peer
+                        && self.num_peers_with_ip(key.ip()) >= self.max_conns_per_ip
+                    {
+                        std::mem::drop(svc);
+                        continue;
+                    }
+
+                    if is_zcashd_compat_peer {
+                        self.zcashd_compat_peer_keys.insert(key);
                     }
 
                     self.push_unready(key, svc);
@@ -763,8 +800,18 @@ where
     fn disconnect_from_outdated_peers(&mut self) {
         if let Some(minimum_version) = self.minimum_peer_version.changed() {
             // It is ok to drop ready services, they don't need anything cancelled.
-            self.ready_services
-                .retain(|_address, peer| peer.remote_version() >= minimum_version);
+            let outdated_peers: Vec<_> = self
+                .ready_services
+                .iter()
+                .filter_map(|(address, peer)| {
+                    (peer.remote_version() < minimum_version).then_some(*address)
+                })
+                .collect();
+
+            for address in outdated_peers {
+                self.ready_services.remove(&address);
+                self.zcashd_compat_peer_keys.remove(&address);
+            }
         }
     }
 
@@ -809,6 +856,7 @@ where
     /// If the peer does not exist, does nothing.
     fn remove(&mut self, key: &D::Key) {
         self.find_response_stalls.clear(*key);
+        self.zcashd_compat_peer_keys.remove(key);
 
         if let Some(ready_service) = self.take_ready_service(key) {
             // A ready service has no work to cancel, so just drop it.
@@ -836,6 +884,7 @@ where
         if svc.remote_version() >= self.minimum_peer_version.current() {
             self.ready_services.insert(key, svc);
         } else {
+            self.zcashd_compat_peer_keys.remove(&key);
             std::mem::drop(svc);
         }
     }
@@ -859,6 +908,7 @@ where
         if peer_version >= self.minimum_peer_version.current() {
             self.cancel_handles.insert(key, tx);
         } else {
+            self.zcashd_compat_peer_keys.remove(&key);
             // Cancel any request made to the service because it is using an outdated protocol
             // version.
             let _ = tx.send(CancelClientWork);

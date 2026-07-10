@@ -60,6 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- zcashd-compat sidecars now get one bounded reserved inbound legacy P2P slot,
+  shared across configured `block_gossip_peer_ips`, so they can reconnect even
+  when ordinary inbound slots or same-IP peer limits are saturated.
 - Fixed a Zakura block-sync stall after header reanchors / tip resets: the
   post-reset producer refill no longer skips when peer-registry outstanding is
   still briefly inflated, so downloads resume instead of leaving an empty work

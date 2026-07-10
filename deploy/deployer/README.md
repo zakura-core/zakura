@@ -196,10 +196,12 @@ iroh identity (the node ids hardcoded as bootstrap peers in
 change every node id and drop the tuning. So the generated CI config sets
 `manage_config = false`: the deployer swaps `/usr/local/bin/zebrad` and restarts
 the existing `zebrad` service, leaving the config, unit, and cache untouched. The
-`rpc_listen_addr` / `log_file` / `[defaults.zakura] bootstrap_peers` in that
-config are read-only inputs for the dashboard's SSH probe, not deployed to nodes.
-Reproducing these configs in the deployer's managed model is separate future
-work.
+`rpc_listen_addr` / `log_file` / `p2p_stack` /
+`[defaults.zakura] bootstrap_peers` in that config are read-only inputs for the
+dashboard's SSH probe, not deployed to nodes. On-node configs should use
+`network.p2p_stack` (not the deprecated `v2_p2p` /
+`legacy_p2p` bools). Reproducing these configs in the deployer's managed model
+is separate future work.
 
 The workflow refreshes a fleet status dashboard on `us-east-0`:
 

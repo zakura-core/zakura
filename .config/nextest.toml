@@ -68,10 +68,10 @@ retries = 2
 [profile.check-no-git-dependencies]
 default-filter = 'test(check_no_git_dependencies)'
 
-[profile.zebrad-config]
+[profile.zakura-config]
 test-threads = 1
 failure-output = "immediate"
-default-filter = 'package(zebrad) and test(=config_tests)'
+default-filter = 'package(zakura) and test(=config_tests)'
 
 [profile.zakura-integration]
 fail-fast = false
@@ -90,40 +90,40 @@ default-filter = 'package(zebra-network) and test(~zakura::testkit::blocksync_fu
 
 [profile.sync-large-checkpoints-empty]
 slow-timeout = { period = "60m", terminate-after = 2 }
-default-filter = 'package(zebrad) and test(=sync_large_checkpoints_empty)'
+default-filter = 'package(zakura) and test(=sync_large_checkpoints_empty)'
 
 [profile.sync-full-mainnet]
 slow-timeout = { period = "30000m", terminate-after = 1 }
 success-output = "immediate"
-default-filter = 'package(zebrad) and test(=sync_full_mainnet)'
+default-filter = 'package(zakura) and test(=sync_full_mainnet)'
 
 [profile.sync-full-testnet]
 slow-timeout = { period = "1500m", terminate-after = 1 }
 success-output = "immediate"
-default-filter = 'package(zebrad) and test(=sync_full_testnet)'
+default-filter = 'package(zakura) and test(=sync_full_testnet)'
 
 [profile.sync-to-mandatory-checkpoint-mainnet]
 slow-timeout = { period = "1500m", terminate-after = 1 }
 success-output = "immediate"
-default-filter = 'package(zebrad) and test(=sync_to_mandatory_checkpoint_mainnet)'
+default-filter = 'package(zakura) and test(=sync_to_mandatory_checkpoint_mainnet)'
 
 [profile.sync-to-mandatory-checkpoint-testnet]
 slow-timeout = { period = "1500m", terminate-after = 1 }
 success-output = "immediate"
-default-filter = 'package(zebrad) and test(=sync_to_mandatory_checkpoint_testnet)'
+default-filter = 'package(zakura) and test(=sync_to_mandatory_checkpoint_testnet)'
 
 [profile.sync-update-mainnet]
 slow-timeout = { period = "30m", terminate-after = 2 }
 success-output = "immediate"
-default-filter = 'package(zebrad) and test(=sync_update_mainnet)'
+default-filter = 'package(zakura) and test(=sync_update_mainnet)'
 
 [profile.sync-past-mandatory-checkpoint-mainnet]
 slow-timeout = { period = "60m", terminate-after = 2 }
-default-filter = 'package(zebrad) and test(=sync_past_mandatory_checkpoint_mainnet)'
+default-filter = 'package(zakura) and test(=sync_past_mandatory_checkpoint_mainnet)'
 
 [profile.sync-past-mandatory-checkpoint-testnet]
 slow-timeout = { period = "60m", terminate-after = 2 }
-default-filter = 'package(zebrad) and test(=sync_past_mandatory_checkpoint_testnet)'
+default-filter = 'package(zakura) and test(=sync_past_mandatory_checkpoint_testnet)'
 
 [profile.sync-range-pre-nu62]
 # A healthy 5k-window sync is ~3-5 min. Terminate a stalled (broken) sync at ~20 min so a
@@ -131,7 +131,7 @@ default-filter = 'package(zebrad) and test(=sync_past_mandatory_checkpoint_testn
 # job-level timeout. Generous margin over the healthy duration to avoid flakes on a slow droplet.
 slow-timeout = { period = "5m", terminate-after = 4 }
 success-output = "immediate"
-default-filter = 'package(zebrad) and test(=sync_range_pre_nu62)'
+default-filter = 'package(zakura) and test(=sync_range_pre_nu62)'
 
 [profile.sync-range-post-nu62]
 # A healthy 5k-window sync is ~3-5 min. Terminate a stalled (broken) sync at ~20 min so a
@@ -139,78 +139,78 @@ default-filter = 'package(zebrad) and test(=sync_range_pre_nu62)'
 # job-level timeout. Generous margin over the healthy duration to avoid flakes on a slow droplet.
 slow-timeout = { period = "5m", terminate-after = 4 }
 success-output = "immediate"
-default-filter = 'package(zebrad) and test(=sync_range_post_nu62)'
+default-filter = 'package(zakura) and test(=sync_range_post_nu62)'
 
 [profile.generate-checkpoints-mainnet]
 slow-timeout = { period = "90m", terminate-after = 1 }
 success-output = "immediate"
-default-filter = 'package(zebrad) and test(=generate_checkpoints_mainnet)'
+default-filter = 'package(zakura) and test(=generate_checkpoints_mainnet)'
 
 [profile.generate-checkpoints-testnet]
 slow-timeout = { period = "90m", terminate-after = 1 }
 success-output = "immediate"
-default-filter = 'package(zebrad) and test(=generate_checkpoints_testnet)'
+default-filter = 'package(zakura) and test(=generate_checkpoints_testnet)'
 
 [profile.lwd-rpc-test]
 test-threads = 1
 slow-timeout = { period = "60m", terminate-after = 2 }
-default-filter = 'package(zebrad) and test(=lwd_rpc_test)'
+default-filter = 'package(zakura) and test(=lwd_rpc_test)'
 
 [profile.lwd-integration]
 slow-timeout = { period = "30m", terminate-after = 2 }
-default-filter = 'package(zebrad) and test(=lwd_integration)'
+default-filter = 'package(zakura) and test(=lwd_integration)'
 
 [profile.lwd-sync-full]
 slow-timeout = { period = "30000m", terminate-after = 1 }
 success-output = "immediate"
-default-filter = 'package(zebrad) and test(=lwd_sync_full)'
+default-filter = 'package(zakura) and test(=lwd_sync_full)'
 
 [profile.lwd-sync-update]
 slow-timeout = { period = "30m", terminate-after = 2 }
 success-output = "immediate"
-default-filter = 'package(zebrad) and test(=lwd_sync_update)'
+default-filter = 'package(zakura) and test(=lwd_sync_update)'
 
 [profile.lwd-grpc-wallet]
 slow-timeout = { period = "60m", terminate-after = 2 }
-default-filter = 'package(zebrad) and test(=lwd_grpc_wallet)'
+default-filter = 'package(zakura) and test(=lwd_grpc_wallet)'
 
 [profile.lwd-rpc-send-tx]
 slow-timeout = { period = "30m", terminate-after = 2 }
-default-filter = 'package(zebrad) and test(=lwd_rpc_send_tx)'
+default-filter = 'package(zakura) and test(=lwd_rpc_send_tx)'
 
 [profile.rpc-get-block-template]
 slow-timeout = { period = "30m", terminate-after = 2 }
-default-filter = 'package(zebrad) and test(=rpc_get_block_template)'
+default-filter = 'package(zakura) and test(=rpc_get_block_template)'
 
 [profile.rpc-submit-block]
 slow-timeout = { period = "30m", terminate-after = 2 }
-default-filter = 'package(zebrad) and test(=rpc_submit_block)'
+default-filter = 'package(zakura) and test(=rpc_submit_block)'
 
 [profile.indexer-has-spending-transaction-ids]
 slow-timeout = { period = "30m", terminate-after = 2 }
-default-filter = 'package(zebrad) and test(=has_spending_transaction_ids)'
+default-filter = 'package(zakura) and test(=has_spending_transaction_ids)'
 
 [profile.lightwalletd-test-suite]
 slow-timeout = { period = "60m", terminate-after = 2 }
-default-filter = 'package(zebrad) and test(=lightwalletd_test_suite)'
+default-filter = 'package(zakura) and test(=lightwalletd_test_suite)'
 
 [profile.rpc-z-getsubtreesbyindex-snapshot]
 slow-timeout = { period = "30m", terminate-after = 2 }
-default-filter = 'package(zebrad) and test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test)'
+default-filter = 'package(zakura) and test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test)'
 
 [profile.zcashd-compat-integration]
 # Run zcashd-compat tests one at a time to avoid port conflicts and resource exhaustion.
 test-threads = 1
 slow-timeout = { period = "15m", terminate-after = 2 }
 failure-output = "immediate"
-default-filter = 'package(zebrad) and test(~zcashd_compat)'
+default-filter = 'package(zakura) and test(~zcashd_compat)'
 
 [profile.zcashd-compat-soak]
 # Long-running local soak for the reorg churn stress test.
 test-threads = 1
 slow-timeout = { period = "4h", terminate-after = 1 }
 failure-output = "immediate"
-default-filter = 'package(zebrad) and test(=zcashd_compat_reorg_churn)'
+default-filter = 'package(zakura) and test(=zcashd_compat_reorg_churn)'
 
 [profile.zcashd-compat-external]
 # External mode: connect to pre-running mainnet/testnet zebrad + zcashd.
@@ -220,4 +220,4 @@ default-filter = 'package(zebrad) and test(=zcashd_compat_reorg_churn)'
 test-threads = 1
 slow-timeout = { period = "5m", terminate-after = 2 }
 failure-output = "immediate"
-default-filter = 'package(zebrad) and test(~zcashd_compat)'
+default-filter = 'package(zakura) and test(~zcashd_compat)'

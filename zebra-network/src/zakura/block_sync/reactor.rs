@@ -840,10 +840,10 @@ impl BlockSyncReactor {
         self.queue_status_refresh_if_changed(old_serving_tip);
         self.flush_status_refresh().await;
         // After a destructive reset the WorkQueue is empty above the new floor, but
-        // peer routines clear their registry outstanding asynchronously. A plain
-        // low-water-gated query can see the pre-reset outstanding sum, decide the
-        // pipeline is "full", and skip the refill — leaving `pending` empty and
-        // `max_outstanding = 0` until an external wake. Force the post-reset
+        // peer routines clear their registry outstanding asynchronously. A plain query can see the pre-reset outstanding amount, decide the
+        // pipeline is "full", and skip the refill, leaving `pending` empty and
+        // `max_outstanding = 0` until an external wake.
+        // Therefore, we force the post-reset
         // producer query so header reanchors / tip resets cannot stall that way.
         self.query_needed_blocks_with_options(reset_advanced).await;
     }

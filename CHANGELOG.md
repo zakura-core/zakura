@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   signed `i64`, matching zcashd, so the `-1` sentinel returned for side-chain
   blocks no longer overflows the previous `u32` conversion and aborts the node.
   Backported from upstream Zebra PR #10889.
+- Reject mempool transactions with non-standard transparent inputs _before_ script
+  verification, avoiding the more expensive script checks and reducing DoS surface.
+  Script verification now runs on the shared Rayon thread pool so it no longer blocks
+  the runtime. Fixes GHSA-84j3-rw4c-gqmj (thanks to @ouicate for reporting).
+  Backported from upstream Zebra PR #10936.
 
 ### Fixed
 

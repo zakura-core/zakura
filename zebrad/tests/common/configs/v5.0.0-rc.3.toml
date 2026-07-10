@@ -187,6 +187,7 @@ use_color = true
 use_journald = false
 
 [zcashd_compat]
+block_gossip_peer_ips = []
 enabled = false
 manage_zcashd = false
 restart_backoff = "2s"
@@ -196,3 +197,4 @@ shutdown_grace_period = "5m"
 startup_delay = "1s"
 zcashd_extra_args = []
 zcashd_source = "path"
+

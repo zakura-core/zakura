@@ -191,6 +191,20 @@ when Zakura listens on an unspecified address. Set
 `zcashd_compat.p2p_connect_addr` when zcashd must reach Zakura through a
 different address (for example across containers).
 
+When `zcashd_compat.enabled = true`, Zakura always includes inbound sidecar
+peers in block inventory gossip, so zcashd does not depend on random peer
+sampling to learn about new blocks. If `block_gossip_peer_ips` is empty, Zakura
+defaults it to loopback addresses. For an externally managed sidecar that
+connects from another local or private IP, enable zcashd-compat without
+supervision and configure that address explicitly:
+
+```toml
+[zcashd_compat]
+enabled = true
+manage_zcashd = false
+block_gossip_peer_ips = ["127.0.0.1"]
+```
+
 zcashd-compat mode requires the legacy Zcash P2P stack, because zcashd speaks the
 legacy Zcash P2P protocol. Every `network.p2p_stack` value runs it except
 `"zakura"`. Do not enable state pruning on the fronting Zakura — a pruned node does

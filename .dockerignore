@@ -26,7 +26,7 @@
 !deploy
 !deploy/zakura-watchdog
 !deploy/zakura-watchdog/**
-!zebra-*
+!zakura-*
 !zakurad
 !docker/entrypoint.sh
 !docker/default-zakura-config.toml

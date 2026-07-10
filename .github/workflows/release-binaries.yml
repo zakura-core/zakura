@@ -349,9 +349,9 @@ jobs:
           set -euo pipefail
           # Drop stale pre-rename assets so installers only see zakurad archives.
           legacy_assets=(
-            "zakurad-${RELEASE_TAG}-linux-x86_64.tar.gz"
-            "zakurad-${RELEASE_TAG}-linux-aarch64.tar.gz"
-            "zakurad-manifest-${RELEASE_TAG}.json"
+            "zebrad-${RELEASE_TAG}-linux-x86_64.tar.gz"
+            "zebrad-${RELEASE_TAG}-linux-aarch64.tar.gz"
+            "zebrad-manifest-${RELEASE_TAG}.json"
           )
           for asset in "${legacy_assets[@]}"; do
             gh release delete-asset "$RELEASE_TAG" "$asset" --repo "$REPOSITORY" --yes 2>/dev/null || true

@@ -70,8 +70,6 @@ audit-as-crates-io = false
 [policy.zakura-utils]
 audit-as-crates-io = false
 
-[policy.zakura]
-audit-as-crates-io = false
 [[exemptions.abscissa_core]]
 version = "0.7.0"
 criteria = "safe-to-deploy"

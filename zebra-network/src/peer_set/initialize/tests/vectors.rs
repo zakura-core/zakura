@@ -21,7 +21,7 @@ use std::{
 
 use chrono::Utc;
 use futures::{channel::mpsc, FutureExt, StreamExt};
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpSocket, TcpStream},
@@ -1054,6 +1054,139 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
     std::mem::drop(rejected_public_connection);
     std::mem::drop(zcashd_compat_connection);
     std::mem::drop(rejected_zcashd_compat_connection);
+}
+
+/// Test the listener does not add zcashd-compat peers to the recent-IP throttle.
+#[tokio::test]
+async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
+    let _init_guard = zebra_test::init();
+
+    // This test requires an IPv4 network stack with 127.0.0.1 as localhost.
+    if zebra_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
+    let success_disconnect_inbound_handshaker =
+        service_fn(|req: HandshakeRequest<TcpStream>| async move {
+            let HandshakeRequest {
+                data_stream: tcp_stream,
+                connected_addr,
+                connection_tracker,
+            } = req;
+
+            let (fake_client, _harness) = ClientTestHarness::build()
+                .with_connected_addr(connected_addr)
+                .finish();
+
+            std::mem::drop(connection_tracker);
+            std::mem::drop(tcp_stream);
+            tokio::task::yield_now().await;
+
+            Ok(fake_client)
+        });
+
+    let mut config = Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        peerset_initial_target_size: 1,
+        max_connections_per_ip: 1,
+        ..Config::default()
+    };
+    let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
+    config.listen_addr = listen_addr;
+
+    let (peerset_tx, mut peerset_rx) = mpsc::channel::<DiscoveredPeer>(2);
+    let (_bans_tx, bans_rx) = tokio::sync::watch::channel(Default::default());
+
+    let listen_fut = accept_inbound_connections(
+        config,
+        tcp_listener,
+        MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
+        success_disconnect_inbound_handshaker,
+        peerset_tx,
+        bans_rx,
+        vec![zcashd_compat_ip.into()],
+    );
+    let listen_task_handle = tokio::spawn(listen_fut);
+
+    let first_connection = connect_from(zcashd_compat_ip, listen_addr).await;
+    tokio::time::sleep(MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS * 2).await;
+    let second_connection = connect_from(zcashd_compat_ip, listen_addr).await;
+
+    tokio::time::sleep(ZCASHD_COMPAT_LISTENER_TEST_DURATION).await;
+
+    listen_task_handle.abort();
+    tokio::task::yield_now().await;
+    assert_listener_task_cancelled(listen_task_handle);
+
+    assert_eq!(
+        drain_discovered_peers(&mut peerset_rx),
+        2,
+        "rapid zcashd-compat reconnects should bypass the recent-IP throttle"
+    );
+
+    std::mem::drop(first_connection);
+    std::mem::drop(second_connection);
+}
+
+/// Test bans are applied before the zcashd-compat reserved slot.
+#[tokio::test]
+async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
+    let _init_guard = zebra_test::init();
+
+    // This test requires an IPv4 network stack with 127.0.0.1 as localhost.
+    if zebra_test::net::zebra_skip_network_tests() {
+        return;
+    }
+
+    let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
+    let unreachable_inbound_handshaker = service_fn(|_| async {
+        unreachable!("banned zcashd-compat peer should never reach the handshaker")
+    });
+
+    let mut config = Config {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        peerset_initial_target_size: 1,
+        ..Config::default()
+    };
+    let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
+    config.listen_addr = listen_addr;
+
+    let (peerset_tx, mut peerset_rx) = mpsc::channel::<DiscoveredPeer>(1);
+    let (bans_tx, bans_rx) = tokio::sync::watch::channel(
+        [(zcashd_compat_ip.into(), std::time::Instant::now())]
+            .into_iter()
+            .collect::<IndexMap<_, _>>()
+            .into(),
+    );
+
+    let listen_fut = accept_inbound_connections(
+        config,
+        tcp_listener,
+        MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
+        unreachable_inbound_handshaker,
+        peerset_tx,
+        bans_rx,
+        vec![zcashd_compat_ip.into()],
+    );
+    let listen_task_handle = tokio::spawn(listen_fut);
+
+    let banned_connection = connect_from(zcashd_compat_ip, listen_addr).await;
+
+    tokio::time::sleep(ZCASHD_COMPAT_LISTENER_TEST_DURATION).await;
+
+    listen_task_handle.abort();
+    tokio::task::yield_now().await;
+    assert_listener_task_cancelled(listen_task_handle);
+
+    assert_eq!(
+        drain_discovered_peers(&mut peerset_rx),
+        0,
+        "banned zcashd-compat peers must not be admitted"
+    );
+
+    std::mem::drop(bans_tx);
+    std::mem::drop(banned_connection);
 }
 
 /// Test the listener with the default inbound peer limit, and a handshaker that always errors.

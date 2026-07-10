@@ -57,13 +57,16 @@ if [ ! -f /root/.ssh/pr_node_loopback ]; then
 fi
 grep -qxF "$(cat /root/.ssh/pr_node_loopback.pub)" /root/.ssh/authorized_keys 2>/dev/null || \
   cat /root/.ssh/pr_node_loopback.pub >> /root/.ssh/authorized_keys
+# No host-key checking for loopback: droplets created from this image
+# regenerate their SSH host keys on first boot, so a baked known_hosts entry
+# would make every deploy.py connection fail with a changed-key error.
 cat > /root/.ssh/config <<'CFG'
 Host localhost
     IdentityFile /root/.ssh/pr_node_loopback
-    StrictHostKeyChecking accept-new
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
 CFG
 chmod 600 /root/.ssh/config
-# Self-test now so the localhost host key is also baked into known_hosts.
 ssh -o BatchMode=yes root@localhost true
 
 # --------------------------------------------------------------------------- #

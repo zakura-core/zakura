@@ -85,6 +85,19 @@ fi
 # Build + deploy via deploy.py against the baked loopback SSH identity
 # ---------------------------------------------------------------------------- #
 
+# Enforce the loopback SSH config regardless of what the image baked: this
+# droplet regenerated its host keys on first boot, so any recorded localhost
+# host key is stale and would fail deploy.py's connections as a changed key.
+cat > /root/.ssh/config <<'CFG'
+Host localhost
+    IdentityFile /root/.ssh/pr_node_loopback
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+CFG
+chmod 600 /root/.ssh/config
+rm -f /root/.ssh/known_hosts
+ssh -o BatchMode=yes root@localhost true
+
 case "$NETWORK" in
   mainnet) NET_TOML=Mainnet ;;
   testnet) NET_TOML=Testnet ;;

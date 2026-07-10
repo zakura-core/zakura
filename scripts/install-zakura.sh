@@ -28,8 +28,8 @@ ZAKURA_DOCKER_RUNTIME_GID=10001
 
 MANIFEST_PATH="$REPO_ROOT/zebrad/zcashd-compat-manifest.json"
 TARGET_TRIPLE="x86_64-pc-linux-gnu"
-ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v0.0.1-compat-alpha.3/zcashd-zebra-compat-v0.0.1-compat-alpha.3-linux-x86_64.tar.gz"
-ZCASHD_RUNTIME_ARCHIVE_SHA256="a2deaf9cfb89e8a1b34664ace0393336b7b5095a8fe0b4c7fb67b3715012ef47"
+ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v0.0.1-compat-alpha.4/zcashd-zebra-compat-v0.0.1-compat-alpha.4-linux-x86_64.tar.gz"
+ZCASHD_RUNTIME_ARCHIVE_SHA256="892c749bc629dc408598b33994b8b0d8e3e90ad5c8f755b214dce5b850083f12"
 ZCASHD_RUNTIME_ARCHIVE_MEMBER_BINARY_PATH="./bin/zcashd"
 
 INSTALL_PROFILE=""
@@ -1908,7 +1908,7 @@ compat_prepare_docker_images() {
         add_error "Docker image is missing or could not be pulled: $ZAKURA_DOCKER_IMAGE"
 
       if [[ -z "$ZCASHD_DOCKER_IMAGE" ]]; then
-        ZCASHD_DOCKER_IMAGE="valargroup/zcashd:v0.0.1-compat-alpha.3@sha256:d9c80e8469f99406cc7e51238ae67708421d739a7446f52f941a7ea44b3af354"
+        ZCASHD_DOCKER_IMAGE="valargroup/zcashd:v0.0.1-compat-alpha.4@sha256:b1e8ee69aecde0ce9cb1ee6e10e37ed9036332d85f0f60f4ce04ba5f152cc704"
       fi
 
       docker_image_available_or_pull "$ZCASHD_DOCKER_IMAGE" ||

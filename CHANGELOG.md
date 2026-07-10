@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   Cargo packages are now named `zakura` and `zakura-watchdog`; the watchdog
   binary, systemd unit, runtime paths, and Sentry identity use
   `zakura-watchdog`.
+- zcashd-compat no longer adds or requires the obsolete zcashd deprecation
+  acknowledgement in `zcash.conf`.
 - Removed the deprecated zcashd-compat dedicated RPC listener (`:28232`) and its
   cookie/TLS configuration. The P2P sidecar syncs over legacy Zcash P2P only;
   use the standard `rpc.listen_addr` endpoint for operator JSON-RPC queries.

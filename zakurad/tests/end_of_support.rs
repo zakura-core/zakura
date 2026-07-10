@@ -34,7 +34,7 @@ fn end_of_support_function() {
     assert!(logs_contain(
         "Checking if Zebra release is inside support range ..."
     ));
-    assert!(logs_contain("Zebra release is supported"));
+    assert!(logs_contain("Zakura release is supported"));
 
     // We are in warn range
     let warn = ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * 1152) - (3 * ESTIMATED_BLOCKS_PER_DAY);
@@ -88,7 +88,7 @@ async fn end_of_support_task() -> Result<()> {
         "Checking if Zebra release is inside support range ..."
     ));
 
-    assert!(logs_contain("Zebra release is supported"));
+    assert!(logs_contain("Zakura release is supported"));
 
     Ok(())
 }

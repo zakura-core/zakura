@@ -1,31 +1,31 @@
 [workspace]
 members = [
-        "zebrad",
-        "zebra-chain",
-        "zebra-network",
-        "zebra-state",
-        "zebra-script",
-        "zebra-consensus",
-        "zebra-rpc",
-        "zebra-node-services",
-        "zebra-test",
-        "zebra-utils",
+        "zakurad",
+        "zakura-chain",
+        "zakura-network",
+        "zakura-state",
+        "zakura-script",
+        "zakura-consensus",
+        "zakura-rpc",
+        "zakura-node-services",
+        "zakura-test",
+        "zakura-utils",
         "tower-batch-control",
         "tower-fallback",
-        "deploy/watchdog",
+        "deploy/zakura-watchdog",
         "xtask",
-        "zebra-jsonl-trace",
+        "zakura-jsonl-trace",
 ]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
 resolver = "2"
 
 [workspace.package]
-authors = ["Zcash Foundation <zebra@zfnd.org>"]
+authors = ["Zakura contributors"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/valargroup/zebra"
-homepage = "https://zfnd.org/zebra/"
-keywords = ["zebra", "zcash"]
+repository = "https://github.com/zakura-core/zakura"
+homepage = "https://github.com/zakura-core/zakura"
+keywords = ["zakura", "zcash"]
 rust-version = "1.91"
 edition = "2021"
 
@@ -198,7 +198,7 @@ allow-branch = ["ironwood-main"]
 # peer, never abort the whole node (a trivial remote DoS otherwise). Because we
 # now unwind, every shared/consensus-state critical section must stay panic-free
 # (no `.await`/`.expect()`/`.unwrap()`/indexing under a lock) — a panic mid-
-# mutation would unwind through it instead of aborting. zebra-network enforces
+# mutation would unwind through it instead of aborting. zakura-network enforces
 # unwind with a `#[cfg(panic = "abort")] compile_error!`. See
 # security_requirements.md SR-1 and SR-2.
 panic = "unwind"
@@ -324,7 +324,7 @@ codegen-units = 16
 [profile.release]
 # See [profile.dev]: panic = "unwind" is required for peer-pipe panic containment
 # (security_requirements.md SR-1); do not set "abort". Enforced by a
-# compile_error guard in zebra-network.
+# compile_error guard in zakura-network.
 panic = "unwind"
 
 # Speed up release builds and sync tests using link-time optimization.

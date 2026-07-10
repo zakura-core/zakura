@@ -1,6 +1,6 @@
 # System Requirements
 
-Zebra has the following hardware requirements.
+Zakura has the following hardware requirements.
 
 ## Recommended Requirements
 
@@ -15,42 +15,42 @@ Zebra has the following hardware requirements.
 - 4 GB RAM
 - 300 GB available disk space
 
-[Zebra has successfully run on an Orange Pi Zero 2W with a 512 GB microSD card
+[Zakura has successfully run on an Orange Pi Zero 2W with a 512 GB microSD card
 without any issues.](https://x.com/Zerodartz/status/1811460885996798159)
 
 ## Disk Requirements
 
-Zebra uses around 300 GB for cached Mainnet data, and 10 GB for cached Testnet
+Zakura uses around 300 GB for cached Mainnet data, and 10 GB for cached Testnet
 data. We expect disk usage to grow over time.
 
-Zebra cleans up its database periodically, and also when you shut it down or
+Zakura cleans up its database periodically, and also when you shut it down or
 restart it. Changes are committed using RocksDB database transactions. If you
-forcibly terminate Zebra, or it panics, any incomplete changes will be rolled
-back the next time it starts. So Zebra's state should always be valid, unless
+forcibly terminate Zakura, or it panics, any incomplete changes will be rolled
+back the next time it starts. So Zakura's state should always be valid, unless
 your OS or disk hardware is corrupting data.
 
 ## Network Requirements and Ports
 
-Zebra uses the following inbound and outbound TCP ports:
+Zakura uses the following inbound and outbound TCP ports:
 
 - 8233 on Mainnet
 - 18233 on Testnet
 
-If you configure Zebra with a specific
-[`listen_addr`](https://docs.rs/zebra-network/latest/zebra_network/config/struct.Config.html#structfield.listen_addr),
+If you configure Zakura with a specific
+[`listen_addr`](https://docs.rs/zakura-network/latest/zakura_network/config/struct.Config.html#structfield.listen_addr),
 it will advertise this address to other nodes for inbound connections. Outbound
 connections are required to sync, inbound connections are optional but
-recommended. Zebra also needs access to the Zcash DNS seeders, via the OS DNS
+recommended. Zakura also needs access to the Zcash DNS seeders, via the OS DNS
 resolver (usually port 53).
 
-If Zebra runs in Docker, publish the P2P port with `-p 8233:8233` (Mainnet) or
+If Zakura runs in Docker, publish the P2P port with `-p 8233:8233` (Mainnet) or
 `-p 18233:18233` (Testnet) so other peers can connect to it. See the
 [P2P section of the Docker guide](./docker.md#p2p-networking) for details. If
 the node sits behind a firewall or NAT, open the P2P port and consider setting
-[`external_addr`](https://docs.rs/zebra-network/latest/zebra_network/config/struct.Config.html#structfield.external_addr)
+[`external_addr`](https://docs.rs/zakura-network/latest/zakura_network/config/struct.Config.html#structfield.external_addr)
 to your public IP so peers can discover it.
 
-Zebra makes outbound connections to peers on any port. But `zcashd` prefers
+Zakura makes outbound connections to peers on any port. But `zcashd` prefers
 peers on the default ports, so that it can't be used for DDoS attacks on other
 networks.
 
@@ -61,6 +61,6 @@ networks.
 - Ongoing updates: 10 MB - 10 GB upload and download per day, depending on
   user-created transaction size and peer requests.
 
-Zebra needs some peers which have a round-trip latency of 2 seconds or less. If
+Zakura needs some peers which have a round-trip latency of 2 seconds or less. If
 this is a problem for you, please [open a
-ticket.](https://github.com/ZcashFoundation/zebra/issues/new/choose)
+ticket.](https://github.com/zakura-core/zakura/issues/new/choose)

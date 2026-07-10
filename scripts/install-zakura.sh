@@ -24,14 +24,14 @@ ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-1.0.0-rc0"
 ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
 ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
 # Persistent Zakura iroh identity (NodeId secret). Kept outside the state cache so
-# snapshots do not clone a node's long-term identity. Matches zebra-network's
+# snapshots do not clone a node's long-term identity. Matches zakura-network's
 # default `network.identity_dir` (~/.zakura).
 ZAKURA_DEFAULT_IDENTITY_DIR="${HOME}/.zakura"
 ZAKURA_DOCKER_RUNTIME_UID=10001
 ZAKURA_DOCKER_RUNTIME_GID=10001
 ZAKURA_DOCKER_IDENTITY_DIR="/home/zebra/.zakura"
 
-MANIFEST_PATH="$REPO_ROOT/zebrad/zcashd-compat-manifest.json"
+MANIFEST_PATH="$REPO_ROOT/zakurad/zcashd-compat-manifest.json"
 TARGET_TRIPLE="x86_64-pc-linux-gnu"
 ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v1.0.0-compat-rc2/zcashd-zebra-compat-v1.0.0-compat-rc2-linux-x86_64.tar.gz"
 ZCASHD_RUNTIME_ARCHIVE_SHA256="9636bfe642a7542f92a31132ecce1139a290df1a9e674e8373167831369a905d"
@@ -491,7 +491,7 @@ compat_zcashd_network_datadir() {
   esac
 }
 
-# Value for ZAKURA_NETWORK__NETWORK, as zebra-network deserializes it.
+# Value for ZAKURA_NETWORK__NETWORK, as zakura-network deserializes it.
 compat_network_config_value() {
   case "$(compat_network_name_lowercase)" in
     mainnet) printf 'Mainnet\n' ;;
@@ -501,7 +501,7 @@ compat_network_config_value() {
   esac
 }
 
-# zebra-network's Config::default() hardcodes [::]:8233 for every network; the
+# zakura-network's Config::default() hardcodes [::]:8233 for every network; the
 # network-aware default_port() only applies when a port-less string is
 # deserialized. So the P2P listener must be set explicitly per network.
 compat_network_default_p2p_port() {
@@ -634,7 +634,7 @@ compat_path_has_min_capacity() {
   ((size >= min_bytes))
 }
 
-compat_zebra_state_has_expected_files() {
+compat_zakura_state_has_expected_files() {
   local dir="$1"
   local net_dir matches match
 
@@ -785,11 +785,11 @@ compat_search_named_candidates() {
   done < <(compat_candidate_search_roots)
 }
 
-compat_search_zebra_state_candidates() {
+compat_search_zakura_state_candidates() {
   local min_bytes="$1"
   local root candidate
 
-  compat_search_named_candidates "$min_bytes" compat_zebra_state_has_expected_files \
+  compat_search_named_candidates "$min_bytes" compat_zakura_state_has_expected_files \
     ".cache/zakura" "zakura" "zakura-state" "data/zakura" "data/zakura-state" \
     "mnt/data/zakura" "mnt/data/zakura-state"
 
@@ -799,7 +799,7 @@ compat_search_zebra_state_candidates() {
     compat_path_has_min_capacity "$root" "$min_bytes" || continue
 
     while IFS= read -r candidate; do
-      compat_maybe_select_better_candidate "$candidate" "$min_bytes" compat_zebra_state_has_expected_files
+      compat_maybe_select_better_candidate "$candidate" "$min_bytes" compat_zakura_state_has_expected_files
     done < <(find "$root" -xdev -maxdepth 5 -type d \( -name zakura -o -name zakura-state \) -print 2>/dev/null)
   done < <(compat_candidate_search_roots)
 }
@@ -823,7 +823,7 @@ compat_search_zcashd_datadir_candidates() {
   done < <(compat_candidate_search_roots)
 }
 
-compat_recommend_zebra_state_dir() {
+compat_recommend_zakura_state_dir() {
   local binary_default="$1"
   local min_bytes
   min_bytes="$(disk_per_datadir_min_bytes)"
@@ -832,8 +832,8 @@ compat_recommend_zebra_state_dir() {
   BEST_CANDIDATE=""
   BEST_CANDIDATE_SCORE=0
 
-  compat_maybe_select_better_candidate "$binary_default" "$min_bytes" compat_zebra_state_has_expected_files
-  compat_search_zebra_state_candidates "$min_bytes"
+  compat_maybe_select_better_candidate "$binary_default" "$min_bytes" compat_zakura_state_has_expected_files
+  compat_search_zakura_state_candidates "$min_bytes"
 
   if [[ -n "$BEST_CANDIDATE" ]]; then
     printf '%s\n' "$BEST_CANDIDATE"
@@ -887,7 +887,7 @@ compat_recommend_datadir_defaults() {
   fi
 
   if ((ZAKURA_STATE_DIR_SET == 0)); then
-    ZAKURA_STATE_DIR="$(compat_recommend_zebra_state_dir "$ZAKURA_DEFAULT_CACHE_DIR")"
+    ZAKURA_STATE_DIR="$(compat_recommend_zakura_state_dir "$ZAKURA_DEFAULT_CACHE_DIR")"
   fi
 
   if ((ZCASHD_DATADIR_SET == 0)); then
@@ -2014,7 +2014,7 @@ EOF
 
 compat_print_docker_supervised_command() {
   local image="${ZAKURA_COMPAT_DOCKER_SELECTED:-$ZAKURA_COMPAT_DOCKER_IMAGE}"
-  local container_zebra_state_dir="/home/zebra/.cache/zakura"
+  local container_zakura_state_dir="/home/zebra/.cache/zakura"
   local container_zakura_identity_dir="$ZAKURA_DOCKER_IDENTITY_DIR"
   local container_zcashd_datadir="/home/zebra/.cache/zcashd"
   local p2p_port
@@ -2026,11 +2026,11 @@ docker run --rm -it --network host \\
   -e ZAKURA_NETWORK__LISTEN_ADDR='[::]:${p2p_port}' \\
   -e ZAKURA_NETWORK__MAX_CONNECTIONS_PER_IP=8 \\
   -e ZAKURA_NETWORK__IDENTITY_DIR=$container_zakura_identity_dir \\
-  -e ZAKURA_STATE__CACHE_DIR=$container_zebra_state_dir \\
+  -e ZAKURA_STATE__CACHE_DIR=$container_zakura_state_dir \\
   -e ZAKURA_ZCASHD_COMPAT__MANAGE_ZCASHD=true \\
   -e ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR=$container_zcashd_datadir \\
   -e ZAKURA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]' \\
-  --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=$container_zebra_state_dir \\
+  --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=$container_zakura_state_dir \\
   --mount type=bind,src=$(shell_quote "$ZAKURA_IDENTITY_DIR"),dst=$container_zakura_identity_dir \\
   --mount type=bind,src=$(shell_quote "$ZCASHD_DATADIR"),dst=$container_zcashd_datadir \\
   $(shell_quote "$image") \\
@@ -2454,7 +2454,7 @@ while (($#)); do
       NETWORK_SET=1
       shift 2
       ;;
-    --zakura-state-dir | --zebra-state-dir)
+    --zakura-state-dir | --zakura-state-dir)
       require_value "$1" "${2:-}"
       ZAKURA_STATE_DIR="$2"
       ZAKURA_STATE_DIR_SET=1
@@ -2494,7 +2494,7 @@ while (($#)); do
       ZCASHD_CONF="$2"
       shift 2
       ;;
-    --zakurad-path | --zebrad-path)
+    --zakurad-path | --zakurad-path)
       require_value "$1" "${2:-}"
       ZAKURAD_PATH="$2"
       shift 2

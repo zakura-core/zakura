@@ -13,7 +13,7 @@ yanked = "deny"
 # Remove each ignore entry as the dependency chain is upgraded.
 ignore = [
     "RUSTSEC-2021-0139", # ansi_term — transitive via abscissa_core -> structopt
-    "RUSTSEC-2022-0104", # structopt (unmaintained) — transitive via abscissa_core and direct dep of zebra-utils
+    "RUSTSEC-2022-0104", # structopt (unmaintained) — transitive via abscissa_core and direct dep of zakura-utils
     "RUSTSEC-2024-0375", # atty (unmaintained) — transitive via abscissa_core -> structopt
     "RUSTSEC-2024-0370", # proc-macro-error — transitive via abscissa_core -> structopt
     "RUSTSEC-2026-0173", # proc-macro-error2 (unmaintained) — transitive via getset
@@ -24,7 +24,7 @@ ignore = [
     "RUSTSEC-2024-0384", # instant — transitive via iroh
     "RUSTSEC-2024-0436", # paste — transitive via iroh/netdev/stun-rs
     "RUSTSEC-2023-0089", # atomic-polyfill — transitive via iroh-metrics/postcard
-    "RUSTSEC-2025-0134", # rustls-pemfile (unmaintained) — transitive via zebra-rpc; also present on ironwood-main
+    "RUSTSEC-2025-0134", # rustls-pemfile (unmaintained) — transitive via zakura-rpc; also present on ironwood-main
     # quick-xml (namespace-resolver unbounded alloc + O(n^2) duplicate-attribute scan on
     # untrusted XML) — both transitive via inferno, only under the optional `flamegraph`
     # dev/profiling feature (not in release binaries) and only over the node's own profiling
@@ -159,8 +159,8 @@ skip-tree = [
     # remove once ed25519-zebra updates hashbrown.
     { name = "hashbrown", version = "=0.16.1" },
 
-    # toml 0.9.x pulled by zebrad direct; 1.1.x by config 0.15 (also via zebrad).
-    # toml 1.x is the spec-1.1 line; remove once zebrad migrates its direct dep.
+    # toml 0.9.x pulled by zakurad direct; 1.1.x by config 0.15 (also via zakurad).
+    # toml 1.x is the spec-1.1 line; remove once zakurad migrates its direct dep.
     { name = "toml", version = "=0.9.12+spec-1.1.0" },
 
     # winnow 0.7.x pulled by toml 0.9.x; 1.x by toml 1.x / config 0.15.

@@ -1,13 +1,13 @@
-![Zebra logotype](https://zfnd.org/wp-content/uploads/2022/03/zebra-logotype.png)
+![Zakura logotype](book/theme/favicon.png)
 
 ---
 
-[![Unit Tests](https://github.com/ZcashFoundation/zebra/actions/workflows/tests-unit.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/tests-unit.yml)
-[![Lint](https://github.com/ZcashFoundation/zebra/actions/workflows/lint.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/lint.yml)
-[![Integration Tests (GCP)](https://github.com/ZcashFoundation/zebra/actions/workflows/zfnd-ci-integration-tests-gcp.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/zfnd-ci-integration-tests-gcp.yml)
-[![codecov](https://codecov.io/gh/ZcashFoundation/zebra/branch/main/graph/badge.svg)](https://codecov.io/gh/ZcashFoundation/zebra)
-[![Build docs](https://github.com/ZcashFoundation/zebra/actions/workflows/book.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/book.yml)
-[![Deploy Nodes (GCP)](https://github.com/ZcashFoundation/zebra/actions/workflows/zfnd-deploy-nodes-gcp.yml/badge.svg)](https://github.com/ZcashFoundation/zebra/actions/workflows/zfnd-deploy-nodes-gcp.yml)
+[![Unit Tests](https://github.com/zakura-core/zakura/actions/workflows/tests-unit.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/tests-unit.yml)
+[![Lint](https://github.com/zakura-core/zakura/actions/workflows/lint.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/lint.yml)
+[![Integration Tests (GCP)](https://github.com/zakura-core/zakura/actions/workflows/zfnd-ci-integration-tests-gcp.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/zfnd-ci-integration-tests-gcp.yml)
+[![codecov](https://codecov.io/gh/zakura-core/zakura/branch/main/graph/badge.svg)](https://codecov.io/gh/zakura-core/zakura)
+[![Build docs](https://github.com/zakura-core/zakura/actions/workflows/book.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/book.yml)
+[![Deploy Nodes (GCP)](https://github.com/zakura-core/zakura/actions/workflows/zfnd-deploy-nodes-gcp.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/zfnd-deploy-nodes-gcp.yml)
 ![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)
 
 - [Getting Started](#getting-started)
@@ -19,12 +19,12 @@
 - [Security](#security)
 - [License](#license)
 
-[Zebra](https://zebra.zfnd.org/) is a Zcash full node written in Rust.
+[Zakura](https://github.com/zakura-core/zakura/) is a Zcash full node written in Rust.
 
 ## Getting Started
 
-You can run Zebra using our [Docker
-image](https://hub.docker.com/r/zfnd/zebra/tags) or you can install it manually.
+You can run Zakura using our [Docker
+image](https://hub.docker.com/r/zakura-core/zakura/tags) or you can install it manually.
 
 ### Docker
 
@@ -32,20 +32,20 @@ This command will run our latest release, and sync it to the tip:
 
 ```sh
 docker run -d \
-  --name zebra \
+  --name zakura \
   -p 8233:8233 \
-  -v zebrad-cache:/home/zebra/.cache/zakura \
-  zfnd/zebra:latest
+  -v zakurad-cache:/home/zakura/.cache/zakura \
+  zakura-core/zakura:latest
 ```
 
 The `-p 8233:8233` flag exposes the P2P port so other Zcash nodes can connect to
 yours, and `-v` persists the chain state across restarts (use port `18233` for
 Testnet). For more information, read our [Docker
-documentation](https://zebra.zfnd.org/user/docker.html).
+documentation](book/src/user/docker.md).
 
 ### Manual Install
 
-Building Zebra requires [Rust](https://www.rust-lang.org/tools/install),
+Building Zakura requires [Rust](https://www.rust-lang.org/tools/install),
 [libclang](https://clang.llvm.org/doxygen/group__CINDEX.html), and a C++
 compiler. Below are quick summaries for installing these dependencies.
 
@@ -58,7 +58,7 @@ compiler. Below are quick summaries for installing these dependencies.
 </summary>
 
 1. Install [`cargo` and `rustc`](https://www.rust-lang.org/tools/install).
-2. Install Zebra's build dependencies:
+2. Install Zakura's build dependencies:
    - **libclang**, which is a library that comes under various names, typically
      `libclang`, `libclang-dev`, `llvm`, or `llvm-dev`;
    - **clang** or another C++ compiler (`g++,` which is for all platforms or
@@ -88,32 +88,32 @@ export CXXFLAGS="$CXXFLAGS -include cstdint"
 
 </details>
 
-Once you have the dependencies in place, you can install Zebra with:
+Once you have the dependencies in place, you can install Zakura with:
 
 ```sh
-cargo install --locked zebrad
+cargo install --locked zakurad
 ```
 
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/ZcashFoundation/zebra --tag v4.5.3 zebrad
+cargo install --git https://github.com/zakura-core/zakura --tag v4.5.3 zakurad
 ```
 
-You can start Zebra by running
+You can start Zakura by running
 
 ```sh
-zebrad start
+zakurad start
 ```
 
 Refer to the [Building and Installing
-Zebra](https://zebra.zfnd.org/user/install.html) and [Running
-Zebra](https://zebra.zfnd.org/user/run.html) sections in the book for enabling
+Zakura](book/src/user/install.md) and [Running
+Zakura](book/src/user/run.md) sections in the book for enabling
 optional features, detailed configuration and further details.
 
 ## CI/CD Architecture
 
-Zebra uses a comprehensive CI/CD system built on GitHub Actions to ensure code
+Zakura uses a comprehensive CI/CD system built on GitHub Actions to ensure code
 quality, maintain stability, and automate routine tasks. Our CI/CD
 infrastructure:
 
@@ -128,45 +128,43 @@ Documentation](.github/workflows/README.md).
 
 ## Documentation
 
-The Zcash Foundation maintains the following resources documenting Zebra:
+The Zakura maintainers provide the following resources:
 
-- The Zebra Book:
-  - [General Introduction](https://zebra.zfnd.org/index.html),
-  - [User Documentation](https://zebra.zfnd.org/user.html),
-  - [Developer Documentation](https://zebra.zfnd.org/dev.html).
+- The Zakura Book:
+  - [General Introduction](README.md),
+  - [User Documentation](book/src/user.md),
+  - [Developer Documentation](book/src/dev.md).
 
   - User guides of note:
-    - [Zebra Health Endpoints](https://zebra.zfnd.org/user/health.html) — liveness/readiness checks for Kubernetes and load balancers
+    - [Zakura Health Endpoints](book/src/user/health.md) — liveness/readiness checks for Kubernetes and load balancers
 
 - The [documentation of the public
-  APIs](https://docs.rs/zebrad/latest/zebrad/#zebra-crates) for the latest
-  releases of the individual Zebra crates.
+  APIs](https://docs.rs/zakurad/latest/zakurad/#zakura-crates) for the latest
+  releases of the individual Zakura crates.
 
-- The [documentation of the internal APIs](https://zebra.zfnd.org/internal)
-  for the `main` branch of the whole Zebra monorepo.
+- The [documentation of the internal APIs](https://zakura-core.github.io/zakura/internal)
+  for the `main` branch of the whole Zakura monorepo.
 
 ## User support
 
-If Zebra doesn't behave the way you expected, [open an
-issue](https://github.com/ZcashFoundation/zebra/issues/new/choose). We regularly
+If Zakura doesn't behave the way you expected, [open an
+issue](https://github.com/zakura-core/zakura/issues/new/choose). We regularly
 triage new issues and we will respond. We maintain a list of known issues in the
-[Troubleshooting](https://zebra.zfnd.org/user/troubleshooting.html) section of
+[Troubleshooting](book/src/user/troubleshooting.md) section of
 the book.
 
-If you want to chat with us, [Join the Zcash Foundation Discord
-Server](https://discord.com/invite/aRgNRVwsM8) and find the "zebra-support"
-channel.
+If you want to chat with us, use the project discussion channels linked from the Zakura repository.
 
 ## Security
 
-Zebra has a [responsible disclosure
-policy](https://github.com/ZcashFoundation/zebra/blob/main/SECURITY.md), which
+Zakura has a [responsible disclosure
+policy](https://github.com/zakura-core/zakura/blob/main/SECURITY.md), which
 we encourage security researchers to follow.
 
 ## License
 
-Zebra is distributed under the terms of both the MIT license and the Apache
-License (Version 2.0). Some Zebra crates are distributed under the [MIT license
+Zakura is distributed under the terms of both the MIT license and the Apache
+License (Version 2.0). Some Zakura crates are distributed under the [MIT license
 only](LICENSE-MIT), because some of their code was originally from MIT-licensed
 projects. See each crate's directory for details.
 

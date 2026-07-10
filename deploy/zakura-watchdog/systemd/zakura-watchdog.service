@@ -1,0 +1,35 @@
+# Systemd unit for the Zakura watchdog sidecar.
+#
+# Installation:
+# 1- Install the binary:
+#    install -m 755 zakura-watchdog /usr/local/bin/zakura-watchdog
+# 2- Optionally create /etc/zakura-watchdog/env with configuration overrides,
+#    including SENTRY_DSN and deployment suppression file path
+#    (see deploy/zakura-watchdog/README.md):
+#    mkdir -p /etc/zakura-watchdog
+#    printf 'SENTRY_DSN=...\nSENTRY_ENVIRONMENT=...\n' > /etc/zakura-watchdog/env
+#    chmod 600 /etc/zakura-watchdog/env
+# 3- Install and start the unit:
+#    cp deploy/zakura-watchdog/systemd/zakura-watchdog.service /etc/systemd/system/
+#    systemctl daemon-reload
+#    systemctl enable --now zakura-watchdog
+[Unit]
+Description=Zakura watchdog sidecar
+Documentation=https://github.com/zakura-core/zakura/tree/main/deploy/zakura-watchdog
+After=network-online.target
+Wants=network-online.target
+AssertPathExists=/usr/local/bin/zakura-watchdog
+
+[Service]
+ExecStart=/usr/local/bin/zakura-watchdog run
+# Optional configuration overrides, including SENTRY_DSN.
+EnvironmentFile=-/etc/zakura-watchdog/env
+Restart=always
+RestartSec=5
+PrivateTmp=true
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

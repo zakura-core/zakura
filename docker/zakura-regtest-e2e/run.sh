@@ -133,9 +133,9 @@ PROPAGATE_TIMEOUT="${PROPAGATE_TIMEOUT:-${DEFAULT_PROPAGATE_TIMEOUT}}"
 # READY_TIMEOUT used for the (fast) startup assertions is too tight here. This
 # ceiling only matters on failure: the waits exit as soon as catch-up starts.
 CATCHUP_TIMEOUT="${CATCHUP_TIMEOUT:-${DEFAULT_CATCHUP_TIMEOUT}}"
-# The Zakura JSONL trace writer (zebra-jsonl-trace) only flushes to disk every
+# The Zakura JSONL trace writer (zakura-jsonl-trace) only flushes to disk every
 # DEFAULT_FILE_FLUSH_INTERVAL (~17s) or after DEFAULT_BUFFER_FLUSH_BYTES (256
-# KiB), and production zebrad uses JsonlTracer::spawn (no guard / no shutdown
+# KiB), and production zakurad uses JsonlTracer::spawn (no guard / no shutdown
 # flush), so stopping the nodes does not flush the tail. The oracle reads the
 # trace files, so it must wait for the final commit_finish rows to be flushed
 # before running, or it sees commit_start rows with no matching finish. This
@@ -230,8 +230,8 @@ assert_trace_layout() {
 }
 
 # Wait until each node's traces are fully flushed to disk before the oracle reads
-# them. The writer (zebra-jsonl-trace) flushes on a ~17s timer / 256 KiB, and
-# production zebrad never flushes on shutdown, so a trace read right after the
+# them. The writer (zakura-jsonl-trace) flushes on a ~17s timer / 256 KiB, and
+# production zakurad never flushes on shutdown, so a trace read right after the
 # final commits has a buffered tail. We require two things to be on disk:
 #   1. commit_state.jsonl: every commit_start has a matching commit_finish
 #      (guards commit_start_has_finish / checkpoint_to_full_handoff_observed).
@@ -833,9 +833,9 @@ snapshot_timeline "pre-reset-catch-up"
 # exercise, and the exact shape of the "drop-through" wedge: a body missing inside a
 # checkpoint range stalls that range's indefinite-wait commit. Hashes are only known once
 # mined, so this runs after the deepening. Only `checkpoints` is overridden — Regtest
-# genesis/magic/PoW are preserved (see build_regtest_params in zebra-network), so node2 still
+# genesis/magic/PoW are preserved (see build_regtest_params in zakura-network), so node2 still
 # peers with node1; checkpoint_sync defaults to true, so node2 verifies the whole range. The
-# config shape is locked by zebra-network's
+# config shape is locked by zakura-network's
 # `configured_regtest_checkpoints_preserve_regtest_identity` unit test.
 # Keep the highest checkpoint strictly below the tip so the trailing tip reorg later is never
 # blocked by a final (immutable) checkpoint.

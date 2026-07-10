@@ -15,10 +15,10 @@ Repo-relative paths below are from the repo root `/root/zakura/`.
 - `perf.sh` — the one entry point (setup + run loop).
 - `cohort.env` — single source of truth: cohort tag, the two serving hosts, their
   captured `node_id@ip:8234`, serve commit, seed height, bench binary path.
-- `zebra-bench-config.toml` — the bench node config (tokenized; `perf.sh` fills
+- `zakura-bench-config.toml` — the bench node config (tokenized; `perf.sh` fills
   the cohort tag + peers, `feed_run.sh` fills the per-run tokens).
 - `nodes.toml.tmpl` — deployer config for the two serving nodes.
-- `feed_run.sh` / `feed_analyze.py` / `zebra-metrics-dashboard.py` —
+- `feed_run.sh` / `feed_analyze.py` / `zakura-metrics-dashboard.py` —
   the run engine, the analyzer, and the live dashboard (all called by `perf.sh`).
 - All host-specific paths (snapshot source, fork dir, work dir, bench binary) are
   the `BENCH_*` vars in `cohort.env` — nothing is hard-coded in the scripts.
@@ -70,7 +70,7 @@ the nodes.
   growing `wrong_network`/`wrong_chain` rejects; kill one serving node and the
   bench peer count drops to 1.
 
-## Bench config knobs that matter (`zebra-bench-config.toml`)
+## Bench config knobs that matter (`zakura-bench-config.toml`)
 
 - `[network]` `p2p_stack="zakura"` — Zakura-only, so the bench node's only
   peers are the cohort.
@@ -90,12 +90,12 @@ the nodes.
 - Warm master: `/mnt/roman-dev-2-data/zebra-ckpt-1800000-warm` (tip 1,802,000).
   `feed_run.sh` makes a hard-link fork per run and breaks links on the
   RocksDB metadata + `version`. If the branch DB format changes, re-check
-  `zebra-state/src/constants.rs` and relabel the warm master `version`.
+  `zakura-state/src/constants.rs` and relabel the warm master `version`.
 
 ## Gotchas
 
-- **Kill nodes by PID, not name** — `comm` truncates to `zebrad-notecomm`, so
-  `pkill -x zebrad` misses it and `pkill -f zebrad-notecommit-instr` kills your
+- **Kill nodes by PID, not name** — `comm` truncates to `zakurad-notecomm`, so
+  `pkill -x zakurad` misses it and `pkill -f zakurad-notecommit-instr` kills your
   own shell. Scan `/proc/*/exe`, `kill -9`.
 - **Unique metrics/listen port per relaunch** — ports linger in TIME_WAIT.
 

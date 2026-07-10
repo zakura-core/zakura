@@ -1,20 +1,20 @@
-# Running lightwalletd with zebra
+# Running lightwalletd with zakura
 
-Zebra's RPC methods can support a lightwalletd service backed by zebrad. We
+Zakura's RPC methods can support a lightwalletd service backed by zakurad. We
 recommend using
 [zcash/lightwalletd](https://github.com/zcash/lightwalletd) because we
 use it in testing. Other `lightwalletd` forks have limited support, see the
 [Sync lightwalletd](#sync-lightwalletd) section for more info.
 
 > [!NOTE]
-> You can also use `docker` to run lightwalletd with zebra. Please see our [docker documentation](./docker.md#running-zebra-with-lightwalletd) for more information.
+> You can also use `docker` to run lightwalletd with zakura. Please see our [docker documentation](./docker.md#running-zakura-with-lightwalletd) for more information.
 
 Contents:
 
-- [Running lightwalletd with zebra](#running-lightwalletd-with-zebra)
-  - [Configure zebra for lightwalletd](#configure-zebra-for-lightwalletd)
+- [Running lightwalletd with zakura](#running-lightwalletd-with-zakura)
+  - [Configure zakura for lightwalletd](#configure-zakura-for-lightwalletd)
     - [JSON-RPC](#json-rpc)
-  - [Sync Zebra](#sync-zebra)
+  - [Sync Zakura](#sync-zakura)
   - [Download and build lightwalletd](#download-and-build-lightwalletd)
   - [Sync lightwalletd](#sync-lightwalletd)
   - [Run tests](#run-tests)
@@ -22,17 +22,17 @@ Contents:
     - [Download and build the cli-wallet](#download-and-build-the-cli-wallet)
     - [Run the wallet](#run-the-wallet)
 
-## Configure zebra for lightwalletd
+## Configure zakura for lightwalletd
 
-[#configure-zebra-for-lightwalletd]: #configure-zebra-for-lightwalletd
+[#configure-zakura-for-lightwalletd]: #configure-zakura-for-lightwalletd
 
-We need a zebra configuration file. First, we create a file with the default settings:
+We need a zakura configuration file. First, we create a file with the default settings:
 
 ```console
-zebrad generate -o ~/.config/zebrad.toml
+zakurad generate -o ~/.config/zakurad.toml
 ```
 
-The above command places the generated `zebrad.toml` config file in the default preferences directory of Linux. For other OSes default locations [see here](https://docs.rs/dirs/latest/dirs/fn.preference_dir.html).
+The above command places the generated `zakurad.toml` config file in the default preferences directory of Linux. For other OSes default locations [see here](https://docs.rs/dirs/latest/dirs/fn.preference_dir.html).
 
 Tweak the following option in order to prepare for lightwalletd setup.
 
@@ -40,16 +40,16 @@ Tweak the following option in order to prepare for lightwalletd setup.
 
 [#rpc-section]: #json-rpc
 
-We need to configure Zebra to behave as an RPC endpoint. The standard RPC port
-for Zebra is:
+We need to configure Zakura to behave as an RPC endpoint. The standard RPC port
+for Zakura is:
 
 - `8232` for Mainnet, and
 - `18232` for Testnet.
 
-Starting with Zebra v2.0.0, a cookie authentication method like the one used by the `zcashd` node is enabled by default for the RPC server. However, lightwalletd currently [does not support cookie authentication](https://github.com/zcash/lightwalletd/blob/master/docs/docker-compose-setup.md#edit-the-two-zcashconf-files), so we need to disable this authentication method to use Zebra as a backend for lightwalletd.
+Starting with Zakura v2.0.0, a cookie authentication method like the one used by the `zcashd` node is enabled by default for the RPC server. However, lightwalletd currently [does not support cookie authentication](https://github.com/zcash/lightwalletd/blob/master/docs/docker-compose-setup.md#edit-the-two-zcashconf-files), so we need to disable this authentication method to use Zakura as a backend for lightwalletd.
 
-For example, to use Zebra as a `lightwalletd` backend on Mainnet, give it this
-`~/.config/zebrad.toml`:
+For example, to use Zakura as a `lightwalletd` backend on Mainnet, give it this
+`~/.config/zakurad.toml`:
 
 ```toml
 [rpc]
@@ -63,24 +63,24 @@ parallel_cpu_threads = 0
 enable_cookie_auth = false
 ```
 
-**WARNING:** This config allows multiple Zebra instances to share the same RPC port.
-See the [RPC config documentation](https://docs.rs/zebra-rpc/latest/zebra_rpc/config/rpc/struct.Config.html) for details.
+**WARNING:** This config allows multiple Zakura instances to share the same RPC port.
+See the [RPC config documentation](https://docs.rs/zakura-rpc/latest/zakura_rpc/config/rpc/struct.Config.html) for details.
 
-## Sync Zebra
+## Sync Zakura
 
-[#sync-zebra]: #sync-zebra
+[#sync-zakura]: #sync-zakura
 
-With the configuration in place you can start synchronizing Zebra with the Zcash blockchain. This may take a while depending on your hardware.
+With the configuration in place you can start synchronizing Zakura with the Zcash blockchain. This may take a while depending on your hardware.
 
 ```console
-zebrad start
+zakurad start
 ```
 
-Zebra will display information about sync process:
+Zakura will display information about sync process:
 
 ```console
 ...
-zebrad::commands::start: estimated progress to chain tip sync_percent=10.783 %
+zakurad::commands::start: estimated progress to chain tip sync_percent=10.783 %
 ...
 ```
 
@@ -88,21 +88,21 @@ Until eventually it will get there:
 
 ```console
 ...
-zebrad::commands::start: finished initial sync to chain tip, using gossiped blocks sync_percent=100.000 %
+zakurad::commands::start: finished initial sync to chain tip, using gossiped blocks sync_percent=100.000 %
 ...
 ```
 
-You can interrupt the process at any time with `ctrl-c` and Zebra will resume the next time at around the block you were downloading when stopping the process.
+You can interrupt the process at any time with `ctrl-c` and Zakura will resume the next time at around the block you were downloading when stopping the process.
 
 When deploying for production infrastructure, the above command can be run as a service or daemon.
 
-For implementing zebra as a service please see the [zebrad systemd service file](https://github.com/ZcashFoundation/zebra/blob/main/zebrad/systemd/zebrad.service).
+For implementing zakura as a service please see the [zakurad systemd service file](https://github.com/zakura-core/zakura/blob/main/zakurad/systemd/zakurad.service).
 
 ## Download and build lightwalletd
 
 [#download-and-build-lightwalletd]: #download-and-build-lightwalletd
 
-While you synchronize Zebra you can install [lightwalletd](https://github.com/zcash/lightwalletd).
+While you synchronize Zakura you can install [lightwalletd](https://github.com/zcash/lightwalletd).
 
 Before installing, you need to have `go` in place. Please visit the [go install page](https://go.dev/doc/install) with download and installation instructions.
 
@@ -121,10 +121,10 @@ If everything went good you should have a `lightwalletd` binary in `~/go/bin/`.
 
 [#sync-lightwalletd]: (#sync-lightwalletd)
 
-Please make sure you have zebrad running (with RPC endpoint and up to date blockchain) to synchronize lightwalletd.
+Please make sure you have zakurad running (with RPC endpoint and up to date blockchain) to synchronize lightwalletd.
 
-- `lightwalletd` requires a `zcash.conf` file, however this file can be empty if you are using the default Zebra rpc endpoint (`127.0.0.1:8232`) and the `zcash/lightwalletd` fork.
-  - Some `lightwalletd` forks also require a `rpcuser` and `rpcpassword`, but Zebra ignores them if it receives them from `lightwalletd`
+- `lightwalletd` requires a `zcash.conf` file, however this file can be empty if you are using the default Zakura rpc endpoint (`127.0.0.1:8232`) and the `zcash/lightwalletd` fork.
+  - Some `lightwalletd` forks also require a `rpcuser` and `rpcpassword`, but Zakura ignores them if it receives them from `lightwalletd`
   - When using a non-default port, use `rpcport=28232` and `rpcbind=127.0.0.1`
   - When using testnet, use `testnet=1`
 
@@ -154,26 +154,26 @@ Wait until lightwalletd is in sync before connecting any wallet into it. You wil
 
 [#run-tests]: (#run-tests)
 
-The Zebra team created tests for the interaction of `zebrad` and `lightwalletd`.
+The Zakura team created tests for the interaction of `zakurad` and `lightwalletd`.
 
-To run all the Zebra `lightwalletd` tests:
+To run all the Zakura `lightwalletd` tests:
 
 1. install `lightwalletd`
 2. install `protoc`
-3. build Zebra with `--features=lightwalletd-grpc-tests`
+3. build Zakura with `--features=lightwalletd-grpc-tests`
 
-Please refer to [acceptance](https://github.com/ZcashFoundation/zebra/blob/main/zebrad/tests/acceptance.rs) tests documentation in the `Lightwalletd tests` section. When running tests that use a cached lightwalletd state, the test harness will use a platform default cache directory (for example, `~/.cache/lwd` on Linux) unless overridden via the `LWD_CACHE_DIR` environment variable.
+Please refer to [acceptance](https://github.com/zakura-core/zakura/blob/main/zakurad/tests/acceptance.rs) tests documentation in the `Lightwalletd tests` section. When running tests that use a cached lightwalletd state, the test harness will use a platform default cache directory (for example, `~/.cache/lwd` on Linux) unless overridden via the `LWD_CACHE_DIR` environment variable.
 
 ## Connect a wallet to lightwalletd
 
 [#connect-wallet-to-lightwalletd]: (#connect-wallet-to-lightwalletd)
 
-The final goal is to connect wallets to the lightwalletd service backed by Zebra.
+The final goal is to connect wallets to the lightwalletd service backed by Zakura.
 
 For demo purposes we used [zecwallet-cli](https://github.com/adityapk00/zecwallet-light-cli) with the [adityapk00/lightwalletd](https://github.com/adityapk00/lightwalletd) fork.
 We didn't test [zecwallet-cli](https://github.com/adityapk00/zecwallet-light-cli) with [zcash/lightwalletd](https://github.com/zcash/lightwalletd) yet.
 
-Make sure both `zebrad` and `lightwalletd` are running and listening.
+Make sure both `zakurad` and `lightwalletd` are running and listening.
 
 ### Download and build the cli-wallet
 

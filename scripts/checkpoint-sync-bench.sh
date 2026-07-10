@@ -30,7 +30,7 @@
 #   SNAPSHOT_URL          primary snapshot .tar.zst URL
 #   SNAPSHOT_SHA256       expected sha256 of the .tar.zst
 #   START_HEIGHT          snapshot tip height                  (default 1707210)
-#   BENCH_HOME            persistent cache root                (default /opt/zebra-bench)
+#   BENCH_HOME            persistent cache root                (default /opt/zakura-bench)
 #   GH_REPO               releases repo                        (default valargroup/zebra)
 #   OUT_DIR               artifact output dir                  (default ./bench-out)
 #   METRICS_PORT          Prometheus port (auto-bumps if busy) (default 19999)
@@ -42,9 +42,9 @@
 # Ports default high and auto-skip busy ones so the bench can coexist with another
 # zakurad already running on the host (which typically holds 8233 / 9999).
 #
-# Observability: each run records a Prometheus time series via scripts/zebra-metrics-dashboard.py
+# Observability: each run records a Prometheus time series via scripts/zakura-metrics-dashboard.py
 # into DASHBOARD_ARCHIVE, classifies it into a commit/download/verify bottleneck verdict
-# (summary banner + verdict-*.json), and the always-on dashboard (scripts/zebra-dashboard.service)
+# (summary banner + verdict-*.json), and the always-on dashboard (scripts/zakura-dashboard.service)
 # replays every recorded run at http://<box>:8090/. See that unit file for one-time setup.
 set -euo pipefail
 
@@ -75,16 +75,16 @@ START_HEIGHT="${START_HEIGHT:-1707210}"
 SNAPSHOT_URL="${SNAPSHOT_URL:-https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
 SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769}"
 SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-https://zebra.valargroup.dev/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
-BENCH_HOME="${BENCH_HOME:-/opt/zebra-bench}"
+BENCH_HOME="${BENCH_HOME:-/opt/zakura-bench}"
 GH_REPO="${GH_REPO:-valargroup/zebra}"
 OUT_DIR="${OUT_DIR:-$PWD/bench-out}"
 # Observability dashboard: record a per-run metrics time series + emit a bottleneck
 # verdict (commit / download / verify). DASHBOARD_ARCHIVE is where the always-on
-# dashboard service (scripts/zebra-dashboard.service) reads recorded runs from.
+# dashboard service (scripts/zakura-dashboard.service) reads recorded runs from.
 DASHBOARD="${DASHBOARD:-1}"
 DASHBOARD_ARCHIVE="${DASHBOARD_ARCHIVE:-$BENCH_HOME/dashboard/runs}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DASHBOARD_PY="${DASHBOARD_PY:-$SCRIPT_DIR/zebra-metrics-dashboard.py}"
+DASHBOARD_PY="${DASHBOARD_PY:-$SCRIPT_DIR/zakura-metrics-dashboard.py}"
 GITHUB_RUN_URL="${GITHUB_RUN_URL:-}"
 if [[ -z "$GITHUB_RUN_URL" && -n "${GITHUB_RUN_ID:-}" ]]; then
   GITHUB_RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-$GH_REPO}/actions/runs/$GITHUB_RUN_ID"
@@ -266,9 +266,9 @@ ensure_binary() {
   log "fetching release $tag from $GH_REPO ..." >&2
   local dl="$bindir/dl"; rm -rf "$dl"; mkdir -p "$dl"
   gh release download "$tag" -R "$GH_REPO" \
-    -p 'zakurad-*-linux-x86_64.tar.gz' -p 'zebrad-*-linux-x86_64.tar.gz' -p 'SHA256SUMS.txt' -D "$dl" \
+    -p 'zakurad-*-linux-x86_64.tar.gz' -p 'zakurad-*-linux-x86_64.tar.gz' -p 'SHA256SUMS.txt' -D "$dl" \
     || die "gh release download failed for $tag"
-  local tgz; tgz="$(find "$dl" \( -name 'zakurad-*-linux-x86_64.tar.gz' -o -name 'zebrad-*-linux-x86_64.tar.gz' \) | head -1)"
+  local tgz; tgz="$(find "$dl" \( -name 'zakurad-*-linux-x86_64.tar.gz' -o -name 'zakurad-*-linux-x86_64.tar.gz' \) | head -1)"
   [[ -n "$tgz" ]] || die "no linux-x86_64 tarball asset on release $tag"
   if [[ -f "$dl/SHA256SUMS.txt" ]]; then
     # NB: keep all output on stderr — this function's stdout is captured as the binary path
@@ -276,7 +276,7 @@ ensure_binary() {
       || die "release tarball checksum mismatch for $tag"
   fi
   tar -xzf "$tgz" -C "$dl"
-  local found; found="$(find "$dl" -type f \( -name zakurad -o -name zebrad \) | head -1)"
+  local found; found="$(find "$dl" -type f \( -name zakurad -o -name zakurad \) | head -1)"
   [[ -n "$found" ]] || die "node binary not found in tarball for $tag"
   mv "$found" "$zakurad"; chmod +x "$zakurad"; rm -rf "$dl"
   log "node binary $tag: $("$zakurad" --version 2>/dev/null | head -1)" >&2
@@ -348,7 +348,7 @@ build_from_ref() {
     cargo build --release -p zakura --features "${BUILD_FEATURES:-prometheus,commit-metrics}" --locked >&2 ) \
     || die "cargo build failed for $sha"
   local built=""
-  for candidate in "$BUILD_TARGET/release/zakurad" "$BUILD_TARGET/release/zebrad"; do
+  for candidate in "$BUILD_TARGET/release/zakurad" "$BUILD_TARGET/release/zakurad"; do
     if [[ -x "$candidate" ]]; then
       built="$candidate"
       break
@@ -439,7 +439,7 @@ run_one() {
   resolve_binary "$tag"; local zakurad="$ZAKURAD_BIN"
   local run_id="${prefix}-$$-$(date +%s)"
   local fork="$BENCH_HOME/forks/$run_id"
-  local logf="/dev/shm/zebra-bench-$run_id.log"
+  local logf="/dev/shm/zakura-bench-$run_id.log"
   local csv="$OUT_DIR/samples-$prefix.csv"
   local trace_dir="$OUT_DIR/zakura-traces-$prefix"
   local cfg="$fork.config.toml"
@@ -540,7 +540,7 @@ run_one() {
   fi
 
   # Dashboard recorder sidecar: scrape this node's /metrics into a per-run series the
-  # always-on dashboard (scripts/zebra-dashboard.service) replays, and the classifier
+  # always-on dashboard (scripts/zakura-dashboard.service) replays, and the classifier
   # reads for the bottleneck verdict. Best-effort: a missing python3 never fails a bench.
   local rec_dir=""
   if [[ "$DASHBOARD" == "1" ]] && command -v python3 >/dev/null 2>&1 && [[ -f "$DASHBOARD_PY" ]]; then
@@ -597,7 +597,7 @@ run_one() {
   # quick error scan (ignore peer/network noise)
   local errs
   errs="$(grep -iE 'panic|ERROR committing|resetting state queue' "$logf" 2>/dev/null \
-            | grep -viE 'zebra_network|peer' | head -3 || true)"
+            | grep -viE 'zakura_network|peer' | head -3 || true)"
   cp "$logf" "$OUT_DIR/node-$prefix.log" 2>/dev/null || true
   [[ "$runs_zakura" == "1" ]] && zip_trace_dir "$trace_dir" "$OUT_DIR/zakura-traces-$prefix.zip"
 

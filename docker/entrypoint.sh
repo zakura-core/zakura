@@ -70,7 +70,7 @@ create_owned_directory() {
   fi
 }
 
-# Create and own cache and config directories based on ZAKURA_* environment variables.
+# Create and own cache and config directories based on ZEBRA_* environment variables.
 [[ -n ${ZAKURA_STATE__CACHE_DIR} ]] && create_owned_directory "${ZAKURA_STATE__CACHE_DIR}"
 [[ -n ${ZAKURA_RPC__COOKIE_DIR} ]] && create_owned_directory "${ZAKURA_RPC__COOKIE_DIR}"
 [[ -n ${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR:-} ]] && create_owned_directory "${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR}"
@@ -93,18 +93,18 @@ if [[ -n ${CONFIG_FILE_PATH} && -f ${CONFIG_FILE_PATH} ]]; then
 fi
 
 # Main Script Logic
-# - If "$1" is "--", "-", "zakurad", or "zebrad" (legacy alias), run `zakurad`
+# - If "$1" is "--", "-", "zakurad", or "zakurad" (legacy alias), run `zakurad`
 #   with the remaining params.
 # - If "$1" is "test", handle test execution
 # - Otherwise run "$@" directly.
 case "$1" in
---* | -* | zakurad | zebrad)
+--* | -* | zakurad | zakurad)
   shift
   exec_as_user zakurad "${CONFIG_ARGS[@]}" "$@"
   ;;
 test)
   shift
-  if [[ "$1" == "zakurad" || "$1" == "zebrad" ]]; then
+  if [[ "$1" == "zakurad" || "$1" == "zakurad" ]]; then
     shift
     exec_as_user zakurad "${CONFIG_ARGS[@]}" "$@"
   elif [[ -n "${NEXTEST_PROFILE}" ]]; then

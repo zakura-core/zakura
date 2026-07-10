@@ -7,17 +7,17 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thank you for taking the time to suggest a feature or change for Zebra!
+        Thank you for taking the time to suggest a feature or change for Zakura!
 
         Please fill out the sections below to help us understand your request.
-        If you have a question, please ask on [Discord](https://discord.gg/fP2JGmhm) or [GitHub Discussions](https://github.com/ZcashFoundation/zebra/discussions)
+        If you have a question, please ask on [Discord](https://discord.gg/fP2JGmhm) or [GitHub Discussions](https://github.com/zakura-core/zakura/discussions)
   - type: textarea
     id: motivation
     attributes:
       label: Motivation
       description: |
         Is your feature request related to a problem?
-        How does this change improve Zebra?
+        How does this change improve Zakura?
     validations:
       required: true
   - type: textarea

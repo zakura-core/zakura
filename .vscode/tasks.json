@@ -4,7 +4,7 @@
     {
       "label": "Generate zebra bench debug config",
       "type": "shell",
-      "command": "perl -pe 's|\\@\\@FORK\\@\\@|${input:benchCacheDir}|g; s|\\@\\@LISTEN\\@\\@|${input:benchListenPort}|g; s|\\@\\@MET\\@\\@|${input:benchMetricsPort}|g; s|\\@\\@STOP\\@\\@|${input:benchStopHeight}|g' zebra-bench-config.toml > .vscode/zebra-bench-debug.generated.toml",
+      "command": "perl -pe 's|\\@\\@FORK\\@\\@|${input:benchCacheDir}|g; s|\\@\\@LISTEN\\@\\@|${input:benchListenPort}|g; s|\\@\\@MET\\@\\@|${input:benchMetricsPort}|g; s|\\@\\@STOP\\@\\@|${input:benchStopHeight}|g' zakura-bench-config.toml > .vscode/zakura-bench-debug.generated.toml",
       "options": {
         "cwd": "${workspaceFolder}"
       },

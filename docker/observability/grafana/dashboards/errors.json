@@ -68,8 +68,8 @@
       "scopedVars": {
         "job": {
           "selected": true,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -199,8 +199,8 @@
       "scopedVars": {
         "job": {
           "selected": true,
-          "text": "zebrad-mainnet-tmp-1",
-          "value": "zebrad-mainnet-tmp-1"
+          "text": "zakurad-mainnet-tmp-1",
+          "value": "zakurad-mainnet-tmp-1"
         }
       },
       "seriesOverrides": [],
@@ -330,8 +330,8 @@
       "scopedVars": {
         "job": {
           "selected": true,
-          "text": "zebrad-testnet-tmp-1",
-          "value": "zebrad-testnet-tmp-1"
+          "text": "zakurad-testnet-tmp-1",
+          "value": "zakurad-testnet-tmp-1"
         }
       },
       "seriesOverrides": [],
@@ -423,14 +423,14 @@
           "selected": true,
           "tags": [],
           "text": [
-            "zebrad-mainnet",
-            "zebrad-mainnet-tmp-1",
-            "zebrad-testnet-tmp-1"
+            "zakurad-mainnet",
+            "zakurad-mainnet-tmp-1",
+            "zakurad-testnet-tmp-1"
           ],
           "value": [
-            "zebrad-mainnet",
-            "zebrad-mainnet-tmp-1",
-            "zebrad-testnet-tmp-1"
+            "zakurad-mainnet",
+            "zakurad-mainnet-tmp-1",
+            "zakurad-testnet-tmp-1"
           ]
         },
         "datasource": {

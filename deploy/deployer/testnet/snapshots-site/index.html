@@ -543,7 +543,7 @@
           </div>
           <p class="body-copy">Install Zakura from the ValarGroup release assets, then run it on testnet.</p>
           <div class="code-block">
-            <pre><code id="run-command">curl -fsSL https://github.com/valargroup/zebra/releases/latest/download/install-zakura.sh | bash</code></pre>
+            <pre><code id="run-command">curl -fsSL https://github.com/zakura-core/zakura/releases/latest/download/install-zakura.sh | bash</code></pre>
             <button class="copy" type="button" data-copy="run-command" aria-label="Copy run command" title="Copy"><span class="copy-icon" aria-hidden="true"></span></button>
           </div>
         </article>
@@ -617,12 +617,12 @@
         const url = snapshotUrl(snapshot);
         const fileName = snapshot.file || siteDefaults.archiveName;
         return [
-          "sudo systemctl stop zebrad",
+          "sudo systemctl stop zakurad",
           `curl -fL -o ${shellQuote(fileName)} ${shellQuote(url)}`,
           `echo ${shellQuote(`${text(snapshot.sha256, "replace-with-sha256")}  ${fileName}`)} | sha256sum -c -`,
           `sudo mkdir -p ${siteDefaults.cacheDir}`,
           `sudo tar --zstd -xf ${shellQuote(fileName)} -C ${siteDefaults.cacheDir}`,
-          "sudo systemctl start zebrad"
+          "sudo systemctl start zakurad"
         ].join("\n");
       }
 

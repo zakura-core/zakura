@@ -1,0 +1,337 @@
+[package]
+# Crate metadata
+name = "zakura"
+version = "1.0.0-rc0"
+authors.workspace = true
+description = "The Zcash Foundation's independent, consensus-compatible implementation of a Zcash node"
+license.workspace = true
+repository.workspace = true
+
+readme = "../README.md"
+homepage.workspace = true
+# crates.io is limited to 5 keywords and categories
+keywords.workspace = true
+# Must be one of <https://crates.io/category_slugs>
+categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
+
+# Settings that impact compilation
+edition.workspace = true
+
+# Zebra can have a higher MSRV than the other crates since it is a binary.
+rust-version = "1.91"
+
+# Settings that impact runtime behaviour
+
+# make `cargo run` use `zakurad` by default
+# when run in the workspace directory
+default-run = "zakurad"
+
+[lib]
+name = "zakurad"
+
+# `cargo release` settings
+[package.metadata.release]
+pre-release-replacements = [
+  {file="../README.md", search="--tag [a-z0-9\\.-]+", replace="--tag v{{version}}"},
+]
+
+[package.metadata.docs.rs]
+
+# Publish Zebra's supported production and developer features on docs.rs.
+# (Except for the log level features, because there are a lot of them.)
+#
+# <https://docs.rs/about/metadata>
+features = [
+    "default-release-binaries",
+    "filter-reload",
+    "flamegraph",
+    "journald",
+    "opentelemetry",
+    "prometheus",
+    "sentry",
+    "indexer",
+]
+
+[features]
+# In release builds, don't compile debug logging code, to improve performance.
+default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "sentry", "opentelemetry"]
+
+
+# Default features for official ZF binary release builds
+default = ["default-release-binaries"]
+
+# Production features that activate extra dependencies, or extra features in dependencies
+
+# Indexer support
+indexer = ["zakura-state/indexer"]
+
+# Per-block commit-phase timing histograms (zebra.state.write.*), for perf profiling
+commit-metrics = ["zakura-state/commit-metrics"]
+
+# Experimental internal miner support
+internal-miner = [
+    "thread-priority",
+    "zakura-chain/internal-miner",
+    # TODO: move common code into zakura-chain or zakura-node-services and remove the RPC dependency
+    "zakura-rpc/internal-miner",
+]
+
+# Experimental elasticsearch indexing
+elasticsearch = [
+    "zakura-state/elasticsearch",
+]
+
+# Tracing and monitoring
+sentry = ["dep:sentry"]
+journald = ["tracing-journald"]
+filter-reload = []
+opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+
+progress-bar = [
+    "howudoin",
+    "indicatif",
+    "zakura-consensus/progress-bar",
+    "zakura-state/progress-bar",
+    "zakura-network/progress-bar",
+]
+
+prometheus = ["metrics-exporter-prometheus"]
+
+# Production features that modify dependency behaviour
+
+# Enable additional error debugging in release builds
+error-debug = ["color-eyre/track-caller", "color-eyre/capture-spantrace"]
+
+# Remove verbose logging at compile-time in release or all builds.
+#
+# Release builds are defined as "cfg(not(debug_assertions))".
+# https://docs.rs/tracing/latest/tracing/level_filters/index.html#compile-time-filters
+release_max_level_warn = ["tracing/release_max_level_warn"]
+release_max_level_info = ["tracing/release_max_level_info", "log/release_max_level_info"]
+release_max_level_debug = ["tracing/release_max_level_debug"]
+
+max_level_warn = ["tracing/max_level_warn"]
+max_level_info = ["tracing/max_level_info"]
+max_level_debug = ["tracing/max_level_debug", "log/max_level_debug"]
+
+# Testing features that activate extra dependencies
+flamegraph = ["tracing-flame", "inferno"]
+
+proptest-impl = [
+    "proptest",
+    "proptest-derive",
+    "zakura-consensus/proptest-impl",
+    "zakura-state/proptest-impl",
+    "zakura-network/proptest-impl",
+    "zakura-chain/proptest-impl",
+]
+
+# Build the zakura-checkpoints utility for checkpoint generation tests
+zakura-checkpoints = [
+    "zakura-utils/zakura-checkpoints",
+]
+
+# The gRPC tests also need an installed lightwalletd binary
+lightwalletd-grpc-tests = ["tonic-prost-build"]
+
+# tokio-console support
+#
+# To activate this feature, run:
+# ```sh
+# RUSTFLAGS="--cfg tokio_unstable" cargo build --no-default-features --features="tokio-console" --bin zakurad
+# ```
+#
+# The console-subscriber is incompatible with the tracing/max_level_* features.
+#
+# For more details, see:
+# https://github.com/tokio-rs/console/blob/main/console-subscriber/README.md#enabling-tokio-instrumentation
+tokio-console = ["console-subscriber"]
+
+# Enable the C++/Rust comparison interpreter. See zakura-script/Cargo.toml for
+# details. This should be only used for testing.
+comparison-interpreter = ["zakura-script/comparison-interpreter"]
+
+[dependencies]
+zakura-chain = { path = "../zakura-chain", version = "9.0.0" }
+zakura-consensus = { path = "../zakura-consensus", version = "8.0.0" }
+zakura-network = { path = "../zakura-network", version = "8.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "7.0.0", features = ["rpc-client"] }
+zakura-rpc = { path = "../zakura-rpc", version = "9.0.0" }
+zakura-state = { path = "../zakura-state", version = "8.0.0" }
+# zakura-script is not used directly, but we list it here to enable the
+# "comparison-interpreter" feature. (Feature unification will take care of
+# enabling it in the other imports of zcash-script.)
+zakura-script = { path = "../zakura-script", version = "8.0.0" }
+zcash_script = { workspace = true }
+
+# Required for crates.io publishing, but it's only used in tests
+zakura-utils = { path = "../zakura-utils", version = "7.0.0", optional = true }
+
+abscissa_core = { workspace = true }
+clap = { workspace = true, features = ["cargo"] }
+chrono = { workspace = true, features = ["clock", "std"] }
+humantime-serde = { workspace = true }
+indexmap = { workspace = true }
+lazy_static = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true, features = ["serde_derive"] }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+futures = { workspace = true }
+rayon = { workspace = true }
+tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "tracing", "signal", "process", "io-util"] }
+tokio-stream = { workspace = true, features = ["time"] }
+tokio-util = { workspace = true }
+tower = { workspace = true, features = ["hedge", "limit"] }
+pin-project = { workspace = true }
+
+color-eyre = { workspace = true, features = ["issue-url"] }
+
+thiserror = { workspace = true }
+
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-appender = { workspace = true }
+tracing-error = { workspace = true }
+tracing-futures = { workspace = true }
+tracing = { workspace = true }
+
+metrics = { workspace = true }
+
+dirs = { workspace = true }
+reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-tls"] }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+flate2 = "1.1.9"
+tar = "0.4.46"
+
+# Health check server dependencies
+hyper = { workspace = true, features = ["server", "http1"] }
+http-body-util = { workspace = true }
+hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
+
+# Configuration management
+config = { workspace = true }
+
+num-integer = { workspace = true }
+rand = { workspace = true }
+nix = { workspace = true, features = ["fs"] }
+
+# prod feature internal-miner
+thread-priority = { workspace = true, optional = true }
+
+# prod feature sentry
+sentry = { workspace = true, features = ["backtrace", "contexts", "logs", "rustls", "tracing", "ureq"], optional = true }
+
+# prod feature flamegraph
+tracing-flame = { workspace = true, optional = true }
+inferno = { workspace = true, optional = true }
+
+# prod feature journald
+tracing-journald = { workspace = true, optional = true }
+
+# prod feature opentelemetry
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { workspace = true, features = ["http-proto", "reqwest-blocking-client"], optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+# prod feature filter-reload
+bytes = { workspace = true }
+
+# prod feature prometheus
+metrics-exporter-prometheus = { workspace = true, features = ["http-listener"], optional = true }
+
+# prod feature release_max_level_info
+#
+# zakurad uses tracing for logging,
+# we only use `log` to set and print the static log levels in transitive dependencies
+log = { workspace = true }
+
+# prod feature progress-bar
+howudoin = { workspace = true, features = ["term-line"], optional = true }
+indicatif = { workspace = true, optional = true }
+
+# test feature proptest-impl
+proptest = { workspace = true, optional = true }
+proptest-derive = { workspace = true, optional = true }
+
+# test feature tokio-console
+console-subscriber = { workspace = true, optional = true }
+
+derive-new.workspace = true
+
+[build-dependencies]
+vergen-git2 = { workspace = true, features = ["cargo", "rustc"] }
+
+# test feature lightwalletd-grpc-tests
+tonic-prost-build = { workspace = true, optional = true }
+
+[dev-dependencies]
+abscissa_core = { workspace = true, features = ["testing"] }
+anyhow = { workspace = true }
+hex = { workspace = true }
+hex-literal = { workspace = true }
+jsonrpsee-types = { workspace = true }
+once_cell = { workspace = true }
+regex = { workspace = true }
+insta = { workspace = true, features = ["json"] }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper-util = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+
+# zakura-rpc needs the preserve_order feature, it also makes test results more stable
+serde_json = { workspace = true, features = ["preserve_order"] }
+tempfile = { workspace = true }
+
+hyper = { workspace = true, features = ["http1", "http2", "server"] }
+tracing-test = { workspace = true, features = ["no-env-filter"] }
+
+tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
+tokio-stream = { workspace = true }
+
+zcash_keys = { workspace = true }
+
+# test feature lightwalletd-grpc-tests
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+proptest = { workspace = true }
+proptest-derive = { workspace = true }
+
+# enable span traces and track caller in tests
+color-eyre = { workspace = true }
+
+zakura-chain = { path = "../zakura-chain", version = "9.0.0", features = ["proptest-impl"] }
+zakura-consensus = { path = "../zakura-consensus", version = "8.0.0", features = ["proptest-impl"] }
+zakura-network = { path = "../zakura-network", version = "8.0.0", features = ["proptest-impl", "zakura-testkit"] }
+zakura-state = { path = "../zakura-state", version = "8.0.0", features = ["proptest-impl"] }
+
+zakura-test = { path = "../zakura-test", version = "3.0.0" }
+
+# Used by the checkpoint generation tests via the zakura-checkpoints feature
+# (the binaries in this crate won't be built unless their features are enabled).
+#
+# Currently, we use zakura-utils/tests/build_utils_for_zakurad_tests.rs as a workaround
+# to build the zakura-checkpoints utility for the zakurad acceptance tests.
+#
+# When `-Z bindeps` is stabilised, enable this binary dependency instead:
+# https://github.com/rust-lang/cargo/issues/9096
+# zakura-utils { path = "../zakura-utils", artifact = "bin:zakura-checkpoints" }
+zakura-utils = { path = "../zakura-utils", version = "7.0.0" }
+
+[package.metadata.cargo-udeps.ignore]
+# These dependencies are false positives - they are actually used
+normal = [
+    "console-subscriber",  # Used behind the tokio-console feature flag
+    "zakura-utils",         # Used for the zakura-checkpoints feature
+]
+development = [
+    "zakura-utils",         # Required workaround to build zakura-checkpoints binary for tests (see zakura-utils/tests/build_utils_for_zakurad_tests.rs)
+]
+
+[lints]
+workspace = true

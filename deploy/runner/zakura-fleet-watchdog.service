@@ -9,7 +9,7 @@ WorkingDirectory=/opt/zakura-fleet-watchdog
 EnvironmentFile=-/etc/zakura-fleet-watchdog/env
 StateDirectory=zakura-fleet-watchdog
 RuntimeDirectory=zakura-fleet-watchdog
-ExecStart=/usr/bin/python3 /opt/zakura-fleet-watchdog/zebra-cluster-watchdog.py --config /opt/zakura-fleet-watchdog/fleets.toml --state-file /var/lib/zakura-fleet-watchdog/state.json --interval 60 --down-after 600 --stalled-after 600 --dashboard-down-after 600
+ExecStart=/usr/bin/python3 /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py --config /opt/zakura-fleet-watchdog/fleets.toml --state-file /var/lib/zakura-fleet-watchdog/state.json --interval 60 --down-after 600 --stalled-after 600 --dashboard-down-after 600
 Restart=always
 RestartSec=5
 

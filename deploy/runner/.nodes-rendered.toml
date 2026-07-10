@@ -17,7 +17,7 @@ listen_addr     = "[::]:8233"
 storage_mode    = "archive"
 p2p_stack       = "zakura"                  # seed phase: dual (sync from public); freeze phase: zakura
 metrics_endpoint = "127.0.0.1:9100"          # loopback Prometheus; scrape via ssh for cohort/peer counts
-tracing_filter   = "info,zebra_network::zakura=debug,zebra_network::zakura::discovery=debug"
+tracing_filter   = "info,zakura_network::zakura=debug,zakura_network::zakura::discovery=debug"
 
 [defaults.zakura]
 listen_addr     = "0.0.0.0:8234"

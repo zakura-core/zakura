@@ -72,8 +72,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -245,8 +245,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-mainnet-tmp",
-          "value": "zebrad-mainnet-tmp"
+          "text": "zakurad-mainnet-tmp",
+          "value": "zakurad-mainnet-tmp"
         }
       },
       "seriesOverrides": [],
@@ -418,8 +418,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-testnet",
-          "value": "zebrad-testnet"
+          "text": "zakurad-testnet",
+          "value": "zakurad-testnet"
         }
       },
       "seriesOverrides": [],
@@ -591,8 +591,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-testnet-tmp",
-          "value": "zebrad-testnet-tmp"
+          "text": "zakurad-testnet-tmp",
+          "value": "zakurad-testnet-tmp"
         }
       },
       "seriesOverrides": [],
@@ -758,8 +758,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -901,8 +901,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-mainnet-tmp",
-          "value": "zebrad-mainnet-tmp"
+          "text": "zakurad-mainnet-tmp",
+          "value": "zakurad-mainnet-tmp"
         }
       },
       "seriesOverrides": [],
@@ -1044,8 +1044,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-testnet",
-          "value": "zebrad-testnet"
+          "text": "zakurad-testnet",
+          "value": "zakurad-testnet"
         }
       },
       "seriesOverrides": [],
@@ -1187,8 +1187,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-testnet-tmp",
-          "value": "zebrad-testnet-tmp"
+          "text": "zakurad-testnet-tmp",
+          "value": "zakurad-testnet-tmp"
         }
       },
       "seriesOverrides": [],
@@ -1329,8 +1329,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -1512,8 +1512,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-mainnet-tmp",
-          "value": "zebrad-mainnet-tmp"
+          "text": "zakurad-mainnet-tmp",
+          "value": "zakurad-mainnet-tmp"
         }
       },
       "seriesOverrides": [],
@@ -1695,8 +1695,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-testnet",
-          "value": "zebrad-testnet"
+          "text": "zakurad-testnet",
+          "value": "zakurad-testnet"
         }
       },
       "seriesOverrides": [],
@@ -1878,8 +1878,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-testnet-tmp",
-          "value": "zebrad-testnet-tmp"
+          "text": "zakurad-testnet-tmp",
+          "value": "zakurad-testnet-tmp"
         }
       },
       "seriesOverrides": [],

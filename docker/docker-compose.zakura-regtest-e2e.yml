@@ -16,7 +16,7 @@
 # asserts legacy compatibility, Zakura propagation, and block sync.
 #
 # Host networking is required: Regtest only accepts localhost initial peers
-# (zebra-network/src/config.rs: initial_peers filters to is_localhost), so the
+# (zakura-network/src/config.rs: initial_peers filters to is_localhost), so the
 # nodes share 127.0.0.1 on distinct ports. State is ephemeral and traces/temp
 # live on tmpfs, so a run leaves nothing on disk. Per-node CPU/memory caps keep
 # the whole cluster well under the resources a single build would use.

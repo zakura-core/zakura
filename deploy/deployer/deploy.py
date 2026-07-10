@@ -62,7 +62,7 @@ DEFAULTS = {
     # One of: default | zebra | zakura | dual (aliases: v1/legacy, v2, combined).
     "p2p_stack": "dual",
     "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
-    "tracing_filter": "",    # e.g. "info,zebra_network::zakura=debug"; "" uses zakurad default
+    "tracing_filter": "",    # e.g. "info,zakura_network::zakura=debug"; "" uses zakurad default
     "checkpoint_sync": True,
     # Setting this false keeps checkpoint sync on while selecting the legacy non-VCT path.
     "vct_fast_sync": True,

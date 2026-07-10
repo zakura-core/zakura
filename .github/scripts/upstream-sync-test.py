@@ -42,7 +42,7 @@ def result_for(
         "branch_name": branch_name or candidate["branch_name"],
         "pr_title": "fix(state): adapt upstream test fixes",
         "pr_body": body,
-        "files_changed": ["zebra-state/src/service/chain_tip.rs"],
+        "files_changed": ["zakura-state/src/service/chain_tip.rs"],
         "validation": validation if validation is not None else [
             {
                 "command": "cargo fmt --all -- --check",

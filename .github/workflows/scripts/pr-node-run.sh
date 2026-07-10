@@ -55,7 +55,10 @@ fi
 # ---------------------------------------------------------------------------- #
 
 cd /root/zakura
-git -c http.extraheader="AUTHORIZATION: bearer ${GH_CLONE_TOKEN}" \
+# git-over-HTTPS wants basic auth (the bearer form is API-only); this is the
+# same header actions/checkout configures.
+GIT_AUTH=$(printf 'x-access-token:%s' "${GH_CLONE_TOKEN}" | base64 -w0)
+git -c http.extraheader="AUTHORIZATION: basic ${GIT_AUTH}" \
   fetch --no-tags origin "${REFSPEC}"
 git checkout --detach "${SHA}"
 

@@ -354,8 +354,8 @@ def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
     print(f"[build] checking out {sha[:9]} into {work.name}")
     run(["git", "worktree", "add", "--detach", str(work), sha], cwd=root)
     try:
-        print(f"[build] cargo build --release -p zebrad ({sha[:9]}) ...")
-        run(["cargo", "build", "--release", "--locked", "-p", "zebrad"], cwd=work)
+        print(f"[build] cargo build --release -p zakura ({sha[:9]}) ...")
+        run(["cargo", "build", "--release", "--locked", "-p", "zakura"], cwd=work)
         # Respect CARGO_TARGET_DIR (set per-worktree or shared) when locating the
         # output, falling back to the in-worktree target dir.
         target_dir = os.environ.get("CARGO_TARGET_DIR")
@@ -862,10 +862,8 @@ def cmd_status(args) -> int:
     nodes = load_nodes(Path(args.config), args.node)
 
     def work(node: Node) -> tuple[str, str]:
-        # `zakurad --version` prints clean semver (e.g. "zakurad 5.0.0-rc.3") with no
-        # commit, so also read the running build's git commit from the startup
-        # diagnostic line in the node's log (`git commit: <sha>`). The configured
-        # ref is appended so requested-vs-running is visible at a glance.
+        # Also read the startup diagnostic's full commit in case an older binary
+        # does not include its source revision in `zakurad --version`.
         if node.service_name:
             service_probe = f"systemctl is-active {shlex.quote(node.service_name)} 2>/dev/null"
         elif node.process_pattern:

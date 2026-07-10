@@ -9,7 +9,7 @@
 //! To run it locally:
 //!
 //! ```sh
-//! cargo test -p zebrad --test zakura_regtest_e2e -- --ignored --nocapture
+//! cargo test -p zakura --test zakura_regtest_e2e -- --ignored --nocapture
 //! ```
 //!
 //! To force it in any CI environment, set `ZAKURA_REGTEST_E2E=1`.

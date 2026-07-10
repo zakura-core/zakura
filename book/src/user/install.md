@@ -17,7 +17,7 @@ cd zebra
 You can then build and run `zebrad` by:
 
 ```bash
-cargo build --release --bin zebrad
+cargo build --release --bin zakurad
 target/release/zebrad start
 ```
 
@@ -74,5 +74,5 @@ to install `libsqlite3`, or use one of these commands instead:
 
 ```sh
 cargo build
-cargo build -p zebrad --all-features
+cargo build -p zakura --all-features
 ```

@@ -9,7 +9,7 @@ issues. ["it's like top(1) for tasks!"][top]
 Support for `tokio-console` is not enabled by default for zebrad. To activate this feature, run:
 
 ```sh
-RUSTFLAGS="--cfg tokio_unstable" cargo build --no-default-features --features="tokio-console" --bin zebrad
+RUSTFLAGS="--cfg tokio_unstable" cargo build --no-default-features --features="tokio-console" --bin zakurad
 ```
 
 Install [`tokio-console`][install].

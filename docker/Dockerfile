@@ -16,6 +16,8 @@
 ARG RUST_VERSION=1.91.0
 
 ARG FEATURES="default-release-binaries"
+ARG SHORT_SHA
+ARG IMAGE_VERSION
 
 ARG UID=10001
 ARG GID=${UID}
@@ -106,7 +108,7 @@ COPY --link --chown=${UID}:${GID} ./ ${HOME}
 # Build Zebra test binaries using nextest, but don't run them.
 # This also copies the necessary binaries to /usr/local/bin.
 RUN [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
-    cargo build --locked --release --features "${FEATURES}" --package zebrad --bin zakurad --bin zebra-rollback-state --bin zebra-prune-state && \
+    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad --bin zebra-rollback-state --bin zebra-prune-state && \
     cargo nextest run --locked --release --no-run --features "${FEATURES}" && \
     # Copy binaries to standard location
     cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin && \
@@ -165,7 +167,7 @@ RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
     --mount=type=cache,target=${CARGO_TARGET_DIR} \
     --mount=type=cache,target=${CARGO_HOME} \
     [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
-    cargo build --locked --release --features "${FEATURES}" --package zebrad --bin zakurad --bin zebra-rollback-state --bin zebra-prune-state && \
+    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad --bin zebra-rollback-state --bin zebra-prune-state && \
     cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin && \
     cp ${CARGO_TARGET_DIR}/release/zebra-rollback-state /usr/local/bin && \
     cp ${CARGO_TARGET_DIR}/release/zebra-prune-state /usr/local/bin
@@ -176,6 +178,13 @@ FROM debian:trixie-slim AS runtime
 
 ARG FEATURES
 ENV FEATURES=${FEATURES}
+
+ARG SHORT_SHA
+ARG IMAGE_VERSION
+LABEL org.opencontainers.image.title="Zakura" \
+      org.opencontainers.image.source="https://github.com/zakura-core/zakura" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${SHORT_SHA}"
 
 # Create a non-privileged user for running `zebrad`.
 #

@@ -51,7 +51,7 @@ mandatory-roots rule on _ranged_ requests does not starve the tip.
 
 ## Harness notes (not failures)
 
-- `cargo test -p zebrad --lib` (single process) cascades ~76 failures from one root panic:
+- `cargo test -p zakura --lib` (single process) cascades ~76 failures from one root panic:
   `zebra_test::init()` → color-eyre `install().unwrap()` → "a hook has already been
   installed", poisoning the init `Once`. CI uses **nextest** (process-per-test), which
   sidesteps this. Always validate zebrad with `cargo nextest run`, not `cargo test --lib`.

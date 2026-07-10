@@ -129,11 +129,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ./out
+          short_sha="$(git rev-parse --short=12 HEAD)"
           docker buildx build \
             --platform "${{ matrix.platform }}" \
             --target release \
             --file ./docker/Dockerfile \
             --build-arg "FEATURES=${FEATURES}" \
+            --build-arg "SHORT_SHA=${short_sha}" \
             --output "type=local,dest=./out" \
             .
           if [ -x ./out/usr/local/bin/zakurad ]; then
@@ -407,11 +409,16 @@ jobs:
           IMAGE_TAG: valargroup/zakura:release-ci-${{ matrix.name }}
         run: |
           set -euo pipefail
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          image_version="${{ needs.resolve-release.outputs.release_tag }}"
+          image_version="${image_version#v}"
           docker buildx build \
             --platform "${{ matrix.platform }}" \
             --target runtime \
             --file ./docker/Dockerfile \
             --build-arg "FEATURES=${FEATURES}" \
+            --build-arg "SHORT_SHA=${short_sha}" \
+            --build-arg "IMAGE_VERSION=${image_version}" \
             --tag "$IMAGE_TAG" \
             --load \
             .
@@ -426,11 +433,14 @@ jobs:
         run: |
           set -euo pipefail
           image_version="${RELEASE_TAG#v}"
+          short_sha="$(git rev-parse --short=12 HEAD)"
           docker buildx build \
             --platform "${{ matrix.platform }}" \
             --target runtime \
             --file ./docker/Dockerfile \
             --build-arg "FEATURES=${FEATURES}" \
+            --build-arg "SHORT_SHA=${short_sha}" \
+            --build-arg "IMAGE_VERSION=${image_version}" \
             --tag "valargroup/zakura:${image_version}-${DOCKER_TAG_SUFFIX}" \
             --push \
             .
@@ -521,12 +531,17 @@ jobs:
           IMAGE_TAG: valargroup/zakura:zcashd-compat-release-ci-${{ matrix.name }}
         run: |
           set -euo pipefail
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          image_version="${{ needs.resolve-release.outputs.release_tag }}"
+          image_version="${image_version#v}"
           docker buildx build \
             --platform "${{ matrix.platform }}" \
             --target runtime-zcashd-compat \
             --file ./docker/Dockerfile \
             --build-context "zcashd_compat=${RUNNER_TEMP}/zcashd-compat-context" \
             --build-arg "FEATURES=${FEATURES}" \
+            --build-arg "SHORT_SHA=${short_sha}" \
+            --build-arg "IMAGE_VERSION=${image_version}" \
             --tag "$IMAGE_TAG" \
             --load \
             .
@@ -541,12 +556,15 @@ jobs:
         run: |
           set -euo pipefail
           image_version="${RELEASE_TAG#v}"
+          short_sha="$(git rev-parse --short=12 HEAD)"
           docker buildx build \
             --platform "${{ matrix.platform }}" \
             --target runtime-zcashd-compat \
             --file ./docker/Dockerfile \
             --build-context "zcashd_compat=${RUNNER_TEMP}/zcashd-compat-context" \
             --build-arg "FEATURES=${FEATURES}" \
+            --build-arg "SHORT_SHA=${short_sha}" \
+            --build-arg "IMAGE_VERSION=${image_version}" \
             --tag "valargroup/zakura:zcashd-compat-${image_version}-${DOCKER_TAG_SUFFIX}" \
             --push \
             .

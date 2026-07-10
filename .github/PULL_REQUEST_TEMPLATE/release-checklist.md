@@ -123,16 +123,14 @@ Check that the release will work:
         API changes: `cargo public-api diff latest -p <crate> -sss`. You can use
         e.g. copilot to turn it into a human-readable list, e.g. (write the output
         to `api.txt` beforehand):
-        ```
         copilot -p "Transform @api.txt which is a API diff into a human-readable description of the API changes. Be terse. Write output api-readable.txt. Use backtick quotes for identifiers. Use '### Breaking Changes' header for changes and removals, and '### Added' for additions. Make each item start with a verb e.g, Added, Changed" --allow-tool write
-        ```
         It might also make sense to copy entries from the `zebrad` changelog.
   - [ ] Update crate versions:
 
 ```sh
 cargo release version --verbose --execute --allow-branch '*' -p <crate> patch # [ major | minor ]
-# zebrad only
-cargo release replace --verbose --execute --allow-branch '*' -p zebrad
+# zakura only
+cargo release replace --verbose --execute --allow-branch '*' -p zakura
 ```
 
 - [ ] Commit and push the above version changes to the release branch.
@@ -158,7 +156,7 @@ The end of support height is calculated from the current blockchain height:
 
 - [ ] Push the version increments and the release constants to the release branch.
 
-# Publish the Zebra Release
+# Publish the Zakura Release
 
 ## Create the GitHub Pre-Release
 
@@ -167,8 +165,8 @@ The end of support height is calculated from the current blockchain height:
 - [ ] Set the tag name to the version tag,
       for example: `v1.0.0`
 - [ ] Set the release to target the `ironwood-main` branch
-- [ ] Set the release title to `Zebra ` followed by the version tag,
-      for example: `Zebra 1.0.0`
+- [ ] Set the release title to `Zakura` followed by the version tag,
+      for example: `Zakura 1.0.0`
 - [ ] Replace the prepopulated draft changelog in the release description with the final changelog you created;
       starting just _after_ the title `## [Zebra ...` of the current version being released,
       and ending just _before_ the title of the previous release.

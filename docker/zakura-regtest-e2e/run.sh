@@ -153,7 +153,7 @@ command -v python3 >/dev/null || fail "python3 is required to run the trace orac
 ZAKURAD_BIN="${ZAKURAD_BIN:-${REPO_DIR}/target/debug/zakurad}"
 if [[ ! -x "${ZAKURAD_BIN}" ]]; then
   log "building host zakurad (debug) — no in-container build"
-  ( cd "${REPO_DIR}" && CXXFLAGS="-include cstdint" cargo build -p zebrad --bin zakurad )
+  ( cd "${REPO_DIR}" && CXXFLAGS="-include cstdint" cargo build -p zakura --bin zakurad )
 fi
 [[ -x "${ZAKURAD_BIN}" ]] || fail "zakurad binary not found at ${ZAKURAD_BIN}"
 export ZAKURAD_BIN

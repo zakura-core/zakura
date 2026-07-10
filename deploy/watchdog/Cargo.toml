@@ -1,8 +1,8 @@
 [package]
-name = "zebra-watchdog"
+name = "zakura-watchdog"
 version = "0.1.0"
 authors.workspace = true
-description = "Standalone watchdog sidecar that checks Zebra services and reports statuses to Sentry"
+description = "Standalone watchdog sidecar that checks Zakura services and reports statuses to Sentry"
 license.workspace = true
 repository.workspace = true
 edition.workspace = true

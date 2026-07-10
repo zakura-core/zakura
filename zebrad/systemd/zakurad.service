@@ -1,7 +1,7 @@
 # Service file to run zakurad by systemd.
 # Setup (Ubuntu/Debian) instructions:
 # 1- Build the zakurad binary:
-# cargo build -p zebrad --release
+# cargo build -p zakura --release
 # 2- Copy/Move the built zakurad binary into your system binaries path:
 # sudo cp target/release/zakurad /usr/bin
 # 3- Replace AssertPathExists and ExecStart with the location of your binary if needed.

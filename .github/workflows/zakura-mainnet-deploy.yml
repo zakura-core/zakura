@@ -324,8 +324,8 @@ jobs:
           ssh_string = "root@159.203.113.196"
           probe_kind = "zcashd"
           service_name = ""
-          # Managed download path from zcashd-compat-manifest.json (alpha.4+).
-          bin_path = "/mnt/snapshots/import-zebra/zcashd-compat/bin/v0.0.1-compat-alpha.4/x86_64-pc-linux-gnu/zcashd"
+          # Managed/path install from zcashd-compat-manifest.json (v1.0.0-compat-rc0).
+          bin_path = "/mnt/snapshots/import-zebra/zcashd-compat/bin/v1.0.0-compat-rc0/x86_64-pc-linux-gnu/zcashd"
           log_file = ""
           rpc_listen_addr = "[::1]:8232"
           rpc_auth = "cookie"
@@ -360,7 +360,6 @@ jobs:
       - name: Install fleet watchdog
         if: always()
         env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
         run: |
           set -euo pipefail
@@ -373,15 +372,19 @@ jobs:
           sudo install -m 644 deploy/runner/fleet-watchdog.toml "$watchdog_dir/fleets.toml"
           sudo install -m 644 deploy/runner/zakura-fleet-watchdog.service /etc/systemd/system/zakura-fleet-watchdog.service
 
+          # Incoming webhook for #zakura-alerts.
           tmp_env="$(mktemp)"
-          if [ -n "${SLACK_BOT_TOKEN}" ]; then
-            printf 'SLACK_BOT_TOKEN=%s\n' "${SLACK_BOT_TOKEN}" > "$tmp_env"
-          elif [ -n "${SLACK_WEB_HOOK}" ]; then
+          if [ -n "${SLACK_WEB_HOOK}" ]; then
             printf 'SLACK_WEB_HOOK=%s\n' "${SLACK_WEB_HOOK}" > "$tmp_env"
           elif sudo test -f /etc/zakura-fleet-watchdog/env; then
-            sudo cp /etc/zakura-fleet-watchdog/env "$tmp_env"
+            # Keep an existing webhook env across deploys that omit the secret.
+            sudo grep -E '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)=' \
+              /etc/zakura-fleet-watchdog/env > "$tmp_env" || : > "$tmp_env"
           else
             : > "$tmp_env"
+          fi
+          if ! grep -qE '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)=' "$tmp_env"; then
+            echo "::warning::SLACK_WEB_HOOK is not set; fleet watchdog cannot post to Slack"
           fi
           sudo install -m 600 "$tmp_env" /etc/zakura-fleet-watchdog/env
           rm -f "$tmp_env"

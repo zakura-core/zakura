@@ -1800,7 +1800,6 @@ compat_ensure_zcashd_conf() {
     printf '# Created by install-zakura.sh for zcashd-compat P2P sidecar mode.\n'
     printf '# Peer selection is pinned on the zcashd command line; do not add\n'
     printf '# connect=/addnode=/seednode= here -- they accumulate and cannot be overridden.\n'
-    printf 'i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1\n'
   } >"$ZCASHD_CONF" || add_error "failed to write zcashd config: $ZCASHD_CONF"
 
   if ((USE_ANSI)); then

@@ -7,8 +7,8 @@
 //!   after command-line overrides are applied.
 //! - Existing configs are audited for known zcashd-compat startup issues, then
 //!   left unchanged.
-//! - Missing configs are bootstrapped with the deprecation acknowledgement so
-//!   `zcashd -zebra-compat` can start without manual first-run setup.
+//! - Missing configs are bootstrapped so `zcashd -zebra-compat` can start
+//!   without manual first-run setup.
 
 use std::{
     fs::{self, OpenOptions},
@@ -30,14 +30,11 @@ const ZCASH_CONF_FILENAME: &str = "zcash.conf";
 
 /// Minimal config that lets zcashd start in zcashd-compat mode on first use.
 pub const BOOTSTRAP_ZCASH_CONF: &str = "\
-i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
 # zcashd-compat P2P sidecar: zcashd peers only with the local Zakura node.
 # Peer selection is pinned on the zcashd command line (-connect/-listen=0);
 # do not add bind=, connect=, addnode=, or listen=1 here -- these accumulate
 # and cannot be overridden by the supervisor's flags.
 ";
-
-const DEPRECATION_ACK: &str = "i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025";
 
 const OVERRIDDEN_P2P_BOOL_OPTIONS: &[&str] = &["listen", "p2p", "dnsseed", "listenonion"];
 const VALIDATION_ERROR_OPTIONS: &[&str] = &["bind", "whitebind", "connect", "addnode", "seednode"];
@@ -289,17 +286,6 @@ fn audit_zcash_conf(conf_path: &Path) -> Result<(), Report> {
 
     let entries = parse_zcash_conf_entries(&contents);
 
-    if !entries
-        .iter()
-        .any(|(key, value)| key == DEPRECATION_ACK && is_truthy(value))
-    {
-        warn!(
-            path = %conf_path.display(),
-            option = DEPRECATION_ACK,
-            "zcashd-compat config is missing the zcashd deprecation acknowledgement; zcashd will refuse to start until this option is set to 1"
-        );
-    }
-
     for (key, value) in entries {
         if OVERRIDDEN_P2P_BOOL_OPTIONS.contains(&key.as_str()) && is_truthy(&value) {
             warn!(
@@ -536,11 +522,7 @@ mod tests {
     fn warns_on_listen_but_continues() {
         let temp_dir = TempDir::new().expect("tempdir should be created");
         let conf_path = temp_dir.path().join("zcash.conf");
-        fs::write(
-            &conf_path,
-            "i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1\nlisten=1\n",
-        )
-        .expect("config should be written");
+        fs::write(&conf_path, "listen=1\n").expect("config should be written");
 
         audit_zcash_conf(&conf_path).expect("config audit should continue");
 
@@ -553,29 +535,11 @@ mod tests {
     fn warns_on_bind() {
         let temp_dir = TempDir::new().expect("tempdir should be created");
         let conf_path = temp_dir.path().join("zcash.conf");
-        fs::write(
-            &conf_path,
-            "i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1\nbind=127.0.0.1\n",
-        )
-        .expect("config should be written");
+        fs::write(&conf_path, "bind=127.0.0.1\n").expect("config should be written");
 
         audit_zcash_conf(&conf_path).expect("config audit should continue");
 
         assert!(logs_contain("bind"));
         assert!(logs_contain("incompatible with -zebra-compat"));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn warns_missing_deprecation_ack() {
-        let temp_dir = TempDir::new().expect("tempdir should be created");
-        let conf_path = temp_dir.path().join("zcash.conf");
-        fs::write(&conf_path, "\n").expect("config should be written");
-
-        audit_zcash_conf(&conf_path).expect("config audit should continue");
-
-        assert!(logs_contain(
-            "missing the zcashd deprecation acknowledgement"
-        ));
     }
 }

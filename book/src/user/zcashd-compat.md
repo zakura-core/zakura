@@ -69,8 +69,7 @@ The installer:
    filesystems and offers them as defaults, so a migration continues from
    your synced data;
 3. downloads SHA256-pinned release binaries (or pulls pinned Docker images);
-4. bootstraps a minimal `zcash.conf` (including the zcashd deprecation
-   acknowledgement) if none exists;
+4. bootstraps a minimal `zcash.conf` if none exists;
 5. for Docker modes, bind-mounts both the Zakura state cache and the
    persistent iroh identity directory (`~/.zakura` by default, override with
    `--zakura-identity-dir`) so NodeId secrets survive `--rm` containers,
@@ -91,9 +90,7 @@ See `install-zakura.sh --help` for the full list, including `--dry-run`.
 ## The sidecar zcashd build
 
 Use the sidecar `zcashd` build from
-[valargroup/zcashd](https://github.com/valargroup/zcashd) (branch
-`feat/p2p-sidecar`; releases are tagged like `v0.0.1-compat-alpha.3`). The
-installer and Zakura's embedded download both pin its release archives by
+[valargroup/zcashd](https://github.com/valargroup/zcashd). The installer and Zakura's embedded download both pin its release archives by
 SHA256. It differs from stock `zcash/zcash` in three ways:
 
 1. **P2P sidecar mode is hard-locked.** The binary refuses to start unless
@@ -133,7 +130,6 @@ Or put the equivalent in `zcash.conf`:
 ```text
 connect=127.0.0.1:8233
 listen=0
-i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025=1
 ```
 
 `make compat-zcashd-start-standalone` (see `make/zcashd-compat.mk`) wraps
@@ -167,8 +163,7 @@ On start, Zakura:
    [Hardware preflight](#hardware-preflight-linux); `--unsafe-low-specs`
    skips the minimums for test rigs);
 2. resolves the zcashd binary (embedded download or local path) and
-   bootstraps the zcashd datadir and a minimal `zcash.conf` (including the
-   zcashd deprecation acknowledgement) if none exists;
+   bootstraps the zcashd datadir and a minimal `zcash.conf` if none exists;
 3. spawns `zcashd` pinned to Zakura's own legacy P2P listener:
 
    ```text

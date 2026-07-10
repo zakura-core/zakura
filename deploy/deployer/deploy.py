@@ -74,6 +74,9 @@ DEFAULTS = {
     "working_dir": "",
     "start_command": "",
     "process_pattern": "",
+    # Docker deploys replace the binary in an existing container without
+    # recreating it, preserving its mounts, networking, and image configuration.
+    "container_name": "",
 }
 
 
@@ -110,6 +113,7 @@ class Node:
     working_dir: str
     start_command: str
     process_pattern: str
+    container_name: str
     port: object = None
     # resolved at runtime
     sha: str = ""
@@ -258,6 +262,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             working_dir=merged["working_dir"],
             start_command=merged["start_command"],
             process_pattern=merged["process_pattern"],
+            container_name=merged["container_name"],
             port=merged["port"],
         ))
 
@@ -693,6 +698,54 @@ systemctl is-active "$SERVICE"
 """
 
 
+# Binary-only deploy into an existing Docker container. The updated binary
+# remains in the container's writable layer, so Compose must not recreate the
+# container after this deploy unless its image has also been updated.
+DOCKER_BINARY_ONLY_INSTALL_SCRIPT = r"""
+set -euo pipefail
+
+CONTAINER={container}
+BIN_PATH={bin_path}
+NO_RESTART={no_restart}
+
+docker inspect "$CONTAINER" >/dev/null
+docker cp /tmp/zakurad-deploy.new "$CONTAINER:/tmp/zakurad-deploy.new"
+rm -f /tmp/zakurad-deploy.new
+
+docker exec --user 0 "$CONTAINER" sh -c \
+    'if [ -x "$1" ]; then cp -a "$1" "$1.bak"; fi
+     install -m 755 /tmp/zakurad-deploy.new "$1.new"
+     mv -f "$1.new" "$1"
+     rm -f /tmp/zakurad-deploy.new' sh "$BIN_PATH"
+
+if [ "$NO_RESTART" = "1" ]; then
+    echo "installed container binary (restart skipped)"
+    exit 0
+fi
+
+if ! docker restart "$CONTAINER" >/dev/null; then
+    restart_failed=1
+else
+    restart_failed=0
+    sleep 3
+fi
+
+if [ "$restart_failed" = "1" ] ||
+   ! docker inspect --format '{{{{.State.Running}}}}' "$CONTAINER" | grep -qx true; then
+    echo "container unhealthy after deploy; rolling back to $BIN_PATH.bak" >&2
+    docker stop "$CONTAINER" >/dev/null || true
+    if docker cp "$CONTAINER:$BIN_PATH.bak" /tmp/zakurad-deploy.rollback; then
+        docker cp /tmp/zakurad-deploy.rollback "$CONTAINER:$BIN_PATH"
+        rm -f /tmp/zakurad-deploy.rollback
+    fi
+    docker start "$CONTAINER" >/dev/null || true
+    exit 1
+fi
+
+docker exec "$CONTAINER" "$BIN_PATH" --version || true
+"""
+
+
 def ssh_with_stdin(node: Node, script: str) -> subprocess.CompletedProcess:
     """Run an install script on the node via `ssh ... bash -s`, feeding it on stdin."""
     return subprocess.run(node.ssh_cmd("bash", "-s"), input=script, text=True)
@@ -727,21 +780,33 @@ def cmd_deploy(args) -> int:
     def work(node: Node) -> tuple[str, bool, str]:
         binary = by_sha[node.sha]
         try:
-            if node.deploy_kind not in ("systemd", "process"):
+            if node.deploy_kind not in ("systemd", "process", "docker"):
                 return (node.name, False, f"unknown deploy_kind: {node.deploy_kind}")
 
             # Binary-only: don't render or ship a config/unit; just swap the
-            # binary and restart the existing service. Only meaningful for
-            # systemd nodes (the restart target is service_name).
+            # binary and restart the existing service or container.
             if not node.manage_config:
-                if node.deploy_kind != "systemd":
-                    return (node.name, False, "manage_config=false requires deploy_kind=systemd")
+                if node.deploy_kind not in ("systemd", "docker"):
+                    return (
+                        node.name,
+                        False,
+                        "manage_config=false requires deploy_kind=systemd or docker",
+                    )
+                if node.deploy_kind == "docker" and not node.container_name:
+                    return (node.name, False, "docker deploy requires container_name")
                 run(node.scp_to(str(binary), "/tmp/zakurad-deploy.new"), capture=True)
-                script = BINARY_ONLY_INSTALL_SCRIPT.format(
-                    bin_path=shlex.quote(node.bin_path),
-                    service=shlex.quote(node.service_name),
-                    no_restart="1" if args.no_restart else "0",
-                )
+                if node.deploy_kind == "docker":
+                    script = DOCKER_BINARY_ONLY_INSTALL_SCRIPT.format(
+                        container=shlex.quote(node.container_name),
+                        bin_path=shlex.quote(node.bin_path),
+                        no_restart="1" if args.no_restart else "0",
+                    )
+                else:
+                    script = BINARY_ONLY_INSTALL_SCRIPT.format(
+                        bin_path=shlex.quote(node.bin_path),
+                        service=shlex.quote(node.service_name),
+                        no_restart="1" if args.no_restart else "0",
+                    )
                 proc = ssh_with_stdin(node, script)
                 if proc.returncode != 0:
                     return (node.name, False, f"install/restart failed (rc={proc.returncode})")
@@ -866,22 +931,34 @@ def cmd_status(args) -> int:
         # commit, so also read the running build's git commit from the startup
         # diagnostic line in the node's log (`git commit: <sha>`). The configured
         # ref is appended so requested-vs-running is visible at a glance.
-        if node.service_name:
+        if node.deploy_kind == "docker":
+            service_probe = (
+                f"docker inspect --format '{{{{.State.Status}}}}' "
+                f"{shlex.quote(node.container_name)} 2>/dev/null"
+            )
+            version_probe = (
+                f"docker exec {shlex.quote(node.container_name)} "
+                f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1"
+            )
+        elif node.service_name:
             service_probe = f"systemctl is-active {shlex.quote(node.service_name)} 2>/dev/null"
+            version_probe = f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1"
         elif node.process_pattern:
             service_probe = (
                 f"pgrep -f {shlex.quote(node.process_pattern)} >/dev/null 2>&1 "
                 "&& printf 'active\\n' || printf 'inactive\\n'"
             )
+            version_probe = f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1"
         else:
             service_probe = "printf 'unknown\\n'"
+            version_probe = f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1"
         log_probe = (
             f"grep -aoE 'git commit: [0-9a-f]+' {shlex.quote(node.log_file)} 2>/dev/null | tail -1"
             if node.log_file else "true"
         )
         probe = (
             f"{service_probe}; "
-            f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1; "
+            f"{version_probe}; "
             f"{log_probe}"
         )
         proc = ssh_capture_script(node, probe)

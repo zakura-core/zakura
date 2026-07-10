@@ -81,9 +81,10 @@ jobs:
         # fail fast instead. deploy.py also now rejects unknown config keys.
         run: |
           set -euo pipefail
-          if ! grep -q 'manage_config' deploy/deployer/deploy.py; then
-            echo "::error::deploy.py at ref '${{ inputs.ref }}' lacks manage_config support." \
-                 "Deploy from a ref whose deploy.py supports binary-only mode."
+          if ! grep -q 'manage_config' deploy/deployer/deploy.py ||
+             ! grep -q 'container_name' deploy/deployer/deploy.py; then
+            echo "::error::deploy.py at ref '${{ inputs.ref }}' lacks binary-only Docker support." \
+                 "Deploy from a ref whose deploy.py supports manage_config and container_name."
             exit 1
           fi
 
@@ -145,7 +146,8 @@ jobs:
             161.35.156.226 \
             139.59.64.115 \
             168.144.173.250 \
-            159.203.113.196; do
+            159.203.113.196 \
+            178.128.66.48; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -239,6 +241,16 @@ jobs:
           service_name = "zebrad-compat"
           log_file   = ""
           rpc_listen_addr = "127.0.0.1:8232"
+
+          [[nodes]]
+          name       = "zakura-compat-docker"
+          ssh_string = "root@178.128.66.48"
+          commit     = "${{ inputs.ref }}"
+          deploy_kind = "docker"
+          container_name = "zakura-compat"
+          service_name = ""
+          log_file   = ""
+          rpc_listen_addr = "127.0.0.1:8232"
           EOF
 
       - name: Build deployer binary
@@ -306,14 +318,23 @@ jobs:
           sudo install -m 755 deploy/runner/zebra-cluster-status.py "$dashboard_dir/zebra-cluster-status.py"
           cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
           # Dashboard-only: deploy.py rejects these fields, so add cookie RPC
-          # auth for zakura-compat into this copy (not the deploy config).
+          # auth for the compatibility nodes into this copy (not the deploy config).
           awk '
             { print }
             $0 ~ /^name[[:space:]]*=[[:space:]]*"zakura-compat"/ { in_compat = 1 }
+            $0 ~ /^name[[:space:]]*=[[:space:]]*"zakura-compat-docker"/ {
+              in_compat = 0
+              in_compat_docker = 1
+            }
             in_compat && $0 ~ /^rpc_listen_addr[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8232"/ {
               print "rpc_auth   = \"cookie\""
               print "rpc_config_path = \"/root/.cache/zakura/.cookie\""
               in_compat = 0
+            }
+            in_compat_docker && $0 ~ /^rpc_listen_addr[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8232"/ {
+              print "rpc_auth   = \"cookie\""
+              print "rpc_config_path = \"/mnt/zcashd-compat-docker-data/zcashd-data/.cookie\""
+              in_compat_docker = 0
             }
           ' "$RUNNER_TEMP/dashboard.nodes.toml" > "$RUNNER_TEMP/dashboard.nodes.toml.tmp"
           mv "$RUNNER_TEMP/dashboard.nodes.toml.tmp" "$RUNNER_TEMP/dashboard.nodes.toml"
@@ -332,6 +353,18 @@ jobs:
           rpc_config_path = "/mnt/snapshots/runtime/zcashd/.cookie"
           # P2P sidecar (post -zebra-compat): supervised with -connect=127.0.0.1:8233.
           process_pattern = "zcashd .*-connect=127.0.0.1:8233"
+
+          [[nodes]]
+          name       = "zcashd-compat-docker"
+          ssh_string = "root@178.128.66.48"
+          probe_kind = "zcashd"
+          service_name = ""
+          container_name = "zakura-compat-zcashd"
+          bin_path = "/usr/local/bin/zcashd"
+          log_file = ""
+          rpc_listen_addr = "127.0.0.1:8232"
+          rpc_auth = "cookie"
+          rpc_config_path = "/mnt/zcashd-compat-docker-data/zcashd-data/.cookie"
           EOF
           sudo install -m 644 "$RUNNER_TEMP/dashboard.nodes.toml" "$dashboard_dir/nodes.toml"
 

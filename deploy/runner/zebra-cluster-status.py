@@ -56,6 +56,7 @@ DEFAULTS = {
     "rpc_user": "",
     "rpc_password": "",
     "process_pattern": "",
+    "container_name": "",
     "port": None,
 }
 
@@ -74,6 +75,7 @@ class Node:
     rpc_user: str
     rpc_password: str
     process_pattern: str
+    container_name: str
     node_id: str
     port: object = None
 
@@ -119,6 +121,7 @@ def load_nodes(config_path: Path) -> list[Node]:
                 rpc_user=merged["rpc_user"],
                 rpc_password=merged["rpc_password"],
                 process_pattern=merged["process_pattern"],
+                container_name=merged["container_name"],
                 node_id=node_ids_by_host.get(ssh_host(merged["ssh_string"]), ""),
                 port=merged["port"],
             )
@@ -190,7 +193,8 @@ import urllib.request
     rpc_user,
     rpc_password,
     rpc_config_path,
-) = sys.argv[1:11]
+    container_name,
+) = sys.argv[1:12]
 
 out = {
     "service": service,
@@ -222,6 +226,22 @@ def process_start_time(pattern):
     if ps_proc.returncode != 0:
         return ""
     return ps_proc.stdout.strip()
+
+def container_state(name):
+    if not name:
+        return None, ""
+    proc = run(["docker", "inspect", "--format",
+                "{{.State.Status}}|{{.State.StartedAt}}", name])
+    if proc.returncode != 0:
+        return "missing", ""
+    status, _, started_at = proc.stdout.strip().partition("|")
+    return status, started_at
+
+def container_logs(name):
+    if not name:
+        return ""
+    proc = run(["docker", "logs", "--tail", "1000", name])
+    return (proc.stdout or "") + (proc.stderr or "")
 
 def parse_zcash_conf(path):
     values = {}
@@ -270,7 +290,11 @@ except Exception as error:
     out["process_error"] = str(error)
 
 try:
-    if service:
+    if container_name:
+        status, started_at = container_state(container_name)
+        out["active_state"] = "active" if status == "running" else status
+        out["last_restarted"] = started_at
+    elif service:
         proc = run(["systemctl", "show", service, "--no-pager",
                     "-p", "ActiveState",
                     "-p", "ActiveEnterTimestamp",
@@ -300,13 +324,23 @@ except Exception as error:
     out["systemd_error"] = str(error)
 
 try:
-    proc = run([bin_path, "--version"])
+    command = (
+        ["docker", "exec", container_name, bin_path, "--version"]
+        if container_name
+        else [bin_path, "--version"]
+    )
+    proc = run(command)
     out["version"] = (proc.stdout or proc.stderr).splitlines()[0].strip()
 except Exception as error:
     out["version_error"] = str(error)
 
 try:
-    if log_file:
+    if container_name:
+        logs = container_logs(container_name)
+        matches = re.findall(r"git commit: ([0-9a-f]+)", logs)
+        if matches:
+            out["commit"] = matches[-1]
+    elif log_file:
         grep = "grep -aoE 'git commit: [0-9a-f]+' {} 2>/dev/null | tail -1".format(
             shlex.quote(log_file)
         )
@@ -330,7 +364,12 @@ except Exception as error:
     out["commit_error"] = str(error)
 
 try:
-    if log_file:
+    if container_name:
+        logs = container_logs(container_name)
+        matches = re.findall(r'node_id=([^, ]+)', logs)
+        if matches:
+            out["node_id"] = matches[-1].strip('"')
+    elif log_file:
         grep = "grep -aoE 'node_id=[^, ]+' {} 2>/dev/null | tail -1".format(
             shlex.quote(log_file)
         )
@@ -418,7 +457,8 @@ def probe_node(node: Node) -> dict:
         f"{shlex.quote(node.rpc_auth)} "
         f"{shlex.quote(node.rpc_user)} "
         f"{shlex.quote(node.rpc_password)} "
-        f"{shlex.quote(node.rpc_config_path)} <<'PY'\n"
+        f"{shlex.quote(node.rpc_config_path)} "
+        f"{shlex.quote(node.container_name)} <<'PY'\n"
         f"{REMOTE_PROBE}\n"
         "PY\n"
     )

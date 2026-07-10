@@ -204,7 +204,7 @@ impl VerifiedSet {
     }
 
     /// Evict one transaction and any transactions that directly or indirectly depend on
-    /// its outputs from the set, returns the victim transaction and any dependent transactions.
+    /// its outputs from the set.
     ///
     /// Removes a transaction with probability in direct proportion to the
     /// eviction weight, as per [ZIP-401].
@@ -226,7 +226,7 @@ impl VerifiedSet {
     ///
     /// [ZIP-401]: https://zips.z.cash/zip-0401
     #[allow(clippy::unwrap_in_result)]
-    pub fn evict_one(&mut self) -> Option<VerifiedUnminedTx> {
+    pub(super) fn evict_one(&mut self) -> Option<Vec<VerifiedUnminedTx>> {
         use rand::distributions::{Distribution, WeightedIndex};
         use rand::prelude::thread_rng;
 
@@ -244,9 +244,7 @@ impl VerifiedSet {
             .get(dist.sample(&mut thread_rng()))
             .expect("should have a key at every index in the distribution");
 
-        // Removes the randomly selected transaction and all of its dependents from the set,
-        // then returns just the randomly selected transaction
-        self.remove(key_to_remove).pop()
+        Some(self.remove(key_to_remove))
     }
 
     /// Clears a list of mined transaction ids from the lists of dependencies for

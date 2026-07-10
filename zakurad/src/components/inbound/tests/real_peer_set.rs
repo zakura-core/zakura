@@ -1028,6 +1028,7 @@ async fn setup(
     let tx_gossip_task_handle = tokio::spawn(gossip_mempool_transaction_id(
         transaction_subscriber.subscribe(),
         peer_set.clone(),
+        mempool_service.clone(),
     ));
 
     // Set up the inbound service response for the isolated peer

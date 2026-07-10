@@ -468,7 +468,7 @@ fn mempool_expired_basic_for_network(network: Network) -> Result<()> {
     assert_eq!(everything_in_mempool.len(), 0);
 
     // No transaction will be sent to peers
-    let send_to_peers = Mempool::remove_expired_from_peer_list(&everything_in_mempool, &expired);
+    let send_to_peers = Mempool::remove_from_peer_list(&everything_in_mempool, &expired);
     assert_eq!(send_to_peers.len(), 0);
 
     Ok(())

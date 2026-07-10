@@ -714,6 +714,7 @@ impl StartCmd {
             mempool::gossip_mempool_transaction_id(
                 mempool_transaction_subscriber.subscribe(),
                 peer_set.clone(),
+                mempool.clone(),
             )
             .in_current_span(),
         );

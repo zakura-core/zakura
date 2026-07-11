@@ -11,16 +11,14 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZAKURA_RELEASE_TAG="v1.0.0-rc0"
+ZAKURA_RELEASE_TAG="v1.0.0-rc1"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
-# sha256 of ZAKURA_ARCHIVE from the release's SHA256SUMS.txt. Pin it once the
-# zakurad-named release artifact is published: an unpinned download in a
-# `curl | bash` installer is a supply-chain hole. Empty = skip verification.
-ZAKURA_ARCHIVE_SHA256=""
+# sha256 of ZAKURA_ARCHIVE from the release's SHA256SUMS.txt.
+ZAKURA_ARCHIVE_SHA256="10a9ce52c2a436b35f5869cacce8a1ff8d197069bb3b775cacf7a0eaed991d12"
 ZAKURA_MEMBER="./bin/zakurad"
-ZAKURA_DOCKER_IMAGE="valargroup/zakura:1.0.0-rc0"
-ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-1.0.0-rc0"
+ZAKURA_DOCKER_IMAGE="valargroup/zakura:1.0.0-rc1"
+ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-1.0.0-rc1"
 ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
 ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
 # Persistent Zakura iroh identity (NodeId secret). Kept outside the state cache so

@@ -191,6 +191,10 @@ Modes for --install-profile zcashd-compat:
   docker-supervised          Pull compat image, print single supervised docker run command
   build-from-source          Validate source tree paths, print build/start commands
 
+build-from-source is valid under both profiles, so it does not imply one. It
+prompts for the profile interactively, and requires an explicit
+--install-profile when combined with --non-interactive.
+
 Options:
   --install-profile PROFILE default|zcashd-compat
   --mode MODE
@@ -419,9 +423,13 @@ mode_implies_compat_profile() {
   esac
 }
 
+# build-from-source is deliberately absent: it is a valid mode under both
+# profiles, so it implies neither. resolve_install_profile falls through to
+# prompt_install_profile, which asks interactively and errors under
+# --non-interactive rather than silently building plain Zakura with no sidecar.
 mode_implies_default_profile() {
   case "$MODE" in
-    native | docker | build-from-source)
+    native | docker)
       return 0
       ;;
     *)
@@ -689,6 +697,7 @@ compat_check_candidate_datadir() {
   local expected_files_check="$3"
 
   [[ -d "$candidate" ]] || return 1
+  path_is_creatable "$candidate" || return 1
   compat_path_has_min_capacity "$candidate" "$min_bytes" || return 1
   "$expected_files_check" "$candidate"
 }
@@ -736,6 +745,8 @@ compat_maybe_select_better_install_root() {
   local score
 
   [[ -n "$root" && "$root" != "/" && -d "$root" ]] || return 0
+  # Callers create a subdirectory under $root, so $root itself must be writable.
+  path_is_creatable "$root" || return 0
   score="$(compat_path_capacity_bytes "$root" 2>/dev/null || printf '0')"
   [[ "$score" =~ ^[0-9]+$ ]] || return 0
   ((score >= min_bytes)) || return 0
@@ -818,10 +829,11 @@ compat_search_zcashd_datadir_candidates() {
   done < <(compat_candidate_search_roots)
 }
 
+# Shared by both install profiles. The default profile passes the standalone disk
+# floor, which differs from the compat per-datadir floor on testnet/regtest.
 compat_recommend_zakura_state_dir() {
   local binary_default="$1"
-  local min_bytes
-  min_bytes="$(disk_per_datadir_min_bytes)"
+  local min_bytes="${2:-$(disk_per_datadir_min_bytes)}"
   local synthetic_min_bytes="${SYNTHETIC_INSTALL_MIN_BYTES:-$min_bytes}"
   local install_root
   BEST_CANDIDATE=""
@@ -835,7 +847,7 @@ compat_recommend_zakura_state_dir() {
     return
   fi
 
-  if ! compat_path_has_min_capacity "$binary_default" "$min_bytes"; then
+  if ! path_is_creatable "$binary_default" || ! compat_path_has_min_capacity "$binary_default" "$min_bytes"; then
     if install_root="$(compat_recommend_install_root "$synthetic_min_bytes")"; then
       printf '%s/.cache/zakura\n' "$install_root"
       return
@@ -1383,6 +1395,19 @@ nearest_existing_ancestor() {
   printf '%s\n' "$current"
 }
 
+# Predicate form of check_writable_target: true when target already exists and is
+# writable, or when it does not exist but its nearest existing ancestor would let
+# the current user create it. Directory recommendations must filter on this, or
+# they can hand back a large but root-owned volume that the installer then fails
+# to create (for example /mnt on a stock cloud image).
+path_is_creatable() {
+  local target="$1"
+  local ancestor
+
+  ancestor="$(nearest_existing_ancestor "$target")" || return 1
+  [[ -d "$ancestor" && -w "$ancestor" && -x "$ancestor" ]]
+}
+
 check_writable_target() {
   local label="$1"
   local target="$2"
@@ -1432,10 +1457,46 @@ human_gib() {
   awk -v bytes="$bytes" 'BEGIN { printf "%.1f GiB", bytes / 1024 / 1024 / 1024 }'
 }
 
+host_arch() {
+  uname -m 2>/dev/null || printf 'unknown\n'
+}
+
+host_arch_is_amd64() {
+  case "$(host_arch)" in
+    x86_64 | amd64) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Every published artifact these modes consume is linux/amd64: the release
+# archives are pinned to *-linux-x86_64.tar.gz, and the zcashd and
+# zcashd-compat Docker images have no arm64 manifest entry. Without this check
+# an arm64 host either downloads an x86_64 binary and dies with an exec format
+# error at start, or gets a bare "no matching manifest" error from Docker.
+# build-from-source compiles natively, so it is exempt.
+collect_host_arch_check() {
+  local docker_hint="$1"
+
+  if [[ "$MODE" == "build-from-source" ]] || host_arch_is_amd64; then
+    return
+  fi
+
+  add_error "$MODE requires an amd64 host; detected $(host_arch). Prebuilt Zakura/zcashd release archives${docker_hint} are published for amd64 only. Re-run on an amd64 host, or use --mode build-from-source to build natively on this machine."
+}
+
 compat_collect_platform_checks() {
   if [[ "$(uname -s)" != "Linux" ]]; then
     add_low_spec_error "zcashd-compat mode is supported on Linux only"
   fi
+
+  case "$MODE" in
+    docker-supervised | docker-split-containers)
+      collect_host_arch_check " and the zcashd-compat Docker images"
+      ;;
+    *)
+      collect_host_arch_check ""
+      ;;
+  esac
 }
 
 compat_collect_cpu_checks() {
@@ -1954,6 +2015,20 @@ compat_print_zakurad_env_lines() {
   printf '%s=%s %s' "ZAKURA_STATE__CACHE_DIR" "$(quote_env_value "$ZAKURA_STATE_DIR")" "\\"
 }
 
+# zakurad re-runs the zcashd-compat hardware preflight at startup and hard-exits
+# below the minimums, so --unsafe-low-specs has to reach the generated command
+# too. Silencing only the installer's own warning leaves the user with a command
+# that cannot start on the machine that needed the override.
+compat_zakurad_start_args() {
+  local args="start --zcashd-compat"
+
+  if ((UNSAFE_LOW_SPECS)); then
+    args+=" --unsafe-low-specs"
+  fi
+
+  printf '%s\n' "$args"
+}
+
 # Shared zcashd P2P-sidecar flags for the binary/source start commands.
 compat_print_zcashd_flag_lines() {
   local arg
@@ -1988,7 +2063,7 @@ compat_print_split_binary_commands() {
   cat <<EOF
 $(style "$GREEN$BOLD" "Start Zakura in terminal 1:")
 $(compat_print_zakurad_env_lines)
-$(shell_quote "$ZAKURAD_PATH") start --zcashd-compat
+$(shell_quote "$ZAKURAD_PATH") $(compat_zakurad_start_args)
 
 $(style "$GREEN$BOLD" "Start zcashd in terminal 2:")
 $(shell_quote "$ZCASHD_PATH") \\
@@ -2003,7 +2078,7 @@ $(compat_print_zakurad_env_lines)
 ZAKURA_ZCASHD_COMPAT__MANAGE_ZCASHD=true \\
 ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE=embedded \\
 ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR=$(shell_quote "$ZCASHD_DATADIR") \\
-$(shell_quote "$ZAKURAD_PATH") start --zcashd-compat
+$(shell_quote "$ZAKURAD_PATH") $(compat_zakurad_start_args)
 EOF
 }
 
@@ -2029,7 +2104,7 @@ docker run --rm -it --network host \\
   --mount type=bind,src=$(shell_quote "$ZAKURA_IDENTITY_DIR"),dst=$container_zakura_identity_dir \\
   --mount type=bind,src=$(shell_quote "$ZCASHD_DATADIR"),dst=$container_zcashd_datadir \\
   $(shell_quote "$image") \\
-  zakurad start --zcashd-compat
+  zakurad $(compat_zakurad_start_args)
 EOF
 }
 
@@ -2047,7 +2122,7 @@ docker run --rm -it --name zakura-compat --network host \\
   --mount type=bind,src=$(shell_quote "$ZAKURA_STATE_DIR"),dst=/home/zebra/.cache/zakura \\
   --mount type=bind,src=$(shell_quote "$ZAKURA_IDENTITY_DIR"),dst=$ZAKURA_DOCKER_IDENTITY_DIR \\
   $(shell_quote "$ZAKURA_DOCKER_IMAGE") \\
-  zakurad start --zcashd-compat
+  zakurad $(compat_zakurad_start_args)
 
 $(style "$GREEN$BOLD" "Start zcashd container in terminal 2:")
 docker run --rm -it --name zakura-compat-zcashd --network host \\
@@ -2067,7 +2142,7 @@ cd $(shell_quote "$ZCASH_SRC_DIR") && ./zcutil/build.sh -j"\$(nproc)"
 
 $(style "$GREEN$BOLD" "Start Zakura in terminal 1:")
 $(compat_print_zakurad_env_lines)
-$(shell_quote "$ZAKURAD_PATH") start --zcashd-compat
+$(shell_quote "$ZAKURAD_PATH") $(compat_zakurad_start_args)
 
 $(style "$GREEN$BOLD" "Start zcashd in terminal 2:")
 $(shell_quote "$ZCASHD_PATH") \\
@@ -2157,9 +2232,27 @@ default_p2p_port() {
   esac
 }
 
+# The standalone default (/mnt/data/zakura-state) is only usable by root on a
+# stock cloud image, so run the same capacity- and permission-aware search the
+# zcashd-compat profile uses. A large writable volume still wins; otherwise this
+# lands on ~/.cache/zakura instead of a path the user cannot create.
+default_recommend_datadir_defaults() {
+  if ((ZAKURA_STATE_DIR_SET)); then
+    return
+  fi
+
+  local min_bytes
+  min_bytes="$(disk_standalone_min_bytes)"
+
+  SYNTHETIC_INSTALL_MIN_BYTES="$min_bytes"
+  ZAKURA_STATE_DIR="$(compat_recommend_zakura_state_dir "$ZAKURA_STANDALONE_STATE_DIR" "$min_bytes")"
+  unset SYNTHETIC_INSTALL_MIN_BYTES
+}
+
 default_normalize_inputs() {
   default_prompt_mode
   default_normalize_network
+  default_recommend_datadir_defaults
 
   if [[ "$MODE" == "native" ]]; then
     if ((DOWNLOAD_BINARIES_SET == 0)); then
@@ -2236,6 +2329,12 @@ default_collect_permission_checks() {
 default_collect_platform_checks() {
   if [[ "$(uname -s)" != "Linux" ]]; then
     add_low_spec_error "zakura mode is supported on Linux only"
+  fi
+
+  # The plain Zakura image publishes an arm64 manifest, so only the native
+  # download path is pinned to amd64 here.
+  if [[ "$MODE" == "native" ]]; then
+    collect_host_arch_check ""
   fi
 }
 

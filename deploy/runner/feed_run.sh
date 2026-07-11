@@ -7,7 +7,7 @@
 #
 #   network   : zcash.net.{in,out}.bytes.total, peers.connected
 #   download  : sync.downloads.in_flight, sync.downloaded.block.count
-#   verifier  : zebra.feed.equihash_pow / merkle_root (checkpoint verifier CPU)
+#   verifier  : zakura.feed.equihash_pow / merkle_root (checkpoint verifier CPU)
 #   commit cpu: update_trees (note tree) + commitment_check + batch_prep
 #   commit db : prep_reads (UTXO/addr reads) + rocksdb.batch_commit (write I/O)
 #   committer : commit busy + input_queue_depth + poll_ready/poll_empty
@@ -205,8 +205,8 @@ while kill -0 "$PID" 2>/dev/null; do
   # Per-apply latency decomposition (commit-metrics): verify+commit roundtrip and the
   # post-commit frontier re-read, summed across apply-class labels. Pinpoints where the
   # serial apply-drain wall goes (verifier+handoff vs read_state) while CPU sits idle.
-  avc_s=$(msum zebra_zakura_apply_verify_commit_duration_seconds_sum "$m");  avc_c=$(msum zebra_zakura_apply_verify_commit_duration_seconds_count "$m")
-  afq_s=$(msum zebra_zakura_apply_frontier_query_duration_seconds_sum "$m"); afq_c=$(msum zebra_zakura_apply_frontier_query_duration_seconds_count "$m")
+  avc_s=$(msum zakura_apply_verify_commit_duration_seconds_sum "$m");  avc_c=$(msum zakura_apply_verify_commit_duration_seconds_count "$m")
+  afq_s=$(msum zakura_apply_frontier_query_duration_seconds_sum "$m"); afq_c=$(msum zakura_apply_frontier_query_duration_seconds_count "$m")
   # LEVER 0 split (commit-metrics): checkpoint VERIFY (process_checkpoint_range CPU) vs
   # the single-writer STATE COMMIT await. Tells us which serial stage caps throughput.
   vr_s=$(mv zakura_consensus_checkpoint_verify_range_duration_seconds_sum "$m");  vr_c=$(mv zakura_consensus_checkpoint_verify_range_duration_seconds_count "$m")
@@ -226,11 +226,11 @@ while kill -0 "$PID" 2>/dev/null; do
   # in-flight concurrency, to see why ~4000 buffered blocks only reach the writer at ~34/s.
   ckin=$(awk '$1=="checkpoint_commit_intake_count_total"||$1=="checkpoint_commit_intake_count"{print $2;exit}' <<<"$m")
   ckrel=$(awk '$1=="checkpoint_commit_release_count_total"||$1=="checkpoint_commit_release_count"{print $2;exit}' <<<"$m")
-  ckq=$(mv checkpoint_queued_slots "$m");   apif=$(mv zebra_zakura_apply_inflight "$m")
+  ckq=$(mv checkpoint_queued_slots "$m");   apif=$(mv zakura_apply_inflight "$m")
   # PROBE 4b: split the apply roundtrip — admit_wait (poll_ready, before the verifier
   # accepts) vs call_to_commit (accepted->committed). Localizes the ~34s outside the verifier.
-  aw_s=$(mv zebra_zakura_apply_admit_wait_duration_seconds_sum "$m");      aw_c=$(mv zebra_zakura_apply_admit_wait_duration_seconds_count "$m")
-  c2c_s=$(mv zebra_zakura_apply_call_to_commit_duration_seconds_sum "$m"); c2c_c=$(mv zebra_zakura_apply_call_to_commit_duration_seconds_count "$m")
+  aw_s=$(mv zakura_apply_admit_wait_duration_seconds_sum "$m");      aw_c=$(mv zakura_apply_admit_wait_duration_seconds_count "$m")
+  c2c_s=$(mv zakura_apply_call_to_commit_duration_seconds_sum "$m"); c2c_c=$(mv zakura_apply_call_to_commit_duration_seconds_count "$m")
   # PROBE 5: the NEXT door — state-service admission (poll_ready behind the state Buffer)
   # vs the actual commit call, + commits in flight at the writer.
   sa_s=$(mv zakura_state_commit_state_admit_wait_duration_seconds_sum "$m");  sa_c=$(mv zakura_state_commit_state_admit_wait_duration_seconds_count "$m")

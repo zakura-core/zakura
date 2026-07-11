@@ -1540,7 +1540,7 @@ where
                             }
                             Err(err) => {
                                 metrics::counter!(
-                                    "zebra.net.in.errors",
+                                    "zakura.net.in.errors",
                                     "error" => err.to_string(),
                                     "addr" => connected_addr.get_transient_addr_label(),
                                 )

@@ -25,7 +25,7 @@ use zakura_test::{
 use zakurad::config::ZakuradConfig;
 
 use crate::common::{
-    config::testdir, lightwalletd::zebra_skip_lightwalletd_tests,
+    config::testdir, lightwalletd::zakura_skip_lightwalletd_tests,
     sync::FINISH_PARTIAL_SYNC_TIMEOUT, test_type::TestType,
 };
 
@@ -223,7 +223,7 @@ pub fn spawn_zakurad_for_rpc<S: AsRef<str> + Debug>(
 /// Spawns a zakurad instance on `network` to test lightwalletd with `test_type`.
 ///
 /// If `use_internet_connection` is `false` then spawn, but without any peers.
-/// This prevents it from downloading blocks. Instead, set `ZEBRA_STATE__CACHE_DIR`
+/// This prevents it from downloading blocks. Instead, set `ZAKURA_STATE__CACHE_DIR`
 /// to provide an initial state to the zakurad instance.
 ///
 /// If `use_non_finalized_backup` is `false` then configure the spawned zakurad instance
@@ -279,7 +279,7 @@ pub fn spawn_zakurad_for_rpc_with_opts<S: AsRef<str> + Debug>(
 /// Otherwise, just create an empty state in this test's new temporary directory.
 ///
 /// If `use_internet_connection` is `false` then spawn, but without any peers.
-/// This prevents it from downloading blocks. Instead, set `ZEBRA_STATE__CACHE_DIR`
+/// This prevents it from downloading blocks. Instead, set `ZAKURA_STATE__CACHE_DIR`
 /// to provide an initial state to the zakurad instance.
 ///
 /// Returns:
@@ -362,8 +362,8 @@ pub fn can_spawn_zakurad_for_test_type<S: AsRef<str> + Debug>(
 
     // Skip the test unless the user specifically asked for it
     //
-    // TODO: pass test_type to zebra_skip_lightwalletd_tests() and check for lightwalletd launch in there
-    if test_type.launches_lightwalletd() && zebra_skip_lightwalletd_tests() {
+    // TODO: pass test_type to zakura_skip_lightwalletd_tests() and check for lightwalletd launch in there
+    if test_type.launches_lightwalletd() && zakura_skip_lightwalletd_tests() {
         return false;
     }
 

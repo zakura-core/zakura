@@ -28,9 +28,9 @@ pub mod wallet;
 /// Set to any non-empty value (e.g. `1`) to run the suite.
 pub const TEST_ZCASHD_COMPAT: &str = "TEST_ZCASHD_COMPAT";
 
-// NOTE: these test env vars deliberately avoid the `ZEBRA_` prefix, because
-// zakurad parses every inherited `ZEBRA_*` env var as a config override, and
-// `ZakuradConfig` rejects unknown fields. A `ZEBRA_`-prefixed test var would
+// NOTE: these test env vars deliberately avoid the `ZAKURA_` prefix, because
+// zakurad parses every inherited `ZAKURA_*` env var as a config override, and
+// `ZakuradConfig` rejects unknown fields. A `ZAKURA_`-prefixed test var would
 // make every spawned zakurad child abort at startup.
 
 /// Optional explicit path to a P2P-sidecar zcashd binary.
@@ -42,7 +42,7 @@ pub const TEST_ZCASHD_PATH: &str = "TEST_ZCASHD_PATH";
 pub const TEST_ZCASHD_COMPAT_NETWORK: &str = "TEST_ZCASHD_COMPAT_NETWORK";
 
 /// Zakurad main RPC address for external mode (e.g. `127.0.0.1:8232`).
-pub const TEST_ZEBRAD_RPC_ADDR: &str = "TEST_ZEBRAD_RPC_ADDR";
+pub const TEST_ZAKURAD_RPC_ADDR: &str = "TEST_ZAKURAD_RPC_ADDR";
 
 /// Zcashd own RPC address for external mode (e.g. `127.0.0.1:8233`).
 pub const TEST_ZCASHD_RPC_ADDR: &str = "TEST_ZCASHD_RPC_ADDR";
@@ -66,7 +66,7 @@ pub const TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG: &str = "TEST_ZCASHD_COMPAT_RES
 
 /// Returns `true` and prints a message if zcashd-compat tests are disabled.
 #[allow(clippy::print_stderr)]
-pub fn zebra_skip_zcashd_compat_tests() -> bool {
+pub fn zakura_skip_zcashd_compat_tests() -> bool {
     if std::env::var_os(TEST_ZCASHD_COMPAT).is_none() {
         eprintln!(
             "Skipped zcashd-compat integration test; \
@@ -189,7 +189,7 @@ pub async fn wait_for_zcashd_height(client: &ZcashdRpcClient, height: u64) -> Re
 ///
 /// Returns `None` if zcashd-compat tests are disabled (`TEST_ZCASHD_COMPAT` unset).
 pub async fn setup_zcashd_compat() -> Result<Option<launch::ZcashdCompatSetup>> {
-    if zebra_skip_zcashd_compat_tests() {
+    if zakura_skip_zcashd_compat_tests() {
         return Ok(None);
     }
 

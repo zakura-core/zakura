@@ -67,13 +67,13 @@ on:
         required: false
         default: "150"
       target_p2p_stack:
-        description: "Target/primary P2P stack: zebra | zakura | dual (aliases: v1/legacy, v2, combined)"
+        description: "Target/primary P2P stack: legacy | zakura | dual"
         required: false
         default: "zakura"
       baseline_p2p_stack:
-        description: "Baseline/base P2P stack: zebra | zakura | dual (aliases: v1/legacy, v2, combined)"
+        description: "Baseline/base P2P stack: legacy | zakura | dual"
         required: false
-        default: "zebra"
+        default: "legacy"
       baseline_tag:
         description: "Optional (download mode): baseline release tag for a speedup comparison. Ignored when skip_baseline is true."
         required: false

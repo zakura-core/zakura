@@ -158,7 +158,7 @@ impl Verifier {
             _ => "failure",
         };
         metrics::histogram!(
-            "zebra.consensus.batch.duration_seconds",
+            "zakura.consensus.batch.duration_seconds",
             "verifier" => "ed25519",
             "result" => result_label
         )

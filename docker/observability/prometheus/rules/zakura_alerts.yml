@@ -1,4 +1,4 @@
-# Zebra Alerting Rules
+# Zakura Alerting Rules
 #
 # These rules are evaluated by Prometheus and sent to AlertManager.
 # AlertManager handles routing, grouping, and notifications.
@@ -7,62 +7,62 @@
 #   docker/observability/alertmanager/alertmanager.yml
 
 groups:
-  - name: zebra
+  - name: zakura
     rules:
       # Node is down or metrics endpoint unreachable
-      - alert: ZebraDown
-        expr: up{job="zebra"} == 0
+      - alert: ZakuraDown
+        expr: up{job="zakura"} == 0
         for: 2m
         labels:
           severity: critical
         annotations:
-          summary: "Zebra node is down"
-          description: "Zebra metrics endpoint has been unreachable for 2 minutes."
+          summary: "Zakura node is down"
+          description: "Zakura metrics endpoint has been unreachable for 2 minutes."
 
       # Block height not increasing (sync may be stalled)
-      - alert: ZebraSyncStalled
+      - alert: ZakuraSyncStalled
         expr: changes(zcash_chain_verified_block_height[15m]) == 0
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "Block height stalled"
-          description: "Zebra block height has not increased in the last 15 minutes. Node may be stuck or network may be partitioned."
+          description: "Zakura block height has not increased in the last 15 minutes. Node may be stuck or network may be partitioned."
 
       # Low peer count (degraded connectivity)
-      - alert: ZebraLowPeers
+      - alert: ZakuraLowPeers
         expr: zcash_net_peers < 3
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "Low peer count"
-          description: "Zebra has fewer than 3 peers for 5 minutes. Network connectivity may be degraded."
+          description: "Zakura has fewer than 3 peers for 5 minutes. Network connectivity may be degraded."
 
       # No peers at all (network isolation)
-      - alert: ZebraNoPeers
+      - alert: ZakuraNoPeers
         expr: zcash_net_peers == 0
         for: 2m
         labels:
           severity: critical
         annotations:
           summary: "No peers connected"
-          description: "Zebra has 0 peers for 2 minutes. Check network connectivity and firewall rules."
+          description: "Zakura has 0 peers for 2 minutes. Check network connectivity and firewall rules."
 
       # High error rate
-      - alert: ZebraHighErrorRate
-        expr: rate(zebra_errors_total[5m]) > 0.1
+      - alert: ZakuraHighErrorRate
+        expr: rate(zakura_errors_total[5m]) > 0.1
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "High error rate"
-          description: "Zebra is experiencing elevated error rates (> 0.1/s for 5 minutes)."
+          description: "Zakura is experiencing elevated error rates (> 0.1/s for 5 minutes)."
 
   # Value Pool Alerts (Monitoring)
-  - name: zebra-value-pools
+  - name: zakura-value-pools
     rules:
-      # Critical: Negative value pool would indicate a bug (should never happen - Zebra rejects such blocks)
+      # Critical: Negative value pool would indicate a bug (should never happen - Zakura rejects such blocks)
       - alert: ValuePoolNegative
         expr: state_finalized_value_pool_transparent < 0 or state_finalized_value_pool_sprout < 0 or state_finalized_value_pool_sapling < 0 or state_finalized_value_pool_orchard < 0
         for: 0m
@@ -70,7 +70,7 @@ groups:
           severity: critical
         annotations:
           summary: "Negative value pool detected"
-          description: "A pool has a negative balance in metrics. Zebra enforces ZIP-209 internally, so this should not occur in normal operation."
+          description: "A pool has a negative balance in metrics. Zakura enforces ZIP-209 internally, so this should not occur in normal operation."
 
       # Warning: Value pool not updating (may indicate sync issues)
       - alert: ValuePoolStale
@@ -116,7 +116,7 @@ groups:
           description: "More than 100 concurrent RPC requests for 2 minutes. Consider rate limiting."
 
   # Peer Health Alerts
-  - name: zebra-peer-health
+  - name: zakura-peer-health
     rules:
       # High handshake failure rate
       - alert: HandshakeFailureRateHigh

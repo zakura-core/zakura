@@ -33,7 +33,7 @@ pub struct SupervisorConfig {
     pub zcashd_datadir: PathBuf,
     /// Zebra's legacy P2P listen address, passed to zcashd as `-connect` so the
     /// sidecar peers only with the local Zebra node.
-    pub zebra_p2p_addr: SocketAddr,
+    pub zakura_p2p_addr: SocketAddr,
     /// Any extra user-provided arguments.
     pub extra_args: Vec<String>,
     /// Active Zebra network kind.
@@ -57,7 +57,7 @@ impl SupervisorConfig {
         zcashd_path: PathBuf,
         state_cache_dir: &Path,
         network: NetworkKind,
-        zebra_p2p_addr: SocketAddr,
+        zakura_p2p_addr: SocketAddr,
     ) -> Self {
         let extra_args = zcashd_compat.zcashd_extra_args.clone();
         let zcashd_datadir = resolve_zcashd_datadir_path(
@@ -68,7 +68,7 @@ impl SupervisorConfig {
         Self {
             zcashd_path,
             zcashd_datadir,
-            zebra_p2p_addr,
+            zakura_p2p_addr,
             extra_args,
             network,
             startup_delay: zcashd_compat.startup_delay,
@@ -115,7 +115,7 @@ impl SupervisorConfig {
         // single-valued command-line argument. Multi-valued peer-selection
         // options (-connect/-addnode/-seednode) accumulate instead, so
         // [`reject_peer_selection_extra_args`] refuses them at startup.
-        args.push(format!("-connect={}", self.zebra_p2p_addr));
+        args.push(format!("-connect={}", self.zakura_p2p_addr));
         args.push("-listen=0".to_string());
         args.push("-dnsseed=0".to_string());
         args.push("-listenonion=0".to_string());
@@ -222,7 +222,7 @@ pub async fn run(
         info!(
             path = %config.zcashd_path.display(),
             datadir = %config.zcashd_datadir.display(),
-            connect = %config.zebra_p2p_addr,
+            connect = %config.zakura_p2p_addr,
             "started zcashd-compat zcashd child"
         );
 
@@ -651,7 +651,7 @@ mod tests {
         SupervisorConfig {
             zcashd_path: PathBuf::from("zcashd"),
             zcashd_datadir: PathBuf::from("/tmp/zcashd-compat-datadir"),
-            zebra_p2p_addr: "127.0.0.1:18233".parse().expect("valid socket address"),
+            zakura_p2p_addr: "127.0.0.1:18233".parse().expect("valid socket address"),
             extra_args,
             network: NetworkKind::Regtest,
             startup_delay: Duration::from_secs(1),
@@ -663,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn command_args_pin_zcashd_to_zebra_p2p() {
+    fn command_args_pin_zcashd_to_zakura_p2p() {
         let config = test_supervisor_config(vec!["-debug=1".to_string()]);
 
         let args = config.command_args();

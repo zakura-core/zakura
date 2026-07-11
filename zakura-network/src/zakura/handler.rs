@@ -5511,7 +5511,7 @@ mod tests {
     #[tokio::test]
     async fn v2_p2p_false_leaves_header_sync_disabled() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
-        let config = Config::for_test(P2pStack::Zebra);
+        let config = Config::for_test(P2pStack::Legacy);
 
         let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
             Arc::new(NoopService) as Arc<dyn Service>

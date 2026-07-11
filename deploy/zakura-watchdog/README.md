@@ -1,6 +1,6 @@
 # Zakura Watchdog (`zakura-watchdog`)
 
-A standalone Rust watchdog sidecar that queries the local Zebra services and
+A standalone Rust watchdog sidecar that queries the local Zakura services and
 reports their status. It is deployed alongside `zakurad` as its own systemd
 service and reports check failures and recoveries to [Sentry](https://sentry.io).
 
@@ -45,13 +45,12 @@ The initial registry contains a single check:
 
 #### `zcashd_compat_sync`
 
-Mirrors the predicates of the legacy `deploy/zcashd-compat/sync-check.sh`:
+Mirrors the predicates of `deploy/zcashd-compat/sync-check.sh`:
 
 1. a `zakurad .*--zcashd-compat` process is running (`pgrep -f`),
 2. a `zcashd .*-connect` process is running (`pgrep -f`),
-3. zcashd `getzebracompatinfo` reports `service_state == "ready"`,
-   `zebra.reachable == true`, and `zebra.identity_verified == true`,
-4. `abs(zebra getblockcount - zcashd getblockcount) <= HEIGHT_MAX_DRIFT`.
+3. zcashd reports exactly one pinned peer,
+4. `abs(zakura getblockcount - zcashd getblockcount) <= HEIGHT_MAX_DRIFT`.
 
 RPC authentication uses the cookie files written by each node
 (`user:password` content, sent as HTTP basic auth).
@@ -69,15 +68,15 @@ transitions.
 ## Configuration
 
 All settings can be provided as CLI flags or environment variables. The
-environment variable names match the legacy sync-check script.
+environment variable names match the sync-check script.
 
 | Environment variable      | Flag                        | Default                               | Purpose |
 | ------------------------- | --------------------------- | ------------------------------------- | ------- |
-| `ZEBRA_RPC_URL`           | `--zakura-rpc-url`           | `http://127.0.0.1:8232`               | Zebra JSON-RPC endpoint |
-| `ZEBRA_COOKIE_FILE`       | `--zebra-cookie-file`       | `/root/.cache/zakura/.cookie`         | Zebra RPC cookie file |
+| `ZAKURA_RPC_URL`          | `--zakura-rpc-url`           | `http://127.0.0.1:8232`               | Zakura JSON-RPC endpoint |
+| `ZAKURA_COOKIE_FILE`      | `--zakura-cookie-file`       | `/root/.cache/zakura/.cookie`         | Zakura RPC cookie file |
 | `ZCASHD_RPC_URL`          | `--zcashd-rpc-url`          | `http://[::1]:8232`                   | zcashd JSON-RPC endpoint |
 | `ZCASHD_COOKIE_FILE`      | `--zcashd-cookie-file`      | `/mnt/snapshots/runtime/zcashd/.cookie` | zcashd RPC cookie file |
-| `ZEBRAD_PROCESS_PATTERN`  | `--zakurad-process-pattern`  | `zakurad .*--zcashd-compat`            | `pgrep -f` pattern for zakurad |
+| `ZAKURAD_PROCESS_PATTERN` | `--zakurad-process-pattern`  | `zakurad .*--zcashd-compat`            | `pgrep -f` pattern for zakurad |
 | `ZCASHD_PROCESS_PATTERN`  | `--zcashd-process-pattern`  | `zcashd .*-connect`              | `pgrep -f` pattern for zcashd |
 | `HEIGHT_MAX_DRIFT`        | `--height-max-drift`        | `10`                                  | Max allowed height drift |
 | `SYNC_CHECK_TIMEOUT`      | `--sync-check-timeout`      | `600`                                 | One-shot `check` total timeout (seconds) |
@@ -163,7 +162,7 @@ Or against custom endpoints:
 ```bash
 zakura-watchdog check \
   --zakura-rpc-url http://127.0.0.1:8232 \
-  --zebra-cookie-file /root/.cache/zakura/.cookie \
+  --zakura-cookie-file /root/.cache/zakura/.cookie \
   --height-max-drift 10
 ```
 

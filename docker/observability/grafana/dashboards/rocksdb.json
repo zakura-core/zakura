@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "RocksDB database metrics for Zebra",
+  "description": "RocksDB database metrics for Zakura",
   "editable": true,
   "gnetId": null,
   "graphTooltip": 0,
@@ -22,7 +22,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -96,7 +96,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "zakura_state_rocksdb_total_disk_size_bytes{job=~\"$job\"}",
           "legendFormat": "Total Disk Size",
@@ -105,7 +105,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "zakura_state_rocksdb_live_data_size_bytes{job=~\"$job\"}",
           "legendFormat": "Live Data Size",
@@ -118,7 +118,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -192,7 +192,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "zakura_state_rocksdb_total_memory_size_bytes{job=~\"$job\"}",
           "legendFormat": "Total Memory Size",
@@ -205,7 +205,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -281,7 +281,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "topk(10, zakura_state_rocksdb_cf_disk_size_bytes{job=~\"$job\"})",
           "legendFormat": "{{cf}}",
@@ -294,7 +294,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -370,7 +370,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "topk(10, zakura_state_rocksdb_cf_memory_size_bytes{job=~\"$job\"})",
           "legendFormat": "{{cf}}",
@@ -383,7 +383,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -428,7 +428,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "zakura_state_rocksdb_total_disk_size_bytes{job=~\"$job\"}",
           "legendFormat": "Total Disk",
@@ -441,7 +441,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -494,7 +494,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "zakura_state_rocksdb_live_data_size_bytes{job=~\"$job\"}",
           "legendFormat": "Live Data",
@@ -507,7 +507,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -559,7 +559,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "zakura_state_rocksdb_total_memory_size_bytes{job=~\"$job\"}",
           "legendFormat": "Memory",
@@ -572,7 +572,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -625,7 +625,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "zakura_state_rocksdb_live_data_size_bytes{job=~\"$job\"} / zakura_state_rocksdb_total_disk_size_bytes{job=~\"$job\"}",
           "legendFormat": "Compaction Efficiency",
@@ -644,7 +644,7 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "RocksDB batch commit latency percentiles (p95, p99)",
       "fieldConfig": {
         "defaults": {
@@ -689,13 +689,13 @@
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "zakura_state_rocksdb_batch_commit_duration_seconds{job=~\"$job\", quantile=\"0.95\"}",
           "legendFormat": "p95",
           "refId": "A"
         },
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "zakura_state_rocksdb_batch_commit_duration_seconds{job=~\"$job\", quantile=\"0.99\"}",
           "legendFormat": "p99",
           "refId": "B"
@@ -705,7 +705,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Block cache memory usage",
       "fieldConfig": {
         "defaults": {
@@ -743,7 +743,7 @@
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "zakura_state_rocksdb_block_cache_usage_bytes{job=~\"$job\"}",
           "legendFormat": "Block Cache",
           "refId": "A"
@@ -761,7 +761,7 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Compaction status - pending bytes and running compactions",
       "fieldConfig": {
         "defaults": {
@@ -807,13 +807,13 @@
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "zakura_state_rocksdb_compaction_pending_bytes{job=~\"$job\"}",
           "legendFormat": "Pending Bytes",
           "refId": "A"
         },
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "zakura_state_rocksdb_compaction_running{job=~\"$job\"}",
           "legendFormat": "Running Compactions",
           "refId": "B"
@@ -823,7 +823,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Number of SST files at each RocksDB level (L0-L6)",
       "fieldConfig": {
         "defaults": {
@@ -861,7 +861,7 @@
       },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "zakura_state_rocksdb_num_files_at_level{job=~\"$job\"}",
           "legendFormat": "Level {{level}}",
           "refId": "A"
@@ -886,7 +886,7 @@
         },
         "datasource": {
           "type": "prometheus",
-          "uid": "zebra-prometheus"
+          "uid": "zakura-prometheus"
         },
         "definition": "label_values(zakura_state_rocksdb_total_disk_size_bytes, job)",
         "description": null,
@@ -920,6 +920,6 @@
   "timepicker": {},
   "timezone": "",
   "title": "RocksDB Database",
-  "uid": "zebra-rocksdb",
+  "uid": "zakura-rocksdb",
   "version": 1
 }

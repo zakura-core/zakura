@@ -1,4 +1,4 @@
-//! Configuration for Zebra's network communication.
+//! Configuration for Zakura's network communication.
 
 use std::{
     collections::HashSet,
@@ -90,10 +90,10 @@ pub enum ZakuraSecretKeyError {
     InvalidConfigured,
 }
 
-/// The number of times Zebra will retry each initial peer's DNS resolution,
+/// The number of times Zakura will retry each initial peer's DNS resolution,
 /// before checking if any other initial peers have returned addresses.
 ///
-/// After doing this number of retries of a failed single peer, Zebra will
+/// After doing this number of retries of a failed single peer, Zakura will
 /// check if it has enough peer addresses from other seed peers. If it has
 /// enough addresses, it won't retry this peer again.
 ///
@@ -101,10 +101,7 @@ pub enum ZakuraSecretKeyError {
 /// or failed DNS attempt.
 const MAX_SINGLE_SEED_PEER_DNS_RETRIES: usize = 0;
 
-/// The peer-to-peer stack Zebra runs, selected by `network.p2p_stack` in `zakurad.toml`.
-///
-/// Each stack has one canonical name and, for readability, some aliases. Only the canonical
-/// name is written back out when a config is serialized.
+/// The peer-to-peer stack Zakura runs, selected by `network.p2p_stack` in `zakurad.toml`.
 ///
 /// [`P2pStack::Default`] is a placeholder for the configured network's binary default; it is
 /// turned into one of the three real stacks by [`P2pStack::resolve`].
@@ -116,16 +113,13 @@ pub enum P2pStack {
     Default,
 
     /// The legacy TCP Zcash P2P stack only.
-    #[serde(alias = "v1", alias = "legacy")]
-    Zebra,
+    Legacy,
 
     /// The native Zakura P2P v2 stack only.
-    #[serde(alias = "v2")]
     Zakura,
 
     /// Both stacks: mutually capable peers are upgraded to Zakura P2P v2, and the legacy
     /// stack stays available for peers that can't upgrade.
-    #[serde(alias = "combined")]
     Dual,
 }
 
@@ -133,12 +127,12 @@ impl P2pStack {
     /// Resolves [`P2pStack::Default`] to the binary default for `network`, and returns every
     /// other stack unchanged.
     ///
-    /// Mainnet defaults to [`P2pStack::Zebra`] until Zakura P2P v2 is proven there. Every other
+    /// Mainnet defaults to [`P2pStack::Legacy`] until Zakura P2P v2 is proven there. Every other
     /// network defaults to [`P2pStack::Dual`], so Zakura P2P v2 gets exercised while legacy
     /// peers stay reachable.
     pub fn resolve(self, network: &Network) -> P2pStack {
         match self {
-            P2pStack::Default if matches!(network, Network::Mainnet) => P2pStack::Zebra,
+            P2pStack::Default if matches!(network, Network::Mainnet) => P2pStack::Legacy,
             P2pStack::Default => P2pStack::Dual,
             resolved => resolved,
         }
@@ -148,7 +142,7 @@ impl P2pStack {
     ///
     /// [`P2pStack::Default`] runs neither stack: resolve it with [`P2pStack::resolve`] first.
     fn runs_legacy(self) -> bool {
-        matches!(self, P2pStack::Zebra | P2pStack::Dual)
+        matches!(self, P2pStack::Legacy | P2pStack::Dual)
     }
 
     /// Returns `true` if this stack runs the native Zakura P2P v2 endpoint.
@@ -166,30 +160,30 @@ pub struct Config {
     /// The address on which this node should listen for connections.
     ///
     /// Can be `address:port` or just `address`. If there is no configured
-    /// port, Zebra will use the default port for the configured `network`.
+    /// port, Zakura will use the default port for the configured `network`.
     ///
     /// `address` can be an IP address or a DNS name. DNS names are
-    /// only resolved once, when Zebra starts up.
+    /// only resolved once, when Zakura starts up.
     ///
-    /// By default, Zebra listens on `[::]` (all IPv6 and IPv4 addresses).
+    /// By default, Zakura listens on `[::]` (all IPv6 and IPv4 addresses).
     /// This enables dual-stack support, accepting both IPv4 and IPv6 connections.
     ///
-    /// If a specific listener address is configured, Zebra will advertise
-    /// it to other nodes. But by default, Zebra uses an unspecified address
+    /// If a specific listener address is configured, Zakura will advertise
+    /// it to other nodes. But by default, Zakura uses an unspecified address
     /// ("\[::\]:port"), which is not advertised to other nodes.
     ///
-    /// Zebra does not currently support:
+    /// Zakura does not currently support:
     /// - [Advertising a different external IP address #1890](https://github.com/ZcashFoundation/zebra/issues/1890), or
     /// - [Auto-discovering its own external IP address #1893](https://github.com/ZcashFoundation/zebra/issues/1893).
     ///
-    /// However, other Zebra instances compensate for unspecified or incorrect
+    /// However, other Zakura instances compensate for unspecified or incorrect
     /// listener addresses by adding the external IP addresses of peers to
     /// their address books.
     pub listen_addr: SocketAddr,
 
     /// The external address of this node if any.
     ///
-    /// Zebra bind to `listen_addr` but this can be an internal address if the node
+    /// Zakura binds to `listen_addr`, but this can be an internal address if the node
     /// is behind a firewall, load balancer or NAT. This field can be used to
     /// advertise a different address to peers making it possible to receive inbound
     /// connections and contribute to the P2P network from behind a firewall, load balancer, or NAT.
@@ -215,7 +209,7 @@ pub struct Config {
     /// - `false` to disable reading and writing peer addresses to disk,
     /// - `'/custom/cache/directory'` to read and write peer addresses to a custom directory.
     ///
-    /// By default, all Zebra instances run by the same user will share a single peer cache.
+    /// By default, all Zakura instances run by the same user will share a single peer cache.
     /// If you use a custom cache path, you might also want to change `state.cache_dir`.
     ///
     /// # Functionality
@@ -229,7 +223,7 @@ pub struct Config {
     /// - reliability: if DNS or the Zcash DNS seeders are unavailable or broken
     /// - security: if DNS is compromised with malicious peers
     ///
-    /// If you delete it, Zebra will replace it with a fresh set of peers from the DNS seeders.
+    /// If you delete it, Zakura will replace it with a fresh set of peers from the DNS seeders.
     ///
     /// # Defaults
     ///
@@ -245,8 +239,8 @@ pub struct Config {
     ///
     /// # Security
     ///
-    /// If you are running Zebra with elevated permissions ("root"), create the
-    /// directory for this file before running Zebra, and make sure the Zebra user
+    /// If you are running Zakura with elevated permissions ("root"), create the
+    /// directory for this file before running Zakura, and make sure the Zakura user
     /// account has exclusive access to that directory, and other users can't modify
     /// its parent directories.
     ///
@@ -274,22 +268,22 @@ pub struct Config {
     ///
     /// This is reserved for Zakura endpoint construction. If unset, a future Zakura endpoint
     /// implementation will generate an ed25519 iroh [`SecretKey`] on first use
-    /// and persist it under [`identity_dir`](Self::identity_dir), outside Zebra's
+    /// and persist it under [`identity_dir`](Self::identity_dir), outside Zakura's
     /// cache and state directories by default.
     ///
     /// This value is not used by the legacy TCP peer set.
     pub zakura_node_secret_key: Option<ZakuraNodeSecretKey>,
 
-    /// The peer-to-peer stack Zebra runs.
+    /// The peer-to-peer stack Zakura runs.
     ///
-    /// | `zakurad.toml` value | Aliases | Stack |
-    /// |---|---|---|
-    /// | `"default"` | | The configured network's binary default |
-    /// | `"zebra"` | `"v1"`, `"legacy"` | The legacy TCP Zcash P2P stack only |
-    /// | `"zakura"` | `"v2"` | The native Zakura P2P v2 stack only |
-    /// | `"dual"` | `"combined"` | Both stacks, with legacy fallback |
+    /// | `zakura.toml` value | Stack |
+    /// |---|---|
+    /// | `"default"` | The configured network's binary default |
+    /// | `"legacy"` | The legacy TCP Zcash P2P stack only |
+    /// | `"zakura"` | The native Zakura P2P v2 stack only |
+    /// | `"dual"` | Both stacks, with legacy fallback |
     ///
-    /// Leave this at `"default"` so Zebra can change the per-network default during upgrades.
+    /// Leave this at `"default"` so Zakura can change the per-network default during upgrades.
     /// See [`P2pStack::resolve`] for the current defaults, and [`legacy_p2p`](Self::legacy_p2p)
     /// and [`v2_p2p`](Self::v2_p2p) for the resolved stack.
     pub p2p_stack: P2pStack,
@@ -303,25 +297,25 @@ pub struct Config {
 
     /// The initial target size for the peer set.
     ///
-    /// Also used to limit the number of inbound and outbound connections made by Zebra,
+    /// Also used to limit the number of inbound and outbound connections made by Zakura,
     /// and the size of the cached peer list.
     ///
-    /// If you have a slow network connection, and Zebra is having trouble
+    /// If you have a slow network connection, and Zakura is having trouble
     /// syncing, try reducing the peer set size. You can also reduce the peer
-    /// set size to reduce Zebra's bandwidth usage.
+    /// set size to reduce Zakura's bandwidth usage.
     pub peerset_initial_target_size: usize,
 
     /// How frequently we attempt to crawl the network to discover new peer
     /// addresses.
     ///
-    /// Zebra asks its connected peers for more peer addresses:
+    /// Zakura asks its connected peers for more peer addresses:
     /// - regularly, every time `crawl_new_peer_interval` elapses, and
     /// - if the peer set is busy, and there aren't any peer addresses for the
     ///   next connection attempt.
     #[serde(with = "humantime_serde")]
     pub crawl_new_peer_interval: Duration,
 
-    /// The maximum number of legacy TCP peer connections Zebra will keep for a given IP address
+    /// The maximum number of legacy TCP peer connections Zakura will keep for a given IP address
     /// before it drops any additional legacy peer connections with that IP.
     ///
     /// The default and minimum value are 1.
@@ -330,23 +324,23 @@ pub struct Config {
     ///
     /// # Security
     ///
-    /// Increasing this config above 1 reduces Zebra's network security.
+    /// Increasing this config above 1 reduces Zakura's network security.
     ///
-    /// If this config is greater than 1, Zebra can initiate multiple outbound handshakes to the same
+    /// If this config is greater than 1, Zakura can initiate multiple outbound handshakes to the same
     /// IP address.
     ///
-    /// This config does not currently limit the number of inbound connections that Zebra will accept
+    /// This config does not currently limit the number of inbound connections that Zakura will accept
     /// from the same IP address.
     ///
-    /// If Zebra makes multiple inbound or outbound connections to the same IP, they will be dropped
+    /// If Zakura makes multiple inbound or outbound connections to the same IP, they will be dropped
     /// after the handshake, but before adding them to the peer set. The total numbers of inbound and
     /// outbound connections are also limited to a multiple of `peerset_initial_target_size`.
     pub max_connections_per_ip: usize,
 }
 
 impl Config {
-    /// The maximum number of outbound connections that Zebra will open at the same time.
-    /// When this limit is reached, Zebra stops opening outbound connections.
+    /// The maximum number of outbound connections that Zakura will open at the same time.
+    /// When this limit is reached, Zakura stops opening outbound connections.
     ///
     /// # Security
     ///
@@ -354,26 +348,26 @@ impl Config {
     ///
     /// # Performance
     ///
-    /// Zebra's peer set should be limited to a reasonable size,
+    /// Zakura's peer set should be limited to a reasonable size,
     /// to avoid queueing too many in-flight block downloads.
     /// A large queue of in-flight block downloads can choke a
     /// constrained local network connection.
     ///
-    /// We assume that Zebra nodes have at least 10 Mbps bandwidth.
+    /// We assume that Zakura nodes have at least 10 Mbps bandwidth.
     /// Therefore, a maximum-sized block can take up to 2 seconds to
     /// download. So the initial outbound peer set adds up to 100 seconds worth
-    /// of blocks to the queue. If Zebra has reached its outbound peer limit,
+    /// of blocks to the queue. If Zakura has reached its outbound peer limit,
     /// that adds an extra 200 seconds of queued blocks.
     ///
     /// But the peer set for slow nodes is typically much smaller, due to
-    /// the handshake RTT timeout. And Zebra responds to inbound request
+    /// the handshake RTT timeout. And Zakura responds to inbound request
     /// overloads by dropping peer connections.
     pub fn peerset_outbound_connection_limit(&self) -> usize {
         self.peerset_initial_target_size * OUTBOUND_PEER_LIMIT_MULTIPLIER
     }
 
-    /// The maximum number of inbound connections that Zebra will accept at the same time.
-    /// When this limit is reached, Zebra drops new inbound connections,
+    /// The maximum number of inbound connections that Zakura will accept at the same time.
+    /// When this limit is reached, Zakura drops new inbound connections,
     /// without handshaking on them.
     ///
     /// # Security
@@ -383,7 +377,7 @@ impl Config {
         self.peerset_initial_target_size * INBOUND_PEER_LIMIT_MULTIPLIER
     }
 
-    /// The maximum number of inbound and outbound connections that Zebra will have
+    /// The maximum number of inbound and outbound connections that Zakura will have
     /// at the same time.
     pub fn peerset_total_connection_limit(&self) -> usize {
         self.peerset_outbound_connection_limit() + self.peerset_inbound_connection_limit()
@@ -433,9 +427,9 @@ impl Config {
         if peers.is_empty() {
             warn!(
                 "no initial peers in the network config. \
-                 Hint: you must configure at least one peer IP or DNS seeder to run Zebra, \
+                 Hint: you must configure at least one peer IP or DNS seeder to run Zakura, \
                  give it some previously cached peer IP addresses on disk, \
-                 or make sure Zebra's listener port gets inbound connections."
+                 or make sure Zakura's listener port gets inbound connections."
             );
             return HashSet::new();
         }
@@ -443,7 +437,7 @@ impl Config {
         loop {
             // We retry each peer individually, as well as retrying if there are
             // no peers in the combined list. DNS failures are correlated, so all
-            // peers can fail DNS, leaving Zebra with a small list of custom IP
+            // peers can fail DNS, leaving Zakura with a small list of custom IP
             // address peers. Individual retries avoid this issue.
             let peer_addresses = peers
                 .iter()
@@ -540,7 +534,7 @@ impl Config {
             Ok(Err(e)) if e.kind() == ErrorKind::InvalidInput => {
                 // TODO: add testnet/mainnet ports, like we do with the listener address
                 panic!(
-                    "Invalid peer IP address in Zebra config: addresses must have ports:\n\
+                    "Invalid peer IP address in Zakura config: addresses must have ports:\n\
                      resolving {host:?} returned {e:?}"
                 );
             }
@@ -564,7 +558,7 @@ impl Config {
         let peer_list = match fs::read_to_string(&peer_cache_file).await {
             Ok(peer_list) => peer_list,
             Err(peer_list_error) => {
-                // We expect that the cache will be missing for new Zebra installs
+                // We expect that the cache will be missing for new Zakura installs
                 if peer_list_error.kind() == ErrorKind::NotFound {
                     return Ok(HashSet::new());
                 } else {
@@ -630,7 +624,7 @@ impl Config {
     ///
     /// Also creates the peer cache directory, if it doesn't already exist.
     ///
-    /// Atomic writes avoid corrupting the cache if Zebra panics or crashes, or if multiple Zebra
+    /// Atomic writes avoid corrupting the cache if Zakura panics or crashes, or if multiple Zakura
     /// instances try to read and write the same cache file.
     pub async fn update_peer_cache(&self, peer_list: HashSet<PeerSocketAddr>) -> io::Result<()> {
         let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(&self.network) else {
@@ -659,7 +653,7 @@ impl Config {
         // Make a newline-separated list
         let peer_data = peer_list.join("\n");
 
-        // Write the peer cache file atomically so the cache is not corrupted if Zebra shuts down
+        // Write the peer cache file atomically so the cache is not corrupted if Zakura shuts down
         // or crashes.
         let span = Span::current();
         let write_result = tokio::task::spawn_blocking(move || {
@@ -722,13 +716,13 @@ impl Config {
         Ok(load_or_generate_zakura_secret_key(&key_file))
     }
 
-    /// Returns `true` if Zebra should run the legacy TCP Zcash P2P listener, initial peer
+    /// Returns `true` if Zakura should run the legacy TCP Zcash P2P listener, initial peer
     /// dialing, and peer crawler on the configured network.
     pub fn legacy_p2p(&self) -> bool {
         self.p2p_stack.resolve(&self.network).runs_legacy()
     }
 
-    /// Returns `true` if Zebra should run the native Zakura P2P v2 endpoint on the configured
+    /// Returns `true` if Zakura should run the native Zakura P2P v2 endpoint on the configured
     /// network, advertise the P2P v2 service bit during the legacy Zcash handshake, and route
     /// mutually capable peers to the Zakura upgrade hook.
     pub fn v2_p2p(&self) -> bool {
@@ -871,7 +865,7 @@ impl Default for Config {
             // The default peerset target size should be large enough to ensure
             // nodes have a reliable set of peers.
             //
-            // But Zebra should only make a small number of initial outbound connections,
+            // But Zakura should only make a small number of initial outbound connections,
             // so that idle peers don't use too many connection slots.
             peerset_initial_target_size: DEFAULT_PEERSET_INITIAL_TARGET_SIZE,
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
@@ -880,14 +874,10 @@ impl Default for Config {
 }
 
 /// Maps the deprecated `legacy_p2p` and `v2_p2p` booleans onto a [`P2pStack`], so configs
-/// written for older releases keep loading under `deny_unknown_fields`.
+/// written before `p2p_stack` keep loading.
 ///
 /// Setting `p2p_stack` alongside either deprecated field is rejected rather than resolved by
-/// precedence: the two spellings can disagree, and silently picking a winner would start a
-/// stack the operator didn't ask for.
-///
-/// A deprecated field that is absent falls back to the default it had in the releases that
-/// understood these fields, which is `true` for both.
+/// precedence, because the settings can contradict each other.
 fn p2p_stack_from_config<'de, D>(
     p2p_stack: Option<P2pStack>,
     legacy_p2p: Option<bool>,
@@ -908,7 +898,7 @@ where
 
         (None, legacy_p2p, v2_p2p) => match (legacy_p2p.unwrap_or(true), v2_p2p.unwrap_or(true)) {
             (true, true) => Ok(P2pStack::Dual),
-            (true, false) => Ok(P2pStack::Zebra),
+            (true, false) => Ok(P2pStack::Legacy),
             (false, true) => Ok(P2pStack::Zakura),
             (false, false) => Err(de::Error::custom(
                 "network.legacy_p2p and network.v2_p2p are both false, which disables all \
@@ -1195,7 +1185,7 @@ impl<'de> Deserialize<'de> for Config {
 
         let [max_connections_per_ip, peerset_initial_target_size] = [
             ("max_connections_per_ip", max_connections_per_ip, DEFAULT_MAX_CONNS_PER_IP),
-            // If we want Zebra to operate with no network,
+            // If we want Zakura to operate with no network,
             // we should implement a `zakurad` command that doesn't use `zakura-network`.
             ("peerset_initial_target_size", Some(peerset_initial_target_size), DEFAULT_PEERSET_INITIAL_TARGET_SIZE)
         ].map(|(field_name, non_zero_config_field, default_config_value)| {

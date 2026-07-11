@@ -25,8 +25,6 @@
 #      - ZAKURA_TRACING__FILTER=debug
 #      - ZAKURA_METRICS__ENDPOINT_ADDR=0.0.0.0:9999
 #
-#    Deprecated ZEBRA_ environment variables are still accepted as a lower-precedence fallback.
-#
 # 2. Configuration file (TOML format)
 #    - At the path specified via -c flag, e.g. `zakurad -c myconfig.toml start`, or
 #    - At the default path in the user's preference directory (platform-dependent, see below)

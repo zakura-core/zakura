@@ -11,23 +11,23 @@ use clap::Args;
 /// Configuration shared by all watchdog checks and run modes.
 #[derive(Args, Clone, Debug)]
 pub struct Config {
-    /// Zebra JSON-RPC endpoint URL.
+    /// Zakura JSON-RPC endpoint URL.
     #[arg(
         long,
         global = true,
-        env = "ZEBRA_RPC_URL",
+        env = "ZAKURA_RPC_URL",
         default_value = "http://127.0.0.1:8232"
     )]
     pub zakura_rpc_url: String,
 
-    /// Path to the Zebra RPC cookie file.
+    /// Path to the Zakura RPC cookie file.
     #[arg(
         global = true,
         long,
-        env = "ZEBRA_COOKIE_FILE",
+        env = "ZAKURA_COOKIE_FILE",
         default_value = "/root/.cache/zakura/.cookie"
     )]
-    pub zebra_cookie_file: PathBuf,
+    pub zakura_cookie_file: PathBuf,
 
     /// zcashd JSON-RPC endpoint URL.
     #[arg(
@@ -51,7 +51,7 @@ pub struct Config {
     #[arg(
         global = true,
         long,
-        env = "ZEBRAD_PROCESS_PATTERN",
+        env = "ZAKURAD_PROCESS_PATTERN",
         default_value = "zakurad .*--zcashd-compat"
     )]
     pub zakurad_process_pattern: String,
@@ -59,7 +59,7 @@ pub struct Config {
     /// `pgrep -f` pattern that must match a running zcashd process.
     ///
     /// The P2P sidecar zcashd is pinned to the local Zakura node with `-connect`
-    /// and no longer takes the legacy RPC-ingest `-zebra-compat` flag, so match
+    /// and no longer takes the retired RPC-ingest compatibility flag, so match
     /// on `-connect` (mirroring `deploy/zcashd-compat/sync-check.sh`).
     #[arg(
         global = true,

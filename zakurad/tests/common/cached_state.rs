@@ -233,7 +233,7 @@ pub async fn raw_future_blocks(
     let mut raw_blocks = Vec::with_capacity(max_num_blocks as usize);
 
     assert!(
-        test_type.needs_zebra_cached_state() && test_type.needs_zakura_rpc_server(),
+        test_type.needs_zakura_cached_state() && test_type.needs_zakura_rpc_server(),
         "raw_future_blocks needs zebra cached state and rpc server"
     );
 

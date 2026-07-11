@@ -46,14 +46,14 @@ const MIN_RAM_BYTES: u64 = 16 * GIB;
 const RECOMMENDED_RAM_BYTES: u64 = 32 * GIB;
 
 #[cfg(target_os = "linux")]
-const MAINNET_MIN_ZEBRA_PROVISIONED_BYTES: u64 = 275 * GIB;
+const MAINNET_MIN_ZAKURA_PROVISIONED_BYTES: u64 = 275 * GIB;
 #[cfg(target_os = "linux")]
 const MAINNET_MIN_ZCASHD_PROVISIONED_BYTES: u64 = 275 * GIB;
 #[cfg(target_os = "linux")]
 const MAINNET_RECOMMENDED_COMBINED_TOTAL_BYTES: u64 = TIB;
 
 #[cfg(target_os = "linux")]
-const TESTNET_MIN_ZEBRA_PROVISIONED_BYTES: u64 = 30 * GIB;
+const TESTNET_MIN_ZAKURA_PROVISIONED_BYTES: u64 = 30 * GIB;
 #[cfg(target_os = "linux")]
 const TESTNET_MIN_ZCASHD_PROVISIONED_BYTES: u64 = 30 * GIB;
 #[cfg(target_os = "linux")]
@@ -91,7 +91,7 @@ pub fn run_preflight(
 #[cfg(target_os = "linux")]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 enum DiskRole {
-    ZebraState,
+    ZakuraState,
     ZcashdData,
 }
 
@@ -99,7 +99,7 @@ enum DiskRole {
 impl DiskRole {
     fn label(self) -> &'static str {
         match self {
-            DiskRole::ZebraState => "zebra state",
+            DiskRole::ZakuraState => "zakura state",
             DiskRole::ZcashdData => "zcashd datadir",
         }
     }
@@ -116,7 +116,7 @@ struct PathRequirement {
 #[cfg(target_os = "linux")]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct DiskThresholds {
-    min_zebra_bytes: u64,
+    min_zakura_bytes: u64,
     min_zcashd_bytes: u64,
     recommended_combined_bytes: u64,
 }
@@ -124,7 +124,7 @@ struct DiskThresholds {
 #[cfg(target_os = "linux")]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 enum PermissionRole {
-    ZebraState,
+    ZakuraState,
     ZcashdDatadir,
     ZcashdConf,
     ManagedZcashdCache,
@@ -134,7 +134,7 @@ enum PermissionRole {
 impl PermissionRole {
     fn label(self) -> &'static str {
         match self {
-            PermissionRole::ZebraState => "zakura state directory",
+            PermissionRole::ZakuraState => "zakura state directory",
             PermissionRole::ZcashdDatadir => "zcashd datadir",
             PermissionRole::ZcashdConf => "zcashd config directory",
             PermissionRole::ManagedZcashdCache => "embedded zcashd cache directory",
@@ -210,12 +210,12 @@ fn run_linux_preflight(config: &ZakuradConfig, unsafe_low_specs: bool) -> Result
 fn disk_thresholds(network: &Network) -> DiskThresholds {
     match network.kind() {
         NetworkKind::Mainnet => DiskThresholds {
-            min_zebra_bytes: MAINNET_MIN_ZEBRA_PROVISIONED_BYTES,
+            min_zakura_bytes: MAINNET_MIN_ZAKURA_PROVISIONED_BYTES,
             min_zcashd_bytes: MAINNET_MIN_ZCASHD_PROVISIONED_BYTES,
             recommended_combined_bytes: MAINNET_RECOMMENDED_COMBINED_TOTAL_BYTES,
         },
         NetworkKind::Testnet | NetworkKind::Regtest => DiskThresholds {
-            min_zebra_bytes: TESTNET_MIN_ZEBRA_PROVISIONED_BYTES,
+            min_zakura_bytes: TESTNET_MIN_ZAKURA_PROVISIONED_BYTES,
             min_zcashd_bytes: TESTNET_MIN_ZCASHD_PROVISIONED_BYTES,
             recommended_combined_bytes: TESTNET_RECOMMENDED_COMBINED_TOTAL_BYTES,
         },
@@ -254,7 +254,7 @@ fn check_permissions(
     zcashd_datadir: &Path,
 ) -> Result<(), Report> {
     let mut requirements = vec![WriteRequirement {
-        role: PermissionRole::ZebraState,
+        role: PermissionRole::ZakuraState,
         target_path: config.state.cache_dir.clone(),
     }];
 
@@ -516,15 +516,15 @@ fn check_memory(summary: &mut PreflightSummary) -> Result<(), Report> {
 fn check_disk(
     summary: &mut PreflightSummary,
     network: &Network,
-    zebra_cache_dir: &Path,
+    zakura_cache_dir: &Path,
     zcashd_datadir: &Path,
 ) -> Result<(), Report> {
     let thresholds = disk_thresholds(network);
     let requirements = vec![
         PathRequirement {
-            role: DiskRole::ZebraState,
-            target_path: zebra_cache_dir.to_path_buf(),
-            min_provisioned_bytes: thresholds.min_zebra_bytes,
+            role: DiskRole::ZakuraState,
+            target_path: zakura_cache_dir.to_path_buf(),
+            min_provisioned_bytes: thresholds.min_zakura_bytes,
         },
         PathRequirement {
             role: DiskRole::ZcashdData,
@@ -855,7 +855,7 @@ mod tests {
         assert_eq!(
             disk_thresholds(&Network::Mainnet),
             DiskThresholds {
-                min_zebra_bytes: 275 * GIB,
+                min_zakura_bytes: 275 * GIB,
                 min_zcashd_bytes: 275 * GIB,
                 recommended_combined_bytes: TIB,
             }
@@ -868,7 +868,7 @@ mod tests {
         assert_eq!(
             disk_thresholds(&Network::new_default_testnet()),
             DiskThresholds {
-                min_zebra_bytes: 30 * GIB,
+                min_zakura_bytes: 30 * GIB,
                 min_zcashd_bytes: 30 * GIB,
                 recommended_combined_bytes: 100 * GIB,
             }
@@ -880,9 +880,9 @@ mod tests {
     fn merges_provisioned_requirement_when_paths_share_filesystem() {
         let requirements = vec![
             PathRequirement {
-                role: DiskRole::ZebraState,
+                role: DiskRole::ZakuraState,
                 target_path: PathBuf::from("/tmp"),
-                min_provisioned_bytes: MAINNET_MIN_ZEBRA_PROVISIONED_BYTES,
+                min_provisioned_bytes: MAINNET_MIN_ZAKURA_PROVISIONED_BYTES,
             },
             PathRequirement {
                 role: DiskRole::ZcashdData,
@@ -897,7 +897,7 @@ mod tests {
 
         assert_eq!(
             filesystem.min_provisioned_sum_bytes,
-            MAINNET_MIN_ZEBRA_PROVISIONED_BYTES + MAINNET_MIN_ZCASHD_PROVISIONED_BYTES
+            MAINNET_MIN_ZAKURA_PROVISIONED_BYTES + MAINNET_MIN_ZCASHD_PROVISIONED_BYTES
         );
     }
 
@@ -966,9 +966,9 @@ mod tests {
         grouped.insert(
             1,
             FilesystemRequirements {
-                roles: vec![DiskRole::ZebraState, DiskRole::ZcashdData],
-                target_paths: vec!["/zebra".into(), "/zcashd".into()],
-                min_provisioned_sum_bytes: MAINNET_MIN_ZEBRA_PROVISIONED_BYTES
+                roles: vec![DiskRole::ZakuraState, DiskRole::ZcashdData],
+                target_paths: vec!["/zakura".into(), "/zcashd".into()],
+                min_provisioned_sum_bytes: MAINNET_MIN_ZAKURA_PROVISIONED_BYTES
                     + MAINNET_MIN_ZCASHD_PROVISIONED_BYTES,
                 provisioned_bytes: 400 * GIB,
             },
@@ -999,9 +999,9 @@ mod tests {
         grouped.insert(
             1,
             FilesystemRequirements {
-                roles: vec![DiskRole::ZebraState, DiskRole::ZcashdData],
-                target_paths: vec!["/zebra".into(), "/zcashd".into()],
-                min_provisioned_sum_bytes: TESTNET_MIN_ZEBRA_PROVISIONED_BYTES
+                roles: vec![DiskRole::ZakuraState, DiskRole::ZcashdData],
+                target_paths: vec!["/zakura".into(), "/zcashd".into()],
+                min_provisioned_sum_bytes: TESTNET_MIN_ZAKURA_PROVISIONED_BYTES
                     + TESTNET_MIN_ZCASHD_PROVISIONED_BYTES,
                 provisioned_bytes: 50 * GIB,
             },
@@ -1032,9 +1032,9 @@ mod tests {
         grouped.insert(
             1,
             FilesystemRequirements {
-                roles: vec![DiskRole::ZebraState, DiskRole::ZcashdData],
-                target_paths: vec!["/zebra".into(), "/zcashd".into()],
-                min_provisioned_sum_bytes: TESTNET_MIN_ZEBRA_PROVISIONED_BYTES
+                roles: vec![DiskRole::ZakuraState, DiskRole::ZcashdData],
+                target_paths: vec!["/zakura".into(), "/zcashd".into()],
+                min_provisioned_sum_bytes: TESTNET_MIN_ZAKURA_PROVISIONED_BYTES
                     + TESTNET_MIN_ZCASHD_PROVISIONED_BYTES,
                 provisioned_bytes: 80 * GIB,
             },

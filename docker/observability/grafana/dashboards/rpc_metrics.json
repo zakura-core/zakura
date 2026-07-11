@@ -29,7 +29,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -82,7 +82,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "rpc_active_requests",
           "legendFormat": "Active Requests",
@@ -95,7 +95,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -140,7 +140,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sum(rate(rpc_requests_total[5m]))",
           "legendFormat": "Requests/s",
@@ -153,7 +153,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -206,7 +206,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sum(rate(rpc_requests_total{status=\"error\"}[5m])) / sum(rate(rpc_requests_total[5m]))",
           "legendFormat": "Error Rate",
@@ -219,7 +219,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -272,7 +272,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "histogram_quantile(0.99, sum(rate(rpc_request_duration_seconds_bucket[5m])) by (le))",
           "legendFormat": "p99 Latency",
@@ -285,7 +285,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -359,7 +359,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sum(rate(rpc_requests_total[5m])) by (method)",
           "legendFormat": "{{ method }}",
@@ -372,7 +372,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -446,7 +446,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "histogram_quantile(0.50, sum(rate(rpc_request_duration_seconds_bucket[5m])) by (le, method))",
           "legendFormat": "{{ method }} p50",
@@ -455,7 +455,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "histogram_quantile(0.95, sum(rate(rpc_request_duration_seconds_bucket[5m])) by (le, method))",
           "legendFormat": "{{ method }} p95",
@@ -464,7 +464,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "histogram_quantile(0.99, sum(rate(rpc_request_duration_seconds_bucket[5m])) by (le, method))",
           "legendFormat": "{{ method }} p99",
@@ -477,7 +477,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -551,7 +551,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sum(rate(rpc_errors_total[5m])) by (method, error_code)",
           "legendFormat": "{{ method }} ({{ error_code }})",
@@ -564,7 +564,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -638,7 +638,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "rpc_active_requests",
           "legendFormat": "Active Requests",
@@ -651,7 +651,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -739,7 +739,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sum(rate(rpc_requests_total[5m])) by (method)",
           "format": "table",
@@ -750,7 +750,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "histogram_quantile(0.50, sum(rate(rpc_request_duration_seconds_bucket[5m])) by (le, method))",
           "format": "table",
@@ -761,7 +761,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "histogram_quantile(0.99, sum(rate(rpc_request_duration_seconds_bucket[5m])) by (le, method))",
           "format": "table",
@@ -803,7 +803,7 @@
   "refresh": "10s",
   "schemaVersion": 37,
   "style": "dark",
-  "tags": ["zebra", "zcash", "rpc", "json-rpc"],
+  "tags": ["zakura", "zcash", "rpc", "json-rpc"],
   "templating": {
     "list": []
   },
@@ -813,7 +813,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Zebra RPC Metrics",
+  "title": "Zakura RPC Metrics",
   "uid": "zakura-rpc-metrics",
   "version": 1,
   "weekStart": ""

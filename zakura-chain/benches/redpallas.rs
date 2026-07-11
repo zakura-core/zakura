@@ -1,7 +1,7 @@
 //! Benchmarks for batch verification of RedPallas signatures.
 //!
 //! Group name `redpallas` matches the `verifier` label in
-//! `zebra.consensus.batch.duration_seconds` emitted from
+//! `zakura.consensus.batch.duration_seconds` emitted from
 //! `zakura-consensus/src/primitives/redpallas.rs`, so a prod regression on
 //! that histogram maps to this file by name.
 

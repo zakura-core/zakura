@@ -1,6 +1,6 @@
-# Zebra Observability Stack
+# Zakura Observability Stack
 
-Metrics, distributed tracing, and alerting for Zebra nodes.
+Metrics, distributed tracing, and alerting for Zakura nodes.
 
 ## Quick Start
 
@@ -9,14 +9,14 @@ Metrics, distributed tracing, and alerting for Zebra nodes.
 docker compose -f docker/docker-compose.observability.yml up -d
 
 # View logs
-docker compose -f docker/docker-compose.observability.yml logs -f zebra
+docker compose -f docker/docker-compose.observability.yml logs -f zakura
 ```text
 
 ## Components
 
 | Component | Port | URL | Purpose |
 |-----------|------|-----|---------|
-| **Zebra** | 9999, 8232 | - | Zcash node with metrics and tracing |
+| **Zakura** | 9999, 8232 | - | Zcash node with metrics and tracing |
 | **Prometheus** | 9094 | <http://localhost:9094> | Metrics collection and storage |
 | **Grafana** | 3000 | <http://localhost:3000> | Dashboards and visualization |
 | **Jaeger** | 16686 | <http://localhost:16686> | Distributed tracing UI |
@@ -28,7 +28,7 @@ Default Grafana credentials: `admin` / `admin` (you'll be prompted to change on 
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         Zebra Node                                  │
+│                         Zakura Node                                  │
 │  ┌─────────────────┐              ┌─────────────────────────────┐  │
 │  │ Metrics         │              │ Tracing (OpenTelemetry)     │  │
 │  │ :9999/metrics   │              │ OTLP HTTP → Jaeger          │  │
@@ -65,7 +65,7 @@ Default Grafana credentials: `admin` / `admin` (you'll be prompted to change on 
 
 ### Metrics (Prometheus + Grafana)
 
-Quantitative data about Zebra's behavior over time:
+Quantitative data about Zakura's behavior over time:
 
 - **Network health**: Peer connections, bandwidth, message rates
 - **Sync progress**: Block height, checkpoint verification, chain tip
@@ -76,7 +76,7 @@ See [grafana/README.md](grafana/README.md) for dashboard details.
 
 ### Tracing (Jaeger)
 
-Request-level visibility into Zebra's internal operations:
+Request-level visibility into Zakura's internal operations:
 
 - **Distributed traces**: Follow a request through all components
 - **Latency breakdown**: See where time is spent in each operation
@@ -114,7 +114,7 @@ During high-volume operations (initial sync), reduce sampling to avoid overwhelm
 
 ```yaml
 # docker-compose.observability.yml
-zebra:
+zakura:
   environment:
     - OTEL_TRACES_SAMPLER_ARG=10  # 10% sampling during sync
 ```text
@@ -125,7 +125,7 @@ zebra:
 | Steady state | 10-50 | Normal operation |
 | Debugging | 100 | Full traces for investigation |
 
-*Note: Zebra uses percentage (0-100) for consistency with other config options, unlike the standard OpenTelemetry ratio (0.0-1.0).
+*Note: Zakura uses percentage (0-100) for consistency with other config options, unlike the standard OpenTelemetry ratio (0.0-1.0).
 
 ## Directory Structure
 
@@ -152,7 +152,7 @@ observability/
 
 ## Common Tasks
 
-### View Zebra's current metrics
+### View Zakura's current metrics
 
 ```bash
 curl -s http://localhost:9999/metrics | grep zcash
@@ -168,7 +168,7 @@ curl -s 'http://localhost:9094/api/v1/query?query=zcash_state_tip_height'
 ### Find slow operations in Jaeger
 
 1. Open <http://localhost:16686>
-2. Select service: `zebra`
+2. Select service: `zakura`
 3. Set "Min Duration" to filter slow traces
 4. Click "Find Traces"
 
@@ -182,9 +182,9 @@ curl -s http://localhost:8889/metrics | grep rpc_request
 
 ### No metrics in Grafana
 
-1. Check Zebra is exposing metrics: `curl http://localhost:9999/metrics`
+1. Check Zakura is exposing metrics: `curl http://localhost:9999/metrics`
 2. Check Prometheus targets: <http://localhost:9094/targets>
-3. Verify job name matches dashboard queries (default: `zebra`)
+3. Verify job name matches dashboard queries (default: `zakura`)
 
 ### No traces in Jaeger
 

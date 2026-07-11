@@ -32,7 +32,7 @@
 //!
 //! It shells out to `docker/zakura-regtest-e2e/run.sh`, which builds `zakurad`
 //! (debug) if needed, brings up four Regtest nodes sharing the host network — a
-//! dual-stack seed, a pure Zakura-only node (`legacy_p2p = false`) that joins
+//! dual-stack seed, a pure Zakura-only node (`p2p_stack = "zakura"`) that joins
 //! only via the seed's `zakura.bootstrap_peers`, a legacy-only node, and a
 //! dual-stack node that upgrades — and asserts legacy TCP backwards
 //! compatibility, the legacy->Zakura upgrade handshake, and block propagation

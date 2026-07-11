@@ -88,7 +88,7 @@ where
         network: network.clone(),
         // Isolated connections are legacy-only: they must not advertise the Zakura P2P v2
         // service bit, or attempt an upgrade that would deanonymise the caller.
-        p2p_stack: P2pStack::Zebra,
+        p2p_stack: P2pStack::Legacy,
         ..Config::default()
     };
 

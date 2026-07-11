@@ -11,7 +11,7 @@ use crate::common::regtest::MiningRpcMethods;
 /// fresh regtest chain only clears once the first block arrives.
 async fn exit_initial_block_download(setup: &ZcashdCompatSetup) -> Result<()> {
     if setup.can_mutate() {
-        setup.zebra_client.generate(1).await?;
+        setup.zakura_client.generate(1).await?;
         wait_for_zcashd_height(&setup.zcashd_client, 1).await?;
     }
     Ok(())

@@ -40,7 +40,7 @@ pub async fn transparent_tx_in_mempool() -> Result<()> {
     if !setup.can_mutate() {
         // On live networks, just check that getmempoolinfo has the expected fields.
         let info: serde_json::Value = setup
-            .zebra_client
+            .zakura_client
             .json_result_from_call("getmempoolinfo", "[]")
             .await
             .map_err(|e| eyre!("getmempoolinfo: {e}"))?;
@@ -55,7 +55,7 @@ pub async fn transparent_tx_in_mempool() -> Result<()> {
     }
 
     // Mine enough blocks to have spendable coinbase (maturity = 100 on regtest).
-    setup.zebra_client.generate(110).await?;
+    setup.zakura_client.generate(110).await?;
     wait_for_zcashd_height(&setup.zcashd_client, 110).await?;
     import_miner_key(&setup).await?;
 
@@ -72,16 +72,16 @@ pub async fn transparent_tx_in_mempool() -> Result<()> {
         .await
         .map_err(|e| eyre!("sendtoaddress: {e}"))?;
 
-    wait_for_zebra_mempool_tx(&setup, &txid).await?;
+    wait_for_zakura_mempool_tx(&setup, &txid).await?;
 
     setup.teardown()
 }
 
 /// Polls zakurad's `getrawmempool` until `txid` appears (up to 30 s).
-async fn wait_for_zebra_mempool_tx(setup: &ZcashdCompatSetup, txid: &str) -> Result<()> {
+async fn wait_for_zakura_mempool_tx(setup: &ZcashdCompatSetup, txid: &str) -> Result<()> {
     for attempt in 1..=30u32 {
         let mempool: Vec<String> = setup
-            .zebra_client
+            .zakura_client
             .json_result_from_call("getrawmempool", "[]")
             .await
             .map_err(|e| eyre!("getrawmempool: {e}"))?;
@@ -115,7 +115,7 @@ pub async fn transparent_tx_confirms() -> Result<()> {
     }
 
     // Mine enough blocks to have spendable coinbase.
-    setup.zebra_client.generate(110).await?;
+    setup.zakura_client.generate(110).await?;
     wait_for_zcashd_height(&setup.zcashd_client, 110).await?;
     import_miner_key(&setup).await?;
 
@@ -134,14 +134,14 @@ pub async fn transparent_tx_confirms() -> Result<()> {
     // Wait for the transaction to relay from zcashd to zakurad over P2P before
     // mining: zcashd trickles tx invs to peers, so mining immediately would
     // build a block that misses the transaction.
-    wait_for_zebra_mempool_tx(&setup, &txid).await?;
+    wait_for_zakura_mempool_tx(&setup, &txid).await?;
 
     // Mine a block to confirm the transaction.
-    setup.zebra_client.generate(1).await?;
+    setup.zakura_client.generate(1).await?;
 
     // Verify via zakurad that the transaction has at least one confirmation.
     let tx_info: serde_json::Value = setup
-        .zebra_client
+        .zakura_client
         .json_result_from_call("getrawtransaction", &format!(r#"["{txid}", 1]"#))
         .await
         .map_err(|e| eyre!("getrawtransaction: {e}"))?;

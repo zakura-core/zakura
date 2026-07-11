@@ -57,11 +57,11 @@ worker:
 - `zcashd_compat_reorg_restart_deep_chain` verifies VerifyDB window coverage on a
   long trusted chain after reorg and restart. Opt-in via
   `TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG=1`.
-- `zcashd_compat_reorg_context_zebra_tip_behind_recovers` verifies no sticky failure
-  when Zebra shrinks after a paused reorg has converged (end-to-end recovery to
+- `zcashd_compat_reorg_context_zakura_tip_behind_recovers` verifies no sticky failure
+  when Zakura shrinks after a paused reorg has converged (end-to-end recovery to
   `zebra_tip_matched`).
-- `zcashd_compat_reorg_zebra_tip_behind_local` verifies the recoverable
-  `zebra_tip_behind_local` degraded state and requires recovery after Zebra
+- `zcashd_compat_reorg_zakura_tip_behind_local` verifies the recoverable
+  `zebra_tip_behind_local` degraded state and requires recovery after Zakura
   mines a replacement branch.
 - `zcashd_compat_reorg_churn` repeats small reorgs and occasional mid-sync
   depth-1 churn.
@@ -89,7 +89,7 @@ No writes are performed on a live network.
 ```
 TEST_ZCASHD_COMPAT=1                          (required)
 TEST_ZCASHD_COMPAT_NETWORK=Mainnet      (or Testnet)
-TEST_ZEBRAD_RPC_ADDR=127.0.0.1:8232     (zakurad main RPC)
+TEST_ZAKURAD_RPC_ADDR=127.0.0.1:8232    (zakurad main RPC)
 TEST_ZCASHD_RPC_ADDR=127.0.0.1:28232    (zcashd own RPC)
 
 # Authentication — provide one of:
@@ -103,19 +103,19 @@ Run:
 ```console
 # Via make (addresses can be overridden as Make vars)
 make compat-test-mainnet \
-  TEST_ZEBRAD_RPC_ADDR=127.0.0.1:8232 \
+  TEST_ZAKURAD_RPC_ADDR=127.0.0.1:8232 \
   TEST_ZCASHD_RPC_ADDR=127.0.0.1:28232 \
   TEST_ZCASHD_COOKIE_FILE=/home/user/.zcash/.cookie
 
 make compat-test-testnet \
-  TEST_ZEBRAD_RPC_ADDR=127.0.0.1:18232 \
+  TEST_ZAKURAD_RPC_ADDR=127.0.0.1:18232 \
   TEST_ZCASHD_RPC_ADDR=127.0.0.1:18233 \
   TEST_ZCASHD_COOKIE_FILE=/home/user/.zcash/testnet3/.cookie
 
 # Via cargo directly (mainnet example)
 TEST_ZCASHD_COMPAT=1 \
   TEST_ZCASHD_COMPAT_NETWORK=Mainnet \
-  TEST_ZEBRAD_RPC_ADDR=127.0.0.1:8232 \
+  TEST_ZAKURAD_RPC_ADDR=127.0.0.1:8232 \
   TEST_ZCASHD_RPC_ADDR=127.0.0.1:28232 \
   TEST_ZCASHD_COOKIE_FILE=/home/user/.zcash/.cookie \
   cargo nextest run --profile zcashd-compat-external --run-ignored=only
@@ -137,7 +137,7 @@ error (misconfiguration, not a skip).
 | `TEST_ZCASHD_COMPAT` | Always | Enable the suite (set to any non-empty value) |
 | `TEST_ZCASHD_PATH` | No | Path to a zcashd binary; uses embedded download if absent |
 | `TEST_ZCASHD_COMPAT_NETWORK` | External only | `Mainnet` or `Testnet`; absent = Regtest/managed |
-| `TEST_ZEBRAD_RPC_ADDR` | External only | zakurad main RPC (`host:port`) |
+| `TEST_ZAKURAD_RPC_ADDR` | External only | zakurad main RPC (`host:port`) |
 | `TEST_ZCASHD_RPC_ADDR` | External only | zcashd own RPC (`host:port`) |
 | `TEST_ZCASHD_COOKIE_FILE` | External (preferred) | Path to zcashd cookie file |
 | `TEST_ZCASHD_RPC_USER` | External (fallback) | zcashd RPC username |
@@ -172,8 +172,8 @@ error (misconfiguration, not a skip).
 | `zcashd_compat_reorg_restart_after_reorg` | reorg | **Opt-in:** slow supervised zcashd restart after several reorgs | **Skipped** |
 | `zcashd_compat_reorg_restart_cycles` | reorg | **Opt-in:** interleaved reorg-then-restart across three cycles | **Skipped** |
 | `zcashd_compat_reorg_restart_deep_chain` | reorg | **Opt-in:** VerifyDB window on long trusted chain after reorg + restart | **Skipped** |
-| `zcashd_compat_reorg_zebra_tip_behind_local` | reorg | Recoverable Zebra-tip-behind-local state and required recovery | **Skipped** |
-| `zcashd_compat_reorg_context_zebra_tip_behind_recovers` | reorg | No sticky failure on tip-behind after paused reorg convergence | **Skipped** |
+| `zcashd_compat_reorg_zakura_tip_behind_local` | reorg | Recoverable Zakura-tip-behind-local state and required recovery | **Skipped** |
+| `zcashd_compat_reorg_context_zakura_tip_behind_recovers` | reorg | No sticky failure on tip-behind after paused reorg convergence | **Skipped** |
 | `zcashd_compat_reorg_churn` | reorg | Repeated small reorg stress loop | **Skipped** |
 
 ## Prerequisites for External Mode
@@ -185,7 +185,7 @@ Before running against mainnet or testnet:
 2. zcashd must be running in zebra-compat mode, connected to that zakurad via
    the compat RPC channel.
 3. Both processes must be reachable from the test runner via the addresses in
-   `TEST_ZEBRAD_RPC_ADDR` and `TEST_ZCASHD_RPC_ADDR`.
+   `TEST_ZAKURAD_RPC_ADDR` and `TEST_ZCASHD_RPC_ADDR`.
 4. zcashd's cookie file path or explicit credentials must be provided.
 
 A typical production layout uses the cookie file (`~/.zcash/.cookie` on
@@ -218,8 +218,8 @@ zakurad/tests/common/
                                over_batch_branch_syncs,
                                over_batch_branch_restart_recovers,
                                restart_after_reorg, restart_cycles,
-                               restart_deep_chain, zebra_tip_behind_local,
-                               reorg_context_zebra_tip_behind_recovers, churn
+                               restart_deep_chain, zakura_tip_behind_local,
+                               reorg_context_zakura_tip_behind_recovers, churn
 ```
 
 Entry points are the `#[tokio::test] #[ignore]` functions in
@@ -243,7 +243,7 @@ Entry points are the `#[tokio::test] #[ignore]` functions in
 
        // Regtest path — free to mine, send, inspect state
        use crate::common::regtest::MiningRpcMethods;
-       setup.zebra_client.generate(1).await?;
+       setup.zakura_client.generate(1).await?;
        // ...
 
        setup.teardown()
@@ -264,4 +264,4 @@ Key rules:
 
 - Call `setup.teardown()` on every exit path that owns a managed process.
 - Guard all writes (`generate`, `sendtoaddress`, `z_sendmany`) behind `setup.can_mutate()`.
-- Use `setup.zebra_client` (unauthenticated) for zakurad and `setup.zcashd_client` (Basic Auth) for zcashd.
+- Use `setup.zakura_client` (unauthenticated) for zakurad and `setup.zcashd_client` (Basic Auth) for zcashd.

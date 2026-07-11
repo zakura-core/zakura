@@ -60,6 +60,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Made opening a read-only secondary state database safe: a read-only open
+  against a missing, unreadable, or ephemeral database now returns an explicit
+  error instead of panicking, and the co-located read-state syncer backs off
+  instead of spinning while the primary node's database is unavailable.
+  Backported from upstream Zebra PR #10741.
+- The read-only secondary database used by the co-located read-state service no
+  longer flushes RocksDB on shutdown. Only the primary owns its files, so a
+  secondary flush on exit could race the primary's writes; read-only secondaries
+  now close without flushing. Backported from upstream Zebra PR #10784.
 - Fixed two zcashd-compat sidecar stalls under production connection patterns.
   Sidecar IP matching now treats native IPv4 and IPv4-mapped IPv6 addresses as
   the same peer, so the configured sidecar is always included in block inventory

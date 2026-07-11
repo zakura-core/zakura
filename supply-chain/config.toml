@@ -31,12 +31,6 @@ url = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audi
 [policy.equihash]
 audit-as-crates-io = true
 
-[policy.tower-batch-control]
-audit-as-crates-io = false
-
-[policy.tower-fallback]
-audit-as-crates-io = false
-
 [policy.zakura]
 audit-as-crates-io = false
 
@@ -62,6 +56,12 @@ audit-as-crates-io = false
 audit-as-crates-io = false
 
 [policy.zakura-test]
+audit-as-crates-io = false
+
+[policy.zakura-tower-batch-control]
+audit-as-crates-io = false
+
+[policy.zakura-tower-fallback]
 audit-as-crates-io = false
 
 [policy.zakura-utils]

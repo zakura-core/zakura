@@ -5,12 +5,12 @@ name: Sync confidence
 # ephemeral DigitalOcean droplets that restore pruned cached state from Spaces.
 #
 # Triggers (push + schedule are currently disabled — see the note on `on:` below):
-# - push to ironwood-main: (re)build the test image and publish the `ironwood-main` tag
+# - push to main: (re)build the test image and publish the `main` tag
 #   to GHCR. No sync test runs on merge, so merges stay cheap.
-# - schedule (every 12h): reuse the latest `ironwood-main` image (no rebuild) and run
+# - schedule (every 12h): reuse the latest `main` image (no rebuild) and run
 #   both windows.
 # - workflow_dispatch: by default build the image from the dispatched ref and run both
-#   windows (so you can test a branch); uncheck `build_image` to reuse the `ironwood-main`
+#   windows (so you can test a branch); uncheck `build_image` to reuse the `main`
 #   image instead.
 #
 # The consumer opens the pruned snapshots in pruned storage mode and runs the image's
@@ -20,15 +20,15 @@ name: Sync confidence
 
 on:
   # NOTE: the `push` (image build) and `schedule` (12h sync) triggers are intentionally
-  # disabled until ironwood-main ships DB format 28.3.0 and matching pruned snapshots.
-  # The sync-confidence snapshots are format 28.3.0, so an image built from ironwood-main
+  # disabled until main ships DB format 28.3.0 and matching pruned snapshots.
+  # The sync-confidence snapshots are format 28.3.0, so an image built from main
   # before then would FormatMismatch when opening them and red the timer. Re-enable by
   # restoring the `push` and `schedule` blocks (see docs/sync-confidence-do-setup.md).
   # `workflow_dispatch` stays available so the job can still be run manually.
   workflow_dispatch:
     inputs:
       build_image:
-        description: "Build the image from this ref (checked) or reuse the last ironwood-main image (unchecked)"
+        description: "Build the image from this ref (checked) or reuse the last main image (unchecked)"
         type: boolean
         default: true
 
@@ -41,8 +41,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Build + push the GHCR test image. Runs on merge to ironwood-main (publishes the
-  # `ironwood-main` tag the scheduled runs reuse) and on a build_image=true dispatch
+  # Build + push the GHCR test image. Runs on merge to main (publishes the
+  # `main` tag the scheduled runs reuse) and on a build_image=true dispatch
   # (publishes a sha tag for that ref). Skipped on schedule and build_image=false dispatch.
   # NOTE: same image used for snapshot generation (make-sync-confidence-snapshots.sh) —
   # keep build-args and the Dockerfile target in sync.
@@ -71,7 +71,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}-tests
           # sha tag first => steps.meta.outputs.version (the job's image_ref). The branch
-          # tag (e.g. `ironwood-main`) is the stable tag scheduled runs reuse.
+          # tag (e.g. `main`) is the stable tag scheduled runs reuse.
           tags: |
             type=sha,prefix=sha-,format=short
             type=ref,event=branch
@@ -92,7 +92,7 @@ jobs:
   pre-nu62:
     needs: build
     # Run on schedule and dispatch (never on merge — merge only refreshes the image).
-    # Tolerate a skipped build: schedule / build_image=false reuse the ironwood-main image.
+    # Tolerate a skipped build: schedule / build_image=false reuse the main image.
     if: ${{ !cancelled() && github.event_name != 'push' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     permissions:
       contents: read
@@ -106,9 +106,9 @@ jobs:
       state_key: pre-nu62
       nextest_profile: sync-range-pre-nu62
       test_variables: "ZAKURA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
-      # Stable ironwood-main image on schedule / build_image=false; the freshly-built sha
+      # Stable main image on schedule / build_image=false; the freshly-built sha
       # image on a build_image dispatch.
-      image_ref: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.build_image)) && format('ghcr.io/{0}-tests:ironwood-main', github.repository) || needs.build.outputs.image_ref }}
+      image_ref: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.build_image)) && format('ghcr.io/{0}-tests:main', github.repository) || needs.build.outputs.image_ref }}
       droplet_size: g-8vcpu-32gb
 
   post-nu62:
@@ -126,7 +126,7 @@ jobs:
       state_key: post-nu62
       nextest_profile: sync-range-post-nu62
       test_variables: "ZAKURA_NETWORK__NETWORK=Mainnet,TEST_SYNC_RANGE=1"
-      image_ref: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.build_image)) && format('ghcr.io/{0}-tests:ironwood-main', github.repository) || needs.build.outputs.image_ref }}
+      image_ref: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.build_image)) && format('ghcr.io/{0}-tests:main', github.repository) || needs.build.outputs.image_ref }}
       droplet_size: g-8vcpu-32gb
 
   # Alert Slack #gh-alerts on any failure (the unattended 12h timer is the main case).

@@ -9,7 +9,7 @@ front end that you can visualize:
 1. Build zakura with `prometheus` feature:
 
    ```bash
-   cargo install --features prometheus --locked --git https://github.com/zakura-core/zakura zakurad
+   cargo install --features prometheus --locked --git https://github.com/zakura-core/zakura zakura
    ```
 
 2. Create a `zakurad.toml` file that we can edit:
@@ -60,4 +60,4 @@ front end that you can visualize:
 
 ![image info](grafana.png)
 
-[metrics_section]: https://docs.rs/zakurad/latest/zakurad/components/metrics/struct.Config.html
+[metrics_section]: https://docs.rs/zakura/latest/zakurad/components/metrics/struct.Config.html

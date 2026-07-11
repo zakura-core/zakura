@@ -8,13 +8,13 @@ assignees: ""
 
 # Prepare for the Release
 
-- [ ] Make sure there has been [at least one successful sync-confidence run on `ironwood-main`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml?query=branch%3Aironwood-main) since the last state change, or start a manual sync-confidence run.
+- [ ] Make sure there has been [at least one successful sync-confidence run on `main`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml?query=branch%3Amain) since the last state change, or start a manual sync-confidence run.
 
 # Checkpoints
 
 For performance and security, we want to update the Zakura checkpoints in every release.
 
-- [ ] You can copy the latest checkpoints from CI by following [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/ironwood-main/zakura-utils/README.md#zakura-checkpoints).
+- [ ] You can copy the latest checkpoints from CI by following [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/zakura-utils/README.md#zakura-checkpoints).
 
 # Missed Dependency Updates
 
@@ -24,9 +24,9 @@ This step can be skipped if there is a large pending dependency upgrade. (For ex
 
 Here's how we make sure we got everything:
 
-- [ ] Run `cargo update` on the latest `ironwood-main` branch, and keep the output
+- [ ] Run `cargo update` on the latest `main` branch, and keep the output
 - [ ] Until we bump the workspace MSRV to 1.88 or higher, `home` must be downgraded manually: `cargo update home@0.5.12 --precise 0.5.11`
-- [ ] If needed, [add duplicate dependency exceptions to deny.toml](https://github.com/zakura-core/zakura/blob/ironwood-main/book/src/dev/continuous-integration.md#fixing-duplicate-dependencies-in-check-denytoml-bans)
+- [ ] If needed, [add duplicate dependency exceptions to deny.toml](https://github.com/zakura-core/zakura/blob/main/book/src/dev/continuous-integration.md#fixing-duplicate-dependencies-in-check-denytoml-bans)
 - [ ] If needed, remove resolved duplicate dependencies from `deny.toml`
 - [ ] Open a separate PR with the changes
 - [ ] Add the output of `cargo update` to that PR as a comment
@@ -37,7 +37,7 @@ These steps can be done a few days before the release, in the same PR:
 
 ## Change Log
 
-**Important**: Any merge into `ironwood-main` deletes any edits to the draft changelog.
+**Important**: Any merge into `main` deletes any edits to the draft changelog.
 Once you are ready to tag a release, copy the draft changelog into `CHANGELOG.md`.
 
 We use [the Release Drafter workflow](https://github.com/marketplace/actions/release-drafter) to automatically create a [draft changelog](https://github.com/zakura-core/zakura/releases). We follow the [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format.
@@ -160,7 +160,7 @@ cargo release replace --verbose --execute --allow-branch '*' -p zakura
 The end of support height is calculated from the current blockchain height:
 
 - [ ] Find where the Zcash blockchain tip is now by using a [Zcash Block Explorer](https://mainnet.zcashexplorer.app/) or other tool.
-- [ ] Replace `ESTIMATED_RELEASE_HEIGHT` in [`end_of_support.rs`](https://github.com/zakura-core/zakura/blob/ironwood-main/zakurad/src/components/sync/end_of_support.rs) with the height you estimate the release will be tagged.
+- [ ] Replace `ESTIMATED_RELEASE_HEIGHT` in [`end_of_support.rs`](https://github.com/zakura-core/zakura/blob/main/zakurad/src/components/sync/end_of_support.rs) with the height you estimate the release will be tagged.
 
 <details>
 
@@ -187,7 +187,7 @@ The end of support height is calculated from the current blockchain height:
       (the tag must match the `zakura` package version — verify with
       `./scripts/check-release-version.sh v<version>`; a mismatched tag fails
       `release-binaries.yml` and publishes nothing)
-- [ ] Set the release to target the `ironwood-main` branch
+- [ ] Set the release to target the `main` branch
 - [ ] Set the release title to `Zakura` followed by the version tag,
       for example: `Zakura 1.0.0`
 - [ ] Replace the prepopulated draft changelog in the release description with the final changelog you created;
@@ -217,17 +217,17 @@ The end of support height is calculated from the current blockchain height:
       have been changed, but keep their overall order:
 
 ```
-for c in zakura-test tower-fallback zakura-chain tower-batch-control zakura-node-services zakura-script zakura-state zakura-consensus zakura-network zakura-rpc zakura-utils zakurad; do cargo release publish --verbose --execute -p $c; done
+for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakura-tower-batch-control zakura-node-services zakura-script zakura-state zakura-consensus zakura-network zakura-rpc zakura-utils zakura; do cargo release publish --verbose --execute -p $c; done
 ```
 
 - [ ] Check that Zakura can be installed from `crates.io`:
-      `cargo install --locked --force --version <version> zakurad && ~/.cargo/bin/zakurad`
+      `cargo install --locked --force --version <version> zakura && ~/.cargo/bin/zakurad`
       and put the output in a comment on the PR.
 
 ## Publish Docker Images
 
 - [ ] Confirm the pinned zcashd compat manifest is ready before publishing:
-  - [ ] Update [`zakurad/zcashd-compat-manifest.json`](https://github.com/zakura-core/zakura/blob/ironwood-main/zakurad/zcashd-compat-manifest.json) to the intended `zcashd` compat release (it is the single source of truth: zakurad embeds it at compile time and CI/Docker builds read it directly).
+  - [ ] Update [`zakurad/zcashd-compat-manifest.json`](https://github.com/zakura-core/zakura/blob/main/zakurad/zcashd-compat-manifest.json) to the intended `zcashd` compat release (it is the single source of truth: zakurad embeds it at compile time and CI/Docker builds read it directly).
   - [ ] Confirm the manifest contains only the `x86_64-pc-linux-gnu` artifact before publishing zcashd-compat Docker images.
   - [ ] Confirm the workflow logs show the expected `/usr/local/bin/zcashd --version` for the zcashd-compat linux/amd64 image variant.
 - [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Arelease).

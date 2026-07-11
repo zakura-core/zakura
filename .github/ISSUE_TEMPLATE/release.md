@@ -15,8 +15,8 @@ They can be skipped for urgent releases.
 
 To check consensus correctness, we want to test that the state format is valid through the sync-confidence ranges. (Format upgrades are tested in CI on each PR.)
 
-- [ ] Make sure there has been [at least one successful sync-confidence run](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml?query=branch%3Aironwood-main) since the last state change, or
-- [ ] Start a manual workflow run of [`sync-confidence.yml`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml) from `ironwood-main`.
+- [ ] Make sure there has been [at least one successful sync-confidence run](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml?query=branch%3Amain) since the last state change, or
+- [ ] Start a manual workflow run of [`sync-confidence.yml`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml) from `main`.
 
 State format changes can be made in `zakura-state` or `zakura-chain`. The state format can be changed by data that is sent to the state, data created within the state using `zakura-chain`, or serialization formats in `zakura-state` or `zakura-chain`.
 
@@ -28,7 +28,7 @@ After the test has been started, or if it has finished already:
 
 For performance and security, we want to update the Zakura checkpoints in every release.
 
-- [ ] You can copy the latest checkpoints from CI by following [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/ironwood-main/zakura-utils/README.md#zakura-checkpoints).
+- [ ] You can copy the latest checkpoints from CI by following [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/zakura-utils/README.md#zakura-checkpoints).
 
 ## Missed Dependency Updates
 
@@ -38,16 +38,16 @@ This step can be skipped if there is a large pending dependency upgrade. (For ex
 
 Here's how we make sure we got everything:
 
-- [ ] Run `cargo update` on the latest `ironwood-main` branch, and keep the output
+- [ ] Run `cargo update` on the latest `main` branch, and keep the output
 - [ ] Until we bump the workspace MSRV to 1.88 or higher, `home` must be downgraded manually: `cargo update home@0.5.12 --precise 0.5.11`
-- [ ] If needed, [add duplicate dependency exceptions to deny.toml](https://github.com/zakura-core/zakura/blob/ironwood-main/book/src/dev/continuous-integration.md#fixing-duplicate-dependencies-in-check-denytoml-bans)
+- [ ] If needed, [add duplicate dependency exceptions to deny.toml](https://github.com/zakura-core/zakura/blob/main/book/src/dev/continuous-integration.md#fixing-duplicate-dependencies-in-check-denytoml-bans)
 - [ ] If needed, remove resolved duplicate dependencies from `deny.toml`
 - [ ] Open a separate PR with the changes
 - [ ] Add the output of `cargo update` to that PR as a comment
 
 # Prepare and Publish the Release
 
-Follow the steps in the [release checklist](https://github.com/zakura-core/zakura/blob/ironwood-main/.github/PULL_REQUEST_TEMPLATE/release-checklist.md) to prepare the release:
+Follow the steps in the [release checklist](https://github.com/zakura-core/zakura/blob/main/.github/PULL_REQUEST_TEMPLATE/release-checklist.md) to prepare the release:
 
 Release PR:
 

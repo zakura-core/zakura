@@ -63,4 +63,4 @@ readinessProbe:
 - Readiness combines a moving‑average “near tip” signal with a hard block‑lag cap.
 - Adjust thresholds based on your SLA and desired routing behavior.
 
-[health_config]: https://docs.rs/zakurad/latest/zakurad/components/health/struct.Config.html
+[health_config]: https://docs.rs/zakura/latest/zakurad/components/health/struct.Config.html

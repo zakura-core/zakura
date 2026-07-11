@@ -49,7 +49,7 @@ You are now ready to start bumping data into elasticsearch with Zakura.
 Elasticsearch is an optional and experimental feature, we need to build and install with the `elasticsearch` rust feature enabled using the following command:
 
 ```sh
-cargo install --features elasticsearch --locked --git https://github.com/zakura-core/zakura zakurad
+cargo install --features elasticsearch --locked --git https://github.com/zakura-core/zakura zakura
 ```
 
 Zakura binary will be at `~/.cargo/bin/zakurad`.

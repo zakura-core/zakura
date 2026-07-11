@@ -37,7 +37,7 @@ impl Runnable for GenerateCmd {
 #
 # The config format (including a complete list of sections and fields) is
 # documented here:
-# https://docs.rs/zakurad/latest/zakurad/config/struct.ZakuradConfig.html
+# https://docs.rs/zakura/latest/zakurad/config/struct.ZakuradConfig.html
 #
 # CONFIGURATION SOURCES (in order of precedence, highest to lowest):
 #

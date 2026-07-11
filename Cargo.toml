@@ -187,8 +187,8 @@ zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "cab
 
 [workspace.metadata.release]
 
-# We always do releases from the ironwood-main branch
-allow-branch = ["ironwood-main"]
+# We always do releases from the main branch
+allow-branch = ["main"]
 
 # Compilation settings
 

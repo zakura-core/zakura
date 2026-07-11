@@ -110,8 +110,8 @@
 //! [The Zakura monorepo](https://github.com/zakura-core/zakura) is a collection of the following
 //! crates:
 //!
-//! - [tower-batch-control](https://docs.rs/tower-batch-control/latest/tower_batch_control/)
-//! - [tower-fallback](https://docs.rs/tower-fallback/latest/tower_fallback/)
+//! - [zakura-tower-batch-control](https://docs.rs/zakura-tower-batch-control/latest/tower_batch_control/)
+//! - [zakura-tower-fallback](https://docs.rs/zakura-tower-fallback/latest/tower_fallback/)
 //! - [zakura-chain](https://docs.rs/zakura-chain/latest/zakura_chain/)
 //! - [zakura-consensus](https://docs.rs/zakura-consensus/latest/zakura_consensus/)
 //! - [zakura-network](https://docs.rs/zakura-network/latest/zakura_network/)
@@ -121,7 +121,7 @@
 //! - [zakura-state](https://docs.rs/zakura-state/latest/zakura_state/)
 //! - [zakura-test](https://docs.rs/zakura-test/latest/zakura_test/)
 //! - [zakura-utils](https://docs.rs/zakura-utils/latest/zakura_utils/)
-//! - [zakurad](https://docs.rs/zakurad/latest/zakurad/)
+//! - [zakura](https://docs.rs/zakura/latest/zakurad/)
 //!
 //! The links in the list above point to the documentation of the public APIs of the crates. For
 //! the documentation of the internal APIs, follow <https://zakura-core.github.io/zakura/internal> that lists
@@ -133,7 +133,7 @@
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/zakura-core/zakura/main/book/theme/favicon.png"
 )]
-#![doc(html_root_url = "https://docs.rs/zakurad")]
+#![doc(html_root_url = "https://docs.rs/zakura")]
 // Tracing causes false positives on this lint:
 // https://github.com/tokio-rs/tracing/issues/553
 #![allow(clippy::cognitive_complexity)]

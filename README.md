@@ -91,13 +91,13 @@ export CXXFLAGS="$CXXFLAGS -include cstdint"
 Once you have the dependencies in place, you can install Zakura with:
 
 ```sh
-cargo install --locked zakurad
+cargo install --locked zakura
 ```
 
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v4.5.3 zakurad
+cargo install --git https://github.com/zakura-core/zakura --tag v1.0.0-rc2 zakura
 ```
 
 You can start Zakura by running
@@ -139,7 +139,7 @@ The Zakura maintainers provide the following resources:
     - [Zakura Health Endpoints](book/src/user/health.md) — liveness/readiness checks for Kubernetes and load balancers
 
 - The [documentation of the public
-  APIs](https://docs.rs/zakurad/latest/zakurad/#zakura-crates) for the latest
+  APIs](https://docs.rs/zakura/latest/zakurad/#zakura-crates) for the latest
   releases of the individual Zakura crates.
 
 - The [documentation of the internal APIs](https://zakura-core.github.io/zakura/internal)

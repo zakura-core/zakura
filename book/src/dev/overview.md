@@ -124,7 +124,7 @@ into several components:
   of blocks and transactions: all consensus
   rules that can be checked independently of the chain state, such as
   verification of signatures, proofs, and scripts. Internally, the library
-  uses [`tower-batch-control`](https://docs.rs/tower_batch_control) to
+  uses [`zakura-tower-batch-control`](https://docs.rs/zakura-tower-batch-control) to
   perform automatic, transparent batch processing of contemporaneous
   verification requests.
 
@@ -136,7 +136,7 @@ into several components:
   such as updating the nullifier set or checking that transaction inputs remain
   unspent.
 
-- [`zakurad`](https://docs.rs/zakurad) contains the full
+- [`zakura`](https://docs.rs/zakura) contains the full
   node, which connects these components together and implements logic to handle
   inbound requests from peers and the chain sync process.
 

@@ -39,7 +39,7 @@ pub fn default_test_config(net: &Network) -> ZakuradConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         // Keep acceptance tests on legacy gossip until Zakura P2P v2 supports
         // the inventory/block propagation those tests depend on.
-        p2p_stack: zakura_network::P2pStack::Zebra,
+        p2p_stack: zakura_network::P2pStack::Legacy,
         crawl_new_peer_interval: TEST_DURATION,
         ..zakura_network::Config::default()
     };

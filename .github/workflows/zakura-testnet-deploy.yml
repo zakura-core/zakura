@@ -15,7 +15,7 @@ on:
         description: "Git branch, tag, or SHA to build and deploy"
         required: true
         type: string
-        default: ironwood-main
+        default: main
       force_rebuild:
         description: "Rebuild even if a cached binary for this commit exists"
         type: boolean
@@ -57,7 +57,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           toolchain: stable
-          cache-on-failure: true
+          cache: false
 
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -107,8 +107,7 @@ jobs:
             138.68.229.254 \
             164.92.209.78 \
             206.189.148.0 \
-            206.189.208.228 \
-            159.65.183.89; do
+            206.189.208.228; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -150,7 +149,6 @@ jobs:
           commit     = "${{ inputs.ref }}"
           network_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
-          cache_dir_migrate_from = "/mnt/zakura-testnet-1-data/zebra-cache"
           log_file = "/mnt/zakura-testnet-1-data/logs/zakura.log"
 
           [[nodes]]
@@ -159,7 +157,6 @@ jobs:
           commit     = "${{ inputs.ref }}"
           network_cache_dir = "/mnt/zakura-testnet-2-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-2-data/zakura-cache"
-          cache_dir_migrate_from = "/mnt/zakura-testnet-2-data/zebra-cache"
           log_file = "/mnt/zakura-testnet-2-data/logs/zakura.log"
 
           [[nodes]]
@@ -168,7 +165,6 @@ jobs:
           commit     = "${{ inputs.ref }}"
           network_cache_dir = "/mnt/zakura-testnet-3-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-3-data/zakura-cache"
-          cache_dir_migrate_from = "/mnt/zakura-testnet-3-data/zebra-cache"
           log_file = "/mnt/zakura-testnet-3-data/logs/zakura.log"
 
           [[nodes]]
@@ -177,7 +173,6 @@ jobs:
           commit     = "${{ inputs.ref }}"
           network_cache_dir = "/mnt/zakura-testnet-eu-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-eu-data/zakura-cache"
-          cache_dir_migrate_from = "/mnt/zakura-testnet-eu-data/zebra-cache"
           log_file = "/mnt/zakura-testnet-eu-data/logs/zakura.log"
 
           [[nodes]]
@@ -186,7 +181,6 @@ jobs:
           commit     = "${{ inputs.ref }}"
           network_cache_dir = "/mnt/zakura-testnet-as-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-as-data/zakura-cache"
-          cache_dir_migrate_from = "/mnt/zakura-testnet-as-data/zebra-cache"
           log_file = "/mnt/zakura-testnet-as-data/logs/zakura.log"
 
           [[nodes]]
@@ -199,12 +193,11 @@ jobs:
           config_path = "/root/unity/zakura-testnet.toml"
           network_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
           state_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
-          cache_dir_migrate_from = "/mnt/zakura-testnet-1-data/zebra-cache"
           log_file = "/mnt/zakura-testnet-1-data/logs/zakura.log"
           working_dir = "/root/unity/zakura"
           start_command = "target/release/zakurad -c /root/unity/zakura-testnet.toml start"
           process_pattern = "target/release/zakurad -c /root/unity/zakura-testnet.toml start"
-          p2p_stack = "zebra"
+          p2p_stack = "legacy"
           checkpoint_sync = true
           EOF
 
@@ -222,17 +215,6 @@ jobs:
           fi
 
           python3 deploy.py build "${args[@]}"
-
-      - name: Suppress fleet watchdog alerts during deploy
-        if: ${{ !inputs.no_restart }}
-        run: |
-          set -euo pipefail
-
-          ssh_options=(-o BatchMode=yes -o ConnectTimeout=15)
-          if ! ssh "${ssh_options[@]}" root@159.65.183.89 \
-            'install -d -m 755 /run/zakura-fleet-watchdog && printf "%s\n" "$(( $(date +%s) + 1200 ))" > /run/zakura-fleet-watchdog/deploy-suppressed-until'; then
-            echo "warning: could not refresh fleet watchdog suppression on us-east-0"
-          fi
 
       - name: Deploy fleet
         working-directory: deploy/deployer
@@ -260,18 +242,18 @@ jobs:
           scp deploy/zcashd-compat/sync-check.sh root@206.189.208.228:/tmp/zcashd-compat-sync-check.sh
           ssh root@206.189.208.228 'chmod 755 /tmp/zcashd-compat-sync-check.sh'
           ssh root@206.189.208.228 '
-            ZEBRA_RPC_URL=http://127.0.0.1:18232
-            ZEBRA_COOKIE_FILE=
+            ZAKURA_RPC_URL=http://127.0.0.1:18232
+            ZAKURA_COOKIE_FILE=
             ZCASHD_RPC_URL=http://127.0.0.1:18231
             ZCASHD_COOKIE_FILE=
             ZCASHD_RPC_CONF=/root/unity/zcashd-testnet.toml
-            ZEBRAD_PROCESS_PATTERN="target/release/zakurad -c /root/unity/zakura-testnet.toml start"
+            ZAKURAD_PROCESS_PATTERN="target/release/zakurad -c /root/unity/zakura-testnet.toml start"
             ZCASHD_PROCESS_PATTERN="zcashd .*zcashd-testnet.toml"
             HEIGHT_MAX_DRIFT=10
             SYNC_CHECK_TIMEOUT=600
             SYNC_CHECK_INTERVAL=15
-            export ZEBRA_RPC_URL ZEBRA_COOKIE_FILE ZCASHD_RPC_URL ZCASHD_COOKIE_FILE ZCASHD_RPC_CONF
-            export ZEBRAD_PROCESS_PATTERN ZCASHD_PROCESS_PATTERN HEIGHT_MAX_DRIFT SYNC_CHECK_TIMEOUT SYNC_CHECK_INTERVAL
+            export ZAKURA_RPC_URL ZAKURA_COOKIE_FILE ZCASHD_RPC_URL ZCASHD_COOKIE_FILE ZCASHD_RPC_CONF
+            export ZAKURAD_PROCESS_PATTERN ZCASHD_PROCESS_PATTERN HEIGHT_MAX_DRIFT SYNC_CHECK_TIMEOUT SYNC_CHECK_INTERVAL
             /tmp/zcashd-compat-sync-check.sh
           '
 

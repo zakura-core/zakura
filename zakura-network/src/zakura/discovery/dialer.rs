@@ -25,7 +25,7 @@ pub(crate) fn spawn_native_bootstrap_dialer(
     }
 
     // Configured bootstrap peers are maintained: keep re-dialing forever so a
-    // node whose only peers are over Zakura (`legacy_p2p = false`) tolerates the
+    // node whose only peers are over Zakura (`p2p_stack = "zakura"`) tolerates the
     // seed not being up yet at startup and recovers when a peer later drops. The
     // legacy crawler is absent on such a node, so this loop is the only healing
     // path for its seeds.

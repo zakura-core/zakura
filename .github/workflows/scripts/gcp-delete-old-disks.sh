@@ -31,14 +31,14 @@ done
 IFS=$' \t\n' # Reset IFS to its default value
 
 # Fetch disks created by managed instance groups, and other jobs that start with "zakurad-"
-if ! ZEBRAD_DISKS=$(gcloud compute disks list --sort-by=creationTimestamp --filter="name~^zakurad- AND creationTimestamp < ${DELETE_BEFORE_DATE}" --format='value(NAME,LOCATION,LOCATION_SCOPE)' | sed 's/\(.*\)\t\(.*\)\t\(.*\)/\1 --\3=\2/'); then
-    echo "Error fetching ZEBRAD_DISKS."
+if ! ZAKURAD_DISKS=$(gcloud compute disks list --sort-by=creationTimestamp --filter="name~^zakurad- AND creationTimestamp < ${DELETE_BEFORE_DATE}" --format='value(NAME,LOCATION,LOCATION_SCOPE)' | sed 's/\(.*\)\t\(.*\)\t\(.*\)/\1 --\3=\2/'); then
+    echo "Error fetching ZAKURAD_DISKS."
     exit 1
 fi
 
 # Delete zakurad disks if any are found
 IFS=$'\n'
-for DISK_AND_LOCATION in ${ZEBRAD_DISKS}; do
+for DISK_AND_LOCATION in ${ZAKURAD_DISKS}; do
     IFS=$' '
     echo "Deleting disk: ${DISK_AND_LOCATION}"
     if ! gcloud compute disks delete --verbosity=info "${DISK_AND_LOCATION}"; then

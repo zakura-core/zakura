@@ -65,7 +65,7 @@ default = ["default-release-binaries"]
 # Indexer support
 indexer = ["zakura-state/indexer"]
 
-# Per-block commit-phase timing histograms (zebra.state.write.*), for perf profiling
+# Per-block commit-phase timing histograms (zakura.state.write.*), for perf profiling
 commit-metrics = ["zakura-state/commit-metrics"]
 
 # Experimental internal miner support

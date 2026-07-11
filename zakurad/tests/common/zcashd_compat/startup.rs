@@ -21,7 +21,7 @@ pub async fn both_processes_start() -> Result<()> {
     let expected_zcashd_chain = expected_zcashd_chain_name(&setup.network);
 
     let zebra_info: serde_json::Value = setup
-        .zebra_client
+        .zakura_client
         .json_result_from_call("getblockchaininfo", "[]")
         .await
         .map_err(|e| color_eyre::eyre::eyre!("zakurad getblockchaininfo: {e}"))?;
@@ -62,11 +62,11 @@ pub async fn sidecar_follows_tip() -> Result<()> {
     };
 
     if setup.can_mutate() {
-        setup.zebra_client.generate(5).await?;
+        setup.zakura_client.generate(5).await?;
         wait_for_zcashd_height(&setup.zcashd_client, 5).await?;
 
         let zebra_best: String = setup
-            .zebra_client
+            .zakura_client
             .json_result_from_call("getbestblockhash", "[]")
             .await
             .map_err(|e| color_eyre::eyre::eyre!("zakurad getbestblockhash: {e}"))?;
@@ -129,10 +129,10 @@ pub async fn miner_rpcs_disabled() -> Result<()> {
 
     if setup.can_mutate() {
         // Mine one block first so Zebra has a non-genesis tip to build on.
-        setup.zebra_client.generate(1).await?;
+        setup.zakura_client.generate(1).await?;
 
         let template: serde_json::Value = setup
-            .zebra_client
+            .zakura_client
             .json_result_from_call("getblocktemplate", "[]")
             .await
             .map_err(|e| color_eyre::eyre::eyre!("zakurad getblocktemplate: {e}"))?;

@@ -26,7 +26,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -78,33 +78,33 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "zebra_error_sapling_binding{job=\"$job\"}",
+          "expr": "zakura_error_sapling_binding{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
-          "expr": "zebra_sighash_error_sapling_spend{job=\"$job\"}",
+          "expr": "zakura_sighash_error_sapling_spend{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
-          "expr": "zebra_sighash_error_sprout_joinsplit{job=\"$job\"}",
+          "expr": "zakura_sighash_error_sprout_joinsplit{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         }
       ],
@@ -156,7 +156,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -209,33 +209,33 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "zebra_error_sapling_binding{job=\"$job\"}",
+          "expr": "zakura_error_sapling_binding{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
-          "expr": "zebra_sighash_error_sapling_spend{job=\"$job\"}",
+          "expr": "zakura_sighash_error_sapling_spend{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
-          "expr": "zebra_sighash_error_sprout_joinsplit{job=\"$job\"}",
+          "expr": "zakura_sighash_error_sprout_joinsplit{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         }
       ],
@@ -287,7 +287,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -340,33 +340,33 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "zebra_error_sapling_binding{job=\"$job\"}",
+          "expr": "zakura_error_sapling_binding{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
-          "expr": "zebra_sighash_error_sapling_spend{job=\"$job\"}",
+          "expr": "zakura_sighash_error_sapling_spend{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
-          "expr": "zebra_sighash_error_sprout_joinsplit{job=\"$job\"}",
+          "expr": "zakura_sighash_error_sprout_joinsplit{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         }
       ],
@@ -435,7 +435,7 @@
         },
         "datasource": {
           "type": "prometheus",
-          "uid": "zebra-prometheus"
+          "uid": "zakura-prometheus"
         },
         "definition": "label_values(zcash_net_peers, job)",
         "hide": 0,

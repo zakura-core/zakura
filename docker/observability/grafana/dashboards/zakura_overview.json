@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Zebra Node Overview - At-a-glance health and status for node operators",
+  "description": "Zakura Node Overview - At-a-glance health and status for node operators",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -32,8 +32,8 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
-      "description": "Zebra node software version",
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
+      "description": "Zakura node software version",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -58,7 +58,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "zakurad_build_info",
           "format": "table",
           "instant": true,
@@ -69,7 +69,7 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Current finalized blockchain height",
       "fieldConfig": {
         "defaults": {
@@ -97,7 +97,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "state_finalized_block_height",
           "legendFormat": "Height",
           "refId": "A"
@@ -107,7 +107,7 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Total ZEC supply on the blockchain",
       "fieldConfig": {
         "defaults": {
@@ -135,7 +135,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "state_finalized_chain_supply_total / 100000000",
           "legendFormat": "ZEC",
           "refId": "A"
@@ -153,7 +153,7 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Peer connectivity - gauge shows current count relative to healthy thresholds",
       "fieldConfig": {
         "defaults": {
@@ -184,7 +184,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "zcash_net_peers",
           "legendFormat": "Peers",
           "refId": "A"
@@ -194,7 +194,7 @@
       "type": "gauge"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Block verification activity (ACTIVE = processing blocks, IDLE = waiting for new blocks)",
       "fieldConfig": {
         "defaults": {
@@ -234,7 +234,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "rate(zcash_chain_verified_block_total[5m])",
           "legendFormat": "Rate",
           "refId": "A"
@@ -244,7 +244,7 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Blocks behind estimated network tip",
       "fieldConfig": {
         "defaults": {
@@ -282,7 +282,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "sync_estimated_distance_to_tip{job=~\"$job\"}",
           "legendFormat": "Distance",
           "refId": "A"
@@ -292,7 +292,7 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "ZIP-209 compliance - all value pools must be non-negative",
       "fieldConfig": {
         "defaults": {
@@ -329,7 +329,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "count(state_finalized_value_pool_transparent < 0 or state_finalized_value_pool_sprout < 0 or state_finalized_value_pool_sapling < 0 or state_finalized_value_pool_orchard < 0) or vector(0)",
           "legendFormat": "Violations",
           "refId": "A"
@@ -339,7 +339,7 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "RPC endpoint health based on error rate (no data = RPC disabled)",
       "fieldConfig": {
         "defaults": {
@@ -375,7 +375,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "sum(rate(rpc_requests_total{status=\"error\"}[5m])) / sum(rate(rpc_requests_total[5m])) or vector(0)",
           "legendFormat": "Error Rate",
           "refId": "A"
@@ -393,7 +393,7 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Network bandwidth - bytes transferred per second",
       "fieldConfig": {
         "defaults": {
@@ -434,14 +434,14 @@
       },
       "pluginVersion": "10.0.0",
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "zebra-prometheus" }, "expr": "sum(rate(zcash_net_in_bytes_total[1m]))", "legendFormat": "Inbound", "refId": "A" },
-        { "datasource": { "type": "prometheus", "uid": "zebra-prometheus" }, "expr": "sum(rate(zcash_net_out_bytes_total[1m]))", "legendFormat": "Outbound", "refId": "B" }
+        { "datasource": { "type": "prometheus", "uid": "zakura-prometheus" }, "expr": "sum(rate(zcash_net_in_bytes_total[1m]))", "legendFormat": "Inbound", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "zakura-prometheus" }, "expr": "sum(rate(zcash_net_out_bytes_total[1m]))", "legendFormat": "Outbound", "refId": "B" }
       ],
       "title": "Network Traffic",
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "P2P message rate - messages per second",
       "fieldConfig": {
         "defaults": {
@@ -482,14 +482,14 @@
       },
       "pluginVersion": "10.0.0",
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "zebra-prometheus" }, "expr": "sum(rate(zcash_net_in_messages[1m]))", "legendFormat": "Inbound", "refId": "A" },
-        { "datasource": { "type": "prometheus", "uid": "zebra-prometheus" }, "expr": "sum(rate(zcash_net_out_messages[1m]))", "legendFormat": "Outbound", "refId": "B" }
+        { "datasource": { "type": "prometheus", "uid": "zakura-prometheus" }, "expr": "sum(rate(zcash_net_in_messages[1m]))", "legendFormat": "Inbound", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "zakura-prometheus" }, "expr": "sum(rate(zcash_net_out_messages[1m]))", "legendFormat": "Outbound", "refId": "B" }
       ],
       "title": "Message Rate",
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Distribution of connected peers by client software",
       "fieldConfig": {
         "defaults": {
@@ -509,7 +509,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "sum by (user_agent) (zcash_net_peers_connected)",
           "legendFormat": "{{user_agent}}",
           "refId": "A"
@@ -527,7 +527,7 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Mempool transaction count and size",
       "fieldConfig": {
         "defaults": {
@@ -567,14 +567,14 @@
       },
       "pluginVersion": "10.0.0",
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "zebra-prometheus" }, "expr": "zcash_mempool_size_transactions", "legendFormat": "Transactions", "refId": "A" },
-        { "datasource": { "type": "prometheus", "uid": "zebra-prometheus" }, "expr": "zcash_mempool_size_bytes", "legendFormat": "Size", "refId": "B" }
+        { "datasource": { "type": "prometheus", "uid": "zakura-prometheus" }, "expr": "zcash_mempool_size_transactions", "legendFormat": "Transactions", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "zakura-prometheus" }, "expr": "zcash_mempool_size_bytes", "legendFormat": "Size", "refId": "B" }
       ],
       "title": "Mempool Size",
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Cryptographic proof verification rate (Halo2 + Groth16)",
       "fieldConfig": {
         "defaults": {
@@ -612,14 +612,14 @@
       },
       "pluginVersion": "10.0.0",
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "zebra-prometheus" }, "expr": "rate(proofs_halo2_verified[1m])", "legendFormat": "Halo2", "refId": "A" },
-        { "datasource": { "type": "prometheus", "uid": "zebra-prometheus" }, "expr": "rate(proofs_groth16_verified[1m])", "legendFormat": "Groth16", "refId": "B" }
+        { "datasource": { "type": "prometheus", "uid": "zakura-prometheus" }, "expr": "rate(proofs_halo2_verified[1m])", "legendFormat": "Halo2", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "zakura-prometheus" }, "expr": "rate(proofs_groth16_verified[1m])", "legendFormat": "Groth16", "refId": "B" }
       ],
       "title": "Proof Verification Rate",
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Block download and verification rate",
       "fieldConfig": {
         "defaults": {
@@ -657,8 +657,8 @@
       },
       "pluginVersion": "10.0.0",
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "zebra-prometheus" }, "expr": "rate(zcash_chain_verified_block_total[1m])", "legendFormat": "Verified", "refId": "A" },
-        { "datasource": { "type": "prometheus", "uid": "zebra-prometheus" }, "expr": "rate(sync_downloaded_block_count[1m])", "legendFormat": "Downloaded", "refId": "B" }
+        { "datasource": { "type": "prometheus", "uid": "zakura-prometheus" }, "expr": "rate(zcash_chain_verified_block_total[1m])", "legendFormat": "Verified", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "zakura-prometheus" }, "expr": "rate(sync_downloaded_block_count[1m])", "legendFormat": "Downloaded", "refId": "B" }
       ],
       "title": "Block Rate",
       "type": "timeseries"
@@ -672,7 +672,7 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "RocksDB database disk usage",
       "fieldConfig": {
         "defaults": {
@@ -703,7 +703,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "zakura_state_rocksdb_total_disk_size_bytes",
           "legendFormat": "DB Size",
           "refId": "A"
@@ -713,7 +713,7 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "RPC endpoint p99 latency (5m window)",
       "fieldConfig": {
         "defaults": {
@@ -744,7 +744,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "histogram_quantile(0.99, sum(rate(rpc_request_duration_seconds_bucket[5m])) by (le))",
           "legendFormat": "p99",
           "refId": "A"
@@ -754,7 +754,7 @@
       "type": "stat"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
       "description": "Peer count trend over time with health thresholds",
       "fieldConfig": {
         "defaults": {
@@ -800,7 +800,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "expr": "zcash_net_peers",
           "legendFormat": "Peers",
           "refId": "A"
@@ -815,7 +815,7 @@
       "id": 106,
       "panels": [
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "description": "Process CPU usage rate",
           "fieldConfig": {
             "defaults": {
@@ -854,7 +854,7 @@
           "pluginVersion": "10.0.0",
           "targets": [
             {
-              "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+              "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
               "expr": "rate(process_cpu_seconds_total{job=~\"$job\"}[1m])",
               "legendFormat": "CPU",
               "refId": "A"
@@ -864,7 +864,7 @@
           "type": "timeseries"
         },
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "description": "Process memory usage (resident and virtual)",
           "fieldConfig": {
             "defaults": {
@@ -903,13 +903,13 @@
           "pluginVersion": "10.0.0",
           "targets": [
             {
-              "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+              "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
               "expr": "process_resident_memory_bytes{job=~\"$job\"}",
               "legendFormat": "Resident",
               "refId": "A"
             },
             {
-              "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+              "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
               "expr": "process_virtual_memory_bytes{job=~\"$job\"}",
               "legendFormat": "Virtual",
               "refId": "B"
@@ -919,7 +919,7 @@
           "type": "timeseries"
         },
         {
-          "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
           "description": "Open and maximum file descriptors",
           "fieldConfig": {
             "defaults": {
@@ -958,13 +958,13 @@
           "pluginVersion": "10.0.0",
           "targets": [
             {
-              "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+              "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
               "expr": "process_open_fds{job=~\"$job\"}",
               "legendFormat": "Open",
               "refId": "A"
             },
             {
-              "datasource": { "type": "prometheus", "uid": "zebra-prometheus" },
+              "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
               "expr": "process_max_fds{job=~\"$job\"}",
               "legendFormat": "Max",
               "refId": "B"
@@ -991,7 +991,7 @@
       "id": 50,
       "options": {
         "code": { "language": "plaintext", "showLineNumbers": false, "showMiniMap": false },
-        "content": "### Detailed Dashboards\n\n| [Syncer](/d/Sl3h19Gnk/syncer) | [Network Health](/d/320aS_dMk/network-health) | [Peers](/d/S29TgUH7k/peers) | [RPC Metrics](/d/zakura-rpc-metrics/zakura-rpc-metrics) | [RPC Tracing](/d/zakura-rpc-tracing/zakura-rpc-tracing) | [Value Pools](/d/zebra-value-pools/zebra-value-pools) | [Mempool](/d/wVXGE6v7z/mempool) | [Database](/d/zebra-rocksdb/rocksdb-database) | [Tx Verification](/d/UXVRR1v7z/transaction-verification) | [Block Verification](/d/rO_Cl5tGz/block-verification) |",
+        "content": "### Detailed Dashboards\n\n| [Syncer](/d/Sl3h19Gnk/syncer) | [Network Health](/d/320aS_dMk/network-health) | [Peers](/d/S29TgUH7k/peers) | [RPC Metrics](/d/zakura-rpc-metrics/zakura-rpc-metrics) | [RPC Tracing](/d/zakura-rpc-tracing/zakura-rpc-tracing) | [Value Pools](/d/zakura-value-pools/zakura-value-pools) | [Mempool](/d/wVXGE6v7z/mempool) | [Database](/d/zakura-rocksdb/rocksdb-database) | [Tx Verification](/d/UXVRR1v7z/transaction-verification) | [Block Verification](/d/rO_Cl5tGz/block-verification) |",
         "mode": "markdown"
       },
       "pluginVersion": "10.0.0",
@@ -1003,7 +1003,7 @@
   "refresh": "10s",
   "schemaVersion": 38,
   "style": "dark",
-  "tags": ["zebra", "zcash", "overview"],
+  "tags": ["zakura", "zcash", "overview"],
   "templating": {
     "list": [
       {
@@ -1015,7 +1015,7 @@
         },
         "datasource": {
           "type": "prometheus",
-          "uid": "zebra-prometheus"
+          "uid": "zakura-prometheus"
         },
         "definition": "label_values(state_finalized_block_height, job)",
         "description": "Filter by Prometheus job label",
@@ -1040,8 +1040,8 @@
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "",
-  "title": "Zebra Overview",
-  "uid": "zebra-overview",
+  "title": "Zakura Overview",
+  "uid": "zakura-overview",
   "version": 1,
   "weekStart": ""
 }

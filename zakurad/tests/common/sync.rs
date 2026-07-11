@@ -334,7 +334,7 @@ pub fn check_sync_logs_until(
 ///
 /// Uses the resolved configuration from [`ZakuradConfig::load(None)`](ZakuradConfig::load), which
 /// incorporates defaults, optional TOML, and environment overrides.
-fn get_zebra_cached_state_dir() -> PathBuf {
+fn get_zakura_cached_state_dir() -> PathBuf {
     ZakuradConfig::load(None)
         .map(|c| c.state.cache_dir)
         .unwrap_or_else(|_| "/zakurad-cache".into())
@@ -343,7 +343,7 @@ fn get_zebra_cached_state_dir() -> PathBuf {
 /// Returns a test config for caching Zebra's state up to the mandatory checkpoint.
 pub fn cached_mandatory_checkpoint_test_config(network: &Network) -> Result<ZakuradConfig> {
     let mut config = persistent_test_config(network)?;
-    config.state.cache_dir = get_zebra_cached_state_dir();
+    config.state.cache_dir = get_zakura_cached_state_dir();
 
     // To get to the mandatory checkpoint, we need to sync lots of blocks.
     // (Most tests use a smaller limit to minimise redundant block downloads.)
@@ -393,7 +393,7 @@ pub fn create_cached_database_height(
     config.state.storage_mode = storage_mode;
     config.consensus.checkpoint_sync = checkpoint_sync;
 
-    let dir = get_zebra_cached_state_dir();
+    let dir = get_zakura_cached_state_dir();
     let mut child = dir
         .with_exact_config(&config)?
         .spawn_child(args!["start"])?

@@ -4,7 +4,7 @@
 //!
 //! - a `zakurad --zcashd-compat` process is running,
 //! - a sidecar `zcashd` process is running,
-//! - `getconnectioncount` on zcashd reports exactly one peer (the Zebra node
+//! - `getconnectioncount` on zcashd reports exactly one peer (the Zakura node
 //!   it is pinned to with `-connect`),
 //! - the absolute difference between zakurad and zcashd `getblockcount`
 //!   is within the configured maximum drift.
@@ -141,23 +141,23 @@ impl Check for ZcashdCompatSyncCheck {
             details.insert("predicate".into(), "peer_pinning".into());
             return CheckOutcome::fail(
                 format!(
-                    "sidecar zcashd must peer with exactly one node (Zebra), got {zcashd_peers}"
+                    "sidecar zcashd must peer with exactly one Zakura node, got {zcashd_peers}"
                 ),
                 details,
             );
         }
 
-        let zebra_height = match self
+        let zakura_height = match self
             .json_rpc(
                 &self.config.zakura_rpc_url,
-                &self.config.zebra_cookie_file,
+                &self.config.zakura_cookie_file,
                 "getblockcount",
             )
             .and_then(|result| block_count(&result))
         {
             Ok(height) => height,
             Err(error) => {
-                details.insert("predicate".into(), "zebra_getblockcount".into());
+                details.insert("predicate".into(), "zakura_getblockcount".into());
                 details.insert("error".into(), error.to_string());
                 return CheckOutcome::fail("zakurad getblockcount RPC failed", details);
             }
@@ -179,8 +179,8 @@ impl Check for ZcashdCompatSyncCheck {
             }
         };
 
-        let drift = zebra_height.abs_diff(zcashd_height);
-        details.insert("zebra_height".into(), zebra_height.to_string());
+        let drift = zakura_height.abs_diff(zcashd_height);
+        details.insert("zakura_height".into(), zakura_height.to_string());
         details.insert("zcashd_height".into(), zcashd_height.to_string());
         details.insert("height_drift".into(), drift.to_string());
         details.insert(
@@ -200,7 +200,7 @@ impl Check for ZcashdCompatSyncCheck {
         }
 
         CheckOutcome::pass(
-            format!("in sync: zakurad={zebra_height} zcashd={zcashd_height} drift={drift}"),
+            format!("in sync: zakurad={zakura_height} zcashd={zcashd_height} drift={drift}"),
             details,
         )
     }

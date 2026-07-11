@@ -630,7 +630,7 @@ impl StartCmd {
             );
 
             info!(
-                connect = %supervisor_config.zebra_p2p_addr,
+                connect = %supervisor_config.zakura_p2p_addr,
                 "zcashd-compat source enabled"
             );
 
@@ -808,7 +808,7 @@ impl StartCmd {
         let miner_task_handle: tokio::task::JoinHandle<Result<(), Report>> =
             tokio::spawn(std::future::pending().in_current_span());
 
-        info!("spawned initial Zebra tasks");
+        info!("spawned initial Zakura tasks");
 
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
 
@@ -1111,8 +1111,8 @@ impl config::Override<ZakuradConfig> for StartCmd {
             if !config.network.legacy_p2p() {
                 return Err(std::io::Error::other(
                     "zcashd-compat P2P sidecar mode requires the legacy Zcash P2P stack, \
-                     because zcashd syncs from Zebra over it; set network.p2p_stack to \
-                     \"zebra\" or \"dual\"",
+                     because zcashd syncs from Zakura over it; set network.p2p_stack to \
+                     \"legacy\" or \"dual\"",
                 )
                 .into());
             }
@@ -1203,7 +1203,7 @@ mod tests {
             unsafe_low_specs: false,
         };
         let mut config = ZakuradConfig::default();
-        config.network.p2p_stack = P2pStack::Zebra;
+        config.network.p2p_stack = P2pStack::Legacy;
         config.sync.debug_blocksync_throughput_target_height = Some(100);
 
         let error = cmd
@@ -1439,19 +1439,19 @@ mod tests {
     }
 
     #[test]
-    fn zcashd_compat_supervisor_ok_exit_does_not_exit_zebra() {
+    fn zcashd_compat_supervisor_ok_exit_does_not_exit_zakura() {
         assert!(!StartCmd::zcashd_compat_supervisor_should_exit(Ok(Ok(()))));
     }
 
     #[test]
-    fn zcashd_compat_supervisor_error_does_not_exit_zebra() {
+    fn zcashd_compat_supervisor_error_does_not_exit_zakura() {
         assert!(!StartCmd::zcashd_compat_supervisor_should_exit(Ok(Err(
             eyre!("simulated zcashd supervisor runtime failure"),
         ))));
     }
 
     #[tokio::test]
-    async fn zcashd_compat_supervisor_panic_does_not_exit_zebra() {
+    async fn zcashd_compat_supervisor_panic_does_not_exit_zakura() {
         let join_err = tokio::spawn(async {
             panic!("simulated zcashd supervisor panic");
         })
@@ -1702,7 +1702,7 @@ mod zakura_header_sync_driver_tests {
 
         assert!(use_zakura_block_sync(&config));
 
-        config.p2p_stack = P2pStack::Zebra;
+        config.p2p_stack = P2pStack::Legacy;
         assert!(!use_zakura_block_sync(&config));
     }
 

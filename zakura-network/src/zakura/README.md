@@ -12,7 +12,8 @@ in the rest of the network, so concurrent experiments interfere. Setting the sam
 overlay** that is invisible to the v2 layer of any non-cohort node, while still
 running on the **unchanged chain** (same genesis, network magic, and activation
 heights). It only scopes the v2 overlay; legacy TCP connectivity to public peers
-is intentionally unaffected, and the tag has no effect unless `v2_p2p` is enabled.
+is intentionally unaffected, and the tag has no effect unless `p2p_stack`
+enables Zakura P2P.
 
 ## Mechanism
 
@@ -21,7 +22,7 @@ A node decides whether to peer over Zakura by comparing two fields of its
 
 | Field | Normal value | Mismatch reject |
 | --- | --- | --- |
-| `network_id: ZakuraNetworkId` | `Mainnet` / `Testnet` / `Regtest` | `WrongNetwork` |
+| `network_id` | `Mainnet`/`Testnet`/`Regtest` | `WrongNetwork` |
 | `chain_id: [u8; 32]` | genesis block hash | `WrongChain` |
 
 These two fields are already exchanged and validated in three places, so scoping
@@ -47,8 +48,8 @@ sets:
 
 Resulting behavior:
 
-- **public node ↔ dev node** → `WrongNetwork` (on `network_id`), both fall back to
-  a legacy connection;
+- **public node ↔ dev node** → `WrongNetwork` (on `network_id`), both fall back
+  to a legacy connection;
 - **cohort A ↔ cohort B** → both advertise `Configured`, so they pass the
   `network_id` check and reject on `chain_id` with `WrongChain`; their discovery
   records also fail import;
@@ -71,15 +72,16 @@ uses the unchanged network parameters, consensus is untouched.
 
 ## Testing
 
-Unit tests live in `handshake.rs` (`dev_cohort_*`, `derive_dev_chain_id_*`) and a
-config round-trip in `../config/tests/vectors.rs`:
+Unit tests live in `handshake.rs` (`dev_cohort_*`,
+`derive_dev_chain_id_*`) and a config round-trip in
+`../config/tests/vectors.rs`:
 
 ```bash
 cargo test -p zakura-network --lib -- zakura::handshake::tests::dev_cohort
 cargo test -p zakura-network --lib -- config::tests::vectors::zakura_dev_network
 ```
 
-For a two-node smoke test, give two nodes `v2_p2p = true`, the same
+For a two-node smoke test, give two nodes `p2p_stack = "zakura"`, the same
 `[network.zakura] dev_network`, and `zakura.bootstrap_peers` pointing at each
 other, plus a third untagged node. The two tagged nodes upgrade to Zakura and
 discover each other (`zakura.p2p.handshake.*` metrics / trace tables) while the

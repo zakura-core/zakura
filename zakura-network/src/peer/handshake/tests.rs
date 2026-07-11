@@ -566,13 +566,13 @@ async fn p2p_v2_service_bit_advertisement_follows_config() {
     let _init_guard = zakura_test::init();
 
     assert!(!configured_advertised_services(
-        &test_config(P2pStack::Zebra),
+        &test_config(P2pStack::Legacy),
         PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2,
     )
     .contains(PeerServices::NODE_P2P_V2));
 
     let (disabled_peer_seen_by_enabled, enabled_peer_seen_by_disabled) =
-        negotiate_test_pair(test_config(P2pStack::Dual), test_config(P2pStack::Zebra)).await;
+        negotiate_test_pair(test_config(P2pStack::Dual), test_config(P2pStack::Legacy)).await;
 
     assert!(!disabled_peer_seen_by_enabled
         .remote
@@ -677,7 +677,7 @@ fn p2p_v2_upgrade_requires_local_enable_and_remote_service_bit() {
     };
 
     assert!(!should_attempt_zakura_upgrade(
-        &test_config(P2pStack::Zebra),
+        &test_config(P2pStack::Legacy),
         &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2),
     ));
     assert!(!should_attempt_zakura_upgrade(
@@ -703,7 +703,7 @@ async fn remote_p2p_v2_with_local_disabled_continues_legacy() {
     let mut remote_counter = ActiveConnectionCounter::new_counter();
 
     let local_handshake = test_handshake(
-        test_config(P2pStack::Zebra),
+        test_config(P2pStack::Legacy),
         address_book_tx.clone(),
         local_calls.clone(),
         upgraded_outcome(),

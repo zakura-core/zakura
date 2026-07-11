@@ -1281,7 +1281,7 @@ impl ZakuraDb {
         self.db
             .write(batch)
             .expect("unexpected rocksdb error while writing block");
-        metrics::histogram!("zebra.state.rocksdb.batch_commit.duration_seconds")
+        metrics::histogram!("zakura.state.rocksdb.batch_commit.duration_seconds")
             .record(batch_start.elapsed().as_secs_f64());
 
         tracing::trace!(?source, "committed block from");

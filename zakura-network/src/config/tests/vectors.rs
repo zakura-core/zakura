@@ -177,7 +177,7 @@ fn p2p_stack_defaults_by_network_and_roundtrips() {
     );
 
     for (network, stack) in [
-        ("Mainnet", P2pStack::Zebra),
+        ("Mainnet", P2pStack::Legacy),
         ("Testnet", P2pStack::Dual),
         ("Regtest", P2pStack::Dual),
     ] {
@@ -186,7 +186,7 @@ fn p2p_stack_defaults_by_network_and_roundtrips() {
         assert_eq!(config.p2p_stack, P2pStack::Default);
         assert_eq!(config.p2p_stack.resolve(&config.network), stack);
         assert_eq!(config.legacy_p2p(), stack != P2pStack::Zakura);
-        assert_eq!(config.v2_p2p(), stack != P2pStack::Zebra);
+        assert_eq!(config.v2_p2p(), stack != P2pStack::Legacy);
     }
 
     // Overriding `network` with struct-update syntax resolves against the new network, so a
@@ -203,15 +203,16 @@ fn p2p_stack_defaults_by_network_and_roundtrips() {
     assert!(mainnet_dual.legacy_p2p());
     assert!(mainnet_dual.v2_p2p());
 
-    let testnet_zebra: Config = toml::from_str("network = 'Testnet'\np2p_stack = 'zebra'").unwrap();
-    assert!(testnet_zebra.legacy_p2p());
-    assert!(!testnet_zebra.v2_p2p());
+    let testnet_legacy: Config =
+        toml::from_str("network = 'Testnet'\np2p_stack = 'legacy'").unwrap();
+    assert!(testnet_legacy.legacy_p2p());
+    assert!(!testnet_legacy.v2_p2p());
 
     // Every stack round-trips through its canonical name, and the deprecated flags are
     // never written back out.
     for stack in [
         P2pStack::Default,
-        P2pStack::Zebra,
+        P2pStack::Legacy,
         P2pStack::Zakura,
         P2pStack::Dual,
     ] {
@@ -361,18 +362,14 @@ fn zakura_dev_network_defaults_off_and_roundtrips() {
 }
 
 #[test]
-fn p2p_stack_aliases_parse_to_the_canonical_stack() {
+fn canonical_p2p_stack_names_parse() {
     let _init_guard = zakura_test::init();
 
     for (value, stack) in [
         ("default", P2pStack::Default),
-        ("zebra", P2pStack::Zebra),
-        ("v1", P2pStack::Zebra),
-        ("legacy", P2pStack::Zebra),
+        ("legacy", P2pStack::Legacy),
         ("zakura", P2pStack::Zakura),
-        ("v2", P2pStack::Zakura),
         ("dual", P2pStack::Dual),
-        ("combined", P2pStack::Dual),
     ] {
         let config: Config = toml::from_str(&format!("p2p_stack = '{value}'"))
             .unwrap_or_else(|error| panic!("p2p_stack = '{value}' should parse: {error}"));
@@ -385,13 +382,13 @@ fn p2p_stack_aliases_parse_to_the_canonical_stack() {
 fn p2p_stack_rejects_unknown_values() {
     let _init_guard = zakura_test::init();
 
-    let error = toml::from_str::<Config>("p2p_stack = 'enabled'")
-        .expect_err("'enabled' is not a P2P stack");
-
-    assert!(
-        error.to_string().contains("unknown variant"),
-        "unexpected p2p_stack error: {error}",
-    );
+    for value in ["enabled", "zebra", "v1", "v2", "combined"] {
+        let error = toml::from_str::<Config>(&format!("p2p_stack = '{value}'")).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "unexpected p2p_stack error for {value:?}: {error}",
+        );
+    }
 }
 
 #[test]
@@ -406,9 +403,9 @@ fn deprecated_p2p_flags_map_onto_p2p_stack() {
     // understood these flags.
     for (toml, stack) in [
         ("legacy_p2p = true\nv2_p2p = true", P2pStack::Dual),
-        ("legacy_p2p = true\nv2_p2p = false", P2pStack::Zebra),
+        ("legacy_p2p = true\nv2_p2p = false", P2pStack::Legacy),
         ("legacy_p2p = false\nv2_p2p = true", P2pStack::Zakura),
-        ("enable_p2p_v2 = false", P2pStack::Zebra),
+        ("enable_p2p_v2 = false", P2pStack::Legacy),
         ("legacy_p2p = false", P2pStack::Zakura),
         ("v2_p2p = true", P2pStack::Dual),
     ] {
@@ -439,7 +436,7 @@ fn deprecated_p2p_flags_conflict_with_p2p_stack() {
     for toml in [
         "p2p_stack = 'dual'\nlegacy_p2p = true",
         "p2p_stack = 'dual'\nv2_p2p = true",
-        "p2p_stack = 'zebra'\nenable_p2p_v2 = false",
+        "p2p_stack = 'legacy'\nenable_p2p_v2 = false",
     ] {
         let error = toml::from_str::<Config>(toml)
             .expect_err("p2p_stack and the deprecated flags can disagree, so both is an error");

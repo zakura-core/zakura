@@ -1,6 +1,6 @@
 # CHANGELOG
 
-All notable changes to Zebra are documented in this file.
+All notable changes to Zakura are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org).
@@ -16,10 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   binary, systemd unit, runtime paths, and Sentry identity use
   `zakura-watchdog`.
 - Renamed Zakura-owned crates, binaries, tools, deployment helpers, and current
-  documentation from Zebra/Zebrad names to Zakura/Zakurad names. Deprecated
-  compatibility inputs such as `zebrad.toml`, `ZEBRA_*`, the legacy `zebrad`
-  release alias, old cache discovery paths, `p2p_stack = "zebra"`, and zcashd's
-  `-zebra-compat` spelling remain available where they are external contracts.
+  documentation from Zebra/Zebrad names to Zakura/Zakurad names. This is a
+  breaking migration: use `zakura.toml`, `ZAKURA_*`, the `zakurad` binary, and
+  `p2p_stack = "legacy"`; the old Zakura-owned aliases and automatic cache
+  migration have been removed. `zebrad.toml` remains a deprecated fallback when
+  `zakura.toml` is absent. The config loader accepts legacy `ZEBRA_*` environment
+  variables with lower precedence than `ZAKURA_*`, and the Docker entrypoint
+  translates them to `ZAKURA_*`. The deprecated `legacy_p2p` and `v2_p2p`
+  booleans still map to `p2p_stack`. External zcashd and protobuf contracts
+  retain their upstream names.
 - zcashd-compat no longer adds or requires the obsolete zcashd deprecation
   acknowledgement in `zcash.conf`.
 - Removed the deprecated zcashd-compat dedicated RPC listener (`:28232`) and its
@@ -38,12 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 ### Changed
 
 - Replaced the `network.legacy_p2p` and `network.v2_p2p` booleans with a single
-  `network.p2p_stack` setting, which selects `"zebra"` (aliases `"v1"`,
-  `"legacy"`) for the legacy TCP Zcash P2P stack, `"zakura"` (alias `"v2"`) for
-  the native Zakura P2P v2 stack, or `"dual"` (alias `"combined"`) for both.
-  It defaults to `"default"`, which follows Zebra's binary default for the
-  configured network so it can change during upgrades: currently `"zebra"` on
-  Mainnet, and `"dual"` on Testnet and Regtest.
+  `network.p2p_stack` setting, which selects `"legacy"` for the legacy TCP
+  Zcash P2P stack, `"zakura"` for the native Zakura P2P v2 stack, or `"dual"`
+  for both. It defaults to `"default"`, which follows Zakura's binary default
+  for the configured network so it can change during upgrades: currently
+  `"legacy"` on Mainnet, and `"dual"` on Testnet and Regtest.
   The old booleans are deprecated but still parsed, so existing configs keep
   working. Setting them alongside `network.p2p_stack` is an error, and setting
   both to `false` — which used to start a node with no peer-to-peer networking

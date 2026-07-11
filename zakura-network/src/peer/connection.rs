@@ -807,7 +807,7 @@ where
                             debug!(%response, "finished receiving peer response to Zebra request");
                             // Add a metric for inbound responses to outbound requests.
                             metrics::counter!(
-                                "zebra.net.in.responses",
+                                "zakura.net.in.responses",
                                 "command" => response.command(),
                                 "addr" => self.metrics_label.clone(),
                             )
@@ -991,7 +991,7 @@ where
             debug!(state = %self.state, %request, "ignoring canceled request");
 
             metrics::counter!(
-                "zebra.net.out.requests.canceled",
+                "zakura.net.out.requests.canceled",
                 "command" => request.command(),
                 "addr" => self.metrics_label.clone(),
             )
@@ -1005,7 +1005,7 @@ where
 
         // Add a metric for outbound requests.
         metrics::counter!(
-            "zebra.net.out.requests",
+            "zakura.net.out.requests",
             "command" => request.command(),
             "addr" => self.metrics_label.clone(),
         )
@@ -1404,7 +1404,7 @@ where
 
         // Add a metric for inbound requests
         metrics::counter!(
-            "zebra.net.in.requests",
+            "zakura.net.in.requests",
             "command" => req.command(),
             "addr" => self.metrics_label.clone(),
         )
@@ -1475,7 +1475,7 @@ where
 
         // Add a metric for outbound responses to inbound requests
         metrics::counter!(
-            "zebra.net.out.responses",
+            "zakura.net.out.responses",
             "command" => rsp.command(),
             "addr" => self.metrics_label.clone(),
         )
@@ -1708,7 +1708,7 @@ where
 
         // Set the new state
         metrics::gauge!(
-            "zebra.net.connection.state",
+            "zakura.net.connection.state",
             "command" => current_metrics_state.clone(),
             "addr" => self.metrics_label.clone(),
         )
@@ -1721,7 +1721,7 @@ where
     fn erase_state_metrics(&mut self) {
         if let Some(last_metrics_state) = self.last_metrics_state.take() {
             metrics::gauge!(
-                "zebra.net.connection.state",
+                "zakura.net.connection.state",
                 "command" => last_metrics_state,
                 "addr" => self.metrics_label.clone(),
             )

@@ -17,11 +17,11 @@ pub const PROCESS_FAILURE_MESSAGES: &[&str] = &[
     // TODO: add other OS or C library errors?
 ];
 
-/// Failure log messages from Zebra.
+/// Failure log messages from Zakura.
 ///
 /// These `zakurad` messages show that the `lightwalletd` integration test has failed.
 /// So when we see them in the logs, we make the test fail.
-pub const ZEBRA_FAILURE_MESSAGES: &[&str] = &[
+pub const ZAKURA_FAILURE_MESSAGES: &[&str] = &[
     // Rust-specific panics
     "The application panicked",
     // RPC port errors
@@ -117,7 +117,7 @@ pub const LIGHTWALLETD_FAILURE_MESSAGES: &[&str] = &[
 ///
 /// These `lightwalletd` messages look like failure messages, but they are actually ok.
 /// So when we see them in the logs, we make the test continue.
-pub const LIGHTWALLETD_EMPTY_ZEBRA_STATE_IGNORE_MESSAGES: &[&str] = &[
+pub const LIGHTWALLETD_EMPTY_ZAKURA_STATE_IGNORE_MESSAGES: &[&str] = &[
     // Exceptions to lightwalletd custom RPC error messages:
     //
     // This log matches the "error with" RPC error message,
@@ -130,7 +130,7 @@ pub const LIGHTWALLETD_EMPTY_ZEBRA_STATE_IGNORE_MESSAGES: &[&str] = &[
 /// These `zakura-checkpoints` messages show that checkpoint generation has failed.
 /// So when we see them in the logs, we make the test fail.
 #[cfg(feature = "zakura-checkpoints")]
-pub const ZEBRA_CHECKPOINTS_FAILURE_MESSAGES: &[&str] = &[
+pub const ZAKURA_CHECKPOINTS_FAILURE_MESSAGES: &[&str] = &[
     // Rust-specific panics
     "The application panicked",
     // RPC port errors

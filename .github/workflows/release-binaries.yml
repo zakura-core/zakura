@@ -155,14 +155,13 @@ jobs:
           set -euo pipefail
           mkdir -p ./artifacts/bin ./artifacts/metadata
           cp "./out/usr/local/bin/${RELEASE_BINARY}" ./artifacts/bin/zakurad
-          cp "./out/usr/local/bin/${RELEASE_BINARY}" ./artifacts/bin/zebrad
           archive_name="zakurad-${RELEASE_TAG}-${{ matrix.name }}.tar.gz"
           (
             cd ./artifacts
             tar --sort=name \
               --mtime='UTC 2020-01-01' \
               --owner=0 --group=0 --numeric-owner \
-              -czf "$archive_name" ./bin/zakurad ./bin/zebrad
+              -czf "$archive_name" ./bin/zakurad
           )
           archive_sha256="$(sha256sum "./artifacts/${archive_name}" | awk '{print $1}')"
           archive_size="$(stat --printf='%s' "./artifacts/${archive_name}")"
@@ -173,8 +172,7 @@ jobs:
             "archive": "${archive_name}",
             "sha256": "${archive_sha256}",
             "size": ${archive_size},
-            "archive_member_binary_path": "./bin/zakurad",
-            "legacy_archive_member_binary_path": "./bin/zebrad"
+            "archive_member_binary_path": "./bin/zakurad"
           }
           EOF
 

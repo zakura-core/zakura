@@ -7,7 +7,7 @@
 #          fixed iroh identity, stable Zakura QUIC port 18234
 #   node2  PURE Zakura-only (p2p_stack = zakura)   rpc 18332  metrics 19002
 #          joins solely by dialing node1's Zakura bootstrap_peers entry
-#   node3  legacy-only (p2p_stack = zebra)        rpc 18432  metrics 19003  -> node1
+#   node3  legacy-only (p2p_stack = legacy)       rpc 18432  metrics 19003  -> node1
 #   node4  dual-stack (legacy TCP + Zakura)       rpc 18532  metrics 19004  -> node1
 #          dials node1 over legacy TCP, then upgrades to Zakura
 #

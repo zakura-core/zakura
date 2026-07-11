@@ -36,7 +36,7 @@ threads-required = "num-test-threads"
 # TODO: We need a better test architecture to run all non-stateful
 [profile.all-tests]
 failure-output = "immediate"
-default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=lwd_rpc_test) and not test(=lwd_rpc_send_tx) and not test(=lwd_grpc_wallet) and not test(=lwd_integration) and not test(=lwd_sync_full) and not test(=lwd_sync_update) and not test(=lightwalletd_test_suite) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(=get_peer_info) and not test(~generate_checkpoints_) and not test(=sync_one_checkpoint_mainnet) and not test(=sync_one_checkpoint_testnet) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=pruned_storage_mode_prunes_during_regtest_sync) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz)"
+default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=lwd_rpc_test) and not test(=lwd_rpc_send_tx) and not test(=lwd_grpc_wallet) and not test(=lwd_integration) and not test(=lwd_sync_full) and not test(=lwd_sync_update) and not test(=lightwalletd_test_suite) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(=get_peer_info) and not test(~generate_checkpoints_) and not test(=sync_one_checkpoint_mainnet) and not test(=sync_one_checkpoint_testnet) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=restart_stop_at_height) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=pruned_storage_mode_prunes_during_regtest_sync) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz)"
 
 # The Zakura block-sync tests drive the real reactor through a real-time (wall-clock)
 # scenario harness — multi-threaded tokio with real sleeps and timeouts. Under a loaded
@@ -55,7 +55,7 @@ retries = 2
 # no-fail-fast without hiding fast unit failures.
 [profile.full-tests]
 failure-output = "immediate"
-default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=lwd_rpc_test) and not test(=lwd_rpc_send_tx) and not test(=lwd_grpc_wallet) and not test(=lwd_integration) and not test(=lwd_sync_full) and not test(=lwd_sync_update) and not test(=lightwalletd_test_suite) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(=get_peer_info) and not test(~generate_checkpoints_) and not test(=sync_one_checkpoint_mainnet) and not test(=sync_one_checkpoint_testnet) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz)"
+default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=lwd_rpc_test) and not test(=lwd_rpc_send_tx) and not test(=lwd_grpc_wallet) and not test(=lwd_integration) and not test(=lwd_sync_full) and not test(=lwd_sync_update) and not test(=lightwalletd_test_suite) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(=get_peer_info) and not test(~generate_checkpoints_) and not test(=sync_one_checkpoint_mainnet) and not test(=sync_one_checkpoint_testnet) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=restart_stop_at_height) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz)"
 
 # Retry the real-time Zakura block-sync scenario tests under load (see the note on the
 # `all-tests` override above).
@@ -72,6 +72,13 @@ default-filter = 'test(check_no_git_dependencies)'
 test-threads = 1
 failure-output = "immediate"
 default-filter = 'package(zakura) and test(=config_tests)'
+
+[profile.zakura-network-dependent]
+test-threads = 1
+retries = 2
+slow-timeout = { period = "5m", terminate-after = 1 }
+failure-output = "immediate"
+default-filter = 'package(zakura) and test(=restart_stop_at_height)'
 
 [profile.zakura-integration]
 fail-fast = false
@@ -214,7 +221,7 @@ default-filter = 'package(zakura) and test(=zcashd_compat_reorg_churn)'
 
 [profile.zcashd-compat-external]
 # External mode: connect to pre-running mainnet/testnet zakurad + zcashd.
-# Set TEST_ZCASHD_COMPAT_NETWORK, TEST_ZEBRAD_RPC_ADDR,
+# Set TEST_ZCASHD_COMPAT_NETWORK, TEST_ZAKURAD_RPC_ADDR,
 # TEST_ZCASHD_RPC_ADDR, and auth env vars before running.
 # No block mining — 5 minutes per test is sufficient.
 test-threads = 1

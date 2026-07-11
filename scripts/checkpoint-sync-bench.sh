@@ -24,14 +24,14 @@
 #   FEED_PEER             single pinned peer ip:port           (default 167.99.162.47:8233)
 #   CKPT_LIMIT            checkpoint_verify_concurrency_limit  (default 1500)
 #   DL_LIMIT              download_concurrency_limit           (default 150)
-#   TARGET_P2P_STACK            zebra | zakura | dual (aliases: v1/legacy, v2, combined)
-#                               default: zakura. Older TARGET_SHOULD_USE_* bools still work.
-#   BASELINE_P2P_STACK          same as TARGET_P2P_STACK for the baseline run (default: zebra)
+#   TARGET_P2P_STACK            legacy | zakura | dual
+#                               default: zakura
+#   BASELINE_P2P_STACK          same as TARGET_P2P_STACK for the baseline run (default: legacy)
 #   SNAPSHOT_URL          primary snapshot .tar.zst URL
 #   SNAPSHOT_SHA256       expected sha256 of the .tar.zst
 #   START_HEIGHT          snapshot tip height                  (default 1707210)
 #   BENCH_HOME            persistent cache root                (default /opt/zakura-bench)
-#   GH_REPO               releases repo                        (default valargroup/zebra)
+#   GH_REPO               releases repo                        (default zakura-core/zakura)
 #   OUT_DIR               artifact output dir                  (default ./bench-out)
 #   METRICS_PORT          Prometheus port (auto-bumps if busy) (default 19999)
 #   LISTEN_PORT           P2P listen port  (auto-bumps if busy)(default 18233)
@@ -66,17 +66,12 @@ DL_LIMIT="${DL_LIMIT:-150}"
 PEERSET_SIZE="${PEERSET_SIZE:-1}"   # 1 = strict single pinned peer; raise to allow DNS-seeder fallback
 TARGET_P2P_STACK="${TARGET_P2P_STACK:-}"
 BASELINE_P2P_STACK="${BASELINE_P2P_STACK:-}"
-# Deprecated bool inputs (pre-p2p_stack); honored only when the new vars are unset.
-TARGET_SHOULD_USE_V2_P2P="${TARGET_SHOULD_USE_V2_P2P:-}"
-TARGET_SHOULD_USE_LEGACY_P2P="${TARGET_SHOULD_USE_LEGACY_P2P:-}"
-BASELINE_SHOULD_USE_V2_P2P="${BASELINE_SHOULD_USE_V2_P2P:-}"
-BASELINE_SHOULD_USE_LEGACY_P2P="${BASELINE_SHOULD_USE_LEGACY_P2P:-}"
 START_HEIGHT="${START_HEIGHT:-1707210}"
 SNAPSHOT_URL="${SNAPSHOT_URL:-https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
 SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769}"
 SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-https://zebra.valargroup.dev/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
 BENCH_HOME="${BENCH_HOME:-/opt/zakura-bench}"
-GH_REPO="${GH_REPO:-valargroup/zebra}"
+GH_REPO="${GH_REPO:-zakura-core/zakura}"
 OUT_DIR="${OUT_DIR:-$PWD/bench-out}"
 # Observability dashboard: record a per-run metrics time series + emit a bottleneck
 # verdict (commit / download / verify). DASHBOARD_ARCHIVE is where the always-on
@@ -120,43 +115,26 @@ normalize_bool() {
 
 SKIP_BASELINE="$(normalize_bool "$SKIP_BASELINE")"
 
-# Map a stack name (or deprecated v2/legacy bool pair) onto a canonical p2p_stack.
+# Validate and normalize a canonical p2p_stack name.
 normalize_p2p_stack() {
   local raw="${1:-}"
   case "${raw,,}" in
     "" ) echo "" ;;
     default) echo "default" ;;
-    zebra|v1|legacy) echo "zebra" ;;
-    zakura|v2) echo "zakura" ;;
-    dual|combined) echo "dual" ;;
-    *) die "invalid p2p_stack '$raw' (use zebra, zakura, dual, or default)" ;;
-  esac
-}
-
-# Resolve TARGET/BASELINE stack from the new string input, else the deprecated bools.
-stack_from_bools() {
-  local v2="$1" legacy="$2" default_stack="$3"
-  if [[ -z "$v2" && -z "$legacy" ]]; then
-    echo "$default_stack"
-    return
-  fi
-  v2="$(normalize_bool "${v2:-0}")"
-  legacy="$(normalize_bool "${legacy:-1}")"
-  case "$v2$legacy" in
-    11) echo "dual" ;;
-    10) echo "zakura" ;;
-    01) echo "zebra" ;;
-    *) die "invalid P2P bools v2=$v2 legacy=$legacy (enable at least one stack)" ;;
+    legacy) echo "legacy" ;;
+    zakura) echo "zakura" ;;
+    dual) echo "dual" ;;
+    *) die "invalid p2p_stack '$raw' (use legacy, zakura, dual, or default)" ;;
   esac
 }
 
 TARGET_P2P_STACK="$(normalize_p2p_stack "$TARGET_P2P_STACK")"
 BASELINE_P2P_STACK="$(normalize_p2p_stack "$BASELINE_P2P_STACK")"
 if [[ -z "$TARGET_P2P_STACK" ]]; then
-  TARGET_P2P_STACK="$(stack_from_bools "$TARGET_SHOULD_USE_V2_P2P" "$TARGET_SHOULD_USE_LEGACY_P2P" "zakura")"
+  TARGET_P2P_STACK="zakura"
 fi
 if [[ -z "$BASELINE_P2P_STACK" ]]; then
-  BASELINE_P2P_STACK="$(stack_from_bools "$BASELINE_SHOULD_USE_V2_P2P" "$BASELINE_SHOULD_USE_LEGACY_P2P" "zebra")"
+  BASELINE_P2P_STACK="legacy"
 fi
 
 # Always tear down a launched node + its fork, even on FATAL/interrupt, so a failed
@@ -430,10 +408,10 @@ run_one() {
   local p2p_stack
   p2p_stack="$(normalize_p2p_stack "$3")"
   [[ -n "$p2p_stack" && "$p2p_stack" != "default" ]] \
-    || die "$prefix run needs an explicit p2p_stack (zebra|zakura|dual), got '${3:-}'"
+    || die "$prefix run needs an explicit p2p_stack (legacy|zakura|dual), got '${3:-}'"
   local runs_zakura=0 runs_legacy=0
   case "$p2p_stack" in
-    zebra) runs_legacy=1 ;;
+    legacy) runs_legacy=1 ;;
     zakura) runs_zakura=1 ;;
     dual) runs_zakura=1; runs_legacy=1 ;;
   esac

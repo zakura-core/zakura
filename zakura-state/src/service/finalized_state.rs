@@ -920,7 +920,7 @@ impl FinalizedState {
                         // checking this block's commitment against the *parent* history
                         // tree. They are independent; the history push below joins them.
                         #[cfg(feature = "commit-metrics")]
-                        metrics::histogram!("zebra.state.write.block_tx_count")
+                        metrics::histogram!("zakura.state.write.block_tx_count")
                             .record(block.transactions.len() as f64);
                         #[cfg(feature = "commit-metrics")]
                         let _ckpt_compute = std::time::Instant::now();
@@ -932,7 +932,7 @@ impl FinalizedState {
                             rayon::in_place_scope_fifo(|scope| {
                                 scope.spawn_fifo(|_scope| {
                                     commitment_result = Some(timed_commit_phase!(
-                                        "zebra.state.write.commitment_check.duration_seconds",
+                                        "zakura.state.write.commitment_check.duration_seconds",
                                         check::block_commitment_is_valid_for_chain_history(
                                             block.clone(),
                                             &network,
@@ -943,7 +943,7 @@ impl FinalizedState {
                                 });
 
                                 timed_commit_phase!(
-                                    "zebra.state.write.update_trees.duration_seconds",
+                                    "zakura.state.write.update_trees.duration_seconds",
                                     note_commitment_trees.update_trees_parallel(&block)
                                 )
                             })
@@ -973,7 +973,7 @@ impl FinalizedState {
 
                         #[cfg(feature = "commit-metrics")]
                         metrics::histogram!(
-                            "zebra.state.write.checkpoint_compute.duration_seconds"
+                            "zakura.state.write.checkpoint_compute.duration_seconds"
                         )
                         .record(_ckpt_compute.elapsed().as_secs_f64());
                     }

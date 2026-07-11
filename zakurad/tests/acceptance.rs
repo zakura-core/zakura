@@ -431,12 +431,27 @@ async fn db_init_outside_future_executor() -> Result<()> {
     Ok(())
 }
 
-/// Check that the block state and peer list caches are written to disk.
+/// Check that persistent block state and peer list caches survive a node run.
 #[test]
 fn persistent_mode() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let testdir = testdir()?.with_config(&mut persistent_test_config(&Mainnet)?)?;
+    let mut config = persistent_test_config(&Mainnet)?;
+    // Avoid depending on live Mainnet peers. A pre-seeded cache exercises the
+    // persistent peer-cache path while failed local dialing leaves it intact.
+    config.network.initial_mainnet_peers.clear();
+    let testdir = testdir()?.with_config(&mut config)?;
+    let peer_cache_file = config
+        .network
+        .cache_dir
+        .peer_cache_file_path(&Mainnet)
+        .expect("persistent test config enables the peer cache");
+    fs::create_dir_all(
+        peer_cache_file
+            .parent()
+            .expect("peer cache file has a parent directory"),
+    )?;
+    fs::write(&peer_cache_file, "127.0.0.1:1\n")?;
     let testdir = &testdir;
 
     let mut child = testdir.spawn_child(args!["-v", "start"])?;
@@ -448,6 +463,7 @@ fn persistent_mode() -> Result<()> {
 
     // Make sure the command was killed
     output.assert_was_killed()?;
+    output.stdout_line_contains("loaded cached peer IP addresses")?;
 
     let cache_dir = testdir.path().join("state");
     assert_with_context!(
@@ -456,11 +472,10 @@ fn persistent_mode() -> Result<()> {
         "state directory empty despite persistent state config"
     );
 
-    let cache_dir = testdir.path().join("network");
     assert_with_context!(
-        cache_dir.read_dir()?.count() > 0,
+        fs::read_to_string(peer_cache_file)?.trim() == "127.0.0.1:1",
         &output,
-        "network directory empty despite persistent network config"
+        "peer cache changed despite having no connected peers"
     );
 
     Ok(())

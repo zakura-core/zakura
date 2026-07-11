@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, watch};
 use tower::{timeout::Timeout, Service, ServiceExt};
 use tracing::Instrument;
 
-use zakura_chain::{block, chain_tip::ChainTip};
+use zakura_chain::block;
 use zakura_network as zn;
 use zakura_state::ChainTipChange;
 
@@ -20,6 +20,14 @@ use crate::{
 };
 
 use BlockGossipError::*;
+
+/// How many completed mined block broadcasts can wait to mark the chain tip.
+/// In normal operations, we expect at most 1 pending mark.
+/// The main loop can be busy for several seconds in the committed-tip path.
+/// During that window, multiple mined-block broadcasts could finish and
+/// try to send marks. A capacity of 16 with 25-75s block times
+/// is chosen arbitrarily high to be safe.
+const MINED_BLOCK_MARK_CHANNEL_CAPACITY: usize = 16;
 
 /// Errors that can occur when gossiping committed blocks
 #[derive(Error, Debug)]
@@ -63,15 +71,30 @@ where
     // so broadcasts don't delay the syncer too long
     let mut broadcast_network = Timeout::new(broadcast_network, TIPS_RESPONSE_TIMEOUT);
 
+    let (mined_block_mark_sender, mut mined_block_mark_receiver) =
+        mpsc::channel(MINED_BLOCK_MARK_CHANNEL_CAPACITY);
+
     loop {
+        // Drain local completion notifications from spawned mined-block
+        // broadcasts before deciding whether the committed-tip fallback should
+        // run. These are not peer acknowledgements: a hash appears here only
+        // after our `AdvertiseBlockToAll` future completed successfully.
+        //
+        // `try_recv()` keeps this non-blocking. `Empty` just means no completed
+        // broadcast has reported back yet, so the gossip loop can keep making
+        // progress.
+        while let Ok(hash) = mined_block_mark_receiver.try_recv() {
+            chain_state.mark_last_change_hash(hash);
+        }
+
         // TODO: Refactor this into a struct and move the contents of this loop into its own method.
         let mut sync_status = sync_status.clone();
-        let mut chain_tip = chain_state.clone();
+        let mut chain_tip = chain_state.clone_for_task();
 
         // TODO: Move the contents of this async block to its own method
         let tip_change_close_to_network_tip_fut = async move {
             /// A brief duration to wait after a tip change for a new message in the mined block channel.
-            // TODO: Add a test to check that Zebra does not advertise mined blocks to peers twice.
+            // TODO: Add a test to check that Zakura does not advertise mined blocks to peers twice.
             const WAIT_FOR_BLOCK_SUBMISSION_DELAY: Duration = Duration::from_micros(100);
 
             // wait for at least the network timeout between gossips
@@ -116,10 +139,24 @@ where
 
                     Some(tip_change) = mined_block_receiver.recv() => {
                        ((tip_change, "sending mined block broadcast", chain_state), true)
-                    }
+                    },
+
+                    Some(mark_hash) = mined_block_mark_receiver.recv() => {
+                        chain_state.mark_last_change_hash(mark_hash);
+                        continue;
+                    },
                 }
             } else {
-                (tip_change_close_to_network_tip_fut.await?, false)
+                tokio::select! {
+                    tip_change_close_to_network_tip = tip_change_close_to_network_tip_fut => {
+                        (tip_change_close_to_network_tip?, false)
+                    },
+
+                    Some(mark_hash) = mined_block_mark_receiver.recv() => {
+                        chain_state.mark_last_change_hash(mark_hash);
+                        continue;
+                    },
+                }
             };
 
         chain_state = updated_chain_state;
@@ -144,19 +181,16 @@ where
         // Await the broadcast future in a spawned task to avoid waiting on
         // `AdvertiseBlockToAll` requests when there are unready peers.
         // Broadcast requests don't return errors, and we'd just want to ignore them anyway.
-        tokio::spawn(broadcast_fut);
-
-        // TODO: Move this logic for marking the last change hash as seen to its own method.
-
-        // Mark the last change hash of `chain_state` as the last block submission hash to avoid
-        // advertising a block hash to some peers twice.
-        if is_block_submission
-            && mined_block_receiver
-                .as_ref()
-                .is_some_and(|rx| rx.is_empty())
-            && chain_state.latest_chain_tip().best_tip_hash() == Some(hash)
-        {
-            chain_state.mark_last_change_hash(hash);
+        if is_block_submission {
+            let mark_tx = mined_block_mark_sender.clone();
+            let submission_hash = hash;
+            tokio::spawn(async move {
+                if broadcast_fut.await.is_ok() {
+                    let _ = mark_tx.send(submission_hash).await;
+                }
+            });
+        } else {
+            tokio::spawn(broadcast_fut);
         }
     }
 }

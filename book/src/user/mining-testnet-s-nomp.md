@@ -1,4 +1,4 @@
-# How to mine with Zebra on testnet
+# How to mine with Zakura on testnet
 
 ## Important
 
@@ -6,14 +6,14 @@
 > The ZcashFoundation fork below includes partial fixes, but this setup is provided for testing purposes only.
 > For production mining, consider using mining pool software that supports current Zcash network upgrades.
 
-The `zebra-mining` branch of the ZcashFoundation s-nomp fork includes fixes that:
+The `zakura-mining` branch of the ZcashFoundation s-nomp fork includes fixes that:
 
 - Disable mining pool operator payments and miner payments (they just pay to the address configured for the node)
-- Provide basic compatibility with Zebra's RPC interface
+- Provide basic compatibility with Zakura's RPC interface
 
-## Install, run, and sync Zebra
+## Install, run, and sync Zakura
 
-1. Configure `zebrad.toml`:
+1. Configure `zakurad.toml`:
    - change the `network.network` config to `Testnet`
    - add your testnet transparent address in `mining.miner_address`, or you can use the ZF testnet address `t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v`
    - ensure that there is an `rpc.listen_addr` in the config to enable the RPC server
@@ -78,13 +78,13 @@ The `zebra-mining` branch of the ZcashFoundation s-nomp fork includes fixes that
 
    </details>
 
-2. [Run Zebra](https://zebra.zfnd.org/user/run.html) with the config you created:
+2. [Run Zakura](run.md) with the config you created:
 
    ```sh
-   zebrad -c zebrad.toml
+   zakurad -c zakurad.toml
    ```
 
-3. Wait for Zebra to sync to the testnet tip. Sync times vary depending on hardware and network conditions, typically 8-12 hours on testnet or 2-3 days on mainnet.
+3. Wait for Zakura to sync to the testnet tip. Sync times vary depending on hardware and network conditions, typically 8-12 hours on testnet or 2-3 days on mainnet.
 
 ## Install `s-nomp`
 
@@ -117,7 +117,7 @@ The `zebra-mining` branch of the ZcashFoundation s-nomp fork includes fixes that
 
 1. `git clone https://github.com/ZcashFoundation/s-nomp`
 2. `cd s-nomp`
-3. Use the Zebra fixes: `git checkout zebra-mining`
+3. Use the Zakura fixes: `git checkout zakura-mining`
 4. Use node 10:
 
    ```sh
@@ -198,7 +198,7 @@ The `zebra-mining` branch of the ZcashFoundation s-nomp fork includes fixes that
 
 ## Run `s-nomp`
 
-1. Edit `pool_configs/zcash.json` so `daemons[0].port` is your Zebra port
+1. Edit `pool_configs/zcash.json` so `daemons[0].port` is your Zakura port
 2. Run `s-nomp` using `npm start`
 
 Note: the website will log an RPC error even when it is disabled in the config. This seems like a `s-nomp` bug.
@@ -230,7 +230,7 @@ in the following instructions since it is the easiest to install and use.
 
 1. `git clone https://github.com/ZcashFoundation/nheqminer`
 2. `cd nheqminer`
-3. Use the Zebra fixes: `git checkout zebra-mining`
+3. Use the Zakura fixes: `git checkout zakura-mining`
 4. Follow the build instructions at
    <https://github.com/nicehash/nheqminer#general-instructions>, or run:
 

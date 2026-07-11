@@ -39,7 +39,7 @@ exclude_path = [
     "target",
     ".git",
     "book/mermaid.min.js",
-    "zebra-rpc/qa/rpc-tests",
+    "zakura-rpc/qa/rpc-tests",
     "supply-chain",
     # CHANGELOG contains historical references to deprecated URLs
     "CHANGELOG.md",
@@ -65,7 +65,7 @@ max_cache_age = "7d"
 max_concurrency = 8
 
 # User agent string
-user_agent = "lychee/0.14 (Zebra link checker; https://github.com/ZcashFoundation/zebra)"
+user_agent = "lychee/0.14 (Zakura link checker; https://github.com/zakura-core/zakura)"
 
 # Skip checking mail addresses
 include_mail = false

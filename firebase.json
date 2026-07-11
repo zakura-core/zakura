@@ -17,7 +17,7 @@
       "redirects": [
         {
           "source": "/",
-          "destination": "/zebrad",
+          "destination": "/zakurad",
           "type": 301
         }
       ]
@@ -39,7 +39,7 @@
       "redirects": [
         {
           "source": "/",
-          "destination": "/zebrad",
+          "destination": "/zakurad",
           "type": 301
         }
       ]

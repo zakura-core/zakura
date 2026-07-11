@@ -12,7 +12,7 @@
       "size": "8.3 GiB",
       "published": "2026-07-04",
       "height": "4130396",
-      "zebraVersion": "zebrad 5.0.0-rc.3",
+      "zebraVersion": "zakurad 5.0.0-rc.3",
       "dbFormat": "28.0.0",
       "sha256": "f4e659c5aaa8857e2b397d3ba92bf68f5e238ba77d73a709c63beffc8da6366f"
     },
@@ -38,7 +38,7 @@
       "size": "8.3 GiB",
       "published": "2026-07-03",
       "height": "4128095",
-      "zebraVersion": "zebrad 5.0.0-rc.3",
+      "zebraVersion": "zakurad 5.0.0-rc.3",
       "dbFormat": "28.0.0",
       "sha256": "93add7c12c52f02943d68378bc341803619e99a02c71f34450eb820ed84cac6b"
     },
@@ -51,7 +51,7 @@
       "size": "0 GiB",
       "published": "YYYY-MM-DD",
       "height": "0",
-      "zebraVersion": "zebrad 2.x.x",
+      "zebraVersion": "zakurad 2.x.x",
       "dbFormat": "0",
       "sha256": "replace-with-lowercase-sha256"
     },
@@ -64,7 +64,7 @@
       "size": "0 GiB",
       "published": "YYYY-MM-DD",
       "height": "0",
-      "zebraVersion": "zebrad 2.x.x",
+      "zebraVersion": "zakurad 2.x.x",
       "dbFormat": "0",
       "sha256": "replace-with-lowercase-sha256"
     }

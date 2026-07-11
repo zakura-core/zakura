@@ -46,7 +46,7 @@ jobs:
       - name: Compute state version
         id: ver
         run: |
-          echo "v=$(grep -oE 'DATABASE_FORMAT_VERSION: .* [0-9]+' zebra-state/src/constants.rs | grep -oE '[0-9]+' | tail -n1)" >> "$GITHUB_OUTPUT"
+          echo "v=$(grep -oE 'DATABASE_FORMAT_VERSION: .* [0-9]+' zakura-state/src/constants.rs | grep -oE '[0-9]+' | tail -n1)" >> "$GITHUB_OUTPUT"
 
       - name: Write SSH key
         env:

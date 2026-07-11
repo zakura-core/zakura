@@ -6,7 +6,7 @@ the self-hosted runners.
 
 ## Fleet Slack Watchdog
 
-`zebra-cluster-watchdog.py` is a small stdlib-only Python service that polls the
+`zakura-cluster-watchdog.py` is a small stdlib-only Python service that polls the
 mainnet and testnet cluster status dashboards and posts Slack transition alerts
 when a fleet node remains unhealthy.
 
@@ -53,7 +53,7 @@ journalctl -u zakura-fleet-watchdog -f
 One-shot dry run:
 
 ```bash
-python3 /opt/zakura-fleet-watchdog/zebra-cluster-watchdog.py \
+python3 /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py \
   --config /opt/zakura-fleet-watchdog/fleets.toml \
   --state-file /tmp/zakura-fleet-watchdog-state.json \
   --once \

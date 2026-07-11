@@ -1,7 +1,7 @@
 # Zakura regtest e2e — node 1 (bootstrap, dual-stack: legacy TCP + Zakura P2P-v2).
 #
 # Run with host networking so Regtest's localhost-only initial-peer filter
-# (zebra-network/src/config.rs: initial_peers) accepts 127.0.0.1 peers.
+# (zakura-network/src/config.rs: initial_peers) accepts 127.0.0.1 peers.
 
 [network]
 network = "Regtest"
@@ -45,4 +45,4 @@ internal_miner = false
 miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
 
 [tracing]
-filter = "info,zebra_network::zakura=debug"
+filter = "info,zakura_network::zakura=debug"

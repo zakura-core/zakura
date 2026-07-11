@@ -11,7 +11,7 @@ const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
 const DEFAULT_RUST_VERSION: &str = "1.91";
 const DEFAULT_IMAGE_TAG: &str = "zebra-ubuntu-package:local";
-const OUTPUT_BINARY_NAME: &str = "zebrad";
+const OUTPUT_BINARY_NAME: &str = "zakurad";
 
 type BoxError = Box<dyn Error>;
 
@@ -88,7 +88,7 @@ fn package_ubuntu() -> Result<(), BoxError> {
     let copy_result = run_command(
         Command::new("docker")
             .arg("cp")
-            .arg(format!("{container_id}:/zebrad"))
+            .arg(format!("{container_id}:/zakurad"))
             .arg(&output_path),
     );
 

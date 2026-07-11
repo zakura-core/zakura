@@ -33,4 +33,4 @@ internal_miner = false
 miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
 
 [tracing]
-filter = "info,zebra_network::zakura=debug,zebrad::components::sync=debug,zebrad::components::inbound=debug"
+filter = "info,zakura_network::zakura=debug,zakurad::components::sync=debug,zakurad::components::inbound=debug"

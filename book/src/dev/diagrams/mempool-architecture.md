@@ -1,6 +1,6 @@
 # Mempool Architecture Diagram
 
-This diagram illustrates the architecture of the Zebra mempool, showing its main components and the flow of transactions through the system.
+This diagram illustrates the architecture of the Zakura mempool, showing its main components and the flow of transactions through the system.
 
 ```mermaid
 graph TD
@@ -59,17 +59,17 @@ graph TD
 
 ## Component Descriptions
 
-1. **Mempool Service**: The central coordinator that handles requests and manages the mempool state. Located at `zebrad/src/components/mempool.rs`.
+1. **Mempool Service**: The central coordinator that handles requests and manages the mempool state. Located at `zakurad/src/components/mempool.rs`.
 
-2. **Storage**: In-memory storage for verified transactions and rejection lists. Located at `zebrad/src/components/mempool/storage.rs`.
+2. **Storage**: In-memory storage for verified transactions and rejection lists. Located at `zakurad/src/components/mempool/storage.rs`.
 
-3. **Transaction Downloads**: Handles downloading and verifying transactions from peers. Located at `zebrad/src/components/mempool/downloads.rs`.
+3. **Transaction Downloads**: Handles downloading and verifying transactions from peers. Located at `zakurad/src/components/mempool/downloads.rs`.
 
-4. **Crawler**: Periodically polls 3 peers (FANOUT=3) every 73 seconds for new transaction IDs. Located at `zebrad/src/components/mempool/crawler.rs`.
+4. **Crawler**: Periodically polls 3 peers (FANOUT=3) every 73 seconds for new transaction IDs. Located at `zakurad/src/components/mempool/crawler.rs`.
 
-5. **Queue Checker**: Triggers the mempool to process verified transactions every 5 seconds. It sends `CheckForVerifiedTransactions` requests but doesn't process responses directly - the Mempool's `poll_ready()` handles collecting verified transactions from the Downloads stream. Located at `zebrad/src/components/mempool/queue_checker.rs`.
+5. **Queue Checker**: Triggers the mempool to process verified transactions every 5 seconds. It sends `CheckForVerifiedTransactions` requests but doesn't process responses directly - the Mempool's `poll_ready()` handles collecting verified transactions from the Downloads stream. Located at `zakurad/src/components/mempool/queue_checker.rs`.
 
-6. **Gossip Task** (not shown): A separate async task that broadcasts new transaction IDs to peers via `MempoolChange` events. Located at `zebrad/src/components/mempool/gossip.rs`.
+6. **Gossip Task** (not shown): A separate async task that broadcasts new transaction IDs to peers via `MempoolChange` events. Located at `zakurad/src/components/mempool/gossip.rs`.
 
 ## Transaction Flow
 

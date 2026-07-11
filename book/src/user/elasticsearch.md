@@ -1,10 +1,10 @@
 # Kibana blockchain explorer
 
-The goal here is to export block data from Zebra into an [elasticsearch](https://www.elastic.co/) database and visualize it with the [kibana](https://www.elastic.co/kibana/) front end.
+The goal here is to export block data from Zakura into an [elasticsearch](https://www.elastic.co/) database and visualize it with the [kibana](https://www.elastic.co/kibana/) front end.
 
 **Attention:** This is an experimental feature tested only in the Zcash Testnet.
 
-Elasticsearch support was introduced to Zebra in [pull request #6274](https://github.com/ZcashFoundation/zebra/pull/6274).
+Elasticsearch support was introduced to Zakura in [pull request #6274](https://github.com/zakura-core/zakura/pull/6274).
 
 ## Download, build and run Elasticsearch
 
@@ -42,24 +42,24 @@ Visit the url to get started, you will need the kibana enrollment token from ela
 
 Kibana will listen in <https://localhost:5601> by default.
 
-You are now ready to start bumping data into elasticsearch with Zebra.
+You are now ready to start bumping data into elasticsearch with Zakura.
 
-## Download and build zebra with `elasticsearch` feature
+## Download and build zakura with `elasticsearch` feature
 
 Elasticsearch is an optional and experimental feature, we need to build and install with the `elasticsearch` rust feature enabled using the following command:
 
 ```sh
-cargo install --features elasticsearch --locked --git https://github.com/ZcashFoundation/zebra zebrad
+cargo install --features elasticsearch --locked --git https://github.com/zakura-core/zakura zakurad
 ```
 
-Zebra binary will be at `~/.cargo/bin/zebrad`.
+Zakura binary will be at `~/.cargo/bin/zakurad`.
 
-## Configure Zebra for `elasticsearch`
+## Configure Zakura for `elasticsearch`
 
 Generate a configuration file with the default settings:
 
 ```sh
-zebrad generate -o ~/.config/zebrad.toml
+zakurad generate -o ~/.config/zakurad.toml
 ```
 
 The following changes are needed:
@@ -72,19 +72,19 @@ Change the `network` field to `Testnet`. The `Mainnet` should work but it is unt
 
 Add your elastic password generated when running the database for the first time into the `elasticsearch_password` field.
 
-## Run Zebra
+## Run Zakura
 
 If the config is in the default path then just running the binary will start the sync.
 
 ```sh
-zebrad
+zakurad
 ```
 
 Sync will take time, but you can use kibana to make sure blocks are being inserted during the process.
 
 ## Visualize your data
 
-As soon as the first batch of data is inserted from Zebra into elasticsearch database, an index `zcash_testnet` will be created.
+As soon as the first batch of data is inserted from Zakura into elasticsearch database, an index `zcash_testnet` will be created.
 
 To observe data, go to Analytics → Discover and create a new data view with the `zcash_testnet` index. Make sure you select `header.time` field as Timestamp field.
 

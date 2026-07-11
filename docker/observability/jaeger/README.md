@@ -1,6 +1,6 @@
 # Jaeger Distributed Tracing
 
-Jaeger shows how requests flow through Zebra, where time is spent, and where errors occur.
+Jaeger shows how requests flow through Zakura, where time is spent, and where errors occur.
 
 ## Why Jaeger?
 
@@ -30,7 +30,7 @@ Open <http://localhost:16686> in your browser.
 
 Jaeger categorizes spans by their role:
 
-| Kind | Description | Example in Zebra |
+| Kind | Description | Example in Zakura |
 |------|-------------|------------------|
 | **SERVER** | Entry point handling external requests | JSON-RPC endpoints (`getblock`, `getinfo`) |
 | **INTERNAL** | Internal operations within the service | Block verification, state operations |
@@ -46,7 +46,7 @@ The Monitor tab provides RED metrics (Rate, Errors, Duration) aggregated from tr
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Service: zebra              Span Kind: [Internal ▼]               │
+│  Service: zakura              Span Kind: [Internal ▼]               │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
 │   Latency (s)          Error rate (%)        Request rate (req/s)  │
@@ -83,7 +83,7 @@ The Monitor tab provides RED metrics (Rate, Errors, Duration) aggregated from tr
 
 The "Span Kind" dropdown filters which operations you see:
 
-- **Internal**: All internal Zebra operations (default view)
+- **Internal**: All internal Zakura operations (default view)
   - Block verification, state operations, network handling
   - High volume during sync
 
@@ -110,7 +110,7 @@ Use the Search tab to find specific traces.
 
 ### Finding Traces
 
-1. **Service**: Select `zebra`
+1. **Service**: Select `zakura`
 2. **Operation**: Choose a specific operation or "all"
 3. **Tags**: Filter by attributes (e.g., `rpc.method=getblock`)
 4. **Min/Max Duration**: Find slow or fast requests
@@ -121,7 +121,7 @@ Use the Search tab to find specific traces.
 **Find slow RPC calls:**
 
 ```text
-Service: zebra
+Service: zakura
 Operation: rpc_request
 Min Duration: 1s
 ```text
@@ -129,14 +129,14 @@ Min Duration: 1s
 **Find failed operations:**
 
 ```text
-Service: zebra
+Service: zakura
 Tags: error=true
 ```text
 
 **Find specific RPC method:**
 
 ```text
-Service: zebra
+Service: zakura
 Tags: rpc.method=getblock
 ```text
 
@@ -204,7 +204,7 @@ Clicking a trace opens the detail view showing:
 Problem: getblock calls are slow
 
 1. Search:
-   - Service: zebra
+   - Service: zakura
    - Operation: rpc_request
    - Tags: rpc.method=getblock
    - Min Duration: 500ms
@@ -224,7 +224,7 @@ Problem: getblock calls are slow
 
 ## RPC Tracing
 
-Zebra's JSON-RPC endpoints are instrumented with `SPAN_KIND_SERVER` spans, enabling:
+Zakura's JSON-RPC endpoints are instrumented with `SPAN_KIND_SERVER` spans, enabling:
 
 - **Jaeger SPM**: View RPC metrics in the Monitor tab (select "Server" span kind)
 - **Per-method analysis**: Filter by `rpc.method` to see specific endpoint performance
@@ -260,9 +260,9 @@ Useful for:
 
 Shows service dependencies based on trace data:
 
-- Nodes: Services (currently just `zebra`)
+- Nodes: Services (currently just `zakura`)
 - Edges: Communication between services
-- Useful when Zebra calls external services
+- Useful when Zakura calls external services
 
 ## Configuration
 
@@ -274,7 +274,7 @@ receivers:
   otlp:
     protocols:
       http:
-        endpoint: 0.0.0.0:4318  # OTLP HTTP (used by Zebra)
+        endpoint: 0.0.0.0:4318  # OTLP HTTP (used by Zakura)
 
 processors:
   batch: {}  # Batches spans for efficiency

@@ -6,13 +6,13 @@ services:
       dockerfile: docker/Dockerfile
       target: tests
     volumes:
-      - zebrad-cache:/home/zebra/.cache/zakura
+      - zakurad-cache:/home/zebra/.cache/zakura
       - lwd-cache:/home/zebra/.cache/lwd
     env_file:
       - test.env
 
 volumes:
-  zebrad-cache:
+  zakurad-cache:
     driver: local
 
   lwd-cache:

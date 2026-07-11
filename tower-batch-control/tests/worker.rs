@@ -9,7 +9,7 @@ use tower_test::mock;
 
 #[tokio::test]
 async fn wakes_pending_waiters_on_close() {
-    let _init_guard = zebra_test::init();
+    let _init_guard = zakura_test::init();
 
     let (service, mut handle) = mock::pair::<_, ()>();
 
@@ -65,7 +65,7 @@ async fn wakes_pending_waiters_on_close() {
 
 #[tokio::test]
 async fn wakes_pending_waiters_on_failure() {
-    let _init_guard = zebra_test::init();
+    let _init_guard = zakura_test::init();
 
     let (service, mut handle) = mock::pair::<_, ()>();
 

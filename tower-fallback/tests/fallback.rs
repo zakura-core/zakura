@@ -5,7 +5,7 @@ use tower_fallback::Fallback;
 
 #[tokio::test]
 async fn fallback() {
-    let _init_guard = zebra_test::init();
+    let _init_guard = zakura_test::init();
 
     // we'd like to use Transcript here but it can't handle errors :(
 

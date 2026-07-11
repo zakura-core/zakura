@@ -52,21 +52,21 @@ For mainnet deploys, confirm the `ref` explicitly with the user before dispatch.
 | `zakura-testnet-as` | `206.189.148.0` | systemd |
 | `zakura-compat` | `206.189.208.228` | process-managed; shares host with `zcashd` sidecar |
 
-### Mainnet (9 nodes)
+### Mainnet (11 nodes)
 
-| Node name | Host |
-| --- | --- |
-| `asia-0` | `165.22.54.66` |
-| `us-0` | `104.131.184.123` |
-| `us-east-0` | `159.65.183.89` |
-| `us-west-0` | `143.244.184.176` |
-| `canada-0` | `159.203.38.10` |
-| `europe-west-0` | `64.227.44.93` |
-| `europe-central-0` | `161.35.156.226` |
-| `asia-south-0` | `139.59.64.115` |
-| `asia-pacific-0` | `168.144.173.250` |
-
-All mainnet nodes are systemd-managed `zakurad.service` nodes.
+| Node name | Host | Notes |
+| --- | --- | --- |
+| `asia-0` | `165.22.54.66` | systemd |
+| `us-0` | `104.131.184.123` | systemd |
+| `us-east-0` | `159.65.183.89` | systemd |
+| `us-west-0` | `143.244.184.176` | systemd |
+| `canada-0` | `159.203.38.10` | systemd |
+| `europe-west-0` | `64.227.44.93` | systemd |
+| `europe-central-0` | `161.35.156.226` | systemd |
+| `asia-south-0` | `139.59.64.115` | systemd |
+| `asia-pacific-0` | `168.144.173.250` | systemd |
+| `zakura-compat` | `159.203.113.196` | systemd `zebrad-compat`; shares host with `zcashd` |
+| `zakura-compat-docker` | `178.128.66.48` | Docker container `zakura-compat`; shares host with `zakura-compat-zcashd` |
 
 ## Preflight
 

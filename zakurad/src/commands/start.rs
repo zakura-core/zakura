@@ -808,7 +808,7 @@ impl StartCmd {
         let miner_task_handle: tokio::task::JoinHandle<Result<(), Report>> =
             tokio::spawn(std::future::pending().in_current_span());
 
-        info!("spawned initial Zebra tasks");
+        info!("spawned initial Zakura tasks");
 
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
 

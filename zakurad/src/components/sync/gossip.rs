@@ -75,9 +75,14 @@ where
         mpsc::channel(MINED_BLOCK_MARK_CHANNEL_CAPACITY);
 
     loop {
-        // Apply marks from completed mined-block broadcasts. A successful
-        // AdvertiseBlockToAll means peers were already told about this hash, so
-        // always record it — even if another mined submission is still queued.
+        // Drain local completion notifications from spawned mined-block
+        // broadcasts before deciding whether the committed-tip fallback should
+        // run. These are not peer acknowledgements: a hash appears here only
+        // after our `AdvertiseBlockToAll` future completed successfully.
+        //
+        // `try_recv()` keeps this non-blocking. `Empty` just means no completed
+        // broadcast has reported back yet, so the gossip loop can keep making
+        // progress.
         while let Ok(hash) = mined_block_mark_receiver.try_recv() {
             chain_state.mark_last_change_hash(hash);
         }

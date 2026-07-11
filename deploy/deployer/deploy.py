@@ -26,7 +26,11 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = SCRIPT_DIR / "templates"
-BUILD_CACHE_DIR = SCRIPT_DIR / ".build-cache"
+DEFAULT_BUILD_CACHE_DIR = SCRIPT_DIR / ".build-cache"
+BUILD_CACHE_DIR_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_DIR"
+BUILD_CACHE_RETAIN_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_RETAIN"
+DEFAULT_BUILD_CACHE_RETAIN = 12
+DATA_MOUNT = Path("/mnt/data")
 
 # ssh/scp options shared by every remote call. BatchMode avoids interactive
 # password prompts hanging a parallel deploy; accept-new pins unknown host keys
@@ -279,6 +283,45 @@ def repo_root() -> Path:
 # --------------------------------------------------------------------------- #
 # Build (cache keyed on resolved commit SHA)
 # --------------------------------------------------------------------------- #
+def build_cache_dir() -> Path:
+    return Path(os.environ.get(BUILD_CACHE_DIR_ENV, DEFAULT_BUILD_CACHE_DIR)).expanduser()
+
+
+def build_cache_retain() -> int:
+    raw = os.environ.get(BUILD_CACHE_RETAIN_ENV, str(DEFAULT_BUILD_CACHE_RETAIN))
+    try:
+        retain = int(raw)
+    except ValueError as exc:
+        raise DeployError(f"{BUILD_CACHE_RETAIN_ENV} must be an integer, got {raw!r}") from exc
+    if retain < 1:
+        raise DeployError(f"{BUILD_CACHE_RETAIN_ENV} must be at least 1")
+    return retain
+
+
+def path_requires_data_mount(path: Path) -> bool:
+    path = path.expanduser()
+    if not path.is_absolute():
+        return False
+    return path == DATA_MOUNT or DATA_MOUNT in path.parents
+
+
+def ensure_data_mount_for_path(path: Path, *, purpose: str) -> None:
+    if path_requires_data_mount(path) and not DATA_MOUNT.is_mount():
+        raise DeployError(
+            f"{purpose} uses {path}, but {DATA_MOUNT} is not a mounted filesystem"
+        )
+
+
+def prune_cached_binaries(cache_dir: Path, current_sha: str) -> None:
+    retain = build_cache_retain()
+    binaries = [
+        path for path in cache_dir.glob("zakurad-*")
+        if path.is_file() and path.name != f"zakurad-{current_sha}"
+    ]
+    binaries.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for old_binary in binaries[max(0, retain - 1):]:
+        old_binary.unlink(missing_ok=True)
+
 
 def resolve_sha(root: Path, commit: str) -> str:
     """Resolve a branch/tag/SHA to a full commit SHA in the repo.
@@ -298,7 +341,7 @@ def resolve_sha(root: Path, commit: str) -> str:
 
 
 def cached_binary(sha: str) -> Path:
-    return BUILD_CACHE_DIR / f"zakurad-{sha}"
+    return build_cache_dir() / f"zakurad-{sha}"
 
 
 def binary_is_runnable(binary: Path) -> bool:
@@ -317,7 +360,9 @@ def binary_is_runnable(binary: Path) -> bool:
 
 def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
     """Build zakurad at `sha` into the cache, or reuse an existing cached build."""
-    BUILD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_dir = build_cache_dir()
+    ensure_data_mount_for_path(cache_dir, purpose="build cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
     target = cached_binary(sha)
     if target.exists() and not force:
         if binary_is_runnable(target):
@@ -327,7 +372,7 @@ def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
 
     # Build at the exact commit in a throwaway detached worktree so the caller's
     # working tree (which may be dirty) is never disturbed.
-    work = BUILD_CACHE_DIR / f"wt-{sha[:12]}"
+    work = cache_dir / f"wt-{sha[:12]}"
     if work.exists():
         run(["git", "worktree", "remove", "--force", str(work)], cwd=root, check=False)
         shutil.rmtree(work, ignore_errors=True)
@@ -347,6 +392,7 @@ def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
         os.chmod(tmp, 0o755)
         tmp.replace(target)
         print(f"[build] cached -> {target}")
+        prune_cached_binaries(cache_dir, sha)
     finally:
         run(["git", "worktree", "remove", "--force", str(work)], cwd=root, check=False)
         shutil.rmtree(work, ignore_errors=True)
@@ -440,11 +486,22 @@ def render_node_config(node: Node) -> str:
 
 
 def render_service(node: Node) -> str:
+    mount_lines = ""
+    if any(
+        path_requires_data_mount(Path(path))
+        for path in (node.state_cache_dir, node.network_cache_dir, node.log_file)
+        if path
+    ):
+        mount_lines = (
+            f"RequiresMountsFor={DATA_MOUNT}\n"
+            f"AssertPathIsMountPoint={DATA_MOUNT}\n"
+        )
     return render_template("zakurad.service", {
         "SERVICE_NAME": node.service_name,
         "BIN_PATH": node.bin_path,
         "CONFIG_PATH": node.config_path,
         "LOG_FILE": node.log_file,
+        "MOUNT_LINES": mount_lines,
     })
 
 
@@ -462,6 +519,20 @@ LEGACY_SERVICE=zebrad
 LOG_FILE={log_file}
 STATE_DIR={state_dir}
 NO_RESTART={no_restart}
+
+require_data_mount_for() {{
+    case "$1" in
+        /mnt/data|/mnt/data/*)
+            if ! mountpoint -q /mnt/data; then
+                echo "required /mnt/data mount is absent for $1" >&2
+                exit 1
+            fi
+            ;;
+    esac
+}}
+
+require_data_mount_for "$STATE_DIR"
+require_data_mount_for "$(dirname "$LOG_FILE")"
 
 mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")" "$(dirname "$LOG_FILE")"
 
@@ -540,6 +611,22 @@ WORKING_DIR={working_dir}
 START_COMMAND={start_command}
 PROCESS_PATTERN={process_pattern}
 NO_RESTART={no_restart}
+
+require_data_mount_for() {{
+    case "$1" in
+        /mnt/data|/mnt/data/*)
+            if ! mountpoint -q /mnt/data; then
+                echo "required /mnt/data mount is absent for $1" >&2
+                exit 1
+            fi
+            ;;
+    esac
+}}
+
+require_data_mount_for "$STATE_DIR"
+if [ -n "$LOG_FILE" ]; then
+    require_data_mount_for "$(dirname "$LOG_FILE")"
+fi
 
 mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")"
 if [ -n "$LOG_FILE" ]; then
@@ -767,14 +854,14 @@ def cmd_deploy(args) -> int:
                 return (node.name, True, f"deployed {node.sha[:9]} (binary-only)")
 
             cfg = render_node_config(node)
-            cfg_tmp = BUILD_CACHE_DIR / f".cfg-{node.name}.toml"
+            cfg_tmp = build_cache_dir() / f".cfg-{node.name}.toml"
             cfg_tmp.write_text(cfg)
             try:
                 run(node.scp_to(str(binary), "/tmp/zakurad-deploy.new"), capture=True)
                 run(node.scp_to(str(cfg_tmp), "/tmp/zakurad-deploy.toml"), capture=True)
                 if node.deploy_kind == "systemd":
                     unit = render_service(node)
-                    unit_tmp = BUILD_CACHE_DIR / f".unit-{node.name}.service"
+                    unit_tmp = build_cache_dir() / f".unit-{node.name}.service"
                     unit_tmp.write_text(unit)
                     try:
                         run(node.scp_to(str(unit_tmp), "/tmp/zakurad-deploy.service"), capture=True)

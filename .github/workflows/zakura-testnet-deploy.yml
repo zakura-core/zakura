@@ -45,6 +45,9 @@ jobs:
     runs-on: [self-hosted, "${{ vars.ZAKURA_TESTNET_RUNNER_LABEL || 'zakura-testnet-deployer' }}"]
     timeout-minutes: 180
     environment: zakura-testnet
+    env:
+      CARGO_TARGET_DIR: /mnt/data/zakura-deployer/cargo-target
+      ZAKURA_DEPLOYER_BUILD_CACHE_DIR: /mnt/data/zakura-deployer/binaries
 
     steps:
       - name: Checkout deploy ref
@@ -58,11 +61,6 @@ jobs:
         with:
           toolchain: stable
           cache: false
-
-      - name: Restore Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          cache-on-failure: true
 
       - name: Install build dependencies
         run: |
@@ -147,41 +145,41 @@ jobs:
           name       = "zakura-testnet-1"
           ssh_string = "root@167.99.103.111"
           commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
-          state_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
-          log_file = "/mnt/zakura-testnet-1-data/logs/zakura.log"
+          network_cache_dir = "/mnt/data/zakura-cache"
+          state_cache_dir = "/mnt/data/zakura-cache"
+          log_file = "/mnt/data/logs/zakura.log"
 
           [[nodes]]
           name       = "zakura-testnet-2"
           ssh_string = "root@167.99.110.145"
           commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-2-data/zakura-cache"
-          state_cache_dir = "/mnt/zakura-testnet-2-data/zakura-cache"
-          log_file = "/mnt/zakura-testnet-2-data/logs/zakura.log"
+          network_cache_dir = "/mnt/data/zakura-cache"
+          state_cache_dir = "/mnt/data/zakura-cache"
+          log_file = "/mnt/data/logs/zakura.log"
 
           [[nodes]]
           name       = "zakura-testnet-3"
           ssh_string = "root@138.68.229.254"
           commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-3-data/zakura-cache"
-          state_cache_dir = "/mnt/zakura-testnet-3-data/zakura-cache"
-          log_file = "/mnt/zakura-testnet-3-data/logs/zakura.log"
+          network_cache_dir = "/mnt/data/zakura-cache"
+          state_cache_dir = "/mnt/data/zakura-cache"
+          log_file = "/mnt/data/logs/zakura.log"
 
           [[nodes]]
           name       = "zakura-testnet-eu"
           ssh_string = "root@164.92.209.78"
           commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-eu-data/zakura-cache"
-          state_cache_dir = "/mnt/zakura-testnet-eu-data/zakura-cache"
-          log_file = "/mnt/zakura-testnet-eu-data/logs/zakura.log"
+          network_cache_dir = "/mnt/data/zakura-cache"
+          state_cache_dir = "/mnt/data/zakura-cache"
+          log_file = "/mnt/data/logs/zakura.log"
 
           [[nodes]]
           name       = "zakura-testnet-as"
           ssh_string = "root@206.189.148.0"
           commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-as-data/zakura-cache"
-          state_cache_dir = "/mnt/zakura-testnet-as-data/zakura-cache"
-          log_file = "/mnt/zakura-testnet-as-data/logs/zakura.log"
+          network_cache_dir = "/mnt/data/zakura-cache"
+          state_cache_dir = "/mnt/data/zakura-cache"
+          log_file = "/mnt/data/logs/zakura.log"
 
           [[nodes]]
           name       = "zakura-compat"
@@ -191,9 +189,9 @@ jobs:
           service_name = ""
           bin_path = "/root/unity/zakura/target/release/zakurad"
           config_path = "/root/unity/zakura-testnet.toml"
-          network_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
-          state_cache_dir = "/mnt/zakura-testnet-1-data/zakura-cache"
-          log_file = "/mnt/zakura-testnet-1-data/logs/zakura.log"
+          network_cache_dir = "/mnt/data/zakura-cache"
+          state_cache_dir = "/mnt/data/zakura-cache"
+          log_file = "/mnt/data/logs/zakura.log"
           working_dir = "/root/unity/zakura"
           start_command = "target/release/zakurad -c /root/unity/zakura-testnet.toml start"
           process_pattern = "target/release/zakurad -c /root/unity/zakura-testnet.toml start"

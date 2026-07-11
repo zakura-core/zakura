@@ -49,40 +49,72 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "ACTION=audit" >> "$GITHUB_ENV"
-            echo "NODE=" >> "$GITHUB_ENV"
-            echo "NO_START=false" >> "$GITHUB_ENV"
+            {
+              echo "ACTION=audit"
+              echo "NODE="
+              echo "NO_START=false"
+            } >> "$GITHUB_ENV"
           else
-            echo "ACTION=${{ inputs.action }}" >> "$GITHUB_ENV"
-            echo "NODE=${{ inputs.node }}" >> "$GITHUB_ENV"
-            echo "NO_START=${{ inputs.no_start }}" >> "$GITHUB_ENV"
+            {
+              echo "ACTION=${{ inputs.action }}"
+              echo "NODE=${{ inputs.node }}"
+              echo "NO_START=${{ inputs.no_start }}"
+            } >> "$GITHUB_ENV"
           fi
 
       - name: Configure SSH
         env:
-          ZAKURA_CONTINUOUS_SYNC_SSH_KEY: ${{ secrets.ZAKURA_CONTINUOUS_SYNC_SSH_KEY }}
+          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
+          if [ -z "${DO_SSH_PRIVATE_KEY}" ]; then
+            echo "::error::DO_SSH_PRIVATE_KEY is required for the continuous sync fleet"
+            exit 1
+          fi
+
+          mapfile -t ssh_targets < <(
+            python3 - <<'PY'
+          import tomllib
+
+          with open("deploy/continuous-sync/nodes.toml", "rb") as config_file:
+              config = tomllib.load(config_file)
+
+          for node in config.get("nodes", []):
+              print(node["ssh_string"])
+          PY
+          )
+          if [ "${#ssh_targets[@]}" -eq 0 ]; then
+            echo "::error::No continuous sync nodes found in nodes.toml"
+            exit 1
+          fi
+
           install -d -m 700 ~/.ssh
           : > ~/.ssh/known_hosts
-          for host in 138.68.43.212 138.197.218.91 134.209.49.92; do
+          for target in "${ssh_targets[@]}"; do
+            host="${target##*@}"
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
 
-          if [ -n "${ZAKURA_CONTINUOUS_SYNC_SSH_KEY}" ]; then
-            install -m 600 /dev/null ~/.ssh/zakura-continuous-sync
-            printf '%s\n' "${ZAKURA_CONTINUOUS_SYNC_SSH_KEY}" > ~/.ssh/zakura-continuous-sync
-            cat >> ~/.ssh/config <<'EOF'
-          Host 138.68.43.212 138.197.218.91 134.209.49.92
-            IdentityFile ~/.ssh/zakura-continuous-sync
-            IdentitiesOnly yes
-            User root
-          EOF
-            chmod 600 ~/.ssh/config
-          else
-            echo "ZAKURA_CONTINUOUS_SYNC_SSH_KEY is not set; using the runner's default SSH identity."
-          fi
+          install -m 600 /dev/null ~/.ssh/zakura-continuous-sync
+          printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > ~/.ssh/zakura-continuous-sync
+          ssh-keygen -y -f ~/.ssh/zakura-continuous-sync >/dev/null
+          {
+            printf 'Host'
+            for target in "${ssh_targets[@]}"; do
+              printf ' %s' "${target##*@}"
+            done
+            printf '\n  IdentityFile ~/.ssh/zakura-continuous-sync\n'
+            printf '  IdentitiesOnly yes\n'
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+          for target in "${ssh_targets[@]}"; do
+            if ! ssh -o BatchMode=yes -o ConnectTimeout=15 "$target" true; then
+              echo "::error::Continuous sync SSH authentication failed for $target; verify the DO_SSH_PRIVATE_KEY secret and zebra-ci authorized key"
+              exit 1
+            fi
+          done
 
       - name: Deploy controllers
         if: env.ACTION == 'deploy'

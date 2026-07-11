@@ -99,6 +99,22 @@ Choose a release level for `zakurad`. Release levels are based on user-visible c
 - significant new features or behaviour changes; changes to RPCs, command-line, or configs; and deprecations or removals are `minor` releases
 - otherwise, it is a `patch` release
 
+**This step is mandatory for every release, including release candidates.**
+Release binaries are built without `.git`, so `zakurad --version` reports the
+`zakura` package version, not the tag — v1.0.0-rc1 was tagged without this bump
+and its binaries self-report `1.0.0-rc0`. The `release-binaries.yml` workflow
+refuses to build or publish assets for a tag that does not match the package
+version.
+
+- [ ] Bump the `zakura` package version to the release version:
+
+```sh
+cargo release version --verbose --execute --allow-branch '*' -p zakura patch # [ major | minor ]
+```
+
+- [ ] On the release commit, check that the version matches the tag you are
+      about to create: `./scripts/check-release-version.sh v<version>`
+
 ## Update Crate Versions and Crate Change Logs
 
 If you're publishing crates for the first time, [log in to crates.io](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio),
@@ -168,6 +184,9 @@ The end of support height is calculated from the current blockchain height:
 - [ ] Create a new release using the draft release as a base, by clicking the Edit icon in the [draft release](https://github.com/zakura-core/zakura/releases)
 - [ ] Set the tag name to the version tag,
       for example: `v1.0.0`
+      (the tag must match the `zakura` package version — verify with
+      `./scripts/check-release-version.sh v<version>`; a mismatched tag fails
+      `release-binaries.yml` and publishes nothing)
 - [ ] Set the release to target the `ironwood-main` branch
 - [ ] Set the release title to `Zakura` followed by the version tag,
       for example: `Zakura 1.0.0`

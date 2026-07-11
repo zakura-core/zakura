@@ -129,3 +129,5 @@ To help ensure that you have sufficient time and a clear path to update, this is
 ## Release candidate & release process
 
 Our release checklist is available as a template, which defines each step our team needs to follow to create a new pre-release or release, and to also build and push the binaries to the official channels [Release Checklist Template](https://github.com/zakura-core/zakura/blob/ironwood-main/.github/PULL_REQUEST_TEMPLATE/release-checklist.md).
+
+Every release tag must match the `zakura` package version: release binaries are built without `.git`, so `zakurad --version` reports the package version, not the tag. The `release-binaries.yml` workflow checks this and refuses to build or publish assets for a mismatched tag. Before pushing a tag, verify the release commit with `./scripts/check-release-version.sh v<version>`.

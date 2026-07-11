@@ -238,6 +238,7 @@ install -d -m 755 "$(dirname "$controller_config")" "$(dirname "$alert_config")"
 install -m 755 /tmp/zakura-continuous-sync.py /usr/local/sbin/zakura-continuous-sync.py
 install -m 755 /tmp/zakura-monitor.py /usr/local/sbin/zakura-monitor.py
 install -m 755 /tmp/zakura-monitor-status.py /usr/local/sbin/zakura-monitor-status.py
+install -m 755 /tmp/zakura-monitor-status.sh /usr/local/sbin/zakura-monitor-status.sh
 install -m 644 /tmp/zakura-continuous-controller.toml "$controller_config"
 install -m 644 /tmp/zakura-alert-monitor.toml "$alert_config"
 install -m 644 /tmp/zakura-continuous-zakurad.toml.template "$config_template"
@@ -255,6 +256,7 @@ touch "$log_file" "$monitor_log"
 rm -f /tmp/zakura-continuous-sync.py \
   /tmp/zakura-monitor.py \
   /tmp/zakura-monitor-status.py \
+  /tmp/zakura-monitor-status.sh \
   /tmp/zakura-continuous-controller.toml \
   /tmp/zakura-alert-monitor.toml \
   /tmp/zakura-continuous-zakurad.toml.template \
@@ -291,6 +293,7 @@ def deploy_node(node: Node, args: argparse.Namespace) -> tuple[str, bool, str]:
         "continuous-sync.py": SCRIPT_DIR / "continuous-sync.py",
         "alert-monitor.py": SCRIPT_DIR / "alert-monitor.py",
         "alert-status.py": SCRIPT_DIR / "alert-status.py",
+        "monitor-status-wrapper.sh": SCRIPT_DIR / "monitor-status-wrapper.sh",
         "controller.toml": tmp_dir / "controller.toml",
         "alert-monitor.toml": tmp_dir / "alert-monitor.toml",
         "zakurad.toml.template": tmp_dir / "zakurad.toml.template",
@@ -308,6 +311,7 @@ def deploy_node(node: Node, args: argparse.Namespace) -> tuple[str, bool, str]:
         (staged["continuous-sync.py"], "/tmp/zakura-continuous-sync.py"),
         (staged["alert-monitor.py"], "/tmp/zakura-monitor.py"),
         (staged["alert-status.py"], "/tmp/zakura-monitor-status.py"),
+        (staged["monitor-status-wrapper.sh"], "/tmp/zakura-monitor-status.sh"),
         (staged["controller.toml"], "/tmp/zakura-continuous-controller.toml"),
         (staged["alert-monitor.toml"], "/tmp/zakura-alert-monitor.toml"),
         (staged["zakurad.toml.template"], "/tmp/zakura-continuous-zakurad.toml.template"),

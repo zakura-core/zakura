@@ -14,6 +14,7 @@ SYNC_PATH = ROOT / "deploy" / "continuous-sync" / "continuous-sync.py"
 DEPLOY_PATH = ROOT / "deploy" / "continuous-sync" / "deploy.py"
 ALERT_PATH = ROOT / "deploy" / "continuous-sync" / "alert-monitor.py"
 ALERT_STATUS_PATH = ROOT / "deploy" / "continuous-sync" / "alert-status.py"
+STATUS_WRAPPER_PATH = ROOT / "deploy" / "continuous-sync" / "monitor-status-wrapper.sh"
 
 
 def load_module(name: str, path: Path):
@@ -187,6 +188,12 @@ class ContinuousSyncTests(unittest.TestCase):
 
     def test_deploy_does_not_stop_node_before_restarting_controller(self):
         self.assertNotIn('systemctl stop "$node_service"', deploy.INSTALL_SCRIPT)
+
+    def test_forced_ssh_wrapper_uses_current_status_script(self):
+        self.assertIn(
+            "exec /usr/local/sbin/zakura-monitor-status.py",
+            STATUS_WRAPPER_PATH.read_text(encoding="utf-8"),
+        )
 
     def test_alert_requires_two_consecutive_down_samples(self):
         hostname = "temp-zakura-sync-test-1"

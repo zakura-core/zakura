@@ -20,7 +20,7 @@ controller, but it does not hold an SSH session open during the long sync.
 1. Fetch `origin/main` in `/root/zakura` and pin the full commit SHA.
 2. Build `zakurad` from a detached worktree and cache the binary by SHA.
 3. Atomically install the binary at `/usr/local/bin/zakurad`.
-4. Stop `zakura-zebrad.service`.
+4. Stop `zakura.service`.
 5. Verify `/var/lib/zakura/.continuous-sync-wipe-ok` exists.
 6. Delete only the configured disposable state entries:
    `/var/lib/zakura/state` and `/var/lib/zakura/non_finalized_state`.
@@ -28,7 +28,7 @@ controller, but it does not hold an SSH session open during the long sync.
    cache.
 8. Render `/etc/zakura/zebrad.toml` with the node's assigned `p2p_stack` and a
    run-specific trace directory.
-9. Start `zakura-zebrad.service` with `Restart=no`.
+9. Start `zakura.service` with `Restart=no`.
 10. Poll metrics and `/ready` until the node is stably near tip.
 11. Stop the node, post a completion alert to `#zakura-alerts`, and start the
     next cycle after a short cooldown.
@@ -73,7 +73,7 @@ Host files:
 
 - controller config: `/etc/zakura-continuous-sync/controller.toml`
 - `zakurad` config: `/etc/zakura/zebrad.toml`
-- node service: `zakura-zebrad.service`
+- node service: `zakura.service`
 - controller service: `zakura-continuous-sync.service`
 - alert service and timer: `zakura-monitor.service` / `zakura-monitor.timer`
 - controller state: `/var/lib/zakura-continuous-sync/state.json`
@@ -124,7 +124,7 @@ On a host:
 
 ```bash
 systemctl status zakura-continuous-sync.service
-systemctl status zakura-zebrad.service
+systemctl status zakura.service
 journalctl -u zakura-continuous-sync.service -f
 /usr/local/sbin/zakura-continuous-sync.py status
 /usr/local/sbin/zakura-monitor-status.py
@@ -212,7 +212,7 @@ For a fresh Ubuntu x86_64 host:
 - Only configured `wipe_entries` are deleted.
 - `preserve_entries` are never deleted by the controller.
 - A failed cleanup halts the controller before `zakurad` starts.
-- `zakura-zebrad.service` uses `Restart=no`; crashes are failures, not hidden
+- `zakura.service` uses `Restart=no`; crashes are failures, not hidden
   restarts.
 - Secrets are read from host env files or GitHub secrets and are never written to
   repository-managed templates.

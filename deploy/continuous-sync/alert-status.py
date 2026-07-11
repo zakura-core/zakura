@@ -41,7 +41,11 @@ def metric_height(text: str) -> int | None:
         "checkpoint_verified_height",
         "checkpoint_processing_next_height",
     ]
-    values = {name: [] for name in priority}
+    estimated = [
+        "sync_estimated_network_tip_height",
+        "sync_estimated_distance_to_tip",
+    ]
+    values = {name: [] for name in priority + estimated}
     for line in text.splitlines():
         if not line or line.startswith("#"):
             continue
@@ -59,6 +63,11 @@ def metric_height(text: str) -> int | None:
     for name in priority:
         if values[name]:
             return max(values[name])
+    if all(values[name] for name in estimated):
+        tip = max(values["sync_estimated_network_tip_height"])
+        distance = min(values["sync_estimated_distance_to_tip"])
+        if 0 <= distance <= tip:
+            return tip - distance
     return None
 
 
@@ -87,7 +96,7 @@ def status(config: dict[str, Any]) -> dict[str, Any]:
     hostname = socket.gethostname().split(".", 1)[0]
     node = node_info(config, hostname)
     metrics_url = str(defaults.get("metrics_url", "http://127.0.0.1:9999/metrics"))
-    service = str(defaults.get("service_name", "zakura-zebrad.service"))
+    service = str(defaults.get("service_name", "zakura.service"))
     controller_state_path = Path(
         str(
             defaults.get(

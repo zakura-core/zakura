@@ -139,6 +139,7 @@ def subst_for(node: Node) -> dict[str, str]:
         "ALERT_SSH_KEY": str(raw["alert_ssh_key"]),
         "ALERT_STATUS_COMMAND": str(raw["alert_status_command"]),
         "ALERT_THROTTLE_SECONDS": str(raw["alert_throttle_seconds"]),
+        "DOWN_CONFIRMATION_SAMPLES": str(raw["down_confirmation_samples"]),
         "CLUSTER_STALL_SECONDS": str(raw["cluster_stall_seconds"]),
         "BRANCH": str(raw["branch"]),
         "REMOTE": str(raw["remote"]),
@@ -204,7 +205,7 @@ def render_files(node: Node) -> dict[str, str]:
         "controller.toml": render_template("controller.toml", subst),
         "alert-monitor.toml": render_template("alert-monitor.toml", subst),
         "zakurad.toml.template": render_template("zakurad.toml.template", subst),
-        "zakura-zebrad.service": render_template("zakura-zebrad.service", subst),
+        "zakura.service": render_template("zakura.service", subst),
         "zakura-continuous-sync.service": render_template("zakura-continuous-sync.service", subst),
         "zakura-monitor.service": render_template("zakura-monitor.service", subst),
         "zakura-monitor.timer": render_template("zakura-monitor.timer", subst),
@@ -240,7 +241,7 @@ install -m 755 /tmp/zakura-monitor-status.py /usr/local/sbin/zakura-monitor-stat
 install -m 644 /tmp/zakura-continuous-controller.toml "$controller_config"
 install -m 644 /tmp/zakura-alert-monitor.toml "$alert_config"
 install -m 644 /tmp/zakura-continuous-zakurad.toml.template "$config_template"
-install -m 644 /tmp/zakura-continuous-zebrad.service "/etc/systemd/system/${{node_service}}"
+install -m 644 /tmp/zakura.service "/etc/systemd/system/${{node_service}}"
 install -m 644 /tmp/zakura-continuous-controller.service "/etc/systemd/system/${{controller_service}}"
 install -m 644 /tmp/zakura-monitor.service /etc/systemd/system/zakura-monitor.service
 install -m 644 /tmp/zakura-monitor.timer /etc/systemd/system/zakura-monitor.timer
@@ -257,7 +258,7 @@ rm -f /tmp/zakura-continuous-sync.py \
   /tmp/zakura-continuous-controller.toml \
   /tmp/zakura-alert-monitor.toml \
   /tmp/zakura-continuous-zakurad.toml.template \
-  /tmp/zakura-continuous-zebrad.service \
+  /tmp/zakura.service \
   /tmp/zakura-continuous-controller.service \
   /tmp/zakura-monitor.service \
   /tmp/zakura-monitor.timer \
@@ -271,7 +272,6 @@ systemctl enable "$controller_service" >/dev/null
 systemctl enable --now zakura-monitor.timer >/dev/null
 
 if [ "$start_controller" = "1" ]; then
-  systemctl stop "$node_service" || true
   systemctl restart "$controller_service"
 fi
 
@@ -294,7 +294,7 @@ def deploy_node(node: Node, args: argparse.Namespace) -> tuple[str, bool, str]:
         "controller.toml": tmp_dir / "controller.toml",
         "alert-monitor.toml": tmp_dir / "alert-monitor.toml",
         "zakurad.toml.template": tmp_dir / "zakurad.toml.template",
-        "zakura-zebrad.service": tmp_dir / "zakura-zebrad.service",
+        "zakura.service": tmp_dir / "zakura.service",
         "zakura-continuous-sync.service": tmp_dir / "zakura-continuous-sync.service",
         "zakura-monitor.service": tmp_dir / "zakura-monitor.service",
         "zakura-monitor.timer": tmp_dir / "zakura-monitor.timer",
@@ -311,7 +311,7 @@ def deploy_node(node: Node, args: argparse.Namespace) -> tuple[str, bool, str]:
         (staged["controller.toml"], "/tmp/zakura-continuous-controller.toml"),
         (staged["alert-monitor.toml"], "/tmp/zakura-alert-monitor.toml"),
         (staged["zakurad.toml.template"], "/tmp/zakura-continuous-zakurad.toml.template"),
-        (staged["zakura-zebrad.service"], "/tmp/zakura-continuous-zebrad.service"),
+        (staged["zakura.service"], "/tmp/zakura.service"),
         (staged["zakura-continuous-sync.service"], "/tmp/zakura-continuous-controller.service"),
         (staged["zakura-monitor.service"], "/tmp/zakura-monitor.service"),
         (staged["zakura-monitor.timer"], "/tmp/zakura-monitor.timer"),

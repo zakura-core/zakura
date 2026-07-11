@@ -6,12 +6,14 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[3]
 SYNC_PATH = ROOT / "deploy" / "continuous-sync" / "continuous-sync.py"
 DEPLOY_PATH = ROOT / "deploy" / "continuous-sync" / "deploy.py"
 ALERT_PATH = ROOT / "deploy" / "continuous-sync" / "alert-monitor.py"
+ALERT_STATUS_PATH = ROOT / "deploy" / "continuous-sync" / "alert-status.py"
 
 
 def load_module(name: str, path: Path):
@@ -25,6 +27,7 @@ def load_module(name: str, path: Path):
 sync = load_module("continuous_sync", SYNC_PATH)
 deploy = load_module("continuous_sync_deploy", DEPLOY_PATH)
 alert = load_module("continuous_sync_alert", ALERT_PATH)
+alert_status = load_module("continuous_sync_alert_status", ALERT_STATUS_PATH)
 
 
 class ContinuousSyncTests(unittest.TestCase):
@@ -40,6 +43,51 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertEqual(sync.metric_value(metrics, "state.memory.best.committed.block.height"), 42)
         self.assertEqual(sync.metric_value(metrics, "sync.estimated_distance_to_tip"), 1)
         self.assertEqual(sync.metric_value(metrics, "checkpoint_processing_next_height"), 99)
+
+    def test_sample_status_falls_back_to_estimated_height(self):
+        metrics = "\n".join(
+            [
+                "sync_estimated_network_tip_height 1000",
+                "sync_estimated_distance_to_tip 100",
+            ]
+        )
+        config = make_config(Path("/tmp"))
+
+        with (
+            patch.object(sync, "service_active", return_value=True),
+            patch.object(sync, "fetch_text", return_value=metrics),
+            patch.object(sync, "fetch_ready", return_value=(False, "syncing")),
+        ):
+            status = sync.sample_status(config)
+
+        self.assertEqual(status["height"], 900)
+        self.assertEqual(status["height_source"], "estimated_tip_minus_distance")
+
+    def test_alert_status_falls_back_to_estimated_height(self):
+        metrics = "\n".join(
+            [
+                "sync_estimated_network_tip_height 1000",
+                "sync_estimated_distance_to_tip 100",
+            ]
+        )
+
+        self.assertEqual(alert_status.metric_height(metrics), 900)
+
+    def test_preflight_checks_dependencies_before_a_cycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = make_config(tmp_path)
+            config.paths.repo_dir.mkdir()
+            config.paths.config_template.write_text("", encoding="utf-8")
+            config.paths.wipe_sentinel.write_text("", encoding="utf-8")
+
+            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool") as which:
+                sync.preflight(config)
+
+            self.assertEqual(
+                [call.args[0] for call in which.call_args_list],
+                ["cargo", "git", "systemctl"],
+            )
 
     def test_safe_wipe_state_removes_only_allowlisted_entries(self):
         os.environ["ZAKURA_CONTINUOUS_SYNC_TESTING"] = "1"
@@ -104,6 +152,23 @@ class ContinuousSyncTests(unittest.TestCase):
             self.assertEqual(len(backups), 1)
             self.assertTrue((backups[0] / "old.jsonl").exists())
 
+    def test_relink_backs_up_stale_temporary_trace_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            link = tmp_path / "traces"
+            target = tmp_path / "runs" / "run" / "traces"
+            stale = tmp_path / ".traces.tmp"
+            target.mkdir(parents=True)
+            stale.mkdir()
+            (stale / "old.jsonl").write_text("old", encoding="utf-8")
+
+            sync.relink(link, target)
+
+            self.assertTrue(link.is_symlink())
+            backups = list(tmp_path.glob(".traces.tmp.migrated-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertTrue((backups[0] / "old.jsonl").exists())
+
     def test_deploy_renders_per_node_p2p_config(self):
         nodes = deploy.load_nodes(
             ROOT / "deploy" / "continuous-sync" / "nodes.toml",
@@ -117,6 +182,88 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertIn('hostname = "temp-zakura-sync-test-1"', rendered["alert-monitor.toml"])
         self.assertIn("zakura-monitor.py", rendered["zakura-monitor.service"])
         self.assertIn("OnUnitActiveSec=1m", rendered["zakura-monitor.timer"])
+        self.assertIn("down_confirmation_samples = 2", rendered["alert-monitor.toml"])
+        self.assertIn("zakura.service", rendered)
+
+    def test_deploy_does_not_stop_node_before_restarting_controller(self):
+        self.assertNotIn('systemctl stop "$node_service"', deploy.INSTALL_SCRIPT)
+
+    def test_alert_requires_two_consecutive_down_samples(self):
+        hostname = "temp-zakura-sync-test-1"
+        status = {
+            "hostname": hostname,
+            "public_ip": "138.68.43.212",
+            "mode": "dual-stack",
+            "service": "zakura.service",
+            "service_active": False,
+            "metrics_status": "unavailable",
+            "height": None,
+            "connection": "root@138.68.43.212",
+            "alias_connection": f"ssh {hostname}",
+            "log_path": "/tmp/zebrad.log",
+            "trace_path": "/tmp/traces",
+            "monitor_log_path": "/tmp/monitor.log",
+            "controller_state": {"phase": "syncing", "failed": False},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "defaults": {
+                    "alert_state_file": str(Path(tmp) / "state.json"),
+                    "monitor_log": str(Path(tmp) / "monitor.log"),
+                    "down_confirmation_samples": 2,
+                },
+                "nodes": [{"hostname": hostname}],
+            }
+            with (
+                patch.object(alert, "query_node", return_value=status),
+                patch.object(alert.socket, "gethostname", return_value=hostname),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                post_alert.assert_not_called()
+
+                alert.run_once(config)
+                post_alert.assert_called_once()
+
+    def test_controller_failure_alerts_immediately(self):
+        hostname = "temp-zakura-sync-test-1"
+        status = {
+            "hostname": hostname,
+            "public_ip": "138.68.43.212",
+            "mode": "dual-stack",
+            "service": "zakura.service",
+            "service_active": False,
+            "metrics_status": "unavailable",
+            "height": None,
+            "connection": "root@138.68.43.212",
+            "alias_connection": f"ssh {hostname}",
+            "log_path": "/tmp/zebrad.log",
+            "trace_path": "/tmp/traces",
+            "monitor_log_path": "/tmp/monitor.log",
+            "controller_state": {
+                "phase": "failed",
+                "failed": True,
+                "failure": "build failed",
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "defaults": {
+                    "alert_state_file": str(Path(tmp) / "state.json"),
+                    "monitor_log": str(Path(tmp) / "monitor.log"),
+                    "down_confirmation_samples": 2,
+                },
+                "nodes": [{"hostname": hostname}],
+            }
+            with (
+                patch.object(alert, "query_node", return_value=status),
+                patch.object(alert.socket, "gethostname", return_value=hostname),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+
+            post_alert.assert_called_once()
+
 
     def test_alert_text_is_concise_and_normalizes_mode(self):
         text = alert.main_alert_text(

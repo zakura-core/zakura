@@ -10,6 +10,7 @@ alert_env_file = "{{ALERT_ENV_FILE}}"
 alert_ssh_key = "{{ALERT_SSH_KEY}}"
 alert_status_command = "{{ALERT_STATUS_COMMAND}}"
 alert_throttle_seconds = {{ALERT_THROTTLE_SECONDS}}
+down_confirmation_samples = {{DOWN_CONFIRMATION_SAMPLES}}
 cluster_stall_seconds = {{CLUSTER_STALL_SECONDS}}
 
 {{ALERT_NODES}}

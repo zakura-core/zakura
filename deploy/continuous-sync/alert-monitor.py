@@ -102,7 +102,7 @@ def query_node(config: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
         "hostname": node["hostname"],
         "public_ip": node.get("public_ip", "unknown"),
         "mode": node.get("mode_label", "unknown"),
-        "service": defaults.get("service_name", "zakura-zebrad.service"),
+        "service": defaults.get("service_name", "zakura.service"),
         "service_active": None,
         "metrics_status": "unknown",
         "height": None,
@@ -315,7 +315,7 @@ def run_once(config: dict[str, Any]) -> int:
         % (leader, local_host, " | ".join(status_line(status) for status in statuses)),
     )
 
-    service_name = str(defaults.get("service_name", "zakura-zebrad.service"))
+    service_name = str(defaults.get("service_name", "zakura.service"))
     for status in statuses:
         name = status["hostname"]
         query_failed = bool(status.get("query_error"))
@@ -334,13 +334,31 @@ def run_once(config: dict[str, Any]) -> int:
             if expects_node_service(status) and status.get("metrics_status") != "ok":
                 down = True
                 reasons.append(f"metrics endpoint is {status.get('metrics_status')}")
+        node_record = state.setdefault("nodes", {}).setdefault(name, {})
+        if down:
+            node_record["consecutive_down_samples"] = int(
+                node_record.get("consecutive_down_samples", 0)
+            ) + 1
+        else:
+            node_record["consecutive_down_samples"] = 0
+        required_samples = int(defaults.get("down_confirmation_samples", 2))
+        confirmed_down = down and (
+            controller_failed(status)
+            or int(node_record["consecutive_down_samples"]) >= required_samples
+        )
+        if down and not confirmed_down:
+            log(
+                config,
+                f"down-pending-confirmation host={name} "
+                f"samples={node_record['consecutive_down_samples']}/{required_samples}",
+            )
         should_process = name == local_host or (leader == local_host and not query_failed)
         if should_process:
             maybe_alert(
                 config,
                 state,
                 f"node-down:{name}",
-                down,
+                confirmed_down,
                 "DOWN",
                 status,
                 statuses,

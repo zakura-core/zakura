@@ -53,7 +53,7 @@ class Paths:
 class Policy:
     branch: str = "main"
     remote: str = "origin"
-    service_name: str = "zakura-zebrad.service"
+    service_name: str = "zakura.service"
     mode_label: str = "unknown"
     p2p_stack: str = "dual"
     public_ip: str = ""
@@ -310,6 +310,20 @@ def check_free_space(config: Config) -> None:
         )
 
 
+def preflight(config: Config) -> None:
+    for command in ("cargo", "git", "systemctl"):
+        if shutil.which(command) is None:
+            raise ControllerError(f"required command is unavailable: {command}")
+    for path, description in (
+        (config.paths.repo_dir, "repository"),
+        (config.paths.config_template, "config template"),
+        (config.paths.wipe_sentinel, "wipe sentinel"),
+    ):
+        if not path.exists():
+            raise ControllerError(f"{description} is missing: {path}")
+    check_free_space(config)
+
+
 def safe_wipe_state(config: Config) -> None:
     root = config.paths.chain_state_dir.resolve()
     testing = os.environ.get("ZAKURA_CONTINUOUS_SYNC_TESTING") == "1"
@@ -357,15 +371,22 @@ def render_config(config: Config, run_dir: Path) -> None:
 def relink(link: Path, target: Path) -> None:
     link.parent.mkdir(parents=True, exist_ok=True)
     tmp = link.with_name(f".{link.name}.tmp")
-    if tmp.exists() or tmp.is_symlink():
+    if tmp.is_symlink() or tmp.is_file():
         tmp.unlink()
+    elif tmp.is_dir():
+        backup = tmp.with_name(f"{tmp.name}.migrated-{utc_stamp()}-{time.time_ns()}")
+        tmp.rename(backup)
     tmp.symlink_to(target)
-    if link.exists() and not link.is_symlink() and link.is_dir():
+    if link.is_symlink():
+        pass
+    elif link.is_dir():
         try:
             link.rmdir()
         except OSError:
-            backup = link.with_name(f"{link.name}.migrated-{utc_stamp()}")
+            backup = link.with_name(f"{link.name}.migrated-{utc_stamp()}-{time.time_ns()}")
             link.rename(backup)
+    elif link.exists():
+        link.unlink()
     tmp.replace(link)
 
 
@@ -432,21 +453,27 @@ def sample_status(config: Config) -> dict[str, Any]:
             value = metric_value(metrics, key)
             if value is not None:
                 status[key] = int(value)
-        status["height"] = status.get("state.memory.best.committed.block.height") or status.get(
-            "state.memory.committed.block.height"
-        )
+        status["height"] = None
+        for key in (
+            "state.memory.best.committed.block.height",
+            "state.memory.committed.block.height",
+            "state_finalized_block_height",
+            "state_checkpoint_finalized_block_height",
+            "zcash_chain_verified_block_height",
+            "sync_block_verified_tip_height",
+            "checkpoint_verified_height",
+            "checkpoint_processing_next_height",
+        ):
+            if status.get(key) is not None:
+                status["height"] = status[key]
+                status["height_source"] = key
+                break
         if status["height"] is None:
-            for key in (
-                "state_finalized_block_height",
-                "state_checkpoint_finalized_block_height",
-                "zcash_chain_verified_block_height",
-                "sync_block_verified_tip_height",
-                "checkpoint_verified_height",
-                "checkpoint_processing_next_height",
-            ):
-                if status.get(key) is not None:
-                    status["height"] = status[key]
-                    break
+            tip = status.get("sync.estimated_network_tip_height")
+            distance = status.get("sync.estimated_distance_to_tip")
+            if isinstance(tip, int) and isinstance(distance, int) and 0 <= distance <= tip:
+                status["height"] = tip - distance
+                status["height_source"] = "estimated_tip_minus_distance"
     except Exception as error:
         status["metrics_status"] = f"{type(error).__name__}: {error}"
         status["height"] = None
@@ -551,7 +578,7 @@ def failure_text(config: Config, run_state: dict[str, Any], reason: str) -> str:
 def policy_mode(policy: Policy) -> str:
     if policy.p2p_stack == "zakura":
         return "v2p2p"
-    if policy.p2p_stack == "zebra":
+    if policy.p2p_stack in ("zebra", "legacy"):
         return "legacy"
     return "dual" if policy.p2p_stack == "dual" else policy.p2p_stack
 
@@ -568,6 +595,7 @@ def short_reason(reason: str, limit: int = 96) -> str:
 
 
 def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[str, Any]:
+    preflight(config)
     sha = resolve_sha(config)
     run_id = f"{utc_stamp()}-{sha[:12]}"
     run_dir = config.paths.runs_dir / run_id

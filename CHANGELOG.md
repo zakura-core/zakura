@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Prepared the Zakura crate graph for publication at `1.0.0-rc2`. Install the
+  `zakura` package with Cargo to obtain the `zakurad` executable; Zakura-owned
+  libraries now share the release version, including the renamed
+  `zakura-tower-batch-control` and `zakura-tower-fallback` packages.
 - Corrected Zakura's release identity and build provenance. `zakurad --version`
   now reports the `1.0.0-rc0` release with source-commit build metadata, and
   Docker images expose OCI version, revision, source, and title labels. The

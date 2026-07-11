@@ -73,9 +73,18 @@ jobs:
               "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
               --jq '.[].path')
           else
-            changed=$(gh api \
-              "repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.sha }}" \
-              --jq '.files[].filename')
+            before="${{ github.event.before }}"
+            # The first push of a branch (and force-pushes that orphan the old
+            # tip) have no usable `before` commit, so the compare would 404;
+            # fall back to comparing against the default branch.
+            if [[ "$before" == "0000000000000000000000000000000000000000" ]] || \
+               ! changed=$(gh api \
+                 "repos/${{ github.repository }}/compare/${before}...${{ github.sha }}" \
+                 --jq '.files[].filename'); then
+              changed=$(gh api \
+                "repos/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...${{ github.sha }}" \
+                --jq '.files[].filename')
+            fi
           fi
 
           if printf '%s\n' "$changed" | grep -qE '^(zakura-network/|zakurad/src/components/sync/|zakurad/tests/zakura_regtest_e2e\.rs|docker/zakura-regtest-e2e/|docker/docker-compose\.zakura-regtest-e2e\.yml|\.github/workflows/zakura-e2e\.yml)'; then

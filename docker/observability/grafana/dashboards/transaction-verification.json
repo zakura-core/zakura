@@ -148,7 +148,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "{instance=\"localhost:9999\", job=\"zebrad\"}"
+              "options": "{instance=\"localhost:9999\", job=\"zakurad\"}"
             },
             "properties": [
               {
@@ -822,7 +822,7 @@
             "type": "prometheus",
             "uid": "zebra-prometheus"
           },
-          "expr": "zebra_consensus_batch_duration_seconds{quantile=\"0.5\"}",
+          "expr": "zakura_consensus_batch_duration_seconds{quantile=\"0.5\"}",
           "legendFormat": "{{verifier}} p50",
           "refId": "A"
         },
@@ -831,7 +831,7 @@
             "type": "prometheus",
             "uid": "zebra-prometheus"
           },
-          "expr": "zebra_consensus_batch_duration_seconds{quantile=\"0.95\"}",
+          "expr": "zakura_consensus_batch_duration_seconds{quantile=\"0.95\"}",
           "legendFormat": "{{verifier}} p95",
           "refId": "B"
         },
@@ -840,7 +840,7 @@
             "type": "prometheus",
             "uid": "zebra-prometheus"
           },
-          "expr": "zebra_consensus_batch_duration_seconds{quantile=\"0.99\"}",
+          "expr": "zakura_consensus_batch_duration_seconds{quantile=\"0.99\"}",
           "legendFormat": "{{verifier}} p99",
           "refId": "C"
         }
@@ -927,7 +927,7 @@
             "type": "prometheus",
             "uid": "zebra-prometheus"
           },
-          "expr": "sum(rate(zebra_consensus_batch_duration_seconds_count{result=\"success\"}[5m])) by (verifier)",
+          "expr": "sum(rate(zakura_consensus_batch_duration_seconds_count{result=\"success\"}[5m])) by (verifier)",
           "legendFormat": "{{verifier}} success/s",
           "refId": "A"
         },
@@ -936,7 +936,7 @@
             "type": "prometheus",
             "uid": "zebra-prometheus"
           },
-          "expr": "sum(rate(zebra_consensus_batch_duration_seconds_count{result=\"failure\"}[5m])) by (verifier)",
+          "expr": "sum(rate(zakura_consensus_batch_duration_seconds_count{result=\"failure\"}[5m])) by (verifier)",
           "legendFormat": "{{verifier}} failure/s",
           "refId": "B"
         }

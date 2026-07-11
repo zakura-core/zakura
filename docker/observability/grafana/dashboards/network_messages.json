@@ -66,8 +66,8 @@
       "scopedVars": {
         "job": {
           "selected": true,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -189,8 +189,8 @@
       "scopedVars": {
         "job": {
           "selected": true,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -416,8 +416,8 @@
       "scopedVars": {
         "job": {
           "selected": true,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -527,8 +527,8 @@
       "scopedVars": {
         "job": {
           "selected": true,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -638,8 +638,8 @@
       "scopedVars": {
         "job": {
           "selected": true,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -749,8 +749,8 @@
       "scopedVars": {
         "job": {
           "selected": true,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -824,10 +824,10 @@
         "current": {
           "selected": false,
           "text": [
-            "zebrad-mainnet"
+            "zakurad-mainnet"
           ],
           "value": [
-            "zebrad-mainnet"
+            "zakurad-mainnet"
           ]
         },
         "datasource": null,

@@ -1,13 +1,13 @@
-# Zebra Crates
+# Zakura Crates
 
-The Zebra project publishes around 20 crates to the Rust [crates.io website](https://crates.io).
+The Zakura project publishes around 20 crates to the Rust [crates.io website](https://crates.io).
 Zcash Foundation crates are controlled by the [`ZcashFoundation/owners`](https://github.com/orgs/ZcashFoundation/teams/owners) GitHub team.
 
-The latest list of Zebra and FROST crates is [available on crates.io](https://crates.io/teams/github:zcashfoundation:owners).
+The latest list of Zakura and FROST crates is [available on crates.io](https://crates.io/teams/github:zcashfoundation:owners).
 
-The Zebra repository can be used to publish the crates in this list that match these patterns:
+The Zakura repository can be used to publish the crates in this list that match these patterns:
 
-- starts with `zebra` (including `zebrad` and the `zebra` placeholder)
+- starts with `zakura` (including `zakurad` and the `zakura` placeholder)
 - starts with `tower`
 
 We also depend on these separate ZF crates:
@@ -43,7 +43,7 @@ please paste the token found on https://crates.io/me below
 
 We publish a new placeholder crate as soon as we have a good idea for a crate name.
 
-Before starting with the publishing, please clone zebra and use the `main` branch to create the placeholder crate, you need `cargo release` installed in the system and be logged to crates.io with `cargo login`.
+Before starting with the publishing, please clone zakura and use the `main` branch to create the placeholder crate, you need `cargo release` installed in the system and be logged to crates.io with `cargo login`.
 
 Next, execute the following commands to publish a new placeholder and set the owners:
 
@@ -72,25 +72,25 @@ New crate owners should go to [crates.io/me](https://crates.io/me) to accept the
 
 Here are some example commands for changing owners:
 
-To change owners of deleted/placeholder Zebra crates:
+To change owners of deleted/placeholder Zakura crates:
 
 ```sh
 $ mkdir placeholders
 $ cd placeholders
-$ for crate in tower-batch-cpu zebra zebra-cli zebra-client; do cargo new $crate; pushd $crate; cargo owner --add oxarbitrage; cargo owner --remove dconnolly; popd; done
-     Created binary (application) `zebra-cli` package
-~/zebra-cli ~
+$ for crate in tower-batch-cpu zakura zakura-cli zakura-client; do cargo new $crate; pushd $crate; cargo owner --add oxarbitrage; cargo owner --remove dconnolly; popd; done
+     Created binary (application) `zakura-cli` package
+~/zakura-cli ~
     Updating crates.io index
-       Owner user oxarbitrage has been invited to be an owner of crate zebra-cli
+       Owner user oxarbitrage has been invited to be an owner of crate zakura-cli
     Updating crates.io index
-       Owner removing ["dconnolly"] from crate zebra-cli
+       Owner removing ["dconnolly"] from crate zakura-cli
 ~
-     Created binary (application) `zebra-client` package
-~/zebra-client ~
+     Created binary (application) `zakura-client` package
+~/zakura-client ~
     Updating crates.io index
-       Owner user oxarbitrage has been invited to be an owner of crate zebra-client
+       Owner user oxarbitrage has been invited to be an owner of crate zakura-client
     Updating crates.io index
-       Owner removing ["dconnolly"] from crate zebra-client
+       Owner removing ["dconnolly"] from crate zakura-client
 ~
 ...
 ```
@@ -108,23 +108,23 @@ $ cargo owner --remove dconnolly
        Owner removing ["dconnolly"] from crate zcash_script
 ```
 
-To change owners of current Zebra crates:
+To change owners of current Zakura crates:
 
 ```sh
-$ git clone https://github.com/ZcashFoundation/zebra
-$ cd zebra
-$ for crate in tower-* zebra*; do pushd $crate; cargo owner --add oxarbitrage; cargo owner --remove dconnolly; popd; done
-~/zebra/tower-batch-control ~/zebra
+$ git clone https://github.com/zakura-core/zakura
+$ cd zakura
+$ for crate in tower-* zakura*; do pushd $crate; cargo owner --add oxarbitrage; cargo owner --remove dconnolly; popd; done
+~/zakura/tower-batch-control ~/zakura
     Updating crates.io index
        Owner user oxarbitrage already has a pending invitation to be an owner of crate tower-batch-control
     Updating crates.io index
        Owner removing ["dconnolly"] from crate tower-batch-control
-~/zebra
-~/zebra/tower-fallback ~/zebra
+~/zakura
+~/zakura/tower-fallback ~/zakura
     Updating crates.io index
        Owner user oxarbitrage has been invited to be an owner of crate tower-fallback
     Updating crates.io index
        Owner removing ["dconnolly"] from crate tower-fallback
-~/zebra
+~/zakura
 ...
 ```

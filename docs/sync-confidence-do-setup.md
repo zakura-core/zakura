@@ -24,7 +24,7 @@ state objects after a DB format-version bump by re-running the snapshots workflo
    at a recent full mainnet snapshot, `REPO` at this checkout, and configure
    `s3cmd` for the destination Space). It rewinds the snapshot to each window
    start, prunes, and uploads `pre-nu62`/`post-nu62` tarballs to the Space.
-2. Make the GHCR image public: GitHub -> the org's **Packages** -> `zebra-tests`
+2. Make the GHCR image public: GitHub -> the org's **Packages** -> `zakura-tests`
    -> Package settings -> Change visibility -> **Public** (created on the first
    `Sync confidence` run; droplets pull it anonymously).
 

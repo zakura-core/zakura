@@ -78,7 +78,7 @@ jobs:
               --jq '.files[].filename')
           fi
 
-          if printf '%s\n' "$changed" | grep -qE '^(zebra-network/|zebrad/src/components/sync/|zebrad/tests/zakura_regtest_e2e\.rs|docker/zakura-regtest-e2e/|docker/docker-compose\.zakura-regtest-e2e\.yml|\.github/workflows/zakura-e2e\.yml)'; then
+          if printf '%s\n' "$changed" | grep -qE '^(zakura-network/|zakurad/src/components/sync/|zakurad/tests/zakura_regtest_e2e\.rs|docker/zakura-regtest-e2e/|docker/docker-compose\.zakura-regtest-e2e\.yml|\.github/workflows/zakura-e2e\.yml)'; then
             echo "zakura=true" >> "$GITHUB_OUTPUT"
           else
             echo "zakura=false" >> "$GITHUB_OUTPUT"
@@ -103,7 +103,7 @@ jobs:
       id-token: write
       statuses: write
     runs-on: ubuntu-latest
-    # Observed warm run ~6 min; a cold zebrad debug build is the long pole. This
+    # Observed warm run ~6 min; a cold zakurad debug build is the long pole. This
     # ceiling catches a hung 4-node stack quickly given the e2e's flake history
     # (it is NOT the expected runtime).
     timeout-minutes: 30
@@ -116,15 +116,15 @@ jobs:
           toolchain: stable
           cache-key: zakura-regtest-e2e-pr-gate
           cache-on-failure: true
-      - uses: ./.github/actions/setup-zebra-build
+      - uses: ./.github/actions/setup-zakura-build
       # Compile the e2e once. `cargo test --no-run` builds both the integration
-      # test binary and the `zebrad` bin (cargo always builds a package's
+      # test binary and the `zakurad` bin (cargo always builds a package's
       # binaries so its integration tests can find them via CARGO_BIN_EXE_*); the
       # run step below reuses these artifacts instead of recompiling.
       #
-      # `setup-zebra-build` exports `ROCKSDB_LIB_DIR`, which makes
+      # `setup-zakura-build` exports `ROCKSDB_LIB_DIR`, which makes
       # librocksdb-sys dynamically link the runner's `librocksdb.so`. The harness
-      # bind-mounts the `zebrad` bin into a stock `debian:trixie-slim` container
+      # bind-mounts the `zakurad` bin into a stock `debian:trixie-slim` container
       # that has no system RocksDB, so a dynamically linked bin crashes every
       # node with "librocksdb.so.8.9: cannot open shared object file". Unset it so
       # RocksDB is vendored and statically linked. Both steps must keep it unset:
@@ -186,7 +186,7 @@ jobs:
       - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
         with:
           tool: cargo-nextest
-      - uses: ./.github/actions/setup-zebra-build
+      - uses: ./.github/actions/setup-zakura-build
       - name: Run Zakura testkit cluster profile
         run: cargo nextest run --profile zakura-integration --locked --features default-release-binaries --no-fail-fast
         env:
@@ -227,7 +227,7 @@ jobs:
       - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
         with:
           tool: cargo-nextest
-      - uses: ./.github/actions/setup-zebra-build
+      - uses: ./.github/actions/setup-zakura-build
       - name: Run Zakura block-sync fuzz scenarios
         run: cargo nextest run --profile zakura-blocksync-fuzz --locked --features default-release-binaries --no-fail-fast
         env:
@@ -267,7 +267,7 @@ jobs:
           toolchain: stable
           cache-key: zakura-regtest-e2e
           cache-on-failure: true
-      - uses: ./.github/actions/setup-zebra-build
+      - uses: ./.github/actions/setup-zakura-build
       # Build once (see the pr-gate job for the ROCKSDB_LIB_DIR / static-link
       # rationale); the run step reuses the compiled artifacts.
       - name: Build Zakura e2e (debug)

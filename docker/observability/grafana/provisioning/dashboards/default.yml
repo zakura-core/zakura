@@ -4,7 +4,7 @@ providers:
   - name: 'Zebra Dashboards'
     orgId: 1
     folder: 'Zebra'
-    folderUid: 'zebra-dashboards'
+    folderUid: 'zakura-dashboards'
     type: file
     disableDeletion: false
     updateIntervalSeconds: 30

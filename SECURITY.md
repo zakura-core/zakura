@@ -52,15 +52,15 @@ AQC1Wmyb9ul/2QNi//8sKNDfaYbn3h6OU45BTAWggp+ACQ==
 
 ## Sending Disclosures
 
-In the case where we become aware of security issues affecting other projects that has never affected Zebra or Zcash, our intention is to inform those projects of security issues on a best effort basis.
+In the case where we become aware of security issues affecting other projects that has never affected Zakura or Zcash, our intention is to inform those projects of security issues on a best effort basis.
 
-In the case where we fix a security issue in Zebra or Zcash that also affects the following neighboring projects, our intention is to engage in responsible disclosures with them as described in <https://github.com/RD-Crypto-Spec/Responsible-Disclosure>, subject to the deviations described in the section at the bottom of this document.
+In the case where we fix a security issue in Zakura or Zcash that also affects the following neighboring projects, our intention is to engage in responsible disclosures with them as described in <https://github.com/RD-Crypto-Spec/Responsible-Disclosure>, subject to the deviations described in the section at the bottom of this document.
 
 ## Bilateral Responsible Disclosure Agreements
 
 We have set up agreements with the following neighboring projects to share vulnerability information, subject to the deviations described in the next section.
 
-Specifically, we have agreed to engage in responsible disclosures for security issues affecting Zebra or Zcash technology with the following contacts:
+Specifically, we have agreed to engage in responsible disclosures for security issues affecting Zakura or Zcash technology with the following contacts:
 
 - The Electric Coin Company - <security@z.cash> via PGP
 

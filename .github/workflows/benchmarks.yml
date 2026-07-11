@@ -15,12 +15,12 @@ concurrency:
 # with `harness = false` in the crate's `Cargo.toml`.
 env:
   BENCHES: |
-    criterion -p zebra-consensus --bench groth16
-    criterion -p zebra-consensus --bench halo2
-    criterion -p zebra-consensus --bench sapling
-    criterion -p zebra-chain --bench transaction
-    criterion -p zebra-chain --bench block --features bench
-    criterion -p zebra-chain --bench redpallas
+    criterion -p zakura-consensus --bench groth16
+    criterion -p zakura-consensus --bench halo2
+    criterion -p zakura-consensus --bench sapling
+    criterion -p zakura-chain --bench transaction
+    criterion -p zakura-chain --bench block --features bench
+    criterion -p zakura-chain --bench redpallas
 
 jobs:
   # Runs all benchmarks and publishes results to gh-pages for historical

@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   Cargo packages are now named `zakura` and `zakura-watchdog`; the watchdog
   binary, systemd unit, runtime paths, and Sentry identity use
   `zakura-watchdog`.
+- Renamed Zakura-owned crates, binaries, tools, deployment helpers, and current
+  documentation from Zebra/Zebrad names to Zakura/Zakurad names. Deprecated
+  compatibility inputs such as `zebrad.toml`, `ZEBRA_*`, the legacy `zebrad`
+  release alias, old cache discovery paths, `p2p_stack = "zebra"`, and zcashd's
+  `-zebra-compat` spelling remain available where they are external contracts.
 - zcashd-compat no longer adds or requires the obsolete zcashd deprecation
   acknowledgement in `zcash.conf`.
 - Removed the deprecated zcashd-compat dedicated RPC listener (`:28232`) and its
@@ -251,7 +256,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   previously routed through `Transaction::to_librustzcash`, which re-serializes
   and reparses the whole transaction — decompressing every Jubjub and Pallas
   curve point — purely to feed the same canonical bytes into the BLAKE2b digest
-  tree. A new `zebra-chain` `transaction::zip244` module builds the txid and
+  tree. A new `zakura-chain` `transaction::zip244` module builds the txid and
   auth-commitment digests directly from Zebra's already-parsed transaction
   fields, removing that reparse on the checkpoint path where no point is ever
   needed. v6 transactions (the unstable `tx_v6` feature) still route through
@@ -284,7 +289,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Parallelize note-commitment tree updates during checkpoint-zone sync. Sapling
   and Orchard note commitments for each block are now appended to the incremental
   Merkle frontier using a parallel divide-and-conquer reduction across the rayon
-  pool (`parallel_append` in `zebra-chain`), and the note-commitment tree update
+  pool (`parallel_append` in `zakura-chain`), and the note-commitment tree update
   runs concurrently with the block-commitment validity check on the rayon pool.
   Combined, these changes roughly double checkpoint-zone throughput on multi-core
   hosts (~20 → ~42 blk/s on an 8-core machine at 1.7M height). A new
@@ -349,7 +354,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   retention floor, so `getrawtransaction` and verbose `getblock` can fail for
   recent-looking heights. The default remains `archive` (keep all data).
 - Offline pruning tooling (`zebrad prune-state` and the standalone
-  `zebra-prune-state` binary) to reclaim historical raw transaction data from an
+  `zakura-prune-state` binary) to reclaim historical raw transaction data from an
   existing database in a single pass, including data left intact when pruning is
   first enabled on an archive database. Defaults to a preview; pass `--confirm`
   to apply.
@@ -363,7 +368,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   duplicate-peer handling scaffolding.
 - Added bounded Zakura header-sync stream-5 wire messages, stateless header
   validation, and the default `network.zakura.header_sync` config surface.
-- Include the `zebra-rollback-state` and `zebra-prune-state` utilities alongside
+- Include the `zakura-rollback-state` and `zakura-prune-state` utilities alongside
   `zebrad` in release Docker images and Docker CI builds.
 - Use the `5.0.0-rc.3` release identity for this fork's v5 rollback build.
 - zcashd-compat mode for managing zcashd as a wallet while leveraging zebra for p2p.
@@ -402,7 +407,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - zcashd-compat now defaults to externally managed `zcashd` path mode, so Zebra
   starts the compat RPC endpoint without spawning `zcashd` unless supervision is
   explicitly enabled.
-- Update `zebra-rollback-state` and `zebrad rollback-state` to run rollback by
+- Update `zakura-rollback-state` and `zebrad rollback-state` to run rollback by
   default and use `--dry-run` for rollback-plan previews (replacing the old
   `--force` gate).
 - Increased Zebra's local rollback window (`MAX_BLOCK_REORG_HEIGHT`) from 99 to
@@ -443,7 +448,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   recoverable download failure, avoiding a panic when public peers no longer
   have a gossiped transaction available.
 - Roll back the Zakura header store together with finalized block data, so
-  databases produced by `zebra-rollback-state` can resume Zakura body sync from
+  databases produced by `zakura-rollback-state` can resume Zakura body sync from
   the new body tip instead of stalling behind stale headers and falling back to
   legacy sync.
 - Report `pruned: true` in `getblockchaininfo` after Zebra has pruned
@@ -460,7 +465,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Always include configured `zcashd_compat.block_gossip_peer_ips` in block
   inventory gossip, preventing pinned zcashd-compat peers from stalling when
   normal fractional peer sampling misses them.
-- Make `zebra-rollback-state` rollback existing v5 databases without replaying
+- Make `zakura-rollback-state` rollback existing v5 databases without replaying
   note commitment trees from genesis for modern rollback targets whose removed
   blocks did not change the Sprout tree. If rolled-back blocks contain Sprout
   commitments, rollback keeps the full rebuild path so the Sprout tip is reset
@@ -837,7 +842,7 @@ documentation with OpenRPC.
 
 ### Removed
 
-- Python QA RPC test framework (`zebra-rpc/qa/`) in favour of the new [integration-tests](https://github.com/zcash/integration-tests) project, which captures all previous work in [zcash/integration-tests#1](https://github.com/zcash/integration-tests/pull/1) ([#10363](https://github.com/ZcashFoundation/zebra/pull/10363))
+- Python QA RPC test framework (`zakura-rpc/qa/`) in favour of the new [integration-tests](https://github.com/zcash/integration-tests) project, which captures all previous work in [zcash/integration-tests#1](https://github.com/zcash/integration-tests/pull/1) ([#10363](https://github.com/ZcashFoundation/zebra/pull/10363))
 - OpenAPI specification and related functionality ([#10298](https://github.com/ZcashFoundation/zebra/pull/10298)) in favour of [OpenRPC](https://github.com/ZcashFoundation/zebra/pull/10201)
 
 ### Changed
@@ -974,7 +979,7 @@ the release candidate was published but otherwise mostly includes technical impr
 
 - Added ZIP 233 (Network Sustainability Mechanism) implementation  ([#8930](https://github.com/ZcashFoundation/zebra/pull/8930))
 - Populated `asm` field returned by Zebra's RPC methods with code in script outputs as well as script types ([#10019](https://github.com/ZcashFoundation/zebra/pull/10019))
-- Added a [CHANGELOG](https://github.com/ZcashFoundation/zebra/blob/main/zebra-rpc/qa/CHANGELOG.md) file to track changes in the python QA framework ([#10076](https://github.com/ZcashFoundation/zebra/pull/10076))
+- Added a [CHANGELOG](https://github.com/ZcashFoundation/zebra/blob/main/zakura-rpc/qa/CHANGELOG.md) file to track changes in the python QA framework ([#10076](https://github.com/ZcashFoundation/zebra/pull/10076))
 - Enabled backtraces and added debug info by default in production builds ([#10097](https://github.com/ZcashFoundation/zebra/pull/10097))
 
 ### Fixed
@@ -1017,7 +1022,7 @@ This release also includes significant updates to Zebra's CI and Docker setup, a
 - Docker and book documentation updated to describe `CONFIG_FILE_PATH` and `ZEBRA_*` environment variable usage; removed references to `ZEBRA_CONF_PATH` and legacy Docker variables ([#9768](https://github.com/ZcashFoundation/zebra/pull/9768)).
 - Implemented nextest and optimized Docker test builds ([#9435](https://github.com/ZcashFoundation/zebra/pull/9435))
 - Replaced light wallet .proto files with canonical versions obtained from <https://github.com/zcash/lightwallet-protocol> ([#9783](https://github.com/ZcashFoundation/zebra/pull/9783))
-- Allow `zebra-rpc` to be compiled without `protoc` ([#9819](https://github.com/ZcashFoundation/zebra/pull/9819))
+- Allow `zakura-rpc` to be compiled without `protoc` ([#9819](https://github.com/ZcashFoundation/zebra/pull/9819))
 - Switched Sapling verifier ([#9737](https://github.com/ZcashFoundation/zebra/pull/9737))
 - Refactor Sapling parameters loading ([#9678](https://github.com/ZcashFoundation/zebra/pull/9678))
 - Adopt upstream types for sapling commitments where possible ([#9828](https://github.com/ZcashFoundation/zebra/pull/9828))
@@ -1112,7 +1117,7 @@ Zebra 2.4.2 prints a warning upon starting if you have been impacted by the bug.
 The log line will look like:
 
 ```
-2025-07-17T17:12:41.636549Z  WARN zebra_state::service::finalized_state::zebra_db: You have been impacted by the Zebra 2.4.0 address indexer corruption bug. If you rely on the data from the RPC interface, you will need to recover your database. Follow the instructions in the 2.4.2 release notes: https://github.com/ZcashFoundation/zebra/releases/tag/v2.4.2 If you just run the node for consensus and don't use data from the RPC interface, you can ignore this warning.
+2025-07-17T17:12:41.636549Z  WARN zakura_state::service::finalized_state::zakura_db: You have been impacted by the Zebra 2.4.0 address indexer corruption bug. If you rely on the data from the RPC interface, you will need to recover your database. Follow the instructions in the 2.4.2 release notes: https://github.com/ZcashFoundation/zebra/releases/tag/v2.4.2 If you just run the node for consensus and don't use data from the RPC interface, you can ignore this warning.
 ```
 
 If you rely on the RPC data, you will need to restore your database. If you have
@@ -1196,7 +1201,7 @@ This release has the following breaking changes:
 - Update `getaddressbalance` RPC to return `received` field ([#9295](https://github.com/ZcashFoundation/zebra/pull/9295), [#9539](https://github.com/ZcashFoundation/zebra/pull/9539))
 - Added a `mempool_change()` gRPC method for listening to changes in the mempool ([#9494](https://github.com/ZcashFoundation/zebra/pull/9494))
 - Added `raw_value` feature to serde\_json ([#9538](https://github.com/ZcashFoundation/zebra/pull/9538))
-- Modified `zebra_network::Config` type to use IPv6 listen\_addr by default ([#9609](https://github.com/ZcashFoundation/zebra/pull/9609))
+- Modified `zakura_network::Config` type to use IPv6 listen\_addr by default ([#9609](https://github.com/ZcashFoundation/zebra/pull/9609))
 - Added `invalidateblock` and `reconsiderblock` RPC methods ([#9551](https://github.com/ZcashFoundation/zebra/pull/9551))
 - Updated `(z_)validateaddress` to validate TEX addresses ([#9483](https://github.com/ZcashFoundation/zebra/pull/9483))
 - Added a `addnode` RPC method ([#9604](https://github.com/ZcashFoundation/zebra/pull/9604))
@@ -1204,13 +1209,13 @@ This release has the following breaking changes:
 - Added value pool balances to `getblock` RPC output ([#9432](https://github.com/ZcashFoundation/zebra/pull/9432), [#9539](https://github.com/ZcashFoundation/zebra/pull/9539))
 - Added support for configuring shielded addresses for mining ([#9574](https://github.com/ZcashFoundation/zebra/pull/9574))
 - Added binding_sig, joinsplit_pub_key and joinsplit_sig fields to `getrawtransaction`/`getblock` response ([#9652](https://github.com/ZcashFoundation/zebra/pull/9652))
-- Added a method in `zebra-rpc` to allow validating addresses ([#9658](https://github.com/ZcashFoundation/zebra/pull/9658))
+- Added a method in `zakura-rpc` to allow validating addresses ([#9658](https://github.com/ZcashFoundation/zebra/pull/9658))
 
 ### Changed
 
 - Allow Zebra crates to be compiled with alternative versions of their dependencies ([#9484](https://github.com/ZcashFoundation/zebra/pull/9484))
 - Updated README with Arch build patch ([#9513](https://github.com/ZcashFoundation/zebra/pull/9513))
-- Renamed and moved exports in `zebra-rpc` ([#9568](https://github.com/ZcashFoundation/zebra/pull/9568))
+- Renamed and moved exports in `zakura-rpc` ([#9568](https://github.com/ZcashFoundation/zebra/pull/9568))
 - Upgraded DB format to support new fields in RPC outputs ([#9539](https://github.com/ZcashFoundation/zebra/pull/9539))
 - Moved GBT RPCs into the main RPC server ([#9459](https://github.com/ZcashFoundation/zebra/pull/9459))
 - Added a `Nu6_1` variant to `NetworkUpgrade` ([#9526](https://github.com/ZcashFoundation/zebra/pull/9526))
@@ -1325,7 +1330,7 @@ against future code changes), along with important refactors and improvements.
 ### Added
 
 - An index to track spending transaction ids by spent outpoints and revealed nullifiers ([#8895](https://github.com/ZcashFoundation/zebra/pull/8895))
-- Accessor methods to `zebra-rpc` request/response types ([#9113](https://github.com/ZcashFoundation/zebra/pull/9113))
+- Accessor methods to `zakura-rpc` request/response types ([#9113](https://github.com/ZcashFoundation/zebra/pull/9113))
 - `getblock` RPC method now can return transaction details with verbosity=2 ([#9083](https://github.com/ZcashFoundation/zebra/pull/9083))
 - Serialized NU5 blocks to test vectors ([#9098](https://github.com/ZcashFoundation/zebra/pull/9098))
 
@@ -1481,7 +1486,7 @@ This release includes deployment of NU6 on Testnet, configurable funding streams
 from 16 weeks to 10 weeks so that it will panic before the expected activation height of NU6 on Mainnet.
 
 It also replaces the `shielded-scan` compilation feature with a new `zebra-scanner` binary, adds a `TrustedChainSync` module
-for replicating Zebra's best chain state, and a gRPC server in `zebra-rpc` as steps towards zcashd deprecation.
+for replicating Zebra's best chain state, and a gRPC server in `zakura-rpc` as steps towards zcashd deprecation.
 
 #### Recovering after finalizing a block from a chain fork
 
@@ -1499,7 +1504,7 @@ Zebra configuration to use the new state cache directory.
 
 - A `zebra-scanner` binary replacing the `shielded-scan` compilation feature in `zebrad` ([#8608](https://github.com/ZcashFoundation/zebra/pull/8608))
 - Adds a `TrustedChainSync` module for keeping up with Zebra's non-finalized best chain from a separate process ([#8596](https://github.com/ZcashFoundation/zebra/pull/8596))
-- Add a tonic server in zebra-rpc with a `chain_tip_change()` method that notifies clients when Zebra's best chain tip changes ([#8674](https://github.com/ZcashFoundation/zebra/pull/8674))
+- Add a tonic server in zakura-rpc with a `chain_tip_change()` method that notifies clients when Zebra's best chain tip changes ([#8674](https://github.com/ZcashFoundation/zebra/pull/8674))
 - NU6 network upgrade variant, minimum protocol version, and Testnet activation height ([#8693](https://github.com/ZcashFoundation/zebra/pull/8693), [8733](https://github.com/ZcashFoundation/zebra/pull/8733), [#8804](https://github.com/ZcashFoundation/zebra/pull/8804))
 - Configurable NU6 activation height on Regtest ([#8700](https://github.com/ZcashFoundation/zebra/pull/8700))
 - Configurable Testnet funding streams ([#8718](https://github.com/ZcashFoundation/zebra/pull/8718))
@@ -1554,7 +1559,7 @@ Thank you to everyone who contributed to this release, we couldn't make Zebra wi
 
 - Use a default unpaid action limit of 0 so that transactions with unpaid actions are excluded from the mempool and block templates by default ([#8638](https://github.com/ZcashFoundation/zebra/pull/8638))
 - Lower the mandatory checkpoint height from immediately above the ZIP-212 grace period to immediately below Canopy activation ([#8629](https://github.com/ZcashFoundation/zebra/pull/8629))
-- Use the new `zcash_script` callback API in `zebra-script`, allowing Zebra's ECC dependencies to be upgraded independently of `zcash_script` and `zcashd` ([#8566](https://github.com/ZcashFoundation/zebra/pull/8566))
+- Use the new `zcash_script` callback API in `zakura-script`, allowing Zebra's ECC dependencies to be upgraded independently of `zcash_script` and `zcashd` ([#8566](https://github.com/ZcashFoundation/zebra/pull/8566))
 - Put Windows in Tier 2 of supported platforms ([#8637](https://github.com/ZcashFoundation/zebra/pull/8637))
 - Remove experimental support for starting the `zebra-scan` in the `zebrad` process as a step towards moving the scanner to its own process ([#8594](https://github.com/ZcashFoundation/zebra/pull/8594))
 - Reduce the end of support time from 20 weeks to 16 weeks ([#8530](https://github.com/ZcashFoundation/zebra/pull/8530))
@@ -1666,7 +1671,7 @@ Book](https://zebra.zfnd.org/user/shielded-scan-grpc-server.html).
 - Implement the `RegisterKeys` scan service request ([#8251](https://github.com/ZcashFoundation/zebra/pull/8251))
 - Implement the `Results` scan service request ([#8224](https://github.com/ZcashFoundation/zebra/pull/8224))
 - Test the `RegisterKeys` scan service request ([#8281](https://github.com/ZcashFoundation/zebra/pull/8281))
-- Add `ViewingKey` type in `zebra-chain` ([#8198](https://github.com/ZcashFoundation/zebra/pull/8198))
+- Add `ViewingKey` type in `zakura-chain` ([#8198](https://github.com/ZcashFoundation/zebra/pull/8198))
 - Handle `RegisterKeys` messages in scan task ([#8222](https://github.com/ZcashFoundation/zebra/pull/8222))
 
 ### Changed
@@ -1692,7 +1697,7 @@ Thank you to everyone who contributed to this release, we couldn't make Zebra wi
 
 This release serves as a hotfix for version 1.5.1, addressing issues encountered after its initial release. For more information about version 1.5.1, refer to [this link](https://github.com/ZcashFoundation/zebra/releases/tag/v1.5.2).
 
-Following the release on GitHub, we identified difficulties in publishing the `zebra-chain` crate to crates.io. Detailed information is available in [issue #8180](https://github.com/ZcashFoundation/zebra/issues/8180) and its references.
+Following the release on GitHub, we identified difficulties in publishing the `zakura-chain` crate to crates.io. Detailed information is available in [issue #8180](https://github.com/ZcashFoundation/zebra/issues/8180) and its references.
 
 Unfortunately, to resolve this challenge, which involves an unpublished dependency, we had to temporarily remove the internal miner support introduced in version 1.5.1.
 
@@ -1783,7 +1788,7 @@ feature on a shared machine. We suggest generating new keys for experimental use
 
 ### Changed
 
-- change(state): Expose ZebraDb methods that can create different kinds of databases ([#8002](https://github.com/ZcashFoundation/zebra/pull/8002))
+- change(state): Expose ZakuraDb methods that can create different kinds of databases ([#8002](https://github.com/ZcashFoundation/zebra/pull/8002))
 - change(state): Make the types for finalized blocks consistent ([#7923](https://github.com/ZcashFoundation/zebra/pull/7923))
 - change(scan): Create a scanner storage database ([#8031](https://github.com/ZcashFoundation/zebra/pull/8031))
 - change(scan): Store scanned TXIDs in "display order" ([#8057](https://github.com/ZcashFoundation/zebra/pull/8057))
@@ -1927,7 +1932,7 @@ macOS x86_64 is now supported on a best-effort basis. macOS builds and some test
 
 - Make the `latest` Docker tag point to the production build, rather than the build with experimental features ([#7817](https://github.com/ZcashFoundation/zebra/pull/7817))
 - Fix an incorrect consensus-critical ZIP 212 comment ([#7774](https://github.com/ZcashFoundation/zebra/pull/7774))
-- Fix broken links to `zebra_network` and `zebra_state` `Config` structs on doc-internal.zebra.zfnd.org ([#7838](https://github.com/ZcashFoundation/zebra/pull/7838))
+- Fix broken links to `zakura_network` and `zakura_state` `Config` structs on doc-internal.zebra.zfnd.org ([#7838](https://github.com/ZcashFoundation/zebra/pull/7838))
 
 ### Contributors
 
@@ -2023,8 +2028,8 @@ This release:
 
 - Documentation for mining with Docker ([#7179](https://github.com/ZcashFoundation/zebra/pull/7179))
 - Note tree sizes field to `getblock` RPC method ([#7278](https://github.com/ZcashFoundation/zebra/pull/7278))
-- Note commitment subtree types to zebra-chain ([#7371](https://github.com/ZcashFoundation/zebra/pull/7371))
-- Note subtree index handling to zebra-state, but we're not writing subtrees to the finalized state yet ([#7334](https://github.com/ZcashFoundation/zebra/pull/7334))
+- Note commitment subtree types to zakura-chain ([#7371](https://github.com/ZcashFoundation/zebra/pull/7371))
+- Note subtree index handling to zakura-state, but we're not writing subtrees to the finalized state yet ([#7334](https://github.com/ZcashFoundation/zebra/pull/7334))
 
 ### Fixed
 
@@ -2129,7 +2134,7 @@ These platforms are no longer supported by the Zebra team:
 - Stop Zebra using 100% CPU even when idle ([#7103](https://github.com/ZcashFoundation/zebra/pull/7103)), thank you to james_katz for reporting this bug
 - Avoid potential hangs in the `tokio` async runtime ([#7094](https://github.com/ZcashFoundation/zebra/pull/7094))
 - Replace or add RPC content type header to support `zcashd` RPC examples ([#6885](https://github.com/ZcashFoundation/zebra/pull/6885))
-- Make `zebra-network` licensing clearer ([#6995](https://github.com/ZcashFoundation/zebra/pull/6995))
+- Make `zakura-network` licensing clearer ([#6995](https://github.com/ZcashFoundation/zebra/pull/6995))
 
 #### Configuration
 
@@ -2138,7 +2143,7 @@ These platforms are no longer supported by the Zebra team:
 
 #### Logging & Error Handling
 
-- Log a zebra-network task cancel on shutdown, rather than panicking ([#7078](https://github.com/ZcashFoundation/zebra/pull/7078))
+- Log a zakura-network task cancel on shutdown, rather than panicking ([#7078](https://github.com/ZcashFoundation/zebra/pull/7078))
 - Fix incorrect function spans in some logs ([#6923](https://github.com/ZcashFoundation/zebra/pull/6923), [#6995](https://github.com/ZcashFoundation/zebra/pull/6995))
 - Replace a state validation chain length assertion with a NotReadyToBeCommitted error ([#7072](https://github.com/ZcashFoundation/zebra/pull/7072))
 
@@ -2238,7 +2243,7 @@ Also, this release adds the ZIP-317 rules to mempool transactions which should h
 ### Added
 
 - Add ZIP-317 rules to mempool ([#6556](https://github.com/ZcashFoundation/zebra/pull/6556))
-- Add user agent argument to zebra-network crate ([#6601](https://github.com/ZcashFoundation/zebra/pull/6601))
+- Add user agent argument to zakura-network crate ([#6601](https://github.com/ZcashFoundation/zebra/pull/6601))
 - Refuse to run zebrad when release is too old ([#6351](https://github.com/ZcashFoundation/zebra/pull/6351))
 
 ### Fixed
@@ -2253,7 +2258,7 @@ Thank you to everyone who contributed to this release, we couldn't make Zebra wi
 
 ## [Zebra 1.0.0-rc.7](https://github.com/ZcashFoundation/zebra/releases/tag/v1.0.0-rc.7) - 2023-04-18
 
-This release features a security fix for unbounded memory use in zebra-network, introduces the "progress-bar" feature, and continues to address audit findings.
+This release features a security fix for unbounded memory use in zakura-network, introduces the "progress-bar" feature, and continues to address audit findings.
 
 ### Security
 
@@ -2419,8 +2424,8 @@ In this release we fixed bugs and inconsistencies between zcashd and zebrad in t
 - Add getpeerinfo RPC method ([#5951](https://github.com/ZcashFoundation/zebra/pull/5951))
 - Add proposal capability to getblocktemplate ([#5870](https://github.com/ZcashFoundation/zebra/pull/5870))
 - Add a test to check that the Docker image config works ([#5968](https://github.com/ZcashFoundation/zebra/pull/5968))
-- Make `zebra-checkpoints` work for zebrad backend ([#5894](https://github.com/ZcashFoundation/zebra/pull/5894), [#5961](https://github.com/ZcashFoundation/zebra/pull/5961))
-- Add test dependency from zebra-rpc to zebra-network with correct features ([#5992](https://github.com/ZcashFoundation/zebra/pull/5992))
+- Make `zakura-checkpoints` work for zebrad backend ([#5894](https://github.com/ZcashFoundation/zebra/pull/5894), [#5961](https://github.com/ZcashFoundation/zebra/pull/5961))
+- Add test dependency from zakura-rpc to zakura-network with correct features ([#5992](https://github.com/ZcashFoundation/zebra/pull/5992))
 - Document zebra download command ([#5901](https://github.com/ZcashFoundation/zebra/pull/5901))
 
 ### Fixed
@@ -2549,7 +2554,7 @@ This release starts work on mining pool RPCs, including some mempool fixes. It a
 
 This release has the following breaking changes:
 
-- Remove unused buggy cryptographic code from zebra-chain ([#5464](https://github.com/ZcashFoundation/zebra/pull/5464), [#5476](https://github.com/ZcashFoundation/zebra/pull/5476)). This code was never used in production, and it had known bugs. Anyone using it should migrate to `librustzcash` instead.
+- Remove unused buggy cryptographic code from zakura-chain ([#5464](https://github.com/ZcashFoundation/zebra/pull/5464), [#5476](https://github.com/ZcashFoundation/zebra/pull/5476)). This code was never used in production, and it had known bugs. Anyone using it should migrate to `librustzcash` instead.
 
 ### Added
 
@@ -2630,7 +2635,7 @@ Thank you to everyone who contributed to this release, we couldn't make Zebra wi
 
 This release improves Zebra's sync and RPC performance, improves test coverage and reliability, and starts creating Docker Hub binaries for releases.
 
-It also changes some of `zebra-network`'s unstable Rust APIs to provide more peer metadata.
+It also changes some of `zakura-network`'s unstable Rust APIs to provide more peer metadata.
 
 ### Breaking Changes
 
@@ -2785,7 +2790,7 @@ The sync performance of `lightwalletd` is also improved.
 - Fix a performance regression when serving blocks via the Zcash network protocol and RPCs (#4933)
 - Update block hash checkpoints for mainnet (#4919, #4972)
 - Enable a `tinyvec` feature to speed up compilation (#4796)
-- Split the `zebra_state::service::read` module (#4827)
+- Split the `zakura_state::service::read` module (#4827)
 - Disallow Orchard `ivk = 0` on `IncomingViewingKey::from` & `SpendingKey` generation (#3962)
 
 #### Docs
@@ -2918,7 +2923,7 @@ When there are a lot of large user-generated transactions on the network, Zebra 
 - Check batch worker tasks for panics and task termination (#4750, #4777)
 - Limit the length of the `reject` network message's `message` and `reason` fields (#4687)
 - Change the `bitvec` dependency from 1.0.0 to 1.0.1, to fix a performance regression (#4769)
-- Fix an occasional panic when a `zebra-network` connection closes (#4782)
+- Fix an occasional panic when a `zakura-network` connection closes (#4782)
 - Stop panicking when the connection error slot is not set (#4770)
 - When writing blocks to disk, don't block other async tasks (#4199)
 - When sending headers to peers, only deserialize the header data from disk (#4792)
@@ -3503,8 +3508,8 @@ The Zebra team made a huge refactor to the database storage and the state to ser
 - Simplify the database design using prefix iterators (#3916)
 - Link to Conventional Commits specification in CONTRIBUTING file (#3858)
 - Update database design for read-only state service (#3843)
-- Explain optional zebra-network/tor dependencies (#3765)
-- Simplify zebra-checkpoints summary (#3612)
+- Explain optional zakura-network/tor dependencies (#3765)
+- Simplify zakura-checkpoints summary (#3612)
 
 #### Tests
 
@@ -3515,7 +3520,7 @@ The Zebra team made a huge refactor to the database storage and the state to ser
 
 #### Others
 
-- Move mempool request and response types to a new `zebra-node-services` crate (#3648)
+- Move mempool request and response types to a new `zakura-node-services` crate (#3648)
 - Enable `checkpoint_sync` by default (#3777)
 - Update Zebra's hard-coded blockchain checkpoint lists  (#3606)
 - Clippy lints: warn on manual printing to stdout or stderr (#3767)
@@ -3681,7 +3686,7 @@ All Rust crates have now been updated to use Rust 2021 Edition.
 #### Documentation
 
 - Document the consensus rules for Spend Transfers, Output Transfers, and their Descriptions (Section 3.6 of the Zcash protocol specification) (#3338)
-- Document the structure of the zebra-network crate (#3317)
+- Document the structure of the zakura-network crate (#3317)
 - Document the consensus rules for Note Commitment Trees (Section 3.8 of the Zcash Protocol Specification) (#3319)
 - Document chain value balances consensus rules with new format (#3286)
 - Document part of the block header consensus rules (#3296)
@@ -3775,7 +3780,7 @@ As of this release, Zebra will automatically download and cache the Sprout and S
 
 - Use prepared verifying key for non-batch Sapling Groth16 verification (#3092)
 - Validate sapling anchors⚓ (#3084)
-- Add Sprout anchors to `zebra-state` (#3100)
+- Add Sprout anchors to `zakura-state` (#3100)
 
 #### Transaction Amount & Header Validation
 
@@ -4032,7 +4037,7 @@ It continues our work on the mempool, including some mempool features that are u
 
 - Stop panicking when using sync and async methods on the same `ChainTipChange` (#2800)
 - Fix an incorrect assertion when the block locator is at the tip (#2789)
-- Fix a missing NULL pointer check in `zebra_script`'s FFI (#2802)
+- Fix a missing NULL pointer check in `zakura_script`'s FFI (#2802)
 
 ### Security
 
@@ -4085,9 +4090,9 @@ Zebra's latest alpha finishes most of the state work needed for NU5 testnet acti
 - Create a transaction crawler for the mempool (#2646, #2672)
 - Create and use types for unmined transactions and their IDs (#2634, #2666)
 - ZIP-239: Implement mempool transaction v5 data structures and network messages (#2618, #2638)
-- Return a transaction verifier from `zebra_consensus::init` (#2665)
+- Return a transaction verifier from `zakura_consensus::init` (#2665)
 - Provide recent syncer response lengths as a watch channel (#2602)
-- Derive Copy and Clone for zebra-consensus errors (#2664)
+- Derive Copy and Clone for zakura-consensus errors (#2664)
 - ChainTip trait creation and usage (#2677, #2676)
 
 #### Metrics
@@ -4141,7 +4146,7 @@ Zebra's latest alpha contains the last of the changes to zebra chain state ahead
 ### Fixed
 
 - Fix the storage of anchors in the state (#2563)
-- Make `zebra-state` compile successfully by itself (#2611)
+- Make `zakura-state` compile successfully by itself (#2611)
 
 #### Documentation
 
@@ -4160,7 +4165,7 @@ Zebra's latest alpha continues our work on NU5, including Orchard and Transactio
 - Pass the finalized state to chain contextual validation (#2503)
 - Calculate incremental note commitment trees (#2407)
 - Reject duplicate Sapling and Orchard nullifiers (#2497)
-- Add `proptest-impl` feature to `zebra-state` crate to help simplify tests(#2529)
+- Add `proptest-impl` feature to `zakura-state` crate to help simplify tests(#2529)
 - Track anchors and note commitment trees (#2458)
 - Validate spends of transparent coinbase outputs (#2525)
 - Calculate the remaining value in the transparent transaction value pool (#2486)
@@ -4177,7 +4182,7 @@ Zebra's latest alpha continues our work on NU5, including Orchard and Transactio
 
 ### Changed
 
-- Decrease the number of randomised test cases in zebra-state (#2521, #2513)
+- Decrease the number of randomised test cases in zakura-state (#2521, #2513)
 - Make nullifier tests consistent with UTXO tests (#2513)
 
 #### Testing
@@ -4213,7 +4218,7 @@ Sapling spends in V5 transactions, and some initial work to validate parts of Or
 
 ### Changed
 
-- Move Utxo type to zebra-chain (#2481)
+- Move Utxo type to zakura-chain (#2481)
 - Combine near-duplicate Utxo creation functions (#2467)
 
 #### Documentation
@@ -4270,7 +4275,7 @@ Zebra's latest alpha continues our work on NU5, including Orchard and Transactio
 - Various transaction verifier refactors (#2371, #2432)
 - Remove unicode in Zebra's user agent (#2376)
 - Update multiple crates to ensure bitvec 0.22.3 is being used (#2351)
-- Move transaction consensus branch ID check function to zebra-chain (#2354)
+- Move transaction consensus branch ID check function to zakura-chain (#2354)
 - Replace primitives_types with uint (#2350)
 - Refactor to return errors from state update methods to prepare for contextual validation (#2417)
 - Refactor of the validation of Sapling shielded data (#2419)
@@ -4286,7 +4291,7 @@ Zebra's latest alpha continues our work on NU5, including Orchard and Transactio
 - Fix intermittent errors in the groth16 verifier tests (#2412)
 - Skip IPv6 tests when SKIP_IPV6_TESTS environmental variable is set (#2405)
 - Stop failing after the mandatory Canopy checkpoint due to incorrect coinbase script verification (#2404)
-- Improved docs and panic messages for zebra_test::command (#2406)
+- Improved docs and panic messages for zakura_test::command (#2406)
 - Gossip dynamic local listener ports to peers (#2277)
 - Stop allowing JoinSplits for Halo (#2428)
 - Fix failing legacy chain tests (#2427)
@@ -4406,7 +4411,7 @@ Zebra's latest alpha continues our work on NU5, including Orchard and Transactio
 ### Added
 
 - Added a new `zcash_serialize_bytes` utility function (#2150)
-- Added new Arbitrary impls for a number of types in zebra-chain and zebra-network (#2179)
+- Added new Arbitrary impls for a number of types in zakura-chain and zakura-network (#2179)
 - Zebra support for leap seconds (#2195)
 
 #### Network Upgrade 5
@@ -4535,7 +4540,7 @@ Zebra now has best-effort support for Apple M1 builds, and logging to systemd-jo
 
 #### Testing
 
-- Speedup proptests for Chain struct in zebra-state (#2012)
+- Speedup proptests for Chain struct in zakura-state (#2012)
 
 ### Fixed
 
@@ -4787,7 +4792,7 @@ Some notable changes include:
 
 ### Changed
 
-- Export new precompute api in zebra-script (#1493)
+- Export new precompute api in zakura-script (#1493)
 - Rewrite peer block request handler to match the zcashd implementation (#1518)
 
 ### Fixed

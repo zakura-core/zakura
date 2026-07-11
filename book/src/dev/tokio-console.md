@@ -6,7 +6,7 @@ issues. ["it's like top(1) for tasks!"][top]
 
 ### Setup
 
-Support for `tokio-console` is not enabled by default for zebrad. To activate this feature, run:
+Support for `tokio-console` is not enabled by default for zakurad. To activate this feature, run:
 
 ```sh
 RUSTFLAGS="--cfg tokio_unstable" cargo build --no-default-features --features="tokio-console" --bin zakurad
@@ -14,15 +14,15 @@ RUSTFLAGS="--cfg tokio_unstable" cargo build --no-default-features --features="t
 
 Install [`tokio-console`][install].
 
-Then start `zebrad` however you wish.
+Then start `zakurad` however you wish.
 
-When `zebrad` is running, run:
+When `zakurad` is running, run:
 
 ```bash
 tokio-console
 ```
 
-The default options are used, so `tokio-console` should connect to the running `zebrad` without other configuration.
+The default options are used, so `tokio-console` should connect to the running `zakurad` without other configuration.
 
 ### Example
 

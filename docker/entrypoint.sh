@@ -70,7 +70,7 @@ create_owned_directory() {
   fi
 }
 
-# Create and own cache and config directories based on ZAKURA_* environment variables.
+# Create and own cache and config directories based on ZEBRA_* environment variables.
 [[ -n ${ZAKURA_STATE__CACHE_DIR} ]] && create_owned_directory "${ZAKURA_STATE__CACHE_DIR}"
 [[ -n ${ZAKURA_RPC__COOKIE_DIR} ]] && create_owned_directory "${ZAKURA_RPC__COOKIE_DIR}"
 [[ -n ${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR:-} ]] && create_owned_directory "${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR}"

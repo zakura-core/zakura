@@ -1,4 +1,4 @@
-# Doing Mass Renames in Zebra Code
+# Doing Mass Renames in Zakura Code
 
 Sometimes we want to rename a Rust type or function, or change a log message.
 
@@ -10,7 +10,7 @@ so changing them can lead to unexpected test failures or hangs.
 
 ## Universal Renames with `sed`
 
-You can use `sed` to rename all the instances of a name in Zebra's code, documentation, and tests:
+You can use `sed` to rename all the instances of a name in Zakura's code, documentation, and tests:
 
 ```sh
 git ls-tree --full-tree -r --name-only HEAD | \
@@ -38,19 +38,19 @@ Here's how to review that PR:
 1. Check out two copies of the repository, one with the PR, and one without:
 
 ```sh
-cd zebra
+cd zakura
 git fetch --all
 # clear the checkout so we can use main elsewhere
 git checkout main^
 # Use the base branch or commit for the PR, which is usually main
-git worktree add ../zebra-sed main
-git worktree add ../zebra-pr origin/pr-branch-name
+git worktree add ../zakura-sed main
+git worktree add ../zakura-pr origin/pr-branch-name
 ```
 
 1. Run the scripts on the repository without the PR:
 
 ```sh
-cd ../zebra-sed
+cd ../zakura-sed
 # run the scripts in the PR or commit message
 git ls-tree --full-tree -r --name-only HEAD | \
 grep -v -e 'path-to-skip' -e 'other-path-to-skip' | \
@@ -62,7 +62,7 @@ cargo fmt --all
 
 ```sh
 cd ..
-git diff zebra-sed zebra-pr
+git diff zakura-sed zakura-pr
 ```
 
 If there are no differences, then the PR can be approved.

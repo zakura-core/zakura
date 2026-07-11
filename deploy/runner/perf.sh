@@ -37,8 +37,8 @@ DEPLOYER="$REPO/deploy/deployer/deploy.py"
 NODES_TMPL="$RUNNER_DIR/nodes.toml.tmpl"
 FEED_RUN="$RUNNER_DIR/feed_run.sh"
 ANALYZE="$RUNNER_DIR/feed_analyze.py"
-DASH="$RUNNER_DIR/zebra-metrics-dashboard.py"
-BENCH_CONFIG="$RUNNER_DIR/zebra-bench-config.toml"
+DASH="$RUNNER_DIR/zakura-metrics-dashboard.py"
+BENCH_CONFIG="$RUNNER_DIR/zakura-bench-config.toml"
 PERF_ARTIFACT_DIR="${PERF_ARTIFACT_DIR:-$REPO/perf-artifacts}"
 ZAKURA_PORT="${ZAKURA_PORT:-8234}"
 LOG_DIR="$RUNNER_DIR/.logs"
@@ -174,7 +174,7 @@ cmd_dashboard() {
   # Re-running should always work: drop any prior dashboard still holding the
   # HTTP port (otherwise the new one dies with "Address already in use"). Safe
   # from inside perf.sh — our own argv does not contain the dashboard path.
-  if pkill -f "zebra-metrics-dashboard.py" 2>/dev/null; then
+  if pkill -f "zakura-metrics-dashboard.py" 2>/dev/null; then
     note "stopped a previous dashboard instance"
     sleep 1
   fi
@@ -190,7 +190,7 @@ cmd_build_local() {
   local bench_dir bench_tmp
   bench_dir="$(dirname "$BENCH_BIN")"
   bench_tmp="$(mktemp "${bench_dir}/.$(basename "$BENCH_BIN").XXXXXX")"
-  if install -m 0755 "$CARGO_TARGET_DIR/release/zebrad" "$bench_tmp"; then
+  if install -m 0755 "$CARGO_TARGET_DIR/release/zakurad" "$bench_tmp"; then
     mv -f "$bench_tmp" "$BENCH_BIN"
   else
     rm -f "$bench_tmp"

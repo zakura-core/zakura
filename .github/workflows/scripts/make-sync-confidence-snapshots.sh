@@ -4,7 +4,7 @@
 # mainnet Zebra snapshot down to each window start and pruning it.
 #
 # Run on a host with ~750 GB-1 TB of free working disk (the ~250 GB tarball plus
-# one ~500 GB extract at a time) and the Zebra build deps. Requires s3cmd
+# one ~500 GB extract at a time) and the Zakura build deps. Requires s3cmd
 # configured for the destination Spaces bucket.
 #
 # Override via env as needed:
@@ -20,10 +20,10 @@ SNAP_URL="${SNAP_URL:-https://zebra-snapshots.nyc3.cdn.digitaloceanspaces.com/ma
 DEST_BUCKET="${DEST_BUCKET:-zebra-sync-confidence-ci}"
 
 cd "${REPO}"
-cargo build --release --bin zebra-rollback-state --bin zebra-prune-state
-ROLLBACK="${REPO}/target/release/zebra-rollback-state"
-PRUNE="${REPO}/target/release/zebra-prune-state"
-VER="$(grep -oE 'DATABASE_FORMAT_VERSION: .* [0-9]+' zebra-state/src/constants.rs | grep -oE '[0-9]+' | tail -n1)"
+cargo build --release --bin zakura-rollback-state --bin zakura-prune-state
+ROLLBACK="${REPO}/target/release/zakura-rollback-state"
+PRUNE="${REPO}/target/release/zakura-prune-state"
+VER="$(grep -oE 'DATABASE_FORMAT_VERSION: .* [0-9]+' zakura-state/src/constants.rs | grep -oE '[0-9]+' | tail -n1)"
 
 mkdir -p "${WORK}"
 cd "${WORK}"

@@ -633,7 +633,7 @@
   "timepicker": {},
   "timezone": "browser",
   "title": "RPC Tracing",
-  "uid": "zebra-rpc-tracing",
+  "uid": "zakura-rpc-tracing",
   "version": 1,
   "weekStart": ""
 }

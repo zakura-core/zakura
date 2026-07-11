@@ -12,8 +12,8 @@ name: Deploy Zakura mainnet fleet
 # per-node configs (external_addr, an inline zakura_node_secret_key that pins
 # each node's iroh identity, custom peers, and mempool/sync tuning) and their
 # state DB at /root/.cache/zebra. To avoid changing node identities or resyncing,
-# this deploy sets manage_config = false: it only swaps /usr/local/bin/zebrad and
-# restarts the existing `zebrad` service, leaving the config, unit, and cache
+# this deploy sets manage_config = false: it only swaps /usr/local/bin/zakurad and
+# restarts the existing `zakurad` service, leaving the config, unit, and cache
 # untouched. Rebuilding those configs into the deployer's managed model is
 # separate future work.
 #
@@ -163,8 +163,8 @@ jobs:
           # the hand-tuned config, unit, and /root/.cache/zebra state untouched.
           deploy_kind     = "systemd"
           manage_config   = false
-          service_name    = "zebrad"
-          bin_path        = "/usr/local/bin/zebrad"
+          service_name    = "zakurad"
+          bin_path        = "/usr/local/bin/zakurad"
           network         = "Mainnet"
           # Dashboard/metadata only (manage_config = false does not render this).
           # Mainnet binary default is zebra; dual/zakura must be set on-node.
@@ -174,7 +174,7 @@ jobs:
           rpc_listen_addr = "0.0.0.0:8232"
           log_file        = "/root/logs/zakura-tracing.log"
 
-          # Public mainnet node ids (zebra-network/src/zakura/handler.rs). Used by
+          # Public mainnet node ids (zakura-network/src/zakura/handler.rs). Used by
           # the dashboard to label each host; not deployed to the nodes.
           [defaults.zakura]
           bootstrap_peers = [
@@ -238,7 +238,7 @@ jobs:
           name       = "zakura-compat"
           ssh_string = "root@159.203.113.196"
           commit     = "${{ inputs.ref }}"
-          service_name = "zebrad-compat"
+          service_name = "zakurad-compat"
           log_file   = ""
           rpc_listen_addr = "127.0.0.1:8232"
 
@@ -315,7 +315,7 @@ jobs:
 
           dashboard_dir="/opt/zakura-mainnet-dashboard"
           sudo install -d -m 755 "$dashboard_dir"
-          sudo install -m 755 deploy/runner/zebra-cluster-status.py "$dashboard_dir/zebra-cluster-status.py"
+          sudo install -m 755 deploy/runner/zakura-cluster-status.py "$dashboard_dir/zakura-cluster-status.py"
           cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
           # Dashboard-only: deploy.py rejects these fields, so add cookie RPC
           # auth for the compatibility nodes into this copy (not the deploy config).
@@ -377,7 +377,7 @@ jobs:
           [Service]
           Type=simple
           WorkingDirectory=/opt/zakura-mainnet-dashboard
-          ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zebra-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --interval 10 --stale-after 300 --upgrade-height 0
+          ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zakura-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --interval 10 --stale-after 300 --upgrade-height 0
           Restart=always
           RestartSec=5
 
@@ -401,7 +401,7 @@ jobs:
           sudo install -d -m 755 "$watchdog_dir"
           sudo install -d -m 755 /var/lib/zakura-fleet-watchdog
           sudo install -d -m 755 /etc/zakura-fleet-watchdog
-          sudo install -m 755 deploy/runner/zebra-cluster-watchdog.py "$watchdog_dir/zebra-cluster-watchdog.py"
+          sudo install -m 755 deploy/runner/zakura-cluster-watchdog.py "$watchdog_dir/zakura-cluster-watchdog.py"
           sudo install -m 644 deploy/runner/fleet-watchdog.toml "$watchdog_dir/fleets.toml"
           sudo install -m 644 deploy/runner/zakura-fleet-watchdog.service /etc/systemd/system/zakura-fleet-watchdog.service
 

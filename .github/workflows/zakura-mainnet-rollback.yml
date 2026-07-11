@@ -17,12 +17,12 @@ on:
         description: "systemd service to restart"
         required: false
         type: string
-        default: zebrad
+        default: zakurad
       bin_path:
         description: "binary path (its .bak is restored)"
         required: false
         type: string
-        default: /usr/local/bin/zebrad
+        default: /usr/local/bin/zakurad
       restore_bak:
         description: "Restore <bin_path>.bak (uncheck to only capture diagnostics)"
         required: false
@@ -77,7 +77,7 @@ jobs:
           echo "=== binaries ==="; ls -l "$BIN" "${BIN}.bak" 2>&1
           echo "=== version ==="; "$BIN" --version 2>&1 | head -1
           echo "=== recent journal ==="; journalctl -u "$SERVICE" -n 40 --no-pager 2>/dev/null | tail -40
-          echo "=== tail node log ==="; tail -n 60 /root/logs/zebrad.log 2>/dev/null
+          echo "=== tail node log ==="; tail -n 60 /root/logs/zakurad.log 2>/dev/null
           EOF
 
       - name: Restore previous binary and restart

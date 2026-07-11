@@ -6,7 +6,7 @@
 # format-version bump) by make-sync-confidence-snapshots.sh.
 #
 # Config is provided via /root/run.env (sourced by the caller before exec):
-#   IMAGE_REF       ghcr.io/valargroup/zebra-tests:sha-xxxx
+#   IMAGE_REF       ghcr.io/valargroup/zakura-tests:sha-xxxx
 #   NEXTEST_PROFILE e.g. sync-range-pre-nu62
 #   TEST_VARIABLES  comma-separated KEY=VALUE passed into the container
 #   STATE_KEY       pre-nu62 | post-nu62

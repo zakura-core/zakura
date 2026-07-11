@@ -38,7 +38,7 @@ MASTER_COLD="${BENCH_MASTER_COLD:-$MASTER_WARM}"
 DBREL="${BENCH_DB_REL:-state/v27/mainnet}"
 FORK_DIR="${BENCH_FORK_DIR:-$WORK}"
 LOG_DIR="${BENCH_LOG_DIR:-$WORK}"
-CONFIG_SRC="${CONFIG_SRC:-${BENCH_CONFIG_SRC:-$RUNNER_DIR/zebra-bench-config.toml}}"
+CONFIG_SRC="${CONFIG_SRC:-${BENCH_CONFIG_SRC:-$RUNNER_DIR/zakura-bench-config.toml}}"
 
 # Prefer the warm master (already upgraded with a repaired history tree) so a run
 # starts in seconds; fall back to the cold snapshot (rebuild on open) if absent.
@@ -102,7 +102,7 @@ else
   mkdir -p "$FORK/$(dirname "$DBREL")"
   cp -al "$MASTER/$DBREL" "$FORK/$DBREL"
   # Break links on every file the clone may rewrite, so writes can't reach the source.
-  ( cd "$FORK/$DBREL"
+  ( cd "$FORK/$DBREL" || exit
     for f in CURRENT IDENTITY LOG LOCK OPTIONS-* MANIFEST-* *.log version; do
       [ -e "$f" ] || continue
       cp -p "$f" "$f.unlink" && mv -f "$f.unlink" "$f"
@@ -160,28 +160,28 @@ ck_intake,ck_release,ck_queued,apply_inflight,\
 aw_sum,aw_cnt,c2c_sum,c2c_cnt,\
 sa_sum,sa_cnt,scl_sum,scl_cnt,cinf,bsz_sum,bsz_cnt" > "$CSV"
 
-read pcpu < <(pstat); prevh=0; START=$(date +%s)
+read -r pcpu < <(pstat); prevh=0; START=$(date +%s)
 while kill -0 "$PID" 2>/dev/null; do
   el=$(( $(date +%s)-START )); [ "$el" -ge "$MAXSEC" ] && { echo "[$LABEL] wall cap"; break; }
   sleep 5
   m=$(curl -s --max-time 4 "http://127.0.0.1:$MET/metrics" 2>/dev/null)
-  read ncpu < <(pstat)
+  read -r ncpu < <(pstat)
   h=$(mv state_finalized_block_height "$m"); h=${h:-0}
   # Zakura overlay health (block data flows over Zakura, not the legacy net/sync counters).
   zkp=$(mv zakura_p2p_conn_active "$m"); zkq=$(mv zakura_p2p_queue_depth "$m")
   zkbs=$(awk '$1 ~ /^zakura_p2p_stream_accepted\{.*block_sync/ {print $2; exit}' <<<"$m")
   # commit CPU: note-commitment compute phases (behind the commit-metrics build feature).
-  btx_s=$(mv zebra_state_write_block_tx_count_sum "$m");                      btx_c=$(mv zebra_state_write_block_tx_count_count "$m")
-  cc_s=$(mv zebra_state_write_commitment_check_duration_seconds_sum "$m");    cc_c=$(mv zebra_state_write_commitment_check_duration_seconds_count "$m")
-  ut_s=$(mv zebra_state_write_update_trees_duration_seconds_sum "$m");        ut_c=$(mv zebra_state_write_update_trees_duration_seconds_count "$m")
-  hp_s=$(mv zebra_state_commit_history_push_duration_seconds_sum "$m");       hp_c=$(mv zebra_state_commit_history_push_duration_seconds_count "$m")
-  ckc_s=$(mv zebra_state_write_checkpoint_compute_duration_seconds_sum "$m"); ckc_c=$(mv zebra_state_write_checkpoint_compute_duration_seconds_count "$m")
+  btx_s=$(mv zakura_state_write_block_tx_count_sum "$m");                      btx_c=$(mv zakura_state_write_block_tx_count_count "$m")
+  cc_s=$(mv zakura_state_write_commitment_check_duration_seconds_sum "$m");    cc_c=$(mv zakura_state_write_commitment_check_duration_seconds_count "$m")
+  ut_s=$(mv zakura_state_write_update_trees_duration_seconds_sum "$m");        ut_c=$(mv zakura_state_write_update_trees_duration_seconds_count "$m")
+  hp_s=$(mv zakura_state_commit_history_push_duration_seconds_sum "$m");       hp_c=$(mv zakura_state_commit_history_push_duration_seconds_count "$m")
+  ckc_s=$(mv zakura_state_write_checkpoint_compute_duration_seconds_sum "$m"); ckc_c=$(mv zakura_state_write_checkpoint_compute_duration_seconds_count "$m")
   # commit DB: spent-UTXO reads + address-balance reads + batch build + rocksdb write.
-  sur_s=$(mv zebra_state_write_spent_utxo_reads_duration_seconds_sum "$m");   sur_c=$(mv zebra_state_write_spent_utxo_reads_duration_seconds_count "$m")
-  ar_s=$(mv zebra_state_write_address_reads_duration_seconds_sum "$m");       ar_c=$(mv zebra_state_write_address_reads_duration_seconds_count "$m")
-  bp_s=$(mv zebra_state_write_batch_prep_duration_seconds_sum "$m");          bp_c=$(mv zebra_state_write_batch_prep_duration_seconds_count "$m")
-  bc_s=$(mv zebra_state_rocksdb_batch_commit_duration_seconds_sum "$m");      bc_c=$(mv zebra_state_rocksdb_batch_commit_duration_seconds_count "$m")
-  bb_s=$(mv zebra_state_write_batch_bytes_sum "$m");                          bb_c=$(mv zebra_state_write_batch_bytes_count "$m")
+  sur_s=$(mv zakura_state_write_spent_utxo_reads_duration_seconds_sum "$m");   sur_c=$(mv zakura_state_write_spent_utxo_reads_duration_seconds_count "$m")
+  ar_s=$(mv zakura_state_write_address_reads_duration_seconds_sum "$m");       ar_c=$(mv zakura_state_write_address_reads_duration_seconds_count "$m")
+  bp_s=$(mv zakura_state_write_batch_prep_duration_seconds_sum "$m");          bp_c=$(mv zakura_state_write_batch_prep_duration_seconds_count "$m")
+  bc_s=$(mv zakura_state_rocksdb_batch_commit_duration_seconds_sum "$m");      bc_c=$(mv zakura_state_rocksdb_batch_commit_duration_seconds_count "$m")
+  bb_s=$(mv zakura_state_write_batch_bytes_sum "$m");                          bb_c=$(mv zakura_state_write_batch_bytes_count "$m")
   vf=$(mv state_vct_fast_block_count "$m"); vl=$(mv state_vct_legacy_block_count "$m")
   # Floor-gap attribution: frontiers + the per-reason state-tick counters (why the
   # next-to-commit height is not advancing). commit_gap = download_floor-verified_tip.
@@ -209,19 +209,19 @@ while kill -0 "$PID" 2>/dev/null; do
   afq_s=$(msum zebra_zakura_apply_frontier_query_duration_seconds_sum "$m"); afq_c=$(msum zebra_zakura_apply_frontier_query_duration_seconds_count "$m")
   # LEVER 0 split (commit-metrics): checkpoint VERIFY (process_checkpoint_range CPU) vs
   # the single-writer STATE COMMIT await. Tells us which serial stage caps throughput.
-  vr_s=$(mv zebra_consensus_checkpoint_verify_range_duration_seconds_sum "$m");  vr_c=$(mv zebra_consensus_checkpoint_verify_range_duration_seconds_count "$m")
-  sc_s=$(mv zebra_consensus_checkpoint_state_commit_duration_seconds_sum "$m");  sc_c=$(mv zebra_consensus_checkpoint_state_commit_duration_seconds_count "$m")
+  vr_s=$(mv zakura_consensus_checkpoint_verify_range_duration_seconds_sum "$m");  vr_c=$(mv zakura_consensus_checkpoint_verify_range_duration_seconds_count "$m")
+  sc_s=$(mv zakura_consensus_checkpoint_state_commit_duration_seconds_sum "$m");  sc_c=$(mv zakura_consensus_checkpoint_state_commit_duration_seconds_count "$m")
   # PROBE 2: total single-writer service per block (cft) vs the per-block tree-read/clone
   # setup (trd). cft-write_block localizes the ~15ms un-instrumented serial cost.
-  cft_s=$(mv zebra_state_commit_commit_finalized_total_duration_seconds_sum "$m"); cft_c=$(mv zebra_state_commit_commit_finalized_total_duration_seconds_count "$m")
-  trd_s=$(mv zebra_state_commit_tree_read_duration_seconds_sum "$m");              trd_c=$(mv zebra_state_commit_tree_read_duration_seconds_count "$m")
+  cft_s=$(mv zakura_state_commit_commit_finalized_total_duration_seconds_sum "$m"); cft_c=$(mv zakura_state_commit_commit_finalized_total_duration_seconds_count "$m")
+  trd_s=$(mv zakura_state_commit_tree_read_duration_seconds_sum "$m");              trd_c=$(mv zakura_state_commit_tree_read_duration_seconds_count "$m")
   # PROBE 3: writer starvation — idle gap between commits (wi) + 10ms empty-channel
   # polls (wpark). Δwi_sum/Δt = fraction of wall the single writer sat idle.
-  wi_s=$(mv zebra_state_write_writer_idle_duration_seconds_sum "$m");  wi_c=$(mv zebra_state_write_writer_idle_duration_seconds_count "$m")
-  wpark=$(awk '$1=="zebra_state_write_writer_park_total" || $1=="zebra_state_write_writer_park"{print $2; exit}' <<<"$m")
+  wi_s=$(mv zakura_state_write_writer_idle_duration_seconds_sum "$m");  wi_c=$(mv zakura_state_write_writer_idle_duration_seconds_count "$m")
+  wpark=$(awk '$1=="zakura_state_write_writer_park_total" || $1=="zakura_state_write_writer_park"{print $2; exit}' <<<"$m")
   # PROBE 3b: the VCT-successor-deferral park (the OTHER park site) — commits paced
   # one-behind by successor arrival. If wpvs ~= writer_idle, this is the bottleneck.
-  wpvs=$(awk '$1=="zebra_state_write_writer_park_vct_successor_total" || $1=="zebra_state_write_writer_park_vct_successor"{print $2; exit}' <<<"$m")
+  wpvs=$(awk '$1=="zakura_state_write_writer_park_vct_successor_total" || $1=="zakura_state_write_writer_park_vct_successor"{print $2; exit}' <<<"$m")
   # PROBE 4: verifier->writer delivery side. intake/release rates + queue depth + apply
   # in-flight concurrency, to see why ~4000 buffered blocks only reach the writer at ~34/s.
   ckin=$(awk '$1=="checkpoint_commit_intake_count_total"||$1=="checkpoint_commit_intake_count"{print $2;exit}' <<<"$m")
@@ -233,13 +233,13 @@ while kill -0 "$PID" 2>/dev/null; do
   c2c_s=$(mv zebra_zakura_apply_call_to_commit_duration_seconds_sum "$m"); c2c_c=$(mv zebra_zakura_apply_call_to_commit_duration_seconds_count "$m")
   # PROBE 5: the NEXT door — state-service admission (poll_ready behind the state Buffer)
   # vs the actual commit call, + commits in flight at the writer.
-  sa_s=$(mv zebra_state_commit_state_admit_wait_duration_seconds_sum "$m");  sa_c=$(mv zebra_state_commit_state_admit_wait_duration_seconds_count "$m")
-  scl_s=$(mv zebra_state_commit_state_call_duration_seconds_sum "$m");       scl_c=$(mv zebra_state_commit_state_call_duration_seconds_count "$m")
-  cinf=$(mv zebra_state_commit_inflight "$m")
+  sa_s=$(mv zakura_state_commit_state_admit_wait_duration_seconds_sum "$m");  sa_c=$(mv zakura_state_commit_state_admit_wait_duration_seconds_count "$m")
+  scl_s=$(mv zakura_state_commit_state_call_duration_seconds_sum "$m");       scl_c=$(mv zakura_state_commit_state_call_duration_seconds_count "$m")
+  cinf=$(mv zakura_state_commit_inflight "$m")
   # Batched body commit: blocks per DiskWriteBatch (>1 means batching is active).
-  bsz_s=$(mv zebra_state_commit_batch_size_sum "$m");  bsz_c=$(mv zebra_state_commit_batch_size_count "$m")
+  bsz_s=$(mv zakura_state_commit_batch_size_sum "$m");  bsz_c=$(mv zakura_state_commit_batch_size_count "$m")
 
-  cores=$(awk -v d=$((ncpu-pcpu)) -v hz=$HZ 'BEGIN{printf "%.2f",d/hz/5}')
+  cores=$(awk -v d=$((ncpu-pcpu)) -v hz="$HZ" 'BEGIN{printf "%.2f",d/hz/5}')
   bps=$(awk -v dh=$((h-prevh)) 'BEGIN{printf "%.1f",dh/5}')
   echo "$(date +%s),$el,$h,$bps,$cores,\
 ${zkp:-0},${zkq:-0},${zkbs:-0},\
@@ -259,6 +259,6 @@ ${aw_s:-0},${aw_c:-0},${c2c_s:-0},${c2c_c:-0},\
 ${sa_s:-0},${sa_c:-0},${scl_s:-0},${scl_c:-0},${cinf:-0},${bsz_s:-0},${bsz_c:-0}" >> "$CSV"
   pcpu=$ncpu; prevh=$h
 done
-fin=$(mv state_finalized_block_height "$(curl -s http://127.0.0.1:$MET/metrics 2>/dev/null)")
+fin=$(mv state_finalized_block_height "$(curl -s "http://127.0.0.1:$MET/metrics" 2>/dev/null)")
 echo "[$LABEL] DONE height=${fin:-?}  csv=$CSV  log=$LOG  traces=$TRACEDIR"
 echo "[$LABEL] cleanup: rm -rf $FORK   (keeps source $MASTER pristine)"

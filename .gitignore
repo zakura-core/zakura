@@ -1,7 +1,7 @@
 # Cargo files
 /coverage-target/
 # Legacy Zebra state (alpha versions only)
-.zebra-state/
+.zakura-state/
 # Nix configs
 shell.nix
 # Docker compose env files
@@ -163,7 +163,7 @@ $RECYCLE.BIN/
 __pycache__/
 
 # RPC tests cache
-zebra-rpc/qa/cache/
+zakura-rpc/qa/cache/
 
 # Lychee link checker cache
 .lycheecache
@@ -172,11 +172,11 @@ zebra-rpc/qa/cache/
 local_data/**
 
 # fuzzing artifacts
-zebra-chain/fuzz/artifacts
-zebra-chain/fuzz/corpus
+zakura-chain/fuzz/artifacts
+zakura-chain/fuzz/corpus
 stako/**/*
 perf-artifacts/**/*
 
 # local VCT fast-sync run artifacts (state cache, config, logs, traces)
-.zebrad-vct-local-cache/
-zebrad-vct-local*
+.zakurad-vct-local-cache/
+zakurad-vct-local*

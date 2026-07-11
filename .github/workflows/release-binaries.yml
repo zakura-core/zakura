@@ -57,7 +57,7 @@ jobs:
           else
             release_tag="$INPUT_RELEASE_TAG"
             # workflow_dispatch builds from the release tag so republished assets
-            # match the tagged source tree (older tags may still ship a zebrad
+            # match the tagged source tree (older tags may still ship a zakurad
             # binary, which the packaging step renames to zakurad).
             if [ -n "$release_tag" ]; then
               checkout_ref="$release_tag"
@@ -140,10 +140,8 @@ jobs:
             .
           if [ -x ./out/usr/local/bin/zakurad ]; then
             echo "release_binary=zakurad" >> "$GITHUB_ENV"
-          elif [ -x ./out/usr/local/bin/zebrad ]; then
-            echo "release_binary=zebrad" >> "$GITHUB_ENV"
           else
-            echo "Expected ./out/usr/local/bin/zakurad or ./out/usr/local/bin/zebrad" >&2
+            echo "Expected ./out/usr/local/bin/zakurad" >&2
             exit 1
           fi
 

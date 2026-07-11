@@ -1,39 +1,39 @@
-# Mining Zcash with zebra
+# Mining Zcash with zakura
 
-Zebra's RPC methods support miners and mining pools.
+Zakura's RPC methods support miners and mining pools.
 
 Contents:
 
-- [Download Zebra](#download-and-build-zebra)
-- [Configure zebra for mining](#configure-zebra-for-mining)
+- [Download Zakura](#download-and-build-zakura)
+- [Configure zakura for mining](#configure-zakura-for-mining)
   - [Miner address](#miner-address)
   - [Extra coinbase data](#extra-coinbase-data)
   - [RPC section](#rpc-section)
-- [Running zebra](#running-zebra)
+- [Running zakura](#running-zakura)
 - [Testing the setup](#testing-the-setup)
 - [Run a mining pool](#run-a-mining-pool)
 
-## Download Zebra
+## Download Zakura
 
-[#download-and-build-zebra]: #download-and-build-zebra
+[#download-and-build-zakura]: #download-and-build-zakura
 
-The easiest way to run Zebra for mining is with [our docker images](https://zebra.zfnd.org/user/mining-docker.html).
+The easiest way to run Zakura for mining is with [our docker images](mining-docker.md).
 
-If you have [installed Zebra another way](https://zebra.zfnd.org/user/install.html), follow the
+If you have [installed Zakura another way](install.md), follow the
 instructions below to start mining:
 
-## Configure zebra for mining
+## Configure zakura for mining
 
-[#configure-zebra-for-mining]: #configure-zebra-for-mining
+[#configure-zakura-for-mining]: #configure-zakura-for-mining
 
 We need a configuration file. First, we create a file with the default settings:
 
 ```console
 mkdir -p ~/.config
-zebrad generate -o ~/.config/zebrad.toml
+zakurad generate -o ~/.config/zakurad.toml
 ```
 
-The above command places the generated `zebrad.toml` config file in the default preferences directory of Linux. For other OSes default locations [see here](https://docs.rs/dirs/latest/dirs/fn.preference_dir.html).
+The above command places the generated `zakurad.toml` config file in the default preferences directory of Linux. For other OSes default locations [see here](https://docs.rs/dirs/latest/dirs/fn.preference_dir.html).
 
 Tweak the following options in order to prepare for mining.
 
@@ -41,7 +41,7 @@ Tweak the following options in order to prepare for mining.
 
 [#miner-address]: #miner-address
 
-Node miner address is required. At the moment zebra only allows `p2pkh` or `p2sh` transparent addresses.
+Node miner address is required. At the moment zakura only allows `p2pkh` or `p2sh` transparent addresses.
 
 ```toml
 [mining]
@@ -54,7 +54,7 @@ The above address is the ZF Mainnet funding stream address. It is used here pure
 
 [#extra-coinbase-data]: #extra-coinbase-data
 
-Zebra prepends a `🌸` marker to the coinbase input of every block it builds.
+Zakura prepends a `🌸` marker to the coinbase input of every block it builds.
 Setting `extra_coinbase_data` adds your own tag, such as a pool name, after it,
 separated by `": "`:
 
@@ -68,7 +68,7 @@ How it's used:
 
 - Inserted into the coinbase input script, after the block height, `🌸` marker,
   and `": "` separator.
-- Limited to 86 bytes. If exceeded, Zebra refuses to start.
+- Limited to 86 bytes. If exceeded, Zakura refuses to start.
 - Optional. If unset, the block still carries the `🌸` marker, just no extra
   data.
 
@@ -81,29 +81,29 @@ after the height bytes you'll see the `🌸` marker (`f0 9f 8c b8`), then, if
 
 [#rpc-section]: #rpc-section
 
-This change is required for zebra to behave as an RPC endpoint. The standard port for RPC endpoint is `8232` on mainnet.
+This change is required for zakura to behave as an RPC endpoint. The standard port for RPC endpoint is `8232` on mainnet.
 
 ```toml
 [rpc]
 listen_addr = "127.0.0.1:8232"
 ```
 
-## Running zebra
+## Running zakura
 
-[#running-zebra]: #running-zebra
+[#running-zakura]: #running-zakura
 
-If the configuration file is in the default directory, then zebra will just read from it. All we need to do is to start zebra as follows:
+If the configuration file is in the default directory, then zakura will just read from it. All we need to do is to start zakura as follows:
 
 ```console
-zebrad
+zakurad
 ```
 
 You can specify the configuration file path with `-c /path/to/config.file`.
 
-Wait until Zebra is in sync. You will see the sync at 100% when this happens:
+Wait until Zakura is in sync. You will see the sync at 100% when this happens:
 
 ```console
-INFO zebrad::components::sync::progress: finished initial sync to chain tip, using gossiped blocks sync_percent=100.000% current_height=Height(...) network_upgrade=Nu6 remaining_sync_blocks=1 time_since_last_state_block=0s
+INFO zakurad::components::sync::progress: finished initial sync to chain tip, using gossiped blocks sync_percent=100.000% current_height=Height(...) network_upgrade=Nu6 remaining_sync_blocks=1 time_since_last_state_block=0s
 ```
 
 ## Testing the setup
@@ -112,7 +112,7 @@ INFO zebrad::components::sync::progress: finished initial sync to chain tip, usi
 
 The easiest way to check your setup is to call the `getblocktemplate` RPC method and check the result.
 
-Starting with Zebra v2.0.0, a cookie authentication method similar to the one used by the `zcashd` node is enabled by default. The cookie is stored in the default cache directory when the RPC endpoint starts and is deleted at shutdown. By default, the cookie is located in the cache directory; for example, on Linux, it may be found at `/home/user/.cache/zakura/.cookie`. You can change the cookie's location using the `rpc.cookie_dir` option in the configuration, or disable cookie authentication altogether by setting `rpc.enable_cookie_auth` to false. The contents of the cookie file look like this:
+Starting with Zakura v2.0.0, a cookie authentication method similar to the one used by the `zcashd` node is enabled by default. The cookie is stored in the default cache directory when the RPC endpoint starts and is deleted at shutdown. By default, the cookie is located in the cache directory; for example, on Linux, it may be found at `/home/user/.cache/zakura/.cookie`. You can change the cookie's location using the `rpc.cookie_dir` option in the configuration, or disable cookie authentication altogether by setting `rpc.enable_cookie_auth` to false. The contents of the cookie file look like this:
 
 ```text
 __cookie__:YwDDua GzvtEmWG6KWnhgd9gilo5mKdi6m38v__we3Ko=
@@ -209,8 +209,8 @@ If you can see something similar to the following then you are good to go.
 
 [#run-a-mining-pool]: #run-a-mining-pool
 
-Just point your mining pool software to the Zebra RPC endpoint (127.0.0.1:8232). Zebra supports the RPC methods needed to run most mining pool software.
+Just point your mining pool software to the Zakura RPC endpoint (127.0.0.1:8232). Zakura supports the RPC methods needed to run most mining pool software.
 
-If you want to run an experimental `s-nomp` mining pool with Zebra on testnet, please refer to [this document](mining-testnet-s-nomp.md) for a very detailed guide. `s-nomp` is not compatible with NU5, so some mining functions are disabled.
+If you want to run an experimental `s-nomp` mining pool with Zakura on testnet, please refer to [this document](mining-testnet-s-nomp.md) for a very detailed guide. `s-nomp` is not compatible with NU5, so some mining functions are disabled.
 
-If your mining pool software needs additional support, or if you as a miner need additional RPC methods, then please open a ticket in the [Zebra repository](https://github.com/ZcashFoundation/zebra/issues/new).
+If your mining pool software needs additional support, or if you as a miner need additional RPC methods, then please open a ticket in the [Zakura repository](https://github.com/zakura-core/zakura/issues/new).

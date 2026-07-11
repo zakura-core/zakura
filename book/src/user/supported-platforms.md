@@ -9,12 +9,12 @@ Platforms are identified by their Rust "target triple" which is a string compose
 
 ## Minimum Supported Rust Version (MSRV)
 
-Zebra's minimum supported Rust version is **1.91**. We recommend using the latest
+Zakura's minimum supported Rust version is **1.91**. We recommend using the latest
 stable Rust release for best performance and security.
 
 ## Tier 1
 
-Tier 1 platforms can be thought of as "guaranteed to work". The Zebra project
+Tier 1 platforms can be thought of as "guaranteed to work". The Zakura project
 builds official binary releases for each tier 1 platform, and automated testing
 ensures that each tier 1 platform builds and passes tests after each change.
 
@@ -30,7 +30,7 @@ For the full requirements, see [Tier 1 platform policy](target-tier-policies.md#
 
 ## Tier 2
 
-Tier 2 platforms can be thought of as "guaranteed to build". The Zebra project
+Tier 2 platforms can be thought of as "guaranteed to build". The Zakura project
 builds in CI for each tier 2 platform, and automated builds ensure that each
 tier 2 platform builds after each change. Not all automated tests are run so it's
 not guaranteed to produce a working build, and official builds are not available,
@@ -50,8 +50,8 @@ For the full requirements, see [Tier 2 platform policy](target-tier-policies.md#
 
 ## Tier 3
 
-Tier 3 platforms are those which the Zebra codebase has support for, but which
-the Zebra project does not build or test automatically, so they may or may not
+Tier 3 platforms are those which the Zakura codebase has support for, but which
+the Zakura project does not build or test automatically, so they may or may not
 work. Official builds are not available.
 
 For the full requirements, see [Tier 3 platform policy](target-tier-policies.md#tier-3-platform-policy) in the Platform Tier Policy.

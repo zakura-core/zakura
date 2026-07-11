@@ -1,6 +1,6 @@
-# Zebra CI/CD Architecture
+# Zakura CI/CD Architecture
 
-This document provides a comprehensive overview of Zebra's Continuous Integration and Continuous Deployment (CI/CD) system. It serves as a guide for contributors, maintainers, and new team members.
+This document provides a comprehensive overview of Zakura's Continuous Integration and Continuous Deployment (CI/CD) system. It serves as a guide for contributors, maintainers, and new team members.
 
 ## Table of Contents
 
@@ -15,7 +15,7 @@ This document provides a comprehensive overview of Zebra's Continuous Integratio
 
 ## System Overview
 
-Zebra's CI/CD system is built on GitHub Actions, providing a unified platform for automation. The system ensures code quality, maintains stability, and automates routine tasks through specialized workflows.
+Zakura's CI/CD system is built on GitHub Actions, providing a unified platform for automation. The system ensures code quality, maintains stability, and automates routine tasks through specialized workflows.
 
 ## CI/CD Workflow Diagram
 
@@ -104,7 +104,7 @@ _The diagram above illustrates the parallel execution patterns in our CI/CD syst
 
 - Optimized build times (~10 min for non-cached, ~30 sec for cached)
 - More efficient than GitHub Runners
-- Addresses [Rust caching limitations](https://github.com/ZcashFoundation/zebra/issues/6169#issuecomment-1712776391)
+- Addresses [Rust caching limitations](https://github.com/zakura-core/zakura/issues/6169#issuecomment-1712776391)
 
 #### Container Registries
 
@@ -145,7 +145,7 @@ _The diagram above illustrates the parallel execution patterns in our CI/CD syst
 - **Unit Tests** (`tests-unit.yml`): OS matrix unit tests via nextest
 - **Lint** (`lint.yml`): Clippy, fmt, deny, features, docs build checks
 - **Coverage** (`coverage.yml`): llvm-cov with nextest, uploads to Codecov
-- **Test Docker Config** (`test-docker.yml`): Validates zebrad configs against built test image
+- **Test Docker Config** (`test-docker.yml`): Validates zakurad configs against built test image
 - **Test Crate Build** (`test-crates.yml`): Builds each crate under various feature sets
 - **Docs (Book + internal)** (`book.yml`): Builds mdBook and internal rustdoc, publishes to Pages
 - **Security Analysis** (`zizmor.yml`): GitHub Actions security lint (SARIF)
@@ -177,10 +177,10 @@ We use `nextest` profiles defined in [`.config/nextest.toml`](../../.config/next
 
 ```bash
 # Run the full test suite using the 'all-tests' profile
-docker run --rm -e NEXTEST_PROFILE=all-tests zebra-tests
+docker run --rm -e NEXTEST_PROFILE=all-tests zakura-tests
 
 # Run a specific test suite, like the lightwalletd integration tests
-docker run --rm -e NEXTEST_PROFILE=lwd-integration zebra-tests
+docker run --rm -e NEXTEST_PROFILE=lwd-integration zakura-tests
 ```
 
 #### Test Categories
@@ -267,8 +267,8 @@ Weekly runs include:
 
 ```bash
 # Build and run tests
-docker build -t zebra-tests --target tests .
-docker run --rm zebra-tests
+docker build -t zakura-tests --target tests .
+docker run --rm zakura-tests
 ```
 
 #### PR Guidelines

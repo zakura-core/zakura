@@ -1,6 +1,6 @@
-# zebrad deploy tool
+# zakurad deploy tool
 
-A small, dependency-free operator tool to build `zebrad` from a per-node commit,
+A small, dependency-free operator tool to build `zakurad` from a per-node commit,
 distribute it to a fleet over SSH, run it as a systemd service that logs to a
 deterministic file, and pull those logs back by node name.
 
@@ -12,7 +12,7 @@ rollback pattern generalized to a dynamic multi-node config.
 - Python 3.11+ (uses the stdlib `tomllib`; no third-party packages).
 - A working SSH key for every node's `ssh_string` (key-based auth; the tool runs
   ssh in `BatchMode`, so password prompts are not supported).
-- A local Rust toolchain + `protoc` to build `zebrad` (same as a normal workspace
+- A local Rust toolchain + `protoc` to build `zakurad` (same as a normal workspace
   build). Builds run on this host; the resulting binary is copied to every node,
   so nodes must share the build host's architecture and a compatible glibc
   (DigitalOcean Ubuntu x86_64 droplets do).
@@ -33,7 +33,7 @@ Copy `nodes.example.toml` to `nodes.toml` and edit. Each `[[nodes]]` entry needs
 ```bash
 cd deploy/deployer
 
-# Build each unique commit into .build-cache/zebrad-<sha> (reused if present).
+# Build each unique commit into .build-cache/zakurad-<sha> (reused if present).
 python3 deploy.py build  --config nodes.toml
 
 # Build-if-needed, distribute, install the unit, restart. Parallel; rolls back
@@ -55,7 +55,7 @@ python3 deploy.py logs follow --config nodes.toml --node node-a   # live tail -F
 
 `.github/workflows/zakura-testnet-deploy.yml` runs this deployer on a Linux x86_64
 self-hosted runner, expected to be `zakura-testnet-1` with the
-`zakura-testnet-deployer` label. The runner builds the native `zebrad` binary and
+`zakura-testnet-deployer` label. The runner builds the native `zakurad` binary and
 then deploys it to:
 
 - `zakura-testnet-1` — `root@167.99.103.111`
@@ -149,7 +149,7 @@ Optional display fields include `name`, `size`, `height`, `zebraVersion`, and
 Manual run from a host with SSH access to every node:
 
 ```bash
-python3 deploy/runner/zebra-cluster-status.py \
+python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
@@ -174,7 +174,7 @@ and deploys it to:
 - `asia-south-0` — `root@139.59.64.115`
 - `asia-pacific-0` — `root@168.144.173.250`
 
-All nine run a hand-provisioned `zebrad` systemd service. One-time runner
+All nine run a hand-provisioned `zakurad` systemd service. One-time runner
 bootstrap from an operator machine with SSH access and CI credentials in
 `~/agents-env`:
 
@@ -190,11 +190,11 @@ The workflow is manual (`workflow_dispatch`) with the same inputs as testnet
 provisioned by hand with rich, per-node configs — `external_addr`, custom peers,
 mempool/sync tuning, and an inline `zakura_node_secret_key` that pins each node's
 iroh identity (the node ids hardcoded as bootstrap peers in
-`zebra-network/src/zakura/handler.rs`) — and their state DB lives at
+`zakura-network/src/zakura/handler.rs`) — and their state DB lives at
 `/root/.cache/zebra`. Rendering the deployer's managed config over that would
 change every node id and drop the tuning. So the generated CI config sets
-`manage_config = false`: the deployer swaps `/usr/local/bin/zebrad` and restarts
-the existing `zebrad` service, leaving the config, unit, and cache untouched. The
+`manage_config = false`: the deployer swaps `/usr/local/bin/zakurad` and restarts
+the existing `zakurad` service, leaving the config, unit, and cache untouched. The
 `rpc_listen_addr` / `log_file` / `p2p_stack` /
 `[defaults.zakura] bootstrap_peers` in that config are read-only inputs for the
 dashboard's SSH probe, not deployed to nodes. On-node configs should use
@@ -208,12 +208,12 @@ The workflow refreshes a fleet status dashboard on `us-east-0`:
 - URL: `http://159.65.183.89:8090/`
 - install dir: `/opt/zakura-mainnet-dashboard`
 
-It is the same `zebra-cluster-status.py` as testnet, launched with
+It is the same `zakura-cluster-status.py` as testnet, launched with
 `--upgrade-height 0`, which hides the upgrade-ETA cards (mainnet has no pending
 Zakura activation to count down to). Manual run:
 
 ```bash
-python3 deploy/runner/zebra-cluster-status.py \
+python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
@@ -250,7 +250,7 @@ in the future, new failure alerts are logged but not posted to Slack.
 Manual dry run from `us-east-0`:
 
 ```bash
-python3 /opt/zakura-fleet-watchdog/zebra-cluster-watchdog.py \
+python3 /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py \
   --config /opt/zakura-fleet-watchdog/fleets.toml \
   --state-file /tmp/zakura-fleet-watchdog-state.json \
   --once \

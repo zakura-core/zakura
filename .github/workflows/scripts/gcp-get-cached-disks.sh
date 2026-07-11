@@ -17,7 +17,7 @@ set -eo pipefail
 
 # Extract local state version
 echo "Extracting local state version..."
-LOCAL_STATE_VERSION=$(grep -oE "DATABASE_FORMAT_VERSION: .* [0-9]+" "${GITHUB_WORKSPACE}/zebra-state/src/constants.rs" | grep -oE "[0-9]+" | tail -n1)
+LOCAL_STATE_VERSION=$(grep -oE "DATABASE_FORMAT_VERSION: .* [0-9]+" "${GITHUB_WORKSPACE}/zakura-state/src/constants.rs" | grep -oE "[0-9]+" | tail -n1)
 echo "STATE_VERSION: ${LOCAL_STATE_VERSION}"
 
 # Function to find a cached disk image based on the git pattern (branch, main, or any branch)
@@ -90,8 +90,8 @@ if [[ -n "${NETWORK}" ]]; then
     # Check for specific disk images (lwd_tip_disk, zebra_tip_disk, zebra_checkpoint_disk)
     echo "Checking for specific disk images..."
     LWD_TIP_DISK=$(find_available_disk_type "lwd" "tip")
-    ZEBRA_TIP_DISK=$(find_available_disk_type "zebrad" "tip")
-    ZEBRA_CHECKPOINT_DISK=$(find_available_disk_type "zebrad" "checkpoint")
+    ZEBRA_TIP_DISK=$(find_available_disk_type "zakurad" "tip")
+    ZEBRA_CHECKPOINT_DISK=$(find_available_disk_type "zakurad" "checkpoint")
 fi
 
 # Exporting variables for subsequent steps

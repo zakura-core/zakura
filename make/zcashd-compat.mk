@@ -31,7 +31,7 @@ ZAKURA_COOKIE_FILE ?= $(ZAKURA_STATE_CACHE_DIR)/.cookie
 HEIGHT_MAX_DRIFT ?= 10
 
 ZAKURA_DOCKER_IMAGE ?= zakura:zcashd-compat
-ZCASHD_COMPAT_MANIFEST ?= $(CURDIR)/zebrad/zcashd-compat-manifest.json
+ZCASHD_COMPAT_MANIFEST ?= $(CURDIR)/zakurad/zcashd-compat-manifest.json
 ZCASHD_COMPAT_TARGET_TRIPLE ?= x86_64-pc-linux-gnu
 ZCASHD_COMPAT_RELEASE_TAG ?= $(shell jq -er '.release_tag' $(ZCASHD_COMPAT_MANIFEST))
 ZCASHD_COMPAT_URL ?= $(shell jq -er --arg target '$(ZCASHD_COMPAT_TARGET_TRIPLE)' '.artifacts[] | select(.target_triple == $$target) | .runtime_archive_url' $(ZCASHD_COMPAT_MANIFEST))
@@ -179,7 +179,7 @@ compat-status-sync:
 # ─── Integration test targets ─────────────────────────────────────────────────
 
 # Optional: path to a local zcashd binary for regtest tests.
-# If unset, the embedded zcashd download in the zebrad binary is used.
+# If unset, the embedded zcashd download in the zakurad binary is used.
 # Override with: make compat-test-regtest TEST_ZCASHD_PATH=/path/to/zcashd
 TEST_ZCASHD_PATH ?=
 TEST_ZCASHD_COMPAT_REORG_ITERATIONS ?= 500
@@ -194,7 +194,7 @@ TEST_ZCASHD_RPC_USER ?=
 TEST_ZCASHD_RPC_PASSWORD ?=
 
 # Run the full zcashd-compat integration test suite against a fresh regtest
-# environment.  zebrad and zcashd are spawned automatically by the test harness.
+# environment.  zakurad and zcashd are spawned automatically by the test harness.
 #
 # Prerequisites: a zcashd binary (set TEST_ZCASHD_PATH) or let the
 #   embedded download provide one.
@@ -213,12 +213,12 @@ compat-test-soak:
 	cargo nextest run --profile zcashd-compat-soak --run-ignored=only
 
 # Run the read-only zcashd-compat test suite against a live mainnet deployment.
-# Requires a fully-synced zebrad and zcashd already running on this host.
+# Requires a fully-synced zakurad and zcashd already running on this host.
 # Tests that require block mining (sendtoaddress, generate, etc.) are skipped.
 #
 # Prerequisites:
-#   - zebrad running with --zcashd-compat on mainnet
-#   - zcashd -zebra-compat connected to that zebrad
+#   - zakurad running with --zcashd-compat on mainnet
+#   - zcashd -zebra-compat connected to that zakurad
 #   - TEST_ZEBRAD_RPC_ADDR and TEST_ZCASHD_RPC_ADDR pointing to them
 #   - TEST_ZCASHD_COOKIE_FILE or TEST_ZCASHD_RPC_USER/PASSWORD set
 # When to use: validating a live mainnet deployment after an upgrade.

@@ -11,9 +11,12 @@
 use std::sync::Arc;
 
 use zakura_chain::{
-    block::{merkle::AuthDataRoot, Block, Height},
+    block::{merkle::AuthDataRoot, Block, Header, Height},
     history_tree::HistoryTree,
     ironwood, orchard,
+    parallel::commitment_aux_verify::{
+        header_commitment_is_valid_for_chain_history, SuppliedRootsError,
+    },
     parameters::{Network, NetworkUpgrade},
     sapling,
 };
@@ -25,7 +28,9 @@ use crate::{service::check, ValidateContextError};
 /// One block-sized step in supplied commitment-root verification.
 #[derive(Clone, Debug)]
 pub(crate) struct CommitmentRootVerification {
-    pub(crate) block: Arc<Block>,
+    pub(crate) block: Option<Arc<Block>>,
+    pub(crate) header: Arc<Header>,
+    pub(crate) height: Height,
     pub(crate) roots: Option<(
         sapling::tree::Root,
         orchard::tree::Root,
@@ -46,8 +51,13 @@ impl CommitmentRootVerification {
         precomputed_auth_data_root: Option<AuthDataRoot>,
         skip_parent_check: bool,
     ) -> Self {
+        let height = block
+            .coinbase_height()
+            .expect("checkpoint-verified blocks have a coinbase height");
         CommitmentRootVerification {
-            block,
+            header: block.header.clone(),
+            height,
+            block: Some(block),
             roots: Some((sapling_root, orchard_root, ironwood_root)),
             precomputed_auth_data_root,
             skip_parent_check,
@@ -59,11 +69,14 @@ impl CommitmentRootVerification {
     /// This confirms the roots already accumulated in the running tree, which is useful
     /// for the final one-block lag: the roots at height `H` are checked by height `H + 1`.
     pub(crate) fn header_only(
-        block: Arc<Block>,
+        header: Arc<Header>,
+        height: Height,
         precomputed_auth_data_root: Option<AuthDataRoot>,
     ) -> Self {
         CommitmentRootVerification {
-            block,
+            block: None,
+            header,
+            height,
             roots: None,
             precomputed_auth_data_root,
             skip_parent_check: false,
@@ -190,14 +203,12 @@ where
     for block_verify in blocks_to_verify {
         let CommitmentRootVerification {
             block,
+            header,
+            height,
             roots,
             precomputed_auth_data_root,
             skip_parent_check,
         } = block_verify;
-
-        let height = block
-            .coinbase_height()
-            .expect("checkpoint-verified blocks have a coinbase height");
 
         // Validate this block's header commitment against the current (parent) tree,
         // i.e. against every root already folded in.
@@ -213,20 +224,42 @@ where
         // with step 3 of the prior iteration so verification can be skipped in that case
         // for perf reasons.
         if !skip_parent_check {
-            // This block + history tree up to and including the previous block.
-            check::block_commitment_is_valid_for_chain_history(
-                block.clone(),
-                network,
-                &history_tree,
-                precomputed_auth_data_root,
-            )
-            .map_err(|error| (height, error))?;
+            if let Some(block) = &block {
+                // This block + history tree up to and including the previous block.
+                check::block_commitment_is_valid_for_chain_history(
+                    block.clone(),
+                    network,
+                    &history_tree,
+                    precomputed_auth_data_root,
+                )
+                .map_err(|error| (height, error))?;
+            } else {
+                let auth_data_root = precomputed_auth_data_root
+                    .expect("header-only VCT witnesses have a stored precomputed auth-data root");
+                header_commitment_is_valid_for_chain_history(
+                    &header,
+                    height,
+                    network,
+                    &history_tree,
+                    auth_data_root,
+                )
+                .map_err(|error| match error {
+                    SuppliedRootsError::InvalidHeaderCommitment(error) => {
+                        ValidateContextError::InvalidBlockCommitment(error)
+                    }
+                    SuppliedRootsError::HistoryTree(error) => {
+                        ValidateContextError::HistoryTreeError(error)
+                    }
+                })
+                .map_err(|error| (height, error))?;
+            }
         }
 
         let Some((sapling_root, orchard_root, ironwood_root)) = roots else {
             continue;
         };
 
+        let block = block.expect("verification items with supplied roots have a block body");
         verify_supplied_sapling_root_below_heartwood(network, &block, &sapling_root)
             .map_err(|error| (height, error))?;
         verify_supplied_orchard_root_below_nu5(network, height, &orchard_root)
@@ -342,7 +375,12 @@ mod tests {
             None,
             true,
         );
-        assert!(Arc::ptr_eq(&with_roots.block, &block));
+        assert!(Arc::ptr_eq(
+            with_roots.block.as_ref().expect("roots item has a block"),
+            &block
+        ));
+        assert!(Arc::ptr_eq(&with_roots.header, &block.header));
+        assert_eq!(with_roots.height, block.coinbase_height().unwrap());
         assert_eq!(
             with_roots.roots,
             Some((sapling_root, orchard_root, ironwood_root))
@@ -350,10 +388,20 @@ mod tests {
         assert_eq!(with_roots.precomputed_auth_data_root, None);
         assert!(with_roots.skip_parent_check);
 
-        let header_only = CommitmentRootVerification::header_only(block.clone(), None);
-        assert!(Arc::ptr_eq(&header_only.block, &block));
+        let height = block.coinbase_height().unwrap();
+        let header_only = CommitmentRootVerification::header_only(
+            block.header.clone(),
+            height,
+            Some(block.auth_data_root()),
+        );
+        assert!(header_only.block.is_none());
+        assert!(Arc::ptr_eq(&header_only.header, &block.header));
+        assert_eq!(header_only.height, height);
         assert_eq!(header_only.roots, None);
-        assert_eq!(header_only.precomputed_auth_data_root, None);
+        assert_eq!(
+            header_only.precomputed_auth_data_root,
+            Some(block.auth_data_root())
+        );
         assert!(!header_only.skip_parent_check);
     }
 
@@ -572,7 +620,7 @@ mod tests {
     /// next block (the V1 `ChainHistoryRoot` path), and rejects a wrong root at the
     /// *next* block (the one-block lag).
     #[test]
-    fn verifies_real_roots_and_rejects_a_wrong_root_at_next_height() {
+    fn verifies_real_roots_with_header_only_successor_and_rejects_a_wrong_root() {
         let activation = NetworkUpgrade::Heartwood
             .activation_height(&Mainnet)
             .expect("mainnet has Heartwood")
@@ -587,7 +635,11 @@ mod tests {
         // Positive: the real roots reconstruct a tree the next block's header commits to.
         let ok_items = vec![
             verification_item(act_block.clone(), act_root, empty_orchard_root),
-            verification_item(next_block.clone(), next_root, empty_orchard_root),
+            CommitmentRootVerification::header_only(
+                next_block.header.clone(),
+                Height(activation + 1),
+                Some(next_block.auth_data_root()),
+            ),
         ];
         verify_commitment_roots(&Mainnet, empty_history_tree(), ok_items)
             .expect("real roots verify against the headers");
@@ -598,7 +650,11 @@ mod tests {
         assert_ne!(act_root, next_root, "test needs two distinct roots");
         let bad_items = vec![
             verification_item(act_block, next_root, empty_orchard_root),
-            verification_item(next_block, next_root, empty_orchard_root),
+            CommitmentRootVerification::header_only(
+                next_block.header.clone(),
+                Height(activation + 1),
+                Some(next_block.auth_data_root()),
+            ),
         ];
         let (fail_height, _error) =
             verify_commitment_roots(&Mainnet, empty_history_tree(), bad_items)

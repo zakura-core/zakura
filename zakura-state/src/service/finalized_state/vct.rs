@@ -14,7 +14,7 @@ use thiserror::Error;
 #[cfg(test)]
 use zakura_chain::parallel::tree::NoteCommitmentTrees;
 use zakura_chain::{
-    block::{self, merkle::AuthDataRoot, Block},
+    block::{self, merkle::AuthDataRoot, Block, Header},
     ironwood, orchard,
     parameters::{Network, NetworkUpgrade},
     sapling, sprout,
@@ -25,14 +25,51 @@ use super::{
     ZakuraDb,
 };
 
-/// A buffered VCT successor block used to authenticate the current block's
-/// supplied note-commitment roots.
+/// A VCT successor header used to authenticate the current block's supplied
+/// note-commitment roots.
 #[derive(Clone, Debug)]
 pub struct NextVctBlock {
-    /// The successor block whose header commits to the current block's VCT roots.
-    pub(crate) block: Arc<Block>,
+    /// The successor header that commits to the current block's VCT roots.
+    pub(crate) header: Arc<Header>,
+    /// The successor header's height.
+    pub(crate) height: block::Height,
+    /// The successor header's hash, used for prevalidation deduplication.
+    pub(crate) hash: block::Hash,
     /// The successor block's precomputed ZIP-244 auth-data root, if available.
     pub(crate) auth_data_root: Option<AuthDataRoot>,
+}
+
+impl NextVctBlock {
+    /// Build a successor witness from a checkpoint-verified block.
+    pub(crate) fn from_block(block: Arc<Block>, auth_data_root: Option<AuthDataRoot>) -> Self {
+        let height = block
+            .coinbase_height()
+            .expect("checkpoint-verified successor blocks have a coinbase height");
+        let auth_data_root = Some(auth_data_root.unwrap_or_else(|| block.auth_data_root()));
+
+        Self {
+            header: block.header.clone(),
+            height,
+            hash: block.hash(),
+            auth_data_root,
+        }
+    }
+
+    /// Build a successor witness from a contextually validated stored header.
+    pub(crate) fn from_header(
+        header: Arc<Header>,
+        height: block::Height,
+        auth_data_root: AuthDataRoot,
+    ) -> Self {
+        let hash = block::Hash::from(&header);
+
+        Self {
+            header,
+            height,
+            hash,
+            auth_data_root: Some(auth_data_root),
+        }
+    }
 }
 
 /// Embedded verified final note-commitment frontiers for Mainnet.

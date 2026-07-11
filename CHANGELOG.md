@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Prevent verified-commitment-trees checkpoint sync from stalling at checkpoint
+  boundaries by authenticating a block's supplied roots with its already-validated
+  successor header, without waiting for the successor block body to finish checkpoint
+  verification.
 - Handle the `invalidateblock` and `reconsiderblock` state-control RPC edge
   cases (invalidating a non-finalized chain root, invalidating same-height
   sibling fork tips, and repeated reconsideration of the same block) without

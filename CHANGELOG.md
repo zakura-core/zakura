@@ -14,9 +14,24 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   signed `i64`, matching zcashd, so the `-1` sentinel returned for side-chain
   blocks no longer overflows the previous `u32` conversion and aborts the node.
   Backported from upstream Zebra PR #10889.
+- Reject mempool transactions with non-standard transparent inputs _before_ script
+  verification, avoiding the more expensive script checks and reducing DoS surface.
+  Script verification now runs on the shared Rayon thread pool so it no longer blocks
+  the runtime. Fixes GHSA-84j3-rw4c-gqmj (thanks to @ouicate for reporting).
+  Backported from upstream Zebra PR #10936.
 
 ### Fixed
 
+- Handle the `invalidateblock` and `reconsiderblock` state-control RPC edge
+  cases (invalidating a non-finalized chain root, invalidating same-height
+  sibling fork tips, and repeated reconsideration of the same block) without
+  panicking the non-finalized state write task. Backported from upstream Zebra
+  PR #10592.
+- Settle `zakura-checkpoints`-generated checkpoints past the full 1000-block
+  rollback window (`MAX_BLOCK_REORG_HEIGHT`) instead of only the coinbase
+  maturity, so a shipped checkpoint cannot be orphaned by a reorg Zakura would
+  still follow. `MAX_BLOCK_REORG_HEIGHT` now lives in `zakura-chain` as the single
+  source of truth. Backported from upstream Zebra PR #10719.
 - Added a default 180-second request timeout to `RpcRequestClient`, so RPC calls
   no longer hang indefinitely when a server accepts the connection but never
   sends a response. A new `new_with_timeout` constructor lets callers with

@@ -7,8 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Added new variants of `error::TransactionError`:
+  - `NonStandardScriptSigSize`
+  - `NonStandardScriptSigNotPushOnly`
+  - `NonStandardInputs`
+
 ### Added
 
+- `transaction::check`:
+  - `mempool_standard_input_scripts`, the pre-verification mempool input-script gate
+  - `are_inputs_standard` and `standard_script_kind` (zcashd's `AreInputsStandard()` and
+    scriptPubKey classifier, moved here from `zakurad`)
+  - the `MAX_P2SH_SIGOPS` and `MAX_STANDARD_SCRIPTSIG_SIZE` policy constants
 - Ironwood transaction errors:
   - `TransactionError::CoinbaseHasEnableSpendsIronwood`
   - `TransactionError::DuplicateIronwoodNullifier`
@@ -18,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ironwood/Orchard structural check helpers:
   - `transaction::check::has_enough_ironwood_flags`
   - `transaction::check::orchard_cross_address_disabled`
+
+### Fixed
+
+- Reject mempool transactions with non-standard transparent inputs _before_ script
+  verification, avoiding the more expensive script checks and reducing DoS surface.
+  Script verification now runs on the shared Rayon thread pool so it no longer blocks
+  the runtime. Fixes
+  [GHSA-84j3-rw4c-gqmj](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-84j3-rw4c-gqmj)
+  (thanks to @ouicate for reporting). Backported from upstream Zebra PR #10936.
 
 ## [8.0.0] - 2026-06-02
 

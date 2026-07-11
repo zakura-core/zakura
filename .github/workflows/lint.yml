@@ -11,6 +11,7 @@ on:
       - .cargo/config.toml
       - .github/workflows/lint.yml
       - supply-chain/**
+      - "scripts/**.sh"
 
   push:
     branches: [main, "feat/**", "release/**"]
@@ -22,6 +23,7 @@ on:
       - .cargo/config.toml
       - .github/workflows/lint.yml
       - supply-chain/**
+      - "scripts/**.sh"
 
   # Run the full lint suite when a PR is queued so the merge queue validates the
   # merged result against the latest `main`. `merge_group` ignores path filters,
@@ -160,6 +162,27 @@ jobs:
       - name: Run fmt
         run: cargo fmt --all -- --check
 
+  # install-zakura.sh is the entry point for every new user, and until now it had
+  # no CI coverage at all -- its only self-check was --self-test-disk-limits,
+  # which nothing invoked.
+  shellcheck:
+    name: shellcheck
+    permissions:
+      contents: read
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Run shellcheck
+        run: shellcheck scripts/*.sh
+
+      - name: Run installer self-tests
+        run: ./scripts/install-zakura.sh --self-test-disk-limits
+
   unused-deps:
     name: unused-deps
     # cargo-udeps needs a clean from-scratch nightly build and is not a
@@ -296,6 +319,7 @@ jobs:
       - clippy
       - docs
       - fmt
+      - shellcheck
       - unused-deps
       - check-cargo-lock
       - no-test-deps

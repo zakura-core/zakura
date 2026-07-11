@@ -41,6 +41,8 @@ git clone "https://x-access-token:${GH_CLONE_TOKEN}@github.com/${GH_REPO}.git" /
 # Strip the token from the baked image; run droplets fetch with a fresh
 # per-run token via an http.extraheader instead.
 git -C /root/zakura remote set-url origin "https://github.com/${GH_REPO}.git"
+rm -f /root/bake.env
+unset GH_CLONE_TOKEN
 
 # Warm the shared target dir that deploy.py's per-run worktree builds reuse.
 cd /root/zakura

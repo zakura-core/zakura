@@ -129,6 +129,7 @@ jobs:
           } > /tmp/bake.env
           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
             /tmp/bake.env .github/workflows/scripts/pr-node-bake.sh "root@${IP}:/root/"
+          rm -f /tmp/bake.env
           # Keepalives: the cold build and snapshot downloads are long and low-output.
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \

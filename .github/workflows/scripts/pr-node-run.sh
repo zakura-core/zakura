@@ -61,6 +61,8 @@ GIT_AUTH=$(printf 'x-access-token:%s' "${GH_CLONE_TOKEN}" | base64 -w0)
 git -c http.extraheader="AUTHORIZATION: basic ${GIT_AUTH}" \
   fetch --no-tags origin "${REFSPEC}"
 git checkout --detach "${SHA}"
+rm -f /root/run.env
+unset GH_CLONE_TOKEN GIT_AUTH
 
 # ---------------------------------------------------------------------------- #
 # Preflight: baked state DB format vs the PR tree's format
@@ -112,6 +114,7 @@ commit = "${SHA}"
 network = "${NET_TOML}"
 state_cache_dir = "${STATE_CACHE_DIR}"
 storage_mode = "${STORAGE_MODE}"
+p2p_stack = "default"
 rpc_listen_addr = "127.0.0.1:8232"
 rpc_enable_cookie_auth = false
 metrics_endpoint = "127.0.0.1:9999"

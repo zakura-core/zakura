@@ -228,6 +228,7 @@ jobs:
             .github/workflows/scripts/pr-node-run.sh \
             .github/workflows/scripts/pr-node-monitor.py \
             "root@${IP}:/root/"
+          rm -f /tmp/run.env
           # Keepalives: the monitored hour is long and low-output.
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \

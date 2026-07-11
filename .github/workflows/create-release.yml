@@ -1,0 +1,108 @@
+# This workflow is the only supported path for creating v* release tags.
+# Repository tag rulesets restrict creation to the dedicated release GitHub App
+# used below. The resulting tag push triggers release-binaries.yml.
+name: Create release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag, matching the zakura package version (for example v1.0.0-rc2)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: create-release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.validate.outputs.release_tag }}
+      target_sha: ${{ steps.validate.outputs.target_sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Validate source, tag, and package version
+        id: validate
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_REF: ${{ github.ref }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$SOURCE_REF" != "refs/heads/main" ]; then
+            echo "Create release must be dispatched from the main branch, not ${SOURCE_REF}." >&2
+            exit 1
+          fi
+
+          ./scripts/check-release-version.sh "$RELEASE_TAG"
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+
+  create:
+    name: Create tag and GitHub release
+    runs-on: ubuntu-latest
+    needs: [validate]
+    environment: release
+    steps:
+      - name: Create release GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 #v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ needs.validate.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          existing_sha="$(
+            gh api "repos/${REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
+              --jq '.object.sha' 2>/dev/null || true
+          )"
+
+          if [ -n "$existing_sha" ]; then
+            if [ "$existing_sha" != "$TARGET_SHA" ]; then
+              echo "Tag ${RELEASE_TAG} already points to ${existing_sha}, not ${TARGET_SHA}." >&2
+              exit 1
+            fi
+            echo "Tag ${RELEASE_TAG} already points to ${TARGET_SHA}; continuing."
+          else
+            gh api --method POST "repos/${REPOSITORY}/git/refs" \
+              --field "ref=refs/tags/${RELEASE_TAG}" \
+              --field "sha=${TARGET_SHA}"
+          fi
+
+          if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub release ${RELEASE_TAG} already exists; nothing to do."
+            exit 0
+          fi
+
+          release_flags=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
+
+          gh release create "$RELEASE_TAG" \
+            --repo "$REPOSITORY" \
+            --verify-tag \
+            --title "$RELEASE_TAG" \
+            --notes "Release created by the protected Create release workflow." \
+            "${release_flags[@]}"

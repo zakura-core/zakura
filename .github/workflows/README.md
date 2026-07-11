@@ -149,6 +149,7 @@ _The diagram above illustrates the parallel execution patterns in our CI/CD syst
 - **Test Crate Build** (`test-crates.yml`): Builds each crate under various feature sets
 - **Docs (Book + internal)** (`book.yml`): Builds mdBook and internal rustdoc, publishes to Pages
 - **Security Analysis** (`zizmor.yml`): GitHub Actions security lint (SARIF)
+- **Create Release** (`create-release.yml`): Validate and create protected release tags and GitHub releases
 - **Release Binaries** (`release-binaries.yml`): Build and publish release artifacts
 - **Release Drafter** (`release-drafter.yml`): Automates release notes
 - **Integration Tests on GCP** (`zfnd-ci-integration-tests-gcp.yml`): Stateful tests, cached disks, lwd flows

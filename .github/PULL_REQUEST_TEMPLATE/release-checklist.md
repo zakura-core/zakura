@@ -181,20 +181,14 @@ The end of support height is calculated from the current blockchain height:
 ## Create the GitHub Pre-Release
 
 - [ ] Wait for all the release PRs to be merged
-- [ ] Create a new release using the draft release as a base, by clicking the Edit icon in the [draft release](https://github.com/zakura-core/zakura/releases)
-- [ ] Set the tag name to the version tag,
-      for example: `v1.0.0`
-      (the tag must match the `zakura` package version — verify with
-      `./scripts/check-release-version.sh v<version>`; a mismatched tag fails
-      `release-binaries.yml` and publishes nothing)
-- [ ] Set the release to target the `main` branch
-- [ ] Set the release title to `Zakura` followed by the version tag,
-      for example: `Zakura 1.0.0`
-- [ ] Replace the prepopulated draft changelog in the release description with the final changelog you created;
-      starting just _after_ the title `## [Zakura ...` of the current version being released,
-      and ending just _before_ the title of the previous release.
-- [ ] Mark the release as 'pre-release', until it has been built and tested
-- [ ] Publish the pre-release to GitHub using "Publish Release"
+- [ ] Run the [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
+      from `main`, entering the exact version tag, for example `v1.0.0-rc2`.
+      The workflow verifies that the tag matches the `zakura` package version,
+      then creates the protected tag and GitHub release.
+- [ ] Edit the new release and replace its placeholder description with the
+      final changelog you created, starting just _after_ the title
+      `## [Zakura ...` of the current version and ending just _before_ the title
+      of the previous release.
 - [ ] Delete all the [draft releases from the list of releases](https://github.com/zakura-core/zakura/releases)
 
 ## Test the Pre-Release

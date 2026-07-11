@@ -468,7 +468,7 @@ resolve_install_profile() {
 
 compat_network_name_lowercase() {
   local network="$NETWORK"
-  network="${network,,}"
+  network="$(printf '%s' "$network" | tr '[:upper:]' '[:lower:]')"
 
   case "$network" in
     main | mainnet) printf 'mainnet\n' ;;
@@ -1341,22 +1341,22 @@ offer_missing_build_dependency_recovery() {
 }
 
 compat_collect_tool_checks() {
-  local tools=()
+  local tools=""
 
   case "$MODE" in
     split-binary | supervised)
-      tools=(curl install tar sha256sum python3)
+      tools="curl install tar sha256sum python3"
       ;;
     docker-split-containers | docker-supervised)
-      tools=(docker)
+      tools="docker"
       ;;
     build-from-source)
-      tools=(cargo make git)
+      tools="cargo make git"
       ;;
   esac
 
   local tool
-  for tool in "${tools[@]}"; do
+  for tool in $tools; do
     if ! command_exists "$tool"; then
       report_missing_tool "$tool"
     fi
@@ -2197,22 +2197,22 @@ default_normalize_inputs() {
 }
 
 default_collect_tool_checks() {
-  local tools=()
+  local tools=""
 
   case "$MODE" in
     native)
-      tools=(curl install tar sha256sum)
+      tools="curl install tar sha256sum"
       ;;
     docker)
-      tools=(docker)
+      tools="docker"
       ;;
     build-from-source)
-      tools=(cargo)
+      tools="cargo"
       ;;
   esac
 
   local tool
-  for tool in "${tools[@]}"; do
+  for tool in $tools; do
     if ! command_exists "$tool"; then
       report_missing_tool "$tool"
     fi

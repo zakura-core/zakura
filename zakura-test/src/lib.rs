@@ -82,7 +82,7 @@ pub fn init() -> impl Drop {
 
     // Globals
 
-    INIT.call_once(|| {
+    INIT.call_once_force(|_| {
         let fmt_layer = fmt::layer().with_target(false);
         // Use the RUST_LOG env var, or by default:
         //  - warn for most tests, and
@@ -108,7 +108,8 @@ pub fn init() -> impl Drop {
             .with(filter_layer)
             .with(fmt_layer)
             .with(ErrorLayer::default())
-            .init();
+            .try_init()
+            .ok();
 
         let _ = color_eyre::config::HookBuilder::default()
             .add_frame_filter(Box::new(|frames| {

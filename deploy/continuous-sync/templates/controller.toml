@@ -1,0 +1,42 @@
+[paths]
+repo_dir = "{{REPO_DIR}}"
+state_dir = "{{STATE_DIR}}"
+runs_dir = "{{RUNS_DIR}}"
+chain_state_dir = "{{CHAIN_STATE_DIR}}"
+wipe_sentinel = "{{WIPE_SENTINEL}}"
+build_cache_dir = "{{BUILD_CACHE_DIR}}"
+config_template = "{{CONFIG_TEMPLATE_PATH}}"
+zakurad_config = "{{CONFIG_PATH}}"
+bin_path = "{{BIN_PATH}}"
+log_file = "{{LOG_FILE}}"
+monitor_log = "{{MONITOR_LOG}}"
+trace_link = "{{TRACE_LINK}}"
+
+[policy]
+branch = "{{BRANCH}}"
+remote = "{{REMOTE}}"
+service_name = "{{SERVICE_NAME}}"
+mode_label = "{{MODE_LABEL}}"
+p2p_stack = "{{P2P_STACK}}"
+public_ip = "{{PUBLIC_IP}}"
+hostname = "{{HOSTNAME}}"
+alias = "{{ALIAS}}"
+ssh_string = "{{SSH_STRING}}"
+metrics_url = "{{METRICS_URL}}"
+ready_url = "{{READY_URL}}"
+healthy_url = "{{HEALTHY_URL}}"
+poll_interval_seconds = {{POLL_INTERVAL_SECONDS}}
+startup_timeout_seconds = {{STARTUP_TIMEOUT_SECONDS}}
+stall_seconds = {{STALL_SECONDS}}
+max_run_seconds = {{MAX_RUN_SECONDS}}
+ready_samples = {{READY_SAMPLES}}
+ready_sample_interval_seconds = {{READY_SAMPLE_INTERVAL_SECONDS}}
+min_free_bytes = {{MIN_FREE_BYTES}}
+retention_days = {{RETENTION_DAYS}}
+cooldown_seconds = {{COOLDOWN_SECONDS}}
+wipe_entries = [{{WIPE_ENTRIES}}]
+preserve_entries = [{{PRESERVE_ENTRIES}}]
+tracing_filter = "{{TRACING_FILTER}}"
+bootstrap_peers = [
+{{BOOTSTRAP_PEERS}}
+]

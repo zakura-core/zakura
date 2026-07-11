@@ -1,0 +1,21 @@
+[Unit]
+Description=Zakura continuous genesis sync controller
+Documentation=https://github.com/zakura-core/zakura
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/zakura-alerts.env
+Environment=PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CARGO_HOME=/root/.cargo
+Environment=RUSTUP_HOME=/root/.rustup
+ExecStart=/usr/local/sbin/zakura-continuous-sync.py --config {{CONTROLLER_CONFIG_PATH}} run
+Restart=no
+TimeoutStopSec=120
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

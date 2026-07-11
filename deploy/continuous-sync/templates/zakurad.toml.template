@@ -1,0 +1,41 @@
+# Rendered by deploy/continuous-sync/deploy.py.
+# The controller fills TRACE_DIR for every fresh sync cycle.
+
+[network]
+network = "Mainnet"
+listen_addr = "0.0.0.0:8233"
+cache_dir = "{{STATE_CACHE_DIR}}"
+p2p_stack = "{{P2P_STACK}}"
+
+[network.zakura]
+listen_addr = "0.0.0.0:8234"
+trace_dir = "{{TRACE_DIR}}"
+bootstrap_peers = [
+{{BOOTSTRAP_PEERS}}
+]
+
+[network.zakura.block_sync]
+replace_legacy_syncer = true
+
+[state]
+cache_dir = "{{STATE_CACHE_DIR}}"
+storage_mode = "pruned"
+
+[metrics]
+endpoint_addr = "127.0.0.1:9999"
+
+[health]
+listen_addr = "127.0.0.1:8080"
+min_connected_peers = 1
+ready_max_blocks_behind = 2
+ready_max_tip_age = "5m"
+enforce_on_test_networks = true
+
+[consensus]
+checkpoint_sync = true
+vct_fast_sync = true
+
+[tracing]
+log_file = "{{LOG_FILE}}"
+use_color = false
+filter = "{{TRACING_FILTER}}"

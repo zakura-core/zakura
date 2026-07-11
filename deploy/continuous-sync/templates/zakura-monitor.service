@@ -1,0 +1,8 @@
+[Unit]
+Description=Zakura continuous sync Slack alert monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zakura-monitor.py --config {{ALERT_CONFIG_PATH}}

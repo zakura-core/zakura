@@ -46,9 +46,9 @@ python3 deploy.py deploy --config nodes.toml --no-restart    # stage only
 python3 deploy.py status --config nodes.toml
 
 # Pull logs (deterministic log_file from the rendered config).
-python3 deploy.py logs fetch  --config nodes.toml                 # -> logs/<name>.log
-python3 deploy.py logs fetch  --config nodes.toml --lines 2000    # last N lines only
-python3 deploy.py logs follow --config nodes.toml --node node-a   # live tail -F
+python3 deploy.py logs fetch  --config nodes.toml              # -> logs/<name>.log
+python3 deploy.py logs fetch  --config nodes.toml --lines 2000 # last N lines only
+python3 deploy.py logs follow --config nodes.toml --node node-a
 ```
 
 ## GitHub Actions testnet fleet deploy
@@ -231,8 +231,8 @@ The mainnet workflow also installs a Slack watchdog on `us-east-0`:
 The watchdog polls the mainnet dashboard locally at
 `http://127.0.0.1:8090/data` and the testnet dashboard at
 `http://167.99.103.111:8090/data`. It posts transition alerts to Slack
-`#zakura-alerts` via an incoming webhook in `SLACK_WEB_HOOK`. A node alert fires when either of these
-conditions stays true for at least 10 minutes:
+`#zakura-alerts` via an incoming webhook in `SLACK_WEB_HOOK`. A node alert fires
+when either of these conditions stays true for at least 10 minutes:
 
 - `health` is `down` or `rpc_error`
 - `seconds_since_advanced` is at least 600 seconds
@@ -263,6 +263,17 @@ Local status checks:
 systemctl status zakura-fleet-watchdog
 journalctl -u zakura-fleet-watchdog -f
 ```
+
+## Continuous genesis sync fleet
+
+The permanent three-node genesis sync canary is managed separately under
+`deploy/continuous-sync/`. It repeatedly builds latest `origin/main`, wipes only
+its dedicated disposable state, syncs from genesis to tip, posts Slack
+completion/failure alerts through its codified monitor timer, and retains five
+days of logs and traces.
+
+See `deploy/continuous-sync/README.md` for the inventory, workflow, safety
+invariants, replacement-node bootstrap, and manual `status` / `resume` commands.
 
 ## How the build cache works
 

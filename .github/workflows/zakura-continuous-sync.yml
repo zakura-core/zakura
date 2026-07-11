@@ -1,0 +1,132 @@
+name: Zakura continuous genesis sync fleet
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Operation to run"
+        required: true
+        type: choice
+        default: status
+        options:
+          - deploy
+          - status
+          - resume
+          - audit
+      node:
+        description: "Optional node name; blank targets the whole fleet"
+        required: false
+        type: string
+        default: ""
+      no_start:
+        description: "For deploy: install files but do not start the controller"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17,47 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zakura-continuous-sync
+  cancel-in-progress: false
+
+jobs:
+  fleet:
+    name: "Continuous sync ${{ github.event_name == 'schedule' && 'audit' || inputs.action }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve operation
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "ACTION=audit" >> "$GITHUB_ENV"
+            echo "NODE=" >> "$GITHUB_ENV"
+            echo "NO_START=false" >> "$GITHUB_ENV"
+          else
+            echo "ACTION=${{ inputs.action }}" >> "$GITHUB_ENV"
+            echo "NODE=${{ inputs.node }}" >> "$GITHUB_ENV"
+            echo "NO_START=${{ inputs.no_start }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure SSH
+        env:
+          ZAKURA_CONTINUOUS_SYNC_SSH_KEY: ${{ secrets.ZAKURA_CONTINUOUS_SYNC_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          : > ~/.ssh/known_hosts
+          for host in 138.68.43.212 138.197.218.91 134.209.49.92; do
+            ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
+          done
+          chmod 600 ~/.ssh/known_hosts
+
+          if [ -n "${ZAKURA_CONTINUOUS_SYNC_SSH_KEY}" ]; then
+            install -m 600 /dev/null ~/.ssh/zakura-continuous-sync
+            printf '%s\n' "${ZAKURA_CONTINUOUS_SYNC_SSH_KEY}" > ~/.ssh/zakura-continuous-sync
+            cat >> ~/.ssh/config <<'EOF'
+          Host 138.68.43.212 138.197.218.91 134.209.49.92
+            IdentityFile ~/.ssh/zakura-continuous-sync
+            IdentitiesOnly yes
+            User root
+          EOF
+            chmod 600 ~/.ssh/config
+          else
+            echo "ZAKURA_CONTINUOUS_SYNC_SSH_KEY is not set; using the runner's default SSH identity."
+          fi
+
+      - name: Deploy controllers
+        if: env.ACTION == 'deploy'
+        run: |
+          set -euo pipefail
+          args=(deploy)
+          if [ "${NO_START}" = "true" ]; then
+            args+=(--no-start)
+          fi
+          if [ -n "${NODE}" ]; then
+            python3 deploy/continuous-sync/deploy.py --node "${NODE}" "${args[@]}"
+          else
+            python3 deploy/continuous-sync/deploy.py "${args[@]}"
+          fi
+
+      - name: Show status
+        if: env.ACTION == 'status'
+        run: |
+          set -euo pipefail
+          if [ -n "${NODE}" ]; then
+            python3 deploy/continuous-sync/deploy.py --node "${NODE}" status
+          else
+            python3 deploy/continuous-sync/deploy.py status
+          fi
+
+      - name: Resume controllers
+        if: env.ACTION == 'resume'
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE}" ]; then
+            echo "::error::resume requires a single node input"
+            exit 1
+          fi
+          python3 deploy/continuous-sync/deploy.py --node "${NODE}" resume
+
+      - name: Audit controllers
+        if: env.ACTION == 'audit'
+        env:
+          SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+        run: |
+          set -euo pipefail
+          args=(audit)
+          if [ -n "${NODE}" ]; then
+            python3 deploy/continuous-sync/deploy.py --node "${NODE}" "${args[@]}"
+          else
+            python3 deploy/continuous-sync/deploy.py "${args[@]}"
+          fi

@@ -1,0 +1,15 @@
+[defaults]
+service_name = "{{SERVICE_NAME}}"
+metrics_url = "{{METRICS_URL}}"
+log_file = "{{LOG_FILE}}"
+trace_link = "{{TRACE_LINK}}"
+monitor_log = "{{MONITOR_LOG}}"
+controller_state_path = "{{STATE_DIR}}/state.json"
+alert_state_file = "{{ALERT_STATE_FILE}}"
+alert_env_file = "{{ALERT_ENV_FILE}}"
+alert_ssh_key = "{{ALERT_SSH_KEY}}"
+alert_status_command = "{{ALERT_STATUS_COMMAND}}"
+alert_throttle_seconds = {{ALERT_THROTTLE_SECONDS}}
+cluster_stall_seconds = {{CLUSTER_STALL_SECONDS}}
+
+{{ALERT_NODES}}

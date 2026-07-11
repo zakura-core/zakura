@@ -75,7 +75,7 @@ environment variable names match the sync-check script.
 | `ZAKURA_RPC_URL`          | `--zakura-rpc-url`           | `http://127.0.0.1:8232`               | Zakura JSON-RPC endpoint |
 | `ZAKURA_COOKIE_FILE`      | `--zakura-cookie-file`       | `/root/.cache/zakura/.cookie`         | Zakura RPC cookie file |
 | `ZCASHD_RPC_URL`          | `--zcashd-rpc-url`          | `http://[::1]:8232`                   | zcashd JSON-RPC endpoint |
-| `ZCASHD_COOKIE_FILE`      | `--zcashd-cookie-file`      | `/mnt/snapshots/runtime/zcashd/.cookie` | zcashd RPC cookie file |
+| `ZCASHD_COOKIE_FILE`      | `--zcashd-cookie-file`      | `/mnt/data/runtime/zcashd/.cookie` | zcashd RPC cookie file |
 | `ZAKURAD_PROCESS_PATTERN` | `--zakurad-process-pattern`  | `zakurad .*--zcashd-compat`            | `pgrep -f` pattern for zakurad |
 | `ZCASHD_PROCESS_PATTERN`  | `--zcashd-process-pattern`  | `zcashd .*-connect`              | `pgrep -f` pattern for zcashd |
 | `HEIGHT_MAX_DRIFT`        | `--height-max-drift`        | `10`                                  | Max allowed height drift |

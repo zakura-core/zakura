@@ -66,6 +66,7 @@ jobs:
     # time fleet rollouts that all build the same tag.
     env:
       CARGO_TARGET_DIR: /root/.cache/zakura-deployer-target
+      ZAKURA_DEPLOYER_BUILD_CACHE_DIR: /root/.cache/zakura-deployer-binaries
 
     steps:
       - name: Checkout deploy ref
@@ -93,11 +94,6 @@ jobs:
         with:
           toolchain: stable
           cache: false
-
-      - name: Restore Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          cache-on-failure: true
 
       - name: Install build dependencies
         run: |
@@ -333,7 +329,7 @@ jobs:
             }
             in_compat_docker && $0 ~ /^rpc_listen_addr[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8232"/ {
               print "rpc_auth   = \"cookie\""
-              print "rpc_config_path = \"/mnt/zcashd-compat-docker-data/zcashd-data/.cookie\""
+              print "rpc_config_path = \"/mnt/data/zcashd-data/.cookie\""
               in_compat_docker = 0
             }
           ' "$RUNNER_TEMP/dashboard.nodes.toml" > "$RUNNER_TEMP/dashboard.nodes.toml.tmp"
@@ -346,11 +342,11 @@ jobs:
           probe_kind = "zcashd"
           service_name = ""
           # Managed/path install from zcashd-compat-manifest.json (v1.0.0-compat-rc0).
-          bin_path = "/mnt/snapshots/import-zebra/zcashd-compat/bin/v1.0.0-compat-rc0/x86_64-pc-linux-gnu/zcashd"
+          bin_path = "/mnt/data/import-zebra/zcashd-compat/bin/v1.0.0-compat-rc0/x86_64-pc-linux-gnu/zcashd"
           log_file = ""
           rpc_listen_addr = "[::1]:8232"
           rpc_auth = "cookie"
-          rpc_config_path = "/mnt/snapshots/runtime/zcashd/.cookie"
+          rpc_config_path = "/mnt/data/runtime/zcashd/.cookie"
           # P2P sidecar (post -zebra-compat): supervised with -connect=127.0.0.1:8233.
           process_pattern = "zcashd .*-connect=127.0.0.1:8233"
 
@@ -364,7 +360,7 @@ jobs:
           log_file = ""
           rpc_listen_addr = "127.0.0.1:8232"
           rpc_auth = "cookie"
-          rpc_config_path = "/mnt/zcashd-compat-docker-data/zcashd-data/.cookie"
+          rpc_config_path = "/mnt/data/zcashd-data/.cookie"
           EOF
           sudo install -m 644 "$RUNNER_TEMP/dashboard.nodes.toml" "$dashboard_dir/nodes.toml"
 
@@ -412,7 +408,7 @@ jobs:
           elif sudo test -f /etc/zakura-fleet-watchdog/env; then
             # Keep an existing webhook env across deploys that omit the secret.
             sudo grep -E '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)=' \
-              /etc/zakura-fleet-watchdog/env > "$tmp_env" || : > "$tmp_env"
+              /etc/zakura-fleet-watchdog/env | tee "$tmp_env" >/dev/null || : > "$tmp_env"
           else
             : > "$tmp_env"
           fi

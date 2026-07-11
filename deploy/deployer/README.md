@@ -99,9 +99,11 @@ explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
 while forcing the legacy non-VCT path. Fleet nodes use `p2p_stack = "dual"`;
 `zakura-compat` uses `p2p_stack = "legacy"` (legacy TCP only). It also writes
 `/etc/zakura/zakura.toml` and uses each node's existing
-`/mnt/<node-name>-data/zakura-cache` snapshot directory, so CI restarts the
-current `zakurad.service` against the existing state instead of creating a
-fresh database. The compat Zakura process uses the same snapshot layout on its
+`/mnt/data/zakura-cache` snapshot directory, so CI restarts the current
+`zakurad.service` against the existing state instead of creating a fresh
+database. Volume-backed fleet hosts mount their attached DigitalOcean block
+volume at `/mnt/data`; legacy `/mnt/<node-name>-data` paths are compatibility
+symlinks only. The compat Zakura process uses the same snapshot layout on its
 host.
 
 The workflow also refreshes a simple fleet status dashboard on
@@ -265,10 +267,35 @@ journalctl -u zakura-fleet-watchdog -f
 ## How the build cache works
 
 `commit` is resolved to a full SHA (`git rev-parse`). The binary is cached at
-`.build-cache/zakurad-<sha>`. A cached binary is reused only if its embedded
-`zakurad --version` matches the SHA, otherwise it is rebuilt. Two nodes on the same
+`.build-cache/zakurad-<sha>` by default, or under
+`$ZAKURA_DEPLOYER_BUILD_CACHE_DIR/zakurad-<sha>` when that environment variable
+is set. A cached binary is reused only if `zakurad --version` runs successfully;
+the SHA-named cache file ties the binary to its commit. Two nodes on the same
 commit build once. Each build happens in a throwaway detached `git worktree`, so
-your dirty working tree is never touched. Use `--force` to rebuild unconditionally.
+your dirty working tree is never touched. Use `--force` to rebuild the exact-SHA
+binary unconditionally while still allowing Cargo to reuse `$CARGO_TARGET_DIR`.
+
+The GitHub Actions deploy workflows set persistent cache locations outside the
+checked-out workspace:
+
+- Testnet: `CARGO_TARGET_DIR=/mnt/data/zakura-deployer/cargo-target` and
+  `ZAKURA_DEPLOYER_BUILD_CACHE_DIR=/mnt/data/zakura-deployer/binaries`.
+- Mainnet: `CARGO_TARGET_DIR=/root/.cache/zakura-deployer-target` and
+  `ZAKURA_DEPLOYER_BUILD_CACHE_DIR=/root/.cache/zakura-deployer-binaries`.
+
+Old exact-SHA binaries are pruned after successful builds. The current binary is
+always kept, and `ZAKURA_DEPLOYER_BUILD_CACHE_RETAIN` controls total retained
+binaries (default `12`). Remove the cache directory manually only when no deploy
+job is running.
+
+When a cache path is under `/mnt/data`, the deployer verifies that `/mnt/data` is
+a real mount point before building. Managed `zakurad` units rendered by the
+deployer also require `/mnt/data` before starting, preventing a missing volume
+from creating chain state on the root disk.
+
+For new DigitalOcean volume-backed fleet hosts, format and mount the attached
+volume at `/mnt/data` in `/etc/fstab`; do not use droplet-specific mount names
+for new hosts.
 
 ## What gets installed on a node
 

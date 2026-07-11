@@ -43,7 +43,7 @@ pub struct Config {
         global = true,
         long,
         env = "ZCASHD_COOKIE_FILE",
-        default_value = "/mnt/snapshots/runtime/zcashd/.cookie"
+        default_value = "/mnt/data/runtime/zcashd/.cookie"
     )]
     pub zcashd_cookie_file: PathBuf,
 

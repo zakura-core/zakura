@@ -2639,11 +2639,12 @@ fn header_history_tree_is_at_height(
 ) -> bool {
     match tree.as_ref().map(|tree| tree.current_height()) {
         Some(current_height) => current_height == height,
-        None => match zakura_chain::parameters::NetworkUpgrade::Heartwood.activation_height(network)
-        {
-            Some(heartwood) => height < heartwood,
-            None => true,
-        },
+        None => {
+            match zakura_chain::parameters::NetworkUpgrade::Heartwood.activation_height(network) {
+                Some(heartwood) => height < heartwood,
+                None => true,
+            }
+        }
     }
 }
 

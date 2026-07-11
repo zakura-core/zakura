@@ -404,7 +404,7 @@ pub enum ReadResponse {
     /// next height.
     BestHeaderHistoryTree {
         /// The reconstructed history tree, positioned at `frontier`.
-        tree: Arc<zebra_chain::history_tree::HistoryTree>,
+        tree: Arc<zakura_chain::history_tree::HistoryTree>,
         /// The `(height, hash)` the tree is positioned at (the confirmed contiguous frontier).
         frontier: (block::Height, block::Hash),
     },

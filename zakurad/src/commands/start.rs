@@ -2193,8 +2193,9 @@ mod zakura_header_sync_driver_tests {
     /// unconfirmed tip root — the exact posture the running reactor keeps.
     #[tokio::test(flavor = "multi_thread")]
     async fn header_sync_driver_startup_resumes_at_reconstructed_frontier() {
-        let network = zebra_chain::parameters::Network::Mainnet;
-        let (mut state_service, read_state, _, _) = zebra_state::init_test_services(&network).await;
+        let network = zakura_chain::parameters::Network::Mainnet;
+        let (mut state_service, read_state, _, _) =
+            zakura_state::init_test_services(&network).await;
 
         let genesis = mainnet_block(&BLOCK_MAINNET_GENESIS_BYTES);
         let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
@@ -2204,8 +2205,8 @@ mod zakura_header_sync_driver_tests {
             .ready()
             .await
             .expect("state service is ready")
-            .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
-                zebra_state::CheckpointVerifiedBlock::from(genesis.clone()),
+            .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
+                zakura_state::CheckpointVerifiedBlock::from(genesis.clone()),
             ))
             .await
             .expect("genesis block commits");
@@ -2216,7 +2217,7 @@ mod zakura_header_sync_driver_tests {
             .ready()
             .await
             .expect("state service is ready")
-            .call(zebra_state::Request::CommitHeaderRange {
+            .call(zakura_state::Request::CommitHeaderRange {
                 anchor: genesis.hash(),
                 headers: vec![block1.header.clone(), block2.header.clone()],
                 body_sizes: vec![0, 0],
@@ -2249,7 +2250,7 @@ mod zakura_header_sync_driver_tests {
         // pre-Heartwood mainnet blocks, so that frontier tree is the empty tree.
         assert_eq!(
             startup.best_header_history_tree.as_ref(),
-            &zebra_chain::history_tree::HistoryTree::default(),
+            &zakura_chain::history_tree::HistoryTree::default(),
             "reconstructed frontier tree is the pre-Heartwood empty tree",
         );
     }
@@ -2275,7 +2276,7 @@ mod zakura_header_sync_driver_tests {
                 best_header_tip: Some((block::Height(0), genesis_hash)),
                 best_header_parent_hash: None,
                 best_header_history_tree: Arc::new(
-                    zebra_chain::history_tree::HistoryTree::default(),
+                    zakura_chain::history_tree::HistoryTree::default(),
                 ),
                 verified_block_tip_hash: genesis_hash,
             }),
@@ -2387,7 +2388,7 @@ mod zakura_header_sync_driver_tests {
                 best_header_tip: Some((block::Height(0), genesis_hash)),
                 best_header_parent_hash: None,
                 best_header_history_tree: Arc::new(
-                    zebra_chain::history_tree::HistoryTree::default(),
+                    zakura_chain::history_tree::HistoryTree::default(),
                 ),
                 verified_block_tip_hash: genesis_hash,
             }),

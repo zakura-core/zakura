@@ -983,9 +983,9 @@ async fn rpc_getblock_missing_error() {
 /// https://github.com/zcash/zcash/blob/v6.3.0/src/rpc/blockchain.cpp#L404
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblock_side_chain_verbosity2_does_not_panic() {
-    let _init_guard = zebra_test::init();
+    let _init_guard = zakura_test::init();
 
-    let block: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .unwrap();
     let block_hash = block.hash();
@@ -1027,7 +1027,7 @@ async fn rpc_getblock_side_chain_verbosity2_does_not_panic() {
         .respond(ReadResponse::BlockHeader {
             header: block_header,
             hash: block_hash,
-            height: zebra_chain::block::Height(0),
+            height: zakura_chain::block::Height(0),
             next_block_hash: None,
         });
     read_state

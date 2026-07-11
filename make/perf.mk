@@ -25,7 +25,7 @@
 
 PERF_SH ?= $(CURDIR)/deploy/runner/perf.sh
 FEED_RUN ?= $(CURDIR)/deploy/runner/feed_run.sh
-PERF_MAINNET_CONFIG ?= $(CURDIR)/deploy/runner/zebra-mainnet-bench-config.toml
+PERF_MAINNET_CONFIG ?= $(CURDIR)/deploy/runner/zakura-mainnet-bench-config.toml
 
 PERF_GOAL_ARG := $(word 2,$(MAKECMDGOALS))
 ifneq ($(filter perf-build-stage-bin perf-run perf-run-mainnet,$(firstword $(MAKECMDGOALS))),)

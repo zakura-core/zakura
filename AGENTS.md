@@ -1,13 +1,13 @@
-# Zebra — Agent Guidelines
+# Zakura — Agent Guidelines
 
 > This file is read by AI coding agents (Claude Code, GitHub Copilot, Cursor, Devin, etc.).
 > It provides project context and contribution policies.
 
 # Before You Contribute
 
-**Every PR to Zebra requires human review.** After the contribution gate above is satisfied, use this pre-PR checklist:
+**Every PR to Zakura requires human review.** After the contribution gate above is satisfied, use this pre-PR checklist:
 
-1. Confirm scope: Zebra is a validator node. Avoid out-of-scope features like wallets, block explorers, or mining pools.
+1. Confirm scope: Zakura is a validator node. Avoid out-of-scope features like wallets, block explorers, or mining pools.
 2. Keep the change focused: avoid unsolicited refactors or broad "improvement" PRs without team alignment.
 3. Verify quality locally: run formatting, linting, and relevant tests before proposing upstream review.
 4. Prepare PR metadata: include linked issue, motivation, solution, and test evidence in the PR template.
@@ -19,11 +19,11 @@ This applies regardless of code quality: maintainer review time is limited, so l
 
 The contribution gate already defines discussion/issue requirements. Additional common closure reasons:
 
-- Issue exists but has no response from a Zebra team member (creating an issue and immediately opening a PR does not count as discussion)
+- Issue exists but has no response from a Zakura team member (creating an issue and immediately opening a PR does not count as discussion)
 - Trivial changes (typo fixes, minor formatting) without team request
 - Refactors or "improvements" nobody asked for
 - Streams of PRs without prior discussion of the overall plan
-- Features outside Zebra's scope (wallets, block explorers, mining pools — these belong in [Zaino](https://github.com/zingolabs/zaino), [Zallet](https://github.com/zcash/wallet), or [librustzcash](https://github.com/zcash/librustzcash))
+- Features outside Zakura's scope (wallets, block explorers, mining pools — these belong in [Zaino](https://github.com/zingolabs/zaino), [Zallet](https://github.com/zcash/wallet), or [librustzcash](https://github.com/zcash/librustzcash))
 - Missing test evidence for behavior changes
 - Inability to explain the logic or design tradeoffs of the changes when asked
 
@@ -33,11 +33,11 @@ If AI tools were used to write code, tests, or PR descriptions, disclose this in
 
 ## Project Structure & Module Organization
 
-Zebra is a Rust workspace. Main crates include:
+Zakura is a Rust workspace. Main crates include:
 
-- `zebrad/` (node CLI/orchestration),
-- core libraries like `zebra-chain/`, `zebra-consensus/`, `zebra-network/`, `zebra-state/`, `zebra-rpc/`,
-- support crates like `zebra-node-services/`, `zebra-test/`, `zebra-utils/`, `tower-batch-control/`, and `tower-fallback/`.
+- `zakurad/` (node CLI/orchestration),
+- core libraries like `zakura-chain/`, `zakura-consensus/`, `zakura-network/`, `zakura-state/`, `zakura-rpc/`,
+- support crates like `zakura-node-services/`, `zakura-test/`, `zakura-utils/`, `tower-batch-control/`, and `tower-fallback/`.
 
 Code is primarily in each crate's `src/`; integration tests are in `*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Documentation is in `book/` and `docs/decisions/`. CI and policy automation live in `.github/workflows/`.
 
@@ -55,11 +55,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
 # Run a single crate's tests
-cargo test -p zebra-chain
-cargo test -p zebra-state
+cargo test -p zakura-chain
+cargo test -p zakura-state
 
 # Run a single test by name
-cargo test -p zebra-chain -- test_name
+cargo test -p zakura-chain -- test_name
 
 # CI-like nextest profile for broad coverage
 cargo nextest run --profile all-tests --locked --release --features default-release-binaries --run-ignored=all
@@ -78,50 +78,50 @@ cargo nextest run --profile sync-large-checkpoints-empty
 
 ## Project Overview
 
-Zebra is a Zcash full node implementation in Rust. It is a validator node — it excludes features not strictly needed for block validation and chain sync.
+Zakura is a Zcash full node implementation in Rust. It is a validator node — it excludes features not strictly needed for block validation and chain sync.
 
 - **Rust edition**: 2021
-- **MSRV**: 1.91 (unified across the library crates and the zebrad binary)
-- **Database format version**: defined in `zebra-state/src/constants.rs`
+- **MSRV**: 1.91 (unified across the library crates and the zakurad binary)
+- **Database format version**: defined in `zakura-state/src/constants.rs`
 
 ## Crate Architecture
 
 ```text
-zebrad (CLI orchestration)
-  ├── zebra-consensus (block/transaction verification)
-  │     └── zebra-script (script validation via FFI)
-  ├── zebra-state (finalized + non-finalized storage)
-  ├── zebra-network (P2P, peer management)
-  └── zebra-rpc (JSON-RPC + gRPC)
-        └── zebra-node-services (service trait aliases)
-              └── zebra-chain (core data types, no async)
+zakurad (CLI orchestration)
+  ├── zakura-consensus (block/transaction verification)
+  │     └── zakura-script (script validation via FFI)
+  ├── zakura-state (finalized + non-finalized storage)
+  ├── zakura-network (P2P, peer management)
+  └── zakura-rpc (JSON-RPC + gRPC)
+        └── zakura-node-services (service trait aliases)
+              └── zakura-chain (core data types, no async)
 ```
 
 **Dependency rules**:
 
 - Dependencies flow **downward only** — lower crates must not depend on higher ones
-- `zebra-chain` is **sync-only**: no async, no tokio, no Tower services
-- `zebra-node-services` defines service trait aliases used across crates
-- `zebrad` orchestrates all components but contains minimal logic
-- Utility crates: `tower-batch-control`, `tower-fallback`, `zebra-test`
+- `zakura-chain` is **sync-only**: no async, no tokio, no Tower services
+- `zakura-node-services` defines service trait aliases used across crates
+- `zakurad` orchestrates all components but contains minimal logic
+- Utility crates: `tower-batch-control`, `tower-fallback`, `zakura-test`
 
 ### Per-Crate Concerns
 
 | Crate | Key Concerns |
 | --- | --- |
-| `zebra-chain` | Serialization correctness, no async, consensus-critical data structures |
-| `zebra-network` | Protocol correctness, peer handling, rate limiting, DoS resistance |
-| `zebra-consensus` | Verification completeness, error handling, checkpoint vs semantic paths |
-| `zebra-state` | Read/write separation (`ReadRequest` vs `Request`), database migrations |
-| `zebra-rpc` | zcashd compatibility, error responses, timeout handling |
-| `zebra-script` | FFI safety, memory management, lifetime/ownership across boundaries |
+| `zakura-chain` | Serialization correctness, no async, consensus-critical data structures |
+| `zakura-network` | Protocol correctness, peer handling, rate limiting, DoS resistance |
+| `zakura-consensus` | Verification completeness, error handling, checkpoint vs semantic paths |
+| `zakura-state` | Read/write separation (`ReadRequest` vs `Request`), database migrations |
+| `zakura-rpc` | zcashd compatibility, error responses, timeout handling |
+| `zakura-script` | FFI safety, memory management, lifetime/ownership across boundaries |
 
 ## Coding Style & Naming Conventions
 
 - Rust 2021 conventions and `rustfmt` defaults apply across the workspace (4-space indentation).
 - Naming: `snake_case` for functions/modules/files, `CamelCase` for types/traits, `SCREAMING_SNAKE_CASE` for constants.
 - Respect workspace lint policy in `.cargo/config.toml` and crate-specific lint config in `clippy.toml`.
-- Keep dependencies flowing downward across crates; maintain `zebra-chain` as sync-only.
+- Keep dependencies flowing downward across crates; maintain `zakura-chain` as sync-only.
 
 ## Code Patterns
 

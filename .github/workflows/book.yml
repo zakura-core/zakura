@@ -49,7 +49,7 @@ jobs:
         with:
           toolchain: nightly
           cache-on-failure: true
-      - uses: ./.github/actions/setup-zebra-build
+      - uses: ./.github/actions/setup-zakura-build
 
       - name: Build Zebra book
         run: |

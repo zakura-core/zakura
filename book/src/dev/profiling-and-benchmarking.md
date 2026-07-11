@@ -1,38 +1,38 @@
-# Profiling and Benchmarking Zebra
+# Profiling and Benchmarking Zakura
 
-Let's have a look at how we can inspect and evaluate Zebra's performance.
+Let's have a look at how we can inspect and evaluate Zakura's performance.
 
 ## Profiling
 
-To profile Zebra, you can use the [samply](https://github.com/mstange/samply)
+To profile Zakura, you can use the [samply](https://github.com/mstange/samply)
 profiler. Once you have it installed, you can run:
 
 ```bash
 cargo build --profile profiling
-sudo samply record ./target/profiling/zebrad
+sudo samply record ./target/profiling/zakurad
 ```
 
 You can then press `Ctrl+c`, and the profiler will instruct you to navigate your
 web browser to <http://127.0.0.1:3000> where you can snoop around the call stack
-to see where Zebra loafs around the most.
+to see where Zakura loafs around the most.
 
 ## Benchmarking
 
-To benchmark Zebra consistently, you'll need to suppress unpredictable latency
-fluctuations coming from the network. You can do that by running two Zebra
+To benchmark Zakura consistently, you'll need to suppress unpredictable latency
+fluctuations coming from the network. You can do that by running two Zakura
 instances on your localhost: one that is synced up to the block height of your
 interest, and one that will connect only to the first instance.
 
 To spin up the synced instance, you can run
 
 ```bash
-cargo run --release -- --config /path/to/zebrad-synced.toml
+cargo run --release -- --config /path/to/zakurad-synced.toml
 ```
 
-with `/path/to/zebrad-synced.toml` pointing to the config below
+with `/path/to/zakurad-synced.toml` pointing to the config below
 
 ```toml
-# Config for a synced Zebra instance in a network-suppressed setup.
+# Config for a synced Zakura instance in a network-suppressed setup.
 
 [network]
 cache_dir = true
@@ -49,8 +49,8 @@ checkpoint_verify_concurrency_limit = 1000
 parallel_cpu_threads = 0
 ```
 
-This config makes Zebra, among other things, accept quick reconnections from the
-same IP, which will be localhost. Without this setup, Zebra would quickly start
+This config makes Zakura, among other things, accept quick reconnections from the
+same IP, which will be localhost. Without this setup, Zakura would quickly start
 treating localhost as a bad peer, and refuse subsequent reconnections, not
 knowing that they come from separate instances.
 
@@ -63,13 +63,13 @@ cargo build --release
 and run
 
 ```bash
-time ./target/release/zebrad --config /path/to/zebrad-isolated.toml
+time ./target/release/zakurad --config /path/to/zakurad-isolated.toml
 ```
 
-with `path/to/zebrad-isolated.toml` pointing to the config below
+with `path/to/zakurad-isolated.toml` pointing to the config below
 
 ```toml
-# Config for an isolated Zebra instance in a network-suppressed setup.
+# Config for an isolated Zakura instance in a network-suppressed setup.
 
 [network]
 listen_addr = "127.0.0.1:8234"
@@ -95,7 +95,7 @@ ephemeral = true
 debug_stop_at_height = 10_000
 ```
 
-This config makes Zebra:
+This config makes Zakura:
 
 1. connect only to the synced instance via localhost;
 2. use an ephemeral state, so you can run the benchmark again;
@@ -106,8 +106,8 @@ Note that:
 - You can adjust both configs to your liking.
 - You can repeat the `time` command as many times as you need.
 - You can use the two-instance setup for profiling as well.
-- You will likely need to rebuild Zebra for each change you want to benchmark.
+- You will likely need to rebuild Zakura for each change you want to benchmark.
   To speed the build process up, you can link RocksDB dynamically, as described
-  in the section on [building Zebra][building-zebra].
+  in the section on [building Zakura][building-zakura].
 
-[building-zebra]: https://zebra.zfnd.org/user/install.html#building-zebra
+[building-zakura]: install.md#building-zakura

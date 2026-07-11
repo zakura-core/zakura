@@ -2,8 +2,8 @@
 #
 # 1. Deletes specific instances in GCP older than a defined number of days.
 # 2. Deletes instance templates older than a set number of days.
-# 3. Deletes older disks not currently in use, with certain ones prefixed by commit hashes or "zebrad-".
-# 4. Deletes cache images from GCP, retaining a specified number of the latest images for certain types like zebrad checkpoint cache, zebrad tip cache, and lightwalletd + zebrad tip cache.
+# 3. Deletes older disks not currently in use, with certain ones prefixed by commit hashes or "zakurad-".
+# 4. Deletes cache images from GCP, retaining a specified number of the latest images for certain types like zakurad checkpoint cache, zakurad tip cache, and lightwalletd + zakurad tip cache.
 #
 # It uses the gcloud CLI for its operations and is scheduled to run daily at 0700 UTC.
 name: Delete GCP resources
@@ -88,9 +88,9 @@ jobs:
       #
       # Keeps all images younger than $DELETE_AGE_DAYS.
       # Also keeps $KEEP_LATEST_IMAGE_COUNT older images of each type, for each network:
-      # - zebrad checkpoint cache
-      # - zebrad tip cache
-      # - lightwalletd + zebrad tip cache
+      # - zakurad checkpoint cache
+      # - zakurad tip cache
+      # - lightwalletd + zakurad tip cache
       #
       # TODO:
       # - refactor out repeated shell script code

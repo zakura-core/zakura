@@ -4,15 +4,26 @@
 #
 # This script handles privilege dropping and launches zakurad or tests.
 # Configuration is managed by config-rs using defaults, optional TOML, and
-# environment variables prefixed with ZAKURA_.
+# environment variables prefixed with ZAKURA_. Legacy ZEBRA_ variables are
+# translated by this entrypoint before zakurad starts.
 
 set -eo pipefail
+
+# Preserve Docker environment compatibility without retaining legacy names in
+# zakurad's config loader. Explicit ZAKURA_ values take precedence.
+while IFS= read -r legacy_name; do
+  zakura_name="ZAKURA_${legacy_name#ZEBRA_}"
+  if ! declare -p "$zakura_name" &>/dev/null; then
+    printf -v "$zakura_name" '%s' "${!legacy_name}"
+    export "$zakura_name"
+  fi
+done < <(compgen -e ZEBRA_)
 
 # Default cache directories for Zakura components.
 # These use the config-rs ZAKURA_SECTION__KEY format and will be picked up
 # by zakurad's configuration system automatically.
-: "${ZAKURA_STATE__CACHE_DIR:=${ZEBRA_STATE__CACHE_DIR:-${HOME}/.cache/zakura}}"
-: "${ZAKURA_RPC__COOKIE_DIR:=${ZEBRA_RPC__COOKIE_DIR:-${HOME}/.cache/zakura}}"
+: "${ZAKURA_STATE__CACHE_DIR:=${HOME}/.cache/zakura}"
+: "${ZAKURA_RPC__COOKIE_DIR:=${HOME}/.cache/zakura}"
 export ZAKURA_STATE__CACHE_DIR ZAKURA_RPC__COOKIE_DIR
 
 # Leave zcashd-compat disabled unless the container runtime explicitly opts in.
@@ -20,10 +31,10 @@ export ZAKURA_STATE__CACHE_DIR ZAKURA_RPC__COOKIE_DIR
 # /usr/local/bin/zcashd, while still allowing ZAKURA_ZCASHD_COMPAT__* overrides.
 case "${ZCASHD_COMPAT_ENABLED:-}" in
 true | TRUE | 1 | yes | YES | on | ON)
-  export ZAKURA_ZCASHD_COMPAT__ENABLED="${ZAKURA_ZCASHD_COMPAT__ENABLED:-${ZEBRA_ZCASHD_COMPAT__ENABLED:-true}}"
+  export ZAKURA_ZCASHD_COMPAT__ENABLED="${ZAKURA_ZCASHD_COMPAT__ENABLED:-true}"
   if [[ -x /usr/local/bin/zcashd ]]; then
-    export ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE="${ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE:-${ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE:-path}}"
-    export ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH="${ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH:-${ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH:-/usr/local/bin/zcashd}}"
+    export ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE="${ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE:-path}"
+    export ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH="${ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH:-/usr/local/bin/zcashd}"
   fi
   ;;
 false | FALSE | 0 | no | NO | off | OFF | "")
@@ -76,12 +87,6 @@ create_owned_directory() {
 [[ -n ${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR:-} ]] && create_owned_directory "${ZAKURA_ZCASHD_COMPAT__ZCASHD_DATADIR}"
 [[ -n ${ZAKURA_TRACING__LOG_FILE:-} ]] && create_owned_directory "$(dirname "${ZAKURA_TRACING__LOG_FILE}")"
 
-# Legacy ZEBRA_* variables remain accepted by the config loader.
-[[ -n ${ZEBRA_STATE__CACHE_DIR:-} ]] && create_owned_directory "${ZEBRA_STATE__CACHE_DIR}"
-[[ -n ${ZEBRA_RPC__COOKIE_DIR:-} ]] && create_owned_directory "${ZEBRA_RPC__COOKIE_DIR}"
-[[ -n ${ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR:-} ]] && create_owned_directory "${ZEBRA_ZCASHD_COMPAT__ZCASHD_DATADIR}"
-[[ -n ${ZEBRA_TRACING__LOG_FILE:-} ]] && create_owned_directory "$(dirname "${ZEBRA_TRACING__LOG_FILE}")"
-
 # --- Optional config file support ---
 # If provided, pass a config file path through to zakurad via CONFIG_FILE_PATH.
 
@@ -93,18 +98,18 @@ if [[ -n ${CONFIG_FILE_PATH} && -f ${CONFIG_FILE_PATH} ]]; then
 fi
 
 # Main Script Logic
-# - If "$1" is "--", "-", "zakurad", or "zebrad" (legacy alias), run `zakurad`
+# - If "$1" is "--", "-", or "zakurad", run `zakurad`
 #   with the remaining params.
 # - If "$1" is "test", handle test execution
 # - Otherwise run "$@" directly.
 case "$1" in
---* | -* | zakurad | zebrad)
+--* | -* | zakurad)
   shift
   exec_as_user zakurad "${CONFIG_ARGS[@]}" "$@"
   ;;
 test)
   shift
-  if [[ "$1" == "zakurad" || "$1" == "zebrad" ]]; then
+  if [[ "$1" == "zakurad" ]]; then
     shift
     exec_as_user zakurad "${CONFIG_ARGS[@]}" "$@"
   elif [[ -n "${NEXTEST_PROFILE}" ]]; then

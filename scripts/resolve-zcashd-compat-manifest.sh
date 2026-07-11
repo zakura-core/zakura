@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Resolve hash-pinned zcashd compat artifacts from zebrad/zcashd-compat-manifest.json.
+# Resolve hash-pinned zcashd compat artifacts from zakurad/zcashd-compat-manifest.json.
 set -euo pipefail
 
-DEFAULT_MANIFEST="zebrad/zcashd-compat-manifest.json"
+DEFAULT_MANIFEST="zakurad/zcashd-compat-manifest.json"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 MANIFEST_PATH=""
@@ -20,7 +20,7 @@ Reads the committed zcashd compat manifest and either exports GitHub Actions
 outputs or prepares a Docker build context containing bin/zcashd.
 
 Options:
-  --manifest-path PATH       Manifest JSON path (default: zebrad/zcashd-compat-manifest.json)
+  --manifest-path PATH       Manifest JSON path (default: zakurad/zcashd-compat-manifest.json)
   --target-triple TRIPLE     Rust-style target triple
   --platform PLATFORM        Docker platform (linux/amd64)
   --require-targets LIST     Comma-separated target triples that must be present
@@ -149,20 +149,18 @@ write_github_output() {
     echo "manifest_path=$manifest"
   } >> "$output_file"
 
-  local triple prefix url sha256
-  for triple in x86_64-pc-linux-gnu; do
-    if jq -e --arg target "$triple" '
-      [.artifacts[] | select(.target_triple == $target)] | length == 1
-    ' "$manifest" >/dev/null; then
-      prefix="$(target_to_github_prefix "$triple")"
-      url="$(artifact_field "$manifest" "$triple" "runtime_archive_url")"
-      sha256="$(artifact_field "$manifest" "$triple" "runtime_archive_sha256")"
-      {
-        echo "url_${prefix}=$url"
-        echo "sha256_${prefix}=$sha256"
-      } >> "$output_file"
-    fi
-  done
+  local triple="x86_64-pc-linux-gnu" prefix url sha256
+  if jq -e --arg target "$triple" '
+    [.artifacts[] | select(.target_triple == $target)] | length == 1
+  ' "$manifest" >/dev/null; then
+    prefix="$(target_to_github_prefix "$triple")"
+    url="$(artifact_field "$manifest" "$triple" "runtime_archive_url")"
+    sha256="$(artifact_field "$manifest" "$triple" "runtime_archive_sha256")"
+    {
+      echo "url_${prefix}=$url"
+      echo "sha256_${prefix}=$sha256"
+    } >> "$output_file"
+  fi
 }
 
 prepare_build_context() {

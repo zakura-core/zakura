@@ -1,0 +1,58 @@
+[package]
+name = "zakura-node-services"
+version = "7.0.0"
+authors.workspace = true
+description = "The interfaces of some Zebra node services"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+readme = "../README.md"
+homepage.workspace = true
+# crates.io is limited to 5 keywords and categories
+keywords.workspace = true
+# Must be one of <https://crates.io/category_slugs>
+categories = ["asynchronous", "cryptography::cryptocurrencies", "network-programming"]
+
+[features]
+default = []
+
+# Production features that activate extra dependencies, or extra features in dependencies
+
+# Tool and test features
+
+rpc-client = [
+    "color-eyre",
+    "jsonrpsee-types",
+    "reqwest",
+    "serde",
+    "serde_json",
+]
+
+[dependencies]
+zakura-chain = { path = "../zakura-chain" , version = "9.0.0" }
+tower = { workspace = true }
+
+# Optional dependencies
+
+# Tool and test feature rpc-client
+color-eyre = { workspace = true, optional = true }
+jsonrpsee-types = { workspace = true, optional = true }
+# Security: avoid default dependency on openssl
+reqwest = { workspace = true, features = ["rustls-tls"], optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["time", "sync"] }
+
+[dev-dependencies]
+
+color-eyre = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonrpsee-types = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

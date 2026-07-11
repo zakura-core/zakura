@@ -24,10 +24,10 @@ header sync (runs ahead of bodies)
    │ GetHeaders { want_tree_aux_roots } ─▶ peer ─▶ Headers { headers, body_sizes, tree_aux_roots }
    │ (roots carried in-band, all-or-nothing, finalized ranges only; §4.2)
    ▼
-header-sync reactor (zebra-network): validate root count + per-height alignment; reject
+header-sync reactor (zakura-network): validate root count + per-height alignment; reject
    │ unrequested or non-finalized roots as MalformedMessage (§8.1)
    ▼
-CommitHeaderRange (zebra-state): persist provisional roots into
+CommitHeaderRange (zakura-state): persist provisional roots into
    │ commitment_roots_by_height, ahead of body commit (§4.2)
    ▼
 PeerSource (DB-backed reader) ── vct_root(height) ──▶ finalized committer
@@ -40,7 +40,7 @@ finalized committer: verify-before-commit (§6) ──fold roots, skip recompute
 **Serving path (how a node answers other nodes' fetches):**
 
 ```text
-peer GetHeaders { want_tree_aux_roots } ─▶ header-sync reactor ─▶ header-sync driver (zebrad)
+peer GetHeaders { want_tree_aux_roots } ─▶ header-sync reactor ─▶ header-sync driver (zakurad)
    ─▶ ReadRequest::BlockRoots ─▶ committed commitment_roots_by_height index, then provisional
       entries in the same index for header-ahead heights (all-or-nothing; §9)
 ```
@@ -195,15 +195,15 @@ orthogonal pruning axis). The resulting modes:
 Gating fast on `checkpoint_sync` is also a correctness precondition: the embedded last checkpoint height
 frontier is pinned to the network's **full** max checkpoint height (§5.2), which only applies
 when `checkpoint_sync = true` (with it `false`, the effective max checkpoint drops to the
-Canopy mandatory checkpoint, so there is no valid last checkpoint height to resume from). zebrad mirrors
+Canopy mandatory checkpoint, so there is no valid last checkpoint height to resume from). zakurad mirrors
 `consensus.checkpoint_sync` into the state config at startup
 (`state_config.checkpoint_sync`), so the state makes the decision without depending on
-`zebra-consensus`.
+`zakura-consensus`.
 
 In the config file, `consensus.vct_fast_sync` is tri-state: unset (the default) means enabled,
 and the generated default config does not write the key, so configs stay readable by older
-zebrad versions. Explicitly setting `vct_fast_sync = true` together with
-`checkpoint_sync = false` is rejected at zebrad startup as a contradiction; leaving it unset
+zakurad versions. Explicitly setting `vct_fast_sync = true` together with
+`checkpoint_sync = false` is rejected at zakurad startup as a contradiction; leaving it unset
 with checkpoint sync disabled is fine (the node runs legacy either way), so pre-VCT configs
 that disable checkpoint sync keep working unchanged.
 
@@ -226,10 +226,10 @@ the status note at the top of this document).
 
 ### 5.1 Per-block commitment roots (the wire payload)
 
-`zebra_chain::parallel::commitment_aux::BlockCommitmentRoots` holds `{ height, sapling_root,
+`zakura_chain::parallel::commitment_aux::BlockCommitmentRoots` holds `{ height, sapling_root,
 orchard_root, ironwood_root, sapling_tx, orchard_tx, ironwood_tx, auth_data_root }` with
-`ZcashSerialize`/`ZcashDeserialize`. It lives in `zebra-chain` so `zebra-network` and
-`zebra-state` share one type without a dependency cycle. `orchard_root` is the empty/default
+`ZcashSerialize`/`ZcashDeserialize`. It lives in `zakura-chain` so `zakura-network` and
+`zakura-state` share one type without a dependency cycle. `orchard_root` is the empty/default
 root below NU5, and `ironwood_root` is the empty/default root below `Nu6_3` (§6.1). The
 deserializer treats `height` as an unvalidated `u32`: a wrong or out-of-range height simply
 fails to match any local header during verification (§6), so it is harmless; malformed root
@@ -244,7 +244,7 @@ exactly as trustworthy as an originating one.
 Fast mode never advances the running Sapling/Orchard/Ironwood frontiers below the checkpoint,
 so the real frontiers at the checkpoint must be supplied for the resume. `FinalFrontiers {
 height, sapling, orchard, sprout, ironwood }` is embedded in the binary
-(`zebra-state/src/service/finalized_state/vct/mainnet-frontier.bin`, via `include_bytes!`),
+(`zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin`, via `include_bytes!`),
 tied to the network's max checkpoint height (validated on load:
 `embedded VCT final frontier height must match the network's max checkpoint height`). When the
 Mainnet checkpoint list advances, this file is regenerated alongside the checkpoint artifacts
@@ -266,7 +266,7 @@ by the maintenance tool described in §16.
 
 ### 5.3 The `CommitmentRootSource` seam
 
-`CommitmentRootSource` (`zebra-state/.../finalized_state/commitment_aux.rs`) abstracts _where_
+`CommitmentRootSource` (`zakura-state/.../finalized_state/commitment_aux.rs`) abstracts _where_
 the fast path's roots and last checkpoint height frontier come from. The committer (`VctState.source`) reads
 through this one seam regardless of source:
 
@@ -302,13 +302,13 @@ exports a root-writer handle. Header sync writes provisional roots through `Comm
 on the normal state write path, and the committer reads them back through the same database. The
 old per-state `TreeAuxRootsWriter` / `PeerSourceHandle` / targeted-refetch signal are removed.
 The persisted roots store no peer identity; peer accountability for bad roots is the header-sync
-reactor's misbehavior reporting (§8.1), preserving the `zebra-state` / `zebra-network` crate
+reactor's misbehavior reporting (§8.1), preserving the `zakura-state` / `zakura-network` crate
 boundary.
 
 ### 5.4 Roots on the header-sync message
 
 There is no separate roots stream. The header-sync `HeaderSyncMessage` carries roots in two
-places (`zebra-network/src/zakura/header_sync/wire.rs`):
+places (`zakura-network/src/zakura/header_sync/wire.rs`):
 
 - `GetHeaders { start_height, count, want_tree_aux_roots }` — header sync sets
   `want_tree_aux_roots` on its range requests (finalized and non-finalized alike; only roots
@@ -547,8 +547,8 @@ current increment: there is no roots-specific refetch, cooldown, or provenance m
 Restoring liveness after a settled bad root requires re-delivering the affected finalized
 range (a possible follow-up mechanism) or a fresh sync. Peer accountability rides header
 sync's general misbehavior scoring rather than a roots-specific cooldown table, so the
-committer still attributes nothing to peers itself and `zebra-state` keeps no dependency on
-`zebra-network` peer types.
+committer still attributes nothing to peers itself and `zakura-state` keeps no dependency on
+`zakura-network` peer types.
 
 ## 9. The serving read path (`BlockRoots`)
 
@@ -628,7 +628,7 @@ commitment before it influences the anchor set or the history MMR.** Consequence
   roots: originally a standalone roots-only `tree_aux` stream with its own serving side, driver,
   and in-memory `PeerSource` cache — the first point at which real nodes obtained roots over the
   network.
-- **Increment 6b — adversarial peer policy.** A `zebrad` driver recorded height→peer provenance
+- **Increment 6b — adversarial peer policy.** A `zakurad` driver recorded height→peer provenance
   and ran a roots-specific cooldown/demotion/disconnect policy over the `tree_aux` stream.
 - **Increment 6c — fold roots into header sync (current).** The standalone `tree_aux` stream,
   its driver, in-memory cache writer, and bespoke peer policy are **removed**. Roots now ride the
@@ -722,39 +722,39 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
 
 | Area | File |
 | --- | --- |
-| Wire payload (`BlockCommitmentRoots`) | `zebra-chain/src/parallel/commitment_aux.rs` |
-| Source seam, `PeerSource`, producers, bulk root invalidation | `zebra-state/src/service/finalized_state/commitment_aux.rs` |
-| Verify-before-commit logic | `zebra-state/src/service/finalized_state/commitment_aux_verify.rs` |
-| Embedded frontier plumbing, `select_source_mode`, counters | `zebra-state/src/service/finalized_state/vct.rs` |
-| `checkpoint_sync` mirror field (mode input) | `zebra-state/src/config.rs`; set in `zebrad/src/commands/start.rs` |
-| Embedded Mainnet frontier | `zebra-state/src/service/finalized_state/vct/mainnet-frontier.bin` |
-| Commit-path hook, last checkpoint height, frozen-frontier policy | `zebra-state/src/service/finalized_state.rs` |
-| `BlockRoots` serving read (committed + provisional) | `zebra-state/src/service.rs` |
-| Provisional roots in `commitment_roots_by_height`, persistence, body-commit/rollback cleanup | `zebra-state/src/service/finalized_state/zebra_db/block.rs`, `.../rollback.rs` |
-| `CommitHeaderRange` with roots, fast-path hit/miss metrics | `zebra-state/src/service/write.rs` |
-| Header-sync wire (`GetHeaders`/`Headers` roots, markers, byte budget) | `zebra-network/src/zakura/header_sync/wire.rs` |
-| Header-sync root validation (count, height alignment, markers) | `zebra-network/src/zakura/header_sync/validation.rs`, `.../error.rs` |
-| Header-sync reactor (request/serve/receive roots, misbehavior) | `zebra-network/src/zakura/header_sync/reactor.rs` |
-| Header-sync driver: serve `BlockRoots`, all-or-nothing helper, route received roots | `zebrad/src/commands/start/zakura/header_sync_driver.rs` |
+| Wire payload (`BlockCommitmentRoots`) | `zakura-chain/src/parallel/commitment_aux.rs` |
+| Source seam, `PeerSource`, producers, bulk root invalidation | `zakura-state/src/service/finalized_state/commitment_aux.rs` |
+| Verify-before-commit logic | `zakura-state/src/service/finalized_state/commitment_aux_verify.rs` |
+| Embedded frontier plumbing, `select_source_mode`, counters | `zakura-state/src/service/finalized_state/vct.rs` |
+| `checkpoint_sync` mirror field (mode input) | `zakura-state/src/config.rs`; set in `zakurad/src/commands/start.rs` |
+| Embedded Mainnet frontier | `zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin` |
+| Commit-path hook, last checkpoint height, frozen-frontier policy | `zakura-state/src/service/finalized_state.rs` |
+| `BlockRoots` serving read (committed + provisional) | `zakura-state/src/service.rs` |
+| Provisional roots in `commitment_roots_by_height`, persistence, body-commit/rollback cleanup | `zakura-state/src/service/finalized_state/zakura_db/block.rs`, `.../rollback.rs` |
+| `CommitHeaderRange` with roots, fast-path hit/miss metrics | `zakura-state/src/service/write.rs` |
+| Header-sync wire (`GetHeaders`/`Headers` roots, markers, byte budget) | `zakura-network/src/zakura/header_sync/wire.rs` |
+| Header-sync root validation (count, height alignment, markers) | `zakura-network/src/zakura/header_sync/validation.rs`, `.../error.rs` |
+| Header-sync reactor (request/serve/receive roots, misbehavior) | `zakura-network/src/zakura/header_sync/reactor.rs` |
+| Header-sync driver: serve `BlockRoots`, all-or-nothing helper, route received roots | `zakurad/src/commands/start/zakura/header_sync_driver.rs` |
 
 ## 16. Frontier regeneration tool
 
 The embedded Mainnet frontier is a release artifact coupled to the last Mainnet checkpoint.
 Whenever the checkpoint list's max height changes, the matching
-`zebra-state/src/service/finalized_state/vct/mainnet-frontier.bin` must be regenerated from a
+`zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin` must be regenerated from a
 synced Zebra state at that same height.
 
 This belongs in the checkpoint-maintenance flow rather than in node runtime configuration. The
-`zebra-checkpoints` utility runs against a synced node and produces the `HEIGHT HASH`
+`zakura-checkpoints` utility runs against a synced node and produces the `HEIGHT HASH`
 checkpoint artifact consumed by `.github/workflows/checkpoint-update.yml`. It also has an
 explicit Mainnet frontier-artifact output:
 
 ```text
-zebra-checkpoints \
+zakura-checkpoints \
   --addr 127.0.0.1:8232 \
   --last-checkpoint <old-height> \
   --mainnet-frontier-output /tmp/mainnet-frontier.bin \
-  --state-cache-dir <synced-zebra-state-cache-dir> \
+  --state-cache-dir <synced-zakura-state-cache-dir> \
   --frontier-height auto
 ```
 
@@ -769,7 +769,7 @@ genesis, because there is no updated last checkpoint height to pair with the fro
 The frontier generator must read Zebra's finalized state, not reconstruct trees from RPC block
 data. Checkpoint generation only needs block hashes and sizes, but frontier generation needs the
 exact Sapling, Orchard, Sprout, and Ironwood note-commitment trees. The utility therefore opens
-Zebra state read-only and calls `zebra-state` helpers that:
+Zebra state read-only and calls `zakura-state` helpers that:
 
 - opens the finalized DB read-only from the supplied state cache directory;
 - reads the Sapling, Orchard, and Ironwood trees at the requested height;
@@ -806,7 +806,7 @@ node will parse the artifact in the same way at startup.
 The focused local checks are:
 
 ```text
-cargo test -p zebra-state final_frontier
-cargo test -p zebra-utils --features zebra-checkpoints
-cargo test -p zebrad --features zebra-checkpoints checkpoints
+cargo test -p zakura-state final_frontier
+cargo test -p zakura-utils --features zakura-checkpoints
+cargo test -p zakura --features zakura-checkpoints checkpoints
 ```

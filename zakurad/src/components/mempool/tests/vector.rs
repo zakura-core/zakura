@@ -1,0 +1,2213 @@
+//! Fixed test vectors for the mempool.
+
+#![allow(clippy::unwrap_in_result)]
+
+use std::{sync::Arc, time::Duration};
+
+use color_eyre::Report;
+use tokio::time::{self, timeout};
+use tower::{ServiceBuilder, ServiceExt};
+
+use rand::{seq::SliceRandom, thread_rng};
+use zakura_chain::{
+    amount::Amount,
+    block::Block,
+    fmt::humantime_seconds,
+    parameters::Network,
+    serialization::ZcashDeserializeInto,
+    transaction::{Transaction, VerifiedUnminedTx},
+    transparent::{self, OutPoint},
+};
+use zakura_consensus::transaction as tx;
+use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
+use zakura_test::mock_service::{MockService, PanicAssertion};
+
+use crate::components::{
+    mempool::{self, *},
+    sync::{RecentSyncLengths, SyncStatus},
+};
+
+/// A [`MockService`] representing the network service.
+type MockPeerSet = MockService<zn::Request, zn::Response, PanicAssertion>;
+
+/// The unmocked Zebra state service's type.
+type StateService = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
+
+/// A [`MockService`] representing the Zebra transaction verifier service.
+type MockTxVerifier = MockService<tx::Request, tx::Response, PanicAssertion, TransactionError>;
+
+#[tokio::test]
+async fn mempool_service_basic() -> Result<(), Report> {
+    // Test multiple times to catch intermittent bugs since eviction is randomized
+    for _ in 0..10 {
+        mempool_service_basic_single().await?;
+    }
+    Ok(())
+}
+
+async fn mempool_service_basic_single() -> Result<(), Report> {
+    // Using the mainnet for now
+    let network = Network::Mainnet;
+
+    // get the genesis block transactions from the Zcash blockchain.
+    let mut unmined_transactions = network.unmined_transactions_in_blocks(1..=10);
+    let genesis_transaction = unmined_transactions
+        .next()
+        .expect("Missing genesis transaction");
+    let last_transaction = unmined_transactions.next_back().unwrap();
+    let more_transactions = unmined_transactions.collect::<Vec<_>>();
+
+    // Use as cost limit the costs of all transactions that will be
+    // inserted except one (the genesis block transaction).
+    let cost_limit = more_transactions.iter().map(|tx| tx.cost()).sum();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    // Enable the mempool
+    service.enable(&mut recent_syncs).await;
+
+    // Insert the genesis block coinbase transaction into the mempool storage.
+    let mut inserted_ids = HashSet::new();
+    service
+        .storage()
+        .insert(genesis_transaction.clone(), Vec::new(), None)?;
+    inserted_ids.insert(genesis_transaction.transaction.id);
+
+    // Test `Request::TransactionIds`
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TransactionIds)
+        .await
+        .unwrap();
+    let genesis_transaction_ids = match response {
+        Response::TransactionIds(ids) => ids,
+        _ => unreachable!("will never happen in this test"),
+    };
+
+    // Test `Request::TransactionsById`
+    let genesis_transactions_hash_set = genesis_transaction_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TransactionsById(
+            genesis_transactions_hash_set.clone(),
+        ))
+        .await
+        .unwrap();
+    let transactions = match response {
+        Response::Transactions(transactions) => transactions,
+        _ => unreachable!("will never happen in this test"),
+    };
+
+    // Make sure the transaction from the blockchain test vector is the same as the
+    // response of `Request::TransactionsById`
+    assert_eq!(genesis_transaction.transaction, transactions[0]);
+
+    // Test `Request::TransactionsByMinedId`
+    // TODO: use a V5 tx to test if it's really matched by mined ID
+    let genesis_transactions_mined_hash_set = genesis_transaction_ids
+        .iter()
+        .map(|txid| txid.mined_id())
+        .collect::<HashSet<_>>();
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TransactionsByMinedId(
+            genesis_transactions_mined_hash_set,
+        ))
+        .await
+        .unwrap();
+    let transactions = match response {
+        Response::Transactions(transactions) => transactions,
+        _ => unreachable!("will never happen in this test"),
+    };
+
+    // Make sure the transaction from the blockchain test vector is the same as the
+    // response of `Request::TransactionsByMinedId`
+    assert_eq!(genesis_transaction.transaction, transactions[0]);
+
+    // Insert more transactions into the mempool storage.
+    // This will cause the genesis transaction to be moved into rejected.
+    // Skip the last (will be used later)
+    for tx in more_transactions {
+        inserted_ids.insert(tx.transaction.id);
+        // Error must be ignored because a insert can trigger an eviction and
+        // an error is returned if the transaction being inserted in chosen.
+        let _ = service.storage().insert(tx.clone(), Vec::new(), None);
+    }
+
+    // Test `Request::RejectedTransactionIds`
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::RejectedTransactionIds(
+            genesis_transactions_hash_set,
+        ))
+        .await
+        .unwrap();
+    let rejected_ids = match response {
+        Response::RejectedTransactionIds(ids) => ids,
+        _ => unreachable!("will never happen in this test"),
+    };
+
+    assert!(rejected_ids.is_subset(&inserted_ids));
+
+    // Test `Request::Queue`
+    // Use the ID of the last transaction in the list
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(vec![last_transaction.transaction.id.into()]))
+        .await
+        .unwrap();
+    let queued_responses = match response {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    assert_eq!(queued_responses.len(), 1);
+    assert!(queued_responses[0].is_ok());
+    assert_eq!(service.tx_downloads().in_flight(), 1);
+
+    // Test `Request::QueueStats`
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::QueueStats)
+        .await
+        .unwrap();
+
+    let (actual_size, actual_bytes, actual_usage) = match response {
+        Response::QueueStats {
+            size,
+            bytes,
+            usage,
+            fully_notified: None,
+        } => (size, bytes, usage),
+        _ => unreachable!("expected QueueStats response"),
+    };
+
+    // Expected values based on storage contents
+    let expected_size = service.storage().transaction_count();
+    let expected_bytes: usize = service
+        .storage()
+        .transactions()
+        .values()
+        .map(|tx| tx.transaction.size)
+        .sum();
+
+    // TODO: Derive memory usage when available
+    let expected_usage = expected_bytes;
+
+    assert_eq!(actual_size, expected_size, "QueueStats size mismatch");
+    assert_eq!(actual_bytes, expected_bytes, "QueueStats bytes mismatch");
+    assert_eq!(actual_usage, expected_usage, "QueueStats usage mismatch");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mempool_queue() -> Result<(), Report> {
+    // Test multiple times to catch intermittent bugs since eviction is randomized
+    for _ in 0..10 {
+        mempool_queue_single().await?;
+    }
+    Ok(())
+}
+
+async fn mempool_queue_single() -> Result<(), Report> {
+    // Using the mainnet for now
+    let network = Network::Mainnet;
+
+    // Get transactions to use in the test
+    let unmined_transactions = network.unmined_transactions_in_blocks(1..=10);
+    let mut transactions = unmined_transactions.collect::<Vec<_>>();
+    // Split unmined_transactions into:
+    // [transactions..., new_tx]
+    // A transaction not in the mempool that will be Queued
+    let new_tx = transactions.pop().unwrap();
+
+    // Use as cost limit the costs of all transactions that will be
+    // inserted except the last.
+    let cost_limit = transactions
+        .iter()
+        .take(transactions.len() - 1)
+        .map(|tx| tx.cost())
+        .sum();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    // Enable the mempool
+    service.enable(&mut recent_syncs).await;
+
+    // Insert [transactions...] into the mempool storage.
+    // This will cause the at least one transaction to be rejected, since
+    // the cost limit is the sum of all costs except of the last transaction.
+    for tx in transactions.iter() {
+        // Error must be ignored because a insert can trigger an eviction and
+        // an error is returned if the transaction being inserted in chosen.
+        let _ = service.storage().insert(tx.clone(), Vec::new(), None);
+    }
+
+    // Test `Request::Queue` for a new transaction
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(vec![new_tx.transaction.id.into()]))
+        .await
+        .unwrap();
+    let queued_responses = match response {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    assert_eq!(queued_responses.len(), 1);
+    assert!(queued_responses[0].is_ok());
+
+    // Test `Request::Queue` with all previously inserted transactions.
+    // They should all be rejected; either because they are already in the mempool,
+    // or because they are in the recently evicted list.
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(
+            transactions
+                .iter()
+                .map(|tx| tx.transaction.id.into())
+                .collect(),
+        ))
+        .await
+        .unwrap();
+    let queued_responses = match response {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    assert_eq!(queued_responses.len(), transactions.len());
+
+    // Check if the responses are consistent
+    let mut in_mempool_count = 0;
+    let mut evicted_count = 0;
+    for response in queued_responses {
+        match response.unbox_mempool_error() {
+            MempoolError::StorageEffectsChain(SameEffectsChainRejectionError::RandomlyEvicted) => {
+                evicted_count += 1
+            }
+            MempoolError::InMempool => in_mempool_count += 1,
+            error => panic!("transaction should not be rejected with reason {error:?}"),
+        }
+    }
+    assert_eq!(in_mempool_count, transactions.len() - 1);
+    assert_eq!(evicted_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mempool_service_stays_enabled_when_legacy_sync_status_falls_behind() -> Result<(), Report>
+{
+    // Using the mainnet for now
+    let network = Network::Mainnet;
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, true).await;
+
+    // get the genesis block transactions from the Zcash blockchain.
+    let mut unmined_transactions = network.unmined_transactions_in_blocks(1..=10);
+    let genesis_transaction = unmined_transactions
+        .next()
+        .expect("Missing genesis transaction");
+    let more_transactions = unmined_transactions;
+
+    // Test if mempool is disabled (it should start disabled)
+    assert!(!service.is_enabled());
+
+    // Enable the mempool
+    service.enable(&mut recent_syncs).await;
+
+    assert!(service.is_enabled());
+
+    // Insert the genesis block coinbase transaction into the mempool storage.
+    service
+        .storage()
+        .insert(genesis_transaction.clone(), Vec::new(), None)?;
+
+    // Test if the mempool answers correctly (i.e. is enabled)
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TransactionIds)
+        .await
+        .unwrap();
+    let _genesis_transaction_ids = match response {
+        Response::TransactionIds(ids) => ids,
+        _ => unreachable!("will never happen in this test"),
+    };
+
+    // Queue a transaction for download
+    // Use the ID of the last transaction in the list
+    let txid = more_transactions.last().unwrap().transaction.id;
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(vec![txid.into()]))
+        .await
+        .unwrap();
+    let queued_responses = match response {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    assert_eq!(queued_responses.len(), 1);
+    assert!(queued_responses[0].is_ok());
+    assert_eq!(service.tx_downloads().in_flight(), 1);
+
+    // Pretend legacy sync discovery is far from tip. Once active, the mempool
+    // should not shut down based on that heuristic alone.
+    service.sync_far_from_tip(&mut recent_syncs).await;
+
+    // Test if mempool stays enabled.
+    assert!(service.is_enabled());
+    assert_eq!(service.tx_downloads().in_flight(), 1);
+
+    // Test if the mempool keeps returning its transactions when legacy sync
+    // status falls behind.
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TransactionIds)
+        .await
+        .unwrap();
+    match response {
+        Response::TransactionIds(ids) => {
+            assert_eq!(
+                ids.len(),
+                1,
+                "mempool should keep transactions when legacy sync status falls behind"
+            )
+        }
+        _ => unreachable!("will never happen in this test"),
+    };
+
+    // Test if mempool returns QueueStats correctly when legacy sync status
+    // falls behind.
+    let response = service
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::QueueStats)
+        .await
+        .unwrap();
+
+    let (size, bytes, usage, fully_notified) = match response {
+        Response::QueueStats {
+            size,
+            bytes,
+            usage,
+            fully_notified,
+        } => (size, bytes, usage, fully_notified),
+        _ => unreachable!("expected QueueStats response"),
+    };
+
+    assert_eq!(
+        size, 1,
+        "size should not be cleared when legacy sync status falls behind"
+    );
+    assert!(bytes > 0, "bytes should not be cleared");
+    assert!(usage > 0, "usage should not be cleared");
+    assert_eq!(
+        fully_notified, None,
+        "fully_notified is not implemented for active mempool stats yet"
+    );
+
+    Ok(())
+}
+
+/// Check that a disabled mempool does not consume the latest tip action until
+/// legacy sync status says Zebra is close enough to activate it.
+///
+/// Regression test: `poll_ready()` used to call `last_tip_change()` before
+/// checking the initial-activation gate. If Zebra was still far from tip, that
+/// consumed the only available tip action and left the disabled mempool unable
+/// to activate when sync status later caught up without another tip change.
+#[tokio::test]
+async fn disabled_mempool_keeps_tip_action_until_legacy_sync_catches_up() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, true).await;
+
+    assert!(!service.is_enabled());
+
+    // Poll while legacy sync discovery says Zebra is far from tip. The mempool
+    // must remain disabled, but it must not consume the latest chain-tip action.
+    SyncStatus::sync_far_from_tip(&mut recent_syncs);
+    service.dummy_call().await;
+    assert!(!service.is_enabled());
+
+    // Now catch up without committing another block. The same tip action should
+    // still be available for initial activation.
+    SyncStatus::sync_close_to_tip(&mut recent_syncs);
+    service.dummy_call().await;
+    assert!(service.is_enabled());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_cancel_mined() -> Result<(), Report> {
+    let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let block2: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+
+    // Using the mainnet for now
+    let network = Network::Mainnet;
+
+    let (
+        mut mempool,
+        _peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        mut mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, true).await;
+
+    // Enable the mempool
+    mempool.enable(&mut recent_syncs).await;
+    assert!(mempool.is_enabled());
+
+    // Query the mempool to make it poll chain_tip_change
+    mempool.dummy_call().await;
+
+    // Push block 1 to the state
+    state_service
+        .ready()
+        .await
+        .unwrap()
+        .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
+            block1.clone().into(),
+        ))
+        .await
+        .unwrap();
+
+    // Wait for the chain tip update
+    if let Err(timeout_error) = timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        chain_tip_change.wait_for_tip_change(),
+    )
+    .await
+    .map(|change_result| change_result.expect("unexpected chain tip update failure"))
+    {
+        info!(
+            timeout = ?humantime_seconds(CHAIN_TIP_UPDATE_WAIT_LIMIT),
+            ?timeout_error,
+            "timeout waiting for chain tip change after committing block"
+        );
+    }
+
+    // Query the mempool to make it poll chain_tip_change
+    mempool.dummy_call().await;
+
+    // Queue transaction from block 2 for download.
+    // It can't be queued before because block 1 triggers a network upgrade,
+    // which cancels all downloads.
+    let txid = block2.transactions[0].unmined_id();
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(vec![txid.into()]))
+        .await
+        .unwrap();
+    let mut queued_responses = match response {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    assert_eq!(queued_responses.len(), 1);
+
+    let queued_response = queued_responses
+        .pop()
+        .expect("already checked that there is exactly 1 item in Vec")
+        .expect("initial queue checks result should be Ok");
+
+    assert_eq!(mempool.tx_downloads().in_flight(), 1);
+
+    // Push block 2 to the state
+    state_service
+        .oneshot(zakura_state::Request::CommitCheckpointVerifiedBlock(
+            block2.clone().into(),
+        ))
+        .await
+        .unwrap();
+
+    // Wait for the chain tip update
+    if let Err(timeout_error) = timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        chain_tip_change.wait_for_tip_change(),
+    )
+    .await
+    .map(|change_result| change_result.expect("unexpected chain tip update failure"))
+    {
+        info!(
+            timeout = ?humantime_seconds(CHAIN_TIP_UPDATE_WAIT_LIMIT),
+            ?timeout_error,
+            "timeout waiting for chain tip change after committing block"
+        );
+    }
+
+    // This is done twice because after the first query the cancellation
+    // is picked up by select!, and after the second the mempool gets the
+    // result and the download future is removed.
+    for _ in 0..2 {
+        // Query the mempool just to poll it and make it cancel the download.
+        mempool.dummy_call().await;
+        // Sleep to avoid starvation and make sure the cancellation is picked up.
+        time::sleep(time::Duration::from_millis(100)).await;
+    }
+
+    // Check if download was cancelled.
+    assert_eq!(mempool.tx_downloads().in_flight(), 0);
+
+    assert!(
+        queued_response
+            .await
+            .expect("channel should not be closed")
+            .is_err(),
+        "queued tx should fail to download and verify due to chain tip change"
+    );
+
+    let mempool_change = timeout(Duration::from_secs(3), mempool_transaction_receiver.recv())
+        .await
+        .expect("should not timeout")
+        .expect("recv should return Ok");
+
+    assert_eq!(
+        mempool_change,
+        MempoolChange::invalidated([txid].into_iter().collect())
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> {
+    // Use a configured Testnet that activates NU5 at `NU5_ACTIVATION_TEST_HEIGHT`, so a real
+    // network-upgrade `TipAction::Reset` is reachable from generated blocks. Under the
+    // `next_height` reset semantics, committing the block at `NU5_ACTIVATION_TEST_HEIGHT - 1`
+    // produces a `Reset` (since the next height is the NU5 activation height).
+    let network = nu_activation_test_network();
+
+    // Generate enough blocks to commit a chain that reaches the NU5 reset boundary, plus a spare
+    // block whose coinbase transaction we queue for download (it is never committed, so it is not
+    // in the best chain and a network download is attempted).
+    let blocks = generate_test_chain(&network, NU5_ACTIVATION_TEST_HEIGHT as usize + 2);
+    let reset_block = blocks[NU5_ACTIVATION_TEST_HEIGHT as usize - 1].clone();
+    assert_eq!(
+        reset_block.coinbase_height(),
+        Some(Height(NU5_ACTIVATION_TEST_HEIGHT - 1)),
+        "reset block should be one below the NU5 activation height"
+    );
+    let uncommitted_tx_id = blocks
+        .last()
+        .expect("generated chain is non-empty")
+        .transactions[0]
+        .unmined_id();
+
+    // Don't commit the mainnet genesis block; we commit the generated chain instead.
+    let (
+        mut mempool,
+        mut peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, false).await;
+
+    // Commit the chain up to (but not including) the NU5 reset boundary. These commits are the
+    // genesis reset followed by plain `Grow`s, leaving the tip at `NU5_ACTIVATION_TEST_HEIGHT - 2`.
+    for block in &blocks[..NU5_ACTIVATION_TEST_HEIGHT as usize - 1] {
+        commit_block_and_wait_for_tip_change(
+            &mut state_service,
+            &mut chain_tip_change,
+            block.clone(),
+        )
+        .await;
+    }
+
+    // Enable the mempool now that the tip is past genesis and stable.
+    mempool.enable(&mut recent_syncs).await;
+    assert!(mempool.is_enabled());
+
+    // Queue the uncommitted transaction for download.
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(vec![uncommitted_tx_id.into()]))
+        .await
+        .unwrap();
+    let queued_responses = match response {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    assert_eq!(queued_responses.len(), 1);
+    assert!(queued_responses[0].is_ok());
+    assert_eq!(mempool.tx_downloads().in_flight(), 1);
+
+    // Query the mempool to make it poll chain_tip_change
+    mempool.dummy_call().await;
+
+    // Commit the NU5 activation block. This is a network upgrade reset (`TipAction::Reset`),
+    // and thus must cancel all pending transaction downloads.
+    commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, reset_block)
+        .await;
+
+    // Ignore all the previous network requests.
+    while let Some(_request) = peer_set.try_next_request().await {}
+
+    // Query the mempool to make it poll chain_tip_change
+    mempool.dummy_call().await;
+
+    // Check if download was cancelled and transaction was retried.
+    let request = peer_set
+        .try_next_request()
+        .await
+        .expect("unexpected missing mempool retry");
+
+    assert_eq!(
+        request.request(),
+        &zakura_network::Request::TransactionsById(iter::once(uncommitted_tx_id).collect()),
+    );
+    assert_eq!(mempool.tx_downloads().in_flight(), 1);
+
+    Ok(())
+}
+
+/// Check that a chain tip reset does not disable an already-active mempool when the legacy
+/// sync status says Zebra is far from the tip, and that pending transactions are still
+/// requeued for download.
+///
+/// Regression test: the reset path used to re-initialise the active state through
+/// `update_state()`, whose initial-activation gate refused to re-enable the mempool while
+/// far-from-tip, silently leaving it disabled and dropping the collected retries.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reset_keeps_active_state_when_legacy_sync_falls_behind() -> Result<(), Report> {
+    // Use a configured Testnet that activates NU5 at `NU5_ACTIVATION_TEST_HEIGHT`, so a real
+    // network-upgrade `TipAction::Reset` is reachable from generated blocks. Under the
+    // `next_height` reset semantics, committing the block at `NU5_ACTIVATION_TEST_HEIGHT - 1`
+    // produces a `Reset` (since the next height is the NU5 activation height).
+    let network = nu_activation_test_network();
+
+    // Generate enough blocks to commit a chain that reaches the NU5 reset boundary, plus a spare
+    // block whose coinbase transaction we queue for download (it is never committed, so it is not
+    // in the best chain and a network download is attempted).
+    let blocks = generate_test_chain(&network, NU5_ACTIVATION_TEST_HEIGHT as usize + 2);
+    let reset_block = blocks[NU5_ACTIVATION_TEST_HEIGHT as usize - 1].clone();
+    assert_eq!(
+        reset_block.coinbase_height(),
+        Some(Height(NU5_ACTIVATION_TEST_HEIGHT - 1)),
+        "reset block should be one below the NU5 activation height"
+    );
+    let uncommitted_tx_id = blocks
+        .last()
+        .expect("generated chain is non-empty")
+        .transactions[0]
+        .unmined_id();
+
+    // Don't commit the mainnet genesis block; we commit the generated chain instead.
+    let (
+        mut mempool,
+        mut peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, false).await;
+
+    // Commit the chain up to (but not including) the NU5 reset boundary. These commits are the
+    // genesis reset followed by plain `Grow`s, leaving the tip at `NU5_ACTIVATION_TEST_HEIGHT - 2`.
+    for block in &blocks[..NU5_ACTIVATION_TEST_HEIGHT as usize - 1] {
+        commit_block_and_wait_for_tip_change(
+            &mut state_service,
+            &mut chain_tip_change,
+            block.clone(),
+        )
+        .await;
+    }
+
+    // Enable the mempool now that the tip is past genesis and stable.
+    mempool.enable(&mut recent_syncs).await;
+    assert!(mempool.is_enabled());
+
+    // Queue the uncommitted transaction for download.
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(vec![uncommitted_tx_id.into()]))
+        .await
+        .unwrap();
+    let queued_responses = match response {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    assert_eq!(queued_responses.len(), 1);
+    assert!(queued_responses[0].is_ok());
+    assert_eq!(mempool.tx_downloads().in_flight(), 1);
+
+    // Query the mempool to make it poll chain_tip_change.
+    mempool.dummy_call().await;
+
+    // Ignore all the previous network requests.
+    while let Some(_request) = peer_set.try_next_request().await {}
+
+    // Pretend legacy sync discovery is far from tip, without polling the mempool yet, so the
+    // reset and the far-from-tip status are observed in the same `poll_ready()` call.
+    SyncStatus::sync_far_from_tip(&mut recent_syncs);
+
+    // Commit the NU5 activation boundary block. This is a network upgrade reset
+    // (`TipAction::Reset`).
+    commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, reset_block)
+        .await;
+
+    // Query the mempool to make it poll chain_tip_change and handle the reset.
+    mempool.dummy_call().await;
+
+    // The reset must not disable the already-active mempool, even though the legacy sync
+    // status says Zebra is far from the tip.
+    assert!(
+        mempool.is_enabled(),
+        "mempool must stay enabled through a chain tip reset while legacy sync status is far \
+         from tip"
+    );
+
+    // Check that the download was cancelled and the transaction was retried.
+    let request = peer_set
+        .try_next_request()
+        .await
+        .expect("unexpected missing mempool retry");
+
+    assert_eq!(
+        request.request(),
+        &zakura_network::Request::TransactionsById(iter::once(uncommitted_tx_id).collect()),
+    );
+    assert_eq!(mempool.tx_downloads().in_flight(), 1);
+
+    Ok(())
+}
+
+/// Check if a transaction that fails verification is rejected by the mempool.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_failed_verification_is_rejected() -> Result<(), Report> {
+    // Using the mainnet for now
+    let network = Network::Mainnet;
+
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        mut mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, true).await;
+
+    // Get transactions to use in the test
+    let mut unmined_transactions = network.unmined_transactions_in_blocks(1..=2);
+    let rejected_tx = unmined_transactions.next().unwrap().clone();
+
+    // Enable the mempool
+    mempool.enable(&mut recent_syncs).await;
+
+    // Queue first transaction for verification
+    // (queue the transaction itself to avoid a download).
+    let request = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(vec![rejected_tx.transaction.clone().into()]));
+    // Make the mock verifier return that the transaction is invalid.
+    let verification = tx_verifier.expect_request_that(|_| true).map(|responder| {
+        responder.respond(Err(TransactionError::BadBalance));
+    });
+    let (response, _) = futures::join!(request, verification);
+    let queued_responses = match response.unwrap() {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    // Check that the request was enqueued successfully.
+    assert_eq!(queued_responses.len(), 1);
+    assert!(queued_responses[0].is_ok());
+
+    for _ in 0..2 {
+        // Query the mempool just to poll it and make get the downloader/verifier result.
+        mempool.dummy_call().await;
+        // Sleep to avoid starvation and make sure the verification failure is picked up.
+        time::sleep(time::Duration::from_millis(100)).await;
+    }
+
+    // Try to queue the same transaction by its ID and check if it's correctly
+    // rejected.
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(vec![rejected_tx.transaction.id.into()]))
+        .await
+        .unwrap();
+    let queued_responses = match response {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    assert_eq!(queued_responses.len(), 1);
+    assert!(matches!(
+        queued_responses
+            .into_iter()
+            .next()
+            .unwrap()
+            .unbox_mempool_error(),
+        MempoolError::StorageExactTip(ExactTipRejectionError::FailedVerification(_))
+    ));
+
+    let mempool_change = timeout(Duration::from_secs(3), mempool_transaction_receiver.recv())
+        .await
+        .expect("should not timeout")
+        .expect("recv should return Ok");
+
+    assert_eq!(
+        mempool_change,
+        MempoolChange::invalidated([rejected_tx.transaction.id].into_iter().collect())
+    );
+
+    Ok(())
+}
+
+/// Check if a transaction that fails download is _not_ rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_failed_download_is_not_rejected() -> Result<(), Report> {
+    // Using the mainnet for now
+    let network = Network::Mainnet;
+
+    let (
+        mut mempool,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        mut mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, true).await;
+
+    // Get transactions to use in the test
+    let mut unmined_transactions = network.unmined_transactions_in_blocks(1..=2);
+    let rejected_valid_tx = unmined_transactions.next().unwrap().clone();
+
+    // Enable the mempool
+    mempool.enable(&mut recent_syncs).await;
+
+    // Queue second transaction for download and verification.
+    let request = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(vec![rejected_valid_tx
+            .transaction
+            .id
+            .into()]));
+    // Make the mock peer set return that the download failed.
+    let verification = peer_set
+        .expect_request_that(|r| matches!(r, zn::Request::TransactionsById(_)))
+        .map(|responder| {
+            responder.respond(zn::Response::Transactions(vec![]));
+        });
+    let (response, _) = futures::join!(request, verification);
+    let queued_responses = match response.unwrap() {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    // Check that the request was enqueued successfully.
+    assert_eq!(queued_responses.len(), 1);
+    assert!(queued_responses[0].is_ok());
+
+    for _ in 0..2 {
+        // Query the mempool just to poll it and make get the downloader/verifier result.
+        mempool.dummy_call().await;
+        // Sleep to avoid starvation and make sure the download failure is picked up.
+        time::sleep(time::Duration::from_millis(100)).await;
+    }
+
+    // Try to queue the same transaction by its ID and check if it's not being
+    // rejected.
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(vec![rejected_valid_tx
+            .transaction
+            .id
+            .into()]))
+        .await
+        .unwrap();
+    let queued_responses = match response {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    assert_eq!(queued_responses.len(), 1);
+    assert!(queued_responses[0].is_ok());
+
+    let mempool_change = timeout(Duration::from_secs(3), mempool_transaction_receiver.recv())
+        .await
+        .expect("should not timeout")
+        .expect("recv should return Ok");
+
+    assert_eq!(
+        mempool_change,
+        MempoolChange::invalidated([rejected_valid_tx.transaction.id].into_iter().collect())
+    );
+
+    Ok(())
+}
+
+/// Check that transactions are re-verified if the tip changes
+/// during verification.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
+    // Use a configured Testnet that activates NU5 at `NU5_ACTIVATION_TEST_HEIGHT`, so a real
+    // network-upgrade `TipAction::Reset` is reachable from generated blocks (see
+    // `nu_activation_test_network`).
+    let network = nu_activation_test_network();
+
+    // Generate enough blocks to commit a chain across the NU5 reset boundary and one block past it,
+    // plus a spare block whose coinbase transaction we queue for download (it is never committed,
+    // so it is not in the best chain and a network download is attempted).
+    let blocks = generate_test_chain(&network, NU5_ACTIVATION_TEST_HEIGHT as usize + 2);
+    // Committing this block produces a network-upgrade `TipAction::Reset` (its next height is the
+    // NU5 activation height).
+    let reset_block = blocks[NU5_ACTIVATION_TEST_HEIGHT as usize - 1].clone();
+    assert_eq!(
+        reset_block.coinbase_height(),
+        Some(Height(NU5_ACTIVATION_TEST_HEIGHT - 1)),
+        "reset block should be one below the NU5 activation height"
+    );
+    // Committing this block (the NU5 activation block) is a plain `TipAction::Grow` that increases
+    // the tip height past the height the queued tx was verified at.
+    let grow_block = blocks[NU5_ACTIVATION_TEST_HEIGHT as usize].clone();
+    assert_eq!(
+        grow_block.coinbase_height(),
+        Some(Height(NU5_ACTIVATION_TEST_HEIGHT)),
+        "grow block should be at the NU5 activation height"
+    );
+
+    // The queued transaction is the coinbase of a generated block that is never committed, so it is
+    // not in the best chain and a network download is attempted. All verification is mocked, so the
+    // transaction contents don't matter.
+    let tx = blocks
+        .last()
+        .expect("generated chain is non-empty")
+        .transactions[0]
+        .clone();
+    let txid = tx.unmined_id();
+
+    // Don't commit the mainnet genesis block; we commit the generated chain instead.
+    let (
+        mut mempool,
+        mut peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, false).await;
+
+    // Commit the chain up to (but not including) the NU5 reset boundary. These commits are the
+    // genesis reset followed by plain `Grow`s, leaving the tip at `NU5_ACTIVATION_TEST_HEIGHT - 2`.
+    for block in &blocks[..NU5_ACTIVATION_TEST_HEIGHT as usize - 1] {
+        commit_block_and_wait_for_tip_change(
+            &mut state_service,
+            &mut chain_tip_change,
+            block.clone(),
+        )
+        .await;
+    }
+
+    // Enable the mempool now that the tip is past genesis and stable.
+    mempool.enable(&mut recent_syncs).await;
+    assert!(mempool.is_enabled());
+
+    // Queue the transaction for download
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(vec![txid.into()]))
+        .await
+        .unwrap();
+    let queued_responses = match response {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    assert_eq!(queued_responses.len(), 1);
+    assert!(queued_responses[0].is_ok());
+    assert_eq!(mempool.tx_downloads().in_flight(), 1);
+
+    // Verify the transaction
+
+    peer_set
+        .expect_request_that(|req| matches!(req, zn::Request::TransactionsById(_)))
+        .map(|responder| {
+            responder.respond(zn::Response::Transactions(vec![
+                zn::InventoryResponse::Available((tx.clone().into(), None)),
+            ]));
+        })
+        .await;
+
+    tx_verifier
+        .expect_request_that(|_| true)
+        .map(|responder| {
+            let transaction = responder
+                .request()
+                .clone()
+                .mempool_transaction()
+                .expect("unexpected non-mempool request");
+
+            // Set a dummy fee and sigops.
+            responder.respond(transaction::Response::from(
+                VerifiedUnminedTx::new(
+                    transaction,
+                    Amount::try_from(1_000_000).expect("invalid value"),
+                    0,
+                    0,
+                    std::sync::Arc::new(vec![]),
+                )
+                .expect("verification should pass"),
+            ));
+        })
+        .await;
+
+    // Commit the NU5 activation block. This is a network upgrade reset (`TipAction::Reset`),
+    // and must cancel all pending transaction downloads and re-queue them for verification.
+    commit_block_and_wait_for_tip_change(
+        &mut state_service,
+        &mut chain_tip_change,
+        reset_block.clone(),
+    )
+    .await;
+
+    // Query the mempool to make it poll chain_tip_change and try reverifying its state for the `TipAction::Reset`
+    mempool.dummy_call().await;
+
+    // Check that there is still an in-flight tx_download and that
+    // no transactions were inserted in the mempool.
+    assert_eq!(mempool.tx_downloads().in_flight(), 1);
+    assert_eq!(mempool.storage().transaction_count(), 0);
+
+    // Verify the transaction again
+
+    peer_set
+        .expect_request_that(|req| matches!(req, zn::Request::TransactionsById(_)))
+        .map(|responder| {
+            responder.respond(zn::Response::Transactions(vec![
+                zn::InventoryResponse::Available((tx.into(), None)),
+            ]));
+        })
+        .await;
+
+    // Verify the transaction now that the mempool has already checked chain_tip_change
+    tx_verifier
+        .expect_request_that(|_| true)
+        .map(|responder| {
+            let transaction = responder
+                .request()
+                .clone()
+                .mempool_transaction()
+                .expect("unexpected non-mempool request");
+
+            // Set a dummy fee and sigops.
+            responder.respond(transaction::Response::from(
+                VerifiedUnminedTx::new(
+                    transaction,
+                    Amount::try_from(1_000_000).expect("invalid value"),
+                    0,
+                    0,
+                    std::sync::Arc::new(vec![]),
+                )
+                .expect("verification should pass"),
+            ));
+        })
+        .await;
+
+    // Commit the next block (a plain `Grow`). This increases the tip height past the expected
+    // tip height that the tx was verified at, so the mempool must re-verify it.
+    commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, grow_block)
+        .await;
+
+    // Query the mempool to make it poll tx_downloads.pending and try reverifying transactions
+    // because the tip height has changed.
+    mempool.dummy_call().await;
+
+    // Check that there is still an in-flight tx_download and that
+    // no transactions were inserted in the mempool.
+    assert_eq!(mempool.tx_downloads().in_flight(), 1);
+    assert_eq!(mempool.storage().transaction_count(), 0);
+
+    Ok(())
+}
+
+/// Checks that the mempool service responds to AwaitOutput requests after verifying transactions
+/// that create those outputs, or immediately if the outputs had been created by transaction that
+/// are already in the mempool.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_responds_to_await_output() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        mut mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    let verified_unmined_tx = network
+        .unmined_transactions_in_blocks(1..=10)
+        .find(|tx| !tx.transaction.transaction.outputs().is_empty())
+        .expect("should have at least 1 tx with transparent outputs");
+
+    let unmined_tx = verified_unmined_tx.transaction.clone();
+    let unmined_tx_id = unmined_tx.id;
+    let output_index = 0;
+    let outpoint = OutPoint::from_usize(unmined_tx.id.mined_id(), output_index);
+    let expected_output = unmined_tx
+        .transaction
+        .outputs()
+        .get(output_index)
+        .expect("already checked that tx has outputs")
+        .clone();
+
+    // Call mempool with an AwaitOutput request
+
+    let request = Request::AwaitOutput(outpoint);
+    let await_output_response_fut = mempool.ready().await.unwrap().call(request);
+
+    // Queue the transaction with the pending output to be added to the mempool
+
+    let request = Request::Queue(vec![Gossip::Tx(unmined_tx)]);
+    let queue_response_fut = mempool.ready().await.unwrap().call(request);
+    let mock_verify_tx_fut = tx_verifier.expect_request_that(|_| true).map(|responder| {
+        responder.respond(transaction::Response::Mempool {
+            transaction: verified_unmined_tx,
+            spent_mempool_outpoints: Vec::new(),
+        });
+    });
+
+    let (response, _) = futures::join!(queue_response_fut, mock_verify_tx_fut);
+    let Response::Queued(mut results) = response.expect("response should be Ok") else {
+        panic!("wrong response from mempool to Queued request");
+    };
+
+    let result_rx = results.remove(0).expect("should pass initial checks");
+    assert!(results.is_empty(), "should have 1 result for 1 queued tx");
+
+    // Wait for post-verification steps in mempool's Downloads
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Note: Buffered services shouldn't be polled without being called.
+    //       See `mempool::Request::CheckForVerifiedTransactions` for more details.
+    mempool
+        .ready()
+        .await
+        .expect("polling mempool should succeed");
+
+    tokio::time::timeout(Duration::from_secs(10), result_rx)
+        .await
+        .expect("should not time out")
+        .expect("mempool tx verification result channel should not be closed")
+        .expect("mocked verification should be successful");
+
+    assert_eq!(
+        mempool.storage().transaction_count(),
+        1,
+        "should have 1 transaction in mempool's verified set"
+    );
+
+    assert_eq!(
+        mempool.storage().created_output(&outpoint),
+        Some(expected_output.clone()),
+        "created output should match expected output"
+    );
+
+    // Check that the AwaitOutput request has been responded to after the relevant tx was added to the verified set
+
+    let response_fut = tokio::time::timeout(Duration::from_secs(30), await_output_response_fut);
+    let response = response_fut
+        .await
+        .expect("should not time out")
+        .expect("should not return RecvError");
+
+    let Response::UnspentOutput(response) = response else {
+        panic!("wrong response from mempool to AwaitOutput request");
+    };
+
+    assert_eq!(
+        response, expected_output,
+        "AwaitOutput response should match expected output"
+    );
+
+    // Check that the mempool responds to AwaitOutput requests correctly when the outpoint is already in its `created_outputs` collection too.
+
+    let request = Request::AwaitOutput(outpoint);
+    let await_output_response_fut = mempool.ready().await.unwrap().call(request);
+    let response_fut = tokio::time::timeout(Duration::from_secs(30), await_output_response_fut);
+    let response = response_fut
+        .await
+        .expect("should not time out")
+        .expect("should not return RecvError");
+
+    let Response::UnspentOutput(response) = response else {
+        panic!("wrong response from mempool to AwaitOutput request");
+    };
+
+    assert_eq!(
+        response, expected_output,
+        "AwaitOutput response should match expected output"
+    );
+
+    let mempool_change = timeout(Duration::from_secs(3), mempool_transaction_receiver.recv())
+        .await
+        .expect("should not timeout")
+        .expect("recv should return Ok");
+
+    assert_eq!(
+        mempool_change,
+        MempoolChange::added([unmined_tx_id].into_iter().collect())
+    );
+
+    Ok(())
+}
+
+/// Check that verified transactions are rejected if non-standard
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reject_non_standard() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    // pick a random transaction from the dummy Zcash blockchain
+    let unmined_transactions = network.unmined_transactions_in_blocks(1..=10);
+    let transactions = unmined_transactions.collect::<Vec<_>>();
+    let mut rng = thread_rng();
+    let mut last_transaction = transactions
+        .choose(&mut rng)
+        .expect("Missing transaction")
+        .clone();
+
+    last_transaction.height = Some(Height(100_000));
+
+    // Modify the transaction to make it non-standard.
+    // This is done by replacing its outputs with a dust output.
+    let mut tx = last_transaction.transaction.transaction.clone();
+    let tx_mut = Arc::make_mut(&mut tx);
+    *tx_mut.outputs_mut() = vec![transparent::Output {
+        value: Amount::new(10), // this is below the dust threshold
+        lock_script: p2pkh_script([0u8; 20]),
+    }];
+    last_transaction.transaction.transaction = tx;
+
+    // Set cost limit to the cost of the transaction we will try to insert.
+    let cost_limit = last_transaction.cost();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    // Enable the mempool
+    service.enable(&mut recent_syncs).await;
+
+    // Insert the modified transaction into the mempool storage.
+    // Expect insertion to fail for non-standard transaction.
+    let insert_err = service
+        .storage()
+        .insert(last_transaction.clone(), Vec::new(), None)
+        .expect_err("expected insert to fail for non-standard tx");
+
+    assert_eq!(
+        insert_err,
+        MempoolError::NonStandardTransaction(storage::NonStandardTransactionError::IsDust)
+    );
+
+    Ok(())
+}
+
+/// Check that standard OP_RETURN outputs are accepted when datacarrier is enabled.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_accept_standard_op_return() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let mut last_transaction = network
+        .unmined_transactions_in_blocks(1..=10)
+        .next()
+        .expect("missing transaction");
+
+    last_transaction.height = Some(Height(100_000));
+
+    let mut tx = last_transaction.transaction.transaction.clone();
+    let tx_mut = Arc::make_mut(&mut tx);
+    *tx_mut.outputs_mut() = vec![transparent::Output {
+        value: Amount::new(0),
+        lock_script: op_return_script(&[0x01]),
+    }];
+    last_transaction.transaction.transaction = tx;
+
+    let cost_limit = last_transaction.cost();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    service.enable(&mut recent_syncs).await;
+
+    service
+        .storage()
+        .insert(last_transaction.clone(), Vec::new(), None)?;
+
+    Ok(())
+}
+
+/// Check that oversized OP_RETURN scripts are rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reject_op_return_too_large() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let mut last_transaction = network
+        .unmined_transactions_in_blocks(1..=10)
+        .next()
+        .expect("missing transaction");
+
+    last_transaction.height = Some(Height(100_000));
+
+    let mut tx = last_transaction.transaction.transaction.clone();
+    let tx_mut = Arc::make_mut(&mut tx);
+    *tx_mut.outputs_mut() = vec![transparent::Output {
+        value: Amount::new(0),
+        lock_script: op_return_script(&[0x03]),
+    }];
+    last_transaction.transaction.transaction = tx;
+
+    let cost_limit = last_transaction.cost();
+    // Shrink the OP_RETURN size limit to trigger the oversized rejection path.
+    let mempool_config = mempool::Config {
+        tx_cost_limit: cost_limit,
+        max_datacarrier_bytes: Some(2),
+        ..Default::default()
+    };
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup_with_mempool_config(&network, mempool_config, true).await;
+
+    service.enable(&mut recent_syncs).await;
+
+    let insert_err = service
+        .storage()
+        .insert(last_transaction.clone(), Vec::new(), None)
+        .expect_err("expected insert to fail for non-standard tx");
+
+    assert_eq!(
+        insert_err,
+        MempoolError::NonStandardTransaction(
+            storage::NonStandardTransactionError::DataCarrierTooLarge
+        )
+    );
+
+    Ok(())
+}
+
+/// Check that multiple OP_RETURN outputs are rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reject_multi_op_return() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let mut last_transaction = network
+        .unmined_transactions_in_blocks(1..=10)
+        .next()
+        .expect("missing transaction");
+
+    last_transaction.height = Some(Height(100_000));
+
+    let mut tx = last_transaction.transaction.transaction.clone();
+    let tx_mut = Arc::make_mut(&mut tx);
+    *tx_mut.outputs_mut() = vec![
+        transparent::Output {
+            value: Amount::new(0),
+            lock_script: op_return_script(&[0x04]),
+        },
+        transparent::Output {
+            value: Amount::new(0),
+            lock_script: op_return_script(&[0x05]),
+        },
+    ];
+    last_transaction.transaction.transaction = tx;
+
+    let cost_limit = last_transaction.cost();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    service.enable(&mut recent_syncs).await;
+
+    let insert_err = service
+        .storage()
+        .insert(last_transaction.clone(), Vec::new(), None)
+        .expect_err("expected insert to fail for non-standard tx");
+
+    assert_eq!(
+        insert_err,
+        MempoolError::NonStandardTransaction(storage::NonStandardTransactionError::MultiOpReturn)
+    );
+
+    Ok(())
+}
+
+/// Check that non-standard scriptPubKeys are rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reject_non_standard_scriptpubkey() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let mut last_transaction = network
+        .unmined_transactions_in_blocks(1..=10)
+        .next()
+        .expect("missing transaction");
+
+    last_transaction.height = Some(Height(100_000));
+
+    let mut tx = last_transaction.transaction.transaction.clone();
+    let tx_mut = Arc::make_mut(&mut tx);
+    *tx_mut.outputs_mut() = vec![transparent::Output {
+        value: Amount::new(1000),
+        lock_script: transparent::Script::new(&[0x00]),
+    }];
+    last_transaction.transaction.transaction = tx;
+
+    let cost_limit = last_transaction.cost();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    service.enable(&mut recent_syncs).await;
+
+    let insert_err = service
+        .storage()
+        .insert(last_transaction.clone(), Vec::new(), None)
+        .expect_err("expected insert to fail for non-standard tx");
+
+    assert_eq!(
+        insert_err,
+        MempoolError::NonStandardTransaction(
+            storage::NonStandardTransactionError::ScriptPubKeyNonStandard
+        )
+    );
+
+    Ok(())
+}
+
+/// Check that bare multisig outputs are rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reject_bare_multisig() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let mut last_transaction = network
+        .unmined_transactions_in_blocks(1..=10)
+        .next()
+        .expect("missing transaction");
+
+    last_transaction.height = Some(Height(100_000));
+
+    let mut tx = last_transaction.transaction.transaction.clone();
+    let tx_mut = Arc::make_mut(&mut tx);
+    *tx_mut.outputs_mut() = vec![transparent::Output {
+        value: Amount::new(1000),
+        lock_script: multisig_script(1, 1),
+    }];
+    last_transaction.transaction.transaction = tx;
+
+    let cost_limit = last_transaction.cost();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    service.enable(&mut recent_syncs).await;
+
+    let insert_err = service
+        .storage()
+        .insert(last_transaction.clone(), Vec::new(), None)
+        .expect_err("expected insert to fail for non-standard tx");
+
+    assert_eq!(
+        insert_err,
+        MempoolError::NonStandardTransaction(storage::NonStandardTransactionError::BareMultiSig)
+    );
+
+    Ok(())
+}
+
+/// Check that oversized bare multisig outputs are rejected as non-standard.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reject_large_multisig() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let mut last_transaction = network
+        .unmined_transactions_in_blocks(1..=10)
+        .next()
+        .expect("missing transaction");
+
+    last_transaction.height = Some(Height(100_000));
+
+    let mut tx = last_transaction.transaction.transaction.clone();
+    let tx_mut = Arc::make_mut(&mut tx);
+    *tx_mut.outputs_mut() = vec![transparent::Output {
+        value: Amount::new(1000),
+        lock_script: multisig_script(1, 4),
+    }];
+    last_transaction.transaction.transaction = tx;
+
+    let cost_limit = last_transaction.cost();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    service.enable(&mut recent_syncs).await;
+
+    let insert_err = service
+        .storage()
+        .insert(last_transaction.clone(), Vec::new(), None)
+        .expect_err("expected insert to fail for non-standard tx");
+
+    assert_eq!(
+        insert_err,
+        MempoolError::NonStandardTransaction(
+            storage::NonStandardTransactionError::ScriptPubKeyNonStandard
+        )
+    );
+
+    Ok(())
+}
+
+/// Check that oversized scriptSig inputs are rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reject_large_scriptsig() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let mut last_transaction = pick_transaction_with_prevout(&network);
+
+    last_transaction.height = Some(Height(100_000));
+
+    let mut tx = last_transaction.transaction.transaction.clone();
+    let tx_mut = Arc::make_mut(&mut tx);
+    set_first_prevout_unlock_script(tx_mut, transparent::Script::new(&vec![0u8; 1651]));
+    last_transaction.transaction.transaction = tx;
+
+    let cost_limit = last_transaction.cost();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    service.enable(&mut recent_syncs).await;
+
+    let insert_err = service
+        .storage()
+        .insert(last_transaction.clone(), Vec::new(), None)
+        .expect_err("expected insert to fail for non-standard tx");
+
+    assert_eq!(
+        insert_err,
+        MempoolError::NonStandardTransaction(
+            storage::NonStandardTransactionError::ScriptSigTooLarge
+        )
+    );
+
+    Ok(())
+}
+
+/// Check that non-push-only scriptSig inputs are rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reject_non_push_only_scriptsig() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let mut last_transaction = pick_transaction_with_prevout(&network);
+
+    last_transaction.height = Some(Height(100_000));
+
+    let mut tx = last_transaction.transaction.transaction.clone();
+    let tx_mut = Arc::make_mut(&mut tx);
+    set_first_prevout_unlock_script(tx_mut, transparent::Script::new(&[0xac]));
+    last_transaction.transaction.transaction = tx;
+
+    let cost_limit = last_transaction.cost();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    service.enable(&mut recent_syncs).await;
+
+    let insert_err = service
+        .storage()
+        .insert(last_transaction.clone(), Vec::new(), None)
+        .expect_err("expected insert to fail for non-standard tx");
+
+    assert_eq!(
+        insert_err,
+        MempoolError::NonStandardTransaction(
+            storage::NonStandardTransactionError::ScriptSigNotPushOnly
+        )
+    );
+
+    Ok(())
+}
+
+/// Check that transactions with too many sigops are rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reject_too_many_sigops() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let mut last_transaction = network
+        .unmined_transactions_in_blocks(1..=10)
+        .next()
+        .expect("missing transaction");
+
+    last_transaction.height = Some(Height(100_000));
+
+    // Set the legacy sigop count above the MAX_STANDARD_TX_SIGOPS limit of 4000.
+    last_transaction.legacy_sigop_count = 4001;
+
+    let cost_limit = last_transaction.cost();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    service.enable(&mut recent_syncs).await;
+
+    let insert_err = service
+        .storage()
+        .insert(last_transaction.clone(), Vec::new(), None)
+        .expect_err("expected insert to fail for too many sigops");
+
+    assert_eq!(
+        insert_err,
+        MempoolError::NonStandardTransaction(storage::NonStandardTransactionError::TooManySigops)
+    );
+
+    Ok(())
+}
+
+/// Check that transactions with non-standard inputs (non-standard spent output script)
+/// are rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reject_non_standard_inputs() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    // Use a transaction that has at least one transparent PrevOut input.
+    let mut last_transaction = pick_transaction_with_prevout(&network);
+
+    last_transaction.height = Some(Height(100_000));
+
+    // Provide a non-standard spent output script so are_inputs_standard() returns false.
+    // Use a script that doesn't match any known template (OP_1 OP_2 OP_ADD).
+    let non_standard_script = transparent::Script::new(&[0x51, 0x52, 0x93]);
+    let non_standard_output = transparent::Output {
+        value: 0u64.try_into().unwrap(),
+        lock_script: non_standard_script,
+    };
+    // Provide one spent output per transparent input (including coinbase inputs in the count,
+    // since are_inputs_standard expects spent_outputs.len() == tx.inputs().len()).
+    let input_count = last_transaction.transaction.transaction.inputs().len();
+    last_transaction.spent_outputs = std::sync::Arc::new(vec![non_standard_output; input_count]);
+
+    let cost_limit = last_transaction.cost();
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, cost_limit, true).await;
+
+    service.enable(&mut recent_syncs).await;
+
+    let insert_err = service
+        .storage()
+        .insert(last_transaction.clone(), Vec::new(), None)
+        .expect_err("expected insert to fail for non-standard inputs");
+
+    assert_eq!(
+        insert_err,
+        MempoolError::NonStandardTransaction(
+            storage::NonStandardTransactionError::NonStandardInputs
+        )
+    );
+
+    Ok(())
+}
+
+fn op_return_script(data: &[u8]) -> transparent::Script {
+    // Build a minimal OP_RETURN script using small pushdata (<= 75 bytes).
+    assert!(data.len() <= 75, "test helper only supports small pushdata");
+
+    let mut bytes = Vec::with_capacity(2 + data.len());
+    bytes.push(0x6a);
+    bytes.push(data.len() as u8);
+    bytes.extend_from_slice(data);
+    transparent::Script::new(&bytes)
+}
+
+fn multisig_script(required: u8, key_count: usize) -> transparent::Script {
+    // Construct a bare multisig output: OP_M <pubkeys> OP_N OP_CHECKMULTISIG.
+    assert!(required >= 1 && required <= key_count as u8);
+    assert!(key_count <= 16);
+
+    let mut bytes = Vec::new();
+    bytes.push(op_n(required));
+
+    for i in 0..key_count {
+        bytes.push(33u8);
+        let mut pubkey = vec![0u8; 33];
+        pubkey[0] = 0x02;
+        pubkey[1] = i as u8;
+        bytes.extend_from_slice(&pubkey);
+    }
+
+    bytes.push(op_n(key_count as u8));
+    bytes.push(0xae);
+
+    transparent::Script::new(&bytes)
+}
+
+fn p2pkh_script(pubkey_hash: [u8; 20]) -> transparent::Script {
+    let mut bytes = Vec::with_capacity(25);
+    bytes.push(0x76);
+    bytes.push(0xa9);
+    bytes.push(20);
+    bytes.extend_from_slice(&pubkey_hash);
+    bytes.push(0x88);
+    bytes.push(0xac);
+    transparent::Script::new(&bytes)
+}
+
+fn op_n(n: u8) -> u8 {
+    if n == 0 {
+        0x00
+    } else {
+        0x50 + n
+    }
+}
+
+fn set_first_prevout_unlock_script(tx: &mut Transaction, script: transparent::Script) {
+    for input in tx.inputs_mut() {
+        if let transparent::Input::PrevOut { unlock_script, .. } = input {
+            *unlock_script = script;
+            return;
+        }
+    }
+
+    panic!("missing prevout input");
+}
+
+fn pick_transaction_with_prevout(network: &Network) -> VerifiedUnminedTx {
+    network
+        .unmined_transactions_in_blocks(..)
+        .find(|transaction| {
+            transaction
+                .transaction
+                .transaction
+                .inputs()
+                .iter()
+                .any(|input| matches!(input, transparent::Input::PrevOut { .. }))
+        })
+        .expect("missing non-coinbase transaction")
+}
+
+/// The height at which the network returned by [`nu_activation_test_network`] activates NU5.
+///
+/// All earlier network upgrades activate at height 1, so the only non-genesis network upgrade
+/// reset boundary is at NU5. Because [`ChainTipChange::action`] resets when the *next* height
+/// (`tip + 1`) is an activation height, committing the block at height
+/// `NU5_ACTIVATION_TEST_HEIGHT - 1` produces a [`TipAction::Reset`].
+const NU5_ACTIVATION_TEST_HEIGHT: u32 = 4;
+
+/// Build a configured Testnet that activates NU5 at [`NU5_ACTIVATION_TEST_HEIGHT`].
+///
+/// This makes a network-upgrade reset reachable from generated blocks: under the
+/// `next_height` reset semantics in [`ChainTipChange::action`], committing the block at height
+/// `NU5_ACTIVATION_TEST_HEIGHT - 1` yields a [`TipAction::Reset`], because the next height is the
+/// NU5 activation height. The temporary Orchard-disabling soft fork is disabled so the only
+/// non-genesis reset boundary is the NU5 activation.
+fn nu_activation_test_network() -> Network {
+    use zakura_chain::parameters::testnet::{
+        ConfiguredActivationHeights, Parameters as TestnetParameters,
+    };
+
+    TestnetParameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(1),
+            sapling: Some(1),
+            blossom: Some(1),
+            heartwood: Some(1),
+            canopy: Some(1),
+            nu5: Some(NU5_ACTIVATION_TEST_HEIGHT),
+            ..Default::default()
+        })
+        .expect("configured activation heights are valid")
+        .disable_temporary_orchard_disabling_soft_fork()
+        .extend_funding_streams()
+        .to_network()
+        .expect("configured network is valid")
+}
+
+/// Generate a chain of `count` valid blocks (starting at the genesis block) for `network`.
+///
+/// The blocks have valid commitments, so they can be committed to a state service via
+/// [`zakura_state::Request::CommitCheckpointVerifiedBlock`].
+fn generate_test_chain(network: &Network, count: usize) -> Vec<Arc<Block>> {
+    use proptest::{
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+    use zakura_chain::block::{arbitrary::allow_all_transparent_coinbase_spends, LedgerState};
+
+    let strategy = LedgerState::genesis_strategy(Some(network.clone()), None, None, false)
+        .prop_flat_map(move |init| {
+            Block::partial_chain_strategy(
+                init,
+                count,
+                allow_all_transparent_coinbase_spends,
+                // Generate valid commitments so the blocks pass the checkpoint commit checks.
+                true,
+            )
+        });
+
+    let mut runner = TestRunner::deterministic();
+    strategy
+        .new_tree(&mut runner)
+        .expect("partial chain strategy should produce a value tree")
+        .current()
+        .0
+}
+
+/// Commit a checkpoint-verified `block` to `state_service` and wait for the chain tip change.
+async fn commit_block_and_wait_for_tip_change(
+    state_service: &mut StateService,
+    chain_tip_change: &mut ChainTipChange,
+    block: Arc<Block>,
+) {
+    state_service
+        .ready()
+        .await
+        .unwrap()
+        .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
+            block.into(),
+        ))
+        .await
+        .expect("unexpected block commit failure");
+
+    chain_tip_change
+        .wait_for_tip_change()
+        .await
+        .expect("unexpected chain tip update failure");
+}
+
+/// Create a new [`Mempool`] instance using mocked services.
+async fn setup(
+    network: &Network,
+    tx_cost_limit: u64,
+    should_commit_genesis_block: bool,
+) -> (
+    Mempool,
+    MockPeerSet,
+    StateService,
+    ChainTipChange,
+    MockTxVerifier,
+    RecentSyncLengths,
+    tokio::sync::broadcast::Receiver<MempoolChange>,
+) {
+    let mempool_config = mempool::Config {
+        tx_cost_limit,
+        ..Default::default()
+    };
+
+    setup_with_mempool_config(network, mempool_config, should_commit_genesis_block).await
+}
+
+async fn setup_with_mempool_config(
+    network: &Network,
+    mempool_config: mempool::Config,
+    should_commit_genesis_block: bool,
+) -> (
+    Mempool,
+    MockPeerSet,
+    StateService,
+    ChainTipChange,
+    MockTxVerifier,
+    RecentSyncLengths,
+    tokio::sync::broadcast::Receiver<MempoolChange>,
+) {
+    let peer_set = MockService::build().for_unit_tests();
+
+    // UTXO verification doesn't matter here.
+    let state_config = StateConfig::ephemeral();
+    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change) =
+        zakura_state::init(state_config, network, Height::MAX, 0).await;
+    let mut state_service = ServiceBuilder::new().buffer(10).service(state);
+
+    let tx_verifier = MockService::build().for_unit_tests();
+
+    let (sync_status, recent_syncs) = SyncStatus::new();
+    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let (mempool, mempool_transaction_subscriber) = Mempool::new(
+        &mempool_config,
+        Buffer::new(BoxService::new(peer_set.clone()), 1),
+        state_service.clone(),
+        Buffer::new(BoxService::new(tx_verifier.clone()), 1),
+        sync_status,
+        latest_chain_tip,
+        chain_tip_change.clone(),
+        misbehavior_tx,
+    );
+
+    let mut mempool_transaction_receiver = mempool_transaction_subscriber.subscribe();
+    tokio::spawn(async move { while mempool_transaction_receiver.recv().await.is_ok() {} });
+
+    if should_commit_genesis_block {
+        let genesis_block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+
+        // Push the genesis block to the state
+        state_service
+            .ready()
+            .await
+            .unwrap()
+            .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
+                genesis_block.clone().into(),
+            ))
+            .await
+            .unwrap();
+
+        // Wait for the chain tip update without a timeout
+        chain_tip_change
+            .wait_for_tip_change()
+            .await
+            .expect("unexpected chain tip update failure");
+    }
+
+    (
+        mempool,
+        peer_set,
+        state_service,
+        chain_tip_change,
+        tx_verifier,
+        recent_syncs,
+        mempool_transaction_subscriber.subscribe(),
+    )
+}
+
+/// Regression test for GHSA-65jj-fmw8-468q.
+///
+/// Before the fix, when the outer `tokio::time::timeout(RATE_LIMIT_DELAY, ..)`
+/// wrapping mempool tx verification fired, `Downloads::poll_next` propagated
+/// the `Elapsed` error without dropping the corresponding `cancel_handles`
+/// entry. Each retained entry held a full `Gossip::Tx(UnminedTx)`, was never
+/// garbage-collected (since `cancel(mined_ids)` only matches mined txids),
+/// and the structure grew without bound under sustained adversarial input.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancel_handles_drained_after_verification_timeout() {
+    use futures::stream::StreamExt;
+    use tower::timeout::Timeout;
+    use zakura_node_services::mempool::Gossip;
+
+    use crate::components::mempool::{
+        crawler::RATE_LIMIT_DELAY,
+        downloads::{Downloads, TRANSACTION_DOWNLOAD_TIMEOUT, TRANSACTION_VERIFY_TIMEOUT},
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let peer_set: MockPeerSet = MockService::build().for_unit_tests();
+    let state: MockService<zs::Request, zs::Response, PanicAssertion> =
+        MockService::build().for_unit_tests();
+    let tx_verifier: MockTxVerifier = MockService::build().for_unit_tests();
+
+    let mut downloads = Box::pin(Downloads::new(
+        Timeout::new(peer_set, TRANSACTION_DOWNLOAD_TIMEOUT),
+        Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
+        state,
+    ));
+
+    let mut iter = Network::Mainnet.unmined_transactions_in_blocks(1..=10);
+    let v1 = iter.next().expect("vector tx 1").transaction;
+    let v2 = iter.next().expect("vector tx 2").transaction;
+    let v3 = iter.next().expect("vector tx 3").transaction;
+
+    downloads
+        .as_mut()
+        .download_if_needed_and_verify(Gossip::Tx(v1), None, None)
+        .expect("queue tx 1");
+    downloads
+        .as_mut()
+        .download_if_needed_and_verify(Gossip::Tx(v2), None, None)
+        .expect("queue tx 2");
+    downloads
+        .as_mut()
+        .download_if_needed_and_verify(Gossip::Tx(v3), None, None)
+        .expect("queue tx 3");
+
+    assert_eq!(downloads.in_flight(), 3);
+    assert_eq!(downloads.transaction_requests().count(), 3);
+
+    // Advance past the RATE_LIMIT_DELAY so every spawned task hits the
+    // outer timeout. We don't service the mocked state/network/verifier,
+    // so verification never makes progress and the timeout deterministically
+    // fires.
+    time::advance(RATE_LIMIT_DELAY + Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+
+    let mut elapsed_count = 0usize;
+    for _ in 0..3 {
+        match downloads.as_mut().next().await {
+            Some(Err(_)) => elapsed_count += 1,
+            Some(Ok(other)) => panic!(
+                "expected Err(Elapsed); got Ok with inner is_ok={}",
+                other.is_ok()
+            ),
+            None => panic!("Downloads stream ended before all tasks resolved"),
+        }
+    }
+    assert_eq!(
+        elapsed_count, 3,
+        "all 3 tasks should have hit RATE_LIMIT_DELAY"
+    );
+    assert_eq!(downloads.in_flight(), 0, "pending should be drained");
+
+    let leaked = downloads.transaction_requests().count();
+    assert_eq!(
+        leaked, 0,
+        "regression GHSA-65jj-fmw8-468q: cancel_handles must be drained after timeout"
+    );
+}

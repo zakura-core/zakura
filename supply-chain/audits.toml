@@ -682,6 +682,61 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.6.13 -> 0.6.18"
 
+[[audits.zakura-chain]]
+who = "Alfredo Garcia <oxarbitrage@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
+
+[[audits.zakura-consensus]]
+who = "Alfredo Garcia <oxarbitrage@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
+
+[[audits.zakura-network]]
+who = "Alfredo Garcia <oxarbitrage@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
+
+[[audits.zakura-node-services]]
+who = "Alfredo Garcia <oxarbitrage@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
+
+[[audits.zakura-rpc]]
+who = "Alfredo Garcia <oxarbitrage@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
+
+[[audits.zakura-script]]
+who = "Alfredo Garcia <oxarbitrage@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
+
+[[audits.zakura-state]]
+who = "Alfredo Garcia <oxarbitrage@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
+
+[[audits.zakura-test]]
+who = "Alfredo Garcia <oxarbitrage@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
+
+[[audits.zakura-test]]
+who = "Alfredo Garcia <oxarbitrage@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-beta.39 -> 1.0.0-beta.40"
+
+[[audits.zakura-utils]]
+who = "Alfredo Garcia <oxarbitrage@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
+
+[[audits.zakurad]]
+who = "Alfredo Garcia <oxarbitrage@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.8.0 -> 1.9.0"
+
 [[audits.zcash_address]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -748,65 +803,10 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.0 -> 0.4.0"
 
-[[audits.zebra-chain]]
-who = "Alfredo Garcia <oxarbitrage@gmail.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
-
-[[audits.zebra-consensus]]
-who = "Alfredo Garcia <oxarbitrage@gmail.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
-
 [[audits.zebra-grpc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.1.0-alpha.5 -> 0.1.0-alpha.6"
-
-[[audits.zebra-network]]
-who = "Alfredo Garcia <oxarbitrage@gmail.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
-
-[[audits.zebra-node-services]]
-who = "Alfredo Garcia <oxarbitrage@gmail.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
-
-[[audits.zebra-rpc]]
-who = "Alfredo Garcia <oxarbitrage@gmail.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
-
-[[audits.zebra-script]]
-who = "Alfredo Garcia <oxarbitrage@gmail.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
-
-[[audits.zebra-state]]
-who = "Alfredo Garcia <oxarbitrage@gmail.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
-
-[[audits.zebra-test]]
-who = "Alfredo Garcia <oxarbitrage@gmail.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
-
-[[audits.zebra-test]]
-who = "Alfredo Garcia <oxarbitrage@gmail.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-beta.39 -> 1.0.0-beta.40"
-
-[[audits.zebra-utils]]
-who = "Alfredo Garcia <oxarbitrage@gmail.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
-
-[[audits.zebrad]]
-who = "Alfredo Garcia <oxarbitrage@gmail.com>"
-criteria = "safe-to-deploy"
-delta = "1.8.0 -> 1.9.0"
 
 [[audits.zip321]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -842,6 +842,12 @@ user-id = 6743
 start = "2021-12-08"
 end = "2025-07-09"
 
+[[trusted.orchard]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-08-12"
+end = "2027-07-10"
+
 [[trusted.serde_json]]
 criteria = "safe-to-deploy"
 user-id = 3618 # David Tolnay (dtolnay)
@@ -859,3 +865,45 @@ criteria = "safe-to-deploy"
 user-id = 6741
 start = "2020-12-25"
 end = "2025-07-29"
+
+[[trusted.zcash_address]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-08-20"
+end = "2027-07-10"
+
+[[trusted.zcash_history]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2026-07-01"
+end = "2027-07-10"
+
+[[trusted.zcash_keys]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-01-15"
+end = "2027-07-10"
+
+[[trusted.zcash_primitives]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-08-20"
+end = "2027-07-10"
+
+[[trusted.zcash_proofs]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-08-20"
+end = "2027-07-10"
+
+[[trusted.zcash_protocol]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-01-27"
+end = "2027-07-10"
+
+[[trusted.zcash_transparent]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2024-12-17"
+end = "2027-07-10"

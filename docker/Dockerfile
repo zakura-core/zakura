@@ -16,6 +16,8 @@
 ARG RUST_VERSION=1.91.0
 
 ARG FEATURES="default-release-binaries"
+ARG SHORT_SHA
+ARG IMAGE_VERSION
 
 ARG UID=10001
 ARG GID=${UID}
@@ -106,15 +108,15 @@ COPY --link --chown=${UID}:${GID} ./ ${HOME}
 # Build Zebra test binaries using nextest, but don't run them.
 # This also copies the necessary binaries to /usr/local/bin.
 RUN [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
-    cargo build --locked --release --features "${FEATURES}" --package zebrad --bin zakurad --bin zebra-rollback-state --bin zebra-prune-state && \
+    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad --bin zakura-rollback-state --bin zakura-prune-state && \
     cargo nextest run --locked --release --no-run --features "${FEATURES}" && \
     # Copy binaries to standard location
     cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin && \
-    cp ${CARGO_TARGET_DIR}/release/zebra-rollback-state /usr/local/bin && \
-    cp ${CARGO_TARGET_DIR}/release/zebra-prune-state /usr/local/bin && \
-    # Only copy zebra-checkpoints if the feature is enabled
-    if echo "${FEATURES}" | grep -q "zebra-checkpoints"; then \
-        cp ${CARGO_TARGET_DIR}/release/zebra-checkpoints /usr/local/bin; \
+    cp ${CARGO_TARGET_DIR}/release/zakura-rollback-state /usr/local/bin && \
+    cp ${CARGO_TARGET_DIR}/release/zakura-prune-state /usr/local/bin && \
+    # Only copy zakura-checkpoints if the feature is enabled
+    if echo "${FEATURES}" | grep -q "zakura-checkpoints"; then \
+        cp ${CARGO_TARGET_DIR}/release/zakura-checkpoints /usr/local/bin; \
     fi && \
     # Set proper ownership
     chown -R ${UID}:${GID} ${CARGO_HOME} && \
@@ -128,7 +130,7 @@ COPY --link --chown=${UID}:${GID} ./docker/entrypoint.sh /usr/local/bin/entrypoi
 ENTRYPOINT [ "entrypoint.sh", "test" ]
 CMD [ "cargo", "test" ]
 
-# This stage builds the zebrad release binaries.
+# This stage builds the zakurad release binaries.
 #
 # It also adds `cache mounts` as this stage is completely independent from the
 # `test` stage. The resulting binaries are used in the `runtime` stage.
@@ -147,28 +149,28 @@ ARG CARGO_TARGET_DIR
 
 RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
     --mount=type=bind,source=tower-fallback,target=tower-fallback \
-    --mount=type=bind,source=deploy/watchdog,target=deploy/watchdog \
+    --mount=type=bind,source=deploy/zakura-watchdog,target=deploy/zakura-watchdog \
     --mount=type=bind,source=xtask,target=xtask \
-    --mount=type=bind,source=zebra-chain,target=zebra-chain \
-    --mount=type=bind,source=zebra-consensus,target=zebra-consensus \
-    --mount=type=bind,source=zebra-jsonl-trace,target=zebra-jsonl-trace \
-    --mount=type=bind,source=zebra-network,target=zebra-network \
-    --mount=type=bind,source=zebra-node-services,target=zebra-node-services \
-    --mount=type=bind,source=zebra-rpc,target=zebra-rpc \
-    --mount=type=bind,source=zebra-script,target=zebra-script \
-    --mount=type=bind,source=zebra-state,target=zebra-state \
-    --mount=type=bind,source=zebra-test,target=zebra-test \
-    --mount=type=bind,source=zebra-utils,target=zebra-utils \
-    --mount=type=bind,source=zebrad,target=zebrad \
+    --mount=type=bind,source=zakura-chain,target=zakura-chain \
+    --mount=type=bind,source=zakura-consensus,target=zakura-consensus \
+    --mount=type=bind,source=zakura-jsonl-trace,target=zakura-jsonl-trace \
+    --mount=type=bind,source=zakura-network,target=zakura-network \
+    --mount=type=bind,source=zakura-node-services,target=zakura-node-services \
+    --mount=type=bind,source=zakura-rpc,target=zakura-rpc \
+    --mount=type=bind,source=zakura-script,target=zakura-script \
+    --mount=type=bind,source=zakura-state,target=zakura-state \
+    --mount=type=bind,source=zakura-test,target=zakura-test \
+    --mount=type=bind,source=zakura-utils,target=zakura-utils \
+    --mount=type=bind,source=zakurad,target=zakurad \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
     --mount=type=cache,target=${CARGO_TARGET_DIR} \
     --mount=type=cache,target=${CARGO_HOME} \
     [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
-    cargo build --locked --release --features "${FEATURES}" --package zebrad --bin zakurad --bin zebra-rollback-state --bin zebra-prune-state && \
+    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad --bin zakura-rollback-state --bin zakura-prune-state && \
     cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin && \
-    cp ${CARGO_TARGET_DIR}/release/zebra-rollback-state /usr/local/bin && \
-    cp ${CARGO_TARGET_DIR}/release/zebra-prune-state /usr/local/bin
+    cp ${CARGO_TARGET_DIR}/release/zakura-rollback-state /usr/local/bin && \
+    cp ${CARGO_TARGET_DIR}/release/zakura-prune-state /usr/local/bin
 
 # This stage starts from scratch using Debian and copies the built Zebra binaries
 # from the `release` stage along with other binaries and files.
@@ -177,7 +179,7 @@ FROM debian:trixie-slim AS runtime
 ARG FEATURES
 ENV FEATURES=${FEATURES}
 
-# Create a non-privileged user for running `zebrad`.
+# Create a non-privileged user for running `zakurad`.
 #
 # We use a high UID/GID (10001) to avoid overlap with host system users.
 # This reduces the risk of container user namespace conflicts with host accounts,
@@ -222,8 +224,8 @@ RUN chown -R ${UID}:${GID} ${HOME}
 # setpriv is part of util-linux, already included in debian:trixie-slim.
 
 COPY --link --from=release /usr/local/bin/zakurad /usr/local/bin/
-COPY --link --from=release /usr/local/bin/zebra-rollback-state /usr/local/bin/
-COPY --link --from=release /usr/local/bin/zebra-prune-state /usr/local/bin/
+COPY --link --from=release /usr/local/bin/zakura-rollback-state /usr/local/bin/
+COPY --link --from=release /usr/local/bin/zakura-prune-state /usr/local/bin/
 COPY --link --chown=${UID}:${GID} ./docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT [ "entrypoint.sh" ]
@@ -240,7 +242,7 @@ RUN test -x /usr/local/bin/zcashd && /usr/local/bin/zcashd --version
 #
 # This stage will be based on `runtime`, and initially:
 #
-# - run `zebrad` on Testnet
+# - run `zakurad` on Testnet
 # - with mining enabled using S-nomp and `nheqminer`.
 #
 # We can add further functionality to this stage for further purposes.

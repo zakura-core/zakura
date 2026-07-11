@@ -2788,6 +2788,13 @@ mod zakura_header_sync_driver_tests {
                             (block::Height(2), read_block2.hash(), None),
                         ]))
                     }
+                    zakura_state::ReadRequest::FinalizedTip => {
+                        Ok(zakura_state::ReadResponse::FinalizedTip(None))
+                    }
+                    zakura_state::ReadRequest::Tip => Ok(zakura_state::ReadResponse::Tip(Some((
+                        block::Height(0),
+                        block::Hash([0; 32]),
+                    )))),
                     request => panic!("unexpected read request in throughput probe: {request:?}"),
                 }
             }

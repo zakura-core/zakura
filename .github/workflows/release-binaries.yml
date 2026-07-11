@@ -7,6 +7,13 @@
 # workflow and never rebuilds or re-uploads anything. Real releases get their
 # own non-hyphenated tag. To repair or re-upload assets for an existing tag,
 # run workflow_dispatch with publish_assets_to_release.
+#
+# The tag must match the `zakura` package version: release binaries are built
+# in Docker without `.git`, so `zakurad --version` reports CARGO_PKG_VERSION,
+# and a tag pushed without bumping the package version ships binaries that
+# self-report the wrong release (this happened with v1.0.0-rc1). The
+# check-release-version job gates every build and publish job on that match;
+# run ./scripts/check-release-version.sh before pushing a tag.
 name: Release binaries
 
 on:
@@ -26,6 +33,11 @@ on:
         default: false
       publish_docker_to_dockerhub:
         description: "Publish Docker images to Docker Hub"
+        required: false
+        type: boolean
+        default: false
+      skip_version_check:
+        description: "Skip the tag / zakura package version match check (only for repairing releases tagged with a mismatched version, like v1.0.0-rc1)"
         required: false
         type: boolean
         default: false
@@ -73,6 +85,25 @@ jobs:
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "checkout_ref=$checkout_ref" >> "$GITHUB_OUTPUT"
 
+  check-release-version:
+    name: Check release tag matches package version
+    runs-on: ubuntu-latest
+    needs: [resolve-release]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.resolve-release.outputs.checkout_ref }}
+
+      # Tag pushes cannot set inputs, so the check always runs for new tags;
+      # skip_version_check only unblocks workflow_dispatch repairs of releases
+      # that were tagged with a mismatched version before this gate existed.
+      - name: Check the zakura package version matches the release tag
+        if: ${{ !inputs.skip_version_check }}
+        env:
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+        run: ./scripts/check-release-version.sh "$RELEASE_TAG"
+
   resolve-zcashd-compat-manifest:
     name: Resolve zcashd compat manifest
     runs-on: ubuntu-latest
@@ -97,7 +128,7 @@ jobs:
   build-zakurad-assets:
     name: Build zakurad assets (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    needs: [resolve-release]
+    needs: [resolve-release, check-release-version]
     strategy:
       fail-fast: false
       matrix:
@@ -145,7 +176,31 @@ jobs:
           fi
 
       - name: Validate binary
-        run: ./out/usr/local/bin/${{ env.release_binary }} --version
+        env:
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+          SKIP_VERSION_CHECK: ${{ inputs.skip_version_check }}
+        run: |
+          set -euo pipefail
+          version_output="$(./out/usr/local/bin/${{ env.release_binary }} --version)"
+          echo "$version_output"
+
+          if [ "$SKIP_VERSION_CHECK" = "true" ]; then
+            echo "Skipping binary version check (skip_version_check input set)."
+            exit 0
+          fi
+
+          # Docker builds have no .git, so the binary reports
+          # CARGO_PKG_VERSION plus "+g<commit>" build metadata; the release
+          # version must match the tag exactly.
+          binary_version="$(printf '%s\n' "$version_output" | head -n1)"
+          binary_version="${binary_version##* }"
+          binary_version="${binary_version%%+*}"
+          tag_version="${RELEASE_TAG#v}"
+          if [ "$binary_version" != "$tag_version" ]; then
+            echo "Binary self-reports version ${binary_version}, but the release tag is ${RELEASE_TAG}." >&2
+            echo "Bump the zakura package version on the release branch before tagging." >&2
+            exit 1
+          fi
 
       - name: Package archive and metadata
         env:
@@ -364,7 +419,7 @@ jobs:
 
   build:
     name: Build Release Docker (${{ matrix.name }})
-    needs: [resolve-release]
+    needs: [resolve-release, check-release-version]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -483,7 +538,7 @@ jobs:
   build-zcashd-compat:
     name: Build Release Docker zcashd Compat (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    needs: [resolve-release, resolve-zcashd-compat-manifest]
+    needs: [resolve-release, resolve-zcashd-compat-manifest, check-release-version]
     strategy:
       fail-fast: false
       matrix:
@@ -610,6 +665,7 @@ jobs:
     if: always()
     needs:
       - resolve-release
+      - check-release-version
       - resolve-zcashd-compat-manifest
       - build-zakurad-assets
       - publish-zakurad-assets

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- VCT checkpoint writes now use the validated header store for the H+1 root witness,
+  avoiding a circular wait for the next checkpoint range's block bodies.
 - `read::history_tree` now returns the finalized history tree only when the
   requested hash or height exactly matches the finalized tip.
 

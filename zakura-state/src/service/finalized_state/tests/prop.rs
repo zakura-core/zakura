@@ -5,8 +5,10 @@ use std::{collections::HashMap, env, error::Error, fs, sync::Arc};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
+use zakura_chain::serialization::ZcashDeserializeInto;
 use zakura_chain::{
     block::{Block, Height},
+    parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{
         testnet::{ConfiguredActivationHeights, ParametersBuilder},
         NetworkUpgrade,
@@ -39,10 +41,71 @@ type OrchardTree = Arc<zakura_chain::orchard::tree::NoteCommitmentTree>;
 type SproutTree = Arc<zakura_chain::sprout::tree::NoteCommitmentTree>;
 
 fn next_vct_block(block: Arc<Block>) -> Option<NextVctBlock> {
-    Some(NextVctBlock {
-        block,
-        auth_data_root: None,
-    })
+    Some(NextVctBlock::from_block(block, None))
+}
+
+#[test]
+fn vct_successor_witness_uses_stored_header_without_body() {
+    let _init_guard = zakura_test::init();
+    let network = zakura_chain::parameters::Network::Mainnet;
+    let mut state = FinalizedState::new(
+        &Config::ephemeral(),
+        &network,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    );
+    let genesis = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("genesis block deserializes");
+    let block1 = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("block 1 deserializes");
+
+    state
+        .commit_finalized_direct(
+            CheckpointVerifiedBlock::from(genesis.clone()).into(),
+            None,
+            None,
+            "header-only VCT successor test genesis",
+        )
+        .expect("genesis commits");
+
+    let roots = BlockCommitmentRoots {
+        height: Height(1),
+        sapling_root: zakura_chain::sapling::tree::NoteCommitmentTree::default().root(),
+        orchard_root: zakura_chain::orchard::tree::NoteCommitmentTree::default().root(),
+        ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+        sapling_tx: 0,
+        orchard_tx: 0,
+        ironwood_tx: 0,
+        auth_data_root: block1.auth_data_root(),
+    };
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch_with_roots(
+            &state.db,
+            genesis.hash(),
+            std::slice::from_ref(&block1.header),
+            &[0],
+            &[roots],
+        )
+        .expect("block 1 header is contextually valid");
+    state
+        .db
+        .write_batch(batch)
+        .expect("header range batch writes");
+
+    assert!(
+        state.db.block(Height(1).into()).is_none(),
+        "the successor body must remain absent"
+    );
+    let witness = state
+        .vct_successor_from_header_store(Height(0), genesis.hash())
+        .expect("the stored header and auth-data root form a successor witness");
+    assert_eq!(witness.header, block1.header);
+    assert_eq!(witness.height, Height(1));
+    assert_eq!(witness.hash, block1.hash());
+    assert_eq!(witness.auth_data_root, Some(block1.auth_data_root()));
 }
 
 /// A handoff frontier over empty trees at `height`, for sources whose test does not
@@ -584,10 +647,8 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
             let mut error_height = None;
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| NextVctBlock {
-                    block: blocks[i + 1].block.clone(),
-                    auth_data_root: None,
-                });
+                let next = (i < last)
+                    .then(|| NextVctBlock::from_block(blocks[i + 1].block.clone(), None));
                 match fast.commit_finalized_direct(cv.into(), None, next, "vct hole fast") {
                     Ok(_) => {}
                     Err(error) => {
@@ -1301,10 +1362,8 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             prop_assert!(!fast.vct_fast_needs_successor(handoff), "the trusted handoff frontier authenticates the handoff root without a successor");
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| NextVctBlock {
-                    block: blocks[i + 1].block.clone(),
-                    auth_data_root: None,
-                });
+                let next = (i < last)
+                    .then(|| NextVctBlock::from_block(blocks[i + 1].block.clone(), None));
                 fast.commit_finalized_direct(cv.into(), None, next, "vct fast handoff")
                     .expect("verified fast commit succeeds");
             }
@@ -1382,10 +1441,8 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             let mut handoff_error = None;
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| NextVctBlock {
-                    block: blocks[i + 1].block.clone(),
-                    auth_data_root: None,
-                });
+                let next = (i < last)
+                    .then(|| NextVctBlock::from_block(blocks[i + 1].block.clone(), None));
                 match bad_handoff.commit_finalized_direct(cv.into(), None, next, "vct bad handoff") {
                     Ok(_) => {}
                     Err(error) => {
@@ -1441,10 +1498,8 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             let mut ironwood_handoff_error = None;
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < last).then(|| NextVctBlock {
-                    block: blocks[i + 1].block.clone(),
-                    auth_data_root: None,
-                });
+                let next = (i < last)
+                    .then(|| NextVctBlock::from_block(blocks[i + 1].block.clone(), None));
                 match bad_ironwood_handoff.commit_finalized_direct(cv.into(), None, next, "vct bad ironwood handoff") {
                     Ok(_) => {}
                     Err(error) => {
@@ -1571,10 +1626,8 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 );
                 for i in 0..=handoff_index {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                    let next = (i < handoff_index).then(|| NextVctBlock {
-                        block: blocks[i + 1].block.clone(),
-                        auth_data_root: None,
-                    });
+                    let next = (i < handoff_index)
+                        .then(|| NextVctBlock::from_block(blocks[i + 1].block.clone(), None));
                     fast.commit_finalized_direct(cv.into(), None, next, "vct switch fast prefix")
                         .expect("verified fast prefix commits");
                 }
@@ -1650,10 +1703,8 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             );
             for i in (seed + 1)..=post_handoff_tip {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
-                let next = (i < post_handoff_tip).then(|| NextVctBlock {
-                    block: blocks[i + 1].block.clone(),
-                    auth_data_root: None,
-                });
+                let next = (i < post_handoff_tip)
+                    .then(|| NextVctBlock::from_block(blocks[i + 1].block.clone(), None));
                 fast_suffix
                     .commit_finalized_direct(cv.into(), None, next, "vct switch fast suffix")
                     .expect("fast suffix commits after manual prefix");

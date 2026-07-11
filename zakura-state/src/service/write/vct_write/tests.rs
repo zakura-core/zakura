@@ -58,18 +58,6 @@ fn take_ready_prefers_retry_over_lookahead() {
 }
 
 #[test]
-fn defer_makes_block_the_next_ready_block() {
-    let mut manager = VctWriteManager::default();
-    let block = queued_block(1);
-    let hash = block.0.hash;
-
-    manager.defer(block);
-
-    let ready = manager.take_ready().expect("deferred block is ready");
-    assert_eq!(ready.0.hash, hash);
-}
-
-#[test]
 fn fill_successor_only_buffers_one_linking_block_at_a_time() {
     let mut manager = VctWriteManager::default();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -127,8 +115,8 @@ fn fill_successor_discards_non_successors_and_keeps_the_linking_block() {
     let witness = manager
         .next_vct_block()
         .expect("successor is buffered")
-        .block;
-    assert_eq!(witness.header.previous_block_hash, current.0.hash);
+        .header;
+    assert_eq!(witness.previous_block_hash, current.0.hash);
 }
 
 /// With no linking block buffered anywhere, the look-ahead ends up empty, so the
@@ -142,7 +130,7 @@ fn fill_successor_empties_the_lookahead_when_no_successor_exists() {
 
     manager.fill_successor(&mut rx, &current);
 
-    assert!(manager.is_lookahead_empty());
+    assert!(manager.lookahead.is_empty());
     assert!(manager.next_vct_block().is_none());
 }
 
@@ -157,7 +145,14 @@ fn next_vct_block_reflects_the_lookahead_front() {
     manager.lookahead.push_back(block);
 
     let next_vct_block = manager.next_vct_block().expect("look-ahead has a block");
-    assert_eq!(next_vct_block.block, expected_block);
+    assert_eq!(next_vct_block.header, expected_block.header);
+    assert_eq!(next_vct_block.hash, expected_block.hash());
+    assert_eq!(
+        next_vct_block.height,
+        expected_block
+            .coinbase_height()
+            .expect("fake block has a height")
+    );
     assert_eq!(next_vct_block.auth_data_root, expected_auth_data_root);
 }
 
@@ -178,7 +173,7 @@ fn reset_clears_the_lookahead() {
 
     manager.reset(&mut finalized_state);
 
-    assert!(manager.is_lookahead_empty());
+    assert!(manager.lookahead.is_empty());
 }
 
 #[test]

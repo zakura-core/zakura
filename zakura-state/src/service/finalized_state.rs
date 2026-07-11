@@ -740,12 +740,11 @@ impl FinalizedState {
                         // write worker only buffers direct successors, so this should
                         // never fire.
                         let next_vct_block = next_vct_block.filter(|next_vct_block| {
-                            let links =
-                                next_vct_block.block.header.previous_block_hash == block_hash;
+                            let links = next_vct_block.header.previous_block_hash == block_hash;
                             if !links {
                                 tracing::warn!(
                                     ?height,
-                                    witness_parent = ?next_vct_block.block.header.previous_block_hash,
+                                    witness_parent = ?next_vct_block.header.previous_block_hash,
                                     expected_parent = ?block_hash,
                                     "VCT: ignoring a successor witness that does not link \
                                      to the block being committed"
@@ -782,7 +781,8 @@ impl FinalizedState {
                         if let Some(next_vct_block) = &next_vct_block {
                             verification_items.push(
                                 commitment_aux_verify::CommitmentRootVerification::header_only(
-                                    next_vct_block.block.clone(),
+                                    next_vct_block.header.clone(),
+                                    next_vct_block.height,
                                     next_vct_block.auth_data_root,
                                 ),
                             );
@@ -805,10 +805,8 @@ impl FinalizedState {
                             })?;
 
                         if let Some(next_vct_block) = &next_vct_block {
-                            self.vct.mark_prevalidated(
-                                (height + 1).expect("checkpoint block heights are valid"),
-                                next_vct_block.block.hash(),
-                            );
+                            self.vct
+                                .mark_prevalidated(next_vct_block.height, next_vct_block.hash);
                         } else if self
                             .vct
                             .source()
@@ -1131,6 +1129,40 @@ impl FinalizedState {
         self.vct
             .source()
             .is_some_and(|v| v.vct_root_needs_successor(height, &self.network()))
+    }
+
+    /// Returns a VCT successor witness from the contextually validated Zakura
+    /// header store, without requiring the successor's block body.
+    pub(crate) fn vct_successor_from_header_store(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Option<NextVctBlock> {
+        let successor_height = (height + 1)?;
+        let header = self.db.zakura_header(successor_height)?;
+        if header.previous_block_hash != hash {
+            tracing::warn!(
+                ?height,
+                ?hash,
+                ?successor_height,
+                successor_parent = ?header.previous_block_hash,
+                "VCT: ignoring a stored successor header that does not link to the block being committed"
+            );
+            return None;
+        }
+
+        let roots = self
+            .db
+            .zakura_header_commitment_roots_by_height_range(successor_height..=successor_height)
+            .into_iter()
+            .next()
+            .filter(|roots| roots.height == successor_height)?;
+
+        Some(NextVctBlock::from_header(
+            header,
+            successor_height,
+            roots.auth_data_root,
+        ))
     }
 
     /// Verify checkpoint handoff frontiers against this block's supplied roots.

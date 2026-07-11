@@ -111,23 +111,12 @@ impl VctWriteManager {
         }
     }
 
-    /// `true` when no block is buffered as the look-ahead successor.
-    pub(super) fn is_lookahead_empty(&self) -> bool {
-        self.lookahead.is_empty()
-    }
-
     /// The buffered successor block's header data, used to verify the
     /// current block's supplied vct roots before trusting them.
     pub(super) fn next_vct_block(&self) -> Option<NextVctBlock> {
-        self.lookahead.front().map(|next| NextVctBlock {
-            block: next.0.block.clone(),
-            auth_data_root: next.0.auth_data_root,
-        })
-    }
-
-    /// Parks `block` for retry instead of committing it now.
-    pub(super) fn defer(&mut self, block: QueuedCheckpointVerified) {
-        self.retry = Some(block);
+        self.lookahead
+            .front()
+            .map(|next| NextVctBlock::from_block(next.0.block.clone(), next.0.auth_data_root))
     }
 
     /// A successful commit clears any vct root stall: logs recovery and
@@ -163,13 +152,14 @@ impl VctWriteManager {
         // requires is available — roots are not individually re-requested, so
         // the node will not advance (it will not, by design, recompute against
         // the stale frontier). Surface it loudly.
-        match self.stall {
-            Some((stuck, _)) if stuck == height => {}
+        let new_stall = match self.stall {
+            Some((stuck, _)) if stuck == height => false,
             _ => {
                 self.stall = Some((height, Instant::now()));
                 self.stall_logged = false;
+                true
             }
-        }
+        };
         if !self.stall_logged
             && self
                 .stall
@@ -179,20 +169,26 @@ impl VctWriteManager {
                 ?height,
                 root_unavailable,
                 stalled_for = ?VCT_ROOT_STALL_WARN_AFTER,
-                "VCT: checkpoint commit stalled with no verifiable supplied root; \
-                 roots are not re-requested, so the node cannot advance without a \
-                 re-delivery of this header range (it will not recompute against \
-                 the frozen frontier)"
+                "VCT: checkpoint commit stalled waiting for a verifiable supplied root \
+                 or successor witness; the node will not recompute against the frozen frontier"
             );
             metrics::gauge!("state.vct.root.stalled.height").set(f64::from(height.0));
             self.stall_logged = true;
-        } else {
+        } else if new_stall {
             tracing::warn!(
                 ?height,
                 block_height = ?block.0.height,
                 block_hash = ?block.0.hash,
                 root_unavailable,
                 "VCT: supplied root not yet verifiable; retrying checkpoint commit in place"
+            );
+        } else {
+            tracing::trace!(
+                ?height,
+                block_height = ?block.0.height,
+                block_hash = ?block.0.hash,
+                root_unavailable,
+                "VCT: supplied root still not verifiable; retrying checkpoint commit in place"
             );
         }
 

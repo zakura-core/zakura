@@ -418,28 +418,33 @@ impl WriteBlockWorkerTask {
             // block's supplied roots against the successor's header.
             vct_write_manager.fill_successor(finalized_block_write_receiver, &ordered_block);
 
-            // A non-handoff VCT fast block's supplied roots are authenticated by
-            // its successor's header. If the successor is not buffered yet, keep
-            // this block local and wait instead of surfacing a checkpoint commit
-            // error through the invalid-block reset path.
-            if vct_write_manager.is_lookahead_empty()
-                && finalized_state.vct_fast_needs_successor(ordered_block.0.height)
-            {
-                tracing::trace!(
-                    height = ?ordered_block.0.height,
-                    hash = ?ordered_block.0.hash,
-                    "VCT: deferring fast checkpoint commit until successor is buffered"
-                );
-                vct_write_manager.defer(ordered_block);
-                std::thread::park_timeout(Duration::from_millis(10));
+            // Prefer a buffered body successor, but fall back to the already-validated
+            // Zakura header store. Requiring the body here creates a circular dependency
+            // at checkpoint boundaries: H waits for H+1 while H+1 cannot be submitted
+            // until its entire checkpoint range is verified.
+            let needs_vct_successor =
+                finalized_state.vct_fast_needs_successor(ordered_block.0.height);
+            let next_vct_block = vct_write_manager.next_vct_block().or_else(|| {
+                if needs_vct_successor {
+                    finalized_state.vct_successor_from_header_store(
+                        ordered_block.0.height,
+                        ordered_block.0.hash,
+                    )
+                } else {
+                    None
+                }
+            });
+
+            if needs_vct_successor && next_vct_block.is_none() {
+                let height = ordered_block.0.height;
+                let wait = vct_write_manager.on_retryable_error(height, false, ordered_block);
+                std::thread::park_timeout(wait);
                 continue;
             }
 
-            // The buffered VCT successor (if any) lets the committer verify this block's
-            // verified-commitment-trees fixture roots before trusting them: a block's
-            // roots are only committed by the next block's header. Its auth data root
-            // is already precomputed by the checkpoint verifier.
-            let next_vct_block = vct_write_manager.next_vct_block();
+            // The successor header authenticates the current block's supplied roots.
+            // Header-sync stores its ZIP-244 auth-data root alongside the contextually
+            // validated header, so this check does not require the successor body.
             let prev_note_commitment_trees = prev_finalized_note_commitment_trees.take();
             let prev_note_commitment_trees_for_retry = prev_note_commitment_trees.clone();
 

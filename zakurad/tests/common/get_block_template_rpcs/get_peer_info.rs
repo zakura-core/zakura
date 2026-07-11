@@ -1,13 +1,15 @@
 //! Tests that `getpeerinfo` RPC method responds with info about at least 1 peer.
 
-use color_eyre::eyre::{eyre, Context, Result};
+use color_eyre::eyre::{eyre, Result};
 
 use zakura_chain::parameters::Network;
 use zakura_node_services::rpc_client::RpcRequestClient;
 use zakura_rpc::client::PeerInfo;
+use zakura_test::{args, net::random_known_port};
 
 use crate::common::{
-    launch::{can_spawn_zakurad_for_test_type, spawn_zakurad_for_rpc},
+    config::testdir,
+    launch::{can_spawn_zakurad_for_test_type, ZakuradTestDirExt},
     test_type::TestType,
 };
 
@@ -20,44 +22,57 @@ pub(crate) async fn run() -> Result<()> {
     let test_name = "get_peer_info_test";
     let network = Network::Mainnet;
 
-    // Skip the test unless the user specifically asked for it and there is a zakurad_state_path
-    if !can_spawn_zakurad_for_test_type(test_name, test_type, true) {
+    if !can_spawn_zakurad_for_test_type(test_name, test_type, false) {
         return Ok(());
     }
 
-    tracing::info!(?network, "running getpeerinfo test using zakurad",);
+    let mut peer_config = test_type
+        .zakurad_config(test_name, false, None, &network)
+        .expect("already checked config")?;
+    let peer_address = format!("127.0.0.1:{}", random_known_port()).parse()?;
+    peer_config.network.listen_addr = peer_address;
 
-    let (mut zakurad, zakura_rpc_address) =
-        spawn_zakurad_for_rpc(network, test_name, test_type, true)?
-            .expect("Already checked zebra state path with can_spawn_zakurad_for_test_type");
+    let (failure_messages, ignore_messages) = test_type.zakurad_failure_messages();
+    let mut peer = testdir()?
+        .with_exact_config(&peer_config)?
+        .spawn_child(args!["start"])?
+        .with_timeout(test_type.zakurad_timeout())
+        .with_failure_regex_iter(failure_messages, ignore_messages);
+    peer.expect_stdout_line_matches(format!("Opened Zcash protocol endpoint at {peer_address}"))?;
 
-    let rpc_address = zakura_rpc_address.expect("getpeerinfo test must have RPC port");
+    let mut config = peer_config;
+    config.network.listen_addr = "127.0.0.1:0".parse()?;
+    config.network.initial_mainnet_peers = [peer_address.to_string()].into();
+    config.rpc.listen_addr = Some(format!("127.0.0.1:{}", random_known_port()).parse()?);
+    let rpc_address = config
+        .rpc
+        .listen_addr
+        .expect("getpeerinfo test config has an RPC port");
 
-    // Wait until port is open.
-    zakurad.expect_stdout_line_matches(format!("Opened RPC endpoint at {rpc_address}"))?;
+    let (failure_messages, ignore_messages) = test_type.zakurad_failure_messages();
+    let mut zakurad = testdir()?
+        .with_exact_config(&config)?
+        .spawn_child(args!["start"])?
+        .with_timeout(test_type.zakurad_timeout())
+        .with_failure_regex_iter(failure_messages, ignore_messages);
+    zakurad.expect_stdout_line_matches_all_unordered([
+        format!("Opened RPC endpoint at {rpc_address}"),
+        "finished connecting to initial seed and disk cache peers".to_string(),
+    ])?;
 
-    tracing::info!(?rpc_address, "zakurad opened its RPC port",);
-
-    // call `getpeerinfo` RPC method
-    let peer_info_result: Vec<PeerInfo> = RpcRequestClient::new(rpc_address)
+    let peer_info: Vec<PeerInfo> = RpcRequestClient::new(rpc_address)
         .json_result_from_call("getpeerinfo", "[]")
         .await
         .map_err(|err| eyre!(err))?;
 
-    assert!(
-        !peer_info_result.is_empty(),
-        "getpeerinfo should return info for at least 1 peer"
+    assert_eq!(
+        peer_info.len(),
+        1,
+        "getpeerinfo should return the configured local peer"
     );
 
-    zakurad.kill(false)?;
-
-    let output = zakurad.wait_with_output()?;
-    let output = output.assert_failure()?;
-
-    // [Note on port conflict](#Note on port conflict)
-    output
-        .assert_was_killed()
-        .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
+    zakurad.kill_and_return_output(false)?;
+    peer.kill_and_return_output(false)?;
 
     Ok(())
 }

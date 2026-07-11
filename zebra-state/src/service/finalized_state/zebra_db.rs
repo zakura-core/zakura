@@ -125,6 +125,16 @@ impl ZebraDb {
         column_families_in_code: impl IntoIterator<Item = String>,
         read_only: bool,
     ) -> Result<ZebraDb, StateInitError> {
+        // A read-only secondary follows another process's primary database and must never delete
+        // it, whereas an ephemeral database deletes its files on drop, so the two modes are
+        // mutually exclusive. Reject the combination up front, before the read-only branch below
+        // probes the (irrelevant) cache directory, so this configuration error surfaces as
+        // `ReadOnlyEphemeralConflict` regardless of whether that directory happens to exist.
+        // `DiskDb::new` re-checks the same invariant for callers that don't open through here.
+        if read_only && config.ephemeral {
+            return Err(StateInitError::ReadOnlyEphemeralConflict);
+        }
+
         // A read-only secondary instance must never modify the primary's cache directory, so it
         // skips the post-major-upgrade DB reuse (which can create directories and rename the
         // on-disk database) and reads the on-disk format version directly. The cache directory is

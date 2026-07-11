@@ -2,9 +2,10 @@
 
 use std::{
     cmp::min,
+    collections::HashSet,
     fmt,
     future::Future,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     panic,
     pin::Pin,
     sync::Arc,
@@ -44,7 +45,7 @@ use crate::{
     },
     peer_set::{ConnectionTracker, InventoryChange},
     protocol::{
-        external::{types::*, AddrInVersion, Codec, InventoryHash, Message},
+        external::{canonical_socket_addr, types::*, AddrInVersion, Codec, InventoryHash, Message},
         internal::{Request, Response},
     },
     types::MetaAddr,
@@ -84,6 +85,7 @@ where
     minimum_peer_version: MinimumPeerVersion<C>,
     nonces: Arc<futures::lock::Mutex<IndexSet<Nonce>>>,
     zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
+    zcashd_compat_peer_ips: Arc<HashSet<IpAddr>>,
 
     parent_span: Span,
 }
@@ -129,6 +131,7 @@ where
             minimum_peer_version: self.minimum_peer_version.clone(),
             nonces: self.nonces.clone(),
             zakura_handshake_connector: self.zakura_handshake_connector.clone(),
+            zcashd_compat_peer_ips: self.zcashd_compat_peer_ips.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -225,6 +228,20 @@ impl ConnectedAddr {
     /// Returns a new outbound directly connected addr.
     pub fn new_outbound_direct(addr: PeerSocketAddr) -> ConnectedAddr {
         OutboundDirect { addr }
+    }
+
+    /// Returns true if this peer connected directly to us from `ip`.
+    ///
+    /// A zcashd-compat sidecar always reaches us as an inbound direct connection,
+    /// because zcashd dials Zakura via `-connect` and never listens itself.
+    pub fn is_inbound_direct_from_ip(&self, ip: &IpAddr) -> bool {
+        let expected_ip = canonical_socket_addr(SocketAddr::new(*ip, 0)).ip();
+
+        matches!(
+            self,
+            InboundDirect { addr }
+                if canonical_socket_addr(addr.remove_socket_addr_privacy()).ip() == expected_ip
+        )
     }
 
     /// Returns a new inbound directly connected addr.
@@ -423,6 +440,7 @@ where
     address_book_updater: Option<tokio::sync::mpsc::Sender<MetaAddrChange>>,
     inv_collector: Option<broadcast::Sender<InventoryChange>>,
     zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
+    zcashd_compat_peer_ips: Option<Arc<HashSet<IpAddr>>>,
     latest_chain_tip: C,
 }
 
@@ -441,6 +459,18 @@ where
     /// Provide a service to handle inbound requests. Mandatory.
     pub fn with_inbound_service(mut self, inbound_service: S) -> Self {
         self.inbound_service = Some(inbound_service);
+        self
+    }
+
+    /// Provide the inbound peer IPs belonging to a zcashd-compat sidecar. Optional.
+    ///
+    /// Requests from these peers are never silently dropped by the inbound
+    /// load-shed path. See [`Connection::drive_peer_request`] for why.
+    pub fn with_zcashd_compat_peer_ips(
+        mut self,
+        zcashd_compat_peer_ips: Arc<HashSet<IpAddr>>,
+    ) -> Self {
+        self.zcashd_compat_peer_ips = Some(zcashd_compat_peer_ips);
         self
     }
 
@@ -506,6 +536,7 @@ where
             relay: self.relay,
             inv_collector: self.inv_collector,
             zakura_handshake_connector: self.zakura_handshake_connector,
+            zcashd_compat_peer_ips: self.zcashd_compat_peer_ips,
         }
     }
 
@@ -565,6 +596,7 @@ where
             minimum_peer_version,
             nonces,
             zakura_handshake_connector: self.zakura_handshake_connector,
+            zcashd_compat_peer_ips: self.zcashd_compat_peer_ips.unwrap_or_default(),
             parent_span: Span::current(),
         })
     }
@@ -589,6 +621,7 @@ where
             address_book_updater: None,
             inv_collector: None,
             zakura_handshake_connector: None,
+            zcashd_compat_peer_ips: None,
             latest_chain_tip: NoChainTip,
         }
     }
@@ -1332,6 +1365,7 @@ where
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
+        let zcashd_compat_peer_ips = self.zcashd_compat_peer_ips.clone();
 
         // # Security
         //
@@ -1598,6 +1632,12 @@ where
                     )
                 });
 
+            // The sidecar's IP set is fixed and the connected address never changes,
+            // so resolve this once per connection rather than on every request.
+            let is_zcashd_compat_peer = zcashd_compat_peer_ips
+                .iter()
+                .any(|ip| connected_addr.is_inbound_direct_from_ip(ip));
+
             let server = Connection::new(
                 inbound_service,
                 server_rx,
@@ -1606,6 +1646,7 @@ where
                 connection_tracker,
                 connection_info.clone(),
                 alternate_addrs.collect(),
+                is_zcashd_compat_peer,
             );
 
             let connection_task = tokio::spawn(

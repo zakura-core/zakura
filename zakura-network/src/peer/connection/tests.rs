@@ -28,8 +28,8 @@ use crate::{
 mod prop;
 mod vectors;
 
-/// Creates a new [`Connection`] instance for testing.
-fn new_test_connection<A>() -> (
+/// A test [`Connection`], with the channels and mocked services driving it.
+type TestConnection<A> = (
     Connection<
         MockService<Request, Response, A>,
         SinkMapErr<mpsc::Sender<Message>, fn(mpsc::SendError) -> SerializationError>,
@@ -38,7 +38,16 @@ fn new_test_connection<A>() -> (
     MockService<Request, Response, A>,
     mpsc::Receiver<Message>,
     ErrorSlot,
-) {
+);
+
+/// Creates a new [`Connection`] instance for testing.
+fn new_test_connection<A>() -> TestConnection<A> {
+    new_test_connection_with_compat_sidecar(false)
+}
+
+/// Creates a new [`Connection`] instance for testing, where `is_zcashd_compat_peer`
+/// marks the peer as a zcashd-compat sidecar.
+fn new_test_connection_with_compat_sidecar<A>(is_zcashd_compat_peer: bool) -> TestConnection<A> {
     let mock_inbound_service = MockService::build().finish();
     let (client_tx, client_rx) = mpsc::channel(0);
     let shared_error_slot = ErrorSlot::default();
@@ -87,6 +96,7 @@ fn new_test_connection<A>() -> (
         ActiveConnectionCounter::new_counter().track_connection(),
         Arc::new(connection_info),
         Vec::new(),
+        is_zcashd_compat_peer,
     );
 
     (

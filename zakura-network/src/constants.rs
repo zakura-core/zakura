@@ -381,6 +381,38 @@ pub const MIN_OVERLOAD_DROP_PROBABILITY: f32 = 0.05;
 /// [`Overloaded`](crate::PeerError::Overloaded) error.
 pub const MAX_OVERLOAD_DROP_PROBABILITY: f32 = 0.5;
 
+/// The total time Zakura will keep retrying an inbound request from a
+/// zcashd-compat sidecar peer that the inbound service shed as overloaded.
+///
+/// # Security
+///
+/// This applies *only* to peers in `zcashd_compat.block_gossip_peer_ips`, which
+/// defaults to loopback: a local zcashd process that Zakura itself supervises.
+/// Ordinary peers keep the randomised drop/ignore load-shedding, so this is not
+/// a denial-of-service vector.
+///
+/// A sidecar zcashd is pinned to Zakura as its single peer (`-connect`), and
+/// classic `getheaders` has no timeout or retry, so one silently ignored request
+/// stalls the sidecar's chain sync permanently. Retrying is the difference
+/// between backpressure and a black hole.
+///
+/// This bound must comfortably exceed `zakurad`'s `MAX_INBOUND_RESPONSE_TIME` (5
+/// seconds), so a request queued behind a full inbound buffer has time to drain.
+///
+/// It must also stay *below* the sidecar's own `HEADERS_RESPONSE_TIMEOUT` (30
+/// seconds in the zcashd-compat build). Giving up first means Zakura closes the
+/// connection, zcashd observes the disconnect and re-dials with fresh sync state,
+/// and no duplicate `getheaders` is ever in flight. If Zakura held the request
+/// longer, zcashd would re-send while the original was still queued.
+pub const MAX_COMPAT_INBOUND_RETRY_TIME: Duration = Duration::from_secs(20);
+
+/// How long to wait between retries of an overloaded inbound request from a
+/// zcashd-compat sidecar peer.
+///
+/// Short enough that a drained buffer is noticed quickly, long enough that a
+/// sustained overload does not spin.
+pub const COMPAT_INBOUND_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
 /// The minimum interval between logging peer set status updates.
 pub const MIN_PEER_SET_LOG_INTERVAL: Duration = Duration::from_secs(60);
 

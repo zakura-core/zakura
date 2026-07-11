@@ -22,7 +22,10 @@ use zakura_chain::serialization::SerializationError;
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
-    constants::{MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY, REQUEST_TIMEOUT},
+    constants::{
+        MAX_COMPAT_INBOUND_RETRY_TIME, MAX_OVERLOAD_DROP_PROBABILITY,
+        MIN_OVERLOAD_DROP_PROBABILITY, REQUEST_TIMEOUT,
+    },
     peer::{
         connection::{overload_drop_connection_probability, Connection, State},
         ClientRequest, ErrorSlot,
@@ -886,6 +889,123 @@ async fn connection_is_randomly_disconnected_on_overload() {
     );
 }
 
+/// Test that an overloaded inbound request from a zcashd-compat sidecar is retried and
+/// answered, rather than silently ignored.
+///
+/// A sidecar zcashd is pinned to Zakura as its only peer and never re-sends `getheaders`,
+/// so an ignored request stalls its chain sync permanently.
+#[tokio::test]
+async fn compat_sidecar_inbound_request_is_retried_not_ignored() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+
+    let (
+        connection,
+        _client_tx,
+        mut inbound_service,
+        mut peer_outbound_messages,
+        shared_error_slot,
+    ) = new_test_compat_sidecar_connection();
+
+    let connection_handle = tokio::spawn(connection.run(peer_rx));
+
+    // Send an inbound request from the sidecar.
+    peer_tx
+        .send(Ok(Message::GetAddr))
+        .await
+        .expect("send to channel always succeeds");
+
+    // Shed it, the way a saturated inbound buffer would.
+    inbound_service
+        .expect_request(Request::Peers)
+        .await
+        .respond_error(Overloaded::new().into());
+
+    // An ordinary peer would be ignored here, with no reply ever sent. The sidecar must
+    // instead see the request retried once the inbound service has capacity again.
+    inbound_service
+        .expect_request(Request::Peers)
+        .await
+        .respond(Response::Peers(vec![]));
+
+    let outbound_message =
+        tokio::time::timeout(Duration::from_secs(1), peer_outbound_messages.next())
+            .await
+            .expect("the retried request must be answered within the timeout")
+            .expect("the outbound message channel must not be closed");
+
+    assert!(
+        matches!(outbound_message, Message::Addr(_)),
+        "the sidecar must receive a response to its retried request, got: {outbound_message:?}",
+    );
+
+    let error = shared_error_slot.try_get_error();
+    assert!(
+        error.is_none(),
+        "the sidecar connection must stay open across a retried overload: {error:?}",
+    );
+
+    connection_handle.abort();
+}
+
+/// Test that a zcashd-compat sidecar connection is closed, not silently ignored, when the
+/// inbound service stays overloaded past the retry budget.
+///
+/// Closing is recoverable: zcashd redials its `-connect` peer and restarts headers sync.
+/// Silently ignoring is not: it black-holes a `getheaders` the sidecar never re-sends.
+#[tokio::test(start_paused = true)]
+async fn compat_sidecar_connection_is_closed_when_retries_are_exhausted() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+
+    let (
+        connection,
+        _client_tx,
+        mut inbound_service,
+        mut peer_outbound_messages,
+        shared_error_slot,
+    ) = new_test_compat_sidecar_connection();
+
+    let connection_handle = tokio::spawn(connection.run(peer_rx));
+
+    peer_tx
+        .send(Ok(Message::GetAddr))
+        .await
+        .expect("send to channel always succeeds");
+
+    // Stay overloaded past the retry budget. Time is paused, so the connection's retry
+    // sleeps auto-advance and this costs no wall-clock time. Once the budget is spent the
+    // connection stops retrying and no further requests arrive, so this loop ends.
+    let overload_until =
+        tokio::time::Instant::now() + MAX_COMPAT_INBOUND_RETRY_TIME + Duration::from_secs(1);
+    while tokio::time::Instant::now() < overload_until {
+        let Some(responder) = inbound_service.try_next_request().await else {
+            break;
+        };
+
+        assert_eq!(*responder.request(), Request::Peers);
+        responder.respond_error(Overloaded::new().into());
+    }
+
+    // The connection must have failed, rather than leaving the sidecar waiting forever.
+    let error = shared_error_slot.try_get_error();
+    assert!(
+        error.is_some(),
+        "the sidecar connection must be closed once the retry budget is exhausted, \
+         so zcashd reconnects instead of stalling",
+    );
+
+    let outbound_result = peer_outbound_messages.try_recv();
+    assert!(
+        !matches!(outbound_result, Ok(Message::Addr(_))),
+        "no response is expected when the inbound service never recovers: {outbound_result:?}",
+    );
+
+    connection_handle.abort();
+}
+
 #[tokio::test]
 async fn connection_ping_pong_round_trip() {
     let _init_guard = zakura_test::init();
@@ -973,4 +1093,18 @@ fn new_test_connection() -> (
     ErrorSlot,
 ) {
     super::new_test_connection()
+}
+
+/// Creates a new [`Connection`] whose peer is a zcashd-compat sidecar.
+fn new_test_compat_sidecar_connection() -> (
+    Connection<
+        MockService<Request, Response, PanicAssertion>,
+        SinkMapErr<mpsc::Sender<Message>, fn(mpsc::SendError) -> SerializationError>,
+    >,
+    mpsc::Sender<ClientRequest>,
+    MockService<Request, Response, PanicAssertion>,
+    mpsc::Receiver<Message>,
+    ErrorSlot,
+) {
+    super::new_test_connection_with_compat_sidecar(true)
 }

@@ -240,6 +240,12 @@ where
             .as_ref()
             .map(|endpoint| endpoint.connector());
 
+        // The sidecar peers whose inbound requests must never be silently shed are the
+        // same peers that must always receive block gossip: the local zcashd this node
+        // supervises.
+        let zcashd_compat_peer_ips: Arc<HashSet<IpAddr>> =
+            Arc::new(block_gossip_peer_ips.iter().copied().collect());
+
         let mut hs_builder = peer::Handshake::builder()
             .with_config(config.clone())
             .with_inbound_service(inbound_service)
@@ -248,6 +254,7 @@ where
             .with_advertised_services(advertised_services)
             .with_user_agent(user_agent)
             .with_latest_chain_tip(latest_chain_tip.clone())
+            .with_zcashd_compat_peer_ips(zcashd_compat_peer_ips)
             .want_transactions(true);
 
         if let Some(zakura_handshake_connector) = zakura_handshake_connector {

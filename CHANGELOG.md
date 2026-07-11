@@ -32,6 +32,24 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   maturity, so a shipped checkpoint cannot be orphaned by a reorg Zakura would
   still follow. `MAX_BLOCK_REORG_HEIGHT` now lives in `zakura-chain` as the single
   source of truth. Backported from upstream Zebra PR #10719.
+- Fixed the zcashd-compat sidecar's chain sync stalling silently and permanently
+  within seconds of a fresh start. Every inbound peer request shares one bounded
+  queue behind a `tower::load_shed` layer, and an overloaded request was silently
+  ignored (95% of the time) with no reply, no log above `DEBUG`, and the
+  connection left open. Zakura's own checkpoint sync keeps that queue busy exactly
+  while the sidecar is fetching headers, so a shed request was near-inevitable on
+  a fresh run. A sidecar zcashd is pinned to Zakura as its only peer and never
+  re-sends `getheaders`, so one ignored request stalled it forever.
+
+  Inbound requests from peers in `zcashd_compat.block_gossip_peer_ips` (loopback
+  by default) are now retried while the queue drains, rather than shed. If the
+  service is still overloaded after `MAX_COMPAT_INBOUND_RETRY_TIME` (20s), the
+  connection is closed with a `WARN` instead of being silently ignored, so zcashd
+  redials and restarts its headers sync. Ordinary peers keep the existing
+  randomised load-shedding, so this is not a denial-of-service vector: the
+  allowlist only covers a local zcashd process that Zakura itself supervises. The
+  `Overloaded` log line also now carries the request, matching the timeout branch
+  next to it, so a shed request is diagnosable at the default filter level.
 - Added a default 180-second request timeout to `RpcRequestClient`, so RPC calls
   no longer hang indefinitely when a server accepts the connection but never
   sends a response. A new `new_with_timeout` constructor lets callers with

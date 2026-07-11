@@ -439,6 +439,18 @@ impl StartCmd {
             PeerServices::NODE_NETWORK
         };
 
+        // The configured list is empty by default and is filled in above, so log what we
+        // actually resolved. These IPs decide which inbound peers always receive block
+        // gossip and are never silently load-shed, so an operator debugging a stalled
+        // sidecar needs to see the effective value, not the empty config field.
+        if config.zcashd_compat.enabled {
+            info!(
+                sidecar_peer_ips = ?zcashd_compat_block_gossip_peer_ips,
+                "zcashd-compat sidecar peers: block gossip is always delivered, and inbound \
+                 requests are retried rather than load-shed",
+            );
+        }
+
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
             zakura_network::init_with_zakura_header_sync(
                 config.network.clone(),

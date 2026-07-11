@@ -23,8 +23,9 @@ use zakura_chain::{
 
 use crate::{
     constants::{
-        self, MAX_ADDRS_IN_MESSAGE, MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY,
-        OVERLOAD_PROTECTION_INTERVAL, PEER_ADDR_RESPONSE_LIMIT,
+        self, COMPAT_INBOUND_RETRY_INTERVAL, MAX_ADDRS_IN_MESSAGE, MAX_COMPAT_INBOUND_RETRY_TIME,
+        MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY, OVERLOAD_PROTECTION_INTERVAL,
+        PEER_ADDR_RESPONSE_LIMIT,
     },
     meta_addr::MetaAddr,
     peer::{
@@ -614,6 +615,14 @@ where
     /// service to a request from this connection,
     /// or None if this connection hasn't yet received an overload error.
     last_overload_time: Option<Instant>,
+
+    /// Whether this peer is a zcashd-compat sidecar, configured via
+    /// `zcashd_compat.block_gossip_peer_ips`.
+    ///
+    /// The sidecar is a local zcashd process that Zakura supervises, and it is
+    /// pinned to Zakura as its only peer. Its inbound requests must never be
+    /// silently ignored: see [`Connection::drive_peer_request`].
+    pub(super) is_zcashd_compat_peer: bool,
 }
 
 impl<S, Tx> fmt::Debug for Connection<S, Tx>
@@ -631,6 +640,7 @@ where
             .field("metrics_label", &self.metrics_label)
             .field("last_metrics_state", &self.last_metrics_state)
             .field("last_overload_time", &self.last_overload_time)
+            .field("is_zcashd_compat_peer", &self.is_zcashd_compat_peer)
             .finish()
     }
 }
@@ -640,6 +650,7 @@ where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     /// Return a new connection from its channels, services, shared state, and metadata.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inbound_service: S,
         client_rx: futures::channel::mpsc::Receiver<ClientRequest>,
@@ -648,6 +659,7 @@ where
         connection_tracker: ConnectionTracker,
         connection_info: Arc<ConnectionInfo>,
         initial_cached_addrs: Vec<MetaAddr>,
+        is_zcashd_compat_peer: bool,
     ) -> Self {
         let metrics_label = connection_info.connected_addr.get_transient_addr_label();
 
@@ -664,6 +676,7 @@ where
             metrics_label,
             last_metrics_state: None,
             last_overload_time: None,
+            is_zcashd_compat_peer,
         }
     }
 }
@@ -1415,62 +1428,8 @@ where
         // before sending the next inbound request.
         tokio::task::yield_now().await;
 
-        // # Security
-        //
-        // Holding buffer slots for a long time can cause hangs:
-        // <https://docs.rs/tower/latest/tower/buffer/struct.Buffer.html#a-note-on-choosing-a-bound>
-        //
-        // The inbound service must be called immediately after a buffer slot is reserved.
-        //
-        // The inbound service never times out in readiness, because the load shed layer is always
-        // ready, and returns an error in response to the request instead.
-        if self.svc.ready().await.is_err() {
-            self.fail_with(PeerError::ServiceShutdown).await;
+        let Some(rsp) = self.call_inbound_service(&req).await else {
             return;
-        }
-
-        // Inbound service request timeouts are handled by the timeout layer in `start::start()`.
-        let rsp = match self.svc.call(req.clone()).await {
-            Err(e) => {
-                if e.is::<tower::load_shed::error::Overloaded>() {
-                    // # Security
-                    //
-                    // The peer request queue must have a limited length.
-                    // The buffer and load shed layers are added in `start::start()`.
-                    tracing::debug!("inbound service is overloaded, may close connection");
-
-                    let now = Instant::now();
-
-                    self.handle_inbound_overload(req, now, PeerError::Overloaded)
-                        .await;
-                } else if e.is::<tower::timeout::error::Elapsed>() {
-                    // # Security
-                    //
-                    // Peer requests must have a timeout.
-                    // The timeout layer is added in `start::start()`.
-                    tracing::info!(%req, "inbound service request timed out, may close connection");
-
-                    let now = Instant::now();
-
-                    self.handle_inbound_overload(req, now, PeerError::InboundTimeout)
-                        .await;
-                } else {
-                    // We could send a reject to the remote peer, but that might cause
-                    // them to disconnect, and we might be using them to sync blocks.
-                    // For similar reasons, we don't want to fail_with() here - we
-                    // only close the connection if the peer is doing something wrong.
-                    info!(
-                        %e,
-                        connection_state = ?self.state,
-                        client_receiver = ?self.client_rx,
-                        "error processing peer request",
-                    );
-                    self.update_state_metrics(format!("In::Req::{}/Rsp::Error", req.command()));
-                }
-
-                return;
-            }
-            Ok(rsp) => rsp,
         };
 
         // Add a metric for outbound responses to inbound requests
@@ -1612,9 +1571,136 @@ where
     /// The inbound connection rate-limit also makes it hard for multiple peers to perform this
     /// attack, because each inbound connection can only send one inbound request before its
     /// probability of being disconnected increases.
+    /// Send `req` to the inbound service and return its response, or `None` if the
+    /// request could not be answered.
+    ///
+    /// # Security
+    ///
+    /// Holding buffer slots for a long time can cause hangs:
+    /// <https://docs.rs/tower/latest/tower/buffer/struct.Buffer.html#a-note-on-choosing-a-bound>
+    ///
+    /// The inbound service must be called immediately after a buffer slot is reserved.
+    ///
+    /// The inbound service never times out in readiness, because the load shed layer is always
+    /// ready, and returns an error in response to the request instead.
+    ///
+    /// # zcashd-compat sidecar
+    ///
+    /// All peers share one bounded inbound queue, so a burst of Zakura's own
+    /// checkpoint-sync work can shed a request from any peer. For ordinary peers that
+    /// is correct: the request is dropped, and a healthy node has other peers to ask.
+    ///
+    /// A zcashd-compat sidecar has no other peers. It is pinned to this node by
+    /// `-connect`, and classic `getheaders` has neither a timeout nor a retry, so one
+    /// silently ignored request stalls its chain sync permanently. Apply backpressure
+    /// to the sidecar instead of shedding it: wait for the inbound queue to drain and
+    /// try again. The sidecar is a local process this node supervises, so retrying it
+    /// is not a denial-of-service vector.
+    async fn call_inbound_service(&mut self, req: &Request) -> Option<Response> {
+        // Measured on the tokio clock, which is the same clock the retry sleeps below
+        // advance. Using `std::time::Instant` here would let a paused-time test spin
+        // forever: the sleeps would auto-advance while the deadline never arrived.
+        let retry_deadline = tokio::time::Instant::now() + MAX_COMPAT_INBOUND_RETRY_TIME;
+        let mut retries: u64 = 0;
+
+        loop {
+            if self.svc.ready().await.is_err() {
+                self.fail_with(PeerError::ServiceShutdown).await;
+                return None;
+            }
+
+            // Inbound service request timeouts are handled by the timeout layer in `start::start()`.
+            let error = match self.svc.call(req.clone()).await {
+                Ok(rsp) => return Some(rsp),
+                Err(error) => error,
+            };
+
+            let peer_error = if error.is::<tower::load_shed::error::Overloaded>() {
+                // # Security
+                //
+                // The peer request queue must have a limited length.
+                // The buffer and load shed layers are added in `start::start()`.
+                PeerError::Overloaded
+            } else if error.is::<tower::timeout::error::Elapsed>() {
+                // # Security
+                //
+                // Peer requests must have a timeout.
+                // The timeout layer is added in `start::start()`.
+                PeerError::InboundTimeout
+            } else {
+                // We could send a reject to the remote peer, but that might cause
+                // them to disconnect, and we might be using them to sync blocks.
+                // For similar reasons, we don't want to fail_with() here - we
+                // only close the connection if the peer is doing something wrong.
+                info!(
+                    %error,
+                    connection_state = ?self.state,
+                    client_receiver = ?self.client_rx,
+                    "error processing peer request",
+                );
+                self.update_state_metrics(format!("In::Req::{}/Rsp::Error", req.command()));
+
+                return None;
+            };
+
+            let now = Instant::now();
+
+            if self.is_zcashd_compat_peer && tokio::time::Instant::now() < retry_deadline {
+                if retries == 0 {
+                    debug!(
+                        %req,
+                        %peer_error,
+                        "inbound service shed a zcashd-compat sidecar request, retrying instead of ignoring it",
+                    );
+                }
+
+                retries += 1;
+                metrics::counter!("pool.retried.loadshed.compat").increment(1);
+                self.update_state_metrics(format!(
+                    "In::Req::{}/Rsp::{peer_error}::Retry",
+                    req.command()
+                ));
+
+                sleep(COMPAT_INBOUND_RETRY_INTERVAL).await;
+                continue;
+            }
+
+            if self.is_zcashd_compat_peer {
+                // Never leave the sidecar waiting on a reply that will not come: that is
+                // exactly what stalls its sync. `handle_inbound_overload` closes this
+                // connection instead, and zcashd redials and restarts its headers sync.
+                warn!(
+                    %req,
+                    %peer_error,
+                    retries,
+                    retry_time = ?MAX_COMPAT_INBOUND_RETRY_TIME,
+                    "inbound service still overloaded for the zcashd-compat sidecar after retrying, \
+                     closing the connection so it reconnects",
+                );
+            } else if matches!(peer_error, PeerError::Overloaded) {
+                debug!(%req, "inbound service is overloaded, may close connection");
+            } else {
+                info!(%req, "inbound service request timed out, may close connection");
+            }
+
+            self.handle_inbound_overload(req.clone(), now, peer_error)
+                .await;
+
+            return None;
+        }
+    }
+
     async fn handle_inbound_overload(&mut self, req: Request, now: Instant, error: PeerError) {
         let prev = self.last_overload_time.replace(now);
-        let drop_connection_probability = overload_drop_connection_probability(now, prev);
+
+        // The sidecar is never silently ignored. Ignoring its request black-holes a
+        // `getheaders` it will never re-send; closing the connection is recoverable,
+        // because zcashd redials its `-connect` peer and starts a fresh headers sync.
+        let drop_connection_probability = if self.is_zcashd_compat_peer {
+            1.0
+        } else {
+            overload_drop_connection_probability(now, prev)
+        };
 
         if thread_rng().gen::<f32>() < drop_connection_probability {
             if matches!(error, PeerError::Overloaded) {

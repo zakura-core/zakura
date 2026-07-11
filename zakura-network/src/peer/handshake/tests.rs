@@ -841,3 +841,47 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
     assert_eq!(local_counter.update_count(), 0);
     assert_eq!(remote_counter.update_count(), 0);
 }
+
+/// Test which peers are recognised as a zcashd-compat sidecar.
+///
+/// This predicate gates two privileges: always receiving block gossip, and never having
+/// inbound requests silently shed. A sidecar zcashd dials Zakura via `-connect` and never
+/// listens, so it must always appear as an inbound direct connection.
+#[test]
+fn zcashd_compat_sidecar_is_matched_by_inbound_direct_ip() {
+    let _init_guard = zakura_test::init();
+
+    let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
+    let other: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+
+    let inbound_loopback =
+        ConnectedAddr::new_inbound_direct(SocketAddr::new(loopback, 8233).into());
+
+    assert!(
+        inbound_loopback.is_inbound_direct_from_ip(&loopback),
+        "a sidecar dialing us from a configured IP must be recognised",
+    );
+    assert!(
+        !inbound_loopback.is_inbound_direct_from_ip(&other),
+        "an inbound peer from an unconfigured IP must not be recognised",
+    );
+
+    // The sidecar always dials us. An outbound connection we made to the same IP is a peer
+    // we chose, not the supervised sidecar, and must not inherit its privileges.
+    let outbound_loopback =
+        ConnectedAddr::new_outbound_direct(SocketAddr::new(loopback, 8233).into());
+    assert!(
+        !outbound_loopback.is_inbound_direct_from_ip(&loopback),
+        "an outbound connection must never be treated as the sidecar",
+    );
+
+    // Zakura canonicalises IPv4-mapped IPv6 addresses, so a sidecar arriving over a
+    // dual-stack listener still matches its configured IPv4 address.
+    let mapped_loopback = ConnectedAddr::new_inbound_direct(
+        SocketAddr::new(Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(), 8233).into(),
+    );
+    assert!(
+        mapped_loopback.is_inbound_direct_from_ip(&loopback),
+        "an IPv4-mapped IPv6 sidecar address must match its IPv4 form",
+    );
+}

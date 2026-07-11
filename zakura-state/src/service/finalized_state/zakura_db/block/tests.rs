@@ -41,7 +41,8 @@ fn read_spent_utxo_uses_new_outputs_for_same_block_spends() {
             .iter()
             .map(ToString::to_string),
         false,
-    );
+    )
+    .expect("opening the finalized state database should succeed");
 
     let height = Height(7);
     let tx_hash = transaction::Hash([0x11; 32]);

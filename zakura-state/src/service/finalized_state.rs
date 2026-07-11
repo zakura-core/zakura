@@ -36,7 +36,7 @@ use crate::{
     error::CommitCheckpointVerifiedError,
     request::{FinalizableBlock, FinalizedBlock, Treestate},
     service::{check, QueuedCheckpointVerified},
-    CheckpointVerifiedBlock, Config, ValidateContextError,
+    CheckpointVerifiedBlock, Config, StateInitError, ValidateContextError,
 };
 
 /// Times `$body` and records its duration to the named histogram when the
@@ -260,7 +260,7 @@ impl FinalizedState {
         config: &Config,
         network: &Network,
         #[cfg(feature = "elasticsearch")] enable_elastic_db: bool,
-    ) -> Self {
+    ) -> Result<Self, StateInitError> {
         Self::new_with_debug(
             config,
             network,
@@ -286,19 +286,25 @@ impl FinalizedState {
             false,
             false,
         )
+        .expect(
+            "opening the read-write finalized state database failed; check that the \
+             state cache directory is writable and not locked by another Zakura instance, \
+             and that there is free disk space",
+        )
     }
 
     /// Returns an on-disk database instance with the supplied production and debug settings.
     /// If there is no existing database, creates a new database on disk.
     ///
     /// This method is intended for use in tests.
+    #[allow(clippy::unwrap_in_result)]
     pub(crate) fn new_with_debug(
         config: &Config,
         network: &Network,
         debug_skip_format_upgrades: bool,
         #[cfg(feature = "elasticsearch")] enable_elastic_db: bool,
         read_only: bool,
-    ) -> Self {
+    ) -> Result<Self, StateInitError> {
         Self::new_with_debug_and_storage_validation(
             config,
             network,
@@ -322,7 +328,7 @@ impl FinalizedState {
         debug_skip_format_upgrades: bool,
         #[cfg(feature = "elasticsearch")] enable_elastic_db: bool,
         read_only: bool,
-    ) -> Self {
+    ) -> Result<Self, StateInitError> {
         Self::new_with_debug_and_storage_validation(
             config,
             network,
@@ -335,6 +341,7 @@ impl FinalizedState {
         )
     }
 
+    #[allow(clippy::unwrap_in_result)]
     fn new_with_debug_and_storage_validation(
         config: &Config,
         network: &Network,
@@ -343,7 +350,7 @@ impl FinalizedState {
         read_only: bool,
         validate_storage_mode: bool,
         enforce_resume_guard: bool,
-    ) -> Self {
+    ) -> Result<Self, StateInitError> {
         // Fail fast on an invalid storage configuration, before opening the database.
         if validate_storage_mode {
             if let Err(error) = config.validate_storage_mode(network) {
@@ -389,7 +396,7 @@ impl FinalizedState {
                 .iter()
                 .map(ToString::to_string),
             read_only,
-        );
+        )?;
 
         let vct = VctState::from_config(
             config.checkpoint_sync,
@@ -490,7 +497,7 @@ impl FinalizedState {
             }
         }
 
-        new_state
+        Ok(new_state)
     }
 
     /// Configure checkpoint raw transaction retention for pruned checkpoint sync.

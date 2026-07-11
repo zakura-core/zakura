@@ -179,7 +179,7 @@ fn open_pruning_db(config: &Config, network: &Network, read_only: bool) -> Zakur
             .iter()
             .map(ToString::to_string),
         read_only,
-    )
+    ).expect("opening the finalized state database failed; the configured cache directory must contain a readable Zakura database")
 }
 
 fn pruning_summary(
@@ -348,7 +348,8 @@ mod tests {
             &Mainnet,
             #[cfg(feature = "elasticsearch")]
             false,
-        );
+        )
+        .expect("opening an ephemeral database should succeed");
 
         let blocks = Mainnet.blockchain_map();
         for height in 0..=TEST_BLOCKS {

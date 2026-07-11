@@ -38,7 +38,8 @@ fn new_state_with_blocks(config: &Config, network: &Network) -> FinalizedState {
         network,
         #[cfg(feature = "elasticsearch")]
         false,
-    );
+    )
+    .expect("opening an ephemeral database should succeed");
 
     let blocks = network.blockchain_map();
     for height in 0..=TEST_BLOCKS {
@@ -69,6 +70,7 @@ fn new_state_with_checkpoint_retention(
         #[cfg(feature = "elasticsearch")]
         false,
     )
+    .expect("opening an ephemeral database should succeed")
     .with_checkpoint_raw_tx_retention(max_checkpoint_height, config);
 
     let blocks = network.blockchain_map();
@@ -105,6 +107,7 @@ fn new_unvalidated_state_with_checkpoint_retention(
         false,
         false,
     )
+    .expect("opening an ephemeral database should succeed")
     .with_checkpoint_raw_tx_retention(max_checkpoint_height, config)
 }
 
@@ -620,7 +623,8 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
         &network,
         #[cfg(feature = "elasticsearch")]
         false,
-    );
+    )
+    .expect("opening an ephemeral database should succeed");
 
     for height in 0..TEST_BLOCKS {
         let block: Arc<Block> = blocks
@@ -719,7 +723,8 @@ fn archive_backlog_flag_is_recomputed_when_reopening_a_pruned_database() {
         &network,
         #[cfg(feature = "elasticsearch")]
         false,
-    );
+    )
+    .expect("opening an ephemeral database should succeed");
     for height in 0..TEST_BLOCKS {
         let block: Arc<Block> = blocks
             .get(&height)
@@ -833,6 +838,7 @@ fn contextual_commits_keep_raw_transactions_before_checkpoint_retention_start() 
         #[cfg(feature = "elasticsearch")]
         false,
     )
+    .expect("opening an ephemeral database should succeed")
     .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
     let blocks = network.blockchain_map();
 
@@ -1107,7 +1113,8 @@ fn reopening_pruned_database_in_archive_mode_panics() {
         &network,
         #[cfg(feature = "elasticsearch")]
         false,
-    );
+    )
+    .expect("opening an ephemeral database should succeed");
 }
 
 #[test]
@@ -1143,7 +1150,8 @@ fn reopening_fast_synced_database_in_archive_mode_succeeds() {
         &network,
         #[cfg(feature = "elasticsearch")]
         false,
-    );
+    )
+    .expect("opening an ephemeral database should succeed");
 
     assert_eq!(
         reopened.db.vct_synced_below(),
@@ -1187,7 +1195,8 @@ fn reopening_fast_synced_database_in_pruned_mode_with_vct_disabled_succeeds() {
         &network,
         #[cfg(feature = "elasticsearch")]
         false,
-    );
+    )
+    .expect("opening an ephemeral database should succeed");
 
     assert_eq!(
         reopened.db.vct_synced_below(),
@@ -1228,7 +1237,8 @@ fn reopening_interrupted_fast_sync_without_a_root_source_panics() {
         &network,
         #[cfg(feature = "elasticsearch")]
         false,
-    );
+    )
+    .expect("opening an ephemeral database should succeed");
 }
 
 #[test]
@@ -1263,7 +1273,8 @@ fn reopening_interrupted_fast_sync_with_vct_disabled_panics() {
         &network,
         #[cfg(feature = "elasticsearch")]
         false,
-    );
+    )
+    .expect("opening an ephemeral database should succeed");
 }
 
 #[test]

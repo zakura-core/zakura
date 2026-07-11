@@ -52,6 +52,7 @@ fn new_ephemeral_zakura_db(network: &Network) -> ZakuraDb {
             .map(ToString::to_string),
         false,
     )
+    .expect("opening an ephemeral database should succeed")
 }
 
 /// Cross-version regression test for the credit-before-debit overflow panic.

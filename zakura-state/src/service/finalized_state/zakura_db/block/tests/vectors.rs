@@ -565,7 +565,8 @@ fn write_block_replaces_matching_provisional_zakura_roots_with_verified_row() {
             .iter()
             .map(ToString::to_string),
         false,
-    );
+    )
+    .expect("opening the finalized state database should succeed");
     // Provisional rows are distinguishable from the verified row the body commit
     // writes: `root_at` uses a zeroed auth-data root, the commit stores the real one.
     let roots = [root_at(Height(1)), root_at(Height(2))];
@@ -627,7 +628,8 @@ fn header_range_roots_do_not_overwrite_committed_serving_index_rows() {
             .iter()
             .map(ToString::to_string),
         false,
-    );
+    )
+    .expect("opening the finalized state database should succeed");
 
     write_full_block(&mut state, genesis.clone());
     write_full_block(&mut state, block1.clone());
@@ -1054,7 +1056,8 @@ fn header_range_commit_reports_missing_genesis_before_scratch_bootstrap() {
             .iter()
             .map(ToString::to_string),
         false,
-    );
+    )
+    .expect("opening the finalized state database should succeed");
 
     let mut batch = DiskWriteBatch::new();
     assert!(matches!(
@@ -1341,7 +1344,8 @@ fn test_block_db_round_trip_with(
             .iter()
             .map(ToString::to_string),
         false,
-    );
+    )
+    .expect("opening an ephemeral database should succeed");
 
     // Check that each block round-trips to the database
     for original_block in block_test_cases.into_iter() {
@@ -1445,7 +1449,8 @@ fn missing_pruning_metadata_cf_is_archive_database() {
         true,
         column_families_without_pruning_metadata,
         false,
-    );
+    )
+    .expect("opening the finalized state database should succeed");
 
     assert!(state.lowest_retained_height().is_none());
     assert!(!state.is_pruned());
@@ -1471,6 +1476,7 @@ fn vct_anchor_only_write_matches_legacy_and_skips_per_height_trees() {
                 .map(ToString::to_string),
             false,
         )
+        .expect("opening the finalized state database should succeed")
     }
 
     let sapling_tree = sapling::tree::NoteCommitmentTree::default();

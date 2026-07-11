@@ -39,7 +39,8 @@ pub(super) fn state_with_genesis_config(
             .iter()
             .map(ToString::to_string),
         false,
-    );
+    )
+    .expect("opening the finalized state database should succeed");
 
     write_full_block_header_and_transactions(&state, genesis.clone());
 
@@ -69,6 +70,7 @@ pub(super) fn persistent_state(config: &Config, network: &Network) -> ZakuraDb {
             .map(ToString::to_string),
         false,
     )
+    .expect("opening the finalized state database should succeed")
 }
 
 /// Returns a configured testnet with only the implicit genesis checkpoint, so header

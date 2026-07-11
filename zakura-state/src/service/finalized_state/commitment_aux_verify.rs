@@ -718,6 +718,7 @@ mod tests {
                     .map(ToString::to_string),
                 true, // read-only
             )
+            .expect("opening the finalized state database should succeed")
         };
 
         let seed_db = open(PathBuf::from(seed_dir));

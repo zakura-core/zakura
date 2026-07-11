@@ -772,7 +772,8 @@ mod tests {
             &network,
             #[cfg(feature = "elasticsearch")]
             false,
-        );
+        )
+        .expect("opening an ephemeral database should succeed");
         finalized_state.set_finalized_value_pool(ValueBalance::fake_populated_pool());
 
         let parent = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES

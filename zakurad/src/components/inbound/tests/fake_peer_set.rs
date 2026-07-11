@@ -1250,6 +1250,7 @@ async fn setup(
             chain_tip_change.clone(),
             peer_set.clone(),
             Some(submitblock_channel.receiver()),
+            false,
         )
         .in_current_span(),
     );

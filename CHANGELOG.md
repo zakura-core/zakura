@@ -32,6 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   maturity, so a shipped checkpoint cannot be orphaned by a reorg Zakura would
   still follow. `MAX_BLOCK_REORG_HEIGHT` now lives in `zakura-chain` as the single
   source of truth. Backported from upstream Zebra PR #10719.
+- Fixed the zcashd-compat sidecar going permanently idle a few thousand blocks into
+  a fresh sync. Block gossip was gated behind `SyncStatus::wait_until_close_to_tip()`.
+  That is right for ordinary peers -- a peer far from the tip is expected to sync from
+  a node that is near it -- but a sidecar has no such fallback: it is pinned to Zakura
+  as its only peer. Once it catches up to Zakura's in-progress tip it receives a short
+  `headers` batch, correctly concludes it has reached our tip, stops sending
+  `getheaders`, and waits for an inventory announcement. Gating every announcement on
+  being close to the tip meant that announcement never came, and the sidecar sat idle
+  for the whole of Zakura's initial block download.
+
+  Zakura now gossips on every tip change while zcashd-compat is enabled, and the peer
+  set restricts the audience: while far from the network tip, only sidecar peers are
+  told, so gossip to ordinary peers is unchanged. This is what
+  `zcashd_compat.block_gossip_peer_ips` already documented ("must always receive block
+  inventory broadcasts") but did not actually do.
 - Fixed the zcashd-compat sidecar's chain sync stalling silently and permanently
   within seconds of a fresh start. Every inbound peer request shares one bounded
   queue behind a `tower::load_shed` layer, and an overloaded request was silently

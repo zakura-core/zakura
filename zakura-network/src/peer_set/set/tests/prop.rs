@@ -10,7 +10,10 @@ use tower::{
 };
 
 use zakura_chain::{
-    block, chain_tip::ChainTip, parameters::Network, serialization::ZcashDeserializeInto,
+    block,
+    chain_tip::{ChainTip, AT_OR_NEAR_TIP_THRESHOLD},
+    parameters::Network,
+    serialization::ZcashDeserializeInto,
 };
 
 use crate::{
@@ -295,12 +298,12 @@ proptest! {
     }
 }
 
-/// Production nodes often accept an IPv4 zcashd sidecar through an IPv6 dual-stack
-/// listener, which reports its address as IPv4-mapped IPv6. Fractional
-/// `AdvertiseBlock` gossip can miss an unrecognized sidecar for many blocks in a
-/// row, so canonical address matching must always include it.
-#[test]
-fn sidecar_peer_always_receives_block_gossip() {
+/// Runs one `AdvertiseBlock` broadcast through a peer set holding a zcashd-compat sidecar
+/// plus many ordinary peers, with our distance to the network tip mocked to
+/// `distance_to_network_tip`.
+///
+/// Returns `(peers_that_received_gossip, sidecar_received, number_of_peers_to_broadcast)`.
+fn block_gossip_recipients(distance_to_network_tip: block::HeightDiff) -> (usize, bool, usize) {
     const TOTAL_PEERS: usize = 59;
     const SIDECAR_INDEX: usize = 0;
 
@@ -319,6 +322,8 @@ fn sidecar_peer_always_receives_block_gossip() {
     let discovered_peers: Vec<Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>> = (0
         ..TOTAL_PEERS)
         .map(|index| {
+            // Production nodes often accept an IPv4 sidecar through an IPv6 dual-stack
+            // listener, which reports its address as IPv4-mapped IPv6.
             let ip = if index == SIDECAR_INDEX {
                 IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped())
             } else {
@@ -336,8 +341,14 @@ fn sidecar_peer_always_receives_block_gossip() {
         })
         .collect();
     let discovered_peers = stream::iter(discovered_peers).chain(stream::pending());
-    let (minimum_peer_version, _best_tip_height) =
+    let (minimum_peer_version, mock_chain_tip_sender) =
         MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    // `estimate_distance_to_network_chain_tip` returns `None` unless the tip height is set
+    // too, and an unknown distance counts as "not near the tip".
+    mock_chain_tip_sender.send_best_tip_height(block::Height(1));
+    mock_chain_tip_sender
+        .send_estimated_distance_to_network_chain_tip(Some(distance_to_network_tip));
 
     runtime.block_on(async move {
         let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
@@ -380,19 +391,61 @@ fn sidecar_peer_always_receives_block_gossip() {
         }
 
         assert!(
-            sidecar_received,
-            "configured sidecar must receive block gossip"
-        );
-        assert_eq!(
-            block_gossip_received,
-            number_of_peers_to_broadcast + 1,
-            "block gossip should include sampled peers plus the sidecar"
-        );
-        assert!(
             block_gossip_received < TOTAL_PEERS,
-            "sidecar block gossip must not broadcast to every connected peer"
+            "block gossip must never broadcast to every connected peer"
         );
-    });
+
+        (
+            block_gossip_received,
+            sidecar_received,
+            number_of_peers_to_broadcast,
+        )
+    })
+}
+
+/// Near the tip, block gossip reaches a random sample of ordinary peers, and always the
+/// configured zcashd-compat sidecar.
+///
+/// Fractional `AdvertiseBlock` gossip can otherwise miss an unrecognized sidecar for many
+/// blocks in a row, so canonical address matching must always include it.
+#[test]
+fn sidecar_peer_always_receives_block_gossip() {
+    let (block_gossip_received, sidecar_received, number_of_peers_to_broadcast) =
+        block_gossip_recipients(0);
+
+    assert!(
+        sidecar_received,
+        "configured sidecar must receive block gossip"
+    );
+    assert_eq!(
+        block_gossip_received,
+        number_of_peers_to_broadcast + 1,
+        "block gossip should include sampled peers plus the sidecar"
+    );
+}
+
+/// Far from the tip, block gossip reaches *only* the zcashd-compat sidecar.
+///
+/// A sidecar is pinned to this node by `-connect` and has no other source of blocks. Once
+/// it catches up to our in-progress tip it stops sending `getheaders` and waits for an
+/// inventory announcement, so it must hear about every tip change, including during our own
+/// initial block download -- otherwise it sits idle until we finish syncing.
+///
+/// Ordinary peers must not: they are expected to sync from a node that is actually near the
+/// tip, so announcing a block we are still catching up on is noise to them.
+#[test]
+fn only_the_sidecar_receives_block_gossip_before_the_tip() {
+    let (block_gossip_received, sidecar_received, _number_of_peers_to_broadcast) =
+        block_gossip_recipients(AT_OR_NEAR_TIP_THRESHOLD + 1_000);
+
+    assert!(
+        sidecar_received,
+        "configured sidecar must receive block gossip while we are far from the tip"
+    );
+    assert_eq!(
+        block_gossip_received, 1,
+        "far from the tip, only the sidecar should receive block gossip"
+    );
 }
 
 /// Check if only peers with up-to-date protocol versions are live.

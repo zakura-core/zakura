@@ -52,12 +52,16 @@ pub async fn gossip_best_tip_block_hashes<ZN>(
     mut chain_state: ChainTipChange,
     broadcast_network: ZN,
     mut mined_block_receiver: Option<mpsc::Receiver<(block::Hash, block::Height)>>,
+    gossip_during_initial_sync: bool,
 ) -> Result<(), BlockGossipError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
 {
-    info!("initializing block gossip task");
+    info!(
+        ?gossip_during_initial_sync,
+        "initializing block gossip task"
+    );
 
     // use the same timeout as tips requests,
     // so broadcasts don't delay the syncer too long
@@ -90,10 +94,23 @@ where
             // wait until we're close to the tip, because broadcasts are only useful for nodes near the tip
             // (if they're a long way from the tip, they use the syncer and block locators), unless a mined block
             // hash is received before `wait_until_close_to_tip()` is ready.
-            sync_status
-                .wait_until_close_to_tip()
-                .map_err(SyncStatus)
-                .await?;
+            //
+            // A zcashd-compat sidecar is the exception: it cannot "use the syncer and block
+            // locators", because it is pinned to this node as its only peer. Once it catches up
+            // to our in-progress tip it receives a short `headers` batch, correctly concludes it
+            // has reached our tip, stops sending `getheaders`, and then waits for an inventory
+            // announcement. Gating every announcement on being close to the tip means that
+            // announcement never arrives, and the sidecar sits idle for the whole of our initial
+            // block download. So when a sidecar is configured, gossip on every tip change.
+            //
+            // The peer set still restricts the audience: while we are far from the network tip,
+            // `select_block_broadcast_peers` sends only to the sidecar, never to ordinary peers.
+            if !gossip_during_initial_sync {
+                sync_status
+                    .wait_until_close_to_tip()
+                    .map_err(SyncStatus)
+                    .await?;
+            }
 
             // get the latest tip change when close to tip - it might be different to the change we awaited,
             // because the syncer might take a long time to reach the tip

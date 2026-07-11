@@ -934,6 +934,15 @@ where
 
     /// Randomly chooses ready peers for block gossip, always including configured
     /// zcashd compat sidecar peers.
+    ///
+    /// While this node is still far from the network tip, only the sidecar peers are
+    /// selected. A zcashd-compat sidecar has no other source of blocks: it is pinned to
+    /// this node by `-connect`, and once it catches up to our in-progress tip it stops
+    /// sending `getheaders` and waits for an inventory announcement. So it needs to hear
+    /// about every tip change, including during our own initial block download.
+    ///
+    /// Ordinary peers do not, and must not: they are told to sync from a node that is
+    /// near the tip, so announcing blocks we are still catching up on would be noise.
     fn select_block_broadcast_peers(&self, max_peers: usize) -> Vec<D::Key> {
         use rand::seq::IteratorRandom;
 
@@ -942,6 +951,14 @@ where
             .iter()
             .filter_map(|(key, service)| self.is_zcashd_compat_peer(service).then_some(*key))
             .collect();
+
+        if !self
+            .minimum_peer_version
+            .chain_tip()
+            .is_at_or_near_network_tip(&self.network)
+        {
+            return selected_peers;
+        }
 
         let zcashd_compat_peers: HashSet<_> = selected_peers.iter().copied().collect();
         selected_peers.extend(

@@ -688,6 +688,7 @@ impl StartCmd {
                 chain_tip_change.clone(),
                 peer_set.clone(),
                 Some(submit_block_channel.receiver()),
+                config.zcashd_compat.enabled,
             )
             .in_current_span(),
         );

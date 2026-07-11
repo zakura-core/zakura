@@ -1,0 +1,79 @@
+[defaults]
+branch = "main"
+remote = "origin"
+repo_dir = "/root/zakura"
+service_name = "zakura.service"
+controller_service_name = "zakura-continuous-sync.service"
+bin_path = "/usr/local/bin/zakurad"
+config_path = "/etc/zakura/zebrad.toml"
+controller_config_path = "/etc/zakura-continuous-sync/controller.toml"
+config_template_path = "/etc/zakura-continuous-sync/zakurad.toml.template"
+state_dir = "/var/lib/zakura-continuous-sync"
+runs_dir = "/var/log/zakura/runs"
+chain_state_dir = "/var/lib/zakura"
+wipe_sentinel = "/var/lib/zakura/.continuous-sync-wipe-ok"
+build_cache_dir = "/var/lib/zakura-continuous-sync/build-cache"
+log_file = "/var/log/zakura/zebrad.log"
+monitor_log = "/var/log/zakura/monitor.log"
+trace_link = "/var/log/zakura/traces"
+alert_config_path = "/etc/zakura-continuous-sync/alert-monitor.toml"
+alert_state_file = "/var/lib/zakura-monitor/cluster-state.json"
+alert_env_file = "/etc/zakura-alerts.env"
+alert_ssh_key = "/root/.ssh/zakura_monitor_ed25519"
+alert_status_command = "/usr/local/sbin/zakura-monitor-status.py"
+alert_throttle_seconds = 1800
+down_confirmation_samples = 2
+cluster_stall_seconds = 600
+metrics_url = "http://127.0.0.1:9999/metrics"
+ready_url = "http://127.0.0.1:8080/ready"
+healthy_url = "http://127.0.0.1:8080/healthy"
+poll_interval_seconds = 30
+startup_timeout_seconds = 600
+stall_seconds = 600
+max_run_seconds = 172800
+ready_samples = 6
+ready_sample_interval_seconds = 30
+min_free_bytes = 10737418240
+retention_days = 5
+cooldown_seconds = 60
+wipe_entries = ["state", "non_finalized_state"]
+preserve_entries = ["network"]
+tracing_filter = "info,zakura_network::zakura=debug,zakura_network::zakura::transport::guard=error,zebrad::commands::start::zakura=debug,iroh=error,iroh::magicsock=error,iroh_quinn_udp=error"
+
+# Public mainnet Zakura peers used by today's temporary nodes.
+bootstrap_peers = [
+    "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234",
+    "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22@143.244.184.176:8234",
+    "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57@159.203.38.10:8234",
+    "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5@64.227.44.93:8234",
+    "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1@161.35.156.226:8234",
+    "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234",
+    "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
+]
+
+[[nodes]]
+name = "temp-zakura-sync-test-1"
+hostname = "temp-zakura-sync-test-1"
+ssh_string = "root@138.68.43.212"
+alias = "temp-zakura-sync-test-1"
+public_ip = "138.68.43.212"
+mode_label = "dual-stack"
+p2p_stack = "dual"
+
+[[nodes]]
+name = "temp-zakura-sync-test-2"
+hostname = "temp-zakura-sync-test-2"
+ssh_string = "root@138.197.218.91"
+alias = "temp-zakura-sync-test-2"
+public_ip = "138.197.218.91"
+mode_label = "Zakura/v2-only"
+p2p_stack = "zakura"
+
+[[nodes]]
+name = "temp-zakura-sync-test-3"
+hostname = "temp-zakura-sync-test-3"
+ssh_string = "root@134.209.49.92"
+alias = "temp-zakura-sync-test-3"
+public_ip = "134.209.49.92"
+mode_label = "Zebra/legacy-only"
+p2p_stack = "legacy"

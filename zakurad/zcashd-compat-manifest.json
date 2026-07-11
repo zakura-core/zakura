@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "release_tag": "v1.0.0-compat-rc2",
+  "release_tag": "v1.0.0-compat-rc3",
   "artifacts": [
     {
       "target_triple": "x86_64-pc-linux-gnu",
-      "runtime_archive_url": "https://github.com/valargroup/zcashd/releases/download/v1.0.0-compat-rc2/zcashd-zebra-compat-v1.0.0-compat-rc2-linux-x86_64.tar.gz",
-      "runtime_archive_sha256": "9636bfe642a7542f92a31132ecce1139a290df1a9e674e8373167831369a905d",
+      "runtime_archive_url": "https://github.com/valargroup/zcashd/releases/download/v1.0.0-compat-rc3/zcashd-zebra-compat-v1.0.0-compat-rc3-linux-x86_64.tar.gz",
+      "runtime_archive_sha256": "b861ea94215647a69a944ded7c9d6c7c3dfd836e54e3e194103242935e6879f2",
       "runtime_archive_member_binary_path": "./bin/zcashd"
     }
   ]

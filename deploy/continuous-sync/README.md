@@ -101,10 +101,13 @@ GitHub Actions:
 4. Use `no_start=true` to install files without handing the node to the
    controller.
 
-The workflow uses `ZAKURA_CONTINUOUS_SYNC_SSH_KEY` when present. If the secret is
-empty, it uses the runner's default SSH identity. Slack audit alerts use the
-existing `SLACK_WEB_HOOK` secret. Per-host completion/failure alerts use the
-root-only `/etc/zakura-alerts.env` file already used by the temporary monitor.
+The workflow uses the repository's `DO_SSH_PRIVATE_KEY` secret and requires its
+matching `zebra-ci` public key in each host's `/root/.ssh/authorized_keys`. It
+validates the key and every host connection before running an operation, so SSH
+configuration failures stop the workflow instead of being reported as node
+health failures. Slack audit alerts use the existing `SLACK_WEB_HOOK` secret.
+Per-host completion/failure alerts use the root-only
+`/etc/zakura-alerts.env` file already used by the temporary monitor.
 
 ## Status and Audit
 
@@ -183,8 +186,11 @@ below `min_free_bytes`, it halts and alerts instead of filling the host.
 For a fresh Ubuntu x86_64 host:
 
 1. Ensure Roman's SSH key can log in as root.
-2. Clone this repository to `/root/zakura`.
-3. Install build prerequisites:
+2. Add the DigitalOcean `zebra-ci` public key (fingerprint
+   `12:4f:db:a1:b1:25:47:c0:92:73:08:76:4d:30:b4:30`) to
+   `/root/.ssh/authorized_keys`.
+3. Clone this repository to `/root/zakura`.
+4. Install build prerequisites:
 
    ```bash
    apt-get update
@@ -193,10 +199,10 @@ For a fresh Ubuntu x86_64 host:
      protobuf-compiler python3
    ```
 
-4. Install the Rust toolchain specified by `rust-toolchain.toml`.
-5. Copy or recreate `/etc/zakura-alerts.env` with the Slack webhook value.
-6. Update `nodes.toml` with the new host address if it changed.
-7. Deploy only that node:
+5. Install the Rust toolchain specified by `rust-toolchain.toml`.
+6. Copy or recreate `/etc/zakura-alerts.env` with the Slack webhook value.
+7. Update `nodes.toml` with the new host address if it changed.
+8. Deploy only that node:
 
    ```bash
    python3 deploy/continuous-sync/deploy.py \

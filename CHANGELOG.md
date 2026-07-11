@@ -40,9 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
-- Added a `shellcheck` lint job covering `scripts/*.sh`, which also runs the
-  installer's `--self-test-disk-limits` self-check. `install-zakura.sh` previously
-  had no CI coverage at all.
 - Corrected Zakura's release identity and build provenance. `zakurad --version`
   now reports the `1.0.0-rc0` release with source-commit build metadata, and
   Docker images expose OCI version, revision, source, and title labels. The

@@ -9,7 +9,6 @@ bin_path        = "/usr/local/bin/zakurad"
 config_path     = "/etc/zakura/zakura.toml"
 log_file        = "/var/log/zakura/zakura.log"   # deterministic log path
 state_cache_dir = "/var/lib/zakura"
-cache_dir_migrate_from = ""                    # optional old cache dir to move during restart deploys
 # manage_config = true                       # false = only swap the binary + restart the existing
 #                                            # service, leaving config/unit/cache untouched (systemd only)
 network         = "Mainnet"
@@ -17,7 +16,7 @@ listen_addr     = "[::]:8233"
 # identity_dir  = "/root/.zakura"           # empty = zakurad default; pins the iroh node_id
 rpc_listen_addr = ""                        # empty = RPC disabled; e.g. "0.0.0.0:8232"
 storage_mode    = "archive"                 # "archive" serves all history; "pruned" does not
-p2p_stack       = "dual"                     # zebra | zakura | dual | default
+p2p_stack       = "dual"                     # legacy | zakura | dual | default
 # port          = 22                        # optional non-default ssh port
 
 # Optional fleet-wide Zakura settings, rendered into [network.zakura] on every

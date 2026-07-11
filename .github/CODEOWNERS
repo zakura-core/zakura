@@ -11,27 +11,27 @@
 # to stop GitHub assigning multiple reviewers
 #
 # lightwalletd epic
-# /zebrad/src/commands/start.rs           @ZcashFoundation/general-rust-reviewers
+# /zakurad/src/commands/start.rs           @ZcashFoundation/general-rust-reviewers
 
 # Network and Async Code
 # /tower-batch-control/                   @ZcashFoundation/network-reviewers
 # /tower-fallback/                        @ZcashFoundation/network-reviewers
-# /zebra-network/                         @ZcashFoundation/network-reviewers
-# /zebra-node-services/                   @ZcashFoundation/network-reviewers
-# /zebra-tests/src/mock_service.rs        @ZcashFoundation/network-reviewers
-# /zebra-tests/src/service_extensions.rs  @ZcashFoundation/network-reviewers
-# /zebra-tests/src/transcript.rs          @ZcashFoundation/network-reviewers
-# /zebrad/src/components/                 @ZcashFoundation/network-reviewers
+# /zakura-network/                         @ZcashFoundation/network-reviewers
+# /zakura-node-services/                   @ZcashFoundation/network-reviewers
+# /zakura-tests/src/mock_service.rs        @ZcashFoundation/network-reviewers
+# /zakura-tests/src/service_extensions.rs  @ZcashFoundation/network-reviewers
+# /zakura-tests/src/transcript.rs          @ZcashFoundation/network-reviewers
+# /zakurad/src/components/                 @ZcashFoundation/network-reviewers
 
 # Cryptographic Code
-# /zebra-consensus/src/primitives/        @ZcashFoundation/cryptographic-reviewers
-# /zebra-chain/src/primitives/            @ZcashFoundation/cryptographic-reviewers
-# /zebra-chain/src/orchard/               @ZcashFoundation/cryptographic-reviewers
-# /zebra-chain/src/sapling/               @ZcashFoundation/cryptographic-reviewers
-# /zebra-chain/src/sprout/                @ZcashFoundation/cryptographic-reviewers
-# /zebra-chain/src/transparent/           @ZcashFoundation/cryptographic-reviewers
-# /zebra-chain/src/history_tree.rs        @ZcashFoundation/cryptographic-reviewers
-# /zebra-chain/src/history_tree/          @ZcashFoundation/cryptographic-reviewers
+# /zakura-consensus/src/primitives/        @ZcashFoundation/cryptographic-reviewers
+# /zakura-chain/src/primitives/            @ZcashFoundation/cryptographic-reviewers
+# /zakura-chain/src/orchard/               @ZcashFoundation/cryptographic-reviewers
+# /zakura-chain/src/sapling/               @ZcashFoundation/cryptographic-reviewers
+# /zakura-chain/src/sprout/                @ZcashFoundation/cryptographic-reviewers
+# /zakura-chain/src/transparent/           @ZcashFoundation/cryptographic-reviewers
+# /zakura-chain/src/history_tree.rs        @ZcashFoundation/cryptographic-reviewers
+# /zakura-chain/src/history_tree/          @ZcashFoundation/cryptographic-reviewers
 
 # Devops Code
 # /.github/workflows/                     @ZcashFoundation/devops-reviewers
@@ -43,4 +43,4 @@
 # katex-header.html                       @ZcashFoundation/devops-reviewers
 
 # Unsafe Code
-# /zebra-script/                          @ZcashFoundation/unsafe-rust-reviewers
+# /zakura-script/                          @ZcashFoundation/unsafe-rust-reviewers

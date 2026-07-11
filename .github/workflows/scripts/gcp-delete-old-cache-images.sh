@@ -32,13 +32,13 @@ set -o pipefail
 # Calculate the date before which images should be deleted
 DELETE_BEFORE_DATE=$(date --date="${DELETE_AGE_DAYS} days ago" '+%Y%m%d')
 
-# Mainnet and Testnet zebrad checkpoint
-delete_images "Mainnet zebrad checkpoint" "name~^zebrad-cache-.*-mainnet-checkpoint" # As of April 2023, these disk names look like: zebrad-cache-6556-merge-a2ca4de-v25-mainnet-tip(-u)?-140654
-delete_images "Testnet zebrad checkpoint" "name~^zebrad-cache-.*-testnet-checkpoint"
+# Mainnet and Testnet zakurad checkpoint
+delete_images "Mainnet zakurad checkpoint" "name~^zakurad-cache-.*-mainnet-checkpoint" # As of April 2023, these disk names look like: zakurad-cache-6556-merge-a2ca4de-v25-mainnet-tip(-u)?-140654
+delete_images "Testnet zakurad checkpoint" "name~^zakurad-cache-.*-testnet-checkpoint"
 
-# Mainnet and Testnet zebrad tip
-delete_images "Mainnet zebrad tip" "name~^zebrad-cache-.*-mainnet-tip"
-delete_images "Testnet zebrad tip" "name~^zebrad-cache-.*-testnet-tip"
+# Mainnet and Testnet zakurad tip
+delete_images "Mainnet zakurad tip" "name~^zakurad-cache-.*-mainnet-tip"
+delete_images "Testnet zakurad tip" "name~^zakurad-cache-.*-testnet-tip"
 
 # Mainnet and Testnet lightwalletd tip
 delete_images "Mainnet lightwalletd tip" "name~^lwd-cache-.*-mainnet-tip"

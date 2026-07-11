@@ -6,10 +6,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thank you for taking the time to report a bug in Zebra!
+        Thank you for taking the time to report a bug in Zakura!
 
         Please fill out the sections below to help us reproduce and fix the bug.
-        If you have a question, please ask on [Discord](https://discord.gg/fP2JGmhm) or [GitHub Discussions](https://github.com/ZcashFoundation/zebra/discussions)
+        If you have a question, please ask on [Discord](https://discord.gg/fP2JGmhm) or [GitHub Discussions](https://github.com/zakura-core/zakura/discussions)
   - type: textarea
     id: what-happened
     attributes:
@@ -34,17 +34,17 @@ body:
   - type: textarea
     id: logs
     attributes:
-      label: Zebra logs
-      description: Copy and paste the last 100 Zebra log lines or upload the full logs to https://gist.github.com/ and add a link to them here.
+      label: Zakura logs
+      description: Copy and paste the last 100 Zakura log lines or upload the full logs to https://gist.github.com/ and add a link to them here.
       placeholder: 'Copy and paste the logs here'
     validations:
       required: false
   - type: input
-    id: zebrad-version
+    id: zakurad-version
     attributes:
-      label: Zebra Version
-      description: 'For bugs in `zebrad`, run `zebrad --version`.'
-      placeholder: 'zebrad 1.0.0-placeholder'
+      label: Zakura Version
+      description: 'For bugs in `zakurad`, run `zakurad --version`.'
+      placeholder: 'zakurad 1.0.0-placeholder'
     validations:
       required: false
   - type: checkboxes

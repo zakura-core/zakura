@@ -1,7 +1,7 @@
 ---
-name: "🚀 Zebra Release"
-about: "Zebra team use only"
-title: "Publish next Zebra release: (version)"
+name: "🚀 Zakura Release"
+about: "Zakura team use only"
+title: "Publish next Zakura release: (version)"
 labels: "A-release, C-exclude-from-changelog, P-Medium :zap:"
 assignees: ""
 ---
@@ -15,10 +15,10 @@ They can be skipped for urgent releases.
 
 To check consensus correctness, we want to test that the state format is valid through the sync-confidence ranges. (Format upgrades are tested in CI on each PR.)
 
-- [ ] Make sure there has been [at least one successful sync-confidence run](https://github.com/valargroup/zebra/actions/workflows/sync-confidence.yml?query=branch%3Aironwood-main) since the last state change, or
-- [ ] Start a manual workflow run of [`sync-confidence.yml`](https://github.com/valargroup/zebra/actions/workflows/sync-confidence.yml) from `ironwood-main`.
+- [ ] Make sure there has been [at least one successful sync-confidence run](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml?query=branch%3Aironwood-main) since the last state change, or
+- [ ] Start a manual workflow run of [`sync-confidence.yml`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml) from `ironwood-main`.
 
-State format changes can be made in `zebra-state` or `zebra-chain`. The state format can be changed by data that is sent to the state, data created within the state using `zebra-chain`, or serialization formats in `zebra-state` or `zebra-chain`.
+State format changes can be made in `zakura-state` or `zakura-chain`. The state format can be changed by data that is sent to the state, data created within the state using `zakura-chain`, or serialization formats in `zakura-state` or `zakura-chain`.
 
 After the test has been started, or if it has finished already:
 
@@ -26,9 +26,9 @@ After the test has been started, or if it has finished already:
 
 ## Checkpoints
 
-For performance and security, we want to update the Zebra checkpoints in every release.
+For performance and security, we want to update the Zakura checkpoints in every release.
 
-- [ ] You can copy the latest checkpoints from CI by following [the zebra-checkpoints README](https://github.com/valargroup/zebra/blob/ironwood-main/zebra-utils/README.md#zebra-checkpoints).
+- [ ] You can copy the latest checkpoints from CI by following [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/ironwood-main/zakura-utils/README.md#zakura-checkpoints).
 
 ## Missed Dependency Updates
 
@@ -40,20 +40,20 @@ Here's how we make sure we got everything:
 
 - [ ] Run `cargo update` on the latest `ironwood-main` branch, and keep the output
 - [ ] Until we bump the workspace MSRV to 1.88 or higher, `home` must be downgraded manually: `cargo update home@0.5.12 --precise 0.5.11`
-- [ ] If needed, [add duplicate dependency exceptions to deny.toml](https://github.com/valargroup/zebra/blob/ironwood-main/book/src/dev/continuous-integration.md#fixing-duplicate-dependencies-in-check-denytoml-bans)
+- [ ] If needed, [add duplicate dependency exceptions to deny.toml](https://github.com/zakura-core/zakura/blob/ironwood-main/book/src/dev/continuous-integration.md#fixing-duplicate-dependencies-in-check-denytoml-bans)
 - [ ] If needed, remove resolved duplicate dependencies from `deny.toml`
 - [ ] Open a separate PR with the changes
 - [ ] Add the output of `cargo update` to that PR as a comment
 
 # Prepare and Publish the Release
 
-Follow the steps in the [release checklist](https://github.com/valargroup/zebra/blob/ironwood-main/.github/PULL_REQUEST_TEMPLATE/release-checklist.md) to prepare the release:
+Follow the steps in the [release checklist](https://github.com/zakura-core/zakura/blob/ironwood-main/.github/PULL_REQUEST_TEMPLATE/release-checklist.md) to prepare the release:
 
 Release PR:
 
 - [ ] Update Changelog
 - [ ] Update README
-- [ ] Update Zebra Versions
+- [ ] Update Zakura Versions
 - [ ] Update Crate Versions and Crate Change Logs
 - [ ] Update End of Support Height
 

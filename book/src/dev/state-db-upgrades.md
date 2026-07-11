@@ -1,8 +1,8 @@
-# Zebra Cached State Database Implementation
+# Zakura Cached State Database Implementation
 
 ## Adding a Column Family
 
-Most Zebra column families are implemented using low-level methods that allow accesses using any
+Most Zakura column families are implemented using low-level methods that allow accesses using any
 type. But this is error-prone, because we can accidentally use different types to read and write
 them. (Or read using different types in different methods.)
 
@@ -22,7 +22,7 @@ For example:
 /// The name of the sapling transaction IDs result column family.
 pub const SAPLING_TX_IDS: &str = "sapling_tx_ids";
 
-/// The column families supported by the running `zebra-scan` database code.
+/// The column families supported by the running `zakura-scan` database code.
 pub const SCANNER_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     sapling::SAPLING_TX_IDS,
 ];
@@ -97,7 +97,7 @@ impl DiskWriteBatch {
     /// Updates the history tree for the tip, if it is not empty.
     ///
     /// The batch must be written to the database by the caller.
-    pub fn update_history_tree(&mut self, db: &ZebraDb, tree: &HistoryTree) {
+    pub fn update_history_tree(&mut self, db: &ZakuraDb, tree: &HistoryTree) {
         let history_tree_cf = db.history_tree_cf().with_batch_for_writing(self);
 
         if let Some(tree) = tree.as_ref().as_ref() {
@@ -112,13 +112,13 @@ To write to a legacy batch, then write it to the database, you can use
 `take_batch_for_writing(batch).write_batch()`.
 
 During database upgrades, you might need to access the same column family using different types.
-[Define a type](https://github.com/ZcashFoundation/zebra/pull/8115/files#diff-ba689ca6516946a903da62153652d91dc1bb3d0100bcf08698cb3f38ead57734R36-R53)
-and [convenience method](https://github.com/ZcashFoundation/zebra/pull/8115/files#diff-ba689ca6516946a903da62153652d91dc1bb3d0100bcf08698cb3f38ead57734R69-R87)
+[Define a type](https://github.com/zakura-core/zakura/pull/8115/files#diff-ba689ca6516946a903da62153652d91dc1bb3d0100bcf08698cb3f38ead57734R36-R53)
+and [convenience method](https://github.com/zakura-core/zakura/pull/8115/files#diff-ba689ca6516946a903da62153652d91dc1bb3d0100bcf08698cb3f38ead57734R69-R87)
 for each legacy type, and use them during the upgrade.
 
 Some full examples of legacy code conversions, and the typed column family implementation itself
-are in [PR #8112](https://github.com/ZcashFoundation/zebra/pull/8112/files) and
-[PR #8115](https://github.com/ZcashFoundation/zebra/pull/8115/files).
+are in [PR #8112](https://github.com/zakura-core/zakura/pull/8112/files) and
+[PR #8115](https://github.com/zakura-core/zakura/pull/8115/files).
 
 ## Current Implementation
 
@@ -126,18 +126,18 @@ are in [PR #8112](https://github.com/ZcashFoundation/zebra/pull/8112/files) and
 
 [verification]: #verification
 
-Zebra's state has two verification modes:
+Zakura's state has two verification modes:
 
 - block hash checkpoints, and
 - full verification.
 
 This means that verification uses two different codepaths, and they must produce the same results.
 
-By default, Zebra uses as many checkpoints as it can, because they are more secure against rollbacks
+By default, Zakura uses as many checkpoints as it can, because they are more secure against rollbacks
 (and some other kinds of chain attacks). Then it uses full verification for the last few thousand
 blocks.
 
-When Zebra gets more checkpoints in each new release, it checks the previously verified cached
+When Zakura gets more checkpoints in each new release, it checks the previously verified cached
 state against those checkpoints. This checks that the two codepaths produce the same results.
 
 ## Upgrading the State Database
@@ -160,17 +160,17 @@ Blocks can be written to the database via two different code paths, and both mus
 This code is high risk, because discovering bugs is tricky, and fixing bugs can require a full reset
 and re-write of an entire column family.
 
-Most Zebra instances will do an upgrade, because they already have a cached state, and upgrades are
+Most Zakura instances will do an upgrade, because they already have a cached state, and upgrades are
 faster. But we run a full sync in CI every week, because new users use that codepath. (And it is
-their first experience of Zebra.)
+their first experience of Zakura.)
 
-When Zebra starts up and shuts down (and periodically in CI tests), we run checks on the state
+When Zakura starts up and shuts down (and periodically in CI tests), we run checks on the state
 format. This makes sure that the two codepaths produce the same state on disk.
 
 To reduce code and testing complexity:
 
-- when a previous Zebra version opens a newer state, the entire state is considered to have that lower version, and
-- when a newer Zebra version opens an older state, each required upgrade is run on the entire state.
+- when a previous Zakura version opens a newer state, the entire state is considered to have that lower version, and
+- when a newer Zakura version opens an older state, each required upgrade is run on the entire state.
 
 ### In-Place Upgrade Goals
 
@@ -179,18 +179,18 @@ To reduce code and testing complexity:
 Here are the goals of in-place upgrades:
 
 - avoid a full download and rebuild of the state
-- Zebra must be able to upgrade the format from previous minor or patch versions of its disk format
+- Zakura must be able to upgrade the format from previous minor or patch versions of its disk format
   (Major disk format versions are breaking changes. They create a new empty state and re-sync the whole chain.)
   - this is checked the first time CI runs on a PR with a new state version.
     After the first CI run, the cached state is marked as upgraded, so the upgrade doesn't run
     again. If CI fails on the first run, any cached states with that version should be deleted.
 - the upgrade and full sync formats must be identical
   - this is partially checked by the state validity checks for each upgrade (see above)
-- previous zebra versions should be able to load the new format
+- previous zakura versions should be able to load the new format
   - this is checked by other PRs running using the upgraded cached state, but only if a Rust PR
     runs after the new PR's CI finishes, but before it merges
-- best-effort loading of older supported states by newer Zebra versions
-- best-effort compatibility between newer states and older supported Zebra versions
+- best-effort loading of older supported states by newer Zakura versions
+- best-effort compatibility between newer states and older supported Zakura versions
 
 ### Design Constraints
 
@@ -209,8 +209,8 @@ This means that:
   - the same write method should be called from both the full sync and upgrade code,
     this helps prevent data inconsistencies
 - repeated upgrades must produce a valid state format
-  - if Zebra is restarted, the format upgrade will run multiple times
-  - if an older Zebra version opens the state, data can be written in an older format
+  - if Zakura is restarted, the format upgrade will run multiple times
+  - if an older Zakura version opens the state, data can be written in an older format
 - the format must be valid before and after each database transaction or API call, because an
   upgrade can be cancelled at any time
   - multi-column family changes should made in database transactions
@@ -221,7 +221,7 @@ This means that:
   - if each database API call produces a valid format, transactions aren't needed
 
 If there is an upgrade failure, panic and tell the user to delete their cached state and re-launch
-Zebra.
+Zakura.
 
 #### Performance Constraints
 
@@ -254,10 +254,10 @@ deletion and iterators.
 
 [testing]: #testing
 
-State upgrades are a high-risk change. They permanently modify the state format on production Zebra
+State upgrades are a high-risk change. They permanently modify the state format on production Zakura
 instances. Format issues are tricky to diagnose, and require extensive testing and a new release to
 fix. Deleting and rebuilding an entire column family can also be costly, taking minutes or hours the
-first time a cached state is upgraded to a new Zebra release.
+first time a cached state is upgraded to a new Zakura release.
 
 Some format bugs can't be fixed, and require an entire rebuild of the state. For example, deleting
 or corrupting transactions or block headers.
@@ -277,23 +277,23 @@ simulates typical user behaviour.
 
 And ideally:
 
-- An upgrade from the earliest supported Zebra version
+- An upgrade from the earliest supported Zakura version
   (the CI sync-past-mandatory-checkpoint tests do this on every PR)
 
 #### Manually Triggering a Format Upgrade
 
 [manual-upgrade]: #manual-upgrade
 
-Zebra stores the current state minor and patch versions in a `version` file in the database
+Zakura stores the current state minor and patch versions in a `version` file in the database
 directory. This path varies based on the OS, major state version, network, and config.
 
 For example, the default mainnet state version on Linux is at:
 `~/.cache/zakura/state/v25/mainnet/version`
 
-To upgrade a cached Zebra state from `v25.0.0` to the latest disk format, delete the version file.
+To upgrade a cached Zakura state from `v25.0.0` to the latest disk format, delete the version file.
 To upgrade from a specific version `v25.x.y`, edit the file so it contains `x.y`.
 
-Editing the file and running Zebra will trigger a re-upgrade over an existing state.
+Editing the file and running Zakura will trigger a re-upgrade over an existing state.
 Re-upgrades can hide format bugs. For example, if the old code was correct, and the
 new code skips blocks, the validity checks won't find that bug.
 

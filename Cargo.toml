@@ -1,31 +1,31 @@
 [workspace]
 members = [
-        "zebrad",
-        "zebra-chain",
-        "zebra-network",
-        "zebra-state",
-        "zebra-script",
-        "zebra-consensus",
-        "zebra-rpc",
-        "zebra-node-services",
-        "zebra-test",
-        "zebra-utils",
+        "zakurad",
+        "zakura-chain",
+        "zakura-network",
+        "zakura-state",
+        "zakura-script",
+        "zakura-consensus",
+        "zakura-rpc",
+        "zakura-node-services",
+        "zakura-test",
+        "zakura-utils",
         "tower-batch-control",
         "tower-fallback",
-        "deploy/watchdog",
+        "deploy/zakura-watchdog",
         "xtask",
-        "zebra-jsonl-trace",
+        "zakura-jsonl-trace",
 ]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
 resolver = "2"
 
 [workspace.package]
-authors = ["Zcash Foundation <zebra@zfnd.org>"]
+authors = ["Zakura contributors"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/valargroup/zebra"
-homepage = "https://zfnd.org/zebra/"
-keywords = ["zebra", "zcash"]
+repository = "https://github.com/zakura-core/zakura"
+homepage = "https://github.com/zakura-core/zakura"
+keywords = ["zakura", "zcash"]
 rust-version = "1.91"
 edition = "2021"
 
@@ -33,16 +33,16 @@ edition = "2021"
 
 [workspace.dependencies]
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
-orchard = "0.15.0-pre.1"
+orchard = "0.15.0"
 sapling-crypto = "0.7"
-zcash_address = "0.13.0-pre.0"
+zcash_address = "0.13.0"
 zcash_encoding = "0.4"
-zcash_history = "0.5.0-pre.0"
-zcash_keys = "0.15.0-pre.0"
-zcash_primitives = "0.29.0-pre.0"
-zcash_proofs = "0.29.0-pre.0"
-zcash_transparent = "0.9.0-pre.0"
-zcash_protocol = "0.10.0-pre.0"
+zcash_history = "0.5.0"
+zcash_keys = "0.15.0"
+zcash_primitives = "0.29.0"
+zcash_proofs = "0.29.0"
+zcash_transparent = "0.9.0"
+zcash_protocol = "0.10.0"
 zip32 = "0.2"
 abscissa_core = "0.7"
 base64 = "0.22.1"
@@ -103,7 +103,7 @@ log = "0.4.27"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 mset = "0.1"
-nix = "0.30"
+nix = "0.31"
 num-integer = "0.1.46"
 once_cell = "1.21"
 openrpsee = "0.1.0"
@@ -198,7 +198,7 @@ allow-branch = ["ironwood-main"]
 # peer, never abort the whole node (a trivial remote DoS otherwise). Because we
 # now unwind, every shared/consensus-state critical section must stay panic-free
 # (no `.await`/`.expect()`/`.unwrap()`/indexing under a lock) — a panic mid-
-# mutation would unwind through it instead of aborting. zebra-network enforces
+# mutation would unwind through it instead of aborting. zakura-network enforces
 # unwind with a `#[cfg(panic = "abort")] compile_error!`. See
 # security_requirements.md SR-1 and SR-2.
 panic = "unwind"
@@ -324,7 +324,7 @@ codegen-units = 16
 [profile.release]
 # See [profile.dev]: panic = "unwind" is required for peer-pipe panic containment
 # (security_requirements.md SR-1); do not set "abort". Enforced by a
-# compile_error guard in zebra-network.
+# compile_error guard in zakura-network.
 panic = "unwind"
 
 # Speed up release builds and sync tests using link-time optimization.

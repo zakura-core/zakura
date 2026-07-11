@@ -37,7 +37,7 @@ configs:
   zakura-config:
     #! To customize the default configuration, edit this file before starting
     #! the container.
-    file: ./default-zebra-config.toml
+    file: ./default-zakura-config.toml
 
 volumes:
   zakura-cache:

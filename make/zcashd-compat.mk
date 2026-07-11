@@ -31,7 +31,7 @@ ZAKURA_COOKIE_FILE ?= $(ZAKURA_STATE_CACHE_DIR)/.cookie
 HEIGHT_MAX_DRIFT ?= 10
 
 ZAKURA_DOCKER_IMAGE ?= zakura:zcashd-compat
-ZCASHD_COMPAT_MANIFEST ?= $(CURDIR)/zebrad/zcashd-compat-manifest.json
+ZCASHD_COMPAT_MANIFEST ?= $(CURDIR)/zakurad/zcashd-compat-manifest.json
 ZCASHD_COMPAT_TARGET_TRIPLE ?= x86_64-pc-linux-gnu
 ZCASHD_COMPAT_RELEASE_TAG ?= $(shell jq -er '.release_tag' $(ZCASHD_COMPAT_MANIFEST))
 ZCASHD_COMPAT_URL ?= $(shell jq -er --arg target '$(ZCASHD_COMPAT_TARGET_TRIPLE)' '.artifacts[] | select(.target_triple == $$target) | .runtime_archive_url' $(ZCASHD_COMPAT_MANIFEST))
@@ -161,14 +161,14 @@ compat-status-sync:
 		echo "Enable rpc.listen_addr and use deploy/zcashd-compat/sync-check.sh for full drift checks."; \
 		exit 0; \
 	fi
-	@zebra_height="$$(curl -sS --fail --user "$$(cat "$(ZAKURA_COOKIE_FILE)")" \
+	@zakura_height="$$(curl -sS --fail --user "$$(cat "$(ZAKURA_COOKIE_FILE)")" \
 		-H 'Content-Type: application/json' \
 		--data '{"jsonrpc":"1.0","id":"make","method":"getblockcount","params":[]}' \
 		"$(ZAKURA_RPC_URL)" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"])')"; \
 		zcashd_height="$$( "$(ZCASH_CLI_BIN)" -conf="$(ZCASHD_CONF)" -datadir="$(ZCASHD_DATADIR)" getblockcount )"; \
-		drift=$$(( zebra_height - zcashd_height )); \
+		drift=$$(( zakura_height - zcashd_height )); \
 		if [ $$drift -lt 0 ]; then drift=$$(( -drift )); fi; \
-		echo "zakurad height: $$zebra_height"; \
+		echo "zakurad height: $$zakura_height"; \
 		echo "zcashd height: $$zcashd_height"; \
 		echo "height drift: $$drift (max allowed: $(HEIGHT_MAX_DRIFT))"; \
 		if [ $$drift -gt "$(HEIGHT_MAX_DRIFT)" ]; then \
@@ -179,14 +179,14 @@ compat-status-sync:
 # ─── Integration test targets ─────────────────────────────────────────────────
 
 # Optional: path to a local zcashd binary for regtest tests.
-# If unset, the embedded zcashd download in the zebrad binary is used.
+# If unset, the embedded zcashd download in the zakurad binary is used.
 # Override with: make compat-test-regtest TEST_ZCASHD_PATH=/path/to/zcashd
 TEST_ZCASHD_PATH ?=
 TEST_ZCASHD_COMPAT_REORG_ITERATIONS ?= 500
 
 # External-mode test addresses and credentials.
 # Set these before running compat-test-mainnet or compat-test-testnet.
-TEST_ZEBRAD_RPC_ADDR ?= 127.0.0.1:8232
+TEST_ZAKURAD_RPC_ADDR ?= 127.0.0.1:8232
 TEST_ZCASHD_RPC_ADDR ?= 127.0.0.1:28232
 # Set one of the following for zcashd authentication (cookie file is preferred):
 TEST_ZCASHD_COOKIE_FILE ?=
@@ -194,7 +194,7 @@ TEST_ZCASHD_RPC_USER ?=
 TEST_ZCASHD_RPC_PASSWORD ?=
 
 # Run the full zcashd-compat integration test suite against a fresh regtest
-# environment.  zebrad and zcashd are spawned automatically by the test harness.
+# environment.  zakurad and zcashd are spawned automatically by the test harness.
 #
 # Prerequisites: a zcashd binary (set TEST_ZCASHD_PATH) or let the
 #   embedded download provide one.
@@ -213,19 +213,19 @@ compat-test-soak:
 	cargo nextest run --profile zcashd-compat-soak --run-ignored=only
 
 # Run the read-only zcashd-compat test suite against a live mainnet deployment.
-# Requires a fully-synced zebrad and zcashd already running on this host.
+# Requires a fully-synced zakurad and zcashd already running on this host.
 # Tests that require block mining (sendtoaddress, generate, etc.) are skipped.
 #
 # Prerequisites:
-#   - zebrad running with --zcashd-compat on mainnet
-#   - zcashd -zebra-compat connected to that zebrad
-#   - TEST_ZEBRAD_RPC_ADDR and TEST_ZCASHD_RPC_ADDR pointing to them
+#   - zakurad running with --zcashd-compat on mainnet
+#   - zcashd -zebra-compat connected to that zakurad
+#   - TEST_ZAKURAD_RPC_ADDR and TEST_ZCASHD_RPC_ADDR pointing to them
 #   - TEST_ZCASHD_COOKIE_FILE or TEST_ZCASHD_RPC_USER/PASSWORD set
 # When to use: validating a live mainnet deployment after an upgrade.
 compat-test-mainnet:
 	TEST_ZCASHD_COMPAT=1 \
 	TEST_ZCASHD_COMPAT_NETWORK=Mainnet \
-	TEST_ZEBRAD_RPC_ADDR="$(TEST_ZEBRAD_RPC_ADDR)" \
+	TEST_ZAKURAD_RPC_ADDR="$(TEST_ZAKURAD_RPC_ADDR)" \
 	TEST_ZCASHD_RPC_ADDR="$(TEST_ZCASHD_RPC_ADDR)" \
 	TEST_ZCASHD_COOKIE_FILE="$(TEST_ZCASHD_COOKIE_FILE)" \
 	TEST_ZCASHD_RPC_USER="$(TEST_ZCASHD_RPC_USER)" \
@@ -241,7 +241,7 @@ compat-test-mainnet:
 compat-test-testnet:
 	TEST_ZCASHD_COMPAT=1 \
 	TEST_ZCASHD_COMPAT_NETWORK=Testnet \
-	TEST_ZEBRAD_RPC_ADDR="$(TEST_ZEBRAD_RPC_ADDR)" \
+	TEST_ZAKURAD_RPC_ADDR="$(TEST_ZAKURAD_RPC_ADDR)" \
 	TEST_ZCASHD_RPC_ADDR="$(TEST_ZCASHD_RPC_ADDR)" \
 	TEST_ZCASHD_COOKIE_FILE="$(TEST_ZCASHD_COOKIE_FILE)" \
 	TEST_ZCASHD_RPC_USER="$(TEST_ZCASHD_RPC_USER)" \

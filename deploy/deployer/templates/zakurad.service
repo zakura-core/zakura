@@ -5,7 +5,7 @@ Description=Zakura full node ({{SERVICE_NAME}})
 Documentation=https://github.com/valargroup/zebra
 After=network-online.target
 Wants=network-online.target
-AssertPathExists={{BIN_PATH}}
+{{MOUNT_LINES}}AssertPathExists={{BIN_PATH}}
 
 [Service]
 Type=simple

@@ -62,7 +62,7 @@ jobs:
   # NOTE: we intentionally do NOT use `--each-feature` here. It checks every
   # feature in isolation, which is stricter than anything this project gated on
   # before and surfaces pre-existing non-additive-feature issues (e.g.
-  # zebra-chain's `async-error` not pulling in tokio's `rt` feature). Enforcing
+  # zakura-chain's `async-error` not pulling in tokio's `rt` feature). Enforcing
   # that is a separate, deliberate effort, not part of this CI change.
   crate-checks:
     name: Build crates (default and no-default features)
@@ -87,7 +87,7 @@ jobs:
         with:
           tool: cargo-hack
 
-      - uses: ./.github/actions/setup-zebra-build
+      - uses: ./.github/actions/setup-zakura-build
 
       - name: Check every crate with default and no-default features
         run: |

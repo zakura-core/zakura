@@ -1,20 +1,20 @@
 ---
 name: "Release Checklist Template"
-about: "Checklist to create and publish a Zebra release"
-title: "Release Zebra (version)"
+about: "Checklist to create and publish a Zakura release"
+title: "Release Zakura (version)"
 labels: "A-release, C-exclude-from-changelog, P-Critical :ambulance:"
 assignees: ""
 ---
 
 # Prepare for the Release
 
-- [ ] Make sure there has been [at least one successful sync-confidence run on `ironwood-main`](https://github.com/valargroup/zebra/actions/workflows/sync-confidence.yml?query=branch%3Aironwood-main) since the last state change, or start a manual sync-confidence run.
+- [ ] Make sure there has been [at least one successful sync-confidence run on `ironwood-main`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml?query=branch%3Aironwood-main) since the last state change, or start a manual sync-confidence run.
 
 # Checkpoints
 
-For performance and security, we want to update the Zebra checkpoints in every release.
+For performance and security, we want to update the Zakura checkpoints in every release.
 
-- [ ] You can copy the latest checkpoints from CI by following [the zebra-checkpoints README](https://github.com/valargroup/zebra/blob/ironwood-main/zebra-utils/README.md#zebra-checkpoints).
+- [ ] You can copy the latest checkpoints from CI by following [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/ironwood-main/zakura-utils/README.md#zakura-checkpoints).
 
 # Missed Dependency Updates
 
@@ -26,7 +26,7 @@ Here's how we make sure we got everything:
 
 - [ ] Run `cargo update` on the latest `ironwood-main` branch, and keep the output
 - [ ] Until we bump the workspace MSRV to 1.88 or higher, `home` must be downgraded manually: `cargo update home@0.5.12 --precise 0.5.11`
-- [ ] If needed, [add duplicate dependency exceptions to deny.toml](https://github.com/valargroup/zebra/blob/ironwood-main/book/src/dev/continuous-integration.md#fixing-duplicate-dependencies-in-check-denytoml-bans)
+- [ ] If needed, [add duplicate dependency exceptions to deny.toml](https://github.com/zakura-core/zakura/blob/ironwood-main/book/src/dev/continuous-integration.md#fixing-duplicate-dependencies-in-check-denytoml-bans)
 - [ ] If needed, remove resolved duplicate dependencies from `deny.toml`
 - [ ] Open a separate PR with the changes
 - [ ] Add the output of `cargo update` to that PR as a comment
@@ -40,17 +40,17 @@ These steps can be done a few days before the release, in the same PR:
 **Important**: Any merge into `ironwood-main` deletes any edits to the draft changelog.
 Once you are ready to tag a release, copy the draft changelog into `CHANGELOG.md`.
 
-We use [the Release Drafter workflow](https://github.com/marketplace/actions/release-drafter) to automatically create a [draft changelog](https://github.com/valargroup/zebra/releases). We follow the [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format.
+We use [the Release Drafter workflow](https://github.com/marketplace/actions/release-drafter) to automatically create a [draft changelog](https://github.com/zakura-core/zakura/releases). We follow the [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format.
 
 To create the final change log:
 
 - [ ] Copy the [**latest** draft
-      changelog](https://github.com/valargroup/zebra/releases) into
+      changelog](https://github.com/zakura-core/zakura/releases) into
       `CHANGELOG.md` (there can be multiple draft releases)
 - [ ] Delete any trivial changes
   - [ ] Put the list of deleted changelog entries in a PR comment to make reviewing easier
 - [ ] Combine duplicate changes
-- [ ] Edit change descriptions so they will make sense to Zebra users
+- [ ] Edit change descriptions so they will make sense to Zakura users
 - [ ] Check the category for each change
   - Prefer the "Fix" category if you're not sure
 
@@ -63,7 +63,7 @@ Update the README to:
 - [ ] Remove any "Known Issues" that have been fixed since the last release.
 - [ ] Update the "Build and Run Instructions" with any new dependencies.
       Check for changes in the `Dockerfile` since the last tag: `git diff <previous-release-tag> docker/Dockerfile`.
-- [ ] If Zebra has started using newer Rust language features or standard library APIs, update the known working Rust version in the README, book, and `Cargo.toml`s
+- [ ] If Zakura has started using newer Rust language features or standard library APIs, update the known working Rust version in the README, book, and `Cargo.toml`s
 
 You can use a command like:
 
@@ -75,13 +75,13 @@ fastmod --fixed-strings '1.58' '1.65'
 
 - [ ] Push the updated changelog and README into a new branch
       for example: `bump-v1.0.0` - this needs to be different to the tag name
-- [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/valargroup/zebra/compare/bump-v1.0.0?expand=1&template=release-checklist.md)).
-- [ ] Freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zebra/queues) using Mergify.
+- [ ] Create a release PR by adding `&template=release-checklist.md` to the comparing url ([Example](https://github.com/zakura-core/zakura/compare/bump-v1.0.0?expand=1&template=release-checklist.md)).
+- [ ] Freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zakura/queues) using Mergify.
 - [ ] Mark all the release PRs as `Critical` priority, so they go in the `urgent` Mergify queue.
 - [ ] Mark all non-release PRs with `do-not-merge`, because Mergify checks approved PRs against every commit, even when a queue is frozen.
 - [ ] Add the `A-release` tag to the release pull request in order for the `check-no-git-dependencies` to run.
 
-## Zebra git sources dependencies
+## Zakura git sources dependencies
 
 - [ ] Ensure the `check-no-git-dependencies` check passes.
 
@@ -89,11 +89,11 @@ This check runs automatically on pull requests with the `A-release` label. It mu
 
 # Update Versions and End of Support
 
-## Update Zebra Version
+## Update Zakura Version
 
-Zebra follows [semantic versioning](https://semver.org). Semantic versions look like: MAJOR.MINOR.PATCH[-TAG.PRE-RELEASE]
+Zakura follows [semantic versioning](https://semver.org). Semantic versions look like: MAJOR.MINOR.PATCH[-TAG.PRE-RELEASE]
 
-Choose a release level for `zebrad`. Release levels are based on user-visible changes from the changelog:
+Choose a release level for `zakurad`. Release levels are based on user-visible changes from the changelog:
 
 - Mainnet Network Upgrades are `major` releases
 - significant new features or behaviour changes; changes to RPCs, command-line, or configs; and deprecations or removals are `minor` releases
@@ -101,7 +101,7 @@ Choose a release level for `zebrad`. Release levels are based on user-visible ch
 
 ## Update Crate Versions and Crate Change Logs
 
-If you're publishing crates for the first time, [log in to crates.io](https://zebra.zfnd.org/dev/crate-owners.html#logging-in-to-cratesio),
+If you're publishing crates for the first time, [log in to crates.io](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio),
 and make sure you're a member of owners group.
 
 Check that the release will work:
@@ -123,16 +123,18 @@ Check that the release will work:
         API changes: `cargo public-api diff latest -p <crate> -sss`. You can use
         e.g. copilot to turn it into a human-readable list, e.g. (write the output
         to `api.txt` beforehand):
+        <!-- markdownlint-disable MD038 -->
         ```
         copilot -p "Transform @api.txt which is a API diff into a human-readable description of the API changes. Be terse. Write output api-readable.txt. Use backtick quotes for identifiers. Use '### Breaking Changes' header for changes and removals, and '### Added' for additions. Make each item start with a verb e.g, Added, Changed" --allow-tool write
         ```
-        It might also make sense to copy entries from the `zebrad` changelog.
+        <!-- markdownlint-enable MD038 -->
+        It might also make sense to copy entries from the `zakurad` changelog.
   - [ ] Update crate versions:
 
 ```sh
 cargo release version --verbose --execute --allow-branch '*' -p <crate> patch # [ major | minor ]
-# zebrad only
-cargo release replace --verbose --execute --allow-branch '*' -p zebrad
+# zakura only
+cargo release replace --verbose --execute --allow-branch '*' -p zakura
 ```
 
 - [ ] Commit and push the above version changes to the release branch.
@@ -142,7 +144,7 @@ cargo release replace --verbose --execute --allow-branch '*' -p zebrad
 The end of support height is calculated from the current blockchain height:
 
 - [ ] Find where the Zcash blockchain tip is now by using a [Zcash Block Explorer](https://mainnet.zcashexplorer.app/) or other tool.
-- [ ] Replace `ESTIMATED_RELEASE_HEIGHT` in [`end_of_support.rs`](https://github.com/valargroup/zebra/blob/ironwood-main/zebrad/src/components/sync/end_of_support.rs) with the height you estimate the release will be tagged.
+- [ ] Replace `ESTIMATED_RELEASE_HEIGHT` in [`end_of_support.rs`](https://github.com/zakura-core/zakura/blob/ironwood-main/zakurad/src/components/sync/end_of_support.rs) with the height you estimate the release will be tagged.
 
 <details>
 
@@ -158,37 +160,37 @@ The end of support height is calculated from the current blockchain height:
 
 - [ ] Push the version increments and the release constants to the release branch.
 
-# Publish the Zebra Release
+# Publish the Zakura Release
 
 ## Create the GitHub Pre-Release
 
 - [ ] Wait for all the release PRs to be merged
-- [ ] Create a new release using the draft release as a base, by clicking the Edit icon in the [draft release](https://github.com/valargroup/zebra/releases)
+- [ ] Create a new release using the draft release as a base, by clicking the Edit icon in the [draft release](https://github.com/zakura-core/zakura/releases)
 - [ ] Set the tag name to the version tag,
       for example: `v1.0.0`
 - [ ] Set the release to target the `ironwood-main` branch
-- [ ] Set the release title to `Zebra ` followed by the version tag,
-      for example: `Zebra 1.0.0`
+- [ ] Set the release title to `Zakura` followed by the version tag,
+      for example: `Zakura 1.0.0`
 - [ ] Replace the prepopulated draft changelog in the release description with the final changelog you created;
-      starting just _after_ the title `## [Zebra ...` of the current version being released,
+      starting just _after_ the title `## [Zakura ...` of the current version being released,
       and ending just _before_ the title of the previous release.
 - [ ] Mark the release as 'pre-release', until it has been built and tested
 - [ ] Publish the pre-release to GitHub using "Publish Release"
-- [ ] Delete all the [draft releases from the list of releases](https://github.com/valargroup/zebra/releases)
+- [ ] Delete all the [draft releases from the list of releases](https://github.com/zakura-core/zakura/releases)
 
 ## Test the Pre-Release
 
 - [ ] Wait until the release assets and Docker images have been built:
-  - [ ] [release-binaries.yml](https://github.com/valargroup/zebra/actions/workflows/release-binaries.yml?query=event%3Arelease)
-- [ ] Run [`sync-confidence.yml`](https://github.com/valargroup/zebra/actions/workflows/sync-confidence.yml) manually for the release tag or release branch if sync validation is required after tagging.
+  - [ ] [release-binaries.yml](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Arelease)
+- [ ] Run [`sync-confidence.yml`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml) manually for the release tag or release branch if sync validation is required after tagging.
 
 ## Publish Release
 
-- [ ] [Publish the release to GitHub](https://github.com/valargroup/zebra/releases) by disabling 'pre-release', then clicking "Set as the latest release"
+- [ ] [Publish the release to GitHub](https://github.com/zakura-core/zakura/releases) by disabling 'pre-release', then clicking "Set as the latest release"
 
 ## Publish Crates
 
-- [ ] [Run `cargo login`](https://zebra.zfnd.org/dev/crate-owners.html#logging-in-to-cratesio)
+- [ ] [Run `cargo login`](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio)
 - [ ] It is recommended that the following step be run from a fresh checkout of
       the repo, to avoid accidentally publishing files like e.g. logs that might
       be lingering around
@@ -196,24 +198,24 @@ The end of support height is calculated from the current blockchain height:
       have been changed, but keep their overall order:
 
 ```
-for c in zebra-test tower-fallback zebra-chain tower-batch-control zebra-node-services zebra-script zebra-state zebra-consensus zebra-network zebra-rpc zebra-utils zebrad; do cargo release publish --verbose --execute -p $c; done
+for c in zakura-test tower-fallback zakura-chain tower-batch-control zakura-node-services zakura-script zakura-state zakura-consensus zakura-network zakura-rpc zakura-utils zakurad; do cargo release publish --verbose --execute -p $c; done
 ```
 
-- [ ] Check that Zebra can be installed from `crates.io`:
-      `cargo install --locked --force --version <version> zebrad && ~/.cargo/bin/zebrad`
+- [ ] Check that Zakura can be installed from `crates.io`:
+      `cargo install --locked --force --version <version> zakurad && ~/.cargo/bin/zakurad`
       and put the output in a comment on the PR.
 
 ## Publish Docker Images
 
 - [ ] Confirm the pinned zcashd compat manifest is ready before publishing:
-  - [ ] Update [`zebrad/zcashd-compat-manifest.json`](https://github.com/valargroup/zebra/blob/ironwood-main/zebrad/zcashd-compat-manifest.json) to the intended `zcashd` compat release (it is the single source of truth: zebrad embeds it at compile time and CI/Docker builds read it directly).
+  - [ ] Update [`zakurad/zcashd-compat-manifest.json`](https://github.com/zakura-core/zakura/blob/ironwood-main/zakurad/zcashd-compat-manifest.json) to the intended `zcashd` compat release (it is the single source of truth: zakurad embeds it at compile time and CI/Docker builds read it directly).
   - [ ] Confirm the manifest contains only the `x86_64-pc-linux-gnu` artifact before publishing zcashd-compat Docker images.
   - [ ] Confirm the workflow logs show the expected `/usr/local/bin/zcashd --version` for the zcashd-compat linux/amd64 image variant.
 - [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Arelease).
 - [ ] Confirm `release-binaries.yml` published `zakurad-<tag>-linux-x86_64.tar.gz`, `zakurad-<tag>-linux-aarch64.tar.gz`, `zakurad-manifest-<tag>.json`, `install-zakura.sh`, and `SHA256SUMS.txt` to the GitHub release.
 - [ ] Wait for the new tag in the [Docker Hub zakura space](https://hub.docker.com/r/valargroup/zakura/tags)
 - [ ] Confirm `valargroup/zakura:<version>` includes `linux/amd64` and `linux/arm64`, and `valargroup/zakura:zcashd-compat-<version>` includes only `linux/amd64`.
-- [ ] Un-freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zebra/queues) using Mergify.
+- [ ] Un-freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zakura/queues) using Mergify.
 - [ ] Remove `do-not-merge` from the PRs you added it to
 
 ## Release Failures
@@ -228,6 +230,6 @@ If building or running fails after tagging:
 2. Start a new `patch` release
 3. Skip the **Release Preparation**, and start at the **Release Changes** step
 4. Update `CHANGELOG.md` with details about the fix
-5. Follow the release checklist for the new Zebra version
+5. Follow the release checklist for the new Zakura version
 
 </details>

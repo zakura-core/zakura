@@ -1,10 +1,10 @@
 # Design Overview
 
-This document sketches the design for Zebra.
+This document sketches the design for Zakura.
 
 ## Desiderata
 
-The following are general desiderata for Zebra:
+The following are general desiderata for Zakura:
 
 - [George's list..]
 
@@ -14,23 +14,23 @@ The following are general desiderata for Zebra:
   libsecp256k1 in Rust, instead of using the same upstream library as
   Bitcoin), we should generally aim for it.
 
-- As much as reasonably possible, Zebra should minimize trust in
+- As much as reasonably possible, Zakura should minimize trust in
   required dependencies.  Note that "minimize number of dependencies"
   is usually a proxy for this desideratum, but is not exactly the same:
   for instance, a collection of crates like the tokio crates are all
   developed together and have one trust boundary.
 
-- Zebra should be well-factored internally into a collection of
+- Zakura should be well-factored internally into a collection of
   component libraries which can be used by other applications to
   perform Zcash-related tasks.  Implementation details of each
   component should not leak into all other components.
 
-- Zebra should checkpoint on Canopy activation and drop all
+- Zakura should checkpoint on Canopy activation and drop all
   Sprout-related functionality not required post-Canopy.
 
 ## Non-Goals
 
-- Zebra keeps a copy of the chain state, so it isn't intended for
+- Zakura keeps a copy of the chain state, so it isn't intended for
   lightweight applications like light wallets. Those applications
   should use a light client protocol.
 
@@ -78,30 +78,30 @@ The dotted lines are for the `getblocktemplate` RPC.
 ## Architecture
 
 Unlike `zcashd`, which originated as a Bitcoin Core fork and inherited its
-monolithic architecture, Zebra has a modular, library-first design, with the
-intent that each component can be independently reused outside of the `zebrad`
-full node. For instance, the `zebra-network` crate containing the network stack
+monolithic architecture, Zakura has a modular, library-first design, with the
+intent that each component can be independently reused outside of the `zakurad`
+full node. For instance, the `zakura-network` crate containing the network stack
 can also be used to implement anonymous transaction relay, network crawlers, or
 other functionality, without requiring a full node.
 
-At a high level, the fullnode functionality required by `zebrad` is factored
+At a high level, the fullnode functionality required by `zakurad` is factored
 into several components:
 
-- [`zebra-chain`](https://docs.rs/zebra_chain), providing
+- [`zakura-chain`](https://docs.rs/zakura_chain), providing
   definitions of core data structures for Zcash, such as blocks, transactions,
   addresses, etc., and related functionality.  It also contains the
   implementation of the consensus-critical serialization formats used in Zcash.
-  The data structures in `zebra-chain` are defined to enforce
-  [_structural validity_](https://zebra.zfnd.org/dev/rfcs/0002-parallel-verification.html#verification-stages)
+  The data structures in `zakura-chain` are defined to enforce
+  [_structural validity_](../dev/rfcs/0002-parallel-verification.md#verification-stages)
   by making invalid states unrepresentable. For instance, the
   `Transaction` enum has variants for each transaction version, and it's
   impossible to construct a transaction with, e.g., spend or output
   descriptions but no binding signature, or, e.g., a version 2 (Sprout)
-  transaction with Sapling proofs. Currently, `zebra-chain` is oriented
+  transaction with Sapling proofs. Currently, `zakura-chain` is oriented
   towards verifying transactions, but will be extended to support creating them
   in the future.
 
-- [`zebra-network`](https://docs.rs/zebra_network),
+- [`zakura-network`](https://docs.rs/zakura_network),
   providing an asynchronous, multithreaded implementation of the Zcash network
   protocol inherited from Bitcoin. In contrast to `zcashd`, each peer
   connection has a separate state machine, and the crate translates the
@@ -114,13 +114,13 @@ into several components:
     isolated from all other node state.  This can be used, for instance, to
     safely relay data over Tor, without revealing distinguishing information.
 
-- [`zebra-script`](https://docs.rs/zebra_script) provides
+- [`zakura-script`](https://docs.rs/zakura_script) provides
   script validation. Currently, this is implemented by linking to the C++
   script verification code from `zcashd`, but in the future we may implement a
   pure-Rust script implementation.
 
-- [`zebra-consensus`](https://docs.rs/zebra_consensus)
-  performs [_semantic validation_](https://zebra.zfnd.org/dev/rfcs/0002-parallel-verification.html#verification-stages)
+- [`zakura-consensus`](https://docs.rs/zakura_consensus)
+  performs [_semantic validation_](../dev/rfcs/0002-parallel-verification.md#verification-stages)
   of blocks and transactions: all consensus
   rules that can be checked independently of the chain state, such as
   verification of signatures, proofs, and scripts. Internally, the library
@@ -128,15 +128,15 @@ into several components:
   perform automatic, transparent batch processing of contemporaneous
   verification requests.
 
-- [`zebra-state`](https://docs.rs/zebra_state) is
+- [`zakura-state`](https://docs.rs/zakura_state) is
   responsible for storing, updating, and querying the chain state. The state
-  service is responsible for [_contextual verification_](https://zebra.zfnd.org/dev/rfcs/0002-parallel-verification.html#verification-stages):
+  service is responsible for [_contextual verification_](../dev/rfcs/0002-parallel-verification.md#verification-stages):
   all consensus rules
   that check whether a new block is a valid extension of an existing chain,
   such as updating the nullifier set or checking that transaction inputs remain
   unspent.
 
-- [`zebrad`](https://docs.rs/zebrad) contains the full
+- [`zakurad`](https://docs.rs/zakurad) contains the full
   node, which connects these components together and implements logic to handle
   inbound requests from peers and the chain sync process.
 
@@ -145,7 +145,7 @@ communication between stateful components is handled internally by
 [internal asynchronous RPC abstraction](https://docs.rs/tower/)
 ("microservices in one process").
 
-### `zebra-chain`
+### `zakura-chain`
 
 #### Internal Dependencies
 
@@ -168,11 +168,11 @@ None: these are the core data structure definitions.
 
 - [...]
 
-### `zebra-network`
+### `zakura-network`
 
 #### Internal Dependencies
 
-- `zebra-chain`
+- `zakura-chain`
 
 #### Responsible for
 
@@ -204,11 +204,11 @@ All peerset management (finding new peers, creating new outbound
 connections, etc) is completely encapsulated, as is responsibility for
 routing outbound requests to appropriate peers.
 
-### `zebra-state`
+### `zakura-state`
 
 #### Internal Dependencies
 
-- `zebra-chain` for data structure definitions.
+- `zakura-chain` for data structure definitions.
 
 #### Responsible for
 
@@ -241,7 +241,7 @@ send requests for the chain state.
 All state management (adding blocks, getting blocks by index or hash) is completely
 encapsulated.
 
-### `zebra-script`
+### `zakura-script`
 
 #### Internal Dependencies
 
@@ -266,13 +266,13 @@ for Zcash script inspection, debugging, etc.
 
 - [...]
 
-### `zebra-consensus`
+### `zakura-consensus`
 
 #### Internal Dependencies
 
-- `zebra-chain` for data structures and parsing.
-- `zebra-state` to read and update the state database.
-- `zebra-script` for script parsing and validation.
+- `zakura-chain` for data structures and parsing.
+- `zakura-state` to read and update the state database.
+- `zakura-script` for script parsing and validation.
 
 #### Responsible for
 
@@ -288,8 +288,8 @@ for Zcash script inspection, debugging, etc.
   - mandatory checkpoints (genesis block, canopy activation)
   - optional regular checkpoints (every Nth block)
 - modifying the chain state
-  - adding new blocks to `ZebraState`, including chain reorganisation
-  - adding new transactions to `ZebraMempoolState`
+  - adding new blocks to `ZakuraState`, including chain reorganisation
+  - adding new transactions to `ZakuraMempoolState`
 - storing the transaction mempool state
   - mempool transactions can be accessed via their hash
 - providing `tower::Service` interfaces for all of the above to
@@ -299,7 +299,7 @@ for Zcash script inspection, debugging, etc.
 
 - `block::init() -> impl Service`, the main entry-point for block
   verification.
-- `ZebraMempoolState`
+- `ZakuraMempoolState`
   - all state management (adding transactions, getting transactions
     by hash) is completely encapsulated.
 - `mempool::init() -> impl Service`, the main entry-point for
@@ -308,13 +308,13 @@ for Zcash script inspection, debugging, etc.
 The `init` entrypoints return `Service`s that can be used to
 verify blocks or transactions, and add them to the relevant state.
 
-### `zebra-rpc`
+### `zakura-rpc`
 
 #### Internal Dependencies
 
-- `zebra-chain` for data structure definitions
-- `zebra-node-services` for shared request type definitions
-- `zebra-utils` for developer and power user tools
+- `zakura-chain` for data structure definitions
+- `zakura-node-services` for shared request type definitions
+- `zakura-utils` for developer and power user tools
 
 #### Responsible for
 
@@ -324,13 +324,13 @@ verify blocks or transactions, and add them to the relevant state.
 
 - [...]
 
-### `zebra-client`
+### `zakura-client`
 
 #### Internal Dependencies
 
-- `zebra-chain` for structure definitions
-- `zebra-state` for transaction queries and client/wallet state storage
-- `zebra-script` possibly? for constructing transactions
+- `zakura-chain` for structure definitions
+- `zakura-state` for transaction queries and client/wallet state storage
+- `zakura-script` possibly? for constructing transactions
 
 #### Responsible for
 
@@ -349,7 +349,7 @@ all client code to a subprocess.
 
 - [...]
 
-### `zebrad`
+### `zakurad`
 
 Abscissa-based application which loads configs, all application components,
 and connects them to each other.
@@ -361,12 +361,12 @@ and connects them to each other.
 
 #### Internal Dependencies
 
-- `zebra-chain`
-- `zebra-network`
-- `zebra-state`
-- `zebra-consensus`
-- `zebra-client`
-- `zebra-rpc`
+- `zakura-chain`
+- `zakura-network`
+- `zakura-state`
+- `zakura-consensus`
+- `zakura-client`
+- `zakura-rpc`
 
 ### Unassigned functionality
 

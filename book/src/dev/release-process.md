@@ -1,16 +1,16 @@
-# Zebra versioning and releases
+# Zakura versioning and releases
 
 This document contains the practices that we follow to provide you with a leading-edge application, balanced with stability.
 We strive to ensure that future changes are always introduced in a predictable way.
-We want everyone who depends on Zebra to know when and how new features are added, and to be well-prepared when obsolete ones are removed.
+We want everyone who depends on Zakura to know when and how new features are added, and to be well-prepared when obsolete ones are removed.
 
 Before reading, you should understand [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and how a [Trunk-based development](https://www.atlassian.com/continuous-delivery/continuous-integration/trunk-based-development) works
 
 <a id="versioning"></a>
 
-## Zebra versioning
+## Zakura versioning
 
-Zebra version numbers show the impact of the changes in a release. They are composed of three parts: `major.minor.patch`.
+Zakura version numbers show the impact of the changes in a release. They are composed of three parts: `major.minor.patch`.
 For example, version `3.1.11` indicates major version 3, minor version 1, and patch level 11.
 
 The version number is incremented based on the level of change included in the release.
@@ -18,7 +18,7 @@ The version number is incremented based on the level of change included in the r
 <div class="alert pre-release">
 
 **NOTE**: <br />
-As Zebra is in a `pre-release` state (is unstable and might not satisfy the intended compatibility requirements as denoted by its associated normal version).
+As Zakura is in a `pre-release` state (is unstable and might not satisfy the intended compatibility requirements as denoted by its associated normal version).
 The pre-release version is denoted by appending a hyphen and a series of dot separated identifiers immediately following the patch version.
 
 </div>
@@ -33,24 +33,24 @@ The pre-release version is denoted by appending a hyphen and a series of dot sep
 
 ### Supported Releases
 
-Every Zebra version released by Valar is supported up to a specific height. Currently we support each version for about **16 weeks** but this can change from release to release.
+Every Zakura version released by Valar is supported up to a specific height. Currently we support each version for about **16 weeks** but this can change from release to release.
 
-When the Zcash chain reaches this end of support height, `zebrad` will shut down and the binary will refuse to start.
+When the Zcash chain reaches this end of support height, `zakurad` will shut down and the binary will refuse to start.
 
 Our process is similar to `zcashd`: <https://zcash.github.io/zcash/user/release-support.html>
 
-Older Zebra versions that only support previous network upgrades will never be supported, because they are operating on an unsupported Zcash chain fork.
+Older Zakura versions that only support previous network upgrades will never be supported, because they are operating on an unsupported Zcash chain fork.
 
 <a id="updating"></a>
 
 ### Supported update paths
 
-You can update to any version of Zebra, provided that the following criteria are met:
+You can update to any version of Zakura, provided that the following criteria are met:
 
 - The version you want to update _to_ is supported.
 - The version you want to update _from_ is within one major version of the version you want to upgrade to.
 
-See [Keeping Up-to-Date](guide/updating "Updating your projects") for more information about updating your Zebra projects to the most recent version.
+See [Keeping Up-to-Date](guide/updating "Updating your projects") for more information about updating your Zakura projects to the most recent version.
 
 <a id="previews"></a>
 
@@ -65,13 +65,13 @@ We let you preview what's coming by providing Release Candidate \(`rc`\) pre-rel
 
 ### Distribution tags
 
-Zebra's tagging relates directly to versions published on Docker. We will reference these [Docker Hub distribution tags](https://hub.docker.com/r/valaroman/zebra/tags) throughout:
+Zakura's tagging relates directly to versions published on Docker. We will reference these [Docker Hub distribution tags](https://hub.docker.com/r/valaroman/zakura/tags) throughout:
 
 | Tag    | Description                                                                                         |
 | :----- | :-------------------------------------------------------------------------------------------------- |
 | latest | The most recent stable version.                                                                     |
-| beta   | The most recent pre-release version of Zebra for testing. May not always exist.                     |
-| rc     | The most recent release candidate of Zebra, meant to become a stable version. May not always exist. |
+| beta   | The most recent pre-release version of Zakura for testing. May not always exist.                     |
+| rc     | The most recent release candidate of Zakura, meant to become a stable version. May not always exist. |
 
 ### Feature Flags
 
@@ -83,7 +83,7 @@ Breaking changes should also be gated behind a feature flag, unless the team dec
 
 ## Release frequency
 
-We work toward a regular schedule of releases, so that you can plan and coordinate your updates with the continuing evolution of Zebra.
+We work toward a regular schedule of releases, so that you can plan and coordinate your updates with the continuing evolution of Zakura.
 
 <div class="alert is-helpful">
 
@@ -93,8 +93,8 @@ Dates are offered as general guidance and are subject to change.
 
 In general, expect the following release cycle:
 
-- A major release for each network upgrade, whenever there are breaking changes to Zebra (by API, severe bugs or other kind of upgrades)
-- Minor releases for significant new Zebra features or severe bug fixes
+- A major release for each network upgrade, whenever there are breaking changes to Zakura (by API, severe bugs or other kind of upgrades)
+- Minor releases for significant new Zakura features or severe bug fixes
 - A patch release around every 6 weeks
 
 This cadence of releases gives eager developers access to new features as soon as they are fully developed and pass through our code review and integration testing processes, while maintaining the stability and reliability of the platform for production users that prefer to receive features after they have been validated by Zcash and other developers that use the pre-release builds.
@@ -105,27 +105,27 @@ This cadence of releases gives eager developers access to new features as soon a
 
 Sometimes "breaking changes", such as the removal of support for RPCs, APIs, and features, are necessary to:
 
-- add new Zebra features,
-- improve Zebra performance or reliability,
+- add new Zakura features,
+- improve Zakura performance or reliability,
 - stay current with changing dependencies, or
 - implement changes in the \(blockchain\) itself.
 
 To make these transitions as straightforward as possible, we make these commitments to you:
 
 - We work hard to minimize the number of breaking changes and to provide migration tools, when possible
-- We follow the deprecation policy described here, so you have time to update your applications to the latest Zebra binaries, RPCs and APIs
+- We follow the deprecation policy described here, so you have time to update your applications to the latest Zakura binaries, RPCs and APIs
 - If a feature has critical security or reliability issues, and we need to remove it as soon as possible, we will explain why at the top of the release notes
 
 To help ensure that you have sufficient time and a clear path to update, this is our deprecation policy:
 
 | Deprecation stages | Details                                                                                                                                                                                                                                                                                                                                                                                |
 | :----------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Announcement       | We announce deprecated RPCs and features in the [change log](https://github.com/valargroup/zebra/blob/ironwood-main/CHANGELOG.md "Zebra change log"). When we announce a deprecation, we also announce a recommended update path.                                                                                                                                                          |
+| Announcement       | We announce deprecated RPCs and features in the [change log](https://github.com/zakura-core/zakura/blob/ironwood-main/CHANGELOG.md "Zakura change log"). When we announce a deprecation, we also announce a recommended update path.                                                                                                                                                          |
 | Deprecation period | When a RPC or a feature is deprecated, it is still present until the next major release. A deprecation can be announced in any release, but the removal of a deprecated RPC or feature happens only in major release. Until a deprecated RPC or feature is removed, it is maintained according to the Tier 1 support policy, meaning that only critical and security issues are fixed. |
-| Rust APIs          | The Rust APIs of the Zebra crates are currently unstable and unsupported. Use the `zebrad` commands or JSON-RPCs to interact with Zebra.                                                                                                                                                                                                                                               |
+| Rust APIs          | The Rust APIs of the Zakura crates are currently unstable and unsupported. Use the `zakurad` commands or JSON-RPCs to interact with Zakura.                                                                                                                                                                                                                                               |
 
 <a id="process"></a>
 
 ## Release candidate & release process
 
-Our release checklist is available as a template, which defines each step our team needs to follow to create a new pre-release or release, and to also build and push the binaries to the official channels [Release Checklist Template](https://github.com/valargroup/zebra/blob/ironwood-main/.github/PULL_REQUEST_TEMPLATE/release-checklist.md).
+Our release checklist is available as a template, which defines each step our team needs to follow to create a new pre-release or release, and to also build and push the binaries to the official channels [Release Checklist Template](https://github.com/zakura-core/zakura/blob/ironwood-main/.github/PULL_REQUEST_TEMPLATE/release-checklist.md).

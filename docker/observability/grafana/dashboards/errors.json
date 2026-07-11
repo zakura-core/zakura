@@ -26,7 +26,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -68,8 +68,8 @@
       "scopedVars": {
         "job": {
           "selected": true,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -78,33 +78,33 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "zebra_error_sapling_binding{job=\"$job\"}",
+          "expr": "zakura_error_sapling_binding{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
-          "expr": "zebra_sighash_error_sapling_spend{job=\"$job\"}",
+          "expr": "zakura_sighash_error_sapling_spend{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
-          "expr": "zebra_sighash_error_sprout_joinsplit{job=\"$job\"}",
+          "expr": "zakura_sighash_error_sprout_joinsplit{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         }
       ],
@@ -156,7 +156,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -199,8 +199,8 @@
       "scopedVars": {
         "job": {
           "selected": true,
-          "text": "zebrad-mainnet-tmp-1",
-          "value": "zebrad-mainnet-tmp-1"
+          "text": "zakurad-mainnet-tmp-1",
+          "value": "zakurad-mainnet-tmp-1"
         }
       },
       "seriesOverrides": [],
@@ -209,33 +209,33 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "zebra_error_sapling_binding{job=\"$job\"}",
+          "expr": "zakura_error_sapling_binding{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
-          "expr": "zebra_sighash_error_sapling_spend{job=\"$job\"}",
+          "expr": "zakura_sighash_error_sapling_spend{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
-          "expr": "zebra_sighash_error_sprout_joinsplit{job=\"$job\"}",
+          "expr": "zakura_sighash_error_sprout_joinsplit{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         }
       ],
@@ -287,7 +287,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -330,8 +330,8 @@
       "scopedVars": {
         "job": {
           "selected": true,
-          "text": "zebrad-testnet-tmp-1",
-          "value": "zebrad-testnet-tmp-1"
+          "text": "zakurad-testnet-tmp-1",
+          "value": "zakurad-testnet-tmp-1"
         }
       },
       "seriesOverrides": [],
@@ -340,33 +340,33 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "zebra_error_sapling_binding{job=\"$job\"}",
+          "expr": "zakura_error_sapling_binding{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
-          "expr": "zebra_sighash_error_sapling_spend{job=\"$job\"}",
+          "expr": "zakura_sighash_error_sapling_spend{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
-          "expr": "zebra_sighash_error_sprout_joinsplit{job=\"$job\"}",
+          "expr": "zakura_sighash_error_sprout_joinsplit{job=\"$job\"}",
           "interval": "",
           "legendFormat": "",
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         }
       ],
@@ -423,19 +423,19 @@
           "selected": true,
           "tags": [],
           "text": [
-            "zebrad-mainnet",
-            "zebrad-mainnet-tmp-1",
-            "zebrad-testnet-tmp-1"
+            "zakurad-mainnet",
+            "zakurad-mainnet-tmp-1",
+            "zakurad-testnet-tmp-1"
           ],
           "value": [
-            "zebrad-mainnet",
-            "zebrad-mainnet-tmp-1",
-            "zebrad-testnet-tmp-1"
+            "zakurad-mainnet",
+            "zakurad-mainnet-tmp-1",
+            "zakurad-testnet-tmp-1"
           ]
         },
         "datasource": {
           "type": "prometheus",
-          "uid": "zebra-prometheus"
+          "uid": "zakura-prometheus"
         },
         "definition": "label_values(zcash_net_peers, job)",
         "hide": 0,

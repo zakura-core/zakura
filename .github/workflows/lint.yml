@@ -72,7 +72,7 @@ jobs:
             features: default-release-binaries
           - type: tests
             args: --workspace --all-targets
-            features: default-release-binaries proptest-impl lightwalletd-grpc-tests zebra-checkpoints
+            features: default-release-binaries proptest-impl lightwalletd-grpc-tests zakura-checkpoints
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
@@ -83,7 +83,7 @@ jobs:
           components: clippy
           toolchain: ${{ matrix.rust-version }}
           cache-on-failure: true
-      - uses: ./.github/actions/setup-zebra-build
+      - uses: ./.github/actions/setup-zakura-build
       - name: Run clippy
         run: cargo clippy ${{ matrix.args }} --features "${{ matrix.features }}"
 
@@ -108,12 +108,12 @@ jobs:
         with:
           toolchain: 1.91 # MSRV
           cache-on-failure: true
-      - uses: ./.github/actions/setup-zebra-build
+      - uses: ./.github/actions/setup-zakura-build
       # Build every workspace binary (and, transitively, every library) on the
       # MSRV toolchain in a single warm target dir instead of a per-binary
-      # matrix. `zebra-watchdog` is excluded: it depends on `sentry`, which
+      # matrix. `zakura-watchdog` is excluded: it depends on `sentry`, which
       # requires a newer rustc than the workspace library MSRV.
-      - run: cargo build --workspace --bins --exclude zebra-watchdog
+      - run: cargo build --workspace --bins --exclude zakura-watchdog
 
   docs:
     name: docs
@@ -134,7 +134,7 @@ jobs:
         with:
           toolchain: nightly
           cache-on-failure: true
-      - uses: ./.github/actions/setup-zebra-build
+      - uses: ./.github/actions/setup-zakura-build
       - run: cargo doc --no-deps --workspace --all-features --document-private-items --target-dir "$(pwd)"/target/internal
         env:
           # Keep in sync with ./book.yml:jobs.build
@@ -183,7 +183,7 @@ jobs:
       - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
         with:
           tool: cargo-udeps
-      - uses: ./.github/actions/setup-zebra-build
+      - uses: ./.github/actions/setup-zakura-build
       - run: cargo udeps --workspace --all-targets --all-features --locked
 
   no-test-deps:
@@ -199,7 +199,7 @@ jobs:
           toolchain: stable
           cache-on-failure: true
       - name: Ensure no arbitrary or proptest dependency on default build
-        run: cargo tree --package zebrad -e=features,no-dev | grep -Eq "arbitrary|proptest" && exit 1 || exit 0
+        run: cargo tree --package zakura -e=features,no-dev | grep -Eq "arbitrary|proptest" && exit 1 || exit 0
 
   # NOTE: the old `features` job (`cargo hack check --all`) is subsumed by the
   # `cargo hack check --workspace` pass in `test-crates.yml`.
@@ -219,7 +219,7 @@ jobs:
         with:
           toolchain: stable
           cache-on-failure: true
-      - uses: ./.github/actions/setup-zebra-build
+      - uses: ./.github/actions/setup-zakura-build
       - run: cargo check --locked --all-features --all-targets
 
   deny:
@@ -262,7 +262,7 @@ jobs:
           tool: cargo-deny@0.19.5
       - name: Check ${{ matrix.checks }} with features ${{ matrix.features }}
         # --all-features spuriously activates openssl, but we want to ban that dependency in
-        # all of zebrad's production features for security reasons. But the --all-features job is
+        # all of zakurad's production features for security reasons. But the --all-features job is
         # the only job that gives accurate "skip tree root was not found" warnings.
         # In other jobs, we expect some of these warnings, due to disabled features.
         run: cargo deny --workspace ${{ matrix.features }} check ${{ matrix.checks }} ${{ matrix.features == '--all-features' && '--allow banned' || '--allow unmatched-skip-root' }}

@@ -1,10 +1,10 @@
 # Mempool Specification
 
-The Zebra mempool handles unmined Zcash transactions: collecting them from peers, verifying them, storing them in memory, providing APIs for other components to access them, and gossiping transactions to peers. This document specifies the architecture, behavior, and interfaces of the mempool.
+The Zakura mempool handles unmined Zcash transactions: collecting them from peers, verifying them, storing them in memory, providing APIs for other components to access them, and gossiping transactions to peers. This document specifies the architecture, behavior, and interfaces of the mempool.
 
 ## Overview
 
-The mempool is a fundamental component of the Zebra node, responsible for managing the lifecycle of unmined transactions. It provides an in-memory storage for valid transactions that haven't yet been included in a block, and offers interfaces for other components to interact with these transactions.
+The mempool is a fundamental component of the Zakura node, responsible for managing the lifecycle of unmined transactions. It provides an in-memory storage for valid transactions that haven't yet been included in a block, and offers interfaces for other components to interact with these transactions.
 
 Key responsibilities of the mempool include:
 
@@ -151,7 +151,7 @@ The mempool exposes a service interface with the following request types:
 
 ## Interaction with Other Components
 
-The mempool interacts with several other Zebra components:
+The mempool interacts with several other Zakura components:
 
 1. **Network Service**: For downloading transactions and gossiping to peers.
 

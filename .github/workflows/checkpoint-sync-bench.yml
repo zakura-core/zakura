@@ -2,7 +2,7 @@ name: Checkpoint-sync benchmark
 
 # Manual, on-demand checkpoint-zone sync benchmark.
 #
-# Picks a published release of this repo (no build in CI), runs zebrad forward from a
+# Picks a published release of this repo (no build in CI), runs zakurad forward from a
 # pre-synced ~1.7M mainnet state snapshot through the checkpoint zone pinned to a single
 # peer, and reports: time taken, blocks covered, blocks/s. Demonstrates the checkpoint-sync
 # throughput work (CHECKPOINT_SYNC_FINDINGS.md / PARALLEL_IDEA.md).
@@ -10,14 +10,14 @@ name: Checkpoint-sync benchmark
 # Each run also records a Prometheus time series and classifies the run into a single
 # bottleneck verdict — commit-starved / download-bound / verify-bound — shown in the step
 # summary and saved as verdict-*.json. The recorded series feed an always-on dashboard
-# on the runner (scripts/zebra-dashboard.service) at http://<box>:8090/, where you can log
+# on the runner (scripts/zakura-dashboard.service) at http://<box>:8090/, where you can log
 # in and replay any past run's charts.
 #
 # Runs on the roman-zakura-3 self-hosted runner (label `zakura-bench`). One-time setup:
 # register the runner, set the BENCH_* repo Actions variables (see
 # scripts/checkpoint-sync-bench.sh header and the repo runbook), and install the dashboard
-# service once: `sudo cp scripts/zebra-dashboard.service /etc/systemd/system/ &&
-# sudo systemctl enable --now zebra-dashboard` (see that file's header).
+# service once: `sudo cp scripts/zakura-dashboard.service /etc/systemd/system/ &&
+# sudo systemctl enable --now zakura-dashboard` (see that file's header).
 
 on:
   workflow_dispatch:
@@ -67,13 +67,13 @@ on:
         required: false
         default: "150"
       target_p2p_stack:
-        description: "Target/primary P2P stack: zebra | zakura | dual (aliases: v1/legacy, v2, combined)"
+        description: "Target/primary P2P stack: legacy | zakura | dual"
         required: false
         default: "zakura"
       baseline_p2p_stack:
-        description: "Baseline/base P2P stack: zebra | zakura | dual (aliases: v1/legacy, v2, combined)"
+        description: "Baseline/base P2P stack: legacy | zakura | dual"
         required: false
-        default: "zebra"
+        default: "legacy"
       baseline_tag:
         description: "Optional (download mode): baseline release tag for a speedup comparison. Ignored when skip_baseline is true."
         required: false
@@ -90,7 +90,7 @@ jobs:
   bench:
     name: "checkpoint sync ${{ inputs.build_ref || inputs.release_tag }}"
     runs-on: [self-hosted, "${{ vars.BENCH_RUNNER_LABEL || 'zakura-bench' }}"]
-    timeout-minutes: 360   # allow long self-hosted benchmark runs; WALL_CAP controls zebrad runtime
+    timeout-minutes: 360   # allow long self-hosted benchmark runs; WALL_CAP controls zakurad runtime
     steps:
       - name: Checkout (for the bench script)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
@@ -118,12 +118,12 @@ jobs:
           SNAPSHOT_URL: ${{ vars.BENCH_SNAPSHOT_URL || 'https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst' }}
           SNAPSHOT_SHA256: ${{ vars.BENCH_SNAPSHOT_SHA256 || '19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769' }}
           START_HEIGHT: ${{ vars.BENCH_SNAPSHOT_START_HEIGHT || '1707210' }}
-          BENCH_HOME: ${{ vars.BENCH_HOME || '/opt/zebra-bench' }}
+          BENCH_HOME: ${{ vars.BENCH_HOME || '/opt/zakura-bench' }}
           OUT_DIR: ${{ github.workspace }}/bench-out
           # record metrics + emit the bottleneck verdict; the always-on dashboard service
           # serves this archive dir. Disable with the BENCH_DASHBOARD repo var = '0'.
           DASHBOARD: ${{ vars.BENCH_DASHBOARD || '1' }}
-          DASHBOARD_ARCHIVE: ${{ vars.BENCH_DASHBOARD_ARCHIVE || '/opt/zebra-bench/dashboard/runs' }}
+          DASHBOARD_ARCHIVE: ${{ vars.BENCH_DASHBOARD_ARCHIVE || '/opt/zakura-bench/dashboard/runs' }}
         run: bash scripts/checkpoint-sync-bench.sh
 
       - name: Build artifact name

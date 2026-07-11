@@ -134,7 +134,7 @@ where
 
             // TODO: identify the unique part of the type name generically,
             //       or make it an argument to this method
-            let batch_kind = batch_kind.trim_start_matches("zebra_consensus::primitives::");
+            let batch_kind = batch_kind.trim_start_matches("zakura_consensus::primitives::");
             let batch_kind = batch_kind.trim_end_matches("::Verifier");
 
             tokio::task::Builder::new()

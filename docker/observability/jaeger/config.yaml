@@ -40,7 +40,7 @@ exporters:
     endpoint: 0.0.0.0:8889
     namespace: traces
     const_labels:
-      service: zebra
+      service: zakura
 
 extensions:
   jaeger_storage:

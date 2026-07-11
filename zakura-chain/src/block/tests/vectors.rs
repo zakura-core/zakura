@@ -1,0 +1,514 @@
+use std::{
+    collections::{HashMap, HashSet},
+    io::{Cursor, Write},
+    sync::Arc,
+};
+
+use chrono::{DateTime, Duration, LocalResult, TimeZone, Utc};
+
+use crate::{
+    amount::{Amount, NonNegative, MAX_MONEY},
+    block::{
+        serialize::MAX_BLOCK_BYTES, Block, BlockTimeError, Commitment::*, Hash, Header, Height,
+    },
+    parameters::{Network, NetworkUpgrade::*},
+    sapling,
+    serialization::{
+        sha256d, SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+    },
+    transaction::{LockTime, Transaction},
+    transparent,
+};
+
+use super::generate; // TODO: this should be rewritten as strategies
+
+#[test]
+fn blockheaderhash_debug() {
+    let _init_guard = zakura_test::init();
+
+    let preimage = b"foo bar baz";
+    let mut sha_writer = sha256d::Writer::default();
+    let _ = sha_writer.write_all(preimage);
+
+    let hash = Hash(sha_writer.finish());
+
+    assert_eq!(
+        format!("{hash:?}"),
+        "block::Hash(\"3166411bd5343e0b284a108f39a929fbbb62619784f8c6dafe520703b5b446bf\")"
+    );
+}
+
+#[test]
+fn blockheaderhash_from_blockheader() {
+    let _init_guard = zakura_test::init();
+
+    let (blockheader, _blockheader_bytes) = generate::block_header();
+
+    let hash = Hash::from(&blockheader);
+
+    assert_eq!(
+        format!("{hash:?}"),
+        "block::Hash(\"d1d6974bbe1d4d127c889119b2fc05724c67588dc72708839727586b8c2bc939\")"
+    );
+
+    let mut bytes = Cursor::new(Vec::new());
+
+    blockheader
+        .zcash_serialize(&mut bytes)
+        .expect("these bytes to serialize from a blockheader without issue");
+
+    bytes.set_position(0);
+    let other_header = bytes
+        .zcash_deserialize_into()
+        .expect("these bytes to deserialize into a blockheader without issue");
+
+    assert_eq!(blockheader, other_header);
+}
+
+/// Regression test for https://github.com/ZcashFoundation/zebra/issues/10585.
+///
+/// `Block::chain_value_pool_change()` previously aggregated transaction value
+/// balances with `flat_map(|tx| tx.value_balance(utxos))`. Because
+/// `Result<T, E>` implements `IntoIterator`, `Err(_)` yielded zero items and
+/// silently dropped the failing transaction from the block sum. The block
+/// helper now uses `try_fold` so transaction-level value-balance errors
+/// propagate.
+#[test]
+fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
+    let _init_guard = zakura_test::init();
+
+    let max_money: Amount<NonNegative> = MAX_MONEY.try_into().expect("MAX_MONEY is a valid amount");
+    // Two `MAX_MONEY` transparent outputs make the transaction-level output
+    // sum exceed `MAX_MONEY`, so `value_balance` returns `Err`.
+    let coinbase = Transaction::V1 {
+        inputs: vec![transparent::Input::Coinbase {
+            height: Height(1),
+            data: vec![],
+            sequence: 0xFFFF_FFFF,
+        }],
+        outputs: vec![
+            transparent::Output::new(max_money, transparent::Script::new(&[])),
+            transparent::Output::new(max_money, transparent::Script::new(&[])),
+        ],
+        lock_time: LockTime::unlocked(),
+    };
+    let utxos = HashMap::new();
+
+    assert!(
+        coinbase.value_balance(&utxos).is_err(),
+        "transaction-level value balance should reject an output sum above MAX_MONEY"
+    );
+
+    let header: Header = zakura_test::vectors::DUMMY_HEADER
+        .zcash_deserialize_into()
+        .expect("dummy header should deserialize");
+    let block = Block {
+        header: Arc::new(header),
+        transactions: vec![Arc::new(coinbase)],
+    };
+
+    assert!(
+        block.chain_value_pool_change(&utxos, None).is_err(),
+        "block-level aggregation should propagate transaction value-balance errors"
+    );
+}
+
+#[test]
+fn blockheader_serialization() {
+    let _init_guard = zakura_test::init();
+
+    // Includes the 32-byte nonce and 3-byte equihash length field.
+    const BLOCK_HEADER_LENGTH: usize = crate::work::equihash::Solution::INPUT_LENGTH
+        + 32
+        + 3
+        + crate::work::equihash::SOLUTION_SIZE;
+
+    for block in zakura_test::vectors::BLOCKS.iter() {
+        // successful deserialization
+
+        let header_bytes = &block[..BLOCK_HEADER_LENGTH];
+
+        let mut header = header_bytes
+            .zcash_deserialize_into::<Header>()
+            .expect("blockheader test vector should deserialize");
+
+        // successful serialization
+
+        let _serialized_header = header
+            .zcash_serialize_to_vec()
+            .expect("blockheader test vector should serialize");
+
+        // deserialiation errors
+
+        let header_bytes = [&[255; 4], &header_bytes[4..]].concat();
+
+        let deserialization_err = header_bytes
+            .zcash_deserialize_into::<Header>()
+            .expect_err("blockheader test vector should fail to deserialize");
+
+        let SerializationError::Parse(err_msg) = deserialization_err else {
+            panic!("SerializationError variant should be Parse")
+        };
+
+        assert_eq!(err_msg, "high bit was set in version field");
+
+        let header_bytes = [&[0; 4], &header_bytes[4..]].concat();
+
+        let deserialization_err = header_bytes
+            .zcash_deserialize_into::<Header>()
+            .expect_err("blockheader test vector should fail to deserialize");
+
+        let SerializationError::Parse(err_msg) = deserialization_err else {
+            panic!("SerializationError variant should be Parse")
+        };
+
+        assert_eq!(err_msg, "version must be at least 4");
+
+        // serialiation errors
+
+        header.version = u32::MAX;
+
+        let serialization_err = header
+            .zcash_serialize_to_vec()
+            .expect_err("blockheader test vector with modified version should fail to serialize");
+
+        assert_eq!(
+            serialization_err.kind(),
+            std::io::ErrorKind::Other,
+            "error kind should be Other"
+        );
+
+        let err_msg = serialization_err
+            .into_inner()
+            .expect("there should be an inner error");
+
+        assert_eq!(err_msg.to_string(), "high bit was set in version field");
+    }
+}
+
+#[test]
+fn round_trip_blocks() {
+    let _init_guard = zakura_test::init();
+
+    // this one has a bad version field, but it is still valid
+    zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
+        .zcash_deserialize_into::<Block>()
+        .expect("bad version block test vector should deserialize");
+
+    // now do a round-trip test on all the block test vectors
+    for block_bytes in zakura_test::vectors::BLOCKS.iter() {
+        let block = block_bytes
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+
+        let round_trip_bytes = block
+            .zcash_serialize_to_vec()
+            .expect("vec serialization is infallible");
+
+        assert_eq!(&round_trip_bytes[..], *block_bytes);
+    }
+}
+
+#[test]
+fn coinbase_parsing_rejects_above_0x80() {
+    let _init_guard = zakura_test::init();
+
+    zakura_test::vectors::BAD_BLOCK_MAINNET_202_BYTES
+        .zcash_deserialize_into::<Block>()
+        .expect_err("parsing fails");
+}
+
+#[test]
+fn block_test_vectors_unique() {
+    let _init_guard = zakura_test::init();
+
+    let block_count = zakura_test::vectors::BLOCKS.len();
+    let block_hashes: HashSet<_> = zakura_test::vectors::BLOCKS
+        .iter()
+        .map(|b| {
+            b.zcash_deserialize_into::<Block>()
+                .expect("block is structurally valid")
+                .hash()
+        })
+        .collect();
+
+    // putting the same block in two files is an easy mistake to make
+    assert_eq!(
+        block_count,
+        block_hashes.len(),
+        "block test vectors must be unique"
+    );
+}
+
+/// Checks that:
+///
+/// - the block test vector indexes match the heights in the block data;
+/// - each post-Sapling block has a corresponding final Sapling root;
+/// - each post-Orchard block has a corresponding final Orchard root.
+#[test]
+fn block_test_vectors() {
+    let _init_guard = zakura_test::init();
+
+    for net in Network::iter() {
+        let sapling_anchors = net.sapling_anchors();
+        let orchard_anchors = net.orchard_anchors();
+
+        for (&height, block) in net.block_iter() {
+            let block = block
+                .zcash_deserialize_into::<Block>()
+                .expect("block is structurally valid");
+            assert_eq!(
+                block.coinbase_height().expect("block height is valid").0,
+                height,
+                "deserialized height must match BTreeMap key height"
+            );
+
+            if height
+                >= Sapling
+                    .activation_height(&net)
+                    .expect("activation height")
+                    .0
+            {
+                assert!(
+                sapling_anchors.contains_key(&height),
+                "post-sapling block test vectors must have matching sapling root test vectors: \
+                 missing {net} {height}"
+            );
+            }
+
+            if height >= Nu5.activation_height(&net).expect("activation height").0 {
+                assert!(
+                    orchard_anchors.contains_key(&height),
+                    "post-nu5 block test vectors must have matching orchard root test vectors: \
+                 missing {net} {height}"
+                );
+            }
+        }
+    }
+}
+
+/// Checks that the block commitment field parses without errors.
+/// For sapling and blossom blocks, also check the final sapling root value.
+///
+/// TODO: add chain history test vectors?
+#[test]
+fn block_commitment() {
+    let _init_guard = zakura_test::init();
+
+    for net in Network::iter() {
+        let sapling_anchors = net.sapling_anchors();
+
+        for (height, block) in net.block_iter() {
+            if let FinalSaplingRoot(anchor) = block
+                .zcash_deserialize_into::<Block>()
+                .expect("block is structurally valid")
+                .commitment(&net)
+                .expect("unexpected structurally invalid block commitment at {net} {height}")
+            {
+                let expected_anchor = *sapling_anchors
+                    .get(height)
+                    .expect("unexpected missing final sapling root test vector");
+                assert_eq!(
+                    anchor,
+                    sapling::tree::Root::try_from(*expected_anchor).unwrap(),
+                    "unexpected invalid final sapling root commitment at {net} {height}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn block_limits_multi_tx() {
+    let _init_guard = zakura_test::init();
+
+    // Test multiple small transactions to fill a block max size
+
+    // Create a block just below the limit
+    let mut block = generate::large_multi_transaction_block();
+
+    // Serialize the block
+    let mut data = Vec::new();
+    block
+        .zcash_serialize(&mut data)
+        .expect("block should serialize as we are not limiting generation yet");
+
+    assert!(data.len() <= MAX_BLOCK_BYTES as usize);
+
+    // Deserialize by now is ok as we are lower than the limit
+    let block2 = Block::zcash_deserialize(&data[..])
+        .expect("block should deserialize as we are just below limit");
+    assert_eq!(block, block2);
+
+    // Add 1 more transaction to the block, limit will be reached
+    block = generate::oversized_multi_transaction_block();
+
+    // Serialize will still be fine
+    let mut data = Vec::new();
+    block
+        .zcash_serialize(&mut data)
+        .expect("block should serialize as we are not limiting generation yet");
+
+    assert!(data.len() > MAX_BLOCK_BYTES as usize);
+
+    // Deserialize will now fail
+    Block::zcash_deserialize(&data[..]).expect_err("block should not deserialize");
+}
+
+#[test]
+fn block_limits_single_tx() {
+    let _init_guard = zakura_test::init();
+
+    // Test block limit with a big single transaction
+
+    // Create a block just below the limit
+    let mut block = generate::large_single_transaction_block_many_inputs();
+
+    // Serialize the block
+    let mut data = Vec::new();
+    block
+        .zcash_serialize(&mut data)
+        .expect("block should serialize as we are not limiting generation yet");
+
+    assert!(data.len() <= MAX_BLOCK_BYTES as usize);
+
+    // Deserialize by now is ok as we are lower than the limit
+    Block::zcash_deserialize(&data[..])
+        .expect("block should deserialize as we are just below limit");
+
+    // Add 1 more input to the transaction, limit will be reached
+    block = generate::oversized_single_transaction_block_many_inputs();
+
+    let mut data = Vec::new();
+    block
+        .zcash_serialize(&mut data)
+        .expect("block should serialize as we are not limiting generation yet");
+
+    assert!(data.len() > MAX_BLOCK_BYTES as usize);
+
+    // Will fail as block overall size is above limit
+    Block::zcash_deserialize(&data[..]).expect_err("block should not deserialize");
+}
+
+/// Test wrapper for `BlockHeader.time_is_valid_at`.
+///
+/// Generates a block header, sets its `time` to `block_header_time`, then
+/// calls `time_is_valid_at`.
+fn node_time_check(
+    block_header_time: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), BlockTimeError> {
+    let (mut header, _header_bytes) = generate::block_header();
+    header.time = block_header_time;
+    // pass a zero height and hash - they are only used in the returned error
+    header.time_is_valid_at(now, &Height(0), &Hash([0; 32]))
+}
+
+#[test]
+fn time_check_now() {
+    let _init_guard = zakura_test::init();
+
+    // These checks are deterministic, because all the times are offset
+    // from the current time.
+    let now = Utc::now();
+    let three_hours_in_the_past = now - Duration::hours(3);
+    let two_hours_in_the_future = now + Duration::hours(2);
+    let two_hours_and_one_second_in_the_future = now + Duration::hours(2) + Duration::seconds(1);
+
+    node_time_check(now, now).expect("the current time should be valid as a block header time");
+    node_time_check(three_hours_in_the_past, now)
+        .expect("a past time should be valid as a block header time");
+    node_time_check(two_hours_in_the_future, now)
+        .expect("2 hours in the future should be valid as a block header time");
+    node_time_check(two_hours_and_one_second_in_the_future, now)
+        .expect_err("2 hours and 1 second in the future should be invalid as a block header time");
+
+    // Now invert the tests
+    // 3 hours in the future should fail
+    node_time_check(now, three_hours_in_the_past)
+        .expect_err("3 hours in the future should be invalid as a block header time");
+    // The past should succeed
+    node_time_check(now, two_hours_in_the_future)
+        .expect("2 hours in the past should be valid as a block header time");
+    node_time_check(now, two_hours_and_one_second_in_the_future)
+        .expect("2 hours and 1 second in the past should be valid as a block header time");
+}
+
+/// Valid unix epoch timestamps for blocks, in seconds
+static BLOCK_HEADER_VALID_TIMESTAMPS: &[i64] = &[
+    // These times are currently invalid DateTimes, but they could
+    // become valid in future chrono versions
+    i64::MIN,
+    i64::MIN + 1,
+    // These times are valid DateTimes
+    (i32::MIN as i64) - 1,
+    (i32::MIN as i64),
+    (i32::MIN as i64) + 1,
+    -1,
+    0,
+    1,
+    LockTime::MIN_TIMESTAMP - 1,
+    LockTime::MIN_TIMESTAMP,
+    LockTime::MIN_TIMESTAMP + 1,
+];
+
+/// Invalid unix epoch timestamps for blocks, in seconds
+static BLOCK_HEADER_INVALID_TIMESTAMPS: &[i64] = &[
+    (i32::MAX as i64) - 1,
+    (i32::MAX as i64),
+    (i32::MAX as i64) + 1,
+    LockTime::MAX_TIMESTAMP - 1,
+    LockTime::MAX_TIMESTAMP,
+    LockTime::MAX_TIMESTAMP + 1,
+    // These times are currently invalid DateTimes, but they could
+    // become valid in future chrono versions
+    i64::MAX - 1,
+    i64::MAX,
+];
+
+#[test]
+fn time_check_fixed() {
+    let _init_guard = zakura_test::init();
+
+    // These checks are non-deterministic, but the times are all in the
+    // distant past or far future. So it's unlikely that the test
+    // machine will have a clock that makes these tests fail.
+    let now = Utc::now();
+
+    for valid_timestamp in BLOCK_HEADER_VALID_TIMESTAMPS {
+        let block_header_time = match Utc.timestamp_opt(*valid_timestamp, 0) {
+            LocalResult::Single(time) => time,
+            LocalResult::None => {
+                // Skip the test if the timestamp is invalid
+                continue;
+            }
+            LocalResult::Ambiguous(_, _) => {
+                // Utc doesn't have ambiguous times
+                unreachable!();
+            }
+        };
+        node_time_check(block_header_time, now)
+            .expect("the time should be valid as a block header time");
+        // Invert the check, leading to an invalid time
+        node_time_check(now, block_header_time)
+            .expect_err("the inverse comparison should be invalid");
+    }
+
+    for invalid_timestamp in BLOCK_HEADER_INVALID_TIMESTAMPS {
+        let block_header_time = match Utc.timestamp_opt(*invalid_timestamp, 0) {
+            LocalResult::Single(time) => time,
+            LocalResult::None => {
+                // Skip the test if the timestamp is invalid
+                continue;
+            }
+            LocalResult::Ambiguous(_, _) => {
+                // Utc doesn't have ambiguous times
+                unreachable!();
+            }
+        };
+        node_time_check(block_header_time, now)
+            .expect_err("the time should be invalid as a block header time");
+        // Invert the check, leading to a valid time
+        node_time_check(now, block_header_time).expect("the inverse comparison should be valid");
+    }
+}

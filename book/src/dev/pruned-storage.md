@@ -1,6 +1,6 @@
 # Pruned Storage Mode
 
-Zebra can run in a **pruned** storage mode that deletes historical raw
+Zakura can run in a **pruned** storage mode that deletes historical raw
 transaction data once it falls outside a configurable retention window. This
 reduces on-disk state size while keeping the node fully consensus-valid: it
 continues to validate and sync new blocks, including spends of UTXOs created in
@@ -124,7 +124,7 @@ up by one, making the single height `T - R` newly prunable. The prune is applied
 inside the same per-block write, so the state size stays roughly constant as the
 chain grows.
 
-Pruning is wired directly into `ZebraDb::write_block`: when a pruning config is
+Pruning is wired directly into `ZakuraDb::write_block`: when a pruning config is
 present, `prune_height_range` computes the half-open height range `[from, until)`
 to delete for this commit, and `prepare_prune_batch` adds those deletes to the
 **same atomic `DiskWriteBatch`** that advances the tip. The prune and the tip
@@ -142,7 +142,7 @@ window relative to the known final checkpoint target.
 
 If an archive database is reopened in pruned mode partway through checkpoint
 sync, older archive-era raw transactions can still exist before that start. In
-that case Zebra temporarily keeps writing raw transaction bytes for new
+that case Zakura temporarily keeps writing raw transaction bytes for new
 checkpoint blocks and uses the per-block write batch to drain the archive-era
 backlog in bounded chunks. Once no raw transaction bytes remain below the skipped
 checkpoint height, checkpoint sync resumes the normal marker-only skip path.
@@ -161,7 +161,7 @@ already-pruned node is reconfigured with a smaller `tx_retention`. In that case,
 pruning resumes from the marker and catches up incrementally, bounded to 100
 heights per commit. In steady state this cap is irrelevant because only one
 height becomes prunable per block. The constant also reserves a tuning parameter
-for a future batch-pruning implementation, if Zebra adds one. The range
+for a future batch-pruning implementation, if Zakura adds one. The range
 arithmetic lives in the pure, unit-tested `prune_height_range_inner` function.
 
 ### The retention floor is load-bearing
@@ -195,13 +195,13 @@ rollback path.
 ## Pruning an existing database (offline tool)
 
 Switching an already-synced archive node to pruned mode does not require a
-re-sync. Zebra ships an offline tool to prune the finalized state in place, in two
+re-sync. Zakura ships an offline tool to prune the finalized state in place, in two
 forms:
 
-- The `zebrad prune-state` subcommand, which defaults to `state.cache_dir` from
-  the loaded `zebrad.toml`.
-- A standalone `zebra-prune-state` binary, which defaults to
-  `zebra_state::Config::default()`.
+- The `zakurad prune-state` subcommand, which defaults to `state.cache_dir` from
+  the loaded `zakurad.toml`.
+- A standalone `zakura-prune-state` binary, which defaults to
+  `zakura_state::Config::default()`.
 
 Both share the same implementation. Pass `--cache-dir` to be explicit and avoid
 pruning the wrong (or an empty) state directory.
@@ -210,13 +210,13 @@ pruning the wrong (or an empty) state directory.
 
 ```bash
 # Preview the pruning plan without writing anything (the default).
-zebrad prune-state \
+zakurad prune-state \
     --network Mainnet \
     --cache-dir /path/to/state \
     --tx-retention 10000
 
 # Apply the plan.
-zebrad prune-state \
+zakurad prune-state \
     --network Mainnet \
     --cache-dir /path/to/state \
     --tx-retention 10000 \
@@ -240,7 +240,7 @@ prune the database carries the pruning marker and is subject to the one-way
 archive restriction described above.
 
 The offline tool also scans the raw transaction column directly, so it can clean
-up databases created by older Zebra versions where the pruning marker is already
+up databases created by older Zakura versions where the pruning marker is already
 ahead of raw transaction data left below the retained boundary.
 
 ## RPC behavior on a pruned node

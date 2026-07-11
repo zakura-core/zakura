@@ -10,12 +10,12 @@ by ZF and ECC engineers over a call.
 ### Make Backup
 
 Make a backup of your current Testnet state. Rename/copy the `testnet` folder in
-Zebra's state cache directory to the lowercase version of the configured network name,
+Zakura's state cache directory to the lowercase version of the configured network name,
 or the default `unknowntestnet` if no network name is explicitly configured.
 
 ### Set Protocol Version
 
-Double check that Zebra has bumped its protocol version.
+Double check that Zakura has bumped its protocol version.
 
 ### Set Up Lightwalletd Server
 
@@ -37,13 +37,13 @@ like 30 minutes in the future?
 
 ### Ensure the Activation Height is Set in Code
 
-While Zebra allows creating a private Testnet in the config file, the height is
+While Zakura allows creating a private Testnet in the config file, the height is
 also set in some librustzcash crates. For this reason, someone will need to
 **create a branch of librustzcash** with the chosen height set and you will need
-to **change Zebra to use that**. However, double check if that's still
+to **change Zakura to use that**. However, double check if that's still
 necessary.
 
-### Configure Zebra to use a custom testnet
+### Configure Zakura to use a custom testnet
 
 See sample config file below. The critical part is setting the activation
 height. It is good to enable verbose logging to help debug things. Some of the
@@ -69,13 +69,13 @@ And monitor logs for behaviour.
 Do tests, including sending transactions if possible (which will require the
 lightwalletd server). Check if whatever activated in the upgrade works.
 
-## Zebra
+## Zakura
 
-Relevant information about Zebra for the testing process.
+Relevant information about Zakura for the testing process.
 
 ### Getting peers
 
-It seems Zebra is not very reliable at returning its currently connected peers;
+It seems Zakura is not very reliable at returning its currently connected peers;
 you can use `getpeerinfo` RPC as above or check the peers file
 (`~/.cache/zakura/network/unknowntestnet.peers`) if `cache_dir = true` in the
 `[network]` section. You might want to sort this out before the next private
@@ -83,13 +83,13 @@ testnet test.
 
 ### Unredact IPs
 
-Zebra redacts IPs when logging for privacy reasons. However, for a test like
+Zakura redacts IPs when logging for privacy reasons. However, for a test like
 this it can be annoying. You can disable that by editing `peer_addr.rs`
 with something like
 
 ```diff
---- a/zebra-network/src/meta_addr/peer_addr.rs
-+++ b/zebra-network/src/meta_addr/peer_addr.rs
+--- a/zakura-network/src/meta_addr/peer_addr.rs
++++ b/zakura-network/src/meta_addr/peer_addr.rs
 @@ -30,7 +30,7 @@ impl fmt::Display for PeerSocketAddr {
          let ip_version = if self.is_ipv4() { "v4" } else { "v6" };
 
@@ -102,7 +102,7 @@ with something like
 
 ### Sample config file
 
-Note: Zebra's db path will end in "unknowntestnet" instead of "testnet" with
+Note: Zakura's db path will end in "unknowntestnet" instead of "testnet" with
 this configuration.
 
 ```toml
@@ -175,5 +175,5 @@ force_use_color = false
 use_color = true
 use_journald = false
 # This enables debug network logging. It can be useful but it's very verbose!
-filter = 'info,zebra_network=debug'
+filter = 'info,zakura_network=debug'
 ```

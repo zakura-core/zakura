@@ -1,6 +1,6 @@
-# Zebra Health Endpoints
+# Zakura Health Endpoints
 
-`zebrad` can serve two lightweight HTTP endpoints for liveness and readiness checks.
+`zakurad` can serve two lightweight HTTP endpoints for liveness and readiness checks.
 These endpoints are intended for Kubernetes probes and load balancers. They are
 disabled by default and can be enabled via configuration.
 
@@ -20,7 +20,7 @@ disabled by default and can be enabled via configuration.
 
 ## Configuration
 
-Add a `health` section to your `zebrad.toml`:
+Add a `health` section to your `zakurad.toml`:
 
 ```toml
 [health]
@@ -63,4 +63,4 @@ readinessProbe:
 - Readiness combines a moving‑average “near tip” signal with a hard block‑lag cap.
 - Adjust thresholds based on your SLA and desired routing behavior.
 
-[health_config]: https://docs.rs/zebrad/latest/zebrad/components/health/struct.Config.html
+[health_config]: https://docs.rs/zakurad/latest/zakurad/components/health/struct.Config.html

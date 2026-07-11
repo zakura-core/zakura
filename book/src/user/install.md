@@ -1,27 +1,27 @@
-# Building and Installing Zebra
+# Building and Installing Zakura
 
-The easiest way to install and run Zebra is to follow the [Getting
-Started](https://zebra.zfnd.org/index.html#getting-started) section.
+The easiest way to install and run Zakura is to follow the [Getting
+Started](../README.md#getting-started) section.
 
-## Building Zebra
+## Building Zakura
 
-If you want to build Zebra, install the build dependencies as described in the
-[Manual Install](https://zebra.zfnd.org/index.html#manual-install) section, and
+If you want to build Zakura, install the build dependencies as described in the
+[Manual Install](../README.md#manual-install) section, and
 get the source code from GitHub:
 
 ```bash
-git clone https://github.com/ZcashFoundation/zebra.git
-cd zebra
+git clone https://github.com/zakura-core/zakura.git
+cd zakura
 ```
 
-You can then build and run `zebrad` by:
+You can then build and run `zakurad` by:
 
 ```bash
-cargo build --release --bin zebrad
-target/release/zebrad start
+cargo build --release --bin zakurad
+target/release/zakurad start
 ```
 
-If you rebuild Zebra often, you can speed the build process up by dynamically
+If you rebuild Zakura often, you can speed the build process up by dynamically
 linking RocksDB, which is a C++ dependency, instead of rebuilding it and linking
 it statically. If you want to utilize dynamic linking, first install RocksDB
 version >= 8.9.1 as a system library. On Arch Linux, you can do that by:
@@ -43,13 +43,13 @@ export ROCKSDB_LIB_DIR="/usr/lib/"
 ```
 
 and enjoy faster builds. Dynamic linking will also decrease the size of the
-resulting `zebrad` binary in release mode by ~ 6 MB.
+resulting `zakurad` binary in release mode by ~ 6 MB.
 
 ### Building on ARM
 
 If you're using an ARM machine, install the [Rust compiler for
 ARM](https://rust-lang.github.io/rustup/installation/other.html). If you build
-Zebra using the `x86_64` tools, it might run really slowly.
+Zakura using the `x86_64` tools, it might run really slowly.
 
 ### Build Troubleshooting
 
@@ -66,7 +66,7 @@ If you are having trouble with:
 
 #### Optional Tor feature
 
-The `zebra-network/tor` feature has an optional dependency named `libsqlite3`.
+The `zakura-network/tor` feature has an optional dependency named `libsqlite3`.
 If you don't have it installed, you might see errors like `note: /usr/bin/ld:
 cannot find -lsqlite3`. Follow [the arti
 instructions](https://gitlab.torproject.org/tpo/core/arti/-/blob/main/CONTRIBUTING.md#setting-up-your-development-environment)
@@ -74,5 +74,5 @@ to install `libsqlite3`, or use one of these commands instead:
 
 ```sh
 cargo build
-cargo build -p zebrad --all-features
+cargo build -p zakura --all-features
 ```

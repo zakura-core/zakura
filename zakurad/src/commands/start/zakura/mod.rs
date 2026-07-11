@@ -139,7 +139,7 @@ pub(crate) use header_sync_driver::{
     root_covered_query_best_header_tip, tree_aux_roots_for_served_header_range,
 };
 pub(crate) use header_sync_driver::{
-    drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,
+    drive_vct_root_repairs, drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,
     zakura_header_sync_driver_startup, ZakuraHeaderSyncDriverHandles,
 };
 pub(crate) use throughput_probe::{BlocksyncThroughputProbe, BlocksyncThroughputSummary};

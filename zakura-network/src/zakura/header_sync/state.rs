@@ -8,6 +8,16 @@ pub(super) const HEADER_SYNC_ADVISORY_BACKOFF: Duration = Duration::from_secs(60
 pub(super) const HEADER_SYNC_ADVISORY_TTL: Duration = DEFAULT_LIVE_SERVICE_SUMMARY_TTL;
 pub(super) const HEADER_SYNC_STALE_ANCHOR_LINK_FAILURES: u32 = 3;
 pub(super) const HEADER_SYNC_STALE_ANCHOR_DISTINCT_PEERS: usize = 2;
+pub(super) const VCT_ROOT_REPAIR_MAX_ATTEMPTS: usize = 6;
+pub(super) const VCT_ROOT_REPAIR_MAX_WALL_TIME: Duration = Duration::from_secs(240);
+pub(super) const VCT_ROOT_REPAIR_BACKOFFS: [Duration; VCT_ROOT_REPAIR_MAX_ATTEMPTS] = [
+    Duration::from_secs(0),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+];
 
 #[derive(Clone, Debug)]
 pub(super) struct HeaderSyncCore {
@@ -23,6 +33,7 @@ pub(super) struct HeaderSyncCore {
     pub(super) pending_new_blocks: HashSet<block::Hash>,
     pub(super) schedule: RangeScheduler,
     pub(super) pending_commits: HashMap<PendingCommitKey, RangeRequest>,
+    pub(super) repair: Option<VctRootRepair>,
     pub(super) advisory: HashMap<ZakuraPeerId, HeaderSyncAdvisoryPeerState>,
     pub(super) stale_anchor: StaleAnchorFailures,
 }
@@ -45,6 +56,7 @@ impl HeaderSyncCore {
             pending_new_blocks: HashSet::new(),
             schedule: RangeScheduler::new(),
             pending_commits: HashMap::new(),
+            repair: None,
             advisory: HashMap::new(),
             stale_anchor: StaleAnchorFailures::default(),
         })
@@ -120,6 +132,95 @@ impl HeaderSyncCore {
             want_tree_aux_roots: true,
             priority: RangePriority::Backward,
         });
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct VctRootRepair {
+    pub(super) height: block::Height,
+    pub(super) generation: u64,
+    pub(super) range: RangeRequest,
+    pub(super) expected_hashes: Vec<(block::Height, block::Hash)>,
+    pub(super) tried_peers: HashSet<ZakuraPeerId>,
+    pub(super) in_flight: Option<ZakuraPeerId>,
+    pub(super) started_at: Instant,
+    pub(super) next_attempt_at: Instant,
+    pub(super) exhausted: bool,
+}
+
+impl VctRootRepair {
+    pub(super) fn new(
+        height: block::Height,
+        generation: u64,
+        anchor_hash: block::Hash,
+        expected_hashes: Vec<(block::Height, block::Hash)>,
+    ) -> Option<Self> {
+        let count = u32::try_from(expected_hashes.len()).ok()?;
+        if count == 0 || count > 2 {
+            return None;
+        }
+        let first_height = expected_hashes.first()?.0;
+        if first_height != height {
+            return None;
+        }
+        if !expected_hashes
+            .iter()
+            .enumerate()
+            .all(|(index, (candidate_height, _))| {
+                u32::try_from(index)
+                    .ok()
+                    .and_then(|offset| height.0.checked_add(offset))
+                    .map(block::Height)
+                    == Some(*candidate_height)
+            })
+        {
+            return None;
+        }
+
+        Some(Self {
+            height,
+            generation,
+            range: RangeRequest {
+                start_height: height,
+                count,
+                anchor_hash,
+                finalized: false,
+                want_tree_aux_roots: true,
+                priority: RangePriority::Repair,
+            },
+            expected_hashes,
+            tried_peers: HashSet::new(),
+            in_flight: None,
+            started_at: Instant::now(),
+            next_attempt_at: Instant::now(),
+            exhausted: false,
+        })
+    }
+
+    pub(super) fn can_attempt(&self, now: Instant) -> bool {
+        !self.exhausted
+            && self.in_flight.is_none()
+            && self.tried_peers.len() < VCT_ROOT_REPAIR_MAX_ATTEMPTS
+            && now.duration_since(self.started_at) < VCT_ROOT_REPAIR_MAX_WALL_TIME
+            && now >= self.next_attempt_at
+    }
+
+    pub(super) fn mark_attempt(&mut self, peer: ZakuraPeerId) {
+        self.tried_peers.insert(peer.clone());
+        self.in_flight = Some(peer);
+    }
+
+    pub(super) fn finish_attempt(&mut self, peer: &ZakuraPeerId, now: Instant) {
+        if self.in_flight.as_ref() == Some(peer) {
+            self.in_flight = None;
+        }
+        let attempt_index = self.tried_peers.len().min(VCT_ROOT_REPAIR_MAX_ATTEMPTS - 1);
+        self.next_attempt_at = now + VCT_ROOT_REPAIR_BACKOFFS[attempt_index];
+        if self.tried_peers.len() >= VCT_ROOT_REPAIR_MAX_ATTEMPTS
+            || now.duration_since(self.started_at) >= VCT_ROOT_REPAIR_MAX_WALL_TIME
+        {
+            self.exhausted = true;
+        }
     }
 }
 
@@ -345,6 +446,7 @@ pub(super) struct OutstandingRange {
     pub(super) deadline: Instant,
     pub(super) expected_max_count: u32,
     pub(super) clear_assignment_on_timeout: bool,
+    pub(super) purpose: RangePurpose,
 }
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
@@ -373,6 +475,7 @@ impl RangeRequest {
 pub(super) enum RangePriority {
     Forward,
     Backward,
+    Repair,
 }
 
 impl RangePriority {
@@ -380,6 +483,16 @@ impl RangePriority {
         match self {
             RangePriority::Forward => "forward",
             RangePriority::Backward => "backward",
+            RangePriority::Repair => "repair",
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum RangePurpose {
+    Sync,
+    VctRepair {
+        height: block::Height,
+        generation: u64,
+    },
 }

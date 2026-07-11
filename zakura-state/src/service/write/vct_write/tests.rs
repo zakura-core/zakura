@@ -5,7 +5,11 @@ use zakura_chain::{block::Height, serialization::ZcashDeserializeInto};
 
 use super::{VctWriteManager, VCT_AWAIT_SUCCESSOR_WAIT, VCT_ROOT_RETRY_WAIT};
 use crate::{
-    request::CheckpointVerifiedBlock, service::queued_blocks::QueuedCheckpointVerified,
+    request::CheckpointVerifiedBlock,
+    service::{
+        queued_blocks::QueuedCheckpointVerified,
+        write::{VctRootRepairState, VctRootRepairStatus},
+    },
     tests::FakeChainHelper,
 };
 
@@ -193,7 +197,7 @@ fn on_commit_success_clears_an_escalated_stall() {
 
     // Force the stall past the warn threshold so it gets escalated (logged).
     manager.stall = Some((height, Instant::now() - Duration::from_secs(31)));
-    manager.on_retryable_error(height, true, queued_block(1));
+    manager.on_retryable_error(height, true, false, queued_block(1));
     assert!(manager.stall_logged, "the stall should have been escalated");
 
     manager.on_commit_success();
@@ -207,10 +211,10 @@ fn on_retryable_error_keeps_the_same_stall_start_for_a_repeated_height() {
     let mut manager = VctWriteManager::default();
     let height = Height(5);
 
-    manager.on_retryable_error(height, true, queued_block(1));
+    manager.on_retryable_error(height, true, false, queued_block(1));
     let first_seen = manager.stall.expect("a stall is now tracked").1;
 
-    manager.on_retryable_error(height, true, queued_block(2));
+    manager.on_retryable_error(height, true, false, queued_block(2));
     let still_first_seen = manager.stall.expect("the stall is still tracked").1;
 
     assert_eq!(
@@ -223,10 +227,10 @@ fn on_retryable_error_keeps_the_same_stall_start_for_a_repeated_height() {
 fn on_retryable_error_resets_the_stall_for_a_different_height() {
     let mut manager = VctWriteManager::default();
 
-    manager.on_retryable_error(Height(1), true, queued_block(1));
+    manager.on_retryable_error(Height(1), true, false, queued_block(1));
     manager.stall_logged = true; // simulate an already-escalated stall
 
-    manager.on_retryable_error(Height(2), true, queued_block(2));
+    manager.on_retryable_error(Height(2), true, false, queued_block(2));
 
     assert_eq!(manager.stall.map(|(h, _)| h), Some(Height(2)));
     assert!(
@@ -241,12 +245,12 @@ fn on_retryable_error_escalates_past_the_warn_threshold() {
     let height = Height(7);
 
     // Below the threshold: not escalated yet.
-    manager.on_retryable_error(height, true, queued_block(1));
+    manager.on_retryable_error(height, true, false, queued_block(1));
     assert!(!manager.stall_logged);
 
     // Backdate the stall past the warn threshold and retry the same height.
     manager.stall = Some((height, Instant::now() - Duration::from_secs(31)));
-    manager.on_retryable_error(height, true, queued_block(2));
+    manager.on_retryable_error(height, true, false, queued_block(2));
     assert!(manager.stall_logged);
 }
 
@@ -256,7 +260,7 @@ fn on_retryable_error_parks_the_block_for_retry() {
     let block = queued_block(1);
     let hash = block.0.hash;
 
-    manager.on_retryable_error(Height(1), true, block);
+    manager.on_retryable_error(Height(1), true, false, block);
 
     let ready = manager
         .take_ready()
@@ -268,9 +272,65 @@ fn on_retryable_error_parks_the_block_for_retry() {
 fn on_retryable_error_wait_depends_on_root_availability() {
     let mut manager = VctWriteManager::default();
 
-    let missing_root_wait = manager.on_retryable_error(Height(1), true, queued_block(1));
+    let missing_root_wait = manager.on_retryable_error(Height(1), true, false, queued_block(1));
     assert_eq!(missing_root_wait, VCT_ROOT_RETRY_WAIT);
 
-    let successor_wait = manager.on_retryable_error(Height(2), false, queued_block(2));
+    let successor_wait = manager.on_retryable_error(Height(2), false, false, queued_block(2));
     assert_eq!(successor_wait, VCT_AWAIT_SUCCESSOR_WAIT);
+}
+
+#[test]
+fn root_repair_signal_deduplicates_repeated_missing_root_polls() {
+    let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let mut manager = VctWriteManager::new(tx);
+
+    manager.on_retryable_error(Height(42), true, false, queued_block(1));
+    let first = *rx.borrow_and_update();
+    assert_eq!(
+        first.state,
+        VctRootRepairState::Unavailable { height: Height(42) }
+    );
+    assert_eq!(first.generation, 1);
+
+    manager.on_retryable_error(Height(42), true, false, queued_block(2));
+    assert!(
+        !rx.has_changed().expect("watch channel remains open"),
+        "polling the same absent root must not flood repair notifications"
+    );
+}
+
+#[test]
+fn root_repair_signal_advances_generation_after_rejected_replacement() {
+    let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let mut manager = VctWriteManager::new(tx);
+
+    manager.on_retryable_error(Height(42), true, false, queued_block(1));
+    let first = *rx.borrow_and_update();
+    assert_eq!(first.generation, 1);
+
+    manager.on_retryable_error(Height(42), true, true, queued_block(2));
+    let second = *rx.borrow_and_update();
+    assert_eq!(second.generation, 2);
+    assert_eq!(second.state, first.state);
+}
+
+#[test]
+fn root_repair_signal_ignores_await_successor_and_clears_on_commit() {
+    let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let mut manager = VctWriteManager::new(tx);
+
+    manager.on_retryable_error(Height(42), false, false, queued_block(1));
+    assert!(
+        !rx.has_changed().expect("watch channel remains open"),
+        "await-successor stalls do not need root repair"
+    );
+
+    manager.on_retryable_error(Height(42), true, false, queued_block(2));
+    assert!(matches!(
+        rx.borrow_and_update().state,
+        VctRootRepairState::Unavailable { .. }
+    ));
+
+    manager.on_commit_success();
+    assert_eq!(rx.borrow_and_update().state, VctRootRepairState::Idle);
 }

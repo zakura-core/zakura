@@ -1,5 +1,13 @@
 use super::*;
-use super::{config::*, error::*, events::*, reactor::*, validation::*, wire::*};
+use super::{
+    config::*,
+    error::*,
+    events::*,
+    reactor::*,
+    state::{VctRootRepair, VCT_ROOT_REPAIR_MAX_ATTEMPTS, VCT_ROOT_REPAIR_MAX_WALL_TIME},
+    validation::*,
+    wire::*,
+};
 use crate::zakura::{
     framed_channel,
     testkit::{TraceCapture, TraceValue},
@@ -1497,6 +1505,211 @@ async fn restart_rebuilds_schedule_from_durable_best_tip_and_peer_status() {
             assert_eq!(start_height, block::Height(5));
             assert_eq!(count, 4);
             break;
+        }
+    }
+}
+
+fn mainnet_repair_event(generation: u64) -> HeaderSyncEvent {
+    let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+    HeaderSyncEvent::VctRootRepairRequested {
+        height: block::Height(1),
+        generation,
+        anchor_hash: Network::Mainnet.genesis_hash(),
+        expected_hashes: vec![
+            (block::Height(1), block1.hash()),
+            (block::Height(2), block2.hash()),
+        ],
+    }
+}
+
+#[test]
+fn vct_repair_episode_enforces_attempt_and_time_bounds() {
+    let mut repair = VctRootRepair::new(
+        block::Height(1),
+        1,
+        Network::Mainnet.genesis_hash(),
+        vec![
+            (
+                block::Height(1),
+                mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+            ),
+            (
+                block::Height(2),
+                mainnet_block(&BLOCK_MAINNET_2_BYTES).hash(),
+            ),
+        ],
+    )
+    .expect("valid repair shape");
+
+    for attempt in 0..VCT_ROOT_REPAIR_MAX_ATTEMPTS {
+        assert!(repair.can_attempt(repair.next_attempt_at));
+        let peer_id = peer(120 + u8::try_from(attempt).expect("attempt fits in u8"));
+        repair.mark_attempt(peer_id.clone());
+        repair.finish_attempt(&peer_id, repair.next_attempt_at);
+    }
+
+    assert!(repair.exhausted);
+    assert!(!repair.can_attempt(repair.next_attempt_at));
+
+    let mut timed = VctRootRepair::new(
+        block::Height(1),
+        2,
+        Network::Mainnet.genesis_hash(),
+        vec![(
+            block::Height(1),
+            mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+        )],
+    )
+    .expect("single-header handoff repair is valid");
+    timed.started_at = Instant::now() - VCT_ROOT_REPAIR_MAX_WALL_TIME;
+    assert!(!timed.can_attempt(Instant::now()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn vct_repair_bypasses_covered_range_and_commits_exact_h_and_successor() {
+    let best = (
+        block::Height(4),
+        mainnet_block(&BLOCK_MAINNET_4_BYTES).hash(),
+    );
+    let mut fixture = spawn_test_reactor(startup_for(
+        Network::Mainnet,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(best),
+    ));
+    let peer_id = peer(101);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(4),
+        2,
+        1,
+    )
+    .await;
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: block::Height(1),
+            tip_height: block::Height(4),
+            tip_hash: best.1,
+        })
+        .await
+        .unwrap();
+    fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
+
+    let (requested_peer, start_height, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, peer_id);
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 2);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: finalized_headers_message_from(
+                block::Height(1),
+                vec![
+                    mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                    mainnet_header(&BLOCK_MAINNET_2_BYTES),
+                ],
+            ),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange {
+                peer,
+                start_height,
+                headers,
+                tree_aux_roots,
+                finalized,
+                ..
+            } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(start_height, block::Height(1));
+                assert_eq!(headers.len(), 2);
+                assert_eq!(tree_aux_roots.len(), 2);
+                assert!(
+                    !finalized,
+                    "repair ranges are canonical but not checkpoint-terminating"
+                );
+                break;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected repair misbehavior from {peer:?}: {reason:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn vct_repair_rejects_noncanonical_response_before_commit() {
+    let best = (
+        block::Height(4),
+        mainnet_block(&BLOCK_MAINNET_4_BYTES).hash(),
+    );
+    let mut fixture = spawn_test_reactor(startup_for(
+        Network::Mainnet,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(best),
+    ));
+    let peer_id = peer(102);
+    let mut event = mainnet_repair_event(1);
+    if let HeaderSyncEvent::VctRootRepairRequested {
+        expected_hashes, ..
+    } = &mut event
+    {
+        expected_hashes[1].1 = block::Hash([99; 32]);
+    }
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(4),
+        2,
+        1,
+    )
+    .await;
+    fixture.handle.send(event).await.unwrap();
+    let (_requested_peer, start_height, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((start_height, count), (block::Height(1), 2));
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: finalized_headers_message_from(
+                block::Height(1),
+                vec![
+                    mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                    mainnet_header(&BLOCK_MAINNET_2_BYTES),
+                ],
+            ),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+                break;
+            }
+            HeaderSyncAction::CommitHeaderRange { .. } => {
+                panic!("noncanonical repair response must not be committed")
+            }
+            _ => {}
         }
     }
 }

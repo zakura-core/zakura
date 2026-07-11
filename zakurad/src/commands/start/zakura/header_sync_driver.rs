@@ -180,6 +180,98 @@ pub(crate) struct ZakuraHeaderSyncDriverHandles {
     pub(crate) header_sync: zakura_network::zakura::HeaderSyncHandle,
 }
 
+pub(crate) async fn drive_vct_root_repairs(
+    read_state: zakura_state::ReadStateService,
+    header_sync: zakura_network::zakura::HeaderSyncHandle,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
+    let mut repairs = read_state.subscribe_vct_root_repairs();
+    pin!(shutdown);
+
+    loop {
+        select! {
+            _ = &mut shutdown => return,
+            changed = repairs.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+
+        let status = *repairs.borrow_and_update();
+        match status.state {
+            zakura_state::VctRootRepairState::Idle => {
+                let _ = header_sync
+                    .send(HeaderSyncEvent::VctRootRepairResolved {
+                        generation: status.generation,
+                    })
+                    .await;
+            }
+            zakura_state::VctRootRepairState::Unavailable { height } => {
+                if let Some(event) =
+                    vct_root_repair_event(read_state.clone(), height, status.generation).await
+                {
+                    let _ = header_sync.send(event).await;
+                }
+            }
+        }
+    }
+}
+
+async fn vct_root_repair_event(
+    read_state: zakura_state::ReadStateService,
+    height: block::Height,
+    generation: u64,
+) -> Option<HeaderSyncEvent> {
+    let anchor_height = height.0.checked_sub(1).map(block::Height)?;
+    let response = read_state
+        .oneshot(zakura_state::ReadRequest::HeadersByHeightRange {
+            start: anchor_height,
+            count: 3,
+        })
+        .await
+        .ok()?;
+    let zakura_state::ReadResponse::Headers(headers) = response else {
+        return None;
+    };
+    if headers.len() < 2 {
+        return None;
+    }
+
+    let (stored_anchor_height, anchor_hash, anchor_header) = &headers[0];
+    if *stored_anchor_height != anchor_height {
+        return None;
+    }
+    let mut expected_hashes: Vec<(block::Height, block::Hash)> = Vec::new();
+    for (expected_offset, (candidate_height, candidate_hash, candidate_header)) in
+        headers.iter().skip(1).take(2).enumerate()
+    {
+        let expected_height = height.0.checked_add(u32::try_from(expected_offset).ok()?)?;
+        if *candidate_height != block::Height(expected_height) {
+            return None;
+        }
+        let expected_parent = if expected_offset == 0 {
+            *anchor_hash
+        } else {
+            expected_hashes.last().map(|(_, hash)| *hash)?
+        };
+        if candidate_header.previous_block_hash != expected_parent {
+            return None;
+        }
+        expected_hashes.push((*candidate_height, *candidate_hash));
+    }
+    if expected_hashes.is_empty() || block::Hash::from(anchor_header.as_ref()) != *anchor_hash {
+        return None;
+    }
+
+    Some(HeaderSyncEvent::VctRootRepairRequested {
+        height,
+        generation,
+        anchor_hash: *anchor_hash,
+        expected_hashes,
+    })
+}
+
 pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<HeaderSyncAction>,
     handles: ZakuraHeaderSyncDriverHandles,

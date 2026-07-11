@@ -54,7 +54,7 @@ fn vct_successor_witness_uses_stored_header_without_body() {
         #[cfg(feature = "elasticsearch")]
         false,
     )
-    .expect("opening an ephemeral database should succeed");
+    .expect("opening an ephemeral finalized state succeeds");
     let genesis = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
         .expect("genesis block deserializes");

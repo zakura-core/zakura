@@ -338,7 +338,7 @@ fn new_invalidate_test_state(network: &Network) -> (NonFinalizedState, Finalized
         #[cfg(feature = "elasticsearch")]
         false,
     )
-    .expect("opening an ephemeral database should succeed");
+    .expect("opening an ephemeral finalized state succeeds");
     finalized_state.set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
     (state, finalized_state)
 }

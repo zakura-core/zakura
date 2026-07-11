@@ -6,13 +6,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::{mpsc::UnboundedReceiver, watch};
 use tracing::info;
 use zakura_chain::block::Height;
 
 use crate::service::{
     finalized_state::{FinalizedState, NextVctBlock},
     queued_blocks::QueuedCheckpointVerified,
+    write::{VctRootRepairState, VctRootRepairStatus},
 };
 
 /// Delay between retryable VCT root-miss commit attempts. Nothing actively re-requests a
@@ -40,7 +41,6 @@ const VCT_ROOT_STALL_WARN_AFTER: Duration = Duration::from_secs(30);
 /// successor and to retry/escalate a stuck height, so their invariants
 /// (single log per stall, look-ahead cleared on reset) live next to the data
 /// they guard.
-#[derive(Default)]
 pub(super) struct VctWriteManager {
     /// One-block look-ahead: the current block's supplied roots are
     /// authenticated by the successor's header commitment.
@@ -53,9 +53,33 @@ pub(super) struct VctWriteManager {
     /// Whether the current stall has already been escalated to an
     /// error-level log and gauge.
     stall_logged: bool,
+    /// Broadcasts missing-root repair needs to node orchestration.
+    root_repair_sender: watch::Sender<VctRootRepairStatus>,
+    /// Last repair status published by this manager.
+    root_repair_status: VctRootRepairStatus,
+}
+
+impl Default for VctWriteManager {
+    fn default() -> Self {
+        let (root_repair_sender, _root_repair_receiver) =
+            watch::channel(VctRootRepairStatus::default());
+        Self::new(root_repair_sender)
+    }
 }
 
 impl VctWriteManager {
+    /// Creates a manager with a dependency-neutral VCT repair watch channel.
+    pub(super) fn new(root_repair_sender: watch::Sender<VctRootRepairStatus>) -> Self {
+        Self {
+            lookahead: VecDeque::new(),
+            retry: None,
+            stall: None,
+            stall_logged: false,
+            root_repair_sender,
+            root_repair_status: VctRootRepairStatus::default(),
+        }
+    }
+
     /// Takes the next locally-buffered block ready to commit (a parked retry,
     /// then the look-ahead), if any.
     pub(super) fn take_ready(&mut self) -> Option<QueuedCheckpointVerified> {
@@ -133,6 +157,7 @@ impl VctWriteManager {
             self.stall = None;
             self.stall_logged = false;
         }
+        self.publish_root_repair_idle();
     }
 
     /// Tracks and, past the warn threshold, escalates a retryable vct root
@@ -142,9 +167,13 @@ impl VctWriteManager {
         &mut self,
         height: Height,
         root_unavailable: bool,
+        had_root_candidate: bool,
         block: QueuedCheckpointVerified,
     ) -> Duration {
         metrics::counter!("state.vct.root.retry.count").increment(1);
+        if root_unavailable {
+            self.publish_root_repair_needed(height, had_root_candidate);
+        }
 
         // Escalate a stall that persists on the same height past the warn
         // threshold: a transient wait resolves in a few polls and stays
@@ -199,6 +228,33 @@ impl VctWriteManager {
         } else {
             VCT_AWAIT_SUCCESSOR_WAIT
         }
+    }
+
+    fn publish_root_repair_needed(&mut self, height: Height, had_root_candidate: bool) {
+        let same_height =
+            self.root_repair_status.state == VctRootRepairState::Unavailable { height };
+        if same_height && !had_root_candidate {
+            return;
+        }
+
+        self.root_repair_status = VctRootRepairStatus {
+            state: VctRootRepairState::Unavailable { height },
+            generation: self.root_repair_status.generation.saturating_add(1),
+        };
+        let _ = self.root_repair_sender.send(self.root_repair_status);
+        metrics::counter!("state.vct.root.repair.requested").increment(1);
+    }
+
+    fn publish_root_repair_idle(&mut self) {
+        if self.root_repair_status.state == VctRootRepairState::Idle {
+            return;
+        }
+
+        self.root_repair_status = VctRootRepairStatus {
+            state: VctRootRepairState::Idle,
+            generation: self.root_repair_status.generation,
+        };
+        let _ = self.root_repair_sender.send(self.root_repair_status);
     }
 }
 

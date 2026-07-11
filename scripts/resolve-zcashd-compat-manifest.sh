@@ -149,20 +149,18 @@ write_github_output() {
     echo "manifest_path=$manifest"
   } >> "$output_file"
 
-  local triple prefix url sha256
-  for triple in x86_64-pc-linux-gnu; do
-    if jq -e --arg target "$triple" '
-      [.artifacts[] | select(.target_triple == $target)] | length == 1
-    ' "$manifest" >/dev/null; then
-      prefix="$(target_to_github_prefix "$triple")"
-      url="$(artifact_field "$manifest" "$triple" "runtime_archive_url")"
-      sha256="$(artifact_field "$manifest" "$triple" "runtime_archive_sha256")"
-      {
-        echo "url_${prefix}=$url"
-        echo "sha256_${prefix}=$sha256"
-      } >> "$output_file"
-    fi
-  done
+  local triple="x86_64-pc-linux-gnu" prefix url sha256
+  if jq -e --arg target "$triple" '
+    [.artifacts[] | select(.target_triple == $target)] | length == 1
+  ' "$manifest" >/dev/null; then
+    prefix="$(target_to_github_prefix "$triple")"
+    url="$(artifact_field "$manifest" "$triple" "runtime_archive_url")"
+    sha256="$(artifact_field "$manifest" "$triple" "runtime_archive_sha256")"
+    {
+      echo "url_${prefix}=$url"
+      echo "sha256_${prefix}=$sha256"
+    } >> "$output_file"
+  fi
 }
 
 prepare_build_context() {

@@ -39,7 +39,6 @@ ZCASHD_RUNTIME_ARCHIVE_MEMBER_BINARY_PATH="./bin/zcashd"
 ZCASHD_DEFAULT_DOCKER_IMAGE="valargroup/zcashd:v1.0.0-compat-rc2"
 
 INSTALL_PROFILE=""
-INSTALL_PROFILE_SET=0
 MODE=""
 NETWORK="Mainnet"
 ZCASHD_DEFAULT_DATADIR="${HOME}/.zcash"
@@ -63,7 +62,6 @@ DOWNLOAD_BINARIES=1
 DOWNLOAD_BINARIES_SET=0
 NETWORK_SET=0
 ZAKURA_STATE_DIR_SET=0
-ZAKURA_IDENTITY_DIR_SET=0
 ZCASHD_DATADIR_SET=0
 INSTALL_DIR_SET=0
 CACHE_DIR_SET=0
@@ -323,7 +321,6 @@ sanitize_terminal_input() {
 read_prompt() {
   local prompt="$1"
   local var_name="$2"
-  local read_opts=(-r)
 
   if ((PROMPT_FD < 0)); then
     if ((PROMPT_INPUT_ERROR_REPORTED == 0)); then
@@ -335,10 +332,10 @@ read_prompt() {
 
   # readline editing (backspace/delete, cursor movement) requires -e on a tty.
   if [[ -t "$PROMPT_FD" ]]; then
-    read_opts=(-e -r)
+    read -r -e -u "$PROMPT_FD" -p "$prompt" "${var_name?}"
+  else
+    read -r -u "$PROMPT_FD" -p "$prompt" "${var_name?}"
   fi
-
-  read "${read_opts[@]}" -u "$PROMPT_FD" -p "$prompt" "$var_name"
 }
 
 prompt_value() {
@@ -1956,7 +1953,7 @@ compat_print_zakurad_env_lines() {
   printf 'ZAKURA_NETWORK__NETWORK=%s \\\n' "$(quote_env_value "$(compat_network_config_value)")"
   printf 'ZAKURA_NETWORK__LISTEN_ADDR=%s \\\n' "$(quote_env_value "$ZAKURA_P2P_ADDR")"
   printf 'ZAKURA_NETWORK__IDENTITY_DIR=%s \\\n' "$(quote_env_value "$ZAKURA_IDENTITY_DIR")"
-  printf 'ZAKURA_STATE__CACHE_DIR=%s \\' "$(quote_env_value "$ZAKURA_STATE_DIR")"
+  printf '%s=%s %s' "ZAKURA_STATE__CACHE_DIR" "$(quote_env_value "$ZAKURA_STATE_DIR")" "\\"
 }
 
 # Shared zcashd P2P-sidecar flags for the binary/source start commands.
@@ -2440,7 +2437,6 @@ while (($#)); do
     --install-profile)
       require_value "$1" "${2:-}"
       INSTALL_PROFILE="$2"
-      INSTALL_PROFILE_SET=1
       shift 2
       ;;
     --mode)
@@ -2454,7 +2450,7 @@ while (($#)); do
       NETWORK_SET=1
       shift 2
       ;;
-    --zakura-state-dir | --zakura-state-dir)
+    --zakura-state-dir | --zebra-state-dir)
       require_value "$1" "${2:-}"
       ZAKURA_STATE_DIR="$2"
       ZAKURA_STATE_DIR_SET=1
@@ -2463,7 +2459,6 @@ while (($#)); do
     --zakura-identity-dir)
       require_value "$1" "${2:-}"
       ZAKURA_IDENTITY_DIR="$2"
-      ZAKURA_IDENTITY_DIR_SET=1
       shift 2
       ;;
     --zcashd-datadir)
@@ -2494,7 +2489,7 @@ while (($#)); do
       ZCASHD_CONF="$2"
       shift 2
       ;;
-    --zakurad-path | --zakurad-path)
+    --zakurad-path | --zebrad-path)
       require_value "$1" "${2:-}"
       ZAKURAD_PATH="$2"
       shift 2

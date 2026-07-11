@@ -90,7 +90,6 @@ if [[ -z "$GITHUB_RUN_URL" && -n "${GITHUB_RUN_ID:-}" ]]; then
   GITHUB_RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-$GH_REPO}/actions/runs/$GITHUB_RUN_ID"
 fi
 
-SNAP_FILE="$(basename "$SNAPSHOT_URL")"
 MASTER="$BENCH_HOME/master-${START_HEIGHT}"
 SAMPLE_INTERVAL=5
 ZAKURAD_BIN=""
@@ -191,7 +190,8 @@ ensure_deps() {
   if ((${#missing[@]})); then
     log "installing missing tools: ${missing[*]}"
     if command -v apt-get >/dev/null 2>&1; then
-      sudo apt-get update -qq && sudo apt-get install -y -qq "${missing[@]}" \
+      sudo apt-get update -qq || die "could not update package lists"
+      sudo apt-get install -y -qq "${missing[@]}" \
         || die "could not install: ${missing[*]} (install them on the runner)"
     else
       die "missing tools and no apt-get: ${missing[*]}"
@@ -201,8 +201,8 @@ ensure_deps() {
 
 ensure_bench_home() {
   if [[ ! -d "$BENCH_HOME" ]]; then
-    sudo mkdir -p "$BENCH_HOME" && sudo chown "$(id -u):$(id -g)" "$BENCH_HOME" \
-      || die "cannot create $BENCH_HOME"
+    sudo mkdir -p "$BENCH_HOME" || die "cannot create $BENCH_HOME"
+    sudo chown "$(id -u):$(id -g)" "$BENCH_HOME" || die "cannot own $BENCH_HOME"
   fi
   [[ -w "$BENCH_HOME" ]] || die "$BENCH_HOME not writable"
   mkdir -p "$BENCH_HOME/snapshots" "$BENCH_HOME/bins" "$BENCH_HOME/forks"
@@ -308,6 +308,7 @@ validate_cached_binary() {
 }
 
 ensure_toolchain() {
+  # shellcheck source=/dev/null
   [[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
   export PATH="$HOME/.cargo/bin:$PATH"
   command -v cargo >/dev/null 2>&1 || die "cargo not found on host (install rustup)"
@@ -437,7 +438,8 @@ run_one() {
     dual) runs_zakura=1; runs_legacy=1 ;;
   esac
   resolve_binary "$tag"; local zakurad="$ZAKURAD_BIN"
-  local run_id="${prefix}-$$-$(date +%s)"
+  local run_id
+  run_id="${prefix}-$$-$(date +%s)"
   local fork="$BENCH_HOME/forks/$run_id"
   local logf="/dev/shm/zakura-bench-$run_id.log"
   local csv="$OUT_DIR/samples-$prefix.csv"
@@ -672,7 +674,11 @@ if [[ "$SKIP_BASELINE" == "1" ]]; then
   [[ -n "$BASELINE_SPEC" ]] && log "skip_baseline=1; ignoring baseline '$BASELINE_SPEC'"
   BASELINE_SPEC=""
 fi
-log "binary source: $MODE; primary='$PRIMARY_SPEC'${BASELINE_SPEC:+, baseline='$BASELINE_SPEC'}"
+if [[ -n "$BASELINE_SPEC" ]]; then
+  log "binary source: $MODE; primary='$PRIMARY_SPEC', baseline='$BASELINE_SPEC'"
+else
+  log "binary source: $MODE; primary='$PRIMARY_SPEC'"
+fi
 
 ensure_deps
 ensure_bench_home

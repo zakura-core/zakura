@@ -102,7 +102,7 @@ else
   mkdir -p "$FORK/$(dirname "$DBREL")"
   cp -al "$MASTER/$DBREL" "$FORK/$DBREL"
   # Break links on every file the clone may rewrite, so writes can't reach the source.
-  ( cd "$FORK/$DBREL"
+  ( cd "$FORK/$DBREL" || exit
     for f in CURRENT IDENTITY LOG LOCK OPTIONS-* MANIFEST-* *.log version; do
       [ -e "$f" ] || continue
       cp -p "$f" "$f.unlink" && mv -f "$f.unlink" "$f"
@@ -160,12 +160,12 @@ ck_intake,ck_release,ck_queued,apply_inflight,\
 aw_sum,aw_cnt,c2c_sum,c2c_cnt,\
 sa_sum,sa_cnt,scl_sum,scl_cnt,cinf,bsz_sum,bsz_cnt" > "$CSV"
 
-read pcpu < <(pstat); prevh=0; START=$(date +%s)
+read -r pcpu < <(pstat); prevh=0; START=$(date +%s)
 while kill -0 "$PID" 2>/dev/null; do
   el=$(( $(date +%s)-START )); [ "$el" -ge "$MAXSEC" ] && { echo "[$LABEL] wall cap"; break; }
   sleep 5
   m=$(curl -s --max-time 4 "http://127.0.0.1:$MET/metrics" 2>/dev/null)
-  read ncpu < <(pstat)
+  read -r ncpu < <(pstat)
   h=$(mv state_finalized_block_height "$m"); h=${h:-0}
   # Zakura overlay health (block data flows over Zakura, not the legacy net/sync counters).
   zkp=$(mv zakura_p2p_conn_active "$m"); zkq=$(mv zakura_p2p_queue_depth "$m")
@@ -239,7 +239,7 @@ while kill -0 "$PID" 2>/dev/null; do
   # Batched body commit: blocks per DiskWriteBatch (>1 means batching is active).
   bsz_s=$(mv zakura_state_commit_batch_size_sum "$m");  bsz_c=$(mv zakura_state_commit_batch_size_count "$m")
 
-  cores=$(awk -v d=$((ncpu-pcpu)) -v hz=$HZ 'BEGIN{printf "%.2f",d/hz/5}')
+  cores=$(awk -v d=$((ncpu-pcpu)) -v hz="$HZ" 'BEGIN{printf "%.2f",d/hz/5}')
   bps=$(awk -v dh=$((h-prevh)) 'BEGIN{printf "%.1f",dh/5}')
   echo "$(date +%s),$el,$h,$bps,$cores,\
 ${zkp:-0},${zkq:-0},${zkbs:-0},\
@@ -259,6 +259,6 @@ ${aw_s:-0},${aw_c:-0},${c2c_s:-0},${c2c_c:-0},\
 ${sa_s:-0},${sa_c:-0},${scl_s:-0},${scl_c:-0},${cinf:-0},${bsz_s:-0},${bsz_c:-0}" >> "$CSV"
   pcpu=$ncpu; prevh=$h
 done
-fin=$(mv state_finalized_block_height "$(curl -s http://127.0.0.1:$MET/metrics 2>/dev/null)")
+fin=$(mv state_finalized_block_height "$(curl -s "http://127.0.0.1:$MET/metrics" 2>/dev/null)")
 echo "[$LABEL] DONE height=${fin:-?}  csv=$CSV  log=$LOG  traces=$TRACEDIR"
 echo "[$LABEL] cleanup: rm -rf $FORK   (keeps source $MASTER pristine)"

@@ -93,18 +93,18 @@ if [[ -n ${CONFIG_FILE_PATH} && -f ${CONFIG_FILE_PATH} ]]; then
 fi
 
 # Main Script Logic
-# - If "$1" is "--", "-", "zakurad", or "zakurad" (legacy alias), run `zakurad`
+# - If "$1" is "--", "-", "zakurad", or "zebrad" (legacy alias), run `zakurad`
 #   with the remaining params.
 # - If "$1" is "test", handle test execution
 # - Otherwise run "$@" directly.
 case "$1" in
---* | -* | zakurad | zakurad)
+--* | -* | zakurad | zebrad)
   shift
   exec_as_user zakurad "${CONFIG_ARGS[@]}" "$@"
   ;;
 test)
   shift
-  if [[ "$1" == "zakurad" || "$1" == "zakurad" ]]; then
+  if [[ "$1" == "zakurad" || "$1" == "zebrad" ]]; then
     shift
     exec_as_user zakurad "${CONFIG_ARGS[@]}" "$@"
   elif [[ -n "${NEXTEST_PROFILE}" ]]; then

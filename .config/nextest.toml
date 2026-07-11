@@ -48,6 +48,14 @@ default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced
 filter = 'package(zakura-network) and test(~zakura)'
 retries = 2
 
+# The `zakura` binary's header/block-sync driver tests (`commands::start::
+# zakura_header_sync_driver_tests`) drive the same real-time reactor harness with real
+# sleeps and timeouts, so they flake under the same load conditions. The override above
+# only matches `zakura-network`, so retry this package's driver tests as well.
+[[profile.all-tests.overrides]]
+filter = 'package(zakura) and test(~zakura_header_sync_driver_tests)'
+retries = 2
+
 # --- Full Tests profile ---
 # Broader coverage for `ironwood-main`, scheduled, manual, and merge-queue runs,
 # while still keeping the known slow/flaky integration buckets in dedicated
@@ -61,6 +69,12 @@ default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced
 # `all-tests` override above).
 [[profile.full-tests.overrides]]
 filter = 'package(zakura-network) and test(~zakura)'
+retries = 2
+
+# The `zakura` binary's header/block-sync driver tests flake under the same load (see the
+# matching `all-tests` override above).
+[[profile.full-tests.overrides]]
+filter = 'package(zakura) and test(~zakura_header_sync_driver_tests)'
 retries = 2
 
 # --- Individual Test Profiles ---

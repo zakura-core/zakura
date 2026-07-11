@@ -72,12 +72,11 @@ initial_testnet_peers = [
     "dnsseed.testnet.z.cash:18233",
     "testnet.seeder.zfnd.org:18233",
 ]
-legacy_p2p = true
+p2p_stack = "dual"
 listen_addr = "[::]:8233"
 max_connections_per_ip = 1
 network = "Mainnet"
 peerset_initial_target_size = 100
-v2_p2p = true
 
 [network.zakura]
 bootstrap_peers = [

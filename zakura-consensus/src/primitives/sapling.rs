@@ -152,7 +152,7 @@ impl Service<BatchControl<Item>> for Verifier {
                         _ => "failure",
                     };
                     metrics::histogram!(
-                        "zebra.consensus.batch.duration_seconds",
+                        "zakura.consensus.batch.duration_seconds",
                         "verifier" => "groth16_sapling",
                         "result" => result_label
                     )

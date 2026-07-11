@@ -57,7 +57,7 @@ debug_stop_at_height = @@STOP@@
 # [sync] — back to defaults. The 2x checkpoint apply-concurrency test (800) was a loss
 # (throughput flat/down, latency 2x, CPU still idle): two ranges serialize, they don't
 # pipeline. The clamp is reverted to 400; next we split verify vs commit to find the
-# serial stage (see zebra.consensus.checkpoint.{verify_range,state_commit}.* below).
+# serial stage (see zakura.consensus.checkpoint.{verify_range,state_commit}.* below).
 
 [tracing]
 # Full-pipeline tracing: Zakura block-sync (BLOCK_SYNC_STATE + limiter), checkpoint

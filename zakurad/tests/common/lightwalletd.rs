@@ -52,9 +52,9 @@ pub const TEST_LIGHTWALLETD: &str = "TEST_LIGHTWALLETD";
 ///   the sending-transactions-via-lightwalletd test), by avoiding the initial lightwalletd sync.
 pub const LWD_CACHE_DIR: &str = "LWD_CACHE_DIR";
 
-/// Should we skip Zebra lightwalletd integration tests?
+/// Should we skip Zakura lightwalletd integration tests?
 #[allow(clippy::print_stderr)]
-pub fn zebra_skip_lightwalletd_tests() -> bool {
+pub fn zakura_skip_lightwalletd_tests() -> bool {
     // TODO: check if the lightwalletd binary is in the PATH?
     //       (this doesn't seem to be implemented in the standard library)
     //
@@ -134,8 +134,8 @@ pub fn can_spawn_lightwalletd_for_rpc<S: AsRef<str> + std::fmt::Debug>(
 
     // Skip the test unless the user specifically asked for it
     //
-    // TODO: pass test_type to zebra_skip_lightwalletd_tests() and check for lightwalletd launch in there
-    if test_type.launches_lightwalletd() && zebra_skip_lightwalletd_tests() {
+    // TODO: pass test_type to zakura_skip_lightwalletd_tests() and check for lightwalletd launch in there
+    if test_type.launches_lightwalletd() && zakura_skip_lightwalletd_tests() {
         return false;
     }
 

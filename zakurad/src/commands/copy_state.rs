@@ -61,10 +61,10 @@ pub struct CopyStateCmd {
     #[clap(long, short, help = "stop copying at this source height")]
     max_source_height: Option<u32>,
 
-    /// Path to a Zebra config.toml for the target state.
+    /// Path to a Zakura config.toml for the target state.
     /// Uses an ephemeral config by default.
     ///
-    /// Zebra only uses the state options from this config.
+    /// Zakura only uses the state options from this config.
     /// All other options are ignored.
     #[clap(
         long,
@@ -87,17 +87,14 @@ impl CopyStateCmd {
 
         // Load the target config if a target config path was provided, or use an ephemeral config otherwise.
         //
-        // Use the `ZEBRA_TARGET_` environment prefix for target overrides to avoid
+        // Use the `ZAKURA_TARGET_` environment prefix for target overrides to avoid
         // conflicting with the source/base config (`ZAKURA_...`).
-        // Example: `ZEBRA_TARGET_STATE__CACHE_DIR=/dst/cache`.
+        // Example: `ZAKURA_TARGET_STATE__CACHE_DIR=/dst/cache`.
         let target_config = self
             .target_config_path
             .as_ref()
             .map(|path| {
-                crate::config::ZakuradConfig::load_with_env_prefixes(
-                    Some(path.clone()),
-                    &["ZEBRA_TARGET", "ZEBRA_TARGET"],
-                )
+                crate::config::ZakuradConfig::load_with_env(Some(path.clone()), "ZAKURA_TARGET")
             })
             .transpose()?
             .map(|app_config| app_config.state)

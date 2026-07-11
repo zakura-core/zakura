@@ -34,10 +34,10 @@ pub async fn basic_depth1() -> Result<()> {
         return setup.teardown();
     }
 
-    setup.zebra_client.generate(10).await?;
+    setup.zakura_client.generate(10).await?;
     wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
 
-    force_zebra_reorg(&setup, 9, 2).await?;
+    force_zakura_reorg(&setup, 9, 2).await?;
     wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
 
     setup.teardown()
@@ -54,18 +54,18 @@ pub async fn equal_work_race() -> Result<()> {
         return setup.teardown();
     }
 
-    setup.zebra_client.generate(10).await?;
+    setup.zakura_client.generate(10).await?;
     wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
 
     let old_zcashd_tip = zcashd_tip(&setup.zcashd_client).await?;
 
     // Replace Zebra's tip block with a competing block at the same height.
-    force_zebra_reorg(&setup, 9, 1).await?;
+    force_zakura_reorg(&setup, 9, 1).await?;
 
     // Give zcashd time to see (and wrongly follow) the replacement tip.
     sleep(EQUAL_WORK_SETTLE).await;
 
-    let zebra_tip = zebra_tip(&setup).await?;
+    let zakura_tip = zakura_tip(&setup).await?;
     let zcashd_tip_now = zcashd_tip(&setup.zcashd_client).await?;
 
     assert_eq!(
@@ -73,12 +73,12 @@ pub async fn equal_work_race() -> Result<()> {
         "zcashd should keep the first-seen equal-work tip until Zebra extends"
     );
     assert_ne!(
-        zcashd_tip_now.1, zebra_tip.1,
+        zcashd_tip_now.1, zakura_tip.1,
         "the equal-work race requires same-height competing tips"
     );
 
     // Once Zebra extends its branch it has strictly more work and zcashd follows.
-    setup.zebra_client.generate(1).await?;
+    setup.zakura_client.generate(1).await?;
     wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
 
     setup.teardown()
@@ -94,10 +94,10 @@ pub async fn deep_reorg_depth33() -> Result<()> {
         return setup.teardown();
     }
 
-    setup.zebra_client.generate(40).await?;
+    setup.zakura_client.generate(40).await?;
     wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
 
-    force_zebra_reorg(&setup, 8, 33).await?;
+    force_zakura_reorg(&setup, 8, 33).await?;
     wait_for_tips_match(&setup, DEEP_REORG_SYNC_TIMEOUT).await?;
 
     setup.teardown()
@@ -113,10 +113,10 @@ pub async fn deep_reorg_depth80() -> Result<()> {
         return setup.teardown();
     }
 
-    setup.zebra_client.generate(90).await?;
+    setup.zakura_client.generate(90).await?;
     wait_for_tips_match(&setup, DEEP_REORG_SYNC_TIMEOUT).await?;
 
-    force_zebra_reorg(&setup, 11, 80).await?;
+    force_zakura_reorg(&setup, 11, 80).await?;
     wait_for_tips_match(&setup, DEEP_REORG_SYNC_TIMEOUT).await?;
 
     setup.teardown()
@@ -132,10 +132,10 @@ pub async fn deep_reorg_restart_recovers() -> Result<()> {
         return setup.teardown();
     }
 
-    setup.zebra_client.generate(40).await?;
+    setup.zakura_client.generate(40).await?;
     wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
 
-    force_zebra_reorg(&setup, 8, 34).await?;
+    force_zakura_reorg(&setup, 8, 34).await?;
 
     wait_for_tips_match(&setup, DEEP_REORG_SYNC_TIMEOUT).await?;
 
@@ -167,12 +167,12 @@ pub async fn restart_after_reorg() -> Result<()> {
         return setup.teardown();
     }
 
-    setup.zebra_client.generate(12).await?;
+    setup.zakura_client.generate(12).await?;
     wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
 
     for depth in 1..=3 {
-        let fork_height = zebra_tip(&setup).await?.0 - u64::from(depth);
-        force_zebra_reorg(&setup, fork_height, depth + 1)
+        let fork_height = zakura_tip(&setup).await?.0 - u64::from(depth);
+        force_zakura_reorg(&setup, fork_height, depth + 1)
             .await
             .map_err(|e| eyre!("force depth-{depth} reorg before restart: {e}"))?;
         wait_for_tips_match(&setup, DEEP_REORG_SYNC_TIMEOUT)
@@ -207,13 +207,13 @@ pub async fn restart_cycles() -> Result<()> {
         return setup.teardown();
     }
 
-    setup.zebra_client.generate(15).await?;
+    setup.zakura_client.generate(15).await?;
     wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
 
     for cycle in 1u64..=3 {
-        let tip_height = zebra_tip(&setup).await?.0;
+        let tip_height = zakura_tip(&setup).await?.0;
         let fork_height = tip_height - cycle;
-        force_zebra_reorg(&setup, fork_height, cycle as u32 + 2)
+        force_zakura_reorg(&setup, fork_height, cycle as u32 + 2)
             .await
             .map_err(|e| eyre!("cycle {cycle}: force reorg: {e}"))?;
         wait_for_tips_match(&setup, DEEP_REORG_SYNC_TIMEOUT)
@@ -249,10 +249,10 @@ pub async fn restart_deep_chain() -> Result<()> {
         return setup.teardown();
     }
 
-    setup.zebra_client.generate(CHAIN_HEIGHT_DEEP).await?;
+    setup.zakura_client.generate(CHAIN_HEIGHT_DEEP).await?;
     wait_for_tips_match(&setup, Duration::from_secs(240)).await?;
 
-    force_zebra_reorg(&setup, (CHAIN_HEIGHT_DEEP - 10) as u64, 12).await?;
+    force_zakura_reorg(&setup, (CHAIN_HEIGHT_DEEP - 10) as u64, 12).await?;
     wait_for_tips_match(&setup, DEEP_REORG_SYNC_TIMEOUT).await?;
     restart_zcashd_and_wait_for_tips(&setup).await?;
 
@@ -261,7 +261,7 @@ pub async fn restart_deep_chain() -> Result<()> {
 
 /// Requires zcashd to hold its chain when Zebra's best tip temporarily rolls
 /// behind zcashd's local tip, then follow once Zebra takes the work lead again.
-pub async fn zebra_tip_behind_local() -> Result<()> {
+pub async fn zakura_tip_behind_local() -> Result<()> {
     let Some(setup) = setup_zcashd_compat().await? else {
         return Ok(());
     };
@@ -270,17 +270,17 @@ pub async fn zebra_tip_behind_local() -> Result<()> {
         return setup.teardown();
     }
 
-    setup.zebra_client.generate(10).await?;
+    setup.zakura_client.generate(10).await?;
     wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
 
     let old_zcashd_tip = zcashd_tip(&setup.zcashd_client).await?;
-    let old_zebra_tip = zebra_tip(&setup).await?;
-    assert_eq!(old_zcashd_tip, old_zebra_tip);
+    let old_zakura_tip = zakura_tip(&setup).await?;
+    assert_eq!(old_zcashd_tip, old_zakura_tip);
 
     // Roll Zebra's tip back one block; Zebra is now behind zcashd.
-    let params = serde_json::to_string(&vec![old_zebra_tip.1])?;
+    let params = serde_json::to_string(&vec![old_zakura_tip.1])?;
     let _: () = setup
-        .zebra_client
+        .zakura_client
         .json_result_from_call("invalidateblock", &params)
         .await
         .map_err(|e| eyre!("zakurad invalidate tip block: {e}"))?;
@@ -295,14 +295,14 @@ pub async fn zebra_tip_behind_local() -> Result<()> {
     );
 
     // Once Zebra mines a strictly-more-work replacement branch, zcashd follows.
-    setup.zebra_client.generate(2).await?;
+    setup.zakura_client.generate(2).await?;
     wait_for_tips_match(&setup, DEEP_REORG_SYNC_TIMEOUT).await?;
 
     setup.teardown()
 }
 
 /// No sticky divergence when Zebra shrinks right after a reorg has converged.
-pub async fn reorg_context_zebra_tip_behind_recovers() -> Result<()> {
+pub async fn reorg_context_zakura_tip_behind_recovers() -> Result<()> {
     let Some(setup) = setup_zcashd_compat().await? else {
         return Ok(());
     };
@@ -311,27 +311,27 @@ pub async fn reorg_context_zebra_tip_behind_recovers() -> Result<()> {
         return setup.teardown();
     }
 
-    setup.zebra_client.generate(20).await?;
+    setup.zakura_client.generate(20).await?;
     wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
 
     for round in 1u32..=3 {
-        let tip_height = zebra_tip(&setup).await?.0;
-        force_zebra_reorg(&setup, tip_height - 2, 3)
+        let tip_height = zakura_tip(&setup).await?.0;
+        force_zakura_reorg(&setup, tip_height - 2, 3)
             .await
             .map_err(|e| eyre!("round {round}: force paused depth-2 reorg: {e}"))?;
         wait_for_tips_match(&setup, DEEP_REORG_SYNC_TIMEOUT)
             .await
             .map_err(|e| eyre!("round {round}: wait after reorg: {e}"))?;
 
-        let new_tip_hash = zebra_tip(&setup).await?.1;
+        let new_tip_hash = zakura_tip(&setup).await?.1;
         let params = serde_json::to_string(&vec![new_tip_hash])?;
         let _: () = setup
-            .zebra_client
+            .zakura_client
             .json_result_from_call("invalidateblock", &params)
             .await
             .map_err(|e| eyre!("round {round}: invalidate new tip: {e}"))?;
 
-        setup.zebra_client.generate(2).await?;
+        setup.zakura_client.generate(2).await?;
         wait_for_tips_match(&setup, DEEP_REORG_SYNC_TIMEOUT)
             .await
             .map_err(|e| eyre!("round {round}: {e}"))?;
@@ -350,13 +350,13 @@ pub async fn churn() -> Result<()> {
         return setup.teardown();
     }
 
-    setup.zebra_client.generate(12).await?;
+    setup.zakura_client.generate(12).await?;
     wait_for_tips_match(&setup, STANDARD_SYNC_TIMEOUT).await?;
 
     for cycle in 1..=reorg_churn_iterations()? {
         if cycle % 8 == 0 {
             setup
-                .zebra_client
+                .zakura_client
                 .generate(30)
                 .await
                 .map_err(|e| eyre!("cycle {cycle}: generate burst before depth-1 reorg: {e}"))?;
@@ -365,8 +365,8 @@ pub async fn churn() -> Result<()> {
                 .map_err(|e| eyre!("cycle {cycle}: force unpaused depth-1 reorg: {e}"))?;
         } else {
             let depth = (cycle % 3) + 1;
-            let fork_height = zebra_tip(&setup).await?.0 - u64::from(depth);
-            force_zebra_reorg(&setup, fork_height, depth + 1)
+            let fork_height = zakura_tip(&setup).await?.0 - u64::from(depth);
+            force_zakura_reorg(&setup, fork_height, depth + 1)
                 .await
                 .map_err(|e| eyre!("cycle {cycle}: force depth-{depth} reorg: {e}"))?;
         }
@@ -379,9 +379,9 @@ pub async fn churn() -> Result<()> {
     setup.teardown()
 }
 
-async fn zebra_tip(setup: &ZcashdCompatSetup) -> Result<(u64, String)> {
+async fn zakura_tip(setup: &ZcashdCompatSetup) -> Result<(u64, String)> {
     let info: serde_json::Value = setup
-        .zebra_client
+        .zakura_client
         .json_result_from_call("getblockchaininfo", "[]")
         .await
         .map_err(|e| eyre!("zakurad getblockchaininfo: {e}"))?;
@@ -389,9 +389,9 @@ async fn zebra_tip(setup: &ZcashdCompatSetup) -> Result<(u64, String)> {
     tip_from_blockchain_info("zakurad", info)
 }
 
-async fn zebra_block_hash(setup: &ZcashdCompatSetup, height: u64) -> Result<String> {
+async fn zakura_block_hash(setup: &ZcashdCompatSetup, height: u64) -> Result<String> {
     setup
-        .zebra_client
+        .zakura_client
         .json_result_from_call("getblockhash", format!("[{height}]"))
         .await
         .map_err(|e| eyre!("zakurad getblockhash({height}): {e}"))
@@ -500,35 +500,35 @@ async fn wait_for_restarted_zcashd_rpc(
 /// Paused reorgs avoid observable intermediate shorter-chain states during test
 /// orchestration. Unpaused depth >1 reorgs can leave zcashd holding its chain
 /// until Zebra's replacement branch takes the work lead.
-async fn force_zebra_reorg(
+async fn force_zakura_reorg(
     setup: &ZcashdCompatSetup,
     fork_height: u64,
     new_branch_len: u32,
 ) -> Result<()> {
-    let invalidated_hash = zebra_block_hash(setup, fork_height + 1).await?;
+    let invalidated_hash = zakura_block_hash(setup, fork_height + 1).await?;
     let params = serde_json::to_string(&vec![invalidated_hash])?;
     let mut pause_guard = ZcashdPauseGuard::pause(setup)?;
 
     let _: () = setup
-        .zebra_client
+        .zakura_client
         .json_result_from_call("invalidateblock", &params)
         .await
         .map_err(|e| eyre!("zakurad invalidateblock: {e}"))?;
-    setup.zebra_client.generate(new_branch_len).await?;
+    setup.zakura_client.generate(new_branch_len).await?;
 
     pause_guard.resume()
 }
 
 async fn force_unpaused_depth1_reorg(setup: &ZcashdCompatSetup) -> Result<()> {
-    let tip_hash = zebra_tip(setup).await?.1;
+    let tip_hash = zakura_tip(setup).await?.1;
     let params = serde_json::to_string(&vec![tip_hash])?;
 
     let _: () = setup
-        .zebra_client
+        .zakura_client
         .json_result_from_call("invalidateblock", &params)
         .await
         .map_err(|e| eyre!("zakurad invalidateblock: {e}"))?;
-    setup.zebra_client.generate(2).await?;
+    setup.zakura_client.generate(2).await?;
 
     Ok(())
 }
@@ -538,14 +538,14 @@ async fn wait_for_tips_match(setup: &ZcashdCompatSetup, timeout: Duration) -> Re
     let mut last_seen;
 
     loop {
-        let zebra_tip = zebra_tip(setup).await?;
+        let zakura_tip = zakura_tip(setup).await?;
         let zcashd_tip = zcashd_tip(&setup.zcashd_client).await?;
 
-        if zebra_tip == zcashd_tip {
+        if zakura_tip == zcashd_tip {
             return Ok(());
         }
 
-        last_seen = Some((zebra_tip, zcashd_tip));
+        last_seen = Some((zakura_tip, zcashd_tip));
 
         if Instant::now() >= deadline {
             return Err(eyre!(

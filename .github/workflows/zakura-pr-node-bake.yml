@@ -1,0 +1,204 @@
+name: PR node image bake
+
+# Bakes the golden assets for the ephemeral PR-node workflow (zakura-pr-node.yml):
+#   - one base droplet image: build deps + rustup + repo clone + warm cargo
+#     release cache + a loopback SSH identity for deploy.py,
+#   - one volume snapshot per network with extracted chain state
+#     (mainnet: tip/ + sandblast/, testnet: tip/).
+# Runs weekly so the tip states and the cargo cache never drift far from main;
+# PR-node runs sync the remaining gap during their hour.
+
+on:
+  workflow_dispatch:
+    inputs:
+      droplet_size:
+        description: "Bake droplet size (its disk becomes the image's minimum disk)"
+        required: false
+        default: c-8
+      region:
+        description: "DO region (must host the run droplets too)"
+        required: false
+        default: nyc3
+  schedule:
+    - cron: "0 4 * * 1" # weekly Monday 04:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zakura-pr-node-bake
+  cancel-in-progress: false
+
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+    # Cold cargo build + three snapshot downloads + a ~50GB image snapshot.
+    timeout-minutes: 210
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install doctl
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          DOCTL_VERSION=1.120.0
+          curl -sL "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
+          sudo install /tmp/doctl /usr/local/bin/doctl
+          doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
+
+      - name: Write SSH key
+        env:
+          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+        run: |
+          install -m 600 /dev/null /tmp/do_ssh
+          printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
+
+      - name: Create state volumes + bake droplet
+        id: droplet
+        env:
+          REGION: ${{ inputs.region || 'nyc3' }}
+          DROPLET_SIZE: ${{ inputs.droplet_size || 'c-8' }}
+          SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          MAINNET_VOL="zakura-pr-bake-mainnet-${GITHUB_RUN_ID}"
+          TESTNET_VOL="zakura-pr-bake-testnet-${GITHUB_RUN_ID}"
+          MAINNET_VOL_ID=$(doctl compute volume create "$MAINNET_VOL" \
+            --region "${REGION}" --size 300GiB --format ID --no-header)
+          TESTNET_VOL_ID=$(doctl compute volume create "$TESTNET_VOL" \
+            --region "${REGION}" --size 100GiB --format ID --no-header)
+          {
+            echo "mainnet_vol=$MAINNET_VOL"
+            echo "testnet_vol=$TESTNET_VOL"
+            echo "mainnet_vol_id=$MAINNET_VOL_ID"
+            echo "testnet_vol_id=$TESTNET_VOL_ID"
+          } >> "$GITHUB_OUTPUT"
+
+          NAME="zakura-pr-bake-${GITHUB_RUN_ID}"
+          doctl compute droplet create "$NAME" \
+            --region "${REGION}" \
+            --size "${DROPLET_SIZE}" \
+            --image ubuntu-24-04-x64 \
+            --ssh-keys "${SSH_FINGERPRINT}" \
+            --volumes "${MAINNET_VOL_ID}" \
+            --volumes "${TESTNET_VOL_ID}" \
+            --tag-name zakura-image-bake \
+            --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
+          echo "id=$(awk '{print $1}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
+          echo "ip=$(awk '{print $2}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i /tmp/do_ssh "root@${IP}" true 2>/dev/null; then
+              echo "SSH up"; exit 0
+            fi
+            sleep 10
+          done
+          echo "SSH did not come up in time"; exit 1
+
+      - name: Run bake script
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+          GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAINNET_VOLUME_NAME: ${{ steps.droplet.outputs.mainnet_vol }}
+          TESTNET_VOLUME_NAME: ${{ steps.droplet.outputs.testnet_vol }}
+          TIP_MAINNET_LATEST_JSON: ${{ vars.ZAKURA_PR_NODE_TIP_LATEST_JSON || 'https://zebra.valargroup.org/mainnet-pruned/latest.json' }}
+          # Pre-spam-region archive snapshot; same artifact checkpoint-sync-bench pins.
+          SANDBLAST_URL: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_URL || 'https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst' }}
+          SANDBLAST_SHA256: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_SHA256 || '19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769' }}
+          TESTNET_SNAPSHOTS_BASE: ${{ vars.ZAKURA_TESTNET_SNAPSHOTS_URL || 'http://167.99.103.111:8091' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          {
+            printf 'GH_REPO=%q\n'                 "${GITHUB_REPOSITORY}"
+            printf 'GH_CLONE_TOKEN=%q\n'          "${GH_CLONE_TOKEN}"
+            printf 'MAINNET_VOLUME_NAME=%q\n'     "${MAINNET_VOLUME_NAME}"
+            printf 'TESTNET_VOLUME_NAME=%q\n'     "${TESTNET_VOLUME_NAME}"
+            printf 'TIP_MAINNET_LATEST_JSON=%q\n' "${TIP_MAINNET_LATEST_JSON}"
+            printf 'SANDBLAST_URL=%q\n'           "${SANDBLAST_URL}"
+            printf 'SANDBLAST_SHA256=%q\n'        "${SANDBLAST_SHA256}"
+            printf 'TESTNET_SNAPSHOTS_BASE=%q\n'  "${TESTNET_SNAPSHOTS_BASE}"
+          } > /tmp/bake.env
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            /tmp/bake.env .github/workflows/scripts/pr-node-bake.sh "root@${IP}:/root/"
+          rm -f /tmp/bake.env
+          # Keepalives: the cold build and snapshot downloads are long and low-output.
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \
+            'set -euo pipefail; set -a; . /root/bake.env; set +a; bash /root/pr-node-bake.sh'
+
+      - name: Snapshot state volumes
+        env:
+          MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
+          TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
+        run: |
+          set -euo pipefail
+          STAMP=$(date -u +%Y%m%d-%H%M)
+          doctl compute volume snapshot "${MAINNET_VOL_ID}" --snapshot-name "zakura-pr-state-mainnet-${STAMP}"
+          doctl compute volume snapshot "${TESTNET_VOL_ID}" --snapshot-name "zakura-pr-state-testnet-${STAMP}"
+
+      - name: Snapshot droplet image
+        env:
+          DROPLET_ID: ${{ steps.droplet.outputs.id }}
+        run: |
+          set -euo pipefail
+          doctl compute droplet-action power-off "${DROPLET_ID}" --wait
+          STAMP=$(date -u +%Y%m%d-%H%M)
+          ACTION_ID=$(doctl compute droplet-action snapshot "${DROPLET_ID}" \
+            --snapshot-name "zakura-pr-node-${STAMP}" --format ID --no-header)
+          # Poll instead of --wait: image snapshots of large disks routinely
+          # exceed doctl's action wait and the status is worth logging.
+          for _ in $(seq 1 180); do
+            STATUS=$(doctl compute droplet-action get "${DROPLET_ID}" \
+              --action-id "${ACTION_ID}" --format Status --no-header)
+            echo "snapshot action: ${STATUS}"
+            case "${STATUS}" in
+              completed) exit 0 ;;
+              errored)   echo "image snapshot failed"; exit 1 ;;
+            esac
+            sleep 30
+          done
+          echo "image snapshot did not complete in time"; exit 1
+
+      - name: Cleanup droplet + volumes, prune old assets
+        if: always()
+        env:
+          DROPLET_ID: ${{ steps.droplet.outputs.id }}
+          MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
+          TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
+        run: |
+          set +e
+          if [ -n "${DROPLET_ID}" ]; then
+            for _ in 1 2 3; do
+              doctl compute droplet delete "${DROPLET_ID}" -f && break
+              sleep 5
+            done
+          fi
+          # Volumes detach asynchronously after the droplet delete.
+          for VOL_ID in "${MAINNET_VOL_ID}" "${TESTNET_VOL_ID}"; do
+            [ -z "${VOL_ID}" ] && continue
+            for _ in $(seq 1 12); do
+              doctl compute volume delete "${VOL_ID}" -f && break
+              sleep 10
+            done
+          done
+          # Keep the newest 2 images and 2 volume snapshots per network so runs
+          # never depend on the latest bake having succeeded.
+          doctl compute image list-user --format ID,Name --no-header | \
+            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | head -n -2 | \
+            while read -r _name id; do doctl compute image delete "$id" -f; done
+          for NET in mainnet testnet; do
+            doctl compute snapshot list --resource volume --format ID,Name --no-header | \
+              awk -v pre="zakura-pr-state-${NET}-" 'index($2, pre) == 1 {print $2, $1}' | \
+              sort | head -n -2 | \
+              while read -r _name id; do doctl compute snapshot delete "$id" -f; done
+          done
+          true

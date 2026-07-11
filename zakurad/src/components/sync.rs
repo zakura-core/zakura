@@ -601,7 +601,7 @@ pub struct Config {
     /// it from). When this is `true`, that shortcut is skipped and genesis must be
     /// downloaded and verified from a peer instead. This exercises the production
     /// genesis-bootstrap path — in particular a Zakura-only node
-    /// (`legacy_p2p = false`) that must fetch genesis over Zakura before native
+    /// (`p2p_stack = "zakura"`) that must fetch genesis over Zakura before native
     /// header/body sync can advance from an empty state.
     ///
     /// Defaults to `false`, so standalone Regtest nodes keep self-seeding genesis.

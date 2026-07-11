@@ -16,12 +16,12 @@ pub async fn height_and_hash_agree() -> Result<()> {
     };
 
     if setup.can_mutate() {
-        setup.zebra_client.generate(5).await?;
+        setup.zakura_client.generate(5).await?;
         wait_for_zcashd_height(&setup.zcashd_client, 5).await?;
     }
 
     let zebra_count: u64 = setup
-        .zebra_client
+        .zakura_client
         .json_result_from_call("getblockcount", "[]")
         .await
         .map_err(|e| eyre!("zakurad getblockcount: {e}"))?;
@@ -44,8 +44,8 @@ pub async fn height_and_hash_agree() -> Result<()> {
         "zakurad and zcashd disagree on block count: {zebra_count} vs {zcashd_count}"
     );
 
-    let zebra_hash: serde_json::Value = setup
-        .zebra_client
+    let zakura_hash: serde_json::Value = setup
+        .zakura_client
         .json_result_from_call("getbestblockhash", "[]")
         .await
         .map_err(|e| eyre!("zakurad getbestblockhash: {e}"))?;
@@ -57,7 +57,7 @@ pub async fn height_and_hash_agree() -> Result<()> {
         .map_err(|e| eyre!("zcashd getbestblockhash: {e}"))?;
 
     assert_eq!(
-        zebra_hash, zcashd_hash,
+        zakura_hash, zcashd_hash,
         "zakurad and zcashd disagree on best block hash"
     );
 
@@ -75,12 +75,12 @@ pub async fn getblock_hash_consistent() -> Result<()> {
     };
 
     let start_height: u64 = if setup.can_mutate() {
-        setup.zebra_client.generate(3).await?;
+        setup.zakura_client.generate(3).await?;
         wait_for_zcashd_height(&setup.zcashd_client, 3).await?;
         1
     } else {
         let tip: u64 = setup
-            .zebra_client
+            .zakura_client
             .json_result_from_call("getblockcount", "[]")
             .await
             .map_err(|e| eyre!("zakurad getblockcount: {e}"))?;
@@ -90,8 +90,8 @@ pub async fn getblock_hash_consistent() -> Result<()> {
     for height in start_height..=start_height + 2 {
         let params = format!("[{height}]");
 
-        let zebra_hash: serde_json::Value = setup
-            .zebra_client
+        let zakura_hash: serde_json::Value = setup
+            .zakura_client
             .json_result_from_call("getblockhash", &params)
             .await
             .map_err(|e| eyre!("zakurad getblockhash({height}): {e}"))?;
@@ -103,8 +103,8 @@ pub async fn getblock_hash_consistent() -> Result<()> {
             .map_err(|e| eyre!("zcashd getblockhash({height}): {e}"))?;
 
         assert_eq!(
-            zebra_hash, zcashd_hash,
-            "block hash mismatch at height {height}: zakurad={zebra_hash} zcashd={zcashd_hash}"
+            zakura_hash, zcashd_hash,
+            "block hash mismatch at height {height}: zakurad={zakura_hash} zcashd={zcashd_hash}"
         );
     }
 

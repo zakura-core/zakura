@@ -39,7 +39,7 @@ fn is_sensitive_leaf_key(leaf_key: &str) -> bool {
 /// of each field is described in the documentation, although it may be necessary
 /// to click through to the sub-structures for each section.
 ///
-/// The path to the configuration file can also be specified with the `--config` flag when running Zebra.
+/// The path to the configuration file can also be specified with the `--config` flag when running Zakura.
 ///
 /// The default path to the `zakurad` config is platform dependent, based on
 /// [`dirs::preference_dir`](https://docs.rs/dirs/latest/dirs/fn.preference_dir.html):
@@ -94,7 +94,7 @@ pub struct ZakuradConfig {
 impl ZakuradConfig {
     /// Loads the configuration from the conventional sources.
     ///
-    /// Configuration is loaded from three sources, in order of precedence:
+    /// Configuration is loaded from four sources, in order of precedence:
     /// 1. Environment variables with `ZAKURA_` prefix (highest precedence)
     /// 2. Environment variables with deprecated `ZEBRA_` prefix
     /// 3. TOML configuration file (if provided)
@@ -125,14 +125,19 @@ impl ZakuradConfig {
     /// This allows callers that need multiple configs in the same process (e.g.,
     /// the `copy-state` command) to keep overrides separate. For example:
     /// - Source/base config uses `ZAKURA_...` env vars (default prefix)
-    /// - Target config uses `ZEBRA_TARGET_...` env vars
+    /// - Target config uses `ZAKURA_TARGET_...` env vars
     ///
-    /// The nested key separator remains `__`, e.g., `ZEBRA_TARGET_STATE__CACHE_DIR`.
+    /// The nested key separator remains `__`, e.g., `ZAKURA_TARGET_STATE__CACHE_DIR`.
     pub fn load_with_env(
         config_path: Option<PathBuf>,
         env_prefix: &str,
     ) -> Result<Self, config::ConfigError> {
-        Self::load_with_env_prefixes(config_path, &[env_prefix])
+        if let Some(suffix) = env_prefix.strip_prefix("ZAKURA") {
+            let legacy_prefix = format!("ZEBRA{suffix}");
+            Self::load_with_env_prefixes(config_path, &[&legacy_prefix, env_prefix])
+        } else {
+            Self::load_with_env_prefixes(config_path, &[env_prefix])
+        }
     }
 
     /// Loads configuration using caller-provided environment variable prefixes.
@@ -161,7 +166,7 @@ impl ZakuradConfig {
         for env_prefix in env_prefixes {
             let filtered_env = filtered_env_vars(env_prefix)?;
 
-            if *env_prefix == "ZEBRA" && !filtered_env.is_empty() {
+            if env_prefix.starts_with("ZEBRA") && !filtered_env.is_empty() {
                 tracing::warn!(
                     "ZEBRA_* config environment variables are deprecated; use ZAKURA_* instead"
                 );

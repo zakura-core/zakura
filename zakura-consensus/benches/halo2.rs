@@ -7,7 +7,7 @@
 //! # Benchmark group
 //!
 //! `halo2`: matches the `verifier` label in
-//! `zebra.consensus.batch.duration_seconds` emitted from
+//! `zakura.consensus.batch.duration_seconds` emitted from
 //! `zakura-consensus/src/primitives/halo2.rs`, so a prod regression on the
 //! Halo2 histogram maps to this file by name.
 //!

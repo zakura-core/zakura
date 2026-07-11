@@ -26,7 +26,11 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = SCRIPT_DIR / "templates"
-BUILD_CACHE_DIR = SCRIPT_DIR / ".build-cache"
+DEFAULT_BUILD_CACHE_DIR = SCRIPT_DIR / ".build-cache"
+BUILD_CACHE_DIR_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_DIR"
+BUILD_CACHE_RETAIN_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_RETAIN"
+DEFAULT_BUILD_CACHE_RETAIN = 12
+DATA_MOUNT = Path("/mnt/data")
 
 # ssh/scp options shared by every remote call. BatchMode avoids interactive
 # password prompts hanging a parallel deploy; accept-new pins unknown host keys
@@ -53,13 +57,12 @@ DEFAULTS = {
     "listen_addr": "[::]:8233",
     "identity_dir": "",     # e.g. "/root/.zakura" -> pins the iroh node_id; "" uses zakurad default
     "network_cache_dir": "",
-    "cache_dir_migrate_from": "",
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
     "rpc_enable_cookie_auth": None,
     "port": None,           # ssh port; None -> ssh default
     # Match zakurad's own defaults so existing fleets render unchanged.
     "storage_mode": "archive",
-    # One of: default | zebra | zakura | dual (aliases: v1/legacy, v2, combined).
+    # One of: default | legacy | zakura | dual.
     "p2p_stack": "dual",
     "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
     "tracing_filter": "",    # e.g. "info,zakura_network::zakura=debug"; "" uses zakurad default
@@ -100,7 +103,6 @@ class Node:
     listen_addr: str
     identity_dir: str
     network_cache_dir: str
-    cache_dir_migrate_from: str
     rpc_listen_addr: str
     rpc_enable_cookie_auth: object
     storage_mode: str
@@ -144,16 +146,13 @@ class Node:
 # Config loading
 # --------------------------------------------------------------------------- #
 
-# Canonical names accepted by zakurad's network.p2p_stack (plus the aliases the
-# binary also accepts). Deployer configs should use a canonical name.
+# Canonical names accepted by zakurad's network.p2p_stack.
 P2P_STACK_VALUES = {
     "default",
-    "zebra", "v1", "legacy",
-    "zakura", "v2",
-    "dual", "combined",
+    "legacy",
+    "zakura",
+    "dual",
 }
-# Deprecated deployer keys from before network.p2p_stack; reject with a pointer.
-DEPRECATED_P2P_KEYS = {"v2_p2p", "legacy_p2p", "enable_p2p_v2", "default_p2p"}
 
 
 def normalize_p2p_stack(value: object, *, where: str) -> str:
@@ -163,15 +162,9 @@ def normalize_p2p_stack(value: object, *, where: str) -> str:
     if stack not in P2P_STACK_VALUES:
         raise DeployError(
             f"{where}: unknown p2p_stack {value!r}; "
-            f"expected one of: default, zebra, zakura, dual"
+            f"expected one of: default, legacy, zakura, dual"
         )
-    # Prefer canonical names in rendered node configs.
-    return {
-        "v1": "zebra",
-        "legacy": "zebra",
-        "v2": "zakura",
-        "combined": "dual",
-    }.get(stack, stack)
+    return stack
 
 
 def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
@@ -186,13 +179,6 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
     known_default_keys = set(DEFAULTS)
     known_node_keys = known_default_keys | {"name", "ssh_string", "commit"}
     defaults_raw = data.get("defaults", {})
-    deprecated_defaults = set(defaults_raw) & DEPRECATED_P2P_KEYS
-    if deprecated_defaults:
-        raise DeployError(
-            f"deprecated key(s) in [defaults]: {', '.join(sorted(deprecated_defaults))}; "
-            f"use p2p_stack = \"dual\"|\"zebra\"|\"zakura\"|\"default\" instead "
-            f"(see network.p2p_stack / PR #21)"
-        )
     unknown_defaults = set(defaults_raw) - known_default_keys
     if unknown_defaults:
         raise DeployError(
@@ -213,12 +199,6 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
         for required in ("name", "ssh_string", "commit"):
             if required not in raw:
                 raise DeployError(f"node missing required field '{required}': {raw}")
-        deprecated_node = set(raw) & DEPRECATED_P2P_KEYS
-        if deprecated_node:
-            raise DeployError(
-                f"deprecated key(s) in [[nodes]] {raw.get('name', '?')}: "
-                f"{', '.join(sorted(deprecated_node))}; use p2p_stack instead"
-            )
         unknown_node = set(raw) - known_node_keys
         if unknown_node:
             raise DeployError(
@@ -247,7 +227,6 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             listen_addr=merged["listen_addr"],
             identity_dir=merged["identity_dir"],
             network_cache_dir=merged["network_cache_dir"],
-            cache_dir_migrate_from=merged["cache_dir_migrate_from"],
             rpc_listen_addr=merged["rpc_listen_addr"],
             rpc_enable_cookie_auth=merged["rpc_enable_cookie_auth"],
             storage_mode=merged["storage_mode"],
@@ -304,6 +283,45 @@ def repo_root() -> Path:
 # --------------------------------------------------------------------------- #
 # Build (cache keyed on resolved commit SHA)
 # --------------------------------------------------------------------------- #
+def build_cache_dir() -> Path:
+    return Path(os.environ.get(BUILD_CACHE_DIR_ENV, DEFAULT_BUILD_CACHE_DIR)).expanduser()
+
+
+def build_cache_retain() -> int:
+    raw = os.environ.get(BUILD_CACHE_RETAIN_ENV, str(DEFAULT_BUILD_CACHE_RETAIN))
+    try:
+        retain = int(raw)
+    except ValueError as exc:
+        raise DeployError(f"{BUILD_CACHE_RETAIN_ENV} must be an integer, got {raw!r}") from exc
+    if retain < 1:
+        raise DeployError(f"{BUILD_CACHE_RETAIN_ENV} must be at least 1")
+    return retain
+
+
+def path_requires_data_mount(path: Path) -> bool:
+    path = path.expanduser()
+    if not path.is_absolute():
+        return False
+    return path == DATA_MOUNT or DATA_MOUNT in path.parents
+
+
+def ensure_data_mount_for_path(path: Path, *, purpose: str) -> None:
+    if path_requires_data_mount(path) and not DATA_MOUNT.is_mount():
+        raise DeployError(
+            f"{purpose} uses {path}, but {DATA_MOUNT} is not a mounted filesystem"
+        )
+
+
+def prune_cached_binaries(cache_dir: Path, current_sha: str) -> None:
+    retain = build_cache_retain()
+    binaries = [
+        path for path in cache_dir.glob("zakurad-*")
+        if path.is_file() and path.name != f"zakurad-{current_sha}"
+    ]
+    binaries.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for old_binary in binaries[max(0, retain - 1):]:
+        old_binary.unlink(missing_ok=True)
+
 
 def resolve_sha(root: Path, commit: str) -> str:
     """Resolve a branch/tag/SHA to a full commit SHA in the repo.
@@ -323,7 +341,7 @@ def resolve_sha(root: Path, commit: str) -> str:
 
 
 def cached_binary(sha: str) -> Path:
-    return BUILD_CACHE_DIR / f"zakurad-{sha}"
+    return build_cache_dir() / f"zakurad-{sha}"
 
 
 def binary_is_runnable(binary: Path) -> bool:
@@ -342,7 +360,9 @@ def binary_is_runnable(binary: Path) -> bool:
 
 def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
     """Build zakurad at `sha` into the cache, or reuse an existing cached build."""
-    BUILD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_dir = build_cache_dir()
+    ensure_data_mount_for_path(cache_dir, purpose="build cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
     target = cached_binary(sha)
     if target.exists() and not force:
         if binary_is_runnable(target):
@@ -352,7 +372,7 @@ def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
 
     # Build at the exact commit in a throwaway detached worktree so the caller's
     # working tree (which may be dirty) is never disturbed.
-    work = BUILD_CACHE_DIR / f"wt-{sha[:12]}"
+    work = cache_dir / f"wt-{sha[:12]}"
     if work.exists():
         run(["git", "worktree", "remove", "--force", str(work)], cwd=root, check=False)
         shutil.rmtree(work, ignore_errors=True)
@@ -372,6 +392,7 @@ def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
         os.chmod(tmp, 0o755)
         tmp.replace(target)
         print(f"[build] cached -> {target}")
+        prune_cached_binaries(cache_dir, sha)
     finally:
         run(["git", "worktree", "remove", "--force", str(work)], cwd=root, check=False)
         shutil.rmtree(work, ignore_errors=True)
@@ -465,11 +486,22 @@ def render_node_config(node: Node) -> str:
 
 
 def render_service(node: Node) -> str:
+    mount_lines = ""
+    if any(
+        path_requires_data_mount(Path(path))
+        for path in (node.state_cache_dir, node.network_cache_dir, node.log_file)
+        if path
+    ):
+        mount_lines = (
+            f"RequiresMountsFor={DATA_MOUNT}\n"
+            f"AssertPathIsMountPoint={DATA_MOUNT}\n"
+        )
     return render_template("zakurad.service", {
         "SERVICE_NAME": node.service_name,
         "BIN_PATH": node.bin_path,
         "CONFIG_PATH": node.config_path,
         "LOG_FILE": node.log_file,
+        "MOUNT_LINES": mount_lines,
     })
 
 
@@ -483,10 +515,24 @@ set -euo pipefail
 BIN_PATH={bin_path}
 CONFIG_PATH={config_path}
 SERVICE={service}
+LEGACY_SERVICE=zebrad
 LOG_FILE={log_file}
 STATE_DIR={state_dir}
-CACHE_DIR_MIGRATE_FROM={cache_dir_migrate_from}
 NO_RESTART={no_restart}
+
+require_data_mount_for() {{
+    case "$1" in
+        /mnt/data|/mnt/data/*)
+            if ! mountpoint -q /mnt/data; then
+                echo "required /mnt/data mount is absent for $1" >&2
+                exit 1
+            fi
+            ;;
+    esac
+}}
+
+require_data_mount_for "$STATE_DIR"
+require_data_mount_for "$(dirname "$LOG_FILE")"
 
 mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")" "$(dirname "$LOG_FILE")"
 
@@ -502,28 +548,21 @@ install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
 rm -f /tmp/zakurad-deploy.new /tmp/zakurad-deploy.service /tmp/zakurad-deploy.toml
 
 systemctl daemon-reload
-systemctl enable "$SERVICE" >/dev/null 2>&1 || true
 
 if [ "$NO_RESTART" = "1" ]; then
-    if [ -n "$CACHE_DIR_MIGRATE_FROM" ] && [ ! -e "$STATE_DIR" ] && [ -d "$CACHE_DIR_MIGRATE_FROM" ]; then
-        echo "cache migration from $CACHE_DIR_MIGRATE_FROM to $STATE_DIR requires restart" >&2
-        exit 1
-    fi
     mkdir -p "$STATE_DIR"
     echo "installed (restart skipped)"
     exit 0
 fi
 
-if [ -n "$CACHE_DIR_MIGRATE_FROM" ] && [ "$CACHE_DIR_MIGRATE_FROM" != "$STATE_DIR" ]; then
-    if [ ! -e "$STATE_DIR" ] && [ -d "$CACHE_DIR_MIGRATE_FROM" ]; then
-        systemctl stop "$SERVICE" || true
-        mkdir -p "$(dirname "$STATE_DIR")"
-        mv "$CACHE_DIR_MIGRATE_FROM" "$STATE_DIR"
-        echo "migrated cache dir: $CACHE_DIR_MIGRATE_FROM -> $STATE_DIR"
-    elif [ -e "$STATE_DIR" ]; then
-        echo "cache dir already present: $STATE_DIR"
-    fi
-fi
+# The Zakura rename is intentionally breaking: remove the obsolete unit so it
+# cannot be re-enabled or mistaken for the active node after deployment. Keep it
+# running during a no-restart deployment because that mode only stages changes.
+systemctl disable --now "$LEGACY_SERVICE.service" >/dev/null 2>&1 || true
+rm -f "/etc/systemd/system/$LEGACY_SERVICE.service"
+systemctl daemon-reload
+systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+
 mkdir -p "$STATE_DIR"
 
 start_service() {{
@@ -568,11 +607,26 @@ BIN_PATH={bin_path}
 CONFIG_PATH={config_path}
 LOG_FILE={log_file}
 STATE_DIR={state_dir}
-CACHE_DIR_MIGRATE_FROM={cache_dir_migrate_from}
 WORKING_DIR={working_dir}
 START_COMMAND={start_command}
 PROCESS_PATTERN={process_pattern}
 NO_RESTART={no_restart}
+
+require_data_mount_for() {{
+    case "$1" in
+        /mnt/data|/mnt/data/*)
+            if ! mountpoint -q /mnt/data; then
+                echo "required /mnt/data mount is absent for $1" >&2
+                exit 1
+            fi
+            ;;
+    esac
+}}
+
+require_data_mount_for "$STATE_DIR"
+if [ -n "$LOG_FILE" ]; then
+    require_data_mount_for "$(dirname "$LOG_FILE")"
+fi
 
 mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")"
 if [ -n "$LOG_FILE" ]; then
@@ -591,10 +645,6 @@ install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
 rm -f /tmp/zakurad-deploy.new /tmp/zakurad-deploy.toml
 
 if [ "$NO_RESTART" = "1" ]; then
-    if [ -n "$CACHE_DIR_MIGRATE_FROM" ] && [ ! -e "$STATE_DIR" ] && [ -d "$CACHE_DIR_MIGRATE_FROM" ]; then
-        echo "cache migration from $CACHE_DIR_MIGRATE_FROM to $STATE_DIR requires restart" >&2
-        exit 1
-    fi
     mkdir -p "$STATE_DIR"
     echo "installed process binary/config (restart skipped)"
     exit 0
@@ -616,15 +666,6 @@ if pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1; then
     pkill -KILL -f "$PROCESS_PATTERN" >/dev/null 2>&1 || true
 fi
 
-if [ -n "$CACHE_DIR_MIGRATE_FROM" ] && [ "$CACHE_DIR_MIGRATE_FROM" != "$STATE_DIR" ]; then
-    if [ ! -e "$STATE_DIR" ] && [ -d "$CACHE_DIR_MIGRATE_FROM" ]; then
-        mkdir -p "$(dirname "$STATE_DIR")"
-        mv "$CACHE_DIR_MIGRATE_FROM" "$STATE_DIR"
-        echo "migrated cache dir: $CACHE_DIR_MIGRATE_FROM -> $STATE_DIR"
-    elif [ -e "$STATE_DIR" ]; then
-        echo "cache dir already present: $STATE_DIR"
-    fi
-fi
 mkdir -p "$STATE_DIR"
 
 if [ -n "$WORKING_DIR" ]; then
@@ -813,14 +854,14 @@ def cmd_deploy(args) -> int:
                 return (node.name, True, f"deployed {node.sha[:9]} (binary-only)")
 
             cfg = render_node_config(node)
-            cfg_tmp = BUILD_CACHE_DIR / f".cfg-{node.name}.toml"
+            cfg_tmp = build_cache_dir() / f".cfg-{node.name}.toml"
             cfg_tmp.write_text(cfg)
             try:
                 run(node.scp_to(str(binary), "/tmp/zakurad-deploy.new"), capture=True)
                 run(node.scp_to(str(cfg_tmp), "/tmp/zakurad-deploy.toml"), capture=True)
                 if node.deploy_kind == "systemd":
                     unit = render_service(node)
-                    unit_tmp = BUILD_CACHE_DIR / f".unit-{node.name}.service"
+                    unit_tmp = build_cache_dir() / f".unit-{node.name}.service"
                     unit_tmp.write_text(unit)
                     try:
                         run(node.scp_to(str(unit_tmp), "/tmp/zakurad-deploy.service"), capture=True)
@@ -836,7 +877,6 @@ def cmd_deploy(args) -> int:
                     service=shlex.quote(node.service_name),
                     log_file=shlex.quote(node.log_file),
                     state_dir=shlex.quote(node.state_cache_dir),
-                    cache_dir_migrate_from=shlex.quote(node.cache_dir_migrate_from),
                     no_restart="1" if args.no_restart else "0",
                 )
             else:
@@ -845,7 +885,6 @@ def cmd_deploy(args) -> int:
                     config_path=shlex.quote(node.config_path),
                     log_file=shlex.quote(node.log_file),
                     state_dir=shlex.quote(node.state_cache_dir),
-                    cache_dir_migrate_from=shlex.quote(node.cache_dir_migrate_from),
                     working_dir=shlex.quote(node.working_dir),
                     start_command=shlex.quote(node.start_command),
                     process_pattern=shlex.quote(node.process_pattern),

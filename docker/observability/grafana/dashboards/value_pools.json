@@ -18,7 +18,7 @@
       }
     ]
   },
-  "description": "Value Pool Monitoring - Track shielded pool balances and total supply. Zebra enforces ZIP-209 internally.",
+  "description": "Value Pool Monitoring - Track shielded pool balances and total supply. Zakura enforces ZIP-209 internally.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
@@ -29,7 +29,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -103,7 +103,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "state_finalized_chain_supply_total / 100000000",
           "legendFormat": "Total Supply (ZEC)",
@@ -116,7 +116,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -266,7 +266,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "state_finalized_value_pool_transparent / 100000000",
           "legendFormat": "Transparent",
@@ -275,7 +275,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "state_finalized_value_pool_sprout / 100000000",
           "legendFormat": "Sprout",
@@ -284,7 +284,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "state_finalized_value_pool_sapling / 100000000",
           "legendFormat": "Sapling",
@@ -293,7 +293,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "state_finalized_value_pool_orchard / 100000000",
           "legendFormat": "Orchard",
@@ -302,7 +302,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "state_finalized_value_pool_deferred / 100000000",
           "legendFormat": "Deferred",
@@ -315,7 +315,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -364,7 +364,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "state_finalized_value_pool_transparent / 100000000",
           "legendFormat": "Transparent ZEC",
@@ -377,7 +377,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -426,7 +426,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "state_finalized_value_pool_sprout / 100000000",
           "legendFormat": "Sprout ZEC",
@@ -439,7 +439,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -488,7 +488,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "state_finalized_value_pool_sapling / 100000000",
           "legendFormat": "Sapling ZEC",
@@ -501,7 +501,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -550,7 +550,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "state_finalized_value_pool_orchard / 100000000",
           "legendFormat": "Orchard ZEC",
@@ -563,9 +563,9 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
-      "description": "Pool Health Check: All pools should be non-negative (enforced internally by Zebra)",
+      "description": "Pool Health Check: All pools should be non-negative (enforced internally by Zakura)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -636,7 +636,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "(state_finalized_value_pool_transparent < 0) + (state_finalized_value_pool_sprout < 0) + (state_finalized_value_pool_sapling < 0) + (state_finalized_value_pool_orchard < 0)",
           "legendFormat": "Pool Health Status",
@@ -649,7 +649,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -694,7 +694,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "state_finalized_block_height",
           "legendFormat": "Block Height",
@@ -708,7 +708,7 @@
   "refresh": "10s",
   "schemaVersion": 37,
   "style": "dark",
-  "tags": ["zebra", "zcash", "value-pools"],
+  "tags": ["zakura", "zcash", "value-pools"],
   "templating": {
     "list": []
   },
@@ -718,8 +718,8 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Zebra Value Pools",
-  "uid": "zebra-value-pools",
+  "title": "Zakura Value Pools",
+  "uid": "zakura-value-pools",
   "version": 1,
   "weekStart": ""
 }

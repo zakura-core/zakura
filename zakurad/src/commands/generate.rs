@@ -50,13 +50,13 @@ impl Runnable for GenerateCmd {
 #      - ZAKURA_TRACING__FILTER=debug
 #      - ZAKURA_METRICS__ENDPOINT_ADDR=0.0.0.0:9999
 #
-#    Deprecated ZEBRA_ environment variables are still accepted as a lower-precedence fallback.
+# 2. Environment variables with deprecated ZEBRA_ prefix
 #
-# 2. Configuration file (TOML format)
+# 3. Configuration file (TOML format)
 #    - At the path specified via -c flag, e.g. `zakurad -c myconfig.toml start`, or
 #    - At the default path in the user's preference directory (platform-dependent, see below)
 #
-# 3. Hard-coded defaults (lowest precedence)
+# 4. Hard-coded defaults (lowest precedence)
 #
 # The user's preference directory and the default path to the `zakurad` config are platform dependent,
 # based on `dirs::preference_dir`, see https://docs.rs/dirs/latest/dirs/fn.preference_dir.html :
@@ -114,11 +114,11 @@ fn document_network_p2p_config(config: &str) -> String {
 
     let comments = [
         "# The peer-to-peer stack to run:",
-        "# - \"zebra\" (aka \"v1\", \"legacy\"): the legacy TCP Zcash P2P stack only.",
-        "# - \"zakura\" (aka \"v2\"): the native Zakura P2P v2 stack only.",
-        "# - \"dual\" (aka \"combined\"): both stacks, with legacy fallback.",
-        "# - \"default\": Zebra's default for this network, which can change between",
-        "#   releases. Currently \"zebra\" on Mainnet, and \"dual\" everywhere else.",
+        "# - \"legacy\": the legacy TCP Zcash P2P stack only.",
+        "# - \"zakura\": the native Zakura P2P v2 stack only.",
+        "# - \"dual\": both stacks, with legacy fallback.",
+        "# - \"default\": Zakura's default for this network, which can change between",
+        "#   releases. Currently \"legacy\" on Mainnet, and \"dual\" everywhere else.",
     ]
     .map(ToString::to_string);
 

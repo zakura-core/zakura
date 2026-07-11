@@ -37,14 +37,14 @@ on:
         description: The name of the cached state disk
         value: ${{ jobs.get-cached-disks.outputs.cached_disk_name }}
       lwd_tip_disk:
-        description: true if there is a lightwalletd and Zebra cached state disk, synced near the chain tip
+        description: true if there is a lightwalletd and Zakura cached state disk, synced near the chain tip
         value: ${{ jobs.get-cached-disks.outputs.lwd_tip_disk }}
-      zebra_tip_disk:
-        description: true if there is a Zebra cached state disk synced near the chain tip
-        value: ${{ jobs.get-cached-disks.outputs.zebra_tip_disk }}
-      zebra_checkpoint_disk:
-        description: true if there is a Zebra cached state disk synced to the mandatory Zebra checkpoint
-        value: ${{ jobs.get-cached-disks.outputs.zebra_checkpoint_disk }}
+      zakura_tip_disk:
+        description: true if there is a Zakura cached state disk synced near the chain tip
+        value: ${{ jobs.get-cached-disks.outputs.zakura_tip_disk }}
+      zakura_checkpoint_disk:
+        description: true if there is a Zakura cached state disk synced to the mandatory Zakura checkpoint
+        value: ${{ jobs.get-cached-disks.outputs.zakura_checkpoint_disk }}
 
 permissions:
   contents: read
@@ -58,8 +58,8 @@ jobs:
       state_version: ${{ steps.get-available-disks.outputs.state_version || steps.set-release-defaults.outputs.state_version }}
       cached_disk_name: ${{ steps.get-available-disks.outputs.cached_disk_name || steps.set-release-defaults.outputs.cached_disk_name }}
       lwd_tip_disk: ${{ steps.get-available-disks.outputs.lwd_tip_disk || steps.set-release-defaults.outputs.lwd_tip_disk }}
-      zebra_tip_disk: ${{ steps.get-available-disks.outputs.zebra_tip_disk || steps.set-release-defaults.outputs.zebra_tip_disk }}
-      zebra_checkpoint_disk: ${{ steps.get-available-disks.outputs.zebra_checkpoint_disk || steps.set-release-defaults.outputs.zebra_checkpoint_disk }}
+      zakura_tip_disk: ${{ steps.get-available-disks.outputs.zakura_tip_disk || steps.set-release-defaults.outputs.zakura_tip_disk }}
+      zakura_checkpoint_disk: ${{ steps.get-available-disks.outputs.zakura_checkpoint_disk || steps.set-release-defaults.outputs.zakura_checkpoint_disk }}
     permissions:
       contents: read
       id-token: write
@@ -118,8 +118,8 @@ jobs:
           echo "state_version=${LOCAL_STATE_VERSION}" >> "${GITHUB_OUTPUT}"
           echo "cached_disk_name=${CACHED_DISK_NAME}" >> "${GITHUB_OUTPUT}"
           echo "lwd_tip_disk=${LWD_TIP_DISK}" >> "${GITHUB_OUTPUT}"
-          echo "zebra_tip_disk=${ZEBRA_TIP_DISK}" >> "${GITHUB_OUTPUT}"
-          echo "zebra_checkpoint_disk=${ZEBRA_CHECKPOINT_DISK}" >> "${GITHUB_OUTPUT}"
+          echo "zakura_tip_disk=${ZAKURA_TIP_DISK}" >> "${GITHUB_OUTPUT}"
+          echo "zakura_checkpoint_disk=${ZAKURA_CHECKPOINT_DISK}" >> "${GITHUB_OUTPUT}"
 
       # For releases, set default outputs indicating no cached disks are available
       - name: Set default outputs for releases
@@ -129,5 +129,5 @@ jobs:
           echo "state_version=" >> "${GITHUB_OUTPUT}"
           echo "cached_disk_name=" >> "${GITHUB_OUTPUT}"
           echo "lwd_tip_disk=false" >> "${GITHUB_OUTPUT}"
-          echo "zebra_tip_disk=false" >> "${GITHUB_OUTPUT}"
-          echo "zebra_checkpoint_disk=false" >> "${GITHUB_OUTPUT}"
+          echo "zakura_tip_disk=false" >> "${GITHUB_OUTPUT}"
+          echo "zakura_checkpoint_disk=false" >> "${GITHUB_OUTPUT}"

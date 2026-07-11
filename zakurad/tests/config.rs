@@ -180,6 +180,21 @@ fn config_env_override_defaults() {
 }
 
 #[test]
+fn config_zakura_env_overrides_legacy_zebra_env() {
+    let env = EnvGuard::new();
+
+    env.set_var("ZEBRA_RPC__LISTEN_ADDR", "127.0.0.1:18231");
+    env.set_var("ZAKURA_RPC__LISTEN_ADDR", "127.0.0.1:18232");
+
+    let config = ZakuradConfig::load(None).expect("load config with both env prefixes");
+
+    assert_eq!(
+        config.rpc.listen_addr.unwrap().to_string(),
+        "127.0.0.1:18232"
+    );
+}
+
+#[test]
 fn config_env_override_file() {
     let env = EnvGuard::new();
 
@@ -229,7 +244,7 @@ network = "Testnet"
 fn config_invalid_env_values_error() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_RPC__LISTEN_ADDR", "invalid_address");
+    env.set_var("ZAKURA_RPC__LISTEN_ADDR", "invalid_address");
 
     ZakuradConfig::load(None).expect_err("Should fail with invalid RPC listen address");
 }
@@ -248,8 +263,8 @@ fn config_nested_env_vars() {
 #[test]
 fn config_zcashd_compat_source_and_path_env() {
     let env = EnvGuard::new();
-    env.set_var("ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE", "path");
-    env.set_var("ZEBRA_ZCASHD_COMPAT__ZCASHD_PATH", "/usr/local/bin/zcashd");
+    env.set_var("ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE", "path");
+    env.set_var("ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH", "/usr/local/bin/zcashd");
 
     let config = ZakuradConfig::load(None).expect("load config with zcashd compat env vars");
     assert_eq!(
@@ -265,7 +280,7 @@ fn config_zcashd_compat_source_and_path_env() {
 #[test]
 fn config_zcashd_compat_embedded_source_env() {
     let env = EnvGuard::new();
-    env.set_var("ZEBRA_ZCASHD_COMPAT__ZCASHD_SOURCE", "embedded");
+    env.set_var("ZAKURA_ZCASHD_COMPAT__ZCASHD_SOURCE", "embedded");
 
     let config = ZakuradConfig::load(None).expect("load config with embedded source");
     assert_eq!(
@@ -280,9 +295,9 @@ fn config_zcashd_compat_embedded_source_env() {
 fn config_zakura_network_network_env() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_NETWORK__NETWORK", "Testnet");
+    env.set_var("ZAKURA_NETWORK__NETWORK", "Testnet");
 
-    let config = ZakuradConfig::load(None).expect("load config with ZEBRA_NETWORK__NETWORK");
+    let config = ZakuradConfig::load(None).expect("load config with ZAKURA_NETWORK__NETWORK");
     assert_eq!(config.network.network.to_string(), "Testnet");
 }
 
@@ -290,9 +305,9 @@ fn config_zakura_network_network_env() {
 fn config_zakura_rpc_listen_addr_env() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_RPC__LISTEN_ADDR", "127.0.0.1:18232");
+    env.set_var("ZAKURA_RPC__LISTEN_ADDR", "127.0.0.1:18232");
 
-    let config = ZakuradConfig::load(None).expect("load config with ZEBRA_RPC__LISTEN_ADDR");
+    let config = ZakuradConfig::load(None).expect("load config with ZAKURA_RPC__LISTEN_ADDR");
     assert_eq!(
         config.rpc.listen_addr.unwrap().to_string(),
         "127.0.0.1:18232"
@@ -304,19 +319,19 @@ fn config_zakura_rpc_listen_addr_env() {
 fn config_zakura_state_cache_dir_env() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_STATE__CACHE_DIR", "/test/cache");
+    env.set_var("ZAKURA_STATE__CACHE_DIR", "/test/cache");
 
-    let config = ZakuradConfig::load(None).expect("load config with ZEBRA_STATE__CACHE_DIR");
+    let config = ZakuradConfig::load(None).expect("load config with ZAKURA_STATE__CACHE_DIR");
     assert_eq!(config.state.cache_dir, PathBuf::from("/test/cache"));
 }
 
 #[test]
-fn config_zebra_metrics_endpoint_addr_env() {
+fn config_zakura_metrics_endpoint_addr_env() {
     let env = EnvGuard::new();
 
-    env.set_var("ZEBRA_METRICS__ENDPOINT_ADDR", "0.0.0.0:9999");
+    env.set_var("ZAKURA_METRICS__ENDPOINT_ADDR", "0.0.0.0:9999");
 
-    let config = ZakuradConfig::load(None).expect("load config with ZEBRA_METRICS__ENDPOINT_ADDR");
+    let config = ZakuradConfig::load(None).expect("load config with ZAKURA_METRICS__ENDPOINT_ADDR");
     assert_eq!(
         config.metrics.endpoint_addr.unwrap().to_string(),
         "0.0.0.0:9999"
@@ -324,7 +339,7 @@ fn config_zebra_metrics_endpoint_addr_env() {
 }
 
 #[test]
-fn config_zebra_tracing_log_file_env() {
+fn config_zakura_tracing_log_file_env() {
     let env = EnvGuard::new();
 
     env.set_var("ZAKURA_TRACING__LOG_FILE", "/test/zakura.log");
@@ -337,21 +352,54 @@ fn config_zebra_tracing_log_file_env() {
 }
 
 #[test]
-fn config_zakura_env_overrides_legacy_zebra_env() {
+fn config_legacy_zebra_env_is_supported() {
     let env = EnvGuard::new();
 
     env.set_var("ZEBRA_RPC__LISTEN_ADDR", "127.0.0.1:18232");
-    env.set_var("ZAKURA_RPC__LISTEN_ADDR", "127.0.0.1:8232");
 
-    let config = ZakuradConfig::load(None).expect("load config with both env prefixes");
+    let config = ZakuradConfig::load(None).expect("load config with legacy ZEBRA_ env var");
     assert_eq!(
         config.rpc.listen_addr.unwrap().to_string(),
-        "127.0.0.1:8232"
+        "127.0.0.1:18232"
     );
 }
 
 #[test]
-fn config_zebra_mining_miner_address_from_toml() {
+fn config_zakura_target_env_is_supported() {
+    let env = EnvGuard::new();
+
+    env.set_var("ZAKURA_TARGET_STATE__CACHE_DIR", "/target/cache");
+
+    let config = ZakuradConfig::load_with_env(None, "ZAKURA_TARGET")
+        .expect("load config with ZAKURA_TARGET_STATE__CACHE_DIR");
+    assert_eq!(config.state.cache_dir, PathBuf::from("/target/cache"));
+}
+
+#[test]
+fn config_legacy_zebra_target_env_is_supported() {
+    let env = EnvGuard::new();
+
+    env.set_var("ZEBRA_TARGET_STATE__CACHE_DIR", "/target/cache");
+
+    let config = ZakuradConfig::load_with_env(None, "ZAKURA_TARGET")
+        .expect("load config with legacy ZEBRA_TARGET_ env var");
+    assert_eq!(config.state.cache_dir, PathBuf::from("/target/cache"));
+}
+
+#[test]
+fn config_zakura_target_env_overrides_legacy_zebra_target_env() {
+    let env = EnvGuard::new();
+
+    env.set_var("ZEBRA_TARGET_STATE__CACHE_DIR", "/legacy/cache");
+    env.set_var("ZAKURA_TARGET_STATE__CACHE_DIR", "/target/cache");
+
+    let config = ZakuradConfig::load_with_env(None, "ZAKURA_TARGET")
+        .expect("load target config with both env prefixes");
+    assert_eq!(config.state.cache_dir, PathBuf::from("/target/cache"));
+}
+
+#[test]
+fn config_zakura_mining_miner_address_from_toml() {
     let _env = EnvGuard::new();
 
     let miner_address = "u1cymdny2u2vllkx7t5jnelp0kde0dgnwu0jzmggzguxvxj6fe7gpuqehywejndlrjwgk9snr6g69azs8jfet78s9zy60uepx6tltk7ee57jlax49dezkhkgvjy2puuue6dvaevt53nah7t2cc2k4p0h0jxmlu9sx58m2xdm5f9sy2n89jdf8llflvtml2ll43e334avu2fwytuna404a";
@@ -386,7 +434,7 @@ fn config_env_unknown_non_sensitive_key_errors() {
     let env = EnvGuard::new();
 
     // Unknown field without sensitive suffix should cause an error
-    env.set_var("ZEBRA_MINING__FOO", "bar");
+    env.set_var("ZAKURA_MINING__FOO", "bar");
 
     ZakuradConfig::load(None)
         .expect_err("Unknown non-sensitive env key should error (deny_unknown_fields)");
@@ -397,7 +445,7 @@ fn config_env_unknown_sensitive_key_errors() {
     let env = EnvGuard::new();
 
     // Unknown field with sensitive suffix should cause an error
-    env.set_var("ZEBRA_MINING__TOKEN", "secret-token");
+    env.set_var("ZAKURA_MINING__TOKEN", "secret-token");
 
     let result = ZakuradConfig::load(None);
     assert!(result.is_err(), "Sensitive env key should cause an error");
@@ -410,7 +458,7 @@ fn config_env_elasticsearch_password_errors() {
     let env = EnvGuard::new();
 
     // This key may or may not exist depending on features. It should be filtered regardless.
-    env.set_var("ZEBRA_STATE__ELASTICSEARCH_PASSWORD", "topsecret");
+    env.set_var("ZAKURA_STATE__ELASTICSEARCH_PASSWORD", "topsecret");
 
     let result = ZakuradConfig::load(None);
     assert!(result.is_err(), "Sensitive env key should cause an error");

@@ -62,7 +62,7 @@ async fn inbound_peers_empty_address_book() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         listen_addr,
-    ) = setup(None, P2pStack::Zebra).await;
+    ) = setup(None, P2pStack::Legacy).await;
 
     // yield and sleep until the address book lock is released.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -215,7 +215,7 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(None, P2pStack::Zebra).await;
+    ) = setup(None, P2pStack::Legacy).await;
 
     let test_block = block::Hash([0x11; 32]);
 
@@ -298,7 +298,7 @@ async fn inbound_tx_empty_state_notfound() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(None, P2pStack::Zebra).await;
+    ) = setup(None, P2pStack::Legacy).await;
 
     let test_tx = UnminedTxId::from_legacy_id(TxHash([0x22; 32]));
     let test_wtx: UnminedTxId = WtxId {
@@ -430,7 +430,7 @@ async fn outbound_tx_unrelated_response_notfound() -> Result<(), crate::BoxError
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(Some(unrelated_response), P2pStack::Zebra).await;
+    ) = setup(Some(unrelated_response), P2pStack::Legacy).await;
 
     let test_tx5 = UnminedTxId::from_legacy_id(TxHash([0x55; 32]));
     let test_wtx67: UnminedTxId = WtxId {
@@ -579,7 +579,7 @@ async fn outbound_tx_partial_response_notfound() -> Result<(), crate::BoxError> 
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(Some(repeated_response), P2pStack::Zebra).await;
+    ) = setup(Some(repeated_response), P2pStack::Legacy).await;
 
     let missing_tx_id = UnminedTxId::from_legacy_id(TxHash([0x22; 32]));
 

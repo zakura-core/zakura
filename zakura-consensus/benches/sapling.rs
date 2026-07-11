@@ -8,7 +8,7 @@
 //! # Benchmark group
 //!
 //! `groth16_sapling`: matches the `verifier` label in
-//! `zebra.consensus.batch.duration_seconds` emitted from
+//! `zakura.consensus.batch.duration_seconds` emitted from
 //! `zakura-consensus/src/primitives/sapling.rs`, so a prod regression on the
 //! Sapling histogram maps to this file by name.
 //!

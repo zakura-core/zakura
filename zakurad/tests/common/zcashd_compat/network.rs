@@ -24,7 +24,7 @@ pub async fn peer_connectivity() -> Result<()> {
     }
 
     let peers: Vec<serde_json::Value> = setup
-        .zebra_client
+        .zakura_client
         .json_result_from_call("getpeerinfo", "[]")
         .await
         .map_err(|e| eyre!("getpeerinfo: {e}"))?;
@@ -49,7 +49,7 @@ pub async fn mempool_info_valid() -> Result<()> {
     };
 
     let info: serde_json::Value = setup
-        .zebra_client
+        .zakura_client
         .json_result_from_call("getmempoolinfo", "[]")
         .await
         .map_err(|e| eyre!("getmempoolinfo: {e}"))?;
@@ -88,8 +88,8 @@ pub async fn historical_block_consistent() -> Result<()> {
 
     let params = "[1]";
 
-    let zebra_hash: serde_json::Value = setup
-        .zebra_client
+    let zakura_hash: serde_json::Value = setup
+        .zakura_client
         .json_result_from_call("getblockhash", params)
         .await
         .map_err(|e| eyre!("zakurad getblockhash(1): {e}"))?;
@@ -101,7 +101,7 @@ pub async fn historical_block_consistent() -> Result<()> {
         .map_err(|e| eyre!("zcashd getblockhash(1): {e}"))?;
 
     assert_eq!(
-        zebra_hash, zcashd_hash,
+        zakura_hash, zcashd_hash,
         "zakurad and zcashd disagree on block hash at height 1"
     );
 

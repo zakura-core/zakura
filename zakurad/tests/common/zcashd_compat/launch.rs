@@ -16,8 +16,8 @@ use super::{
     config::{
         build_zcashd_compat_config, ZcashdCompatConfig, ZCASHD_TEST_RPC_PASS, ZCASHD_TEST_RPC_USER,
     },
-    ZcashdRpcClient, TEST_ZCASHD_COOKIE_FILE, TEST_ZCASHD_RPC_ADDR, TEST_ZCASHD_RPC_PASSWORD,
-    TEST_ZCASHD_RPC_USER, TEST_ZEBRAD_RPC_ADDR,
+    ZcashdRpcClient, TEST_ZAKURAD_RPC_ADDR, TEST_ZCASHD_COOKIE_FILE, TEST_ZCASHD_RPC_ADDR,
+    TEST_ZCASHD_RPC_PASSWORD, TEST_ZCASHD_RPC_USER,
 };
 use crate::common::{
     config::{read_listen_addr_from_logs, testdir},
@@ -35,7 +35,7 @@ pub struct ZcashdCompatSetup {
     /// Zcashd datadir, present only when the test harness manages zcashd.
     pub zcashd_datadir: Option<PathBuf>,
     /// Client for zakurad's unauthenticated main RPC.
-    pub zebra_client: RpcRequestClient,
+    pub zakura_client: RpcRequestClient,
     /// Client for zcashd's own authenticated RPC (wallet operations).
     pub zcashd_client: ZcashdRpcClient,
     /// The network under test.
@@ -151,7 +151,7 @@ pub async fn spawn_zakurad_with_zcashd_compat() -> Result<ZcashdCompatSetup> {
     // Extra stability margin before poking zcashd
     sleep(LAUNCH_DELAY).await;
 
-    let zebra_client = RpcRequestClient::new(zakura_rpc_addr);
+    let zakura_client = RpcRequestClient::new(zakura_rpc_addr);
     let zcashd_client = ZcashdRpcClient::new(
         zcashd_own_rpc_addr,
         ZCASHD_TEST_RPC_USER,
@@ -163,7 +163,7 @@ pub async fn spawn_zakurad_with_zcashd_compat() -> Result<ZcashdCompatSetup> {
     Ok(ZcashdCompatSetup {
         managed: Some(zakurad),
         zcashd_datadir: Some(compat_cfg.zcashd_datadir),
-        zebra_client,
+        zakura_client,
         zcashd_client,
         network: Network::new_regtest(Default::default()),
         zakura_rpc_addr,
@@ -177,10 +177,10 @@ pub async fn spawn_zakurad_with_zcashd_compat() -> Result<ZcashdCompatSetup> {
 pub async fn connect_to_external_zcashd_compat(kind: NetworkKind) -> Result<ZcashdCompatSetup> {
     let _init_guard = zakura_test::init();
 
-    let zakura_rpc_addr: SocketAddr = std::env::var(TEST_ZEBRAD_RPC_ADDR)
-        .map_err(|_| eyre!("{TEST_ZEBRAD_RPC_ADDR} must be set for external mode"))?
+    let zakura_rpc_addr: SocketAddr = std::env::var(TEST_ZAKURAD_RPC_ADDR)
+        .map_err(|_| eyre!("{TEST_ZAKURAD_RPC_ADDR} must be set for external mode"))?
         .parse()
-        .map_err(|e| eyre!("invalid {TEST_ZEBRAD_RPC_ADDR}: {e}"))?;
+        .map_err(|e| eyre!("invalid {TEST_ZAKURAD_RPC_ADDR}: {e}"))?;
 
     let zcashd_own_rpc_addr: SocketAddr = std::env::var(TEST_ZCASHD_RPC_ADDR)
         .map_err(|_| eyre!("{TEST_ZCASHD_RPC_ADDR} must be set for external mode"))?
@@ -213,7 +213,7 @@ pub async fn connect_to_external_zcashd_compat(kind: NetworkKind) -> Result<Zcas
     Ok(ZcashdCompatSetup {
         managed: None,
         zcashd_datadir: None,
-        zebra_client: RpcRequestClient::new(zakura_rpc_addr),
+        zakura_client: RpcRequestClient::new(zakura_rpc_addr),
         zcashd_client,
         network,
         zakura_rpc_addr,

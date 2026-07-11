@@ -31,7 +31,7 @@
 //! - `SYNC_FULL_TESTNET_TIMEOUT_MINUTES` env variable: The total number of minutes we
 //!   will allow this test to run or give up. Value for the Testnet full sync tests.
 //! - A zakurad state cache directory is required for some tests, either at the default state cache
-//!   directory path, or at the path defined in the `ZEBRA_STATE__CACHE_DIR` env variable.
+//!   directory path, or at the path defined in the `ZAKURA_STATE__CACHE_DIR` env variable.
 //!   For some sync tests, this directory needs to be created in the file system
 //!   with write permissions.
 //!
@@ -40,16 +40,16 @@
 //! ```console
 //! $ cargo nextest run --profile sync-large-checkpoints-empty
 //!
-//! $ ZEBRA_STATE__CACHE_DIR="/zakurad-cache" cargo nextest run --profile sync-full-mainnet
+//! $ ZAKURA_STATE__CACHE_DIR="/zakurad-cache" cargo nextest run --profile sync-full-mainnet
 //!
-//! $ ZEBRA_STATE__CACHE_DIR="/zakurad-cache" cargo nextest run --profile sync-full-testnet
+//! $ ZAKURA_STATE__CACHE_DIR="/zakurad-cache" cargo nextest run --profile sync-full-testnet
 //! ```
 //!
 //! For tests that require a cache directory, you may need to create it first:
 //! ```console
-//! $ export ZEBRA_STATE__CACHE_DIR="/zakurad-cache"
-//! $ sudo mkdir -p "$ZEBRA_STATE__CACHE_DIR"
-//! $ sudo chmod 777 "$ZEBRA_STATE__CACHE_DIR"
+//! $ export ZAKURA_STATE__CACHE_DIR="/zakurad-cache"
+//! $ sudo mkdir -p "$ZAKURA_STATE__CACHE_DIR"
+//! $ sudo chmod 777 "$ZAKURA_STATE__CACHE_DIR"
 //! ```
 //!
 //! Please refer to the documentation of each test for more information.
@@ -62,7 +62,7 @@
 //! Some tests require environment variables to be set:
 //!
 //! - `TEST_LIGHTWALLETD`: Must be set to run any of the lightwalletd tests.
-//! - `ZEBRA_STATE__CACHE_DIR`: The path to a Zebra cached state directory.
+//! - `ZAKURA_STATE__CACHE_DIR`: The path to a Zakura cached state directory.
 //! - `LWD_CACHE_DIR`: The path to a lightwalletd database.
 //!
 //! Here are some examples of running each test:
@@ -72,16 +72,16 @@
 //! $ TEST_LIGHTWALLETD=1 cargo nextest run --profile lwd-integration
 //!
 //! # Run the lightwalletd update sync test
-//! $ TEST_LIGHTWALLETD=1 ZEBRA_STATE__CACHE_DIR="/path/to/zebra/state" LWD_CACHE_DIR="/path/to/lightwalletd/database" cargo nextest run --profile lwd-sync-update
+//! $ TEST_LIGHTWALLETD=1 ZAKURA_STATE__CACHE_DIR="/path/to/zakura/state" LWD_CACHE_DIR="/path/to/lightwalletd/database" cargo nextest run --profile lwd-sync-update
 //!
 //! # Run the lightwalletd full sync test
-//! $ TEST_LIGHTWALLETD=1 ZEBRA_STATE__CACHE_DIR="/path/to/zebra/state" cargo nextest run --profile lwd-sync-full
+//! $ TEST_LIGHTWALLETD=1 ZAKURA_STATE__CACHE_DIR="/path/to/zakura/state" cargo nextest run --profile lwd-sync-full
 //!
 //! # Run the lightwalletd gRPC wallet test (requires --features lightwalletd-grpc-tests)
-//! $ TEST_LIGHTWALLETD=1 ZEBRA_STATE__CACHE_DIR="/path/to/zebra/state" LWD_CACHE_DIR="/path/to/lightwalletd/database" cargo nextest run --profile lwd-grpc-wallet --features lightwalletd-grpc-tests
+//! $ TEST_LIGHTWALLETD=1 ZAKURA_STATE__CACHE_DIR="/path/to/zakura/state" LWD_CACHE_DIR="/path/to/lightwalletd/database" cargo nextest run --profile lwd-grpc-wallet --features lightwalletd-grpc-tests
 //!
 //! # Run the lightwalletd send transaction test (requires --features lightwalletd-grpc-tests)
-//! $ TEST_LIGHTWALLETD=1 ZEBRA_STATE__CACHE_DIR="/path/to/zebra/state" LWD_CACHE_DIR="/path/to/lightwalletd/database" cargo nextest run --profile lwd-rpc-send-tx --features lightwalletd-grpc-tests
+//! $ TEST_LIGHTWALLETD=1 ZAKURA_STATE__CACHE_DIR="/path/to/zakura/state" LWD_CACHE_DIR="/path/to/lightwalletd/database" cargo nextest run --profile lwd-rpc-send-tx --features lightwalletd-grpc-tests
 //! ```
 //!
 //! ## Getblocktemplate tests
@@ -89,19 +89,19 @@
 //! Example of how to run the rpc_get_block_template test:
 //!
 //! ```console
-//! ZEBRA_STATE__CACHE_DIR=/path/to/zebra/state cargo nextest run --profile rpc-get-block-template
+//! ZAKURA_STATE__CACHE_DIR=/path/to/zakura/state cargo nextest run --profile rpc-get-block-template
 //! ```
 //!
 //! Example of how to run the rpc_submit_block test:
 //!
 //! ```console
-//! ZEBRA_STATE__CACHE_DIR=/path/to/zebra/state cargo nextest run --profile rpc-submit-block
+//! ZAKURA_STATE__CACHE_DIR=/path/to/zakura/state cargo nextest run --profile rpc-submit-block
 //! ```
 //!
 //! Example of how to run the has_spending_transaction_ids test (requires indexer feature):
 //!
 //! ```console
-//! RUST_LOG=info ZEBRA_STATE__CACHE_DIR=/path/to/zebra/state cargo nextest run --profile indexer-has-spending-transaction-ids --features "indexer"
+//! RUST_LOG=info ZAKURA_STATE__CACHE_DIR=/path/to/zakura/state cargo nextest run --profile indexer-has-spending-transaction-ids --features "indexer"
 //! ```
 //!
 //! Please refer to the documentation of each test for more information.
@@ -111,15 +111,15 @@
 //! Generate checkpoints on mainnet and testnet using a cached state:
 //! ```console
 //! # Generate checkpoints for mainnet:
-//! ZEBRA_STATE__CACHE_DIR=/path/to/zebra/state cargo nextest run --profile generate-checkpoints-mainnet
+//! ZAKURA_STATE__CACHE_DIR=/path/to/zakura/state cargo nextest run --profile generate-checkpoints-mainnet
 //!
 //! # Generate checkpoints for testnet:
-//! ZEBRA_STATE__CACHE_DIR=/path/to/zebra/state cargo nextest run --profile generate-checkpoints-testnet
+//! ZAKURA_STATE__CACHE_DIR=/path/to/zakura/state cargo nextest run --profile generate-checkpoints-testnet
 //! ```
 //!
 //! You can also use the entrypoint script directly:
 //! ```console
-//! FEATURES=zakura-checkpoints ZEBRA_STATE__CACHE_DIR=/path/to/zebra/state docker/entrypoint.sh
+//! FEATURES=zakura-checkpoints ZAKURA_STATE__CACHE_DIR=/path/to/zakura/state docker/entrypoint.sh
 //! ```
 //!
 //! ## Disk Space for Testing
@@ -431,12 +431,27 @@ async fn db_init_outside_future_executor() -> Result<()> {
     Ok(())
 }
 
-/// Check that the block state and peer list caches are written to disk.
+/// Check that persistent block state and peer list caches survive a node run.
 #[test]
 fn persistent_mode() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let testdir = testdir()?.with_config(&mut persistent_test_config(&Mainnet)?)?;
+    let mut config = persistent_test_config(&Mainnet)?;
+    // Avoid depending on live Mainnet peers. A pre-seeded cache exercises the
+    // persistent peer-cache path while failed local dialing leaves it intact.
+    config.network.initial_mainnet_peers.clear();
+    let testdir = testdir()?.with_config(&mut config)?;
+    let peer_cache_file = config
+        .network
+        .cache_dir
+        .peer_cache_file_path(&Mainnet)
+        .expect("persistent test config enables the peer cache");
+    fs::create_dir_all(
+        peer_cache_file
+            .parent()
+            .expect("peer cache file has a parent directory"),
+    )?;
+    fs::write(&peer_cache_file, "127.0.0.1:1\n")?;
     let testdir = &testdir;
 
     let mut child = testdir.spawn_child(args!["-v", "start"])?;
@@ -448,6 +463,7 @@ fn persistent_mode() -> Result<()> {
 
     // Make sure the command was killed
     output.assert_was_killed()?;
+    output.stdout_line_contains("loaded cached peer IP addresses")?;
 
     let cache_dir = testdir.path().join("state");
     assert_with_context!(
@@ -456,11 +472,10 @@ fn persistent_mode() -> Result<()> {
         "state directory empty despite persistent state config"
     );
 
-    let cache_dir = testdir.path().join("network");
     assert_with_context!(
-        cache_dir.read_dir()?.count() > 0,
+        fs::read_to_string(peer_cache_file)?.trim() == "127.0.0.1:1",
         &output,
-        "network directory empty despite persistent network config"
+        "peer cache changed despite having no connected peers"
     );
 
     Ok(())
@@ -665,7 +680,7 @@ fn config_tests() -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     last_config_is_stored()?;
 
-    // Check that Zebra's previous configurations still work
+    // Check that previous Zakura configurations still work
     stored_configs_work()?;
 
     // We run the `zakurad` app test after the config tests, to avoid potential port conflicts
@@ -843,7 +858,7 @@ fn last_config_is_stored() -> Result<()> {
         "latest zakurad config is not being tested for compatibility. \n\
          \n\
          Take the missing config file logged above, \n\
-         and commit it to Zebra's git repository as:\n\
+         and commit it to Zakura's git repository as:\n\
          {} \n\
          \n\
          Or run: \n\
@@ -1895,7 +1910,7 @@ fn lwd_integration() -> Result<()> {
 /// Make sure `zakurad` can sync from peers, but don't actually launch `lightwalletd`.
 ///
 /// This test only runs when a persistent cached state directory path is configured
-/// (for example, by setting `ZEBRA_STATE__CACHE_DIR`).
+/// (for example, by setting `ZAKURA_STATE__CACHE_DIR`).
 ///
 /// This test might work on Windows.
 #[test]
@@ -1908,7 +1923,7 @@ fn sync_update_mainnet() -> Result<()> {
 ///
 /// This test only runs when:
 /// - `TEST_LIGHTWALLETD` is set,
-/// - a persistent cached state directory path is configured (e.g., via `ZEBRA_STATE__CACHE_DIR`), and
+/// - a persistent cached state directory path is configured (e.g., via `ZAKURA_STATE__CACHE_DIR`), and
 /// - Zebra is compiled with `--features=lightwalletd-grpc-tests`.
 ///
 /// This test doesn't work on Windows, so it is always skipped on that platform.
@@ -1923,7 +1938,7 @@ fn lwd_sync_update() -> Result<()> {
 ///
 /// This test only runs when:
 /// - `TEST_LIGHTWALLETD` is set,
-/// - a persistent cached state is configured (e.g., via `ZEBRA_STATE__CACHE_DIR`), and
+/// - a persistent cached state is configured (e.g., via `ZAKURA_STATE__CACHE_DIR`), and
 /// - Zebra is compiled with `--features=lightwalletd-grpc-tests`.
 ///
 ///
@@ -2041,7 +2056,7 @@ fn lwd_integration_test(test_type: TestType) -> Result<()> {
     // Store the state version message so we can wait for the upgrade later if needed.
     let state_version_message = wait_for_state_version_message(&mut zakurad)?;
 
-    if test_type.needs_zebra_cached_state() {
+    if test_type.needs_zakura_cached_state() {
         zakurad
             .expect_stdout_line_matches(r"loaded Zebra state cache .*tip.*=.*Height\([0-9]{7}\)")?;
     } else {
@@ -2082,7 +2097,7 @@ fn lwd_integration_test(test_type: TestType) -> Result<()> {
     // Wait for zakurad to sync the genesis block before launching lightwalletd,
     // if lightwalletd is launched and zakurad starts with an empty state.
     // This prevents lightwalletd from exiting early due to an empty state.
-    if test_type.launches_lightwalletd() && !test_type.needs_zebra_cached_state() {
+    if test_type.launches_lightwalletd() && !test_type.needs_zakura_cached_state() {
         tracing::info!(
             ?test_type,
             "waiting for zakurad to sync genesis block before launching lightwalletd...",
@@ -2118,7 +2133,7 @@ fn lwd_integration_test(test_type: TestType) -> Result<()> {
         // Check that `lightwalletd` is calling the expected Zebra RPCs
 
         // getblockchaininfo
-        if test_type.needs_zebra_cached_state() {
+        if test_type.needs_zakura_cached_state() {
             lightwalletd.expect_stdout_line_matches(
                 "Got sapling height 419200 block height [0-9]{7} chain main branchID [0-9a-f]{8}",
             )?;
@@ -2155,7 +2170,7 @@ fn lwd_integration_test(test_type: TestType) -> Result<()> {
         // Until the Sapling activation block has been downloaded,
         // lightwalletd will keep retrying getblock.
         if !test_type.allow_lightwalletd_cached_state() {
-            if test_type.needs_zebra_cached_state() {
+            if test_type.needs_zakura_cached_state() {
                 lightwalletd.expect_stdout_line_matches(
                     "([Aa]dding block to cache)|([Ww]aiting for block)",
                 )?;
@@ -2172,7 +2187,7 @@ fn lwd_integration_test(test_type: TestType) -> Result<()> {
     };
 
     // Wait for zakurad and lightwalletd to sync, if needed.
-    let (mut zakurad, lightwalletd) = if test_type.needs_zebra_cached_state() {
+    let (mut zakurad, lightwalletd) = if test_type.needs_zakura_cached_state() {
         if let Some((lightwalletd, lightwalletd_rpc_port)) = lightwalletd_and_port {
             #[cfg(feature = "lightwalletd-grpc-tests")]
             {
@@ -2278,7 +2293,7 @@ fn lwd_integration_test(test_type: TestType) -> Result<()> {
 /// The second node will panic with the Zcash listener conflict hint added in #1535.
 #[test]
 #[cfg(not(target_os = "windows"))]
-fn zebra_zcash_listener_conflict() -> Result<()> {
+fn zakura_zcash_listener_conflict() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     // [Note on port conflict](#Note on port conflict)
@@ -2307,7 +2322,7 @@ fn zebra_zcash_listener_conflict() -> Result<()> {
 /// conflict hint added in #1535.
 #[test]
 #[cfg(all(feature = "prometheus", not(target_os = "windows")))]
-fn zebra_metrics_conflict() -> Result<()> {
+fn zakura_metrics_conflict() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     // [Note on port conflict](#Note on port conflict)
@@ -2336,7 +2351,7 @@ fn zebra_metrics_conflict() -> Result<()> {
 /// conflict hint added in #1535.
 #[test]
 #[cfg(all(feature = "filter-reload", not(target_os = "windows")))]
-fn zebra_tracing_conflict() -> Result<()> {
+fn zakura_tracing_conflict() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     // [Note on port conflict](#Note on port conflict)
@@ -4390,7 +4405,10 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
     config.network.crawl_new_peer_interval = Duration::from_secs(5);
 
     let rpc_listen_addr = config.rpc.listen_addr.unwrap();
-    let rpc_client_1 = RpcRequestClient::new(rpc_listen_addr);
+    // Use a longer timeout because `generate [500]` mines 500 blocks in a single
+    // RPC call, which can exceed the default timeout at ~400ms per block.
+    let rpc_client_1 =
+        RpcRequestClient::new_with_timeout(rpc_listen_addr, Duration::from_secs(15 * 60));
 
     tracing::info!(
         ?rpc_listen_addr,
@@ -4750,20 +4768,20 @@ async fn zcashd_compat_reorg_restart_deep_chain() -> Result<()> {
     common::zcashd_compat::reorg::restart_deep_chain().await
 }
 
-/// See [`common::zcashd_compat::reorg::zebra_tip_behind_local`] for details.
+/// See [`common::zcashd_compat::reorg::zakura_tip_behind_local`] for details.
 #[tokio::test]
 #[ignore]
 #[cfg(unix)]
-async fn zcashd_compat_reorg_zebra_tip_behind_local() -> Result<()> {
-    common::zcashd_compat::reorg::zebra_tip_behind_local().await
+async fn zcashd_compat_reorg_zakura_tip_behind_local() -> Result<()> {
+    common::zcashd_compat::reorg::zakura_tip_behind_local().await
 }
 
-/// See [`common::zcashd_compat::reorg::reorg_context_zebra_tip_behind_recovers`] for details.
+/// See [`common::zcashd_compat::reorg::reorg_context_zakura_tip_behind_recovers`] for details.
 #[tokio::test]
 #[ignore]
 #[cfg(unix)]
-async fn zcashd_compat_reorg_context_zebra_tip_behind_recovers() -> Result<()> {
-    common::zcashd_compat::reorg::reorg_context_zebra_tip_behind_recovers().await
+async fn zcashd_compat_reorg_context_zakura_tip_behind_recovers() -> Result<()> {
+    common::zcashd_compat::reorg::reorg_context_zakura_tip_behind_recovers().await
 }
 
 /// See [`common::zcashd_compat::reorg::churn`] for details.

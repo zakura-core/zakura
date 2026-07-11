@@ -265,7 +265,7 @@ pub(crate) fn add_ironwood_to_non_finalized_chain_unique<'block>(
 }
 
 /// Remove nullifiers that were previously added to this non-finalized
-/// [`Chain`][1] by this shielded data.
+/// [`Chain`] by this shielded data.
 ///
 /// "A note can change from being unspent to spent as a node’s view
 /// of the best valid block chain is extended by new transactions.
@@ -285,9 +285,7 @@ pub(crate) fn add_ironwood_to_non_finalized_chain_unique<'block>(
 ///
 /// Blocks with duplicate nullifiers are rejected by
 /// [`add_to_non_finalized_chain_unique`], so this shielded data should be the
-/// only shielded data that added this nullifier to this [`Chain`][1].
-///
-/// [1]: service::non_finalized_state::Chain
+/// only shielded data that added this nullifier to this [`Chain`].
 #[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
 pub(crate) fn remove_from_non_finalized_chain<'block, NullifierT>(
     chain_nullifiers: &mut HashMap<NullifierT, SpendingTransactionId>,

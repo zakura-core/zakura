@@ -16,9 +16,9 @@ use crate::{
 pub use zakura_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
 
 /// The maximum chain reorganisation height; it bounds the length of the best
-/// non-finalized chain. The value lives in `zebra-chain` so tooling (e.g.
-/// `zebra-checkpoints`) can use it without depending on `zebra-state`.
-pub const MAX_BLOCK_REORG_HEIGHT: u32 = zebra_chain::parameters::constants::MAX_BLOCK_REORG_HEIGHT;
+/// non-finalized chain. The value lives in `zakura-chain` so tooling (e.g.
+/// `zakura-checkpoints`) can use it without depending on `zakura-state`.
+pub const MAX_BLOCK_REORG_HEIGHT: u32 = zakura_chain::parameters::constants::MAX_BLOCK_REORG_HEIGHT;
 
 /// The directory name used to distinguish the state database from Zebra's other databases or flat files.
 pub const STATE_DATABASE_KIND: &str = "state";

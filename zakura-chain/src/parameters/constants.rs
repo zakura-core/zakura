@@ -20,8 +20,8 @@ pub const SLOW_START_SHIFT: Height = Height(SLOW_START_INTERVAL.0 / 2);
 /// The maximum chain reorganisation height.
 ///
 /// This threshold determines the maximum length of the best non-finalized
-/// chain. Once the chain grows past this height, Zebra finalizes its oldest
-/// blocks; deeper reorganisations are outside Zebra's rollback window.
+/// chain. Once the chain grows past this height, Zakura finalizes its oldest
+/// blocks; deeper reorganisations are outside Zakura's rollback window.
 ///
 /// This is a local-only node policy; it is not part of consensus. The window is
 /// sized as a defence-in-depth measure against sustained consensus splits.

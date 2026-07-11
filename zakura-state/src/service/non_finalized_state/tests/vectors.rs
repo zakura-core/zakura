@@ -346,7 +346,7 @@ fn new_invalidate_test_state(network: &Network) -> (NonFinalizedState, Finalized
 /// successfully without panicking.
 #[test]
 fn invalidating_non_finalized_root_does_not_panic() {
-    let _init_guard = zebra_test::init();
+    let _init_guard = zakura_test::init();
 
     let network = Network::Mainnet;
     let block1: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
@@ -381,7 +381,7 @@ fn invalidating_non_finalized_root_does_not_panic() {
 /// pre-existing parent chain is retained.
 #[test]
 fn invalidating_same_height_fork_tips_is_idempotent() {
-    let _init_guard = zebra_test::init();
+    let _init_guard = zakura_test::init();
 
     let network = Network::Mainnet;
     let block1: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
@@ -425,7 +425,7 @@ fn invalidating_same_height_fork_tips_is_idempotent() {
 /// removed and the second call returns `MissingInvalidatedBlock`.
 #[test]
 fn reconsider_block_removes_live_entry_and_second_call_returns_missing() {
-    let _init_guard = zebra_test::init();
+    let _init_guard = zakura_test::init();
 
     let network = Network::Mainnet;
     let block1: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
@@ -480,7 +480,7 @@ fn reconsider_block_removes_live_entry_and_second_call_returns_missing() {
 /// later reconsider.
 #[test]
 fn reconsider_block_preserves_record_when_parent_chain_missing() {
-    let _init_guard = zebra_test::init();
+    let _init_guard = zakura_test::init();
 
     let network = Network::Mainnet;
     let block1: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());

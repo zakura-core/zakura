@@ -33,7 +33,7 @@ use zakura_node_services::{
 };
 use zakura_utils::init_tracing;
 
-// Checkpoints are generated past Zebra's rollback window (`MAX_BLOCK_REORG_HEIGHT`),
+// Checkpoints are generated past Zakura's rollback window (`MAX_BLOCK_REORG_HEIGHT`),
 // which must be at least the coinbase maturity so that checkpointed coinbase outputs
 // are already settled.
 const _: () = assert!(
@@ -172,8 +172,8 @@ async fn main() -> Result<()> {
         .expect("height: unexpected invalid value, missing field, or field type");
 
     // Checkpoints must be on a settled part of the best chain, so we skip blocks
-    // within Zebra's rollback window (`MAX_BLOCK_REORG_HEIGHT`). A smaller margin
-    // could let a reorg that Zebra would still follow orphan a shipped checkpoint.
+    // within Zakura's rollback window (`MAX_BLOCK_REORG_HEIGHT`). A smaller margin
+    // could let a reorg that Zakura would still follow orphan a shipped checkpoint.
     let height_limit = height_limit - HeightDiff::from(MAX_BLOCK_REORG_HEIGHT);
     let height_limit = height_limit
         .ok_or_else(|| {

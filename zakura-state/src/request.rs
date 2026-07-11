@@ -909,7 +909,7 @@ pub enum Request {
     ///
     /// <https://zips.z.cash/protocol/protocol.pdf#blockchain>
     ///
-    /// Note: Zebra's local rollback window
+    /// Note: Zakura's local rollback window
     /// ([`MAX_BLOCK_REORG_HEIGHT`](crate::MAX_BLOCK_REORG_HEIGHT)) is now 1000 blocks, larger
     /// than the 100 quoted from the protocol specification above.
     ///

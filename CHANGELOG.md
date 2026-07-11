@@ -32,14 +32,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   maturity, so a shipped checkpoint cannot be orphaned by a reorg Zakura would
   still follow. `MAX_BLOCK_REORG_HEIGHT` now lives in `zakura-chain` as the single
   source of truth. Backported from upstream Zebra PR #10719.
-- `install-zakura.sh` no longer fails for non-root users on the default install
-  profile. The standalone state directory defaulted to a hardcoded
-  `/mnt/data/zakura-state`, which cannot be created by anyone but root on a stock
-  cloud image, so the first interactive menu option failed before downloading
-  anything. The default profile now runs the same capacity-aware directory search
-  the zcashd-compat profile already used, falling back to `~/.cache/zakura`. That
-  search also filters on writability now, so it can no longer recommend a large
-  but root-owned volume that the installer then fails to create.
 - `install-zakura.sh --unsafe-low-specs` now appends the flag to every generated
   `zakurad start` command. Previously it only silenced the installer's own
   preflight warning, so the command it printed still hard-exited on the

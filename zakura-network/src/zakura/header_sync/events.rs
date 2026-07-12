@@ -231,6 +231,22 @@ pub enum HeaderSyncEvent {
     },
     /// State finalized or verified-body frontiers changed.
     StateFrontiersChanged(HeaderSyncFrontiers),
+    /// State needs a bounded re-delivery of VCT supplied roots for a covered height.
+    VctRootRepairRequested {
+        /// Height whose supplied root is missing or was evicted after rejection.
+        height: block::Height,
+        /// State repair generation.
+        generation: u64,
+        /// Parent hash for `height - 1`, used as the first header anchor.
+        anchor_hash: block::Hash,
+        /// Canonical hashes expected in the repair response, starting at `height`.
+        expected_hashes: Vec<(block::Height, block::Hash)>,
+    },
+    /// State successfully committed the formerly parked VCT height.
+    VctRootRepairResolved {
+        /// State repair generation that was resolved.
+        generation: u64,
+    },
     /// State successfully committed a header range.
     HeaderRangeCommitted {
         /// First committed height.
@@ -297,6 +313,8 @@ impl HeaderSyncEvent {
             Self::WireDecodeFailed { .. } => "wire_decode_failed",
             Self::WireProtocolFailure { .. } => "wire_protocol_failure",
             Self::StateFrontiersChanged(_) => "state_frontiers_changed",
+            Self::VctRootRepairRequested { .. } => "vct_root_repair_requested",
+            Self::VctRootRepairResolved { .. } => "vct_root_repair_resolved",
             Self::HeaderRangeCommitted { .. } => "header_range_committed",
             Self::HeaderRangeCommitFailed { .. } => "header_range_commit_failed",
             Self::HeaderRangeResponseFinished { .. } => "header_range_response_finished",

@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Repair evicted verified-commitment-trees supplied roots instead of stalling
+  sync forever. When the finalized writer rejects and evicts a well-formed but
+  invalid supplied root, header sync now re-requests the canonical `H`/`H+1`
+  header/root tuple through a bounded repair lane (one episode per stalled
+  height: six serial peer attempts within four minutes, pinned to the node's
+  own canonical hashes). The state writer remains the final verifier, and the
+  node stays fail-closed with an operator signal if repair exhausts.
 - Prevent verified-commitment-trees checkpoint sync from stalling at checkpoint
   boundaries by authenticating a block's supplied roots with its already-validated
   successor header, without waiting for the successor block body to finish checkpoint

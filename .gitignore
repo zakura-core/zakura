@@ -1,5 +1,6 @@
 # Cargo files
 /coverage-target/
+/out/
 # Legacy Zebra state (alpha versions only)
 .zakura-state/
 # Nix configs

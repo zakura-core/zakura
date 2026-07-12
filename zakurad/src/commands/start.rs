@@ -97,9 +97,10 @@ use zakura_network::types::PeerServices;
 use zakura_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
 use zakura::{
-    drive_block_sync_actions, drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,
-    query_block_sync_frontiers, zakura_header_sync_driver_startup, BlocksyncThroughputProbe,
-    BlocksyncThroughputSummary, ZakuraHeaderSyncDriverHandles,
+    drive_block_sync_actions, drive_vct_root_repairs, drive_zakura_header_sync_actions,
+    mirror_zakura_full_block_commits, query_block_sync_frontiers,
+    zakura_header_sync_driver_startup, BlocksyncThroughputProbe, BlocksyncThroughputSummary,
+    ZakuraHeaderSyncDriverHandles,
 };
 
 use crate::{
@@ -491,6 +492,16 @@ impl StartCmd {
                     .in_current_span(),
                 );
                 endpoint.push_header_sync_task(driver_task).await;
+
+                let vct_repair_task = tokio::spawn(
+                    drive_vct_root_repairs(
+                        read_only_state_service.clone(),
+                        header_sync.clone(),
+                        shutdown.clone().cancelled_owned(),
+                    )
+                    .in_current_span(),
+                );
+                endpoint.push_header_sync_task(vct_repair_task).await;
 
                 if let (Some(block_sync), Some(block_actions)) = (
                     endpoint.block_sync(),

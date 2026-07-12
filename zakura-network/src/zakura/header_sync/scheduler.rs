@@ -76,6 +76,7 @@ impl RangeScheduler {
         let queue = match priority {
             RangePriority::Forward => &mut self.forward,
             RangePriority::Backward => &mut self.backward,
+            RangePriority::Repair => return,
         };
         if !queue.contains(&range)
             && !queue.iter().any(|queued| {
@@ -129,6 +130,7 @@ impl RangeScheduler {
         let queue = match original.priority {
             RangePriority::Forward => &mut self.forward,
             RangePriority::Backward => &mut self.backward,
+            RangePriority::Repair => return,
         };
         for queued in queue {
             if *queued == original {
@@ -148,6 +150,7 @@ impl RangeScheduler {
         match range.priority {
             RangePriority::Forward => self.forward.push_front(range),
             RangePriority::Backward => self.backward.push_front(range),
+            RangePriority::Repair => {}
         }
     }
 

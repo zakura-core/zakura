@@ -1,4 +1,7 @@
-use std::{future::Future, time::Instant};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use color_eyre::eyre::{eyre, Report};
 use tokio::{pin, select, sync::mpsc};
@@ -178,6 +181,202 @@ pub(crate) fn block_roots_cover_range(
 pub(crate) struct ZakuraHeaderSyncDriverHandles {
     pub(crate) endpoint: ZakuraEndpoint,
     pub(crate) header_sync: zakura_network::zakura::HeaderSyncHandle,
+}
+
+pub(crate) async fn drive_vct_root_repairs(
+    read_state: zakura_state::ReadStateService,
+    header_sync: zakura_network::zakura::HeaderSyncHandle,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
+    let repairs = read_state.subscribe_vct_root_repairs();
+    drive_vct_root_repair_updates(repairs, shutdown, move |status| {
+        let read_state = read_state.clone();
+        let header_sync = header_sync.clone();
+        async move {
+            match status.state {
+                zakura_state::VctRootRepairState::Idle => header_sync
+                    .send(HeaderSyncEvent::VctRootRepairResolved {
+                        generation: status.generation,
+                    })
+                    .await
+                    .is_ok(),
+                zakura_state::VctRootRepairState::Unavailable { height } => {
+                    let Some(event) =
+                        vct_root_repair_event(read_state, height, status.generation).await
+                    else {
+                        return false;
+                    };
+                    header_sync.send(event).await.is_ok()
+                }
+            }
+        }
+    })
+    .await;
+}
+
+async fn drive_vct_root_repair_updates<Deliver, Delivery>(
+    mut repairs: tokio::sync::watch::Receiver<zakura_state::VctRootRepairStatus>,
+    shutdown: impl Future<Output = ()>,
+    mut deliver: Deliver,
+) where
+    Deliver: FnMut(zakura_state::VctRootRepairStatus) -> Delivery,
+    Delivery: Future<Output = bool>,
+{
+    const RETRY_DELAY: Duration = Duration::from_millis(500);
+    /// One warning per this many consecutive failed deliveries (~30s at
+    /// [`RETRY_DELAY`]), so a permanently undeliverable repair status is
+    /// visible to operators instead of an invisible silent retry loop.
+    const RETRY_WARN_EVERY: u32 = 60;
+
+    pin!(shutdown);
+    let mut status = *repairs.borrow_and_update();
+    // A repair can already be pending when this driver subscribes. Idle is not
+    // sent initially because there cannot yet be a driver-owned repair to clear.
+    let mut delivery_pending = matches!(
+        status.state,
+        zakura_state::VctRootRepairState::Unavailable { .. }
+    );
+    let mut consecutive_failures: u32 = 0;
+
+    loop {
+        if delivery_pending {
+            delivery_pending = !deliver(status).await;
+            if delivery_pending {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures.is_multiple_of(RETRY_WARN_EVERY) {
+                    tracing::warn!(
+                        ?status,
+                        consecutive_failures,
+                        "VCT root repair status could not be delivered to header sync \
+                         (state read or event send keeps failing); still retrying"
+                    );
+                }
+            } else {
+                consecutive_failures = 0;
+            }
+        }
+
+        select! {
+            _ = &mut shutdown => return,
+            changed = repairs.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                status = *repairs.borrow_and_update();
+                delivery_pending = true;
+                consecutive_failures = 0;
+            }
+            _ = tokio::time::sleep(RETRY_DELAY), if delivery_pending => {}
+        }
+    }
+}
+
+async fn vct_root_repair_event(
+    read_state: zakura_state::ReadStateService,
+    height: block::Height,
+    generation: u64,
+) -> Option<HeaderSyncEvent> {
+    let anchor_height = height.0.checked_sub(1).map(block::Height)?;
+    let response = read_state
+        .oneshot(zakura_state::ReadRequest::HeadersByHeightRange {
+            start: anchor_height,
+            count: 3,
+        })
+        .await
+        .ok()?;
+    let zakura_state::ReadResponse::Headers(headers) = response else {
+        return None;
+    };
+    if headers.len() < 2 {
+        return None;
+    }
+
+    let (stored_anchor_height, anchor_hash, anchor_header) = &headers[0];
+    if *stored_anchor_height != anchor_height {
+        return None;
+    }
+    let mut expected_hashes: Vec<(block::Height, block::Hash)> = Vec::new();
+    for (expected_offset, (candidate_height, candidate_hash, candidate_header)) in
+        headers.iter().skip(1).take(2).enumerate()
+    {
+        let expected_height = height.0.checked_add(u32::try_from(expected_offset).ok()?)?;
+        if *candidate_height != block::Height(expected_height) {
+            return None;
+        }
+        let expected_parent = if expected_offset == 0 {
+            *anchor_hash
+        } else {
+            expected_hashes.last().map(|(_, hash)| *hash)?
+        };
+        if candidate_header.previous_block_hash != expected_parent {
+            return None;
+        }
+        expected_hashes.push((*candidate_height, *candidate_hash));
+    }
+    if expected_hashes.is_empty() || block::Hash::from(anchor_header.as_ref()) != *anchor_hash {
+        return None;
+    }
+
+    Some(HeaderSyncEvent::VctRootRepairRequested {
+        height,
+        generation,
+        anchor_hash: *anchor_hash,
+        expected_hashes,
+    })
+}
+
+#[cfg(test)]
+mod vct_root_repair_driver_tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn retries_transient_delivery_failure_without_another_watch_change() {
+        let status = zakura_state::VctRootRepairStatus {
+            state: zakura_state::VctRootRepairState::Unavailable {
+                height: block::Height(42),
+            },
+            generation: 1,
+        };
+        let (_repairs_tx, repairs_rx) = tokio::sync::watch::channel(status);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let delivery_attempts = attempts.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let driver = tokio::spawn(drive_vct_root_repair_updates(
+            repairs_rx,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            move |delivered_status| {
+                assert_eq!(delivered_status, status);
+                let attempt = delivery_attempts.fetch_add(1, Ordering::SeqCst);
+                async move { attempt > 0 }
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "a successful delivery must stop timer retries"
+        );
+
+        shutdown_tx.send(()).expect("driver is still running");
+        driver.await.expect("driver shuts down cleanly");
+    }
 }
 
 pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(

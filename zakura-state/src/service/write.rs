@@ -43,6 +43,40 @@ mod vct_write;
 
 use vct_write::VctWriteManager;
 
+/// Status published by the finalized write loop when a VCT fast-sync height needs a
+/// replacement supplied root.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct VctRootRepairStatus {
+    /// The state of the current root repair need.
+    pub state: VctRootRepairState,
+    /// Monotonic generation for repair attempts. A new generation means the previous
+    /// replacement candidate was absent or rejected and the networking layer should try
+    /// another bounded repair candidate.
+    pub generation: u64,
+}
+
+impl Default for VctRootRepairStatus {
+    fn default() -> Self {
+        Self {
+            state: VctRootRepairState::Idle,
+            generation: 0,
+        }
+    }
+}
+
+/// Dependency-neutral VCT root repair state.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum VctRootRepairState {
+    /// No VCT root repair is currently required.
+    Idle,
+    /// The finalized writer cannot commit this height until a verifiable supplied root is
+    /// re-delivered through header sync.
+    Unavailable {
+        /// Height whose supplied roots are missing from the VCT source.
+        height: block::Height,
+    },
+}
+
 /// The maximum size of the parent error map.
 ///
 /// We allow enough space for multiple concurrent chain forks with errors.
@@ -181,6 +215,7 @@ struct WriteBlockWorkerTask {
     non_finalized_rejected_sender: UnboundedSender<block::Hash>,
     chain_tip_sender: ChainTipSender,
     non_finalized_state_sender: watch::Sender<NonFinalizedState>,
+    vct_root_repair_sender: watch::Sender<VctRootRepairStatus>,
     /// If `Some`, the non-finalized state is written to this backup directory
     /// synchronously before each channel update, instead of via the async backup task.
     backup_dir_path: Option<PathBuf>,
@@ -257,6 +292,7 @@ impl BlockWriteSender {
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
+        watch::Receiver<VctRootRepairStatus>,
         Option<Arc<std::thread::JoinHandle<()>>>,
     ) {
         // Security: The number of blocks in these channels is limited by
@@ -269,6 +305,8 @@ impl BlockWriteSender {
             tokio::sync::mpsc::unbounded_channel();
         let (non_finalized_rejected_sender, non_finalized_rejected_receiver) =
             tokio::sync::mpsc::unbounded_channel();
+        let (vct_root_repair_sender, vct_root_repair_receiver) =
+            watch::channel(VctRootRepairStatus::default());
 
         let seed_zakura_header_from_best_chain_commits = finalized_state
             .db
@@ -288,6 +326,7 @@ impl BlockWriteSender {
                     non_finalized_rejected_sender,
                     chain_tip_sender,
                     non_finalized_state_sender,
+                    vct_root_repair_sender,
                     backup_dir_path,
                 }
                 .run()
@@ -302,6 +341,7 @@ impl BlockWriteSender {
             },
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
+            vct_root_repair_receiver,
             Some(Arc::new(task)),
         )
     }
@@ -328,6 +368,7 @@ impl WriteBlockWorkerTask {
             non_finalized_rejected_sender,
             chain_tip_sender,
             non_finalized_state_sender,
+            vct_root_repair_sender,
             seed_zakura_header_from_best_chain_commits,
             backup_dir_path,
         } = &mut self;
@@ -337,7 +378,7 @@ impl WriteBlockWorkerTask {
 
         // Look-ahead buffering and root-stall tracking for the VCT fast-sync
         // checkpoint path. See [`VctWriteManager`].
-        let mut vct_write_manager = VctWriteManager::default();
+        let mut vct_write_manager = VctWriteManager::new(vct_root_repair_sender.clone());
 
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
@@ -437,7 +478,8 @@ impl WriteBlockWorkerTask {
 
             if needs_vct_successor && next_vct_block.is_none() {
                 let height = ordered_block.0.height;
-                let wait = vct_write_manager.on_retryable_error(height, false, ordered_block);
+                let wait =
+                    vct_write_manager.on_retryable_error(height, false, false, ordered_block);
                 std::thread::park_timeout(wait);
                 continue;
             }
@@ -489,6 +531,7 @@ impl WriteBlockWorkerTask {
                         let wait = vct_write_manager.on_retryable_error(
                             height,
                             root_unavailable.is_some(),
+                            next_block_took_vct_path,
                             ordered_block,
                         );
                         std::thread::park_timeout(wait);

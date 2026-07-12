@@ -85,6 +85,7 @@ mod tests;
 
 pub use finalized_state::{OutputLocation, TransactionIndex, TransactionLocation};
 use write::NonFinalizedWriteMessage;
+pub use write::{VctRootRepairState, VctRootRepairStatus};
 
 use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, SentHashes};
 
@@ -242,6 +243,9 @@ pub struct ReadStateService {
     ///
     /// Used to check for panics when writing blocks.
     block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
+
+    /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
+    vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
 }
 
 impl Drop for StateService {
@@ -401,6 +405,7 @@ impl StateService {
             block_write_sender,
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
+            vct_root_repair_receiver,
             block_write_task,
         ) = write::BlockWriteSender::spawn(
             finalized_state_for_writing,
@@ -415,6 +420,7 @@ impl StateService {
             &finalized_state,
             block_write_task,
             non_finalized_state_receiver,
+            vct_root_repair_receiver,
         );
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
@@ -1051,12 +1057,14 @@ impl ReadStateService {
         finalized_state: &FinalizedState,
         block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
         non_finalized_state_receiver: WatchReceiver<NonFinalizedState>,
+        vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
     ) -> Self {
         let read_service = Self {
             network: finalized_state.network(),
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
+            vct_root_repair_receiver,
         };
 
         tracing::debug!("created new read-only state service");
@@ -1067,6 +1075,11 @@ impl ReadStateService {
     /// Return the tip of the current best chain.
     pub fn best_tip(&self) -> Option<(block::Height, block::Hash)> {
         read::best_tip(&self.latest_non_finalized_state(), &self.db)
+    }
+
+    /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.
+    pub fn subscribe_vct_root_repairs(&self) -> tokio::sync::watch::Receiver<VctRootRepairStatus> {
+        self.vct_root_repair_receiver.clone()
     }
 
     /// Gets a clone of the latest non-finalized state from the `non_finalized_state_receiver`
@@ -2247,12 +2260,15 @@ pub fn init_read_only(
     )?;
     let (non_finalized_state_sender, non_finalized_state_receiver) =
         tokio::sync::watch::channel(NonFinalizedState::new(network));
+    let (_vct_root_repair_sender, vct_root_repair_receiver) =
+        tokio::sync::watch::channel(VctRootRepairStatus::default());
 
     Ok((
         ReadStateService::new(
             &finalized_state,
             None,
             WatchReceiver::new(non_finalized_state_receiver),
+            vct_root_repair_receiver,
         ),
         finalized_state.db.clone(),
         non_finalized_state_sender,

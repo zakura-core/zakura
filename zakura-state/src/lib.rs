@@ -87,7 +87,7 @@ pub use service::finalized_state::{
 };
 pub use service::{
     finalized_state::{DiskWriteBatch, FromDisk, IntoDisk, WriteDisk, ZakuraDb},
-    ReadStateService,
+    ReadStateService, VctRootRepairState, VctRootRepairStatus,
 };
 
 // Allow use in external tests

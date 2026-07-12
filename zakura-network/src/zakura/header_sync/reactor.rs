@@ -639,6 +639,7 @@ impl HeaderSyncReactor {
         if self.state.parked_peers.contains(&peer) {
             return;
         }
+        record_wire_validation_metrics(&error);
         self.trace_peer_violation(&peer, HeaderSyncMisbehavior::MalformedMessage);
         tracing::debug!(?peer, ?error, "malformed Zakura header-sync frame");
         self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage)
@@ -654,6 +655,7 @@ impl HeaderSyncReactor {
         if self.state.parked_peers.contains(&peer) {
             return;
         }
+        record_wire_validation_metrics(&error);
         self.trace_peer_violation(&peer, reason);
         tracing::debug!(?peer, ?error, ?reason, "invalid Zakura header-sync message");
         self.report_misbehavior(peer, reason).await;
@@ -836,7 +838,7 @@ impl HeaderSyncReactor {
             requested_count,
             returned_count,
             false,
-            0,
+            TreeAuxTraceSummary::default(),
         );
         if let Some(peer_state) = self.state.peers.get_mut(&peer) {
             peer_state.finish_serving_headers();
@@ -871,7 +873,7 @@ impl HeaderSyncReactor {
             tree_aux_roots.clear();
         };
         let returned_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
-        let served_tree_aux_roots_len = u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX);
+        let served_tree_aux_roots = TreeAuxTraceSummary::new(&tree_aux_roots);
         let send_result = peer_state.session.try_send_headers_with_sizes_and_roots(
             headers,
             body_sizes,
@@ -888,7 +890,7 @@ impl HeaderSyncReactor {
                 requested_count,
                 returned_count,
                 want_tree_aux_roots,
-                served_tree_aux_roots_len,
+                served_tree_aux_roots,
             ),
             Err(error) => {
                 tracing::debug!(
@@ -1217,7 +1219,7 @@ impl HeaderSyncReactor {
                 peer_max_headers_per_response,
                 in_flight_count,
                 outstanding.range.want_tree_aux_roots,
-                u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX),
+                &tree_aux_roots,
             );
             if let Some(peer_state) = self.state.peers.get_mut(&peer) {
                 peer_state.outstanding.push(OutstandingRange {
@@ -1239,7 +1241,7 @@ impl HeaderSyncReactor {
             peer_max_headers_per_response,
             in_flight_count,
             outstanding.range.want_tree_aux_roots,
-            u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX),
+            &tree_aux_roots,
         );
         if header_count > outstanding.expected_max_count || header_count > outstanding.range.count {
             self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::ResponseTooLong)
@@ -1319,8 +1321,24 @@ impl HeaderSyncReactor {
             self.schedule().await;
             return;
         }
-        if validate_tree_aux_root_heights(outstanding.range.start_height, &tree_aux_roots).is_err()
+        if let Err(error) =
+            validate_tree_aux_root_heights(outstanding.range.start_height, &tree_aux_roots)
         {
+            tracing::debug!(
+                ?peer,
+                ?error,
+                start_height = ?outstanding.range.start_height,
+                count = ?header_count,
+                "Zakura header-sync rejected tree-aux root heights"
+            );
+            self.trace_range_validation_rejected(
+                &peer,
+                outstanding.range,
+                header_count,
+                "tree_aux_heights",
+                header_sync_wire_error_kind(&error),
+            );
+            metrics::counter!("sync.header.tree_aux.height_mismatch").increment(1);
             self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::MalformedMessage)
                 .await;
             self.retry_or_finish_outstanding(&peer, outstanding);
@@ -2055,6 +2073,7 @@ impl HeaderSyncReactor {
                     Some(header_sync_wire_error_kind(error)),
                 );
                 insert_peer(row, hs_trace::PEER, peer);
+                trace_wire_error_fields(row, error);
             }
             HeaderSyncEvent::WireProtocolFailure {
                 peer,
@@ -2073,6 +2092,7 @@ impl HeaderSyncReactor {
                     Some(header_sync_wire_error_kind(error)),
                 );
                 insert_peer(row, hs_trace::PEER, peer);
+                trace_wire_error_fields(row, error);
             }
             HeaderSyncEvent::StateFrontiersChanged(frontiers) => {
                 insert_optional_str(row, hs_trace::KIND, Some("state_frontiers_changed"));
@@ -2350,9 +2370,10 @@ impl HeaderSyncReactor {
         advertised_cap: u32,
         in_flight_count: usize,
         want_tree_aux_roots: bool,
-        tree_aux_roots_len: u32,
+        tree_aux_roots: &[BlockCommitmentRoots],
     ) {
         self.emit_trace(hs_trace::HEADER_HEADERS_RECEIVED, |row| {
+            let roots = TreeAuxTraceSummary::new(tree_aux_roots);
             insert_peer(row, hs_trace::PEER, peer);
             insert_height(row, hs_trace::RANGE_START, start_height);
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(count));
@@ -2360,11 +2381,8 @@ impl HeaderSyncReactor {
             insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(expected_max_count));
             insert_u64(row, hs_trace::IN_FLIGHT_COUNT, in_flight_count as u64);
             insert_bool(row, hs_trace::WANT_TREE_AUX_ROOTS, want_tree_aux_roots);
-            insert_u64(
-                row,
-                hs_trace::TREE_AUX_ROOTS_LEN,
-                u64::from(tree_aux_roots_len),
-            );
+            insert_u64(row, hs_trace::TREE_AUX_ROOTS_LEN, u64::from(roots.len));
+            roots.insert_into(row);
         });
     }
 
@@ -2375,7 +2393,7 @@ impl HeaderSyncReactor {
         requested_count: u32,
         returned_count: u32,
         want_tree_aux_roots: bool,
-        tree_aux_roots_len: u32,
+        roots: TreeAuxTraceSummary,
     ) {
         self.emit_trace(hs_trace::HEADER_HEADERS_SERVED, |row| {
             insert_peer(row, hs_trace::PEER, peer);
@@ -2383,11 +2401,8 @@ impl HeaderSyncReactor {
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(returned_count));
             insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(requested_count));
             insert_bool(row, hs_trace::WANT_TREE_AUX_ROOTS, want_tree_aux_roots);
-            insert_u64(
-                row,
-                hs_trace::TREE_AUX_ROOTS_LEN,
-                u64::from(tree_aux_roots_len),
-            );
+            insert_u64(row, hs_trace::TREE_AUX_ROOTS_LEN, u64::from(roots.len));
+            roots.insert_into(row);
         });
     }
 
@@ -2629,6 +2644,66 @@ fn set_header_connectivity_gauges(connected_peers: usize, healthy_peers: usize) 
     metrics::gauge!("zakura.p2p.healthy_peers").set(healthy_peers as f64);
 }
 
+#[derive(Default)]
+struct TreeAuxTraceSummary {
+    len: u32,
+    first_height: Option<block::Height>,
+    last_height: Option<block::Height>,
+}
+
+impl TreeAuxTraceSummary {
+    fn new(roots: &[BlockCommitmentRoots]) -> Self {
+        Self {
+            len: u32::try_from(roots.len()).unwrap_or(u32::MAX),
+            first_height: roots.first().map(|root| root.height),
+            last_height: roots.last().map(|root| root.height),
+        }
+    }
+
+    fn insert_into(&self, row: &mut serde_json::Map<String, Value>) {
+        if let Some(height) = self.first_height {
+            insert_height(row, hs_trace::FIRST_ROOT_HEIGHT, height);
+        }
+        if let Some(height) = self.last_height {
+            insert_height(row, hs_trace::LAST_ROOT_HEIGHT, height);
+        }
+    }
+}
+
+fn record_wire_validation_metrics(error: &HeaderSyncWireError) {
+    let error_kind = header_sync_wire_error_kind(error);
+    metrics::counter!(
+        "sync.header.validation.rejected",
+        "stage" => "wire",
+        "error_kind" => error_kind
+    )
+    .increment(1);
+    if matches!(error, HeaderSyncWireError::TreeAuxRootHeightMismatch { .. }) {
+        metrics::counter!("sync.header.tree_aux.height_mismatch").increment(1);
+    }
+}
+
+fn trace_wire_error_fields(row: &mut serde_json::Map<String, Value>, error: &HeaderSyncWireError) {
+    if let HeaderSyncWireError::TreeAuxRootHeightMismatch {
+        offset,
+        expected_height,
+        root_height,
+        first_root_height,
+        last_root_height,
+    } = error
+    {
+        insert_u64(
+            row,
+            hs_trace::ROOT_MISMATCH_OFFSET,
+            u64::try_from(*offset).unwrap_or(u64::MAX),
+        );
+        insert_height(row, hs_trace::EXPECTED_ROOT_HEIGHT, *expected_height);
+        insert_height(row, hs_trace::ACTUAL_ROOT_HEIGHT, *root_height);
+        insert_height(row, hs_trace::FIRST_ROOT_HEIGHT, *first_root_height);
+        insert_height(row, hs_trace::LAST_ROOT_HEIGHT, *last_root_height);
+    }
+}
+
 fn header_sync_wire_error_kind(error: &HeaderSyncWireError) -> &'static str {
     match error {
         HeaderSyncWireError::OversizedPayload { .. } => "oversized_payload",
@@ -2699,7 +2774,11 @@ fn trace_header_sync_message_fields(
             );
         }
         HeaderSyncMessage::Headers { headers, .. } => {
-            insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
+            insert_u64(
+                row,
+                hs_trace::RANGE_COUNT,
+                u64::try_from(headers.len()).unwrap_or(u64::MAX),
+            );
         }
         HeaderSyncMessage::GetHeaders {
             start_height,

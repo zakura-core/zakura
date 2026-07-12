@@ -1214,13 +1214,23 @@ fn headers_codec_rejects_body_size_mismatch_truncation_and_trailing_bytes() {
         })
     ));
 
-    assert!(matches!(
-        validate_tree_aux_root_heights(block::Height(1), &[root_at(block::Height(2))]),
+    let roots = [root_at(block::Height(1)), root_at(block::Height(3))];
+    match validate_tree_aux_root_heights(block::Height(1), &roots) {
         Err(HeaderSyncWireError::TreeAuxRootHeightMismatch {
-            expected_height: block::Height(1),
-            root_height: block::Height(2),
-        })
-    ));
+            offset,
+            expected_height,
+            root_height,
+            first_root_height,
+            last_root_height,
+        }) => {
+            assert_eq!(offset, 1);
+            assert_eq!(expected_height, block::Height(2));
+            assert_eq!(root_height, block::Height(3));
+            assert_eq!(first_root_height, block::Height(1));
+            assert_eq!(last_root_height, block::Height(3));
+        }
+        result => panic!("expected tree-aux root height mismatch, got {result:?}"),
+    }
 
     let mut truncated_mid_size = message.encode().unwrap();
     truncated_mid_size.pop();
@@ -4663,6 +4673,61 @@ async fn rejected_non_linking_range_traces_link_stage_and_error_kind() {
                 hs_trace::ERROR_KIND,
                 TraceValue::Str("first_header_does_not_link"),
             ),
+        ],
+    );
+
+    let _ = capture.finish().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tree_aux_height_mismatch_traces_structured_diagnostics() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut capture =
+        TraceCapture::for_test("tree_aux_height_mismatch_traces_structured_diagnostics").unwrap();
+    let mut startup = startup_for(network, anchor, Some(anchor));
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(65);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireProtocolFailure {
+            peer: peer_id.clone(),
+            reason: HeaderSyncMisbehavior::MalformedMessage,
+            error: Arc::new(HeaderSyncWireError::TreeAuxRootHeightMismatch {
+                offset: 7,
+                expected_height: block::Height(108),
+                root_height: block::Height(208),
+                first_root_height: block::Height(201),
+                last_root_height: block::Height(300),
+            }),
+        })
+        .await
+        .unwrap();
+
+    match next_non_query_action(&mut fixture.actions).await {
+        HeaderSyncAction::Misbehavior { peer, reason } => {
+            assert_eq!(peer, peer_id);
+            assert_eq!(reason, HeaderSyncMisbehavior::MalformedMessage);
+        }
+        action => panic!("unexpected action: {action:?}"),
+    }
+
+    capture.flush().await;
+    let reader = capture.reader().unwrap();
+    reader.table(HEADER_SYNC_TABLE.table()).assert_row(
+        hs_trace::HEADER_EVENT_RECEIVED,
+        &[
+            (
+                hs_trace::ERROR_KIND,
+                TraceValue::Str("tree_aux_root_height_mismatch"),
+            ),
+            (hs_trace::ROOT_MISMATCH_OFFSET, TraceValue::U64(7)),
+            (hs_trace::EXPECTED_ROOT_HEIGHT, TraceValue::U64(108)),
+            (hs_trace::ACTUAL_ROOT_HEIGHT, TraceValue::U64(208)),
+            (hs_trace::FIRST_ROOT_HEIGHT, TraceValue::U64(201)),
+            (hs_trace::LAST_ROOT_HEIGHT, TraceValue::U64(300)),
         ],
     );
 

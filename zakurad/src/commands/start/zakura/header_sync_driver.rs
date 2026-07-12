@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -740,13 +741,21 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 &block_roots,
                             )
                             .unwrap_or_else(|error| {
-                                debug!(
-                                    ?peer,
-                                    ?start,
-                                    requested_count = count,
-                                    ?error,
-                                    "serving header range without tree aux roots"
-                                );
+                                metrics::counter!("sync.header.tree_aux.sender_alignment_failure")
+                                    .increment(1);
+                                static ALIGNMENT_FAILURES: AtomicU64 = AtomicU64::new(0);
+                                let occurrences =
+                                    ALIGNMENT_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                                if occurrences.is_power_of_two() {
+                                    warn!(
+                                        ?peer,
+                                        ?start,
+                                        requested_count = count,
+                                        occurrences,
+                                        ?error,
+                                        "serving header range without tree aux roots"
+                                    );
+                                }
 
                                 Vec::new()
                             })

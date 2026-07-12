@@ -379,6 +379,16 @@ pub mod header_sync_trace {
     pub const BEST_HEADER_TIP: &str = "best_header_tip";
     /// Number of header-carried tree-aux roots present on this send/receive.
     pub const TREE_AUX_ROOTS_LEN: &str = "tree_aux_roots_len";
+    /// First encoded tree-aux root height.
+    pub const FIRST_ROOT_HEIGHT: &str = "first_root_height";
+    /// Last encoded tree-aux root height.
+    pub const LAST_ROOT_HEIGHT: &str = "last_root_height";
+    /// Zero-based index of the first mismatching root.
+    pub const ROOT_MISMATCH_OFFSET: &str = "root_mismatch_offset";
+    /// Expected height of the first mismatching root.
+    pub const EXPECTED_ROOT_HEIGHT: &str = "expected_root_height";
+    /// Actual height of the first mismatching root.
+    pub const ACTUAL_ROOT_HEIGHT: &str = "actual_root_height";
     /// Destination peer count field.
     pub const DESTINATION_PEER_COUNT: &str = "destination_peer_count";
     /// Active reactor service sessions after this event.

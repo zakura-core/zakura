@@ -27,7 +27,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{events::*, scheduler::*, service::HeaderSyncPeerCommand, wire::*, *};
 use crate::zakura::{
-    Edge, Flow, FramedRecv, Node, NodeKind, Pipe, PipeCx, PipeShape, SinkReject, ZakuraPeerId,
+    Edge, Flow, FramedRecv, Node, NodeKind, Pipe, PipeCx, PipeShape, SinkReject, ZakuraConnId,
+    ZakuraPeerId,
 };
 
 const MAX_RETIRED_HEADER_REQUEST_IDS: usize = 4096;
@@ -159,12 +160,20 @@ impl HsLocal {
 pub(super) struct HsEnv {
     /// Handle used to forward inbound wire events to the header-sync reactor.
     handle: HeaderSyncHandle,
+    /// Transport connection generation that owns this pipe.
+    conn_id: ZakuraConnId,
 }
 
 impl HsEnv {
     /// Wrap a cloneable reactor handle as the pipe's shared environment.
+    #[cfg(test)]
     pub(super) fn new(handle: HeaderSyncHandle) -> Self {
-        Self { handle }
+        Self { handle, conn_id: 0 }
+    }
+
+    /// Wrap a reactor handle and its owning transport connection generation.
+    pub(super) fn new_with_conn_id(handle: HeaderSyncHandle, conn_id: ZakuraConnId) -> Self {
+        Self { handle, conn_id }
     }
 }
 
@@ -279,6 +288,7 @@ pub(super) fn run_inbound(cx: &mut PipeCx<'_, HsLocal, HsEnv>, frame: Frame) -> 
     match deliver(
         &cx.env.handle,
         cx.local.stream_version,
+        cx.env.conn_id,
         expected,
         cx.peer_id.clone(),
         frame,
@@ -330,6 +340,7 @@ pub(super) fn run_inbound(cx: &mut PipeCx<'_, HsLocal, HsEnv>, frame: Frame) -> 
 pub(super) fn deliver(
     handle: &HeaderSyncHandle,
     stream_version: u16,
+    conn_id: ZakuraConnId,
     expected: Option<ExpectedHeadersResponse>,
     peer_id: ZakuraPeerId,
     frame: Frame,
@@ -374,6 +385,7 @@ pub(super) fn deliver(
                 handle,
                 HeaderSyncEvent::WireHeaders {
                     peer: peer_id,
+                    conn_id,
                     request_id,
                     headers,
                     body_sizes,
@@ -407,13 +419,21 @@ pub(super) fn deliver(
             handle,
             HeaderSyncEvent::WireGetHeaders {
                 peer: peer_id,
+                conn_id,
                 request_id,
                 start_height,
                 count,
                 want_tree_aux_roots,
             },
         ),
-        msg => forward(handle, HeaderSyncEvent::WireMessage { peer: peer_id, msg }),
+        msg => forward(
+            handle,
+            HeaderSyncEvent::SessionWireMessage {
+                peer: peer_id,
+                conn_id,
+                msg,
+            },
+        ),
     }
 }
 
@@ -584,6 +604,7 @@ mod tests {
         let flow = deliver(
             &handle,
             ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            0,
             None,
             peer(),
             headers_frame(Vec::new()),
@@ -610,6 +631,7 @@ mod tests {
         let flow = deliver(
             &handle,
             ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            0,
             Some(expected),
             peer(),
             headers_frame(Vec::new()),

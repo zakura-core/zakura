@@ -51,6 +51,7 @@ pub(crate) fn header_sync_streams() -> &'static [Stream] {
 #[derive(Clone, Debug)]
 pub struct HeaderSyncPeerSession {
     peer_id: ZakuraPeerId,
+    conn_id: ZakuraConnId,
     direction: ServicePeerDirection,
     inner: Arc<HeaderSyncPeerSessionInner>,
 }
@@ -70,9 +71,11 @@ impl HeaderSyncPeerSession {
         direction: ServicePeerDirection,
         commands: mpsc::UnboundedSender<HeaderSyncPeerCommand>,
         stream_version: u16,
+        conn_id: ZakuraConnId,
     ) -> Self {
         Self::from_parts_with_direction_and_commands(
             session.peer_id().clone(),
+            conn_id,
             direction,
             session.sender(),
             session.cancel_token(),
@@ -99,6 +102,7 @@ impl HeaderSyncPeerSession {
     ) -> Self {
         Self::from_parts_with_direction_and_commands(
             peer_id,
+            0,
             direction,
             send,
             cancel_token,
@@ -115,8 +119,28 @@ impl HeaderSyncPeerSession {
         cancel_token: CancellationToken,
         stream_version: u16,
     ) -> Self {
+        Self::from_parts_with_direction_version_and_conn_id(
+            peer_id,
+            direction,
+            send,
+            cancel_token,
+            stream_version,
+            0,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_with_direction_version_and_conn_id(
+        peer_id: ZakuraPeerId,
+        direction: ServicePeerDirection,
+        send: FramedSend,
+        cancel_token: CancellationToken,
+        stream_version: u16,
+        conn_id: ZakuraConnId,
+    ) -> Self {
         Self::from_parts_with_direction_and_commands(
             peer_id,
+            conn_id,
             direction,
             send,
             cancel_token,
@@ -128,6 +152,7 @@ impl HeaderSyncPeerSession {
     #[cfg(test)]
     fn from_parts_with_direction_and_commands(
         peer_id: ZakuraPeerId,
+        conn_id: ZakuraConnId,
         direction: ServicePeerDirection,
         send: FramedSend,
         cancel_token: CancellationToken,
@@ -136,6 +161,7 @@ impl HeaderSyncPeerSession {
     ) -> Self {
         Self {
             peer_id,
+            conn_id,
             direction,
             inner: Arc::new(HeaderSyncPeerSessionInner {
                 send,
@@ -150,6 +176,7 @@ impl HeaderSyncPeerSession {
     #[cfg(not(test))]
     fn from_parts_with_direction_and_commands(
         peer_id: ZakuraPeerId,
+        conn_id: ZakuraConnId,
         direction: ServicePeerDirection,
         send: FramedSend,
         cancel_token: CancellationToken,
@@ -158,6 +185,7 @@ impl HeaderSyncPeerSession {
     ) -> Self {
         Self {
             peer_id,
+            conn_id,
             direction,
             inner: Arc::new(HeaderSyncPeerSessionInner {
                 send,
@@ -172,6 +200,11 @@ impl HeaderSyncPeerSession {
     /// Authenticated peer identity for this header-sync session.
     pub fn peer_id(&self) -> &ZakuraPeerId {
         &self.peer_id
+    }
+
+    /// Transport connection generation that owns this session.
+    pub fn conn_id(&self) -> ZakuraConnId {
+        self.conn_id
     }
 
     /// Direction of the underlying Zakura connection.
@@ -375,6 +408,7 @@ pub(crate) async fn drive_header_sync_actions(
             }
             HeaderSyncAction::QueryHeadersByHeightRange {
                 peer,
+                conn_id,
                 request_id,
                 start,
                 count,
@@ -383,6 +417,7 @@ pub(crate) async fn drive_header_sync_actions(
                 let _ = handle
                     .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                         peer,
+                        conn_id,
                         request_id,
                         start_height: start,
                         requested_count: count,
@@ -488,6 +523,7 @@ impl Service for HeaderSyncService {
             peer.direction,
             commands_tx,
             stream.version,
+            conn_id,
         );
 
         {
@@ -529,7 +565,7 @@ impl Service for HeaderSyncService {
                 DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
                 stream.version,
             ),
-            HsEnv::new(self.header_sync.clone()),
+            HsEnv::new_with_conn_id(self.header_sync.clone(), conn_id),
             SessionGuard::oversize_only(header_sync_guard_max_bytes()),
             run_inbound,
             &PIPE_SHAPE,
@@ -633,6 +669,7 @@ impl Service for HeaderSyncService {
         match deliver(
             &self.header_sync,
             ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            0,
             None,
             peer_id,
             frame,

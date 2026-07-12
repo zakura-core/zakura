@@ -1,6 +1,6 @@
 [package]
 name = "zakura-utils"
-version = "7.0.0"
+version = "1.0.0-rc2"
 authors.workspace = true
 description = "Developer tools for Zebra maintenance and testing"
 license.workspace = true
@@ -60,11 +60,11 @@ tracing-error = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 
-zakura-node-services = { path = "../zakura-node-services", version = "7.0.0" }
-zakura-chain = { path = "../zakura-chain", version = "9.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "1.0.0-rc2" }
+zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc2" }
 
 # These crates are needed for the block-template-to-proposal binary
-zakura-rpc = { path = "../zakura-rpc", version = "9.0.0" }
+zakura-rpc = { path = "../zakura-rpc", version = "1.0.0-rc2" }
 
 # These crates are needed for the zakura-checkpoints binary
 itertools = { workspace = true, optional = true }

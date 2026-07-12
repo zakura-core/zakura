@@ -55,10 +55,10 @@ values are read at runtime, so container images do not need CI-specific build
 arguments, and the `ZEBRA_*` environment namespace remains reserved for Zakura
 configuration.
 
-[tracing_section]: https://docs.rs/zakurad/latest/zakurad/components/tracing/struct.InnerConfig.html
-[filter]: https://docs.rs/zakurad/latest/zakurad/components/tracing/struct.InnerConfig.html#structfield.filter
-[flamegraph]: https://docs.rs/zakurad/latest/zakurad/components/tracing/struct.InnerConfig.html#structfield.flamegraph
+[tracing_section]: https://docs.rs/zakura/latest/zakurad/components/tracing/struct.InnerConfig.html
+[filter]: https://docs.rs/zakura/latest/zakurad/components/tracing/struct.InnerConfig.html#structfield.filter
+[flamegraph]: https://docs.rs/zakura/latest/zakurad/components/tracing/struct.InnerConfig.html#structfield.flamegraph
 [flamegraphs]: http://www.brendangregg.com/flamegraphs.html
 [systemd_journald]: https://www.freedesktop.org/software/systemd/man/systemd-journald.service.html
-[use_journald]: https://docs.rs/zakurad/latest/zakurad/components/tracing/struct.InnerConfig.html#structfield.use_journald
+[use_journald]: https://docs.rs/zakura/latest/zakurad/components/tracing/struct.InnerConfig.html#structfield.use_journald
 [sentry]: https://sentry.io/welcome/

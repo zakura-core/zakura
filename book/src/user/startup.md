@@ -28,7 +28,7 @@ Some important parts of the config are:
 - `state.cache_dir`: where the cached state is stored on disk
 - `rpc.listen_addr`: optional JSON-RPC listener port
 
-See [the full list of configuration options](https://docs.rs/zakurad/latest/zakurad/config/struct.ZakuradConfig.html).
+See [the full list of configuration options](https://docs.rs/zakura/latest/zakurad/config/struct.ZakuradConfig.html).
 
 ```text
 zakurad::commands::start: Starting zakurad

@@ -1,6 +1,6 @@
 [package]
-name = "tower-fallback"
-version = "0.2.41"
+name = "zakura-tower-fallback"
+version = "1.0.0-rc2"
 authors.workspace = true
 description = "A Tower service combinator that sends requests to a first service, then retries processing on a second fallback service if the first service errors."
 license.workspace = true
@@ -16,6 +16,9 @@ keywords = ["tower", "batch"]
 # Must be one of <https://crates.io/category_slugs>
 categories = ["algorithms", "asynchronous"]
 
+[lib]
+name = "tower_fallback"
+
 [dependencies]
 pin-project = { workspace = true }
 tower = { workspace = true }
@@ -25,7 +28,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-test = { path = "../zakura-test/", version = "3.0.0" }
+zakura-test = { path = "../zakura-test/", version = "1.0.0-rc2" }
 
 [lints]
 workspace = true

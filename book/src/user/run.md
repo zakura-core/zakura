@@ -28,7 +28,7 @@ no config is present. The contents of the config file is a TOML encoding of the
 internal config structure. All config options are documented
 in the [ZakuradConfig documentation][config-options].
 
-[config-options]: https://docs.rs/zakurad/latest/zakurad/config/struct.ZakuradConfig.html
+[config-options]: https://docs.rs/zakura/latest/zakurad/config/struct.ZakuradConfig.html
 [config-locations]: https://docs.rs/dirs/latest/dirs/fn.preference_dir.html
 
 ### Configuring Progress Bars
@@ -64,7 +64,7 @@ cargo install --features="<feature1> <feature2> ..." ...
 ```
 
 The full list of all features is in [the API
-documentation](https://docs.rs/zakurad/latest/zakurad/index.html#zakura-feature-flags).
+documentation](https://docs.rs/zakura/latest/zakurad/index.html#zakura-feature-flags).
 Some debugging and monitoring features are disabled in release builds to
 increase performance.
 

@@ -11,14 +11,14 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZAKURA_RELEASE_TAG="v1.0.0-rc1"
+ZAKURA_RELEASE_TAG="v1.0.0-rc2"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
-# sha256 of ZAKURA_ARCHIVE from the release's SHA256SUMS.txt.
-ZAKURA_ARCHIVE_SHA256="10a9ce52c2a436b35f5869cacce8a1ff8d197069bb3b775cacf7a0eaed991d12"
+# Replaced with the archive checksum by release-binaries.yml before publishing.
+ZAKURA_ARCHIVE_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
 ZAKURA_MEMBER="./bin/zakurad"
-ZAKURA_DOCKER_IMAGE="valargroup/zakura:1.0.0-rc1"
-ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-1.0.0-rc1"
+ZAKURA_DOCKER_IMAGE="valargroup/zakura:1.0.0-rc2"
+ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-1.0.0-rc2"
 ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
 ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
 # Persistent Zakura iroh identity (NodeId secret). Kept outside the state cache so
@@ -31,10 +31,10 @@ ZAKURA_DOCKER_IDENTITY_DIR="/home/zebra/.zakura"
 
 MANIFEST_PATH="$REPO_ROOT/zakurad/zcashd-compat-manifest.json"
 TARGET_TRIPLE="x86_64-pc-linux-gnu"
-ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v1.0.0-compat-rc2/zcashd-zebra-compat-v1.0.0-compat-rc2-linux-x86_64.tar.gz"
-ZCASHD_RUNTIME_ARCHIVE_SHA256="9636bfe642a7542f92a31132ecce1139a290df1a9e674e8373167831369a905d"
+ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v1.0.0-compat-rc3/zcashd-zebra-compat-v1.0.0-compat-rc3-linux-x86_64.tar.gz"
+ZCASHD_RUNTIME_ARCHIVE_SHA256="b861ea94215647a69a944ded7c9d6c7c3dfd836e54e3e194103242935e6879f2"
 ZCASHD_RUNTIME_ARCHIVE_MEMBER_BINARY_PATH="./bin/zcashd"
-ZCASHD_DEFAULT_DOCKER_IMAGE="valargroup/zcashd:v1.0.0-compat-rc2"
+ZCASHD_DEFAULT_DOCKER_IMAGE="valargroup/zcashd:v1.0.0-compat-rc3"
 
 INSTALL_PROFILE=""
 MODE=""

@@ -113,18 +113,18 @@ To change owners of current Zakura crates:
 ```sh
 $ git clone https://github.com/zakura-core/zakura
 $ cd zakura
-$ for crate in tower-* zakura*; do pushd $crate; cargo owner --add oxarbitrage; cargo owner --remove dconnolly; popd; done
+$ for crate in zakura* tower-*; do pushd $crate; cargo owner --add oxarbitrage; cargo owner --remove dconnolly; popd; done
 ~/zakura/tower-batch-control ~/zakura
     Updating crates.io index
-       Owner user oxarbitrage already has a pending invitation to be an owner of crate tower-batch-control
+       Owner user oxarbitrage already has a pending invitation to be an owner of crate zakura-tower-batch-control
     Updating crates.io index
-       Owner removing ["dconnolly"] from crate tower-batch-control
+       Owner removing ["dconnolly"] from crate zakura-tower-batch-control
 ~/zakura
 ~/zakura/tower-fallback ~/zakura
     Updating crates.io index
-       Owner user oxarbitrage has been invited to be an owner of crate tower-fallback
+       Owner user oxarbitrage has been invited to be an owner of crate zakura-tower-fallback
     Updating crates.io index
-       Owner removing ["dconnolly"] from crate tower-fallback
+       Owner removing ["dconnolly"] from crate zakura-tower-fallback
 ~/zakura
 ...
 ```

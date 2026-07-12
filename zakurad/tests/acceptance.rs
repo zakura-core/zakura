@@ -1432,7 +1432,7 @@ fn sync_confidence_range(stop_height: block::Height) -> Result<()> {
 /// Full-validation sync of ~5k mainnet blocks ending just below NU6.2, from a
 /// cached state at the top mainnet checkpoint.
 ///
-/// Skipped unless `TEST_SYNC_RANGE` is set. Runs in CI on merge to `ironwood-main`
+/// Skipped unless `TEST_SYNC_RANGE` is set. Runs in CI on merge to `main`
 /// via the `sync-range-pre-nu62` nextest profile.
 #[allow(dead_code)]
 #[test]
@@ -1450,7 +1450,7 @@ fn sync_range_pre_nu62() -> Result<()> {
 /// Full-validation sync of ~5k mainnet blocks above NU6.2, from a cached state at
 /// height 3,375,000.
 ///
-/// Skipped unless `TEST_SYNC_RANGE` is set. Runs in CI on merge to `ironwood-main`
+/// Skipped unless `TEST_SYNC_RANGE` is set. Runs in CI on merge to `main`
 /// via the `sync-range-post-nu62` nextest profile.
 #[allow(dead_code)]
 #[test]

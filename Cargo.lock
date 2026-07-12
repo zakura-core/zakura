@@ -7551,40 +7551,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tower-batch-control"
-version = "1.0.1"
-dependencies = [
- "color-eyre",
- "ed25519-zebra",
- "futures",
- "futures-core",
- "pin-project",
- "rand 0.8.6",
- "rayon",
- "tokio",
- "tokio-test",
- "tokio-util",
- "tower 0.4.13",
- "tower-fallback",
- "tower-test",
- "tracing",
- "tracing-futures",
- "zakura-test",
-]
-
-[[package]]
-name = "tower-fallback"
-version = "0.2.41"
-dependencies = [
- "futures-core",
- "pin-project",
- "tokio",
- "tower 0.4.13",
- "tracing",
- "zakura-test",
-]
-
-[[package]]
 name = "tower-http"
 version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8798,7 +8764,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
 name = "zakura"
-version = "1.0.0-rc0"
+version = "1.0.0-rc2"
 dependencies = [
  "abscissa_core",
  "anyhow",
@@ -8886,7 +8852,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "9.0.0"
+version = "1.0.0-rc2"
 dependencies = [
  "bech32",
  "bitflags 2.13.0",
@@ -8956,7 +8922,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "8.0.0"
+version = "1.0.0-rc2"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -8989,8 +8955,6 @@ dependencies = [
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tower 0.4.13",
- "tower-batch-control",
- "tower-fallback",
  "tracing",
  "tracing-error",
  "tracing-futures",
@@ -9000,6 +8964,8 @@ dependencies = [
  "zakura-script",
  "zakura-state",
  "zakura-test",
+ "zakura-tower-batch-control",
+ "zakura-tower-fallback",
  "zcash_primitives",
  "zcash_proofs",
  "zcash_protocol",
@@ -9009,7 +8975,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-jsonl-trace"
-version = "0.1.0"
+version = "1.0.0-rc2"
 dependencies = [
  "tempfile",
  "tokio",
@@ -9019,7 +8985,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "8.0.0"
+version = "1.0.0-rc2"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -9067,7 +9033,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "7.0.0"
+version = "1.0.0-rc2"
 dependencies = [
  "color-eyre",
  "jsonrpsee-types",
@@ -9081,7 +9047,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "9.0.0"
+version = "1.0.0-rc2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9151,7 +9117,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "8.0.0"
+version = "1.0.0-rc2"
 dependencies = [
  "hex",
  "lazy_static",
@@ -9169,7 +9135,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "8.0.0"
+version = "1.0.0-rc2"
 dependencies = [
  "bincode",
  "chrono",
@@ -9220,7 +9186,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-test"
-version = "3.0.0"
+version = "1.0.0-rc2"
 dependencies = [
  "color-eyre",
  "futures",
@@ -9246,8 +9212,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-tower-batch-control"
+version = "1.0.0-rc2"
+dependencies = [
+ "color-eyre",
+ "ed25519-zebra",
+ "futures",
+ "futures-core",
+ "pin-project",
+ "rand 0.8.6",
+ "rayon",
+ "tokio",
+ "tokio-test",
+ "tokio-util",
+ "tower 0.4.13",
+ "tower-test",
+ "tracing",
+ "tracing-futures",
+ "zakura-test",
+ "zakura-tower-fallback",
+]
+
+[[package]]
+name = "zakura-tower-fallback"
+version = "1.0.0-rc2"
+dependencies = [
+ "futures-core",
+ "pin-project",
+ "tokio",
+ "tower 0.4.13",
+ "tracing",
+ "zakura-test",
+]
+
+[[package]]
 name = "zakura-utils"
-version = "7.0.0"
+version = "1.0.0-rc2"
 dependencies = [
  "color-eyre",
  "hex",

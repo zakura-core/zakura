@@ -9,7 +9,7 @@
 #
 # The config format, including a complete list of sections and fields, is
 # documented here:
-# https://docs.rs/zakurad/latest/zakurad/config/struct.ZakuradConfig.html
+# https://docs.rs/zakura/latest/zakurad/config/struct.ZakuradConfig.html
 
 [network]
 network = "Mainnet"

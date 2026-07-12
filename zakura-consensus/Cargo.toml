@@ -1,6 +1,6 @@
 [package]
 name = "zakura-consensus"
-version = "8.0.0"
+version = "1.0.0-rc2"
 authors.workspace = true
 description = "Implementation of Zcash consensus checks"
 license.workspace = true
@@ -65,13 +65,13 @@ libzcash_script = { workspace = true }
 zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
 
-tower-fallback = { path = "../tower-fallback/", version = "0.2.41" }
-tower-batch-control = { path = "../tower-batch-control/", version = "1.0.1" }
+tower-fallback = { package = "zakura-tower-fallback", path = "../tower-fallback/", version = "1.0.0-rc2" }
+tower-batch-control = { package = "zakura-tower-batch-control", path = "../tower-batch-control/", version = "1.0.0-rc2" }
 
-zakura-script = { path = "../zakura-script", version = "8.0.0" }
-zakura-state = { path = "../zakura-state", version = "8.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "7.0.0" }
-zakura-chain = { path = "../zakura-chain", version = "9.0.0" }
+zakura-script = { path = "../zakura-script", version = "1.0.0-rc2" }
+zakura-state = { path = "../zakura-state", version = "1.0.0-rc2" }
+zakura-node-services = { path = "../zakura-node-services", version = "1.0.0-rc2" }
+zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc2" }
 
 zcash_protocol.workspace = true
 
@@ -96,9 +96,9 @@ tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 tracing-error = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-zakura-state = { path = "../zakura-state", version = "8.0.0", features = ["proptest-impl"] }
-zakura-chain = { path = "../zakura-chain", version = "9.0.0", features = ["proptest-impl"] }
-zakura-test = { path = "../zakura-test/", version = "3.0.0" }
+zakura-state = { path = "../zakura-state", version = "1.0.0-rc2", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc2", features = ["proptest-impl"] }
+zakura-test = { path = "../zakura-test/", version = "1.0.0-rc2" }
 
 criterion = { workspace = true, features = ["html_reports"] }
 

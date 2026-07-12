@@ -72,7 +72,7 @@ docker build -f ./docker/Dockerfile --target runtime \
 ```
 
 All available Cargo features are listed at
-<https://docs.rs/zakurad/latest/zakurad/index.html#zakura-feature-flags>.
+<https://docs.rs/zakura/latest/zakurad/index.html#zakura-feature-flags>.
 
 ## Configuring Zakura
 

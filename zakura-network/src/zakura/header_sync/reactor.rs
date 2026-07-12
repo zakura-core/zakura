@@ -1415,7 +1415,9 @@ impl HeaderSyncReactor {
         let Some(repair) = self.state.repair.as_mut() else {
             return;
         };
-        repair.finish_attempt(peer, Instant::now());
+        if !repair.finish_attempt(peer, Instant::now()) {
+            return;
+        }
         if repair.exhausted {
             tracing::error!(
                 height = ?repair.height,

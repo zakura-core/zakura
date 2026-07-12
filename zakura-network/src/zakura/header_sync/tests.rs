@@ -1546,7 +1546,7 @@ fn vct_repair_episode_enforces_attempt_and_time_bounds() {
         assert!(repair.can_attempt(repair.next_attempt_at));
         let peer_id = peer(120 + u8::try_from(attempt).expect("attempt fits in u8"));
         repair.mark_attempt(peer_id.clone());
-        repair.finish_attempt(&peer_id, repair.next_attempt_at);
+        assert!(repair.finish_attempt(&peer_id, repair.next_attempt_at));
     }
 
     assert!(repair.exhausted);
@@ -1564,6 +1564,31 @@ fn vct_repair_episode_enforces_attempt_and_time_bounds() {
     .expect("single-header handoff repair is valid");
     timed.started_at = Instant::now() - VCT_ROOT_REPAIR_MAX_WALL_TIME;
     assert!(!timed.can_attempt(Instant::now()));
+}
+
+#[test]
+fn vct_repair_ignores_unrelated_peer_disconnects() {
+    let mut repair = VctRootRepair::new(
+        block::Height(1),
+        1,
+        Network::Mainnet.genesis_hash(),
+        vec![(
+            block::Height(1),
+            mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+        )],
+    )
+    .expect("single-header handoff repair is valid");
+    let repair_peer = peer(130);
+    repair.mark_attempt(repair_peer.clone());
+    let next_attempt_at = repair.next_attempt_at;
+
+    assert!(!repair.finish_attempt(
+        &peer(131),
+        repair.started_at + VCT_ROOT_REPAIR_MAX_WALL_TIME
+    ));
+    assert_eq!(repair.in_flight.as_ref(), Some(&repair_peer));
+    assert_eq!(repair.next_attempt_at, next_attempt_at);
+    assert!(!repair.exhausted);
 }
 
 #[tokio::test(flavor = "current_thread")]

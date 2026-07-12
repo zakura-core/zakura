@@ -210,10 +210,11 @@ impl VctRootRepair {
         self.in_flight = Some(peer);
     }
 
-    pub(super) fn finish_attempt(&mut self, peer: &ZakuraPeerId, now: Instant) {
-        if self.in_flight.as_ref() == Some(peer) {
-            self.in_flight = None;
+    pub(super) fn finish_attempt(&mut self, peer: &ZakuraPeerId, now: Instant) -> bool {
+        if self.in_flight.as_ref() != Some(peer) {
+            return false;
         }
+        self.in_flight = None;
         let attempt_index = self.tried_peers.len().min(VCT_ROOT_REPAIR_MAX_ATTEMPTS - 1);
         self.next_attempt_at = now + VCT_ROOT_REPAIR_BACKOFFS[attempt_index];
         if self.tried_peers.len() >= VCT_ROOT_REPAIR_MAX_ATTEMPTS
@@ -221,6 +222,7 @@ impl VctRootRepair {
         {
             self.exhausted = true;
         }
+        true
     }
 }
 

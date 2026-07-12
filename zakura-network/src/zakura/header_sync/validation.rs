@@ -271,22 +271,25 @@ pub(super) async fn validate_pow_spawn_blocking(
     headers: Vec<Arc<block::Header>>,
     network: &Network,
 ) -> Result<(), HeaderSyncWireError> {
-    let skip_pow_filter = network
-        .parameters()
-        .is_some_and(|parameters| parameters.is_regtest());
-    tokio::task::spawn_blocking(move || validate_pow_blocking(&headers, skip_pow_filter)).await?
+    let network = network.clone();
+    tokio::task::spawn_blocking(move || validate_pow_blocking(&headers, &network)).await?
 }
 
 pub(super) fn validate_pow_blocking(
     headers: &[Arc<block::Header>],
-    skip_pow_filter: bool,
+    network: &Network,
 ) -> Result<(), HeaderSyncWireError> {
+    let skip_pow_filter = network
+        .parameters()
+        .is_some_and(|parameters| parameters.is_regtest());
     if skip_pow_filter {
         return Ok(());
     }
 
     for header in headers {
-        header.solution.check(header)?;
+        // Bind the Equihash parameters to `network` so a short 36-byte
+        // Regtest-shaped solution cannot pass the PoW check on Mainnet/Testnet.
+        header.solution.check(header, network)?;
         let hash = block::Hash::from(header.as_ref());
         validate_difficulty_filter(hash, header.difficulty_threshold)?;
     }

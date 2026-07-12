@@ -6,6 +6,7 @@ use proptest::{prelude::*, test_runner::Config};
 
 use crate::{
     block::{self, Block},
+    parameters::Network,
     serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
 };
 
@@ -51,7 +52,10 @@ fn equihash_prop_test_solution() -> color_eyre::eyre::Result<()> {
     for block_bytes in zakura_test::vectors::BLOCKS.iter() {
         let block = Block::zcash_deserialize(&block_bytes[..])
             .expect("block test vector should deserialize");
-        block.header.solution.check(&block.header)?;
+        block
+            .header
+            .solution
+            .check(&block.header, &Network::Mainnet)?;
 
         // The equihash solution test can be really slow, so we use fewer cases by
         // default. Set the PROPTEST_CASES env var to override this default.
@@ -61,7 +65,7 @@ fn equihash_prop_test_solution() -> color_eyre::eyre::Result<()> {
                                       .unwrap_or(DEFAULT_TEST_INPUT_PROPTEST_CASES)),
                 |(fake_header in randomized_solutions(*block.header.as_ref()))| {
             fake_header.solution
-                .check(&fake_header)
+                .check(&fake_header, &Network::Mainnet)
                 .expect_err("block header should not validate on randomized solution");
         });
     }
@@ -91,11 +95,14 @@ fn equihash_prop_test_nonce() -> color_eyre::eyre::Result<()> {
     for block_bytes in zakura_test::vectors::BLOCKS.iter() {
         let block = Block::zcash_deserialize(&block_bytes[..])
             .expect("block test vector should deserialize");
-        block.header.solution.check(&block.header)?;
+        block
+            .header
+            .solution
+            .check(&block.header, &Network::Mainnet)?;
 
         proptest!(|(fake_header in randomized_nonce(*block.header.as_ref()))| {
             fake_header.solution
-                .check(&fake_header)
+                .check(&fake_header, &Network::Mainnet)
                 .expect_err("block header should not validate on randomized nonce");
         });
     }
@@ -127,7 +134,10 @@ fn equihash_prop_test_input() -> color_eyre::eyre::Result<()> {
     for block_bytes in zakura_test::vectors::BLOCKS.iter() {
         let block = Block::zcash_deserialize(&block_bytes[..])
             .expect("block test vector should deserialize");
-        block.header.solution.check(&block.header)?;
+        block
+            .header
+            .solution
+            .check(&block.header, &Network::Mainnet)?;
 
         proptest!(Config::with_cases(env::var("PROPTEST_CASES")
                                   .ok()
@@ -135,7 +145,7 @@ fn equihash_prop_test_input() -> color_eyre::eyre::Result<()> {
                                  .unwrap_or(DEFAULT_TEST_INPUT_PROPTEST_CASES)),
               |(fake_header in randomized_input(*block.header.as_ref()))| {
             fake_header.solution
-                .check(&fake_header)
+                .check(&fake_header, &Network::Mainnet)
                 .expect_err("equihash solution should not validate on randomized input");
         });
     }

@@ -4,10 +4,8 @@
 
 [![Unit Tests](https://github.com/zakura-core/zakura/actions/workflows/tests-unit.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/tests-unit.yml)
 [![Lint](https://github.com/zakura-core/zakura/actions/workflows/lint.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/lint.yml)
-[![Integration Tests (GCP)](https://github.com/zakura-core/zakura/actions/workflows/zfnd-ci-integration-tests-gcp.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/zfnd-ci-integration-tests-gcp.yml)
 [![codecov](https://codecov.io/gh/zakura-core/zakura/branch/main/graph/badge.svg)](https://codecov.io/gh/zakura-core/zakura)
 [![Build docs](https://github.com/zakura-core/zakura/actions/workflows/book.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/book.yml)
-[![Deploy Nodes (GCP)](https://github.com/zakura-core/zakura/actions/workflows/zfnd-deploy-nodes-gcp.yml/badge.svg)](https://github.com/zakura-core/zakura/actions/workflows/zfnd-deploy-nodes-gcp.yml)
 ![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)
 
 - [Getting Started](#getting-started)
@@ -24,7 +22,7 @@
 ## Getting Started
 
 You can run Zakura using our [Docker
-image](https://hub.docker.com/r/zakura-core/zakura/tags) or you can install it manually.
+image](https://hub.docker.com/r/valargroup/zakura/tags) or you can install it manually.
 
 ### Docker
 
@@ -35,7 +33,7 @@ docker run -d \
   --name zakura \
   -p 8233:8233 \
   -v zakurad-cache:/home/zakura/.cache/zakura \
-  zakura-core/zakura:latest
+  valargroup/zakura:latest
 ```
 
 The `-p 8233:8233` flag exposes the P2P port so other Zcash nodes can connect to

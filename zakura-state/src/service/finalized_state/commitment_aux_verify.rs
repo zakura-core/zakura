@@ -795,4 +795,261 @@ mod tests {
             fail_height.0
         );
     }
+
+    /// Validates the exact tree-aux records an archive database would serve for arbitrary ranges.
+    ///
+    /// This check needs only one read-only database and is intended for diagnosing a serving node.
+    /// It verifies contiguous encoded heights and compares every served root, transaction count,
+    /// and auth-data root with the database's block and per-height tree data.
+    ///
+    /// Run:
+    /// ```text
+    /// VCT_ARCHIVE_DB=<archive-db> \
+    /// VCT_RANGES=187401-188400,200401-201400 \
+    ///   cargo test -p zakura-state --lib validates_served_vct_ranges_from_read_only_db \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[ignore]
+    #[test]
+    #[allow(clippy::print_stderr)] // intentional progress output for a manual diagnostic
+    fn validates_served_vct_ranges_from_read_only_db() {
+        use std::path::PathBuf;
+
+        use crate::{
+            constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+            service::finalized_state::{
+                commitment_aux::serve_block_roots, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE,
+            },
+            Config,
+        };
+
+        let archive_dir = std::env::var_os("VCT_ARCHIVE_DB")
+            .expect("set VCT_ARCHIVE_DB to an archive state cache directory");
+        let ranges = std::env::var("VCT_RANGES")
+            .expect("set VCT_RANGES to comma-separated inclusive ranges, for example 10-20,30-40");
+
+        let config = Config {
+            cache_dir: PathBuf::from(archive_dir),
+            ephemeral: false,
+            ..Default::default()
+        };
+        let archive_db = ZakuraDb::new(
+            &config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &Mainnet,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            true,
+        )
+        .expect("opening the archive database read-only should succeed");
+
+        let ranges: Vec<_> = ranges
+            .split(',')
+            .map(str::trim)
+            .filter(|range| !range.is_empty())
+            .map(|range| {
+                let (start, end) = range
+                    .split_once('-')
+                    .unwrap_or_else(|| panic!("range {range:?} must use START-END syntax"));
+                let start: u32 = start
+                    .parse()
+                    .unwrap_or_else(|_| panic!("invalid start height in range {range:?}"));
+                let end: u32 = end
+                    .parse()
+                    .unwrap_or_else(|_| panic!("invalid end height in range {range:?}"));
+                assert!(start <= end, "range start must not exceed end: {range:?}");
+                (start, end)
+            })
+            .collect();
+        assert!(!ranges.is_empty(), "VCT_RANGES did not contain any ranges");
+
+        let root_at = |height: Height| {
+            serve_block_roots(&archive_db, height..=height)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("served root is missing at {height:?}"))
+        };
+        let verification_item_at = |height: Height| {
+            let roots = root_at(height);
+            assert_eq!(roots.height, height, "served root height at {height:?}");
+            let block = archive_db
+                .block(height.into())
+                .unwrap_or_else(|| panic!("archive body is missing at {height:?}"));
+            assert_eq!(
+                roots.sapling_tx,
+                block.sapling_transactions_count(),
+                "Sapling transaction count at {height:?}"
+            );
+            assert_eq!(
+                roots.orchard_tx,
+                block.orchard_transactions_count(),
+                "Orchard transaction count at {height:?}"
+            );
+            assert_eq!(
+                roots.ironwood_tx,
+                block.ironwood_transactions_count(),
+                "Ironwood transaction count at {height:?}"
+            );
+            assert_eq!(
+                roots.auth_data_root,
+                block.auth_data_root(),
+                "auth-data root at {height:?}"
+            );
+            CommitmentRootVerification::with_roots(
+                block,
+                roots.sapling_root,
+                roots.orchard_root,
+                roots.ironwood_root,
+                Some(roots.auth_data_root),
+                false,
+            )
+        };
+
+        let mut checked = 0usize;
+        for &(start, end) in &ranges {
+            let range = format!("{start}-{end}");
+            let roots = serve_block_roots(&archive_db, Height(start)..=Height(end));
+            let expected_len = usize::try_from(end - start + 1)
+                .expect("a u32 range length fits in usize on supported targets");
+            assert_eq!(
+                roots.len(),
+                expected_len,
+                "served roots must fully cover range {range:?}"
+            );
+
+            for (offset, roots) in roots.into_iter().enumerate() {
+                let offset =
+                    u32::try_from(offset).expect("the bounded diagnostic range offset fits in u32");
+                let height = Height(
+                    start
+                        .checked_add(offset)
+                        .expect("the validated range end fits in u32"),
+                );
+                assert_eq!(
+                    roots.height, height,
+                    "served root height is misaligned in range {range:?}"
+                );
+
+                let block = archive_db
+                    .block(height.into())
+                    .unwrap_or_else(|| panic!("archive body is missing at {height:?}"));
+                let sapling = archive_db
+                    .sapling_tree_by_height(&height)
+                    .unwrap_or_else(|| panic!("Sapling tree is missing at {height:?}"));
+                let orchard = archive_db
+                    .orchard_tree_by_height(&height)
+                    .unwrap_or_else(|| panic!("Orchard tree is missing at {height:?}"));
+                let ironwood = archive_db
+                    .ironwood_tree_by_height(&height)
+                    .map(|tree| tree.root())
+                    .unwrap_or_else(|| ironwood::tree::NoteCommitmentTree::default().root());
+
+                assert_eq!(
+                    roots.sapling_root,
+                    sapling.root(),
+                    "Sapling root at {height:?}"
+                );
+                assert_eq!(
+                    roots.orchard_root,
+                    orchard.root(),
+                    "Orchard root at {height:?}"
+                );
+                assert_eq!(roots.ironwood_root, ironwood, "Ironwood root at {height:?}");
+                assert_eq!(
+                    roots.sapling_tx,
+                    block.sapling_transactions_count(),
+                    "Sapling transaction count at {height:?}"
+                );
+                assert_eq!(
+                    roots.orchard_tx,
+                    block.orchard_transactions_count(),
+                    "Orchard transaction count at {height:?}"
+                );
+                assert_eq!(
+                    roots.ironwood_tx,
+                    block.ironwood_transactions_count(),
+                    "Ironwood transaction count at {height:?}"
+                );
+                assert_eq!(
+                    roots.auth_data_root,
+                    block.auth_data_root(),
+                    "auth-data root at {height:?}"
+                );
+                checked += 1;
+            }
+
+            eprintln!("validated served tree-aux records for {start}..={end}");
+        }
+
+        eprintln!("validated {checked} served tree-aux records");
+
+        let heartwood = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("Heartwood has a mainnet activation height")
+            .0;
+        for &(start, end) in ranges.iter().filter(|(start, _)| *start < heartwood) {
+            let items = (start..=end).map(|height| verification_item_at(Height(height)));
+            verify_commitment_roots(&Mainnet, empty_history_tree(), items).unwrap_or_else(
+                |(height, error)| panic!("pre-Heartwood roots failed at {height:?}: {error}"),
+            );
+            eprintln!("validated direct pre-Heartwood commitments for {start}..={end}");
+        }
+
+        let mut epoch_ends = std::collections::BTreeMap::new();
+        for &(start, end) in ranges.iter().filter(|(start, _)| *start >= heartwood) {
+            let upgrade = NetworkUpgrade::current(&Mainnet, Height(start));
+            assert_eq!(
+                NetworkUpgrade::current(&Mainnet, Height(end)),
+                upgrade,
+                "diagnostic range {start}..={end} must not cross a network upgrade"
+            );
+            let activation = upgrade
+                .activation_height(&Mainnet)
+                .expect("an active mainnet upgrade has an activation height")
+                .0;
+            epoch_ends
+                .entry((activation, upgrade))
+                .and_modify(|max_end: &mut u32| *max_end = (*max_end).max(end))
+                .or_insert(end);
+        }
+
+        for ((activation, upgrade), end) in epoch_ends {
+            let activation_item = verification_item_at(Height(activation));
+            let activation_block = activation_item
+                .block
+                .expect("served root verification items contain block bodies");
+            let (sapling_root, orchard_root, ironwood_root) = activation_item
+                .roots
+                .expect("served root verification items contain roots");
+            let history_tree = HistoryTree::from_block(
+                &Mainnet,
+                activation_block,
+                &sapling_root,
+                &orchard_root,
+                &ironwood_root,
+            )
+            .expect("network-upgrade activation starts a history-tree epoch");
+            let confirm_end = end
+                .checked_add(1)
+                .expect("diagnostic range end has a successor");
+            let items =
+                (activation + 1..=confirm_end).map(|height| verification_item_at(Height(height)));
+
+            verify_commitment_roots(&Mainnet, history_tree, items).unwrap_or_else(
+                |(height, error)| {
+                    panic!(
+                        "{upgrade:?} MMR linkage failed at {height:?} while validating through \
+                         {confirm_end}: {error}"
+                    )
+                },
+            );
+            eprintln!(
+                "validated {upgrade:?} MMR linkage for {activation}..={end} \
+                 (confirmed by {confirm_end})"
+            );
+        }
+    }
 }

@@ -164,8 +164,8 @@ On failure, the workflow uploads deploy logs as a GitHub Actions artifact.
 
 ## Hard Guards
 
-- Do not dispatch mainnet without explicit user confirmation of the `ref`.
-- Do not change cache paths or resync mainnet archive nodes. The workflow pins
+- Do not dispatch mainnet without explicit user confirmation of the `ref`, unless explicitly allowed to be overriden and confirmed by user.
+- Do not change cache paths or resync mainnet archive nodesm, unless explicitly allowed and confirmed by yser. The workflow pins
   existing cache and identity paths so nodes keep their state DB and iroh node id.
 - `node` must match a deployer config name exactly (case-sensitive).
 - Only one deploy per network runs at a time (`cancel-in-progress: false`).

@@ -47,9 +47,10 @@ pub const NODE_ID_ENV: &str = "ZEBRA_NODE_ID";
 
 /// Returns the process-wide node identifier used to tag JSONL trace records.
 ///
-/// Resolution order: `ZEBRA_NODE_ID`, then `HOSTNAME`, then `"unknown"`. The
-/// value is resolved once on first call and cached for the lifetime of the
-/// process so every trace record from this node reports the same id.
+/// Resolution order: `ZEBRA_NODE_ID`, `HOSTNAME`, `/etc/hostname`, then
+/// `"unknown"`. The value is resolved once on first call and cached for the
+/// lifetime of the process so every trace record from this node reports the
+/// same id.
 pub fn node_id() -> &'static str {
     static NODE_ID: OnceLock<String> = OnceLock::new();
     NODE_ID
@@ -57,6 +58,8 @@ pub fn node_id() -> &'static str {
             std::env::var(NODE_ID_ENV)
                 .ok()
                 .or_else(|| std::env::var("HOSTNAME").ok())
+                .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+                .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "unknown".to_string())
         })

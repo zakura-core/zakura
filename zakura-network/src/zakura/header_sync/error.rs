@@ -55,12 +55,22 @@ pub enum HeaderSyncWireError {
     },
 
     /// An inbound `Headers` response carried a root for the wrong height.
-    #[error("Zakura header-sync Headers tree-aux root height {root_height:?} does not match expected height {expected_height:?}")]
+    #[error(
+        "Zakura header-sync Headers tree-aux root height {root_height:?} does not match \
+         expected height {expected_height:?} at offset {offset} \
+         (first={first_root_height:?}, last={last_root_height:?})"
+    )]
     TreeAuxRootHeightMismatch {
+        /// Zero-based root offset within the response.
+        offset: usize,
         /// Expected root height.
         expected_height: block::Height,
         /// Actual root height.
         root_height: block::Height,
+        /// First encoded root height.
+        first_root_height: block::Height,
+        /// Last encoded root height.
+        last_root_height: block::Height,
     },
 
     /// A boolean marker field used a value other than 0 or 1.

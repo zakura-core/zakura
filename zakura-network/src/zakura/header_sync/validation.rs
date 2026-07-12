@@ -357,18 +357,27 @@ pub(super) fn validate_tree_aux_root_heights(
     roots: &[BlockCommitmentRoots],
 ) -> Result<(), HeaderSyncWireError> {
     for (offset, root) in roots.iter().enumerate() {
-        let offset = u32::try_from(offset)
+        let height_offset = u32::try_from(offset)
             .map_err(|_| HeaderSyncWireError::NumericOverflow("tree-aux root height offset"))?;
         let expected_height = block::Height(
             start_height
                 .0
-                .checked_add(offset)
+                .checked_add(height_offset)
                 .ok_or(HeaderSyncWireError::NumericOverflow("tree-aux root height"))?,
         );
         if root.height != expected_height {
             return Err(HeaderSyncWireError::TreeAuxRootHeightMismatch {
+                offset,
                 expected_height,
                 root_height: root.height,
+                first_root_height: roots
+                    .first()
+                    .expect("a mismatching root exists because the loop is processing it")
+                    .height,
+                last_root_height: roots
+                    .last()
+                    .expect("a mismatching root exists because the loop is processing it")
+                    .height,
             });
         }
     }

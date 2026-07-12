@@ -3,7 +3,13 @@
 
 #[cfg(test)]
 use std::collections::HashMap;
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use thiserror::Error;
 use zakura_chain::{
@@ -462,17 +468,28 @@ pub(crate) fn produce_block_roots(
         // archival node holds the body for these heights). Zero only if the body is somehow
         // absent, in which case the recipient simply re-fetches from a node that has it.
         let block = db.block(height.into());
-        let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = block
-            .as_ref()
-            .map(|block| {
+        let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) =
+            if let Some(block) = block.as_ref() {
                 (
                     block.sapling_transactions_count(),
                     block.orchard_transactions_count(),
                     block.ironwood_transactions_count(),
                     block.auth_data_root(),
                 )
-            })
-            .unwrap_or((0, 0, 0, AuthDataRoot::from([0u8; 32])));
+            } else {
+                metrics::counter!("state.block_roots.zero_aux_fallback").increment(1);
+                static ZERO_AUX_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+                let occurrences = ZERO_AUX_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1;
+                if occurrences.is_power_of_two() {
+                    tracing::error!(
+                        ?height,
+                        occurrences,
+                        "serving tree-aux roots with zero transaction counts and auth-data root \
+                         because the finalized block body is unavailable"
+                    );
+                }
+                (0, 0, 0, AuthDataRoot::from([0u8; 32]))
+            };
         roots.push(BlockCommitmentRoots {
             height,
             sapling_root: sapling.root(),

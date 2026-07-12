@@ -1556,6 +1556,14 @@ where
     C: AsRef<Chain>,
 {
     let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
+    let end = (start + i64::from(capped_count.saturating_sub(1))).unwrap_or(start);
+    let source = match db.vct_upgrade_height() {
+        None => "trees",
+        Some(upgrade) if start >= upgrade => "compact_index",
+        Some(upgrade) if end < upgrade => "trees",
+        Some(_) => "mixed",
+    };
+    metrics::counter!("state.block_roots.response", "source" => source).increment(1);
     let mut roots =
         Vec::with_capacity(usize::try_from(capped_count).expect("capped root count fits in usize"));
 

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `VctRootRepairStatus`, `VctRootRepairState`, and
+  `ReadStateService::subscribe_vct_root_repairs`: a watch channel the finalized
+  writer uses to request a bounded re-delivery of missing or evicted VCT
+  supplied roots through header sync. A queue reset withdraws any published
+  repair need.
+
 ### Fixed
 
 - VCT checkpoint writes now use the validated header store for the H+1 root witness,

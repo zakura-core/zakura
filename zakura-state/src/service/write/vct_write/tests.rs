@@ -334,3 +334,45 @@ fn root_repair_signal_ignores_await_successor_and_clears_on_commit() {
     manager.on_commit_success();
     assert_eq!(rx.borrow_and_update().state, VctRootRepairState::Idle);
 }
+
+#[test]
+fn reset_withdraws_published_root_repair_need() {
+    let _init_guard = zakura_test::init();
+    let (tx, mut rx) = tokio::sync::watch::channel(VctRootRepairStatus::default());
+    let mut manager = VctWriteManager::new(tx);
+    let mut finalized_state = crate::service::finalized_state::FinalizedState::new(
+        &crate::Config::ephemeral(),
+        &zakura_chain::parameters::Network::Mainnet,
+        #[cfg(feature = "elasticsearch")]
+        false,
+    )
+    .expect("opening an ephemeral finalized state succeeds");
+
+    manager.on_retryable_error(Height(42), true, false, queued_block(1));
+    let published = *rx.borrow_and_update();
+    assert_eq!(
+        published.state,
+        VctRootRepairState::Unavailable { height: Height(42) }
+    );
+
+    manager.reset(&mut finalized_state);
+    let withdrawn = *rx.borrow_and_update();
+    assert_eq!(
+        withdrawn.state,
+        VctRootRepairState::Idle,
+        "a queue reset must withdraw the published repair need"
+    );
+    assert_eq!(
+        withdrawn.generation, published.generation,
+        "withdrawing a repair must not consume a new generation"
+    );
+
+    // A stall that persists across the reset re-publishes under a new generation.
+    manager.on_retryable_error(Height(42), true, false, queued_block(2));
+    let republished = *rx.borrow_and_update();
+    assert_eq!(
+        republished.state,
+        VctRootRepairState::Unavailable { height: Height(42) }
+    );
+    assert_eq!(republished.generation, published.generation + 1);
+}

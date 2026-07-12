@@ -223,6 +223,10 @@ async fn drive_vct_root_repair_updates<Deliver, Delivery>(
     Delivery: Future<Output = bool>,
 {
     const RETRY_DELAY: Duration = Duration::from_millis(500);
+    /// One warning per this many consecutive failed deliveries (~30s at
+    /// [`RETRY_DELAY`]), so a permanently undeliverable repair status is
+    /// visible to operators instead of an invisible silent retry loop.
+    const RETRY_WARN_EVERY: u32 = 60;
 
     pin!(shutdown);
     let mut status = *repairs.borrow_and_update();
@@ -232,10 +236,24 @@ async fn drive_vct_root_repair_updates<Deliver, Delivery>(
         status.state,
         zakura_state::VctRootRepairState::Unavailable { .. }
     );
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         if delivery_pending {
             delivery_pending = !deliver(status).await;
+            if delivery_pending {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures.is_multiple_of(RETRY_WARN_EVERY) {
+                    tracing::warn!(
+                        ?status,
+                        consecutive_failures,
+                        "VCT root repair status could not be delivered to header sync \
+                         (state read or event send keeps failing); still retrying"
+                    );
+                }
+            } else {
+                consecutive_failures = 0;
+            }
         }
 
         select! {
@@ -246,6 +264,7 @@ async fn drive_vct_root_repair_updates<Deliver, Delivery>(
                 }
                 status = *repairs.borrow_and_update();
                 delivery_pending = true;
+                consecutive_failures = 0;
             }
             _ = tokio::time::sleep(RETRY_DELAY), if delivery_pending => {}
         }

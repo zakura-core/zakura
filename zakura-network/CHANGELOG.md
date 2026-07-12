@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added `HeaderSyncEvent::VctRootRepairRequested` and
+  `HeaderSyncEvent::VctRootRepairResolved`, plus a bounded VCT supplied-root
+  repair lane in the header-sync reactor: one episode per stalled height with
+  serial idle-peer attempts pinned to the node's own canonical hashes,
+  bypassing covered-range suppression without advancing the sync frontier.
 - `MinimumPeerVersion::chain_tip()` for checking tip state from peer routing
   logic.
 - Added `zebra_network::zakura`, a default-off iroh scaffold that exposes a

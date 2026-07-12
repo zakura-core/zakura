@@ -88,9 +88,16 @@ impl VctWriteManager {
 
     /// Clears the look-ahead and any cached successor prevalidation, for a
     /// queue reset (wrong-height block, or a hard commit failure).
+    ///
+    /// Also withdraws any published root-repair need: after a reset the queue
+    /// is redelivered from upstream, so the stall that requested the repair may
+    /// no longer exist and a still-active repair episode would go stale. A
+    /// stall that persists across the reset re-publishes with a new generation
+    /// on its next commit attempt.
     pub(super) fn reset(&mut self, finalized_state: &mut FinalizedState) {
         self.lookahead.clear();
         finalized_state.clear_vct_prevalidated_next();
+        self.publish_root_repair_idle();
     }
 
     /// Buffers the direct successor of `current` into the look-ahead, if available.

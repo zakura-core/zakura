@@ -95,15 +95,15 @@ fn coinbase() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The Zebra marker is always prepended, and `extra_coinbase_data` can't exceed
+/// The Zakura marker is always prepended, and `extra_coinbase_data` can't exceed
 /// the limit.
 #[test]
 fn coinbase_tag_and_limit() {
     use zcash_address::ZcashAddress;
 
     use crate::config::mining::{
-        Config, ExtraCoinbaseData, MAX_USER_COINBASE_DATA_LEN, ZEBRA_COINBASE_MARKER,
-        ZEBRA_COINBASE_SEPARATOR,
+        Config, ExtraCoinbaseData, MAX_USER_COINBASE_DATA_LEN, ZAKURA_COINBASE_MARKER,
+        ZAKURA_COINBASE_SEPARATOR,
     };
 
     // `ExtraCoinbaseData` accepts data up to the limit and rejects one byte over. Its
@@ -129,13 +129,13 @@ fn coinbase_tag_and_limit() {
     };
 
     // The marker is prepended whether or not `extra_coinbase_data` is set, so every
-    // block Zebra builds is tagged. Without extra data, the coinbase data is exactly
+    // block Zakura builds is tagged. Without extra data, the coinbase data is exactly
     // the marker.
     let untagged = params(None).expect("valid config");
     let untagged = untagged.data().as_ref().expect("marker is always present");
     assert_eq!(
         untagged.value().as_slice(),
-        ZEBRA_COINBASE_MARKER.as_bytes()
+        ZAKURA_COINBASE_MARKER.as_bytes()
     );
 
     // With extra data, the marker and separator precede it.
@@ -144,7 +144,7 @@ fn coinbase_tag_and_limit() {
     let tagged = tagged.data().as_ref().expect("marker is always present");
     assert_eq!(
         tagged.value().as_slice(),
-        [ZEBRA_COINBASE_MARKER, ZEBRA_COINBASE_SEPARATOR, "/pool/"]
+        [ZAKURA_COINBASE_MARKER, ZAKURA_COINBASE_SEPARATOR, "/pool/"]
             .concat()
             .as_bytes()
     );

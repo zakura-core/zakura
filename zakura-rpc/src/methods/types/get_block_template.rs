@@ -47,7 +47,7 @@ use zakura_state::GetBlockTemplateChainInfo;
 use crate::{
     config::{
         self,
-        mining::{ZEBRA_COINBASE_MARKER, ZEBRA_COINBASE_SEPARATOR},
+        mining::{ZAKURA_COINBASE_MARKER, ZAKURA_COINBASE_SEPARATOR},
     },
     methods::types::{
         default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
@@ -444,14 +444,14 @@ pub struct MinerParams {
     memo: Option<MemoBytes>,
 }
 
-/// Builds the coinbase input data for a block Zebra constructs.
+/// Builds the coinbase input data for a block Zakura constructs.
 ///
-/// Returns the [`ZEBRA_COINBASE_MARKER`], followed by the
-/// [`ZEBRA_COINBASE_SEPARATOR`] and `extra` when `extra` is non-empty.
+/// Returns the [`ZAKURA_COINBASE_MARKER`], followed by the
+/// [`ZAKURA_COINBASE_SEPARATOR`] and `extra` when `extra` is non-empty.
 fn coinbase_data(extra: &[u8]) -> Vec<u8> {
-    let mut bytes = ZEBRA_COINBASE_MARKER.as_bytes().to_vec();
+    let mut bytes = ZAKURA_COINBASE_MARKER.as_bytes().to_vec();
     if !extra.is_empty() {
-        bytes.extend_from_slice(ZEBRA_COINBASE_SEPARATOR.as_bytes());
+        bytes.extend_from_slice(ZAKURA_COINBASE_SEPARATOR.as_bytes());
         bytes.extend_from_slice(extra);
     }
     bytes
@@ -468,8 +468,8 @@ impl MinerParams {
             .map(|addr| Address::try_from_zcash_address(net, addr))
             .ok_or(MinerParamsError::MissingAddr)??;
 
-        // Always tag the coinbase with the Zebra marker, even without configured
-        // `extra_coinbase_data`, so every block Zebra builds is identifiable. The type
+        // Always tag the coinbase with the Zakura marker, even without configured
+        // `extra_coinbase_data`, so every block Zakura builds is identifiable. The type
         // of `extra_coinbase_data` bounds its length, so the marker, separator, and
         // data always fit in a single push.
         let user_data = conf.extra_coinbase_data.as_deref().unwrap_or_default();

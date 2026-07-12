@@ -241,6 +241,7 @@ jobs:
     name: Publish zakurad assets
     needs: [resolve-release, build-zakurad-assets]
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
       id-token: write

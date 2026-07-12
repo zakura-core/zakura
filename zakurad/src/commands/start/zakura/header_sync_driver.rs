@@ -600,7 +600,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
             }
             HeaderSyncAction::QueryHeadersByHeightRange {
                 peer,
-                conn_id,
+                session_id,
                 request_id,
                 start,
                 count,
@@ -785,7 +785,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseReady {
                                 peer,
-                                conn_id,
+                                session_id,
                                 request_id,
                                 start_height: start,
                                 requested_count: count,
@@ -812,7 +812,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                                 peer,
-                                conn_id,
+                                session_id,
                                 request_id,
                                 start_height: start,
                                 requested_count: count,
@@ -840,7 +840,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                                 peer,
-                                conn_id,
+                                session_id,
                                 request_id,
                                 start_height: start,
                                 requested_count: count,
@@ -852,7 +852,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
             }
             HeaderSyncAction::CommitHeaderRange {
                 peer,
-                conn_id,
+                session_id,
                 anchor,
                 start_height,
                 headers,
@@ -962,7 +962,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeCommitFailed {
                                 peer,
-                                conn_id,
+                                session_id,
                                 start_height,
                                 count,
                                 kind: HeaderSyncCommitFailureKind::Local,
@@ -1019,7 +1019,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeCommitFailed {
                                 peer,
-                                conn_id,
+                                session_id,
                                 start_height,
                                 count,
                                 kind,

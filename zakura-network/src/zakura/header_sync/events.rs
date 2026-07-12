@@ -1,7 +1,7 @@
 use super::{config::*, error::*, validation::*, wire::*, *};
 use crate::zakura::{
     FrontierUpdate, HeaderSyncPeerSession, HeaderSyncServiceSummary, ServicePeerSnapshot,
-    ZakuraConnId, ZakuraHeaderSyncCandidateState,
+    ZakuraHeaderSyncCandidateState,
 };
 
 /// Cached state frontiers used by the header-sync reactor.
@@ -217,8 +217,8 @@ pub enum HeaderSyncEvent {
     SessionWireMessage {
         /// Serving peer.
         peer: ZakuraPeerId,
-        /// Transport connection generation that delivered the message.
-        conn_id: ZakuraConnId,
+        /// Ordered-stream generation that delivered the message.
+        session_id: u64,
         /// Decoded header-sync message.
         msg: HeaderSyncMessage,
     },
@@ -226,8 +226,8 @@ pub enum HeaderSyncEvent {
     WireHeaders {
         /// Serving peer.
         peer: ZakuraPeerId,
-        /// Transport connection generation that delivered the response.
-        conn_id: ZakuraConnId,
+        /// Ordered-stream generation that delivered the response.
+        session_id: u64,
         /// Request ID echoed by the peer, present on header-sync v7.
         request_id: Option<HeaderSyncRequestId>,
         /// Headers in ascending height order.
@@ -241,8 +241,8 @@ pub enum HeaderSyncEvent {
     WireGetHeaders {
         /// Requesting peer.
         peer: ZakuraPeerId,
-        /// Transport connection generation that delivered the request.
-        conn_id: ZakuraConnId,
+        /// Ordered-stream generation that delivered the request.
+        session_id: u64,
         /// Request ID supplied by the peer, present on header-sync v7.
         request_id: Option<HeaderSyncRequestId>,
         /// First requested height.
@@ -299,8 +299,8 @@ pub enum HeaderSyncEvent {
     HeaderRangeCommitFailed {
         /// Peer that supplied the failed range.
         peer: ZakuraPeerId,
-        /// Transport connection generation that supplied the range.
-        conn_id: ZakuraConnId,
+        /// Ordered-stream generation that supplied the range.
+        session_id: u64,
         /// First failed range height.
         start_height: block::Height,
         /// Failed range count.
@@ -312,8 +312,8 @@ pub enum HeaderSyncEvent {
     HeaderRangeResponseFinished {
         /// Peer whose served-response slot can be released.
         peer: ZakuraPeerId,
-        /// Transport connection generation that requested the range.
-        conn_id: ZakuraConnId,
+        /// Ordered-stream generation that requested the range.
+        session_id: u64,
         /// Request ID supplied by the peer, present on header-sync v7.
         request_id: Option<HeaderSyncRequestId>,
         /// First requested height.
@@ -327,8 +327,8 @@ pub enum HeaderSyncEvent {
     HeaderRangeResponseReady {
         /// Peer whose inbound request is being served.
         peer: ZakuraPeerId,
-        /// Transport connection generation that requested the range.
-        conn_id: ZakuraConnId,
+        /// Ordered-stream generation that requested the range.
+        session_id: u64,
         /// Request ID supplied by the peer, present on header-sync v7.
         request_id: Option<HeaderSyncRequestId>,
         /// First requested height.
@@ -390,8 +390,8 @@ pub enum HeaderSyncAction {
     CommitHeaderRange {
         /// Peer that supplied the range.
         peer: ZakuraPeerId,
-        /// Transport connection generation that supplied the range.
-        conn_id: ZakuraConnId,
+        /// Ordered-stream generation that supplied the range.
+        session_id: u64,
         /// Parent anchor hash for the first header.
         anchor: block::Hash,
         /// First header height.
@@ -411,8 +411,8 @@ pub enum HeaderSyncAction {
     QueryHeadersByHeightRange {
         /// Peer that requested the range.
         peer: ZakuraPeerId,
-        /// Transport connection generation that requested the range.
-        conn_id: ZakuraConnId,
+        /// Ordered-stream generation that requested the range.
+        session_id: u64,
         /// Request ID supplied by the peer, present on header-sync v7.
         request_id: Option<HeaderSyncRequestId>,
         /// First height.

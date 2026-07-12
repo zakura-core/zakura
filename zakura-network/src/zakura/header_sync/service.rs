@@ -51,7 +51,7 @@ pub(crate) fn header_sync_streams() -> &'static [Stream] {
 #[derive(Clone, Debug)]
 pub struct HeaderSyncPeerSession {
     peer_id: ZakuraPeerId,
-    conn_id: ZakuraConnId,
+    session_id: u64,
     direction: ServicePeerDirection,
     inner: Arc<HeaderSyncPeerSessionInner>,
 }
@@ -71,11 +71,11 @@ impl HeaderSyncPeerSession {
         direction: ServicePeerDirection,
         commands: mpsc::UnboundedSender<HeaderSyncPeerCommand>,
         stream_version: u16,
-        conn_id: ZakuraConnId,
+        session_id: u64,
     ) -> Self {
         Self::from_parts_with_direction_and_commands(
             session.peer_id().clone(),
-            conn_id,
+            session_id,
             direction,
             session.sender(),
             session.cancel_token(),
@@ -119,7 +119,7 @@ impl HeaderSyncPeerSession {
         cancel_token: CancellationToken,
         stream_version: u16,
     ) -> Self {
-        Self::from_parts_with_direction_version_and_conn_id(
+        Self::from_parts_with_direction_version_and_session_id(
             peer_id,
             direction,
             send,
@@ -130,17 +130,17 @@ impl HeaderSyncPeerSession {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_parts_with_direction_version_and_conn_id(
+    pub(crate) fn from_parts_with_direction_version_and_session_id(
         peer_id: ZakuraPeerId,
         direction: ServicePeerDirection,
         send: FramedSend,
         cancel_token: CancellationToken,
         stream_version: u16,
-        conn_id: ZakuraConnId,
+        session_id: u64,
     ) -> Self {
         Self::from_parts_with_direction_and_commands(
             peer_id,
-            conn_id,
+            session_id,
             direction,
             send,
             cancel_token,
@@ -152,7 +152,7 @@ impl HeaderSyncPeerSession {
     #[cfg(test)]
     fn from_parts_with_direction_and_commands(
         peer_id: ZakuraPeerId,
-        conn_id: ZakuraConnId,
+        session_id: u64,
         direction: ServicePeerDirection,
         send: FramedSend,
         cancel_token: CancellationToken,
@@ -161,7 +161,7 @@ impl HeaderSyncPeerSession {
     ) -> Self {
         Self {
             peer_id,
-            conn_id,
+            session_id,
             direction,
             inner: Arc::new(HeaderSyncPeerSessionInner {
                 send,
@@ -176,7 +176,7 @@ impl HeaderSyncPeerSession {
     #[cfg(not(test))]
     fn from_parts_with_direction_and_commands(
         peer_id: ZakuraPeerId,
-        conn_id: ZakuraConnId,
+        session_id: u64,
         direction: ServicePeerDirection,
         send: FramedSend,
         cancel_token: CancellationToken,
@@ -185,7 +185,7 @@ impl HeaderSyncPeerSession {
     ) -> Self {
         Self {
             peer_id,
-            conn_id,
+            session_id,
             direction,
             inner: Arc::new(HeaderSyncPeerSessionInner {
                 send,
@@ -202,9 +202,9 @@ impl HeaderSyncPeerSession {
         &self.peer_id
     }
 
-    /// Transport connection generation that owns this session.
-    pub fn conn_id(&self) -> ZakuraConnId {
-        self.conn_id
+    /// Unique ordered-stream generation that owns this session.
+    pub fn session_id(&self) -> u64 {
+        self.session_id
     }
 
     /// Direction of the underlying Zakura connection.
@@ -408,7 +408,7 @@ pub(crate) async fn drive_header_sync_actions(
             }
             HeaderSyncAction::QueryHeadersByHeightRange {
                 peer,
-                conn_id,
+                session_id,
                 request_id,
                 start,
                 count,
@@ -417,7 +417,7 @@ pub(crate) async fn drive_header_sync_actions(
                 let _ = handle
                     .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                         peer,
-                        conn_id,
+                        session_id,
                         request_id,
                         start_height: start,
                         requested_count: count,
@@ -457,6 +457,7 @@ pub(crate) struct HeaderSyncService {
 #[derive(Debug)]
 struct HeaderSyncPeerRecord {
     conn_id: ZakuraConnId,
+    session_id: u64,
     cancel_token: CancellationToken,
 }
 
@@ -494,7 +495,7 @@ impl Service for HeaderSyncService {
     }
 
     fn add_peer(&self, mut peer: Peer) {
-        let Some((stream, recv, send)) =
+        let Some((stream, session_id, recv, send)) =
             peer.take_stream_with_declaration(ZAKURA_STREAM_HEADER_SYNC)
         else {
             return;
@@ -523,7 +524,7 @@ impl Service for HeaderSyncService {
             peer.direction,
             commands_tx,
             stream.version,
-            conn_id,
+            session_id,
         );
 
         {
@@ -542,6 +543,7 @@ impl Service for HeaderSyncService {
                 peer_id.clone(),
                 HeaderSyncPeerRecord {
                     conn_id,
+                    session_id,
                     cancel_token: header_sync_session.cancel_token(),
                 },
             ) {
@@ -565,7 +567,7 @@ impl Service for HeaderSyncService {
                 DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
                 stream.version,
             ),
-            HsEnv::new_with_conn_id(self.header_sync.clone(), conn_id),
+            HsEnv::new_with_session_id(self.header_sync.clone(), session_id),
             SessionGuard::oversize_only(header_sync_guard_max_bytes()),
             run_inbound,
             &PIPE_SHAPE,
@@ -602,10 +604,9 @@ impl Service for HeaderSyncService {
                 let mut peers = teardown_peers
                     .lock()
                     .expect("header-sync peer map mutex is never poisoned");
-                if peers
-                    .get(&teardown_peer)
-                    .is_some_and(|record| record.conn_id == conn_id)
-                {
+                if peers.get(&teardown_peer).is_some_and(|record| {
+                    record.conn_id == conn_id && record.session_id == session_id
+                }) {
                     peers.remove(&teardown_peer);
                     true
                 } else {

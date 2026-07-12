@@ -44,6 +44,7 @@ pub struct Stream {
 #[derive(Debug)]
 pub(crate) struct ServiceStream {
     pub(crate) stream: Stream,
+    pub(crate) session_id: u64,
     pub(crate) recv: FramedRecv,
     pub(crate) send: FramedSend,
     pub(crate) cancel_token: CancellationToken,
@@ -52,12 +53,14 @@ pub(crate) struct ServiceStream {
 impl ServiceStream {
     pub(crate) fn new(
         stream: Stream,
+        session_id: u64,
         recv: FramedRecv,
         send: FramedSend,
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
             stream,
+            session_id,
             recv,
             send,
             cancel_token,
@@ -169,7 +172,7 @@ impl Peer {
                 };
                 (
                     kind,
-                    ServiceStream::new(stream, recv, send, cancel_token.child_token()),
+                    ServiceStream::new(stream, 0, recv, send, cancel_token.child_token()),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -250,10 +253,10 @@ impl Peer {
     pub fn take_stream_with_declaration(
         &mut self,
         kind: u16,
-    ) -> Option<(Stream, FramedRecv, FramedSend)> {
+    ) -> Option<(Stream, u64, FramedRecv, FramedSend)> {
         self.streams
             .remove(&kind)
-            .map(|stream| (stream.stream, stream.recv, stream.send))
+            .map(|stream| (stream.stream, stream.session_id, stream.recv, stream.send))
     }
 
     /// Return the cancellation token for this peer's service tasks.

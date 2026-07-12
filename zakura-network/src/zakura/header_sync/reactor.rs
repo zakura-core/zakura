@@ -4,7 +4,7 @@ use super::super::trace::{
 use super::{config::*, error::*, events::*, scheduler::*, state::*, validation::*, wire::*, *};
 use crate::zakura::{
     FrontierChange, FrontierUpdate, HeaderSyncServiceSummary, OrderedSendError,
-    ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot, ZakuraConnId,
+    ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
     ZakuraHeaderSyncCandidateState,
 };
 
@@ -184,8 +184,12 @@ impl HeaderSyncReactor {
             HeaderSyncEvent::WireMessage { peer, msg } => {
                 self.handle_wire_message(peer, msg).await;
             }
-            HeaderSyncEvent::SessionWireMessage { peer, conn_id, msg } => {
-                if self.is_current_session(&peer, conn_id) {
+            HeaderSyncEvent::SessionWireMessage {
+                peer,
+                session_id,
+                msg,
+            } => {
+                if self.is_current_session(&peer, session_id) {
                     self.handle_wire_message(peer, msg).await;
                 } else {
                     metrics::counter!("sync.header.session.stale_event").increment(1);
@@ -193,13 +197,13 @@ impl HeaderSyncReactor {
             }
             HeaderSyncEvent::WireHeaders {
                 peer,
-                conn_id,
+                session_id,
                 request_id,
                 headers,
                 body_sizes,
                 tree_aux_roots,
             } => {
-                if self.is_current_session(&peer, conn_id) {
+                if self.is_current_session(&peer, session_id) {
                     self.handle_headers(peer, request_id, headers, body_sizes, tree_aux_roots)
                         .await;
                 } else {
@@ -208,13 +212,13 @@ impl HeaderSyncReactor {
             }
             HeaderSyncEvent::WireGetHeaders {
                 peer,
-                conn_id,
+                session_id,
                 request_id,
                 start_height,
                 count,
                 want_tree_aux_roots,
             } => {
-                if self.is_current_session(&peer, conn_id) {
+                if self.is_current_session(&peer, session_id) {
                     self.handle_get_headers(
                         peer,
                         request_id,
@@ -267,12 +271,12 @@ impl HeaderSyncReactor {
             }
             HeaderSyncEvent::HeaderRangeCommitFailed {
                 peer,
-                conn_id,
+                session_id,
                 start_height,
                 count,
                 kind,
             } => {
-                if self.is_current_session(&peer, conn_id) {
+                if self.is_current_session(&peer, session_id) {
                     self.handle_header_range_commit_failed(peer, start_height, count, kind)
                         .await;
                 } else {
@@ -281,13 +285,13 @@ impl HeaderSyncReactor {
             }
             HeaderSyncEvent::HeaderRangeResponseFinished {
                 peer,
-                conn_id,
+                session_id,
                 request_id,
                 start_height,
                 requested_count,
                 returned_count,
             } => {
-                if self.is_current_session(&peer, conn_id) {
+                if self.is_current_session(&peer, session_id) {
                     self.handle_header_range_response_finished(
                         peer,
                         request_id,
@@ -301,7 +305,7 @@ impl HeaderSyncReactor {
             }
             HeaderSyncEvent::HeaderRangeResponseReady {
                 peer,
-                conn_id,
+                session_id,
                 request_id,
                 start_height,
                 requested_count,
@@ -310,7 +314,7 @@ impl HeaderSyncReactor {
                 body_sizes,
                 tree_aux_roots,
             } => {
-                if self.is_current_session(&peer, conn_id) {
+                if self.is_current_session(&peer, session_id) {
                     self.handle_header_range_response_ready(
                         peer,
                         request_id,
@@ -351,11 +355,11 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn is_current_session(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+    fn is_current_session(&self, peer: &ZakuraPeerId, session_id: u64) -> bool {
         self.state
             .peers
             .get(peer)
-            .is_some_and(|state| state.session.conn_id() == conn_id)
+            .is_some_and(|state| state.session.session_id() == session_id)
     }
 
     async fn handle_frontier_update(&mut self, update: FrontierUpdate) {
@@ -510,7 +514,7 @@ impl HeaderSyncReactor {
             .state
             .peers
             .get(&peer)
-            .is_some_and(|state| state.session.conn_id() > session.conn_id())
+            .is_some_and(|state| state.session.session_id() > session.session_id())
         {
             metrics::counter!("sync.header.session.stale_connect").increment(1);
             session.cancel_token().cancel();
@@ -1126,11 +1130,11 @@ impl HeaderSyncReactor {
                 .await;
             return;
         }
-        let conn_id = peer_state.session.conn_id();
+        let session_id = peer_state.session.session_id();
 
         if !self.dispatch_action(HeaderSyncAction::QueryHeadersByHeightRange {
             peer: peer.clone(),
-            conn_id,
+            session_id,
             request_id,
             start: start_height,
             count,
@@ -1507,15 +1511,15 @@ impl HeaderSyncReactor {
             },
             outstanding.range,
         );
-        let conn_id = self
+        let session_id = self
             .state
             .peers
             .get(&peer)
-            .map(|state| state.session.conn_id())
+            .map(|state| state.session.session_id())
             .expect("peer exists because its outstanding response is being committed");
         let _ = self.dispatch_action(HeaderSyncAction::CommitHeaderRange {
             peer,
-            conn_id,
+            session_id,
             anchor: outstanding.range.anchor_hash,
             start_height: outstanding.range.start_height,
             headers,

@@ -15,8 +15,9 @@ Initial release of Zakura.
   newer requests on the same peer stream. Dual-version header-sync negotiation
   now prefers a request-id capable v7 stream while preserving v6 compatibility.
   V7 responses are matched to exact outstanding requests, and retained v6
-  streams are retired after ambiguous timeout/cancellation paths so delayed
-  responses cannot consume unrelated work or trigger stale-anchor recovery.
+  streams are retired and reopened on the same connection with a fresh session
+  generation after ambiguous timeout/cancellation paths, so delayed responses
+  cannot consume unrelated work or trigger stale-anchor recovery.
 
 Zakura is a fork of the Zcash Foundation's
 [Zebra](https://github.com/ZcashFoundation/zebra), forked at Zebra v5.0.0. For

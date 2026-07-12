@@ -910,7 +910,7 @@ mod tests {
                 }
                 HeaderSyncAction::QueryHeadersByHeightRange {
                     peer,
-                    conn_id,
+                    session_id,
                     request_id,
                     start,
                     count,
@@ -934,7 +934,7 @@ mod tests {
                             .handle
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                                 peer,
-                                conn_id,
+                                session_id,
                                 request_id,
                                 start_height: start,
                                 requested_count: count,
@@ -945,7 +945,7 @@ mod tests {
                 }
                 HeaderSyncAction::CommitHeaderRange {
                     peer,
-                    conn_id,
+                    session_id,
                     anchor,
                     start_height,
                     headers,
@@ -983,7 +983,7 @@ mod tests {
                                 .handle
                                 .send(HeaderSyncEvent::HeaderRangeCommitFailed {
                                     peer,
-                                    conn_id,
+                                    session_id,
                                     start_height,
                                     count,
                                     kind,
@@ -1319,7 +1319,7 @@ mod tests {
                     }
                     HeaderSyncAction::QueryHeadersByHeightRange {
                         peer,
-                        conn_id,
+                        session_id,
                         request_id,
                         start,
                         count,
@@ -1331,7 +1331,7 @@ mod tests {
                         let _ = handle
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                                 peer,
-                                conn_id,
+                                session_id,
                                 request_id,
                                 start_height: start,
                                 requested_count: count,
@@ -1341,7 +1341,7 @@ mod tests {
                     }
                     HeaderSyncAction::CommitHeaderRange {
                         peer,
-                        conn_id,
+                        session_id,
                         start_height,
                         headers,
                         ..
@@ -1353,7 +1353,7 @@ mod tests {
                         let _ = handle
                             .send(HeaderSyncEvent::HeaderRangeCommitFailed {
                                 peer,
-                                conn_id,
+                                session_id,
                                 start_height,
                                 count,
                                 kind: HeaderSyncCommitFailureKind::Local,

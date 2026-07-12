@@ -1929,7 +1929,7 @@ async fn vct_repair_commit_failure_retries_another_peer() {
         .handle
         .send(HeaderSyncEvent::HeaderRangeCommitFailed {
             peer: first_peer,
-            conn_id: 0,
+            session_id: 0,
             start_height: block::Height(1),
             count: 2,
             kind: HeaderSyncCommitFailureKind::Local,
@@ -2970,7 +2970,7 @@ async fn invalid_async_header_commit_failure_reports_peer_disconnect() {
         .handle
         .send(HeaderSyncEvent::HeaderRangeCommitFailed {
             peer: peer_id.clone(),
-            conn_id: 0,
+            session_id: 0,
             start_height: block::Height(1),
             count: 1,
             kind: HeaderSyncCommitFailureKind::InvalidPeerRange,
@@ -3359,7 +3359,7 @@ async fn local_commit_failure_retries_without_peer_misbehavior() {
         .handle
         .send(HeaderSyncEvent::HeaderRangeCommitFailed {
             peer: first_peer.clone(),
-            conn_id: 0,
+            session_id: 0,
             start_height: start,
             count: 1,
             kind: HeaderSyncCommitFailureKind::Local,
@@ -4626,7 +4626,7 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
         .handle
         .send(HeaderSyncEvent::HeaderRangeResponseFinished {
             peer: requester.clone(),
-            conn_id: 0,
+            session_id: 0,
             request_id: None,
             start_height: block::Height(1),
             requested_count: 1,
@@ -4704,7 +4704,7 @@ async fn v7_serving_responses_echo_request_ids_in_completion_order() {
             .handle
             .send(HeaderSyncEvent::WireGetHeaders {
                 peer: peer_id.clone(),
-                conn_id: 0,
+                session_id: 0,
                 request_id: Some(request_id),
                 start_height,
                 count: 1,
@@ -4731,7 +4731,7 @@ async fn v7_serving_responses_echo_request_ids_in_completion_order() {
             .handle
             .send(HeaderSyncEvent::HeaderRangeResponseReady {
                 peer: peer_id.clone(),
-                conn_id: 0,
+                session_id: 0,
                 request_id: Some(request_id),
                 start_height,
                 requested_count: 1,
@@ -4765,7 +4765,7 @@ async fn v7_replacement_session_ignores_old_wire_response_with_reused_id() {
     let peer_id = peer(80);
     let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
     let (old_send, _old_recv) = crate::zakura::framed_channel(8);
-    let old_session = HeaderSyncPeerSession::from_parts_with_direction_version_and_conn_id(
+    let old_session = HeaderSyncPeerSession::from_parts_with_direction_version_and_session_id(
         peer_id.clone(),
         ServicePeerDirection::Inbound,
         old_send,
@@ -4782,7 +4782,7 @@ async fn v7_replacement_session_ignores_old_wire_response_with_reused_id() {
         .handle
         .send(HeaderSyncEvent::SessionWireMessage {
             peer: peer_id.clone(),
-            conn_id: 1,
+            session_id: 1,
             msg: HeaderSyncMessage::Status(HeaderSyncStatus {
                 tip_height: block::Height(4),
                 tip_hash: block::Hash([4; 32]),
@@ -4799,7 +4799,7 @@ async fn v7_replacement_session_ignores_old_wire_response_with_reused_id() {
     );
 
     let (new_send, _new_recv) = crate::zakura::framed_channel(8);
-    let new_session = HeaderSyncPeerSession::from_parts_with_direction_version_and_conn_id(
+    let new_session = HeaderSyncPeerSession::from_parts_with_direction_version_and_session_id(
         peer_id.clone(),
         ServicePeerDirection::Inbound,
         new_send,
@@ -4816,7 +4816,7 @@ async fn v7_replacement_session_ignores_old_wire_response_with_reused_id() {
         .handle
         .send(HeaderSyncEvent::SessionWireMessage {
             peer: peer_id.clone(),
-            conn_id: 2,
+            session_id: 2,
             msg: HeaderSyncMessage::Status(HeaderSyncStatus {
                 tip_height: block::Height(4),
                 tip_hash: block::Hash([4; 32]),
@@ -4837,7 +4837,7 @@ async fn v7_replacement_session_ignores_old_wire_response_with_reused_id() {
         .handle
         .send(HeaderSyncEvent::WireHeaders {
             peer: peer_id.clone(),
-            conn_id: 1,
+            session_id: 1,
             request_id: Some(request_id),
             headers: headers.clone(),
             body_sizes: vec![0],
@@ -4849,7 +4849,7 @@ async fn v7_replacement_session_ignores_old_wire_response_with_reused_id() {
         .handle
         .send(HeaderSyncEvent::WireHeaders {
             peer: peer_id.clone(),
-            conn_id: 2,
+            session_id: 2,
             request_id: Some(request_id),
             headers,
             body_sizes: vec![0],
@@ -4862,12 +4862,12 @@ async fn v7_replacement_session_ignores_old_wire_response_with_reused_id() {
         match next_non_query_action(&mut fixture.actions).await {
             HeaderSyncAction::CommitHeaderRange {
                 peer,
-                conn_id,
+                session_id,
                 start_height,
                 ..
             } => {
                 assert_eq!(peer, peer_id);
-                assert_eq!(conn_id, 2);
+                assert_eq!(session_id, 2);
                 assert_eq!(start_height, block::Height(4));
                 break;
             }
@@ -4892,7 +4892,7 @@ async fn v7_replacement_session_ignores_old_state_completion_with_reused_id() {
     let peer_id = peer(81);
     let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
     let (old_send, _old_recv) = crate::zakura::framed_channel(8);
-    let old_session = HeaderSyncPeerSession::from_parts_with_direction_version_and_conn_id(
+    let old_session = HeaderSyncPeerSession::from_parts_with_direction_version_and_session_id(
         peer_id.clone(),
         ServicePeerDirection::Inbound,
         old_send,
@@ -4909,7 +4909,7 @@ async fn v7_replacement_session_ignores_old_state_completion_with_reused_id() {
         .handle
         .send(HeaderSyncEvent::SessionWireMessage {
             peer: peer_id.clone(),
-            conn_id: 1,
+            session_id: 1,
             msg: HeaderSyncMessage::Status(HeaderSyncStatus::default()),
         })
         .await
@@ -4918,7 +4918,7 @@ async fn v7_replacement_session_ignores_old_state_completion_with_reused_id() {
         .handle
         .send(HeaderSyncEvent::WireGetHeaders {
             peer: peer_id.clone(),
-            conn_id: 1,
+            session_id: 1,
             request_id: Some(request_id),
             start_height: block::Height(1),
             count: 1,
@@ -4928,11 +4928,11 @@ async fn v7_replacement_session_ignores_old_state_completion_with_reused_id() {
         .unwrap();
     assert!(matches!(
         next_query_headers_action(&mut fixture.actions).await,
-        HeaderSyncAction::QueryHeadersByHeightRange { conn_id: 1, .. }
+        HeaderSyncAction::QueryHeadersByHeightRange { session_id: 1, .. }
     ));
 
     let (new_send, mut new_recv) = crate::zakura::framed_channel(8);
-    let new_session = HeaderSyncPeerSession::from_parts_with_direction_version_and_conn_id(
+    let new_session = HeaderSyncPeerSession::from_parts_with_direction_version_and_session_id(
         peer_id.clone(),
         ServicePeerDirection::Inbound,
         new_send,
@@ -4953,7 +4953,7 @@ async fn v7_replacement_session_ignores_old_state_completion_with_reused_id() {
         .handle
         .send(HeaderSyncEvent::HeaderRangeResponseReady {
             peer: peer_id.clone(),
-            conn_id: 1,
+            session_id: 1,
             request_id: Some(request_id),
             start_height: block::Height(1),
             requested_count: 1,
@@ -4975,7 +4975,7 @@ async fn v7_replacement_session_ignores_old_state_completion_with_reused_id() {
         .handle
         .send(HeaderSyncEvent::SessionWireMessage {
             peer: peer_id.clone(),
-            conn_id: 2,
+            session_id: 2,
             msg: HeaderSyncMessage::Status(HeaderSyncStatus::default()),
         })
         .await
@@ -4984,7 +4984,7 @@ async fn v7_replacement_session_ignores_old_state_completion_with_reused_id() {
         .handle
         .send(HeaderSyncEvent::WireGetHeaders {
             peer: peer_id.clone(),
-            conn_id: 2,
+            session_id: 2,
             request_id: Some(request_id),
             start_height: block::Height(1),
             count: 1,
@@ -4994,13 +4994,13 @@ async fn v7_replacement_session_ignores_old_state_completion_with_reused_id() {
         .unwrap();
     assert!(matches!(
         next_query_headers_action(&mut fixture.actions).await,
-        HeaderSyncAction::QueryHeadersByHeightRange { conn_id: 2, .. }
+        HeaderSyncAction::QueryHeadersByHeightRange { session_id: 2, .. }
     ));
     fixture
         .handle
         .send(HeaderSyncEvent::HeaderRangeResponseReady {
             peer: peer_id,
-            conn_id: 2,
+            session_id: 2,
             request_id: Some(request_id),
             start_height: block::Height(1),
             requested_count: 1,

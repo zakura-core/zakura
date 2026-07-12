@@ -118,7 +118,7 @@ impl ZakuraHeaderSyncConfig {
     }
 }
 
-/// Returns the serialized byte length of a header-sync v6 header on `network`.
+/// Returns the serialized byte length of a header-sync header on `network`.
 pub fn header_sync_header_bytes_for_network(network: &Network) -> usize {
     if network
         .parameters()
@@ -130,7 +130,10 @@ pub fn header_sync_header_bytes_for_network(network: &Network) -> usize {
     }
 }
 
-/// Maximum `Headers` count that fits both the header-sync v6 payload cap and the app frame cap.
+/// Maximum `Headers` count that fits the header-sync payload and app frame caps.
+///
+/// The fixed overhead reserves the v7 request ID. V6 therefore uses the same
+/// conservative count, avoiding version-dependent advertised range limits.
 pub fn header_sync_count_by_byte_budget(
     network: &Network,
     max_frame_bytes: u32,
@@ -149,7 +152,10 @@ pub fn header_sync_count_by_byte_budget(
         .saturating_add(HEADER_SYNC_BODY_SIZE_BYTES)
         .saturating_add(root_bytes);
     let count = payload_cap.saturating_sub(
-        HEADER_SYNC_MESSAGE_TYPE_BYTES + HEADER_SYNC_COUNT_BYTES + HEADER_SYNC_HAS_ROOTS_BYTES,
+        HEADER_SYNC_MESSAGE_TYPE_BYTES
+            + HEADER_SYNC_REQUEST_ID_BYTES
+            + HEADER_SYNC_COUNT_BYTES
+            + HEADER_SYNC_HAS_ROOTS_BYTES,
     ) / header_bytes;
 
     u32::try_from(count)

@@ -1,4 +1,4 @@
-//! header_sync/pipe.rs - the per-peer header-sync pipe (v6).
+//! header_sync/pipe.rs - the per-peer versioned header-sync pipe.
 //!
 //! THE PHASE-2 DAG SLICE IS THIS DIAGRAM. The code below is a mechanical
 //! transcription; the [`PIPE_SHAPE`] const is the inspectable, drift-checked
@@ -50,7 +50,7 @@ pub(super) struct HsLocal {
     stream_version: u16,
     /// Pre-decode rate gate for inbound `NewBlock` floods.
     ///
-    /// `NewBlock` is the only header-sync v6 message that deserializes a full
+    /// `NewBlock` is the only header-sync message that deserializes a full
     /// `Arc<Block>` (up to `MAX_HS_MESSAGE_BYTES`) directly from the wire. The
     /// reactor's semantic `inbound_new_block` meter only fires *after* that
     /// decode, so an authenticated peer could otherwise force one full-block
@@ -61,7 +61,7 @@ pub(super) struct HsLocal {
 }
 
 impl HsLocal {
-    /// Build per-peer local state around this peer's header-sync v6 session.
+    /// Build per-peer local state around this peer's negotiated header-sync session.
     pub(super) fn new(
         commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
         new_block_min_interval: Duration,
@@ -136,9 +136,9 @@ impl HsLocal {
 
     /// Restore a solicited-response expectation that was popped for decode but
     /// whose decoded `Headers` event could not be handed to the reactor (the
-    /// bounded `events` queue was full or closed). It goes back to the *front* so
-    /// FIFO order is preserved and the reactor's still-outstanding range stays
-    /// correlated, instead of leaving the expectation silently consumed.
+    /// bounded `events` queue was full or closed). V6 restores it to the FIFO
+    /// front; v7 restores it by request ID. Either path keeps the reactor's
+    /// outstanding range correlated instead of silently consuming the expectation.
     fn restore_expected_headers(&mut self, expected: ExpectedHeadersResponse) {
         if let Some(request_id) = expected.request_id {
             self.reactivate_request_id(request_id);
@@ -340,10 +340,10 @@ pub(super) fn run_inbound(cx: &mut PipeCx<'_, HsLocal, HsEnv>, frame: Frame) -> 
             // the expectation was already popped before decode, so restore it: the
             // reactor's matching range is still outstanding, and a consumed-but-
             // undelivered expectation would otherwise lose the response entirely
-            // (recoverable only by the request timeout) and desynchronize the
-            // peer-local FIFO from that outstanding range. Restoring keeps the pipe
-            // in the same state as a request still awaiting its response, which the
-            // timeout/retry machinery already handles correctly.
+            // (recoverable only by the request timeout) and desynchronize
+            // peer-local correlation from that outstanding range. Restoring keeps
+            // the pipe in the same state as a request still awaiting its response,
+            // which the timeout/retry machinery already handles correctly.
             if let Some(expected) = expected {
                 cx.local.restore_expected_headers(expected);
             }
@@ -684,12 +684,10 @@ mod tests {
         }
     }
 
-    /// The peer-local correlation queue is FIFO and is filled by draining ready
-    /// commands. This is the invariant `run_peer` relies on: an expectation
-    /// recorded by a `Reserve` command is drained and available to
-    /// pop before the matching `Headers` response is processed.
+    /// V6's peer-local correlation queue is FIFO and is filled by draining ready
+    /// commands. V7 uses the parallel request-ID map tested below.
     #[test]
-    fn local_correlation_queue_drains_commands_in_fifo_order() {
+    fn v6_local_correlation_queue_drains_commands_in_fifo_order() {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let mut local = HsLocal::new(
             commands_rx,
@@ -1021,11 +1019,8 @@ mod tests {
     /// Under reactor `events`-queue saturation, a valid *solicited* `Headers`
     /// response must not silently consume its peer-local expectation. The pipe
     /// pops the expectation before decode; when the decoded response cannot be
-    /// delivered to the full reactor queue, the pipe logs and continues
-    /// (`Flow::Done`) — but the popped expectation is restored to the FIFO so the
-    /// reactor's still-outstanding range stays correlated. Without the fix the
-    /// expectation is consumed and lost, stranding the range until the request
-    /// timeout and desynchronizing the peer-local FIFO from the outstanding range.
+    /// delivered to the full reactor queue, it restores the version-specific
+    /// correlation state so the reactor's outstanding range remains usable.
     #[test]
     fn saturated_events_queue_restores_solicited_expectation() {
         use zakura_chain::{orchard, sapling, serialization::ZcashDeserializeInto};
@@ -1122,8 +1117,8 @@ mod tests {
 
         // (b) Phase 2's real runtime fork is still frame-shape based:
         // `Headers` needs peer-local request correlation, while all other
-        // Header-sync v6 messages decode as `Control` and are forwarded to the
-        // compatibility reactor for semantic dispatch.
+        // Non-`Headers` messages decode as `Control` for both negotiated versions
+        // and are forwarded to the reactor for semantic dispatch.
         let frame_forks: Vec<&str> = PIPE_SHAPE
             .edges
             .iter()

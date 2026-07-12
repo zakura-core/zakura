@@ -25,16 +25,17 @@ pub const MSG_HS_HEADERS: u8 = 3;
 /// Flood a newly seen tip block, including its full body.
 pub const MSG_HS_NEW_BLOCK: u8 = 4;
 
-/// Maximum encoded header-sync v6 message bytes.
+/// Maximum encoded header-sync message bytes.
 pub const MAX_HS_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 /// Default number of headers advertised per response.
 pub const DEFAULT_HS_RANGE: u32 = 1000;
-/// Maximum number of headers ever honored by header-sync v6.
+/// Maximum number of headers ever honored by header sync.
 pub const MAX_HS_RANGE: u32 = 4000;
 /// Default number of in-flight header requests advertised per peer.
 pub const DEFAULT_HS_MAX_INFLIGHT: u16 = 10;
 
 pub(super) const HEADER_SYNC_MESSAGE_TYPE_BYTES: usize = 1;
+pub(super) const HEADER_SYNC_REQUEST_ID_BYTES: usize = 8;
 pub(super) const HEADER_SYNC_COUNT_BYTES: usize = 4;
 pub(super) const HEADER_SYNC_HAS_ROOTS_BYTES: usize = 1;
 pub(super) const HEADER_SYNC_BODY_SIZE_BYTES: usize = 4;
@@ -59,6 +60,7 @@ pub(super) const DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL: Duration = Duration:
 const _: () = assert!(MAX_HS_MESSAGE_BYTES < LOCAL_MAX_MESSAGE_BYTES as usize);
 const _: () = assert!(
     HEADER_SYNC_MESSAGE_TYPE_BYTES
+        + HEADER_SYNC_REQUEST_ID_BYTES
         + HEADER_SYNC_COUNT_BYTES
         + (COMMON_HEADER_BYTES
             + HEADER_SYNC_BODY_SIZE_BYTES
@@ -67,7 +69,7 @@ const _: () = assert!(
         < MAX_HS_MESSAGE_BYTES
 );
 
-/// Native header-sync v6 message.
+/// Native versioned header-sync message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeaderSyncMessage {
     /// Peer tip, anchor, and served-range advertisement.
@@ -101,7 +103,7 @@ pub enum HeaderSyncMessage {
 }
 
 impl HeaderSyncMessage {
-    /// Returns this message's header-sync v6 discriminator.
+    /// Returns this message's header-sync discriminator.
     pub fn message_type(&self) -> u8 {
         match self {
             Self::Status(_) => MSG_HS_STATUS,
@@ -183,7 +185,7 @@ impl HeaderSyncMessage {
         Ok(bytes)
     }
 
-    /// Decode a header-sync v6 message using the peer/request bounds in `context`.
+    /// Decode a header-sync message using the negotiated version and request bounds.
     pub fn decode(
         bytes: &[u8],
         context: HeaderSyncDecodeContext,

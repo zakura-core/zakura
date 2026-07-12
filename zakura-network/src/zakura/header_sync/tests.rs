@@ -1442,6 +1442,7 @@ fn header_serialized_sizes_are_exact_and_message_cap_has_headroom() {
     assert_eq!(regtest_bytes.len(), REGTEST_HEADER_BYTES);
 
     let default_response_bytes = HEADER_SYNC_MESSAGE_TYPE_BYTES
+        + HEADER_SYNC_REQUEST_ID_BYTES
         + HEADER_SYNC_COUNT_BYTES
         + (COMMON_HEADER_BYTES
             + HEADER_SYNC_BODY_SIZE_BYTES
@@ -1495,10 +1496,19 @@ fn request_and_serving_counts_are_clamped_by_byte_budget() {
         &Network::Mainnet,
         LOCAL_MAX_MESSAGE_BYTES,
     );
-    let encoded = headers_message(headers).encode().unwrap();
+    let message = headers_message(headers);
+    let encoded = message.encode().unwrap();
+    let encoded_v7 = message
+        .encode_for_version(
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+            Some(HeaderSyncRequestId::new(1).expect("non-zero id")),
+        )
+        .unwrap();
 
     assert!(encoded.len() <= MAX_HS_MESSAGE_BYTES);
+    assert!(encoded_v7.len() <= MAX_HS_MESSAGE_BYTES);
     assert!(encoded.len() + FRAME_HEADER_BYTES <= LOCAL_MAX_MESSAGE_BYTES as usize);
+    assert!(encoded_v7.len() + FRAME_HEADER_BYTES <= LOCAL_MAX_MESSAGE_BYTES as usize);
 }
 
 #[tokio::test(flavor = "current_thread")]

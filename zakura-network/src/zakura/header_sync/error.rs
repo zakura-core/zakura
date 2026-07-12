@@ -15,7 +15,7 @@ pub enum HeaderSyncStartError {
     IncompleteAnchor,
 }
 
-/// Structured wire and stateless-validation errors for header-sync v6.
+/// Structured wire and stateless-validation errors for versioned header sync.
 #[derive(Debug, Error)]
 pub enum HeaderSyncWireError {
     /// A payload or peer-controlled count exceeded its cap.
@@ -105,15 +105,15 @@ pub enum HeaderSyncWireError {
     #[error("Zakura header-sync height {0} exceeds supported range")]
     HeightOutOfRange(u32),
 
-    /// A payload used an unknown header-sync v6 message discriminator.
+    /// A payload used an unknown header-sync message discriminator.
     #[error("unknown Zakura header-sync message type {0}")]
     UnknownMessageType(u8),
 
-    /// A frame used a message type that does not fit header-sync v6's u8 discriminator.
+    /// A frame used a message type that does not fit header sync's u8 discriminator.
     #[error("unknown Zakura header-sync frame message type {0}")]
     UnknownFrameMessageType(u16),
 
-    /// Frame flags are reserved in header-sync v6.
+    /// Frame flags are reserved in header sync.
     #[error("unsupported Zakura header-sync frame flags {0}")]
     UnsupportedFlags(u16),
 

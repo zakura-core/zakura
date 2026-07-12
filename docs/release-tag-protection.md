@@ -8,11 +8,22 @@ version before creating the tag and GitHub release. The tag push then triggers
 
 ## GitHub App
 
-Create an organization-owned GitHub App named `zakura-release-bot` with:
+In the `zakura-core` organization settings, open **Developer settings > GitHub
+Apps**, select **New GitHub App**, and create an organization-owned app with:
 
+- Name `zakura-release-bot`
+- Homepage URL set to the `zakura-core/zakura` repository
 - Repository permission `Contents: Read and write`
-- Installation access limited to `zakura-core/zakura`
-- No webhook subscription
+- Repository permission `Pull requests: Read and write`
+- All other permissions set to `No access`
+- Webhooks disabled
+- Installation restricted to `zakura-core`
+
+The pull-request permission allows the app to open and update pull requests,
+while the contents permission allows it to create their branches and commits.
+
+After creating the app, select **Install App**, install it on `zakura-core`, and
+grant it access only to the `zakura` repository.
 
 Create a private key for the app. Configure a GitHub Actions environment named
 `release`, add the app's client ID as the environment variable

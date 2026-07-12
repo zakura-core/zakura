@@ -417,6 +417,158 @@ jobs:
             --repo "$REPOSITORY" \
             --clobber
 
+      - name: Create release GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 #v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout main for installer checksum update
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+          ref: main
+          path: source-update
+
+      - name: Resolve release GitHub App user
+        id: app-user
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: echo "id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
+
+      - name: Update source installer checksum
+        id: source-installer
+        env:
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="$RELEASE_TAG" python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          release_tag = os.environ["RELEASE_TAG"]
+          generated_path = Path("./publish/final/install-zakura.sh")
+          source_path = Path("./source-update/scripts/install-zakura.sh")
+          generated = generated_path.read_text(encoding="utf-8")
+          source = source_path.read_text(encoding="utf-8")
+
+          def assignment(contents: str, name: str) -> str:
+              match = re.search(rf'^{name}="([^"]*)"$', contents, flags=re.MULTILINE)
+              if not match:
+                  raise SystemExit(f"Missing {name} assignment.")
+              return match.group(1)
+
+          generated_tag = assignment(generated, "ZAKURA_RELEASE_TAG")
+          generated_sha256 = assignment(generated, "ZAKURA_ARCHIVE_SHA256")
+          source_tag = assignment(source, "ZAKURA_RELEASE_TAG")
+
+          if generated_tag != release_tag:
+              raise SystemExit(
+                  f"Generated installer tag {generated_tag} does not match {release_tag}."
+              )
+          if not re.fullmatch(r"[0-9a-f]{64}", generated_sha256) or set(generated_sha256) == {"0"}:
+              raise SystemExit("Generated installer does not contain a valid archive checksum.")
+          if source_tag != release_tag:
+              print(
+                  f"main targets {source_tag}, not {release_tag}; "
+                  "skipping the stale release checksum update."
+              )
+              with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+                  output.write("changed=false\n")
+              raise SystemExit(0)
+
+          updated, count = re.subn(
+              r'^ZAKURA_ARCHIVE_SHA256="[^"]*"$',
+              f'ZAKURA_ARCHIVE_SHA256="{generated_sha256}"',
+              source,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit("Expected exactly one ZAKURA_ARCHIVE_SHA256 assignment.")
+
+          source_path.write_text(updated, encoding="utf-8")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"changed={'true' if updated != source else 'false'}\n")
+              output.write(f"sha256={generated_sha256}\n")
+          PY
+
+      - name: Open installer checksum update PR
+        if: steps.source-installer.outputs.changed == 'true'
+        env:
+          APP_ID: ${{ steps.app-user.outputs.id }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+          SHA256: ${{ steps.source-installer.outputs.sha256 }}
+        working-directory: source-update
+        run: |
+          set -euo pipefail
+          branch="automation/update-installer-${RELEASE_TAG}"
+          existing_pr="$(
+            gh pr list \
+              --repo "$REPOSITORY" \
+              --head "$branch" \
+              --state open \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+          if [ -n "$existing_pr" ]; then
+            echo "Installer checksum PR #${existing_pr} is already open."
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            branch="${branch}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          fi
+
+          git switch -c "$branch"
+          git add scripts/install-zakura.sh
+          git -c user.name="${APP_SLUG}[bot]" \
+            -c user.email="${APP_ID}+${APP_SLUG}[bot]@users.noreply.github.com" \
+            commit -m "chore(release): update installer checksum for ${RELEASE_TAG}"
+          git push --set-upstream origin "$branch"
+
+          gh pr create \
+            --repo "$REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --title "chore(release): update installer checksum for ${RELEASE_TAG}" \
+            --body "$(cat <<EOF
+          ## Motivation
+
+          Keep the installer served from \`main\` pinned to the archive published for ${RELEASE_TAG}.
+
+          ## Solution
+
+          Update \`ZAKURA_ARCHIVE_SHA256\` to the checksum calculated by the release workflow:
+          \`${SHA256}\`
+
+          ### Tests
+
+          - The release workflow built the archive and calculated this checksum.
+          - The published installer was generated with the same checksum.
+
+          ### AI Disclosure
+
+          - [x] No AI tools were used in this automatically generated PR.
+
+          ### PR Checklist
+
+          - [x] The PR title follows conventional commits format.
+          - [x] The change is limited to generated release metadata.
+          - [x] The solution is validated by the release workflow.
+          - [x] Documentation and changelogs do not require changes.
+          EOF
+          )"
+
   build:
     name: Build Release Docker (${{ matrix.name }})
     needs: [resolve-release, check-release-version]

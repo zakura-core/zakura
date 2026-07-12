@@ -241,7 +241,6 @@ jobs:
     name: Publish zakurad assets
     needs: [resolve-release, build-zakurad-assets]
     runs-on: ubuntu-latest
-    environment: release
     permissions:
       contents: write
       id-token: write
@@ -417,6 +416,28 @@ jobs:
             ./publish/final/SHA256SUMS.txt \
             --repo "$REPOSITORY" \
             --clobber
+
+  update-source-installer:
+    name: Update source installer checksum
+    needs: [resolve-release, publish-zakurad-assets]
+    runs-on: ubuntu-latest
+    environment: release-automation
+    permissions:
+      contents: read
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_assets_to_release
+    steps:
+      - name: Download published installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p ./publish/final
+          gh release download "$RELEASE_TAG" \
+            --repo "$REPOSITORY" \
+            --pattern install-zakura.sh \
+            --dir ./publish/final
 
       - name: Create release GitHub App token
         id: app-token

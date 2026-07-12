@@ -29,7 +29,14 @@ Create a private key for the app. Configure a GitHub Actions environment named
 `release`, add the app's client ID as the environment variable
 `RELEASE_APP_CLIENT_ID`, and add its private key as the environment secret
 `RELEASE_APP_PRIVATE_KEY`. Configure required reviewers for the environment so
-that creating a release requires explicit approval.
+that creating a release requires explicit approval. Restrict this environment
+to the `main` deployment branch.
+
+Configure a second environment named `release-automation` with the same
+variable and secret. Allow deployments from the `main` branch and tags matching
+`v*`. This environment is used only after assets are published to open the
+installer checksum update pull request. It is separate so tag deployment rules
+or approvals cannot block release asset publication.
 
 The app private key is a credential. Store its source copy in the team's secret
 manager and do not commit it or paste it into issues, pull requests, or logs.

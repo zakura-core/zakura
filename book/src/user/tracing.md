@@ -52,7 +52,7 @@ the optional `CI_TEST_ID` runtime variable for CI context. If `github-slug-actio
 uses that slugged branch or tag name for the `git.ref` tag, and CI workflows
 can pass `CI_PR_NUMBER` and `CI_TEST_ID` for additional correlation. These
 values are read at runtime, so container images do not need CI-specific build
-arguments, and the `ZEBRA_*` environment namespace remains reserved for Zakura
+arguments, and the `ZAKURA_*` environment namespace remains reserved for Zakura
 configuration.
 
 [tracing_section]: https://docs.rs/zakura/latest/zakurad/components/tracing/struct.InnerConfig.html

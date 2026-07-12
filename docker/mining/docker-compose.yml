@@ -6,6 +6,9 @@ services:
     container_name: zakura
     environment:
       - ZAKURA_NETWORK__NETWORK=${NETWORK:-Testnet}
+      # The mining stack only publishes the legacy TCP peer port, so keep the
+      # native Zakura QUIC transport disabled on every network.
+      - ZAKURA_NETWORK__P2P_STACK=legacy
       - ZAKURA_RPC__LISTEN_ADDR=0.0.0.0:${RPC_PORT:-18232}
       - ZAKURA_RPC__ENABLE_COOKIE_AUTH=false
       - ZAKURA_SYNC__PARALLEL_CPU_THREADS=12

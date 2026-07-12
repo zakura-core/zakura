@@ -8,6 +8,8 @@ use crate::zakura::{
     ZakuraHeaderSyncCandidateState,
 };
 
+const STALE_REPAIR_GENERATION: &str = "stale_repair_generation";
+
 /// Spawn a header-sync reactor and return its handle plus action stream.
 pub fn spawn_header_sync_reactor(
     startup: HeaderSyncStartup,
@@ -1216,8 +1218,6 @@ impl HeaderSyncReactor {
         if let Err(reason) =
             self.validate_vct_repair_response(&outstanding, &headers, &tree_aux_roots)
         {
-            self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
-                .await;
             tracing::debug!(
                 ?peer,
                 ?reason,
@@ -1225,6 +1225,12 @@ impl HeaderSyncReactor {
                 count = header_count,
                 "Zakura header-sync rejected VCT root repair response"
             );
+            if reason == STALE_REPAIR_GENERATION {
+                self.schedule().await;
+                return;
+            }
+            self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
+                .await;
             self.finish_vct_repair_attempt(&peer);
             self.schedule().await;
             return;
@@ -1369,7 +1375,7 @@ impl HeaderSyncReactor {
             .as_ref()
             .filter(|repair| repair.generation == generation)
         else {
-            return Err("stale_repair_generation");
+            return Err(STALE_REPAIR_GENERATION);
         };
         if headers.len() != repair.expected_hashes.len()
             || tree_aux_roots.len() != repair.expected_hashes.len()
@@ -1620,7 +1626,8 @@ impl HeaderSyncReactor {
             .iter()
             .filter(|(peer_id, peer)| {
                 peer.received_status
-                    && peer.available_slots() > 0
+                    && peer.outstanding.is_empty()
+                    && peer.late_covered_responses == 0
                     && peer.advertised_tip >= repair.range.end_height()
                     && !repair.tried_peers.contains(*peer_id)
             })

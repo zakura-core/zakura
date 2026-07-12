@@ -1837,6 +1837,69 @@ async fn stale_vct_repair_response_is_dropped_without_peer_misbehavior() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn vct_repair_generation_change_keeps_tried_peers_at_same_height() {
+    let best = (
+        block::Height(4),
+        mainnet_block(&BLOCK_MAINNET_4_BYTES).hash(),
+    );
+    let mut fixture = spawn_test_reactor(startup_for(
+        Network::Mainnet,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(best),
+    ));
+    let first_peer = peer(103);
+    let second_peer = peer(104);
+
+    for peer_id in [&first_peer, &second_peer] {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(&fixture, peer_id.clone(), block::Height(0), best.0, 2, 1).await;
+    }
+
+    fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
+    let (requested_peer, _, _) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, first_peer);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: first_peer.clone(),
+            msg: finalized_headers_message_from(
+                block::Height(1),
+                vec![
+                    mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                    mainnet_header(&BLOCK_MAINNET_2_BYTES),
+                ],
+            ),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        if matches!(
+            next_action(&mut fixture.actions).await,
+            HeaderSyncAction::CommitHeaderRange { .. }
+        ) {
+            break;
+        }
+    }
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: block::Height(1),
+            tip_height: block::Height(2),
+            tip_hash: mainnet_block(&BLOCK_MAINNET_2_BYTES).hash(),
+        })
+        .await
+        .unwrap();
+
+    fixture.handle.send(mainnet_repair_event(2)).await.unwrap();
+    let (requested_peer, start_height, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, second_peer);
+    assert_eq!((start_height, count), (block::Height(1), 2));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn vct_repair_scheduler_requires_an_idle_peer() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(

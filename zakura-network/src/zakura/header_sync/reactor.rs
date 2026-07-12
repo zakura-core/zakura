@@ -685,7 +685,14 @@ impl HeaderSyncReactor {
             return;
         }
 
-        let Some(repair) = VctRootRepair::new(height, generation, anchor_hash, expected_hashes)
+        let previous_episode = self
+            .state
+            .repair
+            .as_ref()
+            .filter(|repair| repair.height == height)
+            .map(|repair| (repair.tried_peers.clone(), repair.started_at));
+
+        let Some(mut repair) = VctRootRepair::new(height, generation, anchor_hash, expected_hashes)
         else {
             tracing::warn!(
                 ?height,
@@ -695,6 +702,10 @@ impl HeaderSyncReactor {
             metrics::counter!("sync.header.vct_repair.invalid_request").increment(1);
             return;
         };
+        if let Some((tried_peers, started_at)) = previous_episode {
+            repair.tried_peers = tried_peers;
+            repair.started_at = started_at;
+        }
 
         tracing::warn!(
             ?height,

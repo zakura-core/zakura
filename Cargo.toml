@@ -180,11 +180,6 @@ zcash_script = "0.4.5"
 config = { version = "0.15.14", features = ["toml"] }
 which = "8.0.0"
 
-[patch.crates-io]
-# TEMPORARY: Pin librustzcash crates to https://github.com/zcash/librustzcash/pull/2509
-equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "cabbc6cab07562fe1b94868f65f6af2871d9cbc5" }
-zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "cabbc6cab07562fe1b94868f65f6af2871d9cbc5" }
-
 [workspace.metadata.release]
 
 # We always do releases from the main branch

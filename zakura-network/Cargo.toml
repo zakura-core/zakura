@@ -1,6 +1,6 @@
 [package]
 name = "zakura-network"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 authors = ["Zcash Foundation <zebra@zfnd.org>", "Tower Maintainers <team@tower-rs.com>"]
 description = "Networking code for Zebra"
 # # Legal
@@ -93,8 +93,8 @@ howudoin = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
-zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc2", features = ["async-error"] }
-zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.0.0-rc2" }
+zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc3", features = ["async-error"] }
+zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.0.0-rc3" }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -106,8 +106,8 @@ static_assertions = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 toml = { workspace = true }
 
-zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc2", features = ["proptest-impl"] }
-zakura-test = { path = "../zakura-test/", version = "1.0.0-rc2" }
+zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc3", features = ["proptest-impl"] }
+zakura-test = { path = "../zakura-test/", version = "1.0.0-rc3" }
 
 [lints]
 workspace = true

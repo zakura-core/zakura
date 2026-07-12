@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Bumped Zakura's unified Cargo package graph and installer defaults to
+  `1.0.0-rc3`, replacing temporary `librustzcash` Git pins with the published
+  crates.io releases.
 - Prepared the Zakura crate graph for publication at `1.0.0-rc2`. Install the
   `zakura` package with Cargo to obtain the `zakurad` executable; Zakura-owned
   libraries now share the release version, including the renamed

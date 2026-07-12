@@ -1955,7 +1955,8 @@ dependencies = [
 [[package]]
 name = "equihash"
 version = "0.3.0"
-source = "git+https://github.com/zcash/librustzcash.git?rev=cabbc6cab07562fe1b94868f65f6af2871d9cbc5#cabbc6cab07562fe1b94868f65f6af2871d9cbc5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "306286e8dcc39ab3dfceb74c792ce8baffdab90591321d3ffaae64829734c37f"
 dependencies = [
  "blake2b_simd",
  "cc",
@@ -7108,7 +7109,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -8764,7 +8765,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
 name = "zakura"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "abscissa_core",
  "anyhow",
@@ -8852,7 +8853,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "bech32",
  "bitflags 2.13.0",
@@ -8922,7 +8923,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -8975,7 +8976,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-jsonl-trace"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "tempfile",
  "tokio",
@@ -8985,7 +8986,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -9033,7 +9034,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "color-eyre",
  "jsonrpsee-types",
@@ -9047,7 +9048,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9117,7 +9118,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "hex",
  "lazy_static",
@@ -9135,7 +9136,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "bincode",
  "chrono",
@@ -9186,7 +9187,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-test"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "color-eyre",
  "futures",
@@ -9213,7 +9214,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-tower-batch-control"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "color-eyre",
  "ed25519-zebra",
@@ -9235,7 +9236,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-tower-fallback"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "futures-core",
  "pin-project",
@@ -9247,7 +9248,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 dependencies = [
  "color-eyre",
  "hex",
@@ -9297,7 +9298,8 @@ dependencies = [
 [[package]]
 name = "zcash_encoding"
 version = "0.4.0"
-source = "git+https://github.com/zcash/librustzcash.git?rev=cabbc6cab07562fe1b94868f65f6af2871d9cbc5#cabbc6cab07562fe1b94868f65f6af2871d9cbc5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1440921903cdb86133fb9e2fe800be488015db2939a30bedb413078a1acb0306"
 dependencies = [
  "corez",
  "hex",

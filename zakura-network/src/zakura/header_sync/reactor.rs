@@ -67,6 +67,13 @@ pub(super) struct HeaderSyncReactor {
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GetHeadersTraceMeta {
+    request_id: Option<HeaderSyncRequestId>,
+    session_id: u64,
+    stream_version: u16,
+}
+
 impl HeaderSyncReactor {
     async fn run(mut self) {
         let mut frontier_updates = self.startup.frontier_updates.clone();
@@ -1762,6 +1769,8 @@ impl HeaderSyncReactor {
         let Some(peer) = self.state.peers.get(&peer_id) else {
             return false;
         };
+        let session_id = peer.session.session_id();
+        let stream_version = peer.session.stream_version();
         let request_id = match peer.session.try_send_get_headers(
             range.start_height,
             count,
@@ -1805,7 +1814,17 @@ impl HeaderSyncReactor {
         }
         self.state.schedule.mark_assigned(peer_id.clone(), range);
         metrics::counter!("sync.header.request.sent").increment(1);
-        self.trace_get_headers_sent(&peer_id, range, count, peer_cap);
+        self.trace_get_headers_sent(
+            &peer_id,
+            range,
+            count,
+            peer_cap,
+            GetHeadersTraceMeta {
+                request_id,
+                session_id,
+                stream_version,
+            },
+        );
         #[cfg(test)]
         let _ = self
             .actions
@@ -1873,6 +1892,8 @@ impl HeaderSyncReactor {
         };
         let range = repair.range;
         let peer_cap = peer.max_headers_per_response;
+        let session_id = peer.session.session_id();
+        let stream_version = peer.session.stream_version();
         let request_id =
             match peer
                 .session
@@ -1913,7 +1934,17 @@ impl HeaderSyncReactor {
         }
 
         metrics::counter!("sync.header.vct_repair.request.sent").increment(1);
-        self.trace_get_headers_sent(&peer_id, range, range.count, peer_cap);
+        self.trace_get_headers_sent(
+            &peer_id,
+            range,
+            range.count,
+            peer_cap,
+            GetHeadersTraceMeta {
+                request_id,
+                session_id,
+                stream_version,
+            },
+        );
         #[cfg(test)]
         let _ = self
             .actions
@@ -2523,9 +2554,19 @@ impl HeaderSyncReactor {
         range: RangeRequest,
         count: u32,
         advertised_cap: u32,
+        meta: GetHeadersTraceMeta,
     ) {
         self.emit_trace(hs_trace::HEADER_GET_HEADERS_SENT, |row| {
             insert_peer(row, hs_trace::PEER, peer);
+            insert_u64(row, hs_trace::SESSION_ID, meta.session_id);
+            insert_u64(
+                row,
+                hs_trace::STREAM_VERSION,
+                u64::from(meta.stream_version),
+            );
+            if let Some(request_id) = meta.request_id {
+                insert_u64(row, hs_trace::REQUEST_ID, request_id.get());
+            }
             insert_height(row, hs_trace::RANGE_START, range.start_height);
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(count));
             insert_u64(row, hs_trace::ADVERTISED_CAP, u64::from(advertised_cap));

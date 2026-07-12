@@ -869,11 +869,16 @@ mod request_id_tests {
                 .is_err(),
             "failed expectation reservation must publish no wire request"
         );
+        assert_eq!(
+            session.inner.next_request_id.load(Ordering::Relaxed),
+            2,
+            "a failed reservation burns its request ID instead of reusing it ambiguously"
+        );
     }
 
-    #[test]
-    fn transport_queue_failure_rolls_back_reserved_expectation() {
-        let (send, _recv) = crate::zakura::framed_channel(1);
+    #[tokio::test]
+    async fn full_transport_queue_rolls_back_and_does_not_reuse_request_id() {
+        let (send, mut recv) = crate::zakura::framed_channel(1);
         send.try_send(Frame {
             message_type: 0,
             flags: 0,
@@ -905,5 +910,74 @@ mod request_id_tests {
             command => panic!("expected rollback command, got {command:?}"),
         };
         assert_eq!(cancelled, reserved);
+        assert_eq!(
+            reserved.request_id,
+            Some(HeaderSyncRequestId::new(1).expect("non-zero id"))
+        );
+
+        recv.recv().await.expect("dummy frame remains queued");
+        let next_id = session
+            .try_send_get_headers(block::Height(2), 1, true)
+            .expect("queue has capacity after draining");
+        assert_eq!(
+            next_id,
+            Some(HeaderSyncRequestId::new(2).expect("non-zero id")),
+            "the rolled-back ID must not be reused"
+        );
+        let next_reserved = match commands_rx
+            .try_recv()
+            .expect("next reservation is published")
+        {
+            HeaderSyncPeerCommand::Reserve(expected) => expected,
+            command => panic!("expected reservation command, got {command:?}"),
+        };
+        assert_eq!(next_reserved.request_id, next_id);
+        let frame = recv.recv().await.expect("second request is published");
+        let (message, wire_request_id) = HeaderSyncMessage::decode_frame_with_request_id(
+            frame,
+            HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7),
+        )
+        .expect("published v7 request decodes");
+        assert!(matches!(message, HeaderSyncMessage::GetHeaders { .. }));
+        assert_eq!(
+            wire_request_id,
+            Some(next_id.expect("v7 request has an ID"))
+        );
+    }
+
+    #[test]
+    fn closed_transport_queue_rolls_back_reserved_expectation() {
+        let (send, recv) = crate::zakura::framed_channel(1);
+        drop(recv);
+        let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+        let peer_id = ZakuraPeerId::new(vec![4; 32]).expect("test peer id is valid");
+        let session = HeaderSyncPeerSession::from_parts_with_direction_and_commands(
+            peer_id,
+            1,
+            ServicePeerDirection::Outbound,
+            send,
+            CancellationToken::new(),
+            Some(commands_tx),
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        );
+
+        assert!(matches!(
+            session.try_send_get_headers(block::Height(1), 1, true),
+            Err(OrderedSendError::Closed)
+        ));
+        let reserved = match commands_rx.try_recv().expect("reservation is published") {
+            HeaderSyncPeerCommand::Reserve(expected) => expected,
+            command => panic!("expected reservation command, got {command:?}"),
+        };
+        let cancelled = match commands_rx.try_recv().expect("rollback is published") {
+            HeaderSyncPeerCommand::Cancel(expected) => expected,
+            command => panic!("expected rollback command, got {command:?}"),
+        };
+        assert_eq!(cancelled, reserved);
+        assert_eq!(
+            reserved.request_id,
+            Some(HeaderSyncRequestId::new(1).expect("non-zero id"))
+        );
+        assert_eq!(session.inner.next_request_id.load(Ordering::Relaxed), 2);
     }
 }

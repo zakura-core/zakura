@@ -212,6 +212,9 @@ pub struct ZakuraTestNodeBuilder {
     discovery_direct_addrs: Vec<SocketAddr>,
     extra_advertised_services: Vec<ZakuraServiceId>,
     header_sync: Option<TestHeaderSyncStartup>,
+    header_sync_config: ZakuraHeaderSyncConfig,
+    header_sync_request_timeout: Option<Duration>,
+    supported_capabilities: Option<u64>,
     block_sync_config: ZakuraBlockSyncConfig,
 }
 
@@ -263,6 +266,9 @@ impl ZakuraTestNodeBuilder {
             discovery_direct_addrs: Vec::new(),
             extra_advertised_services: Vec::new(),
             header_sync: None,
+            header_sync_config: ZakuraHeaderSyncConfig::default(),
+            header_sync_request_timeout: None,
+            supported_capabilities: None,
             block_sync_config: ZakuraBlockSyncConfig::default(),
         }
     }
@@ -352,6 +358,24 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
+    /// Override the header-sync reactor configuration used by the test node.
+    pub fn header_sync_config(mut self, config: ZakuraHeaderSyncConfig) -> Self {
+        self.header_sync_config = config;
+        self
+    }
+
+    /// Override the header-sync request timeout used by the test node.
+    pub fn header_sync_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.header_sync_request_timeout = Some(request_timeout);
+        self
+    }
+
+    /// Restrict the capability mask advertised by this test node.
+    pub fn supported_capabilities(mut self, supported_capabilities: u64) -> Self {
+        self.supported_capabilities = Some(supported_capabilities);
+        self
+    }
+
     /// Override the block-sync config used with [`Self::header_sync_driver`].
     pub fn block_sync_config(mut self, config: ZakuraBlockSyncConfig) -> Self {
         self.block_sync_config = config;
@@ -412,9 +436,12 @@ impl ZakuraTestNodeBuilder {
                 anchor,
                 frontiers,
                 best_header_tip,
-                ZakuraHeaderSyncConfig::default(),
+                self.header_sync_config.clone(),
                 self.limits.max_frame_bytes,
             );
+            if let Some(request_timeout) = self.header_sync_request_timeout {
+                startup.request_timeout = request_timeout;
+            }
             startup.range_state_actions_enabled = true;
             startup.inbound_new_block_acceptance_enabled = true;
             startup.status_refresh_interval = Duration::from_millis(200);
@@ -472,7 +499,7 @@ impl ZakuraTestNodeBuilder {
             base_service,
             discovery_service,
         )?;
-        let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
+        let mut handler = ZakuraProtocolHandler::new_with_registry_and_trace(
             supervisor.clone(),
             network.clone(),
             handshake_config,
@@ -480,6 +507,9 @@ impl ZakuraTestNodeBuilder {
             registry,
             ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed)),
         );
+        if let Some(supported_capabilities) = self.supported_capabilities {
+            handler = handler.with_supported_capabilities(supported_capabilities);
+        }
         let router = Router::builder(endpoint)
             .accept(P2P_V2_ALPN, handler.clone())
             .spawn();

@@ -1143,6 +1143,62 @@ fn codec_round_trips_v7_get_headers_request_id() {
 }
 
 #[test]
+fn v7_get_headers_rejects_missing_and_zero_request_ids() {
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let message = HeaderSyncMessage::GetHeaders {
+        start_height: block::Height(42),
+        count: DEFAULT_HS_RANGE,
+        want_tree_aux_roots: false,
+    };
+
+    assert!(matches!(
+        message.encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, None),
+        Err(HeaderSyncWireError::MissingRequestId {
+            message: "GetHeaders"
+        })
+    ));
+
+    let mut encoded = message
+        .encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+        .expect("valid v7 request encodes");
+    encoded[1..9].fill(0);
+    assert!(matches!(
+        HeaderSyncMessage::decode_with_request_id(
+            &encoded,
+            HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7),
+        ),
+        Err(HeaderSyncWireError::MissingRequestId {
+            message: "GetHeaders"
+        })
+    ));
+}
+
+#[test]
+fn get_headers_rejects_cross_version_payloads() {
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let message = HeaderSyncMessage::GetHeaders {
+        start_height: block::Height(42),
+        count: DEFAULT_HS_RANGE,
+        want_tree_aux_roots: false,
+    };
+    let v6 = message.encode().expect("v6 request encodes");
+    let v7 = message
+        .encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+        .expect("v7 request encodes");
+
+    assert!(HeaderSyncMessage::decode_with_request_id(
+        &v6,
+        HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7),
+    )
+    .is_err());
+    assert!(HeaderSyncMessage::decode_with_request_id(
+        &v7,
+        HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION),
+    )
+    .is_err());
+}
+
+#[test]
 fn codec_round_trips_headers_with_bounded_vector() {
     let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
     let message = finalized_headers_message_with_sizes(headers, vec![123_456]);
@@ -1173,6 +1229,64 @@ fn codec_round_trips_v7_headers_request_id() {
 
     assert_eq!(decoded, message);
     assert_eq!(decoded_request_id, Some(request_id));
+}
+
+#[test]
+fn v7_headers_rejects_missing_and_zero_request_ids() {
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let message = HeaderSyncMessage::Headers {
+        headers: Vec::new(),
+        body_sizes: Vec::new(),
+        tree_aux_roots: Vec::new(),
+    };
+    let expected = ExpectedHeadersResponse::new(block::Height(1), 1, false)
+        .expect("count is valid")
+        .with_request_id(request_id);
+
+    assert!(matches!(
+        message.encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, None),
+        Err(HeaderSyncWireError::MissingRequestId { message: "Headers" })
+    ));
+
+    let mut encoded = message
+        .encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+        .expect("valid v7 response encodes");
+    encoded[1..9].fill(0);
+    assert!(matches!(
+        HeaderSyncMessage::decode_with_request_id(
+            &encoded,
+            HeaderSyncDecodeContext::for_headers_response(expected, 1),
+        ),
+        Err(HeaderSyncWireError::MissingRequestId { message: "Headers" })
+    ));
+}
+
+#[test]
+fn headers_rejects_cross_version_payloads() {
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let message = HeaderSyncMessage::Headers {
+        headers: Vec::new(),
+        body_sizes: Vec::new(),
+        tree_aux_roots: Vec::new(),
+    };
+    let v6_expected =
+        ExpectedHeadersResponse::new(block::Height(1), 1, false).expect("count is valid");
+    let v7_expected = v6_expected.with_request_id(request_id);
+    let v6 = message.encode().expect("v6 response encodes");
+    let v7 = message
+        .encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+        .expect("v7 response encodes");
+
+    assert!(HeaderSyncMessage::decode_with_request_id(
+        &v6,
+        HeaderSyncDecodeContext::for_headers_response(v7_expected, 1),
+    )
+    .is_err());
+    assert!(HeaderSyncMessage::decode_with_request_id(
+        &v7,
+        HeaderSyncDecodeContext::for_headers_response(v6_expected, 1),
+    )
+    .is_err());
 }
 
 #[test]

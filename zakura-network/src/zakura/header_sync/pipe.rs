@@ -852,6 +852,38 @@ mod tests {
     }
 
     #[test]
+    fn v7_retired_request_ids_are_bounded_at_exact_limit() {
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let mut local = HsLocal::new(
+            commands_rx,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        );
+
+        for id in 1..=u64::try_from(MAX_RETIRED_HEADER_REQUEST_IDS)
+            .expect("retired-id test bound fits in u64")
+        {
+            let request_id = HeaderSyncRequestId::new(id).expect("positive id");
+            local.handle_command(HeaderSyncPeerCommand::Retire(request_id));
+        }
+
+        let first = HeaderSyncRequestId::new(1).expect("non-zero id");
+        assert_eq!(local.retired_headers.len(), MAX_RETIRED_HEADER_REQUEST_IDS);
+        assert_eq!(
+            local.retired_header_order.len(),
+            MAX_RETIRED_HEADER_REQUEST_IDS
+        );
+        assert!(local.retired_headers.contains(&first));
+        assert_eq!(local.retired_header_order.front(), Some(&first));
+        assert_eq!(
+            local
+                .pop_expected_headers_response_by_id(first)
+                .expect("boundary tombstone remains known"),
+            None
+        );
+    }
+
+    #[test]
     fn v7_evicted_retired_id_is_still_stale_but_future_id_is_unknown() {
         let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
         let mut local = HsLocal::new(
@@ -877,6 +909,15 @@ mod tests {
         .expect("non-zero id");
 
         assert!(!local.retired_headers.contains(&evicted));
+        assert_eq!(local.retired_headers.len(), MAX_RETIRED_HEADER_REQUEST_IDS);
+        assert_eq!(
+            local.retired_header_order.len(),
+            MAX_RETIRED_HEADER_REQUEST_IDS
+        );
+        assert_eq!(
+            local.retired_header_order.front(),
+            Some(&HeaderSyncRequestId::new(2).expect("non-zero id"))
+        );
         assert_eq!(
             local
                 .pop_expected_headers_response_by_id(evicted)
@@ -1000,7 +1041,7 @@ mod tests {
         // First flood frame: admitted, decoded, and forwarded to the reactor.
         assert!(matches!(pipe.run_one(frame_one), Flow::Continue(())));
         match events.try_recv() {
-            Ok(HeaderSyncEvent::WireMessage {
+            Ok(HeaderSyncEvent::SessionWireMessage {
                 msg: HeaderSyncMessage::NewBlock(block),
                 ..
             }) => assert_eq!(block.hash(), block_one.hash()),

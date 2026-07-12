@@ -69,9 +69,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            pull_file_names() {
+              jq -r '.[].filename'
+            }
+            detector_fixture='[{"filename":"zakura-network/src/zakura/mod.rs","path":"docs/not-zakura.md"}]'
+            detected_fixture=$(printf '%s\n' "$detector_fixture" | pull_file_names)
+            if [[ "$detected_fixture" != "zakura-network/src/zakura/mod.rs" ]]; then
+              echo "pull-files detector must read the API filename field" >&2
+              exit 1
+            fi
             changed=$(gh api --paginate \
-              "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-              --jq '.[].path')
+              "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" |
+              pull_file_names)
           else
             before="${{ github.event.before }}"
             # The first push of a branch (and force-pushes that orphan the old

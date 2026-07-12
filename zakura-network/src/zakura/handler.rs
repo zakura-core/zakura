@@ -1703,6 +1703,16 @@ impl ZakuraProtocolHandler {
         }
     }
 
+    /// Restrict the locally advertised capability mask.
+    ///
+    /// Test nodes use this to exercise compatibility negotiation against older
+    /// peers while retaining the production service registry.
+    #[cfg(any(test, feature = "zakura-testkit"))]
+    pub(crate) fn with_supported_capabilities(mut self, supported_capabilities: u64) -> Self {
+        self.handshake_config.supported_capabilities &= supported_capabilities;
+        self
+    }
+
     /// Attach the bound iroh endpoint so inbound Router-accepted connections can
     /// resolve the peer's UDP source IP and enforce the per-IP connection cap.
     pub fn with_endpoint(mut self, endpoint: Endpoint) -> Self {

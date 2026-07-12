@@ -2125,12 +2125,16 @@ fn watchdog_after_held_settle_releases_once() {
     budget.release(20);
     assert_eq!(budget.reserved(), 80);
 
-    let watchdog_released = queue.release_reserved_and_return_items([block::Height(1)]);
+    let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)]);
+    let watchdog_released = outcome.released_bytes;
     budget.release(watchdog_released);
     assert_eq!(
         watchdog_released, 0,
         "watchdog must not release a held body owned by the sequencer handoff"
     );
+    assert_eq!(outcome.held_count, 1);
+    assert_eq!(outcome.returned_count, 0);
+    assert_eq!(outcome.missing_count, 0);
     assert!(queue.in_flight_contains(block::Height(1)));
     assert_eq!(budget.reserved(), 80);
 
@@ -2148,10 +2152,21 @@ fn late_delivery_after_watchdog_cancellation_does_not_resurrect_released_claim()
     assert!(budget.try_reserve(100));
     assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
 
-    let watchdog_released = queue.release_reserved_and_return_items([block::Height(1)]);
+    let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)]);
+    let watchdog_released = outcome.released_bytes;
     budget.release(watchdog_released);
+    assert_eq!(outcome.returned_count, 1);
+    assert_eq!(outcome.held_count, 0);
+    assert_eq!(outcome.missing_count, 0);
     assert_eq!(budget.reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
+
+    let duplicate =
+        queue.release_reserved_and_return_items_detailed([block::Height(1), block::Height(2)]);
+    assert_eq!(duplicate.already_pending_count, 1);
+    assert_eq!(duplicate.missing_count, 1);
+    assert_eq!(duplicate.min_height, Some(block::Height(1)));
+    assert_eq!(duplicate.max_height, Some(block::Height(2)));
 
     assert_eq!(
         queue.settle_active_reserved_height(block::Height(1), 80),

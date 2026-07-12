@@ -49,6 +49,31 @@ pub(super) struct WorkItem {
     pub(super) budget: BlockBudgetLedger,
 }
 
+/// Diagnostics for an attempted `in_flight -> pending` retry transition.
+///
+/// A retry cleanup can legitimately encounter a body that another path already
+/// settled to `Held`, or a height that another owner already removed. Keeping
+/// those outcomes separate makes a lost floor height attributable from traces.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct WorkReturnOutcome {
+    /// Reserved bytes released while moving items back to `pending`.
+    pub(super) released_bytes: u64,
+    /// Reserved items successfully moved back to `pending`.
+    pub(super) returned_count: u64,
+    /// Requested heights that were already back in `pending`.
+    pub(super) already_pending_count: u64,
+    /// Items still present in `in_flight`, but already settled to `Held`.
+    pub(super) held_count: u64,
+    /// Items present in `in_flight` with an unexpected `Released` ledger.
+    pub(super) released_count: u64,
+    /// Requested heights absent from both `pending` and `in_flight`.
+    pub(super) missing_count: u64,
+    /// Lowest height considered by the cleanup.
+    pub(super) min_height: Option<block::Height>,
+    /// Highest height considered by the cleanup.
+    pub(super) max_height: Option<block::Height>,
+}
+
 #[derive(Debug)]
 struct WorkQueueInner {
     pending: std::collections::BTreeMap<block::Height, WorkItem>,
@@ -451,16 +476,50 @@ impl WorkQueue {
         &self,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> u64 {
+        self.release_reserved_and_return_items_detailed(heights)
+            .released_bytes
+    }
+
+    /// Release and return still-reserved items, preserving the outcome of every
+    /// requested height for low-volume lifecycle tracing.
+    pub(super) fn release_reserved_and_return_items_detailed(
+        &self,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> WorkReturnOutcome {
         let mut moved = false;
-        let mut released = 0u64;
+        let mut outcome = WorkReturnOutcome::default();
         {
             let mut inner = self.lock();
             for height in heights {
+                outcome.min_height = Some(
+                    outcome
+                        .min_height
+                        .map_or(height, |current| current.min(height)),
+                );
+                outcome.max_height = Some(
+                    outcome
+                        .max_height
+                        .map_or(height, |current| current.max(height)),
+                );
                 let Some(item) = inner.in_flight.get(&height) else {
+                    if inner.pending.contains_key(&height) {
+                        outcome.already_pending_count =
+                            outcome.already_pending_count.saturating_add(1);
+                    } else {
+                        outcome.missing_count = outcome.missing_count.saturating_add(1);
+                    }
                     continue;
                 };
-                if !item.budget.is_reserved() {
-                    continue;
+                match item.budget {
+                    BlockBudgetLedger::Held(_) => {
+                        outcome.held_count = outcome.held_count.saturating_add(1);
+                        continue;
+                    }
+                    BlockBudgetLedger::Released => {
+                        outcome.released_count = outcome.released_count.saturating_add(1);
+                        continue;
+                    }
+                    BlockBudgetLedger::Reserved(_) => {}
                 }
                 let mut item = inner
                     .in_flight
@@ -468,16 +527,18 @@ impl WorkQueue {
                     .expect("reserved item exists because it was just checked");
                 // Only reserved items reach here, so the released bytes are exactly
                 // the reserved charge leaving the queue.
-                released = released.saturating_add(item.budget.release());
+                outcome.released_bytes =
+                    outcome.released_bytes.saturating_add(item.budget.release());
+                outcome.returned_count = outcome.returned_count.saturating_add(1);
                 inner.pending.insert(height, item);
                 moved = true;
             }
-            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(outcome.released_bytes);
         }
         if moved {
             self.available.notify_waiters();
         }
-        released
+        outcome
     }
 
     /// Garbage-collect committed heights: raise the floor to `max(self.floor,

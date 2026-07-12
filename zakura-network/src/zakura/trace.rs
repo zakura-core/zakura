@@ -300,6 +300,10 @@ pub mod block_sync_trace {
     pub const BLOCK_WORK_EXTENDED: &str = "block_work_extended";
     /// A peer claimed a contiguous chunk of pending work for issuance.
     pub const BLOCK_WORK_TAKEN: &str = "block_work_taken";
+    /// A request cleanup found an anomalous outcome returning work to `pending`.
+    pub const BLOCK_WORK_RETURNED: &str = "block_work_returned";
+    /// The floor watchdog force-cancelled an expired request claim.
+    pub const BLOCK_FLOOR_WATCHDOG_CANCELLED: &str = "block_floor_watchdog_cancelled";
     /// A `try_fill` pass ended having issued no request: the routine went idle this wake.
     /// Carries [`FILL_STOP_REASON`] plus the slot/budget/work snapshot so a trace can
     /// attribute carrier idle ("bubble") time to a cause rather than inferring it.
@@ -314,6 +318,8 @@ pub mod block_sync_trace {
     pub const BLOCK_FRONTIERS_CHANGED: &str = "block_frontiers_changed";
     /// Chain tip reset rolled the body frontier back.
     pub const BLOCK_CHAIN_TIP_RESET: &str = "block_chain_tip_reset";
+    /// Sequencer classified a frontier reset as growth, preservation, or destructive.
+    pub const BLOCK_FRONTIER_RESET_CLASSIFIED: &str = "block_frontier_reset_classified";
     /// Periodic reactor state snapshot (the key stall-diagnosis row).
     pub const BLOCK_SYNC_STATE: &str = "block_sync_state";
     /// Periodic per-peer BBR controller heartbeat, emitted on a fixed cadence even while

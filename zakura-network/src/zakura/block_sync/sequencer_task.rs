@@ -17,7 +17,7 @@
 
 use super::{
     events::*,
-    reactor::{bs_insert_height, bs_insert_u64},
+    reactor::{bs_insert_height, bs_insert_str, bs_insert_u64},
     reorder::BufferedBlockBody,
     sequencer::*,
     state::*,
@@ -455,6 +455,14 @@ impl SequencerTask {
                 ))
             && reset_tip_matches_local_work
         {
+            self.trace_frontier_reset_classified(
+                "growth",
+                &frontiers,
+                preserve_active_successors,
+                peer_has_successor_after,
+                peer_outstanding_conflicts_at_tip,
+                reset_tip_matches_local_work,
+            );
             // Growth-classified reset: treat it as a frontier advance, releasing
             // applied bodies.
             self.handle_frontier_advance(frontiers, true).await;
@@ -478,10 +486,26 @@ impl SequencerTask {
                 frontiers.verified_block_hash,
             )
         {
+            self.trace_frontier_reset_classified(
+                "preserved_stale",
+                &frontiers,
+                preserve_active_successors,
+                peer_has_successor_after,
+                peer_outstanding_conflicts_at_tip,
+                reset_tip_matches_local_work,
+            );
             self.handle_frontier_advance(frontiers, true).await;
             return;
         }
 
+        self.trace_frontier_reset_classified(
+            "destructive",
+            &frontiers,
+            preserve_active_successors,
+            peer_has_successor_after,
+            peer_outstanding_conflicts_at_tip,
+            reset_tip_matches_local_work,
+        );
         let remember_released_applies = frontiers.verified_block_tip > frontiers.finalized_height
             && frontiers.verified_block_tip <= self.sequencer.floor();
 
@@ -659,6 +683,61 @@ impl SequencerTask {
             row.insert(
                 bs_trace::RESULT.to_string(),
                 serde_json::Value::String(outcome.to_string()),
+            );
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn trace_frontier_reset_classified(
+        &self,
+        classification: &'static str,
+        frontiers: &BlockSyncFrontiers,
+        preserve_active_successors: bool,
+        peer_has_successor_after: bool,
+        peer_outstanding_conflicts_at_tip: bool,
+        reset_tip_matches_local_work: bool,
+    ) {
+        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
+            bs_insert_str(
+                row,
+                bs_trace::EVENT,
+                bs_trace::BLOCK_FRONTIER_RESET_CLASSIFIED,
+            );
+            bs_insert_str(row, bs_trace::RESULT, classification);
+            bs_insert_height(
+                row,
+                bs_trace::VERIFIED_BLOCK_TIP,
+                frontiers.verified_block_tip,
+            );
+            bs_insert_height(row, "previous_verified_tip", self.sequencer.verified_tip());
+            bs_insert_height(row, "previous_download_floor", self.sequencer.floor());
+            bs_insert_u64(
+                row,
+                "preserve_active_successors",
+                u64::from(preserve_active_successors),
+            );
+            bs_insert_u64(
+                row,
+                "peer_has_successor_after",
+                u64::from(peer_has_successor_after),
+            );
+            bs_insert_u64(
+                row,
+                "peer_outstanding_conflicts_at_tip",
+                u64::from(peer_outstanding_conflicts_at_tip),
+            );
+            bs_insert_u64(
+                row,
+                "reset_tip_matches_local_work",
+                u64::from(reset_tip_matches_local_work),
+            );
+            bs_insert_u64(
+                row,
+                "has_local_successor_after",
+                u64::from(
+                    next_height(frontiers.verified_block_tip)
+                        .is_some_and(|next| self.sequencer.has_buffered_at_or_above(next)),
+                ),
             );
         });
     }

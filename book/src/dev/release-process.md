@@ -75,7 +75,7 @@ Zakura's tagging relates directly to versions published on Docker. We will refer
 
 ### Feature Flags
 
-To keep the `ironwood-main` branch in a releasable state, experimental features must be gated behind a [Rust feature flag](https://doc.rust-lang.org/cargo/reference/features.html).
+To keep the `main` branch in a releasable state, experimental features must be gated behind a [Rust feature flag](https://doc.rust-lang.org/cargo/reference/features.html).
 Breaking changes should also be gated behind a feature flag, unless the team decides they are urgent.
 (For example, security fixes which also break backwards compatibility.)
 
@@ -120,7 +120,7 @@ To help ensure that you have sufficient time and a clear path to update, this is
 
 | Deprecation stages | Details                                                                                                                                                                                                                                                                                                                                                                                |
 | :----------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Announcement       | We announce deprecated RPCs and features in the [change log](https://github.com/zakura-core/zakura/blob/ironwood-main/CHANGELOG.md "Zakura change log"). When we announce a deprecation, we also announce a recommended update path.                                                                                                                                                          |
+| Announcement       | We announce deprecated RPCs and features in the [change log](https://github.com/zakura-core/zakura/blob/main/CHANGELOG.md "Zakura change log"). When we announce a deprecation, we also announce a recommended update path.                                                                                                                                                          |
 | Deprecation period | When a RPC or a feature is deprecated, it is still present until the next major release. A deprecation can be announced in any release, but the removal of a deprecated RPC or feature happens only in major release. Until a deprecated RPC or feature is removed, it is maintained according to the Tier 1 support policy, meaning that only critical and security issues are fixed. |
 | Rust APIs          | The Rust APIs of the Zakura crates are currently unstable and unsupported. Use the `zakurad` commands or JSON-RPCs to interact with Zakura.                                                                                                                                                                                                                                               |
 
@@ -128,6 +128,6 @@ To help ensure that you have sufficient time and a clear path to update, this is
 
 ## Release candidate & release process
 
-Our release checklist is available as a template, which defines each step our team needs to follow to create a new pre-release or release, and to also build and push the binaries to the official channels [Release Checklist Template](https://github.com/zakura-core/zakura/blob/ironwood-main/.github/PULL_REQUEST_TEMPLATE/release-checklist.md).
+Our release checklist is available as a template, which defines each step our team needs to follow to create a new pre-release or release, and to also build and push the binaries to the official channels [Release Checklist Template](https://github.com/zakura-core/zakura/blob/main/.github/PULL_REQUEST_TEMPLATE/release-checklist.md).
 
 Every release tag must match the `zakura` package version: release binaries are built without `.git`, so `zakurad --version` reports the package version, not the tag. The `release-binaries.yml` workflow checks this and refuses to build or publish assets for a mismatched tag. Before pushing a tag, verify the release commit with `./scripts/check-release-version.sh v<version>`.

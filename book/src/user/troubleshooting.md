@@ -51,7 +51,7 @@ Make sure you're using a release build on your native architecture.
 ### Syncer Lookahead Limit
 
 If your connection is slow, try
-[downloading fewer blocks at a time](https://docs.rs/zakurad/latest/zakurad/components/sync/struct.Config.html#structfield.lookahead_limit):
+[downloading fewer blocks at a time](https://docs.rs/zakura/latest/zakurad/components/sync/struct.Config.html#structfield.lookahead_limit):
 
 ```toml
 [sync]

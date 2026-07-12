@@ -25,7 +25,7 @@ on:
       target_ref:
         description: "Fork branch to target"
         type: string
-        default: ironwood-main
+        default: main
       candidate_pr:
         description: "Optional upstream PR number override for debugging"
         type: string
@@ -76,7 +76,7 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-          ref: ${{ inputs.target_ref || 'ironwood-main' }}
+          ref: ${{ inputs.target_ref || 'main' }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -87,7 +87,7 @@ jobs:
           SOURCE_REPO: ${{ inputs.source_repo || 'ZcashFoundation/zebra' }}
           SOURCE_REF: ${{ inputs.source_ref || 'main' }}
           TARGET_REPO: ${{ github.repository }}
-          TARGET_REF: ${{ inputs.target_ref || 'ironwood-main' }}
+          TARGET_REF: ${{ inputs.target_ref || 'main' }}
           CANDIDATE_PR: ${{ inputs.candidate_pr || '' }}
           LIMIT: ${{ inputs.limit || '25' }}
         run: |
@@ -126,7 +126,7 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-          ref: ${{ inputs.target_ref || 'ironwood-main' }}
+          ref: ${{ inputs.target_ref || 'main' }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -188,7 +188,7 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-          ref: ${{ inputs.target_ref || 'ironwood-main' }}
+          ref: ${{ inputs.target_ref || 'main' }}
           fetch-depth: 0
           persist-credentials: true
 
@@ -215,7 +215,7 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-          ref: ${{ inputs.target_ref || 'ironwood-main' }}
+          ref: ${{ inputs.target_ref || 'main' }}
           fetch-depth: 0
           persist-credentials: true
 
@@ -245,7 +245,7 @@ jobs:
         id: create-pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPSTREAM_SYNC_TARGET_REF: ${{ inputs.target_ref || 'ironwood-main' }}
+          UPSTREAM_SYNC_TARGET_REF: ${{ inputs.target_ref || 'main' }}
         run: .github/scripts/upstream-sync-run.sh create-human-review-pr
 
       - name: Verify PR state
@@ -272,7 +272,7 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
-          ref: ${{ inputs.target_ref || 'ironwood-main' }}
+          ref: ${{ inputs.target_ref || 'main' }}
           fetch-depth: 0
           persist-credentials: true
 
@@ -322,7 +322,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: ${{ steps.pr-meta.outputs.branch }}
-          base: ${{ inputs.target_ref || 'ironwood-main' }}
+          base: ${{ inputs.target_ref || 'main' }}
           title: ${{ steps.pr-meta.outputs.title }}
           body-path: .github/upstream-sync/work/pr-body.md
           commit-message: ${{ steps.pr-meta.outputs.title }}

@@ -15,7 +15,7 @@ Dispatch the manual fleet deploy workflows in `zakura-core/zakura`:
 
 | Network | Workflow | GitHub Environment | Default `ref` |
 | --- | --- | --- | --- |
-| testnet | `zakura-testnet-deploy.yml` | `zakura-testnet` | `ironwood-main` |
+| testnet | `zakura-testnet-deploy.yml` | `zakura-testnet` | `main` |
 | mainnet | `zakura-mainnet-deploy.yml` | `zakura-mainnet` | `main` |
 
 Both workflows build a native `zakurad` binary on a self-hosted runner, then use
@@ -115,8 +115,8 @@ gh workflow run zakura-testnet-deploy.yml \
 Examples:
 
 ```bash
-gh workflow run zakura-testnet-deploy.yml --repo zakura-core/zakura -f ref=ironwood-main -f node=zakura-testnet-1
-gh workflow run zakura-testnet-deploy.yml --repo zakura-core/zakura -f ref=ironwood-main -f node=zakura-compat
+gh workflow run zakura-testnet-deploy.yml --repo zakura-core/zakura -f ref=main -f node=zakura-testnet-1
+gh workflow run zakura-testnet-deploy.yml --repo zakura-core/zakura -f ref=main -f node=zakura-compat
 ```
 
 ## Dispatch — Single Mainnet Node

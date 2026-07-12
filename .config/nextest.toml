@@ -57,7 +57,7 @@ filter = 'package(zakura) and test(~zakura_header_sync_driver_tests)'
 retries = 2
 
 # --- Full Tests profile ---
-# Broader coverage for `ironwood-main`, scheduled, manual, and merge-queue runs,
+# Broader coverage for `main`, scheduled, manual, and merge-queue runs,
 # while still keeping the known slow/flaky integration buckets in dedicated
 # profiles that can use retries, serial execution, trace artifacts, and
 # no-fail-fast without hiding fast unit failures.

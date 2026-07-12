@@ -31,19 +31,19 @@ state objects after a DB format-version bump by re-running the snapshots workflo
 ## Running
 
 > **Currently disabled.** The `push` and `schedule` triggers below are commented out in
-> `sync-confidence.yml` until `ironwood-main` ships DB format 28.3.0 and matching pruned
-> snapshots (the snapshots are 28.3.0, so an `ironwood-main` image built before then would
+> `sync-confidence.yml` until `main` ships DB format 28.3.0 and matching pruned
+> snapshots (the snapshots are 28.3.0, so a `main` image built before then would
 > `FormatMismatch` on open). Only manual dispatch is active. Re-enable by restoring the
 > `push` and `schedule` blocks in `sync-confidence.yml`.
 
 Once the snapshots exist and the package is public, **Sync confidence**:
 
-- **on merge to `ironwood-main`** rebuilds and publishes the `ironwood-main` test image
+- **on merge to `main`** rebuilds and publishes the `main` test image
   to GHCR — no sync test runs, so merges stay cheap;
-- **every 12 hours (schedule)** reuses that `ironwood-main` image (no rebuild) and syncs
+- **every 12 hours (schedule)** reuses that `main` image (no rebuild) and syncs
   both windows;
 - **on manual dispatch** builds the image from the dispatched ref and syncs both windows
-  by default; uncheck `build_image` to reuse the `ironwood-main` image instead.
+  by default; uncheck `build_image` to reuse the `main` image instead.
 
 Each window restores its pruned tarball and syncs its 5k-block range. A red means a
 sync/consensus regression or a broken DB-format migration — the consumer runs the image's

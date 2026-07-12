@@ -564,6 +564,7 @@ impl HeaderSyncReactor {
                 peer_state.late_covered_responses = 0;
                 peer_state.served_headers_inflight = 0;
                 peer_state.served_header_request_ids.clear();
+                peer_state.highest_served_header_request_id = None;
                 peer_state.meters = HeaderSyncPeerMeters::new(
                     status_refresh_interval,
                     DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL,

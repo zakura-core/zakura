@@ -3499,6 +3499,34 @@ fn peer_state_suppresses_redundant_status_until_session_reset() {
     assert!(peer_state.status_differs_from_last_sent(status));
 }
 
+#[test]
+fn completed_v7_inbound_request_id_cannot_be_reused() {
+    let (send, _recv) = crate::zakura::framed_channel(32);
+    let session = HeaderSyncPeerSession::from_parts_with_direction_and_version(
+        peer(82),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+        ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+    );
+    let mut peer_state = super::state::PeerHeaderState::new(
+        session,
+        (block::Height(0), block::Hash([0; 32])),
+        DEFAULT_HS_RANGE,
+        DEFAULT_HS_MAX_INFLIGHT,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+    );
+    let first = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let second = HeaderSyncRequestId::new(2).expect("non-zero id");
+
+    assert!(peer_state.try_start_serving_headers(2, Some(first)));
+    assert!(peer_state.finish_serving_headers(Some(first)));
+    assert!(!peer_state.try_start_serving_headers(2, Some(first)));
+    assert!(peer_state.try_start_serving_headers(2, Some(second)));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn reconnect_resends_initial_status_after_session_reset() {
     let network = regtest_network();

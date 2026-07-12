@@ -522,7 +522,7 @@ pub enum HeaderSyncCommitFailureKind {
     Local,
 }
 
-/// Locally allocated header-sync request identifier.
+/// Header-sync request identifier, non-zero and strictly increasing per stream session.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct HeaderSyncRequestId(u64);
 

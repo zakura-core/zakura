@@ -42,6 +42,8 @@ pub(super) struct HsLocal {
     retired_headers: HashSet<HeaderSyncRequestId>,
     /// Insertion order used to keep retired request IDs bounded.
     retired_header_order: VecDeque<HeaderSyncRequestId>,
+    /// Highest locally reserved v7 request ID in this stream session.
+    highest_reserved_request_id: Option<HeaderSyncRequestId>,
     /// Commands from shared scheduling state into this peer-local pipe.
     commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
     /// Negotiated header-sync stream version.
@@ -70,6 +72,7 @@ impl HsLocal {
             expected_headers_by_id: HashMap::new(),
             retired_headers: HashSet::new(),
             retired_header_order: VecDeque::new(),
+            highest_reserved_request_id: None,
             commands,
             stream_version,
             new_block_meter: RateMeter::new(new_block_min_interval),
@@ -96,6 +99,13 @@ impl HsLocal {
         }
         if self.retired_headers.contains(&request_id) {
             metrics::counter!("sync.header.response.retired").increment(1);
+            return Ok(None);
+        }
+        if self
+            .highest_reserved_request_id
+            .is_some_and(|highest| request_id.get() <= highest.get())
+        {
+            metrics::counter!("sync.header.response.evicted_retired").increment(1);
             return Ok(None);
         }
         Err(HeaderSyncWireError::UnsolicitedHeaders)
@@ -142,6 +152,11 @@ impl HsLocal {
         match command {
             HeaderSyncPeerCommand::Reserve(expected) => {
                 if let Some(request_id) = expected.request_id {
+                    self.highest_reserved_request_id = Some(
+                        self.highest_reserved_request_id
+                            .filter(|highest| highest.get() >= request_id.get())
+                            .unwrap_or(request_id),
+                    );
                     self.reactivate_request_id(request_id);
                     self.expected_headers_by_id.insert(request_id, expected);
                 } else {
@@ -836,6 +851,44 @@ mod tests {
                 Err(mpsc::error::TryRecvError::Empty)
             ));
         }
+    }
+
+    #[test]
+    fn v7_evicted_retired_id_is_still_stale_but_future_id_is_unknown() {
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let mut local = HsLocal::new(
+            commands_rx,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        );
+        for id in 1..=u64::try_from(MAX_RETIRED_HEADER_REQUEST_IDS + 1)
+            .expect("retired-id test bound fits in u64")
+        {
+            let request_id = HeaderSyncRequestId::new(id).expect("positive id");
+            let expected = ExpectedHeadersResponse::new(block::Height(1), 1, true)
+                .expect("count is valid")
+                .with_request_id(request_id);
+            local.handle_command(HeaderSyncPeerCommand::Reserve(expected));
+            local.handle_command(HeaderSyncPeerCommand::Retire(request_id));
+        }
+        let evicted = HeaderSyncRequestId::new(1).expect("non-zero id");
+        let never_issued = HeaderSyncRequestId::new(
+            u64::try_from(MAX_RETIRED_HEADER_REQUEST_IDS + 2)
+                .expect("retired-id test bound fits in u64"),
+        )
+        .expect("non-zero id");
+
+        assert!(!local.retired_headers.contains(&evicted));
+        assert_eq!(
+            local
+                .pop_expected_headers_response_by_id(evicted)
+                .expect("evicted issued id remains stale"),
+            None
+        );
+        assert!(matches!(
+            local.pop_expected_headers_response_by_id(never_issued),
+            Err(HeaderSyncWireError::UnsolicitedHeaders)
+        ));
     }
 
     #[test]

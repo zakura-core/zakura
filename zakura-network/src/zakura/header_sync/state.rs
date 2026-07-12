@@ -332,6 +332,7 @@ pub(super) struct PeerHeaderState {
     pub(super) meters: HeaderSyncPeerMeters,
     pub(super) served_headers_inflight: u16,
     pub(super) served_header_request_ids: HashSet<HeaderSyncRequestId>,
+    pub(super) highest_served_header_request_id: Option<HeaderSyncRequestId>,
 }
 
 impl PeerHeaderState {
@@ -364,6 +365,7 @@ impl PeerHeaderState {
             ),
             served_headers_inflight: 0,
             served_header_request_ids: HashSet::new(),
+            highest_served_header_request_id: None,
         }
     }
 
@@ -430,9 +432,16 @@ impl PeerHeaderState {
             return false;
         }
         if let Some(request_id) = request_id {
+            if self
+                .highest_served_header_request_id
+                .is_some_and(|highest| request_id.get() <= highest.get())
+            {
+                return false;
+            }
             if !self.served_header_request_ids.insert(request_id) {
                 return false;
             }
+            self.highest_served_header_request_id = Some(request_id);
         }
         self.served_headers_inflight = self.served_headers_inflight.saturating_add(1);
         true

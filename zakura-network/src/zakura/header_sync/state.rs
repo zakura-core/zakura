@@ -370,9 +370,12 @@ impl PeerHeaderState {
     }
 
     pub(super) fn available_slots(&self) -> usize {
-        usize::from(self.max_inflight_requests)
-            .min(EFFECTIVE_HS_OUTBOUND_INFLIGHT_PER_PEER)
-            .saturating_sub(self.outstanding.len())
+        let effective_limit = if self.session.has_request_ids() {
+            usize::from(self.max_inflight_requests)
+        } else {
+            1
+        };
+        effective_limit.saturating_sub(self.outstanding.len())
     }
 
     pub(super) fn pop_oldest_outstanding(&mut self) -> Option<OutstandingRange> {

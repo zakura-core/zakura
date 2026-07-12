@@ -2409,6 +2409,97 @@ async fn scheduler_limits_v1_to_one_outstanding_request_per_peer() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn scheduler_uses_v7_inflight_slots_and_matches_reverse_response_ids() {
+    let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
+    let mut fixture = spawn_test_reactor(startup_for(
+        network,
+        (block::Height(3), checkpoint_hash),
+        Some((block::Height(3), checkpoint_hash)),
+    ));
+    let peer_id = peer(83);
+    let (send, mut recv) = crate::zakura::framed_channel(32);
+    let session = HeaderSyncPeerSession::from_parts_with_direction_and_version(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+        ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .unwrap();
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(8),
+        DEFAULT_HS_RANGE,
+        2,
+    )
+    .await;
+
+    let mut starts = HashSet::new();
+    while starts.len() < 2 {
+        if let HeaderSyncAction::SendMessage {
+            peer,
+            msg: HeaderSyncMessage::GetHeaders { start_height, .. },
+        } = next_non_query_action(&mut fixture.actions).await
+        {
+            assert_eq!(peer, peer_id);
+            starts.insert(start_height);
+        }
+    }
+    assert_eq!(starts, HashSet::from([block::Height(1), block::Height(4)]));
+
+    let mut request_ids = HashMap::new();
+    while request_ids.len() < 2 {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
+            .await
+            .expect("v7 outbound frame arrives")
+            .expect("v7 stream stays open");
+        let (message, request_id) = HeaderSyncMessage::decode_frame_with_request_id(
+            frame,
+            HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7),
+        )
+        .expect("v7 outbound frame decodes");
+        if let HeaderSyncMessage::GetHeaders { start_height, .. } = message {
+            request_ids.insert(
+                start_height,
+                request_id.expect("v7 GetHeaders carries request id"),
+            );
+        }
+    }
+    let backward_id = request_ids[&block::Height(1)];
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireHeaders {
+            peer: peer_id.clone(),
+            session_id: 0,
+            request_id: Some(backward_id),
+            headers: vec![mainnet_header(&BLOCK_MAINNET_1_BYTES); 4],
+            body_sizes: vec![0; 4],
+            tree_aux_roots: roots_from_height(block::Height(1), 4),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(reason, HeaderSyncMisbehavior::ResponseTooLong);
+                break;
+            }
+            HeaderSyncAction::SendMessage { .. } => {}
+            action => panic!("unexpected action for reverse v7 response: {action:?}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn scheduler_fans_out_same_forward_range_to_three_peers() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(

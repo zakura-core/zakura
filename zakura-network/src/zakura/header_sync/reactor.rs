@@ -1717,101 +1717,108 @@ impl HeaderSyncReactor {
             return;
         }
 
-        let mut peer_ids: Vec<ZakuraPeerId> = self.state.peers.keys().cloned().collect();
-        peer_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-
-        for peer_id in peer_ids {
-            let Some(peer) = self.state.peers.get(&peer_id) else {
-                continue;
-            };
-            if !peer.received_status || peer.available_slots() == 0 {
-                continue;
+        loop {
+            let mut peer_ids: Vec<ZakuraPeerId> = self.state.peers.keys().cloned().collect();
+            peer_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            let mut scheduled_any = false;
+            for peer_id in peer_ids {
+                scheduled_any |= self.schedule_one_for_peer(peer_id).await;
             }
-
-            let Some(mut range) = self.state.schedule.next_for_peer(&peer_id, peer) else {
-                continue;
-            };
-            let original_range = range;
-
-            let count = clamp_header_sync_request_count(
-                range.count,
-                peer.max_headers_per_response,
-                &self.startup.network,
-                self.startup.max_frame_bytes,
-                range.want_tree_aux_roots,
-            );
-            if range.finalized && count < range.count {
-                self.state.schedule.retry(range);
-                continue;
+            if !scheduled_any {
+                break;
             }
-            range.count = count;
-            self.state
-                .schedule
-                .narrow_queued_range(original_range, range);
-
-            let peer_cap = peer.max_headers_per_response;
-            let Some(peer) = self.state.peers.get(&peer_id) else {
-                continue;
-            };
-            let request_id = match peer.session.try_send_get_headers(
-                range.start_height,
-                count,
-                range.want_tree_aux_roots,
-            ) {
-                Ok(request_id) => request_id,
-                Err(error) => {
-                    tracing::debug!(
-                        peer = ?peer_id,
-                        start_height = ?range.start_height,
-                        count,
-                        ?error,
-                        "failed to queue Zakura header-sync GetHeaders"
-                    );
-                    self.trace_queue_send_failed(
-                        &peer_id,
-                        "get_headers",
-                        &error,
-                        peer.session.outbound_capacity(),
-                        peer.session.outbound_max_capacity(),
-                        |row| {
-                            insert_height(row, qs_trace::RANGE_START, range.start_height);
-                            insert_u64(row, qs_trace::RANGE_COUNT, u64::from(count));
-                        },
-                    );
-                    self.state.schedule.retry(range);
-                    continue;
-                }
-            };
-
-            let deadline = Instant::now() + self.startup.request_timeout;
-            let outstanding = OutstandingRange {
-                request_id,
-                range,
-                deadline,
-                expected_max_count: count,
-                clear_assignment_on_timeout: false,
-                purpose: RangePurpose::Sync,
-            };
-            if let Some(peer) = self.state.peers.get_mut(&peer_id) {
-                peer.outstanding.push(outstanding);
-            }
-            self.state.schedule.mark_assigned(peer_id.clone(), range);
-            let destination = peer_id.clone();
-            metrics::counter!("sync.header.request.sent").increment(1);
-            self.trace_get_headers_sent(&destination, range, count, peer_cap);
-            #[cfg(test)]
-            let _ = self
-                .actions
-                .send(HeaderSyncAction::SendMessage {
-                    peer: destination,
-                    msg: HeaderSyncMessage::GetHeaders {
-                        start_height: range.start_height,
-                        count,
-                        want_tree_aux_roots: range.want_tree_aux_roots,
-                    },
-                })
-                .await;
         }
+    }
+
+    async fn schedule_one_for_peer(&mut self, peer_id: ZakuraPeerId) -> bool {
+        let Some(peer) = self.state.peers.get(&peer_id) else {
+            return false;
+        };
+        if !peer.received_status || peer.available_slots() == 0 {
+            return false;
+        }
+
+        let Some(mut range) = self.state.schedule.next_for_peer(&peer_id, peer) else {
+            return false;
+        };
+        let original_range = range;
+        let count = clamp_header_sync_request_count(
+            range.count,
+            peer.max_headers_per_response,
+            &self.startup.network,
+            self.startup.max_frame_bytes,
+            range.want_tree_aux_roots,
+        );
+        if range.finalized && count < range.count {
+            self.state.schedule.retry(range);
+            return false;
+        }
+        range.count = count;
+        self.state
+            .schedule
+            .narrow_queued_range(original_range, range);
+
+        let peer_cap = peer.max_headers_per_response;
+        let Some(peer) = self.state.peers.get(&peer_id) else {
+            return false;
+        };
+        let request_id = match peer.session.try_send_get_headers(
+            range.start_height,
+            count,
+            range.want_tree_aux_roots,
+        ) {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                tracing::debug!(
+                    peer = ?peer_id,
+                    start_height = ?range.start_height,
+                    count,
+                    ?error,
+                    "failed to queue Zakura header-sync GetHeaders"
+                );
+                self.trace_queue_send_failed(
+                    &peer_id,
+                    "get_headers",
+                    &error,
+                    peer.session.outbound_capacity(),
+                    peer.session.outbound_max_capacity(),
+                    |row| {
+                        insert_height(row, qs_trace::RANGE_START, range.start_height);
+                        insert_u64(row, qs_trace::RANGE_COUNT, u64::from(count));
+                    },
+                );
+                self.state.schedule.retry(range);
+                return false;
+            }
+        };
+
+        let outstanding = OutstandingRange {
+            request_id,
+            range,
+            deadline: Instant::now() + self.startup.request_timeout,
+            expected_max_count: count,
+            clear_assignment_on_timeout: false,
+            purpose: RangePurpose::Sync,
+        };
+        if let Some(peer) = self.state.peers.get_mut(&peer_id) {
+            peer.outstanding.push(outstanding);
+        }
+        self.state.schedule.mark_assigned(peer_id.clone(), range);
+        metrics::counter!("sync.header.request.sent").increment(1);
+        self.trace_get_headers_sent(&peer_id, range, count, peer_cap);
+        #[cfg(test)]
+        let _ = self
+            .actions
+            .send(HeaderSyncAction::SendMessage {
+                peer: peer_id,
+                msg: HeaderSyncMessage::GetHeaders {
+                    start_height: range.start_height,
+                    count,
+                    want_tree_aux_roots: range.want_tree_aux_roots,
+                },
+            })
+            .await;
+        true
     }
 
     async fn schedule_vct_repair(&mut self) -> bool {

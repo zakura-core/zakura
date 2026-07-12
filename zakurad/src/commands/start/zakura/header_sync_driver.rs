@@ -1,4 +1,7 @@
-use std::{future::Future, time::Instant};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use color_eyre::eyre::{eyre, Report};
 use tokio::{pin, select, sync::mpsc};
@@ -185,35 +188,66 @@ pub(crate) async fn drive_vct_root_repairs(
     header_sync: zakura_network::zakura::HeaderSyncHandle,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) {
-    let mut repairs = read_state.subscribe_vct_root_repairs();
+    let repairs = read_state.subscribe_vct_root_repairs();
+    drive_vct_root_repair_updates(repairs, shutdown, move |status| {
+        let read_state = read_state.clone();
+        let header_sync = header_sync.clone();
+        async move {
+            match status.state {
+                zakura_state::VctRootRepairState::Idle => header_sync
+                    .send(HeaderSyncEvent::VctRootRepairResolved {
+                        generation: status.generation,
+                    })
+                    .await
+                    .is_ok(),
+                zakura_state::VctRootRepairState::Unavailable { height } => {
+                    let Some(event) =
+                        vct_root_repair_event(read_state, height, status.generation).await
+                    else {
+                        return false;
+                    };
+                    header_sync.send(event).await.is_ok()
+                }
+            }
+        }
+    })
+    .await;
+}
+
+async fn drive_vct_root_repair_updates<Deliver, Delivery>(
+    mut repairs: tokio::sync::watch::Receiver<zakura_state::VctRootRepairStatus>,
+    shutdown: impl Future<Output = ()>,
+    mut deliver: Deliver,
+) where
+    Deliver: FnMut(zakura_state::VctRootRepairStatus) -> Delivery,
+    Delivery: Future<Output = bool>,
+{
+    const RETRY_DELAY: Duration = Duration::from_millis(500);
+
     pin!(shutdown);
+    let mut status = *repairs.borrow_and_update();
+    // A repair can already be pending when this driver subscribes. Idle is not
+    // sent initially because there cannot yet be a driver-owned repair to clear.
+    let mut delivery_pending = matches!(
+        status.state,
+        zakura_state::VctRootRepairState::Unavailable { .. }
+    );
 
     loop {
+        if delivery_pending {
+            delivery_pending = !deliver(status).await;
+        }
+
         select! {
             _ = &mut shutdown => return,
             changed = repairs.changed() => {
                 if changed.is_err() {
                     return;
                 }
+                status = *repairs.borrow_and_update();
+                delivery_pending = true;
             }
-        }
-
-        let status = *repairs.borrow_and_update();
-        match status.state {
-            zakura_state::VctRootRepairState::Idle => {
-                let _ = header_sync
-                    .send(HeaderSyncEvent::VctRootRepairResolved {
-                        generation: status.generation,
-                    })
-                    .await;
-            }
-            zakura_state::VctRootRepairState::Unavailable { height } => {
-                if let Some(event) =
-                    vct_root_repair_event(read_state.clone(), height, status.generation).await
-                {
-                    let _ = header_sync.send(event).await;
-                }
-            }
+            _ = tokio::time::sleep(RETRY_DELAY), if delivery_pending => {}
         }
     }
 }
@@ -270,6 +304,60 @@ async fn vct_root_repair_event(
         anchor_hash: *anchor_hash,
         expected_hashes,
     })
+}
+
+#[cfg(test)]
+mod vct_root_repair_driver_tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn retries_transient_delivery_failure_without_another_watch_change() {
+        let status = zakura_state::VctRootRepairStatus {
+            state: zakura_state::VctRootRepairState::Unavailable {
+                height: block::Height(42),
+            },
+            generation: 1,
+        };
+        let (_repairs_tx, repairs_rx) = tokio::sync::watch::channel(status);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let delivery_attempts = attempts.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let driver = tokio::spawn(drive_vct_root_repair_updates(
+            repairs_rx,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            move |delivered_status| {
+                assert_eq!(delivered_status, status);
+                let attempt = delivery_attempts.fetch_add(1, Ordering::SeqCst);
+                async move { attempt > 0 }
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "a successful delivery must stop timer retries"
+        );
+
+        shutdown_tx.send(()).expect("driver is still running");
+        driver.await.expect("driver shuts down cleanly");
+    }
 }
 
 pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(

@@ -246,7 +246,7 @@ impl HeaderSyncPeerSession {
             return Ok(());
         };
         commands
-            .send(HeaderSyncPeerCommand::RetireExpectedHeaders(request_id))
+            .send(HeaderSyncPeerCommand::Retire(request_id))
             .map_err(|_| OrderedSendError::Closed)
     }
 
@@ -274,7 +274,7 @@ impl HeaderSyncPeerSession {
         self.try_send_message(HeaderSyncMessage::Status(status), None)
     }
 
-    /// Send a typed header range request and record the expected response after queueing succeeds.
+    /// Reserve response correlation, then send a typed header range request.
     pub fn try_send_get_headers(
         &self,
         start_height: block::Height,
@@ -288,18 +288,21 @@ impl HeaderSyncPeerSession {
             expected = expected.with_request_id(request_id);
         }
         if let Some(commands) = &self.inner.commands {
-            self.try_send_message(
+            commands
+                .send(HeaderSyncPeerCommand::Reserve(expected))
+                .map_err(|_| OrderedSendError::Closed)?;
+            if let Err(error) = self.try_send_message(
                 HeaderSyncMessage::GetHeaders {
                     start_height,
                     count,
                     want_tree_aux_roots,
                 },
                 expected.request_id,
-            )?;
-            return commands
-                .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
-                .map_err(|_| OrderedSendError::Closed)
-                .map(|()| expected.request_id);
+            ) {
+                let _ = commands.send(HeaderSyncPeerCommand::Cancel(expected));
+                return Err(error);
+            }
+            return Ok(expected.request_id);
         }
 
         self.try_send_message(
@@ -366,10 +369,12 @@ impl HeaderSyncPeerSession {
 /// Commands from shared scheduling state into one peer-owned header-sync pipe.
 #[derive(Debug)]
 pub(super) enum HeaderSyncPeerCommand {
-    /// Record an expected `Headers` response after `GetHeaders` was queued.
-    RecordExpectedHeaders(ExpectedHeadersResponse),
+    /// Reserve an expected `Headers` response before `GetHeaders` is queued.
+    Reserve(ExpectedHeadersResponse),
+    /// Roll back an expectation when `GetHeaders` could not be queued.
+    Cancel(ExpectedHeadersResponse),
     /// Retire an expected `Headers` response after timeout or cancellation.
-    RetireExpectedHeaders(HeaderSyncRequestId),
+    Retire(HeaderSyncRequestId),
 }
 
 /// Pump actor actions that can be satisfied at the transport/service seam.
@@ -836,5 +841,69 @@ mod request_id_tests {
 
         assert!(session.next_request_id().is_err());
         assert!(session.next_request_id().is_err());
+    }
+
+    #[tokio::test]
+    async fn expectation_channel_failure_prevents_get_headers_publication() {
+        let (send, mut recv) = crate::zakura::framed_channel(1);
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        drop(commands_rx);
+        let peer_id = ZakuraPeerId::new(vec![2; 32]).expect("test peer id is valid");
+        let session = HeaderSyncPeerSession::from_parts_with_direction_and_commands(
+            peer_id,
+            1,
+            ServicePeerDirection::Outbound,
+            send,
+            CancellationToken::new(),
+            Some(commands_tx),
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        );
+
+        assert!(matches!(
+            session.try_send_get_headers(block::Height(1), 1, true),
+            Err(OrderedSendError::Closed)
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), recv.recv())
+                .await
+                .is_err(),
+            "failed expectation reservation must publish no wire request"
+        );
+    }
+
+    #[test]
+    fn transport_queue_failure_rolls_back_reserved_expectation() {
+        let (send, _recv) = crate::zakura::framed_channel(1);
+        send.try_send(Frame {
+            message_type: 0,
+            flags: 0,
+            payload: Vec::new(),
+        })
+        .expect("test transport queue starts empty");
+        let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+        let peer_id = ZakuraPeerId::new(vec![3; 32]).expect("test peer id is valid");
+        let session = HeaderSyncPeerSession::from_parts_with_direction_and_commands(
+            peer_id,
+            1,
+            ServicePeerDirection::Outbound,
+            send,
+            CancellationToken::new(),
+            Some(commands_tx),
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        );
+
+        assert!(matches!(
+            session.try_send_get_headers(block::Height(1), 1, true),
+            Err(OrderedSendError::Full)
+        ));
+        let reserved = match commands_rx.try_recv().expect("reservation is published") {
+            HeaderSyncPeerCommand::Reserve(expected) => expected,
+            command => panic!("expected reservation command, got {command:?}"),
+        };
+        let cancelled = match commands_rx.try_recv().expect("rollback is published") {
+            HeaderSyncPeerCommand::Cancel(expected) => expected,
+            command => panic!("expected rollback command, got {command:?}"),
+        };
+        assert_eq!(cancelled, reserved);
     }
 }

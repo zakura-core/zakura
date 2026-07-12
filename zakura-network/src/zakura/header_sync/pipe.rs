@@ -4,18 +4,19 @@
 //! transcription; the [`PIPE_SHAPE`] const is the inspectable, drift-checked
 //! copy of it.
 //!
-//!  queued(GetHeaders) ─▶ command(record expected) ─▶ expected_headers.push_back
+//!  command(reserve expected) ─▶ expected_headers.push_back ─▶ queued(GetHeaders)
+//!  queue failure ─────────────▶ command(cancel expected) ───▶ expected_headers.remove
 //!  recv ─▶ guard ─┬─ Headers ─▶ expected_headers.pop_front ─▶ decode ─▶ forward(WireMessage)
 //!                 └─ Control ───────────────────────────────▶ decode ─▶ forward(WireMessage)
 //!
 //! Phase 2 moves request/response correlation out of
 //! [`HeaderSyncPeerSession`] and into [`HsLocal`]. The shared scheduler still
-//! decides when to ask a peer for headers, but it sends that decision to this
-//! peer-owned pipe as a command after the outbound `GetHeaders` is queued
-//! successfully. The pipe prioritizes and drains those commands before inbound
-//! frames so a response cannot beat its local expectation. This retires the
-//! session mutex without changing the reactor's synthetic `WireMessage` test
-//! path.
+//! decides when to ask a peer for headers, but reserves the expectation in this
+//! peer-owned pipe before queueing outbound `GetHeaders`, rolling it back if the
+//! transport queue rejects the frame. The pipe prioritizes and drains commands
+//! before inbound frames so a response cannot beat its local expectation. This
+//! retires the session mutex without changing the reactor's synthetic
+//! `WireMessage` test path.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -139,7 +140,7 @@ impl HsLocal {
 
     fn handle_command(&mut self, command: HeaderSyncPeerCommand) {
         match command {
-            HeaderSyncPeerCommand::RecordExpectedHeaders(expected) => {
+            HeaderSyncPeerCommand::Reserve(expected) => {
                 if let Some(request_id) = expected.request_id {
                     self.reactivate_request_id(request_id);
                     self.expected_headers_by_id.insert(request_id, expected);
@@ -147,7 +148,19 @@ impl HsLocal {
                     self.expected_headers.push_back(expected);
                 }
             }
-            HeaderSyncPeerCommand::RetireExpectedHeaders(request_id) => {
+            HeaderSyncPeerCommand::Cancel(expected) => {
+                if let Some(request_id) = expected.request_id {
+                    self.expected_headers_by_id.remove(&request_id);
+                    self.reactivate_request_id(request_id);
+                } else if let Some(index) = self
+                    .expected_headers
+                    .iter()
+                    .rposition(|candidate| *candidate == expected)
+                {
+                    self.expected_headers.remove(index);
+                }
+            }
+            HeaderSyncPeerCommand::Retire(request_id) => {
                 self.expected_headers_by_id.remove(&request_id);
                 self.remember_consumed_request_id(request_id);
             }
@@ -452,15 +465,12 @@ pub(super) fn deliver(
 
 /// Run one peer-owned header-sync pipe until stream close, cancellation, or reject.
 ///
-/// Correlation-ordering invariant: a `RecordExpectedHeaders` command is enqueued
-/// synchronously the moment its outbound `GetHeaders` is queued, so it is already
-/// in this peer's command channel before any network response can return (a round
-/// trip is orders of magnitude slower than a local enqueue). The loop drains
-/// ready commands before every inbound frame, and the `biased` select prefers the
-/// command channel over `recv`, so the expectation is always popped into
-/// `HsLocal.expected_headers` before the matching `Headers` frame is decoded —
-/// never the reverse, which would reject a solicited response as
-/// `UnsolicitedHeaders`.
+/// Correlation-ordering invariant: a `Reserve` command is enqueued
+/// before outbound `GetHeaders` is queued. If transport queueing fails, a matching
+/// `Cancel` command follows. The loop drains ready commands before
+/// every inbound frame, and the `biased` select prefers the command channel over
+/// `recv`, so a wire response can never arrive before its reservation is visible
+/// in `HsLocal`.
 pub(super) async fn run_peer(
     mut pipe: Pipe<HsLocal, HsEnv>,
     mut recv: FramedRecv,
@@ -661,7 +671,7 @@ mod tests {
 
     /// The peer-local correlation queue is FIFO and is filled by draining ready
     /// commands. This is the invariant `run_peer` relies on: an expectation
-    /// recorded by a `RecordExpectedHeaders` command is drained and available to
+    /// recorded by a `Reserve` command is drained and available to
     /// pop before the matching `Headers` response is processed.
     #[test]
     fn local_correlation_queue_drains_commands_in_fifo_order() {
@@ -677,10 +687,10 @@ mod tests {
         let second =
             ExpectedHeadersResponse::new(block::Height(2), 2, false).expect("count is valid");
         commands_tx
-            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(first))
+            .send(HeaderSyncPeerCommand::Reserve(first))
             .expect("pipe is alive");
         commands_tx
-            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(second))
+            .send(HeaderSyncPeerCommand::Reserve(second))
             .expect("pipe is alive");
 
         // Nothing is available until the pipe drains its ready commands.
@@ -690,6 +700,32 @@ mod tests {
         assert_eq!(local.pop_expected_headers_response(), Some(first));
         assert_eq!(local.pop_expected_headers_response(), Some(second));
         assert_eq!(local.pop_expected_headers_response(), None);
+    }
+
+    #[test]
+    fn cancelled_v7_reservation_leaves_no_active_or_retired_expectation() {
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let request_id = HeaderSyncRequestId::new(10).expect("non-zero id");
+        let expected = ExpectedHeadersResponse::new(block::Height(1), 1, true)
+            .expect("count is valid")
+            .with_request_id(request_id);
+        commands_tx
+            .send(HeaderSyncPeerCommand::Reserve(expected))
+            .expect("pipe is alive");
+        commands_tx
+            .send(HeaderSyncPeerCommand::Cancel(expected))
+            .expect("pipe is alive");
+        let mut local = HsLocal::new(
+            commands_rx,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        );
+
+        local.drain_ready_commands();
+
+        assert!(!local.expected_headers_by_id.contains_key(&request_id));
+        assert!(!local.retired_headers.contains(&request_id));
+        assert!(local.retired_header_order.is_empty());
     }
 
     #[test]
@@ -705,10 +741,10 @@ mod tests {
             .expect("count is valid")
             .with_request_id(second_id);
         commands_tx
-            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(first))
+            .send(HeaderSyncPeerCommand::Reserve(first))
             .expect("pipe is alive");
         commands_tx
-            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(second))
+            .send(HeaderSyncPeerCommand::Reserve(second))
             .expect("pipe is alive");
 
         let mut local = HsLocal::new(
@@ -769,7 +805,7 @@ mod tests {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let request_id = HeaderSyncRequestId::new(7).expect("non-zero id");
         commands_tx
-            .send(HeaderSyncPeerCommand::RetireExpectedHeaders(request_id))
+            .send(HeaderSyncPeerCommand::Retire(request_id))
             .expect("pipe is alive");
         let mut local = HsLocal::new(
             commands_rx,
@@ -950,7 +986,7 @@ mod tests {
         let expected =
             ExpectedHeadersResponse::new(block::Height(1), 1, true).expect("count is valid");
         commands_tx
-            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(expected))
+            .send(HeaderSyncPeerCommand::Reserve(expected))
             .expect("pipe is alive");
 
         // A syntactically valid one-header solicited response: it decodes against

@@ -746,9 +746,32 @@ impl HeaderSyncReactor {
             None,
             None,
         );
+        let completed_repair_peer = self
+            .state
+            .repair
+            .as_ref()
+            .and_then(|repair| repair.in_flight.as_ref())
+            .filter(|repair_peer| {
+                self.state.pending_commits.iter().any(|(key, range)| {
+                    &key.peer == *repair_peer
+                        && range.priority == RangePriority::Repair
+                        && range.is_within(start_height, tip_height)
+                })
+            })
+            .cloned();
         self.state
             .pending_commits
             .retain(|_, range| !range.is_within(start_height, tip_height));
+        if let Some(repair_peer) = completed_repair_peer {
+            if let Some(repair) = self.state.repair.as_mut() {
+                if repair.in_flight.as_ref() == Some(&repair_peer) {
+                    // Committing the repair range finishes this peer's attempt, but does
+                    // not prove the VCT root issue is fixed. Keep the repair active until
+                    // the state writer reports it resolved, and free this peer slot.
+                    repair.in_flight = None;
+                }
+            }
+        }
         self.state
             .schedule
             .mark_range_covered(start_height, tip_height);
@@ -1426,20 +1449,24 @@ impl HeaderSyncReactor {
         let Some(repair) = self.state.repair.as_mut() else {
             return;
         };
+        let was_exhausted = repair.exhausted;
         if !repair.finish_attempt(peer, Instant::now()) {
             return;
         }
-        if repair.exhausted {
-            tracing::error!(
-                height = ?repair.height,
-                generation = repair.generation,
-                attempts = repair.tried_peers.len(),
-                "VCT supplied-root repair exhausted bounded peer attempts; node remains fail-closed"
-            );
-            metrics::counter!("sync.header.vct_repair.exhausted").increment(1);
-            metrics::gauge!("sync.header.vct_repair.stalled.height")
-                .set(f64::from(repair.height.0));
+        if !was_exhausted && repair.exhausted {
+            Self::report_vct_repair_exhausted(repair);
         }
+    }
+
+    fn report_vct_repair_exhausted(repair: &VctRootRepair) {
+        tracing::error!(
+            height = ?repair.height,
+            generation = repair.generation,
+            attempts = repair.tried_peers.len(),
+            "VCT supplied-root repair exhausted bounded peer attempts or wall time; node remains fail-closed"
+        );
+        metrics::counter!("sync.header.vct_repair.exhausted").increment(1);
+        metrics::gauge!("sync.header.vct_repair.stalled.height").set(f64::from(repair.height.0));
     }
 
     async fn handle_possible_stale_anchor_link_failure(
@@ -1626,6 +1653,19 @@ impl HeaderSyncReactor {
 
     async fn schedule_vct_repair(&mut self) -> bool {
         let now = Instant::now();
+        let newly_exhausted = self
+            .state
+            .repair
+            .as_mut()
+            .is_some_and(|repair| repair.refresh_exhausted(now));
+        if newly_exhausted {
+            let repair = self
+                .state
+                .repair
+                .as_ref()
+                .expect("repair exists after its exhaustion transition");
+            Self::report_vct_repair_exhausted(repair);
+        }
         let Some(repair) = self.state.repair.as_ref() else {
             return false;
         };
@@ -1638,7 +1678,13 @@ impl HeaderSyncReactor {
             .peers
             .iter()
             .filter(|(peer_id, peer)| {
-                peer.received_status
+                !self.state.parked_peers.contains(*peer_id)
+                    && !self
+                        .state
+                        .advisory
+                        .get(*peer_id)
+                        .is_some_and(|advisory| advisory.is_backed_off(now))
+                    && peer.received_status
                     && peer.outstanding.is_empty()
                     && peer.late_covered_responses == 0
                     && peer.advertised_tip >= repair.range.end_height()

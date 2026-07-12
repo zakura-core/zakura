@@ -215,13 +215,28 @@ impl VctRootRepair {
             return false;
         }
         self.in_flight = None;
-        let attempt_index = self.tried_peers.len().min(VCT_ROOT_REPAIR_MAX_ATTEMPTS - 1);
+        let attempt_index = self
+            .tried_peers
+            .len()
+            .saturating_sub(1)
+            .min(VCT_ROOT_REPAIR_MAX_ATTEMPTS - 1);
         self.next_attempt_at = now + VCT_ROOT_REPAIR_BACKOFFS[attempt_index];
-        if self.tried_peers.len() >= VCT_ROOT_REPAIR_MAX_ATTEMPTS
-            || now.duration_since(self.started_at) >= VCT_ROOT_REPAIR_MAX_WALL_TIME
+        self.refresh_exhausted(now);
+        true
+    }
+
+    /// Marks an episode exhausted once either bound has elapsed.
+    ///
+    /// Returns `true` only for the transition so callers emit operator signals once.
+    pub(super) fn refresh_exhausted(&mut self, now: Instant) -> bool {
+        if self.exhausted
+            || (self.tried_peers.len() < VCT_ROOT_REPAIR_MAX_ATTEMPTS
+                && now.duration_since(self.started_at) < VCT_ROOT_REPAIR_MAX_WALL_TIME)
         {
-            self.exhausted = true;
+            return false;
         }
+
+        self.exhausted = true;
         true
     }
 }

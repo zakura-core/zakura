@@ -4,7 +4,7 @@ use super::{
     error::*,
     events::*,
     reactor::*,
-    state::{VctRootRepair, VCT_ROOT_REPAIR_MAX_ATTEMPTS, VCT_ROOT_REPAIR_MAX_WALL_TIME},
+    state::{VctRootRepair, VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME},
     validation::*,
     wire::*,
 };
@@ -1523,6 +1523,21 @@ fn mainnet_repair_event(generation: u64) -> HeaderSyncEvent {
     }
 }
 
+fn mainnet_repair_event_at_two(generation: u64) -> HeaderSyncEvent {
+    let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+    let block3 = mainnet_block(&BLOCK_MAINNET_3_BYTES);
+    HeaderSyncEvent::VctRootRepairRequested {
+        height: block::Height(2),
+        generation,
+        anchor_hash: block1.hash(),
+        expected_hashes: vec![
+            (block::Height(2), block2.hash()),
+            (block::Height(3), block3.hash()),
+        ],
+    }
+}
+
 #[test]
 fn vct_repair_episode_enforces_attempt_and_time_bounds() {
     let mut repair = VctRootRepair::new(
@@ -1542,11 +1557,17 @@ fn vct_repair_episode_enforces_attempt_and_time_bounds() {
     )
     .expect("valid repair shape");
 
-    for attempt in 0..VCT_ROOT_REPAIR_MAX_ATTEMPTS {
+    for (attempt, backoff) in VCT_ROOT_REPAIR_BACKOFFS.iter().copied().enumerate() {
         assert!(repair.can_attempt(repair.next_attempt_at));
         let peer_id = peer(120 + u8::try_from(attempt).expect("attempt fits in u8"));
         repair.mark_attempt(peer_id.clone());
-        assert!(repair.finish_attempt(&peer_id, repair.next_attempt_at));
+        let finished_at = repair.next_attempt_at;
+        assert!(repair.finish_attempt(&peer_id, finished_at));
+        assert_eq!(
+            repair.next_attempt_at,
+            finished_at + backoff,
+            "each failure uses the backoff with the same zero-based attempt index"
+        );
     }
 
     assert!(repair.exhausted);
@@ -1562,8 +1583,12 @@ fn vct_repair_episode_enforces_attempt_and_time_bounds() {
         )],
     )
     .expect("single-header handoff repair is valid");
-    timed.started_at = Instant::now() - VCT_ROOT_REPAIR_MAX_WALL_TIME;
-    assert!(!timed.can_attempt(Instant::now()));
+    let now = Instant::now();
+    timed.started_at = now - VCT_ROOT_REPAIR_MAX_WALL_TIME;
+    assert!(timed.refresh_exhausted(now));
+    assert!(timed.exhausted);
+    assert!(!timed.refresh_exhausted(now));
+    assert!(!timed.can_attempt(now));
 }
 
 #[test]
@@ -1589,6 +1614,33 @@ fn vct_repair_ignores_unrelated_peer_disconnects() {
     assert_eq!(repair.in_flight.as_ref(), Some(&repair_peer));
     assert_eq!(repair.next_attempt_at, next_attempt_at);
     assert!(!repair.exhausted);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn vct_repair_wall_time_exhaustion_emits_operator_signal_without_an_attempt() {
+    let metrics = metric_snapshot(&["sync.header.vct_repair.exhausted"]);
+    let best = (
+        block::Height(4),
+        mainnet_block(&BLOCK_MAINNET_4_BYTES).hash(),
+    );
+    let fixture = spawn_test_reactor(startup_for(
+        Network::Mainnet,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(best),
+    ));
+
+    fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(VCT_ROOT_REPAIR_MAX_WALL_TIME).await;
+
+    // Connecting a peer without a Status runs the scheduler but cannot start an
+    // attempt, exercising expiry on the otherwise quiet path.
+    connect_peer(&fixture, peer(132)).await;
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    assert_metric_incremented(&metrics, "sync.header.vct_repair.exhausted");
+    assert_eq!(gauge_value("sync.header.vct_repair.stalled.height"), 1.0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1699,6 +1751,209 @@ async fn vct_repair_scheduler_skips_peers_with_insufficient_response_capacity() 
         next_outbound_get_headers(&mut fixture.actions).await;
     assert_eq!(requested_peer, capable_peer);
     assert_eq!((start_height, count), (block::Height(1), 2));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn vct_repair_timeout_retries_another_peer() {
+    let metrics = metric_snapshot(&["sync.header.vct_repair.timeout"]);
+    let best = (
+        block::Height(4),
+        mainnet_block(&BLOCK_MAINNET_4_BYTES).hash(),
+    );
+    let mut startup = startup_for(
+        Network::Mainnet,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(best),
+    );
+    startup.request_timeout = std::time::Duration::from_millis(10);
+    let mut fixture = spawn_test_reactor(startup);
+    let first_peer = peer(109);
+    let second_peer = peer(110);
+
+    for peer_id in [&first_peer, &second_peer] {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(&fixture, peer_id.clone(), block::Height(0), best.0, 2, 1).await;
+    }
+    fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
+
+    assert_eq!(
+        next_outbound_get_headers(&mut fixture.actions).await.0,
+        first_peer
+    );
+    assert_eq!(
+        next_outbound_get_headers(&mut fixture.actions).await.0,
+        second_peer
+    );
+    assert_metric_incremented(&metrics, "sync.header.vct_repair.timeout");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn vct_repair_disconnect_retries_another_peer() {
+    let best = (
+        block::Height(4),
+        mainnet_block(&BLOCK_MAINNET_4_BYTES).hash(),
+    );
+    let mut startup = startup_for(
+        Network::Mainnet,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(best),
+    );
+    startup.request_timeout = std::time::Duration::from_millis(10);
+    let mut fixture = spawn_test_reactor(startup);
+    let first_peer = peer(111);
+    let second_peer = peer(112);
+
+    for peer_id in [&first_peer, &second_peer] {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(&fixture, peer_id.clone(), block::Height(0), best.0, 2, 1).await;
+    }
+    fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
+    assert_eq!(
+        next_outbound_get_headers(&mut fixture.actions).await.0,
+        first_peer
+    );
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerDisconnected(first_peer))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        next_outbound_get_headers(&mut fixture.actions).await.0,
+        second_peer
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn vct_repair_commit_failure_retries_another_peer() {
+    let best = (
+        block::Height(4),
+        mainnet_block(&BLOCK_MAINNET_4_BYTES).hash(),
+    );
+    let mut fixture = spawn_test_reactor(startup_for(
+        Network::Mainnet,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(best),
+    ));
+    let first_peer = peer(113);
+    let second_peer = peer(114);
+
+    for peer_id in [&first_peer, &second_peer] {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(&fixture, peer_id.clone(), block::Height(0), best.0, 2, 1).await;
+    }
+    fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
+    assert_eq!(
+        next_outbound_get_headers(&mut fixture.actions).await.0,
+        first_peer
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: first_peer.clone(),
+            msg: finalized_headers_message_from(
+                block::Height(1),
+                vec![
+                    mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                    mainnet_header(&BLOCK_MAINNET_2_BYTES),
+                ],
+            ),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        if matches!(
+            next_action(&mut fixture.actions).await,
+            HeaderSyncAction::CommitHeaderRange { .. }
+        ) {
+            break;
+        }
+    }
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitFailed {
+            peer: first_peer,
+            start_height: block::Height(1),
+            count: 2,
+            kind: HeaderSyncCommitFailureKind::Local,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        next_outbound_get_headers(&mut fixture.actions).await.0,
+        second_peer
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn vct_repair_scheduler_skips_advisory_backoff_across_episode_heights() {
+    let best = (
+        block::Height(4),
+        mainnet_block(&BLOCK_MAINNET_4_BYTES).hash(),
+    );
+    let mut fixture = spawn_test_reactor(startup_for(
+        Network::Mainnet,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(best),
+    ));
+    let backed_off_peer = peer(115);
+    let eligible_peer = peer(116);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::AdvisoryHeaderSummary {
+            peer: backed_off_peer.clone(),
+            summary: advisory_header_summary(block::Height(10), 1),
+        })
+        .await
+        .unwrap();
+    connect_peer(&fixture, backed_off_peer.clone()).await;
+    advertise_tip(
+        &fixture,
+        backed_off_peer.clone(),
+        block::Height(0),
+        best.0,
+        2,
+        1,
+    )
+    .await;
+    fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
+    assert_eq!(
+        next_outbound_get_headers(&mut fixture.actions).await.0,
+        backed_off_peer
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: backed_off_peer.clone(),
+            msg: finalized_headers_message_from(block::Height(1), Vec::new()),
+        })
+        .await
+        .unwrap();
+
+    connect_peer(&fixture, eligible_peer.clone()).await;
+    fixture
+        .handle
+        .send(mainnet_repair_event_at_two(2))
+        .await
+        .unwrap();
+    advertise_tip(
+        &fixture,
+        eligible_peer.clone(),
+        block::Height(0),
+        best.0,
+        2,
+        1,
+    )
+    .await;
+
+    let (requested_peer, start_height, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, eligible_peer);
+    assert_eq!((start_height, count), (block::Height(2), 2));
 }
 
 #[tokio::test(flavor = "current_thread")]

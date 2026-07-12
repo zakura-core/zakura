@@ -91,20 +91,37 @@ impl HsLocal {
         request_id: HeaderSyncRequestId,
     ) -> Result<Option<ExpectedHeadersResponse>, HeaderSyncWireError> {
         if let Some(expected) = self.expected_headers_by_id.remove(&request_id) {
+            self.remember_consumed_request_id(request_id);
             return Ok(Some(expected));
         }
-        if self.retired_headers.remove(&request_id) {
-            if let Some(index) = self
-                .retired_header_order
-                .iter()
-                .position(|retired| *retired == request_id)
-            {
-                self.retired_header_order.remove(index);
-            }
+        if self.retired_headers.contains(&request_id) {
             metrics::counter!("sync.header.response.retired").increment(1);
             return Ok(None);
         }
         Err(HeaderSyncWireError::UnsolicitedHeaders)
+    }
+
+    fn remember_consumed_request_id(&mut self, request_id: HeaderSyncRequestId) {
+        if self.retired_headers.insert(request_id) {
+            self.retired_header_order.push_back(request_id);
+        }
+        while self.retired_headers.len() > MAX_RETIRED_HEADER_REQUEST_IDS {
+            let Some(oldest) = self.retired_header_order.pop_front() else {
+                break;
+            };
+            self.retired_headers.remove(&oldest);
+        }
+    }
+
+    fn reactivate_request_id(&mut self, request_id: HeaderSyncRequestId) {
+        self.retired_headers.remove(&request_id);
+        if let Some(index) = self
+            .retired_header_order
+            .iter()
+            .position(|retired| *retired == request_id)
+        {
+            self.retired_header_order.remove(index);
+        }
     }
 
     /// Restore a solicited-response expectation that was popped for decode but
@@ -114,6 +131,7 @@ impl HsLocal {
     /// correlated, instead of leaving the expectation silently consumed.
     fn restore_expected_headers(&mut self, expected: ExpectedHeadersResponse) {
         if let Some(request_id) = expected.request_id {
+            self.reactivate_request_id(request_id);
             self.expected_headers_by_id.insert(request_id, expected);
         } else {
             self.expected_headers.push_front(expected);
@@ -124,6 +142,7 @@ impl HsLocal {
         match command {
             HeaderSyncPeerCommand::RecordExpectedHeaders(expected) => {
                 if let Some(request_id) = expected.request_id {
+                    self.reactivate_request_id(request_id);
                     self.expected_headers_by_id.insert(request_id, expected);
                 } else {
                     self.expected_headers.push_back(expected);
@@ -131,15 +150,7 @@ impl HsLocal {
             }
             HeaderSyncPeerCommand::RetireExpectedHeaders(request_id) => {
                 self.expected_headers_by_id.remove(&request_id);
-                if self.retired_headers.insert(request_id) {
-                    self.retired_header_order.push_back(request_id);
-                }
-                while self.retired_headers.len() > MAX_RETIRED_HEADER_REQUEST_IDS {
-                    let Some(oldest) = self.retired_header_order.pop_front() else {
-                        break;
-                    };
-                    self.retired_headers.remove(&oldest);
-                }
+                self.remember_consumed_request_id(request_id);
             }
         }
     }
@@ -739,6 +750,15 @@ mod tests {
             }
             other => panic!("expected first response to be forwarded by id, got {other:?}"),
         }
+
+        let duplicate = empty_headers
+            .encode_frame_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(second_id))
+            .expect("duplicate v7 response encodes");
+        assert!(matches!(pipe.run_one(duplicate), Flow::Done));
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
@@ -763,19 +783,50 @@ mod tests {
             run_inbound,
             &PIPE_SHAPE,
         );
-        let frame = HeaderSyncMessage::Headers {
-            headers: Vec::new(),
-            body_sizes: Vec::new(),
-            tree_aux_roots: Vec::new(),
-        }
-        .encode_frame_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
-        .expect("v7 response encodes");
+        for _ in 0..2 {
+            let frame = HeaderSyncMessage::Headers {
+                headers: Vec::new(),
+                body_sizes: Vec::new(),
+                tree_aux_roots: Vec::new(),
+            }
+            .encode_frame_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+            .expect("v7 response encodes");
 
-        assert!(matches!(pipe.run_one(frame), Flow::Done));
-        assert!(matches!(
-            events.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+            assert!(matches!(pipe.run_one(frame), Flow::Done));
+            assert!(matches!(
+                events.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[test]
+    fn v7_restored_expectation_reactivates_consumed_request_id() {
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let request_id = HeaderSyncRequestId::new(9).expect("non-zero id");
+        let expected = ExpectedHeadersResponse::new(block::Height(1), 1, true)
+            .expect("count is valid")
+            .with_request_id(request_id);
+        let mut local = HsLocal::new(
+            commands_rx,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        );
+        local.expected_headers_by_id.insert(request_id, expected);
+
+        assert_eq!(
+            local
+                .pop_expected_headers_response_by_id(request_id)
+                .expect("active id is known"),
+            Some(expected)
+        );
+        local.restore_expected_headers(expected);
+        assert_eq!(
+            local
+                .pop_expected_headers_response_by_id(request_id)
+                .expect("restored id is active"),
+            Some(expected)
+        );
     }
 
     #[test]

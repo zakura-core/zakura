@@ -600,6 +600,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
             }
             HeaderSyncAction::QueryHeadersByHeightRange {
                 peer,
+                request_id,
                 start,
                 count,
                 want_tree_aux_roots,
@@ -783,6 +784,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseReady {
                                 peer,
+                                request_id,
                                 start_height: start,
                                 requested_count: count,
                                 want_tree_aux_roots,
@@ -808,6 +810,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                                 peer,
+                                request_id,
                                 start_height: start,
                                 requested_count: count,
                                 returned_count: 0,
@@ -834,6 +837,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                                 peer,
+                                request_id,
                                 start_height: start,
                                 requested_count: count,
                                 returned_count: 0,

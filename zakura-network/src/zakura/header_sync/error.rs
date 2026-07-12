@@ -90,6 +90,13 @@ pub enum HeaderSyncWireError {
     #[error("unsolicited Zakura header-sync Headers response")]
     UnsolicitedHeaders,
 
+    /// A request-id capable header-sync message was missing its request ID.
+    #[error("Zakura header-sync v7 {message} message is missing a request ID")]
+    MissingRequestId {
+        /// Message that required the ID.
+        message: &'static str,
+    },
+
     /// A `GetHeaders` request asked for zero headers.
     #[error("Zakura header-sync GetHeaders count must be non-zero")]
     ZeroHeaderRequestCount,

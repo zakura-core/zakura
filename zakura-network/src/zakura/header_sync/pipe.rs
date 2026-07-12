@@ -17,7 +17,10 @@
 //! session mutex without changing the reactor's synthetic `WireMessage` test
 //! path.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -27,11 +30,21 @@ use crate::zakura::{
     Edge, Flow, FramedRecv, Node, NodeKind, Pipe, PipeCx, PipeShape, SinkReject, ZakuraPeerId,
 };
 
+const MAX_RETIRED_HEADER_REQUEST_IDS: usize = 4096;
+
 pub(super) struct HsLocal {
     /// Plain peer-local response expectations, owned by this pipe task.
     expected_headers: VecDeque<ExpectedHeadersResponse>,
+    /// Request-id keyed response expectations for header-sync v7.
+    expected_headers_by_id: HashMap<HeaderSyncRequestId, ExpectedHeadersResponse>,
+    /// Retired request IDs whose late responses should be dropped without scoring.
+    retired_headers: HashSet<HeaderSyncRequestId>,
+    /// Insertion order used to keep retired request IDs bounded.
+    retired_header_order: VecDeque<HeaderSyncRequestId>,
     /// Commands from shared scheduling state into this peer-local pipe.
     commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
+    /// Negotiated header-sync stream version.
+    stream_version: u16,
     /// Pre-decode rate gate for inbound `NewBlock` floods.
     ///
     /// `NewBlock` is the only header-sync v6 message that deserializes a full
@@ -49,10 +62,15 @@ impl HsLocal {
     pub(super) fn new(
         commands: mpsc::UnboundedReceiver<HeaderSyncPeerCommand>,
         new_block_min_interval: Duration,
+        stream_version: u16,
     ) -> Self {
         Self {
             expected_headers: VecDeque::new(),
+            expected_headers_by_id: HashMap::new(),
+            retired_headers: HashSet::new(),
+            retired_header_order: VecDeque::new(),
             commands,
+            stream_version,
             new_block_meter: RateMeter::new(new_block_min_interval),
         }
     }
@@ -67,19 +85,60 @@ impl HsLocal {
         self.expected_headers.pop_front()
     }
 
+    fn pop_expected_headers_response_by_id(
+        &mut self,
+        request_id: HeaderSyncRequestId,
+    ) -> Result<Option<ExpectedHeadersResponse>, HeaderSyncWireError> {
+        if let Some(expected) = self.expected_headers_by_id.remove(&request_id) {
+            return Ok(Some(expected));
+        }
+        if self.retired_headers.remove(&request_id) {
+            if let Some(index) = self
+                .retired_header_order
+                .iter()
+                .position(|retired| *retired == request_id)
+            {
+                self.retired_header_order.remove(index);
+            }
+            metrics::counter!("sync.header.response.retired").increment(1);
+            return Ok(None);
+        }
+        Err(HeaderSyncWireError::UnsolicitedHeaders)
+    }
+
     /// Restore a solicited-response expectation that was popped for decode but
     /// whose decoded `Headers` event could not be handed to the reactor (the
     /// bounded `events` queue was full or closed). It goes back to the *front* so
     /// FIFO order is preserved and the reactor's still-outstanding range stays
     /// correlated, instead of leaving the expectation silently consumed.
     fn restore_expected_headers(&mut self, expected: ExpectedHeadersResponse) {
-        self.expected_headers.push_front(expected);
+        if let Some(request_id) = expected.request_id {
+            self.expected_headers_by_id.insert(request_id, expected);
+        } else {
+            self.expected_headers.push_front(expected);
+        }
     }
 
     fn handle_command(&mut self, command: HeaderSyncPeerCommand) {
         match command {
             HeaderSyncPeerCommand::RecordExpectedHeaders(expected) => {
-                self.expected_headers.push_back(expected);
+                if let Some(request_id) = expected.request_id {
+                    self.expected_headers_by_id.insert(request_id, expected);
+                } else {
+                    self.expected_headers.push_back(expected);
+                }
+            }
+            HeaderSyncPeerCommand::RetireExpectedHeaders(request_id) => {
+                self.expected_headers_by_id.remove(&request_id);
+                if self.retired_headers.insert(request_id) {
+                    self.retired_header_order.push_back(request_id);
+                }
+                while self.retired_headers.len() > MAX_RETIRED_HEADER_REQUEST_IDS {
+                    let Some(oldest) = self.retired_header_order.pop_front() else {
+                        break;
+                    };
+                    self.retired_headers.remove(&oldest);
+                }
             }
         }
     }
@@ -188,10 +247,42 @@ pub(super) fn run_inbound(cx: &mut PipeCx<'_, HsLocal, HsEnv>, frame: Frame) -> 
         return Flow::Done;
     }
 
-    let expected = (u8::try_from(frame.message_type).ok() == Some(MSG_HS_HEADERS))
-        .then(|| cx.local.pop_expected_headers_response())
-        .flatten();
-    match deliver(&cx.env.handle, expected, cx.peer_id.clone(), frame) {
+    let expected = if u8::try_from(frame.message_type).ok() == Some(MSG_HS_HEADERS) {
+        if cx.local.stream_version >= ZAKURA_HEADER_SYNC_STREAM_VERSION_V7 {
+            match HeaderSyncMessage::peek_headers_request_id(&frame.payload)
+                .and_then(|request_id| cx.local.pop_expected_headers_response_by_id(request_id))
+            {
+                Ok(Some(expected)) => Some(expected),
+                Ok(None) => return Flow::Done,
+                Err(error) => {
+                    let error = Arc::new(error);
+                    let _ = cx
+                        .env
+                        .handle
+                        .try_send(HeaderSyncEvent::WireProtocolFailure {
+                            peer: cx.peer_id.clone(),
+                            reason: HeaderSyncMisbehavior::UnsolicitedHeaders,
+                            error: error.clone(),
+                        });
+                    return Flow::Reject(SinkReject::protocol(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        error.to_string(),
+                    )));
+                }
+            }
+        } else {
+            cx.local.pop_expected_headers_response()
+        }
+    } else {
+        None
+    };
+    match deliver(
+        &cx.env.handle,
+        cx.local.stream_version,
+        expected,
+        cx.peer_id.clone(),
+        frame,
+    ) {
         Flow::Reject(SinkReject::Local(error)) => {
             // The reactor `events` queue was full or closed, so this decoded frame
             // could not be delivered locally. For a *solicited* `Headers` response
@@ -238,6 +329,7 @@ pub(super) fn run_inbound(cx: &mut PipeCx<'_, HsLocal, HsEnv>, frame: Frame) -> 
 ///   registry as `Err(SinkReject::Local(_))`.
 pub(super) fn deliver(
     handle: &HeaderSyncHandle,
+    stream_version: u16,
     expected: Option<ExpectedHeadersResponse>,
     peer_id: ZakuraPeerId,
     frame: Frame,
@@ -255,7 +347,7 @@ pub(super) fn deliver(
             return Flow::Reject(SinkReject::protocol(protocol_error));
         };
 
-        let msg = match HeaderSyncMessage::decode_frame(
+        let (msg, request_id) = match HeaderSyncMessage::decode_frame_with_request_id(
             frame,
             HeaderSyncDecodeContext::for_headers_response(expected, expected.count),
         ) {
@@ -272,10 +364,28 @@ pub(super) fn deliver(
             }
         };
 
+        if let HeaderSyncMessage::Headers {
+            headers,
+            body_sizes,
+            tree_aux_roots,
+        } = msg
+        {
+            return forward(
+                handle,
+                HeaderSyncEvent::WireHeaders {
+                    peer: peer_id,
+                    request_id,
+                    headers,
+                    body_sizes,
+                    tree_aux_roots,
+                },
+            );
+        }
+
         return forward(handle, HeaderSyncEvent::WireMessage { peer: peer_id, msg });
     }
 
-    let msg = match decode_control_frame(frame) {
+    let (msg, request_id) = match decode_control_frame(frame, stream_version) {
         Ok(msg) => msg,
         Err(error) => {
             let protocol_error =
@@ -288,7 +398,23 @@ pub(super) fn deliver(
         }
     };
 
-    forward(handle, HeaderSyncEvent::WireMessage { peer: peer_id, msg })
+    match msg {
+        HeaderSyncMessage::GetHeaders {
+            start_height,
+            count,
+            want_tree_aux_roots,
+        } => forward(
+            handle,
+            HeaderSyncEvent::WireGetHeaders {
+                peer: peer_id,
+                request_id,
+                start_height,
+                count,
+                want_tree_aux_roots,
+            },
+        ),
+        msg => forward(handle, HeaderSyncEvent::WireMessage { peer: peer_id, msg }),
+    }
 }
 
 /// Run one peer-owned header-sync pipe until stream close, cancellation, or reject.
@@ -367,12 +493,18 @@ fn forward(handle: &HeaderSyncHandle, event: HeaderSyncEvent) -> Flow<()> {
 /// in [`deliver`]; a `Headers` frame reaching this path has no correlated
 /// request, so it is rejected as `UnsolicitedHeaders` exactly as the old
 /// `decode_header_sync_frame` did.
-fn decode_control_frame(frame: Frame) -> Result<HeaderSyncMessage, HeaderSyncWireError> {
+fn decode_control_frame(
+    frame: Frame,
+    stream_version: u16,
+) -> Result<(HeaderSyncMessage, Option<HeaderSyncRequestId>), HeaderSyncWireError> {
     if u8::try_from(frame.message_type).ok() == Some(MSG_HS_HEADERS) {
         return Err(HeaderSyncWireError::UnsolicitedHeaders);
     }
 
-    HeaderSyncMessage::decode_frame(frame, HeaderSyncDecodeContext::control())
+    HeaderSyncMessage::decode_frame_with_request_id(
+        frame,
+        HeaderSyncDecodeContext::control_for_version(stream_version),
+    )
 }
 
 #[cfg(test)]
@@ -449,7 +581,13 @@ mod tests {
     fn deliver_unsolicited_headers_rejects_without_expectation() {
         let (handle, mut events) = test_handle();
 
-        let flow = deliver(&handle, None, peer(), headers_frame(Vec::new()));
+        let flow = deliver(
+            &handle,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            None,
+            peer(),
+            headers_frame(Vec::new()),
+        );
 
         assert!(matches!(flow, Flow::Reject(SinkReject::Protocol(_))));
         match events.try_recv() {
@@ -469,7 +607,13 @@ mod tests {
         let expected =
             ExpectedHeadersResponse::new(block::Height(1), 1, true).expect("count is valid");
 
-        let flow = deliver(&handle, Some(expected), peer(), headers_frame(Vec::new()));
+        let flow = deliver(
+            &handle,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            Some(expected),
+            peer(),
+            headers_frame(Vec::new()),
+        );
 
         assert!(matches!(flow, Flow::Reject(SinkReject::Protocol(_))));
         match events.try_recv() {
@@ -487,7 +631,11 @@ mod tests {
     #[test]
     fn local_correlation_queue_drains_commands_in_fifo_order() {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let mut local = HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL);
+        let mut local = HsLocal::new(
+            commands_rx,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        );
 
         let first =
             ExpectedHeadersResponse::new(block::Height(1), 1, false).expect("count is valid");
@@ -507,6 +655,139 @@ mod tests {
         assert_eq!(local.pop_expected_headers_response(), Some(first));
         assert_eq!(local.pop_expected_headers_response(), Some(second));
         assert_eq!(local.pop_expected_headers_response(), None);
+    }
+
+    #[test]
+    fn v7_headers_responses_match_by_request_id_not_fifo_order() {
+        let (handle, mut events) = test_handle();
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let first_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+        let second_id = HeaderSyncRequestId::new(2).expect("non-zero id");
+        let first = ExpectedHeadersResponse::new(block::Height(1), 1, true)
+            .expect("count is valid")
+            .with_request_id(first_id);
+        let second = ExpectedHeadersResponse::new(block::Height(2), 1, true)
+            .expect("count is valid")
+            .with_request_id(second_id);
+        commands_tx
+            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(first))
+            .expect("pipe is alive");
+        commands_tx
+            .send(HeaderSyncPeerCommand::RecordExpectedHeaders(second))
+            .expect("pipe is alive");
+
+        let mut local = HsLocal::new(
+            commands_rx,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        );
+        local.drain_ready_commands();
+        let mut pipe = Pipe::new(
+            peer(),
+            local,
+            HsEnv::new(handle),
+            crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
+            run_inbound,
+            &PIPE_SHAPE,
+        );
+        let empty_headers = HeaderSyncMessage::Headers {
+            headers: Vec::new(),
+            body_sizes: Vec::new(),
+            tree_aux_roots: Vec::new(),
+        };
+        let second_frame = empty_headers
+            .encode_frame_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(second_id))
+            .expect("v7 response encodes");
+        let first_frame = empty_headers
+            .encode_frame_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(first_id))
+            .expect("v7 response encodes");
+
+        assert!(matches!(pipe.run_one(second_frame), Flow::Continue(())));
+        match events.try_recv() {
+            Ok(HeaderSyncEvent::WireHeaders { request_id, .. }) => {
+                assert_eq!(request_id, Some(second_id));
+            }
+            other => panic!("expected second response to be forwarded by id, got {other:?}"),
+        }
+
+        assert!(matches!(pipe.run_one(first_frame), Flow::Continue(())));
+        match events.try_recv() {
+            Ok(HeaderSyncEvent::WireHeaders { request_id, .. }) => {
+                assert_eq!(request_id, Some(first_id));
+            }
+            other => panic!("expected first response to be forwarded by id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v7_retired_headers_response_is_dropped_without_scoring() {
+        let (handle, mut events) = test_handle();
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let request_id = HeaderSyncRequestId::new(7).expect("non-zero id");
+        commands_tx
+            .send(HeaderSyncPeerCommand::RetireExpectedHeaders(request_id))
+            .expect("pipe is alive");
+        let mut local = HsLocal::new(
+            commands_rx,
+            DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        );
+        local.drain_ready_commands();
+        let mut pipe = Pipe::new(
+            peer(),
+            local,
+            HsEnv::new(handle),
+            crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
+            run_inbound,
+            &PIPE_SHAPE,
+        );
+        let frame = HeaderSyncMessage::Headers {
+            headers: Vec::new(),
+            body_sizes: Vec::new(),
+            tree_aux_roots: Vec::new(),
+        }
+        .encode_frame_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+        .expect("v7 response encodes");
+
+        assert!(matches!(pipe.run_one(frame), Flow::Done));
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn v7_unknown_headers_response_id_is_protocol_failure() {
+        let (handle, mut events) = test_handle();
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let request_id = HeaderSyncRequestId::new(8).expect("non-zero id");
+        let mut pipe = Pipe::new(
+            peer(),
+            HsLocal::new(
+                commands_rx,
+                DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+            ),
+            HsEnv::new(handle),
+            crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
+            run_inbound,
+            &PIPE_SHAPE,
+        );
+        let frame = HeaderSyncMessage::Headers {
+            headers: Vec::new(),
+            body_sizes: Vec::new(),
+            tree_aux_roots: Vec::new(),
+        }
+        .encode_frame_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+        .expect("v7 response encodes");
+
+        assert!(matches!(pipe.run_one(frame), Flow::Reject(_)));
+        match events.try_recv() {
+            Ok(HeaderSyncEvent::WireProtocolFailure { reason, .. }) => {
+                assert_eq!(reason, HeaderSyncMisbehavior::UnsolicitedHeaders);
+            }
+            other => panic!("expected unknown id protocol failure, got {other:?}"),
+        }
     }
 
     /// A `NewBlock` flood is throttled *before* full-block decode: the first
@@ -543,7 +824,11 @@ mod tests {
 
         let mut pipe = Pipe::new(
             peer(),
-            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
+            HsLocal::new(
+                commands_rx,
+                DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            ),
             HsEnv::new(handle),
             crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
             run_inbound,
@@ -620,7 +905,11 @@ mod tests {
 
         let mut pipe = Pipe::new(
             peer(),
-            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
+            HsLocal::new(
+                commands_rx,
+                DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            ),
             HsEnv::new(handle),
             crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
             run_inbound,

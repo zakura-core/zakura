@@ -89,6 +89,8 @@ pub const DEFAULT_LIVE_SERVICE_SUMMARY_TTL: Duration = Duration::from_secs(30);
 pub const SERVICE_ID_DISCOVERY: &str = "zakura.discovery.v1";
 /// Native header-sync service id.
 pub const SERVICE_ID_HEADER_SYNC: &str = "zakura.header_sync.v1";
+/// Request-id capable native header-sync service id.
+pub const SERVICE_ID_HEADER_SYNC_V2: &str = "zakura.header_sync.v2";
 /// Native block-sync service id.
 pub const SERVICE_ID_BLOCK_SYNC: &str = "zakura.block_sync.v1";
 /// Native legacy gossip service id.
@@ -138,6 +140,12 @@ impl ZakuraServiceId {
     pub fn header_sync() -> Self {
         Self::new(SERVICE_ID_HEADER_SYNC)
             .expect("built-in Zakura header-sync service id is non-empty bounded ASCII")
+    }
+
+    /// Returns the request-id capable native header-sync service id.
+    pub fn header_sync_v2() -> Self {
+        Self::new(SERVICE_ID_HEADER_SYNC_V2)
+            .expect("built-in Zakura header-sync v2 service id is non-empty bounded ASCII")
     }
 
     /// Returns the native block-sync service id.

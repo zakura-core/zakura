@@ -158,7 +158,8 @@ mod tests {
             HeaderSyncStatus, Peer, Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig,
             ZakuraConnId, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace,
             MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
+            ZAKURA_CAP_HEADER_SYNC_V7, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
             ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
@@ -908,7 +909,11 @@ mod tests {
                     }
                 }
                 HeaderSyncAction::QueryHeadersByHeightRange {
-                    peer, start, count, ..
+                    peer,
+                    request_id,
+                    start,
+                    count,
+                    ..
                 } => {
                     let headers = local
                         .store
@@ -928,6 +933,7 @@ mod tests {
                             .handle
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                                 peer,
+                                request_id,
                                 start_height: start,
                                 requested_count: count,
                                 returned_count,
@@ -1308,7 +1314,11 @@ mod tests {
                             .push(reason);
                     }
                     HeaderSyncAction::QueryHeadersByHeightRange {
-                        peer, start, count, ..
+                        peer,
+                        request_id,
+                        start,
+                        count,
+                        ..
                     } => {
                         let Some(handle) = endpoint.header_sync() else {
                             continue;
@@ -1316,6 +1326,7 @@ mod tests {
                         let _ = handle
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                                 peer,
+                                request_id,
                                 start_height: start,
                                 requested_count: count,
                                 returned_count: 0,
@@ -1822,6 +1833,52 @@ mod tests {
         );
 
         hostile.shutdown().await;
+
+        let victim = cluster.node(victim_idx);
+        let recorder = victim.recorder();
+        let hostile = HostilePeer::connect_native_with_capabilities(
+            victim,
+            6,
+            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V7 | ZAKURA_CAP_LEGACY_GOSSIP,
+        )
+        .await?;
+        let selected_header_sync_v7 = b"header-sync-kind-5-version-7".to_vec();
+        let non_selected_header_sync_v6 = b"dual-header-sync-kind-5-version-6".to_vec();
+        hostile
+            .send_frame_with_version(
+                ZAKURA_STREAM_HEADER_SYNC,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+                selected_header_sync_v7.clone(),
+            )
+            .await?;
+        await_until(
+            "selected header-sync v7 frame delivered",
+            Duration::from_secs(5),
+            || recorder.contains_payload(ZAKURA_STREAM_HEADER_SYNC, &selected_header_sync_v7),
+        )
+        .await?;
+        hostile
+            .send_frame_with_version(
+                ZAKURA_STREAM_HEADER_SYNC,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                non_selected_header_sync_v6.clone(),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let delivered = recorder.drain();
+        assert!(
+            delivered
+                .iter()
+                .any(|message| message.frame.payload == selected_header_sync_v7),
+            "dual-stack peers must deliver selected header-sync v7"
+        );
+        assert!(
+            !delivered
+                .iter()
+                .any(|message| message.frame.payload == non_selected_header_sync_v6),
+            "dual-stack peers must reject non-selected header-sync v6"
+        );
 
         let victim = cluster.node(victim_idx);
         let recorder = victim.recorder();

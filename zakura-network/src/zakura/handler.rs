@@ -1451,6 +1451,7 @@ impl StreamWorkerContext {
 
 struct AdmittedOrderedStream {
     kind: u16,
+    stream: Stream,
     recv: FramedRecv,
     send: FramedSend,
     cancel_token: CancellationToken,
@@ -1940,10 +1941,11 @@ impl ZakuraProtocolHandler {
             close_cause.record("resource_queue_split");
             connection_token.cancel();
         }
-        let ordered_kinds: HashSet<u16> = negotiated_ordered_streams
+        let selected_ordered_streams: HashMap<u16, Stream> = negotiated_ordered_streams
             .iter()
-            .map(|stream| stream.kind)
+            .map(|stream| (stream.kind, *stream))
             .collect();
+        let ordered_kinds: HashSet<u16> = selected_ordered_streams.keys().copied().collect();
         let queue_split_stream_count = negotiated_ordered_streams.len().max(ordered_streams.len());
         let per_stream_queue_depth = per_stream_inbound_queue_depth(
             limits.max_inbound_queue_depth,
@@ -2010,7 +2012,12 @@ impl ZakuraProtocolHandler {
                 opened_kinds.insert(admitted.kind);
                 service_streams.insert(
                     admitted.kind,
-                    ServiceStream::new(admitted.recv, admitted.send, admitted.cancel_token),
+                    ServiceStream::new(
+                        admitted.stream,
+                        admitted.recv,
+                        admitted.send,
+                        admitted.cancel_token,
+                    ),
                 );
             }
             if !connection_token.is_cancelled() {
@@ -2079,6 +2086,16 @@ impl ZakuraProtocolHandler {
                                         "closing peer after unexpected ordered stream"
                                     );
                                     close_cause.record("unexpected_stream");
+                                    connection_token.cancel();
+                                    continue;
+                                }
+                                if selected_ordered_streams.get(&kind) != Some(&admitted.stream) {
+                                    debug!(
+                                        stream_kind = kind,
+                                        stream_version = admitted.stream.version,
+                                        "closing peer after non-selected ordered stream version"
+                                    );
+                                    close_cause.record("unexpected_stream_version");
                                     connection_token.cancel();
                                     continue;
                                 }
@@ -2162,6 +2179,7 @@ impl ZakuraProtocolHandler {
                                 let service_streams = HashMap::from([(
                                     kind,
                                     ServiceStream::new(
+                                        admitted.stream,
                                         admitted.recv,
                                         admitted.send,
                                         admitted.cancel_token.clone(),
@@ -2352,6 +2370,7 @@ impl ZakuraProtocolHandler {
             workers,
             send,
             recv,
+            stream,
             prelude,
             context,
             per_stream_queue_depth,
@@ -2531,6 +2550,7 @@ impl ZakuraProtocolHandler {
                 admission.workers,
                 send,
                 recv,
+                stream,
                 prelude,
                 context,
                 per_stream_queue_depth,
@@ -3109,6 +3129,7 @@ fn spawn_persistent_stream_worker(
     workers: &mut JoinSet<()>,
     send: SendStream,
     recv: RecvStream,
+    stream: Stream,
     prelude: StreamPrelude,
     context: StreamWorkerContext,
     queue_depth: usize,
@@ -3117,6 +3138,7 @@ fn spawn_persistent_stream_worker(
     let (from_service_tx, from_service_rx) = mpsc::channel(queue_depth);
     let admitted = AdmittedOrderedStream {
         kind: prelude.stream_kind,
+        stream,
         recv: FramedRecv::new(to_service_rx),
         send: FramedSend::new(from_service_tx),
         cancel_token: context.stream_token.clone(),

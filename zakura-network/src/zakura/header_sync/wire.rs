@@ -1,4 +1,4 @@
-use super::{config::*, error::*, validation::*, *};
+use super::{config::*, error::*, events::HeaderSyncRequestId, validation::*, *};
 
 /// Zakura stream kind reserved for native header sync.
 pub const ZAKURA_STREAM_HEADER_SYNC: u16 = 5;
@@ -13,6 +13,8 @@ pub const ZAKURA_STREAM_HEADER_SYNC: u16 = 5;
 /// breaking wire change: earlier version-5 Ironwood builds used a shorter root record and
 /// cannot exchange header-sync ranges with version 6.
 pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 6;
+/// Request-id capable header-sync stream version.
+pub const ZAKURA_HEADER_SYNC_STREAM_VERSION_V7: u16 = 7;
 
 /// Peer status advertisement.
 pub const MSG_HS_STATUS: u8 = 1;
@@ -112,6 +114,15 @@ impl HeaderSyncMessage {
 
     /// Encode this message as `[u8 message_type][bounded fields...]`.
     pub fn encode(&self) -> Result<Vec<u8>, HeaderSyncWireError> {
+        self.encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION, None)
+    }
+
+    /// Encode this message for a negotiated stream version.
+    pub fn encode_for_version(
+        &self,
+        stream_version: u16,
+        request_id: Option<HeaderSyncRequestId>,
+    ) -> Result<Vec<u8>, HeaderSyncWireError> {
         let mut bytes = Vec::new();
         bytes.write_u8(self.message_type())?;
         match self {
@@ -122,6 +133,15 @@ impl HeaderSyncMessage {
                 want_tree_aux_roots,
             } => {
                 validate_get_headers_count(*count)?;
+                if stream_version >= ZAKURA_HEADER_SYNC_STREAM_VERSION_V7 {
+                    bytes.write_u64::<LittleEndian>(
+                        request_id
+                            .ok_or(HeaderSyncWireError::MissingRequestId {
+                                message: "GetHeaders",
+                            })?
+                            .get(),
+                    )?;
+                }
                 write_height(&mut bytes, *start_height)?;
                 bytes.write_u32::<LittleEndian>(*count)?;
                 bytes.write_u8(u8::from(*want_tree_aux_roots))?;
@@ -134,6 +154,13 @@ impl HeaderSyncMessage {
                 validate_headers_len(headers.len(), usize_from_u32(MAX_HS_RANGE, "headers cap")?)?;
                 validate_body_sizes_len(headers.len(), body_sizes.len())?;
                 validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len())?;
+                if stream_version >= ZAKURA_HEADER_SYNC_STREAM_VERSION_V7 {
+                    bytes.write_u64::<LittleEndian>(
+                        request_id
+                            .ok_or(HeaderSyncWireError::MissingRequestId { message: "Headers" })?
+                            .get(),
+                    )?;
+                }
                 bytes.write_u32::<LittleEndian>(u32_from_usize(headers.len(), "headers count")?)?;
                 bytes.write_u8(u8::from(!tree_aux_roots.is_empty()))?;
                 for (header, body_size) in headers.iter().zip(body_sizes) {
@@ -162,6 +189,14 @@ impl HeaderSyncMessage {
         bytes: &[u8],
         context: HeaderSyncDecodeContext,
     ) -> Result<Self, HeaderSyncWireError> {
+        Self::decode_with_request_id(bytes, context).map(|(message, _request_id)| message)
+    }
+
+    /// Decode a header-sync message and return its request ID when v7 carries one.
+    pub fn decode_with_request_id(
+        bytes: &[u8],
+        context: HeaderSyncDecodeContext,
+    ) -> Result<(Self, Option<HeaderSyncRequestId>), HeaderSyncWireError> {
         if bytes.len() > MAX_HS_MESSAGE_BYTES {
             return Err(HeaderSyncWireError::OversizedPayload {
                 actual: bytes.len(),
@@ -170,9 +205,18 @@ impl HeaderSyncMessage {
         }
         let mut reader = Cursor::new(bytes);
         let message_type = reader.read_u8()?;
+        let mut request_id = None;
         let message = match message_type {
             MSG_HS_STATUS => Self::Status(HeaderSyncStatus::decode_from(&mut reader)?),
             MSG_HS_GET_HEADERS => {
+                if context.stream_version >= ZAKURA_HEADER_SYNC_STREAM_VERSION_V7 {
+                    request_id = HeaderSyncRequestId::new(reader.read_u64::<LittleEndian>()?);
+                    if request_id.is_none() {
+                        return Err(HeaderSyncWireError::MissingRequestId {
+                            message: "GetHeaders",
+                        });
+                    }
+                }
                 let start_height = read_height(&mut reader)?;
                 let count = reader.read_u32::<LittleEndian>()?;
                 let want_tree_aux_roots = read_bool_marker(&mut reader, "want_tree_aux_roots")?;
@@ -184,6 +228,12 @@ impl HeaderSyncMessage {
                 }
             }
             MSG_HS_HEADERS => {
+                if context.stream_version >= ZAKURA_HEADER_SYNC_STREAM_VERSION_V7 {
+                    request_id = HeaderSyncRequestId::new(reader.read_u64::<LittleEndian>()?);
+                    if request_id.is_none() {
+                        return Err(HeaderSyncWireError::MissingRequestId { message: "Headers" });
+                    }
+                }
                 let count = usize_from_u32(reader.read_u32::<LittleEndian>()?, "headers count")?;
                 let has_roots = read_bool_marker(&mut reader, "has_roots")?;
                 let Some(max_headers) = context.headers_response_limit()? else {
@@ -225,15 +275,37 @@ impl HeaderSyncMessage {
             value => return Err(HeaderSyncWireError::UnknownMessageType(value)),
         };
         reject_trailing(bytes, &reader)?;
-        Ok(message)
+        Ok((message, request_id))
+    }
+
+    /// Return a v7 `Headers` request ID without decoding the full header payload.
+    pub fn peek_headers_request_id(
+        bytes: &[u8],
+    ) -> Result<HeaderSyncRequestId, HeaderSyncWireError> {
+        let mut reader = Cursor::new(bytes);
+        let message_type = reader.read_u8()?;
+        if message_type != MSG_HS_HEADERS {
+            return Err(HeaderSyncWireError::UnknownMessageType(message_type));
+        }
+        HeaderSyncRequestId::new(reader.read_u64::<LittleEndian>()?)
+            .ok_or(HeaderSyncWireError::MissingRequestId { message: "Headers" })
     }
 
     /// Convert this message into a bounded Zakura frame.
     pub fn encode_frame(&self) -> Result<Frame, HeaderSyncWireError> {
+        self.encode_frame_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION, None)
+    }
+
+    /// Convert this message into a bounded Zakura frame for `stream_version`.
+    pub fn encode_frame_for_version(
+        &self,
+        stream_version: u16,
+        request_id: Option<HeaderSyncRequestId>,
+    ) -> Result<Frame, HeaderSyncWireError> {
         Ok(Frame {
             message_type: u16::from(self.message_type()),
             flags: 0,
-            payload: self.encode()?,
+            payload: self.encode_for_version(stream_version, request_id)?,
         })
     }
 
@@ -242,10 +314,18 @@ impl HeaderSyncMessage {
         frame: Frame,
         context: HeaderSyncDecodeContext,
     ) -> Result<Self, HeaderSyncWireError> {
+        Self::decode_frame_with_request_id(frame, context).map(|(message, _request_id)| message)
+    }
+
+    /// Decode this message from a Zakura frame, preserving any v7 request ID.
+    pub fn decode_frame_with_request_id(
+        frame: Frame,
+        context: HeaderSyncDecodeContext,
+    ) -> Result<(Self, Option<HeaderSyncRequestId>), HeaderSyncWireError> {
         if frame.flags != 0 {
             return Err(HeaderSyncWireError::UnsupportedFlags(frame.flags));
         }
-        let message = Self::decode(&frame.payload, context)?;
+        let (message, request_id) = Self::decode_with_request_id(&frame.payload, context)?;
         let frame_message_type = u8::try_from(frame.message_type)
             .map_err(|_| HeaderSyncWireError::UnknownFrameMessageType(frame.message_type))?;
         if frame_message_type != message.message_type() {
@@ -254,6 +334,6 @@ impl HeaderSyncMessage {
                 payload: message.message_type(),
             });
         }
-        Ok(message)
+        Ok((message, request_id))
     }
 }

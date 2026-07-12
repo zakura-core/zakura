@@ -43,14 +43,21 @@ pub struct Stream {
 /// Transport state for one ordered service stream.
 #[derive(Debug)]
 pub(crate) struct ServiceStream {
+    pub(crate) stream: Stream,
     pub(crate) recv: FramedRecv,
     pub(crate) send: FramedSend,
     pub(crate) cancel_token: CancellationToken,
 }
 
 impl ServiceStream {
-    pub(crate) fn new(recv: FramedRecv, send: FramedSend, cancel_token: CancellationToken) -> Self {
+    pub(crate) fn new(
+        stream: Stream,
+        recv: FramedRecv,
+        send: FramedSend,
+        cancel_token: CancellationToken,
+    ) -> Self {
         Self {
+            stream,
             recv,
             send,
             cancel_token,
@@ -153,9 +160,16 @@ impl Peer {
         let streams = streams
             .into_iter()
             .map(|(kind, (recv, send))| {
+                let stream = Stream {
+                    kind,
+                    version: 1,
+                    frame_cap: 0,
+                    capability: 0,
+                    mode: StreamMode::Ordered,
+                };
                 (
                     kind,
-                    ServiceStream::new(recv, send, cancel_token.child_token()),
+                    ServiceStream::new(stream, recv, send, cancel_token.child_token()),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -230,6 +244,16 @@ impl Peer {
         self.streams
             .remove(&kind)
             .map(|stream| (stream.recv, stream.send))
+    }
+
+    /// Take ownership of a stream pair and its negotiated declaration for `kind`.
+    pub fn take_stream_with_declaration(
+        &mut self,
+        kind: u16,
+    ) -> Option<(Stream, FramedRecv, FramedSend)> {
+        self.streams
+            .remove(&kind)
+            .map(|stream| (stream.stream, stream.recv, stream.send))
     }
 
     /// Return the cancellation token for this peer's service tasks.

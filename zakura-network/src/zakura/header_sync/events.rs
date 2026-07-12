@@ -213,6 +213,32 @@ pub enum HeaderSyncEvent {
         /// Decoded header-sync v6 message.
         msg: HeaderSyncMessage,
     },
+    /// Inbound `Headers` response with an optional request ID.
+    WireHeaders {
+        /// Serving peer.
+        peer: ZakuraPeerId,
+        /// Request ID echoed by the peer, present on header-sync v7.
+        request_id: Option<HeaderSyncRequestId>,
+        /// Headers in ascending height order.
+        headers: Vec<Arc<block::Header>>,
+        /// Advisory serialized body sizes, parallel to `headers`.
+        body_sizes: Vec<u32>,
+        /// Per-height commitment roots, parallel to `headers`.
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
+    },
+    /// Inbound `GetHeaders` request with an optional request ID.
+    WireGetHeaders {
+        /// Requesting peer.
+        peer: ZakuraPeerId,
+        /// Request ID supplied by the peer, present on header-sync v7.
+        request_id: Option<HeaderSyncRequestId>,
+        /// First requested height.
+        start_height: block::Height,
+        /// Requested header count.
+        count: u32,
+        /// Whether the requester wants all-or-nothing tree-aux roots.
+        want_tree_aux_roots: bool,
+    },
     /// Header-sync v6 frame decoding failed after handler admission.
     WireDecodeFailed {
         /// Peer that sent the malformed frame.
@@ -271,6 +297,8 @@ pub enum HeaderSyncEvent {
     HeaderRangeResponseFinished {
         /// Peer whose served-response slot can be released.
         peer: ZakuraPeerId,
+        /// Request ID supplied by the peer, present on header-sync v7.
+        request_id: Option<HeaderSyncRequestId>,
         /// First requested height.
         start_height: block::Height,
         /// Requested header count.
@@ -282,6 +310,8 @@ pub enum HeaderSyncEvent {
     HeaderRangeResponseReady {
         /// Peer whose inbound request is being served.
         peer: ZakuraPeerId,
+        /// Request ID supplied by the peer, present on header-sync v7.
+        request_id: Option<HeaderSyncRequestId>,
         /// First requested height.
         start_height: block::Height,
         /// Requested header count.
@@ -310,6 +340,8 @@ impl HeaderSyncEvent {
             Self::NewBlockAcceptedNonBestChain { .. } => "new_block_accepted_non_best_chain",
             Self::NewBlockRejected { .. } => "new_block_rejected",
             Self::WireMessage { .. } => "wire_message",
+            Self::WireHeaders { .. } => "wire_headers",
+            Self::WireGetHeaders { .. } => "wire_get_headers",
             Self::WireDecodeFailed { .. } => "wire_decode_failed",
             Self::WireProtocolFailure { .. } => "wire_protocol_failure",
             Self::StateFrontiersChanged(_) => "state_frontiers_changed",
@@ -357,6 +389,8 @@ pub enum HeaderSyncAction {
     QueryHeadersByHeightRange {
         /// Peer that requested the range.
         peer: ZakuraPeerId,
+        /// Request ID supplied by the peer, present on header-sync v7.
+        request_id: Option<HeaderSyncRequestId>,
         /// First height.
         start: block::Height,
         /// Maximum count.
@@ -464,9 +498,27 @@ pub enum HeaderSyncCommitFailureKind {
     Local,
 }
 
+/// Locally allocated header-sync request identifier.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub struct HeaderSyncRequestId(u64);
+
+impl HeaderSyncRequestId {
+    /// Create a non-zero request identifier.
+    pub fn new(id: u64) -> Option<Self> {
+        (id != 0).then_some(Self(id))
+    }
+
+    /// Return the wire representation of this request identifier.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// A single outbound `GetHeaders` range expected by a peer session.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ExpectedHeadersResponse {
+    /// Request ID for ID-capable header-sync streams.
+    pub request_id: Option<HeaderSyncRequestId>,
     /// First requested height.
     pub start_height: block::Height,
     /// Requested header count.
@@ -484,9 +536,16 @@ impl ExpectedHeadersResponse {
     ) -> Result<Self, HeaderSyncWireError> {
         validate_get_headers_count(count)?;
         Ok(Self {
+            request_id: None,
             start_height,
             count,
             want_tree_aux_roots,
         })
+    }
+
+    /// Attach a request ID to this expected response.
+    pub fn with_request_id(mut self, request_id: HeaderSyncRequestId) -> Self {
+        self.request_id = Some(request_id);
+        self
     }
 }

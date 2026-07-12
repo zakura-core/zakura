@@ -3,7 +3,7 @@
 name = "zakura"
 version = "1.0.0-rc2"
 authors.workspace = true
-description = "The Zcash Foundation's independent, consensus-compatible implementation of a Zcash node"
+description = "Zakura, an independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true
 repository.workspace = true
 

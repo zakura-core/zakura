@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Nodes running the Zakura or dual P2P stack no longer advertise a doubled
+  `/Zakura:<version>/Zakura:<version>/` user agent on legacy connections: the
+  Zakura token is only prepended when the configured user agent doesn't
+  already carry it.
 - Repair evicted verified-commitment-trees supplied roots instead of stalling
   sync forever. When the finalized writer rejects and evicts a well-formed but
   invalid supplied root, header sync now re-requests the canonical `H`/`H+1`

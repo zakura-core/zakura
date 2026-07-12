@@ -594,7 +594,7 @@ where
     }
 }
 
-/// Return the services Zebra should advertise for this handshake.
+/// Return the services Zakura should advertise for this handshake.
 fn configured_advertised_services(config: &Config, mut services: PeerServices) -> PeerServices {
     services.remove(PeerServices::NODE_P2P_V2);
 
@@ -605,7 +605,7 @@ fn configured_advertised_services(config: &Config, mut services: PeerServices) -
     services
 }
 
-/// Return the user-agent Zebra should advertise for this handshake.
+/// Return the user-agent Zakura should advertise for this handshake.
 fn configured_user_agent(config: &Config, user_agent: String) -> String {
     if !config.v2_p2p() {
         return user_agent;
@@ -616,6 +616,13 @@ fn configured_user_agent(config: &Config, user_agent: String) -> String {
 
     if trimmed_user_agent.is_empty() {
         format!("/{zakura_token}/")
+    } else if trimmed_user_agent
+        .split('/')
+        .any(|token| token == zakura_token)
+    {
+        // The default user agent already carries the Zakura token, so
+        // prepending it again would advertise `/Zakura:x/Zakura:x/`.
+        format!("/{trimmed_user_agent}/")
     } else {
         format!("/{zakura_token}/{trimmed_user_agent}/")
     }

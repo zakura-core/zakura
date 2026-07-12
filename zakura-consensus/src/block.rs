@@ -233,7 +233,7 @@ where
                 // Do the difficulty checks first, to raise the threshold for
                 // attacks that use any other fields.
                 check::difficulty_is_valid(&block.header, &network, &height, &hash)?;
-                check::equihash_solution_is_valid(&block.header)?;
+                check::equihash_solution_is_valid(&block.header, &network)?;
             }
 
             // Next, check the Merkle root validity, to ensure that

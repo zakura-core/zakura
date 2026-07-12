@@ -139,14 +139,21 @@ pub fn difficulty_is_valid(
     Ok(())
 }
 
-/// Returns `Ok(())` if the `EquihashSolution` is valid for `header`
-pub fn equihash_solution_is_valid(header: &Header) -> Result<(), equihash::Error> {
+/// Returns `Ok(())` if the `EquihashSolution` is valid for `header` on `network`
+pub fn equihash_solution_is_valid(
+    header: &Header,
+    network: &Network,
+) -> Result<(), equihash::Error> {
     // # Consensus
     //
     // > `solution` MUST represent a valid Equihash solution.
     //
     // https://zips.z.cash/protocol/protocol.pdf#blockheader
-    header.solution.check(header)
+    //
+    // The Equihash `(n, k)` parameters are bound to `network`, so a peer cannot
+    // downgrade the proof of work to the trivial Regtest `(48, 5)` parameters
+    // by sending a short 36-byte solution on Mainnet or Testnet.
+    header.solution.check(header, network)
 }
 
 /// Returns `Ok()` with the deferred pool balance change of the coinbase transaction if the block

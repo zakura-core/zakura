@@ -610,7 +610,7 @@ where
             )?;
         } else {
             crate::block::check::difficulty_is_valid(&block.header, &self.network, &height, &hash)?;
-            crate::block::check::equihash_solution_is_valid(&block.header)?;
+            crate::block::check::equihash_solution_is_valid(&block.header, &self.network)?;
         }
 
         // See [ZIP-1015](https://zips.z.cash/zip-1015).

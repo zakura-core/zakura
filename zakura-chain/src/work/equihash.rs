@@ -20,8 +20,21 @@ use crate::serialization::AtLeastOne;
 /// The error type for Equihash validation.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
-#[error("invalid equihash solution for BlockHeader")]
-pub struct Error(#[from] equihash::Error);
+pub enum Error {
+    /// The solution failed Equihash verification under the parameters
+    /// required by the active network.
+    #[error("invalid equihash solution for BlockHeader")]
+    Equihash(#[from] equihash::Error),
+
+    /// The solution's size does not match the Equihash parameters required by
+    /// the active network (for example, a 36-byte Regtest-shaped solution
+    /// submitted on Mainnet or Testnet).
+    #[error("equihash solution size is invalid for the {network} network")]
+    InvalidSolutionSize {
+        /// The network whose Equihash parameters the solution violated.
+        network: Network,
+    },
+}
 
 /// The error type for Equihash solving.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -74,16 +87,52 @@ impl Solution {
         }
     }
 
-    /// Returns `Ok(())` if `EquihashSolution` is valid for `header`
+    /// Returns `Ok(())` if this solution is a valid Equihash solution for
+    /// `header` under the Equihash parameters required by `network`.
+    ///
+    /// The `(n, k)` Equihash parameters are chosen from `network`, never from
+    /// the attacker-controlled solution length. A solution whose variant does
+    /// not match the parameters `network` requires is rejected: Mainnet and
+    /// Testnet require the memory-hard `(200, 9)` [`Solution::Common`]
+    /// solution, and the toy `(48, 5)` [`Solution::Regtest`] solution is only
+    /// accepted on Regtest. This prevents a peer from downgrading the proof of
+    /// work by choosing the on-wire solution length.
     #[allow(clippy::unwrap_in_result)]
-    pub fn check(&self, header: &Header) -> Result<(), Error> {
+    pub fn check(&self, header: &Header, network: &Network) -> Result<(), Error> {
         // TODO:
         // - Add Equihash parameters field to `testnet::Parameters`
         // - Update `Solution::Regtest` variant to hold a `Vec` to support arbitrary parameters - rename to `Other`
-        let (n, k) = match self {
-            Solution::Common(_) => (200, 9),
-            Solution::Regtest(_) => (REGTEST_N, REGTEST_K),
+        let (n, k) = match (network.is_regtest(), self) {
+            // Mainnet and Testnet require the memory-hard (200, 9) parameters,
+            // encoded as a 1344-byte `Common` solution.
+            (false, Solution::Common(_)) => (200, 9),
+            // Regtest accepts either the toy (48, 5) solution used by its
+            // genesis block or a full (200, 9) solution from a miner.
+            (true, Solution::Common(_)) => (200, 9),
+            (true, Solution::Regtest(_)) => (REGTEST_N, REGTEST_K),
+            // A 36-byte `Regtest`-shaped solution is not a valid proof of work
+            // on Mainnet or Testnet. Reject it before selecting parameters, so
+            // the attacker-controlled solution length cannot downgrade the PoW
+            // to the trivial (48, 5) parameter set.
+            (false, Solution::Regtest(_)) => {
+                return Err(Error::InvalidSolutionSize {
+                    network: network.clone(),
+                })
+            }
         };
+
+        self.check_equihash(header, n, k)
+    }
+
+    /// Returns `Ok(())` if this solution is valid for `header` under the given
+    /// Equihash `(n, k)` parameters.
+    ///
+    /// The parameters are supplied explicitly and must be chosen from a trusted
+    /// source, never derived from the solution length. Callers on the block
+    /// ingestion path must go through [`Solution::check`], which binds `(n, k)`
+    /// to the active network.
+    #[allow(clippy::unwrap_in_result)]
+    fn check_equihash(&self, header: &Header, n: u32, k: u32) -> Result<(), Error> {
         let nonce = &header.nonce;
 
         let mut input = Vec::new();
@@ -187,7 +236,11 @@ impl Solution {
                     .expect("unexpected invalid solution: incorrect length");
 
                 // TODO: work out why we sometimes get invalid solutions here
-                if let Err(error) = header.solution.check(&header) {
+                //
+                // The solver only ever produces (200, 9) `Common` solutions
+                // (see `solve_200_9` above), so verify against those parameters
+                // directly rather than binding to a network.
+                if let Err(error) = header.solution.check_equihash(&header, 200, 9) {
                     info!(?error, "found invalid solution for header");
                     continue;
                 }

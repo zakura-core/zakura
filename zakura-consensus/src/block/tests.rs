@@ -283,7 +283,7 @@ fn equihash_is_valid_for_historical_blocks() -> Result<(), Report> {
             .zcash_deserialize_into::<Block>()
             .expect("block is structurally valid");
 
-        check::equihash_solution_is_valid(&block.header)
+        check::equihash_solution_is_valid(&block.header, &Network::Mainnet)
             .expect("the equihash solution from a historical block should be valid");
     }
 

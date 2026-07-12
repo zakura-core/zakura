@@ -1,10 +1,11 @@
 use crate::{
     block::{Block, MAX_BLOCK_BYTES},
+    parameters::Network,
     serialization::{
         CompactSizeMessage, SerializationError, ZcashDeserialize, ZcashDeserializeInto,
         ZcashSerialize,
     },
-    work::equihash::{Solution, SOLUTION_SIZE},
+    work::equihash::{Error, Solution, REGTEST_SOLUTION_SIZE, SOLUTION_SIZE},
 };
 
 use super::super::*;
@@ -44,7 +45,10 @@ fn equihash_solution_test_vectors_are_valid() -> color_eyre::eyre::Result<()> {
         let block =
             Block::zcash_deserialize(&block[..]).expect("block test vector should deserialize");
 
-        block.header.solution.check(&block.header)?;
+        block
+            .header
+            .solution
+            .check(&block.header, &Network::Mainnet)?;
     }
 
     Ok(())
@@ -107,5 +111,50 @@ fn equihash_solution_rejects_oversize_compactsize_before_allocating() {
             SerializationError::Parse("incorrect equihash solution size"),
         ),
         "expected size-rejection Parse error, got: {err:?}",
+    );
+}
+
+/// Regression test for the Regtest-solution proof-of-work downgrade.
+///
+/// A 36-byte [`Solution::Regtest`] is only a valid proof of work under the toy
+/// `(48, 5)` Equihash parameters. It must never be accepted on Mainnet or
+/// Testnet, which require the memory-hard `(200, 9)` parameters. Previously the
+/// `(n, k)` parameters were selected from the solution length alone, so a peer
+/// could downgrade the PoW to `(48, 5)` by sending a short solution on Mainnet.
+#[test]
+fn regtest_solution_is_rejected_off_regtest() {
+    let _init_guard = zakura_test::init();
+
+    let block = Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
+        .expect("block test vector should deserialize");
+    let mut header = *block.header;
+
+    // A short Regtest-shaped solution, as a malicious peer would send it.
+    header.solution = Solution::Regtest([0; REGTEST_SOLUTION_SIZE]);
+
+    // Rejected on Mainnet and Testnet by the network-parameter binding, before
+    // the Equihash verifier is ever reached.
+    for network in [Network::Mainnet, Network::new_default_testnet()] {
+        assert!(
+            matches!(
+                header.solution.check(&header, &network),
+                Err(Error::InvalidSolutionSize { .. }),
+            ),
+            "a 36-byte Regtest solution must be rejected on {network}",
+        );
+    }
+
+    // On Regtest the variant is permitted, so the check proceeds to Equihash
+    // verification rather than rejecting on size. (The all-zero solution is not
+    // a valid (48, 5) proof, so this is an Equihash error, not `Ok`, and in
+    // particular not `InvalidSolutionSize`.)
+    assert!(
+        !matches!(
+            header
+                .solution
+                .check(&header, &Network::new_regtest(Default::default())),
+            Err(Error::InvalidSolutionSize { .. }),
+        ),
+        "a Regtest solution must be accepted for verification on Regtest",
     );
 }

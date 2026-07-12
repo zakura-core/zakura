@@ -1,8 +1,8 @@
 [book]
-authors = ["Zcash Foundation <zebra@zfnd.org>"]
+authors = ["Zakura contributors"]
 language = "en"
 src = "src"
-title = "The Zebra Book"
+title = "The Zakura Book"
 
 [preprocessor]
 

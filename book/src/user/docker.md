@@ -76,11 +76,11 @@ All available Cargo features are listed at
 
 ## Configuring Zakura
 
-Zakura uses [config-rs](https://crates.io/crates/config) to layer configuration from defaults, an optional TOML file, and `ZEBRA_`-prefixed environment variables. When running with Docker, configure Zakura using any of the following (later items override earlier ones):
+Zakura uses [config-rs](https://crates.io/crates/config) to layer configuration from defaults, an optional TOML file, and `ZAKURA_`-prefixed environment variables. When running with Docker, configure Zakura using any of the following (later items override earlier ones):
 
 1. **Provide a specific config file path:** Set the `CONFIG_FILE_PATH` environment variable to point to your config file within the container. The entrypoint will pass it to `zakurad` via `--config`.
 2. **Use the default config file:** Mount a config file to `/home/zakura/.config/zakurad.toml` (for example using the `configs:` mapping in `docker-compose.yml`). This file is loaded if `CONFIG_FILE_PATH` is not set.
-3. **Use environment variables:** Set `ZEBRA_`-prefixed environment variables to override settings from the config file. Examples: `ZEBRA_NETWORK__NETWORK`, `ZEBRA_RPC__LISTEN_ADDR`, `ZEBRA_RPC__ENABLE_COOKIE_AUTH`, `ZEBRA_RPC__COOKIE_DIR`, `ZEBRA_METRICS__ENDPOINT_ADDR`, `ZEBRA_MINING__MINER_ADDRESS`.
+3. **Use environment variables:** Set `ZAKURA_`-prefixed environment variables to override settings from the config file. Examples: `ZAKURA_NETWORK__NETWORK`, `ZAKURA_RPC__LISTEN_ADDR`, `ZAKURA_RPC__ENABLE_COOKIE_AUTH`, `ZAKURA_RPC__COOKIE_DIR`, `ZAKURA_METRICS__ENDPOINT_ADDR`, `ZAKURA_MINING__MINER_ADDRESS`. (The deprecated `ZEBRA_` prefix is still accepted, with lower precedence.)
 
 You can verify your configuration by inspecting Zakura's logs at startup.
 
@@ -89,7 +89,7 @@ You can verify your configuration by inspecting Zakura's logs at startup.
 Zakura's RPC server is disabled by default. Enable and configure it via the TOML configuration file, or configuration environment variables:
 
 - **Using a config file:** Add or uncomment the `[rpc]` section in your `zakurad.toml`. Set `listen_addr` (e.g., `"0.0.0.0:8232"` for Mainnet).
-- **Using environment variables:** Set `ZEBRA_RPC__LISTEN_ADDR` (e.g., `0.0.0.0:8232`). To disable cookie auth, set `ZEBRA_RPC__ENABLE_COOKIE_AUTH=false`. To change the cookie directory, set `ZEBRA_RPC__COOKIE_DIR=/path/inside/container`.
+- **Using environment variables:** Set `ZAKURA_RPC__LISTEN_ADDR` (e.g., `0.0.0.0:8232`). To disable cookie auth, set `ZAKURA_RPC__ENABLE_COOKIE_AUTH=false`. To change the cookie directory, set `ZAKURA_RPC__COOKIE_DIR=/path/inside/container`.
 
 **Cookie Authentication:**
 
@@ -113,16 +113,16 @@ By default, Zakura uses cookie-based authentication for RPC requests (`enable_co
     enable_cookie_auth = false
     ```
 
-  - If using **environment variables**, set `ZEBRA_RPC__ENABLE_COOKIE_AUTH=false`.
+  - If using **environment variables**, set `ZAKURA_RPC__ENABLE_COOKIE_AUTH=false`.
 
 Remember that Zakura only generates the cookie file if the RPC server is enabled _and_ `enable_cookie_auth` is set to `true` (or omitted, as `true` is the default).
 
 Environment variable examples for health endpoints:
 
-- `ZEBRA_HEALTH__LISTEN_ADDR=0.0.0.0:8080`
-- `ZEBRA_HEALTH__MIN_CONNECTED_PEERS=1`
-- `ZEBRA_HEALTH__READY_MAX_BLOCKS_BEHIND=2`
-- `ZEBRA_HEALTH__ENFORCE_ON_TEST_NETWORKS=false`
+- `ZAKURA_HEALTH__LISTEN_ADDR=0.0.0.0:8080`
+- `ZAKURA_HEALTH__MIN_CONNECTED_PEERS=1`
+- `ZAKURA_HEALTH__READY_MAX_BLOCKS_BEHIND=2`
+- `ZAKURA_HEALTH__ENFORCE_ON_TEST_NETWORKS=false`
 
 ### Health Endpoints
 
@@ -164,7 +164,7 @@ external_addr = "203.0.113.42:8233"
 Or via environment variable:
 
 ```shell
--e ZEBRA_NETWORK__EXTERNAL_ADDR=203.0.113.42:8233
+-e ZAKURA_NETWORK__EXTERNAL_ADDR=203.0.113.42:8233
 ```
 
 For reference, the ports Zakura can use are:
@@ -194,7 +194,7 @@ docker compose -f docker/docker-compose.lwd.yml up
 
 Note that Docker will run Zakura with the RPC server enabled and the cookie
 authentication mechanism disabled when running `docker compose -f docker/docker-compose.lwd.yml up`, since Lightwalletd doesn't support cookie authentication. In this
-example, the RPC server is configured by setting `ZEBRA_` environment variables
+example, the RPC server is configured by setting `ZAKURA_` environment variables
 directly in `docker/docker-compose.lwd.yml` (or an accompanying `.env` file).
 
 ### Running Zakura with Prometheus and Grafana

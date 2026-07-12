@@ -603,6 +603,48 @@ async fn p2p_v2_service_bit_advertisement_follows_config() {
         .contains("/Zebra:local-test/"));
 }
 
+/// The Zakura token is prepended for the v2 stack, but never doubled when the
+/// user agent (like zakurad's default) already carries it.
+#[test]
+fn configured_user_agent_deduplicates_zakura_token() {
+    let _init_guard = zakura_test::init();
+
+    let zakura_token = format!("Zakura:{}", env!("CARGO_PKG_VERSION"));
+    let default_user_agent = format!("/{zakura_token}/");
+
+    // The legacy stack passes the configured user agent through unchanged.
+    assert_eq!(
+        configured_user_agent(&test_config(P2pStack::Legacy), default_user_agent.clone()),
+        default_user_agent,
+    );
+
+    // The v2 stack advertises the token on its own or before a foreign agent.
+    assert_eq!(
+        configured_user_agent(&test_config(P2pStack::Dual), String::new()),
+        default_user_agent,
+    );
+    assert_eq!(
+        configured_user_agent(
+            &test_config(P2pStack::Dual),
+            "/MagicBean:6.3.0/".to_string()
+        ),
+        format!("/{zakura_token}/MagicBean:6.3.0/"),
+    );
+
+    // A user agent that already carries the token is not doubled.
+    assert_eq!(
+        configured_user_agent(&test_config(P2pStack::Dual), default_user_agent.clone()),
+        default_user_agent,
+    );
+    assert_eq!(
+        configured_user_agent(
+            &test_config(P2pStack::Dual),
+            format!("/{zakura_token}/MagicBean:6.3.0/"),
+        ),
+        format!("/{zakura_token}/MagicBean:6.3.0/"),
+    );
+}
+
 #[test]
 fn zakura_upgrade_errors_are_neutral_disconnects() {
     let _init_guard = zakura_test::init();

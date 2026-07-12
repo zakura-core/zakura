@@ -14,15 +14,15 @@ use zcash_transparent::coinbase::{MAX_COINBASE_HEIGHT_LEN, MAX_COINBASE_SCRIPT_L
 /// a coinbase tx.
 pub(crate) const MAX_MINER_DATA_LEN: usize = MAX_COINBASE_SCRIPT_LEN - MAX_COINBASE_HEIGHT_LEN;
 
-/// The marker Zebra prepends to the coinbase input of every block it builds.
+/// The marker Zakura prepends to the coinbase input of every block it builds.
 ///
 /// The sakura flower emoji (`U+1F338`), 4 UTF-8 bytes.
-pub(crate) const ZEBRA_COINBASE_MARKER: &str = "🌸";
+pub(crate) const ZAKURA_COINBASE_MARKER: &str = "🌸";
 
-/// Separates [`ZEBRA_COINBASE_MARKER`] from `extra_coinbase_data`.
+/// Separates [`ZAKURA_COINBASE_MARKER`] from `extra_coinbase_data`.
 ///
 /// Present only when that is set.
-pub(crate) const ZEBRA_COINBASE_SEPARATOR: &str = ": ";
+pub(crate) const ZAKURA_COINBASE_SEPARATOR: &str = ": ";
 
 /// The maximum length of the user-configurable `extra_coinbase_data`.
 ///
@@ -30,7 +30,7 @@ pub(crate) const ZEBRA_COINBASE_SEPARATOR: &str = ": ";
 /// so the user portion is [`MAX_MINER_DATA_LEN`] minus the marker, separator,
 /// and the 2-byte `OP_PUSHDATA1` opcode (for pushes over 75 bytes).
 pub(crate) const MAX_USER_COINBASE_DATA_LEN: usize =
-    MAX_MINER_DATA_LEN - ZEBRA_COINBASE_MARKER.len() - ZEBRA_COINBASE_SEPARATOR.len() - 2;
+    MAX_MINER_DATA_LEN - ZAKURA_COINBASE_MARKER.len() - ZAKURA_COINBASE_SEPARATOR.len() - 2;
 
 /// Mining configuration section.
 #[serde_as]
@@ -43,19 +43,19 @@ pub struct Config {
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub miner_address: Option<ZcashAddress>,
 
-    /// Optional tag that Zebra appends to the coinbase input of every block it
-    /// builds, after the Zebra `🌸` marker and a `: ` separator.
+    /// Optional tag that Zakura appends to the coinbase input of every block it
+    /// builds, after the Zakura `🌸` marker and a `: ` separator.
     ///
     /// Limited to `MAX_USER_COINBASE_DATA_LEN` bytes.
     pub extra_coinbase_data: Option<ExtraCoinbaseData>,
 
-    /// Optional shielded memo that Zebra will include in the output of a shielded coinbase
+    /// Optional shielded memo that Zakura will include in the output of a shielded coinbase
     /// transaction. Limited to 512 bytes.
     ///
     /// Applies only if [`Self::miner_address`] contains a shielded component.
     pub miner_memo: Option<String>,
 
-    /// Mine blocks using Zebra's internal miner, without an external mining pool or equihash solver.
+    /// Mine blocks using Zakura's internal miner, without an external mining pool or equihash solver.
     ///
     /// This experimental feature is only supported on regtest as it uses null solutions and skips checking
     /// for a valid Proof of Work.
@@ -76,12 +76,12 @@ impl Config {
     }
 }
 
-/// Operator-configured data appended to the coinbase input of every block Zebra
-/// builds, after Zebra's `🌸` marker and `: ` separator.
+/// Operator-configured data appended to the coinbase input of every block Zakura
+/// builds, after Zakura's `🌸` marker and `: ` separator.
 ///
 /// Validated on construction to fit within the coinbase data budget, so an
 /// oversized value can't be represented, and an oversized
-/// `mining.extra_coinbase_data` in the config makes Zebra fail to start.
+/// `mining.extra_coinbase_data` in the config makes Zakura fail to start.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtraCoinbaseData(String);
 

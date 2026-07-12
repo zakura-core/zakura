@@ -1,6 +1,6 @@
 # Mining with Zakura in Docker
 
-Zakura's [Docker images](https://hub.docker.com/r/zakura-core/zakura/tags) can be used
+Zakura's [Docker images](https://hub.docker.com/r/valargroup/zakura/tags) can be used
 for your mining operations. If you don't have Docker, see the [manual
 configuration instructions](mining.md).
 
@@ -9,11 +9,11 @@ Using docker, you can start mining by running:
 ```bash
 docker run -d --name zakura_local \
   -e MINER_ADDRESS="t3dvVE3SQEi7kqNzwrfNePxZ1d4hUyztBA1" \
-  -e ZEBRA_RPC__LISTEN_ADDR=0.0.0.0:8232 \
+  -e ZAKURA_RPC__LISTEN_ADDR=0.0.0.0:8232 \
   -p 8233:8233 \
   -p 8232:8232 \
   -v zakurad-cache:/home/zakura/.cache/zakura \
-  zakura-core/zakura:latest
+  valargroup/zakura:latest
 ```
 
 This command starts a container on Mainnet and binds the P2P port (8233) and
@@ -37,19 +37,19 @@ If you don't want to set any environment variables, you can edit the
 the container. There's an example in `docker/docker-compose.yml` of how to do
 that.
 
-If you want to mine on Testnet, you need to set the `ZEBRA_NETWORK__NETWORK` environment
+If you want to mine on Testnet, you need to set the `ZAKURA_NETWORK__NETWORK` environment
 variable to `Testnet` and use a Testnet address for the rewards. For example,
 running
 
 ```bash
 docker run -d --name zakura_local \
-  -e ZEBRA_NETWORK__NETWORK="Testnet" \
+  -e ZAKURA_NETWORK__NETWORK="Testnet" \
   -e MINER_ADDRESS="t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v" \
-  -e ZEBRA_RPC__LISTEN_ADDR=0.0.0.0:18232 \
+  -e ZAKURA_RPC__LISTEN_ADDR=0.0.0.0:18232 \
   -p 18233:18233 \
   -p 18232:18232 \
   -v zakurad-cache:/home/zakura/.cache/zakura \
-  zakura-core/zakura:latest
+  valargroup/zakura:latest
 ```
 
 will start a container on Testnet and bind the P2P port (18233) and the RPC port

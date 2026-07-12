@@ -1631,6 +1631,7 @@ impl HeaderSyncReactor {
                     && peer.outstanding.is_empty()
                     && peer.late_covered_responses == 0
                     && peer.advertised_tip >= repair.range.end_height()
+                    && peer.max_headers_per_response >= repair.range.count
                     && !repair.tried_peers.contains(*peer_id)
             })
             .map(|(peer_id, _)| peer_id.clone())
@@ -1645,9 +1646,6 @@ impl HeaderSyncReactor {
         };
         let range = repair.range;
         let peer_cap = peer.max_headers_per_response;
-        if peer_cap < range.count {
-            return false;
-        }
         if let Err(error) = peer
             .session
             .try_send_get_headers(range.start_height, range.count, true)

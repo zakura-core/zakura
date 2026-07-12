@@ -1675,6 +1675,33 @@ async fn vct_repair_bypasses_covered_range_and_commits_exact_h_and_successor() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn vct_repair_scheduler_skips_peers_with_insufficient_response_capacity() {
+    let best = (
+        block::Height(4),
+        mainnet_block(&BLOCK_MAINNET_4_BYTES).hash(),
+    );
+    let mut fixture = spawn_test_reactor(startup_for(
+        Network::Mainnet,
+        (block::Height(0), Network::Mainnet.genesis_hash()),
+        Some(best),
+    ));
+    let low_capacity_peer = peer(101);
+    let capable_peer = peer(102);
+
+    for (peer_id, capacity) in [(low_capacity_peer, 1), (capable_peer.clone(), 2)] {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(&fixture, peer_id, block::Height(0), best.0, capacity, 1).await;
+    }
+
+    fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
+
+    let (requested_peer, start_height, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, capable_peer);
+    assert_eq!((start_height, count), (block::Height(1), 2));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn vct_repair_rejects_noncanonical_response_before_commit() {
     let best = (
         block::Height(4),

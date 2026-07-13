@@ -489,7 +489,8 @@ jobs:
           name: staged-release-assets
           path: ./publish/final
           if-no-files-found: error
-          retention-days: 1
+          # Staged assets must outlive a pending release environment approval.
+          retention-days: 3
 
   update-source-installer:
     name: Update source installer metadata

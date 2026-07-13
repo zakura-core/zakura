@@ -54,8 +54,12 @@ jobs:
     name: Build and verify release assets
     needs: [validate]
     uses: ./.github/workflows/release-binaries.yml
+    # The nested publish-zakurad-assets job declares contents: write, and a
+    # called workflow may not request more than the caller grants. The staging
+    # run never uses the write scope: it skips every release-mutating step,
+    # and GITHUB_TOKEN cannot create v* tags (ruleset bypass is app-only).
     permissions:
-      contents: read
+      contents: write
       id-token: write
       attestations: write
     with:
@@ -107,7 +111,8 @@ jobs:
             "zakurad-manifest-${RELEASE_TAG}.json"
           )
           printf '%s\n' "${expected_payloads[@]}" | sort > ./expected-payloads.txt
-          awk '{print $2}' ./assets/SHA256SUMS.txt | sort > ./checksummed-payloads.txt
+          # SHA256SUMS.txt entries are ./-prefixed (sha256sum ./*).
+          awk '{print $2}' ./assets/SHA256SUMS.txt | sed 's|^\./||' | sort > ./checksummed-payloads.txt
           diff --unified ./expected-payloads.txt ./checksummed-payloads.txt
           (
             cd ./assets
@@ -142,7 +147,7 @@ jobs:
               encoding="utf-8"
           ).splitlines()
           checksums = {
-              filename: digest
+              filename.removeprefix("./"): digest
               for digest, filename in (line.split(maxsplit=1) for line in checksum_lines)
           }
           x86_archive = f"zakurad-{release_tag}-linux-x86_64.tar.gz"

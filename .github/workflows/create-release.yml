@@ -217,12 +217,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          existing_sha="$(
-            gh api "repos/${REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
-              --jq '.object.sha' 2>/dev/null || true
-          )"
-          if [ -n "$existing_sha" ] && [ "$existing_sha" != "$TARGET_SHA" ]; then
-            echo "Tag ${RELEASE_TAG} already points to ${existing_sha}, not ${TARGET_SHA}." >&2
+          # On HTTP errors `gh api` prints the JSON error body to stdout, so
+          # branch on the exit status instead of the captured output, and only
+          # treat a 404 (tag does not exist yet) as the create-tag path.
+          ref_status=0
+          ref_json="$(gh api "repos/${REPOSITORY}/git/ref/tags/${RELEASE_TAG}" 2>/dev/null)" || ref_status=$?
+          if [ "$ref_status" -eq 0 ]; then
+            existing_sha="$(echo "$ref_json" | jq -r '.object.sha')"
+            if [ "$existing_sha" != "$TARGET_SHA" ]; then
+              echo "Tag ${RELEASE_TAG} already points to ${existing_sha}, not ${TARGET_SHA}." >&2
+              exit 1
+            fi
+          elif [ "$(echo "$ref_json" | jq -r '.status? // empty' 2>/dev/null)" != "404" ]; then
+            echo "Failed to look up tag ${RELEASE_TAG}: ${ref_json}" >&2
             exit 1
           fi
 

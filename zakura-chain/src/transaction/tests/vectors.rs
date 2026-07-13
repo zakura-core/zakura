@@ -157,6 +157,56 @@ fn v5_orchard_cross_address_flag_fails_serialization() {
 }
 
 #[test]
+fn v5_orchard_cross_address_flag_fails_deserialization() {
+    let _init_guard = zakura_test::init();
+
+    let mut tx = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find(|transaction| transaction.orchard_shielded_data().is_some())
+        .expect("test vectors include an Orchard transaction");
+
+    let original_bytes = tx
+        .zcash_serialize_to_vec()
+        .expect("valid V5 transaction should serialize");
+
+    let Transaction::V5 {
+        orchard_shielded_data: Some(orchard_shielded_data),
+        ..
+    } = &mut tx
+    else {
+        unreachable!("test transaction is V5 with Orchard shielded data");
+    };
+
+    orchard_shielded_data
+        .flags
+        .toggle(crate::orchard::Flags::ENABLE_SPENDS);
+
+    let toggled_bytes = tx
+        .zcash_serialize_to_vec()
+        .expect("V5 Orchard spend flag should serialize");
+    let differing_indices: Vec<_> = original_bytes
+        .iter()
+        .zip(&toggled_bytes)
+        .enumerate()
+        .filter_map(|(index, (original, toggled))| (original != toggled).then_some(index))
+        .collect();
+    let [flags_index] = differing_indices.as_slice() else {
+        panic!("toggling the Orchard spend flag should change exactly one byte");
+    };
+
+    let mut malformed_bytes = original_bytes;
+    malformed_bytes[*flags_index] = crate::orchard::Flags::ENABLE_CROSS_ADDRESS.bits();
+
+    let error = Transaction::zcash_deserialize(&malformed_bytes[..])
+        .expect_err("V5 Orchard flags must reject reserved cross-address bit");
+
+    assert!(matches!(
+        error,
+        SerializationError::Parse("invalid reserved orchard flags")
+    ));
+}
+
+#[test]
 fn doesnt_deserialize_transaction_with_invalid_value_balance() {
     let _init_guard = zakura_test::init();
 

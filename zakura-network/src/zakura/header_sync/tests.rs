@@ -2602,6 +2602,61 @@ async fn scheduler_fans_out_same_forward_range_to_three_peers() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peers = [peer(33), peer(34)];
+    let start = block::Height(1);
+    let tip = block::Height(2);
+
+    for peer_id in peers.clone() {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(&fixture, peer_id, block::Height(0), tip, 2, 1).await;
+    }
+
+    let mut requests = HashMap::new();
+    while requests.len() < peers.len() {
+        let (peer, request_id, start_height, count) =
+            next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(start_height, start);
+        assert_eq!(count, 2);
+        requests.insert(peer, request_id);
+    }
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: start,
+            tip_height: tip,
+            tip_hash: block::Hash([2; 32]),
+        })
+        .await
+        .unwrap();
+
+    for peer_id in peers {
+        send_headers(
+            &fixture,
+            &peer_id,
+            requests[&peer_id],
+            headers_message_from(
+                start,
+                vec![
+                    mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                    mainnet_header(&BLOCK_MAINNET_2_BYTES),
+                ],
+            ),
+        )
+        .await;
+    }
+
+    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
     let network = Network::Mainnet;
     let first_checkpoint = network

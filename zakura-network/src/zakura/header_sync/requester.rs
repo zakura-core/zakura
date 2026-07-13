@@ -159,3 +159,220 @@ impl Drop for HeaderRequesterExit {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_SESSION_ID: u64 = 41;
+    const TEST_GENERATION: u64 = 73;
+
+    fn peer(byte: u8) -> ZakuraPeerId {
+        ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds")
+    }
+
+    fn command(start: u32, expected_max_count: u32) -> HeaderRequesterCommand {
+        HeaderRequesterCommand {
+            range: RangeRequest {
+                start_height: block::Height(start),
+                count: expected_max_count.max(1),
+                anchor_hash: None,
+                finalized: false,
+                want_tree_aux_roots: true,
+                priority: RangePriority::Forward,
+            },
+            expected_max_count,
+            purpose: RangePurpose::Sync,
+        }
+    }
+
+    fn session(
+        peer: ZakuraPeerId,
+        depth: usize,
+    ) -> (
+        HeaderSyncPeerSession,
+        crate::zakura::FramedRecv,
+        CancellationToken,
+    ) {
+        let (send, recv) = crate::zakura::framed_channel(depth);
+        let cancel = CancellationToken::new();
+        let session = HeaderSyncPeerSession::from_parts_with_direction_and_session_id(
+            peer,
+            crate::zakura::ServicePeerDirection::Inbound,
+            send,
+            cancel.clone(),
+            TEST_SESSION_ID,
+        );
+        (session, recv, cancel)
+    }
+
+    async fn next_event(
+        events: &mut mpsc::UnboundedReceiver<HeaderRequesterEvent>,
+    ) -> HeaderRequesterEvent {
+        time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("requester event arrives before timeout")
+            .expect("requester event channel stays open")
+    }
+
+    fn assert_command_eq(actual: HeaderRequesterCommand, expected: HeaderRequesterCommand) {
+        assert_eq!(actual.range, expected.range);
+        assert_eq!(actual.expected_max_count, expected.expected_max_count);
+        assert_eq!(actual.purpose, expected.purpose);
+    }
+
+    #[tokio::test]
+    async fn successful_send_reports_correlated_request_metadata() {
+        let peer = peer(1);
+        let (session, mut frames, _cancel) = session(peer.clone(), 1);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let requester =
+            spawn_header_requester(session, TEST_GENERATION, events_tx, shutdown.clone());
+        let command = command(5, 2);
+
+        requester
+            .try_send(command)
+            .expect("requester command queue has capacity");
+
+        let request_id = match next_event(&mut events_rx).await {
+            HeaderRequesterEvent::Sent {
+                peer: event_peer,
+                session_id,
+                generation,
+                command: sent,
+                request_id,
+            } => {
+                assert_eq!(event_peer, peer);
+                assert_eq!(session_id, TEST_SESSION_ID);
+                assert_eq!(generation, TEST_GENERATION);
+                assert_command_eq(sent, command);
+                request_id
+            }
+            event => panic!("unexpected requester event: {event:?}"),
+        };
+        let frame = time::timeout(Duration::from_secs(1), frames.recv())
+            .await
+            .expect("request frame arrives before timeout")
+            .expect("request frame channel stays open");
+        let (message, decoded_request_id) =
+            HeaderSyncMessage::decode(&frame.payload, HeaderSyncDecodeContext::control())
+                .expect("request frame decodes");
+        assert_eq!(
+            message,
+            HeaderSyncMessage::GetHeaders {
+                start_height: command.range.start_height,
+                count: command.expected_max_count,
+                want_tree_aux_roots: command.range.want_tree_aux_roots,
+            }
+        );
+        assert_eq!(decoded_request_id, Some(request_id));
+
+        shutdown.cancel();
+        assert!(matches!(
+            next_event(&mut events_rx).await,
+            HeaderRequesterEvent::Stopped {
+                peer: event_peer,
+                session_id: TEST_SESSION_ID,
+                generation: TEST_GENERATION,
+            } if event_peer == peer
+        ));
+    }
+
+    #[tokio::test]
+    async fn encode_failure_reports_the_command_and_requester_continues() {
+        let peer = peer(2);
+        let (session, mut frames, _cancel) = session(peer.clone(), 1);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let requester =
+            spawn_header_requester(session, TEST_GENERATION, events_tx, shutdown.clone());
+        let invalid = command(7, 0);
+        let valid = command(8, 1);
+
+        requester
+            .try_send(invalid)
+            .expect("requester command queue has capacity");
+        match next_event(&mut events_rx).await {
+            HeaderRequesterEvent::Failed {
+                peer: event_peer,
+                session_id,
+                generation,
+                command: failed,
+                reason,
+            } => {
+                assert_eq!(event_peer, peer);
+                assert_eq!(session_id, TEST_SESSION_ID);
+                assert_eq!(generation, TEST_GENERATION);
+                assert_command_eq(failed, invalid);
+                assert_eq!(reason, HeaderRequesterFailure::Encode);
+            }
+            event => panic!("unexpected requester event: {event:?}"),
+        }
+
+        requester
+            .try_send(valid)
+            .expect("requester remains available after an encode failure");
+        assert!(matches!(
+            next_event(&mut events_rx).await,
+            HeaderRequesterEvent::Sent { command: sent, .. }
+                if sent.range == valid.range
+                    && sent.expected_max_count == valid.expected_max_count
+                    && sent.purpose == valid.purpose
+        ));
+        time::timeout(Duration::from_secs(1), frames.recv())
+            .await
+            .expect("valid request frame arrives before timeout")
+            .expect("request frame channel stays open");
+
+        shutdown.cancel();
+        assert!(matches!(
+            next_event(&mut events_rx).await,
+            HeaderRequesterEvent::Stopped { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn closed_send_reports_failure_then_stops() {
+        let peer = peer(3);
+        let (session, frames, _cancel) = session(peer.clone(), 1);
+        drop(frames);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let requester = spawn_header_requester(
+            session,
+            TEST_GENERATION,
+            events_tx,
+            CancellationToken::new(),
+        );
+        let command = command(9, 1);
+
+        requester
+            .try_send(command)
+            .expect("requester command queue has capacity");
+
+        match next_event(&mut events_rx).await {
+            HeaderRequesterEvent::Failed {
+                peer: event_peer,
+                session_id,
+                generation,
+                command: failed,
+                reason,
+            } => {
+                assert_eq!(event_peer, peer);
+                assert_eq!(session_id, TEST_SESSION_ID);
+                assert_eq!(generation, TEST_GENERATION);
+                assert_command_eq(failed, command);
+                assert_eq!(reason, HeaderRequesterFailure::Closed);
+            }
+            event => panic!("unexpected requester event: {event:?}"),
+        }
+        assert!(matches!(
+            next_event(&mut events_rx).await,
+            HeaderRequesterEvent::Stopped {
+                peer: event_peer,
+                session_id: TEST_SESSION_ID,
+                generation: TEST_GENERATION,
+            } if event_peer == peer
+        ));
+    }
+}

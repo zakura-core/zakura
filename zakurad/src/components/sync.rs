@@ -1607,6 +1607,7 @@ where
                     let unknown_hashes = if let Some(index) = first_unknown {
                         &hashes[index..]
                     } else {
+                        self.probe_all_known_response(hashes).await;
                         self.trace.tips_response("all_hashes_known", received, 0, 0);
                         continue;
                     };
@@ -2219,6 +2220,78 @@ where
         {
             zs::Response::KnownBlock(loc) => Ok(loc.is_some()),
             _ => unreachable!("wrong response to known block request"),
+        }
+    }
+
+    /// Diagnostic: report where the state thinks every hash of a discarded `FindBlocks` response
+    /// lives, and how deep the endpoints are in the best chain.
+    ///
+    /// `state_contains` collapses [`zs::KnownBlock`] to a bool, which hides the difference between
+    /// a peer answering from an old intersection (all `finalized`, at depth) and the state claiming
+    /// blocks it has not committed, and may never commit (`queue` / `write_channel`).
+    async fn probe_all_known_response(&mut self, hashes: &[block::Hash]) {
+        let mut counts: [(&'static str, usize); 6] = [
+            ("finalized", 0),
+            ("best_chain", 0),
+            ("side_chain", 0),
+            ("write_channel", 0),
+            ("queue", 0),
+            ("absent", 0),
+        ];
+
+        for &hash in hashes {
+            let index = match self.known_block_location(hash).await {
+                Some(zs::KnownBlock::Finalized) => 0,
+                Some(zs::KnownBlock::BestChain) => 1,
+                Some(zs::KnownBlock::SideChain) => 2,
+                Some(zs::KnownBlock::WriteChannel) => 3,
+                Some(zs::KnownBlock::Queue) => 4,
+                None => 5,
+            };
+            counts[index].1 += 1;
+        }
+
+        let first = match hashes.first().copied() {
+            Some(hash) => Some((hash, self.block_depth(hash).await)),
+            None => None,
+        };
+        let last = match hashes.last().copied() {
+            Some(hash) => Some((hash, self.block_depth(hash).await)),
+            None => None,
+        };
+
+        self.trace.tips_known_probe(first, last, &counts);
+    }
+
+    /// Diagnostic: where the state claims `hash` lives, if anywhere.
+    async fn known_block_location(&mut self, hash: block::Hash) -> Option<zs::KnownBlock> {
+        match self
+            .state
+            .ready()
+            .await
+            .ok()?
+            .call(zs::Request::KnownBlock(hash))
+            .await
+            .ok()?
+        {
+            zs::Response::KnownBlock(location) => location,
+            _ => None,
+        }
+    }
+
+    /// Diagnostic: how far below the best chain tip `hash` sits, if it is in the best chain.
+    async fn block_depth(&mut self, hash: block::Hash) -> Option<u32> {
+        match self
+            .state
+            .ready()
+            .await
+            .ok()?
+            .call(zs::Request::Depth(hash))
+            .await
+            .ok()?
+        {
+            zs::Response::Depth(depth) => depth,
+            _ => None,
         }
     }
 

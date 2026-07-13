@@ -122,6 +122,37 @@ impl LegacySyncTrace {
         });
     }
 
+    /// Records where the state claims each hash of a fully-known `FindBlocks` response lives, plus
+    /// the best-chain depth of the response's endpoints.
+    ///
+    /// A response whose hashes are all `finalized` at a large depth means the peer answered from an
+    /// old intersection. Any `queue` or `write_channel` hash means the state is reporting blocks it
+    /// has not committed and may never commit.
+    pub(super) fn tips_known_probe(
+        &self,
+        first: Option<(block::Hash, Option<u32>)>,
+        last: Option<(block::Hash, Option<u32>)>,
+        locations: &[(&'static str, usize)],
+    ) {
+        self.emit("tips_known_probe", |row| {
+            if let Some((hash, depth)) = first {
+                row.insert("first_hash".to_string(), Value::String(hash.to_string()));
+                if let Some(depth) = depth {
+                    row.insert("first_depth".to_string(), Value::from(depth));
+                }
+            }
+            if let Some((hash, depth)) = last {
+                row.insert("last_hash".to_string(), Value::String(hash.to_string()));
+                if let Some(depth) = depth {
+                    row.insert("last_depth".to_string(), Value::from(depth));
+                }
+            }
+            for (location, count) in locations {
+                insert_count(row, location, *count);
+            }
+        });
+    }
+
     pub(super) fn block_finish(
         &self,
         hash: block::Hash,

@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Finalized chain-identity lookups now use retained height/hash indexes after block
+  bodies are pruned.
 - VCT checkpoint writes now use the validated header store for the H+1 root witness,
   avoiding a circular wait for the next checkpoint range's block bodies.
 - `read::history_tree` now returns the finalized history tree only when the
@@ -24,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Removed the body-gated `ZakuraDb::body_hash` and `ZakuraDb::contains_hash`
+  helpers. Use the retained `hash` / `height` indexes for chain identity and the
+  explicit `contains_body_at_height` predicate for body availability.
 - Bumped the state database format to 28 during upgrade, backfilling empty
   Ironwood tree, value pool, and index data, then rebuilding stored history tree
   entries so they use the Ironwood-capable entry size.

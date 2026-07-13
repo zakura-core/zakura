@@ -4707,7 +4707,7 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
         }
     }
 
-    // Completing the first served request frees its slot.
+    // Even a supervised responder panic frees exactly the original request's slot.
     fixture
         .handle
         .send(HeaderSyncEvent::HeaderRangeResponseFinished {
@@ -4717,6 +4717,9 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
             start_height: block::Height(1),
             requested_count: 1,
             returned_count: 0,
+            want_tree_aux_roots: false,
+            roots_complete: true,
+            result: HeaderRangeServeResult::TaskPanic,
         })
         .await
         .unwrap();
@@ -4813,6 +4816,9 @@ async fn serving_responses_echo_request_ids_in_completion_order() {
                 headers: Vec::new(),
                 body_sizes: Vec::new(),
                 tree_aux_roots: Vec::new(),
+                deadline: Instant::now() + HEADER_SYNC_SERVE_DEADLINE,
+                completion: HeaderRangeResponseToken::new(),
+                result: HeaderRangeServeResult::Unavailable,
             })
             .await
             .unwrap();
@@ -4825,6 +4831,131 @@ async fn serving_responses_echo_request_ids_in_completion_order() {
             request_id
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_action_queue_waits_without_manufacturing_an_empty_response() {
+    let network = regtest_network();
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    startup.config.max_inflight_requests = 1;
+    let mut fixture = spawn_test_reactor(startup);
+    let requester = peer(209);
+    let request_id = HeaderSyncRequestId::new(7).expect("non-zero id");
+    let (send, mut recv) = crate::zakura::framed_channel(8);
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        requester.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
+        .await
+        .expect("initial status arrives")
+        .expect("v7 stream stays open");
+    advertise_tip(
+        &fixture,
+        requester.clone(),
+        block::Height(0),
+        block::Height(0),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    // Match the production action-channel capacity without consuming it.
+    for id in 0..128 {
+        connect_peer(&fixture, peer(id)).await;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while fixture.actions.len() < 128 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer status actions fill the action queue");
+    assert_eq!(fixture.actions.len(), 128);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireGetHeaders {
+            peer: requester.clone(),
+            session_id: 0,
+            request_id,
+            start_height: block::Height(1),
+            count: 1,
+            want_tree_aux_roots: false,
+        })
+        .await
+        .unwrap();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), recv.recv())
+            .await
+            .is_err(),
+        "temporary driver backpressure must not look like an unavailable range"
+    );
+
+    // Draining capacity is the only wakeup needed. The original correlated
+    // request eventually reaches the driver without another peer event.
+    let mut query_deadline = None;
+    while query_deadline.is_none() {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryHeadersByHeightRange {
+                peer,
+                session_id,
+                request_id: action_id,
+                start,
+                count,
+                deadline,
+                ..
+            } if peer == requester => {
+                assert_eq!(session_id, 0);
+                assert_eq!(action_id, request_id);
+                assert_eq!(start, block::Height(1));
+                assert_eq!(count, 1);
+                query_deadline = Some(deadline);
+            }
+            _ => {}
+        }
+    }
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeResponseReady {
+            peer: requester,
+            session_id: 0,
+            request_id,
+            start_height: block::Height(1),
+            requested_count: 1,
+            want_tree_aux_roots: false,
+            headers: Vec::new(),
+            body_sizes: Vec::new(),
+            tree_aux_roots: Vec::new(),
+            deadline: query_deadline.expect("query action carries its admission deadline"),
+            completion: HeaderRangeResponseToken::new(),
+            result: HeaderRangeServeResult::Unavailable,
+        })
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
+        .await
+        .expect("real response arrives after action capacity is available")
+        .expect("v7 stream stays open");
+    assert_eq!(
+        HeaderSyncMessage::peek_headers_request_id(&frame.payload).unwrap(),
+        request_id
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -5035,6 +5166,9 @@ async fn replacement_session_ignores_old_state_completion_with_reused_id() {
             headers: Vec::new(),
             body_sizes: Vec::new(),
             tree_aux_roots: Vec::new(),
+            deadline: Instant::now() + HEADER_SYNC_SERVE_DEADLINE,
+            completion: HeaderRangeResponseToken::new(),
+            result: HeaderRangeServeResult::Unavailable,
         })
         .await
         .unwrap();
@@ -5082,6 +5216,9 @@ async fn replacement_session_ignores_old_state_completion_with_reused_id() {
             headers: Vec::new(),
             body_sizes: Vec::new(),
             tree_aux_roots: Vec::new(),
+            deadline: Instant::now() + HEADER_SYNC_SERVE_DEADLINE,
+            completion: HeaderRangeResponseToken::new(),
+            result: HeaderRangeServeResult::Unavailable,
         })
         .await
         .unwrap();

@@ -113,6 +113,106 @@ pub struct DiskDb {
     db: Arc<DB>,
 }
 
+/// A consistent read view shared by all column-family reads in one state request.
+pub struct DiskDbSnapshot<'a> {
+    snapshot: rocksdb::SnapshotWithThreadMode<'a, DB>,
+}
+
+impl DiskDbSnapshot<'_> {
+    /// Returns one typed value from this snapshot.
+    pub fn zs_get<C, K, V>(&self, cf: &C, key: &K) -> Option<V>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk,
+        V: FromDisk,
+    {
+        self.snapshot
+            .get_cf(cf, key.as_bytes())
+            .expect("unexpected database failure")
+            .map(V::from_bytes)
+    }
+
+    /// Returns a forward typed iterator over `range` from this snapshot.
+    pub fn zs_forward_range_iter<'a, C, K, V, R>(
+        &'a self,
+        cf: &'a C,
+        range: R,
+    ) -> impl Iterator<Item = (K, V)> + 'a
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk,
+        R: RangeBounds<K>,
+    {
+        use std::ops::Bound::{self, *};
+
+        let map_to_vec = |bound: Bound<&K>| -> Bound<Vec<u8>> {
+            match bound {
+                Unbounded => Unbounded,
+                Included(value) => Included(value.as_bytes().as_ref().to_vec()),
+                Excluded(value) => Excluded(value.as_bytes().as_ref().to_vec()),
+            }
+        };
+        let range = (
+            map_to_vec(range.start_bound()),
+            map_to_vec(range.end_bound()),
+        );
+        let mode = DiskDb::zs_iter_mode(&range, false);
+        let opts = DiskDb::zs_iter_opts(&range);
+
+        self.snapshot
+            .iterator_cf_opt(cf, opts, mode)
+            .map(|result| result.expect("unexpected database failure"))
+            .map(|(key, value)| (key.to_vec(), value))
+            .skip_while({
+                let range = range.clone();
+                move |(key, _)| !range.contains(key)
+            })
+            .take_while(move |(key, _)| range.contains(key))
+            .map(|(key, value)| (K::from_bytes(key), V::from_bytes(value)))
+    }
+
+    /// Returns a reverse typed iterator over `range` from this snapshot.
+    pub fn zs_reverse_range_iter<'a, C, K, V, R>(
+        &'a self,
+        cf: &'a C,
+        range: R,
+    ) -> impl Iterator<Item = (K, V)> + 'a
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk,
+        R: RangeBounds<K>,
+    {
+        use std::ops::Bound::{self, *};
+
+        let map_to_vec = |bound: Bound<&K>| -> Bound<Vec<u8>> {
+            match bound {
+                Unbounded => Unbounded,
+                Included(value) => Included(value.as_bytes().as_ref().to_vec()),
+                Excluded(value) => Excluded(value.as_bytes().as_ref().to_vec()),
+            }
+        };
+        let range = (
+            map_to_vec(range.start_bound()),
+            map_to_vec(range.end_bound()),
+        );
+        let mode = DiskDb::zs_iter_mode(&range, true);
+        let opts = DiskDb::zs_iter_opts(&range);
+
+        self.snapshot
+            .iterator_cf_opt(cf, opts, mode)
+            .map(|result| result.expect("unexpected database failure"))
+            .map(|(key, value)| (key.to_vec(), value))
+            .skip_while({
+                let range = range.clone();
+                move |(key, _)| !range.contains(key)
+            })
+            .take_while(move |(key, _)| range.contains(key))
+            .map(|(key, value)| (K::from_bytes(key), V::from_bytes(value)))
+    }
+}
+
 /// Wrapper struct to ensure low-level database writes go through the correct API.
 ///
 /// [`rocksdb::WriteBatch`] is a batched set of database updates,
@@ -586,6 +686,13 @@ impl DiskWriteBatch {
 }
 
 impl DiskDb {
+    /// Acquire one RocksDB sequence view for a multi-column read.
+    pub fn snapshot(&self) -> DiskDbSnapshot<'_> {
+        DiskDbSnapshot {
+            snapshot: rocksdb::SnapshotWithThreadMode::new(self.db.as_ref()),
+        }
+    }
+
     /// Prints rocksdb metrics for each column family along with total database disk size, live data disk size and database memory size.
     pub fn print_db_metrics(&self) {
         let mut total_size_on_disk = 0;

@@ -40,7 +40,7 @@ use crate::{
     request::FinalizedBlock,
     service::check,
     service::finalized_state::{
-        disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk},
+        disk_db::{DiskDb, DiskDbSnapshot, DiskWriteBatch, ReadDisk, WriteDisk},
         disk_format::{
             block::TransactionLocation,
             shielded::CommitmentRootsByHeight,
@@ -66,6 +66,200 @@ const ZAKURA_HEADER_HASH_BY_HEIGHT: &str = "zakura_header_hash_by_height";
 const ZAKURA_HEADER_HEIGHT_BY_HASH: &str = "zakura_header_height_by_hash";
 const ZAKURA_HEADER_BY_HEIGHT: &str = "zakura_header_by_height";
 pub const ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT: &str = "zakura_header_body_size_by_height";
+
+fn take_value_at_height<I, V>(rows: &mut std::iter::Peekable<I>, height: block::Height) -> Option<V>
+where
+    I: Iterator<Item = (block::Height, V)>,
+{
+    while rows
+        .peek()
+        .is_some_and(|(row_height, _)| *row_height < height)
+    {
+        let _ = rows.next();
+    }
+    rows.next_if(|(row_height, _)| *row_height == height)
+        .map(|(_, value)| value)
+}
+
+fn fill_header_sync_fallback_roots(
+    db: &DiskDb,
+    snapshot: &DiskDbSnapshot<'_>,
+    rows: &mut [crate::HeaderSyncRangeEntry],
+) {
+    let Some(start) = rows.first().map(|row| row.height) else {
+        return;
+    };
+    let end = rows
+        .last()
+        .expect("a first row exists because the empty case returned")
+        .height;
+    if rows.iter().all(|row| row.commitment_roots.is_some()) {
+        return;
+    }
+
+    let sapling_cf = db.cf_handle("sapling_note_commitment_tree").unwrap();
+    let orchard_cf = db.cf_handle("orchard_note_commitment_tree").unwrap();
+    let ironwood_cf = db.cf_handle("ironwood_note_commitment_tree").unwrap();
+    let tx_cf = db.cf_handle("tx_by_loc").unwrap();
+    let hash_cf = db.cf_handle("hash_by_height").unwrap();
+    let upgrade_cf = db.cf_handle(VCT_UPGRADE_METADATA);
+    let sync_cf = db.cf_handle(VCT_SYNC_METADATA);
+    let upgrade = upgrade_cf.and_then(|cf| snapshot.zs_get::<_, (), Height>(&cf, &()));
+    let handoff = sync_cf.and_then(|cf| snapshot.zs_get::<_, (), Height>(&cf, &()));
+    let finalized_tip = snapshot
+        .zs_reverse_range_iter::<_, Height, block::Hash, _>(&hash_cf, ..)
+        .next()
+        .map(|(height, _)| height);
+
+    let mut sapling = snapshot
+        .zs_reverse_range_iter::<_, Height, Arc<sapling::tree::NoteCommitmentTree>, _>(
+            &sapling_cf,
+            ..=start,
+        )
+        .next()
+        .map(|(_, tree)| tree);
+    let mut orchard = snapshot
+        .zs_reverse_range_iter::<_, Height, Arc<orchard::tree::NoteCommitmentTree>, _>(
+            &orchard_cf,
+            ..=start,
+        )
+        .next()
+        .map(|(_, tree)| tree);
+    let mut ironwood = snapshot
+        .zs_reverse_range_iter::<_, Height, Arc<ironwood::tree::NoteCommitmentTree>, _>(
+            &ironwood_cf,
+            ..=start,
+        )
+        .next()
+        .map(|(_, tree)| tree);
+    let mut sapling_updates = snapshot
+        .zs_forward_range_iter::<_, Height, Arc<sapling::tree::NoteCommitmentTree>, _>(
+            &sapling_cf,
+            (
+                std::ops::Bound::Excluded(start),
+                std::ops::Bound::Included(end),
+            ),
+        )
+        .peekable();
+    let mut orchard_updates = snapshot
+        .zs_forward_range_iter::<_, Height, Arc<orchard::tree::NoteCommitmentTree>, _>(
+            &orchard_cf,
+            (
+                std::ops::Bound::Excluded(start),
+                std::ops::Bound::Included(end),
+            ),
+        )
+        .peekable();
+    let mut ironwood_updates = snapshot
+        .zs_forward_range_iter::<_, Height, Arc<ironwood::tree::NoteCommitmentTree>, _>(
+            &ironwood_cf,
+            (
+                std::ops::Bound::Excluded(start),
+                std::ops::Bound::Included(end),
+            ),
+        )
+        .peekable();
+    let mut transactions = snapshot
+        .zs_forward_range_iter::<_, TransactionLocation, RawBytes, _>(
+            &tx_cf,
+            TransactionLocation::min_for_height(start)..=TransactionLocation::max_for_height(end),
+        )
+        .peekable();
+    metrics::counter!("state.header_sync_range.fallback_iterators").increment(4);
+
+    for row in rows {
+        while let Some((height, _)) = sapling_updates.peek() {
+            if *height > row.height {
+                break;
+            }
+            sapling = sapling_updates.next().map(|(_, tree)| tree);
+        }
+        while let Some((height, _)) = orchard_updates.peek() {
+            if *height > row.height {
+                break;
+            }
+            orchard = orchard_updates.next().map(|(_, tree)| tree);
+        }
+        while let Some((height, _)) = ironwood_updates.peek() {
+            if *height > row.height {
+                break;
+            }
+            ironwood = ironwood_updates.next().map(|(_, tree)| tree);
+        }
+
+        let needs_roots = row.commitment_roots.is_none();
+        let mut block_transactions = Vec::new();
+        while transactions
+            .peek()
+            .is_some_and(|(location, _)| location.height < row.height)
+        {
+            let _ = transactions.next();
+        }
+        while transactions
+            .peek()
+            .is_some_and(|(location, _)| location.height == row.height)
+        {
+            let (_, raw) = transactions
+                .next()
+                .expect("peeked transaction remains available");
+            if needs_roots {
+                block_transactions.push(Arc::<Transaction>::from_bytes(raw.raw_bytes()));
+            }
+        }
+        if !needs_roots {
+            continue;
+        }
+        if finalized_tip.is_none_or(|tip| row.height > tip) {
+            continue;
+        }
+        if upgrade.is_some_and(|upgrade| row.height >= upgrade) {
+            continue;
+        }
+        if handoff.is_some_and(|handoff| {
+            upgrade.unwrap_or(Height(0)) <= row.height && row.height < handoff
+        }) {
+            continue;
+        }
+        let (Some(sapling), Some(orchard)) = (sapling.as_ref(), orchard.as_ref()) else {
+            continue;
+        };
+        let ironwood_root = ironwood
+            .as_ref()
+            .map(|tree| tree.root())
+            .unwrap_or_else(|| ironwood::tree::NoteCommitmentTree::default().root());
+        let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = if block_transactions.is_empty()
+        {
+            metrics::counter!("state.block_roots.zero_aux_fallback").increment(1);
+            (
+                0,
+                0,
+                0,
+                zakura_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+            )
+        } else {
+            let block = Block {
+                header: row.header.clone(),
+                transactions: block_transactions,
+            };
+            (
+                block.sapling_transactions_count(),
+                block.orchard_transactions_count(),
+                block.ironwood_transactions_count(),
+                block.auth_data_root(),
+            )
+        };
+        row.commitment_roots = Some(BlockCommitmentRoots {
+            height: row.height,
+            sapling_root: sapling.root(),
+            orchard_root: orchard.root(),
+            ironwood_root,
+            sapling_tx,
+            orchard_tx,
+            ironwood_tx,
+            auth_data_root,
+        });
+    }
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct AdvertisedBodySize(u32);
@@ -541,11 +735,12 @@ impl ZakuraDb {
     }
 
     /// Returns a contiguous ascending header range from full blocks and Zakura header rows.
-    pub fn headers_by_height_range(
+    pub(crate) fn header_sync_range_snapshot(
         &self,
         start: block::Height,
         count: u32,
-    ) -> Vec<(block::Height, block::Hash, Arc<block::Header>)> {
+        include_roots: bool,
+    ) -> Vec<crate::HeaderSyncRangeEntry> {
         let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
 
         if capped_count == 0 {
@@ -557,32 +752,64 @@ impl ZakuraDb {
         let header_by_height = self.db.cf_handle("block_header_by_height").unwrap();
         let zakura_hash_by_height = self.db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
         let zakura_header_by_height = self.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
+        let block_info = self.db.cf_handle("block_info").unwrap();
+        let body_size_by_height = self
+            .db
+            .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+            .unwrap();
+        let roots_by_height = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+        let snapshot = self.db.snapshot();
 
-        let consensus_hashes: BTreeMap<_, _> = self
-            .db
+        let mut consensus_hashes = snapshot
             .zs_forward_range_iter::<_, block::Height, block::Hash, _>(&hash_by_height, start..=end)
-            .collect();
-        let consensus_headers: BTreeMap<_, _> = self
-            .db
+            .peekable();
+        let mut consensus_headers = snapshot
             .zs_forward_range_iter::<_, block::Height, Arc<block::Header>, _>(
                 &header_by_height,
                 start..=end,
             )
-            .collect();
-        let provisional_hashes: BTreeMap<_, _> = self
-            .db
+            .peekable();
+        let mut provisional_hashes = snapshot
             .zs_forward_range_iter::<_, block::Height, block::Hash, _>(
                 &zakura_hash_by_height,
                 start..=end,
             )
-            .collect();
-        let provisional_headers: BTreeMap<_, _> = self
-            .db
+            .peekable();
+        let mut provisional_headers = snapshot
             .zs_forward_range_iter::<_, block::Height, Arc<block::Header>, _>(
                 &zakura_header_by_height,
                 start..=end,
             )
-            .collect();
+            .peekable();
+        let mut block_infos = snapshot
+            .zs_forward_range_iter::<_, block::Height, zakura_chain::block_info::BlockInfo, _>(
+                &block_info,
+                start..=end,
+            )
+            .peekable();
+        let mut advertised_sizes = snapshot
+            .zs_forward_range_iter::<_, block::Height, AdvertisedBodySize, _>(
+                &body_size_by_height,
+                start..=end,
+            )
+            .peekable();
+        let mut roots = include_roots.then(|| {
+            snapshot
+                .zs_forward_range_iter::<_, block::Height, CommitmentRootsByHeight, _>(
+                    &roots_by_height,
+                    start..=end,
+                )
+                .peekable()
+        });
+        metrics::counter!("state.header_sync_range.iterators", "column" => "header_hash")
+            .increment(2);
+        metrics::counter!("state.header_sync_range.iterators", "column" => "header").increment(2);
+        metrics::counter!("state.header_sync_range.iterators", "column" => "body_size")
+            .increment(2);
+        if include_roots {
+            metrics::counter!("state.header_sync_range.iterators", "column" => "roots")
+                .increment(1);
+        }
 
         let mut headers = Vec::with_capacity(
             usize::try_from(capped_count).expect("capped header count fits in usize"),
@@ -590,17 +817,39 @@ impl ZakuraDb {
         let mut height = start;
 
         for _ in 0..capped_count {
-            let consensus = consensus_hashes
-                .get(&height)
-                .zip(consensus_headers.get(&height));
-            let provisional = provisional_hashes
-                .get(&height)
-                .zip(provisional_headers.get(&height));
+            let consensus = take_value_at_height(&mut consensus_hashes, height)
+                .zip(take_value_at_height(&mut consensus_headers, height));
+            let provisional = take_value_at_height(&mut provisional_hashes, height)
+                .zip(take_value_at_height(&mut provisional_headers, height));
             let Some((hash, header)) = consensus.or(provisional) else {
                 break;
             };
 
-            headers.push((height, *hash, header.clone()));
+            let body_size = take_value_at_height(&mut block_infos, height)
+                .map(|info| info.size())
+                .or_else(|| {
+                    take_value_at_height(&mut advertised_sizes, height).map(AdvertisedBodySize::get)
+                });
+            let commitment_roots = roots
+                .as_mut()
+                .and_then(|roots| take_value_at_height(roots, height))
+                .map(|value| BlockCommitmentRoots {
+                    height,
+                    sapling_root: value.sapling,
+                    orchard_root: value.orchard,
+                    ironwood_root: value.ironwood,
+                    sapling_tx: value.sapling_tx,
+                    orchard_tx: value.orchard_tx,
+                    ironwood_tx: value.ironwood_tx,
+                    auth_data_root: value.auth_data_root,
+                });
+            headers.push(crate::HeaderSyncRangeEntry {
+                height,
+                hash,
+                header,
+                body_size,
+                commitment_roots,
+            });
 
             let Ok(next_height) = height.next() else {
                 break;
@@ -608,7 +857,23 @@ impl ZakuraDb {
             height = next_height;
         }
 
+        if include_roots {
+            fill_header_sync_fallback_roots(&self.db, &snapshot, &mut headers);
+        }
+
         headers
+    }
+
+    /// Returns a contiguous ascending header range from full blocks and Zakura header rows.
+    pub fn headers_by_height_range(
+        &self,
+        start: block::Height,
+        count: u32,
+    ) -> Vec<(block::Height, block::Hash, Arc<block::Header>)> {
+        self.header_sync_range_snapshot(start, count, false)
+            .into_iter()
+            .map(|row| (row.height, row.hash, row.header))
+            .collect()
     }
 
     /// Returns recent header difficulty/time context in reverse height order,

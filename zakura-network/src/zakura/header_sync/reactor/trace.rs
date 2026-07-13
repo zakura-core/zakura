@@ -5,8 +5,8 @@ use super::super::{
     config::HeaderSyncStatus,
     error::HeaderSyncWireError,
     events::{
-        HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncMisbehavior,
-        HeaderSyncRequestId,
+        HeaderRangeServeResult, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
+        HeaderSyncMisbehavior, HeaderSyncRequestId,
     },
     state::RangeRequest,
     validation::count_between,
@@ -41,6 +41,27 @@ impl TreeAuxTraceSummary {
             len: u32::try_from(roots.len()).unwrap_or(u32::MAX),
             first_height: roots.first().map(|root| root.height),
             last_height: roots.last().map(|root| root.height),
+        }
+    }
+
+    /// Rebuilds the summary from a completion report, which carries counts rather than roots.
+    ///
+    /// A serve that wanted no roots, did not carry complete ones, or returned no headers has no
+    /// root range to describe.
+    pub(super) fn from_completion(
+        start_height: block::Height,
+        returned_count: u32,
+        want_tree_aux_roots: bool,
+        roots_complete: bool,
+    ) -> Self {
+        if !want_tree_aux_roots || !roots_complete || returned_count == 0 {
+            return Self::default();
+        }
+
+        Self {
+            len: returned_count,
+            first_height: Some(start_height),
+            last_height: start_height + i64::from(returned_count.saturating_sub(1)),
         }
     }
 
@@ -170,6 +191,7 @@ impl HeaderSyncReactor {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn trace_headers_served(
         &self,
         peer: &ZakuraPeerId,
@@ -178,6 +200,8 @@ impl HeaderSyncReactor {
         returned_count: u32,
         want_tree_aux_roots: bool,
         roots: TreeAuxTraceSummary,
+        roots_complete: bool,
+        result: HeaderRangeServeResult,
     ) {
         self.emit_trace(hs_trace::HEADER_HEADERS_SERVED, |row| {
             insert_peer(row, hs_trace::PEER, peer);
@@ -186,6 +210,8 @@ impl HeaderSyncReactor {
             insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(requested_count));
             insert_bool(row, hs_trace::WANT_TREE_AUX_ROOTS, want_tree_aux_roots);
             insert_u64(row, hs_trace::TREE_AUX_ROOTS_LEN, u64::from(roots.len));
+            insert_bool(row, hs_trace::ROOTS_COMPLETE, roots_complete);
+            insert_optional_str(row, hs_trace::RESULT, Some(result.label()));
             roots.insert_into(row);
         });
     }
@@ -543,22 +569,36 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
         }
         HeaderSyncEvent::HeaderRangeResponseFinished {
             peer,
+            session_id,
+            request_id,
             start_height,
             requested_count,
             returned_count,
-            ..
+            want_tree_aux_roots,
+            roots_complete,
+            result,
         } => {
             insert_optional_str(row, hs_trace::KIND, Some("header_range_response_finished"));
             insert_peer(row, hs_trace::PEER, peer);
             insert_height(row, hs_trace::RANGE_START, *start_height);
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*returned_count));
             insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(*requested_count));
+            insert_u64(row, hs_trace::SESSION_ID, *session_id);
+            insert_u64(row, hs_trace::REQUEST_ID, request_id.get());
+            insert_bool(row, hs_trace::WANT_TREE_AUX_ROOTS, *want_tree_aux_roots);
+            insert_bool(row, hs_trace::ROOTS_COMPLETE, *roots_complete);
+            insert_optional_str(row, hs_trace::RESULT, Some(result.label()));
         }
         HeaderSyncEvent::HeaderRangeResponseReady {
             peer,
+            session_id,
+            request_id,
             start_height,
             requested_count,
+            want_tree_aux_roots,
             headers,
+            tree_aux_roots,
+            result,
             ..
         } => {
             insert_optional_str(row, hs_trace::KIND, Some("header_range_response_ready"));
@@ -566,6 +606,15 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
             insert_height(row, hs_trace::RANGE_START, *start_height);
             insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
             insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(*requested_count));
+            insert_u64(row, hs_trace::SESSION_ID, *session_id);
+            insert_u64(row, hs_trace::REQUEST_ID, request_id.get());
+            insert_bool(row, hs_trace::WANT_TREE_AUX_ROOTS, *want_tree_aux_roots);
+            insert_u64(
+                row,
+                hs_trace::TREE_AUX_ROOTS_LEN,
+                tree_aux_roots.len() as u64,
+            );
+            insert_optional_str(row, hs_trace::RESULT, Some(result.label()));
         }
     }
 }
@@ -898,7 +947,10 @@ mod tests {
     use crate::zakura::{
         framed_channel,
         header_sync::{
-            events::HeaderSyncFrontiers, service::HeaderSyncPeerSession, state::RangePriority,
+            events::{HeaderRangeResponseToken, HeaderSyncFrontiers},
+            service::HeaderSyncPeerSession,
+            state::RangePriority,
+            wire::HEADER_SYNC_SERVE_DEADLINE,
         },
         HeaderSyncServiceSummary,
     };
@@ -1085,6 +1137,9 @@ mod tests {
                 start_height: block::Height(5),
                 requested_count: 3,
                 returned_count: 2,
+                want_tree_aux_roots: false,
+                roots_complete: false,
+                result: HeaderRangeServeResult::Success,
             },
             HeaderSyncEvent::HeaderRangeResponseReady {
                 peer,
@@ -1096,6 +1151,9 @@ mod tests {
                 headers: vec![header],
                 body_sizes: vec![1],
                 tree_aux_roots: Vec::new(),
+                deadline: tokio::time::Instant::now() + HEADER_SYNC_SERVE_DEADLINE,
+                completion: HeaderRangeResponseToken::new(),
+                result: HeaderRangeServeResult::Success,
             },
         ];
 
@@ -1162,6 +1220,7 @@ mod tests {
                     start: block::Height(3),
                     count: 4,
                     want_tree_aux_roots: true,
+                    deadline: tokio::time::Instant::now() + HEADER_SYNC_SERVE_DEADLINE,
                 },
                 "query_headers_by_height_range",
             ),

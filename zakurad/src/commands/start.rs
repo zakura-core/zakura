@@ -1517,11 +1517,241 @@ mod zakura_header_sync_driver_tests {
         commit_block_sync_body, drive_block_sync_actions, drive_zakura_header_sync_actions,
         header_range_commit_error_label, header_range_commit_failure_kind,
         notify_block_sync_header_tip, query_block_sync_frontiers, query_block_sync_needed_blocks,
-        root_covered_query_best_header_tip, tree_aux_roots_for_served_header_range,
-        verified_block_tip_from_state, BlockApplyClass, BlocksyncThroughputProbe,
-        ZakuraHeaderSyncDriverHandles, ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL,
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+        root_covered_query_best_header_tip, serve_header_sync_range,
+        tree_aux_roots_for_served_header_range, verified_block_tip_from_state, BlockApplyClass,
+        BlocksyncThroughputProbe, ZakuraHeaderSyncDriverHandles,
+        ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+        ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
     };
+
+    fn header_sync_handle_for_serving_test() -> (
+        zakura_network::zakura::HeaderSyncHandle,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let network = zakura_chain::parameters::Network::Mainnet;
+        let anchor = (block::Height(0), network.genesis_hash());
+        let startup = zakura_network::zakura::HeaderSyncStartup::new(
+            network,
+            anchor,
+            HeaderSyncFrontiers {
+                finalized_height: anchor.0,
+                verified_block_tip: anchor.0,
+                verified_block_hash: anchor.1,
+            },
+            Some(anchor),
+            zakura_network::zakura::ZakuraHeaderSyncConfig::default(),
+            2 * 1024 * 1024,
+        );
+        let (handle, _actions, task) = zakura_network::zakura::spawn_header_sync_reactor(startup)
+            .expect("serving test header-sync reactor starts");
+        (handle, task)
+    }
+
+    struct ActiveServingRead(Arc<AtomicUsize>);
+
+    impl Drop for ActiveServingRead {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn timed_out_header_reads_keep_the_real_concurrency_slot() {
+        let (header_sync, reactor_task) = header_sync_handle_for_serving_test();
+        let read_slots = Arc::new(tokio::sync::Semaphore::new(32));
+        let read_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let read_state = service_fn({
+            let read_gate = read_gate.clone();
+            let active = active.clone();
+            let started = started.clone();
+            move |request: zakura_state::ReadRequest| {
+                let read_gate = read_gate.clone();
+                let active = active.clone();
+                let started = started.clone();
+                async move {
+                    assert!(matches!(
+                        request,
+                        zakura_state::ReadRequest::HeaderSyncRange { .. }
+                    ));
+                    started.fetch_add(1, Ordering::SeqCst);
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _active = ActiveServingRead(active);
+                    let permit = read_gate
+                        .acquire()
+                        .await
+                        .expect("read test gate stays open");
+                    permit.forget();
+                    Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::HeaderSyncRange(
+                        Vec::new(),
+                    ))
+                }
+            }
+        });
+        let peer = test_zakura_peer(240);
+        let now = tokio::time::Instant::now();
+        let mut tasks = Vec::new();
+        for id in 1..=32 {
+            tasks.push(tokio::spawn(serve_header_sync_range(
+                read_state.clone(),
+                header_sync.clone(),
+                zakura_network::zakura::ZakuraTrace::noop(),
+                read_slots.clone(),
+                peer.clone(),
+                0,
+                zakura_network::zakura::HeaderSyncRequestId::new(id)
+                    .expect("test request ID is non-zero"),
+                block::Height(id as u32),
+                1,
+                false,
+                now + Duration::from_secs(10),
+            )));
+        }
+        tasks.push(tokio::spawn(serve_header_sync_range(
+            read_state,
+            header_sync,
+            zakura_network::zakura::ZakuraTrace::noop(),
+            read_slots.clone(),
+            peer,
+            0,
+            zakura_network::zakura::HeaderSyncRequestId::new(33)
+                .expect("test request ID is non-zero"),
+            block::Height(33),
+            1,
+            false,
+            now + Duration::from_secs(20),
+        )));
+
+        while active.load(Ordering::SeqCst) < 32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(started.load(Ordering::SeqCst), 32);
+        assert_eq!(read_slots.available_permits(), 0);
+
+        // The request tasks stop waiting at the response deadline minus the
+        // outbound margin. Their state workers deliberately remain alive.
+        tokio::time::advance(Duration::from_secs(9)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 32);
+        assert_eq!(started.load(Ordering::SeqCst), 32);
+        assert_eq!(read_slots.available_permits(), 0);
+
+        // Finishing one actual state worker, rather than timing out its caller,
+        // is what lets the 33rd read enter state.
+        read_gate.add_permits(1);
+        while started.load(Ordering::SeqCst) < 33 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 32);
+        assert_eq!(read_slots.available_permits(), 0);
+
+        read_gate.add_permits(32);
+        for task in tasks {
+            task.await.expect("serving task does not panic");
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(read_slots.available_permits(), 32);
+        reactor_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn header_serving_uses_one_absolute_deadline_across_stages() {
+        let (header_sync, reactor_task) = header_sync_handle_for_serving_test();
+        let read_slots = Arc::new(tokio::sync::Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let read_state = service_fn({
+            let active = active.clone();
+            move |request: zakura_state::ReadRequest| {
+                let active = active.clone();
+                async move {
+                    assert!(matches!(
+                        request,
+                        zakura_state::ReadRequest::HeaderSyncRange { .. }
+                    ));
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _active = ActiveServingRead(active);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::HeaderSyncRange(
+                        Vec::new(),
+                    ))
+                }
+            }
+        });
+        let now = tokio::time::Instant::now();
+        let task = tokio::spawn(serve_header_sync_range(
+            read_state,
+            header_sync,
+            zakura_network::zakura::ZakuraTrace::noop(),
+            read_slots.clone(),
+            test_zakura_peer(241),
+            0,
+            zakura_network::zakura::HeaderSyncRequestId::new(1)
+                .expect("test request ID is non-zero"),
+            block::Height(1),
+            1,
+            false,
+            now + Duration::from_secs(10),
+        ));
+
+        tokio::time::advance(Duration::from_secs(8)).await;
+        read_slots.add_permits(1);
+        while active.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            task.is_finished(),
+            "the state stage must inherit the original deadline instead of receiving a fresh one"
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        assert_eq!(read_slots.available_permits(), 0);
+
+        task.await.expect("serving task does not panic");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        while active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(read_slots.available_permits(), 1);
+        reactor_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn panicking_header_state_read_is_supervised_and_releases_its_permit() {
+        let (header_sync, reactor_task) = header_sync_handle_for_serving_test();
+        let read_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
+            assert!(matches!(
+                request,
+                zakura_state::ReadRequest::HeaderSyncRange { .. }
+            ));
+            panic!("injected header-range state panic");
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::HeaderSyncRange(Vec::new()))
+        });
+        serve_header_sync_range(
+            read_state,
+            header_sync,
+            zakura_network::zakura::ZakuraTrace::noop(),
+            read_slots.clone(),
+            test_zakura_peer(242),
+            0,
+            zakura_network::zakura::HeaderSyncRequestId::new(1)
+                .expect("test request ID is non-zero"),
+            block::Height(1),
+            1,
+            false,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(read_slots.available_permits(), 1);
+        reactor_task.abort();
+    }
 
     fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
         Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))

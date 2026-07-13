@@ -28,8 +28,12 @@ use crate::{
     arbitrary::Prepare,
     init_test,
     service::{
-        arbitrary::populated_state, chain_tip::TipAction, headers_by_height_range,
-        non_finalized_state::Chain, read, StateService,
+        arbitrary::populated_state,
+        chain_tip::TipAction,
+        finalized_state::{serve_block_roots, DiskWriteBatch, WriteDisk, VCT_UPGRADE_METADATA},
+        headers_by_height_range,
+        non_finalized_state::Chain,
+        read, StateService,
     },
     tests::{
         setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
@@ -498,6 +502,39 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
             .oneshot(ReadRequest::FinalizedTip)
             .await?,
         ReadResponse::FinalizedTip(Some((Height(0), genesis.hash()))),
+    );
+
+    // Simulate a pre-index archive database. HeaderSyncRange must derive the
+    // finalized roots from the same snapshot as its header/hash/body columns.
+    read_state
+        .db
+        .delete_zakura_header_commitment_roots([Height(0)])?;
+    let upgrade_cf = read_state
+        .db
+        .db()
+        .cf_handle(VCT_UPGRADE_METADATA)
+        .expect("VCT upgrade metadata column exists");
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_delete(&upgrade_cf, ());
+    read_state.db.write_batch(batch)?;
+    let expected_genesis_roots = serve_block_roots(&read_state.db, Height(0)..=Height(0));
+    let ReadResponse::HeaderSyncRange(genesis_rows) = read_state
+        .clone()
+        .oneshot(ReadRequest::HeaderSyncRange {
+            start: Height(0),
+            count: 1,
+            include_roots: true,
+        })
+        .await?
+    else {
+        panic!("HeaderSyncRange returns its matching response variant");
+    };
+    assert_eq!(genesis_rows.len(), 1);
+    assert_eq!(genesis_rows[0].height, Height(0));
+    assert_eq!(genesis_rows[0].hash, genesis.hash());
+    assert_eq!(
+        genesis_rows[0].commitment_roots.as_ref(),
+        expected_genesis_roots.first()
     );
 
     let genesis_size = u32::try_from(genesis.zcash_serialize_to_vec()?.len())

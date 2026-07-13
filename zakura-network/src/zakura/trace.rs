@@ -418,6 +418,10 @@ pub mod header_sync_trace {
     pub const SESSION_ID: &str = "session_id";
     /// Header-sync v7 request identifier, when present.
     pub const REQUEST_ID: &str = "request_id";
+    /// Exact serving/request terminal result.
+    pub const RESULT: &str = "result";
+    /// Whether requested serving roots were complete and height-aligned.
+    pub const ROOTS_COMPLETE: &str = "roots_complete";
     /// Negotiated header-sync stream version for this peer session.
     pub const STREAM_VERSION: &str = "stream_version";
     /// Bounded reason field.

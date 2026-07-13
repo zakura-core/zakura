@@ -4,6 +4,110 @@ use crate::zakura::{
     ZakuraHeaderSyncCandidateState,
 };
 
+/// Terminal outcome of an admitted inbound header-range request.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HeaderRangeServeResult {
+    /// A non-empty response was enqueued.
+    Success,
+    /// State had no contiguous rows at the requested start.
+    Unavailable,
+    /// Required commitment roots were incomplete.
+    IncompleteRoots,
+    /// State returned an error or an unexpected response variant.
+    StateError,
+    /// The one end-to-end serving deadline expired during state work.
+    StateTimeout,
+    /// The deadline expired before the request reached state.
+    AdmissionTimeout,
+    /// The deadline expired while waiting for outbound capacity.
+    OutboundTimeout,
+    /// The peer stream closed before enqueue completed.
+    StreamClosed,
+    /// The request belonged to a replaced session.
+    StaleSession,
+    /// A supervised serving task panicked.
+    TaskPanic,
+    /// The reactor or driver closed before completion.
+    ReactorClosed,
+    /// Internal response alignment validation failed.
+    InvalidPreparedResponse,
+}
+
+impl HeaderRangeServeResult {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Unavailable => "unavailable",
+            Self::IncompleteRoots => "incomplete_roots",
+            Self::StateError => "state_error",
+            Self::StateTimeout => "state_timeout",
+            Self::AdmissionTimeout => "admission_timeout",
+            Self::OutboundTimeout => "outbound_timeout",
+            Self::StreamClosed => "stream_closed",
+            Self::StaleSession => "stale_session",
+            Self::TaskPanic => "task_panic",
+            Self::ReactorClosed => "reactor_closed",
+            Self::InvalidPreparedResponse => "invalid_prepared_response",
+        }
+    }
+}
+
+/// Acknowledges when a materialized response no longer consumes global serving capacity.
+#[derive(Clone, Debug)]
+pub struct HeaderRangeResponseToken {
+    inner: Arc<HeaderRangeResponseTokenInner>,
+}
+
+#[derive(Debug)]
+struct HeaderRangeResponseTokenInner {
+    finished: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl HeaderRangeResponseToken {
+    /// Create an unfinished response token.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(HeaderRangeResponseTokenInner {
+                finished: std::sync::atomic::AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    /// Mark the response payload as released. This operation is idempotent.
+    pub fn finish(&self) {
+        if !self
+            .inner
+            .finished
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    /// Wait until outbound processing releases the response payload.
+    pub async fn finished(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            if self
+                .inner
+                .finished
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Default for HeaderRangeResponseToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Cached state frontiers used by the header-sync reactor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct HeaderSyncFrontiers {
@@ -322,6 +426,12 @@ pub enum HeaderSyncEvent {
         requested_count: u32,
         /// Number of headers read from state and sent in the response.
         returned_count: u32,
+        /// Whether roots were requested by the peer.
+        want_tree_aux_roots: bool,
+        /// Whether requested roots were complete and aligned.
+        roots_complete: bool,
+        /// Precise terminal outcome.
+        result: HeaderRangeServeResult,
     },
     /// State returned headers requested by a peer and the reactor should send them.
     HeaderRangeResponseReady {
@@ -343,6 +453,12 @@ pub enum HeaderSyncEvent {
         body_sizes: Vec<u32>,
         /// Per-height commitment roots, parallel to `headers`.
         tree_aux_roots: Vec<BlockCommitmentRoots>,
+        /// One absolute deadline created when the wire request was admitted.
+        deadline: Instant,
+        /// Holds global materialized-response capacity until outbound completion.
+        completion: HeaderRangeResponseToken,
+        /// Preparation outcome to preserve through terminal tracing.
+        result: HeaderRangeServeResult,
     },
 }
 
@@ -424,6 +540,8 @@ pub enum HeaderSyncAction {
         count: u32,
         /// Whether the requester wants all-or-nothing tree-aux roots.
         want_tree_aux_roots: bool,
+        /// One absolute deadline created when the wire request was admitted.
+        deadline: Instant,
     },
     /// Ask state for missing block-body gaps.
     QueryMissingBlockBodies {

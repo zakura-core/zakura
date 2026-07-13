@@ -412,6 +412,7 @@ pub(crate) async fn drive_header_sync_actions(
                 request_id,
                 start,
                 count,
+                want_tree_aux_roots,
                 ..
             } => {
                 let _ = handle
@@ -422,6 +423,9 @@ pub(crate) async fn drive_header_sync_actions(
                         start_height: start,
                         requested_count: count,
                         returned_count: 0,
+                        want_tree_aux_roots,
+                        roots_complete: false,
+                        result: HeaderRangeServeResult::ReactorClosed,
                     })
                     .await;
             }

@@ -1473,18 +1473,22 @@ where
     C: AsRef<Chain> + Clone,
 {
     let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
+    let mut disk_headers = db
+        .headers_by_height_range(start, capped_count)
+        .into_iter()
+        .peekable();
     let mut headers = Vec::with_capacity(
         usize::try_from(capped_count).expect("capped header count fits in usize"),
     );
     let mut height = start;
 
     for _ in 0..capped_count {
-        let next_header = read::hash_by_height(chain.clone(), db, height)
-            .and_then(|hash| {
-                read::block_header(chain.clone(), db, height.into())
-                    .map(|header| (height, hash, header))
-            })
-            .or_else(|| db.headers_by_height_range(height, 1).into_iter().next());
+        let disk_header = disk_headers.next_if(|(disk_height, _, _)| *disk_height == height);
+        let next_header = chain
+            .as_ref()
+            .and_then(|chain| chain.as_ref().block(height.into()))
+            .map(|block| (height, block.hash, block.block.header.clone()))
+            .or(disk_header);
 
         let Some(header) = next_header else {
             break;
@@ -1512,29 +1516,52 @@ where
     C: AsRef<Chain> + Clone,
 {
     let count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
-    let headers = headers_by_height_range(chain.clone(), db, start, count);
-    let body_sizes: HashMap<_, _> = read::block_size_hints(chain.clone(), db, start, count)
+    let mut disk_rows = db
+        .header_sync_range_snapshot(start, count, include_roots)
         .into_iter()
-        .collect();
-    let commitment_roots: HashMap<_, _> = if include_roots {
-        block_roots_by_height_range(chain, db, start, count)
-            .into_iter()
-            .map(|roots| (roots.height, roots))
-            .collect()
-    } else {
-        HashMap::new()
-    };
+        .peekable();
+    let mut rows = Vec::with_capacity(
+        usize::try_from(count).expect("capped header-sync range count fits in usize"),
+    );
+    let mut height = start;
+    for _ in 0..count {
+        let disk_row = disk_rows.next_if(|row| row.height == height);
+        let row = chain
+            .as_ref()
+            .and_then(|chain| chain.as_ref().block(height.into()))
+            .map(|block| crate::HeaderSyncRangeEntry {
+                height,
+                hash: block.hash,
+                header: block.block.header.clone(),
+                body_size: Some(
+                    u32::try_from(block.block.zcash_serialized_size())
+                        .expect("serialized consensus blocks are bounded below u32::MAX"),
+                ),
+                commitment_roots: None,
+            })
+            .or(disk_row);
+        let Some(row) = row else {
+            break;
+        };
+        rows.push(row);
+        let Ok(next) = height.next() else {
+            break;
+        };
+        height = next;
+    }
 
-    headers
-        .into_iter()
-        .map(|(height, hash, header)| crate::HeaderSyncRangeEntry {
-            height,
-            hash,
-            header,
-            body_size: body_sizes.get(&height).copied().flatten(),
-            commitment_roots: commitment_roots.get(&height).cloned(),
-        })
-        .collect()
+    if include_roots && rows.iter().any(|row| row.commitment_roots.is_none()) {
+        let mut fallback = block_roots_by_height_range(chain, db, start, count)
+            .into_iter()
+            .peekable();
+        for row in &mut rows {
+            if let Some(roots) = fallback.next_if(|roots| roots.height == row.height) {
+                row.commitment_roots.get_or_insert(roots);
+            }
+        }
+    }
+
+    rows
 }
 
 fn missing_block_body_metadata<C>(

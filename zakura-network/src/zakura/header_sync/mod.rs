@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use iroh::NodeId;
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{mpsc, watch, Notify},
     task::{JoinError, JoinHandle},
     time::{self, Instant},
 };
@@ -49,9 +49,9 @@ pub use config::{
 };
 pub use error::{HeaderSyncStartError, HeaderSyncWireError};
 pub use events::{
-    ExpectedHeadersResponse, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
-    HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncRequestId,
-    HeaderSyncStartup,
+    ExpectedHeadersResponse, HeaderRangeResponseToken, HeaderRangeServeResult, HeaderSyncAction,
+    HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle,
+    HeaderSyncMisbehavior, HeaderSyncRequestId, HeaderSyncStartup,
 };
 pub use reactor::spawn_header_sync_reactor;
 pub use service::HeaderSyncPeerSession;

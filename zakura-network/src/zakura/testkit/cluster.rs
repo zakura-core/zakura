@@ -152,7 +152,8 @@ mod tests {
             block_sync::{MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC},
             spawn_header_sync_reactor, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
             BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage,
-            BlockSyncStatus, DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderSyncAction,
+            BlockSyncStatus, DiscoveryMessage, Frame, FramedRecv, FramedSend,
+            HeaderRangeResponseToken, HeaderRangeServeResult, HeaderSyncAction,
             HeaderSyncCommitFailureKind, HeaderSyncDecodeContext, HeaderSyncEvent,
             HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage, HeaderSyncMisbehavior,
             HeaderSyncPeerSession, HeaderSyncRequestId, HeaderSyncStartup, HeaderSyncStatus, Peer,
@@ -171,6 +172,7 @@ mod tests {
     use tokio::{
         sync::{mpsc, Mutex},
         task::JoinHandle,
+        time::Instant,
     };
     use tokio_util::sync::CancellationToken;
     use zakura_chain::{
@@ -1049,6 +1051,9 @@ mod tests {
                                 start_height: start,
                                 requested_count: count,
                                 returned_count,
+                                want_tree_aux_roots: false,
+                                roots_complete: true,
+                                result: HeaderRangeServeResult::Success,
                             })
                             .await;
                     }
@@ -1414,6 +1419,7 @@ mod tests {
         start: block::Height,
         count: u32,
         want_tree_aux_roots: bool,
+        deadline: Instant,
     }
 
     #[derive(Debug)]
@@ -1438,6 +1444,7 @@ mod tests {
                         start,
                         count,
                         want_tree_aux_roots,
+                        deadline,
                     }) => {
                         return Ok(ControlledHeaderQuery {
                             peer,
@@ -1446,6 +1453,7 @@ mod tests {
                             start,
                             count,
                             want_tree_aux_roots,
+                            deadline,
                         });
                     }
                     Some(HeaderSyncAction::Misbehavior { reason, .. }) => {
@@ -1561,6 +1569,11 @@ mod tests {
         else {
             unreachable!("headers_for_query always returns Headers");
         };
+        let result = if headers.is_empty() {
+            HeaderRangeServeResult::Unavailable
+        } else {
+            HeaderRangeServeResult::Success
+        };
         handle
             .send(HeaderSyncEvent::HeaderRangeResponseReady {
                 peer: query.peer.clone(),
@@ -1572,6 +1585,9 @@ mod tests {
                 headers,
                 body_sizes,
                 tree_aux_roots,
+                deadline: query.deadline,
+                completion: HeaderRangeResponseToken::new(),
+                result,
             })
             .await?;
         Ok(())
@@ -1617,6 +1633,9 @@ mod tests {
                                 start_height: start,
                                 requested_count: count,
                                 returned_count: 0,
+                                want_tree_aux_roots: false,
+                                roots_complete: false,
+                                result: HeaderRangeServeResult::ReactorClosed,
                             })
                             .await;
                     }
@@ -2919,6 +2938,7 @@ mod tests {
                 start: *start,
                 count: *count,
                 want_tree_aux_roots: *want_tree_aux_roots,
+                deadline: Instant::now() + Duration::from_secs(10),
             };
             hostile
                 .send_ordered_raw_frame_with_version(

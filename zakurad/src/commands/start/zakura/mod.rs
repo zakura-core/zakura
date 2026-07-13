@@ -136,7 +136,8 @@ pub(crate) use header_sync_driver::{
     block_roots_cover_range, block_sync_chain_tip_event, body_sizes_for_served_header_range,
     chain_tip_mirror_frontier_change, header_range_commit_error_label,
     header_range_commit_failure_kind, notify_block_sync_header_tip,
-    root_covered_query_best_header_tip, tree_aux_roots_for_served_header_range,
+    root_covered_query_best_header_tip, serve_header_sync_range,
+    tree_aux_roots_for_served_header_range,
 };
 pub(crate) use header_sync_driver::{
     drive_vct_root_repairs, drive_zakura_header_sync_actions, mirror_zakura_full_block_commits,

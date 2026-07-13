@@ -1,10 +1,12 @@
 use std::{
     future::Future,
+    panic::AssertUnwindSafe,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use color_eyre::eyre::{eyre, Report};
+use futures::FutureExt;
 use tokio::{
     pin, select,
     sync::{mpsc, Semaphore},
@@ -18,7 +20,8 @@ use zakura_chain::{
     parallel::commitment_aux::BlockCommitmentRoots,
 };
 use zakura_network::zakura::{
-    commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange, HeaderSyncAction,
+    commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange,
+    HeaderRangeResponseToken, HeaderRangeServeResult, HeaderSyncAction,
     HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, ZakuraEndpoint,
     ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
 };
@@ -383,8 +386,131 @@ mod vct_root_repair_driver_tests {
     }
 }
 
+struct DriverServingCompletion {
+    header_sync: zakura_network::zakura::HeaderSyncHandle,
+    peer: zakura_network::zakura::ZakuraPeerId,
+    session_id: u64,
+    request_id: zakura_network::zakura::HeaderSyncRequestId,
+    start: block::Height,
+    count: u32,
+    want_tree_aux_roots: bool,
+    armed: bool,
+}
+
+struct ActiveHeaderRangeRead;
+
+impl ActiveHeaderRangeRead {
+    fn new() -> Self {
+        metrics::gauge!("sync.header.serve.active_reads").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for ActiveHeaderRangeRead {
+    fn drop(&mut self) {
+        metrics::gauge!("sync.header.serve.active_reads").decrement(1.0);
+    }
+}
+
+impl DriverServingCompletion {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        header_sync: zakura_network::zakura::HeaderSyncHandle,
+        peer: zakura_network::zakura::ZakuraPeerId,
+        session_id: u64,
+        request_id: zakura_network::zakura::HeaderSyncRequestId,
+        start: block::Height,
+        count: u32,
+        want_tree_aux_roots: bool,
+    ) -> Self {
+        Self {
+            header_sync,
+            peer,
+            session_id,
+            request_id,
+            start,
+            count,
+            want_tree_aux_roots,
+            armed: true,
+        }
+    }
+
+    fn finish(&mut self, result: HeaderRangeServeResult) {
+        self.send(result);
+        self.armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn send(&self, result: HeaderRangeServeResult) {
+        let _ = self
+            .header_sync
+            .send_lifecycle(HeaderSyncEvent::HeaderRangeResponseFinished {
+                peer: self.peer.clone(),
+                session_id: self.session_id,
+                request_id: self.request_id,
+                start_height: self.start,
+                requested_count: self.count,
+                returned_count: 0,
+                want_tree_aux_roots: self.want_tree_aux_roots,
+                roots_complete: false,
+                result,
+            });
+    }
+}
+
+impl Drop for DriverServingCompletion {
+    fn drop(&mut self) {
+        if self.armed {
+            self.send(HeaderRangeServeResult::TaskPanic);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn serve_header_sync_range<ReadState>(
+async fn send_empty_header_range_response(
+    header_sync: &zakura_network::zakura::HeaderSyncHandle,
+    peer: zakura_network::zakura::ZakuraPeerId,
+    session_id: u64,
+    request_id: zakura_network::zakura::HeaderSyncRequestId,
+    start: block::Height,
+    count: u32,
+    want_tree_aux_roots: bool,
+    deadline: tokio::time::Instant,
+    result: HeaderRangeServeResult,
+) -> Result<(), ()> {
+    let completion = HeaderRangeResponseToken::new();
+    metrics::gauge!("sync.header.serve.prepared_responses").increment(1.0);
+    if header_sync
+        .send_lifecycle(HeaderSyncEvent::HeaderRangeResponseReady {
+            peer,
+            session_id,
+            request_id,
+            start_height: start,
+            requested_count: count,
+            want_tree_aux_roots,
+            headers: Vec::new(),
+            body_sizes: Vec::new(),
+            tree_aux_roots: Vec::new(),
+            deadline,
+            completion: completion.clone(),
+            result,
+        })
+        .is_err()
+    {
+        completion.finish();
+        metrics::gauge!("sync.header.serve.prepared_responses").decrement(1.0);
+        return Err(());
+    }
+    completion.finished().await;
+    metrics::gauge!("sync.header.serve.prepared_responses").decrement(1.0);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_header_sync_range<ReadState>(
     read_state: ReadState,
     header_sync: zakura_network::zakura::HeaderSyncHandle,
     trace: ZakuraTrace,
@@ -395,6 +521,7 @@ async fn serve_header_sync_range<ReadState>(
     start: block::Height,
     count: u32,
     want_tree_aux_roots: bool,
+    deadline: tokio::time::Instant,
 ) where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -404,41 +531,147 @@ async fn serve_header_sync_range<ReadState>(
         + 'static,
     ReadState::Future: Send + 'static,
 {
-    const STATE_READ_DEADLINE: Duration = Duration::from_secs(9);
+    const OUTBOUND_DEADLINE_MARGIN: Duration = Duration::from_secs(1);
+    let mut terminal = DriverServingCompletion::new(
+        header_sync.clone(),
+        peer.clone(),
+        session_id,
+        request_id,
+        start,
+        count,
+        want_tree_aux_roots,
+    );
     let queue_started = Instant::now();
-    let Ok(permit) = read_slots.acquire_owned().await else {
-        return;
+    let read_deadline = deadline
+        .checked_sub(OUTBOUND_DEADLINE_MARGIN)
+        .unwrap_or(deadline);
+    metrics::gauge!("sync.header.serve.queued_requests").increment(1.0);
+    let permit = match tokio::time::timeout_at(read_deadline, read_slots.acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            metrics::gauge!("sync.header.serve.queued_requests").decrement(1.0);
+            terminal.finish(HeaderRangeServeResult::ReactorClosed);
+            return;
+        }
+        Err(_) => {
+            metrics::gauge!("sync.header.serve.queued_requests").decrement(1.0);
+            if send_empty_header_range_response(
+                &header_sync,
+                peer,
+                session_id,
+                request_id,
+                start,
+                count,
+                want_tree_aux_roots,
+                deadline,
+                HeaderRangeServeResult::AdmissionTimeout,
+            )
+            .await
+            .is_ok()
+            {
+                terminal.disarm();
+            } else {
+                terminal.finish(HeaderRangeServeResult::ReactorClosed);
+            }
+            return;
+        }
     };
+    metrics::gauge!("sync.header.serve.queued_requests").decrement(1.0);
+    if tokio::time::Instant::now() >= read_deadline {
+        if send_empty_header_range_response(
+            &header_sync,
+            peer,
+            session_id,
+            request_id,
+            start,
+            count,
+            want_tree_aux_roots,
+            deadline,
+            HeaderRangeServeResult::AdmissionTimeout,
+        )
+        .await
+        .is_ok()
+        {
+            terminal.disarm();
+        } else {
+            terminal.finish(HeaderRangeServeResult::ReactorClosed);
+        }
+        return;
+    }
     metrics::histogram!("sync.header.serve.admission_wait_seconds")
         .record(queue_started.elapsed().as_secs_f64());
     trace_state_read_start(&trace, "header_sync_range", Some(&peer), start, count);
 
     let state_read_started = Instant::now();
-    let rows = match tokio::time::timeout(
-        STATE_READ_DEADLINE,
-        read_state.oneshot(zakura_state::ReadRequest::HeaderSyncRange {
-            start,
-            count,
-            include_roots: want_tree_aux_roots,
-        }),
-    )
-    .await
-    {
-        Ok(Ok(zakura_state::ReadResponse::HeaderSyncRange(rows))) => {
+    let active_read = ActiveHeaderRangeRead::new();
+    let mut read_task = tokio::spawn(async move {
+        let _active_read = active_read;
+        let result = read_state
+            .oneshot(zakura_state::ReadRequest::HeaderSyncRange {
+                start,
+                count,
+                include_roots: want_tree_aux_roots,
+            })
+            .await;
+        (result, permit)
+    });
+    let (read_result, permit) = match tokio::time::timeout_at(read_deadline, &mut read_task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            metrics::counter!("sync.header.serve.state_read", "result" => "panic").increment(1);
+            warn!(?peer, ?error, "Zakura HeaderSyncRange read task panicked");
+            terminal.finish(HeaderRangeServeResult::TaskPanic);
+            return;
+        }
+        Err(_) => {
+            metrics::counter!("sync.header.serve.state_read", "result" => "timeout").increment(1);
+            metrics::gauge!("sync.header.serve.abandoned_reads").increment(1.0);
+            tokio::spawn(async move {
+                let _ = read_task.await;
+                metrics::gauge!("sync.header.serve.abandoned_reads").decrement(1.0);
+            });
+            if send_empty_header_range_response(
+                &header_sync,
+                peer,
+                session_id,
+                request_id,
+                start,
+                count,
+                want_tree_aux_roots,
+                deadline,
+                HeaderRangeServeResult::StateTimeout,
+            )
+            .await
+            .is_err()
+            {
+                terminal.finish(HeaderRangeServeResult::ReactorClosed);
+                return;
+            }
+            terminal.disarm();
+            return;
+        }
+    };
+    let (rows, mut result) = match read_result {
+        Ok(zakura_state::ReadResponse::HeaderSyncRange(rows)) => {
             metrics::histogram!("sync.header.serve.state_read_seconds")
                 .record(state_read_started.elapsed().as_secs_f64());
             metrics::counter!("sync.header.serve.state_read", "result" => "success").increment(1);
-            rows
+            let result = if rows.is_empty() {
+                HeaderRangeServeResult::Unavailable
+            } else {
+                HeaderRangeServeResult::Success
+            };
+            (rows, result)
         }
-        Ok(Ok(response)) => {
+        Ok(response) => {
             metrics::histogram!("sync.header.serve.state_read_seconds")
                 .record(state_read_started.elapsed().as_secs_f64());
             metrics::counter!("sync.header.serve.state_read", "result" => "unexpected")
                 .increment(1);
             warn!(?peer, ?response, "unexpected HeaderSyncRange response");
-            Vec::new()
+            (Vec::new(), HeaderRangeServeResult::StateError)
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             metrics::histogram!("sync.header.serve.state_read_seconds")
                 .record(state_read_started.elapsed().as_secs_f64());
             metrics::counter!("sync.header.serve.state_read", "result" => "error").increment(1);
@@ -447,25 +680,9 @@ async fn serve_header_sync_range<ReadState>(
                 ?error,
                 "failed to read Zakura HeaderSyncRange response"
             );
-            Vec::new()
-        }
-        Err(_) => {
-            metrics::histogram!("sync.header.serve.state_read_seconds")
-                .record(state_read_started.elapsed().as_secs_f64());
-            metrics::counter!("sync.header.serve.state_read", "result" => "timeout").increment(1);
-            warn!(
-                ?peer,
-                ?start,
-                count,
-                "Zakura HeaderSyncRange read timed out"
-            );
-            Vec::new()
+            (Vec::new(), HeaderRangeServeResult::StateError)
         }
     };
-
-    // The semaphore bounds state I/O only. Release it before waiting on the reactor
-    // event queue so transport backpressure cannot consume all database read slots.
-    drop(permit);
 
     let roots_complete = !want_tree_aux_roots
         || rows.iter().all(|row| {
@@ -489,6 +706,7 @@ async fn serve_header_sync_range<ReadState>(
     } else {
         metrics::counter!("sync.header.serve.rejected", "reason" => "incomplete_roots")
             .increment(1);
+        result = HeaderRangeServeResult::IncompleteRoots;
         (Vec::new(), Vec::new(), Vec::new())
     };
 
@@ -501,6 +719,8 @@ async fn serve_header_sync_range<ReadState>(
         block::Hash([0; 32]),
         u32::try_from(returned_count).unwrap_or(u32::MAX),
     );
+    let completion = HeaderRangeResponseToken::new();
+    metrics::gauge!("sync.header.serve.prepared_responses").increment(1.0);
     if header_sync
         .send_lifecycle(HeaderSyncEvent::HeaderRangeResponseReady {
             peer,
@@ -512,11 +732,22 @@ async fn serve_header_sync_range<ReadState>(
             headers,
             body_sizes,
             tree_aux_roots,
+            deadline,
+            completion: completion.clone(),
+            result,
         })
         .is_err()
     {
+        completion.finish();
+        metrics::gauge!("sync.header.serve.prepared_responses").decrement(1.0);
         metrics::counter!("sync.header.serve.failed", "reason" => "reactor_closed").increment(1);
+        terminal.finish(HeaderRangeServeResult::ReactorClosed);
+        return;
     }
+    terminal.disarm();
+    completion.finished().await;
+    metrics::gauge!("sync.header.serve.prepared_responses").decrement(1.0);
+    drop(permit);
 }
 
 pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
@@ -748,19 +979,32 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 start,
                 count,
                 want_tree_aux_roots,
+                deadline,
             } => {
-                tokio::spawn(serve_header_sync_range(
+                let task = serve_header_sync_range(
                     read_state.clone(),
                     handles.header_sync.clone(),
                     trace.clone(),
                     header_range_reads.clone(),
-                    peer,
+                    peer.clone(),
                     session_id,
                     request_id,
                     start,
                     count,
                     want_tree_aux_roots,
-                ));
+                    deadline,
+                );
+                tokio::spawn(async move {
+                    if AssertUnwindSafe(task).catch_unwind().await.is_err() {
+                        metrics::counter!("sync.header.serve.task_panics").increment(1);
+                        warn!(
+                            ?peer,
+                            session_id,
+                            ?request_id,
+                            "header range serving task panicked"
+                        );
+                    }
+                });
             }
             HeaderSyncAction::CommitHeaderRange {
                 peer,

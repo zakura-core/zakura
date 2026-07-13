@@ -306,6 +306,203 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
     Ok(())
 }
 
+/// A short tip response must not strand an incomplete checkpoint range in the verifier.
+///
+/// This scales the production failure at checkpoints 400 and 800 down to a four-block checkpoint:
+/// the first peer supplies blocks 1-2 and then cannot extend, while a later tip refresh discovers
+/// blocks 3-4. The already-downloaded blocks must stay useful and the full range must verify without
+/// waiting for [`BLOCK_VERIFY_TIMEOUT`].
+#[tokio::test]
+#[ignore = "known regression: an empty extension strands a partial checkpoint range"]
+async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
+) -> Result<(), crate::BoxError> {
+    let (
+        chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        mut state_service,
+        mock_chain_tip_sender,
+    ) = setup_chain_sync_with_max_checkpoint_height(Height(4));
+    mock_chain_tip_sender.send_best_tip_height(Height(0));
+
+    let blocks: Vec<Arc<Block>> = vec![
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into()?,
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?,
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?,
+        zakura_test::vectors::BLOCK_MAINNET_3_BYTES.zcash_deserialize_into()?,
+        zakura_test::vectors::BLOCK_MAINNET_4_BYTES.zcash_deserialize_into()?,
+        zakura_test::vectors::BLOCK_MAINNET_5_BYTES.zcash_deserialize_into()?,
+    ];
+    let hashes: Vec<_> = blocks.iter().map(|block| block.hash()).collect();
+
+    let sync_task = tokio::spawn(chain_sync.sync());
+
+    state_service
+        .expect_request(zs::Request::KnownBlock(hashes[0]))
+        .await
+        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
+
+    // The first peer only provides half of the next checkpoint range. The trailing hash is discarded
+    // by the legacy zcashd-quirk workaround, leaving blocks 1-2 to download and verify.
+    state_service
+        .expect_request(zs::Request::BlockLocator)
+        .await
+        .respond(zs::Response::BlockLocator(vec![hashes[0]]));
+    peer_set
+        .expect_request(zn::Request::FindBlocks {
+            known_blocks: vec![hashes[0]],
+            stop: None,
+        })
+        .await
+        .respond(zn::Response::BlockHashes(vec![
+            hashes[1], hashes[2], hashes[3],
+        ]));
+    state_service
+        .expect_request(zs::Request::KnownBlock(hashes[1]))
+        .await
+        .respond(zs::Response::KnownBlock(None));
+    for _ in 0..(sync::FANOUT - 1) {
+        peer_set
+            .expect_request(zn::Request::FindBlocks {
+                known_blocks: vec![hashes[0]],
+                stop: None,
+            })
+            .await
+            .respond(Err(zn::BoxError::from("synthetic short-tip peer error")));
+    }
+    for hash in &hashes[1..=2] {
+        state_service
+            .expect_request(zs::Request::KnownBlock(*hash))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+    }
+    for (hash, block) in hashes[1..=2].iter().zip(&blocks[1..=2]) {
+        peer_set
+            .expect_request(zn::Request::BlocksByHash(iter::once(*hash).collect()))
+            .await
+            .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+    }
+
+    // Hold the first half in the checkpoint verifier, matching the production state where those
+    // requests cannot complete until the remaining checkpoint blocks arrive.
+    let mut pending_verifications = Vec::new();
+    let mut expected_verifications: HashSet<_> = hashes[1..=2].iter().copied().collect();
+    for _ in 0..2 {
+        pending_verifications.push(
+            block_verifier_router
+                .expect_request_that(|request| {
+                    expected_verifications.remove(&request.block().hash())
+                })
+                .await,
+        );
+    }
+    assert!(expected_verifications.is_empty());
+
+    // The prospective tip cannot be extended by the current peers.
+    peer_set
+        .expect_request(zn::Request::FindBlocks {
+            known_blocks: vec![hashes[1]],
+            stop: None,
+        })
+        .await
+        .respond(zn::Response::BlockHashes(vec![hashes[2]]));
+    for _ in 0..(sync::FANOUT - 1) {
+        peer_set
+            .expect_request(zn::Request::FindBlocks {
+                known_blocks: vec![hashes[1]],
+                stop: None,
+            })
+            .await
+            .respond(Err(zn::BoxError::from(
+                "synthetic empty-extension peer error",
+            )));
+    }
+
+    // A fresh ObtainTips fanout must run before the verifier timeout. A newly available peer then
+    // supplies the rest of the checkpoint range.
+    state_service
+        .expect_request(zs::Request::BlockLocator)
+        .await
+        .respond(zs::Response::BlockLocator(vec![hashes[0]]));
+    peer_set
+        .expect_request(zn::Request::FindBlocks {
+            known_blocks: vec![hashes[0]],
+            stop: None,
+        })
+        .await
+        .respond(zn::Response::BlockHashes(vec![
+            hashes[3], hashes[4], hashes[5],
+        ]));
+    state_service
+        .expect_request(zs::Request::KnownBlock(hashes[3]))
+        .await
+        .respond(zs::Response::KnownBlock(None));
+    for _ in 0..(sync::FANOUT - 1) {
+        peer_set
+            .expect_request(zn::Request::FindBlocks {
+                known_blocks: vec![hashes[0]],
+                stop: None,
+            })
+            .await
+            .respond(Err(zn::BoxError::from("synthetic refreshed-tip error")));
+    }
+    for hash in &hashes[3..=4] {
+        state_service
+            .expect_request(zs::Request::KnownBlock(*hash))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+    }
+    for (hash, block) in hashes[3..=4].iter().zip(&blocks[3..=4]) {
+        peer_set
+            .expect_request(zn::Request::BlocksByHash(iter::once(*hash).collect()))
+            .await
+            .respond(zn::Response::Blocks(vec![Available((block.clone(), None))]));
+    }
+    let mut expected_verifications: HashSet<_> = hashes[3..=4].iter().copied().collect();
+    for _ in 0..2 {
+        pending_verifications.push(
+            block_verifier_router
+                .expect_request_that(|request| {
+                    expected_verifications.remove(&request.block().hash())
+                })
+                .await,
+        );
+    }
+    assert!(expected_verifications.is_empty());
+
+    // The final extension is empty because this miniature chain ends at checkpoint 4.
+    peer_set
+        .expect_request(zn::Request::FindBlocks {
+            known_blocks: vec![hashes[3]],
+            stop: None,
+        })
+        .await
+        .respond(zn::Response::BlockHashes(vec![hashes[4]]));
+    for _ in 0..(sync::FANOUT - 1) {
+        peer_set
+            .expect_request(zn::Request::FindBlocks {
+                known_blocks: vec![hashes[3]],
+                stop: None,
+            })
+            .await
+            .respond(Err(zn::BoxError::from("synthetic final-tip error")));
+    }
+
+    for verification in pending_verifications {
+        verification.respond_with(|request| request.block().hash());
+    }
+
+    tokio::task::yield_now().await;
+    assert!(
+        !sync_task.is_finished(),
+        "legacy sync should continue after the checkpoint range completes"
+    );
+    sync_task.abort();
+
+    Ok(())
+}
+
 /// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips,
 /// with duplicate block hashes.
 ///
@@ -1860,6 +2057,19 @@ fn setup_chain_sync() -> (
     MockService<zakura_state::Request, zakura_state::Response, PanicAssertion>,
     MockChainTipSender,
 ) {
+    setup_chain_sync_with_max_checkpoint_height(Height(0))
+}
+
+fn setup_chain_sync_with_max_checkpoint_height(
+    max_checkpoint_height: Height,
+) -> (
+    TestChainSync,
+    SyncStatus,
+    MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
+    MockService<zakura_network::Request, zakura_network::Response, PanicAssertion>,
+    MockService<zakura_state::Request, zakura_state::Response, PanicAssertion>,
+    MockChainTipSender,
+) {
     let _init_guard = zakura_test::init();
 
     let consensus_config = ConsensusConfig::default();
@@ -1890,7 +2100,7 @@ fn setup_chain_sync() -> (
     let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let (chain_sync, sync_status) = ChainSync::new(
         &config,
-        Height(0),
+        max_checkpoint_height,
         peer_set.clone(),
         block_verifier_router.clone(),
         state_service.clone(),

@@ -255,13 +255,21 @@ impl HeaderSyncPeerSession {
             return Ok(None);
         }
 
-        let id = self
-            .inner
-            .next_request_id
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| {
+        let mut id = self.inner.next_request_id.load(Ordering::Relaxed);
+        loop {
+            let next_id = id.checked_add(1).ok_or_else(|| {
                 OrderedSendError::Encode("header-sync request ID counter exhausted".into())
             })?;
+            match self.inner.next_request_id.compare_exchange_weak(
+                id,
+                next_id,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current_id) => id = current_id,
+            }
+        }
         HeaderSyncRequestId::new(id)
             .ok_or_else(|| {
                 OrderedSendError::Encode("header-sync request ID counter exhausted".into())

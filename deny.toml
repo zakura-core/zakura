@@ -16,7 +16,6 @@ ignore = [
     "RUSTSEC-2022-0104", # structopt (unmaintained) — transitive via abscissa_core and direct dep of zakura-utils
     "RUSTSEC-2024-0375", # atty (unmaintained) — transitive via abscissa_core -> structopt
     "RUSTSEC-2024-0370", # proc-macro-error — transitive via abscissa_core -> structopt
-    "RUSTSEC-2026-0173", # proc-macro-error2 (unmaintained) — transitive via getset
     "RUSTSEC-2025-0119", # number_prefix — transitive via indicatif
     "RUSTSEC-2025-0141", # bincode — direct dependency
     "RUSTSEC-2026-0118", # hickory-proto — transitive via iroh
@@ -25,12 +24,6 @@ ignore = [
     "RUSTSEC-2024-0436", # paste — transitive via iroh/netdev/stun-rs
     "RUSTSEC-2023-0089", # atomic-polyfill — transitive via iroh-metrics/postcard
     "RUSTSEC-2025-0134", # rustls-pemfile (unmaintained) — transitive via zakura-rpc; also present on main
-    # quick-xml (namespace-resolver unbounded alloc + O(n^2) duplicate-attribute scan on
-    # untrusted XML) — both transitive via inferno, only under the optional `flamegraph`
-    # dev/profiling feature (not in release binaries) and only over the node's own profiling
-    # output, not untrusted input; inferno 0.12 pins quick-xml ^0.39 so there is no upgrade yet.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
 ]
 
 # This section is considered when running `cargo deny check licenses`.

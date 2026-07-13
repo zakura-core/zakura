@@ -1955,7 +1955,8 @@ dependencies = [
 [[package]]
 name = "equihash"
 version = "0.3.0"
-source = "git+https://github.com/zcash/librustzcash.git?rev=cabbc6cab07562fe1b94868f65f6af2871d9cbc5#cabbc6cab07562fe1b94868f65f6af2871d9cbc5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "306286e8dcc39ab3dfceb74c792ce8baffdab90591321d3ffaae64829734c37f"
 dependencies = [
  "blake2b_simd",
  "cc",
@@ -9297,7 +9298,8 @@ dependencies = [
 [[package]]
 name = "zcash_encoding"
 version = "0.4.0"
-source = "git+https://github.com/zcash/librustzcash.git?rev=cabbc6cab07562fe1b94868f65f6af2871d9cbc5#cabbc6cab07562fe1b94868f65f6af2871d9cbc5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1440921903cdb86133fb9e2fe800be488015db2939a30bedb413078a1acb0306"
 dependencies = [
  "corez",
  "hex",

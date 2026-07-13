@@ -21,7 +21,11 @@ use crate::{
     constants::{MAX_BLOCK_REORG_HEIGHT, MAX_PRUNE_HEIGHTS_PER_COMMIT, MIN_PRUNING_RETENTION},
     request::{CheckpointVerifiedBlock, FinalizableBlock, FinalizedBlock, Treestate},
     rollback_finalized_state,
-    service::finalized_state::{disk_db::DiskWriteBatch, FinalizedState},
+    service::{
+        finalized_state::{disk_db::DiskWriteBatch, FinalizedState},
+        non_finalized_state::Chain,
+        read::find::{block_locator, chain_contains_hash},
+    },
     Config, ContextuallyVerifiedBlock, PruningConfig, RollbackFinalizedStateError,
     RollbackFinalizedStateOptions, SemanticallyVerifiedBlock,
 };
@@ -604,6 +608,30 @@ fn checkpoint_retention_skips_old_raw_transactions_in_pruned_mode() {
         Some(checkpoint_lowest_retained),
         "skipped checkpoint raw transactions advance the pruning marker atomically"
     );
+}
+
+#[test]
+fn block_locator_uses_retained_hashes_when_checkpoint_bodies_are_skipped() {
+    let _init_guard = zakura_test::init();
+    let network = Mainnet;
+    let config = pruned_config();
+    let checkpoint_lowest_retained = Height(TEST_BLOCKS + 1);
+    let max_checkpoint_height = Height(MIN_PRUNING_RETENTION + checkpoint_lowest_retained.0 - 1);
+
+    let state = new_state_with_checkpoint_retention(&config, &network, max_checkpoint_height);
+    let (tip_height, tip_hash) = state.db.tip().expect("test state has a finalized tip");
+
+    assert_eq!(tip_height, Height(TEST_BLOCKS));
+    assert_eq!(state.db.body_hash(tip_height), None);
+    assert_eq!(state.db.hash(tip_height), Some(tip_hash));
+    assert!(!state.db.contains_hash(tip_hash));
+
+    let no_chain = Option::<Arc<Chain>>::None;
+    let locator = block_locator(no_chain.clone(), &state.db)
+        .expect("a finalized tip produces a block locator");
+
+    assert_eq!(locator.first(), Some(&tip_hash));
+    assert!(chain_contains_hash(no_chain, &state.db, tip_hash));
 }
 
 #[test]

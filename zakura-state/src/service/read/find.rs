@@ -239,7 +239,7 @@ where
     chain
         .map(|chain| chain.as_ref().height_by_hash.contains_key(&hash))
         .unwrap_or(false)
-        || db.contains_hash(hash)
+        || db.height(hash).is_some()
 }
 
 /// Create a block locator from `chain` and `db`.
@@ -272,7 +272,11 @@ where
     let mut hashes = Vec::with_capacity(heights.len());
 
     for height in heights {
-        if let Some(hash) = hash_by_height(chain, db, height) {
+        let hash = chain
+            .and_then(|chain| chain.as_ref().hash_by_height(height))
+            .or_else(|| db.hash(height));
+
+        if let Some(hash) = hash {
             hashes.push(hash);
         }
     }

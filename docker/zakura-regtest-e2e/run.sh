@@ -659,11 +659,23 @@ run_restart_matrix() {
   restart_node2_at_height_then_catch_up "${near_tip_gap_height}" "near-tip-1000-gap" "${target}"
 }
 
-log "starting cluster"
-docker compose -f "${COMPOSE_FILE}" up -d
+log "starting bootstrap node"
+docker compose -f "${COMPOSE_FILE}" up -d zakura-node-1
 
-log "waiting for RPC readiness"
+log "waiting for bootstrap node readiness"
 wait_ready 18232 node1
+
+# `depends_on` only controls container start order, not application readiness.
+# Wait for node1 to finish opening its legacy listener before its initial peers
+# dial it, otherwise a fast peer can get ConnectionRefused and remain in address
+# backoff for the entire test.
+log "starting peer nodes"
+docker compose -f "${COMPOSE_FILE}" up -d \
+  zakura-node-2 \
+  zakura-node-3 \
+  zakura-node-4
+
+log "waiting for peer RPC readiness"
 wait_ready 18332 node2
 wait_ready 18432 node3
 wait_ready 18532 node4

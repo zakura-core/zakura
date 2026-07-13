@@ -69,18 +69,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            pull_file_names() {
-              jq -r '.[].filename'
-            }
-            detector_fixture='[{"filename":"zakura-network/src/zakura/mod.rs","path":"docs/not-zakura.md"}]'
-            detected_fixture=$(printf '%s\n' "$detector_fixture" | pull_file_names)
-            if [[ "$detected_fixture" != "zakura-network/src/zakura/mod.rs" ]]; then
-              echo "pull-files detector must read the API filename field" >&2
-              exit 1
-            fi
+            # The pulls/files API exposes changed paths as `filename` (unlike
+            # the compare API's `.files[].filename`, this array is top-level).
             changed=$(gh api --paginate \
-              "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" |
-              pull_file_names)
+              "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+              --jq '.[].filename')
           else
             before="${{ github.event.before }}"
             # The first push of a branch (and force-pushes that orphan the old
@@ -276,6 +269,7 @@ jobs:
           - checkpoint-long
           - no-checkpoint-long
           - restart-matrix
+          - header-faults
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:

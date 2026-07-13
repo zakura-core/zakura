@@ -163,6 +163,7 @@ const STREAM_PRELUDE_REQUEST_ID_BYTES: usize = 8;
 const STREAM_PRELUDE_CAP_BYTES: usize = 4;
 const STREAM_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const ORDERED_STREAM_REOPEN_BACKOFF: Duration = Duration::from_millis(250);
+const ORDERED_STREAM_REOPEN_BACKOFF_CAP: Duration = Duration::from_secs(8);
 const OUTBOUND_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 // Mirrors the legacy gossip compatibility protocol. Compile-time assertions
@@ -1477,6 +1478,15 @@ fn should_reopen_ordered_stream(
         && !connection_cancelled
 }
 
+/// Exponential reopen delay for one ordered stream kind, capped so a
+/// persistently failing local open cannot spin the connection loop.
+fn ordered_stream_reopen_backoff(attempts: u32) -> Duration {
+    // The shift is safe: attempts is clamped so the multiplier fits in u32.
+    ORDERED_STREAM_REOPEN_BACKOFF
+        .saturating_mul(1u32 << attempts.min(8))
+        .min(ORDERED_STREAM_REOPEN_BACKOFF_CAP)
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum InboundMessageAdmission {
     Admit,
@@ -1924,6 +1934,9 @@ impl ZakuraProtocolHandler {
         let mut workers = JoinSet::new();
         let (ordered_stream_exit_tx, mut ordered_stream_exit_rx) = mpsc::unbounded_channel();
         let (ordered_stream_reopen_tx, mut ordered_stream_reopen_rx) = mpsc::unbounded_channel();
+        // Consecutive reopen attempts per stream kind; reset once a reopen
+        // succeeds so ordinary retirements keep the base delay.
+        let mut ordered_stream_reopen_attempts: HashMap<u16, u32> = HashMap::new();
         let mut open_limiter = TokenBucket::new(limits.stream_open_rate_per_second);
         let mut message_buckets = MessageRateBuckets::new();
         let (freshness_tx, freshness_rx) = watch::channel(Instant::now());
@@ -2094,15 +2107,21 @@ impl ZakuraProtocolHandler {
                         context.is_initiator,
                         connection_token.is_cancelled(),
                     ) {
+                        let attempts = ordered_stream_reopen_attempts
+                            .entry(exited.stream.kind)
+                            .or_insert(0);
+                        let delay = ordered_stream_reopen_backoff(*attempts);
+                        *attempts = attempts.saturating_add(1);
                         debug!(
                             stream_kind = exited.stream.kind,
                             stream_version = exited.stream.version,
                             session_id = exited.session_id,
+                            ?delay,
                             "scheduling Zakura ordered stream reopen"
                         );
                         let reopen = ordered_stream_reopen_tx.clone();
                         tokio::spawn(async move {
-                            tokio::time::sleep(ORDERED_STREAM_REOPEN_BACKOFF).await;
+                            tokio::time::sleep(delay).await;
                             let _ = reopen.send(exited.stream);
                         });
                     }
@@ -2141,6 +2160,7 @@ impl ZakuraProtocolHandler {
                         .await
                     {
                         Ok(admitted) => {
+                            ordered_stream_reopen_attempts.remove(&admitted.kind);
                             opened_kinds.insert(admitted.kind);
                             let service_streams = HashMap::from([(
                                 admitted.kind,
@@ -2167,14 +2187,20 @@ impl ZakuraProtocolHandler {
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
                         Err(error) => {
+                            let attempts = ordered_stream_reopen_attempts
+                                .entry(stream.kind)
+                                .or_insert(0);
+                            let delay = ordered_stream_reopen_backoff(*attempts);
+                            *attempts = attempts.saturating_add(1);
                             debug!(
                                 ?error,
                                 stream_kind = stream.kind,
+                                ?delay,
                                 "retrying Zakura ordered stream reopen after local failure"
                             );
                             let reopen = ordered_stream_reopen_tx.clone();
                             tokio::spawn(async move {
-                                tokio::time::sleep(ORDERED_STREAM_REOPEN_BACKOFF).await;
+                                tokio::time::sleep(delay).await;
                                 let _ = reopen.send(stream);
                             });
                         }
@@ -6685,6 +6711,26 @@ mod tests {
             ..local_header
         };
         assert!(!should_reopen_ordered_stream(gossip, true, false));
+    }
+
+    #[test]
+    fn ordered_stream_reopen_backoff_grows_and_caps() {
+        assert_eq!(
+            ordered_stream_reopen_backoff(0),
+            ORDERED_STREAM_REOPEN_BACKOFF
+        );
+        assert_eq!(
+            ordered_stream_reopen_backoff(1),
+            ORDERED_STREAM_REOPEN_BACKOFF * 2
+        );
+        assert_eq!(
+            ordered_stream_reopen_backoff(5),
+            ORDERED_STREAM_REOPEN_BACKOFF_CAP
+        );
+        assert_eq!(
+            ordered_stream_reopen_backoff(u32::MAX),
+            ORDERED_STREAM_REOPEN_BACKOFF_CAP
+        );
     }
 
     #[tokio::test]

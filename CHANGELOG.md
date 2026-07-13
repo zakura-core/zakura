@@ -17,7 +17,11 @@ Initial release of Zakura.
   V7 responses are matched to exact outstanding requests, and retained v6
   streams are retired and reopened on the same connection with a fresh session
   generation after ambiguous timeout/cancellation paths, so delayed responses
-  cannot consume unrelated work or trigger stale-anchor recovery.
+  cannot consume unrelated work or trigger stale-anchor recovery. Known
+  limitation: only the connection initiator reopens a retired stream, so a
+  v6-only peer that dialed this node loses header sync on that connection
+  after an ambiguous timeout until it reconnects; header sync on connections
+  this node dialed, and all v7 sessions, are unaffected.
 
 Zakura is a fork of the Zcash Foundation's
 [Zebra](https://github.com/ZcashFoundation/zebra), forked at Zebra v5.0.0. For

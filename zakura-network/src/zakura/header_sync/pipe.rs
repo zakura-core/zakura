@@ -89,6 +89,13 @@ impl HsLocal {
         self.expected_headers.pop_front()
     }
 
+    /// Correlate one v7 `Headers` response with its reserved expectation.
+    ///
+    /// `Ok(None)` drops the response without misbehavior scoring: any ID at or
+    /// below the highest reservation could be a legitimately late response to a
+    /// timed-out, cancelled, or tombstone-evicted request, so replays here are
+    /// bounded only by the transport's per-stream rate and byte caps. Only IDs
+    /// this session never issued fail closed as `UnsolicitedHeaders`.
     fn pop_expected_headers_response_by_id(
         &mut self,
         request_id: HeaderSyncRequestId,

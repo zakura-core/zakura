@@ -2729,7 +2729,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "hostile-opened v7 sessions register, but the responder's typed Status is not emitted onto the accepted physical stream"]
     async fn native_stream5_v7_correlates_reversed_physical_responses() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
@@ -2741,7 +2740,24 @@ mod tests {
             max_inflight_requests: 2,
             ..ZakuraHeaderSyncConfig::default()
         };
-        let victim = header_sync_test_builder(70, e2e_network([4]), &mut capture)
+        // The scheduler keeps at most one forward range outstanding, so the two
+        // concurrent v7 requests come from distinct queues: anchoring at the
+        // height-2 checkpoint leaves a backward backfill bracket (1..=2) plus a
+        // forward range (3..=4), each within the peer's advertised cap of 2.
+        let network = e2e_network([2]);
+        let anchor = (block::Height(2), mainnet_block(block_bytes(2)).hash());
+        let victim = ZakuraTestNode::builder(70)
+            .tracer(capture.tracer_for_node(70))
+            .header_sync_driver(
+                network,
+                anchor,
+                HeaderSyncFrontiers {
+                    finalized_height: block::Height(0),
+                    verified_block_tip: block::Height(0),
+                    verified_block_hash: mainnet_genesis_hash(),
+                },
+                Some(anchor),
+            )
             .header_sync_config(config)
             .spawn()
             .await?;
@@ -2794,17 +2810,6 @@ mod tests {
             .await?;
 
         next_observed_get_headers(&mut actions).await?;
-        victim
-            .header_sync()
-            .expect("header-sync handle is enabled")
-            .send(HeaderSyncEvent::StateFrontiersChanged(
-                HeaderSyncFrontiers {
-                    finalized_height: block::Height(0),
-                    verified_block_tip: block::Height(0),
-                    verified_block_hash: mainnet_genesis_hash(),
-                },
-            ))
-            .await?;
         next_observed_get_headers(&mut actions).await?;
 
         let mut requests = Vec::new();
@@ -2837,11 +2842,13 @@ mod tests {
         }
         assert_ne!(requests[0].0, requests[1].0);
         assert!(requests.iter().all(|(id, _, _, _)| id.get() != 0));
+        let mut request_ranges: Vec<_> = requests
+            .iter()
+            .map(|(_, start, count, _)| (*start, *count))
+            .collect();
+        request_ranges.sort_by_key(|(start, _)| *start);
         assert_eq!(
-            requests
-                .iter()
-                .map(|(_, start, count, _)| (*start, *count))
-                .collect::<Vec<_>>(),
+            request_ranges,
             vec![(block::Height(1), 2), (block::Height(3), 2)]
         );
 

@@ -53,17 +53,39 @@
 
 #![allow(clippy::print_stderr)]
 
-use std::{path::PathBuf, process::Command};
+use std::{
+    path::PathBuf,
+    process::Command,
+    sync::{Mutex, MutexGuard},
+};
+
+/// Serializes the docker e2e lanes: each run owns the shared host network and
+/// the per-label container namespace, so two stacks must never overlap.
+static E2E_STACK_LOCK: Mutex<()> = Mutex::new(());
 
 #[ignore = "opt-in docker e2e: needs docker (builds the host zakurad binary itself)"]
 #[test]
 fn zakura_regtest_dual_stack_e2e() {
+    // `ZAKURA_E2E_MODE` routes an unfiltered `--ignored` run to exactly one
+    // lane per CI job; `header-faults` belongs to the dedicated test below.
+    if std::env::var("ZAKURA_E2E_MODE").as_deref() == Ok("header-faults") {
+        eprintln!(
+            "skipping dual-stack e2e: ZAKURA_E2E_MODE=header-faults runs the header-sync fault lane"
+        );
+        return;
+    }
     run_zakura_regtest_e2e(None);
 }
 
 #[ignore = "opt-in docker e2e: header-sync v7 fault lane"]
 #[test]
 fn zakura_regtest_header_sync_faults() {
+    if std::env::var("ZAKURA_E2E_MODE").is_ok_and(|mode| mode != "header-faults") {
+        eprintln!(
+            "skipping header-sync fault e2e: ZAKURA_E2E_MODE selects the dual-stack lane above"
+        );
+        return;
+    }
     run_zakura_regtest_e2e(Some("header-faults"));
 }
 
@@ -81,6 +103,10 @@ fn run_zakura_regtest_e2e(mode: Option<&str>) {
         eprintln!("skipping Zakura regtest e2e: docker is unavailable");
         return;
     }
+
+    let _stack: MutexGuard<'_, ()> = E2E_STACK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docker/zakura-regtest-e2e/run.sh");

@@ -5,18 +5,20 @@ use std::{
 };
 
 use chrono::{DateTime, Duration, LocalResult, TimeZone, Utc};
+use halo2::pasta::pallas;
 
 use crate::{
     amount::{Amount, NonNegative, MAX_MONEY},
     block::{
         serialize::MAX_BLOCK_BYTES, Block, BlockTimeError, Commitment::*, Hash, Header, Height,
     },
+    ironwood, orchard,
     parameters::{Network, NetworkUpgrade::*},
     sapling,
     serialization::{
         sha256d, SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
     },
-    transaction::{LockTime, Transaction},
+    transaction::{arbitrary::v5_transactions, LockTime, Transaction},
     transparent,
 };
 
@@ -111,6 +113,207 @@ fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
         block.chain_value_pool_change(&utxos, None).is_err(),
         "block-level aggregation should propagate transaction value-balance errors"
     );
+}
+
+/// The block-level Orchard and Ironwood accessors must read from their own
+/// pool's shielded data and preserve transaction order.
+///
+/// Each transaction carries *different* Orchard and Ironwood bundles (and the
+/// second transaction swaps them), so an accessor that read from the wrong
+/// pool, or reordered transactions, would produce a different sequence.
+#[test]
+fn ironwood_block_accessors_preserve_pool_and_wire_order() {
+    let _init_guard = zakura_test::init();
+
+    let mut orchard_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+    // Ironwood reuses the Orchard bundle encoding, so an Orchard test bundle
+    // can be cloned into the Ironwood slot of a V6 transaction.
+    let mut ironwood_data = orchard_data.clone();
+
+    let mut orchard_actions = orchard_data.actions.as_slice().to_vec();
+    orchard_actions[0].action.nullifier =
+        orchard::Nullifier::try_from([0; 32]).expect("zero is a valid Pallas base field");
+    orchard_actions[0].action.cm_x = pallas::Base::from(0);
+    orchard_data.actions = orchard_actions
+        .try_into()
+        .expect("the test bundle has at least one action");
+
+    let mut one = [0; 32];
+    one[0] = 1;
+    let mut ironwood_actions = ironwood_data.actions.as_slice().to_vec();
+    ironwood_actions[0].action.nullifier =
+        ironwood::Nullifier::try_from(one).expect("one is a valid Pallas base field");
+    ironwood_actions[0].action.cm_x = pallas::Base::from(1);
+    ironwood_data.actions = ironwood_actions
+        .try_into()
+        .expect("the test bundle has at least one action");
+
+    let make_transaction =
+        |orchard_shielded_data: orchard::ShieldedData,
+         ironwood_shielded_data: ironwood::ShieldedData| {
+            Arc::new(Transaction::V6 {
+                network_upgrade: Nu6_3,
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(1),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                sapling_shielded_data: None,
+                orchard_shielded_data: Some(orchard_shielded_data),
+                ironwood_shielded_data: Some(ironwood_shielded_data),
+            })
+        };
+
+    let header: Header = zakura_test::vectors::DUMMY_HEADER
+        .zcash_deserialize_into()
+        .expect("dummy header should deserialize");
+    let block = Block {
+        header: Arc::new(header),
+        transactions: vec![
+            make_transaction(orchard_data.clone(), ironwood_data.clone()),
+            make_transaction(ironwood_data, orchard_data),
+        ],
+    };
+
+    let expected_orchard_nullifiers: Vec<_> = block
+        .transactions
+        .iter()
+        .flat_map(|transaction| transaction.orchard_nullifiers().copied())
+        .collect();
+    let expected_ironwood_nullifiers: Vec<_> = block
+        .transactions
+        .iter()
+        .flat_map(|transaction| transaction.ironwood_nullifiers().copied())
+        .collect();
+    assert_ne!(expected_orchard_nullifiers, expected_ironwood_nullifiers);
+    assert_eq!(
+        block.orchard_nullifiers().copied().collect::<Vec<_>>(),
+        expected_orchard_nullifiers
+    );
+    assert_eq!(
+        block.ironwood_nullifiers().copied().collect::<Vec<_>>(),
+        expected_ironwood_nullifiers
+    );
+
+    let expected_orchard_commitments: Vec<_> = block
+        .transactions
+        .iter()
+        .flat_map(|transaction| transaction.orchard_note_commitments().copied())
+        .collect();
+    let expected_ironwood_commitments: Vec<_> = block
+        .transactions
+        .iter()
+        .flat_map(|transaction| transaction.ironwood_note_commitments().copied())
+        .collect();
+    assert_ne!(expected_orchard_commitments, expected_ironwood_commitments);
+    assert_eq!(
+        block
+            .orchard_note_commitments()
+            .copied()
+            .collect::<Vec<_>>(),
+        expected_orchard_commitments
+    );
+    assert_eq!(
+        block
+            .ironwood_note_commitments()
+            .copied()
+            .collect::<Vec<_>>(),
+        expected_ironwood_commitments
+    );
+}
+
+/// The ZIP-221 history-leaf transaction counts must count transactions with a
+/// bundle in the matching pool: Orchard-only transactions must not count as
+/// Ironwood ones, and a multi-action Ironwood bundle counts as one transaction.
+#[test]
+fn ironwood_transaction_count_is_pool_specific_and_counts_bundles() {
+    let _init_guard = zakura_test::init();
+
+    let orchard_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+    let mut ironwood_data = orchard_data.clone();
+    let mut ironwood_actions = ironwood_data.actions.as_slice().to_vec();
+    ironwood_actions.push(ironwood_actions[0].clone());
+    ironwood_data.actions = ironwood_actions
+        .try_into()
+        .expect("duplicating an action keeps the bundle non-empty");
+    let ironwood_action_count = ironwood_data.actions.len();
+
+    let make_transaction =
+        |orchard_shielded_data: Option<orchard::ShieldedData>,
+         ironwood_shielded_data: Option<ironwood::ShieldedData>| {
+            Arc::new(Transaction::V6 {
+                network_upgrade: Nu6_3,
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(1),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                sapling_shielded_data: None,
+                orchard_shielded_data,
+                ironwood_shielded_data,
+            })
+        };
+
+    let header: Header = zakura_test::vectors::DUMMY_HEADER
+        .zcash_deserialize_into()
+        .expect("dummy header should deserialize");
+    let block = Block {
+        header: Arc::new(header),
+        transactions: vec![
+            make_transaction(Some(orchard_data.clone()), None),
+            make_transaction(Some(orchard_data), None),
+            make_transaction(None, Some(ironwood_data)),
+        ],
+    };
+
+    assert_eq!(block.orchard_transactions_count(), 2);
+    assert_eq!(block.ironwood_transactions_count(), 1);
+    assert!(ironwood_action_count > 1);
+    assert_eq!(
+        block
+            .transactions
+            .iter()
+            .flat_map(|transaction| transaction.ironwood_actions())
+            .count(),
+        ironwood_action_count,
+        "the history field counts a multi-action bundle as one transaction"
+    );
+}
+
+/// NU6.3 introduces the V3 history leaf but must not change how the block
+/// header's `hashBlockCommitments` field is interpreted: at and after NU5 it
+/// is the `ChainHistoryBlockTxAuthCommitment` digest, with no structural
+/// restriction on its bytes.
+#[test]
+fn nu6_3_uses_post_nu5_block_commitment_format() {
+    let _init_guard = zakura_test::init();
+
+    let regtest = Network::new_regtest(
+        crate::parameters::testnet::ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let commitment_bytes = [0x5a; 32];
+
+    for network in [Network::Mainnet, Network::new_default_testnet(), regtest] {
+        let activation_height = Nu6_3
+            .activation_height(&network)
+            .expect("NU6.3 is configured on this test network");
+        let commitment =
+            super::super::Commitment::from_bytes(commitment_bytes, &network, activation_height)
+                .expect("post-NU5 commitment bytes have no structural restriction");
+
+        let ChainHistoryBlockTxAuthCommitment(commitment) = commitment else {
+            panic!("NU6.3 must retain the post-NU5 block commitment format");
+        };
+        assert_eq!(<[u8; 32]>::from(commitment), commitment_bytes);
+    }
 }
 
 #[test]

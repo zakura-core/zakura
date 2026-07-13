@@ -33,10 +33,10 @@ pub struct BlockCommitmentRoots {
     pub sapling_root: sapling::tree::Root,
     /// The Orchard note-commitment tree root as of the end of this block (empty below NU5).
     pub orchard_root: orchard::tree::Root,
-    /// The Ironwood note-commitment tree root as of the end of this block (empty below Nu7).
+    /// The Ironwood note-commitment tree root as of the end of this block (empty below NU6.3).
     ///
     /// Carried alongside the Sapling/Orchard roots because the ZIP-221 V3 history leaf
-    /// (Nu7+) folds the Ironwood root into the chain-history MMR; a recipient rebuilding
+    /// (NU6.3+) folds the Ironwood root into the chain-history MMR; a recipient rebuilding
     /// the leaf to verify against header commitments (design §6) needs it, without the body.
     pub ironwood_root: ironwood::tree::Root,
     /// Number of this block's transactions carrying Sapling shielded data
@@ -53,7 +53,7 @@ pub struct BlockCommitmentRoots {
     /// (`Block::orchard_transactions_count`); the Orchard V2 leaf count input (NU5+).
     pub orchard_tx: u64,
     /// Number of this block's transactions carrying Ironwood shielded data; the Ironwood
-    /// V3 leaf count input (Nu7+).
+    /// V3 leaf count input (NU6.3+).
     pub ironwood_tx: u64,
     /// The authorizing-data root (ZIP-244 `hashAuthDataRoot`) of *this* block's own
     /// transactions. Serialized last.

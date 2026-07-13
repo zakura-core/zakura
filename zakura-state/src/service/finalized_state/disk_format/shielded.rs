@@ -106,7 +106,7 @@ pub struct CommitmentRootsByHeight {
     /// against this block's NU5+ header commitment, without re-reading the body.
     /// Default/zero below NU5.
     pub auth_data_root: AuthDataRoot,
-    /// The Ironwood note-commitment tree root at this height (empty below Nu7). Stored so a
+    /// The Ironwood note-commitment tree root at this height (empty below NU6.3). Stored so a
     /// fast-synced node can serve it as a ZIP-221 V3 history-leaf input.
     pub ironwood: ironwood::tree::Root,
     /// This block's Sapling shielded transaction count — a ZIP-221 history-leaf input the
@@ -114,7 +114,7 @@ pub struct CommitmentRootsByHeight {
     pub sapling_tx: u64,
     /// This block's Orchard shielded transaction count (V2 leaf input, NU5+).
     pub orchard_tx: u64,
-    /// This block's Ironwood shielded transaction count (V3 leaf input, Nu7+).
+    /// This block's Ironwood shielded transaction count (V3 leaf input, NU6.3+).
     pub ironwood_tx: u64,
 }
 

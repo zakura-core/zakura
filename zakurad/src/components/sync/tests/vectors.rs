@@ -328,15 +328,15 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
 /// - blocks 1-2 are now parked in the checkpoint verifier, which cannot verify *any* block in a
 ///   range until the whole range up to checkpoint 4 has arrived. So they stay in flight forever.
 ///
-/// Discovering the rest of the range is the only way out, and only a fresh fanout can do it. The
-/// syncer must therefore keep discovering hashes while blocks are parked, rather than waiting for
-/// the download queue to drain first — that wait cannot terminate. The chain grows to block 5, a
-/// refreshed fanout picks up blocks 3-4, and the range verifies.
+/// Discovering the rest of the range is the only way out, and only another fanout can do it. The
+/// syncer must therefore preserve and retry the checked frontier while blocks are parked, rather
+/// than falling back to the older committed state locator. The chain grows to block 5, the retried
+/// frontier picks up blocks 3-4, and the range verifies.
 ///
 /// Time is paused, so a syncer that instead waits out [`sync::BLOCK_VERIFY_TIMEOUT`] and restarts
 /// fails here in milliseconds of wall-clock time.
 #[tokio::test(start_paused = true)]
-async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
+async fn incomplete_checkpoint_range_retries_frontier_without_verifier_timeout(
 ) -> Result<(), crate::BoxError> {
     let (
         chain_sync,
@@ -443,49 +443,32 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
     }
 
     // Nothing is left to discover, but blocks 1-2 are parked in the verifier and can only be
-    // verified once the rest of the range arrives. The syncer must run a fresh fanout to find it,
-    // rather than waiting for its in-flight downloads to drain: that wait cannot terminate.
+    // verified once the rest of the range arrives. Retry the checked frontier instead of using the
+    // committed locator, which cannot include these parked blocks.
     let refresh_requested_at = tokio::time::Instant::now();
-    let refreshed_locator = tokio::time::timeout(
+    let retried_extension = tokio::time::timeout(
         sync::BLOCK_VERIFY_TIMEOUT,
-        state_service.expect_request(zs::Request::BlockLocator),
+        peer_set.expect_request(zn::Request::FindBlocks {
+            known_blocks: vec![hashes[1]],
+            stop: None,
+        }),
     )
     .await
-    .expect(
-        "syncer must discover the rest of the checkpoint range while its blocks are parked in the \
-         verifier: waiting out BLOCK_VERIFY_TIMEOUT and restarting discards the partial range",
-    );
+    .expect("syncer must retry the parked checkpoint frontier before its verifier timeout");
 
-    // The chain has grown to block 5, so the refreshed fanout covers the rest of the range. Blocks
-    // 1-2 are still in flight, so they are re-dispatched as duplicates and not downloaded again.
-    refreshed_locator.respond(zs::Response::BlockLocator(vec![hashes[0]]));
-    peer_set
-        .expect_request(zn::Request::FindBlocks {
-            known_blocks: vec![hashes[0]],
-            stop: None,
-        })
-        .await
-        .respond(zn::Response::BlockHashes(vec![
-            hashes[1], hashes[2], hashes[3], hashes[4], hashes[5],
-        ]));
-    state_service
-        .expect_request(zs::Request::KnownBlock(hashes[1]))
-        .await
-        .respond(zs::Response::KnownBlock(None));
+    // The chain has grown to block 5, so retrying the frontier covers the rest of the range without
+    // rediscovering the parked blocks from the committed state locator.
+    retried_extension.respond(zn::Response::BlockHashes(vec![
+        hashes[2], hashes[3], hashes[4], hashes[5],
+    ]));
     for _ in 0..(sync::FANOUT - 1) {
         peer_set
             .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![hashes[0]],
+                known_blocks: vec![hashes[1]],
                 stop: None,
             })
             .await
-            .respond(Err(zn::BoxError::from("synthetic refreshed-tip error")));
-    }
-    for hash in &hashes[1..=4] {
-        state_service
-            .expect_request(zs::Request::KnownBlock(*hash))
-            .await
-            .respond(zs::Response::KnownBlock(None));
+            .respond(Err(zn::BoxError::from("synthetic frontier retry error")));
     }
     for (hash, block) in hashes[3..=4].iter().zip(&blocks[3..=4]) {
         peer_set
@@ -541,6 +524,75 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
         "legacy sync should continue after the checkpoint range completes"
     );
     sync_task.abort();
+
+    Ok(())
+}
+
+/// A peer response that falls back to genesis and contains only finalized hashes must not create a
+/// false prospective tip or queue duplicate downloads.
+#[tokio::test]
+async fn obtain_tips_discards_genesis_fallback_when_all_hashes_are_finalized(
+) -> Result<(), crate::BoxError> {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        mut state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let blocks: Vec<Arc<Block>> = vec![
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into()?,
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?,
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?,
+        zakura_test::vectors::BLOCK_MAINNET_3_BYTES.zcash_deserialize_into()?,
+        zakura_test::vectors::BLOCK_MAINNET_4_BYTES.zcash_deserialize_into()?,
+        zakura_test::vectors::BLOCK_MAINNET_5_BYTES.zcash_deserialize_into()?,
+    ];
+    let hashes: Vec<_> = blocks.iter().map(|block| block.hash()).collect();
+
+    let respond_to_requests = async {
+        state_service
+            .expect_request(zs::Request::BlockLocator)
+            .await
+            .respond(zs::Response::BlockLocator(vec![hashes[5]]));
+
+        for _ in 0..sync::FANOUT {
+            peer_set
+                .expect_request(zn::Request::FindBlocks {
+                    known_blocks: vec![hashes[5]],
+                    stop: None,
+                })
+                .await
+                .respond(zn::Response::BlockHashes(vec![
+                    hashes[0], hashes[1], hashes[2], hashes[3],
+                ]));
+        }
+
+        for _ in 0..sync::FANOUT {
+            for hash in &hashes[0..3] {
+                state_service
+                    .expect_request(zs::Request::KnownBlock(*hash))
+                    .await
+                    .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::Finalized)));
+            }
+        }
+    };
+
+    let (reserve, ()) = tokio::join!(chain_sync.obtain_tips(), respond_to_requests);
+    let reserve = reserve?;
+
+    assert!(
+        reserve.is_empty(),
+        "already-finalized genesis fallback hashes must not be downloaded"
+    );
+    assert!(
+        chain_sync.prospective_tips.is_empty(),
+        "an all-finalized response must not create a prospective tip"
+    );
+    peer_set.expect_no_requests().await;
+    block_verifier_router.expect_no_requests().await;
 
     Ok(())
 }

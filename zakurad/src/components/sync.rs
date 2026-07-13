@@ -9,7 +9,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::Poll,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use color_eyre::eyre::{eyre, Report};
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinError,
-    time::{sleep, sleep_until, timeout},
+    time::{sleep, sleep_until, timeout, Instant},
 };
 use tower::{
     builder::ServiceBuilder, hedge::Hedge, limit::ConcurrencyLimit, retry::Retry, timeout::Timeout,
@@ -104,6 +104,13 @@ const MISSING_BLOCK_REGISTRY_RETRY_LIMIT: usize = 60;
 /// the peer crawler connect new peers / inventory marks expire, short enough that the pipeline
 /// resumes promptly once a peer that has the block appears.
 const REGISTRY_MISS_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Backoff between attempts to extend a frontier whose last response contained no usable hashes.
+///
+/// A checkpoint verifier parks every block until its complete range arrives. If a short peer
+/// response leaves that range incomplete, retrying from the last checked frontier can discover the
+/// missing hashes without falling back to a locator built from the older committed state tip.
+const TIP_FRONTIER_RETRY_BACKOFF: Duration = Duration::from_secs(10);
 
 /// A lower bound on the user-specified checkpoint verification concurrency limit.
 ///
@@ -1251,7 +1258,15 @@ where
     #[instrument(skip(self, reserve))]
     async fn sync_round(&mut self, mut reserve: IndexSet<block::Hash>) -> Result<(), Report> {
         // The type of the in-flight tip-extension future.
-        type ExtendOutput = Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report>;
+        type ExtendOutput = Result<
+            (
+                IndexSet<block::Hash>,
+                HashSet<CheckedTip>,
+                HashSet<CheckedTip>,
+                usize,
+            ),
+            Report,
+        >;
 
         // The currently running request for more block hashes, if any.
         //
@@ -1260,11 +1275,16 @@ where
         // syncer cannot build up an unbounded backlog of undispatched hashes.
         let mut extend: Option<Pin<Box<dyn Future<Output = ExtendOutput> + Send>>> = None;
 
+        // An empty extension can be caused by a peer whose chain ends before the next checkpoint.
+        // Keep the checked frontier and retry it after a short backoff while verifier tasks are
+        // parked, rather than rebuilding discovery from the older committed state locator.
+        let mut frontier_retry_at: Option<Instant> = None;
+
         // The last time this sync round made observable progress.
         //
-        // Progress means a block finished verification, a background hash
-        // extension finished, or more full-block downloads were queued. If none
-        // of those happen for `BLOCK_VERIFY_TIMEOUT`, restart the round.
+        // Progress means a block finished verification, a background extension discovered hashes,
+        // or more full-block downloads were queued. Empty frontier retries are not progress. If
+        // none of those happen for `BLOCK_VERIFY_TIMEOUT`, restart the round.
         let mut last_progress = Instant::now();
 
         loop {
@@ -1276,6 +1296,12 @@ where
                 self.handle_block_response_with_missing_retry(rsp).await?;
                 last_progress = Instant::now();
             }
+            if last_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
+                self.trace_sync_snapshot("round_stalled", reserve.len());
+                return Err(eyre!(
+                    "sync round stalled: no block completed or tips extended within timeout"
+                ));
+            }
             metrics::gauge!("sync.reserve.depth").set(reserve.len() as f64);
             self.update_metrics();
 
@@ -1286,6 +1312,7 @@ where
             // next extension early lets downloads keep running during that round
             // trip.
             if extend.is_none()
+                && frontier_retry_at.is_none()
                 && reserve.len() < MIN_UNREQUESTED_HASHES_BEFORE_EXTEND
                 && !self.prospective_tips.is_empty()
             {
@@ -1298,7 +1325,12 @@ where
 
                 let tip_network = self.tip_network.clone();
                 let tips = std::mem::take(&mut self.prospective_tips);
-                extend = Some(Box::pin(Self::build_extend(tip_network, tips)));
+                let attempted_tips = tips.clone();
+                extend = Some(Box::pin(async move {
+                    let (download_set, new_tips, discovered) =
+                        Self::build_extend(tip_network, tips).await?;
+                    Ok((download_set, new_tips, attempted_tips, discovered))
+                }));
             }
 
             // Dispatch from the reserve while we're below the lookahead limit.
@@ -1407,6 +1439,7 @@ where
                 && extend.is_none()
                 && self.prospective_tips.is_empty()
                 && self.registry_miss_retry.is_empty()
+                && frontier_retry_at.is_none()
             {
                 break;
             }
@@ -1422,6 +1455,14 @@ where
             let step = timeout(BLOCK_VERIFY_TIMEOUT, async {
                 tokio::select! {
                     biased;
+
+                    // Retry a checked frontier after an empty extension. This timer is deliberately
+                    // not sync progress: repeated empty responses must still trip the stall timeout.
+                    _ = OptionFuture::from(frontier_retry_at.map(sleep_until)),
+                        if frontier_retry_at.is_some() =>
+                    {
+                        frontier_retry_at = None;
+                    }
 
                     // Retry required blocks that registry-missed once their backoff elapses. This
                     // is not gated by speculative lookahead dispatch, so the head-of-line block gets
@@ -1460,16 +1501,26 @@ where
                     }
 
                     extended = OptionFuture::from(extend.as_mut()), if extend.is_some() => {
-                        let (download_set, new_tips, discovered) =
+                        let (download_set, new_tips, attempted_tips, discovered) =
                             extended.expect("only polled while an extension is in flight")?;
                         self.trace.tips_extended(discovered, new_tips.len());
-                        self.prospective_tips = new_tips;
+                        if discovered == 0 && new_tips.is_empty() && has_inflight {
+                            self.prospective_tips = attempted_tips;
+                            frontier_retry_at =
+                                Some(Instant::now() + TIP_FRONTIER_RETRY_BACKOFF);
+                            metrics::counter!("sync.tip.frontier.retry").increment(1);
+                        } else {
+                            self.prospective_tips = new_tips;
+                            frontier_retry_at = None;
+                        }
                         // security: use the actual number of new downloads from all peers, so the
                         // last peer to respond can't toggle our mempool.
                         self.recent_syncs.push_extend_tips_length(discovered);
                         reserve.extend(download_set);
                         extend = None;
-                        last_progress = Instant::now();
+                        if discovered > 0 {
+                            last_progress = Instant::now();
+                        }
                     }
                 }
 

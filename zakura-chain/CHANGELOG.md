@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serialize and deserialize successfully, while unsupported later placeholders
   are rejected.
 
+### Fixed
+
+- Local-genesis networks that activate NU6.1 or later now configure the
+  required zero-value lockbox marker output, so their first semantic
+  activation block can pass subsidy validation. Requests for an upgrade with
+  no compiled consensus branch ID now fail during generation.
+
 ## [9.0.0] - 2026-06-02
 
 ### Added

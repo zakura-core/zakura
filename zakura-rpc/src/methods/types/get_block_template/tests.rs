@@ -11,6 +11,7 @@ use zakura_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 
 use zakura_chain::{
     block::Height,
+    local_genesis::generate_local_testnet_with_funded_keys,
     parameters::{
         subsidy::FundingStreamReceiver::{Deferred, Ecc, MajorGrants, ZcashFoundation},
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
@@ -18,6 +19,7 @@ use zakura_chain::{
     },
     serialization::ZcashDeserializeInto,
     transaction::Transaction,
+    transparent,
 };
 
 use crate::client::TransactionTemplate;
@@ -91,6 +93,43 @@ fn coinbase() -> anyhow::Result<()> {
             }
         }
     }
+
+    Ok(())
+}
+
+/// The coinbase built for a local testnet's activation block must include the
+/// network's configured zero-value lockbox marker output, so a mining node
+/// can produce a block that satisfies the one-time ZIP-271 disbursement rule.
+#[test]
+fn local_genesis_activation_coinbase_includes_lockbox_marker() -> anyhow::Result<()> {
+    let generated = generate_local_testnet_with_funded_keys(
+        vec!["alice".to_string(), "bob".to_string()],
+        Default::default(),
+    )
+    .map_err(|error| anyhow!(error.to_string()))?;
+    let net = generated.network;
+    let height = NetworkUpgrade::Nu6_3
+        .activation_height(&net)
+        .expect("the default local network activates NU6.3");
+    let miner_params = MinerParams::from(
+        Address::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Transparent),
+        )
+        .ok_or(anyhow!("hard-coded address must be valid"))?,
+    );
+    let transaction =
+        TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero())?
+            .data()
+            .as_ref()
+            .zcash_deserialize_into::<Transaction>()?;
+    let lockbox_disbursements = net.lockbox_disbursements(height);
+    let [(lockbox_address, lockbox_amount)] = lockbox_disbursements.as_slice() else {
+        return Err(anyhow!("local network must have one lockbox marker"));
+    };
+    let lockbox_output = transparent::Output::new(*lockbox_amount, lockbox_address.script());
+
+    assert!(transaction.outputs().contains(&lockbox_output));
 
     Ok(())
 }

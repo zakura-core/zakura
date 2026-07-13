@@ -19,7 +19,8 @@ use crate::{
     fmt::HexDebug,
     parameters::{
         testnet::{
-            ConfiguredActivationHeights, ConfiguredCheckpoints, Parameters as TestnetParams,
+            ConfiguredActivationHeights, ConfiguredCheckpoints, ConfiguredLockboxDisbursement,
+            Parameters as TestnetParams,
         },
         Magic, Network, NetworkKind, NetworkUpgrade,
     },
@@ -66,6 +67,9 @@ impl Default for LocalTestnetGenesisOptions {
 /// Fixed private-network PoW limit used by both generated seed blocks and the
 /// configured custom testnet.
 const LOCAL_TESTNET_TARGET_DIFFICULTY_LIMIT: [u8; 32] = [0x0f; 32];
+
+/// Script hash for the zero-value output that marks the implicit NU6.1 event.
+const LOCAL_TESTNET_LOCKBOX_SCRIPT_HASH: [u8; 20] = [0; 20];
 
 /// A secp256k1 keypair with a transparent Zcash address.
 pub struct FundedKey {
@@ -384,6 +388,7 @@ fn build_network(options: BuildNetworkOptions<'_>) -> Result<Network, crate::Box
 
     let activation_heights =
         configured_activation_heights(latest_network_upgrade, activation_height)?;
+    let lockbox_disbursements = configured_lockbox_disbursements(latest_network_upgrade);
 
     // Order matters: with_halving_interval must come before with_funding_streams
     // because funding_streams locks the halving interval.
@@ -397,7 +402,7 @@ fn build_network(options: BuildNetworkOptions<'_>) -> Result<Network, crate::Box
         .with_activation_heights(activation_heights)?
         .with_halving_interval(144)?
         .with_funding_streams(vec![])
-        .with_lockbox_disbursements(vec![])
+        .with_lockbox_disbursements(lockbox_disbursements)
         .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(
             checkpoints.to_vec(),
         ))?;
@@ -416,6 +421,10 @@ fn configured_activation_heights(
         return Err("latest_network_upgrade must be BeforeOverwinter or later".into());
     }
 
+    if latest_network_upgrade >= Overwinter && latest_network_upgrade.branch_id().is_none() {
+        return Err("latest_network_upgrade must have a consensus branch ID".into());
+    }
+
     Ok(ConfiguredActivationHeights {
         before_overwinter: Some(1),
         overwinter: (latest_network_upgrade >= Overwinter).then_some(activation_height),
@@ -425,15 +434,33 @@ fn configured_activation_heights(
         canopy: (latest_network_upgrade >= Canopy).then_some(activation_height),
         nu5: (latest_network_upgrade >= Nu5).then_some(activation_height),
         nu6: (latest_network_upgrade >= Nu6).then_some(activation_height),
-        // Nu6.1 is the one-time ZIP-271 lockbox disbursement event from mainnet; activating it on
-        // a local testnet would require synthesising disbursement outputs in the activation-block
-        // coinbase, which the local genesis builder does not produce. Skipping it lets NU6.3 activate
-        // directly without tripping the lockbox-disbursements consensus rule.
-        nu6_1: None,
+        nu6_1: (latest_network_upgrade >= Nu6_1).then_some(activation_height),
         nu6_2: (latest_network_upgrade >= Nu6_2).then_some(activation_height),
         nu6_3: (latest_network_upgrade >= Nu6_3).then_some(activation_height),
         nu7: (latest_network_upgrade >= Nu7).then_some(activation_height),
     })
+}
+
+fn configured_lockbox_disbursements(
+    latest_network_upgrade: NetworkUpgrade,
+) -> Vec<ConfiguredLockboxDisbursement> {
+    if latest_network_upgrade < NetworkUpgrade::Nu6_1 {
+        return Vec::new();
+    }
+
+    // Later upgrades implicitly activate every earlier consensus rule. In particular,
+    // activating NU6.2 or later still triggers the one-time NU6.1 disbursement rule. A
+    // zero-value P2SH output satisfies that structural rule without creating funds or
+    // drawing from the empty local deferred pool. The mining transaction builder reads
+    // this configured output and includes it in the activation-block coinbase.
+    vec![ConfiguredLockboxDisbursement {
+        address: transparent::Address::from_script_hash(
+            NetworkKind::Testnet,
+            LOCAL_TESTNET_LOCKBOX_SCRIPT_HASH,
+        )
+        .to_string(),
+        amount: Amount::<NonNegative>::zero(),
+    }]
 }
 
 /// RIPEMD-160(SHA-256(data)) - standard Bitcoin/Zcash hash160 for public keys.
@@ -521,12 +548,51 @@ mod tests {
             NetworkUpgrade::Nu6_3.activation_height(network),
             Some(activation_height)
         );
+        assert_eq!(
+            NetworkUpgrade::Nu6_1.activation_height(network),
+            Some(activation_height),
+            "later upgrades implicitly activate the NU6.1 one-time rule"
+        );
+        let lockbox_disbursements = network.lockbox_disbursements(activation_height);
+        let [(lockbox_address, lockbox_amount)] = lockbox_disbursements.as_slice() else {
+            panic!("post-NU6 local networks have one lockbox marker output");
+        };
+        assert!(lockbox_address.is_script_hash());
+        assert!(lockbox_amount.is_zero());
         // NU6.3 inherits the post-Blossom consensus target spacing (75s); this is the
         // protocol block spacing and is independent of the harness `target_spacing_secs`
         // option used to space the generated seeded-block timestamps.
         assert_eq!(
             NetworkUpgrade::target_spacing_for_height(network, activation_height).num_seconds(),
             i64::from(crate::parameters::POST_BLOSSOM_POW_TARGET_SPACING)
+        );
+    }
+
+    /// NU6.1 itself must be usable as the latest upgrade: it has a compiled
+    /// consensus branch ID, and the network still gets the lockbox marker its
+    /// activation block needs.
+    #[test]
+    fn nu6_1_can_be_the_latest_network_upgrade() {
+        let generated = generate_local_testnet_with_funded_keys(
+            vec!["alice".to_string(), "bob".to_string()],
+            LocalTestnetGenesisOptions {
+                latest_network_upgrade: NetworkUpgrade::Nu6_1,
+                ..Default::default()
+            },
+        )
+        .expect("local testnet should generate");
+
+        let activation_height = Height(3);
+        assert_eq!(
+            NetworkUpgrade::current(&generated.network, activation_height),
+            NetworkUpgrade::Nu6_1
+        );
+        assert_eq!(
+            generated
+                .network
+                .lockbox_disbursements(activation_height)
+                .len(),
+            1
         );
     }
 

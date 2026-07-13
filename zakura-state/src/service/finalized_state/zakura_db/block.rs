@@ -188,6 +188,25 @@ impl ZakuraDb {
             .map(AdvertisedBodySize::get)
     }
 
+    /// Returns provisional advisory body-size hints for a bounded height range.
+    pub fn advertised_body_sizes_by_height_range(
+        &self,
+        range: impl RangeBounds<block::Height>,
+    ) -> BTreeMap<block::Height, u32> {
+        let body_size_by_height = self
+            .db
+            .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+            .unwrap();
+
+        self.db
+            .zs_forward_range_iter::<_, block::Height, AdvertisedBodySize, _>(
+                &body_size_by_height,
+                range,
+            )
+            .map(|(height, size)| (height, size.get()))
+            .collect()
+    }
+
     /// Returns provisional header-sync commitment roots for a contiguous height range.
     pub fn zakura_header_commitment_roots_by_height_range(
         &self,
@@ -524,17 +543,59 @@ impl ZakuraDb {
     ) -> Vec<(block::Height, block::Hash, Arc<block::Header>)> {
         let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
 
+        if capped_count == 0 {
+            return Vec::new();
+        }
+
+        let end = (start + i64::from(capped_count.saturating_sub(1))).unwrap_or(start);
+        let hash_by_height = self.db.cf_handle("hash_by_height").unwrap();
+        let header_by_height = self.db.cf_handle("block_header_by_height").unwrap();
+        let zakura_hash_by_height = self.db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
+        let zakura_header_by_height = self.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
+
+        let consensus_hashes: BTreeMap<_, _> = self
+            .db
+            .zs_forward_range_iter::<_, block::Height, block::Hash, _>(&hash_by_height, start..=end)
+            .collect();
+        let consensus_headers: BTreeMap<_, _> = self
+            .db
+            .zs_forward_range_iter::<_, block::Height, Arc<block::Header>, _>(
+                &header_by_height,
+                start..=end,
+            )
+            .collect();
+        let provisional_hashes: BTreeMap<_, _> = self
+            .db
+            .zs_forward_range_iter::<_, block::Height, block::Hash, _>(
+                &zakura_hash_by_height,
+                start..=end,
+            )
+            .collect();
+        let provisional_headers: BTreeMap<_, _> = self
+            .db
+            .zs_forward_range_iter::<_, block::Height, Arc<block::Header>, _>(
+                &zakura_header_by_height,
+                start..=end,
+            )
+            .collect();
+
         let mut headers = Vec::with_capacity(
             usize::try_from(capped_count).expect("capped header count fits in usize"),
         );
         let mut height = start;
 
         for _ in 0..capped_count {
-            let Some((hash, header)) = self.header_by_height(height) else {
+            let consensus = consensus_hashes
+                .get(&height)
+                .zip(consensus_headers.get(&height));
+            let provisional = provisional_hashes
+                .get(&height)
+                .zip(provisional_headers.get(&height));
+            let Some((hash, header)) = consensus.or(provisional) else {
                 break;
             };
 
-            headers.push((height, hash, header));
+            headers.push((height, *hash, header.clone()));
 
             let Ok(next_height) = height.next() else {
                 break;

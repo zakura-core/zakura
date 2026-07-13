@@ -379,6 +379,12 @@ where
     C: AsRef<Chain>,
 {
     let count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
+    if count == 0 {
+        return Vec::new();
+    }
+    let end = (from + i64::from(count.saturating_sub(1))).unwrap_or(from);
+    let finalized_infos = db.block_infos_by_height_range(from..=end);
+    let advertised_sizes = db.advertised_body_sizes_by_height_range(from..=end);
     let mut hints = Vec::with_capacity(
         usize::try_from(count).expect("capped block size hint count fits in usize"),
     );
@@ -390,9 +396,9 @@ where
         let confirmed_size = chain
             .as_ref()
             .and_then(|chain| chain.as_ref().block_info(height.into()))
-            .or_else(|| db.block_info(height.into()))
+            .or_else(|| finalized_infos.get(&height).cloned())
             .map(|info| info.size());
-        let size = confirmed_size.or_else(|| db.advertised_body_size(height));
+        let size = confirmed_size.or_else(|| advertised_sizes.get(&height).copied());
 
         hints.push((height, size));
     }

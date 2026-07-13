@@ -2349,6 +2349,10 @@ async fn vct_repair_scheduler_requires_an_idle_peer() {
     .await;
     let (requested_peer, _request_id, _, _) = next_outbound_get_headers(&mut fixture.actions).await;
     assert_eq!(requested_peer, busy_peer);
+    while tokio::time::timeout(std::time::Duration::from_millis(25), fixture.actions.recv())
+        .await
+        .is_ok()
+    {}
 
     fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
     advertise_tip(
@@ -2433,7 +2437,7 @@ async fn status_updates_peer_caps_and_scheduler_respects_them() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_limits_v1_to_one_outstanding_request_per_peer() {
+async fn scheduler_fills_v7_outstanding_request_slots() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -2453,26 +2457,34 @@ async fn scheduler_limits_v1_to_one_outstanding_request_per_peer() {
     )
     .await;
 
-    let mut get_headers_count = 0;
+    let mut starts = HashSet::new();
     while let Ok(Some(action)) = tokio::time::timeout(
         std::time::Duration::from_millis(100),
         fixture.actions.recv(),
     )
     .await
     {
-        if matches!(
-            action,
-            HeaderSyncAction::SendMessage {
-                peer,
-                msg: HeaderSyncMessage::GetHeaders { .. },
-                ..
-            } if peer == peer_id
-        ) {
-            get_headers_count += 1;
+        if let HeaderSyncAction::SendMessage {
+            peer,
+            msg:
+                HeaderSyncMessage::GetHeaders {
+                    start_height,
+                    count,
+                    ..
+                },
+            ..
+        } = action
+        {
+            if peer == peer_id {
+                assert_eq!(count, 2);
+                assert!(starts.insert(start_height));
+            }
         }
     }
 
-    assert_eq!(get_headers_count, 1);
+    assert_eq!(starts.len(), 10);
+    assert_eq!(starts.iter().copied().min(), Some(block::Height(1)));
+    assert_eq!(starts.iter().copied().max(), Some(block::Height(19)));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2565,7 +2577,7 @@ async fn scheduler_uses_v7_inflight_slots_and_matches_reverse_response_ids() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_fans_out_same_forward_range_to_three_peers() {
+async fn work_queue_assigns_each_forward_range_to_one_peer() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -2580,7 +2592,7 @@ async fn scheduler_fans_out_same_forward_range_to_three_peers() {
     }
 
     let mut requested = HashSet::new();
-    while requested.len() < HEADER_SYNC_FANOUT {
+    while requested.is_empty() {
         if let HeaderSyncAction::SendMessage {
             peer,
             msg:
@@ -2598,34 +2610,29 @@ async fn scheduler_fans_out_same_forward_range_to_three_peers() {
         }
     }
 
-    assert_eq!(requested.len(), HEADER_SYNC_FANOUT);
+    assert_eq!(requested.len(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
+async fn covered_outstanding_range_does_not_commit_late_response() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
         (block::Height(0), network.genesis_hash()),
         None,
     ));
-    let peers = [peer(33), peer(34)];
+    let peer_id = peer(33);
     let start = block::Height(1);
     let tip = block::Height(2);
 
-    for peer_id in peers.clone() {
-        connect_peer(&fixture, peer_id.clone()).await;
-        advertise_tip(&fixture, peer_id, block::Height(0), tip, 2, 1).await;
-    }
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), block::Height(0), tip, 2, 1).await;
 
-    let mut requests = HashMap::new();
-    while requests.len() < peers.len() {
-        let (peer, request_id, start_height, count) =
-            next_outbound_get_headers(&mut fixture.actions).await;
-        assert_eq!(start_height, start);
-        assert_eq!(count, 2);
-        requests.insert(peer, request_id);
-    }
+    let (requested_peer, request_id, start_height, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, peer_id);
+    assert_eq!(start_height, start);
+    assert_eq!(count, 2);
 
     fixture
         .handle
@@ -2637,152 +2644,25 @@ async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
         .await
         .unwrap();
 
-    for peer_id in peers {
-        send_headers(
-            &fixture,
-            &peer_id,
-            requests[&peer_id],
-            headers_message_from(
-                start,
-                vec![
-                    mainnet_header(&BLOCK_MAINNET_1_BYTES),
-                    mainnet_header(&BLOCK_MAINNET_2_BYTES),
-                ],
-            ),
-        )
-        .await;
-    }
+    send_headers(
+        &fixture,
+        &peer_id,
+        request_id,
+        headers_message_from(
+            start,
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+        ),
+    )
+    .await;
 
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
-/// Hedged responses can double-commit, and that must stay benign.
-///
-/// The scheduler fans one range out to several peers, and `pending_commits` is keyed per
-/// `(peer, start_height, count)`, so the commit dispatch does not check for an overlapping
-/// pending commit from another peer. Redundant outstanding ranges are only cancelled in
-/// `handle_header_range_committed`, once the state writer confirms. Two responses that land
-/// inside that window therefore each dispatch their own `CommitHeaderRange`.
-///
-/// That is harmless *today*: the state writer treats an identical header at a height as a
-/// non-conflict, so the second commit revalidates and rewrites the same rows and returns
-/// `Ok`; the duplicate committed event is idempotent in the reactor; and the tip only
-/// publishes on a strictly higher height. Neither honest peer is scored.
-///
-/// The property holds only because of those downstream details, so it is tested at both
-/// layers: the state writer's half (re-committing an identical range succeeds) is covered by
-/// `header_range_commit_merges_same_header_advertised_body_size_by_max` in `zakura-state`,
-/// and this test covers the reactor's half. If `commit_header_range` starts rejecting an
-/// already-present range, or a conflict error is reclassified as scoring, honest hedged peers
-/// would be scored for misbehavior; these two tests are what catch that.
 #[tokio::test(flavor = "current_thread")]
-async fn hedged_double_commit_does_not_score_peers_or_publish_the_tip_twice() {
-    // A checkpoint at height 3 with the range starting at 4: above the checkpoint, so the
-    // range is non-finalized and gets hedged, while the mainnet header still validates.
-    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
-    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
-    let start = block::Height(4);
-    let header = mainnet_header(&BLOCK_MAINNET_4_BYTES);
-    let tip_hash = block::Hash::from(header.as_ref());
-    let mut fixture = spawn_test_reactor(startup_for(
-        network.clone(),
-        (block::Height(0), network.genesis_hash()),
-        Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peers = [peer(43), peer(44)];
-
-    for peer_id in peers.clone() {
-        connect_peer(&fixture, peer_id.clone()).await;
-        advertise_tip(&fixture, peer_id, block::Height(0), start, 1, 1).await;
-    }
-
-    // The same range is hedged across both peers.
-    let mut requests = HashMap::new();
-    while requests.len() < peers.len() {
-        let (peer, request_id, start_height, count) =
-            next_outbound_get_headers(&mut fixture.actions).await;
-        assert_eq!(start_height, start);
-        assert_eq!(count, 1);
-        requests.insert(peer, request_id);
-    }
-
-    // Both answer before either commit is confirmed, so both outstandings are still live.
-    for peer_id in peers.clone() {
-        send_headers(
-            &fixture,
-            &peer_id,
-            requests[&peer_id],
-            headers_message(vec![header.clone()]),
-        )
-        .await;
-    }
-
-    // Each response dispatches its own commit: the race is real, and neither peer is scored.
-    let mut committed_peers = Vec::new();
-    while committed_peers.len() < peers.len() {
-        match next_non_query_action(&mut fixture.actions).await {
-            HeaderSyncAction::CommitHeaderRange {
-                peer, start_height, ..
-            } => {
-                assert_eq!(start_height, start);
-                committed_peers.push(peer);
-            }
-            HeaderSyncAction::Misbehavior { peer, reason } => {
-                panic!("an honest hedged peer must not be scored: {peer:?} {reason:?}")
-            }
-            _ => {}
-        }
-    }
-    committed_peers.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    let mut expected_peers = peers.to_vec();
-    expected_peers.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    assert_eq!(
-        committed_peers, expected_peers,
-        "both hedged responses should dispatch their own commit"
-    );
-
-    // The state writer confirms both: rewriting an identical range succeeds.
-    for _ in 0..peers.len() {
-        fixture
-            .handle
-            .send(HeaderSyncEvent::HeaderRangeCommitted {
-                start_height: start,
-                tip_height: start,
-                tip_hash,
-            })
-            .await
-            .unwrap();
-    }
-
-    // The duplicate commit neither scores a peer nor republishes the frontier.
-    let mut advanced = 0;
-    while let Ok(Some(action)) = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        fixture.actions.recv(),
-    )
-    .await
-    {
-        match action {
-            HeaderSyncAction::HeaderAdvanced { height, hash } => {
-                assert_eq!(height, start);
-                assert_eq!(hash, tip_hash);
-                advanced += 1;
-            }
-            HeaderSyncAction::Misbehavior { peer, reason } => {
-                panic!("a duplicate commit must not score {peer:?}: {reason:?}")
-            }
-            _ => {}
-        }
-    }
-    assert_eq!(
-        advanced, 1,
-        "a duplicate commit at the same tip must not republish the header frontier"
-    );
-    assert_eq!(fixture.handle.best_header_tip(), (start, tip_hash));
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
+async fn work_queue_splits_large_ranges_without_duplicate_ownership() {
     let network = Network::Mainnet;
     let first_checkpoint = network
         .checkpoint_list()
@@ -2823,7 +2703,7 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
         .await;
     }
 
-    let mut requested = HashSet::new();
+    let mut requested = HashMap::new();
     while let Ok(Some(action)) = tokio::time::timeout(
         std::time::Duration::from_millis(100),
         fixture.actions.recv(),
@@ -2841,48 +2721,16 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
             ..
         } = action
         {
-            assert_eq!(start_height, start);
-            assert_eq!(count, clamped_count);
+            assert!(count <= clamped_count);
+            assert!(count > 0);
             assert!(
-                requested.insert(peer),
-                "scheduler must not duplicate a clamped chunk for one peer"
+                requested.insert(start_height, peer).is_none(),
+                "work queue must not assign one clamped chunk to multiple peers"
             );
         }
     }
-    assert_eq!(requested.len(), HEADER_SYNC_FANOUT);
-
-    let chunk_tip = height_after_count(start, clamped_count)
-        .and_then(previous_height)
-        .expect("clamped range has a tip");
-    fixture
-        .handle
-        .send(HeaderSyncEvent::HeaderRangeCommitted {
-            start_height: start,
-            tip_height: chunk_tip,
-            tip_hash: block::Hash([4; 32]),
-        })
-        .await
-        .unwrap();
-
-    loop {
-        if let HeaderSyncAction::SendMessage {
-            msg:
-                HeaderSyncMessage::GetHeaders {
-                    start_height,
-                    count,
-                    want_tree_aux_roots: true,
-                },
-            ..
-        } = next_non_query_action(&mut fixture.actions).await
-        {
-            assert_eq!(
-                start_height,
-                next_height(chunk_tip).expect("committed chunk tip has successor")
-            );
-            assert_eq!(count, clamped_count);
-            break;
-        }
-    }
+    assert_eq!(requested.len(), peers.len());
+    assert_eq!(requested.keys().copied().min(), Some(start));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -5519,6 +5367,39 @@ async fn empty_headers_for_outstanding_range_retries_without_disconnect() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn one_silent_peer_retries_the_same_missing_range_indefinitely() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_with_timeout(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        std::time::Duration::from_millis(5),
+    ));
+    let peer_id = peer(90);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+
+    for _ in 0..3 {
+        let (request_peer, _request_id, start, count) =
+            next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(request_peer, peer_id);
+        assert_eq!(start, block::Height(1));
+        assert_eq!(count, 1);
+        // Silence: let the request deadline expire. The work queue must return
+        // the claim and make it eligible again after the short peer-local delay.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn committed_range_updates_best_tip_watch_and_does_not_advance_finality() {
     let network = regtest_network();
     let fixture = spawn_test_reactor(startup_for(
@@ -5754,7 +5635,7 @@ async fn forward_genesis_backfill_reaches_checkpoint_before_finalized_commit() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn truncated_finalized_backfill_is_rejected_before_commit() {
+async fn truncated_finalized_backfill_commits_valid_prefix_and_requeues_suffix() {
     let headers = [
         mainnet_header(&BLOCK_MAINNET_1_BYTES),
         mainnet_header(&BLOCK_MAINNET_2_BYTES),
@@ -5790,9 +5671,17 @@ async fn truncated_finalized_backfill_is_rejected_before_commit() {
     .await;
 
     match next_non_query_action(&mut fixture.actions).await {
-        HeaderSyncAction::Misbehavior { peer, reason } => {
+        HeaderSyncAction::CommitHeaderRange {
+            peer,
+            start_height,
+            headers,
+            finalized,
+            ..
+        } => {
             assert_eq!(peer, peer_id);
-            assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+            assert_eq!(start_height, block::Height(1));
+            assert_eq!(headers.len(), 2);
+            assert!(finalized);
         }
         action => panic!("unexpected action: {action:?}"),
     }

@@ -20,6 +20,21 @@ use zakura_chain::{
 
 use zakura_chain::work::difficulty::CompactDifficulty;
 
+/// One height-aligned row returned by a native header-sync range read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderSyncRangeEntry {
+    /// Block height for this row.
+    pub height: block::Height,
+    /// Block hash for this row.
+    pub hash: block::Hash,
+    /// Block header for this row.
+    pub header: Arc<block::Header>,
+    /// Advisory serialized block size, when known.
+    pub body_size: Option<u32>,
+    /// Commitment roots for this height, when requested and available.
+    pub commitment_roots: Option<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>,
+}
+
 // Allow *only* these unused imports, so that rustdoc link resolution
 // will work with inline links.
 #[allow(unused_imports)]
@@ -394,6 +409,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::HeadersByHeightRange`].
     Headers(Vec<(block::Height, block::Hash, Arc<block::Header>)>),
 
+    /// Response to [`ReadRequest::HeaderSyncRange`].
+    HeaderSyncRange(Vec<HeaderSyncRangeEntry>),
+
     /// Response to [`ReadRequest::BestHeaderTip`].
     BestHeaderTip(Option<(block::Height, block::Hash)>),
 
@@ -595,6 +613,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)
             | ReadResponse::Headers(_)
+            | ReadResponse::HeaderSyncRange(_)
             | ReadResponse::BestHeaderTip(_)
             | ReadResponse::MissingBlockBodies(_)
             | ReadResponse::MissingBlockBodyMetadata(_)

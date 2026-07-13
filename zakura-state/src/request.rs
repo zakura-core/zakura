@@ -1398,6 +1398,21 @@ pub enum ReadRequest {
         count: u32,
     },
 
+    /// Returns one contiguous, height-aligned native header-sync range.
+    ///
+    /// Headers, hashes, advisory body sizes, and optional commitment roots are
+    /// collected from one best-chain snapshot in one blocking state read. The
+    /// response stops before the first missing header and is capped by
+    /// [`MAX_HEADER_SYNC_HEIGHT_RANGE`](crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE).
+    HeaderSyncRange {
+        /// First height to read.
+        start: block::Height,
+        /// Maximum number of rows to return.
+        count: u32,
+        /// Include commitment roots where state has them.
+        include_roots: bool,
+    },
+
     /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
     /// with the per-block commitment roots for the requested heights, in ascending height
     /// order. May return fewer than `count` roots if the node does not hold the whole range.
@@ -1637,6 +1652,7 @@ impl ReadRequest {
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeadersByHeightRange { .. } => "headers_by_height_range",
+            ReadRequest::HeaderSyncRange { .. } => "header_sync_range",
             ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodies { .. } => "missing_block_bodies",

@@ -1,6 +1,6 @@
 # Zakura Continuous Genesis Sync Fleet
 
-This directory codifies the six permanent mainnet sync nodes that repeatedly
+This directory codifies the seven permanent mainnet sync nodes that repeatedly
 test a fresh genesis-to-tip sync from the latest `origin/main` build:
 
 | Node | Address | Mode |
@@ -11,6 +11,7 @@ test a fresh genesis-to-tip sync from the latest `origin/main` build:
 | `temp-zakura-sync-test-4` | `root@134.209.57.146` | Zebra/legacy-only |
 | `temp-zakura-sync-test-5` | `root@142.93.27.189` | Zebra/legacy-only |
 | `temp-zakura-sync-test-6` | `root@138.68.249.46` | Zebra/legacy-only |
+| `temp-zakura-sync-test-7` | `root@134.209.50.231` | dual-stack |
 
 Each node runs a local systemd controller. GitHub Actions installs and audits the
 controller, but it does not hold an SSH session open during the long sync.

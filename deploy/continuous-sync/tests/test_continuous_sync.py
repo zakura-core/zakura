@@ -219,9 +219,9 @@ class ContinuousSyncTests(unittest.TestCase):
 
         self.assertIn('p2p_stack = "legacy"', rendered["zakurad.toml.template"])
         self.assertIn('mode_label = "Zebra/legacy-only"', rendered["controller.toml"])
-        self.assertIn('branch = "fix/checkpoint-refill-minimal"', rendered["controller.toml"])
-        self.assertEqual(rendered["alert-monitor.toml"].count("[[nodes]]"), 6)
-        for index in range(1, 7):
+        self.assertIn('branch = "main"', rendered["controller.toml"])
+        self.assertEqual(rendered["alert-monitor.toml"].count("[[nodes]]"), 7)
+        for index in range(1, 8):
             self.assertIn(
                 f'hostname = "temp-zakura-sync-test-{index}"',
                 rendered["alert-monitor.toml"],

@@ -266,7 +266,7 @@ journalctl -u zakura-fleet-watchdog -f
 
 ## Continuous genesis sync fleet
 
-The permanent six-node genesis sync canary is managed separately under
+The permanent seven-node genesis sync canary is managed separately under
 `deploy/continuous-sync/`. It repeatedly builds latest `origin/main`, wipes only
 its dedicated disposable state, syncs from genesis to tip, posts Slack
 completion/failure alerts through its codified monitor timer, and retains five

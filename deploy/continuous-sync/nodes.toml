@@ -77,7 +77,6 @@ alias = "temp-zakura-sync-test-3"
 public_ip = "134.209.49.92"
 mode_label = "Zebra/legacy-only"
 p2p_stack = "legacy"
-branch = "fix/checkpoint-refill-minimal"
 stall_seconds = 1800
 
 [[nodes]]
@@ -88,7 +87,6 @@ alias = "temp-zakura-sync-test-4"
 public_ip = "134.209.57.146"
 mode_label = "Zebra/legacy-only"
 p2p_stack = "legacy"
-branch = "fix/checkpoint-refill-minimal"
 stall_seconds = 1800
 
 [[nodes]]
@@ -99,7 +97,6 @@ alias = "temp-zakura-sync-test-5"
 public_ip = "142.93.27.189"
 mode_label = "Zebra/legacy-only"
 p2p_stack = "legacy"
-branch = "fix/checkpoint-refill-minimal"
 stall_seconds = 1800
 
 [[nodes]]
@@ -110,5 +107,13 @@ alias = "temp-zakura-sync-test-6"
 public_ip = "138.68.249.46"
 mode_label = "Zebra/legacy-only"
 p2p_stack = "legacy"
-branch = "fix/checkpoint-refill-minimal"
 stall_seconds = 1800
+
+[[nodes]]
+name = "temp-zakura-sync-test-7"
+hostname = "temp-zakura-sync-test-7"
+ssh_string = "root@134.209.50.231"
+alias = "temp-zakura-sync-test-7"
+public_ip = "134.209.50.231"
+mode_label = "dual-stack"
+p2p_stack = "dual"

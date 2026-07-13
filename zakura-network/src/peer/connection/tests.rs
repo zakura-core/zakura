@@ -5,11 +5,13 @@
 use std::{
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    panic,
     sync::Arc,
+    task::{Context, Poll},
 };
 
 use chrono::Utc;
-use futures::{channel::mpsc, sink::SinkMapErr, SinkExt};
+use futures::{channel::mpsc, sink::SinkMapErr, Sink, SinkExt};
 
 use zakura_chain::{block::Height, serialization::SerializationError};
 use zakura_test::mock_service::MockService;
@@ -27,6 +29,47 @@ use crate::{
 
 mod prop;
 mod vectors;
+
+/// Test that dropping a peer sender does not require a Tokio timer context.
+#[test]
+fn peer_tx_drop_does_not_require_tokio_timer() {
+    let result = panic::catch_unwind(|| drop(super::peer_tx::PeerTx::from(NeverClosingSink)));
+
+    assert!(result.is_ok(), "dropping a peer sender must not panic");
+}
+
+/// A sink that accepts messages but never finishes closing.
+#[derive(Clone, Debug)]
+struct NeverClosingSink;
+
+impl Sink<Message> for NeverClosingSink {
+    type Error = SerializationError;
+
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: std::pin::Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Poll::Pending
+    }
+}
 
 /// Creates a new [`Connection`] instance for testing.
 fn new_test_connection<A>() -> (
@@ -96,4 +139,50 @@ fn new_test_connection<A>() -> (
         peer_rx,
         shared_error_slot,
     )
+}
+
+/// Creates a connection whose peer writer never finishes closing.
+fn new_never_closing_test_connection<A>(
+    connection_tracker: crate::peer_set::ConnectionTracker,
+) -> (
+    Connection<MockService<Request, Response, A>, NeverClosingSink>,
+    mpsc::Sender<ClientRequest>,
+    ErrorSlot,
+) {
+    let mock_inbound_service = MockService::build().finish();
+    let (client_tx, client_rx) = mpsc::channel(0);
+    let shared_error_slot = ErrorSlot::default();
+
+    let fake_addr: SocketAddr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4).into();
+    let fake_version = CURRENT_NETWORK_PROTOCOL_VERSION;
+    let fake_services = PeerServices::default();
+    let remote = VersionMessage {
+        version: fake_version,
+        services: fake_services,
+        timestamp: Utc::now(),
+        address_recv: AddrInVersion::new(fake_addr, fake_services),
+        address_from: AddrInVersion::new(fake_addr, fake_services),
+        nonce: Nonce::default(),
+        user_agent: "connection test".to_string(),
+        start_height: Height(0),
+        relay: true,
+    };
+    let connection_info = ConnectionInfo {
+        connected_addr: ConnectedAddr::Isolated,
+        local: remote.clone(),
+        remote,
+        negotiated_version: fake_version,
+    };
+
+    let connection = Connection::new(
+        mock_inbound_service,
+        client_rx,
+        shared_error_slot.clone(),
+        NeverClosingSink,
+        connection_tracker,
+        Arc::new(connection_info),
+        Vec::new(),
+    );
+
+    (connection, client_tx, shared_error_slot)
 }

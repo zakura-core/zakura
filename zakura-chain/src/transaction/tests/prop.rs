@@ -160,6 +160,7 @@ fn nu5_or_later_upgrade() -> BoxedStrategy<NetworkUpgrade> {
         Just(NetworkUpgrade::Nu6),
         Just(NetworkUpgrade::Nu6_1),
         Just(NetworkUpgrade::Nu6_2),
+        Just(NetworkUpgrade::Nu6_3),
     ]
     .boxed()
 }
@@ -252,6 +253,15 @@ proptest! {
             crate::transaction::zip244::auth_digest(&tx).expect("v5/v6"),
             native_auth
         );
+
+        // The public wrappers route v5/v6 transactions through the same
+        // native decomposition. Keep that routing pinned to the oracle too,
+        // rather than only testing the internal ZIP-244 helpers.
+        let (public_txid, public_auth) = tx.txid_and_auth_digest();
+        prop_assert_eq!(public_txid, ref_txid);
+        prop_assert_eq!(public_auth, Some(ref_auth));
+        prop_assert_eq!(tx.hash(), ref_txid);
+        prop_assert_eq!(tx.auth_digest(), Some(ref_auth));
     }
 
     #[test]

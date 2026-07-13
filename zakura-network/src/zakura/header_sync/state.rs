@@ -1,4 +1,4 @@
-use super::{error::*, events::*, scheduler::*, validation::*, wire::*, *};
+use super::{error::*, events::*, validation::*, wire::*, work_queue::*, *};
 use crate::zakura::{
     HeaderSyncServiceSummary, ServicePeerDirection, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
 };
@@ -31,7 +31,9 @@ pub(super) struct HeaderSyncCore {
     pub(super) parked_peers: HashSet<ZakuraPeerId>,
     pub(super) seen: HeaderHashDedup,
     pub(super) pending_new_blocks: HashSet<block::Hash>,
-    pub(super) schedule: RangeScheduler,
+    pub(super) schedule: HeaderWorkQueue,
+    pub(super) buffered: BTreeMap<(RangePriority, block::Height), BufferedHeaderRange>,
+    pub(super) backward_frontier: Option<(block::Height, block::Hash)>,
     pub(super) pending_commits: HashMap<PendingCommitKey, RangeRequest>,
     pub(super) repair: Option<VctRootRepair>,
     pub(super) advisory: HashMap<ZakuraPeerId, HeaderSyncAdvisoryPeerState>,
@@ -42,6 +44,17 @@ impl HeaderSyncCore {
     pub(super) fn new(startup: &HeaderSyncStartup) -> Result<Self, HeaderSyncStartError> {
         validate_anchor(&startup.network, startup.anchor)?;
         let (best_header_tip, best_header_hash) = startup.best_header_tip.unwrap_or(startup.anchor);
+        let backward_frontier = startup
+            .network
+            .checkpoint_list()
+            .max_height_in_range(..startup.anchor.0)
+            .and_then(|height| {
+                startup
+                    .network
+                    .checkpoint_list()
+                    .hash(height)
+                    .map(|hash| (height, hash))
+            });
 
         Ok(Self {
             anchor: startup.anchor,
@@ -54,7 +67,9 @@ impl HeaderSyncCore {
             parked_peers: HashSet::new(),
             seen: HeaderHashDedup::default(),
             pending_new_blocks: HashSet::new(),
-            schedule: RangeScheduler::new(),
+            schedule: HeaderWorkQueue::new(),
+            buffered: BTreeMap::new(),
+            backward_frontier,
             pending_commits: HashMap::new(),
             repair: None,
             advisory: HashMap::new(),
@@ -90,18 +105,58 @@ impl HeaderSyncCore {
             }
         }
 
-        let count = count_between(start, end);
-        if count == 0 {
+        let batch_count = clamp_header_sync_request_count(
+            startup.config.advertised_max_headers_per_response(),
+            startup.config.advertised_max_headers_per_response(),
+            &startup.network,
+            startup.max_frame_bytes,
+            true,
+        );
+        let resident_height_cap =
+            u64::from(batch_count.saturating_mul(HEADER_SYNC_MAX_RESIDENT_BATCHES));
+        let available = resident_height_cap.saturating_sub(self.schedule.resident_heights());
+        let Ok(available) = u32::try_from(available) else {
+            return;
+        };
+        if available == 0 {
             return;
         }
-        self.schedule.ensure_forward(RangeRequest {
-            start_height: start,
-            count,
-            anchor_hash: self.best_header_hash,
-            finalized,
-            want_tree_aux_roots: true,
-            priority: RangePriority::Forward,
-        });
+        let batch_start = self
+            .schedule
+            .highest_end(RangePriority::Forward)
+            .and_then(next_height)
+            .unwrap_or(start)
+            .max(start);
+        if batch_start > end {
+            return;
+        }
+        let count = count_between(batch_start, end).min(available);
+        let mut remaining = count;
+        let mut batch_start = batch_start;
+        let mut anchor_hash = (batch_start == start).then_some(self.best_header_hash);
+        while remaining > 0 {
+            let mut batch_len = remaining.min(batch_count);
+            let batch_end = height_after_count(batch_start, batch_len)
+                .and_then(previous_height)
+                .expect("bounded header work batch has an end height");
+            if let Some(checkpoint) = checkpoints.min_height_in_range(batch_start..=batch_end) {
+                batch_len = count_between(batch_start, checkpoint);
+            }
+            self.schedule.ensure_forward(RangeRequest {
+                start_height: batch_start,
+                count: batch_len,
+                anchor_hash,
+                finalized,
+                want_tree_aux_roots: true,
+                priority: RangePriority::Forward,
+            });
+            remaining = remaining.saturating_sub(batch_len);
+            let Some(next_start) = height_after_count(batch_start, batch_len) else {
+                break;
+            };
+            batch_start = next_start;
+            anchor_hash = None;
+        }
     }
 
     pub(super) fn refresh_backward_range(&mut self, startup: &HeaderSyncStartup) {
@@ -111,27 +166,66 @@ impl HeaderSyncCore {
         let checkpoints = startup.network.checkpoint_list();
         // v1 backfill schedules one checkpoint bracket below the configured anchor.
         // Iterating all deeper brackets is left to final node wiring/backfill policy.
-        let Some(previous_checkpoint) = checkpoints.max_height_in_range(..self.anchor.0) else {
+        let Some((frontier_height, frontier_hash)) = self.backward_frontier else {
             return;
         };
-        let Some(previous_hash) = checkpoints.hash(previous_checkpoint) else {
-            return;
-        };
-        let Some(start) = next_height(previous_checkpoint) else {
-            return;
-        };
-        let count = count_between(start, self.anchor.0);
-        if count == 0 {
+        if frontier_height >= self.anchor.0 {
             return;
         }
-        self.schedule.ensure_backward(RangeRequest {
-            start_height: start,
-            count,
-            anchor_hash: previous_hash,
-            finalized: true,
-            want_tree_aux_roots: true,
-            priority: RangePriority::Backward,
-        });
+        let Some(start) = next_height(frontier_height) else {
+            return;
+        };
+        let batch_count = clamp_header_sync_request_count(
+            startup.config.advertised_max_headers_per_response(),
+            startup.config.advertised_max_headers_per_response(),
+            &startup.network,
+            startup.max_frame_bytes,
+            true,
+        );
+        let resident_height_cap =
+            u64::from(batch_count.saturating_mul(HEADER_SYNC_MAX_RESIDENT_BATCHES));
+        let available = resident_height_cap.saturating_sub(self.schedule.resident_heights());
+        let Ok(available) = u32::try_from(available) else {
+            return;
+        };
+        if available == 0 {
+            return;
+        }
+        let batch_start = self
+            .schedule
+            .highest_end(RangePriority::Backward)
+            .and_then(next_height)
+            .unwrap_or(start)
+            .max(start);
+        if batch_start > self.anchor.0 {
+            return;
+        }
+        let mut remaining = count_between(batch_start, self.anchor.0).min(available);
+        let mut batch_start = batch_start;
+        let mut anchor_hash = (batch_start == start).then_some(frontier_hash);
+        while remaining > 0 {
+            let mut batch_len = remaining.min(batch_count);
+            let batch_end = height_after_count(batch_start, batch_len)
+                .and_then(previous_height)
+                .expect("bounded backward work batch has an end height");
+            if let Some(checkpoint) = checkpoints.min_height_in_range(batch_start..=batch_end) {
+                batch_len = count_between(batch_start, checkpoint);
+            }
+            self.schedule.ensure_backward(RangeRequest {
+                start_height: batch_start,
+                count: batch_len,
+                anchor_hash,
+                finalized: true,
+                want_tree_aux_roots: true,
+                priority: RangePriority::Backward,
+            });
+            remaining = remaining.saturating_sub(batch_len);
+            let Some(next_start) = height_after_count(batch_start, batch_len) else {
+                break;
+            };
+            batch_start = next_start;
+            anchor_hash = None;
+        }
     }
 }
 
@@ -183,7 +277,7 @@ impl VctRootRepair {
             range: RangeRequest {
                 start_height: height,
                 count,
-                anchor_hash,
+                anchor_hash: Some(anchor_hash),
                 finalized: false,
                 want_tree_aux_roots: true,
                 priority: RangePriority::Repair,
@@ -479,11 +573,21 @@ pub(super) struct OutstandingRange {
     pub(super) purpose: RangePurpose,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct BufferedHeaderRange {
+    pub(super) peer: ZakuraPeerId,
+    pub(super) session_id: u64,
+    pub(super) range: RangeRequest,
+    pub(super) headers: Vec<Arc<block::Header>>,
+    pub(super) body_sizes: Vec<u32>,
+    pub(super) tree_aux_roots: Vec<BlockCommitmentRoots>,
+}
+
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct RangeRequest {
     pub(super) start_height: block::Height,
     pub(super) count: u32,
-    pub(super) anchor_hash: block::Hash,
+    pub(super) anchor_hash: Option<block::Hash>,
     pub(super) finalized: bool,
     pub(super) want_tree_aux_roots: bool,
     pub(super) priority: RangePriority,
@@ -501,7 +605,7 @@ impl RangeRequest {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) enum RangePriority {
     Forward,
     Backward,

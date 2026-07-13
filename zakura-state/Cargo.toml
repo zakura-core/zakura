@@ -19,6 +19,9 @@ categories = ["asynchronous", "caching", "cryptography::cryptocurrencies"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
+# Exposes narrow internal hooks used by benchmarks.
+internal-bench = []
+
 progress-bar = [
     "howudoin",
 ]
@@ -119,3 +122,8 @@ zakura-test = { path = "../zakura-test/", version = "1.0.0" }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "transparent_spend_worst_case"
+harness = false
+required-features = ["internal-bench"]

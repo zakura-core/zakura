@@ -2,7 +2,7 @@
 name = "zakura-node-services"
 version = "1.0.0-rc2"
 authors.workspace = true
-description = "The interfaces of some Zebra node services"
+description = "The interfaces of some Zakura node services. Internal crate, published to support cargo install zakura"
 license.workspace = true
 repository.workspace = true
 edition.workspace = true

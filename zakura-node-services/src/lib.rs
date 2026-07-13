@@ -1,4 +1,4 @@
-//! The interfaces of some Zebra node services.
+//! The interfaces of some Zakura node services.
 
 pub use zakura_chain::parameters::checkpoint::constants;
 pub mod mempool;

@@ -2,7 +2,7 @@
 name = "zakura-consensus"
 version = "1.0.0-rc2"
 authors.workspace = true
-description = "Implementation of Zcash consensus checks"
+description = "Implementation of Zcash consensus checks for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
 repository.workspace = true
 edition.workspace = true

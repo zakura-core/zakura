@@ -6,9 +6,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
+categories = ["development-tools::debugging"]
 edition.workspace = true
 rust-version.workspace = true
-description = "Shared non-blocking JSONL tracing support for Zebra"
+description = "Shared non-blocking JSONL tracing support for the Zakura node. Internal crate, published to support cargo install zakura"
 
 [dependencies]
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "time", "rt", "macros"] }

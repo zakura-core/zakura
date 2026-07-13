@@ -2,7 +2,7 @@
 name = "zakura-network"
 version = "1.0.0-rc2"
 authors = ["Zcash Foundation <zebra@zfnd.org>", "Tower Maintainers <team@tower-rs.com>"]
-description = "Networking code for Zebra"
+description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal
 #
 # This licence is deliberately different to the rest of Zebra.

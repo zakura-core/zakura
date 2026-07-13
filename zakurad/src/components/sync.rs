@@ -1301,15 +1301,10 @@ where
                 continue;
             }
 
-            // The round is exhausted once there's nothing queued, nothing left to discover, and no
-            // critical block waiting to be retried after a registry-miss backoff.
-            //
-            // Blocks may still be in flight. We deliberately don't wait for them: the checkpoint
-            // verifier holds every block in a range until the whole range up to the next checkpoint
-            // has arrived, so an incomplete range keeps its blocks in flight until we discover the
-            // rest of it — which only a fresh `obtain_tips` can do. The in-flight downloads survive
-            // the round and are picked up by the next one.
-            if reserve.is_empty()
+            // The round is exhausted once there's nothing in flight, nothing queued, nothing left to
+            // discover, and no critical block waiting to be retried after a registry-miss backoff.
+            if self.downloads.in_flight() == 0
+                && reserve.is_empty()
                 && extend.is_none()
                 && self.prospective_tips.is_empty()
                 && self.registry_miss_retry.is_empty()

@@ -21,7 +21,6 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
-import calendar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -70,7 +69,7 @@ class Policy:
     ready_samples: int = 6
     ready_sample_interval_seconds: int = 30
     min_free_bytes: int = 10 * 1024 * 1024 * 1024
-    retention_days: int = 5
+    retention_runs: int = 3
     cooldown_seconds: int = 60
     wipe_entries: tuple[str, ...] = ("state", "non_finalized_state")
     preserve_entries: tuple[str, ...] = ("network",)
@@ -449,6 +448,14 @@ def sample_status(config: Config) -> dict[str, Any]:
             "checkpoint_processing_next_height",
             "sync.estimated_network_tip_height",
             "sync.estimated_distance_to_tip",
+            "sync.prospective_tips.len",
+            "sync.reserve.depth",
+            "sync.downloads.in_flight",
+            "sync.downloads.waiting_network",
+            "sync.downloads.downloading",
+            "sync.downloads.response_received",
+            "sync.downloads.waiting_verifier",
+            "sync.downloads.verifying",
         ):
             value = metric_value(metrics, key)
             if value is not None:
@@ -534,7 +541,7 @@ def wait_for_completion(config: Config, run_dir: Path, run_state: dict[str, Any]
             time.sleep(config.policy.poll_interval_seconds)
 
 
-def compress_previous_log(config: Config, run_dir: Path) -> None:
+def archive_run_log(config: Config, run_dir: Path) -> None:
     if not config.paths.log_file.exists():
         return
     dest = run_dir / "zebrad.log"
@@ -542,8 +549,8 @@ def compress_previous_log(config: Config, run_dir: Path) -> None:
     config.paths.log_file.write_text("", encoding="utf-8")
 
 
-def cleanup_retention(config: Config) -> None:
-    cutoff = now() - config.policy.retention_days * 86400
+def cleanup_retention(config: Config, active_run: Path | None = None) -> None:
+    runs = []
     for child in config.paths.runs_dir.iterdir() if config.paths.runs_dir.exists() else []:
         if not child.is_dir():
             continue
@@ -554,14 +561,19 @@ def cleanup_retention(config: Config) -> None:
             data = json.loads(run_json.read_text(encoding="utf-8"))
         except Exception:
             continue
-        completed_at = data.get("completed_at") or data.get("failed_at")
-        if not completed_at:
-            continue
-        try:
-            parsed = int(calendar.timegm(time.strptime(completed_at, "%Y%m%dT%H%M%SZ")))
-        except ValueError:
-            continue
-        if parsed < cutoff:
+        runs.append((str(data.get("started_at", "")), child))
+
+    runs.sort(key=lambda run: (run[0], run[1].name), reverse=True)
+    keep_count = max(config.policy.retention_runs, 1 if active_run else 0)
+    keep = {child for _, child in runs[:keep_count]}
+    if active_run is not None and active_run not in keep:
+        keep.add(active_run)
+        if len(keep) > keep_count:
+            oldest_kept = next(child for _, child in reversed(runs) if child in keep and child != active_run)
+            keep.remove(oldest_kept)
+
+    for _, child in runs:
+        if child not in keep:
             shutil.rmtree(child, ignore_errors=True)
 
 
@@ -613,6 +625,7 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
     write_run_json(run_dir, run_state)
     state.update({"failed": False, "current_run": run_id, "phase": "building", "running_sha": sha})
     save_state(state_path, state)
+    cleanup_retention(config, active_run=run_dir)
 
     binary = build_binary(config, sha)
     run_state.update({"phase": "installing", "binary_sha256": sha256_file(binary)})
@@ -624,17 +637,18 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
     stop_service(config)
     safe_wipe_state(config)
     render_config(config, run_dir)
-    compress_previous_log(config, run_dir)
+    config.paths.log_file.write_text("", encoding="utf-8")
 
     run_state["phase"] = "syncing"
     write_run_json(run_dir, run_state)
     state.update({"phase": "syncing", "running_sha": sha, "current_run": run_id})
     save_state(state_path, state)
-    start_service(config)
     try:
+        start_service(config)
         wait_for_completion(config, run_dir, run_state)
     finally:
         stop_service(config)
+        archive_run_log(config, run_dir)
 
     completed_at = utc_stamp()
     run_state.update({"phase": "complete", "completed_at": completed_at})

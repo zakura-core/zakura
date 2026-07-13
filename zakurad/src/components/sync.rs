@@ -43,6 +43,7 @@ use crate::{
 mod downloads;
 pub mod end_of_support;
 mod gossip;
+mod legacy_trace;
 mod progress;
 mod recent_sync_lengths;
 mod status;
@@ -51,6 +52,7 @@ mod status;
 mod tests;
 
 use downloads::{AlwaysHedge, Downloads, NotFoundKind};
+use legacy_trace::LegacySyncTrace;
 
 pub use downloads::VERIFICATION_PIPELINE_SCALING_MULTIPLIER;
 pub use gossip::{gossip_best_tip_block_hashes, BlockGossipError};
@@ -783,6 +785,9 @@ where
 
     /// Sender for reporting peer addresses that advertised unexpectedly invalid transactions.
     misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
+
+    /// Structured diagnostics for the legacy sync pipeline.
+    trace: LegacySyncTrace,
 }
 
 /// Polls the network to determine whether further blocks are available and
@@ -892,6 +897,7 @@ where
 
         let (past_lookahead_limit_sender, past_lookahead_limit_receiver) = watch::channel(false);
         let past_lookahead_limit_receiver = zs::WatchReceiver::new(past_lookahead_limit_receiver);
+        let trace = LegacySyncTrace::new(config.network.zakura.trace_dir.clone());
 
         let downloads = Box::pin(Downloads::new(
             block_network,
@@ -903,6 +909,7 @@ where
                 full_verify_concurrency_limit,
             ),
             max_checkpoint_height,
+            trace.clone(),
         ));
 
         let new_syncer = Self {
@@ -922,6 +929,7 @@ where
             registry_miss_retry: HashMap::new(),
             past_lookahead_limit_receiver,
             misbehavior_sender,
+            trace,
         };
 
         (new_syncer, sync_status)
@@ -1189,11 +1197,10 @@ where
         self.missing_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
+        let state_tip = self.latest_chain_tip.best_tip_height();
+        self.trace.round_start(state_tip);
 
-        info!(
-            state_tip = ?self.latest_chain_tip.best_tip_height(),
-            "starting sync, obtaining new tips"
-        );
+        info!(?state_tip, "starting sync, obtaining new tips");
         let extra_hashes = timeout(SYNC_RESTART_DELAY, self.obtain_tips())
             .await
             .map_err(Into::into)
@@ -1202,12 +1209,32 @@ where
             .map_err(|e| {
                 info!("temporary error obtaining tips: {:#}", e);
                 e
-            })?;
+            });
+        let extra_hashes = match extra_hashes {
+            Ok(extra_hashes) => extra_hashes,
+            Err(error) => {
+                self.trace
+                    .round_finish("obtain_tips_error", state_tip, Some(&error));
+                return Err(error);
+            }
+        };
         self.update_metrics();
+        self.trace
+            .tips_obtained(extra_hashes.len(), self.prospective_tips.len());
 
-        self.sync_round(extra_hashes).await?;
+        if let Err(error) = self.sync_round(extra_hashes).await {
+            self.trace_sync_snapshot("round_error_snapshot", 0);
+            self.trace.round_finish(
+                "sync_error",
+                self.latest_chain_tip.best_tip_height(),
+                Some(&error),
+            );
+            return Err(error);
+        }
 
         info!("exhausted prospective tip set");
+        self.trace
+            .round_finish("exhausted", self.latest_chain_tip.best_tip_height(), None);
 
         Ok(())
     }
@@ -1435,6 +1462,7 @@ where
                     extended = OptionFuture::from(extend.as_mut()), if extend.is_some() => {
                         let (download_set, new_tips, discovered) =
                             extended.expect("only polled while an extension is in flight")?;
+                        self.trace.tips_extended(discovered, new_tips.len());
                         self.prospective_tips = new_tips;
                         // security: use the actual number of new downloads from all peers, so the
                         // last peer to respond can't toggle our mempool.
@@ -1453,6 +1481,7 @@ where
                 Ok(result) => result?,
                 Err(_elapsed) => {
                     if last_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
+                        self.trace_sync_snapshot("round_stalled", reserve.len());
                         return Err(eyre!(
                             "sync round stalled: no block completed or tips extended within timeout"
                         ));
@@ -2177,6 +2206,28 @@ where
     fn update_metrics(&mut self) {
         metrics::gauge!("sync.prospective_tips.len",).set(self.prospective_tips.len() as f64);
         metrics::gauge!("sync.downloads.in_flight",).set(self.downloads.in_flight() as f64);
+        let phase_counts = self.downloads.phase_counts();
+        for (phase, metric) in [
+            ("waiting_network", "sync.downloads.waiting_network"),
+            ("downloading", "sync.downloads.downloading"),
+            ("response_received", "sync.downloads.response_received"),
+            ("waiting_verifier", "sync.downloads.waiting_verifier"),
+            ("verifying", "sync.downloads.verifying"),
+        ] {
+            let count = u32::try_from(phase_counts.get(phase).copied().unwrap_or_default())
+                .unwrap_or(u32::MAX);
+            metrics::gauge!(metric).set(f64::from(count));
+        }
+    }
+
+    fn trace_sync_snapshot(&self, event: &'static str, reserve: usize) {
+        self.downloads.as_ref().get_ref().emit_diagnostic_snapshot(
+            event,
+            self.latest_chain_tip.best_tip_height(),
+            reserve,
+            self.prospective_tips.len(),
+            self.registry_miss_retry.len(),
+        );
     }
 
     /// Return if the sync should be restarted based on the given error

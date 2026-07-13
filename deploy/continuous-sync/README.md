@@ -81,6 +81,7 @@ Host files:
 - run artifacts: `/var/log/zakura/runs/<timestamp>-<sha>/`
 - node log: `/var/log/zakura/zebrad.log`
 - trace symlink: `/var/log/zakura/traces`
+- legacy sync trace: `/var/log/zakura/traces/legacy_sync.jsonl`
 - monitor log: `/var/log/zakura/monitor.log`
 
 ## Deployment
@@ -161,7 +162,9 @@ The controller requires several consecutive `/ready` successes before declaring
 a cycle complete. `/ready` checks that the node has live peers, is near the
 estimated network tip, and has a fresh tip. The controller also records
 Prometheus samples in `samples.jsonl` so a completed or failed run has evidence
-for height movement and readiness.
+for height movement, readiness, legacy pipeline depth, and each active download
+or verification phase. The controller copies the current node log into the run
+directory on both completion and failure.
 
 The relevant loopback endpoints are only bound locally:
 
@@ -171,9 +174,9 @@ The relevant loopback endpoints are only bound locally:
 
 ## Retention
 
-Detailed run artifacts live under `/var/log/zakura/runs/`. Completed and failed
-run directories older than `retention_days = 5` are deleted after each successful
-cycle. The active run is never age-deleted.
+Detailed run artifacts live under `/var/log/zakura/runs/`. The controller keeps
+the active run and the two newest prior runs (`retention_runs = 3`), deleting
+older completed or failed run directories when each cycle starts.
 
 `templates/logrotate` also rotates `/var/log/zakura/zebrad.log` and
 `/var/log/zakura/monitor.log` daily, keeping five compressed rotations.

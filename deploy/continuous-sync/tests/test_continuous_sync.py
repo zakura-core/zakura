@@ -3,7 +3,6 @@ import json
 import os
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -50,6 +49,8 @@ class ContinuousSyncTests(unittest.TestCase):
             [
                 "sync_estimated_network_tip_height 1000",
                 "sync_estimated_distance_to_tip 100",
+                "sync_downloads_in_flight 17",
+                "sync_downloads_verifying 4",
             ]
         )
         config = make_config(Path("/tmp"))
@@ -63,6 +64,8 @@ class ContinuousSyncTests(unittest.TestCase):
 
         self.assertEqual(status["height"], 900)
         self.assertEqual(status["height_source"], "estimated_tip_minus_distance")
+        self.assertEqual(status["sync.downloads.in_flight"], 17)
+        self.assertEqual(status["sync.downloads.verifying"], 4)
 
     def test_alert_status_falls_back_to_estimated_height(self):
         metrics = "\n".join(
@@ -113,28 +116,49 @@ class ContinuousSyncTests(unittest.TestCase):
             self.assertTrue((network / "marker").exists())
         os.environ.pop("ZAKURA_CONTINUOUS_SYNC_TESTING", None)
 
-    def test_cleanup_retention_keeps_active_recent_and_deletes_old(self):
+    def test_cleanup_retention_keeps_active_and_two_newest_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             runs_dir = tmp_path / "runs"
-            old = runs_dir / "old"
-            recent = runs_dir / "recent"
             active = runs_dir / "active"
-            for path in (old, recent, active):
+            completed = [runs_dir / f"completed-{index}" for index in range(4)]
+            for path in (*completed, active):
                 path.mkdir(parents=True)
-            old_stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time() - 10 * 86400))
-            recent_stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            (old / "run.json").write_text(json.dumps({"completed_at": old_stamp}), encoding="utf-8")
-            (recent / "run.json").write_text(json.dumps({"completed_at": recent_stamp}), encoding="utf-8")
-            (active / "run.json").write_text(json.dumps({"phase": "syncing"}), encoding="utf-8")
+            for index, path in enumerate(completed):
+                (path / "run.json").write_text(
+                    json.dumps({"started_at": f"2026071{index}T000000Z", "phase": "complete"}),
+                    encoding="utf-8",
+                )
+            (active / "run.json").write_text(
+                json.dumps({"started_at": "20260709T000000Z", "phase": "syncing"}),
+                encoding="utf-8",
+            )
 
-            config = make_config(tmp_path, runs_dir=runs_dir, policy=sync.Policy(retention_days=5))
+            config = make_config(tmp_path, runs_dir=runs_dir, policy=sync.Policy(retention_runs=3))
 
-            sync.cleanup_retention(config)
+            sync.cleanup_retention(config, active_run=active)
 
-            self.assertFalse(old.exists())
-            self.assertTrue(recent.exists())
             self.assertTrue(active.exists())
+            self.assertFalse(completed[0].exists())
+            self.assertFalse(completed[1].exists())
+            self.assertTrue(completed[2].exists())
+            self.assertTrue(completed[3].exists())
+
+    def test_archive_run_log_copies_current_log_and_truncates_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            run_dir = tmp_path / "runs" / "current"
+            run_dir.mkdir(parents=True)
+            config = make_config(tmp_path)
+            config.paths.log_file.write_text("current run log\n", encoding="utf-8")
+
+            sync.archive_run_log(config, run_dir)
+
+            self.assertEqual(
+                (run_dir / "zebrad.log").read_text(encoding="utf-8"),
+                "current run log\n",
+            )
+            self.assertEqual(config.paths.log_file.read_text(encoding="utf-8"), "")
 
     def test_relink_backs_up_existing_trace_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

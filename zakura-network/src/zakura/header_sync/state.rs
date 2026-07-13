@@ -1,4 +1,6 @@
-use super::{error::*, events::*, validation::*, wire::*, work_queue::*, *};
+use super::{
+    error::*, events::*, requester::HeaderRequesterHandle, validation::*, wire::*, work_queue::*, *,
+};
 use crate::zakura::{
     HeaderSyncServiceSummary, ServicePeerDirection, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
 };
@@ -27,6 +29,7 @@ pub(super) struct HeaderSyncCore {
     pub(super) verified_block_hash: block::Hash,
     pub(super) best_header_tip: block::Height,
     pub(super) best_header_hash: block::Hash,
+    pub(super) last_header_progress_at: Instant,
     pub(super) peers: HashMap<ZakuraPeerId, PeerHeaderState>,
     pub(super) parked_peers: HashSet<ZakuraPeerId>,
     pub(super) seen: HeaderHashDedup,
@@ -63,6 +66,7 @@ impl HeaderSyncCore {
             verified_block_hash: startup.frontiers.verified_block_hash,
             best_header_tip,
             best_header_hash,
+            last_header_progress_at: Instant::now(),
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
             seen: HeaderHashDedup::default(),
@@ -422,6 +426,9 @@ pub(super) struct PeerHeaderState {
     /// which the peer's inbound rate limiter would otherwise treat as spam.
     pub(super) last_sent_status: Option<HeaderSyncStatus>,
     pub(super) outstanding: Vec<OutstandingRange>,
+    pub(super) pending_request_sends: usize,
+    pub(super) requester_generation: u64,
+    pub(super) requester: Option<HeaderRequesterHandle>,
     pub(super) meters: HeaderSyncPeerMeters,
     pub(super) served_headers_inflight: u16,
     pub(super) served_header_request_ids: HashSet<HeaderSyncRequestId>,
@@ -450,6 +457,9 @@ impl PeerHeaderState {
             last_received_status_at: None,
             last_sent_status: None,
             outstanding: Vec::new(),
+            pending_request_sends: 0,
+            requester_generation: 0,
+            requester: None,
             meters: HeaderSyncPeerMeters::new(
                 status_refresh_interval,
                 inbound_status_min_interval,
@@ -462,7 +472,11 @@ impl PeerHeaderState {
     }
 
     pub(super) fn available_slots(&self) -> usize {
-        usize::from(self.max_inflight_requests).saturating_sub(self.outstanding.len())
+        usize::from(self.max_inflight_requests).saturating_sub(
+            self.outstanding
+                .len()
+                .saturating_add(self.pending_request_sends),
+        )
     }
 
     pub(super) fn remove_outstanding_by_request_id(

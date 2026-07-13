@@ -446,6 +446,8 @@ pub mod header_sync_trace {
     pub const HEADER_FRONTIER_REANCHORED: &str = "header_frontier_reanchored";
     /// Missing block bodies reported.
     pub const HEADER_MISSING_BODIES_REPORTED: &str = "header_missing_bodies_reported";
+    /// The reactor woke because a real retry, timeout, or status deadline expired.
+    pub const HEADER_MAINTENANCE_WAKEUP: &str = "header_maintenance_wakeup";
 }
 
 /// Shared commit/frontier adapter trace event names and field keys.

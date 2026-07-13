@@ -249,6 +249,28 @@ impl HeaderSyncPeerSession {
         )
     }
 
+    /// Wait for bounded outbound capacity and enqueue a correlated header response.
+    pub async fn send_headers_with_sizes_and_roots(
+        &self,
+        request_id: HeaderSyncRequestId,
+        headers: Vec<Arc<block::Header>>,
+        body_sizes: Vec<u32>,
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
+    ) -> Result<(), OrderedSendError> {
+        let frame = HeaderSyncMessage::Headers {
+            headers,
+            body_sizes,
+            tree_aux_roots,
+        }
+        .encode_frame(Some(request_id))
+        .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+        self.inner
+            .send
+            .send(frame)
+            .await
+            .map_err(|_| OrderedSendError::Closed)
+    }
+
     /// Send a typed full tip block announcement.
     pub fn try_send_new_block(&self, block: Arc<block::Block>) -> Result<(), OrderedSendError> {
         self.try_send_message(HeaderSyncMessage::NewBlock(block), None)

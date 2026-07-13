@@ -35,6 +35,7 @@ pub fn spawn_header_sync_reactor(
     let state = HeaderSyncCore::new(&startup)?;
     let (events_tx, events_rx) = mpsc::channel(128);
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+    let lifecycle_events = lifecycle_tx.clone();
     let (actions_tx, actions_rx) = mpsc::channel(128);
     let (commit_permits_tx, commit_permits_rx) = mpsc::unbounded_channel();
     let (requester_events_tx, requester_events_rx) = mpsc::unbounded_channel();
@@ -58,6 +59,7 @@ pub fn spawn_header_sync_reactor(
         state,
         events: events_rx,
         lifecycle: lifecycle_rx,
+        lifecycle_events,
         actions: actions_tx,
         commit_permits: commit_permits_rx,
         commit_permits_tx,
@@ -80,6 +82,7 @@ pub(super) struct HeaderSyncReactor {
     state: HeaderSyncCore,
     events: mpsc::Receiver<HeaderSyncEvent>,
     lifecycle: mpsc::UnboundedReceiver<HeaderSyncEvent>,
+    lifecycle_events: mpsc::UnboundedSender<HeaderSyncEvent>,
     actions: mpsc::Sender<HeaderSyncAction>,
     commit_permits: mpsc::UnboundedReceiver<mpsc::OwnedPermit<HeaderSyncAction>>,
     commit_permits_tx: mpsc::UnboundedSender<mpsc::OwnedPermit<HeaderSyncAction>>,
@@ -742,6 +745,7 @@ impl HeaderSyncReactor {
                 peer_state.requester = None;
                 peer_state.served_headers_inflight = 0;
                 peer_state.served_header_request_ids.clear();
+                peer_state.served_header_started_at.clear();
                 peer_state.highest_served_header_request_id = None;
                 peer_state.meters = HeaderSyncPeerMeters::new(
                     status_refresh_interval,
@@ -1193,6 +1197,10 @@ impl HeaderSyncReactor {
             TreeAuxTraceSummary::default(),
         );
         if let Some(peer_state) = self.state.peers.get_mut(&peer) {
+            if let Some(started) = peer_state.serving_started_at(request_id) {
+                metrics::histogram!("sync.header.serve.total_seconds")
+                    .record(started.elapsed().as_secs_f64());
+            }
             let _ = peer_state.finish_serving_headers(request_id);
         }
     }
@@ -1213,64 +1221,85 @@ impl HeaderSyncReactor {
             return;
         };
         if validate_body_sizes_len(headers.len(), body_sizes.len()).is_err() {
-            let _ = peer_state.finish_serving_headers(request_id);
-            return;
+            headers.clear();
+            body_sizes.clear();
+            tree_aux_roots.clear();
         }
 
         let roots_complete = validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len())
             .and_then(|()| validate_tree_aux_root_heights(start_height, &tree_aux_roots))
             .is_ok();
-        if !headers.is_empty() && (!want_tree_aux_roots || !roots_complete) {
+        if !headers.is_empty()
+            && ((want_tree_aux_roots && !roots_complete)
+                || (!want_tree_aux_roots && !tree_aux_roots.is_empty()))
+        {
             headers.clear();
             body_sizes.clear();
             tree_aux_roots.clear();
         };
         let returned_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
         let served_tree_aux_roots = TreeAuxTraceSummary::new(&tree_aux_roots);
-        if !peer_state.finish_serving_headers(request_id) {
+        let deadline = Instant::now() + HEADER_SYNC_SERVE_DEADLINE;
+        let session = peer_state.session.clone();
+        if !peer_state.served_header_request_ids.contains(&request_id) {
             metrics::counter!("sync.header.response.stale_serving_request_id").increment(1);
             return;
         }
-        let send_result = peer_state.session.try_send_headers_with_sizes_and_roots(
-            request_id,
-            headers,
-            body_sizes,
-            tree_aux_roots,
-        );
-        let queue_capacity = peer_state.session.outbound_capacity();
-        let queue_max_capacity = peer_state.session.outbound_max_capacity();
-
-        match send_result {
-            Ok(()) => self.trace_headers_served(
-                &peer,
+        let queue_capacity = session.outbound_capacity();
+        let queue_max_capacity = session.outbound_max_capacity();
+        let completions = self.lifecycle_events.clone();
+        tokio::spawn(async move {
+            let outbound_started = Instant::now();
+            let returned_count = match time::timeout_at(
+                deadline,
+                session.send_headers_with_sizes_and_roots(
+                    request_id,
+                    headers,
+                    body_sizes,
+                    tree_aux_roots,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => returned_count,
+                Ok(Err(error)) => {
+                    metrics::counter!(
+                        "sync.header.response.failed",
+                        "reason" => ordered_send_error_label(&error)
+                    )
+                    .increment(1);
+                    tracing::debug!(
+                        ?peer,
+                        ?start_height,
+                        requested_count,
+                        ?error,
+                        queue_capacity,
+                        queue_max_capacity,
+                        "failed to queue Zakura header-sync Headers response"
+                    );
+                    0
+                }
+                Err(_) => {
+                    metrics::counter!(
+                        "sync.header.response.failed",
+                        "reason" => "outbound_timeout"
+                    )
+                    .increment(1);
+                    0
+                }
+            };
+            metrics::histogram!("sync.header.serve.outbound_enqueue_seconds")
+                .record(outbound_started.elapsed().as_secs_f64());
+            let _ = served_tree_aux_roots;
+            let _ = completions.send(HeaderSyncEvent::HeaderRangeResponseFinished {
+                peer,
+                session_id: session.session_id(),
+                request_id,
                 start_height,
                 requested_count,
                 returned_count,
-                want_tree_aux_roots,
-                served_tree_aux_roots,
-            ),
-            Err(error) => {
-                tracing::debug!(
-                    ?peer,
-                    ?start_height,
-                    ?requested_count,
-                    ?error,
-                    "failed to queue Zakura header-sync Headers response"
-                );
-                self.trace_queue_send_failed(
-                    &peer,
-                    "headers",
-                    &error,
-                    queue_capacity,
-                    queue_max_capacity,
-                    |row| {
-                        insert_height(row, qs_trace::RANGE_START, start_height);
-                        insert_u64(row, qs_trace::RANGE_COUNT, u64::from(requested_count));
-                        insert_u64(row, qs_trace::RETURNED, u64::from(returned_count));
-                    },
-                );
-            }
-        }
+            });
+        });
     }
 
     async fn handle_wire_message(&mut self, peer: ZakuraPeerId, msg: HeaderSyncMessage) {
@@ -1375,9 +1404,18 @@ impl HeaderSyncReactor {
             count,
             want_tree_aux_roots,
         }) {
-            if let Some(peer_state) = self.state.peers.get_mut(&peer) {
-                let _ = peer_state.finish_serving_headers(request_id);
-            }
+            metrics::counter!("sync.header.serve.rejected", "reason" => "action_queue_full")
+                .increment(1);
+            self.handle_header_range_response_ready(
+                peer,
+                request_id,
+                start_height,
+                count,
+                want_tree_aux_roots,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
         }
     }
 

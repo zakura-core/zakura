@@ -1501,6 +1501,42 @@ where
     headers
 }
 
+fn header_sync_range<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    start: block::Height,
+    count: u32,
+    include_roots: bool,
+) -> Vec<crate::HeaderSyncRangeEntry>
+where
+    C: AsRef<Chain> + Clone,
+{
+    let count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
+    let headers = headers_by_height_range(chain.clone(), db, start, count);
+    let body_sizes: HashMap<_, _> = read::block_size_hints(chain.clone(), db, start, count)
+        .into_iter()
+        .collect();
+    let commitment_roots: HashMap<_, _> = if include_roots {
+        block_roots_by_height_range(chain, db, start, count)
+            .into_iter()
+            .map(|roots| (roots.height, roots))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    headers
+        .into_iter()
+        .map(|(height, hash, header)| crate::HeaderSyncRangeEntry {
+            height,
+            hash,
+            header,
+            body_size: body_sizes.get(&height).copied().flatten(),
+            commitment_roots: commitment_roots.get(&height).cloned(),
+        })
+        .collect()
+}
+
 fn missing_block_body_metadata<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -1566,19 +1602,29 @@ where
     metrics::counter!("state.block_roots.response", "source" => source).increment(1);
     let mut roots =
         Vec::with_capacity(usize::try_from(capped_count).expect("capped root count fits in usize"));
+    let finalized_tip = db.finalized_tip_height();
+    let finalized_roots: HashMap<_, _> = finalized_tip
+        .filter(|tip| *tip >= start)
+        .map(|tip| {
+            finalized_state::serve_block_roots(db, start..=end.min(tip))
+                .into_iter()
+                .map(|roots| (roots.height, roots))
+                .collect()
+        })
+        .unwrap_or_default();
+    let provisional_roots: HashMap<_, _> = db
+        .zakura_header_commitment_roots_by_height_range(start..=end)
+        .into_iter()
+        .map(|roots| (roots.height, roots))
+        .collect();
 
     for offset in 0..capped_count {
         let Some(height) = start + i64::from(offset) else {
             break;
         };
 
-        let root = if db
-            .finalized_tip_height()
-            .is_some_and(|finalized_tip| height <= finalized_tip)
-        {
-            finalized_state::serve_block_roots(db, height..=height)
-                .into_iter()
-                .next()
+        let root = if finalized_tip.is_some_and(|finalized_tip| height <= finalized_tip) {
+            finalized_roots.get(&height).cloned()
         } else if let Some(chain) = chain
             .as_ref()
             .map(|chain| chain.as_ref())
@@ -1621,9 +1667,7 @@ where
                 _ => None,
             }
         } else {
-            db.zakura_header_commitment_roots_by_height_range(height..=height)
-                .into_iter()
-                .next()
+            provisional_roots.get(&height).cloned()
         };
 
         let Some(root) = root else {
@@ -1872,6 +1916,21 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::HeadersByHeightRange { start, count } => Ok(ReadResponse::Headers(
                 headers_by_height_range(state.latest_best_chain(), &state.db, start, count),
             )),
+
+            ReadRequest::HeaderSyncRange {
+                start,
+                count,
+                include_roots,
+            } => {
+                let best_chain = state.latest_best_chain();
+                Ok(ReadResponse::HeaderSyncRange(header_sync_range(
+                    best_chain,
+                    &state.db,
+                    start,
+                    count,
+                    include_roots,
+                )))
+            }
 
             ReadRequest::BlockRoots {
                 start_height,

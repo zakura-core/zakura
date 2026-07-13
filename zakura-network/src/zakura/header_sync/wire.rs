@@ -51,6 +51,7 @@ pub(super) const HEADER_SYNC_RETRY_AVOIDANCE: Duration = Duration::from_millis(5
 pub(super) const STATUS_PUBLICATION_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub(super) const HEADER_SYNC_SEEN_HASH_CAPACITY: usize = 4096;
 pub(super) const DEFAULT_HS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const HEADER_SYNC_SERVE_DEADLINE: Duration = Duration::from_secs(10);
 pub(super) const EMPTY_HEADERS_RETRY_DELAY: Duration = Duration::from_secs(1);
 pub(super) const DEFAULT_HS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 // v1 semantic meters intentionally use strict spacing for unsolicited status refreshes and

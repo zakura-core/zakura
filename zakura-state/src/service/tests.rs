@@ -35,8 +35,8 @@ use crate::{
         setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
         FakeChainHelper,
     },
-    BoxError, CheckpointVerifiedBlock, Config, ReadRequest, ReadResponse, Request, Response,
-    SemanticallyVerifiedBlock,
+    BoxError, CheckpointVerifiedBlock, Config, HeaderSyncRangeEntry, ReadRequest, ReadResponse,
+    Request, Response, SemanticallyVerifiedBlock,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
@@ -624,6 +624,33 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
         ReadResponse::Headers(vec![
             (Height(1), block1_hash, block1.header.clone()),
             (Height(2), block2_hash, block2.header.clone()),
+        ]),
+    );
+    let expected_roots = roots_from_height(Height(1), 2);
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::HeaderSyncRange {
+                start: Height(1),
+                count: 2,
+                include_roots: true,
+            })
+            .await?,
+        ReadResponse::HeaderSyncRange(vec![
+            HeaderSyncRangeEntry {
+                height: Height(1),
+                hash: block1_hash,
+                header: block1.header.clone(),
+                body_size: Some(999_999),
+                commitment_roots: Some(expected_roots[0].clone()),
+            },
+            HeaderSyncRangeEntry {
+                height: Height(2),
+                hash: block2_hash,
+                header: block2.header.clone(),
+                body_size: None,
+                commitment_roots: Some(expected_roots[1].clone()),
+            },
         ]),
     );
     assert_eq!(

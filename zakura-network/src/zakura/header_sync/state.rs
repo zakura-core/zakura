@@ -446,6 +446,7 @@ pub(super) struct PeerHeaderState {
     pub(super) meters: HeaderSyncPeerMeters,
     pub(super) served_headers_inflight: u16,
     pub(super) served_header_request_ids: HashSet<HeaderSyncRequestId>,
+    pub(super) served_header_started_at: HashMap<HeaderSyncRequestId, Instant>,
     pub(super) highest_served_header_request_id: Option<HeaderSyncRequestId>,
 }
 
@@ -480,6 +481,7 @@ impl PeerHeaderState {
             ),
             served_headers_inflight: 0,
             served_header_request_ids: HashSet::new(),
+            served_header_started_at: HashMap::new(),
             highest_served_header_request_id: None,
         }
     }
@@ -538,14 +540,21 @@ impl PeerHeaderState {
             return false;
         }
         self.highest_served_header_request_id = Some(request_id);
+        self.served_header_started_at
+            .insert(request_id, Instant::now());
         self.served_headers_inflight = self.served_headers_inflight.saturating_add(1);
         true
+    }
+
+    pub(super) fn serving_started_at(&self, request_id: HeaderSyncRequestId) -> Option<Instant> {
+        self.served_header_started_at.get(&request_id).copied()
     }
 
     pub(super) fn finish_serving_headers(&mut self, request_id: HeaderSyncRequestId) -> bool {
         if !self.served_header_request_ids.remove(&request_id) {
             return false;
         }
+        self.served_header_started_at.remove(&request_id);
         self.served_headers_inflight = self.served_headers_inflight.saturating_sub(1);
         true
     }

@@ -13,6 +13,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    ops::RangeBounds,
     sync::Arc,
 };
 
@@ -192,6 +193,14 @@ impl ZakuraDb {
         let block_info_cf = self.block_info_cf();
 
         block_info_cf.zs_get(&height)
+    }
+
+    /// Returns finalized block metadata for a bounded height range.
+    pub fn block_infos_by_height_range(
+        &self,
+        range: impl RangeBounds<Height>,
+    ) -> BTreeMap<Height, BlockInfo> {
+        self.block_info_cf().zs_forward_range_iter(range).collect()
     }
 }
 

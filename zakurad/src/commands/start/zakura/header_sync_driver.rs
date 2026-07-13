@@ -1,11 +1,14 @@
 use std::{
     future::Future,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use color_eyre::eyre::{eyre, Report};
-use tokio::{pin, select, sync::mpsc};
+use tokio::{
+    pin, select,
+    sync::{mpsc, Semaphore},
+};
 use tower::{Service, ServiceExt};
 use tracing::{debug, warn};
 
@@ -380,6 +383,142 @@ mod vct_root_repair_driver_tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn serve_header_sync_range<ReadState>(
+    read_state: ReadState,
+    header_sync: zakura_network::zakura::HeaderSyncHandle,
+    trace: ZakuraTrace,
+    read_slots: Arc<Semaphore>,
+    peer: zakura_network::zakura::ZakuraPeerId,
+    session_id: u64,
+    request_id: zakura_network::zakura::HeaderSyncRequestId,
+    start: block::Height,
+    count: u32,
+    want_tree_aux_roots: bool,
+) where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    const STATE_READ_DEADLINE: Duration = Duration::from_secs(9);
+    let queue_started = Instant::now();
+    let Ok(permit) = read_slots.acquire_owned().await else {
+        return;
+    };
+    metrics::histogram!("sync.header.serve.admission_wait_seconds")
+        .record(queue_started.elapsed().as_secs_f64());
+    trace_state_read_start(&trace, "header_sync_range", Some(&peer), start, count);
+
+    let state_read_started = Instant::now();
+    let rows = match tokio::time::timeout(
+        STATE_READ_DEADLINE,
+        read_state.oneshot(zakura_state::ReadRequest::HeaderSyncRange {
+            start,
+            count,
+            include_roots: want_tree_aux_roots,
+        }),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::HeaderSyncRange(rows))) => {
+            metrics::histogram!("sync.header.serve.state_read_seconds")
+                .record(state_read_started.elapsed().as_secs_f64());
+            metrics::counter!("sync.header.serve.state_read", "result" => "success").increment(1);
+            rows
+        }
+        Ok(Ok(response)) => {
+            metrics::histogram!("sync.header.serve.state_read_seconds")
+                .record(state_read_started.elapsed().as_secs_f64());
+            metrics::counter!("sync.header.serve.state_read", "result" => "unexpected")
+                .increment(1);
+            warn!(?peer, ?response, "unexpected HeaderSyncRange response");
+            Vec::new()
+        }
+        Ok(Err(error)) => {
+            metrics::histogram!("sync.header.serve.state_read_seconds")
+                .record(state_read_started.elapsed().as_secs_f64());
+            metrics::counter!("sync.header.serve.state_read", "result" => "error").increment(1);
+            warn!(
+                ?peer,
+                ?error,
+                "failed to read Zakura HeaderSyncRange response"
+            );
+            Vec::new()
+        }
+        Err(_) => {
+            metrics::histogram!("sync.header.serve.state_read_seconds")
+                .record(state_read_started.elapsed().as_secs_f64());
+            metrics::counter!("sync.header.serve.state_read", "result" => "timeout").increment(1);
+            warn!(
+                ?peer,
+                ?start,
+                count,
+                "Zakura HeaderSyncRange read timed out"
+            );
+            Vec::new()
+        }
+    };
+
+    // The semaphore bounds state I/O only. Release it before waiting on the reactor
+    // event queue so transport backpressure cannot consume all database read slots.
+    drop(permit);
+
+    let roots_complete = !want_tree_aux_roots
+        || rows.iter().all(|row| {
+            row.commitment_roots
+                .as_ref()
+                .is_some_and(|root| root.height == row.height)
+        });
+    let (headers, body_sizes, tree_aux_roots) = if roots_complete {
+        let mut headers = Vec::with_capacity(rows.len());
+        let mut body_sizes = Vec::with_capacity(rows.len());
+        let mut tree_aux_roots =
+            Vec::with_capacity(if want_tree_aux_roots { rows.len() } else { 0 });
+        for row in rows {
+            headers.push(row.header);
+            body_sizes.push(row.body_size.unwrap_or(0));
+            if let Some(roots) = row.commitment_roots {
+                tree_aux_roots.push(roots);
+            }
+        }
+        (headers, body_sizes, tree_aux_roots)
+    } else {
+        metrics::counter!("sync.header.serve.rejected", "reason" => "incomplete_roots")
+            .increment(1);
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+
+    let returned_count = headers.len();
+    trace_header_reactor_event(
+        &trace,
+        "header_range_response_ready",
+        Some(&peer),
+        start,
+        block::Hash([0; 32]),
+        u32::try_from(returned_count).unwrap_or(u32::MAX),
+    );
+    if header_sync
+        .send_lifecycle(HeaderSyncEvent::HeaderRangeResponseReady {
+            peer,
+            session_id,
+            request_id,
+            start_height: start,
+            requested_count: count,
+            want_tree_aux_roots,
+            headers,
+            body_sizes,
+            tree_aux_roots,
+        })
+        .is_err()
+    {
+        metrics::counter!("sync.header.serve.failed", "reason" => "reactor_closed").increment(1);
+    }
+}
+
 pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<HeaderSyncAction>,
     handles: ZakuraHeaderSyncDriverHandles,
@@ -410,6 +549,10 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
+    const MAX_CONCURRENT_HEADER_RANGE_READS: usize = 32;
+    // Requests wait for a slot in their own task, so saturation backpressures
+    // only that peer's admitted requests and never the header-sync reactor.
+    let header_range_reads = Arc::new(Semaphore::new(MAX_CONCURRENT_HEADER_RANGE_READS));
     pin!(shutdown);
     loop {
         let action = select! {
@@ -606,249 +749,18 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 count,
                 want_tree_aux_roots,
             } => {
-                trace_state_read_start(
-                    &trace,
-                    "query_headers_by_height_range",
-                    Some(&peer),
+                tokio::spawn(serve_header_sync_range(
+                    read_state.clone(),
+                    handles.header_sync.clone(),
+                    trace.clone(),
+                    header_range_reads.clone(),
+                    peer,
+                    session_id,
+                    request_id,
                     start,
                     count,
-                );
-                let started = Instant::now();
-                match read_state
-                    .clone()
-                    .oneshot(zakura_state::ReadRequest::HeadersByHeightRange { start, count })
-                    .await
-                {
-                    Ok(zakura_state::ReadResponse::Headers(headers)) => {
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::STATE_READ_SUCCESS,
-                            "header_sync_driver",
-                            |row| {
-                                insert_cs_str(
-                                    row,
-                                    cs_trace::ACTION,
-                                    "query_headers_by_height_range",
-                                );
-                                insert_cs_peer(row, cs_trace::PEER, &peer);
-                                insert_cs_height(row, cs_trace::RANGE_START, start);
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, headers.len() as u64);
-                                insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                            },
-                        );
-                        trace_state_read_start(
-                            &trace,
-                            "block_size_hints",
-                            Some(&peer),
-                            start,
-                            count,
-                        );
-                        let body_size_hints = match read_state
-                            .clone()
-                            .oneshot(zakura_state::ReadRequest::BlockSizeHints {
-                                from: start,
-                                count,
-                            })
-                            .await
-                        {
-                            Ok(zakura_state::ReadResponse::BlockSizeHints(hints)) => hints,
-                            Ok(response) => {
-                                trace_state_read_error(
-                                    &trace,
-                                    "block_size_hints",
-                                    Some(&peer),
-                                    start,
-                                    count,
-                                    "unexpected_response",
-                                    started,
-                                );
-                                warn!(?peer, ?response, "unexpected BlockSizeHints response");
-                                Vec::new()
-                            }
-                            Err(error) => {
-                                trace_state_read_error(
-                                    &trace,
-                                    "block_size_hints",
-                                    Some(&peer),
-                                    start,
-                                    count,
-                                    &format!("{error}"),
-                                    started,
-                                );
-                                warn!(
-                                    ?peer,
-                                    ?error,
-                                    "failed to read Zakura BlockSizeHints response from state"
-                                );
-                                Vec::new()
-                            }
-                        };
-                        let block_roots = if want_tree_aux_roots {
-                            trace_state_read_start(
-                                &trace,
-                                "block_roots",
-                                Some(&peer),
-                                start,
-                                count,
-                            );
-                            match read_state
-                                .clone()
-                                .oneshot(zakura_state::ReadRequest::BlockRoots {
-                                    start_height: start,
-                                    count,
-                                })
-                                .await
-                            {
-                                Ok(zakura_state::ReadResponse::BlockRoots(roots)) => roots,
-                                Ok(response) => {
-                                    trace_state_read_error(
-                                        &trace,
-                                        "block_roots",
-                                        Some(&peer),
-                                        start,
-                                        count,
-                                        "unexpected_response",
-                                        started,
-                                    );
-                                    warn!(?peer, ?response, "unexpected BlockRoots response");
-                                    Vec::new()
-                                }
-                                Err(error) => {
-                                    trace_state_read_error(
-                                        &trace,
-                                        "block_roots",
-                                        Some(&peer),
-                                        start,
-                                        count,
-                                        &format!("{error}"),
-                                        started,
-                                    );
-                                    warn!(
-                                        ?peer,
-                                        ?error,
-                                        "failed to read Zakura BlockRoots response from state"
-                                    );
-                                    Vec::new()
-                                }
-                            }
-                        } else {
-                            Vec::new()
-                        };
-                        let header_heights: Vec<_> =
-                            headers.iter().map(|(height, _, _)| *height).collect();
-                        let tree_aux_roots = if want_tree_aux_roots {
-                            tree_aux_roots_for_served_header_range(
-                                start,
-                                header_heights.iter().copied(),
-                                &block_roots,
-                            )
-                            .unwrap_or_else(|error| {
-                                metrics::counter!("sync.header.tree_aux.sender_alignment_failure")
-                                    .increment(1);
-                                static ALIGNMENT_FAILURES: AtomicU64 = AtomicU64::new(0);
-                                let occurrences =
-                                    ALIGNMENT_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-                                if occurrences.is_power_of_two() {
-                                    warn!(
-                                        ?peer,
-                                        ?start,
-                                        requested_count = count,
-                                        occurrences,
-                                        ?error,
-                                        "serving header range without tree aux roots"
-                                    );
-                                }
-
-                                Vec::new()
-                            })
-                        } else {
-                            Vec::new()
-                        };
-                        let body_sizes = body_sizes_for_served_header_range(
-                            start,
-                            header_heights.iter().copied(),
-                            &body_size_hints,
-                        );
-                        let headers = headers
-                            .into_iter()
-                            .map(|(_height, _hash, header)| header)
-                            .collect();
-                        trace_header_reactor_event(
-                            &trace,
-                            "header_range_response_ready",
-                            Some(&peer),
-                            start,
-                            block::Hash([0; 32]),
-                            count,
-                        );
-                        let _ = handles
-                            .header_sync
-                            .send(HeaderSyncEvent::HeaderRangeResponseReady {
-                                peer,
-                                session_id,
-                                request_id,
-                                start_height: start,
-                                requested_count: count,
-                                want_tree_aux_roots,
-                                headers,
-                                body_sizes,
-                                tree_aux_roots,
-                            })
-                            .await;
-                    }
-                    Ok(response) => {
-                        trace_state_read_error(
-                            &trace,
-                            "query_headers_by_height_range",
-                            Some(&peer),
-                            start,
-                            count,
-                            "unexpected_response",
-                            started,
-                        );
-                        warn!(?peer, ?response, "unexpected HeadersByHeightRange response");
-                        trace_header_range_finished(&trace, &peer, start, count, 0);
-                        let _ = handles
-                            .header_sync
-                            .send(HeaderSyncEvent::HeaderRangeResponseFinished {
-                                peer,
-                                session_id,
-                                request_id,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            })
-                            .await;
-                    }
-                    Err(error) => {
-                        trace_state_read_error(
-                            &trace,
-                            "query_headers_by_height_range",
-                            Some(&peer),
-                            start,
-                            count,
-                            &format!("{error}"),
-                            started,
-                        );
-                        warn!(
-                            ?peer,
-                            ?error,
-                            "failed to read Zakura Headers response from state"
-                        );
-                        trace_header_range_finished(&trace, &peer, start, count, 0);
-                        let _ = handles
-                            .header_sync
-                            .send(HeaderSyncEvent::HeaderRangeResponseFinished {
-                                peer,
-                                session_id,
-                                request_id,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            })
-                            .await;
-                    }
-                }
+                    want_tree_aux_roots,
+                ));
             }
             HeaderSyncAction::CommitHeaderRange {
                 peer,
@@ -1201,6 +1113,7 @@ pub(crate) async fn notify_block_sync_header_tip(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn body_sizes_for_served_header_range(
     start: block::Height,
     header_heights: impl IntoIterator<Item = block::Height>,
@@ -1227,6 +1140,7 @@ pub(crate) fn body_sizes_for_served_header_range(
         .collect()
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TreeAuxRootsForServedHeaderRangeError {
     HeaderBeforeStart {
@@ -1248,6 +1162,7 @@ pub(crate) enum TreeAuxRootsForServedHeaderRangeError {
     },
 }
 
+#[cfg(test)]
 pub(crate) fn tree_aux_roots_for_served_header_range(
     start: block::Height,
     header_heights: impl IntoIterator<Item = block::Height>,
@@ -1864,27 +1779,6 @@ fn trace_header_reactor_event(
             insert_cs_height(row, cs_trace::HEIGHT, height);
             insert_cs_hash(row, cs_trace::HASH, hash);
             insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-        },
-    );
-}
-
-fn trace_header_range_finished(
-    trace: &ZakuraTrace,
-    peer: &zakura_network::zakura::ZakuraPeerId,
-    start: block::Height,
-    requested_count: u32,
-    returned_count: u32,
-) {
-    emit_commit_state(
-        trace,
-        cs_trace::REACTOR_EVENT_SENT,
-        "header_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, "header_range_response_finished");
-            insert_cs_peer(row, cs_trace::PEER, peer);
-            insert_cs_height(row, cs_trace::RANGE_START, start);
-            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(returned_count));
-            insert_cs_u64(row, "requested_count", u64::from(requested_count));
         },
     );
 }

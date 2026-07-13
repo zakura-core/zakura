@@ -127,7 +127,6 @@ pub mod queue_send_trace {
     /// Range count field.
     pub const RANGE_COUNT: &str = "range_count";
     /// Returned response count field.
-    pub const RETURNED: &str = "returned";
     /// Height field.
     pub const HEIGHT: &str = "height";
     /// Hash field.

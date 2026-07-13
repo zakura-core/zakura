@@ -14,33 +14,20 @@ use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, Flow, Frame, FramedRecv, FramedSend,
     OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServicePeerDirection, SessionGuard,
     Sink, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId, ZakuraSupervisorHandle,
-    ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_HEADER_SYNC_V7,
+    ZAKURA_CAP_HEADER_SYNC,
 };
 
-const HEADER_SYNC_SERVICE_STREAMS: [Stream; 2] = [
-    Stream {
-        kind: ZAKURA_STREAM_HEADER_SYNC,
-        version: ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
-        // Advisory until the transport wires Stream::frame_cap end-to-end; the
-        // authoritative inbound cap is app_frame_cap_for_stream_kind. The cast is
-        // safe because both terms are small protocol constants checked against the
-        // local message cap in header_sync::wire.
-        frame_cap: (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32,
-        capability: ZAKURA_CAP_HEADER_SYNC_V7,
-        mode: StreamMode::Ordered,
-    },
-    Stream {
-        kind: ZAKURA_STREAM_HEADER_SYNC,
-        version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        // Advisory until the transport wires Stream::frame_cap end-to-end; the
-        // authoritative inbound cap is app_frame_cap_for_stream_kind. The cast is
-        // safe because both terms are small protocol constants checked against the
-        // local message cap in header_sync::wire.
-        frame_cap: (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32,
-        capability: ZAKURA_CAP_HEADER_SYNC,
-        mode: StreamMode::Ordered,
-    },
-];
+const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
+    kind: ZAKURA_STREAM_HEADER_SYNC,
+    version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
+    // Advisory until the transport wires Stream::frame_cap end-to-end; the
+    // authoritative inbound cap is app_frame_cap_for_stream_kind. The cast is
+    // safe because both terms are small protocol constants checked against the
+    // local message cap in header_sync::wire.
+    frame_cap: (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32,
+    capability: ZAKURA_CAP_HEADER_SYNC,
+    mode: StreamMode::Ordered,
+}];
 
 /// Service-declared streams for native header sync.
 pub(crate) fn header_sync_streams() -> &'static [Stream] {
@@ -61,7 +48,6 @@ struct HeaderSyncPeerSessionInner {
     send: FramedSend,
     cancel_token: CancellationToken,
     commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
-    stream_version: u16,
     next_request_id: AtomicU64,
 }
 
@@ -70,7 +56,6 @@ impl HeaderSyncPeerSession {
         session: &PeerStreamSession,
         direction: ServicePeerDirection,
         commands: mpsc::UnboundedSender<HeaderSyncPeerCommand>,
-        stream_version: u16,
         session_id: u64,
     ) -> Self {
         Self::from_parts_with_direction_and_commands(
@@ -80,7 +65,6 @@ impl HeaderSyncPeerSession {
             session.sender(),
             session.cancel_token(),
             Some(commands),
-            stream_version,
         )
     }
 
@@ -107,35 +91,15 @@ impl HeaderSyncPeerSession {
             send,
             cancel_token,
             None,
-            ZAKURA_HEADER_SYNC_STREAM_VERSION,
         )
     }
 
     #[cfg(test)]
-    pub(crate) fn from_parts_with_direction_and_version(
+    pub(crate) fn from_parts_with_direction_and_session_id(
         peer_id: ZakuraPeerId,
         direction: ServicePeerDirection,
         send: FramedSend,
         cancel_token: CancellationToken,
-        stream_version: u16,
-    ) -> Self {
-        Self::from_parts_with_direction_version_and_session_id(
-            peer_id,
-            direction,
-            send,
-            cancel_token,
-            stream_version,
-            0,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_parts_with_direction_version_and_session_id(
-        peer_id: ZakuraPeerId,
-        direction: ServicePeerDirection,
-        send: FramedSend,
-        cancel_token: CancellationToken,
-        stream_version: u16,
         session_id: u64,
     ) -> Self {
         Self::from_parts_with_direction_and_commands(
@@ -145,11 +109,9 @@ impl HeaderSyncPeerSession {
             send,
             cancel_token,
             None,
-            stream_version,
         )
     }
 
-    #[cfg(test)]
     fn from_parts_with_direction_and_commands(
         peer_id: ZakuraPeerId,
         session_id: u64,
@@ -157,7 +119,6 @@ impl HeaderSyncPeerSession {
         send: FramedSend,
         cancel_token: CancellationToken,
         commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
-        stream_version: u16,
     ) -> Self {
         Self {
             peer_id,
@@ -167,31 +128,6 @@ impl HeaderSyncPeerSession {
                 send,
                 cancel_token,
                 commands,
-                stream_version,
-                next_request_id: AtomicU64::new(1),
-            }),
-        }
-    }
-
-    #[cfg(not(test))]
-    fn from_parts_with_direction_and_commands(
-        peer_id: ZakuraPeerId,
-        session_id: u64,
-        direction: ServicePeerDirection,
-        send: FramedSend,
-        cancel_token: CancellationToken,
-        commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
-        stream_version: u16,
-    ) -> Self {
-        Self {
-            peer_id,
-            session_id,
-            direction,
-            inner: Arc::new(HeaderSyncPeerSessionInner {
-                send,
-                cancel_token,
-                commands,
-                stream_version,
                 next_request_id: AtomicU64::new(1),
             }),
         }
@@ -227,16 +163,6 @@ impl HeaderSyncPeerSession {
         self.inner.send.max_capacity()
     }
 
-    /// Negotiated header-sync stream version for this peer session.
-    pub fn stream_version(&self) -> u16 {
-        self.inner.stream_version
-    }
-
-    /// Return true when this session can correlate responses by request ID.
-    pub fn has_request_ids(&self) -> bool {
-        self.stream_version() >= ZAKURA_HEADER_SYNC_STREAM_VERSION_V7
-    }
-
     /// Retire a request ID so any late response is dropped without scoring.
     pub fn retire_expected_headers(
         &self,
@@ -250,11 +176,7 @@ impl HeaderSyncPeerSession {
             .map_err(|_| OrderedSendError::Closed)
     }
 
-    fn next_request_id(&self) -> Result<Option<HeaderSyncRequestId>, OrderedSendError> {
-        if self.stream_version() < ZAKURA_HEADER_SYNC_STREAM_VERSION_V7 {
-            return Ok(None);
-        }
-
+    fn next_request_id(&self) -> Result<HeaderSyncRequestId, OrderedSendError> {
         let id = self
             .inner
             .next_request_id
@@ -262,11 +184,9 @@ impl HeaderSyncPeerSession {
             .map_err(|_| {
                 OrderedSendError::Encode("header-sync request ID counter exhausted".into())
             })?;
-        HeaderSyncRequestId::new(id)
-            .ok_or_else(|| {
-                OrderedSendError::Encode("header-sync request ID counter exhausted".into())
-            })
-            .map(Some)
+        HeaderSyncRequestId::new(id).ok_or_else(|| {
+            OrderedSendError::Encode("header-sync request ID counter exhausted".into())
+        })
     }
 
     /// Send a typed status advertisement.
@@ -280,13 +200,11 @@ impl HeaderSyncPeerSession {
         start_height: block::Height,
         count: u32,
         want_tree_aux_roots: bool,
-    ) -> Result<Option<HeaderSyncRequestId>, OrderedSendError> {
+    ) -> Result<HeaderSyncRequestId, OrderedSendError> {
         let request_id = self.next_request_id()?;
-        let mut expected = ExpectedHeadersResponse::new(start_height, count, want_tree_aux_roots)
-            .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
-        if let Some(request_id) = request_id {
-            expected = expected.with_request_id(request_id);
-        }
+        let expected =
+            ExpectedHeadersResponse::new(request_id, start_height, count, want_tree_aux_roots)
+                .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
         if let Some(commands) = &self.inner.commands {
             commands
                 .send(HeaderSyncPeerCommand::Reserve(expected))
@@ -297,12 +215,12 @@ impl HeaderSyncPeerSession {
                     count,
                     want_tree_aux_roots,
                 },
-                expected.request_id,
+                Some(request_id),
             ) {
                 let _ = commands.send(HeaderSyncPeerCommand::Cancel(expected));
                 return Err(error);
             }
-            return Ok(expected.request_id);
+            return Ok(request_id);
         }
 
         self.try_send_message(
@@ -311,9 +229,9 @@ impl HeaderSyncPeerSession {
                 count,
                 want_tree_aux_roots,
             },
-            expected.request_id,
+            Some(request_id),
         )
-        .map(|()| expected.request_id)
+        .map(|()| request_id)
     }
 
     /// Send a typed header range response.
@@ -356,7 +274,7 @@ impl HeaderSyncPeerSession {
         request_id: Option<HeaderSyncRequestId>,
     ) -> Result<(), OrderedSendError> {
         let frame = msg
-            .encode_frame_for_version(self.stream_version(), request_id)
+            .encode_frame(request_id)
             .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
         match self.inner.send.try_send(frame) {
             Ok(()) => Ok(()),
@@ -500,8 +418,8 @@ impl Service for HeaderSyncService {
     }
 
     fn add_peer(&self, mut peer: Peer) {
-        let Some((stream, session_id, recv, send)) =
-            peer.take_stream_with_declaration(ZAKURA_STREAM_HEADER_SYNC)
+        let Some((session_id, recv, send)) =
+            peer.take_stream_with_session_id(ZAKURA_STREAM_HEADER_SYNC)
         else {
             return;
         };
@@ -528,7 +446,6 @@ impl Service for HeaderSyncService {
             &session,
             peer.direction,
             commands_tx,
-            stream.version,
             session_id,
         );
 
@@ -567,11 +484,7 @@ impl Service for HeaderSyncService {
         // the expected `Headers` response in plain local state.
         let pipe = Pipe::new(
             peer_id.clone(),
-            HsLocal::new(
-                commands_rx,
-                DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL,
-                stream.version,
-            ),
+            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
             HsEnv::new_with_session_id(self.header_sync.clone(), session_id),
             SessionGuard::oversize_only(header_sync_guard_max_bytes()),
             run_inbound,
@@ -672,14 +585,7 @@ impl Service for HeaderSyncService {
         // with no outstanding request is rejected as `UnsolicitedHeaders`. A
         // `Local` reject (closed reactor queue) is surfaced to the registry
         // exactly as the old `deliver_header_sync_frame` returned it.
-        match deliver(
-            &self.header_sync,
-            ZAKURA_HEADER_SYNC_STREAM_VERSION,
-            0,
-            None,
-            peer_id,
-            frame,
-        ) {
+        match deliver(&self.header_sync, 0, None, peer_id, frame) {
             Flow::Continue(()) | Flow::Done => Ok(()),
             Flow::Reject(reject) => Err(reject),
         }
@@ -824,15 +730,14 @@ mod request_id_tests {
     use super::*;
 
     #[test]
-    fn v7_request_id_exhaustion_remains_fail_closed() {
+    fn request_id_exhaustion_remains_fail_closed() {
         let (send, _recv) = crate::zakura::framed_channel(1);
         let peer_id = ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid");
-        let session = HeaderSyncPeerSession::from_parts_with_direction_and_version(
+        let session = HeaderSyncPeerSession::from_parts_with_direction(
             peer_id,
             ServicePeerDirection::Outbound,
             send,
             CancellationToken::new(),
-            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
         );
         session
             .inner
@@ -856,7 +761,6 @@ mod request_id_tests {
             send,
             CancellationToken::new(),
             Some(commands_tx),
-            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
         );
 
         assert!(matches!(
@@ -894,7 +798,6 @@ mod request_id_tests {
             send,
             CancellationToken::new(),
             Some(commands_tx),
-            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
         );
 
         assert!(matches!(
@@ -912,7 +815,7 @@ mod request_id_tests {
         assert_eq!(cancelled, reserved);
         assert_eq!(
             reserved.request_id,
-            Some(HeaderSyncRequestId::new(1).expect("non-zero id"))
+            HeaderSyncRequestId::new(1).expect("non-zero id")
         );
 
         recv.recv().await.expect("dummy frame remains queued");
@@ -921,7 +824,7 @@ mod request_id_tests {
             .expect("queue has capacity after draining");
         assert_eq!(
             next_id,
-            Some(HeaderSyncRequestId::new(2).expect("non-zero id")),
+            HeaderSyncRequestId::new(2).expect("non-zero id"),
             "the rolled-back ID must not be reused"
         );
         let next_reserved = match commands_rx
@@ -933,16 +836,11 @@ mod request_id_tests {
         };
         assert_eq!(next_reserved.request_id, next_id);
         let frame = recv.recv().await.expect("second request is published");
-        let (message, wire_request_id) = HeaderSyncMessage::decode_frame_with_request_id(
-            frame,
-            HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7),
-        )
-        .expect("published v7 request decodes");
+        let (message, wire_request_id) =
+            HeaderSyncMessage::decode_frame(frame, HeaderSyncDecodeContext::control())
+                .expect("published request decodes");
         assert!(matches!(message, HeaderSyncMessage::GetHeaders { .. }));
-        assert_eq!(
-            wire_request_id,
-            Some(next_id.expect("v7 request has an ID"))
-        );
+        assert_eq!(wire_request_id, Some(next_id));
     }
 
     #[test]
@@ -958,7 +856,6 @@ mod request_id_tests {
             send,
             CancellationToken::new(),
             Some(commands_tx),
-            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
         );
 
         assert!(matches!(
@@ -976,7 +873,7 @@ mod request_id_tests {
         assert_eq!(cancelled, reserved);
         assert_eq!(
             reserved.request_id,
-            Some(HeaderSyncRequestId::new(1).expect("non-zero id"))
+            HeaderSyncRequestId::new(1).expect("non-zero id")
         );
         assert_eq!(session.inner.next_request_id.load(Ordering::Relaxed), 2);
     }

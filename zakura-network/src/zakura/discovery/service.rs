@@ -26,7 +26,6 @@ use crate::zakura::{
     OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServiceAdmissionDecision,
     ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-    ZAKURA_CAP_HEADER_SYNC_V7,
 };
 
 #[cfg(test)]
@@ -731,7 +730,7 @@ fn peer_has_other_service_owner(
 }
 
 fn has_other_negotiated_service(negotiated: u64) -> bool {
-    negotiated & !(ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V7) != 0
+    negotiated & !(ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC) != 0
 }
 
 /// Returns the iroh node id encoded by a discovery peer id, if it is a 32-byte
@@ -781,18 +780,13 @@ mod tests {
     use zakura_chain::{block, parameters::Network};
 
     #[test]
-    fn header_sync_v6_and_v7_capabilities_share_one_service_owner() {
+    fn discovery_and_header_sync_do_not_count_as_another_service_owner() {
+        assert!(!has_other_negotiated_service(ZAKURA_CAP_DISCOVERY));
         assert!(!has_other_negotiated_service(
             ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC
         ));
-        assert!(!has_other_negotiated_service(
-            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC_V7
-        ));
-        assert!(!has_other_negotiated_service(
-            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V7
-        ));
         assert!(has_other_negotiated_service(
-            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC_V7 | ZAKURA_CAP_BLOCK_SYNC
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_BLOCK_SYNC
         ));
     }
 
@@ -1066,15 +1060,17 @@ mod tests {
             })
             .await?;
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let request_id = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(HeaderSyncAction::SendMessage {
                     peer,
+                    request_id,
                     msg: HeaderSyncMessage::GetHeaders { .. },
                 }) = fixture.header_actions.recv().await
                 {
                     if peer == fixture.peer_id {
-                        return;
+                        return request_id
+                            .expect("an outbound GetHeaders always carries a request ID");
                     }
                 }
             }
@@ -1084,13 +1080,13 @@ mod tests {
 
         fixture
             .header_sync
-            .send(HeaderSyncEvent::WireMessage {
+            .send(HeaderSyncEvent::WireHeaders {
                 peer: fixture.peer_id.clone(),
-                msg: HeaderSyncMessage::Headers {
-                    headers: Vec::new(),
-                    body_sizes: Vec::new(),
-                    tree_aux_roots: Vec::new(),
-                },
+                session_id: 0,
+                request_id,
+                headers: Vec::new(),
+                body_sizes: Vec::new(),
+                tree_aux_roots: Vec::new(),
             })
             .await?;
         tokio::time::sleep(Duration::from_millis(20)).await;

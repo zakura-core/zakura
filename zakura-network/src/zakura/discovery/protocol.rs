@@ -88,9 +88,13 @@ pub const DEFAULT_LIVE_SERVICE_SUMMARY_TTL: Duration = Duration::from_secs(30);
 /// Native peer discovery service id.
 pub const SERVICE_ID_DISCOVERY: &str = "zakura.discovery.v1";
 /// Native header-sync service id.
-pub const SERVICE_ID_HEADER_SYNC: &str = "zakura.header_sync.v1";
-/// Request-id capable native header-sync service id.
-pub const SERVICE_ID_HEADER_SYNC_V2: &str = "zakura.header_sync.v2";
+///
+/// Generation `v2` is the request-id correlated header-sync service. Generation `v1`
+/// is retired, so a peer advertising only `v1` is not a header-sync candidate.
+pub const SERVICE_ID_HEADER_SYNC: &str = "zakura.header_sync.v2";
+/// Retired header-sync service id, kept only to keep a pre-upgrade peer's summaries
+/// wire-valid. Never advertised, never selected on.
+pub const SERVICE_ID_HEADER_SYNC_RETIRED: &str = "zakura.header_sync.v1";
 /// Native block-sync service id.
 pub const SERVICE_ID_BLOCK_SYNC: &str = "zakura.block_sync.v1";
 /// Native legacy gossip service id.
@@ -99,12 +103,23 @@ pub const SERVICE_ID_LEGACY_GOSSIP: &str = "zakura.legacy_gossip.v1";
 pub const SERVICE_ID_LEGACY_REQUESTS: &str = "zakura.legacy_requests.v1";
 /// Native service discovery service id.
 pub const SERVICE_ID_SERVICE_DISCOVERY: &str = "zakura.service_discovery.v1";
-/// Summary tag for [`HeaderSyncServiceSummary`].
-pub const SUMMARY_TAG_HEADER_SYNC_V1: u16 = 1;
+/// Retired header-sync summary tag, bound to [`SERVICE_ID_HEADER_SYNC_RETIRED`].
+///
+/// A pre-upgrade peer still sends this tag with the retired service id. Keeping the
+/// binding lets its `Services` messages validate, so retiring header-sync v6 does not
+/// tear down discovery with peers that have not upgraded. We never emit it, and a
+/// summary under this tag is not a header-sync candidate hint.
+pub const SUMMARY_TAG_HEADER_SYNC_RETIRED: u16 = 1;
 /// Summary tag for [`DiscoveryServiceSummary`].
 pub const SUMMARY_TAG_DISCOVERY_V1: u16 = 2;
 /// Summary tag for [`BlockSyncServiceSummary`].
 pub const SUMMARY_TAG_BLOCK_SYNC_V1: u16 = 3;
+/// Summary tag for [`HeaderSyncServiceSummary`].
+///
+/// A distinct tag rather than a reuse of [`SUMMARY_TAG_HEADER_SYNC_RETIRED`]: peers
+/// that predate it fall through to the unknown-tag path and ignore the summary,
+/// instead of rejecting it as a service/tag mismatch.
+pub const SUMMARY_TAG_HEADER_SYNC: u16 = 4;
 
 const SIGNATURE_BYTES: usize = 64;
 const NODE_ID_BYTES: usize = 32;
@@ -142,10 +157,12 @@ impl ZakuraServiceId {
             .expect("built-in Zakura header-sync service id is non-empty bounded ASCII")
     }
 
-    /// Returns the request-id capable native header-sync service id.
-    pub fn header_sync_v2() -> Self {
-        Self::new(SERVICE_ID_HEADER_SYNC_V2)
-            .expect("built-in Zakura header-sync v2 service id is non-empty bounded ASCII")
+    /// Returns the retired header-sync service id.
+    ///
+    /// Only used to validate a pre-upgrade peer's summaries; never advertised.
+    pub fn header_sync_retired() -> Self {
+        Self::new(SERVICE_ID_HEADER_SYNC_RETIRED)
+            .expect("built-in retired Zakura header-sync service id is non-empty bounded ASCII")
     }
 
     /// Returns the native block-sync service id.
@@ -334,7 +351,7 @@ impl ServiceSummaryEnvelope {
         encode_header_sync_summary(summary, &mut summary_bytes)?;
         Ok(Self {
             service_id: ZakuraServiceId::header_sync(),
-            summary_tag: SUMMARY_TAG_HEADER_SYNC_V1,
+            summary_tag: SUMMARY_TAG_HEADER_SYNC,
             summary_bytes,
         })
     }
@@ -365,7 +382,7 @@ impl ServiceSummaryEnvelope {
     pub fn decode_header_sync(
         &self,
     ) -> Result<Option<HeaderSyncServiceSummary>, DiscoveryWireError> {
-        if self.summary_tag == SUMMARY_TAG_HEADER_SYNC_V1 {
+        if self.summary_tag == SUMMARY_TAG_HEADER_SYNC {
             decode_header_sync_summary(&self.summary_bytes).map(Some)
         } else {
             Ok(None)
@@ -3629,7 +3646,8 @@ fn validate_summary_service_binding(
     service_id: &ZakuraServiceId,
 ) -> Result<(), DiscoveryWireError> {
     let expected = match summary_tag {
-        SUMMARY_TAG_HEADER_SYNC_V1 => Some(ZakuraServiceId::header_sync()),
+        SUMMARY_TAG_HEADER_SYNC => Some(ZakuraServiceId::header_sync()),
+        SUMMARY_TAG_HEADER_SYNC_RETIRED => Some(ZakuraServiceId::header_sync_retired()),
         SUMMARY_TAG_DISCOVERY_V1 => Some(ZakuraServiceId::discovery()),
         SUMMARY_TAG_BLOCK_SYNC_V1 => Some(ZakuraServiceId::block_sync()),
         _ => None,
@@ -3653,7 +3671,7 @@ fn validate_known_summary_payload(
     summary_bytes: &[u8],
 ) -> Result<(), DiscoveryWireError> {
     match summary_tag {
-        SUMMARY_TAG_HEADER_SYNC_V1 => {
+        SUMMARY_TAG_HEADER_SYNC | SUMMARY_TAG_HEADER_SYNC_RETIRED => {
             decode_header_sync_summary(summary_bytes)?;
         }
         SUMMARY_TAG_DISCOVERY_V1 => {
@@ -4826,7 +4844,7 @@ mod tests {
         truncated_known.write_u16::<LittleEndian>(1).unwrap();
         encode_service_id(&ZakuraServiceId::header_sync(), &mut truncated_known).unwrap();
         truncated_known
-            .write_u16::<LittleEndian>(SUMMARY_TAG_HEADER_SYNC_V1)
+            .write_u16::<LittleEndian>(SUMMARY_TAG_HEADER_SYNC)
             .unwrap();
         truncated_known.write_u16::<LittleEndian>(1).unwrap();
         truncated_known.write_u8(0).unwrap();
@@ -5115,11 +5133,45 @@ mod tests {
         ));
     }
 
+    /// Retiring header-sync v6 must not break discovery with peers that have not
+    /// upgraded. A pre-upgrade peer still sends the retired tag with the retired
+    /// service id; that pairing must stay wire-valid, or every `Services` exchange
+    /// with such a peer fails as a protocol violation and takes discovery down with
+    /// it. The summary is accepted but is not a header-sync candidate hint, because
+    /// we cannot header-sync with that peer.
+    #[test]
+    fn retired_header_sync_summary_from_a_pre_upgrade_peer_stays_valid() {
+        let mut summary_bytes = Vec::new();
+        encode_header_sync_summary(&header_summary(), &mut summary_bytes)
+            .expect("test header summary encodes");
+        let retired = ServiceSummaryEnvelope {
+            service_id: ZakuraServiceId::header_sync_retired(),
+            summary_tag: SUMMARY_TAG_HEADER_SYNC_RETIRED,
+            summary_bytes,
+        };
+
+        let encoded = services_message(vec![retired.clone()])
+            .encode()
+            .expect("a pre-upgrade peer's header-sync summary must still encode");
+        assert!(
+            DiscoveryMessage::decode(&encoded).is_ok(),
+            "a pre-upgrade peer's Services message must not be a wire protocol violation"
+        );
+
+        assert_eq!(
+            retired
+                .decode_header_sync()
+                .expect("the retired payload is well-formed"),
+            None,
+            "a retired-generation summary is not a header-sync candidate hint"
+        );
+    }
+
     #[test]
     fn known_summary_tags_must_match_their_service_ids() {
         let mismatched_header = ServiceSummaryEnvelope {
             service_id: ZakuraServiceId::discovery(),
-            summary_tag: SUMMARY_TAG_HEADER_SYNC_V1,
+            summary_tag: SUMMARY_TAG_HEADER_SYNC,
             summary_bytes: {
                 let mut bytes = Vec::new();
                 encode_header_sync_summary(&header_summary(), &mut bytes)
@@ -5130,7 +5182,7 @@ mod tests {
         assert!(matches!(
             services_message(vec![mismatched_header.clone()]).encode(),
             Err(DiscoveryWireError::MismatchedSummaryService {
-                summary_tag: SUMMARY_TAG_HEADER_SYNC_V1,
+                summary_tag: SUMMARY_TAG_HEADER_SYNC,
                 ..
             })
         ));
@@ -5147,7 +5199,7 @@ mod tests {
         encode_service_id(&ZakuraServiceId::discovery(), &mut mismatched_header_wire)
             .expect("test service id writes");
         mismatched_header_wire
-            .write_u16::<LittleEndian>(SUMMARY_TAG_HEADER_SYNC_V1)
+            .write_u16::<LittleEndian>(SUMMARY_TAG_HEADER_SYNC)
             .expect("test summary tag writes");
         mismatched_header_wire
             .write_u16::<LittleEndian>(
@@ -5161,7 +5213,7 @@ mod tests {
         assert!(matches!(
             DiscoveryMessage::decode(&mismatched_header_wire),
             Err(DiscoveryWireError::MismatchedSummaryService {
-                summary_tag: SUMMARY_TAG_HEADER_SYNC_V1,
+                summary_tag: SUMMARY_TAG_HEADER_SYNC,
                 ..
             })
         ));

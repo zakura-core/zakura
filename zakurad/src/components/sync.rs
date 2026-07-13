@@ -1355,13 +1355,16 @@ where
                             // TODO: replace with flatten() when it stabilises (#70142)
                             .and_then(convert::identity)?;
 
-                        // Only a refresh that discovers something counts as progress. Otherwise a
-                        // syncer whose peers can't supply the rest of the range would refresh
-                        // forever instead of tripping the stall detector and restarting.
-                        if !refreshed.is_empty() || !self.prospective_tips.is_empty() {
-                            last_progress = Instant::now();
-                        }
-
+                        // A refresh is not progress, even when it returns hashes.
+                        //
+                        // Peers will happily keep returning hashes for blocks we already hold: an
+                        // incomplete checkpoint range is parked in the verifier, not committed to
+                        // the state, so `obtain_tips` rediscovers those same blocks every time and
+                        // `request_blocks` drops them as duplicates. Treating that as progress would
+                        // hold off the stall detector forever, so a range that can never complete
+                        // would refresh every `TIP_REFRESH_INTERVAL` instead of restarting the round
+                        // and re-downloading. Only a completed block or a finished extension counts,
+                        // which is what the arms below record.
                         reserve.extend(refreshed);
                         self.update_metrics();
                     }

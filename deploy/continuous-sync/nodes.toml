@@ -77,7 +77,13 @@ alias = "temp-zakura-sync-test-3"
 public_ip = "134.209.49.92"
 mode_label = "Zebra/legacy-only"
 p2p_stack = "legacy"
-# TEMPORARY: validating the checkpoint-refill fix (PR #137) on the legacy-only node,
-# which is the one reproducing the stall. Do not merge; revert to the `main` default
-# once the fix lands.
-branch = "fix/checkpoint-refill-minimal"
+# TEMPORARY: validating the checkpoint-refill fix on the legacy-only node, which is
+# the one reproducing the stall. Do not merge; revert to the `main` default once the
+# fix lands.
+branch = "fix/checkpoint-refill-refresh"
+# The fix recovers from a range that cannot complete by tripping BLOCK_VERIFY_TIMEOUT
+# (480s) and re-downloading. That is longer than the default 600s reap/alert windows
+# allow for, so give the run room to demonstrate the recovery instead of being killed
+# mid-restart. Revert with the branch pin.
+stall_seconds = 1800
+cluster_stall_seconds = 1800

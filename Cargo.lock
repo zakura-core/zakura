@@ -8840,6 +8840,7 @@ dependencies = [
  "vergen-git2",
  "zakura-chain",
  "zakura-consensus",
+ "zakura-jsonl-trace",
  "zakura-network",
  "zakura-node-services",
  "zakura-rpc",

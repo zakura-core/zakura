@@ -4,9 +4,9 @@
 # Release binaries are built in Docker without `.git`, so `zakurad --version`
 # reports CARGO_PKG_VERSION, not the tag: tagging without bumping the package
 # version ships binaries that self-report the wrong release (v1.0.0-rc1 shipped
-# reporting 1.0.0-rc0). Run this on the release commit before pushing the tag;
-# release-binaries.yml runs the same check and refuses to build or publish
-# assets for a mismatched tag.
+# reporting 1.0.0-rc0). Run this on the release commit before dispatching the
+# protected release workflow; release-binaries.yml runs the same check and
+# refuses to build or publish assets for a mismatched tag.
 #
 # Usage:
 #   ./scripts/check-release-version.sh <release-tag>

@@ -122,6 +122,33 @@ impl LegacySyncTrace {
         });
     }
 
+    /// Records the block locator we send to peers in `FindBlocks`.
+    ///
+    /// `first_depth` should be 0 (the state tip). A large `first_depth` means we are asking peers to
+    /// extend a chain from far behind our tip, so they answer with blocks we already have.
+    pub(super) fn locator_sent(
+        &self,
+        len: usize,
+        first: Option<(block::Hash, Option<u32>)>,
+        last: Option<(block::Hash, Option<u32>)>,
+    ) {
+        self.emit("locator_sent", |row| {
+            insert_count(row, "len", len);
+            if let Some((hash, depth)) = first {
+                row.insert("first_hash".to_string(), Value::String(hash.to_string()));
+                if let Some(depth) = depth {
+                    row.insert("first_depth".to_string(), Value::from(depth));
+                }
+            }
+            if let Some((hash, depth)) = last {
+                row.insert("last_hash".to_string(), Value::String(hash.to_string()));
+                if let Some(depth) = depth {
+                    row.insert("last_depth".to_string(), Value::from(depth));
+                }
+            }
+        });
+    }
+
     /// Records where the state claims each hash of a fully-known `FindBlocks` response lives, plus
     /// the best-chain depth of the response's endpoints.
     ///

@@ -1514,6 +1514,21 @@ where
             })
             .map_err(|e| eyre!(e))?;
 
+        // Diagnostic: peers answer our `FindBlocks` from genesis, which only happens when they can't
+        // match any hash we send. Record what we are actually sending: the first locator hash should
+        // be the state tip (depth 0), and the last should be `MAX_BLOCK_REORG_HEIGHT` below it.
+        {
+            let first = match block_locator.first().copied() {
+                Some(hash) => Some((hash, self.block_depth(hash).await)),
+                None => None,
+            };
+            let last = match block_locator.last().copied() {
+                Some(hash) => Some((hash, self.block_depth(hash).await)),
+                None => None,
+            };
+            self.trace.locator_sent(block_locator.len(), first, last);
+        }
+
         debug!(
             tip = ?block_locator.first().expect("we have at least one block locator object"),
             ?block_locator,

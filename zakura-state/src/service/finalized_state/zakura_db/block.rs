@@ -234,22 +234,15 @@ impl ZakuraDb {
                 .map(|tree| tree.root())
                 .unwrap_or_else(|| ironwood::tree::NoteCommitmentTree::default().root());
 
-            let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = self
-                .block(height.into())
-                .map(|block| {
-                    (
-                        block.sapling_transactions_count(),
-                        block.orchard_transactions_count(),
-                        block.ironwood_transactions_count(),
-                        block.auth_data_root(),
-                    )
-                })
-                .unwrap_or((
-                    0,
-                    0,
-                    0,
-                    zakura_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
-                ));
+            let Some(block) = self.block(height.into()) else {
+                break;
+            };
+            let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = (
+                block.sapling_transactions_count(),
+                block.orchard_transactions_count(),
+                block.ironwood_transactions_count(),
+                block.auth_data_root(),
+            );
 
             roots.push(BlockCommitmentRoots {
                 height,

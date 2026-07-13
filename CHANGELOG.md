@@ -7,12 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-### Fixed
-
-- Contained panics while decoding peer-controlled legacy messages to the
-  affected connection, which is disconnected through the normal peer failure
-  path.
-
 Initial release of Zakura.
 
 Zakura is a fork of the Zcash Foundation's

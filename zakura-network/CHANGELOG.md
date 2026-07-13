@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Contained panics while decoding peer-controlled legacy messages to the
+  affected connection, which is disconnected through the normal peer failure
+  path.
+
 ### Added
 
 - Added `HeaderSyncEvent::VctRootRepairRequested` and

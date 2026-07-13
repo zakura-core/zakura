@@ -347,6 +347,42 @@ async fn connection_run_loop_inbound_close() {
     assert_eq!(outbound_message, None);
 }
 
+/// Test that an inbound parser error takes the normal peer failure path.
+#[tokio::test]
+async fn connection_run_loop_inbound_parser_error() {
+    let _init_guard = zakura_test::init();
+
+    // The real stream and sink are from a split TCP connection,
+    // but that doesn't change how the state machine behaves.
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+
+    let (connection, client_tx, mut inbound_service, mut peer_outbound_messages, error_slot) =
+        new_test_connection();
+
+    peer_tx
+        .try_send(Err(SerializationError::Parse("test peer parser panic")))
+        .expect("test peer channel should accept a parser error");
+
+    let connection = connection.run(peer_rx).shared();
+    let connection_guard = connection.clone();
+    assert_eq!(connection.now_or_never(), Some(()));
+
+    let error = error_slot
+        .try_get_error()
+        .expect("peer parser error should be stored");
+    assert_eq!(
+        error.inner_debug(),
+        "Serialization(Parse(\"test peer parser panic\"))"
+    );
+    assert!(client_tx.is_closed());
+    assert!(peer_tx.is_closed());
+
+    inbound_service.expect_no_requests().await;
+
+    std::mem::drop(connection_guard);
+    assert_eq!(peer_outbound_messages.next().await, None);
+}
+
 /// Test that the connection run loop fails correctly when the peer channel is dropped
 /// (We're not sure if tokio closes or drops the TcpStream when the TCP connection closes.)
 #[tokio::test]

@@ -489,6 +489,23 @@ async fn responder_upgrade_disconnects_on_malformed_prelude() {
     );
 }
 
+/// A panic in structured prelude decoding is a terminal serialization error
+/// for that legacy peer, not a handshake-task panic.
+#[test]
+fn upgrade_prelude_parser_panic_becomes_serialization_error() {
+    let _init_guard = zakura_test::init();
+
+    let error = decode_upgrade_prelude_with(|| panic!("test prelude parser panic"))
+        .expect_err("the parser panic must become a handshake error");
+
+    assert!(matches!(
+        error,
+        HandshakeError::Serialization(SerializationError::Parse(
+            "Zakura P2P v2 upgrade prelude parser panicked"
+        ))
+    ));
+}
+
 /// The TCP initiator side of the same regression: a peer that advertised
 /// `NODE_P2P_V2`, receives our `Init`, and replies with a `p2pv2up` message
 /// whose payload fails to decode must be disconnected, not kept on legacy.

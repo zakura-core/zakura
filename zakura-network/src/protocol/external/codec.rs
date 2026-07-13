@@ -4,7 +4,11 @@ use std::{
     cmp::min,
     fmt,
     io::{Cursor, Read, Write},
+    panic::{self, AssertUnwindSafe},
 };
+
+#[cfg(test)]
+use std::cell::Cell;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
@@ -46,10 +50,23 @@ const HEADER_LEN: usize = 24usize;
 /// verack is 0 bytes. 1 KB provides headroom for future protocol changes.
 const MAX_HANDSHAKE_BODY_LEN: usize = 1024;
 
+/// The parse error returned when a legacy message body parser panics.
+const PANICKED_MESSAGE_BODY_PARSE_ERROR: &str = "panic while parsing peer message body";
+
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BodyDecodePanic {
+    CommandDispatch,
+    AfterBlockConversion,
+    AfterTransactionConversion,
+}
+
 /// A codec which produces Bitcoin messages from byte streams and vice versa.
 pub struct Codec {
     builder: Builder,
     state: DecodeState,
+    #[cfg(test)]
+    body_decode_panic: Cell<Option<BodyDecodePanic>>,
 }
 
 /// A builder for specifying [`Codec`] options.
@@ -95,6 +112,8 @@ impl Builder {
         Codec {
             builder: self,
             state: DecodeState::Head,
+            #[cfg(test)]
+            body_decode_panic: Cell::new(None),
         }
     }
 
@@ -466,60 +485,93 @@ impl Decoder for Codec {
                 }
 
                 let mut body_reader = Cursor::new(&body);
-                match &command {
-                    b"version\0\0\0\0\0" => self.read_version(&mut body_reader),
-                    b"verack\0\0\0\0\0\0" => self.read_verack(&mut body_reader),
-                    b"ping\0\0\0\0\0\0\0\0" => self.read_ping(&mut body_reader),
-                    b"pong\0\0\0\0\0\0\0\0" => self.read_pong(&mut body_reader),
-                    b"reject\0\0\0\0\0\0" => self.read_reject(&mut body_reader),
-                    crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES => {
-                        self.read_p2p_v2_upgrade(&mut body_reader, body_len)
-                    }
-                    b"addr\0\0\0\0\0\0\0\0" => self.read_addr(&mut body_reader),
-                    b"addrv2\0\0\0\0\0\0" => self.read_addrv2(&mut body_reader),
-                    b"getaddr\0\0\0\0\0" => self.read_getaddr(&mut body_reader),
-                    b"block\0\0\0\0\0\0\0" => self.read_block(&mut body_reader),
-                    b"getblocks\0\0\0" => self.read_getblocks(&mut body_reader),
-                    b"headers\0\0\0\0\0" => self.read_headers(&mut body_reader),
-                    b"getheaders\0\0" => self.read_getheaders(&mut body_reader),
-                    b"inv\0\0\0\0\0\0\0\0\0" => self.read_inv(&mut body_reader),
-                    b"getdata\0\0\0\0\0" => self.read_getdata(&mut body_reader),
-                    b"notfound\0\0\0\0" => self.read_notfound(&mut body_reader),
-                    b"tx\0\0\0\0\0\0\0\0\0\0" => self.read_tx(&mut body_reader),
-                    b"mempool\0\0\0\0\0" => self.read_mempool(&mut body_reader),
-                    b"filterload\0\0" => self.read_filterload(&mut body_reader, body_len),
-                    b"filteradd\0\0\0" => self.read_filteradd(&mut body_reader, body_len),
-                    b"filterclear\0" => self.read_filterclear(&mut body_reader),
-                    _ => {
-                        let command_string = String::from_utf8_lossy(&command);
 
-                        // # Security
-                        //
-                        // Zcash connections are not authenticated, so malicious nodes can
-                        // send fake messages, with connected peers' IP addresses in the IP header.
-                        //
-                        // Since we can't verify their source, Zebra needs to ignore unexpected messages,
-                        // because closing the connection could cause a denial of service or eclipse attack.
-                        debug!(?command, %command_string, "unknown message command from peer");
-                        return Ok(None);
+                // The body bytes are owned locally and the decoder state was
+                // reset above, before entering this unwind boundary. Body
+                // readers do not mutate shared services or connection state.
+                // A caught panic returns an error that the network treats as
+                // terminal, dropping this codec and its peer transport.
+                let decode_result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    self.panic_at_body_decode_point(BodyDecodePanic::CommandDispatch);
+
+                    match &command {
+                        b"version\0\0\0\0\0" => self.read_version(&mut body_reader),
+                        b"verack\0\0\0\0\0\0" => self.read_verack(&mut body_reader),
+                        b"ping\0\0\0\0\0\0\0\0" => self.read_ping(&mut body_reader),
+                        b"pong\0\0\0\0\0\0\0\0" => self.read_pong(&mut body_reader),
+                        b"reject\0\0\0\0\0\0" => self.read_reject(&mut body_reader),
+                        crate::zakura::P2P_V2_UPGRADE_COMMAND_BYTES => {
+                            self.read_p2p_v2_upgrade(&mut body_reader, body_len)
+                        }
+                        b"addr\0\0\0\0\0\0\0\0" => self.read_addr(&mut body_reader),
+                        b"addrv2\0\0\0\0\0\0" => self.read_addrv2(&mut body_reader),
+                        b"getaddr\0\0\0\0\0" => self.read_getaddr(&mut body_reader),
+                        b"block\0\0\0\0\0\0\0" => self.read_block(&mut body_reader),
+                        b"getblocks\0\0\0" => self.read_getblocks(&mut body_reader),
+                        b"headers\0\0\0\0\0" => self.read_headers(&mut body_reader),
+                        b"getheaders\0\0" => self.read_getheaders(&mut body_reader),
+                        b"inv\0\0\0\0\0\0\0\0\0" => self.read_inv(&mut body_reader),
+                        b"getdata\0\0\0\0\0" => self.read_getdata(&mut body_reader),
+                        b"notfound\0\0\0\0" => self.read_notfound(&mut body_reader),
+                        b"tx\0\0\0\0\0\0\0\0\0\0" => self.read_tx(&mut body_reader),
+                        b"mempool\0\0\0\0\0" => self.read_mempool(&mut body_reader),
+                        b"filterload\0\0" => self.read_filterload(&mut body_reader, body_len),
+                        b"filteradd\0\0\0" => self.read_filteradd(&mut body_reader, body_len),
+                        b"filterclear\0" => self.read_filterclear(&mut body_reader),
+                        _ => {
+                            let command_string = String::from_utf8_lossy(&command);
+
+                            // # Security
+                            //
+                            // Zcash connections are not authenticated, so malicious nodes can
+                            // send fake messages, with connected peers' IP addresses
+                            // in the IP header.
+                            //
+                            // Since we can't verify their source, Zebra needs to ignore
+                            // unexpected messages, because closing the connection could
+                            // cause a denial of service or eclipse attack.
+                            debug!(?command, %command_string, "unknown message command from peer");
+                            return Ok(None);
+                        }
+                    }
+                    // We need Ok(Some(msg)) to signal that we're done decoding.
+                    // This is also convenient for tracing the parse result.
+                    .map(|msg| {
+                        // bitcoin allows extra data at the end of most messages,
+                        // so that old nodes can still read newer message formats,
+                        // and ignore any extra fields
+                        let extra_bytes = body.len() as u64 - body_reader.position();
+                        if extra_bytes == 0 {
+                            trace!(?extra_bytes, %msg, "finished message decoding");
+                        } else {
+                            // log when there are extra bytes, so we know when we need to
+                            // upgrade message formats
+                            debug!(?extra_bytes, %msg, "extra data after decoding message");
+                        }
+                        Some(msg)
+                    })
+                }));
+
+                match decode_result {
+                    Ok(result) => result,
+                    Err(_panic_payload) => {
+                        let command = String::from_utf8_lossy(&command)
+                            .trim_end_matches('\0')
+                            .to_owned();
+                        metrics::counter!(
+                            "peer.message.parse.panics",
+                            "parser" => "legacy_body"
+                        )
+                        .increment(1);
+                        tracing::error!(
+                            %command,
+                            "peer-controlled message parser panicked; disconnecting legacy peer"
+                        );
+
+                        Err(Parse(PANICKED_MESSAGE_BODY_PARSE_ERROR))
                     }
                 }
-                // We need Ok(Some(msg)) to signal that we're done decoding.
-                // This is also convenient for tracing the parse result.
-                .map(|msg| {
-                    // bitcoin allows extra data at the end of most messages,
-                    // so that old nodes can still read newer message formats,
-                    // and ignore any extra fields
-                    let extra_bytes = body.len() as u64 - body_reader.position();
-                    if extra_bytes == 0 {
-                        trace!(?extra_bytes, %msg, "finished message decoding");
-                    } else {
-                        // log when there are extra bytes, so we know when we need to
-                        // upgrade message formats
-                        debug!(?extra_bytes, %msg, "extra data after decoding message");
-                    }
-                    Some(msg)
-                })
             }
         }
     }
@@ -702,7 +754,12 @@ impl Codec {
 
     fn read_block<R: Read + std::marker::Send>(&self, reader: R) -> Result<Message, Error> {
         let result = Self::deserialize_block_spawning(reader);
-        Ok(Message::Block(result?.into()))
+        let block = result?.into();
+
+        #[cfg(test)]
+        self.panic_at_body_decode_point(BodyDecodePanic::AfterBlockConversion);
+
+        Ok(Message::Block(block))
     }
 
     fn read_getblocks<R: Read>(&self, mut reader: R) -> Result<Message, Error> {
@@ -770,7 +827,12 @@ impl Codec {
 
     fn read_tx<R: Read + std::marker::Send>(&self, reader: R) -> Result<Message, Error> {
         let result = Self::deserialize_transaction_spawning(reader);
-        Ok(Message::Tx(result?.into()))
+        let transaction = result?.into();
+
+        #[cfg(test)]
+        self.panic_at_body_decode_point(BodyDecodePanic::AfterTransactionConversion);
+
+        Ok(Message::Tx(transaction))
     }
 
     fn read_mempool<R: Read>(&self, mut _reader: R) -> Result<Message, Error> {
@@ -817,6 +879,19 @@ impl Codec {
 
     fn read_filterclear<R: Read>(&self, mut _reader: R) -> Result<Message, Error> {
         Ok(Message::FilterClear)
+    }
+
+    #[cfg(test)]
+    fn inject_body_decode_panic(&self, panic_point: BodyDecodePanic) {
+        self.body_decode_panic.set(Some(panic_point));
+    }
+
+    #[cfg(test)]
+    fn panic_at_body_decode_point(&self, panic_point: BodyDecodePanic) {
+        if self.body_decode_panic.get() == Some(panic_point) {
+            self.body_decode_panic.set(None);
+            panic!("injected legacy message body parser panic at {panic_point:?}");
+        }
     }
 
     /// Given the reader, deserialize the transaction in the rayon thread pool.

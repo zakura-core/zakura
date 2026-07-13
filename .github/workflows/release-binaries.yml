@@ -492,7 +492,7 @@ jobs:
           retention-days: 1
 
   update-source-installer:
-    name: Update source installer checksum
+    name: Update source installer metadata
     needs: [resolve-release, publish-zakurad-assets]
     runs-on: ubuntu-latest
     environment: release-automation
@@ -531,7 +531,7 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
-      - name: Checkout main for installer checksum update
+      - name: Checkout main for installer metadata update
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -546,7 +546,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: echo "id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
 
-      - name: Update source installer checksum
+      - name: Update source installer metadata
         id: source-installer
         env:
           RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
@@ -555,13 +555,18 @@ jobs:
           RELEASE_TAG="$RELEASE_TAG" python3 - <<'PY'
           import os
           import re
+          import tomllib
           from pathlib import Path
 
           release_tag = os.environ["RELEASE_TAG"]
           generated_path = Path("./publish/final/install-zakura.sh")
           source_path = Path("./source-update/scripts/install-zakura.sh")
+          manifest_path = Path("./source-update/zakurad/Cargo.toml")
           generated = generated_path.read_text(encoding="utf-8")
           source = source_path.read_text(encoding="utf-8")
+          package_version = tomllib.loads(
+              manifest_path.read_text(encoding="utf-8")
+          )["package"]["version"]
 
           def assignment(contents: str, name: str) -> str:
               match = re.search(rf'^{name}="([^"]*)"$', contents, flags=re.MULTILINE)
@@ -571,7 +576,6 @@ jobs:
 
           generated_tag = assignment(generated, "ZAKURA_RELEASE_TAG")
           generated_sha256 = assignment(generated, "ZAKURA_ARCHIVE_SHA256")
-          source_tag = assignment(source, "ZAKURA_RELEASE_TAG")
 
           if generated_tag != release_tag:
               raise SystemExit(
@@ -579,24 +583,32 @@ jobs:
               )
           if not re.fullmatch(r"[0-9a-f]{64}", generated_sha256) or set(generated_sha256) == {"0"}:
               raise SystemExit("Generated installer does not contain a valid archive checksum.")
-          if source_tag != release_tag:
+          if f"v{package_version}" != release_tag:
               print(
-                  f"main targets {source_tag}, not {release_tag}; "
-                  "skipping the stale release checksum update."
+                  f"main package version is v{package_version}, not {release_tag}; "
+                  "skipping the stale release metadata update."
               )
               with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
                   output.write("changed=false\n")
               raise SystemExit(0)
 
-          updated, count = re.subn(
-              r'^ZAKURA_ARCHIVE_SHA256="[^"]*"$',
-              f'ZAKURA_ARCHIVE_SHA256="{generated_sha256}"',
-              source,
-              count=1,
-              flags=re.MULTILINE,
-          )
-          if count != 1:
-              raise SystemExit("Expected exactly one ZAKURA_ARCHIVE_SHA256 assignment.")
+          updated = source
+          for name in (
+              "ZAKURA_RELEASE_TAG",
+              "ZAKURA_ARCHIVE_SHA256",
+              "ZAKURA_DOCKER_IMAGE",
+              "ZAKURA_COMPAT_DOCKER_IMAGE",
+          ):
+              value = assignment(generated, name)
+              updated, count = re.subn(
+                  rf'^{name}="[^"]*"$',
+                  f'{name}="{value}"',
+                  updated,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one {name} assignment.")
 
           source_path.write_text(updated, encoding="utf-8")
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
@@ -604,7 +616,7 @@ jobs:
               output.write(f"sha256={generated_sha256}\n")
           PY
 
-      - name: Open installer checksum update PR
+      - name: Open installer metadata update PR
         if: steps.source-installer.outputs.changed == 'true'
         env:
           APP_ID: ${{ steps.app-user.outputs.id }}
@@ -626,7 +638,38 @@ jobs:
               --jq '.[0].number // empty'
           )"
           if [ -n "$existing_pr" ]; then
-            echo "Installer checksum PR #${existing_pr} is already open."
+            existing_installer="${RUNNER_TEMP}/existing-install-zakura.sh"
+            gh api \
+              "repos/${REPOSITORY}/contents/scripts/install-zakura.sh?ref=${branch}" \
+              --jq .content \
+            | base64 --decode > "$existing_installer"
+            EXPECTED_INSTALLER="scripts/install-zakura.sh" \
+              EXISTING_INSTALLER="$existing_installer" \
+              python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          expected = Path(os.environ["EXPECTED_INSTALLER"]).read_text(encoding="utf-8")
+          existing = Path(os.environ["EXISTING_INSTALLER"]).read_text(encoding="utf-8")
+          names = (
+              "ZAKURA_RELEASE_TAG",
+              "ZAKURA_ARCHIVE_SHA256",
+              "ZAKURA_DOCKER_IMAGE",
+              "ZAKURA_COMPAT_DOCKER_IMAGE",
+          )
+          for name in names:
+              pattern = rf'^{name}="[^"]*"$'
+              expected_match = re.search(pattern, expected, flags=re.MULTILINE)
+              existing_match = re.search(pattern, existing, flags=re.MULTILINE)
+              if expected_match is None or existing_match is None:
+                  raise SystemExit(f"Missing {name} in an installer.")
+              if existing_match.group(0) != expected_match.group(0):
+                  raise SystemExit(
+                      f"Installer metadata PR contains a stale {name}; update it before retrying."
+                  )
+          PY
+            echo "Installer metadata PR #${existing_pr} is already current."
             exit 0
           fi
 
@@ -638,22 +681,23 @@ jobs:
           git add scripts/install-zakura.sh
           git -c user.name="${APP_SLUG}[bot]" \
             -c user.email="${APP_ID}+${APP_SLUG}[bot]@users.noreply.github.com" \
-            commit -m "chore(release): update installer checksum for ${RELEASE_TAG}"
+            commit -m "chore(release): update installer metadata for ${RELEASE_TAG}"
           git push --set-upstream origin "$branch"
 
           gh pr create \
             --repo "$REPOSITORY" \
             --base main \
             --head "$branch" \
-            --title "chore(release): update installer checksum for ${RELEASE_TAG}" \
+            --title "chore(release): update installer metadata for ${RELEASE_TAG}" \
             --body "$(cat <<EOF
           ## Motivation
 
-          Keep the installer served from \`main\` pinned to the archive published for ${RELEASE_TAG}.
+          Keep the installer served from \`main\` pinned to the release artifacts published for ${RELEASE_TAG}.
 
           ## Solution
 
-          Update \`ZAKURA_ARCHIVE_SHA256\` to the checksum calculated by the release workflow:
+          Update the installer release tag, Docker image tags, and
+          \`ZAKURA_ARCHIVE_SHA256\` calculated by the release workflow:
           \`${SHA256}\`
 
           ### Tests

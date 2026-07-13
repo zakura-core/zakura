@@ -54,7 +54,7 @@ follow semver, depending on the thing being fixed.
 ## Test the Pre-Release (if Zakura hotfix)
 
 - [ ] Wait until the Docker binaries have been built on the hotfix release branch, and the quick tests have passed:
-  - [ ] [release-binaries.yml](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Arelease)
+  - [ ] [release-binaries.yml](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush)
 
 ## Publish Release (if Zakura hotfix)
 
@@ -72,7 +72,7 @@ follow semver, depending on the thing being fixed.
 
 ## Publish Docker Images (if Zakura hotfix)
 
-- [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Arelease).
+- [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush).
 - [ ] Wait for the new tag in the [Docker Hub zakura space](https://hub.docker.com/r/valaroman/zakura/tags)
 
 ## Merge hotfix into main

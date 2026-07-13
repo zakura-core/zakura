@@ -6,7 +6,7 @@ workflow validates that the requested `v*` tag matches the `zakura` package
 version, builds and verifies the release assets from that exact commit, and
 then creates the tag by publishing a complete pre-release. The tag push then
 triggers [`release-binaries.yml`](../.github/workflows/release-binaries.yml) to
-publish Docker images and open the installer checksum update pull request.
+publish Docker images and open the installer metadata update pull request.
 
 ## GitHub App
 
@@ -37,7 +37,7 @@ to the `main` deployment branch.
 Configure a second environment named `release-automation` with the same
 variable and secret. Allow deployments from the `main` branch and tags matching
 `v*`. This environment is used only after assets are published to open the
-installer checksum update pull request. It is separate so tag deployment rules
+installer metadata update pull request. It is separate so tag deployment rules
 or approvals cannot block post-release automation.
 
 The app private key is a credential. Store its source copy in the team's secret
@@ -75,7 +75,7 @@ ruleset administration must remain limited.
    complete pre-release, creating the protected tag as its final step.
 6. Confirm that `Release binaries` starts from the new tag, skips rebuilding
    the existing assets, publishes the Docker images, and opens the installer
-   checksum update pull request.
+   metadata update pull request.
 
 The workflow always builds the commit selected when it was dispatched, even if
 `main` advances before approval. It is safe to rerun after a partial failure:

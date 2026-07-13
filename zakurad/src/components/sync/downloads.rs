@@ -4,8 +4,9 @@ use std::{
     collections::HashMap,
     convert,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
+    time::Instant,
 };
 
 use futures::{
@@ -14,6 +15,7 @@ use futures::{
     stream::{FuturesUnordered, Stream},
 };
 use pin_project::pin_project;
+use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::{
     sync::{oneshot, watch},
@@ -31,6 +33,7 @@ use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
 use crate::components::sync::{
+    legacy_trace::{elapsed_millis, LegacyBlockOutcome, LegacySyncTrace, LegacyTaskState},
     FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT,
 };
 
@@ -280,6 +283,22 @@ where
     /// A list of channels that can be used to cancel pending block download and
     /// verify tasks.
     cancel_handles: HashMap<block::Hash, oneshot::Sender<()>>,
+
+    /// Current lifecycle phase for each pending legacy block task.
+    task_states: Arc<Mutex<HashMap<block::Hash, LegacyTaskState>>>,
+
+    /// Structured diagnostics for legacy block downloads and verification.
+    trace: LegacySyncTrace,
+}
+
+fn take_task_state(
+    task_states: &Mutex<HashMap<block::Hash, LegacyTaskState>>,
+    hash: block::Hash,
+) -> Option<LegacyTaskState> {
+    task_states
+        .lock()
+        .expect("legacy task state lock is only held for synchronous updates")
+        .remove(&hash)
 }
 
 impl<ZN, ZV, ZSTip> Stream for Downloads<ZN, ZV, ZSTip>
@@ -311,11 +330,17 @@ where
             match join_result.expect("block download and verify tasks must not panic") {
                 Ok((height, hash)) => {
                     this.cancel_handles.remove(&hash);
+                    let state = take_task_state(this.task_states, hash);
+                    this.trace
+                        .block_finish(hash, LegacyBlockOutcome::Verified(height), state);
 
                     Poll::Ready(Some(Ok((height, hash))))
                 }
                 Err((e, hash)) => {
                     this.cancel_handles.remove(&hash);
+                    let state = take_task_state(this.task_states, hash);
+                    this.trace
+                        .block_finish(hash, LegacyBlockOutcome::Error(&e), state);
                     Poll::Ready(Some(Err(e)))
                 }
             }
@@ -358,6 +383,7 @@ where
         past_lookahead_limit_sender: watch::Sender<bool>,
         lookahead_limit: usize,
         max_checkpoint_height: Height,
+        trace: LegacySyncTrace,
     ) -> Self {
         let past_lookahead_limit_receiver =
             zs::WatchReceiver::new(past_lookahead_limit_sender.subscribe());
@@ -374,7 +400,130 @@ where
             past_lookahead_limit_receiver,
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
+            task_states: Arc::new(Mutex::new(HashMap::new())),
+            trace,
         }
+    }
+
+    fn transition_task(
+        task_states: &Arc<Mutex<HashMap<block::Hash, LegacyTaskState>>>,
+        trace: &LegacySyncTrace,
+        hash: block::Hash,
+        phase: &'static str,
+        height: Option<Height>,
+    ) {
+        let now = Instant::now();
+        let mut states = task_states
+            .lock()
+            .expect("legacy task state lock is only held for synchronous updates");
+        let state = states.entry(hash).or_insert(LegacyTaskState {
+            phase,
+            height,
+            started: now,
+            phase_started: now,
+        });
+        let previous_phase = state.phase;
+        let phase_elapsed = state.phase_started.elapsed();
+        state.phase = phase;
+        state.height = height.or(state.height);
+        state.phase_started = now;
+        let state = state.clone();
+        drop(states);
+
+        trace.emit("block_phase", |row| {
+            row.insert("hash".to_string(), Value::String(hash.to_string()));
+            row.insert("phase".to_string(), Value::String(phase.to_string()));
+            row.insert(
+                "previous_phase".to_string(),
+                Value::String(previous_phase.to_string()),
+            );
+            if let Some(height) = state.height {
+                row.insert("height".to_string(), Value::from(height.0));
+            }
+            row.insert(
+                "phase_elapsed_ms".to_string(),
+                elapsed_millis(phase_elapsed),
+            );
+            row.insert(
+                "elapsed_ms".to_string(),
+                elapsed_millis(state.started.elapsed()),
+            );
+        });
+    }
+
+    pub(super) fn emit_diagnostic_snapshot(
+        &self,
+        event: &'static str,
+        state_tip: Option<Height>,
+        reserve: usize,
+        prospective_tips: usize,
+        registry_retries: usize,
+    ) {
+        let states = self
+            .task_states
+            .lock()
+            .expect("legacy task state lock is only held for synchronous updates");
+        let mut tasks: Vec<_> = states
+            .iter()
+            .map(|(hash, state)| {
+                let mut task = Map::new();
+                task.insert("hash".to_string(), Value::String(hash.to_string()));
+                task.insert("phase".to_string(), Value::String(state.phase.to_string()));
+                if let Some(height) = state.height {
+                    task.insert("height".to_string(), Value::from(height.0));
+                }
+                task.insert(
+                    "elapsed_ms".to_string(),
+                    elapsed_millis(state.started.elapsed()),
+                );
+                task.insert(
+                    "phase_elapsed_ms".to_string(),
+                    elapsed_millis(state.phase_started.elapsed()),
+                );
+                Value::Object(task)
+            })
+            .collect();
+        tasks.sort_by_key(|task| {
+            task.get("height")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX)
+        });
+        drop(states);
+
+        self.trace.emit(event, |row| {
+            if let Some(state_tip) = state_tip {
+                row.insert("state_tip".to_string(), Value::from(state_tip.0));
+            }
+            row.insert(
+                "in_flight".to_string(),
+                Value::from(u64::try_from(self.in_flight()).unwrap_or(u64::MAX)),
+            );
+            row.insert(
+                "reserve".to_string(),
+                Value::from(u64::try_from(reserve).unwrap_or(u64::MAX)),
+            );
+            row.insert(
+                "prospective_tips".to_string(),
+                Value::from(u64::try_from(prospective_tips).unwrap_or(u64::MAX)),
+            );
+            row.insert(
+                "registry_retries".to_string(),
+                Value::from(u64::try_from(registry_retries).unwrap_or(u64::MAX)),
+            );
+            row.insert("tasks".to_string(), Value::Array(tasks));
+        });
+    }
+
+    pub(super) fn phase_counts(&self) -> HashMap<&'static str, usize> {
+        let states = self
+            .task_states
+            .lock()
+            .expect("legacy task state lock is only held for synchronous updates");
+        let mut counts = HashMap::new();
+        for state in states.values() {
+            *counts.entry(state.phase).or_default() += 1;
+        }
+        counts
     }
 
     /// Queue a block for download and verification.
@@ -392,6 +541,14 @@ where
             return Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { hash });
         }
 
+        Self::transition_task(
+            &self.task_states,
+            &self.trace,
+            hash,
+            "waiting_network",
+            None,
+        );
+
         // We construct the block requests sequentially, waiting for the peer
         // set to be ready to process each request. This ensures that we start
         // block downloads in the order we want them (though they may resolve
@@ -399,12 +556,17 @@ where
         // if we waited for readiness and did the service call in the spawned
         // tasks, all of the spawned tasks would race each other waiting for the
         // network to become ready.
-        let block_req = self
-            .network
-            .ready()
-            .await
-            .map_err(|error| BlockDownloadVerifyError::NetworkServiceError { error })?
-            .call(zn::Request::BlocksByHash(std::iter::once(hash).collect()));
+        let network = match self.network.ready().await {
+            Ok(network) => network,
+            Err(error) => {
+                let state = take_task_state(&self.task_states, hash);
+                self.trace
+                    .block_finish(hash, LegacyBlockOutcome::Error(&error), state);
+                return Err(BlockDownloadVerifyError::NetworkServiceError { error });
+            }
+        };
+        let block_req = network.call(zn::Request::BlocksByHash(std::iter::once(hash).collect()));
+        Self::transition_task(&self.task_states, &self.trace, hash, "downloading", None);
 
         // This oneshot is used to signal cancellation to the download task.
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
@@ -417,6 +579,8 @@ where
 
         let past_lookahead_limit_sender = self.past_lookahead_limit_sender.clone();
         let past_lookahead_limit_receiver = self.past_lookahead_limit_receiver.clone();
+        let task_states = self.task_states.clone();
+        let trace = self.trace.clone();
 
         let task = tokio::spawn(
             async move {
@@ -434,6 +598,13 @@ where
                     }
                     rsp = block_req => rsp.map_err(|error| BlockDownloadVerifyError::DownloadFailed { error, hash})?,
                 };
+                Self::transition_task(
+                    &task_states,
+                    &trace,
+                    hash,
+                    "response_received",
+                    None,
+                );
 
                 let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) = rsp {
                     // A cooperating peer returns exactly one available block for a
@@ -536,6 +707,27 @@ where
 
                     return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr });
                 };
+                trace.emit("block_downloaded", |row| {
+                    row.insert("hash".to_string(), Value::String(hash.to_string()));
+                    row.insert("height".to_string(), Value::from(block_height.0));
+                    row.insert(
+                        "download_elapsed_ms".to_string(),
+                        elapsed_millis(download_start.elapsed()),
+                    );
+                    if let Some(advertiser_addr) = advertiser_addr {
+                        row.insert(
+                            "peer".to_string(),
+                            Value::String(format!("{advertiser_addr:?}")),
+                        );
+                    }
+                });
+                Self::transition_task(
+                    &task_states,
+                    &trace,
+                    hash,
+                    "waiting_verifier",
+                    Some(block_height),
+                );
 
                 if block_height > lookahead_drop_height {
                     Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit { height: block_height, hash, advertiser_addr })?;
@@ -610,6 +802,13 @@ where
                     }
                     verifier = readiness => verifier,
                 };
+                Self::transition_task(
+                    &task_states,
+                    &trace,
+                    hash,
+                    "verifying",
+                    Some(block_height),
+                );
 
                 // Verify the block.
                 let verify_start = std::time::Instant::now();
@@ -674,6 +873,14 @@ where
 
     /// Cancel all running tasks and reset the downloader state.
     pub fn cancel_all(&mut self) {
+        self.emit_diagnostic_snapshot(
+            "pipeline_reset",
+            self.latest_chain_tip.best_tip_height(),
+            0,
+            0,
+            0,
+        );
+
         // Replace the pending task list with an empty one and drop it.
         let _ = std::mem::take(&mut self.pending);
 
@@ -683,6 +890,10 @@ where
         for (_hash, cancel) in self.cancel_handles.drain() {
             let _ = cancel.send(());
         }
+        self.task_states
+            .lock()
+            .expect("legacy task state lock is only held for synchronous updates")
+            .clear();
 
         assert!(self.pending.is_empty());
         assert!(self.cancel_handles.is_empty());
@@ -699,7 +910,7 @@ where
     }
 
     /// Get the number of currently in-flight download and verify tasks.
-    pub fn in_flight(&mut self) -> usize {
+    pub fn in_flight(&self) -> usize {
         self.pending.len()
     }
 

@@ -281,9 +281,25 @@ pub(super) fn run_inbound(cx: &mut PipeCx<'_, HsLocal, HsEnv>, frame: Frame) -> 
     }
 
     let expected = if u8::try_from(frame.message_type).ok() == Some(MSG_HS_HEADERS) {
-        match HeaderSyncMessage::peek_headers_request_id(&frame.payload)
-            .and_then(|request_id| cx.local.pop_expected_headers_response_by_id(request_id))
-        {
+        let request_id = match HeaderSyncMessage::peek_headers_request_id(&frame.payload) {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                let error = Arc::new(error);
+                let _ = cx
+                    .env
+                    .handle
+                    .try_send(HeaderSyncEvent::WireProtocolFailure {
+                        peer: cx.peer_id.clone(),
+                        reason: HeaderSyncMisbehavior::MalformedMessage,
+                        error: error.clone(),
+                    });
+                return Flow::Reject(SinkReject::protocol(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                )));
+            }
+        };
+        match cx.local.pop_expected_headers_response_by_id(request_id) {
             Ok(Some(expected)) => Some(expected),
             Ok(None) => return Flow::Done,
             Err(error) => {
@@ -734,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_headers_responses_match_by_request_id_not_fifo_order() {
+    fn headers_responses_match_by_request_id_not_fifo_order() {
         let (handle, mut events) = test_handle();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let first_id = HeaderSyncRequestId::new(1).expect("non-zero id");
@@ -799,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_retired_headers_response_is_dropped_without_scoring() {
+    fn retired_headers_response_is_dropped_without_scoring() {
         let (handle, mut events) = test_handle();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let request_id = HeaderSyncRequestId::new(7).expect("non-zero id");
@@ -834,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_retired_request_ids_are_bounded_at_exact_limit() {
+    fn retired_request_ids_are_bounded_at_exact_limit() {
         let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
         let mut local = HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL);
 
@@ -862,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_evicted_retired_id_is_still_stale_but_future_id_is_unknown() {
+    fn evicted_retired_id_is_still_stale_but_future_id_is_unknown() {
         let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
         let mut local = HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL);
         for id in 1..=u64::try_from(MAX_RETIRED_HEADER_REQUEST_IDS + 1)
@@ -904,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_restored_expectation_reactivates_consumed_request_id() {
+    fn restored_expectation_reactivates_consumed_request_id() {
         let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
         let request_id = HeaderSyncRequestId::new(9).expect("non-zero id");
         let expected = ExpectedHeadersResponse::new(request_id, block::Height(1), 1, true)
@@ -928,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_unknown_headers_response_id_is_protocol_failure() {
+    fn unknown_headers_response_id_is_protocol_failure() {
         let (handle, mut events) = test_handle();
         let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
         let request_id = HeaderSyncRequestId::new(8).expect("non-zero id");
@@ -954,6 +970,31 @@ mod tests {
                 assert_eq!(reason, HeaderSyncMisbehavior::UnsolicitedHeaders);
             }
             other => panic!("expected unknown id protocol failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_headers_frame_is_malformed_not_unsolicited() {
+        let (handle, mut events) = test_handle();
+        let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let mut pipe = Pipe::new(
+            peer(),
+            HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL),
+            HsEnv::new(handle),
+            crate::zakura::SessionGuard::oversize_only(MAX_HS_MESSAGE_BYTES as u32),
+            run_inbound,
+            &PIPE_SHAPE,
+        );
+
+        assert!(matches!(
+            pipe.run_one(headers_frame(Vec::new())),
+            Flow::Reject(SinkReject::Protocol(_))
+        ));
+        match events.try_recv() {
+            Ok(HeaderSyncEvent::WireProtocolFailure { reason, .. }) => {
+                assert_eq!(reason, HeaderSyncMisbehavior::MalformedMessage);
+            }
+            other => panic!("expected malformed Headers protocol failure, got {other:?}"),
         }
     }
 

@@ -1210,7 +1210,7 @@ fn codec_round_trips_get_headers_request_id() {
 }
 
 #[test]
-fn v7_get_headers_rejects_missing_and_zero_request_ids() {
+fn get_headers_rejects_missing_and_zero_request_ids() {
     let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
     let message = HeaderSyncMessage::GetHeaders {
         start_height: block::Height(42),
@@ -1256,7 +1256,7 @@ fn codec_round_trips_headers_with_bounded_vector_and_request_id() {
 }
 
 #[test]
-fn v7_headers_rejects_missing_and_zero_request_ids() {
+fn headers_rejects_missing_and_zero_request_ids() {
     let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
     let message = HeaderSyncMessage::Headers {
         headers: Vec::new(),
@@ -2222,18 +2222,21 @@ async fn stale_vct_repair_response_is_dropped_without_peer_misbehavior() {
     }
 
     fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
-    let (requested_peer, _request_id, start_height, count) =
+    let (requested_peer, stale_request_id, start_height, count) =
         next_outbound_get_headers(&mut fixture.actions).await;
     assert_eq!(requested_peer, stale_peer);
     assert_eq!((start_height, count), (block::Height(1), 2));
 
     fixture.handle.send(mainnet_repair_event(2)).await.unwrap();
-    let (requested_peer, request_id, start_height, count) =
+    let (requested_peer, current_request_id, start_height, count) =
         next_outbound_get_headers(&mut fixture.actions).await;
     assert_eq!(requested_peer, current_peer);
     assert_eq!((start_height, count), (block::Height(1), 2));
 
-    for peer_id in [stale_peer, current_peer.clone()] {
+    for (peer_id, request_id) in [
+        (stale_peer, stale_request_id),
+        (current_peer.clone(), current_request_id),
+    ] {
         send_headers(
             &fixture,
             &peer_id,
@@ -2488,7 +2491,7 @@ async fn scheduler_fills_v7_outstanding_request_slots() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_uses_v7_inflight_slots_and_matches_reverse_response_ids() {
+async fn scheduler_uses_inflight_slots_and_matches_reverse_response_ids() {
     let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
     let mut fixture = spawn_test_reactor(startup_for(
         network,
@@ -4565,7 +4568,7 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn v7_serving_responses_echo_request_ids_in_completion_order() {
+async fn serving_responses_echo_request_ids_in_completion_order() {
     let network = regtest_network();
     let mut startup = startup_for(
         network.clone(),
@@ -4659,7 +4662,7 @@ async fn v7_serving_responses_echo_request_ids_in_completion_order() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn v7_replacement_session_ignores_old_wire_response_with_reused_id() {
+async fn replacement_session_ignores_old_wire_response_with_reused_id() {
     let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
     let mut fixture = spawn_test_reactor(startup_for(
@@ -4787,7 +4790,7 @@ async fn v7_replacement_session_ignores_old_wire_response_with_reused_id() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn v7_replacement_session_ignores_old_state_completion_with_reused_id() {
+async fn replacement_session_ignores_old_state_completion_with_reused_id() {
     let network = regtest_network();
     let mut startup = startup_for(
         network.clone(),

@@ -36,6 +36,7 @@ use crate::{
         sync::{
             self,
             downloads::{BlockDownloadVerifyError, Downloads},
+            legacy_trace::LegacySyncTrace,
             SyncStatus,
         },
         ChainSync,
@@ -1978,6 +1979,7 @@ async fn empty_block_response_is_retryable_download_failure() {
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Height(0),
+        LegacySyncTrace::new(None),
     );
 
     let block0: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES

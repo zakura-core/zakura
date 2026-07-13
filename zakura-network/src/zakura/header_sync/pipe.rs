@@ -750,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_headers_responses_match_by_request_id_not_fifo_order() {
+    fn headers_responses_match_by_request_id_not_fifo_order() {
         let (handle, mut events) = test_handle();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let first_id = HeaderSyncRequestId::new(1).expect("non-zero id");
@@ -815,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_retired_headers_response_is_dropped_without_scoring() {
+    fn retired_headers_response_is_dropped_without_scoring() {
         let (handle, mut events) = test_handle();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let request_id = HeaderSyncRequestId::new(7).expect("non-zero id");
@@ -850,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_retired_request_ids_are_bounded_at_exact_limit() {
+    fn retired_request_ids_are_bounded_at_exact_limit() {
         let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
         let mut local = HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL);
 
@@ -878,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_evicted_retired_id_is_still_stale_but_future_id_is_unknown() {
+    fn evicted_retired_id_is_still_stale_but_future_id_is_unknown() {
         let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
         let mut local = HsLocal::new(commands_rx, DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL);
         for id in 1..=u64::try_from(MAX_RETIRED_HEADER_REQUEST_IDS + 1)
@@ -920,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_restored_expectation_reactivates_consumed_request_id() {
+    fn restored_expectation_reactivates_consumed_request_id() {
         let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
         let request_id = HeaderSyncRequestId::new(9).expect("non-zero id");
         let expected = ExpectedHeadersResponse::new(request_id, block::Height(1), 1, true)
@@ -944,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn v7_unknown_headers_response_id_is_protocol_failure() {
+    fn unknown_headers_response_id_is_protocol_failure() {
         let (handle, mut events) = test_handle();
         let (_commands_tx, commands_rx) = mpsc::unbounded_channel();
         let request_id = HeaderSyncRequestId::new(8).expect("non-zero id");

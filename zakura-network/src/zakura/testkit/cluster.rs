@@ -2832,7 +2832,7 @@ mod tests {
             .take_header_sync_actions()
             .await
             .expect("header-sync actions are enabled");
-        let capabilities = ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC;
+        let capabilities = ZAKURA_CAP_HEADER_SYNC;
         let hostile =
             HostilePeer::connect_native_with_capabilities(&victim, 71, capabilities).await?;
         assert_eq!(

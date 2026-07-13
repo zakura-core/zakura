@@ -265,6 +265,16 @@ const SYNC_RESTART_SLEEP: Duration = Duration::from_secs(10);
 /// The default restart sleep matches the typical fast-retry cadence for this fork.
 const REGTEST_SYNC_RESTART_DELAY: Duration = Duration::from_secs(2);
 
+/// How long to wait for in-flight blocks to finish before refreshing an exhausted tip set.
+///
+/// When there are no hashes left to discover but blocks are still in flight, those blocks can be
+/// waiting on hashes we haven't discovered yet: the checkpoint verifier holds every block in a
+/// range until the whole range up to the next checkpoint has arrived, and the trailing hash of
+/// each `FindBlocks` response is discarded on the promise that a later fanout re-discovers it. So
+/// waiting for the downloads to drain would wait forever. This interval bounds how often the
+/// syncer re-runs [`ChainSync::obtain_tips`] while it waits.
+const TIP_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Controls how long we wait to retry a failed attempt to download
 /// and verify the genesis block.
 ///
@@ -1298,6 +1308,65 @@ where
                 .map_err(Report::from)?;
                 reserve = Self::handle_hash_response(response)?;
                 last_progress = Instant::now();
+                continue;
+            }
+
+            // There's nothing left to discover, but blocks are still in flight. Those blocks can be
+            // waiting on hashes we haven't discovered yet: the checkpoint verifier can't verify any
+            // block in a range until the whole range up to the next checkpoint has arrived. So
+            // waiting for them to drain can wait forever, and the only way out is to keep looking
+            // for the rest of the range. Refresh the tip set so a peer can supply it.
+            if reserve.is_empty()
+                && extend.is_none()
+                && self.prospective_tips.is_empty()
+                && self.registry_miss_retry.is_empty()
+                && self.downloads.in_flight() > 0
+            {
+                // Give the in-flight blocks a chance to finish on their own first, so a healthy
+                // sync doesn't re-run the fanout.
+                let completed = timeout(TIP_REFRESH_INTERVAL, self.downloads.next()).await;
+
+                match completed {
+                    Ok(Some(rsp)) => {
+                        self.handle_block_response_with_missing_retry(rsp).await?;
+                        last_progress = Instant::now();
+                        self.update_metrics();
+                    }
+                    // `downloads` only yields `None` when nothing is in flight, which we just ruled
+                    // out. Loop around and re-check rather than relying on that.
+                    Ok(None) => {}
+                    Err(_) => {
+                        if last_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
+                            return Err(eyre!(
+                                "sync round stalled: no block completed or tips extended within timeout"
+                            ));
+                        }
+
+                        info!(
+                            in_flight = self.downloads.in_flight(),
+                            state_tip = ?self.latest_chain_tip.best_tip_height(),
+                            "refreshing tips: in-flight blocks are waiting on undiscovered hashes",
+                        );
+                        metrics::counter!("sync.tip.refresh").increment(1);
+
+                        let refreshed = timeout(SYNC_RESTART_DELAY, self.obtain_tips())
+                            .await
+                            .map_err(Into::into)
+                            // TODO: replace with flatten() when it stabilises (#70142)
+                            .and_then(convert::identity)?;
+
+                        // Only a refresh that discovers something counts as progress. Otherwise a
+                        // syncer whose peers can't supply the rest of the range would refresh
+                        // forever instead of tripping the stall detector and restarting.
+                        if !refreshed.is_empty() || !self.prospective_tips.is_empty() {
+                            last_progress = Instant::now();
+                        }
+
+                        reserve.extend(refreshed);
+                        self.update_metrics();
+                    }
+                }
+
                 continue;
             }
 

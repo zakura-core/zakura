@@ -2656,6 +2656,131 @@ async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
+/// Hedged responses can double-commit, and that must stay benign.
+///
+/// The scheduler fans one range out to several peers, and `pending_commits` is keyed per
+/// `(peer, start_height, count)`, so the commit dispatch does not check for an overlapping
+/// pending commit from another peer. Redundant outstanding ranges are only cancelled in
+/// `handle_header_range_committed`, once the state writer confirms. Two responses that land
+/// inside that window therefore each dispatch their own `CommitHeaderRange`.
+///
+/// That is harmless *today*: the state writer treats an identical header at a height as a
+/// non-conflict, so the second commit revalidates and rewrites the same rows and returns
+/// `Ok`; the duplicate committed event is idempotent in the reactor; and the tip only
+/// publishes on a strictly higher height. Neither honest peer is scored.
+///
+/// The property holds only because of those downstream details, so it is tested at both
+/// layers: the state writer's half (re-committing an identical range succeeds) is covered by
+/// `header_range_commit_merges_same_header_advertised_body_size_by_max` in `zakura-state`,
+/// and this test covers the reactor's half. If `commit_header_range` starts rejecting an
+/// already-present range, or a conflict error is reclassified as scoring, honest hedged peers
+/// would be scored for misbehavior; these two tests are what catch that.
+#[tokio::test(flavor = "current_thread")]
+async fn hedged_double_commit_does_not_score_peers_or_publish_the_tip_twice() {
+    // A checkpoint at height 3 with the range starting at 4: above the checkpoint, so the
+    // range is non-finalized and gets hedged, while the mainnet header still validates.
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let start = block::Height(4);
+    let header = mainnet_header(&BLOCK_MAINNET_4_BYTES);
+    let tip_hash = block::Hash::from(header.as_ref());
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(3), checkpoint_hash)),
+    ));
+    let peers = [peer(43), peer(44)];
+
+    for peer_id in peers.clone() {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(&fixture, peer_id, block::Height(0), start, 1, 1).await;
+    }
+
+    // The same range is hedged across both peers.
+    let mut requests = HashMap::new();
+    while requests.len() < peers.len() {
+        let (peer, request_id, start_height, count) =
+            next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(start_height, start);
+        assert_eq!(count, 1);
+        requests.insert(peer, request_id);
+    }
+
+    // Both answer before either commit is confirmed, so both outstandings are still live.
+    for peer_id in peers.clone() {
+        send_headers(
+            &fixture,
+            &peer_id,
+            requests[&peer_id],
+            headers_message(vec![header.clone()]),
+        )
+        .await;
+    }
+
+    // Each response dispatches its own commit: the race is real, and neither peer is scored.
+    let mut committed_peers = Vec::new();
+    while committed_peers.len() < peers.len() {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange {
+                peer, start_height, ..
+            } => {
+                assert_eq!(start_height, start);
+                committed_peers.push(peer);
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("an honest hedged peer must not be scored: {peer:?} {reason:?}")
+            }
+            _ => {}
+        }
+    }
+    committed_peers.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let mut expected_peers = peers.to_vec();
+    expected_peers.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    assert_eq!(
+        committed_peers, expected_peers,
+        "both hedged responses should dispatch their own commit"
+    );
+
+    // The state writer confirms both: rewriting an identical range succeeds.
+    for _ in 0..peers.len() {
+        fixture
+            .handle
+            .send(HeaderSyncEvent::HeaderRangeCommitted {
+                start_height: start,
+                tip_height: start,
+                tip_hash,
+            })
+            .await
+            .unwrap();
+    }
+
+    // The duplicate commit neither scores a peer nor republishes the frontier.
+    let mut advanced = 0;
+    while let Ok(Some(action)) = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        fixture.actions.recv(),
+    )
+    .await
+    {
+        match action {
+            HeaderSyncAction::HeaderAdvanced { height, hash } => {
+                assert_eq!(height, start);
+                assert_eq!(hash, tip_hash);
+                advanced += 1;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("a duplicate commit must not score {peer:?}: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        advanced, 1,
+        "a duplicate commit at the same tip must not republish the header frontier"
+    );
+    assert_eq!(fixture.handle.best_header_tip(), (start, tip_hash));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
     let network = Network::Mainnet;

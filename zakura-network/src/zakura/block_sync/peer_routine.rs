@@ -48,7 +48,7 @@ use super::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
         ThroughputMeter,
     },
-    work_queue::{WorkItem, WorkQueue},
+    work_queue::{WorkItem, WorkQueue, WorkReturnOutcome},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
@@ -169,6 +169,16 @@ enum Disposition {
     Satisfied,
     RetryOriginal,
     RetryMissing,
+}
+
+impl Disposition {
+    fn trace_label(self) -> &'static str {
+        match self {
+            Self::Satisfied => "satisfied",
+            Self::RetryOriginal => "retry_original",
+            Self::RetryMissing => "retry_missing",
+        }
+    }
 }
 
 /// The per-peer pipe-routine. Owns its `FramedRecv` (transport read), the session
@@ -576,8 +586,12 @@ impl PeerRoutine {
         // `reset_above`) and release their reservations exactly once.
         let outstanding = std::mem::take(&mut self.window.outstanding);
         for outstanding in outstanding {
-            let released = self.return_unreceived_to_queue(&outstanding);
-            self.budget.release(released);
+            let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
+            let outcome = self
+                .work
+                .release_reserved_and_return_items_detailed(unreceived.iter().copied());
+            self.budget.release(outcome.released_bytes);
+            self.trace_work_returned("view_reset", &outstanding, unreceived.len(), outcome);
         }
         self.retry_avoid.clear();
         // Clear our (now-empty) registry outstanding and refresh slot diagnostics.
@@ -1110,8 +1124,12 @@ impl PeerRoutine {
             // Return only the unreceived heights — received ones are buffered (in
             // `in_flight` until committed); re-queuing them would re-fetch a body
             // we already hold (the WorkQueue single-owner invariant forbids it).
-            let released = self.return_unreceived_to_queue(outstanding);
-            self.budget.release(released);
+            let unreceived: Vec<_> = unreceived_heights(outstanding).collect();
+            let outcome = self
+                .work
+                .release_reserved_and_return_items_detailed(unreceived.iter().copied());
+            self.budget.release(outcome.released_bytes);
+            self.trace_work_returned("request_timeout", outstanding, unreceived.len(), outcome);
         }
         // Bias away from immediately re-grabbing the heights this peer just timed
         // out, so another peer can contest them (the peer-local timeout bias).
@@ -1769,13 +1787,22 @@ impl PeerRoutine {
             // be re-fetched, so both retry dispositions return only the still-reserved
             // unreceived heights to `pending`. `return_items` is idempotent.
             Disposition::RetryOriginal | Disposition::RetryMissing => {
-                let released = self.return_unreceived_to_queue(&outstanding);
-                self.budget.release(released);
+                let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
+                let outcome = self
+                    .work
+                    .release_reserved_and_return_items_detailed(unreceived.iter().copied());
+                self.budget.release(outcome.released_bytes);
+                self.trace_work_returned(
+                    disposition.trace_label(),
+                    &outstanding,
+                    unreceived.len(),
+                    outcome,
+                );
                 // This peer just failed these heights (RangeUnavailable / short
                 // BlocksDone): bias away from re-grabbing them so another peer
                 // contests the range first (and so the routine cannot self-wake
                 // into a re-take spin off its own `return_items`).
-                self.note_retry_avoid(unreceived_heights(&outstanding));
+                self.note_retry_avoid(unreceived);
             }
         }
         self.publish_outstanding();
@@ -1809,11 +1836,6 @@ impl PeerRoutine {
         } else {
             self.publish_outstanding();
         }
-    }
-
-    fn return_unreceived_to_queue(&self, outstanding: &OutstandingBlockRange) -> u64 {
-        self.work
-            .release_reserved_and_return_items(unreceived_heights(outstanding))
     }
 
     fn apply_budget_delta(&mut self, delta: i128) {
@@ -1991,6 +2013,36 @@ impl PeerRoutine {
             bs_insert_height(row, "servable_low", low);
             bs_insert_height(row, "servable_high", high);
             bs_insert_u64(row, bs_trace::RANGE_COUNT, count as u64);
+        });
+    }
+
+    fn trace_work_returned(
+        &self,
+        reason: &'static str,
+        outstanding: &OutstandingBlockRange,
+        unreceived_count: usize,
+        outcome: WorkReturnOutcome,
+    ) {
+        let unreceived_count = u64::try_from(unreceived_count).unwrap_or(u64::MAX);
+        if outcome.missing_count == 0
+            && outcome.held_count == 0
+            && outcome.released_count == 0
+            && outcome.returned_count == unreceived_count
+        {
+            return;
+        }
+
+        self.emit(bs_trace::BLOCK_WORK_RETURNED, |row| {
+            bs_insert_peer(row, bs_trace::PEER, &self.peer);
+            bs_insert_str(row, bs_trace::REASON, reason);
+            bs_insert_height(row, bs_trace::RANGE_START, outstanding.request.start_height);
+            bs_insert_u64(
+                row,
+                bs_trace::RANGE_COUNT,
+                u64::from(outstanding.request.count),
+            );
+            bs_insert_u64(row, "unreceived_count", unreceived_count);
+            insert_work_return_outcome(row, outcome);
         });
     }
 
@@ -2266,6 +2318,24 @@ fn elapsed_ms_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn insert_work_return_outcome(
+    row: &mut serde_json::Map<String, serde_json::Value>,
+    outcome: WorkReturnOutcome,
+) {
+    bs_insert_u64(row, "released_bytes", outcome.released_bytes);
+    bs_insert_u64(row, "returned_count", outcome.returned_count);
+    bs_insert_u64(row, "already_pending_count", outcome.already_pending_count);
+    bs_insert_u64(row, "held_count", outcome.held_count);
+    bs_insert_u64(row, "released_count", outcome.released_count);
+    bs_insert_u64(row, "missing_count", outcome.missing_count);
+    if let Some(height) = outcome.min_height {
+        bs_insert_height(row, "return_min_height", height);
+    }
+    if let Some(height) = outcome.max_height {
+        bs_insert_height(row, "return_max_height", height);
+    }
+}
+
 /// The still-unreceived heights of an outstanding request (the ones that return
 /// to `pending` on retry/timeout — never the received-and-buffered ones, which
 /// stay claimed in `work.in_flight`).
@@ -2309,18 +2379,22 @@ impl Drop for PeerRoutine {
     /// The reactor owns entry insert (on connect) and remove (on disconnect/
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {
-        for outstanding in self.window.outstanding.drain(..) {
+        let outstanding_ranges: Vec<_> = self.window.outstanding.drain(..).collect();
+        for outstanding in outstanding_ranges {
             // Held-aware: a height a competing peer delivered late is owned by the
             // Sequencer, so return + release only still-reserved unreceived heights.
-            let released = self.work.release_reserved_and_return_items(
-                outstanding
-                    .request
-                    .expected_blocks
-                    .iter()
-                    .filter(|expected| !outstanding.has_received(expected.height))
-                    .map(|expected| expected.height),
-            );
-            self.budget.release(released);
+            let unreceived: Vec<_> = outstanding
+                .request
+                .expected_blocks
+                .iter()
+                .filter(|expected| !outstanding.has_received(expected.height))
+                .map(|expected| expected.height)
+                .collect();
+            let outcome = self
+                .work
+                .release_reserved_and_return_items_detailed(unreceived.iter().copied());
+            self.budget.release(outcome.released_bytes);
+            self.trace_work_returned("peer_routine_drop", &outstanding, unreceived.len(), outcome);
         }
         self.registry.clear_outstanding(&self.peer, self.generation);
     }

@@ -181,26 +181,24 @@ The end of support height is calculated from the current blockchain height:
 ## Create the GitHub Pre-Release
 
 - [ ] Wait for all the release PRs to be merged
-- [ ] Create a new release using the draft release as a base, by clicking the Edit icon in the [draft release](https://github.com/zakura-core/zakura/releases)
-- [ ] Set the tag name to the version tag,
-      for example: `v1.0.0`
-      (the tag must match the `zakura` package version — verify with
-      `./scripts/check-release-version.sh v<version>`; a mismatched tag fails
-      `release-binaries.yml` and publishes nothing)
-- [ ] Set the release to target the `main` branch
-- [ ] Set the release title to `Zakura` followed by the version tag,
-      for example: `Zakura 1.0.0`
-- [ ] Replace the prepopulated draft changelog in the release description with the final changelog you created;
-      starting just _after_ the title `## [Zakura ...` of the current version being released,
-      and ending just _before_ the title of the previous release.
-- [ ] Mark the release as 'pre-release', until it has been built and tested
-- [ ] Publish the pre-release to GitHub using "Publish Release"
-- [ ] Delete all the [draft releases from the list of releases](https://github.com/zakura-core/zakura/releases)
+- [ ] Run the [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
+      from `main`, entering the exact version tag, for example `v1.0.0-rc2`.
+      The workflow verifies that the tag matches the `zakura` package version,
+      then builds and verifies the assets without creating a tag.
+- [ ] Wait for the build and no-push Docker checks to pass, then approve the
+      `release` environment deployment. The workflow publishes a complete
+      pre-release and creates the protected tag as its final step.
+- [ ] Review and update the new release description against the final changelog
+      you created, starting just _after_ the title `## [Zakura ...` of the
+      current version and ending just _before_ the title of the previous
+      release.
 
 ## Test the Pre-Release
 
 - [ ] Wait until the release assets and Docker images have been built:
-  - [ ] [release-binaries.yml](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Arelease)
+  - [ ] [release-binaries.yml](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush)
+- [ ] Review and merge the installer metadata update PR opened by the release
+      workflow.
 - [ ] Run [`sync-confidence.yml`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml) manually for the release tag or release branch if sync validation is required after tagging.
 
 ## Publish Release
@@ -230,7 +228,7 @@ for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakur
   - [ ] Update [`zakurad/zcashd-compat-manifest.json`](https://github.com/zakura-core/zakura/blob/main/zakurad/zcashd-compat-manifest.json) to the intended `zcashd` compat release (it is the single source of truth: zakurad embeds it at compile time and CI/Docker builds read it directly).
   - [ ] Confirm the manifest contains only the `x86_64-pc-linux-gnu` artifact before publishing zcashd-compat Docker images.
   - [ ] Confirm the workflow logs show the expected `/usr/local/bin/zcashd --version` for the zcashd-compat linux/amd64 image variant.
-- [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Arelease).
+- [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush).
 - [ ] Confirm `release-binaries.yml` published `zakurad-<tag>-linux-x86_64.tar.gz`, `zakurad-<tag>-linux-aarch64.tar.gz`, `zakurad-manifest-<tag>.json`, `install-zakura.sh`, and `SHA256SUMS.txt` to the GitHub release.
 - [ ] Wait for the new tag in the [Docker Hub zakura space](https://hub.docker.com/r/valargroup/zakura/tags)
 - [ ] Confirm `valargroup/zakura:<version>` includes `linux/amd64` and `linux/arm64`, and `valargroup/zakura:zcashd-compat-<version>` includes only `linux/amd64`.
@@ -239,7 +237,11 @@ for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakur
 
 ## Release Failures
 
-If building or running fails after tagging:
+If the pre-tag build or packaging stage fails, fix the failure on `main` and
+dispatch the workflow again with the same version. No tag has been created, so
+the version remains usable.
+
+If testing fails after the pre-release has been published and tagged:
 
 <details>
 

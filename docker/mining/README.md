@@ -22,6 +22,10 @@ Docker Compose setup for running a Zcash mining pool with Zebra and S-NOMP.
 - **S-NOMP**: Stratum mining pool - distributes work to miners, submits blocks
 - **Redis**: Stores share counts and pool statistics
 
+The included full node explicitly uses the legacy TCP P2P stack. Native Zakura
+QUIC transport is disabled, matching the single TCP peer port published by the
+Compose configuration.
+
 All block rewards go to the address configured in `MINER_ADDRESS`.
 
 ## Quick Start

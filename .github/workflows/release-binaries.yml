@@ -1,7 +1,6 @@
 # This workflow builds and publishes zakurad release assets and Docker images
-# when a release tag is pushed. Tags containing a hyphen (v1.0.0-rc0,
-# v0.0.1-alpha.1) are created as GitHub pre-releases; tags without a hyphen
-# (v1.0.0) are created as full releases and also move the :latest Docker tags.
+# when a release tag is pushed. It can also stage verified release assets for
+# create-release.yml before the immutable tag exists.
 #
 # Editing a release's pre-release checkbox on GitHub does not trigger this
 # workflow and never rebuilds or re-uploads anything. Real releases get their
@@ -20,6 +19,21 @@ on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Release tag whose assets are being staged"
+        required: true
+        type: string
+      checkout_ref:
+        description: "Exact commit to build before the release tag exists"
+        required: true
+        type: string
+      stage_release_assets:
+        description: "Build and attest assets, then upload them as a workflow artifact"
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       release_tag:
@@ -52,6 +66,7 @@ jobs:
     outputs:
       release_tag: ${{ steps.resolve.outputs.release_tag }}
       checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
+      assets_published: ${{ steps.resolve.outputs.assets_published }}
     steps:
       - name: Resolve release tag
         id: resolve
@@ -59,7 +74,11 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_CHECKOUT_REF: ${{ inputs.checkout_ref }}
           GITHUB_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "$REF_TYPE" = "tag" ]; then
@@ -67,10 +86,11 @@ jobs:
             checkout_ref="$REF_NAME"
           else
             release_tag="$INPUT_RELEASE_TAG"
-            # workflow_dispatch builds from the release tag so republished assets
-            # match the tagged source tree (older tags may still ship a zakurad
-            # binary, which the packaging step renames to zakurad).
-            if [ -n "$release_tag" ]; then
+            # Reusable staging builds pin the validated commit before its tag
+            # exists. workflow_dispatch repairs still build from the tag.
+            if [ -n "$INPUT_CHECKOUT_REF" ]; then
+              checkout_ref="$INPUT_CHECKOUT_REF"
+            elif [ -n "$release_tag" ]; then
               checkout_ref="$release_tag"
             else
               checkout_ref="$GITHUB_SHA"
@@ -84,6 +104,41 @@ jobs:
 
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "checkout_ref=$checkout_ref" >> "$GITHUB_OUTPUT"
+
+          assets_published=false
+          # A tag created by create-release.yml already has its complete asset
+          # set. Skip rebuilding only for tag-push runs; manual repair runs must
+          # continue to rebuild and replace assets.
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            for attempt in 1 2 3 4 5 6; do
+              release_json="$(
+                gh api "repos/${REPOSITORY}/releases/tags/${release_tag}" \
+                  2>/dev/null || true
+              )"
+              has_complete_assets="$(
+                echo "$release_json" | jq -r --arg tag "$release_tag" '
+                  [.assets[].name] as $names
+                  | [
+                      "SHA256SUMS.txt",
+                      "install-zakura.sh",
+                      ("zakurad-" + $tag + "-linux-aarch64.tar.gz"),
+                      ("zakurad-" + $tag + "-linux-x86_64.tar.gz"),
+                      ("zakurad-manifest-" + $tag + ".json")
+                    ] as $required
+                  | (($required - $names) | length) == 0
+                ' 2>/dev/null || true
+              )"
+              if [ "$has_complete_assets" = "true" ]; then
+                assets_published=true
+                break
+              fi
+              if [ "$attempt" -lt 6 ]; then
+                echo "Waiting for published release assets (attempt ${attempt}/6)."
+                sleep 5
+              fi
+            done
+          fi
+          echo "assets_published=$assets_published" >> "$GITHUB_OUTPUT"
 
   check-release-version:
     name: Check release tag matches package version
@@ -129,6 +184,7 @@ jobs:
     name: Build zakurad assets (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     needs: [resolve-release, check-release-version]
+    if: needs.resolve-release.outputs.assets_published != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -238,14 +294,21 @@ jobs:
           path: ./artifacts
 
   publish-zakurad-assets:
-    name: Publish zakurad assets
+    name: Assemble zakurad assets
     needs: [resolve-release, build-zakurad-assets]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
       attestations: write
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_assets_to_release
+    if: >-
+      ${{
+        inputs.stage_release_assets
+        || (
+          needs.resolve-release.outputs.assets_published != 'true'
+          && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_assets_to_release)
+        )
+      }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
@@ -357,6 +420,7 @@ jobs:
             ./publish/final/SHA256SUMS.txt
 
       - name: Ensure release exists
+        if: ${{ !inputs.stage_release_assets }}
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
@@ -375,13 +439,14 @@ jobs:
             exit 1
           fi
 
-          release_flags=()
+          # Always create as a pre-release, whatever the tag looks like:
+          # promoting to a full release (and setting it as latest) stays a
+          # manual step after the release has been tested and signed.
+          release_flags=(--prerelease)
           release_notes="Release created by release-binaries."
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            release_flags+=(--draft --prerelease)
+            release_flags+=(--draft)
             release_notes="Temporary release created by release-binaries workflow_dispatch."
-          elif [[ "$RELEASE_TAG" == *-* ]]; then
-            release_flags+=(--prerelease)
           fi
 
           target_commitish="$(git rev-parse --verify "${TARGET_REF}^{commit}")"
@@ -393,6 +458,7 @@ jobs:
             "${release_flags[@]}"
 
       - name: Upload assets to release
+        if: ${{ !inputs.stage_release_assets }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -416,6 +482,243 @@ jobs:
             ./publish/final/SHA256SUMS.txt \
             --repo "$REPOSITORY" \
             --clobber
+
+      - name: Upload staged release assets
+        if: ${{ inputs.stage_release_assets }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: staged-release-assets
+          path: ./publish/final
+          if-no-files-found: error
+          # Staged assets must outlive a pending release environment approval.
+          retention-days: 3
+
+  update-source-installer:
+    name: Update source installer metadata
+    needs: [resolve-release, publish-zakurad-assets]
+    runs-on: ubuntu-latest
+    environment: release-automation
+    permissions:
+      contents: read
+    if: >-
+      ${{
+        !cancelled()
+        && needs.resolve-release.result == 'success'
+        && (
+          needs.publish-zakurad-assets.result == 'success'
+          || needs.resolve-release.outputs.assets_published == 'true'
+        )
+        && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_assets_to_release)
+      }}
+    steps:
+      - name: Download published installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p ./publish/final
+          gh release download "$RELEASE_TAG" \
+            --repo "$REPOSITORY" \
+            --pattern install-zakura.sh \
+            --dir ./publish/final
+
+      - name: Create release GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 #v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout main for installer metadata update
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+          ref: main
+          path: source-update
+
+      - name: Resolve release GitHub App user
+        id: app-user
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: echo "id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
+
+      - name: Update source installer metadata
+        id: source-installer
+        env:
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="$RELEASE_TAG" python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          release_tag = os.environ["RELEASE_TAG"]
+          generated_path = Path("./publish/final/install-zakura.sh")
+          source_path = Path("./source-update/scripts/install-zakura.sh")
+          manifest_path = Path("./source-update/zakurad/Cargo.toml")
+          generated = generated_path.read_text(encoding="utf-8")
+          source = source_path.read_text(encoding="utf-8")
+          package_version = tomllib.loads(
+              manifest_path.read_text(encoding="utf-8")
+          )["package"]["version"]
+
+          def assignment(contents: str, name: str) -> str:
+              match = re.search(rf'^{name}="([^"]*)"$', contents, flags=re.MULTILINE)
+              if not match:
+                  raise SystemExit(f"Missing {name} assignment.")
+              return match.group(1)
+
+          generated_tag = assignment(generated, "ZAKURA_RELEASE_TAG")
+          generated_sha256 = assignment(generated, "ZAKURA_ARCHIVE_SHA256")
+
+          if generated_tag != release_tag:
+              raise SystemExit(
+                  f"Generated installer tag {generated_tag} does not match {release_tag}."
+              )
+          if not re.fullmatch(r"[0-9a-f]{64}", generated_sha256) or set(generated_sha256) == {"0"}:
+              raise SystemExit("Generated installer does not contain a valid archive checksum.")
+          if f"v{package_version}" != release_tag:
+              print(
+                  f"main package version is v{package_version}, not {release_tag}; "
+                  "skipping the stale release metadata update."
+              )
+              with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+                  output.write("changed=false\n")
+              raise SystemExit(0)
+
+          updated = source
+          for name in (
+              "ZAKURA_RELEASE_TAG",
+              "ZAKURA_ARCHIVE_SHA256",
+              "ZAKURA_DOCKER_IMAGE",
+              "ZAKURA_COMPAT_DOCKER_IMAGE",
+          ):
+              value = assignment(generated, name)
+              updated, count = re.subn(
+                  rf'^{name}="[^"]*"$',
+                  f'{name}="{value}"',
+                  updated,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one {name} assignment.")
+
+          source_path.write_text(updated, encoding="utf-8")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"changed={'true' if updated != source else 'false'}\n")
+              output.write(f"sha256={generated_sha256}\n")
+          PY
+
+      - name: Open installer metadata update PR
+        if: steps.source-installer.outputs.changed == 'true'
+        env:
+          APP_ID: ${{ steps.app-user.outputs.id }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+          SHA256: ${{ steps.source-installer.outputs.sha256 }}
+        working-directory: source-update
+        run: |
+          set -euo pipefail
+          branch="automation/update-installer-${RELEASE_TAG}"
+          existing_pr="$(
+            gh pr list \
+              --repo "$REPOSITORY" \
+              --head "$branch" \
+              --state open \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+          if [ -n "$existing_pr" ]; then
+            existing_installer="${RUNNER_TEMP}/existing-install-zakura.sh"
+            gh api \
+              "repos/${REPOSITORY}/contents/scripts/install-zakura.sh?ref=${branch}" \
+              --jq .content \
+            | base64 --decode > "$existing_installer"
+            EXPECTED_INSTALLER="scripts/install-zakura.sh" \
+              EXISTING_INSTALLER="$existing_installer" \
+              python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          expected = Path(os.environ["EXPECTED_INSTALLER"]).read_text(encoding="utf-8")
+          existing = Path(os.environ["EXISTING_INSTALLER"]).read_text(encoding="utf-8")
+          names = (
+              "ZAKURA_RELEASE_TAG",
+              "ZAKURA_ARCHIVE_SHA256",
+              "ZAKURA_DOCKER_IMAGE",
+              "ZAKURA_COMPAT_DOCKER_IMAGE",
+          )
+          for name in names:
+              pattern = rf'^{name}="[^"]*"$'
+              expected_match = re.search(pattern, expected, flags=re.MULTILINE)
+              existing_match = re.search(pattern, existing, flags=re.MULTILINE)
+              if expected_match is None or existing_match is None:
+                  raise SystemExit(f"Missing {name} in an installer.")
+              if existing_match.group(0) != expected_match.group(0):
+                  raise SystemExit(
+                      f"Installer metadata PR contains a stale {name}; update it before retrying."
+                  )
+          PY
+            echo "Installer metadata PR #${existing_pr} is already current."
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            branch="${branch}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          fi
+
+          git switch -c "$branch"
+          git add scripts/install-zakura.sh
+          git -c user.name="${APP_SLUG}[bot]" \
+            -c user.email="${APP_ID}+${APP_SLUG}[bot]@users.noreply.github.com" \
+            commit -m "chore(release): update installer metadata for ${RELEASE_TAG}"
+          git push --set-upstream origin "$branch"
+
+          gh pr create \
+            --repo "$REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --title "chore(release): update installer metadata for ${RELEASE_TAG}" \
+            --body "$(cat <<EOF
+          ## Motivation
+
+          Keep the installer served from \`main\` pinned to the release artifacts published for ${RELEASE_TAG}.
+
+          ## Solution
+
+          Update the installer release tag, Docker image tags, and
+          \`ZAKURA_ARCHIVE_SHA256\` calculated by the release workflow:
+          \`${SHA256}\`
+
+          ### Tests
+
+          - The release workflow built the archive and calculated this checksum.
+          - The published installer was generated with the same checksum.
+
+          ### AI Disclosure
+
+          - [x] No AI tools were used in this automatically generated PR.
+
+          ### PR Checklist
+
+          - [x] The PR title follows conventional commits format.
+          - [x] The change is limited to generated release metadata.
+          - [x] The solution is validated by the release workflow.
+          - [x] Documentation and changelogs do not require changes.
+          EOF
+          )"
 
   build:
     name: Build Release Docker (${{ matrix.name }})
@@ -669,6 +972,7 @@ jobs:
       - resolve-zcashd-compat-manifest
       - build-zakurad-assets
       - publish-zakurad-assets
+      - update-source-installer
       - build
       - publish-docker-manifest
       - build-zcashd-compat
@@ -679,4 +983,4 @@ jobs:
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          allowed-skips: publish-zakurad-assets,publish-docker-manifest,publish-zcashd-compat-docker-manifest
+          allowed-skips: build-zakurad-assets,publish-zakurad-assets,update-source-installer,publish-docker-manifest,publish-zcashd-compat-docker-manifest

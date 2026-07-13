@@ -29,6 +29,14 @@ use crate::sapling;
 const ALLOW_CROSS_ADDRESS_BIT: bool = true;
 const ORCHARD_SPEND_OUTPUT_FLAG_BITS: u8 = 0b0000_0011;
 
+fn orchard_allowed_flag_bits(allow_cross_address_bit: bool) -> u8 {
+    if allow_cross_address_bit {
+        ORCHARD_SPEND_OUTPUT_FLAG_BITS | orchard::Flags::ENABLE_CROSS_ADDRESS.bits()
+    } else {
+        ORCHARD_SPEND_OUTPUT_FLAG_BITS
+    }
+}
+
 impl ZcashDeserialize for jubjub::Fq {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
         let possible_scalar = jubjub::Fq::from_bytes(&reader.read_32_bytes()?);
@@ -460,11 +468,7 @@ fn serialize_orchard_flags<W: io::Write>(
     mut writer: W,
     allow_cross_address_bit: bool,
 ) -> Result<(), io::Error> {
-    let valid_bits = if allow_cross_address_bit {
-        ORCHARD_SPEND_OUTPUT_FLAG_BITS | orchard::Flags::ENABLE_CROSS_ADDRESS.bits()
-    } else {
-        ORCHARD_SPEND_OUTPUT_FLAG_BITS
-    };
+    let valid_bits = orchard_allowed_flag_bits(allow_cross_address_bit);
 
     if flags.bits() & !valid_bits != 0 {
         return Err(io::Error::new(
@@ -554,18 +558,11 @@ fn deserialize_orchard_flags<R: io::Read>(
     allow_cross_address_bit: bool,
 ) -> Result<orchard::Flags, SerializationError> {
     let bits = reader.read_u8()?;
-    if allow_cross_address_bit {
-        if bits & !(ORCHARD_SPEND_OUTPUT_FLAG_BITS | orchard::Flags::ENABLE_CROSS_ADDRESS.bits())
-            == 0
-        {
-            Some(orchard::Flags::from_bits_retain(bits))
-        } else {
-            None
-        }
+    if bits & !orchard_allowed_flag_bits(allow_cross_address_bit) == 0 {
+        Ok(orchard::Flags::from_bits_retain(bits))
     } else {
-        orchard::Flags::from_bits(bits)
+        Err(SerializationError::Parse("invalid reserved orchard flags"))
     }
-    .ok_or(SerializationError::Parse("invalid reserved orchard flags"))
 }
 
 // we can't split ShieldedData out of Option<ShieldedData> deserialization,

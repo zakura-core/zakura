@@ -403,14 +403,35 @@ impl BlockSyncReactor {
             let released = self
                 .state
                 .work_queue
-                .release_reserved_and_return_items([claim.height]);
-            self.state.budget.release(released);
+                .release_reserved_and_return_items_detailed([claim.height]);
+            self.state.budget.release(released.released_bytes);
+            self.emit_trace(bs_trace::BLOCK_FLOOR_WATCHDOG_CANCELLED, |row| {
+                bs_insert_peer(row, bs_trace::PEER, &claim.peer);
+                bs_insert_height(row, bs_trace::HEIGHT, claim.height);
+                bs_insert_u64(row, bs_trace::ESTIMATED_BYTES, claim.meta.estimated_bytes);
+                bs_insert_u64(row, "released_bytes", released.released_bytes);
+                bs_insert_u64(row, "returned_count", released.returned_count);
+                bs_insert_u64(row, "already_pending_count", released.already_pending_count);
+                bs_insert_u64(row, "held_count", released.held_count);
+                bs_insert_u64(row, "released_count", released.released_count);
+                bs_insert_u64(row, "missing_count", released.missing_count);
+                bs_insert_u64(
+                    row,
+                    "pending_after",
+                    u64::from(self.state.work_queue.pending_contains(claim.height)),
+                );
+                bs_insert_u64(
+                    row,
+                    "in_flight_after",
+                    u64::from(self.state.work_queue.in_flight_contains(claim.height)),
+                );
+            });
             metrics::counter!("sync.block.floor_watchdog.cancelled").increment(1);
             tracing::debug!(
                 peer = ?claim.peer,
                 height = ?claim.height,
                 estimated_bytes = claim.meta.estimated_bytes,
-                released,
+                released = released.released_bytes,
                 "force-cancelled expired Zakura block-sync floor request"
             );
         }

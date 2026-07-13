@@ -693,6 +693,37 @@ struct CheckedTip {
     expected_next: block::Hash,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TipRequestMode {
+    Obtain,
+    Extend,
+    Refresh,
+}
+
+impl TipRequestMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Obtain => "obtain",
+            Self::Extend => "extend",
+            Self::Refresh => "refresh",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct TipFanoutDiagnostics {
+    response_count: usize,
+    unique_peers: HashSet<PeerSocketAddr>,
+    genesis_fallback_count: usize,
+    usable_hashes: usize,
+}
+
+impl TipFanoutDiagnostics {
+    fn all_genesis_fallback(&self) -> bool {
+        self.response_count == FANOUT && self.genesis_fallback_count == self.response_count
+    }
+}
+
 pub struct ChainSync<ZN, ZS, ZV, ZSTip>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>
@@ -795,6 +826,12 @@ where
 
     /// Structured diagnostics for the legacy sync pipeline.
     trace: LegacySyncTrace,
+
+    /// Monotonic identifier for the current legacy sync round.
+    round_id: u64,
+
+    /// Number of consecutive refresh fanouts that produced no usable hashes.
+    zero_usable_refreshes: usize,
 }
 
 /// Polls the network to determine whether further blocks are available and
@@ -937,6 +974,8 @@ where
             past_lookahead_limit_receiver,
             misbehavior_sender,
             trace,
+            round_id: 0,
+            zero_usable_refreshes: 0,
         };
 
         (new_syncer, sync_status)
@@ -1200,6 +1239,7 @@ where
     /// long time. (These usually indicate hangs.)
     #[instrument(skip(self))]
     async fn try_to_sync(&mut self) -> Result<(), Report> {
+        self.round_id = self.round_id.saturating_add(1);
         self.prospective_tips = HashSet::new();
         self.missing_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
@@ -1208,7 +1248,7 @@ where
         self.trace.round_start(state_tip);
 
         info!(?state_tip, "starting sync, obtaining new tips");
-        let extra_hashes = timeout(SYNC_RESTART_DELAY, self.obtain_tips())
+        let extra_hashes = timeout(SYNC_RESTART_DELAY, self.obtain_tips(TipRequestMode::Obtain))
             .await
             .map_err(Into::into)
             // TODO: replace with flatten() when it stabilises (#70142)
@@ -1264,6 +1304,8 @@ where
                 HashSet<CheckedTip>,
                 HashSet<CheckedTip>,
                 usize,
+                TipRequestMode,
+                Vec<TipFanoutDiagnostics>,
             ),
             Report,
         >;
@@ -1279,6 +1321,7 @@ where
         // Keep the checked frontier and retry it after a short backoff while verifier tasks are
         // parked, rather than rebuilding discovery from the older committed state locator.
         let mut frontier_retry_at: Option<Instant> = None;
+        let mut next_extend_mode = TipRequestMode::Extend;
 
         // The last time this sync round made observable progress.
         //
@@ -1326,10 +1369,31 @@ where
                 let tip_network = self.tip_network.clone();
                 let tips = std::mem::take(&mut self.prospective_tips);
                 let attempted_tips = tips.clone();
+                let request_mode = next_extend_mode;
+                next_extend_mode = TipRequestMode::Extend;
+                let trace = self.trace.clone();
+                let round_id = self.round_id;
+                let genesis_hash = self.genesis_hash;
+                let state_tip = self.latest_chain_tip.best_tip_height();
                 extend = Some(Box::pin(async move {
-                    let (download_set, new_tips, discovered) =
-                        Self::build_extend(tip_network, tips).await?;
-                    Ok((download_set, new_tips, attempted_tips, discovered))
+                    let (download_set, new_tips, discovered, diagnostics) = Self::build_extend(
+                        tip_network,
+                        tips,
+                        trace,
+                        round_id,
+                        request_mode,
+                        genesis_hash,
+                        state_tip,
+                    )
+                    .await?;
+                    Ok((
+                        download_set,
+                        new_tips,
+                        attempted_tips,
+                        discovered,
+                        request_mode,
+                        diagnostics,
+                    ))
                 }));
             }
 
@@ -1408,11 +1472,14 @@ where
                         );
                         metrics::counter!("sync.tip.refresh").increment(1);
 
-                        let refreshed = timeout(SYNC_RESTART_DELAY, self.obtain_tips())
-                            .await
-                            .map_err(Into::into)
-                            // TODO: replace with flatten() when it stabilises (#70142)
-                            .and_then(convert::identity)?;
+                        let refreshed = timeout(
+                            SYNC_RESTART_DELAY,
+                            self.obtain_tips(TipRequestMode::Refresh),
+                        )
+                        .await
+                        .map_err(Into::into)
+                        // TODO: replace with flatten() when it stabilises (#70142)
+                        .and_then(convert::identity)?;
 
                         // A refresh is not progress, even when it returns hashes.
                         //
@@ -1462,6 +1529,7 @@ where
                         if frontier_retry_at.is_some() =>
                     {
                         frontier_retry_at = None;
+                        next_extend_mode = TipRequestMode::Refresh;
                     }
 
                     // Retry required blocks that registry-missed once their backoff elapses. This
@@ -1501,9 +1569,17 @@ where
                     }
 
                     extended = OptionFuture::from(extend.as_mut()), if extend.is_some() => {
-                        let (download_set, new_tips, attempted_tips, discovered) =
+                        let (
+                            download_set,
+                            new_tips,
+                            attempted_tips,
+                            discovered,
+                            request_mode,
+                            diagnostics,
+                        ) =
                             extended.expect("only polled while an extension is in flight")?;
                         self.trace.tips_extended(discovered, new_tips.len());
+                        let had_checked_tips = !attempted_tips.is_empty();
                         if discovered == 0 && new_tips.is_empty() && has_inflight {
                             self.prospective_tips = attempted_tips;
                             frontier_retry_at =
@@ -1521,6 +1597,17 @@ where
                         if discovered > 0 {
                             last_progress = Instant::now();
                         }
+                        if had_checked_tips
+                            && has_inflight
+                            && self.prospective_tips.is_empty()
+                        {
+                            self.trace_sync_snapshot("checked_tip_lost_snapshot", reserve.len());
+                        }
+                        self.record_tip_fanout_diagnostics(
+                            request_mode,
+                            &diagnostics,
+                            reserve.len(),
+                        );
                     }
                 }
 
@@ -1547,7 +1634,10 @@ where
     /// Given a block_locator list fan out request for subsequent hashes to
     /// multiple peers
     #[instrument(skip(self))]
-    async fn obtain_tips(&mut self) -> Result<IndexSet<block::Hash>, Report> {
+    async fn obtain_tips(
+        &mut self,
+        request_mode: TipRequestMode,
+    ) -> Result<IndexSet<block::Hash>, Report> {
         let stage_start = std::time::Instant::now();
 
         let block_locator = self
@@ -1571,6 +1661,21 @@ where
             "got block locator and trying to obtain new chain tips"
         );
 
+        let fanout_id = self.trace.next_fanout_id();
+        let first_locator_height = self
+            .latest_chain_tip
+            .best_tip_height_and_hash()
+            .filter(|(_, hash)| block_locator.first() == Some(hash))
+            .map(|(height, _)| height);
+        self.trace.tips_request(
+            fanout_id,
+            self.round_id,
+            request_mode.as_str(),
+            self.latest_chain_tip.best_tip_height(),
+            &block_locator,
+            first_locator_height,
+        );
+
         let mut requests = FuturesUnordered::new();
         for attempt in 0..FANOUT {
             if attempt > 0 {
@@ -1581,18 +1686,23 @@ where
             }
 
             let ready_tip_network = self.tip_network.ready().await;
-            requests.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
-                zn::Request::FindBlocks {
+            let request_started = std::time::Instant::now();
+            let request = ready_tip_network
+                .map_err(|e| eyre!(e))?
+                .call(zn::Request::FindBlocks {
                     known_blocks: block_locator.clone(),
                     stop: None,
-                },
-            )));
+                });
+            requests.push(tokio::spawn(async move {
+                (attempt, request_started.elapsed(), request.await)
+            }));
         }
 
         let mut download_set = IndexSet::new();
+        let mut diagnostics = TipFanoutDiagnostics::default();
         while let Some(res) = requests.next().await {
-            match res
-                .unwrap_or_else(|e @ JoinError { .. }| {
+            let (attempt, caller_latency, response) =
+                res.unwrap_or_else(|e @ JoinError { .. }| {
                     if e.is_panic() {
                         panic!("panic in obtain tips task: {e:?}");
                     } else {
@@ -1600,13 +1710,46 @@ where
                             "task error during obtain tips task: {e:?},\
                      is Zebra shutting down?"
                         );
-                        Err(e.into())
+                        (usize::MAX, Duration::ZERO, Err(e.into()))
                     }
-                })
-                .map_err::<Report, _>(|e| eyre!(e))
-            {
-                Ok(zn::Response::BlockHashes(hashes)) => {
-                    trace!(?hashes);
+                });
+            match response.map_err::<Report, _>(|e| eyre!(e)) {
+                Ok(zn::Response::BlockHashes {
+                    hashes: response_hashes,
+                    peer,
+                    latency,
+                    error,
+                }) => {
+                    diagnostics.response_count = diagnostics.response_count.saturating_add(1);
+                    let peer_reused = peer
+                        .map(|peer| !diagnostics.unique_peers.insert(peer))
+                        .unwrap_or(false);
+                    let starts_with_genesis = response_hashes.first() == Some(&self.genesis_hash);
+                    if starts_with_genesis {
+                        diagnostics.genesis_fallback_count =
+                            diagnostics.genesis_fallback_count.saturating_add(1);
+                    }
+                    let response_latency = latency.or(Some(caller_latency));
+                    if let Some(error) = error {
+                        self.trace.tips_response(
+                            fanout_id,
+                            self.round_id,
+                            request_mode.as_str(),
+                            attempt,
+                            peer,
+                            peer_reused,
+                            response_latency,
+                            &response_hashes,
+                            self.genesis_hash,
+                            None,
+                            0,
+                            0,
+                            "error",
+                            Some(&error),
+                        );
+                        continue;
+                    }
+                    trace!(hashes = ?response_hashes);
 
                     // zcashd sometimes appends an unrelated hash at the start
                     // or end of its response.
@@ -1628,14 +1771,52 @@ where
                     // last hash leaves only 1 unknown hash and rchunks_exact(2)
                     // would discard the entire response.
                     let hashes = if self.is_regtest {
-                        hashes.as_slice()
+                        response_hashes.as_slice()
                     } else {
-                        match hashes.as_slice() {
-                            [] => continue,
+                        match response_hashes.as_slice() {
+                            [] => {
+                                self.trace.tips_response(
+                                    fanout_id,
+                                    self.round_id,
+                                    request_mode.as_str(),
+                                    attempt,
+                                    peer,
+                                    peer_reused,
+                                    response_latency,
+                                    &response_hashes,
+                                    self.genesis_hash,
+                                    None,
+                                    0,
+                                    0,
+                                    "empty",
+                                    None,
+                                );
+                                continue;
+                            }
                             [rest @ .., _last] => rest,
                         }
                     };
                     if hashes.is_empty() {
+                        self.trace.tips_response(
+                            fanout_id,
+                            self.round_id,
+                            request_mode.as_str(),
+                            attempt,
+                            peer,
+                            peer_reused,
+                            response_latency,
+                            &response_hashes,
+                            self.genesis_hash,
+                            None,
+                            0,
+                            0,
+                            if starts_with_genesis {
+                                "genesis_fallback"
+                            } else {
+                                "empty"
+                            },
+                            None,
+                        );
                         continue;
                     }
 
@@ -1652,6 +1833,26 @@ where
                     let unknown_hashes = if let Some(index) = first_unknown {
                         &hashes[index..]
                     } else {
+                        self.trace.tips_response(
+                            fanout_id,
+                            self.round_id,
+                            request_mode.as_str(),
+                            attempt,
+                            peer,
+                            peer_reused,
+                            response_latency,
+                            &response_hashes,
+                            self.genesis_hash,
+                            None,
+                            hashes.len(),
+                            0,
+                            if starts_with_genesis {
+                                "genesis_fallback"
+                            } else {
+                                "all_known"
+                            },
+                            None,
+                        );
                         continue;
                     };
 
@@ -1664,6 +1865,26 @@ where
                         }
                     } else {
                         debug!("discarding response that extends only one block");
+                        self.trace.tips_response(
+                            fanout_id,
+                            self.round_id,
+                            request_mode.as_str(),
+                            attempt,
+                            peer,
+                            peer_reused,
+                            response_latency,
+                            &response_hashes,
+                            self.genesis_hash,
+                            first_unknown,
+                            first_unknown.unwrap_or_default(),
+                            0,
+                            if starts_with_genesis {
+                                "genesis_fallback"
+                            } else {
+                                "all_known"
+                            },
+                            None,
+                        );
                         continue;
                     };
 
@@ -1689,15 +1910,66 @@ where
                     download_set.extend(unknown_hashes);
                     let new_download_len = download_set.len();
                     let new_hashes = new_download_len - prev_download_len;
+                    diagnostics.usable_hashes =
+                        diagnostics.usable_hashes.saturating_add(new_hashes);
+                    self.trace.tips_response(
+                        fanout_id,
+                        self.round_id,
+                        request_mode.as_str(),
+                        attempt,
+                        peer,
+                        peer_reused,
+                        response_latency,
+                        &response_hashes,
+                        self.genesis_hash,
+                        first_unknown,
+                        first_unknown.unwrap_or_default(),
+                        new_hashes,
+                        if starts_with_genesis {
+                            "genesis_fallback"
+                        } else {
+                            "usable"
+                        },
+                        None,
+                    );
                     debug!(new_hashes, "added hashes to download set");
                     metrics::histogram!("sync.obtain.response.hash.count")
                         .record(new_hashes as f64);
                 }
                 Ok(_) => unreachable!("network returned wrong response"),
                 // We ignore this error because we made multiple fanout requests.
-                Err(e) => debug!(?e),
+                Err(e) => {
+                    self.trace.tips_response(
+                        fanout_id,
+                        self.round_id,
+                        request_mode.as_str(),
+                        attempt,
+                        None,
+                        false,
+                        Some(caller_latency),
+                        &[],
+                        self.genesis_hash,
+                        None,
+                        0,
+                        0,
+                        "error",
+                        Some(&e),
+                    );
+                    debug!(?e);
+                }
             }
         }
+
+        self.trace.tips_fanout_finish(
+            fanout_id,
+            self.round_id,
+            request_mode.as_str(),
+            diagnostics.response_count,
+            diagnostics.unique_peers.len(),
+            diagnostics.usable_hashes,
+            diagnostics.all_genesis_fallback(),
+        );
+        self.record_tip_fanout_diagnostics(request_mode, &[diagnostics], 0);
 
         debug!(?self.prospective_tips);
 
@@ -1737,14 +2009,38 @@ where
     async fn build_extend(
         mut tip_network: Timeout<ZN>,
         tips: HashSet<CheckedTip>,
-    ) -> Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report> {
+        trace: LegacySyncTrace,
+        round_id: u64,
+        request_mode: TipRequestMode,
+        genesis_hash: block::Hash,
+        state_tip: Option<Height>,
+    ) -> Result<
+        (
+            IndexSet<block::Hash>,
+            HashSet<CheckedTip>,
+            usize,
+            Vec<TipFanoutDiagnostics>,
+        ),
+        Report,
+    > {
         let stage_start = std::time::Instant::now();
 
         let mut prospective_tips: HashSet<CheckedTip> = HashSet::new();
         let mut download_set = IndexSet::new();
+        let mut fanout_diagnostics = Vec::new();
         debug!(tips = ?tips.len(), "trying to extend chain tips");
         for tip in tips {
             debug!(?tip, "asking peers to extend chain tip");
+            let fanout_id = trace.next_fanout_id();
+            trace.tips_request(
+                fanout_id,
+                round_id,
+                request_mode.as_str(),
+                state_tip,
+                &[tip.tip],
+                None,
+            );
+
             let mut responses = FuturesUnordered::new();
             for attempt in 0..FANOUT {
                 if attempt > 0 {
@@ -1755,55 +2051,111 @@ where
                 }
 
                 let ready_tip_network = tip_network.ready().await;
-                responses.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
-                    zn::Request::FindBlocks {
-                        known_blocks: vec![tip.tip],
-                        stop: None,
-                    },
-                )));
+                let request_started = std::time::Instant::now();
+                let request =
+                    ready_tip_network
+                        .map_err(|e| eyre!(e))?
+                        .call(zn::Request::FindBlocks {
+                            known_blocks: vec![tip.tip],
+                            stop: None,
+                        });
+                responses.push(tokio::spawn(async move {
+                    (attempt, request_started.elapsed(), request.await)
+                }));
             }
+
+            let mut diagnostics = TipFanoutDiagnostics::default();
             while let Some(res) = responses.next().await {
-                match res
-                    .expect("panic in spawned extend tips request")
-                    .map_err::<Report, _>(|e| eyre!(e))
-                {
-                    Ok(zn::Response::BlockHashes(hashes)) => {
+                let (attempt, caller_latency, response) =
+                    res.expect("panic in spawned extend tips request");
+                match response.map_err::<Report, _>(|e| eyre!(e)) {
+                    Ok(zn::Response::BlockHashes {
+                        hashes,
+                        peer,
+                        latency,
+                        error,
+                    }) => {
+                        diagnostics.response_count = diagnostics.response_count.saturating_add(1);
+                        let peer_reused = peer
+                            .map(|peer| !diagnostics.unique_peers.insert(peer))
+                            .unwrap_or(false);
+                        let starts_with_genesis = hashes.first() == Some(&genesis_hash);
+                        if starts_with_genesis {
+                            diagnostics.genesis_fallback_count =
+                                diagnostics.genesis_fallback_count.saturating_add(1);
+                        }
+                        let response_latency = latency.or(Some(caller_latency));
+                        if let Some(error) = error {
+                            trace.tips_response(
+                                fanout_id,
+                                round_id,
+                                request_mode.as_str(),
+                                attempt,
+                                peer,
+                                peer_reused,
+                                response_latency,
+                                &hashes,
+                                genesis_hash,
+                                None,
+                                0,
+                                0,
+                                "error",
+                                Some(&error),
+                            );
+                            continue;
+                        }
                         debug!(first = ?hashes.first(), len = ?hashes.len());
                         trace!(?hashes);
 
                         // zcashd sometimes appends an unrelated hash at the
                         // start or end of its response. Check the first hash
                         // against the previous response, and discard mismatches.
-                        let unknown_hashes = match hashes.as_slice() {
-                            [expected_hash, rest @ ..] if expected_hash == &tip.expected_next => {
-                                rest
-                            }
-                            // If the first hash doesn't match, retry with the second.
-                            [first_hash, expected_hash, rest @ ..]
-                                if expected_hash == &tip.expected_next =>
-                            {
-                                debug!(?first_hash,
-                                                ?tip.expected_next,
-                                                ?tip.tip,
-                                                "unexpected first hash, but the second matches: using the hashes after the match");
-                                rest
-                            }
-                            // We ignore these responses
-                            [] => continue,
-                            [single_hash] => {
-                                debug!(?single_hash,
-                                                ?tip.expected_next,
-                                                ?tip.tip,
-                                                "discarding response containing a single unexpected hash");
-                                continue;
-                            }
-                            [first_hash, second_hash, rest @ ..] => {
-                                debug!(?first_hash,
-                                                ?second_hash,
-                                                rest_len = ?rest.len(),
-                                                ?tip.expected_next,
-                                                ?tip.tip,
-                                                "discarding response that starts with two unexpected hashes");
+                        let expected_next_position = hashes
+                            .iter()
+                            .take(2)
+                            .position(|hash| hash == &tip.expected_next);
+                        let unknown_hashes = match expected_next_position {
+                            Some(position) => &hashes[position.saturating_add(1)..],
+                            None => {
+                                let discard_reason = if hashes.is_empty() {
+                                    "short_response"
+                                } else {
+                                    "expected_next_missing"
+                                };
+                                trace.tips_response(
+                                    fanout_id,
+                                    round_id,
+                                    request_mode.as_str(),
+                                    attempt,
+                                    peer,
+                                    peer_reused,
+                                    response_latency,
+                                    &hashes,
+                                    genesis_hash,
+                                    None,
+                                    0,
+                                    0,
+                                    if hashes.is_empty() {
+                                        "empty"
+                                    } else if starts_with_genesis {
+                                        "genesis_fallback"
+                                    } else {
+                                        "all_known"
+                                    },
+                                    None,
+                                );
+                                trace.tip_transition(
+                                    fanout_id,
+                                    round_id,
+                                    request_mode.as_str(),
+                                    tip.tip,
+                                    tip.expected_next,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(discard_reason),
+                                    true,
+                                );
                                 continue;
                             }
                         };
@@ -1813,7 +2165,41 @@ where
                         // to worry about missed downloads, because we will pick
                         // them up again in the next ExtendTips.)
                         let unknown_hashes = match unknown_hashes {
-                            [] => continue,
+                            [] => {
+                                trace.tips_response(
+                                    fanout_id,
+                                    round_id,
+                                    request_mode.as_str(),
+                                    attempt,
+                                    peer,
+                                    peer_reused,
+                                    response_latency,
+                                    &hashes,
+                                    genesis_hash,
+                                    expected_next_position,
+                                    expected_next_position.unwrap_or_default().saturating_add(1),
+                                    0,
+                                    if starts_with_genesis {
+                                        "genesis_fallback"
+                                    } else {
+                                        "all_known"
+                                    },
+                                    None,
+                                );
+                                trace.tip_transition(
+                                    fanout_id,
+                                    round_id,
+                                    request_mode.as_str(),
+                                    tip.tip,
+                                    tip.expected_next,
+                                    expected_next_position,
+                                    None,
+                                    None,
+                                    Some("short_response"),
+                                    true,
+                                );
+                                continue;
+                            }
                             [rest @ .., _last] => rest,
                         };
 
@@ -1824,6 +2210,38 @@ where
                             }
                         } else {
                             debug!("discarding response that extends only one block");
+                            trace.tips_response(
+                                fanout_id,
+                                round_id,
+                                request_mode.as_str(),
+                                attempt,
+                                peer,
+                                peer_reused,
+                                response_latency,
+                                &hashes,
+                                genesis_hash,
+                                expected_next_position,
+                                expected_next_position.unwrap_or_default().saturating_add(1),
+                                0,
+                                if starts_with_genesis {
+                                    "genesis_fallback"
+                                } else {
+                                    "all_known"
+                                },
+                                None,
+                            );
+                            trace.tip_transition(
+                                fanout_id,
+                                round_id,
+                                request_mode.as_str(),
+                                tip.tip,
+                                tip.expected_next,
+                                expected_next_position,
+                                None,
+                                None,
+                                Some("short_response"),
+                                true,
+                            );
                             continue;
                         };
 
@@ -1850,15 +2268,77 @@ where
                         download_set.extend(unknown_hashes);
                         let new_download_len = download_set.len();
                         let new_hashes = new_download_len - prev_download_len;
+                        diagnostics.usable_hashes =
+                            diagnostics.usable_hashes.saturating_add(new_hashes);
+                        trace.tips_response(
+                            fanout_id,
+                            round_id,
+                            request_mode.as_str(),
+                            attempt,
+                            peer,
+                            peer_reused,
+                            response_latency,
+                            &hashes,
+                            genesis_hash,
+                            expected_next_position,
+                            expected_next_position.unwrap_or_default().saturating_add(1),
+                            new_hashes,
+                            if starts_with_genesis {
+                                "genesis_fallback"
+                            } else {
+                                "usable"
+                            },
+                            None,
+                        );
+                        trace.tip_transition(
+                            fanout_id,
+                            round_id,
+                            request_mode.as_str(),
+                            tip.tip,
+                            tip.expected_next,
+                            expected_next_position,
+                            Some(new_tip.tip),
+                            Some(new_tip.expected_next),
+                            None,
+                            false,
+                        );
                         debug!(new_hashes, "added hashes to download set");
                         metrics::histogram!("sync.extend.response.hash.count")
                             .record(new_hashes as f64);
                     }
                     Ok(_) => unreachable!("network returned wrong response"),
                     // We ignore this error because we made multiple fanout requests.
-                    Err(e) => debug!(?e),
+                    Err(e) => {
+                        trace.tips_response(
+                            fanout_id,
+                            round_id,
+                            request_mode.as_str(),
+                            attempt,
+                            None,
+                            false,
+                            Some(caller_latency),
+                            &[],
+                            genesis_hash,
+                            None,
+                            0,
+                            0,
+                            "error",
+                            Some(&e),
+                        );
+                        debug!(?e);
+                    }
                 }
             }
+            trace.tips_fanout_finish(
+                fanout_id,
+                round_id,
+                request_mode.as_str(),
+                diagnostics.response_count,
+                diagnostics.unique_peers.len(),
+                diagnostics.usable_hashes,
+                diagnostics.all_genesis_fallback(),
+            );
+            fanout_diagnostics.push(diagnostics);
         }
 
         let new_downloads = download_set.len();
@@ -1870,7 +2350,12 @@ where
 
         // The caller records `new_downloads` via `recent_syncs.push_extend_tips_length` on
         // write-back, preserving the "last peer can't toggle our mempool" security property.
-        Ok((download_set, prospective_tips, new_downloads))
+        Ok((
+            download_set,
+            prospective_tips,
+            new_downloads,
+            fanout_diagnostics,
+        ))
     }
 
     /// Download and verify the genesis block, if it isn't currently known to
@@ -2268,6 +2753,45 @@ where
             let count = u32::try_from(phase_counts.get(phase).copied().unwrap_or_default())
                 .unwrap_or(u32::MAX);
             metrics::gauge!(metric).set(f64::from(count));
+        }
+    }
+
+    fn record_tip_fanout_diagnostics(
+        &mut self,
+        request_mode: TipRequestMode,
+        diagnostics: &[TipFanoutDiagnostics],
+        reserve: usize,
+    ) {
+        let usable_hashes = diagnostics
+            .iter()
+            .map(|diagnostics| diagnostics.usable_hashes)
+            .sum::<usize>();
+
+        if request_mode == TipRequestMode::Refresh {
+            if usable_hashes == 0 {
+                self.zero_usable_refreshes = self.zero_usable_refreshes.saturating_add(1);
+            } else {
+                self.zero_usable_refreshes = 0;
+            }
+        } else if usable_hashes > 0 {
+            self.zero_usable_refreshes = 0;
+        }
+
+        if diagnostics
+            .iter()
+            .any(TipFanoutDiagnostics::all_genesis_fallback)
+        {
+            self.trace_sync_snapshot("tips_all_genesis_snapshot", reserve);
+        }
+        if diagnostics
+            .iter()
+            .any(|diagnostics| diagnostics.unique_peers.len() < FANOUT)
+        {
+            self.trace_sync_snapshot("tips_peer_reuse_snapshot", reserve);
+        }
+        if self.zero_usable_refreshes >= 3 {
+            self.trace_sync_snapshot("tips_zero_refresh_snapshot", reserve);
+            self.zero_usable_refreshes = 0;
         }
     }
 

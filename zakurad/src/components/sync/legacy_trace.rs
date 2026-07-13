@@ -1,7 +1,10 @@
 use std::{
     fmt::Display,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -31,6 +34,7 @@ pub(super) struct LegacySyncTrace {
     tracer: JsonlTracer,
     node: Arc<str>,
     started: Instant,
+    next_fanout_id: Arc<AtomicU64>,
 }
 
 impl LegacySyncTrace {
@@ -43,7 +47,12 @@ impl LegacySyncTrace {
             tracer,
             node: zakura_jsonl_trace::node_id().into(),
             started: Instant::now(),
+            next_fanout_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    pub(super) fn next_fanout_id(&self) -> u64 {
+        self.next_fanout_id.fetch_add(1, Ordering::Relaxed)
     }
 
     pub(super) fn emit(&self, event: &'static str, build: impl FnOnce(&mut Map<String, Value>)) {
@@ -98,6 +107,150 @@ impl LegacySyncTrace {
         self.emit("tips_extended", |row| {
             insert_count(row, "discovered", discovered);
             insert_count(row, "prospective_tips", prospective_tips);
+        });
+    }
+
+    pub(super) fn tips_request(
+        &self,
+        fanout_id: u64,
+        round_id: u64,
+        mode: &'static str,
+        state_tip: Option<Height>,
+        locator: &[block::Hash],
+        first_locator_height: Option<Height>,
+    ) {
+        self.emit("tips_request", |row| {
+            row.insert("fanout_id".to_string(), Value::from(fanout_id));
+            row.insert("round_id".to_string(), Value::from(round_id));
+            row.insert("mode".to_string(), Value::String(mode.to_string()));
+            insert_height(row, "state_tip", state_tip);
+            insert_count(row, "locator_count", locator.len());
+            insert_hash(row, "first_locator_hash", locator.first().copied());
+            insert_hash(row, "last_locator_hash", locator.last().copied());
+            insert_height(row, "first_locator_height", first_locator_height);
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tips_response(
+        &self,
+        fanout_id: u64,
+        round_id: u64,
+        mode: &'static str,
+        attempt: usize,
+        peer: Option<zakura_network::PeerSocketAddr>,
+        peer_reused: bool,
+        latency: Option<Duration>,
+        hashes: &[block::Hash],
+        genesis_hash: block::Hash,
+        first_unknown_index: Option<usize>,
+        known_hashes: usize,
+        usable_hashes: usize,
+        classification: &'static str,
+        error: Option<&dyn Display>,
+    ) {
+        self.emit("tips_response", |row| {
+            row.insert("fanout_id".to_string(), Value::from(fanout_id));
+            row.insert("round_id".to_string(), Value::from(round_id));
+            row.insert("mode".to_string(), Value::String(mode.to_string()));
+            insert_count(row, "attempt", attempt);
+            if let Some(peer) = peer {
+                // These operator-only local traces intentionally bypass the normal peer-address
+                // redaction so repeated selections can be correlated within a fanout.
+                row.insert(
+                    "peer".to_string(),
+                    Value::String(peer.remove_socket_addr_privacy().to_string()),
+                );
+            }
+            row.insert("peer_reused".to_string(), Value::Bool(peer_reused));
+            if let Some(latency) = latency {
+                row.insert("response_latency_ms".to_string(), elapsed_millis(latency));
+            }
+            insert_count(row, "response_len", hashes.len());
+            insert_hash(row, "first_hash", hashes.first().copied());
+            insert_hash(row, "last_hash", hashes.last().copied());
+            row.insert(
+                "starts_with_genesis".to_string(),
+                Value::Bool(hashes.first() == Some(&genesis_hash)),
+            );
+            if let Some(index) = first_unknown_index {
+                insert_count(row, "first_unknown_index", index);
+            }
+            insert_count(row, "known_hashes", known_hashes);
+            insert_count(row, "usable_hashes", usable_hashes);
+            row.insert(
+                "classification".to_string(),
+                Value::String(classification.to_string()),
+            );
+            if let Some(error) = error {
+                row.insert("error".to_string(), Value::String(error.to_string()));
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tips_fanout_finish(
+        &self,
+        fanout_id: u64,
+        round_id: u64,
+        mode: &'static str,
+        responses: usize,
+        unique_peers: usize,
+        usable_hashes: usize,
+        all_genesis_fallback: bool,
+    ) {
+        self.emit("tips_fanout_finish", |row| {
+            row.insert("fanout_id".to_string(), Value::from(fanout_id));
+            row.insert("round_id".to_string(), Value::from(round_id));
+            row.insert("mode".to_string(), Value::String(mode.to_string()));
+            insert_count(row, "responses", responses);
+            insert_count(row, "unique_peers_selected", unique_peers);
+            insert_count(row, "usable_hashes", usable_hashes);
+            row.insert(
+                "all_genesis_fallback".to_string(),
+                Value::Bool(all_genesis_fallback),
+            );
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tip_transition(
+        &self,
+        fanout_id: u64,
+        round_id: u64,
+        mode: &'static str,
+        old_tip: block::Hash,
+        old_expected_next: block::Hash,
+        expected_next_position: Option<usize>,
+        new_tip: Option<block::Hash>,
+        new_expected_next: Option<block::Hash>,
+        discard_reason: Option<&'static str>,
+        old_tip_retained: bool,
+    ) {
+        self.emit("tip_transition", |row| {
+            row.insert("fanout_id".to_string(), Value::from(fanout_id));
+            row.insert("round_id".to_string(), Value::from(round_id));
+            row.insert("mode".to_string(), Value::String(mode.to_string()));
+            row.insert("old_tip".to_string(), Value::String(old_tip.to_string()));
+            row.insert(
+                "old_expected_next".to_string(),
+                Value::String(old_expected_next.to_string()),
+            );
+            if let Some(position) = expected_next_position {
+                insert_count(row, "expected_next_position", position);
+            }
+            insert_hash(row, "new_tip", new_tip);
+            insert_hash(row, "new_expected_next", new_expected_next);
+            if let Some(reason) = discard_reason {
+                row.insert(
+                    "discard_reason".to_string(),
+                    Value::String(reason.to_string()),
+                );
+            }
+            row.insert(
+                "old_tip_retained".to_string(),
+                Value::Bool(old_tip_retained),
+            );
         });
     }
 
@@ -157,6 +310,12 @@ fn insert_count(row: &mut Map<String, Value>, key: &'static str, count: usize) {
     );
 }
 
+fn insert_hash(row: &mut Map<String, Value>, key: &'static str, hash: Option<block::Hash>) {
+    if let Some(hash) = hash {
+        row.insert(key.to_string(), Value::String(hash.to_string()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +328,7 @@ mod tests {
             tracer: guard.tracer(),
             node: "test-node".into(),
             started: Instant::now(),
+            next_fanout_id: Arc::new(AtomicU64::new(1)),
         };
 
         trace.round_start(Some(Height(42)));
@@ -181,5 +341,64 @@ mod tests {
         assert_eq!(event["event"], "round_start");
         assert_eq!(event["node"], "test-node");
         assert_eq!(event["state_tip"], 42);
+    }
+
+    #[tokio::test]
+    async fn correlates_tip_requests_with_peer_responses() {
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
+        let trace = LegacySyncTrace {
+            tracer: guard.tracer(),
+            node: "test-node".into(),
+            started: Instant::now(),
+            next_fanout_id: Arc::new(AtomicU64::new(1)),
+        };
+        let genesis = block::Hash::from([0; 32]);
+        let peer = "127.0.0.1:8233"
+            .parse()
+            .expect("test peer address is valid");
+
+        trace.tips_request(
+            7,
+            3,
+            "refresh",
+            Some(Height(57_696)),
+            &[genesis],
+            Some(Height(57_696)),
+        );
+        trace.tips_response(
+            7,
+            3,
+            "refresh",
+            0,
+            Some(peer),
+            false,
+            Some(Duration::from_millis(12)),
+            &[genesis],
+            genesis,
+            None,
+            1,
+            0,
+            "genesis_fallback",
+            None,
+        );
+        drop(trace);
+        guard.shutdown().await;
+
+        let events = std::fs::read_to_string(dir.path().join(FILE_NAME))
+            .expect("legacy trace file is written");
+        let events = events
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("trace row is valid JSON"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(events[0]["event"], "tips_request");
+        assert_eq!(events[0]["fanout_id"], 7);
+        assert_eq!(events[0]["first_locator_height"], 57_696);
+        assert_eq!(events[1]["event"], "tips_response");
+        assert_eq!(events[1]["fanout_id"], 7);
+        assert_eq!(events[1]["peer"], "127.0.0.1:8233");
+        assert_eq!(events[1]["classification"], "genesis_fallback");
+        assert_eq!(events[1]["starts_with_genesis"], true);
     }
 }

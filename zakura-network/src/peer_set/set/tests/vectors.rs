@@ -751,9 +751,25 @@ fn find_blocks_stall_not_tracked_when_at_tip() {
                 .expect("peer received the request");
 
             // Reply with an empty `BlockHashes` response: protocol-correct at tip.
-            let _ = client_request.tx.send(Ok(Response::BlockHashes(vec![])));
+            let _ = client_request.tx.send(Ok(Response::BlockHashes {
+                hashes: vec![],
+                peer: None,
+                latency: None,
+                error: None,
+            }));
 
-            response_fut.await.expect("response received");
+            let response = response_fut.await.expect("response received");
+            let Response::BlockHashes { peer, latency, .. } = response else {
+                panic!("FindBlocks returned an unexpected response");
+            };
+            assert!(
+                peer.is_some(),
+                "peer set must attribute FindBlocks responses"
+            );
+            assert!(
+                latency.is_some(),
+                "peer set must record FindBlocks response latency"
+            );
         }
 
         assert!(
@@ -805,7 +821,12 @@ fn find_blocks_stall_not_tracked_for_zcashd_compat() {
                 .try_to_receive_outbound_client_request()
                 .request()
                 .expect("sidecar received the request");
-            let _ = client_request.tx.send(Ok(Response::BlockHashes(vec![])));
+            let _ = client_request.tx.send(Ok(Response::BlockHashes {
+                hashes: vec![],
+                peer: None,
+                latency: None,
+                error: None,
+            }));
             response_fut.await.expect("response received");
         }
 
@@ -861,7 +882,12 @@ fn find_blocks_stall_tracked_when_syncing() {
                 .request()
                 .expect("peer received the request");
 
-            let _ = client_request.tx.send(Ok(Response::BlockHashes(vec![])));
+            let _ = client_request.tx.send(Ok(Response::BlockHashes {
+                hashes: vec![],
+                peer: None,
+                latency: None,
+                error: None,
+            }));
 
             response_fut.await.expect("response received");
         }
@@ -913,7 +939,12 @@ fn find_blocks_stall_tracked_when_tip_unknown() {
                 .request()
                 .expect("peer received the request");
 
-            let _ = client_request.tx.send(Ok(Response::BlockHashes(vec![])));
+            let _ = client_request.tx.send(Ok(Response::BlockHashes {
+                hashes: vec![],
+                peer: None,
+                latency: None,
+                error: None,
+            }));
 
             response_fut.await.expect("response received");
         }
@@ -969,7 +1000,12 @@ fn find_blocks_stall_count_preserved_across_tip_transition() {
                 .request()
                 .expect("peer received the request");
 
-            let _ = client_request.tx.send(Ok(Response::BlockHashes(vec![])));
+            let _ = client_request.tx.send(Ok(Response::BlockHashes {
+                hashes: vec![],
+                peer: None,
+                latency: None,
+                error: None,
+            }));
 
             response_fut.await.expect("response received");
         }
@@ -988,7 +1024,12 @@ fn find_blocks_stall_count_preserved_across_tip_transition() {
             .try_to_receive_outbound_client_request()
             .request()
             .expect("peer received the request");
-        let _ = client_request.tx.send(Ok(Response::BlockHashes(vec![])));
+        let _ = client_request.tx.send(Ok(Response::BlockHashes {
+            hashes: vec![],
+            peer: None,
+            latency: None,
+            error: None,
+        }));
         response_fut.await.expect("response received");
 
         // Transition back to syncing. One more empty response reaches the
@@ -1005,7 +1046,12 @@ fn find_blocks_stall_count_preserved_across_tip_transition() {
             .try_to_receive_outbound_client_request()
             .request()
             .expect("peer received the request");
-        let _ = client_request.tx.send(Ok(Response::BlockHashes(vec![])));
+        let _ = client_request.tx.send(Ok(Response::BlockHashes {
+            hashes: vec![],
+            peer: None,
+            latency: None,
+            error: None,
+        }));
         response_fut.await.expect("response received");
 
         let _ = peer_set.ready().now_or_never();

@@ -174,8 +174,8 @@ enum StallOutcome {
 
 fn classify_find_response<E>(result: &Result<Response, E>) -> Option<StallOutcome> {
     match result {
-        Ok(Response::BlockHashes(hashes)) if hashes.is_empty() => Some(StallOutcome::Stall),
-        Ok(Response::BlockHashes(_)) => Some(StallOutcome::Clear),
+        Ok(Response::BlockHashes { hashes, .. }) if hashes.is_empty() => Some(StallOutcome::Stall),
+        Ok(Response::BlockHashes { .. }) => Some(StallOutcome::Clear),
         Ok(Response::BlockHeaders(headers)) if headers.is_empty() => Some(StallOutcome::Stall),
         Ok(Response::BlockHeaders(_)) => Some(StallOutcome::Clear),
         Ok(_) => None,
@@ -979,10 +979,8 @@ where
                 .take_ready_service(&p2c_key)
                 .expect("selected peer must be ready");
 
-            let is_find_request = matches!(
-                &req,
-                Request::FindBlocks { .. } | Request::FindHeaders { .. }
-            );
+            let is_find_blocks = matches!(&req, Request::FindBlocks { .. });
+            let is_find_request = is_find_blocks || matches!(&req, Request::FindHeaders { .. });
             let track_stalls = is_find_request
                 && !self.is_zcashd_compat_peer(&svc)
                 && !self
@@ -990,15 +988,35 @@ where
                     .chain_tip()
                     .is_at_or_near_network_tip(&self.network);
 
+            let request_started = Instant::now();
             let fut = svc.call(req);
             self.push_unready(p2c_key, svc);
 
-            if track_stalls {
-                let stall_tx = self.stall_event_tx.clone();
+            if is_find_request {
+                let stall_tx = track_stalls.then(|| self.stall_event_tx.clone());
                 return async move {
-                    let result = fut.await;
-                    if let Some(outcome) = classify_find_response(&result) {
-                        let _ = stall_tx.send((p2c_key, outcome));
+                    let result = match fut.await {
+                        Ok(Response::BlockHashes { hashes, .. }) if is_find_blocks => {
+                            Ok(Response::BlockHashes {
+                                hashes,
+                                peer: Some(p2c_key),
+                                latency: Some(request_started.elapsed()),
+                                error: None,
+                            })
+                        }
+                        Ok(response) => Ok(response),
+                        Err(error) if is_find_blocks => Ok(Response::BlockHashes {
+                            hashes: Vec::new(),
+                            peer: Some(p2c_key),
+                            latency: Some(request_started.elapsed()),
+                            error: Some(error.to_string()),
+                        }),
+                        Err(error) => Err(error),
+                    };
+                    if let Some(stall_tx) = stall_tx {
+                        if let Some(outcome) = classify_find_response(&result) {
+                            let _ = stall_tx.send((p2c_key, outcome));
+                        }
                     }
                     result.map_err(Into::into)
                 }

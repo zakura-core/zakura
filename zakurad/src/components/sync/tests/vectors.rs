@@ -159,7 +159,7 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
+        .respond(block_hashes(vec![
             block1_hash, // tip
             block2_hash, // expected_next
             block3_hash, // (discarded - last hash, possibly incorrect)
@@ -244,7 +244,7 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
+        .respond(block_hashes(vec![
             block2_hash, // tip (discarded - already fetched)
             block3_hash, // expected_next
             block4_hash,
@@ -377,9 +377,7 @@ async fn incomplete_checkpoint_range_retries_frontier_without_verifier_timeout(
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            hashes[1], hashes[2], hashes[3],
-        ]));
+        .respond(block_hashes(vec![hashes[1], hashes[2], hashes[3]]));
     state_service
         .expect_request(zs::Request::KnownBlock(hashes[1]))
         .await
@@ -429,7 +427,7 @@ async fn incomplete_checkpoint_range_retries_frontier_without_verifier_timeout(
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![hashes[2], hashes[3]]));
+        .respond(block_hashes(vec![hashes[2], hashes[3]]));
     for _ in 0..(sync::FANOUT - 1) {
         peer_set
             .expect_request(zn::Request::FindBlocks {
@@ -458,7 +456,7 @@ async fn incomplete_checkpoint_range_retries_frontier_without_verifier_timeout(
 
     // The chain has grown to block 5, so retrying the frontier covers the rest of the range without
     // rediscovering the parked blocks from the committed state locator.
-    retried_extension.respond(zn::Response::BlockHashes(vec![
+    retried_extension.respond(block_hashes(vec![
         hashes[2], hashes[3], hashes[4], hashes[5],
     ]));
     for _ in 0..(sync::FANOUT - 1) {
@@ -496,7 +494,7 @@ async fn incomplete_checkpoint_range_retries_frontier_without_verifier_timeout(
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![hashes[4], hashes[5]]));
+        .respond(block_hashes(vec![hashes[4], hashes[5]]));
     for _ in 0..(sync::FANOUT - 1) {
         peer_set
             .expect_request(zn::Request::FindBlocks {
@@ -565,7 +563,7 @@ async fn obtain_tips_discards_genesis_fallback_when_all_hashes_are_finalized(
                     stop: None,
                 })
                 .await
-                .respond(zn::Response::BlockHashes(vec![
+                .respond(block_hashes(vec![
                     hashes[0], hashes[1], hashes[2], hashes[3],
                 ]));
         }
@@ -580,7 +578,10 @@ async fn obtain_tips_discards_genesis_fallback_when_all_hashes_are_finalized(
         }
     };
 
-    let (reserve, ()) = tokio::join!(chain_sync.obtain_tips(), respond_to_requests);
+    let (reserve, ()) = tokio::join!(
+        chain_sync.obtain_tips(sync::TipRequestMode::Obtain),
+        respond_to_requests
+    );
     let reserve = reserve?;
 
     assert!(
@@ -689,7 +690,7 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
+        .respond(block_hashes(vec![
             block1_hash,
             block1_hash,
             block1_hash, // tip
@@ -776,7 +777,7 @@ async fn sync_blocks_duplicate_hashes_ok() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
+        .respond(block_hashes(vec![
             block2_hash, // tip (discarded - already fetched)
             block3_hash, // expected_next
             block4_hash,
@@ -992,7 +993,7 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
+        .respond(block_hashes(vec![
             block982k_hash,
             block1_hash, // tip
             block2_hash, // expected_next
@@ -1170,7 +1171,7 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
+        .respond(block_hashes(vec![
             block1_hash, // tip
             block2_hash, // expected_next
             block3_hash, // (discarded - last hash, possibly incorrect)
@@ -1255,7 +1256,7 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
+        .respond(block_hashes(vec![
             block2_hash, // tip (discarded - already fetched)
             block3_hash, // expected_next
             block4_hash,
@@ -1735,7 +1736,15 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
 
     // `build_extend` owns a clone of the tip network so it can run without borrowing `self`.
     let tip_network = Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT);
-    let extend_handle = tokio::spawn(TestChainSync::build_extend(tip_network, tips));
+    let extend_handle = tokio::spawn(TestChainSync::build_extend(
+        tip_network,
+        tips,
+        LegacySyncTrace::new(None),
+        1,
+        sync::TipRequestMode::Extend,
+        block::Hash::from([0; 32]),
+        Some(Height(0)),
+    ));
 
     // One peer extends the tip. The response starts with the expected hash (the match anchor) and
     // ends with a possibly-incorrect trailing hash that the syncer discards.
@@ -1745,7 +1754,7 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
+        .respond(block_hashes(vec![
             block2_hash, // expected_next (match anchor, not downloaded)
             block3_hash,
             block4_hash,
@@ -1763,7 +1772,7 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
             .respond(Err(zn::BoxError::from("synthetic test extend tips error")));
     }
 
-    let (download_set, prospective_tips, discovered) = extend_handle
+    let (download_set, prospective_tips, discovered, _diagnostics) = extend_handle
         .await
         .expect("build_extend task should not panic")?;
 
@@ -2215,6 +2224,15 @@ fn setup_chain_sync_with_options(
 
 fn not_found_block_error(_hash: block::Hash) -> crate::BoxError {
     zn::SharedPeerError::from(zn::PeerError::NotFoundResponse(Vec::new())).into()
+}
+
+fn block_hashes(hashes: Vec<block::Hash>) -> zn::Response {
+    zn::Response::BlockHashes {
+        hashes,
+        peer: None,
+        latency: None,
+        error: None,
+    }
 }
 
 /// Builds a download error representing a registry miss: the peer set found

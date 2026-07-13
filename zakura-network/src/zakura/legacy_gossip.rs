@@ -560,7 +560,7 @@ impl LegacyResponseCodec {
                     )?;
                 }
             }
-            Response::BlockHashes(hashes) => {
+            Response::BlockHashes { hashes, .. } => {
                 // FindBlocks should already be service-capped; overflowing the wire cap is a bug.
                 push_response_frame(
                     &mut frames,
@@ -747,7 +747,12 @@ impl LegacyResponseCodec {
         match request_kind {
             LegacyRequestKind::Blocks => Ok(Response::Blocks(blocks)),
             LegacyRequestKind::Transactions => Ok(Response::Transactions(transactions)),
-            LegacyRequestKind::FindBlocks => Ok(Response::BlockHashes(block_hashes)),
+            LegacyRequestKind::FindBlocks => Ok(Response::BlockHashes {
+                hashes: block_hashes,
+                peer: None,
+                latency: None,
+                error: None,
+            }),
             LegacyRequestKind::FindHeaders => Ok(Response::BlockHeaders(block_headers)),
             LegacyRequestKind::MempoolTransactionIds => {
                 Ok(Response::TransactionIds(transaction_ids))
@@ -2035,7 +2040,7 @@ fn all_inventory_missing(response: &Response) -> bool {
                     .iter()
                     .all(|transaction| transaction.is_missing())
         }
-        Response::BlockHashes(hashes) => hashes.is_empty(),
+        Response::BlockHashes { hashes, .. } => hashes.is_empty(),
         Response::BlockHeaders(headers) => headers.is_empty(),
         Response::TransactionIds(ids) => ids.is_empty(),
         _ => false,
@@ -2113,7 +2118,7 @@ fn response_summary(response: &Response) -> (&'static str, u64, u64) {
                     .count(),
             ),
         ),
-        Response::BlockHashes(hashes) => ("BlockHashes", bounded_u64(hashes.len()), 0),
+        Response::BlockHashes { hashes, .. } => ("BlockHashes", bounded_u64(hashes.len()), 0),
         Response::BlockHeaders(headers) => ("BlockHeaders", bounded_u64(headers.len()), 0),
         Response::TransactionIds(ids) => ("TransactionIds", bounded_u64(ids.len()), 0),
         Response::Pong(_) => ("Pong", 1, 0),
@@ -3255,7 +3260,12 @@ mod tests {
 
         fn call(&mut self, request: Request) -> Self::Future {
             let response = match request {
-                Request::FindBlocks { .. } => Response::BlockHashes(vec![self.block.hash()]),
+                Request::FindBlocks { .. } => Response::BlockHashes {
+                    hashes: vec![self.block.hash()],
+                    peer: None,
+                    latency: None,
+                    error: None,
+                },
                 Request::FindHeaders { .. } => Response::BlockHeaders(vec![self.header()]),
                 Request::MempoolTransactionIds => {
                     Response::TransactionIds(vec![self.transaction.id])
@@ -3725,7 +3735,11 @@ mod tests {
                 Some(PeerSource::Zakura(a_peer_id.clone())),
             )
             .await?;
-        let Response::BlockHashes(remote_hashes) = find_blocks else {
+        let Response::BlockHashes {
+            hashes: remote_hashes,
+            ..
+        } = find_blocks
+        else {
             panic!("unexpected FindBlocks response: {find_blocks:?}");
         };
         assert_eq!(remote_hashes, vec![block.hash()]);
@@ -3826,7 +3840,7 @@ mod tests {
                 Some(PeerSource::Zakura(a_peer_id.clone())),
             )
             .await?;
-        let Response::BlockHashes(hashes) = hashes else {
+        let Response::BlockHashes { hashes, .. } = hashes else {
             panic!("unexpected FindBlocks response: {hashes:?}");
         };
         assert_eq!(hashes, vec![block.hash()]);
@@ -4584,7 +4598,12 @@ mod tests {
                 None,
             )
             .expect("nil is a valid empty FindBlocks response"),
-            Response::BlockHashes(vec![]),
+            Response::BlockHashes {
+                hashes: vec![],
+                peer: None,
+                latency: None,
+                error: None,
+            },
         );
         assert_eq!(
             LegacyResponseCodec::decode_response(
@@ -4861,7 +4880,12 @@ mod tests {
             header: block.header.clone(),
         };
 
-        let block_hash_response = Response::BlockHashes(vec![block.hash(), block_hash(10)]);
+        let block_hash_response = Response::BlockHashes {
+            hashes: vec![block.hash(), block_hash(10)],
+            peer: None,
+            latency: None,
+            error: None,
+        };
         let frames = LegacyResponseCodec::encode_response(
             8,
             block_hash_response.clone(),
@@ -5584,7 +5608,7 @@ mod tests {
             })
             .await?;
         match find_blocks {
-            Response::BlockHashes(hashes) => assert_eq!(hashes, vec![block.hash()]),
+            Response::BlockHashes { hashes, .. } => assert_eq!(hashes, vec![block.hash()]),
             other => panic!("unexpected FindBlocks response: {other:?}"),
         }
 

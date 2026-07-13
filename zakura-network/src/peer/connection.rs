@@ -404,9 +404,12 @@ impl Handler {
                     .iter()
                     .all(|item| matches!(item, InventoryHash::Block(_))) =>
             {
-                Handler::Finished(Ok(Response::BlockHashes(
-                    block_hashes(&items[..]).collect(),
-                )))
+                Handler::Finished(Ok(Response::BlockHashes {
+                    hashes: block_hashes(&items[..]).collect(),
+                    peer: transient_addr,
+                    latency: None,
+                    error: None,
+                }))
             }
             (Handler::FindHeaders, Message::Headers(headers)) => {
                 Handler::Finished(Ok(Response::BlockHeaders(headers)))
@@ -1541,7 +1544,7 @@ where
                     }
                 }
             }
-            Response::BlockHashes(hashes) => {
+            Response::BlockHashes { hashes, .. } => {
                 if let Err(e) = self
                     .peer_tx
                     .send(Message::Inv(hashes.into_iter().map(Into::into).collect()))

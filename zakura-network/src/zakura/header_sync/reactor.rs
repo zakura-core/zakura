@@ -1673,11 +1673,15 @@ impl HeaderSyncReactor {
             return;
         }
 
+        // Sorted once, not per pass: scheduling only fills a peer's in-flight slots,
+        // it never adds or removes peers, so the set is fixed for this call. A peer
+        // that disconnects concurrently is skipped by `schedule_one_for_peer`.
+        let mut peer_ids: Vec<ZakuraPeerId> = self.state.peers.keys().cloned().collect();
+        peer_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
         loop {
-            let mut peer_ids: Vec<ZakuraPeerId> = self.state.peers.keys().cloned().collect();
-            peer_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
             let mut scheduled_any = false;
-            for peer_id in peer_ids {
+            for peer_id in &peer_ids {
                 scheduled_any |= self.schedule_one_for_peer(peer_id).await;
             }
             if !scheduled_any {
@@ -1686,15 +1690,15 @@ impl HeaderSyncReactor {
         }
     }
 
-    async fn schedule_one_for_peer(&mut self, peer_id: ZakuraPeerId) -> bool {
-        let Some(peer) = self.state.peers.get(&peer_id) else {
+    async fn schedule_one_for_peer(&mut self, peer_id: &ZakuraPeerId) -> bool {
+        let Some(peer) = self.state.peers.get(peer_id) else {
             return false;
         };
         if !peer.received_status || peer.available_slots() == 0 {
             return false;
         }
 
-        let Some(mut range) = self.state.schedule.next_for_peer(&peer_id, peer) else {
+        let Some(mut range) = self.state.schedule.next_for_peer(peer_id, peer) else {
             return false;
         };
         let original_range = range;
@@ -1715,7 +1719,7 @@ impl HeaderSyncReactor {
             .narrow_queued_range(original_range, range);
 
         let peer_cap = peer.max_headers_per_response;
-        let Some(peer) = self.state.peers.get(&peer_id) else {
+        let Some(peer) = self.state.peers.get(peer_id) else {
             return false;
         };
         let session_id = peer.session.session_id();
@@ -1735,7 +1739,7 @@ impl HeaderSyncReactor {
                     "failed to queue Zakura header-sync GetHeaders"
                 );
                 self.trace_queue_send_failed(
-                    &peer_id,
+                    peer_id,
                     "get_headers",
                     &error,
                     peer.session.outbound_capacity(),
@@ -1758,13 +1762,13 @@ impl HeaderSyncReactor {
             clear_assignment_on_timeout: false,
             purpose: RangePurpose::Sync,
         };
-        if let Some(peer) = self.state.peers.get_mut(&peer_id) {
+        if let Some(peer) = self.state.peers.get_mut(peer_id) {
             peer.outstanding.push(outstanding);
         }
         self.state.schedule.mark_assigned(peer_id.clone(), range);
         metrics::counter!("sync.header.request.sent").increment(1);
         self.trace_get_headers_sent(
-            &peer_id,
+            peer_id,
             range,
             count,
             peer_cap,
@@ -1778,7 +1782,7 @@ impl HeaderSyncReactor {
         let _ = self
             .actions
             .send(HeaderSyncAction::SendMessage {
-                peer: peer_id,
+                peer: peer_id.clone(),
                 request_id: Some(request_id),
                 msg: HeaderSyncMessage::GetHeaders {
                     start_height: range.start_height,

@@ -162,7 +162,7 @@ def subst_for(node: Node) -> dict[str, str]:
         "READY_SAMPLES": str(raw["ready_samples"]),
         "READY_SAMPLE_INTERVAL_SECONDS": str(raw["ready_sample_interval_seconds"]),
         "MIN_FREE_BYTES": str(raw["min_free_bytes"]),
-        "RETENTION_DAYS": str(raw["retention_days"]),
+        "RETENTION_RUNS": str(raw["retention_runs"]),
         "COOLDOWN_SECONDS": str(raw["cooldown_seconds"]),
         "WIPE_ENTRIES": toml_string_list(raw["wipe_entries"]),
         "PRESERVE_ENTRIES": toml_string_list(raw["preserve_entries"]),

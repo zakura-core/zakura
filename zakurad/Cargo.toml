@@ -154,6 +154,7 @@ comparison-interpreter = ["zakura-script/comparison-interpreter"]
 [dependencies]
 zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc3" }
 zakura-consensus = { path = "../zakura-consensus", version = "1.0.0-rc3" }
+zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.0.0-rc3" }
 zakura-network = { path = "../zakura-network", version = "1.0.0-rc3" }
 zakura-node-services = { path = "../zakura-node-services", version = "1.0.0-rc3", features = ["rpc-client"] }
 zakura-rpc = { path = "../zakura-rpc", version = "1.0.0-rc3" }

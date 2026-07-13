@@ -11,13 +11,19 @@
 - [Getting Started](#getting-started)
   - [Docker](#docker)
   - [Manual Install](#manual-install)
-- [CI/CD Architecture](#cicd-architecture)
 - [Documentation](#documentation)
 - [User support](#user-support)
 - [Security](#security)
 - [License](#license)
 
-[Zakura](https://github.com/zakura-core/zakura/) is a Zcash full node written in Rust.
+[Zakura](https://github.com/zakura-core/zakura/) is a fully consensus compatible Zcash full node written in Rust, built for scale. We dream of the future where Zcash can power the worlds payments. Mastercard and Visa give a lower bound, we have to first hit 50k TPS of capacity. With ongoing cryptographic optimizations to the Zcash protocol, from [Project Tachyon](https://tachyon.z.cash/) and [Valargroup](https://valargroup.dev), this implies consensus must be capable of at least 100MB/s of block data. The starting point today is 28 KB/s. Zakura builds for this future.
+
+Zakura is forked off of [Zebra](https://github.com/ZcashFoundation/zebra). This first release brings major improvements over existing Zcash node software:
+
+- Performance: Blockchain sync is nearly 5× faster than Zebra. Block execution is notably faster than Zebra on worst case sandblast attacks as well.
+- Pruning and snapshots: Native block pruning with configurable retention cuts disk usage substantially. We also publish snapshots (~11 GB pruned) that let you bootstrap a node 680× faster than syncing over the standard P2P network. See [here](https://zakura.com/snapshots/)
+- zcashd compatibility: A compatibility mode reproduces the legacy zcashd RPC interface, so existing wallets and integrations keep working.
+- Alpha of a v2 p2p layer: We are building a new P2P transport layer for Zakura nodes, currently off by default. The goals: sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol with strict DoS resistance built in.
 
 ## Getting Started
 
@@ -109,32 +115,9 @@ Zakura](book/src/user/install.md) and [Running
 Zakura](book/src/user/run.md) sections in the book for enabling
 optional features, detailed configuration and further details.
 
-## CI/CD Architecture
-
-Zakura uses a comprehensive CI/CD system built on GitHub Actions to ensure code
-quality, maintain stability, and automate routine tasks. Our CI/CD
-infrastructure:
-
-- Runs automated tests on every PR and commit.
-- Manages deployments to various environments.
-- Handles cross-platform compatibility checks.
-- Automates release processes.
-
-For a detailed understanding of our CI/CD system, including workflow diagrams,
-infrastructure details, and best practices, see our [CI/CD Architecture
-Documentation](.github/workflows/README.md).
-
 ## Documentation
 
 The Zakura maintainers provide the following resources:
-
-- The Zakura Book:
-  - [General Introduction](README.md),
-  - [User Documentation](book/src/user.md),
-  - [Developer Documentation](book/src/dev.md).
-
-  - User guides of note:
-    - [Zakura Health Endpoints](book/src/user/health.md) — liveness/readiness checks for Kubernetes and load balancers
 
 - The [documentation of the public
   APIs](https://docs.rs/zakura/latest/zakurad/#zakura-crates) for the latest

@@ -101,6 +101,27 @@ impl LegacySyncTrace {
         });
     }
 
+    /// Records what `obtain_tips` did with one peer's `FindBlocks` response.
+    ///
+    /// `tips_obtained` only reports the totals for a whole fanout, so a syncer that discovers
+    /// nothing looks the same whether its peers answered with nothing or answered with hashes that
+    /// were all thrown away. `reason` distinguishes those, and `hashes`/`unknown` say how much the
+    /// response carried and how much survived the state check.
+    pub(super) fn tips_response(
+        &self,
+        reason: &'static str,
+        hashes: usize,
+        unknown: usize,
+        new_hashes: usize,
+    ) {
+        self.emit("tips_response", |row| {
+            row.insert("reason".to_string(), Value::String(reason.to_string()));
+            insert_count(row, "hashes", hashes);
+            insert_count(row, "unknown", unknown);
+            insert_count(row, "new_hashes", new_hashes);
+        });
+    }
+
     pub(super) fn block_finish(
         &self,
         hash: block::Hash,

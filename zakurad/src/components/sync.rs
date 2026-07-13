@@ -1576,15 +1576,21 @@ where
                     // blocks to sync (e.g. 2 new blocks), where stripping the
                     // last hash leaves only 1 unknown hash and rchunks_exact(2)
                     // would discard the entire response.
+                    let received = hashes.len();
                     let hashes = if self.is_regtest {
                         hashes.as_slice()
                     } else {
                         match hashes.as_slice() {
-                            [] => continue,
+                            [] => {
+                                self.trace.tips_response("empty_response", 0, 0, 0);
+                                continue;
+                            }
                             [rest @ .., _last] => rest,
                         }
                     };
                     if hashes.is_empty() {
+                        self.trace
+                            .tips_response("only_trailing_hash", received, 0, 0);
                         continue;
                     }
 
@@ -1601,6 +1607,7 @@ where
                     let unknown_hashes = if let Some(index) = first_unknown {
                         &hashes[index..]
                     } else {
+                        self.trace.tips_response("all_hashes_known", received, 0, 0);
                         continue;
                     };
 
@@ -1613,6 +1620,12 @@ where
                         }
                     } else {
                         debug!("discarding response that extends only one block");
+                        self.trace.tips_response(
+                            "extends_only_one_block",
+                            received,
+                            unknown_hashes.len(),
+                            0,
+                        );
                         continue;
                     };
 
@@ -1639,6 +1652,12 @@ where
                     let new_download_len = download_set.len();
                     let new_hashes = new_download_len - prev_download_len;
                     debug!(new_hashes, "added hashes to download set");
+                    self.trace.tips_response(
+                        "accepted",
+                        received,
+                        unknown_hashes.len(),
+                        new_hashes,
+                    );
                     metrics::histogram!("sync.obtain.response.hash.count")
                         .record(new_hashes as f64);
                 }

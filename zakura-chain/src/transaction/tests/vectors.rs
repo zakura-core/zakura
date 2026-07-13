@@ -206,104 +206,126 @@ fn v5_orchard_cross_address_flag_fails_deserialization() {
     ));
 }
 
-/// V6 Orchard and Ironwood bundles must round-trip the `ENABLE_CROSS_ADDRESS`
-/// flag bit (which V5 reserves and rejects), while still rejecting the
-/// undefined flag bits 3..7.
-///
-/// The flags byte position is located by serializing the same transaction
-/// with and without the cross-address bit and diffing: exactly one byte may
-/// change.
+/// V6 Orchard keeps the cross-address bit reserved on the wire, even though
+/// V6 Ironwood uses the same internal `Flags` type and permits that bit.
 #[test]
-fn v6_orchard_style_flags_allow_cross_address_but_reject_reserved_bits() {
+fn v6_orchard_cross_address_flag_fails_serialization_and_deserialization() {
     let _init_guard = zakura_test::init();
 
-    let shielded_data = Network::iter()
+    let mut shielded_data = Network::iter()
         .flat_map(|network| v5_transactions(network.block_iter()))
         .find_map(|transaction| transaction.orchard_shielded_data().cloned())
         .expect("test vectors include an Orchard transaction");
 
-    let make_tx = |mut shielded_data: crate::orchard::ShieldedData, ironwood: bool| {
-        shielded_data
-            .flags
-            .insert(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
-
-        Transaction::V6 {
-            network_upgrade: NetworkUpgrade::Nu6_3,
-            lock_time: LockTime::unlocked(),
-            expiry_height: Height(1),
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            sapling_shielded_data: None,
-            orchard_shielded_data: (!ironwood).then_some(shielded_data.clone()),
-            ironwood_shielded_data: ironwood.then_some(shielded_data),
-        }
+    let make_tx = |shielded_data: crate::orchard::ShieldedData| Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(shielded_data),
+        ironwood_shielded_data: None,
     };
 
-    for ironwood in [false, true] {
-        let tx = make_tx(shielded_data.clone(), ironwood);
-        let cross_address_bytes = tx
-            .zcash_serialize_to_vec()
-            .expect("V6 Orchard-style formats allow the cross-address bit on the wire");
-        let parsed = Transaction::zcash_deserialize(&cross_address_bytes[..])
-            .expect("V6 Orchard-style cross-address flag must deserialize");
-        let parsed_flags = if ironwood {
-            parsed
-                .ironwood_shielded_data()
-                .expect("test transaction has Ironwood data")
-                .flags
-        } else {
-            parsed
-                .orchard_shielded_data()
-                .expect("test transaction has Orchard data")
-                .flags
-        };
-        assert!(parsed_flags.contains(crate::orchard::Flags::ENABLE_CROSS_ADDRESS));
+    let valid_bytes = make_tx(shielded_data.clone())
+        .zcash_serialize_to_vec()
+        .expect("V6 Orchard flags without cross-address must serialize");
 
-        let mut without_cross_address = tx;
-        let Transaction::V6 {
-            orchard_shielded_data,
-            ironwood_shielded_data,
-            ..
-        } = &mut without_cross_address
-        else {
-            unreachable!("test transaction is V6");
-        };
-        if ironwood {
-            ironwood_shielded_data
-                .as_mut()
-                .expect("test transaction has Ironwood data")
-                .flags
-                .remove(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
-        } else {
-            orchard_shielded_data
-                .as_mut()
-                .expect("test transaction has Orchard data")
-                .flags
-                .remove(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
-        }
+    let mut toggled = shielded_data.clone();
+    toggled.flags.toggle(crate::orchard::Flags::ENABLE_SPENDS);
+    let toggled_bytes = make_tx(toggled)
+        .zcash_serialize_to_vec()
+        .expect("V6 Orchard spend flag should serialize");
+    let differing_indices: Vec<_> = valid_bytes
+        .iter()
+        .zip(&toggled_bytes)
+        .enumerate()
+        .filter_map(|(index, (original, toggled))| (original != toggled).then_some(index))
+        .collect();
+    let [flags_index] = differing_indices.as_slice() else {
+        panic!("toggling the V6 Orchard spend flag should change exactly one byte");
+    };
 
-        let without_cross_address_bytes = without_cross_address
-            .zcash_serialize_to_vec()
-            .expect("V6 Orchard-style flags without cross-address must serialize");
-        let differing_indices: Vec<_> = cross_address_bytes
-            .iter()
-            .zip(&without_cross_address_bytes)
-            .enumerate()
-            .filter_map(|(index, (with, without))| (with != without).then_some(index))
-            .collect();
-        let [flags_index] = differing_indices.as_slice() else {
-            panic!("toggling the cross-address flag should change exactly one byte");
-        };
+    shielded_data
+        .flags
+        .insert(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
+    let error = make_tx(shielded_data)
+        .zcash_serialize_to_vec()
+        .expect_err("V6 Orchard flags must reject reserved cross-address bit");
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
 
-        let mut reserved_bit_bytes = cross_address_bytes;
-        reserved_bit_bytes[*flags_index] |= 0b0000_1000;
-        let error = Transaction::zcash_deserialize(&reserved_bit_bytes[..])
-            .expect_err("V6 Orchard-style flags must reject reserved bits 3..7");
-        assert!(matches!(
-            error,
-            SerializationError::Parse("invalid reserved orchard flags")
-        ));
-    }
+    let mut malformed_bytes = valid_bytes;
+    malformed_bytes[*flags_index] |= crate::orchard::Flags::ENABLE_CROSS_ADDRESS.bits();
+    let error = Transaction::zcash_deserialize(&malformed_bytes[..])
+        .expect_err("V6 Orchard flags must reject reserved cross-address bit");
+    assert!(matches!(
+        error,
+        SerializationError::Parse("invalid reserved orchard flags")
+    ));
+}
+
+/// V6 Ironwood must round-trip `ENABLE_CROSS_ADDRESS`, while still rejecting
+/// undefined flag bits 3..7.
+#[test]
+fn v6_ironwood_cross_address_flag_round_trips_and_rejects_reserved_bits() {
+    let _init_guard = zakura_test::init();
+
+    let mut shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+    shielded_data
+        .flags
+        .insert(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
+
+    let make_tx = |shielded_data: crate::ironwood::ShieldedData| Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(shielded_data),
+    };
+
+    let tx = make_tx(shielded_data.clone());
+    let cross_address_bytes = tx
+        .zcash_serialize_to_vec()
+        .expect("V6 Ironwood must allow the cross-address bit on the wire");
+    let parsed = Transaction::zcash_deserialize(&cross_address_bytes[..])
+        .expect("V6 Ironwood cross-address flag must deserialize");
+    assert!(parsed
+        .ironwood_shielded_data()
+        .expect("test transaction has Ironwood data")
+        .flags
+        .contains(crate::orchard::Flags::ENABLE_CROSS_ADDRESS));
+
+    shielded_data
+        .flags
+        .remove(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
+    let without_cross_address_bytes = make_tx(shielded_data)
+        .zcash_serialize_to_vec()
+        .expect("V6 Ironwood flags without cross-address must serialize");
+    let differing_indices: Vec<_> = cross_address_bytes
+        .iter()
+        .zip(&without_cross_address_bytes)
+        .enumerate()
+        .filter_map(|(index, (with, without))| (with != without).then_some(index))
+        .collect();
+    let [flags_index] = differing_indices.as_slice() else {
+        panic!("toggling the V6 Ironwood cross-address flag should change exactly one byte");
+    };
+
+    let mut reserved_bit_bytes = cross_address_bytes;
+    reserved_bit_bytes[*flags_index] |= 0b0000_1000;
+    let error = Transaction::zcash_deserialize(&reserved_bit_bytes[..])
+        .expect_err("V6 Ironwood flags must reject reserved bits 3..7");
+    assert!(matches!(
+        error,
+        SerializationError::Parse("invalid reserved orchard flags")
+    ));
 }
 
 #[test]
@@ -2200,6 +2222,128 @@ fn sapling_lazy_cv_epk_edge_cases() {
         ValidatingKey::try_from(small_order).is_err(),
         "Sapling rk must still reject a small-order point at deserialization",
     );
+}
+
+/// Native ZIP-244 hashing must stay byte-oriented for lazy Sapling points.
+///
+/// Checkpoint hashing and pre-verification mempool IDs are computed before
+/// semantic point validation. An off-curve Sapling commitment must therefore
+/// still produce a deterministic V5/V6 `UnminedTx` ID, while the later
+/// librustzcash conversion remains fail-closed.
+#[test]
+fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() {
+    use group::Group;
+
+    use crate::{
+        amount::Amount,
+        at_least_one,
+        block::Height,
+        parameters::NetworkUpgrade,
+        primitives::{
+            redjubjub::{Binding, Signature},
+            Groth16Proof,
+        },
+        sapling::{
+            self,
+            keys::EphemeralPublicKey,
+            shielded_data::{ShieldedData, TransferData},
+            EncryptedNote, Output, ValueCommitment, WrappedNoteKey,
+        },
+        serialization::{ZcashDeserializeInto, ZcashSerialize},
+        transaction::{LockTime, Transaction, UnminedTx},
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let off_curve = [0xffu8; 32];
+    let other_off_curve = [0xfeu8; 32];
+    assert!(
+        bool::from(jubjub::AffinePoint::from_bytes(off_curve).is_none()),
+        "0xff..ff must not be a valid Jubjub point encoding",
+    );
+    assert!(
+        bool::from(jubjub::AffinePoint::from_bytes(other_off_curve).is_none()),
+        "0xfe..fe must not be a valid Jubjub point encoding",
+    );
+    let valid_epk = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
+
+    let shielded_data = |cv: [u8; 32]| ShieldedData::<sapling::SharedAnchor> {
+        value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+        transfers: TransferData::JustOutputs {
+            outputs: at_least_one![Output {
+                cv: ValueCommitment(cv),
+                cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32])
+                    .expect("zero bytes encode a valid extracted note commitment"),
+                ephemeral_key: EphemeralPublicKey(valid_epk),
+                enc_ciphertext: EncryptedNote([0u8; 580]),
+                out_ciphertext: WrappedNoteKey([0u8; 80]),
+                zkproof: Groth16Proof([0u8; 192]),
+            }],
+        },
+        binding_sig: Signature::<Binding>::from([0u8; 64]),
+    };
+
+    let make_transactions = |cv: [u8; 32]| {
+        [
+            Transaction::V5 {
+                network_upgrade: NetworkUpgrade::Nu5,
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(0),
+                inputs: vec![],
+                outputs: vec![],
+                sapling_shielded_data: Some(shielded_data(cv)),
+                orchard_shielded_data: None,
+            },
+            Transaction::V6 {
+                network_upgrade: NetworkUpgrade::Nu6_3,
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(0),
+                inputs: vec![],
+                outputs: vec![],
+                sapling_shielded_data: Some(shielded_data(cv)),
+                orchard_shielded_data: None,
+                ironwood_shielded_data: None,
+            },
+        ]
+    };
+
+    for (tx, changed_tx) in make_transactions(off_curve)
+        .into_iter()
+        .zip(make_transactions(other_off_curve))
+    {
+        let network_upgrade = tx
+            .network_upgrade()
+            .expect("V5/V6 transactions carry a network upgrade");
+        let parsed: Transaction = tx
+            .zcash_serialize_to_vec()
+            .expect("crafted transaction must serialize")
+            .zcash_deserialize_into()
+            .expect("lazy Sapling point bytes must deserialize");
+        let changed_parsed: Transaction = changed_tx
+            .zcash_serialize_to_vec()
+            .expect("crafted transaction must serialize")
+            .zcash_deserialize_into()
+            .expect("lazy Sapling point bytes must deserialize");
+
+        assert!(
+            !parsed.sapling_point_encodings_are_valid(),
+            "off-curve Sapling cv must fail deferred semantic validation",
+        );
+        assert!(
+            parsed.to_librustzcash(network_upgrade).is_err(),
+            "off-curve Sapling cv must fail librustzcash conversion",
+        );
+
+        let unmined = UnminedTx::from(parsed.clone());
+        let (txid, auth_digest) = parsed.txid_and_auth_digest();
+        assert_eq!(unmined.id.mined_id(), txid);
+        assert_eq!(unmined.id.auth_digest(), auth_digest);
+        assert_ne!(
+            txid,
+            changed_parsed.hash(),
+            "native txid must commit to the raw lazy Sapling cv bytes",
+        );
+    }
 }
 
 /// The local Sapling binding-key helper stays fail-closed when it sees a lazy

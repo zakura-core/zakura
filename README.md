@@ -11,13 +11,12 @@
 - [Getting Started](#getting-started)
   - [Docker](#docker)
   - [Manual Install](#manual-install)
-- [CI/CD Architecture](#cicd-architecture)
 - [Documentation](#documentation)
 - [User support](#user-support)
 - [Security](#security)
 - [License](#license)
 
-[Zakura](https://github.com/zakura-core/zakura/) is a fully consensus compatible Zcash full node written in Rust, built for scale. We dream of the future where Zcash can power the worlds payments. Mastercard and Visa give a lower bound, we have to first hit 50k TPS of capacity. With ongoing cryptographic optimizations to the Zcash protocol, from [Project Tachyon]() and [Valargroup](), this implies consensus must be capable of at least 100MB/s of block data. The starting point today is 28 KB/s. Zakura builds for this future.
+[Zakura](https://github.com/zakura-core/zakura/) is a fully consensus compatible Zcash full node written in Rust, built for scale. We dream of the future where Zcash can power the worlds payments. Mastercard and Visa give a lower bound, we have to first hit 50k TPS of capacity. With ongoing cryptographic optimizations to the Zcash protocol, from [Project Tachyon](https://tachyon.z.cash/) and [Valargroup](https://valargroup.dev), this implies consensus must be capable of at least 100MB/s of block data. The starting point today is 28 KB/s. Zakura builds for this future.
 
 Zakura is forked off of [Zebra](https://github.com/ZcashFoundation/zebra). This first release brings major improvements over existing Zcash node software:
 

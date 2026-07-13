@@ -2228,7 +2228,7 @@ mod tests {
                 .iter()
                 .any(|m| m.stream_kind == ZAKURA_STREAM_HEADER_SYNC
                     && m.frame.payload == bad_header_sync_payload),
-            "recorder nodes assert transport routing only; production header-sync owners decode v6 frames and reject malformed payloads, got {delivered:?}"
+            "recorder nodes assert transport routing only; production header-sync owners decode header-sync frames and reject malformed payloads, got {delivered:?}"
         );
         assert!(
             delivered.iter().any(|m| m.frame.payload == after),
@@ -3061,7 +3061,7 @@ mod tests {
         cluster.connect_full_mesh(Duration::from_secs(5)).await?;
         cluster.await_all_connected(Duration::from_secs(5)).await?;
         await_until(
-            "native header-sync v6 status received",
+            "native header-sync status received",
             Duration::from_secs(5),
             || {
                 capture.reader().is_ok_and(|reader| {

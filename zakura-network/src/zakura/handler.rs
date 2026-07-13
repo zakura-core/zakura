@@ -4571,7 +4571,8 @@ fn should_run_freshness_reaper(
 }
 
 /// The stream-kind versions this handler serves. Most known kinds are at version 1;
-/// header sync is at version 6 after the expanded Ironwood root-record wire break.
+/// header sync is at version 7, which correlates each `Headers` response with the
+/// request that solicited it. Earlier header-sync versions are not served.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
 const ZAKURA_STREAM_VERSION_7: u16 = 7;
 
@@ -6052,7 +6053,7 @@ mod tests {
             service.deliver_frame(peer, HEADER_SYNC_STREAM_KIND, malformed_frame);
         assert!(
             matches!(malformed_result, Err(SinkReject::Protocol(_))),
-            "malformed header-sync v6 frames must disconnect independently of reactor queue availability"
+            "malformed header-sync frames must disconnect independently of reactor queue availability"
         );
 
         Ok(())

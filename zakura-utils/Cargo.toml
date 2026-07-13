@@ -18,7 +18,7 @@ categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
 
 [[bin]]
 name = "zakura-checkpoints"
-# this setting is required for Zebra's Docker build caches
+# this setting is required for Zakura's Docker build caches
 path = "src/bin/zakura-checkpoints/main.rs"
 required-features = ["zakura-checkpoints"]
 
@@ -29,7 +29,7 @@ required-features = ["search-issue-refs"]
 
 [[bin]]
 name = "block-template-to-proposal"
-# this setting is required for Zebra's Docker build caches
+# this setting is required for Zakura's Docker build caches
 path = "src/bin/block-template-to-proposal/main.rs"
 
 [features]

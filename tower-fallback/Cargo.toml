@@ -8,9 +8,7 @@ repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-# TODO: decide if we want to use the Zebra readme and home page
-#readme = "../README.md"
-#homepage = "https://zfnd.org/zebra/"
+homepage.workspace = true
 # crates.io is limited to 5 keywords and categories
 keywords = ["tower", "fallback"]
 # Must be one of <https://crates.io/category_slugs>

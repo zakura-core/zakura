@@ -17,7 +17,7 @@ categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
 # Settings that impact compilation
 edition.workspace = true
 
-# Zebra can have a higher MSRV than the other crates since it is a binary.
+# Zakura can have a higher MSRV than the other crates since it is a binary.
 rust-version = "1.91"
 
 # Settings that impact runtime behaviour
@@ -37,7 +37,7 @@ pre-release-replacements = [
 
 [package.metadata.docs.rs]
 
-# Publish Zebra's supported production and developer features on docs.rs.
+# Publish Zakura's supported production and developer features on docs.rs.
 # (Except for the log level features, because there are a lot of them.)
 #
 # <https://docs.rs/about/metadata>

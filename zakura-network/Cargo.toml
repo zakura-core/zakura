@@ -1,11 +1,11 @@
 [package]
 name = "zakura-network"
 version = "1.0.0-rc2"
-authors = ["Zcash Foundation <zebra@zfnd.org>", "Tower Maintainers <team@tower-rs.com>"]
+authors.workspace = true
 description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal
 #
-# This licence is deliberately different to the rest of Zebra.
+# This licence is deliberately different to the rest of Zakura.
 #
 # Some code in:
 # zakura-network/src/peer_set/set.rs
@@ -42,7 +42,7 @@ proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl"]
 zakura-testkit = []
 
 # Exposes an offline benchmark helper for the block-sync Sequencer
-# (`zakura::spawn_bench_sequencer`), used by zebra-replay-bench. Not for production.
+# (`zakura::spawn_bench_sequencer`), used by replay-bench tooling. Not for production.
 internal-bench = []
 
 [dependencies]

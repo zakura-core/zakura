@@ -242,6 +242,40 @@ impl HeaderSyncPeerSession {
         .map(|()| request_id)
     }
 
+    /// Reserve response correlation and wait asynchronously for outbound capacity.
+    ///
+    /// The frame is encoded once before waiting. If this future is cancelled while
+    /// waiting, the reservation guard synchronously removes the request ID from the
+    /// peer pipe so it cannot consume a later response.
+    pub(super) async fn send_get_headers(
+        &self,
+        start_height: block::Height,
+        count: u32,
+        want_tree_aux_roots: bool,
+    ) -> Result<HeaderSyncRequestId, OrderedSendError> {
+        let request_id = self.next_request_id()?;
+        let expected =
+            ExpectedHeadersResponse::new(request_id, start_height, count, want_tree_aux_roots)
+                .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+        let frame = HeaderSyncMessage::GetHeaders {
+            start_height,
+            count,
+            want_tree_aux_roots,
+        }
+        .encode_frame(Some(request_id))
+        .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+
+        let mut reservation =
+            ExpectedHeadersReservation::new(self.inner.commands.clone(), expected)?;
+        self.inner
+            .send
+            .send(frame)
+            .await
+            .map_err(|_| OrderedSendError::Closed)?;
+        reservation.disarm();
+        Ok(request_id)
+    }
+
     /// Send a typed header range response with one advisory body-size hint and
     /// tree-aux root payload per header.
     pub fn try_send_headers_with_sizes_and_roots(
@@ -278,6 +312,44 @@ impl HeaderSyncPeerSession {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_frame)) => Err(OrderedSendError::Full),
             Err(mpsc::error::TrySendError::Closed(_frame)) => Err(OrderedSendError::Closed),
+        }
+    }
+}
+
+struct ExpectedHeadersReservation {
+    commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
+    expected: ExpectedHeadersResponse,
+    armed: bool,
+}
+
+impl ExpectedHeadersReservation {
+    fn new(
+        commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
+        expected: ExpectedHeadersResponse,
+    ) -> Result<Self, OrderedSendError> {
+        if let Some(commands) = &commands {
+            commands
+                .send(HeaderSyncPeerCommand::Reserve(expected))
+                .map_err(|_| OrderedSendError::Closed)?;
+        }
+        Ok(Self {
+            commands,
+            expected,
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ExpectedHeadersReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(commands) = &self.commands {
+                let _ = commands.send(HeaderSyncPeerCommand::Cancel(self.expected));
+            }
         }
     }
 }

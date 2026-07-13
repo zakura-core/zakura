@@ -5113,7 +5113,7 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_violation_recor
         Some((first_checkpoint, checkpoint_hash)),
     );
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
-    let fixture = spawn_test_reactor(startup);
+    let mut fixture = spawn_test_reactor(startup);
     let peer_id = peer(55);
 
     connect_peer(&fixture, peer_id.clone()).await;
@@ -5126,6 +5126,7 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_violation_recor
         1,
     )
     .await;
+    let _ = next_get_headers_request_id(&mut fixture.actions).await;
     fixture
         .handle
         .send(HeaderSyncEvent::FullBlockCommitted {
@@ -5400,6 +5401,399 @@ async fn one_silent_peer_retries_the_same_missing_range_indefinitely() {
         // the claim and make it eligible again after the short peer-local delay.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn commit_failure_after_source_disconnect_retries_without_blocking_the_lane() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(3), checkpoint_hash)),
+    ));
+    let first_peer = peer(140);
+    let second_peer = peer(141);
+
+    for peer_id in [&first_peer, &second_peer] {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id.clone(),
+            block::Height(0),
+            block::Height(4),
+            1,
+            1,
+        )
+        .await;
+    }
+    let (source, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(source, first_peer);
+    assert_eq!((start, count), (block::Height(4), 1));
+    send_headers(
+        &fixture,
+        &source,
+        request_id,
+        headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+    )
+    .await;
+    loop {
+        if matches!(
+            next_non_query_action(&mut fixture.actions).await,
+            HeaderSyncAction::CommitHeaderRange { .. }
+        ) {
+            break;
+        }
+    }
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerDisconnected(first_peer.clone()))
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitFailed {
+            peer: first_peer,
+            session_id: 0,
+            start_height: start,
+            count,
+            kind: HeaderSyncCommitFailureKind::Local,
+        })
+        .await
+        .unwrap();
+
+    let (retry_peer, _, retry_start, retry_count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(retry_peer, second_peer);
+    assert_eq!((retry_start, retry_count), (start, count));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn partial_full_block_coverage_retires_old_request_and_requests_suffix() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(142);
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(2),
+        2,
+        1,
+    )
+    .await;
+    let (_, old_request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((start, count), (block::Height(1), 2));
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: block::Height(1),
+            hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        })
+        .await
+        .unwrap();
+
+    let (_, _, retry_start, retry_count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((retry_start, retry_count), (block::Height(2), 1));
+    send_headers(
+        &fixture,
+        &peer_id,
+        old_request_id,
+        headers_message_from(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+        ),
+    )
+    .await;
+    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn buffered_successor_drains_after_full_block_covers_its_predecessor() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(143);
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(2),
+        1,
+        2,
+    )
+    .await;
+
+    let mut requests = HashMap::new();
+    while requests.len() < 2 {
+        let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(count, 1);
+        requests.insert(start, request_id);
+    }
+    send_headers(
+        &fixture,
+        &peer_id,
+        requests[&block::Height(2)],
+        headers_message_from(
+            block::Height(2),
+            vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)],
+        ),
+    )
+    .await;
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: block::Height(1),
+            hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange {
+                start_height,
+                headers,
+                ..
+            } => {
+                assert_eq!(start_height, block::Height(2));
+                assert_eq!(headers.len(), 1);
+                break;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_action_queue_preserves_buffer_until_commit_capacity_returns() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(3), checkpoint_hash)),
+    ));
+    let source = peer(200);
+    connect_peer(&fixture, source.clone()).await;
+    advertise_tip(
+        &fixture,
+        source.clone(),
+        block::Height(0),
+        block::Height(4),
+        1,
+        1,
+    )
+    .await;
+    let (_, request_id, _, _) = next_outbound_get_headers(&mut fixture.actions).await;
+
+    for id in 0..128 {
+        connect_peer(&fixture, peer(id)).await;
+    }
+    let violations_before = metric_value("sync.header.peer.violation");
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireDecodeFailed {
+            peer: peer(0),
+            error: Arc::new(HeaderSyncWireError::TrailingBytes),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while metric_value("sync.header.peer.violation") == violations_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the final action fills the remaining queue slot");
+    assert_eq!(
+        fixture.actions.len(),
+        128,
+        "test must saturate action queue"
+    );
+    let responses_before = metric_value("sync.header.response.received");
+    let unknown_before = metric_value("sync.header.response.unknown_request_id");
+    let response_violations_before = metric_value("sync.header.peer.violation");
+    let commit_full_before = metric_value("sync.header.commit.action_queue_full");
+    send_headers(
+        &fixture,
+        &source,
+        request_id,
+        headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while metric_value("sync.header.commit.action_queue_full") == commit_full_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the reactor reaches commit admission while its action queue is full");
+    assert!(metric_value("sync.header.response.received") > responses_before);
+    assert_eq!(
+        metric_value("sync.header.peer.violation"),
+        response_violations_before,
+        "the test response must reach commit admission"
+    );
+    assert_eq!(
+        metric_value("sync.header.response.unknown_request_id"),
+        unknown_before,
+        "the source request must remain outstanding"
+    );
+    assert_eq!(gauge_value("sync.header.work.buffered.count"), 1.0);
+
+    // Freeing one action slot is the only wakeup. The capacity waiter must
+    // admit the preserved buffer without requiring another peer event.
+    let _ = fixture
+        .actions
+        .recv()
+        .await
+        .expect("status action fills queue");
+    tokio::task::yield_now().await;
+    for _ in 0..129 {
+        if let HeaderSyncAction::CommitHeaderRange {
+            peer,
+            start_height,
+            headers,
+            ..
+        } = next_action(&mut fixture.actions).await
+        {
+            assert_eq!(peer, source);
+            assert_eq!(start_height, block::Height(4));
+            assert_eq!(headers.len(), 1);
+            return;
+        }
+    }
+    panic!("preserved header buffer was not committed after action capacity returned");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn peer_requester_waits_for_outbound_capacity_without_reencoding_or_polling() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(201);
+    let (send, mut recv) = crate::zakura::framed_channel(1);
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .unwrap();
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+
+    // The initial Status occupies the only real outbound slot. The requester
+    // owns the range descriptor but must not publish a sent request yet.
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(20),
+        next_outbound_get_headers(&mut fixture.actions),
+    )
+    .await
+    .is_err());
+    let _status_frame = recv.recv().await.expect("initial status frame is queued");
+
+    let (request_peer, _, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(request_peer, peer_id);
+    assert_eq!((start, count), (block::Height(1), 1));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn retry_avoidance_does_not_create_a_permanent_idle_tick() {
+    let mut capture =
+        TraceCapture::for_test("retry_avoidance_does_not_create_a_permanent_idle_tick").unwrap();
+    let network = regtest_network();
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    startup.trace = ZakuraTrace::new(capture.tracer(), "idle-reactor");
+    let _fixture = spawn_test_reactor(startup);
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+
+    capture.flush().await;
+    let reader = capture.reader().unwrap();
+    assert_eq!(
+        reader
+            .table(HEADER_SYNC_TABLE.table())
+            .count(hs_trace::HEADER_MAINTENANCE_WAKEUP),
+        0,
+        "an idle reactor should sleep until real work or maintenance is due"
+    );
+    let _ = capture.finish().await.unwrap();
+}
+
+#[test]
+fn work_queue_transitions_have_one_explicit_owner() {
+    use super::state::{RangePriority, RangeRequest};
+    use super::work_queue::{HeaderWorkQueue, HeaderWorkState};
+
+    let owner = peer(144);
+    let range = RangeRequest {
+        start_height: block::Height(1),
+        count: 2,
+        anchor_hash: Some(block::Hash([1; 32])),
+        finalized: false,
+        want_tree_aux_roots: true,
+        priority: RangePriority::Forward,
+    };
+    let mut queue = HeaderWorkQueue::new();
+    queue.ensure_forward(range);
+    let pending = queue.forward.pop_front().expect("range is pending");
+    queue.mark_assigned(owner.clone(), pending);
+    assert!(matches!(
+        queue.state(range),
+        Some(HeaderWorkState::InFlight { peer }) if peer == &owner
+    ));
+    queue.mark_buffered(owner.clone(), range);
+    assert!(matches!(
+        queue.state(range),
+        Some(HeaderWorkState::Buffered { peer }) if peer == &owner
+    ));
+    queue.mark_committing(owner.clone(), 7, range);
+    assert!(matches!(
+        queue.state(range),
+        Some(HeaderWorkState::Committing { peer, session_id: 7 }) if peer == &owner
+    ));
+    queue.complete(range);
+    assert!(queue.state(range).is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]

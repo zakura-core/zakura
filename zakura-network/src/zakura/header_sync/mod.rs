@@ -37,6 +37,7 @@ mod error;
 mod events;
 mod pipe;
 mod reactor;
+mod requester;
 mod service;
 mod state;
 #[cfg(test)]

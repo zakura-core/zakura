@@ -439,13 +439,14 @@ jobs:
             exit 1
           fi
 
-          release_flags=()
+          # Always create as a pre-release, whatever the tag looks like:
+          # promoting to a full release (and setting it as latest) stays a
+          # manual step after the release has been tested and signed.
+          release_flags=(--prerelease)
           release_notes="Release created by release-binaries."
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            release_flags+=(--draft --prerelease)
+            release_flags+=(--draft)
             release_notes="Temporary release created by release-binaries workflow_dispatch."
-          elif [[ "$RELEASE_TAG" == *-* ]]; then
-            release_flags+=(--prerelease)
           fi
 
           target_commitish="$(git rev-parse --verify "${TARGET_REF}^{commit}")"

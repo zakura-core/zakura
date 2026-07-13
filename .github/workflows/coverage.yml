@@ -64,7 +64,9 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       - name: Run coverage tests
         run: |
-          cargo llvm-cov --no-report nextest
+          # Use the CI-safe profile so real-time scenario tests run in their dedicated,
+          # retrying workflows instead of under slow coverage instrumentation.
+          cargo llvm-cov --no-report nextest --profile all-tests
           # TODO: Do we need --locked --release --features "default-release-binaries" here?
           cargo llvm-cov report --lcov --output-path lcov.info
         env:

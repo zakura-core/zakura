@@ -83,6 +83,38 @@ fn v5_transactions_basic_check() -> Result<(), Report> {
     Ok(())
 }
 
+/// Orchard and Ironwood nullifiers are separate namespaces: a V6 transaction
+/// whose Orchard and Ironwood bundles happen to contain bit-identical
+/// nullifiers must not be rejected as a double-spend, because each pool tracks
+/// its own nullifier set. `spend_conflicts` must only reject duplicates
+/// *within* a pool.
+#[test]
+fn matching_orchard_and_ironwood_nullifiers_are_not_conflicts() {
+    let _init_guard = zakura_test::init();
+
+    let shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+    let transaction = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(shielded_data.clone()),
+        ironwood_shielded_data: Some(shielded_data),
+    };
+
+    assert_eq!(
+        transaction.orchard_nullifiers().collect::<Vec<_>>(),
+        transaction.ironwood_nullifiers().collect::<Vec<_>>()
+    );
+    check::spend_conflicts(&transaction)
+        .expect("matching bit patterns in separate nullifier sets are not duplicates");
+}
+
 #[test]
 fn v5_transaction_with_orchard_actions_has_inputs_and_outputs() {
     for net in Network::iter() {
@@ -3599,6 +3631,51 @@ async fn orchard_disabling_soft_fork_accepts_orchard_actions_below_activation_he
         )),
         "Orchard transaction must be rejected at the soft fork height",
     );
+}
+
+/// Checks that public-network branch-ID admission switches exactly at NU6.3 activation.
+#[test]
+fn public_nu6_3_consensus_branch_id_boundary() {
+    let mut tx = Transaction::V5 {
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height::MAX_EXPIRY_HEIGHT,
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        network_upgrade: NetworkUpgrade::Nu6_2,
+    };
+
+    for network in Network::iter() {
+        let activation_height = NetworkUpgrade::Nu6_3
+            .activation_height(&network)
+            .expect("NU6.3 is scheduled on both public networks");
+        let previous_height = (activation_height - 1).expect("NU6.3 is not genesis");
+
+        assert_eq!(
+            check::consensus_branch_id(&tx, previous_height, &network),
+            Ok(()),
+        );
+        assert_eq!(
+            check::consensus_branch_id(&tx, activation_height, &network),
+            Err(TransactionError::WrongConsensusBranchId),
+        );
+
+        tx.update_network_upgrade(NetworkUpgrade::Nu6_3)
+            .expect("V5 transactions support the NU6.3 branch ID");
+
+        assert_eq!(
+            check::consensus_branch_id(&tx, previous_height, &network),
+            Err(TransactionError::WrongConsensusBranchId),
+        );
+        assert_eq!(
+            check::consensus_branch_id(&tx, activation_height, &network),
+            Ok(()),
+        );
+
+        tx.update_network_upgrade(NetworkUpgrade::Nu6_2)
+            .expect("V5 transactions support the NU6.2 branch ID");
+    }
 }
 
 /// Checks that the tx verifier handles consensus branch ids in V5 txs correctly.

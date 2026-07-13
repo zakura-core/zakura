@@ -328,7 +328,6 @@ pub(super) struct PeerHeaderState {
     /// which the peer's inbound rate limiter would otherwise treat as spam.
     pub(super) last_sent_status: Option<HeaderSyncStatus>,
     pub(super) outstanding: Vec<OutstandingRange>,
-    pub(super) late_covered_responses: usize,
     pub(super) meters: HeaderSyncPeerMeters,
     pub(super) served_headers_inflight: u16,
     pub(super) served_header_request_ids: HashSet<HeaderSyncRequestId>,
@@ -357,7 +356,6 @@ impl PeerHeaderState {
             last_received_status_at: None,
             last_sent_status: None,
             outstanding: Vec::new(),
-            late_covered_responses: 0,
             meters: HeaderSyncPeerMeters::new(
                 status_refresh_interval,
                 inbound_status_min_interval,
@@ -370,16 +368,7 @@ impl PeerHeaderState {
     }
 
     pub(super) fn available_slots(&self) -> usize {
-        let effective_limit = if self.session.has_request_ids() {
-            usize::from(self.max_inflight_requests)
-        } else {
-            1
-        };
-        effective_limit.saturating_sub(self.outstanding.len())
-    }
-
-    pub(super) fn pop_oldest_outstanding(&mut self) -> Option<OutstandingRange> {
-        (!self.outstanding.is_empty()).then(|| self.outstanding.remove(0))
+        usize::from(self.max_inflight_requests).saturating_sub(self.outstanding.len())
     }
 
     pub(super) fn remove_outstanding_by_request_id(
@@ -388,20 +377,8 @@ impl PeerHeaderState {
     ) -> Option<OutstandingRange> {
         self.outstanding
             .iter()
-            .position(|outstanding| outstanding.request_id == Some(request_id))
+            .position(|outstanding| outstanding.request_id == request_id)
             .map(|index| self.outstanding.remove(index))
-    }
-
-    pub(super) fn restore_oldest_outstanding(&mut self, outstanding: OutstandingRange) {
-        self.outstanding.insert(0, outstanding);
-    }
-
-    pub(super) fn take_late_covered_response(&mut self) -> bool {
-        if self.late_covered_responses == 0 {
-            return false;
-        }
-        self.late_covered_responses -= 1;
-        true
     }
 
     /// Whether `status` differs from the most recent status sent to this peer
@@ -429,35 +406,28 @@ impl PeerHeaderState {
     pub(super) fn try_start_serving_headers(
         &mut self,
         local_inflight_cap: u16,
-        request_id: Option<HeaderSyncRequestId>,
+        request_id: HeaderSyncRequestId,
     ) -> bool {
         if self.served_headers_inflight >= local_inflight_cap {
             return false;
         }
-        if let Some(request_id) = request_id {
-            if self
-                .highest_served_header_request_id
-                .is_some_and(|highest| request_id.get() <= highest.get())
-            {
-                return false;
-            }
-            if !self.served_header_request_ids.insert(request_id) {
-                return false;
-            }
-            self.highest_served_header_request_id = Some(request_id);
+        if self
+            .highest_served_header_request_id
+            .is_some_and(|highest| request_id.get() <= highest.get())
+        {
+            return false;
         }
+        if !self.served_header_request_ids.insert(request_id) {
+            return false;
+        }
+        self.highest_served_header_request_id = Some(request_id);
         self.served_headers_inflight = self.served_headers_inflight.saturating_add(1);
         true
     }
 
-    pub(super) fn finish_serving_headers(
-        &mut self,
-        request_id: Option<HeaderSyncRequestId>,
-    ) -> bool {
-        if let Some(request_id) = request_id {
-            if !self.served_header_request_ids.remove(&request_id) {
-                return false;
-            }
+    pub(super) fn finish_serving_headers(&mut self, request_id: HeaderSyncRequestId) -> bool {
+        if !self.served_header_request_ids.remove(&request_id) {
+            return false;
         }
         self.served_headers_inflight = self.served_headers_inflight.saturating_sub(1);
         true
@@ -501,7 +471,7 @@ impl HeaderSyncPeerMeters {
 
 #[derive(Copy, Clone, Debug)]
 pub(super) struct OutstandingRange {
-    pub(super) request_id: Option<HeaderSyncRequestId>,
+    pub(super) request_id: HeaderSyncRequestId,
     pub(super) range: RangeRequest,
     pub(super) deadline: Instant,
     pub(super) expected_max_count: u32,

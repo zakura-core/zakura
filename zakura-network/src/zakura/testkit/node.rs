@@ -339,7 +339,7 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
-    /// Enable the production header-sync v6 adapter on this test node and
+    /// Enable the production header-sync adapter on this test node and
     /// expose its action receiver for an external test driver.
     pub fn header_sync_driver(
         mut self,

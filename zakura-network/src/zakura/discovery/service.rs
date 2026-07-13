@@ -26,7 +26,6 @@ use crate::zakura::{
     OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServiceAdmissionDecision,
     ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-    ZAKURA_CAP_HEADER_SYNC_V7,
 };
 
 #[cfg(test)]
@@ -731,7 +730,7 @@ fn peer_has_other_service_owner(
 }
 
 fn has_other_negotiated_service(negotiated: u64) -> bool {
-    negotiated & !(ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V7) != 0
+    negotiated & !(ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC) != 0
 }
 
 /// Returns the iroh node id encoded by a discovery peer id, if it is a 32-byte
@@ -769,6 +768,7 @@ mod tests {
     use super::*;
     use crate::zakura::discovery::protocol::{
         DiscoveryServiceSummary, ZakuraLiveServiceSummary, ZakuraNodeRecordBody,
+        SUMMARY_TAG_HEADER_SYNC_RETIRED,
     };
     use crate::zakura::{
         framed_channel, spawn_block_sync_reactor, spawn_header_sync_reactor, BlockSyncFrontiers,
@@ -781,18 +781,13 @@ mod tests {
     use zakura_chain::{block, parameters::Network};
 
     #[test]
-    fn header_sync_v6_and_v7_capabilities_share_one_service_owner() {
+    fn discovery_and_header_sync_do_not_count_as_another_service_owner() {
+        assert!(!has_other_negotiated_service(ZAKURA_CAP_DISCOVERY));
         assert!(!has_other_negotiated_service(
             ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC
         ));
-        assert!(!has_other_negotiated_service(
-            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC_V7
-        ));
-        assert!(!has_other_negotiated_service(
-            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V7
-        ));
         assert!(has_other_negotiated_service(
-            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC_V7 | ZAKURA_CAP_BLOCK_SYNC
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_BLOCK_SYNC
         ));
     }
 
@@ -1066,15 +1061,17 @@ mod tests {
             })
             .await?;
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let request_id = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(HeaderSyncAction::SendMessage {
                     peer,
+                    request_id,
                     msg: HeaderSyncMessage::GetHeaders { .. },
                 }) = fixture.header_actions.recv().await
                 {
                     if peer == fixture.peer_id {
-                        return;
+                        return request_id
+                            .expect("an outbound GetHeaders always carries a request ID");
                     }
                 }
             }
@@ -1084,13 +1081,13 @@ mod tests {
 
         fixture
             .header_sync
-            .send(HeaderSyncEvent::WireMessage {
+            .send(HeaderSyncEvent::WireHeaders {
                 peer: fixture.peer_id.clone(),
-                msg: HeaderSyncMessage::Headers {
-                    headers: Vec::new(),
-                    body_sizes: Vec::new(),
-                    tree_aux_roots: Vec::new(),
-                },
+                session_id: 0,
+                request_id,
+                headers: Vec::new(),
+                body_sizes: Vec::new(),
+                tree_aux_roots: Vec::new(),
             })
             .await?;
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1404,6 +1401,54 @@ mod tests {
         assert!(
             advisory_backoff_after_empty_headers(&mut fixture).await?,
             "first-party header SERVICES should emit a header-sync advisory event"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_party_retired_header_services_emit_header_sync_advisory(
+    ) -> Result<(), crate::BoxError> {
+        let mut fixture = spawn_header_advisory_fixture(35)?;
+        let summary = header_summary(block::Height(10));
+        let mut legacy_envelope = ServiceSummaryEnvelope::header_sync(&summary)?;
+        legacy_envelope.service_id = ZakuraServiceId::header_sync_retired();
+        legacy_envelope.summary_tag = SUMMARY_TAG_HEADER_SYNC_RETIRED;
+
+        send_discovery_message(
+            &fixture,
+            DiscoveryMessage::Services(Services {
+                node_id: fixture.peer_node_id,
+                expires_at_unix_secs: u64::MAX,
+                summaries: vec![legacy_envelope],
+            }),
+        )
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(cached) = fixture
+                    .discovery_handle
+                    .live_service_summaries(fixture.peer_node_id)
+                    .await
+                {
+                    if cached.iter().any(|cached_summary| {
+                        cached_summary.service_id == ZakuraServiceId::header_sync_retired()
+                            && cached_summary.summary
+                                == ZakuraLiveServiceSummary::HeaderSync(summary)
+                    }) {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retired first-party header summary is cached");
+
+        assert!(
+            advisory_backoff_after_empty_headers(&mut fixture).await?,
+            "retired first-party header SERVICES should emit a header-sync advisory event"
         );
 
         Ok(())

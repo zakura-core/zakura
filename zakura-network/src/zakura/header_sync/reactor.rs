@@ -69,7 +69,7 @@ pub(super) struct HeaderSyncReactor {
 
 #[derive(Clone, Copy, Debug)]
 struct GetHeadersTraceMeta {
-    request_id: Option<HeaderSyncRequestId>,
+    request_id: HeaderSyncRequestId,
     session_id: u64,
     stream_version: u16,
 }
@@ -568,7 +568,6 @@ impl HeaderSyncReactor {
                 peer_state.last_received_status_at = None;
                 peer_state.reset_sent_status();
                 peer_state.outstanding.clear();
-                peer_state.late_covered_responses = 0;
                 peer_state.served_headers_inflight = 0;
                 peer_state.served_header_request_ids.clear();
                 peer_state.highest_served_header_request_id = None;
@@ -928,7 +927,7 @@ impl HeaderSyncReactor {
     fn handle_header_range_response_finished(
         &mut self,
         peer: ZakuraPeerId,
-        request_id: Option<HeaderSyncRequestId>,
+        request_id: HeaderSyncRequestId,
         start_height: block::Height,
         requested_count: u32,
         returned_count: u32,
@@ -950,7 +949,7 @@ impl HeaderSyncReactor {
     fn handle_header_range_response_ready(
         &mut self,
         peer: ZakuraPeerId,
-        request_id: Option<HeaderSyncRequestId>,
+        request_id: HeaderSyncRequestId,
         start_height: block::Height,
         requested_count: u32,
         want_tree_aux_roots: bool,
@@ -1062,48 +1061,23 @@ impl HeaderSyncReactor {
                 self.publish_connectivity_metrics();
                 self.schedule().await;
             }
-            HeaderSyncMessage::Headers {
-                headers,
-                body_sizes,
-                tree_aux_roots,
-            } => {
-                self.handle_headers(peer, None, headers, body_sizes, tree_aux_roots)
-                    .await;
-            }
-            HeaderSyncMessage::GetHeaders {
-                start_height,
-                count,
-                want_tree_aux_roots,
-            } => {
-                self.handle_get_headers(peer, None, start_height, count, want_tree_aux_roots)
-                    .await;
-            }
             HeaderSyncMessage::NewBlock(block) => {
                 self.handle_new_block(peer, block).await;
             }
+            // `GetHeaders`/`Headers` carry a request ID and are decoded into the
+            // correlated `WireGetHeaders`/`WireHeaders` events, so they never reach
+            // this uncorrelated path.
+            HeaderSyncMessage::GetHeaders { .. } | HeaderSyncMessage::Headers { .. } => {
+                self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage)
+                    .await;
+            }
         }
-    }
-
-    fn restore_outstanding_after_late_covered_response(
-        &mut self,
-        peer: &ZakuraPeerId,
-        outstanding: OutstandingRange,
-    ) -> bool {
-        let Some(peer_state) = self.state.peers.get_mut(peer) else {
-            return false;
-        };
-        if !peer_state.take_late_covered_response() {
-            return false;
-        }
-        peer_state.restore_oldest_outstanding(outstanding);
-        metrics::counter!("sync.header.response.late_covered_dropped").increment(1);
-        true
     }
 
     async fn handle_get_headers(
         &mut self,
         peer: ZakuraPeerId,
-        request_id: Option<HeaderSyncRequestId>,
+        request_id: HeaderSyncRequestId,
         start_height: block::Height,
         count: u32,
         want_tree_aux_roots: bool,
@@ -1251,7 +1225,7 @@ impl HeaderSyncReactor {
     async fn handle_headers(
         &mut self,
         peer: ZakuraPeerId,
-        request_id: Option<HeaderSyncRequestId>,
+        request_id: HeaderSyncRequestId,
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
         tree_aux_roots: Vec<BlockCommitmentRoots>,
@@ -1262,19 +1236,11 @@ impl HeaderSyncReactor {
                 .await;
             return;
         };
-        let Some(outstanding) = (match request_id {
-            Some(request_id) => peer_state.remove_outstanding_by_request_id(request_id),
-            None => peer_state.pop_oldest_outstanding(),
-        }) else {
-            if request_id.is_none() {
-                if peer_state.take_late_covered_response() {
-                    return;
-                }
-                self.report_misbehavior(peer, HeaderSyncMisbehavior::UnsolicitedHeaders)
-                    .await;
-            } else {
-                metrics::counter!("sync.header.response.unknown_request_id").increment(1);
-            }
+        let Some(outstanding) = peer_state.remove_outstanding_by_request_id(request_id) else {
+            // The pipe already dropped responses to retired IDs and fails closed on IDs
+            // this session never issued, so an ID with no outstanding range here is one
+            // the reactor retired after the pipe correlated it. Drop it without scoring.
+            metrics::counter!("sync.header.response.unknown_request_id").increment(1);
             return;
         };
         let peer_max_headers_per_response = peer_state.max_headers_per_response;
@@ -1396,6 +1362,7 @@ impl HeaderSyncReactor {
             start_height: outstanding.range.start_height,
             decode_context: HeaderSyncDecodeContext::for_headers_response(
                 ExpectedHeadersResponse::new(
+                    outstanding.request_id,
                     outstanding.range.start_height,
                     outstanding.expected_max_count,
                     outstanding.range.want_tree_aux_roots,
@@ -1420,12 +1387,6 @@ impl HeaderSyncReactor {
                 "link",
                 header_sync_wire_error_kind(&error),
             );
-            if matches!(outstanding.purpose, RangePurpose::Sync)
-                && matches!(error, HeaderSyncWireError::FirstHeaderDoesNotLink)
-                && self.restore_outstanding_after_late_covered_response(&peer, outstanding)
-            {
-                return;
-            }
             if self
                 .handle_possible_stale_anchor_link_failure(&peer, outstanding.range, &error)
                 .await
@@ -1657,7 +1618,6 @@ impl HeaderSyncReactor {
     async fn handle_timeouts(&mut self) {
         let now = Instant::now();
         let mut timed_out = Vec::new();
-        let mut peers_with_sync_timeouts = Vec::new();
         let mut retired_request_ids = Vec::new();
         for peer in self.state.peers.values_mut() {
             let mut index = 0;
@@ -1665,13 +1625,7 @@ impl HeaderSyncReactor {
                 if peer.outstanding[index].deadline <= now {
                     let outstanding = peer.outstanding.remove(index);
                     let peer_id = peer.session.peer_id().clone();
-                    if outstanding.request_id.is_none() && !outstanding.clear_assignment_on_timeout
-                    {
-                        peers_with_sync_timeouts.push(peer_id.clone());
-                    }
-                    if let Some(request_id) = outstanding.request_id {
-                        retired_request_ids.push((peer_id.clone(), request_id));
-                    }
+                    retired_request_ids.push((peer_id.clone(), outstanding.request_id));
                     timed_out.push((outstanding, peer_id));
                 } else {
                     index += 1;
@@ -1692,18 +1646,13 @@ impl HeaderSyncReactor {
                 }
             }
         }
+        // Retiring the ID is enough: a response that arrives after its deadline is
+        // matched to the retired request and dropped, so it can never be mistaken for
+        // a newer one. The stream stays up.
         for (peer, request_id) in retired_request_ids {
             if let Some(peer) = self.state.peers.get(&peer) {
                 let _ = peer.session.retire_expected_headers(request_id);
             }
-        }
-        for peer in peers_with_sync_timeouts {
-            if let Some(peer) = self.state.peers.get(&peer) {
-                metrics::counter!("sync.header.peer.session_cancelled", "reason" => "timeout")
-                    .increment(1);
-                peer.session.cancel_token().cancel();
-            }
-            self.handle_peer_disconnected(peer);
         }
         self.schedule().await;
     }
@@ -1724,11 +1673,15 @@ impl HeaderSyncReactor {
             return;
         }
 
+        // Sorted once, not per pass: scheduling only fills a peer's in-flight slots,
+        // it never adds or removes peers, so the set is fixed for this call. A peer
+        // that disconnects concurrently is skipped by `schedule_one_for_peer`.
+        let mut peer_ids: Vec<ZakuraPeerId> = self.state.peers.keys().cloned().collect();
+        peer_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
         loop {
-            let mut peer_ids: Vec<ZakuraPeerId> = self.state.peers.keys().cloned().collect();
-            peer_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
             let mut scheduled_any = false;
-            for peer_id in peer_ids {
+            for peer_id in &peer_ids {
                 scheduled_any |= self.schedule_one_for_peer(peer_id).await;
             }
             if !scheduled_any {
@@ -1737,15 +1690,15 @@ impl HeaderSyncReactor {
         }
     }
 
-    async fn schedule_one_for_peer(&mut self, peer_id: ZakuraPeerId) -> bool {
-        let Some(peer) = self.state.peers.get(&peer_id) else {
+    async fn schedule_one_for_peer(&mut self, peer_id: &ZakuraPeerId) -> bool {
+        let Some(peer) = self.state.peers.get(peer_id) else {
             return false;
         };
         if !peer.received_status || peer.available_slots() == 0 {
             return false;
         }
 
-        let Some(mut range) = self.state.schedule.next_for_peer(&peer_id, peer) else {
+        let Some(mut range) = self.state.schedule.next_for_peer(peer_id, peer) else {
             return false;
         };
         let original_range = range;
@@ -1766,11 +1719,11 @@ impl HeaderSyncReactor {
             .narrow_queued_range(original_range, range);
 
         let peer_cap = peer.max_headers_per_response;
-        let Some(peer) = self.state.peers.get(&peer_id) else {
+        let Some(peer) = self.state.peers.get(peer_id) else {
             return false;
         };
         let session_id = peer.session.session_id();
-        let stream_version = peer.session.stream_version();
+        let stream_version = ZAKURA_HEADER_SYNC_STREAM_VERSION;
         let request_id = match peer.session.try_send_get_headers(
             range.start_height,
             count,
@@ -1786,7 +1739,7 @@ impl HeaderSyncReactor {
                     "failed to queue Zakura header-sync GetHeaders"
                 );
                 self.trace_queue_send_failed(
-                    &peer_id,
+                    peer_id,
                     "get_headers",
                     &error,
                     peer.session.outbound_capacity(),
@@ -1809,13 +1762,13 @@ impl HeaderSyncReactor {
             clear_assignment_on_timeout: false,
             purpose: RangePurpose::Sync,
         };
-        if let Some(peer) = self.state.peers.get_mut(&peer_id) {
+        if let Some(peer) = self.state.peers.get_mut(peer_id) {
             peer.outstanding.push(outstanding);
         }
         self.state.schedule.mark_assigned(peer_id.clone(), range);
         metrics::counter!("sync.header.request.sent").increment(1);
         self.trace_get_headers_sent(
-            &peer_id,
+            peer_id,
             range,
             count,
             peer_cap,
@@ -1829,7 +1782,8 @@ impl HeaderSyncReactor {
         let _ = self
             .actions
             .send(HeaderSyncAction::SendMessage {
-                peer: peer_id,
+                peer: peer_id.clone(),
+                request_id: Some(request_id),
                 msg: HeaderSyncMessage::GetHeaders {
                     start_height: range.start_height,
                     count,
@@ -1875,7 +1829,6 @@ impl HeaderSyncReactor {
                         .is_some_and(|advisory| advisory.is_backed_off(now))
                     && peer.received_status
                     && peer.outstanding.is_empty()
-                    && peer.late_covered_responses == 0
                     && peer.advertised_tip >= repair.range.end_height()
                     && peer.max_headers_per_response >= repair.range.count
                     && !repair.tried_peers.contains(*peer_id)
@@ -1893,7 +1846,7 @@ impl HeaderSyncReactor {
         let range = repair.range;
         let peer_cap = peer.max_headers_per_response;
         let session_id = peer.session.session_id();
-        let stream_version = peer.session.stream_version();
+        let stream_version = ZAKURA_HEADER_SYNC_STREAM_VERSION;
         let request_id =
             match peer
                 .session
@@ -1950,6 +1903,7 @@ impl HeaderSyncReactor {
             .actions
             .send(HeaderSyncAction::SendMessage {
                 peer: peer_id,
+                request_id: Some(request_id),
                 msg: HeaderSyncMessage::GetHeaders {
                     start_height: range.start_height,
                     count: range.count,
@@ -2004,6 +1958,7 @@ impl HeaderSyncReactor {
                 #[cfg(test)]
                 let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
                     peer: peer.clone(),
+                    request_id: None,
                     msg: HeaderSyncMessage::Status(status),
                 });
                 true
@@ -2393,7 +2348,7 @@ impl HeaderSyncReactor {
     fn trace_action_dispatched(&self, action: &HeaderSyncAction) {
         self.emit_trace(hs_trace::HEADER_ACTION_DISPATCHED, |row| match action {
             #[cfg(test)]
-            HeaderSyncAction::SendMessage { peer, msg } => {
+            HeaderSyncAction::SendMessage { peer, msg, .. } => {
                 insert_optional_str(row, hs_trace::KIND, Some("send_message"));
                 insert_optional_str(row, hs_trace::REASON, Some(header_sync_message_label(msg)));
                 insert_peer(row, hs_trace::PEER, peer);
@@ -2564,9 +2519,7 @@ impl HeaderSyncReactor {
                 hs_trace::STREAM_VERSION,
                 u64::from(meta.stream_version),
             );
-            if let Some(request_id) = meta.request_id {
-                insert_u64(row, hs_trace::REQUEST_ID, request_id.get());
-            }
+            insert_u64(row, hs_trace::REQUEST_ID, meta.request_id.get());
             insert_height(row, hs_trace::RANGE_START, range.start_height);
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(count));
             insert_u64(row, hs_trace::ADVERTISED_CAP, u64::from(advertised_cap));
@@ -2828,10 +2781,13 @@ impl HeaderSyncReactor {
         }
     }
 
+    /// Retire outstanding sync ranges the schedule has since covered elsewhere.
+    ///
+    /// Retiring the request ID is sufficient: a response that arrives after its range
+    /// was covered is matched to the retired ID and dropped, so it cannot be mistaken
+    /// for a newer request or trigger a spurious link failure. The stream stays up.
     fn cancel_covered_outstanding(&mut self) {
-        let mut peers_to_disconnect = Vec::new();
         for peer in self.state.peers.values_mut() {
-            let mut cancelled = false;
             let mut index = 0;
             while index < peer.outstanding.len() {
                 if self
@@ -2841,55 +2797,27 @@ impl HeaderSyncReactor {
                     && matches!(peer.outstanding[index].purpose, RangePurpose::Sync)
                 {
                     let outstanding = peer.outstanding.remove(index);
-                    if let Some(request_id) = outstanding.request_id {
-                        let _ = peer.session.retire_expected_headers(request_id);
-                    } else {
-                        peer.late_covered_responses = peer.late_covered_responses.saturating_add(1);
-                        cancelled = true;
-                    }
+                    let _ = peer.session.retire_expected_headers(outstanding.request_id);
                 } else {
                     index += 1;
                 }
             }
-            if cancelled {
-                metrics::counter!("sync.header.peer.session_cancelled", "reason" => "covered")
-                    .increment(1);
-                peer.session.cancel_token().cancel();
-                peers_to_disconnect.push(peer.session.peer_id().clone());
-            }
-        }
-        for peer in peers_to_disconnect {
-            self.handle_peer_disconnected(peer);
         }
     }
 
+    /// Retire outstanding forward ranges dropped by a re-anchor, as in
+    /// [`Self::cancel_covered_outstanding`].
     fn cancel_forward_outstanding(&mut self) {
-        let mut peers_to_disconnect = Vec::new();
         for peer in self.state.peers.values_mut() {
-            let mut cancelled = false;
             let mut index = 0;
             while index < peer.outstanding.len() {
                 if peer.outstanding[index].range.priority == RangePriority::Forward {
                     let outstanding = peer.outstanding.remove(index);
-                    if let Some(request_id) = outstanding.request_id {
-                        let _ = peer.session.retire_expected_headers(request_id);
-                    } else {
-                        peer.late_covered_responses = peer.late_covered_responses.saturating_add(1);
-                        cancelled = true;
-                    }
+                    let _ = peer.session.retire_expected_headers(outstanding.request_id);
                 } else {
                     index += 1;
                 }
             }
-            if cancelled {
-                metrics::counter!("sync.header.peer.session_cancelled", "reason" => "forward_reset")
-                    .increment(1);
-                peer.session.cancel_token().cancel();
-                peers_to_disconnect.push(peer.session.peer_id().clone());
-            }
-        }
-        for peer in peers_to_disconnect {
-            self.handle_peer_disconnected(peer);
         }
     }
 }

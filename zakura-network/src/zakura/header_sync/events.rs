@@ -228,8 +228,8 @@ pub enum HeaderSyncEvent {
         peer: ZakuraPeerId,
         /// Ordered-stream generation that delivered the response.
         session_id: u64,
-        /// Request ID echoed by the peer, present on header-sync v7.
-        request_id: Option<HeaderSyncRequestId>,
+        /// Request ID echoed by the peer.
+        request_id: HeaderSyncRequestId,
         /// Headers in ascending height order.
         headers: Vec<Arc<block::Header>>,
         /// Advisory serialized body sizes, parallel to `headers`.
@@ -243,8 +243,8 @@ pub enum HeaderSyncEvent {
         peer: ZakuraPeerId,
         /// Ordered-stream generation that delivered the request.
         session_id: u64,
-        /// Request ID supplied by the peer, present on header-sync v7.
-        request_id: Option<HeaderSyncRequestId>,
+        /// Request ID supplied by the peer.
+        request_id: HeaderSyncRequestId,
         /// First requested height.
         start_height: block::Height,
         /// Requested header count.
@@ -314,8 +314,8 @@ pub enum HeaderSyncEvent {
         peer: ZakuraPeerId,
         /// Ordered-stream generation that requested the range.
         session_id: u64,
-        /// Request ID supplied by the peer, present on header-sync v7.
-        request_id: Option<HeaderSyncRequestId>,
+        /// Request ID supplied by the peer.
+        request_id: HeaderSyncRequestId,
         /// First requested height.
         start_height: block::Height,
         /// Requested header count.
@@ -329,8 +329,8 @@ pub enum HeaderSyncEvent {
         peer: ZakuraPeerId,
         /// Ordered-stream generation that requested the range.
         session_id: u64,
-        /// Request ID supplied by the peer, present on header-sync v7.
-        request_id: Option<HeaderSyncRequestId>,
+        /// Request ID supplied by the peer.
+        request_id: HeaderSyncRequestId,
         /// First requested height.
         start_height: block::Height,
         /// Requested header count.
@@ -383,6 +383,8 @@ pub enum HeaderSyncAction {
     SendMessage {
         /// Destination peer.
         peer: ZakuraPeerId,
+        /// Request ID the session allocated, for correlated messages.
+        request_id: Option<HeaderSyncRequestId>,
         /// Message that was queued.
         msg: HeaderSyncMessage,
     },
@@ -413,8 +415,8 @@ pub enum HeaderSyncAction {
         peer: ZakuraPeerId,
         /// Ordered-stream generation that requested the range.
         session_id: u64,
-        /// Request ID supplied by the peer, present on header-sync v7.
-        request_id: Option<HeaderSyncRequestId>,
+        /// Request ID supplied by the peer.
+        request_id: HeaderSyncRequestId,
         /// First height.
         start: block::Height,
         /// Maximum count.
@@ -541,8 +543,8 @@ impl HeaderSyncRequestId {
 /// A single outbound `GetHeaders` range expected by a peer session.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ExpectedHeadersResponse {
-    /// Request ID for ID-capable header-sync streams.
-    pub request_id: Option<HeaderSyncRequestId>,
+    /// Request ID correlating the response with the request that solicited it.
+    pub request_id: HeaderSyncRequestId,
     /// First requested height.
     pub start_height: block::Height,
     /// Requested header count.
@@ -554,22 +556,17 @@ pub struct ExpectedHeadersResponse {
 impl ExpectedHeadersResponse {
     /// Create a bounded expected response.
     pub fn new(
+        request_id: HeaderSyncRequestId,
         start_height: block::Height,
         count: u32,
         want_tree_aux_roots: bool,
     ) -> Result<Self, HeaderSyncWireError> {
         validate_get_headers_count(count)?;
         Ok(Self {
-            request_id: None,
+            request_id,
             start_height,
             count,
             want_tree_aux_roots,
         })
-    }
-
-    /// Attach a request ID to this expected response.
-    pub fn with_request_id(mut self, request_id: HeaderSyncRequestId) -> Self {
-        self.request_id = Some(request_id);
-        self
     }
 }

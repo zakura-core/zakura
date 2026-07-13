@@ -26,17 +26,6 @@ pub enum RegistryError {
         second_service: &'static str,
     },
 
-    /// A service declared the same stream tuple more than once.
-    #[error("duplicate Zakura stream kind {kind} version {version} declared by {service}")]
-    DuplicateStream {
-        /// Duplicated stream kind.
-        kind: u16,
-        /// Duplicated stream version.
-        version: u16,
-        /// Service that declared the duplicate tuple.
-        service: &'static str,
-    },
-
     /// A service declared a stream whose capability is not exactly one bit.
     ///
     /// Each [`Stream`] maps to a single capability bit so
@@ -70,7 +59,7 @@ pub struct ServiceRegistry {
 impl ServiceRegistry {
     /// Build a registry from protocol services.
     pub fn new(services: Vec<Arc<dyn Service>>) -> Result<Self, RegistryError> {
-        let mut by_kind: HashMap<u16, usize> = HashMap::new();
+        let mut by_kind = HashMap::new();
         let mut by_capability: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut supported_capabilities = 0;
 
@@ -89,34 +78,12 @@ impl ServiceRegistry {
                     });
                 }
 
-                match by_kind.get(&stream.kind).copied() {
-                    Some(first_index) if first_index != index => {
-                        return Err(RegistryError::DuplicateKind {
-                            kind: stream.kind,
-                            first_service: services[first_index].name(),
-                            second_service: service.name(),
-                        });
-                    }
-                    Some(_) => {
-                        if service
-                            .streams()
-                            .iter()
-                            .filter(|candidate| {
-                                candidate.kind == stream.kind && candidate.version == stream.version
-                            })
-                            .count()
-                            > 1
-                        {
-                            return Err(RegistryError::DuplicateStream {
-                                kind: stream.kind,
-                                version: stream.version,
-                                service: service.name(),
-                            });
-                        }
-                    }
-                    None => {
-                        by_kind.insert(stream.kind, index);
-                    }
+                if let Some(first_index) = by_kind.insert(stream.kind, index) {
+                    return Err(RegistryError::DuplicateKind {
+                        kind: stream.kind,
+                        first_service: services[first_index].name(),
+                        second_service: service.name(),
+                    });
                 }
 
                 supported_capabilities |= stream.capability;
@@ -210,7 +177,15 @@ impl ServiceRegistry {
 
     /// Ordered streams negotiated with a peer, in registry service order.
     pub fn ordered_streams_for_negotiated(&self, negotiated: u64) -> Vec<Stream> {
-        self.selected_streams_for_negotiated(negotiated, StreamMode::Ordered)
+        let mut streams = Vec::new();
+
+        for service in self.services_for_negotiated(negotiated) {
+            streams.extend(service.streams().iter().copied().filter(|stream| {
+                stream.mode == StreamMode::Ordered && negotiated & stream.capability != 0
+            }));
+        }
+
+        streams
     }
 
     /// Ordered streams that should be lazily escalated for this peer now.
@@ -225,17 +200,19 @@ impl ServiceRegistry {
         peer_id: &ZakuraPeerId,
         direction: ServicePeerDirection,
     ) -> Vec<Stream> {
-        let mut selected = self.selected_streams_for_negotiated(negotiated, StreamMode::Ordered);
-        selected.retain(|stream| {
-            let Some(service) = self.service_for_kind(stream.kind) else {
-                return false;
-            };
+        let mut streams = Vec::new();
+
+        for service in self.services_for_negotiated(negotiated) {
             if !service.wants_peer(peer_id, negotiated, direction) {
-                return false;
+                continue;
             }
-            true
-        });
-        selected
+
+            streams.extend(service.streams().iter().copied().filter(|stream| {
+                stream.mode == StreamMode::Ordered && negotiated & stream.capability != 0
+            }));
+        }
+
+        streams
     }
 
     /// Return true when the service owning `kind` still wants this peer.
@@ -255,30 +232,14 @@ impl ServiceRegistry {
 
     /// Request/response streams negotiated with a peer, in registry service order.
     pub fn request_response_streams_for_negotiated(&self, negotiated: u64) -> Vec<Stream> {
-        self.selected_streams_for_negotiated(negotiated, StreamMode::RequestResponse)
-    }
-
-    fn selected_streams_for_negotiated(&self, negotiated: u64, mode: StreamMode) -> Vec<Stream> {
         let mut streams = Vec::new();
+
         for service in self.services_for_negotiated(negotiated) {
-            let mut selected_by_kind: HashMap<u16, Stream> = HashMap::new();
-            for stream in service.streams().iter().copied() {
-                if stream.mode != mode || negotiated & stream.capability != stream.capability {
-                    continue;
-                }
-                selected_by_kind
-                    .entry(stream.kind)
-                    .and_modify(|selected| {
-                        if stream.version > selected.version {
-                            *selected = stream;
-                        }
-                    })
-                    .or_insert(stream);
-            }
-            let mut selected: Vec<_> = selected_by_kind.into_values().collect();
-            selected.sort_by_key(|stream| stream.kind);
-            streams.extend(selected);
+            streams.extend(service.streams().iter().copied().filter(|stream| {
+                stream.mode == StreamMode::RequestResponse && negotiated & stream.capability != 0
+            }));
         }
+
         streams
     }
 
@@ -343,29 +304,13 @@ impl ServiceRegistry {
         ) = peer.into_parts();
 
         for service in self.services_for_negotiated(negotiated) {
-            let service_kinds: Vec<_> = streams
+            let service_streams: HashMap<_, _> = service
+                .streams()
                 .iter()
-                .filter_map(|(kind, handles)| {
-                    self.declaration_for_service_stream(
-                        service.as_ref(),
-                        handles,
-                        *kind,
-                        negotiated,
-                    )
-                    .map(|_| *kind)
-                })
-                .collect();
-            let service_streams: HashMap<_, _> = service_kinds
-                .into_iter()
-                .filter_map(|kind| {
-                    let mut handles = streams.remove(&kind)?;
-                    handles.stream = self.declaration_for_service_stream(
-                        service.as_ref(),
-                        &handles,
-                        kind,
-                        negotiated,
-                    )?;
-                    Some((kind, handles))
+                .filter_map(|stream| {
+                    streams
+                        .remove(&stream.kind)
+                        .map(|handles| (stream.kind, handles))
                 })
                 .collect();
             let service_cancel_token = service_streams
@@ -406,32 +351,14 @@ impl ServiceRegistry {
         let mut admitted_capabilities = 0;
 
         for service in self.services_for_negotiated(negotiated) {
-            let service_kinds: Vec<_> = streams
+            let service_streams: HashMap<_, _> = service
+                .streams()
                 .iter()
-                .filter_map(|(kind, handles)| {
-                    self.declaration_for_service_stream(
-                        service.as_ref(),
-                        handles,
-                        *kind,
-                        negotiated,
-                    )
-                    .map(|stream| {
+                .filter_map(|stream| {
+                    streams.remove(&stream.kind).map(|handles| {
                         admitted_capabilities |= stream.capability;
-                        *kind
+                        (stream.kind, handles)
                     })
-                })
-                .collect();
-            let service_streams: HashMap<_, _> = service_kinds
-                .into_iter()
-                .filter_map(|kind| {
-                    let mut handles = streams.remove(&kind)?;
-                    handles.stream = self.declaration_for_service_stream(
-                        service.as_ref(),
-                        &handles,
-                        kind,
-                        negotiated,
-                    )?;
-                    Some((kind, handles))
                 })
                 .collect();
 
@@ -459,33 +386,6 @@ impl ServiceRegistry {
         }
 
         admitted_capabilities
-    }
-
-    fn declaration_for_service_stream(
-        &self,
-        service: &dyn Service,
-        handles: &super::ServiceStream,
-        kind: u16,
-        negotiated: u64,
-    ) -> Option<Stream> {
-        if handles.stream.capability != 0 {
-            return service
-                .streams()
-                .iter()
-                .copied()
-                .find(|stream| stream.kind == kind && stream.version == handles.stream.version);
-        }
-
-        service
-            .streams()
-            .iter()
-            .copied()
-            .filter(|stream| {
-                stream.kind == kind
-                    && negotiated & stream.capability == stream.capability
-                    && stream.mode == StreamMode::Ordered
-            })
-            .max_by_key(|stream| stream.version)
     }
 
     /// Fan a disconnected peer out to every service enabled by `negotiated`.
@@ -601,13 +501,9 @@ mod tests {
     }
 
     fn stream(kind: u16, capability: u64) -> Stream {
-        stream_version(kind, 1, capability)
-    }
-
-    fn stream_version(kind: u16, version: u16, capability: u64) -> Stream {
         Stream {
             kind,
-            version,
+            version: 1,
             frame_cap: 1024,
             capability,
             mode: StreamMode::Ordered,
@@ -659,28 +555,6 @@ mod tests {
                 second_service: "second"
             }
         ));
-    }
-
-    #[test]
-    fn registry_allows_one_service_to_own_multiple_versions_of_one_kind() {
-        let header = TestService::new(
-            "header",
-            vec![stream_version(5, 6, 0b0001), stream_version(5, 7, 0b0010)],
-        );
-
-        let registry =
-            ServiceRegistry::new(vec![header]).expect("one service can own two versions");
-
-        assert_eq!(registry.capability_for_stream(5, 6), Some(0b0001));
-        assert_eq!(registry.capability_for_stream(5, 7), Some(0b0010));
-        assert_eq!(
-            registry.ordered_streams_for_negotiated(0b0011),
-            vec![stream_version(5, 7, 0b0010)]
-        );
-        assert_eq!(
-            registry.ordered_streams_for_negotiated(0b0001),
-            vec![stream_version(5, 6, 0b0001)]
-        );
     }
 
     #[test]
@@ -741,6 +615,46 @@ mod tests {
         let service_names: Vec<_> = services.iter().map(|service| service.name()).collect();
 
         assert_eq!(service_names, ["header", "discovery"]);
+    }
+
+    #[test]
+    fn stream_selection_filters_each_stream_by_negotiated_capability() {
+        let mut request_response_one = stream(7, 0b0001);
+        request_response_one.mode = StreamMode::RequestResponse;
+        let mut request_response_two = stream(8, 0b0010);
+        request_response_two.mode = StreamMode::RequestResponse;
+        let service = TestService::new(
+            "multi-capability",
+            vec![
+                stream(5, 0b0001),
+                stream(6, 0b0010),
+                request_response_one,
+                request_response_two,
+            ],
+        );
+        let registry =
+            ServiceRegistry::new(vec![service]).expect("stream kinds and capabilities are valid");
+        let peer = ZakuraPeerId::new(vec![8; 32]).expect("32-byte test peer id is valid");
+
+        let ordered_kinds: Vec<_> = registry
+            .ordered_streams_for_negotiated(0b0001)
+            .iter()
+            .map(|stream| stream.kind)
+            .collect();
+        let escalated_kinds: Vec<_> = registry
+            .ordered_streams_for_escalation(0b0001, &peer, ServicePeerDirection::Outbound)
+            .iter()
+            .map(|stream| stream.kind)
+            .collect();
+        let request_response_kinds: Vec<_> = registry
+            .request_response_streams_for_negotiated(0b0001)
+            .iter()
+            .map(|stream| stream.kind)
+            .collect();
+
+        assert_eq!(ordered_kinds, [5]);
+        assert_eq!(escalated_kinds, [5]);
+        assert_eq!(request_response_kinds, [7]);
     }
 
     #[test]

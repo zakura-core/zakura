@@ -112,22 +112,14 @@ pub struct HeaderSyncDecodeContext {
     pub requested: Option<ExpectedHeadersResponse>,
     /// Peer's advertised response cap.
     pub peer_max_headers_per_response: u32,
-    /// Header-sync stream version used by this peer session.
-    pub stream_version: u16,
 }
 
 impl HeaderSyncDecodeContext {
     /// Context for messages that are not `Headers` responses.
     pub fn control() -> Self {
-        Self::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION)
-    }
-
-    /// Context for messages that are not `Headers` responses, using `stream_version`.
-    pub fn control_for_version(stream_version: u16) -> Self {
         Self {
             requested: None,
             peer_max_headers_per_response: DEFAULT_HS_RANGE,
-            stream_version,
         }
     }
 
@@ -139,11 +131,6 @@ impl HeaderSyncDecodeContext {
         Self {
             requested: Some(requested),
             peer_max_headers_per_response: clamp_advertised_range(peer_max_headers_per_response),
-            stream_version: if requested.request_id.is_some() {
-                ZAKURA_HEADER_SYNC_STREAM_VERSION_V7
-            } else {
-                ZAKURA_HEADER_SYNC_STREAM_VERSION
-            },
         }
     }
 

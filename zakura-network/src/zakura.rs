@@ -57,14 +57,15 @@ pub const IROH_VERSION: &str = "0.92.0";
 /// Capability bit for the legacy gossip compatibility service.
 pub const ZAKURA_CAP_LEGACY_GOSSIP: u64 = 1 << 0;
 
-/// Capability bit for the native header-sync service.
-pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 1;
-
 /// Capability bit for the native discovery service.
 pub const ZAKURA_CAP_DISCOVERY: u64 = 1 << 2;
 
-/// Capability bit for the request-id capable native header-sync service.
-pub const ZAKURA_CAP_HEADER_SYNC_V7: u64 = 1 << 4;
+/// Capability bit for the native header-sync service.
+pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 4;
+
+// Bit `1 << 1` is retired: it advertised the pre-request-id header-sync stream, which
+// correlated responses by arrival order and is no longer spoken. Do not lease it to a new
+// service. (`1 << 3` is block sync, declared in `block_sync::wire`.)
 
 /// Production default for per-service peer caps.
 pub const DEFAULT_SERVICE_MAX_PEERS: usize = 256;

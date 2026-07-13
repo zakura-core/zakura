@@ -43,7 +43,6 @@ pub struct Stream {
 /// Transport state for one ordered service stream.
 #[derive(Debug)]
 pub(crate) struct ServiceStream {
-    pub(crate) stream: Stream,
     pub(crate) session_id: u64,
     pub(crate) recv: FramedRecv,
     pub(crate) send: FramedSend,
@@ -52,14 +51,12 @@ pub(crate) struct ServiceStream {
 
 impl ServiceStream {
     pub(crate) fn new(
-        stream: Stream,
         session_id: u64,
         recv: FramedRecv,
         send: FramedSend,
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
-            stream,
             session_id,
             recv,
             send,
@@ -163,16 +160,9 @@ impl Peer {
         let streams = streams
             .into_iter()
             .map(|(kind, (recv, send))| {
-                let stream = Stream {
-                    kind,
-                    version: 1,
-                    frame_cap: 0,
-                    capability: 0,
-                    mode: StreamMode::Ordered,
-                };
                 (
                     kind,
-                    ServiceStream::new(stream, 0, recv, send, cancel_token.child_token()),
+                    ServiceStream::new(0, recv, send, cancel_token.child_token()),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -249,14 +239,14 @@ impl Peer {
             .map(|stream| (stream.recv, stream.send))
     }
 
-    /// Take ownership of a stream pair and its negotiated declaration for `kind`.
-    pub fn take_stream_with_declaration(
+    /// Take ownership of a stream pair and its owning ordered-stream generation.
+    pub fn take_stream_with_session_id(
         &mut self,
         kind: u16,
-    ) -> Option<(Stream, u64, FramedRecv, FramedSend)> {
+    ) -> Option<(u64, FramedRecv, FramedSend)> {
         self.streams
             .remove(&kind)
-            .map(|stream| (stream.stream, stream.session_id, stream.recv, stream.send))
+            .map(|stream| (stream.session_id, stream.recv, stream.send))
     }
 
     /// Return the cancellation token for this peer's service tasks.

@@ -132,8 +132,7 @@ pub fn header_sync_header_bytes_for_network(network: &Network) -> usize {
 
 /// Maximum `Headers` count that fits the header-sync payload and app frame caps.
 ///
-/// The fixed overhead reserves the v7 request ID. V6 therefore uses the same
-/// conservative count, avoiding version-dependent advertised range limits.
+/// The fixed overhead includes the per-message request ID.
 pub fn header_sync_count_by_byte_budget(
     network: &Network,
     max_frame_bytes: u32,

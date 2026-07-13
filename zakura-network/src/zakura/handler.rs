@@ -213,7 +213,7 @@ const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
 const _: () = assert!(DISCOVERY_STREAM_KIND == super::discovery::ZAKURA_STREAM_DISCOVERY);
 const _: () = assert!(HEADER_SYNC_STREAM_KIND == super::header_sync::ZAKURA_STREAM_HEADER_SYNC);
-const _: () = assert!(ZAKURA_STREAM_VERSION_6 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
+const _: () = assert!(ZAKURA_STREAM_VERSION_7 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
 const _: () =
     assert!(LEGACY_REQUEST_BLOCKS_BY_HASH == super::legacy_gossip::MSG_REQUEST_BLOCKS_BY_HASH);
 const _: () = assert!(
@@ -1453,7 +1453,6 @@ impl StreamWorkerContext {
 
 struct AdmittedOrderedStream {
     kind: u16,
-    stream: Stream,
     session_id: u64,
     recv: FramedRecv,
     send: FramedSend,
@@ -1467,6 +1466,14 @@ struct OrderedStreamExit {
     opened_locally: bool,
 }
 
+/// Whether an exited ordered stream should be reopened on the same connection.
+///
+/// A header-sync stream can die while its connection stays healthy: the responder
+/// parks it when the service is at capacity or has no demand, and the transport can
+/// drop it on its own. Nothing else reopens it, so without this the connection keeps
+/// running with header sync permanently dark on it. Only the initiator reopens, and
+/// only a stream it opened itself, so the two sides cannot race to reopen the same
+/// kind.
 fn should_reopen_ordered_stream(
     exited: OrderedStreamExit,
     is_initiator: bool,
@@ -1935,7 +1942,7 @@ impl ZakuraProtocolHandler {
         let (ordered_stream_exit_tx, mut ordered_stream_exit_rx) = mpsc::unbounded_channel();
         let (ordered_stream_reopen_tx, mut ordered_stream_reopen_rx) = mpsc::unbounded_channel();
         // Consecutive reopen attempts per stream kind; reset once a reopen
-        // succeeds so ordinary retirements keep the base delay.
+        // succeeds so ordinary stream deaths keep the base delay.
         let mut ordered_stream_reopen_attempts: HashMap<u16, u32> = HashMap::new();
         let mut open_limiter = TokenBucket::new(limits.stream_open_rate_per_second);
         let mut message_buckets = MessageRateBuckets::new();
@@ -2059,7 +2066,6 @@ impl ZakuraProtocolHandler {
                 service_streams.insert(
                     admitted.kind,
                     ServiceStream::new(
-                        admitted.stream,
                         admitted.session_id,
                         admitted.recv,
                         admitted.send,
@@ -2097,6 +2103,9 @@ impl ZakuraProtocolHandler {
                     break;
                 }
                 Some(exited) = ordered_stream_exit_rx.recv() => {
+                    // Stop tracking the dead generation, or a legitimate reopen of the
+                    // same kind would look like a duplicate stream and kill the whole
+                    // connection, taking block sync and gossip down with header sync.
                     if exited.opened_locally {
                         opened_kinds.remove(&exited.stream.kind);
                     } else {
@@ -2165,7 +2174,6 @@ impl ZakuraProtocolHandler {
                             let service_streams = HashMap::from([(
                                 admitted.kind,
                                 ServiceStream::new(
-                                    admitted.stream,
                                     admitted.session_id,
                                     admitted.recv,
                                     admitted.send,
@@ -2252,17 +2260,6 @@ impl ZakuraProtocolHandler {
                                     connection_token.cancel();
                                     continue;
                                 }
-                                if selected_ordered_streams.get(&kind) != Some(&admitted.stream) {
-                                    debug!(
-                                        stream_kind = kind,
-                                        stream_version = admitted.stream.version,
-                                        "closing peer after non-selected ordered stream version"
-                                    );
-                                    close_cause.record("unexpected_stream_version");
-                                    connection_token.cancel();
-                                    continue;
-                                }
-
                                 let is_block_sync = kind == ZAKURA_STREAM_BLOCK_SYNC;
                                 // A block-sync collision means both sides opened
                                 // block-sync (the only symmetric service).
@@ -2342,7 +2339,6 @@ impl ZakuraProtocolHandler {
                                 let service_streams = HashMap::from([(
                                     kind,
                                     ServiceStream::new(
-                                        admitted.stream,
                                         admitted.session_id,
                                         admitted.recv,
                                         admitted.send,
@@ -3311,7 +3307,6 @@ fn spawn_persistent_stream_worker(
     let (from_service_tx, from_service_rx) = mpsc::channel(queue_depth);
     let admitted = AdmittedOrderedStream {
         kind: prelude.stream_kind,
-        stream,
         session_id: context.stream_id,
         recv: FramedRecv::new(to_service_rx),
         send: FramedSend::new(from_service_tx),
@@ -4576,9 +4571,10 @@ fn should_run_freshness_reaper(
 }
 
 /// The stream-kind versions this handler serves. Most known kinds are at version 1;
-/// header sync is at version 6 after the expanded Ironwood root-record wire break.
+/// header sync is at version 7, which correlates each `Headers` response with the
+/// request that solicited it. Earlier header-sync versions are not served.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
-const ZAKURA_STREAM_VERSION_6: u16 = 6;
+const ZAKURA_STREAM_VERSION_7: u16 = 7;
 
 /// Returns whether the handler can serve a stream with this kind and version.
 ///
@@ -4777,9 +4773,10 @@ mod tests {
             legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
             testkit::LocalEndpointFactory,
             HeaderSyncEvent, HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession,
-            HeaderSyncStatus, ServicePeerLimits, ZakuraDiscoveryConfig, ZakuraDiscoveryHandle,
-            ZakuraDiscoveryLocalConfig, LOCAL_MAX_MESSAGE_BYTES, MAX_HS_MESSAGE_BYTES,
-            MSG_HS_STATUS, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
+            HeaderSyncRequestId, HeaderSyncStatus, ServicePeerLimits, ZakuraDiscoveryConfig,
+            ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, LOCAL_MAX_MESSAGE_BYTES,
+            MAX_HS_MESSAGE_BYTES, MSG_HS_STATUS, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP,
         },
         P2pStack,
     };
@@ -5958,7 +5955,9 @@ mod tests {
             count: 1,
             want_tree_aux_roots: false,
         }
-        .encode_frame()?;
+        .encode_frame(Some(
+            HeaderSyncRequestId::new(1).expect("non-zero request id"),
+        ))?;
 
         let (gossip_result, request_result, header_sync_result) = tokio::join!(
             async { registry.deliver(peer.clone(), LEGACY_GOSSIP_STREAM_KIND, gossip_frame) },
@@ -6037,12 +6036,12 @@ mod tests {
         task.await?;
 
         let valid_status_frame =
-            HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)).encode_frame()?;
+            HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)).encode_frame(None)?;
         let valid_result =
             service.deliver_frame(peer.clone(), HEADER_SYNC_STREAM_KIND, valid_status_frame);
         assert!(
             matches!(valid_result, Err(SinkReject::Local(_))),
-            "valid header-sync v6 frames depend on local reactor queue availability"
+            "valid header-sync frames depend on local reactor queue availability"
         );
 
         let malformed_frame = Frame {
@@ -6054,7 +6053,7 @@ mod tests {
             service.deliver_frame(peer, HEADER_SYNC_STREAM_KIND, malformed_frame);
         assert!(
             matches!(malformed_result, Err(SinkReject::Protocol(_))),
-            "malformed header-sync v6 frames must disconnect independently of reactor queue availability"
+            "malformed header-sync frames must disconnect independently of reactor queue availability"
         );
 
         Ok(())
@@ -6176,30 +6175,20 @@ mod tests {
                 msg: HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)),
             })
             .await?;
-        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        header_sync
-            .send(HeaderSyncEvent::WireMessage {
-                peer: peer.clone(),
-                msg: HeaderSyncMessage::GetHeaders {
-                    start_height: block::Height(1),
-                    count: 1,
-                    want_tree_aux_roots: false,
-                },
-            })
-            .await?;
+        assert_eq!(header_sync.peer_snapshot().inbound_peers, 1);
 
-        let action = next_header_sync_action(&mut actions).await;
-        assert!(
-            matches!(
-                action,
-                HeaderSyncAction::Misbehavior {
-                    reason: HeaderSyncMisbehavior::GetHeadersSpam,
-                    ..
-                }
-            ),
-            "deregistered peer must be removed from header-sync state, got {action:?}"
-        );
+        registry.remove_peer(&peer, 0, ZAKURA_CAP_HEADER_SYNC);
+
+        // Deregistering must drop the peer from header-sync state and release its
+        // slot. Its in-flight wire events are then dropped by the session guard
+        // rather than scored, so the freed slot is the observable.
+        timeout(Duration::from_secs(2), async {
+            while header_sync.peer_snapshot().inbound_peers != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deregistered peer must be removed from header-sync state");
 
         shutdown.cancel();
         reactor_task.await?;
@@ -6367,6 +6356,7 @@ mod tests {
             HeaderSyncAction::SendMessage {
                 peer: action_peer,
                 msg: HeaderSyncMessage::Status(_),
+                ..
             } if action_peer == peer
         ));
         assert_eq!(header_sync.peer_snapshot().inbound_peers, 1);
@@ -6679,6 +6669,9 @@ mod tests {
         Ok(())
     }
 
+    /// Reopen exists because a header-sync stream can die while its connection is
+    /// healthy (the responder parks it at capacity or with no demand). It is not tied
+    /// to any particular header-sync version.
     #[test]
     fn ordered_stream_reopen_is_limited_to_local_header_initiator() {
         let header = Stream {
@@ -6833,6 +6826,8 @@ mod tests {
         );
 
         admitted.cancel_token.cancel();
+        // The exit must be reported, or the connection loop never prunes the dead
+        // generation and never reopens the stream.
         let exited = timeout(Duration::from_secs(1), ordered_stream_exit_rx.recv())
             .await
             .expect("stream cancellation reports worker exit")
@@ -7520,7 +7515,6 @@ mod tests {
             freshness_tx,
         };
         let (ordered_stream_exit_tx, _ordered_stream_exit_rx) = mpsc::unbounded_channel();
-
         let admitted = handler
             .admit_bi_stream(
                 server_send,
@@ -7693,7 +7687,7 @@ mod tests {
                 },
                 Stream {
                     kind: HEADER_SYNC_STREAM_KIND,
-                    version: ZAKURA_STREAM_VERSION_6,
+                    version: ZAKURA_STREAM_VERSION_7,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_HEADER_SYNC,
                     mode: StreamMode::Ordered,
@@ -7713,7 +7707,7 @@ mod tests {
             (LEGACY_GOSSIP_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (LEGACY_REQUEST_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (DISCOVERY_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
-            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_6),
+            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_7),
             (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_VERSION_1),
         ] {
             assert!(

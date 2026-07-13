@@ -50,7 +50,8 @@ use crate::{
     types::MetaAddr,
     zakura::{
         P2pV2Upgrade, P2pV2UpgradeAccept, P2pV2UpgradeInit, P2pV2UpgradeReject,
-        ZakuraHandshakeConfig, ZakuraLegacyNonces, ZakuraPeerId, PRELUDE_MAGIC,
+        ZakuraHandshakeConfig, ZakuraLegacyNonces, ZakuraPeerId, ZakuraProtocolError,
+        P2P_V2_UPGRADE_COMMAND, PRELUDE_MAGIC,
     },
     zakura::{ZakuraHandshakeConnector, ZakuraRejectReason, ZakuraUpgradeOutcome},
     BoxError, Config, PeerSocketAddr, VersionMessage,
@@ -1234,6 +1235,40 @@ where
     Ok(())
 }
 
+/// Decode a peer-controlled Zakura upgrade prelude.
+///
+/// A panic is terminal for this legacy connection: callers propagate the
+/// returned serialization error and drop the framed transport without reusing
+/// its parser state.
+fn decode_upgrade_prelude(payload: &[u8]) -> Result<P2pV2Upgrade, HandshakeError> {
+    decode_upgrade_prelude_with(|| P2pV2Upgrade::decode(payload))
+}
+
+/// Run the structured upgrade prelude decoder inside its panic boundary.
+fn decode_upgrade_prelude_with(
+    decode: impl FnOnce() -> Result<P2pV2Upgrade, ZakuraProtocolError> + panic::UnwindSafe,
+) -> Result<P2pV2Upgrade, HandshakeError> {
+    match panic::catch_unwind(decode) {
+        Ok(Ok(prelude)) => Ok(prelude),
+        Ok(Err(error)) => {
+            metrics::counter!("zakura.p2p.upgrade.prelude.malformed").increment(1);
+            Err(HandshakeError::ZakuraUpgradePreludeMalformed(error))
+        }
+        Err(_panic_payload) => {
+            metrics::counter!(
+                "peer.message.parse.panics",
+                "parser" => "upgrade_prelude",
+            )
+            .increment(1);
+            tracing::error!(
+                command = P2P_V2_UPGRADE_COMMAND,
+                "peer-controlled message parser panicked; disconnecting legacy peer"
+            );
+            Err(SerializationError::Parse("Zakura P2P v2 upgrade prelude parser panicked").into())
+        }
+    }
+}
+
 /// Reads the next legacy [`P2pV2Upgrade`] prelude from the peer.
 ///
 /// Skips a small bounded number of unrelated messages (the overall handshake
@@ -1265,13 +1300,7 @@ where
             .await
             .ok_or(HandshakeError::ConnectionClosed)??;
         if let Message::P2pV2Upgrade(payload) = message {
-            return match P2pV2Upgrade::decode(&payload) {
-                Ok(prelude) => Ok(Some(prelude)),
-                Err(error) => {
-                    metrics::counter!("zakura.p2p.upgrade.prelude.malformed").increment(1);
-                    Err(HandshakeError::ZakuraUpgradePreludeMalformed(error))
-                }
-            };
+            return decode_upgrade_prelude(&payload).map(Some);
         }
     }
 

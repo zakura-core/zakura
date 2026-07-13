@@ -674,6 +674,116 @@ fn headers_message_at_protocol_cap_is_accepted() {
     }
 }
 
+/// A panic in synchronous message-body dispatch becomes a terminal parse error
+/// without unwinding the runtime task.
+#[test]
+fn body_dispatch_panic_returns_parse_error_and_task_survives() {
+    let _init_guard = zakura_test::init();
+
+    let mut panicking_frame = BytesMut::new();
+    Codec::builder()
+        .finish()
+        .encode(Message::Ping(Nonce(1)), &mut panicking_frame)
+        .expect("test ping should encode");
+
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async move {
+        let task = tokio::spawn(async move {
+            let mut codec = Codec::builder().finish();
+            codec.inject_body_decode_panic(BodyDecodePanic::CommandDispatch);
+
+            let error = codec
+                .decode(&mut panicking_frame)
+                .expect_err("injected body parser panic should become an error");
+            match error {
+                Error::Parse(message) => {
+                    assert_eq!(message, PANICKED_MESSAGE_BODY_PARSE_ERROR);
+                }
+                other => panic!("body parser panic should be a parse error: {other:?}"),
+            }
+        });
+
+        task.await
+            .expect("body parser panic should not terminate the runtime task");
+    });
+}
+
+/// The containment boundary includes block conversion after parallel
+/// deserialization.
+#[test]
+fn block_conversion_panic_returns_parse_error() {
+    let _init_guard = zakura_test::init();
+    let block = Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
+        .expect("block test vector should deserialize");
+
+    let mut block_frame = BytesMut::new();
+    let mut encoding_codec = Codec::builder().finish();
+    encoding_codec.reconfigure_full_body_len();
+    encoding_codec
+        .encode(Message::Block(block.into()), &mut block_frame)
+        .expect("test block should encode");
+
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async move {
+        let task = tokio::spawn(async move {
+            let mut codec = Codec::builder().finish();
+            codec.reconfigure_full_body_len();
+            codec.inject_body_decode_panic(BodyDecodePanic::AfterBlockConversion);
+
+            codec
+                .decode(&mut block_frame)
+                .expect_err("post-conversion panic should become an error")
+        });
+
+        let error = task
+            .await
+            .expect("post-conversion panic should not terminate the runtime task");
+        match error {
+            Error::Parse(message) => {
+                assert_eq!(message, PANICKED_MESSAGE_BODY_PARSE_ERROR);
+            }
+            other => panic!("block conversion panic should be a parse error: {other:?}"),
+        }
+    });
+}
+
+/// The containment boundary includes transaction conversion after parallel
+/// deserialization.
+#[test]
+fn transaction_conversion_panic_returns_parse_error() {
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    let _init_guard = zakura_test::init();
+    let tx: Transaction = zakura_test::vectors::DUMMY_TX1
+        .zcash_deserialize_into()
+        .expect("dummy transaction should deserialize");
+
+    let mut tx_frame = BytesMut::new();
+    Codec::builder()
+        .finish()
+        .encode(Message::Tx(tx.into()), &mut tx_frame)
+        .expect("test transaction should encode");
+
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async move {
+        let task = tokio::spawn(async move {
+            let mut codec = Codec::builder().finish();
+            codec.inject_body_decode_panic(BodyDecodePanic::AfterTransactionConversion);
+
+            codec
+                .decode(&mut tx_frame)
+                .expect_err("post-conversion panic should become an error")
+        });
+
+        let error = task
+            .await
+            .expect("post-conversion panic should not terminate the runtime task");
+        match error {
+            Error::Parse(message) => {
+                assert_eq!(message, PANICKED_MESSAGE_BODY_PARSE_ERROR);
+            }
+            other => panic!("transaction conversion panic should be a parse error: {other:?}"),
+        }
+    });
+}
+
 /// Check that the version test vector deserialization fails when there's a network magic mismatch.
 #[test]
 fn message_with_wrong_network_magic_returns_error() {

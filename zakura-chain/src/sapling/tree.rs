@@ -788,6 +788,43 @@ mod tests {
         assert_eq!(tree.root(), original.root());
     }
 
+    /// `append_batch` must match sequential appends when a batch exactly fills
+    /// the last two leaf positions of the tree, completing the final tracked
+    /// subtree (index `u16::MAX`) without reporting a spurious overflow.
+    #[test]
+    fn append_batch_matches_sequential_at_tree_capacity() {
+        let max_position = (1u64 << MERKLE_DEPTH) - 1;
+        let start_position = max_position - 2;
+        let leaf = node(1);
+        // A frontier at position `p` stores one ommer per set bit of `p`;
+        // `max_position - 2` has 31 of its 32 bits set.
+        let ommers: Vec<sapling_crypto::Node> = (2..=32).map(node).collect();
+        let inner = Frontier::from_parts(Position::from(start_position), leaf, ommers)
+            .expect("frontier two leaves below capacity is valid");
+        let start = NoteCommitmentTree {
+            inner,
+            cached_root: Default::default(),
+        };
+        let note_commitments = [note_commitment(100), note_commitment(200)];
+
+        let mut seq_tree = start.clone();
+        let seq_result = sequential_append_batch(&mut seq_tree, &note_commitments)
+            .expect("two sequential appends reach exact capacity");
+
+        let mut batch_tree = start;
+        let batch_result = batch_tree
+            .append_batch(&note_commitments)
+            .expect("batch append reaches exact capacity");
+
+        assert_eq!(batch_result, seq_result);
+        assert_eq!(
+            batch_result.map(|(index, _)| index),
+            Some(NoteCommitmentSubtreeIndex(u16::MAX)),
+        );
+        batch_tree.assert_frontier_eq(&seq_tree);
+        assert_eq!(batch_tree.root(), seq_tree.root());
+    }
+
     #[test]
     fn append_batch_multiple_subtrees_preserves_tree_and_cached_root() {
         let mut tree = NoteCommitmentTree::default();

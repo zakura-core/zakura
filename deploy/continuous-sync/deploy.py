@@ -220,6 +220,7 @@ set -euo pipefail
 controller_config={controller_config}
 alert_config={alert_config}
 config_template={config_template}
+config_path={config_path}
 chain_state_dir={chain_state_dir}
 wipe_sentinel={wipe_sentinel}
 state_dir={state_dir}
@@ -232,8 +233,9 @@ start_controller={start_controller}
 
 install -d -m 755 /usr/local/sbin
 install -d -m 755 "$(dirname "$controller_config")" "$(dirname "$alert_config")" \
-  "$(dirname "$config_template")" "$chain_state_dir" "$state_dir" "$runs_dir" \
-  "$(dirname "$log_file")" "$(dirname "$monitor_log")" /var/lib/zakura-monitor
+  "$(dirname "$config_template")" "$(dirname "$config_path")" "$chain_state_dir" \
+  "$state_dir" "$runs_dir" "$(dirname "$log_file")" "$(dirname "$monitor_log")" \
+  /var/lib/zakura-monitor
 
 install -m 755 /tmp/zakura-continuous-sync.py /usr/local/sbin/zakura-continuous-sync.py
 install -m 755 /tmp/zakura-monitor.py /usr/local/sbin/zakura-monitor.py
@@ -332,6 +334,7 @@ def deploy_node(node: Node, args: argparse.Namespace) -> tuple[str, bool, str]:
             controller_config=shlex.quote(str(raw["controller_config_path"])),
             alert_config=shlex.quote(str(raw["alert_config_path"])),
             config_template=shlex.quote(str(raw["config_template_path"])),
+            config_path=shlex.quote(str(raw["config_path"])),
             chain_state_dir=shlex.quote(str(raw["chain_state_dir"])),
             wipe_sentinel=shlex.quote(str(raw["wipe_sentinel"])),
             state_dir=shlex.quote(str(raw["state_dir"])),

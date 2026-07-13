@@ -1,7 +1,6 @@
 # This workflow builds and publishes zakurad release assets and Docker images
-# when a release tag is pushed. Tags containing a hyphen (v1.0.0-rc0,
-# v0.0.1-alpha.1) are created as GitHub pre-releases; tags without a hyphen
-# (v1.0.0) are created as full releases and also move the :latest Docker tags.
+# when a release tag is pushed. It can also stage verified release assets for
+# create-release.yml before the immutable tag exists.
 #
 # Editing a release's pre-release checkbox on GitHub does not trigger this
 # workflow and never rebuilds or re-uploads anything. Real releases get their
@@ -20,6 +19,21 @@ on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Release tag whose assets are being staged"
+        required: true
+        type: string
+      checkout_ref:
+        description: "Exact commit to build before the release tag exists"
+        required: true
+        type: string
+      stage_release_assets:
+        description: "Build and attest assets, then upload them as a workflow artifact"
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       release_tag:
@@ -52,6 +66,7 @@ jobs:
     outputs:
       release_tag: ${{ steps.resolve.outputs.release_tag }}
       checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
+      assets_published: ${{ steps.resolve.outputs.assets_published }}
     steps:
       - name: Resolve release tag
         id: resolve
@@ -59,7 +74,11 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_CHECKOUT_REF: ${{ inputs.checkout_ref }}
           GITHUB_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "$REF_TYPE" = "tag" ]; then
@@ -67,10 +86,11 @@ jobs:
             checkout_ref="$REF_NAME"
           else
             release_tag="$INPUT_RELEASE_TAG"
-            # workflow_dispatch builds from the release tag so republished assets
-            # match the tagged source tree (older tags may still ship a zakurad
-            # binary, which the packaging step renames to zakurad).
-            if [ -n "$release_tag" ]; then
+            # Reusable staging builds pin the validated commit before its tag
+            # exists. workflow_dispatch repairs still build from the tag.
+            if [ -n "$INPUT_CHECKOUT_REF" ]; then
+              checkout_ref="$INPUT_CHECKOUT_REF"
+            elif [ -n "$release_tag" ]; then
               checkout_ref="$release_tag"
             else
               checkout_ref="$GITHUB_SHA"
@@ -84,6 +104,41 @@ jobs:
 
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "checkout_ref=$checkout_ref" >> "$GITHUB_OUTPUT"
+
+          assets_published=false
+          # A tag created by create-release.yml already has its complete asset
+          # set. Skip rebuilding only for tag-push runs; manual repair runs must
+          # continue to rebuild and replace assets.
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            for attempt in 1 2 3 4 5 6; do
+              release_json="$(
+                gh api "repos/${REPOSITORY}/releases/tags/${release_tag}" \
+                  2>/dev/null || true
+              )"
+              has_complete_assets="$(
+                echo "$release_json" | jq -r --arg tag "$release_tag" '
+                  [.assets[].name] as $names
+                  | [
+                      "SHA256SUMS.txt",
+                      "install-zakura.sh",
+                      ("zakurad-" + $tag + "-linux-aarch64.tar.gz"),
+                      ("zakurad-" + $tag + "-linux-x86_64.tar.gz"),
+                      ("zakurad-manifest-" + $tag + ".json")
+                    ] as $required
+                  | (($required - $names) | length) == 0
+                ' 2>/dev/null || true
+              )"
+              if [ "$has_complete_assets" = "true" ]; then
+                assets_published=true
+                break
+              fi
+              if [ "$attempt" -lt 6 ]; then
+                echo "Waiting for published release assets (attempt ${attempt}/6)."
+                sleep 5
+              fi
+            done
+          fi
+          echo "assets_published=$assets_published" >> "$GITHUB_OUTPUT"
 
   check-release-version:
     name: Check release tag matches package version
@@ -129,6 +184,7 @@ jobs:
     name: Build zakurad assets (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     needs: [resolve-release, check-release-version]
+    if: needs.resolve-release.outputs.assets_published != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -238,14 +294,21 @@ jobs:
           path: ./artifacts
 
   publish-zakurad-assets:
-    name: Publish zakurad assets
+    name: Assemble zakurad assets
     needs: [resolve-release, build-zakurad-assets]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
       attestations: write
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_assets_to_release
+    if: >-
+      ${{
+        inputs.stage_release_assets
+        || (
+          needs.resolve-release.outputs.assets_published != 'true'
+          && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_assets_to_release)
+        )
+      }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
@@ -357,6 +420,7 @@ jobs:
             ./publish/final/SHA256SUMS.txt
 
       - name: Ensure release exists
+        if: ${{ !inputs.stage_release_assets }}
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
@@ -393,6 +457,7 @@ jobs:
             "${release_flags[@]}"
 
       - name: Upload assets to release
+        if: ${{ !inputs.stage_release_assets }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -417,6 +482,15 @@ jobs:
             --repo "$REPOSITORY" \
             --clobber
 
+      - name: Upload staged release assets
+        if: ${{ inputs.stage_release_assets }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: staged-release-assets
+          path: ./publish/final
+          if-no-files-found: error
+          retention-days: 1
+
   update-source-installer:
     name: Update source installer checksum
     needs: [resolve-release, publish-zakurad-assets]
@@ -424,7 +498,16 @@ jobs:
     environment: release-automation
     permissions:
       contents: read
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_assets_to_release
+    if: >-
+      ${{
+        !cancelled()
+        && needs.resolve-release.result == 'success'
+        && (
+          needs.publish-zakurad-assets.result == 'success'
+          || needs.resolve-release.outputs.assets_published == 'true'
+        )
+        && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_assets_to_release)
+      }}
     steps:
       - name: Download published installer
         env:
@@ -843,6 +926,7 @@ jobs:
       - resolve-zcashd-compat-manifest
       - build-zakurad-assets
       - publish-zakurad-assets
+      - update-source-installer
       - build
       - publish-docker-manifest
       - build-zcashd-compat
@@ -853,4 +937,4 @@ jobs:
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          allowed-skips: publish-zakurad-assets,publish-docker-manifest,publish-zcashd-compat-docker-manifest
+          allowed-skips: build-zakurad-assets,publish-zakurad-assets,update-source-installer,publish-docker-manifest,publish-zcashd-compat-docker-manifest

@@ -184,17 +184,21 @@ The end of support height is calculated from the current blockchain height:
 - [ ] Run the [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
       from `main`, entering the exact version tag, for example `v1.0.0-rc2`.
       The workflow verifies that the tag matches the `zakura` package version,
-      then creates the protected tag and GitHub release.
-- [ ] Edit the new release and replace its placeholder description with the
-      final changelog you created, starting just _after_ the title
-      `## [Zakura ...` of the current version and ending just _before_ the title
-      of the previous release.
-- [ ] Delete all the [draft releases from the list of releases](https://github.com/zakura-core/zakura/releases)
+      then builds and verifies the assets without creating a tag.
+- [ ] Wait for the build and no-push Docker checks to pass, then approve the
+      `release` environment deployment. The workflow publishes a complete
+      pre-release and creates the protected tag as its final step.
+- [ ] Review and update the new release description against the final changelog
+      you created, starting just _after_ the title `## [Zakura ...` of the
+      current version and ending just _before_ the title of the previous
+      release.
 
 ## Test the Pre-Release
 
 - [ ] Wait until the release assets and Docker images have been built:
   - [ ] [release-binaries.yml](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Arelease)
+- [ ] Review and merge the installer checksum update PR opened by the release
+      workflow.
 - [ ] Run [`sync-confidence.yml`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml) manually for the release tag or release branch if sync validation is required after tagging.
 
 ## Publish Release
@@ -233,7 +237,11 @@ for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakur
 
 ## Release Failures
 
-If building or running fails after tagging:
+If the pre-tag build or packaging stage fails, fix the failure on `main` and
+dispatch the workflow again with the same version. No tag has been created, so
+the version remains usable.
+
+If testing fails after the pre-release has been published and tagged:
 
 <details>
 

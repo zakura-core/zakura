@@ -149,8 +149,8 @@ _The diagram above illustrates the parallel execution patterns in our CI/CD syst
 - **Test Crate Build** (`test-crates.yml`): Builds each crate under various feature sets
 - **Docs (Book + internal)** (`book.yml`): Builds mdBook and internal rustdoc, publishes to Pages
 - **Security Analysis** (`zizmor.yml`): GitHub Actions security lint (SARIF)
-- **Create Release** (`create-release.yml`): Validate and create protected release tags and GitHub releases
-- **Release Binaries** (`release-binaries.yml`): Build and publish release artifacts
+- **Create Release** (`create-release.yml`): Build and verify release assets, then publish complete pre-releases and create protected tags
+- **Release Binaries** (`release-binaries.yml`): Stage or publish release artifacts and Docker images
 - **Release Drafter** (`release-drafter.yml`): Automates release notes
 - **Integration Tests on GCP** (`zfnd-ci-integration-tests-gcp.yml`): Stateful tests, cached disks, lwd flows
 - **Sync Confidence** (`sync-confidence.yml`): Full-validation sync of fixed pre/post-NU6.2 mainnet ranges on ephemeral DigitalOcean droplets (nyc3) restoring cached state from Spaces. The automatic `push` and `schedule` triggers are currently disabled (manual dispatch only) until `main` ships DB format 28.3.0 and matching snapshots. See `docs/sync-confidence-do-setup.md`.

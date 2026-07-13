@@ -3,8 +3,10 @@
 Zakura release tags must be created by the
 [`Create release`](../.github/workflows/create-release.yml) workflow. The
 workflow validates that the requested `v*` tag matches the `zakura` package
-version before creating the tag and GitHub release. The tag push then triggers
-[`release-binaries.yml`](../.github/workflows/release-binaries.yml).
+version, builds and verifies the release assets from that exact commit, and
+then creates the tag by publishing a complete pre-release. The tag push then
+triggers [`release-binaries.yml`](../.github/workflows/release-binaries.yml) to
+publish Docker images and open the installer checksum update pull request.
 
 ## GitHub App
 
@@ -36,7 +38,7 @@ Configure a second environment named `release-automation` with the same
 variable and secret. Allow deployments from the `main` branch and tags matching
 `v*`. This environment is used only after assets are published to open the
 installer checksum update pull request. It is separate so tag deployment rules
-or approvals cannot block release asset publication.
+or approvals cannot block post-release automation.
 
 The app private key is a credential. Store its source copy in the team's secret
 manager and do not commit it or paste it into issues, pull requests, or logs.
@@ -67,9 +69,19 @@ ruleset administration must remain limited.
 1. Merge the release version bump into `main`.
 2. Open **Actions > Create release > Run workflow**.
 3. Select the `main` branch and enter the exact release tag.
-4. Approve the `release` environment deployment.
-5. Confirm that the workflow creates the tag and GitHub release.
-6. Confirm that `Release binaries` starts from the new tag.
+4. Wait for the workflow to build and verify the release assets and no-push
+   Docker builds. Nothing is tagged or published during this stage.
+5. Approve the `release` environment deployment. The workflow publishes the
+   complete pre-release, creating the protected tag as its final step.
+6. Confirm that `Release binaries` starts from the new tag, skips rebuilding
+   the existing assets, publishes the Docker images, and opens the installer
+   checksum update pull request.
 
-The workflow is safe to rerun after a partial failure when the tag already
-points to the same commit. It refuses to reuse a tag that points elsewhere.
+The workflow always builds the commit selected when it was dispatched, even if
+`main` advances before approval. It is safe to rerun after a partial failure:
+it reuses an unpublished draft or exits successfully for a release already
+published from the expected commit. It refuses to reuse a tag that points
+elsewhere. Every release is initially a pre-release; promotion remains a manual
+GitHub step after testing and signing. Existing Docker behavior is unchanged:
+a non-hyphenated stable tag moves the Docker `latest` aliases during the
+tag-triggered workflow, before that GitHub promotion.

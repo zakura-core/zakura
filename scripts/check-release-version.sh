@@ -10,11 +10,11 @@
 #
 # Usage:
 #   ./scripts/check-release-version.sh <release-tag>
-#   ./scripts/check-release-version.sh v1.0.0-rc2
+#   ./scripts/check-release-version.sh v1.0.0-rc3
 set -euo pipefail
 
 if [ $# -ne 1 ] || [ -z "$1" ]; then
-  echo "Usage: $0 <release-tag> (for example v1.0.0-rc2)" >&2
+  echo "Usage: $0 <release-tag> (for example v1.0.0-rc3)" >&2
   exit 1
 fi
 RELEASE_TAG="$1"

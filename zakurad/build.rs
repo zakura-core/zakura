@@ -1,6 +1,6 @@
 //! Build script for zakurad.
 //!
-//! Turns Zebra version information into build-time environmental variables,
+//! Turns Zakura version information into build-time environmental variables,
 //! so that it can be compiled into `zakurad`, and used in diagnostics.
 //!
 //! When compiling the `lightwalletd` gRPC tests, also builds a gRPC client
@@ -15,12 +15,25 @@ fn main() {
 
     // Configures an [`Emitter`] for everything except for `git` env vars.
     // This builder fails the build on error.
+    //
+    // The cargo instructions are listed explicitly instead of using
+    // `all_cargo()`: its `dependencies` instruction (whose output nothing
+    // consumes) runs `cargo metadata` at compile time, which resolves the
+    // dependency graph against the registry index — that fails in the
+    // `cargo package`/`cargo publish` verify build of the packaged crate
+    // (before the zakura-* dependencies are published) and in offline builds.
+    let cargo_instructions = CargoBuilder::default()
+        .debug(true)
+        .features(true)
+        .opt_level(true)
+        .target_triple(true)
+        .build()
+        .expect("cargo instruction builder should build successfully");
+
     emitter
         .fail_on_error()
-        .add_instructions(
-            &CargoBuilder::all_cargo().expect("all_cargo() should build successfully"),
-        )
-        .expect("adding all_cargo() instructions should succeed")
+        .add_instructions(&cargo_instructions)
+        .expect("adding cargo instructions should succeed")
         .add_instructions(
             &RustcBuilder::all_rustc().expect("all_rustc() should build successfully"),
         )

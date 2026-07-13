@@ -224,10 +224,7 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-# TODO: Remove the URLs once the patch table in Cargo.toml is removed.
-allow-git = [
-    "https://github.com/zcash/librustzcash.git",
-]
+allow-git = []
 
 [sources.allow-org]
 github = [

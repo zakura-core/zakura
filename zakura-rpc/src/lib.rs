@@ -1,4 +1,4 @@
-//! A Zebra Remote Procedure Call (RPC) interface
+//! The Zakura node's Remote Procedure Call (RPC) interface
 
 #![doc(html_favicon_url = "https://zfnd.org/wp-content/uploads/2022/03/zebra-favicon-128.png")]
 #![doc(html_logo_url = "https://zfnd.org/wp-content/uploads/2022/03/zebra-icon.png")]

@@ -9,7 +9,11 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::time::timeout;
 use tracing_futures::Instrument;
 
-use zakura_chain::{parameters::Network::*, serialization::ZcashDeserialize};
+use zakura_chain::{
+    local_genesis::{generate_local_testnet_with_funded_keys, LocalTestnetGenesisOptions},
+    parameters::Network::*,
+    serialization::ZcashDeserialize,
+};
 
 use super::*;
 
@@ -196,6 +200,57 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
     assert_eq!(
         checkpoint_verifier.checkpoint_list.max_height(),
         block::Height(1)
+    );
+
+    Ok(())
+}
+
+/// Every block of a generated local testnet (genesis, premine, and maturity
+/// padding) must verify against the network's own configured checkpoints, and
+/// the verifier must finish once the last generated block is in.
+///
+/// The generated network checkpoints every seed block, so this exercises the
+/// checkpoint path a fresh local-genesis node uses to accept its seed chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_local_seed_chain_passes_checkpoint_verification() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let generated = generate_local_testnet_with_funded_keys(
+        vec!["alice".to_string(), "bob".to_string()],
+        LocalTestnetGenesisOptions {
+            maturity_padding_blocks: 2,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| eyre!(error.to_string()))?;
+    let network = generated.network;
+    let state_service = zakura_state::init_test(&network).await;
+    let mut checkpoint_verifier = CheckpointVerifier::new(&network, None, state_service);
+
+    for block in generated.blocks {
+        let block = Arc::new(block);
+        let expected_hash = block.hash();
+        let response = timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            checkpoint_verifier
+                .ready()
+                .map_err(|error| eyre!(error))
+                .await?
+                .call(block),
+        )
+        .await
+        .expect("generated checkpoint verification should not time out")
+        .expect("generated seed block should verify");
+
+        assert_eq!(response, expected_hash);
+    }
+
+    assert_eq!(
+        checkpoint_verifier.previous_checkpoint_height(),
+        FinalCheckpoint
+    );
+    assert_eq!(
+        checkpoint_verifier.target_checkpoint_height(),
+        FinishedVerifying
     );
 
     Ok(())

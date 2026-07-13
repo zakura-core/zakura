@@ -77,3 +77,4 @@ alias = "temp-zakura-sync-test-3"
 public_ip = "134.209.49.92"
 mode_label = "Zebra/legacy-only"
 p2p_stack = "legacy"
+stall_seconds = 1800

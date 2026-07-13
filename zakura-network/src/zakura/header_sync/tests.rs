@@ -1121,6 +1121,84 @@ fn codec_round_trips_get_headers() {
 }
 
 #[test]
+fn codec_round_trips_v7_get_headers_request_id() {
+    let request_id = HeaderSyncRequestId::new(42).expect("non-zero id");
+    let message = HeaderSyncMessage::GetHeaders {
+        start_height: block::Height(42),
+        count: DEFAULT_HS_RANGE,
+        want_tree_aux_roots: false,
+    };
+
+    let encoded = message
+        .encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+        .unwrap();
+    let (decoded, decoded_request_id) = HeaderSyncMessage::decode_with_request_id(
+        &encoded,
+        HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7),
+    )
+    .unwrap();
+
+    assert_eq!(decoded, message);
+    assert_eq!(decoded_request_id, Some(request_id));
+}
+
+#[test]
+fn v7_get_headers_rejects_missing_and_zero_request_ids() {
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let message = HeaderSyncMessage::GetHeaders {
+        start_height: block::Height(42),
+        count: DEFAULT_HS_RANGE,
+        want_tree_aux_roots: false,
+    };
+
+    assert!(matches!(
+        message.encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, None),
+        Err(HeaderSyncWireError::MissingRequestId {
+            message: "GetHeaders"
+        })
+    ));
+
+    let mut encoded = message
+        .encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+        .expect("valid v7 request encodes");
+    encoded[1..9].fill(0);
+    assert!(matches!(
+        HeaderSyncMessage::decode_with_request_id(
+            &encoded,
+            HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7),
+        ),
+        Err(HeaderSyncWireError::MissingRequestId {
+            message: "GetHeaders"
+        })
+    ));
+}
+
+#[test]
+fn get_headers_rejects_cross_version_payloads() {
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let message = HeaderSyncMessage::GetHeaders {
+        start_height: block::Height(42),
+        count: DEFAULT_HS_RANGE,
+        want_tree_aux_roots: false,
+    };
+    let v6 = message.encode().expect("v6 request encodes");
+    let v7 = message
+        .encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+        .expect("v7 request encodes");
+
+    assert!(HeaderSyncMessage::decode_with_request_id(
+        &v6,
+        HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7),
+    )
+    .is_err());
+    assert!(HeaderSyncMessage::decode_with_request_id(
+        &v7,
+        HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION),
+    )
+    .is_err());
+}
+
+#[test]
 fn codec_round_trips_headers_with_bounded_vector() {
     let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
     let message = finalized_headers_message_with_sizes(headers, vec![123_456]);
@@ -1129,6 +1207,86 @@ fn codec_round_trips_headers_with_bounded_vector() {
     let decoded = HeaderSyncMessage::decode(&encoded, finalized_headers_context(1, 1)).unwrap();
 
     assert_eq!(decoded, message);
+}
+
+#[test]
+fn codec_round_trips_v7_headers_request_id() {
+    let request_id = HeaderSyncRequestId::new(43).expect("non-zero id");
+    let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
+    let message = finalized_headers_message_with_sizes(headers, vec![123_456]);
+    let expected = ExpectedHeadersResponse::new(block::Height(1), 1, true)
+        .unwrap()
+        .with_request_id(request_id);
+
+    let encoded = message
+        .encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+        .unwrap();
+    let (decoded, decoded_request_id) = HeaderSyncMessage::decode_with_request_id(
+        &encoded,
+        HeaderSyncDecodeContext::for_headers_response(expected, 1),
+    )
+    .unwrap();
+
+    assert_eq!(decoded, message);
+    assert_eq!(decoded_request_id, Some(request_id));
+}
+
+#[test]
+fn v7_headers_rejects_missing_and_zero_request_ids() {
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let message = HeaderSyncMessage::Headers {
+        headers: Vec::new(),
+        body_sizes: Vec::new(),
+        tree_aux_roots: Vec::new(),
+    };
+    let expected = ExpectedHeadersResponse::new(block::Height(1), 1, false)
+        .expect("count is valid")
+        .with_request_id(request_id);
+
+    assert!(matches!(
+        message.encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, None),
+        Err(HeaderSyncWireError::MissingRequestId { message: "Headers" })
+    ));
+
+    let mut encoded = message
+        .encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+        .expect("valid v7 response encodes");
+    encoded[1..9].fill(0);
+    assert!(matches!(
+        HeaderSyncMessage::decode_with_request_id(
+            &encoded,
+            HeaderSyncDecodeContext::for_headers_response(expected, 1),
+        ),
+        Err(HeaderSyncWireError::MissingRequestId { message: "Headers" })
+    ));
+}
+
+#[test]
+fn headers_rejects_cross_version_payloads() {
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let message = HeaderSyncMessage::Headers {
+        headers: Vec::new(),
+        body_sizes: Vec::new(),
+        tree_aux_roots: Vec::new(),
+    };
+    let v6_expected =
+        ExpectedHeadersResponse::new(block::Height(1), 1, false).expect("count is valid");
+    let v7_expected = v6_expected.with_request_id(request_id);
+    let v6 = message.encode().expect("v6 response encodes");
+    let v7 = message
+        .encode_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, Some(request_id))
+        .expect("v7 response encodes");
+
+    assert!(HeaderSyncMessage::decode_with_request_id(
+        &v6,
+        HeaderSyncDecodeContext::for_headers_response(v7_expected, 1),
+    )
+    .is_err());
+    assert!(HeaderSyncMessage::decode_with_request_id(
+        &v7,
+        HeaderSyncDecodeContext::for_headers_response(v6_expected, 1),
+    )
+    .is_err());
 }
 
 #[test]
@@ -1398,6 +1556,7 @@ fn header_serialized_sizes_are_exact_and_message_cap_has_headroom() {
     assert_eq!(regtest_bytes.len(), REGTEST_HEADER_BYTES);
 
     let default_response_bytes = HEADER_SYNC_MESSAGE_TYPE_BYTES
+        + HEADER_SYNC_REQUEST_ID_BYTES
         + HEADER_SYNC_COUNT_BYTES
         + (COMMON_HEADER_BYTES
             + HEADER_SYNC_BODY_SIZE_BYTES
@@ -1451,10 +1610,19 @@ fn request_and_serving_counts_are_clamped_by_byte_budget() {
         &Network::Mainnet,
         LOCAL_MAX_MESSAGE_BYTES,
     );
-    let encoded = headers_message(headers).encode().unwrap();
+    let message = headers_message(headers);
+    let encoded = message.encode().unwrap();
+    let encoded_v7 = message
+        .encode_for_version(
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+            Some(HeaderSyncRequestId::new(1).expect("non-zero id")),
+        )
+        .unwrap();
 
     assert!(encoded.len() <= MAX_HS_MESSAGE_BYTES);
+    assert!(encoded_v7.len() <= MAX_HS_MESSAGE_BYTES);
     assert!(encoded.len() + FRAME_HEADER_BYTES <= LOCAL_MAX_MESSAGE_BYTES as usize);
+    assert!(encoded_v7.len() + FRAME_HEADER_BYTES <= LOCAL_MAX_MESSAGE_BYTES as usize);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1885,6 +2053,7 @@ async fn vct_repair_commit_failure_retries_another_peer() {
         .handle
         .send(HeaderSyncEvent::HeaderRangeCommitFailed {
             peer: first_peer,
+            session_id: 0,
             start_height: block::Height(1),
             count: 2,
             kind: HeaderSyncCommitFailureKind::Local,
@@ -2361,6 +2530,97 @@ async fn scheduler_limits_v1_to_one_outstanding_request_per_peer() {
     }
 
     assert_eq!(get_headers_count, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scheduler_uses_v7_inflight_slots_and_matches_reverse_response_ids() {
+    let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
+    let mut fixture = spawn_test_reactor(startup_for(
+        network,
+        (block::Height(3), checkpoint_hash),
+        Some((block::Height(3), checkpoint_hash)),
+    ));
+    let peer_id = peer(83);
+    let (send, mut recv) = crate::zakura::framed_channel(32);
+    let session = HeaderSyncPeerSession::from_parts_with_direction_and_version(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+        ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .unwrap();
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(8),
+        DEFAULT_HS_RANGE,
+        2,
+    )
+    .await;
+
+    let mut starts = HashSet::new();
+    while starts.len() < 2 {
+        if let HeaderSyncAction::SendMessage {
+            peer,
+            msg: HeaderSyncMessage::GetHeaders { start_height, .. },
+        } = next_non_query_action(&mut fixture.actions).await
+        {
+            assert_eq!(peer, peer_id);
+            starts.insert(start_height);
+        }
+    }
+    assert_eq!(starts, HashSet::from([block::Height(1), block::Height(4)]));
+
+    let mut request_ids = HashMap::new();
+    while request_ids.len() < 2 {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
+            .await
+            .expect("v7 outbound frame arrives")
+            .expect("v7 stream stays open");
+        let (message, request_id) = HeaderSyncMessage::decode_frame_with_request_id(
+            frame,
+            HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7),
+        )
+        .expect("v7 outbound frame decodes");
+        if let HeaderSyncMessage::GetHeaders { start_height, .. } = message {
+            request_ids.insert(
+                start_height,
+                request_id.expect("v7 GetHeaders carries request id"),
+            );
+        }
+    }
+    let backward_id = request_ids[&block::Height(1)];
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireHeaders {
+            peer: peer_id.clone(),
+            session_id: 0,
+            request_id: Some(backward_id),
+            headers: vec![mainnet_header(&BLOCK_MAINNET_1_BYTES); 4],
+            body_sizes: vec![0; 4],
+            tree_aux_roots: roots_from_height(block::Height(1), 4),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(reason, HeaderSyncMisbehavior::ResponseTooLong);
+                break;
+            }
+            HeaderSyncAction::SendMessage { .. } => {}
+            action => panic!("unexpected action for reverse v7 response: {action:?}"),
+        }
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2925,6 +3185,7 @@ async fn invalid_async_header_commit_failure_reports_peer_disconnect() {
         .handle
         .send(HeaderSyncEvent::HeaderRangeCommitFailed {
             peer: peer_id.clone(),
+            session_id: 0,
             start_height: block::Height(1),
             count: 1,
             kind: HeaderSyncCommitFailureKind::InvalidPeerRange,
@@ -3062,6 +3323,95 @@ async fn timed_out_range_retries_with_another_peer() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn late_timed_out_responses_do_not_consume_newer_outstanding_range() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let start = block::Height(4);
+    let next = block::Height(5);
+    let request_timeout = std::time::Duration::from_millis(10);
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(3), checkpoint_hash)),
+    );
+    startup.request_timeout = request_timeout;
+    let mut fixture = spawn_test_reactor(startup);
+    let timed_out_peer = peer(75);
+    let retry_peer = peer(76);
+    let committed_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_4_BYTES).as_ref());
+
+    let timed_out_cancel = connect_peer_with_direction(
+        &fixture,
+        timed_out_peer.clone(),
+        ServicePeerDirection::Inbound,
+    )
+    .await;
+    advertise_tip(
+        &fixture,
+        timed_out_peer.clone(),
+        block::Height(0),
+        next,
+        1,
+        1,
+    )
+    .await;
+
+    assert_eq!(
+        next_outbound_get_headers(&mut fixture.actions).await,
+        (timed_out_peer.clone(), start, 1),
+    );
+
+    tokio::time::sleep(request_timeout * 3).await;
+
+    connect_peer(&fixture, retry_peer.clone()).await;
+    advertise_tip(&fixture, retry_peer.clone(), block::Height(0), next, 1, 1).await;
+
+    assert_eq!(
+        next_outbound_get_headers(&mut fixture.actions).await,
+        (retry_peer.clone(), start, 1),
+        "another peer should receive the timed-out request",
+    );
+    assert!(
+        timed_out_cancel.is_cancelled(),
+        "the ambiguous v6 stream must be cancelled before it can receive newer work",
+    );
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: retry_peer.clone(),
+            msg: headers_message_from(start, vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+        })
+        .await
+        .unwrap();
+    match next_non_query_action(&mut fixture.actions).await {
+        HeaderSyncAction::CommitHeaderRange {
+            peer, start_height, ..
+        } => {
+            assert_eq!(peer, retry_peer);
+            assert_eq!(start_height, start);
+        }
+        action => panic!("unexpected action before retry commit: {action:?}"),
+    }
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: start,
+            tip_height: start,
+            tip_hash: committed_hash,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        next_outbound_get_headers(&mut fixture.actions).await,
+        (retry_peer, next, 1),
+        "newer work must stay on the unambiguous retry stream",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
@@ -3071,9 +3421,13 @@ async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
     ));
     let first_peer = peer(33);
     let second_peer = peer(34);
+    let mut cancel_tokens = Vec::new();
 
     for peer_id in [first_peer.clone(), second_peer.clone()] {
-        connect_peer(&fixture, peer_id.clone()).await;
+        cancel_tokens.push(
+            connect_peer_with_direction(&fixture, peer_id.clone(), ServicePeerDirection::Inbound)
+                .await,
+        );
         advertise_tip(&fixture, peer_id, block::Height(0), block::Height(2), 2, 1).await;
     }
 
@@ -3097,20 +3451,18 @@ async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
         })
         .await
         .unwrap();
-    fixture
-        .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: second_peer,
-            msg: headers_message(Vec::new()),
-        })
-        .await
-        .unwrap();
 
+    for cancel in cancel_tokens {
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancel.cancelled())
+            .await
+            .expect("covered v6 session is retired");
+    }
+    assert_eq!(fixture.handle.peer_snapshot().inbound_peers, 0);
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn late_covered_response_does_not_reanchor_newer_outstanding_range() {
+async fn covered_v6_response_retires_session_before_newer_work() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -3120,7 +3472,8 @@ async fn late_covered_response_does_not_reanchor_newer_outstanding_range() {
     let peer_id = peer(74);
     let committed_hash = block::Hash([1; 32]);
 
-    connect_peer(&fixture, peer_id.clone()).await;
+    let cancel =
+        connect_peer_with_direction(&fixture, peer_id.clone(), ServicePeerDirection::Inbound).await;
     advertise_tip(
         &fixture,
         peer_id.clone(),
@@ -3154,50 +3507,12 @@ async fn late_covered_response_does_not_reanchor_newer_outstanding_range() {
         })
         .await
         .unwrap();
-    loop {
-        match next_non_query_action(&mut fixture.actions).await {
-            HeaderSyncAction::SendMessage {
-                peer,
-                msg:
-                    HeaderSyncMessage::GetHeaders {
-                        start_height: block::Height(2),
-                        count: 1,
-                        want_tree_aux_roots: true,
-                    },
-            } if peer == peer_id => break,
-            _ => {}
-        }
-    }
 
-    while tokio::time::timeout(std::time::Duration::from_millis(10), fixture.actions.recv())
+    tokio::time::timeout(std::time::Duration::from_secs(1), cancel.cancelled())
         .await
-        .is_ok()
-    {}
-
-    fixture
-        .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id,
-            msg: headers_message(vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
-        })
-        .await
-        .unwrap();
-
-    while let Ok(Some(action)) =
-        tokio::time::timeout(std::time::Duration::from_millis(50), fixture.actions.recv()).await
-    {
-        match action {
-            HeaderSyncAction::SendMessage {
-                msg: HeaderSyncMessage::GetHeaders { .. },
-                ..
-            }
-            | HeaderSyncAction::HeaderReanchored { .. }
-            | HeaderSyncAction::Misbehavior { .. } => {
-                panic!("late covered response must not trigger a new action: {action:?}")
-            }
-            _ => {}
-        }
-    }
+        .expect("covered v6 session is retired");
+    assert_eq!(fixture.handle.peer_snapshot().inbound_peers, 0);
+    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3259,6 +3574,7 @@ async fn local_commit_failure_retries_without_peer_misbehavior() {
         .handle
         .send(HeaderSyncEvent::HeaderRangeCommitFailed {
             peer: first_peer.clone(),
+            session_id: 0,
             start_height: start,
             count: 1,
             kind: HeaderSyncCommitFailureKind::Local,
@@ -3396,6 +3712,34 @@ fn peer_state_suppresses_redundant_status_until_session_reset() {
     // resent — a fresh channel's remote has not received it and gates serving on it.
     peer_state.reset_sent_status();
     assert!(peer_state.status_differs_from_last_sent(status));
+}
+
+#[test]
+fn completed_v7_inbound_request_id_cannot_be_reused() {
+    let (send, _recv) = crate::zakura::framed_channel(32);
+    let session = HeaderSyncPeerSession::from_parts_with_direction_and_version(
+        peer(82),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+        ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+    );
+    let mut peer_state = super::state::PeerHeaderState::new(
+        session,
+        (block::Height(0), block::Hash([0; 32])),
+        DEFAULT_HS_RANGE,
+        DEFAULT_HS_MAX_INFLIGHT,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+    );
+    let first = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let second = HeaderSyncRequestId::new(2).expect("non-zero id");
+
+    assert!(peer_state.try_start_serving_headers(2, Some(first)));
+    assert!(peer_state.finish_serving_headers(Some(first)));
+    assert!(!peer_state.try_start_serving_headers(2, Some(first)));
+    assert!(peer_state.try_start_serving_headers(2, Some(second)));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3571,7 +3915,8 @@ async fn full_block_committed_covers_outstanding_height() {
     ));
     let peer_id = peer(42);
 
-    connect_peer(&fixture, peer_id.clone()).await;
+    let cancel =
+        connect_peer_with_direction(&fixture, peer_id.clone(), ServicePeerDirection::Inbound).await;
     advertise_tip(
         &fixture,
         peer_id.clone(),
@@ -3609,15 +3954,9 @@ async fn full_block_committed_covers_outstanding_height() {
         }
         action => panic!("full block commit must publish a header advance, got {action:?}"),
     }
-    fixture
-        .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id,
-            msg: headers_message(Vec::new()),
-        })
-        .await
-        .unwrap();
 
+    assert!(cancel.is_cancelled());
+    assert_eq!(fixture.handle.peer_snapshot().inbound_peers, 0);
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
@@ -4530,6 +4869,8 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
         .handle
         .send(HeaderSyncEvent::HeaderRangeResponseFinished {
             peer: requester.clone(),
+            session_id: 0,
+            request_id: None,
             start_height: block::Height(1),
             requested_count: 1,
             returned_count: 0,
@@ -4558,6 +4899,369 @@ async fn inbound_get_headers_requires_status_and_respects_serving_cap() {
         }
         action => panic!("unexpected action: {action:?}"),
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v7_serving_responses_echo_request_ids_in_completion_order() {
+    let network = regtest_network();
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    startup.config.max_inflight_requests = 2;
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(79);
+    let first_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let second_id = HeaderSyncRequestId::new(2).expect("non-zero id");
+    let (send, mut recv) = crate::zakura::framed_channel(8);
+    let session = HeaderSyncPeerSession::from_parts_with_direction_and_version(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+        ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
+        .await
+        .expect("initial status arrives")
+        .expect("v7 stream stays open");
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(0),
+        DEFAULT_HS_RANGE,
+        2,
+    )
+    .await;
+
+    for (request_id, start_height) in [(first_id, block::Height(1)), (second_id, block::Height(2))]
+    {
+        fixture
+            .handle
+            .send(HeaderSyncEvent::WireGetHeaders {
+                peer: peer_id.clone(),
+                session_id: 0,
+                request_id: Some(request_id),
+                start_height,
+                count: 1,
+                want_tree_aux_roots: false,
+            })
+            .await
+            .unwrap();
+        match next_query_headers_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryHeadersByHeightRange {
+                request_id: action_id,
+                start,
+                ..
+            } => {
+                assert_eq!(action_id, Some(request_id));
+                assert_eq!(start, start_height);
+            }
+            action => panic!("unexpected action: {action:?}"),
+        }
+    }
+
+    for (request_id, start_height) in [(second_id, block::Height(2)), (first_id, block::Height(1))]
+    {
+        fixture
+            .handle
+            .send(HeaderSyncEvent::HeaderRangeResponseReady {
+                peer: peer_id.clone(),
+                session_id: 0,
+                request_id: Some(request_id),
+                start_height,
+                requested_count: 1,
+                want_tree_aux_roots: false,
+                headers: Vec::new(),
+                body_sizes: Vec::new(),
+                tree_aux_roots: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
+            .await
+            .expect("headers response arrives")
+            .expect("v7 stream stays open");
+        assert_eq!(
+            HeaderSyncMessage::peek_headers_request_id(&frame.payload).unwrap(),
+            request_id
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v7_replacement_session_ignores_old_wire_response_with_reused_id() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(3), checkpoint_hash)),
+    ));
+    let peer_id = peer(80);
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let (old_send, _old_recv) = crate::zakura::framed_channel(8);
+    let old_session = HeaderSyncPeerSession::from_parts_with_direction_version_and_session_id(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        old_send,
+        CancellationToken::new(),
+        ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        1,
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(old_session))
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::SessionWireMessage {
+            peer: peer_id.clone(),
+            session_id: 1,
+            msg: HeaderSyncMessage::Status(HeaderSyncStatus {
+                tip_height: block::Height(4),
+                tip_hash: block::Hash([4; 32]),
+                anchor_height: block::Height(0),
+                max_headers_per_response: 1,
+                max_inflight_requests: 1,
+            }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_outbound_get_headers(&mut fixture.actions).await,
+        (peer_id.clone(), block::Height(4), 1)
+    );
+
+    let (new_send, _new_recv) = crate::zakura::framed_channel(8);
+    let new_session = HeaderSyncPeerSession::from_parts_with_direction_version_and_session_id(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        new_send,
+        CancellationToken::new(),
+        ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        2,
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(new_session))
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::SessionWireMessage {
+            peer: peer_id.clone(),
+            session_id: 2,
+            msg: HeaderSyncMessage::Status(HeaderSyncStatus {
+                tip_height: block::Height(4),
+                tip_hash: block::Hash([4; 32]),
+                anchor_height: block::Height(0),
+                max_headers_per_response: 1,
+                max_inflight_requests: 1,
+            }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_outbound_get_headers(&mut fixture.actions).await,
+        (peer_id.clone(), block::Height(4), 1)
+    );
+
+    let headers = vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)];
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireHeaders {
+            peer: peer_id.clone(),
+            session_id: 1,
+            request_id: Some(request_id),
+            headers: headers.clone(),
+            body_sizes: vec![0],
+            tree_aux_roots: roots_from_height(block::Height(4), 1),
+        })
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireHeaders {
+            peer: peer_id.clone(),
+            session_id: 2,
+            request_id: Some(request_id),
+            headers,
+            body_sizes: vec![0],
+            tree_aux_roots: roots_from_height(block::Height(4), 1),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange {
+                peer,
+                session_id,
+                start_height,
+                ..
+            } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(session_id, 2);
+                assert_eq!(start_height, block::Height(4));
+                break;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("stale response must not affect replacement {peer:?}: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn v7_replacement_session_ignores_old_state_completion_with_reused_id() {
+    let network = regtest_network();
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    startup.config.max_inflight_requests = 2;
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(81);
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
+    let (old_send, _old_recv) = crate::zakura::framed_channel(8);
+    let old_session = HeaderSyncPeerSession::from_parts_with_direction_version_and_session_id(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        old_send,
+        CancellationToken::new(),
+        ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        1,
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(old_session))
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::SessionWireMessage {
+            peer: peer_id.clone(),
+            session_id: 1,
+            msg: HeaderSyncMessage::Status(HeaderSyncStatus::default()),
+        })
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireGetHeaders {
+            peer: peer_id.clone(),
+            session_id: 1,
+            request_id: Some(request_id),
+            start_height: block::Height(1),
+            count: 1,
+            want_tree_aux_roots: false,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_query_headers_action(&mut fixture.actions).await,
+        HeaderSyncAction::QueryHeadersByHeightRange { session_id: 1, .. }
+    ));
+
+    let (new_send, mut new_recv) = crate::zakura::framed_channel(8);
+    let new_session = HeaderSyncPeerSession::from_parts_with_direction_version_and_session_id(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        new_send,
+        CancellationToken::new(),
+        ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        2,
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(new_session))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), new_recv.recv())
+        .await
+        .expect("replacement status arrives")
+        .expect("replacement stream stays open");
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeResponseReady {
+            peer: peer_id.clone(),
+            session_id: 1,
+            request_id: Some(request_id),
+            start_height: block::Height(1),
+            requested_count: 1,
+            want_tree_aux_roots: false,
+            headers: Vec::new(),
+            body_sizes: Vec::new(),
+            tree_aux_roots: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), new_recv.recv())
+            .await
+            .is_err(),
+        "old state completion must not send through replacement session"
+    );
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::SessionWireMessage {
+            peer: peer_id.clone(),
+            session_id: 2,
+            msg: HeaderSyncMessage::Status(HeaderSyncStatus::default()),
+        })
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireGetHeaders {
+            peer: peer_id.clone(),
+            session_id: 2,
+            request_id: Some(request_id),
+            start_height: block::Height(1),
+            count: 1,
+            want_tree_aux_roots: false,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_query_headers_action(&mut fixture.actions).await,
+        HeaderSyncAction::QueryHeadersByHeightRange { session_id: 2, .. }
+    ));
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeResponseReady {
+            peer: peer_id,
+            session_id: 2,
+            request_id: Some(request_id),
+            start_height: block::Height(1),
+            requested_count: 1,
+            want_tree_aux_roots: false,
+            headers: Vec::new(),
+            body_sizes: Vec::new(),
+            tree_aux_roots: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(1), new_recv.recv())
+        .await
+        .expect("current response arrives")
+        .expect("replacement stream stays open");
+    assert_eq!(
+        HeaderSyncMessage::peek_headers_request_id(&frame.payload).unwrap(),
+        request_id
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

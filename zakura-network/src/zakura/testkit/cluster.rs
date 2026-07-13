@@ -153,12 +153,14 @@ mod tests {
             spawn_header_sync_reactor, BlockApplyResult, BlockSizeEstimate, BlockSyncAction,
             BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage,
             BlockSyncStatus, DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderSyncAction,
-            HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle,
-            HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession, HeaderSyncStartup,
-            HeaderSyncStatus, Peer, Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig,
-            ZakuraConnId, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace,
-            MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
+            HeaderSyncCommitFailureKind, HeaderSyncDecodeContext, HeaderSyncEvent,
+            HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage, HeaderSyncMisbehavior,
+            HeaderSyncPeerSession, HeaderSyncRequestId, HeaderSyncStartup, HeaderSyncStatus, Peer,
+            Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig, ZakuraConnId,
+            ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace, MAX_BS_RESPONSE_BYTES,
+            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_HEADER_SYNC_V7,
+            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
             ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
@@ -908,7 +910,12 @@ mod tests {
                     }
                 }
                 HeaderSyncAction::QueryHeadersByHeightRange {
-                    peer, start, count, ..
+                    peer,
+                    session_id,
+                    request_id,
+                    start,
+                    count,
+                    ..
                 } => {
                     let headers = local
                         .store
@@ -928,6 +935,8 @@ mod tests {
                             .handle
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                                 peer,
+                                session_id,
+                                request_id,
                                 start_height: start,
                                 requested_count: count,
                                 returned_count,
@@ -937,6 +946,7 @@ mod tests {
                 }
                 HeaderSyncAction::CommitHeaderRange {
                     peer,
+                    session_id,
                     anchor,
                     start_height,
                     headers,
@@ -974,6 +984,7 @@ mod tests {
                                 .handle
                                 .send(HeaderSyncEvent::HeaderRangeCommitFailed {
                                     peer,
+                                    session_id,
                                     start_height,
                                     count,
                                     kind,
@@ -1286,6 +1297,177 @@ mod tests {
             )
     }
 
+    #[derive(Debug)]
+    struct ControlledHeaderQuery {
+        peer: ZakuraPeerId,
+        session_id: u64,
+        request_id: Option<HeaderSyncRequestId>,
+        start: block::Height,
+        count: u32,
+        want_tree_aux_roots: bool,
+    }
+
+    #[derive(Debug)]
+    struct ControlledHeaderCommit {
+        peer: ZakuraPeerId,
+        session_id: u64,
+        anchor: block::Hash,
+        start_height: block::Height,
+        headers: Vec<Arc<block::Header>>,
+    }
+
+    async fn next_controlled_header_query(
+        actions: &mut mpsc::Receiver<HeaderSyncAction>,
+    ) -> Result<ControlledHeaderQuery, BoxError> {
+        tokio::time::timeout(TEST_NET_TIMEOUT, async {
+            loop {
+                match actions.recv().await {
+                    Some(HeaderSyncAction::QueryHeadersByHeightRange {
+                        peer,
+                        session_id,
+                        request_id,
+                        start,
+                        count,
+                        want_tree_aux_roots,
+                    }) => {
+                        return Ok(ControlledHeaderQuery {
+                            peer,
+                            session_id,
+                            request_id,
+                            start,
+                            count,
+                            want_tree_aux_roots,
+                        });
+                    }
+                    Some(HeaderSyncAction::Misbehavior { reason, .. }) => {
+                        return Err(format!(
+                            "unexpected header-sync misbehavior while awaiting state query: {reason:?}"
+                        )
+                        .into());
+                    }
+                    Some(_) => {}
+                    None => return Err("header-sync action channel closed".into()),
+                }
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError {
+            Box::new(WaitError::new(
+                "controlled header-sync state query",
+                TEST_NET_TIMEOUT,
+            ))
+        })?
+    }
+
+    async fn next_controlled_header_commit(
+        actions: &mut mpsc::Receiver<HeaderSyncAction>,
+    ) -> Result<ControlledHeaderCommit, BoxError> {
+        tokio::time::timeout(TEST_NET_TIMEOUT, async {
+            loop {
+                match actions.recv().await {
+                    Some(HeaderSyncAction::CommitHeaderRange {
+                        peer,
+                        session_id,
+                        anchor,
+                        start_height,
+                        headers,
+                        ..
+                    }) => {
+                        return Ok(ControlledHeaderCommit {
+                            peer,
+                            session_id,
+                            anchor,
+                            start_height,
+                            headers,
+                        });
+                    }
+                    Some(HeaderSyncAction::Misbehavior { reason, .. }) => {
+                        return Err(format!(
+                            "unexpected header-sync misbehavior while awaiting commit: {reason:?}"
+                        )
+                        .into());
+                    }
+                    Some(_) => {}
+                    None => return Err("header-sync action channel closed".into()),
+                }
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError {
+            Box::new(WaitError::new(
+                "controlled header-sync commit",
+                TEST_NET_TIMEOUT,
+            ))
+        })?
+    }
+
+    async fn next_observed_get_headers(
+        actions: &mut mpsc::Receiver<HeaderSyncAction>,
+    ) -> Result<(), BoxError> {
+        tokio::time::timeout(TEST_NET_TIMEOUT, async {
+            loop {
+                match actions.recv().await {
+                    Some(HeaderSyncAction::SendMessage {
+                        msg: HeaderSyncMessage::GetHeaders { .. },
+                        ..
+                    }) => return Ok(()),
+                    Some(HeaderSyncAction::Misbehavior { reason, .. }) => {
+                        return Err(format!(
+                            "unexpected header-sync misbehavior while awaiting GetHeaders: {reason:?}"
+                        )
+                        .into());
+                    }
+                    Some(_) => {}
+                    None => return Err("header-sync action channel closed".into()),
+                }
+            }
+        })
+        .await
+        .map_err(|_| -> BoxError {
+            Box::new(WaitError::new(
+                "observed header-sync GetHeaders",
+                TEST_NET_TIMEOUT,
+            ))
+        })?
+    }
+
+    fn headers_for_query(query: &ControlledHeaderQuery) -> HeaderSyncMessage {
+        let start = query.start.0;
+        let end = start.saturating_add(query.count);
+        let headers = (start..end)
+            .map(|height| mainnet_block(block_bytes(height)).header.clone())
+            .collect();
+        headers_message(headers)
+    }
+
+    async fn complete_controlled_query(
+        handle: &HeaderSyncHandle,
+        query: &ControlledHeaderQuery,
+    ) -> Result<(), BoxError> {
+        let HeaderSyncMessage::Headers {
+            headers,
+            body_sizes,
+            tree_aux_roots,
+        } = headers_for_query(query)
+        else {
+            unreachable!("headers_for_query always returns Headers");
+        };
+        handle
+            .send(HeaderSyncEvent::HeaderRangeResponseReady {
+                peer: query.peer.clone(),
+                session_id: query.session_id,
+                request_id: query.request_id,
+                start_height: query.start,
+                requested_count: query.count,
+                want_tree_aux_roots: query.want_tree_aux_roots,
+                headers,
+                body_sizes,
+                tree_aux_roots,
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn drive_native_header_sync_actions(
         node: &ZakuraTestNode,
         misbehaviors: Arc<StdMutex<Vec<HeaderSyncMisbehavior>>>,
@@ -1308,7 +1490,12 @@ mod tests {
                             .push(reason);
                     }
                     HeaderSyncAction::QueryHeadersByHeightRange {
-                        peer, start, count, ..
+                        peer,
+                        session_id,
+                        request_id,
+                        start,
+                        count,
+                        ..
                     } => {
                         let Some(handle) = endpoint.header_sync() else {
                             continue;
@@ -1316,6 +1503,8 @@ mod tests {
                         let _ = handle
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
                                 peer,
+                                session_id,
+                                request_id,
                                 start_height: start,
                                 requested_count: count,
                                 returned_count: 0,
@@ -1324,6 +1513,7 @@ mod tests {
                     }
                     HeaderSyncAction::CommitHeaderRange {
                         peer,
+                        session_id,
                         start_height,
                         headers,
                         ..
@@ -1335,6 +1525,7 @@ mod tests {
                         let _ = handle
                             .send(HeaderSyncEvent::HeaderRangeCommitFailed {
                                 peer,
+                                session_id,
                                 start_height,
                                 count,
                                 kind: HeaderSyncCommitFailureKind::Local,
@@ -1822,6 +2013,52 @@ mod tests {
         );
 
         hostile.shutdown().await;
+
+        let victim = cluster.node(victim_idx);
+        let recorder = victim.recorder();
+        let hostile = HostilePeer::connect_native_with_capabilities(
+            victim,
+            6,
+            ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V7 | ZAKURA_CAP_LEGACY_GOSSIP,
+        )
+        .await?;
+        let selected_header_sync_v7 = b"header-sync-kind-5-version-7".to_vec();
+        let non_selected_header_sync_v6 = b"dual-header-sync-kind-5-version-6".to_vec();
+        hostile
+            .send_frame_with_version(
+                ZAKURA_STREAM_HEADER_SYNC,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+                selected_header_sync_v7.clone(),
+            )
+            .await?;
+        await_until(
+            "selected header-sync v7 frame delivered",
+            Duration::from_secs(5),
+            || recorder.contains_payload(ZAKURA_STREAM_HEADER_SYNC, &selected_header_sync_v7),
+        )
+        .await?;
+        hostile
+            .send_frame_with_version(
+                ZAKURA_STREAM_HEADER_SYNC,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                non_selected_header_sync_v6.clone(),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let delivered = recorder.drain();
+        assert!(
+            delivered
+                .iter()
+                .any(|message| message.frame.payload == selected_header_sync_v7),
+            "dual-stack peers must deliver selected header-sync v7"
+        );
+        assert!(
+            !delivered
+                .iter()
+                .any(|message| message.frame.payload == non_selected_header_sync_v6),
+            "dual-stack peers must reject non-selected header-sync v6"
+        );
 
         let victim = cluster.node(victim_idx);
         let recorder = victim.recorder();
@@ -2492,6 +2729,261 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_stream5_v7_correlates_reversed_physical_responses() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut capture = TraceCapture::for_test_with_keep_override(
+            "native_stream5_v7_correlates_reversed_physical_responses",
+            false,
+        )?;
+        let config = ZakuraHeaderSyncConfig {
+            max_headers_per_response: 2,
+            max_inflight_requests: 2,
+            ..ZakuraHeaderSyncConfig::default()
+        };
+        // The scheduler keeps at most one forward range outstanding, so the two
+        // concurrent v7 requests come from distinct queues: anchoring at the
+        // height-2 checkpoint leaves a backward backfill bracket (1..=2) plus a
+        // forward range (3..=4), each within the peer's advertised cap of 2.
+        let network = e2e_network([2]);
+        let anchor = (block::Height(2), mainnet_block(block_bytes(2)).hash());
+        let victim = ZakuraTestNode::builder(70)
+            .tracer(capture.tracer_for_node(70))
+            .header_sync_driver(
+                network,
+                anchor,
+                HeaderSyncFrontiers {
+                    finalized_height: block::Height(0),
+                    verified_block_tip: block::Height(0),
+                    verified_block_hash: mainnet_genesis_hash(),
+                },
+                Some(anchor),
+            )
+            .header_sync_config(config)
+            .spawn()
+            .await?;
+        let mut actions = victim
+            .take_header_sync_actions()
+            .await
+            .expect("header-sync actions are enabled");
+        let capabilities = ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V7;
+        let hostile =
+            HostilePeer::connect_native_with_capabilities(&victim, 71, capabilities).await?;
+        assert_eq!(
+            HostilePeer::selected_header_sync_version(capabilities),
+            Some(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7)
+        );
+
+        hostile
+            .reopen_ordered_stream(
+                ZAKURA_STREAM_HEADER_SYNC,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+            )
+            .await?;
+        await_until("v7 physical session registered", TEST_NET_TIMEOUT, || {
+            victim.header_sync().is_some_and(|handle| {
+                let peers = handle.peer_snapshot();
+                peers.inbound_peers + peers.outbound_peers == 1
+            })
+        })
+        .await?;
+        let initial_status = tokio::time::timeout(
+            TEST_NET_TIMEOUT,
+            hostile.recv_ordered_frame_with_version(
+                ZAKURA_STREAM_HEADER_SYNC,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+            ),
+        )
+        .await??;
+        let (initial_status, request_id) = HeaderSyncMessage::decode_frame_with_request_id(
+            initial_status,
+            HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7),
+        )?;
+        assert!(matches!(initial_status, HeaderSyncMessage::Status(_)));
+        assert_eq!(request_id, None);
+        hostile
+            .send_ordered_raw_frame_with_version(
+                ZAKURA_STREAM_HEADER_SYNC,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+                status_for_tip(4, 2, 2)
+                    .encode_frame_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7, None)?,
+            )
+            .await?;
+
+        next_observed_get_headers(&mut actions).await?;
+        next_observed_get_headers(&mut actions).await?;
+
+        let mut requests = Vec::new();
+        while requests.len() < 2 {
+            let frame = tokio::time::timeout(
+                TEST_NET_TIMEOUT,
+                hostile.recv_ordered_frame_with_version(
+                    ZAKURA_STREAM_HEADER_SYNC,
+                    ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+                ),
+            )
+            .await??;
+            let (message, request_id) = HeaderSyncMessage::decode_frame_with_request_id(
+                frame,
+                HeaderSyncDecodeContext::control_for_version(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7),
+            )?;
+            if let HeaderSyncMessage::GetHeaders {
+                start_height,
+                count,
+                want_tree_aux_roots,
+            } = message
+            {
+                requests.push((
+                    request_id.expect("v7 GetHeaders carries a request id"),
+                    start_height,
+                    count,
+                    want_tree_aux_roots,
+                ));
+            }
+        }
+        assert_ne!(requests[0].0, requests[1].0);
+        assert!(requests.iter().all(|(id, _, _, _)| id.get() != 0));
+        let mut request_ranges: Vec<_> = requests
+            .iter()
+            .map(|(_, start, count, _)| (*start, *count))
+            .collect();
+        request_ranges.sort_by_key(|(start, _)| *start);
+        assert_eq!(
+            request_ranges,
+            vec![(block::Height(1), 2), (block::Height(3), 2)]
+        );
+
+        let hostile_id = hostile.id()?;
+        for (request_id, start, count, want_tree_aux_roots) in requests.iter().rev() {
+            let query = ControlledHeaderQuery {
+                peer: hostile_id.clone(),
+                session_id: 0,
+                request_id: Some(*request_id),
+                start: *start,
+                count: *count,
+                want_tree_aux_roots: *want_tree_aux_roots,
+            };
+            hostile
+                .send_ordered_raw_frame_with_version(
+                    ZAKURA_STREAM_HEADER_SYNC,
+                    ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+                    headers_for_query(&query).encode_frame_for_version(
+                        ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+                        Some(*request_id),
+                    )?,
+                )
+                .await?;
+        }
+
+        let mut commits = vec![
+            next_controlled_header_commit(&mut actions).await?,
+            next_controlled_header_commit(&mut actions).await?,
+        ];
+        commits.sort_by_key(|commit| commit.start_height);
+        for commit in &commits {
+            assert_eq!(commit.peer, hostile_id);
+            assert_ne!(commit.session_id, 0);
+            let expected_anchor = if commit.start_height == block::Height(1) {
+                mainnet_genesis_hash()
+            } else {
+                mainnet_block(block_bytes(commit.start_height.0 - 1)).hash()
+            };
+            assert_eq!(commit.anchor, expected_anchor);
+            assert_eq!(
+                test_header_height(
+                    commit
+                        .headers
+                        .first()
+                        .expect("each correlated response contains headers")
+                ),
+                commit.start_height
+            );
+        }
+        for commit in commits {
+            let tip_height = block::Height(
+                commit.start_height.0
+                    + u32::try_from(commit.headers.len()).expect("test header count fits u32")
+                    - 1,
+            );
+            let tip_hash = commit
+                .headers
+                .last()
+                .expect("each correlated response contains headers")
+                .hash();
+            victim
+                .header_sync()
+                .expect("header-sync handle is enabled")
+                .send(HeaderSyncEvent::HeaderRangeCommitted {
+                    start_height: commit.start_height,
+                    tip_height,
+                    tip_hash,
+                })
+                .await?;
+        }
+        await_until("v7 correlated header tip", TEST_NET_TIMEOUT, || {
+            victim
+                .header_sync()
+                .is_some_and(|handle| handle.best_header_tip().0 == block::Height(4))
+        })
+        .await?;
+
+        let inbound_request_id =
+            HeaderSyncRequestId::new(9_001).expect("nonzero test request id is valid");
+        hostile
+            .send_ordered_raw_frame_with_version(
+                ZAKURA_STREAM_HEADER_SYNC,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+                HeaderSyncMessage::GetHeaders {
+                    start_height: block::Height(1),
+                    count: 1,
+                    want_tree_aux_roots: true,
+                }
+                .encode_frame_for_version(
+                    ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+                    Some(inbound_request_id),
+                )?,
+            )
+            .await?;
+        let query = next_controlled_header_query(&mut actions).await?;
+        assert_eq!(query.request_id, Some(inbound_request_id));
+        complete_controlled_query(
+            &victim.header_sync().expect("header-sync handle is enabled"),
+            &query,
+        )
+        .await?;
+        loop {
+            let frame = tokio::time::timeout(
+                TEST_NET_TIMEOUT,
+                hostile.recv_ordered_frame_with_version(
+                    ZAKURA_STREAM_HEADER_SYNC,
+                    ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+                ),
+            )
+            .await??;
+            if frame.message_type
+                == u16::from(
+                    HeaderSyncMessage::Headers {
+                        headers: Vec::new(),
+                        body_sizes: Vec::new(),
+                        tree_aux_roots: Vec::new(),
+                    }
+                    .message_type(),
+                )
+            {
+                assert_eq!(
+                    HeaderSyncMessage::peek_headers_request_id(&frame.payload)?,
+                    inbound_request_id
+                );
+                break;
+            }
+        }
+
+        hostile.shutdown().await;
+        victim.shutdown().await;
+        assert!(capture.finish().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_stream5_status_exchange_uses_handler_wire_path() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
@@ -2554,6 +3046,146 @@ mod tests {
         cluster.shutdown().await;
         driver1.abort();
         driver2.abort();
+        assert!(capture.finish().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_stream5_v6_timeout_reopens_on_same_connection() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut capture = TraceCapture::for_test_with_keep_override(
+            "native_stream5_v6_timeout_reopens_on_same_connection",
+            false,
+        )?;
+        let network = e2e_network([2]);
+        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let capabilities = ZAKURA_CAP_HEADER_SYNC;
+        let source = ZakuraTestNode::builder(80)
+            .tracer(capture.tracer_for_node(80))
+            .supported_capabilities(capabilities)
+            .header_sync_driver(
+                network.clone(),
+                anchor,
+                HeaderSyncFrontiers {
+                    finalized_height: block::Height(0),
+                    verified_block_tip: block::Height(0),
+                    verified_block_hash: anchor.1,
+                },
+                Some((
+                    block::Height(2),
+                    mainnet_block(&BLOCK_MAINNET_2_BYTES).hash(),
+                )),
+            )
+            .spawn()
+            .await?;
+        let target = header_sync_test_builder(81, network, &mut capture)
+            .supported_capabilities(capabilities)
+            .header_sync_request_timeout(Duration::from_millis(100))
+            .spawn()
+            .await?;
+        let mut source_actions = source
+            .take_header_sync_actions()
+            .await
+            .expect("source header-sync actions are enabled");
+        let mut target_actions = target
+            .take_header_sync_actions()
+            .await
+            .expect("target header-sync actions are enabled");
+        let source_id = ZakuraPeerId::new(source.node_addr().await.node_id.as_bytes().to_vec())?;
+        let target_peers = target.supervisor().subscribe();
+
+        target.connect_native(&source, TEST_NET_TIMEOUT).await?;
+        let first = next_controlled_header_query(&mut source_actions).await?;
+        assert_eq!(
+            first.request_id, None,
+            "v6 requests do not carry request ids"
+        );
+        assert_eq!(
+            HostilePeer::selected_header_sync_version(capabilities),
+            Some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
+        );
+
+        let second = next_controlled_header_query(&mut source_actions).await?;
+        assert_ne!(
+            first.session_id, second.session_id,
+            "the retry must arrive on a fresh ordered-stream generation"
+        );
+        assert_eq!(second.request_id, None);
+        assert_eq!(second.start, first.start);
+        assert_eq!(second.count, first.count);
+        assert!(
+            target_peers.borrow().contains(&source_id),
+            "header-sync timeout must not tear down the shared QUIC connection"
+        );
+
+        complete_controlled_query(
+            &source
+                .header_sync()
+                .expect("source header-sync handle is enabled"),
+            &second,
+        )
+        .await?;
+        let commit = next_controlled_header_commit(&mut target_actions).await?;
+        assert_eq!(commit.peer, source_id);
+        assert_ne!(commit.session_id, 0);
+        assert_eq!(commit.start_height, block::Height(1));
+        assert_eq!(commit.anchor, mainnet_genesis_hash());
+        let tip_hash = commit
+            .headers
+            .last()
+            .expect("v6 retry returns headers")
+            .hash();
+        target
+            .header_sync()
+            .expect("target header-sync handle is enabled")
+            .send(HeaderSyncEvent::HeaderRangeCommitted {
+                start_height: commit.start_height,
+                tip_height: block::Height(2),
+                tip_hash,
+            })
+            .await?;
+        await_until("v6 reopened stream advances tip", TEST_NET_TIMEOUT, || {
+            target
+                .header_sync()
+                .is_some_and(|handle| handle.best_header_tip().0 == block::Height(2))
+        })
+        .await?;
+
+        complete_controlled_query(
+            &source
+                .header_sync()
+                .expect("source header-sync handle is enabled"),
+            &first,
+        )
+        .await?;
+        assert!(
+            target_peers.borrow().contains(&source_id),
+            "a stale v6 state completion must not close the replacement connection"
+        );
+        assert_eq!(
+            target
+                .header_sync()
+                .expect("target header-sync handle is enabled")
+                .best_header_tip()
+                .0,
+            block::Height(2),
+            "a stale response cannot reanchor or regress the replacement session"
+        );
+
+        capture.flush().await;
+        let reader = capture.reader()?;
+        assert_eq!(
+            reader.node("80").table("conn").count("accepted"),
+            1,
+            "v6 stream retirement must reuse the original physical connection"
+        );
+        assert!(
+            reader.node("80").table("stream").count("accepted") >= 2,
+            "the responder must accept the original and replacement v6 streams"
+        );
+
+        target.shutdown().await;
+        source.shutdown().await;
         assert!(capture.finish().await?.is_none());
         Ok(())
     }

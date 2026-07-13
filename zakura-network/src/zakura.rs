@@ -63,6 +63,9 @@ pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 1;
 /// Capability bit for the native discovery service.
 pub const ZAKURA_CAP_DISCOVERY: u64 = 1 << 2;
 
+/// Capability bit for the request-id capable native header-sync service.
+pub const ZAKURA_CAP_HEADER_SYNC_V7: u64 = 1 << 4;
+
 /// Production default for per-service peer caps.
 pub const DEFAULT_SERVICE_MAX_PEERS: usize = 256;
 /// Production default for per-service bounded inbound work queues.

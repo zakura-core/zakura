@@ -26,6 +26,7 @@ use crate::zakura::{
     OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServiceAdmissionDecision,
     ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+    ZAKURA_CAP_HEADER_SYNC_V7,
 };
 
 #[cfg(test)]
@@ -231,8 +232,7 @@ impl Service for DiscoveryService {
         let service_cancel = discovery_session.cancel_token();
         let connection_cancel = peer.cancel_token();
         let close_cause = peer.close_cause();
-        let other_service_negotiated =
-            peer.negotiated & !(ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC) != 0;
+        let other_service_negotiated = has_other_negotiated_service(peer.negotiated);
         let (_peer_id, _stream_kind, recv, _send, _session_cancel) = session.into_parts();
 
         let handle = self.handle.clone();
@@ -730,6 +730,10 @@ fn peer_has_other_service_owner(
     })
 }
 
+fn has_other_negotiated_service(negotiated: u64) -> bool {
+    negotiated & !(ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V7) != 0
+}
+
 /// Returns the iroh node id encoded by a discovery peer id, if it is a 32-byte
 /// node id.
 fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
@@ -775,6 +779,22 @@ mod tests {
         MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
     };
     use zakura_chain::{block, parameters::Network};
+
+    #[test]
+    fn header_sync_v6_and_v7_capabilities_share_one_service_owner() {
+        assert!(!has_other_negotiated_service(
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC
+        ));
+        assert!(!has_other_negotiated_service(
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC_V7
+        ));
+        assert!(!has_other_negotiated_service(
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_HEADER_SYNC_V7
+        ));
+        assert!(has_other_negotiated_service(
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC_V7 | ZAKURA_CAP_BLOCK_SYNC
+        ));
+    }
 
     struct HeaderAdvisoryFixture {
         discovery_handle: ZakuraDiscoveryHandle,

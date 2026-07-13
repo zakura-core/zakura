@@ -162,6 +162,8 @@ const STREAM_PRELUDE_REQUEST_ID_FLAG_OFFSET: usize = STREAM_PRELUDE_FIXED_BYTES 
 const STREAM_PRELUDE_REQUEST_ID_BYTES: usize = 8;
 const STREAM_PRELUDE_CAP_BYTES: usize = 4;
 const STREAM_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const ORDERED_STREAM_REOPEN_BACKOFF: Duration = Duration::from_millis(250);
+const ORDERED_STREAM_REOPEN_BACKOFF_CAP: Duration = Duration::from_secs(8);
 const OUTBOUND_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 // Mirrors the legacy gossip compatibility protocol. Compile-time assertions
@@ -1451,9 +1453,38 @@ impl StreamWorkerContext {
 
 struct AdmittedOrderedStream {
     kind: u16,
+    stream: Stream,
+    session_id: u64,
     recv: FramedRecv,
     send: FramedSend,
     cancel_token: CancellationToken,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct OrderedStreamExit {
+    stream: Stream,
+    session_id: u64,
+    opened_locally: bool,
+}
+
+fn should_reopen_ordered_stream(
+    exited: OrderedStreamExit,
+    is_initiator: bool,
+    connection_cancelled: bool,
+) -> bool {
+    exited.opened_locally
+        && is_initiator
+        && exited.stream.kind == ZAKURA_STREAM_HEADER_SYNC
+        && !connection_cancelled
+}
+
+/// Exponential reopen delay for one ordered stream kind, capped so a
+/// persistently failing local open cannot spin the connection loop.
+fn ordered_stream_reopen_backoff(attempts: u32) -> Duration {
+    // The shift is safe: attempts is clamped so the multiplier fits in u32.
+    ORDERED_STREAM_REOPEN_BACKOFF
+        .saturating_mul(1u32 << attempts.min(8))
+        .min(ORDERED_STREAM_REOPEN_BACKOFF_CAP)
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1682,6 +1713,16 @@ impl ZakuraProtocolHandler {
         }
     }
 
+    /// Restrict the locally advertised capability mask.
+    ///
+    /// Test nodes use this to exercise compatibility negotiation against older
+    /// peers while retaining the production service registry.
+    #[cfg(any(test, feature = "zakura-testkit"))]
+    pub(crate) fn with_supported_capabilities(mut self, supported_capabilities: u64) -> Self {
+        self.handshake_config.supported_capabilities &= supported_capabilities;
+        self
+    }
+
     /// Attach the bound iroh endpoint so inbound Router-accepted connections can
     /// resolve the peer's UDP source IP and enforce the per-IP connection cap.
     pub fn with_endpoint(mut self, endpoint: Endpoint) -> Self {
@@ -1891,6 +1932,11 @@ impl ZakuraProtocolHandler {
         let accepted_capabilities = context.accepted_capabilities;
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
         let mut workers = JoinSet::new();
+        let (ordered_stream_exit_tx, mut ordered_stream_exit_rx) = mpsc::unbounded_channel();
+        let (ordered_stream_reopen_tx, mut ordered_stream_reopen_rx) = mpsc::unbounded_channel();
+        // Consecutive reopen attempts per stream kind; reset once a reopen
+        // succeeds so ordinary retirements keep the base delay.
+        let mut ordered_stream_reopen_attempts: HashMap<u16, u32> = HashMap::new();
         let mut open_limiter = TokenBucket::new(limits.stream_open_rate_per_second);
         let mut message_buckets = MessageRateBuckets::new();
         let (freshness_tx, freshness_rx) = watch::channel(Instant::now());
@@ -1940,10 +1986,11 @@ impl ZakuraProtocolHandler {
             close_cause.record("resource_queue_split");
             connection_token.cancel();
         }
-        let ordered_kinds: HashSet<u16> = negotiated_ordered_streams
+        let selected_ordered_streams: HashMap<u16, Stream> = negotiated_ordered_streams
             .iter()
-            .map(|stream| stream.kind)
+            .map(|stream| (stream.kind, *stream))
             .collect();
+        let ordered_kinds: HashSet<u16> = selected_ordered_streams.keys().copied().collect();
         let queue_split_stream_count = negotiated_ordered_streams.len().max(ordered_streams.len());
         let per_stream_queue_depth = per_stream_inbound_queue_depth(
             limits.max_inbound_queue_depth,
@@ -1988,6 +2035,7 @@ impl ZakuraProtocolHandler {
                         freshness_tx.clone(),
                         conn.clone(),
                         peer_id.clone(),
+                        ordered_stream_exit_tx.clone(),
                     )
                     .await
                 {
@@ -2010,7 +2058,13 @@ impl ZakuraProtocolHandler {
                 opened_kinds.insert(admitted.kind);
                 service_streams.insert(
                     admitted.kind,
-                    ServiceStream::new(admitted.recv, admitted.send, admitted.cancel_token),
+                    ServiceStream::new(
+                        admitted.stream,
+                        admitted.session_id,
+                        admitted.recv,
+                        admitted.send,
+                        admitted.cancel_token,
+                    ),
                 );
             }
             if !connection_token.is_cancelled() {
@@ -2042,6 +2096,116 @@ impl ZakuraProtocolHandler {
                     close_cause.record("idle_timeout");
                     break;
                 }
+                Some(exited) = ordered_stream_exit_rx.recv() => {
+                    if exited.opened_locally {
+                        opened_kinds.remove(&exited.stream.kind);
+                    } else {
+                        accepted_ordered_kinds.remove(&exited.stream.kind);
+                    }
+                    if should_reopen_ordered_stream(
+                        exited,
+                        context.is_initiator,
+                        connection_token.is_cancelled(),
+                    ) {
+                        let attempts = ordered_stream_reopen_attempts
+                            .entry(exited.stream.kind)
+                            .or_insert(0);
+                        let delay = ordered_stream_reopen_backoff(*attempts);
+                        *attempts = attempts.saturating_add(1);
+                        debug!(
+                            stream_kind = exited.stream.kind,
+                            stream_version = exited.stream.version,
+                            session_id = exited.session_id,
+                            ?delay,
+                            "scheduling Zakura ordered stream reopen"
+                        );
+                        let reopen = ordered_stream_reopen_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = reopen.send(exited.stream);
+                        });
+                    }
+                }
+                Some(stream) = ordered_stream_reopen_rx.recv() => {
+                    if connection_token.is_cancelled()
+                        || !context.is_initiator
+                        || opened_kinds.contains(&stream.kind)
+                        || selected_ordered_streams.get(&stream.kind) != Some(&stream)
+                        || !self.registry.wants_ordered_stream(
+                            stream.kind,
+                            accepted_capabilities,
+                            &peer_id,
+                            context.direction,
+                        )
+                    {
+                        continue;
+                    }
+
+                    match self
+                        .open_ordered_service_stream(
+                            &connection,
+                            stream,
+                            &mut workers,
+                            &stream_sem,
+                            &mut message_buckets,
+                            limits,
+                            per_stream_queue_depth,
+                            connection_token.clone(),
+                            close_cause.clone(),
+                            freshness_tx.clone(),
+                            conn.clone(),
+                            peer_id.clone(),
+                            ordered_stream_exit_tx.clone(),
+                        )
+                        .await
+                    {
+                        Ok(admitted) => {
+                            ordered_stream_reopen_attempts.remove(&admitted.kind);
+                            opened_kinds.insert(admitted.kind);
+                            let service_streams = HashMap::from([(
+                                admitted.kind,
+                                ServiceStream::new(
+                                    admitted.stream,
+                                    admitted.session_id,
+                                    admitted.recv,
+                                    admitted.send,
+                                    admitted.cancel_token,
+                                ),
+                            )]);
+                            let admitted_capabilities = self.registry.add_escalated_peer(
+                                Peer::new_with_service_streams(
+                                    conn_id,
+                                    peer_id.clone(),
+                                    remote_ip,
+                                    accepted_capabilities,
+                                    context.direction,
+                                    service_streams,
+                                    connection_token.clone(),
+                                    close_cause.clone(),
+                                ),
+                            );
+                            cleanup_guard.add_admitted_capabilities(admitted_capabilities);
+                        }
+                        Err(error) => {
+                            let attempts = ordered_stream_reopen_attempts
+                                .entry(stream.kind)
+                                .or_insert(0);
+                            let delay = ordered_stream_reopen_backoff(*attempts);
+                            *attempts = attempts.saturating_add(1);
+                            debug!(
+                                ?error,
+                                stream_kind = stream.kind,
+                                ?delay,
+                                "retrying Zakura ordered stream reopen after local failure"
+                            );
+                            let reopen = ordered_stream_reopen_tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                let _ = reopen.send(stream);
+                            });
+                        }
+                    }
+                }
                 Some(joined) = workers.join_next() => {
                     if let Err(error) = joined {
                         debug!(?error, "Zakura stream worker exited unexpectedly");
@@ -2065,7 +2229,13 @@ impl ZakuraProtocolHandler {
                                 freshness_tx: freshness_tx.clone(),
                             };
                             if let Some(admitted) = self
-                                .admit_bi_stream(send, recv, &mut admission, per_stream_queue_depth)
+                                .admit_bi_stream(
+                                    send,
+                                    recv,
+                                    &mut admission,
+                                    per_stream_queue_depth,
+                                    ordered_stream_exit_tx.clone(),
+                                )
                                 .await
                             {
                                 let kind = admitted.kind;
@@ -2079,6 +2249,16 @@ impl ZakuraProtocolHandler {
                                         "closing peer after unexpected ordered stream"
                                     );
                                     close_cause.record("unexpected_stream");
+                                    connection_token.cancel();
+                                    continue;
+                                }
+                                if selected_ordered_streams.get(&kind) != Some(&admitted.stream) {
+                                    debug!(
+                                        stream_kind = kind,
+                                        stream_version = admitted.stream.version,
+                                        "closing peer after non-selected ordered stream version"
+                                    );
+                                    close_cause.record("unexpected_stream_version");
                                     connection_token.cancel();
                                     continue;
                                 }
@@ -2162,6 +2342,8 @@ impl ZakuraProtocolHandler {
                                 let service_streams = HashMap::from([(
                                     kind,
                                     ServiceStream::new(
+                                        admitted.stream,
+                                        admitted.session_id,
                                         admitted.recv,
                                         admitted.send,
                                         admitted.cancel_token.clone(),
@@ -2291,6 +2473,7 @@ impl ZakuraProtocolHandler {
         freshness_tx: watch::Sender<Instant>,
         conn: ZakuraConnTrace,
         peer_id: ZakuraPeerId,
+        ordered_stream_exit_tx: mpsc::UnboundedSender<OrderedStreamExit>,
     ) -> Result<AdmittedOrderedStream, ZakuraHandlerError> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let permit = stream_sem
@@ -2352,9 +2535,12 @@ impl ZakuraProtocolHandler {
             workers,
             send,
             recv,
+            stream,
             prelude,
             context,
             per_stream_queue_depth,
+            true,
+            ordered_stream_exit_tx,
         ))
     }
 
@@ -2364,6 +2550,7 @@ impl ZakuraProtocolHandler {
         mut recv: RecvStream,
         admission: &mut StreamAdmission<'_>,
         per_stream_queue_depth: usize,
+        ordered_stream_exit_tx: mpsc::UnboundedSender<OrderedStreamExit>,
     ) -> Option<AdmittedOrderedStream> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let Ok(permit) = admission.stream_sem.clone().try_acquire_owned() else {
@@ -2531,9 +2718,12 @@ impl ZakuraProtocolHandler {
                 admission.workers,
                 send,
                 recv,
+                stream,
                 prelude,
                 context,
                 per_stream_queue_depth,
+                false,
+                ordered_stream_exit_tx,
             ))
         }
     }
@@ -3105,32 +3295,47 @@ async fn run_native_initiator_handshake(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_persistent_stream_worker(
     workers: &mut JoinSet<()>,
     send: SendStream,
     recv: RecvStream,
+    stream: Stream,
     prelude: StreamPrelude,
     context: StreamWorkerContext,
     queue_depth: usize,
+    opened_locally: bool,
+    ordered_stream_exit_tx: mpsc::UnboundedSender<OrderedStreamExit>,
 ) -> AdmittedOrderedStream {
     let (to_service_tx, to_service_rx) = mpsc::channel(queue_depth);
     let (from_service_tx, from_service_rx) = mpsc::channel(queue_depth);
     let admitted = AdmittedOrderedStream {
         kind: prelude.stream_kind,
+        stream,
+        session_id: context.stream_id,
         recv: FramedRecv::new(to_service_rx),
         send: FramedSend::new(from_service_tx),
         cancel_token: context.stream_token.clone(),
     };
 
-    workers.spawn(persistent_stream_worker(
-        send,
-        recv,
-        prelude,
-        context,
-        to_service_tx,
-        from_service_rx,
-        queue_depth,
-    ));
+    let exit = OrderedStreamExit {
+        stream,
+        session_id: admitted.session_id,
+        opened_locally,
+    };
+    workers.spawn(async move {
+        persistent_stream_worker(
+            send,
+            recv,
+            prelude,
+            context,
+            to_service_tx,
+            from_service_rx,
+            queue_depth,
+        )
+        .await;
+        let _ = ordered_stream_exit_tx.send(exit);
+    });
 
     admitted
 }
@@ -6474,6 +6679,60 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn ordered_stream_reopen_is_limited_to_local_header_initiator() {
+        let header = Stream {
+            kind: ZAKURA_STREAM_HEADER_SYNC,
+            version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            frame_cap: 1,
+            capability: ZAKURA_CAP_HEADER_SYNC,
+            mode: StreamMode::Ordered,
+        };
+        let local_header = OrderedStreamExit {
+            stream: header,
+            session_id: 1,
+            opened_locally: true,
+        };
+        assert!(should_reopen_ordered_stream(local_header, true, false));
+        assert!(!should_reopen_ordered_stream(local_header, false, false));
+        assert!(!should_reopen_ordered_stream(local_header, true, true));
+
+        let accepted_header = OrderedStreamExit {
+            opened_locally: false,
+            ..local_header
+        };
+        assert!(!should_reopen_ordered_stream(accepted_header, true, false));
+
+        let gossip = OrderedStreamExit {
+            stream: Stream {
+                kind: LEGACY_GOSSIP_STREAM_KIND,
+                ..header
+            },
+            ..local_header
+        };
+        assert!(!should_reopen_ordered_stream(gossip, true, false));
+    }
+
+    #[test]
+    fn ordered_stream_reopen_backoff_grows_and_caps() {
+        assert_eq!(
+            ordered_stream_reopen_backoff(0),
+            ORDERED_STREAM_REOPEN_BACKOFF
+        );
+        assert_eq!(
+            ordered_stream_reopen_backoff(1),
+            ORDERED_STREAM_REOPEN_BACKOFF * 2
+        );
+        assert_eq!(
+            ordered_stream_reopen_backoff(5),
+            ORDERED_STREAM_REOPEN_BACKOFF_CAP
+        );
+        assert_eq!(
+            ordered_stream_reopen_backoff(u32::MAX),
+            ORDERED_STREAM_REOPEN_BACKOFF_CAP
+        );
+    }
+
     #[tokio::test]
     async fn stream_cancel_closes_ordered_worker_without_connection_cancel() -> Result<(), BoxError>
     {
@@ -6527,8 +6786,6 @@ mod tests {
         let stream_kind = DISCOVERY_STREAM_KIND;
         let connection_token = CancellationToken::new();
         let stream_token = connection_token.child_token();
-        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
-        let (outbound_tx, outbound_rx) = mpsc::channel(1);
         let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
         let permit = Arc::new(Semaphore::new(1))
             .try_acquire_owned()
@@ -6554,21 +6811,39 @@ mod tests {
             max_frame_bytes: app_frame_cap_for_stream_kind(&limits, stream_kind),
         };
 
-        let worker = tokio::spawn(persistent_stream_worker(
+        let stream = Stream {
+            kind: stream_kind,
+            version: ZAKURA_STREAM_VERSION_1,
+            frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+            capability: ZAKURA_CAP_DISCOVERY,
+            mode: StreamMode::Ordered,
+        };
+        let mut workers = JoinSet::new();
+        let (ordered_stream_exit_tx, mut ordered_stream_exit_rx) = mpsc::unbounded_channel();
+        let admitted = spawn_persistent_stream_worker(
+            &mut workers,
             server_send,
             server_recv,
+            stream,
             prelude,
             context,
-            inbound_tx,
-            outbound_rx,
             1,
-        ));
+            true,
+            ordered_stream_exit_tx,
+        );
 
-        drop(outbound_tx);
-        stream_token.cancel();
-        timeout(Duration::from_secs(1), worker)
+        admitted.cancel_token.cancel();
+        let exited = timeout(Duration::from_secs(1), ordered_stream_exit_rx.recv())
             .await
-            .expect("stream cancellation stops the worker promptly")?;
+            .expect("stream cancellation reports worker exit")
+            .expect("exit channel stays open");
+        assert_eq!(exited.stream, stream);
+        assert_eq!(exited.session_id, 1);
+        assert!(exited.opened_locally);
+        timeout(Duration::from_secs(1), workers.join_next())
+            .await
+            .expect("stream cancellation stops the worker promptly")
+            .expect("worker exit is observed")?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !connection_token.is_cancelled(),
@@ -7244,9 +7519,16 @@ mod tests {
             close_cause: CloseCause::new(),
             freshness_tx,
         };
+        let (ordered_stream_exit_tx, _ordered_stream_exit_rx) = mpsc::unbounded_channel();
 
         let admitted = handler
-            .admit_bi_stream(server_send, server_recv, &mut admission, 16)
+            .admit_bi_stream(
+                server_send,
+                server_recv,
+                &mut admission,
+                16,
+                ordered_stream_exit_tx,
+            )
             .await;
 
         assert!(

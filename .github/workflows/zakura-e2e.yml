@@ -69,9 +69,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # The pulls/files API exposes changed paths as `filename` (unlike
+            # the compare API's `.files[].filename`, this array is top-level).
             changed=$(gh api --paginate \
               "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-              --jq '.[].path')
+              --jq '.[].filename')
           else
             before="${{ github.event.before }}"
             # The first push of a branch (and force-pushes that orphan the old
@@ -267,6 +269,7 @@ jobs:
           - checkpoint-long
           - no-checkpoint-long
           - restart-matrix
+          - header-faults
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:

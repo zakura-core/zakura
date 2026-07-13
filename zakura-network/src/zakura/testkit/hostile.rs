@@ -13,8 +13,8 @@ use crate::{
         ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES,
         LEGACY_GOSSIP_VERSION, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC, ZAKURA_BLOCK_SYNC_STREAM_VERSION,
         ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
-        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY,
-        ZAKURA_STREAM_HEADER_SYNC,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
     },
     BoxError, Config,
 };
@@ -26,7 +26,7 @@ pub struct HostilePeer {
     connection: Connection,
     limits: ZakuraLocalLimits,
     held_streams: Vec<SendStream>,
-    ordered_streams: Mutex<HashMap<u16, (SendStream, RecvStream)>>,
+    ordered_streams: Mutex<HashMap<(u16, u16), (SendStream, RecvStream)>>,
 }
 
 impl HostilePeer {
@@ -108,12 +108,28 @@ impl HostilePeer {
     }
 
     async fn send_ordered_raw_frame(&self, stream_kind: u16, frame: Frame) -> Result<(), BoxError> {
+        self.send_ordered_raw_frame_with_version(
+            stream_kind,
+            Self::stream_version(stream_kind),
+            frame,
+        )
+        .await
+    }
+
+    /// Send `frame` on a persistent ordered stream at an explicit version.
+    pub async fn send_ordered_raw_frame_with_version(
+        &self,
+        stream_kind: u16,
+        stream_version: u16,
+        frame: Frame,
+    ) -> Result<(), BoxError> {
         let mut streams = self.ordered_streams.lock().await;
-        let (send, _recv) = match streams.entry(stream_kind) {
+        let (send, _recv) = match streams.entry((stream_kind, stream_version)) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let (mut send, recv) = self.connection.open_bi().await?;
-                self.write_prelude(&mut send, stream_kind).await?;
+                self.write_prelude_with_version(&mut send, stream_kind, stream_version)
+                    .await?;
                 entry.insert((send, recv))
             }
         };
@@ -124,16 +140,81 @@ impl HostilePeer {
 
     /// Receive the next frame written by the victim on this ordered stream.
     pub async fn recv_ordered_frame(&self, stream_kind: u16) -> Result<Frame, BoxError> {
+        self.recv_ordered_frame_with_version(stream_kind, Self::stream_version(stream_kind))
+            .await
+    }
+
+    /// Receive the next frame on a persistent ordered stream at an explicit version.
+    pub async fn recv_ordered_frame_with_version(
+        &self,
+        stream_kind: u16,
+        stream_version: u16,
+    ) -> Result<Frame, BoxError> {
         let mut streams = self.ordered_streams.lock().await;
-        let (_send, recv) = match streams.entry(stream_kind) {
+        let (_send, recv) = match streams.entry((stream_kind, stream_version)) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let (mut send, recv) = self.connection.open_bi().await?;
-                self.write_prelude(&mut send, stream_kind).await?;
+                self.write_prelude_with_version(&mut send, stream_kind, stream_version)
+                    .await?;
                 entry.insert((send, recv))
             }
         };
         Self::read_frame(recv, self.limits.max_frame_bytes).await
+    }
+
+    /// Gracefully finish and forget one persistent ordered stream generation.
+    pub async fn finish_ordered_stream(
+        &self,
+        stream_kind: u16,
+        stream_version: u16,
+    ) -> Result<(), BoxError> {
+        let Some((mut send, _recv)) = self
+            .ordered_streams
+            .lock()
+            .await
+            .remove(&(stream_kind, stream_version))
+        else {
+            return Ok(());
+        };
+        send.finish()?;
+        Ok(())
+    }
+
+    /// Reset and forget one persistent ordered stream generation.
+    pub async fn reset_ordered_stream(
+        &self,
+        stream_kind: u16,
+        stream_version: u16,
+    ) -> Result<(), BoxError> {
+        let Some((mut send, mut recv)) = self
+            .ordered_streams
+            .lock()
+            .await
+            .remove(&(stream_kind, stream_version))
+        else {
+            return Ok(());
+        };
+        let code = VarInt::from_u32(0);
+        send.reset(code)?;
+        recv.stop(code)?;
+        Ok(())
+    }
+
+    /// Replace one persistent ordered stream with a fresh physical generation.
+    pub async fn reopen_ordered_stream(
+        &self,
+        stream_kind: u16,
+        stream_version: u16,
+    ) -> Result<(), BoxError> {
+        self.reset_ordered_stream(stream_kind, stream_version)
+            .await?;
+        let mut streams = self.ordered_streams.lock().await;
+        let (mut send, recv) = self.connection.open_bi().await?;
+        self.write_prelude_with_version(&mut send, stream_kind, stream_version)
+            .await?;
+        streams.insert((stream_kind, stream_version), (send, recv));
+        Ok(())
     }
 
     /// Send a valid frame header with a payload shorter than its declared
@@ -323,10 +404,20 @@ impl HostilePeer {
     }
 
     async fn write_prelude(&self, send: &mut SendStream, stream_kind: u16) -> Result<(), BoxError> {
+        self.write_prelude_with_version(send, stream_kind, Self::stream_version(stream_kind))
+            .await
+    }
+
+    async fn write_prelude_with_version(
+        &self,
+        send: &mut SendStream,
+        stream_kind: u16,
+        stream_version: u16,
+    ) -> Result<(), BoxError> {
         let prelude = StreamPrelude {
             magic: STREAM_PRELUDE_MAGIC,
             stream_kind,
-            stream_version: Self::stream_version(stream_kind),
+            stream_version,
             request_id: None,
             max_frame_bytes: self.limits.max_frame_bytes,
         };
@@ -341,6 +432,17 @@ impl HostilePeer {
             ZAKURA_STREAM_HEADER_SYNC => ZAKURA_HEADER_SYNC_STREAM_VERSION,
             ZAKURA_STREAM_BLOCK_SYNC => ZAKURA_BLOCK_SYNC_STREAM_VERSION,
             _ => 1,
+        }
+    }
+
+    /// Selected header-sync stream version for an explicit capability mask.
+    pub fn selected_header_sync_version(capabilities: u64) -> Option<u16> {
+        if capabilities & crate::zakura::ZAKURA_CAP_HEADER_SYNC_V7 != 0 {
+            Some(ZAKURA_HEADER_SYNC_STREAM_VERSION_V7)
+        } else if capabilities & ZAKURA_CAP_HEADER_SYNC != 0 {
+            Some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
+        } else {
+            None
         }
     }
 

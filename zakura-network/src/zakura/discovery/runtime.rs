@@ -18,6 +18,7 @@ pub(crate) fn default_advertised_services() -> Vec<ZakuraServiceId> {
         ZakuraServiceId::discovery(),
         ZakuraServiceId::block_sync(),
         ZakuraServiceId::header_sync(),
+        ZakuraServiceId::header_sync_v2(),
         ZakuraServiceId::legacy_gossip(),
         ZakuraServiceId::legacy_requests(),
         ZakuraServiceId::service_discovery(),

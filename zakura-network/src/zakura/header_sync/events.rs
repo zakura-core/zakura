@@ -28,7 +28,7 @@ pub struct HeaderSyncStartup {
     pub best_header_tip: Option<(block::Height, block::Hash)>,
     /// Shared sync exchange frontier stream.
     pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
-    /// Local header-sync v6 advertisement.
+    /// Local header-sync advertisement.
     pub config: ZakuraHeaderSyncConfig,
     /// Negotiated or local application frame cap for header-sync responses.
     pub max_frame_bytes: u32,
@@ -145,7 +145,7 @@ impl HeaderSyncHandle {
 /// Facts accepted by the header-sync reactor.
 #[derive(Clone, Debug)]
 pub enum HeaderSyncEvent {
-    /// A peer became available for header-sync v6.
+    /// A peer became available for negotiated header sync.
     PeerConnected(HeaderSyncPeerSession),
     /// A peer disconnected; all of its outstanding work is dropped.
     PeerDisconnected(ZakuraPeerId),
@@ -206,21 +206,60 @@ pub enum HeaderSyncEvent {
         /// Rejected block hash.
         hash: block::Hash,
     },
-    /// Inbound header-sync v6 message from `peer`.
+    /// Compatibility/test inbound header-sync message without a session generation.
     WireMessage {
         /// Serving peer.
         peer: ZakuraPeerId,
-        /// Decoded header-sync v6 message.
+        /// Decoded header-sync message.
         msg: HeaderSyncMessage,
     },
-    /// Header-sync v6 frame decoding failed after handler admission.
+    /// Inbound control message from a specific transport session.
+    SessionWireMessage {
+        /// Serving peer.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation that delivered the message.
+        session_id: u64,
+        /// Decoded header-sync message.
+        msg: HeaderSyncMessage,
+    },
+    /// Inbound `Headers` response with an optional request ID.
+    WireHeaders {
+        /// Serving peer.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation that delivered the response.
+        session_id: u64,
+        /// Request ID echoed by the peer, present on header-sync v7.
+        request_id: Option<HeaderSyncRequestId>,
+        /// Headers in ascending height order.
+        headers: Vec<Arc<block::Header>>,
+        /// Advisory serialized body sizes, parallel to `headers`.
+        body_sizes: Vec<u32>,
+        /// Per-height commitment roots, parallel to `headers`.
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
+    },
+    /// Inbound `GetHeaders` request with an optional request ID.
+    WireGetHeaders {
+        /// Requesting peer.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation that delivered the request.
+        session_id: u64,
+        /// Request ID supplied by the peer, present on header-sync v7.
+        request_id: Option<HeaderSyncRequestId>,
+        /// First requested height.
+        start_height: block::Height,
+        /// Requested header count.
+        count: u32,
+        /// Whether the requester wants all-or-nothing tree-aux roots.
+        want_tree_aux_roots: bool,
+    },
+    /// Header-sync frame decoding failed after handler admission.
     WireDecodeFailed {
         /// Peer that sent the malformed frame.
         peer: ZakuraPeerId,
         /// Decode/validation error.
         error: Arc<HeaderSyncWireError>,
     },
-    /// Header-sync v6 protocol failure decoded by the peer-owned session.
+    /// Header-sync protocol failure decoded by the peer-owned session.
     WireProtocolFailure {
         /// Peer that sent the invalid message.
         peer: ZakuraPeerId,
@@ -260,6 +299,8 @@ pub enum HeaderSyncEvent {
     HeaderRangeCommitFailed {
         /// Peer that supplied the failed range.
         peer: ZakuraPeerId,
+        /// Ordered-stream generation that supplied the range.
+        session_id: u64,
         /// First failed range height.
         start_height: block::Height,
         /// Failed range count.
@@ -271,6 +312,10 @@ pub enum HeaderSyncEvent {
     HeaderRangeResponseFinished {
         /// Peer whose served-response slot can be released.
         peer: ZakuraPeerId,
+        /// Ordered-stream generation that requested the range.
+        session_id: u64,
+        /// Request ID supplied by the peer, present on header-sync v7.
+        request_id: Option<HeaderSyncRequestId>,
         /// First requested height.
         start_height: block::Height,
         /// Requested header count.
@@ -282,6 +327,10 @@ pub enum HeaderSyncEvent {
     HeaderRangeResponseReady {
         /// Peer whose inbound request is being served.
         peer: ZakuraPeerId,
+        /// Ordered-stream generation that requested the range.
+        session_id: u64,
+        /// Request ID supplied by the peer, present on header-sync v7.
+        request_id: Option<HeaderSyncRequestId>,
         /// First requested height.
         start_height: block::Height,
         /// Requested header count.
@@ -310,6 +359,9 @@ impl HeaderSyncEvent {
             Self::NewBlockAcceptedNonBestChain { .. } => "new_block_accepted_non_best_chain",
             Self::NewBlockRejected { .. } => "new_block_rejected",
             Self::WireMessage { .. } => "wire_message",
+            Self::SessionWireMessage { .. } => "session_wire_message",
+            Self::WireHeaders { .. } => "wire_headers",
+            Self::WireGetHeaders { .. } => "wire_get_headers",
             Self::WireDecodeFailed { .. } => "wire_decode_failed",
             Self::WireProtocolFailure { .. } => "wire_protocol_failure",
             Self::StateFrontiersChanged(_) => "state_frontiers_changed",
@@ -326,7 +378,7 @@ impl HeaderSyncEvent {
 /// Actions emitted by the header-sync reactor for the eventual node wiring.
 #[derive(Clone, Debug)]
 pub enum HeaderSyncAction {
-    /// Test-only observation of a header-sync v6 message sent directly through a typed session.
+    /// Test-only observation of a header-sync message sent through a typed session.
     #[cfg(test)]
     SendMessage {
         /// Destination peer.
@@ -338,6 +390,8 @@ pub enum HeaderSyncAction {
     CommitHeaderRange {
         /// Peer that supplied the range.
         peer: ZakuraPeerId,
+        /// Ordered-stream generation that supplied the range.
+        session_id: u64,
         /// Parent anchor hash for the first header.
         anchor: block::Hash,
         /// First header height.
@@ -357,6 +411,10 @@ pub enum HeaderSyncAction {
     QueryHeadersByHeightRange {
         /// Peer that requested the range.
         peer: ZakuraPeerId,
+        /// Ordered-stream generation that requested the range.
+        session_id: u64,
+        /// Request ID supplied by the peer, present on header-sync v7.
+        request_id: Option<HeaderSyncRequestId>,
         /// First height.
         start: block::Height,
         /// Maximum count.
@@ -439,7 +497,7 @@ pub enum HeaderSyncMisbehavior {
     ResponseTooLong,
     /// Peer supplied a range that failed state/contextual commit.
     InvalidRange,
-    /// A header-sync v6 payload was malformed before semantic handling.
+    /// A header-sync payload was malformed before semantic handling.
     MalformedMessage,
     /// A peer sent semantic `Status` messages faster than the v1 budget.
     StatusSpam,
@@ -449,7 +507,7 @@ pub enum HeaderSyncMisbehavior {
     GetHeadersSpam,
     /// A peer requested more headers than this node advertised it can serve.
     GetHeadersTooLong,
-    /// A header-sync v6 message came from a peer with no active header-sync state.
+    /// A header-sync message came from a peer with no active header-sync state.
     UnknownPeer,
     /// A full-block tip flood failed stateless validation.
     InvalidNewBlock,
@@ -464,9 +522,27 @@ pub enum HeaderSyncCommitFailureKind {
     Local,
 }
 
+/// Header-sync request identifier, non-zero and strictly increasing per stream session.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub struct HeaderSyncRequestId(u64);
+
+impl HeaderSyncRequestId {
+    /// Create a non-zero request identifier.
+    pub fn new(id: u64) -> Option<Self> {
+        (id != 0).then_some(Self(id))
+    }
+
+    /// Return the wire representation of this request identifier.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// A single outbound `GetHeaders` range expected by a peer session.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ExpectedHeadersResponse {
+    /// Request ID for ID-capable header-sync streams.
+    pub request_id: Option<HeaderSyncRequestId>,
     /// First requested height.
     pub start_height: block::Height,
     /// Requested header count.
@@ -484,9 +560,16 @@ impl ExpectedHeadersResponse {
     ) -> Result<Self, HeaderSyncWireError> {
         validate_get_headers_count(count)?;
         Ok(Self {
+            request_id: None,
             start_height,
             count,
             want_tree_aux_roots,
         })
+    }
+
+    /// Attach a request ID to this expected response.
+    pub fn with_request_id(mut self, request_id: HeaderSyncRequestId) -> Self {
+        self.request_id = Some(request_id);
+        self
     }
 }

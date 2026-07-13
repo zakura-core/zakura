@@ -77,3 +77,7 @@ alias = "temp-zakura-sync-test-3"
 public_ip = "134.209.49.92"
 mode_label = "Zebra/legacy-only"
 p2p_stack = "legacy"
+# TEMPORARY: validating the checkpoint-refill fix (PR #137) on the legacy-only node,
+# which is the one reproducing the stall. Do not merge; revert to the `main` default
+# once the fix lands.
+branch = "fix/checkpoint-refill-minimal"

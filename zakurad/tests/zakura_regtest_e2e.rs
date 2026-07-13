@@ -29,6 +29,8 @@
 //! - `restart-matrix`: uses the long checkpoint chain and restarts node2 around
 //!   height 0, 399/400/401, 2,000, near tip with a 1,000-block gap, and after
 //!   the non-finalized reorg.
+//! - `header-faults`: uses a bounded multi-range chain, restarts node2 with
+//!   outstanding header-sync work, and requires v7 request-id trace coverage.
 //!
 //! It shells out to `docker/zakura-regtest-e2e/run.sh`, which builds `zakurad`
 //! (debug) if needed, brings up four Regtest nodes sharing the host network — a
@@ -51,11 +53,43 @@
 
 #![allow(clippy::print_stderr)]
 
-use std::{path::PathBuf, process::Command};
+use std::{
+    path::PathBuf,
+    process::Command,
+    sync::{Mutex, MutexGuard},
+};
+
+/// Serializes the docker e2e lanes: each run owns the shared host network and
+/// the per-label container namespace, so two stacks must never overlap.
+static E2E_STACK_LOCK: Mutex<()> = Mutex::new(());
 
 #[ignore = "opt-in docker e2e: needs docker (builds the host zakurad binary itself)"]
 #[test]
 fn zakura_regtest_dual_stack_e2e() {
+    // `ZAKURA_E2E_MODE` routes an unfiltered `--ignored` run to exactly one
+    // lane per CI job; `header-faults` belongs to the dedicated test below.
+    if std::env::var("ZAKURA_E2E_MODE").as_deref() == Ok("header-faults") {
+        eprintln!(
+            "skipping dual-stack e2e: ZAKURA_E2E_MODE=header-faults runs the header-sync fault lane"
+        );
+        return;
+    }
+    run_zakura_regtest_e2e(None);
+}
+
+#[ignore = "opt-in docker e2e: header-sync v7 fault lane"]
+#[test]
+fn zakura_regtest_header_sync_faults() {
+    if std::env::var("ZAKURA_E2E_MODE").is_ok_and(|mode| mode != "header-faults") {
+        eprintln!(
+            "skipping header-sync fault e2e: ZAKURA_E2E_MODE selects the dual-stack lane above"
+        );
+        return;
+    }
+    run_zakura_regtest_e2e(Some("header-faults"));
+}
+
+fn run_zakura_regtest_e2e(mode: Option<&str>) {
     // The unit-test CI lane runs ignored tests (`--run-ignored=all`) on runners
     // that have Docker, so `#[ignore]` plus the Docker guard below is not enough
     // to keep this host-networked, environment-sensitive e2e out of CI. Skip in
@@ -70,11 +104,19 @@ fn zakura_regtest_dual_stack_e2e() {
         return;
     }
 
+    let _stack: MutexGuard<'_, ()> = E2E_STACK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docker/zakura-regtest-e2e/run.sh");
 
-    let status = Command::new("bash")
-        .arg(&script)
+    let mut command = Command::new("bash");
+    command.arg(&script);
+    if let Some(mode) = mode {
+        command.env("ZAKURA_E2E_MODE", mode);
+    }
+    let status = command
         .status()
         .expect("failed to spawn the Zakura regtest e2e script");
 

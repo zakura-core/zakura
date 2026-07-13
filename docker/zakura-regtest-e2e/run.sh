@@ -45,6 +45,15 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 log()  { printf '\n=== %s ===\n' "$*"; }
 fail() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
 
+sed_in_place() {
+  local script="$1"
+  local file="$2"
+  local tmp="${file}.tmp.$$"
+  sed "${script}" "${file}" > "${tmp}" \
+    && mv "${tmp}" "${file}" \
+    || { rm -f "${tmp}"; return 1; }
+}
+
 ZAKURA_E2E_MODE="${ZAKURA_E2E_MODE:-smoke}"
 ZAKURA_E2E_LONG_BLOCKS="${ZAKURA_E2E_LONG_BLOCKS:-4000}"
 
@@ -99,10 +108,23 @@ case "${ZAKURA_E2E_MODE}" in
     ZAKURA_E2E_RESTART_MATRIX=1
     ZAKURA_E2E_REQUIRE_HANDOFF=1
     ;;
+  header-faults)
+    DEFAULT_GENERATE_BLOCKS=3
+    DEFAULT_CATCHUP_BLOCKS=240
+    DEFAULT_CHECKPOINT_INTERVAL=80
+    DEFAULT_PROPAGATE_TIMEOUT=180
+    DEFAULT_CATCHUP_TIMEOUT=600
+    ZAKURA_E2E_DISABLE_CHECKPOINTS=0
+    ZAKURA_E2E_RESTART_MATRIX=1
+    ZAKURA_E2E_REQUIRE_HANDOFF=1
+    ZAKURA_E2E_REQUIRE_V7_IDS=1
+    ;;
   *)
-    fail "unknown ZAKURA_E2E_MODE='${ZAKURA_E2E_MODE}' (expected smoke, pr-gate, checkpoint-long, no-checkpoint-long, restart-matrix)"
+    fail "unknown ZAKURA_E2E_MODE='${ZAKURA_E2E_MODE}' (expected smoke, pr-gate, checkpoint-long, no-checkpoint-long, restart-matrix, header-faults)"
     ;;
 esac
+
+ZAKURA_E2E_REQUIRE_V7_IDS="${ZAKURA_E2E_REQUIRE_V7_IDS:-0}"
 
 (( DEFAULT_CATCHUP_BLOCKS >= 0 )) || fail "ZAKURA_E2E_LONG_BLOCKS must be >= ${DEFAULT_GENERATE_BLOCKS}"
 
@@ -170,14 +192,14 @@ for node in 1 2 3 4; do
   cp "${SCRIPT_DIR}/node${node}.toml" "${CONFIG_DIR}/node${node}.toml"
 done
 if [[ "${ZAKURA_E2E_DISABLE_CHECKPOINTS}" == "1" ]]; then
-  sed -i \
+  sed_in_place \
     's|^network = "Regtest"$|network = { params = { checkpoints = false } }|' \
     "${CONFIG_DIR}/node2.toml"
   grep -q '^network = { params = { checkpoints = false } }' "${CONFIG_DIR}/node2.toml" \
     || fail "failed to disable node2 Regtest checkpoints"
 fi
 if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
-  sed -i \
+  sed_in_place \
     's|^ephemeral = true$|cache_dir = "/tmp/zakura-node2-state"\nephemeral = false|' \
     "${CONFIG_DIR}/node2.toml"
   grep -q '^ephemeral = false$' "${CONFIG_DIR}/node2.toml" \
@@ -291,6 +313,9 @@ run_trace_oracle() {
   )
   if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
     oracle_args+=("--require-handoff-boundary")
+  fi
+  if [[ "${ZAKURA_E2E_REQUIRE_V7_IDS}" == "1" ]]; then
+    oracle_args+=("--require-v7-request-ids")
   fi
   if ! strict_upgrade; then
     oracle_args+=("--optional-lag-node" "node4")
@@ -869,7 +894,7 @@ elif (( CHECKPOINT_INTERVAL > 0 && checkpoint_ceiling >= CHECKPOINT_INTERVAL ));
 
   # Replace node2's plain `network = "Regtest"` with a ConfiguredRegtest inline table carrying
   # the derived checkpoints (the deserializer matches ConfiguredRegtest by the `params` key).
-  sed -i \
+  sed_in_place \
     "s|^network = \"Regtest\"\$|network = { params = { checkpoints = [${cp_entries}] } }|" \
     "${CONFIG_DIR}/node2.toml"
   grep -q '^network = { params = ' "${CONFIG_DIR}/node2.toml" \

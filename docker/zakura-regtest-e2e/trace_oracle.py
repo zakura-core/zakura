@@ -96,6 +96,7 @@ class OracleOptions:
     commit_trend_min_ms: int = COMMIT_TREND_MIN_MS
     commit_trend_factor: float = COMMIT_TREND_FACTOR
     optional_lag_nodes: tuple[str, ...] = ()
+    require_v7_request_ids: bool = False
 
 
 class NodeTrace:
@@ -787,8 +788,82 @@ def run_oracle(root: Path, options: OracleOptions = OracleOptions()) -> list[Fai
 
     if options.require_handoff_boundary:
         failures.extend(check_checkpoint_to_full_handoff(nodes, options))
+    if options.require_v7_request_ids:
+        failures.extend(check_v7_request_ids(nodes))
 
     return failures
+
+
+def check_v7_request_ids(nodes: list[NodeTrace]) -> list[Failure]:
+    requests = [
+        row
+        for node in nodes
+        for row in node.events("header_sync", HEADER_GET_HEADERS_SENT)
+    ]
+    v7_requests = [
+        row
+        for row in requests
+        if int_field(row.row, "stream_version") is not None
+        and int_field(row.row, "stream_version") >= 7
+    ]
+    if not v7_requests:
+        node = nodes[0] if nodes else NodeTrace("<none>", {})
+        return [
+            failure(
+                node,
+                "v7_header_request_ids_present",
+                requests[-1] if requests else None,
+                {"header_get_headers_sent_rows": len(requests)},
+            )
+        ]
+
+    missing_or_zero = [
+        row for row in v7_requests if (int_field(row.row, "request_id") or 0) == 0
+    ]
+    if missing_or_zero:
+        node = next(node for node in nodes if node.node == missing_or_zero[0].node)
+        return [
+            failure(
+                node,
+                "v7_header_request_ids_nonzero",
+                missing_or_zero[0],
+                {"v7_header_get_headers_sent_rows": len(v7_requests)},
+            )
+        ]
+
+    duplicate_ids: set[tuple[str, int, int]] = set()
+    seen_ids: set[tuple[str, int, int]] = set()
+    for row in v7_requests:
+        request_id = int_field(row.row, "request_id")
+        session_id = int_field(row.row, "session_id")
+        if request_id is None or session_id is None:
+            continue
+        key = (row.node, session_id, request_id)
+        if key in seen_ids:
+            duplicate_ids.add(key)
+        seen_ids.add(key)
+    if duplicate_ids:
+        first_duplicate = next(
+            row
+            for row in v7_requests
+            if (
+                row.node,
+                int_field(row.row, "session_id"),
+                int_field(row.row, "request_id"),
+            )
+            in duplicate_ids
+        )
+        node = next(node for node in nodes if node.node == first_duplicate.node)
+        return [
+            failure(
+                node,
+                "v7_header_request_ids_unique_per_session",
+                first_duplicate,
+                {"duplicate_session_request_ids": sorted(duplicate_ids)[:8]},
+            )
+        ]
+
+    return []
 
 
 def print_failures(failures: list[Failure]) -> None:
@@ -850,6 +925,35 @@ def run_self_test() -> None:
             ],
         )
         assert not run_oracle(root / "good"), "good trace should pass"
+
+        v7_ids = root / "v7_ids" / "node2"
+        write_jsonl(
+            v7_ids / "header_sync.jsonl",
+            [
+                {
+                    "ts": 1,
+                    "event": HEADER_GET_HEADERS_SENT,
+                    "stream_version": 7,
+                    "session_id": 11,
+                    "request_id": 1,
+                    "range_start": 1,
+                    "range_count": 80,
+                },
+                {
+                    "ts": 2,
+                    "event": HEADER_GET_HEADERS_SENT,
+                    "stream_version": 7,
+                    "session_id": 12,
+                    "request_id": 1,
+                    "range_start": 81,
+                    "range_count": 80,
+                },
+            ],
+        )
+        assert not run_oracle(
+            root / "v7_ids",
+            OracleOptions(require_v7_request_ids=True),
+        ), "v7 request IDs should pass when nonzero and unique per session"
 
         handoff = root / "handoff" / "node2"
         write_jsonl(
@@ -1388,6 +1492,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="require at least one checkpoint commit followed by a higher full-verifier commit",
     )
     parser.add_argument(
+        "--require-v7-request-ids",
+        action="store_true",
+        help="require header-sync v7 GetHeaders trace rows to carry nonzero request IDs",
+    )
+    parser.add_argument(
         "--optional-lag-node",
         action="append",
         default=[],
@@ -1412,6 +1521,7 @@ def main(argv: list[str]) -> int:
             commit_elapsed_micros=args.commit_elapsed_ms * 1_000,
             persistent_lag_micros=args.persistent_lag_seconds * 1_000_000,
             require_handoff_boundary=args.require_handoff_boundary,
+            require_v7_request_ids=args.require_v7_request_ids,
             handoff_stall_micros=args.handoff_stall_seconds * 1_000_000,
             commit_trend_min_ms=args.commit_trend_min_ms,
             commit_trend_factor=args.commit_trend_factor,

@@ -53,7 +53,8 @@ pub use config::{
 pub use error::{HeaderSyncStartError, HeaderSyncWireError};
 pub use events::{
     ExpectedHeadersResponse, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
-    HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncStartup,
+    HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncRequestId,
+    HeaderSyncStartup,
 };
 pub use reactor::spawn_header_sync_reactor;
 pub use service::HeaderSyncPeerSession;
@@ -67,5 +68,6 @@ pub use validation::{
 pub use wire::{
     HeaderSyncMessage, DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, MAX_HS_MESSAGE_BYTES,
     MAX_HS_RANGE, MSG_HS_GET_HEADERS, MSG_HS_HEADERS, MSG_HS_NEW_BLOCK, MSG_HS_STATUS,
-    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
+    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_HEADER_SYNC_STREAM_VERSION_V7,
+    ZAKURA_STREAM_HEADER_SYNC,
 };

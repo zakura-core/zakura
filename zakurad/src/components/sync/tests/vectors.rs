@@ -36,6 +36,7 @@ use crate::{
         sync::{
             self,
             downloads::{BlockDownloadVerifyError, Downloads},
+            legacy_trace::LegacySyncTrace,
             SyncStatus,
         },
         ChainSync,
@@ -335,7 +336,6 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
 /// Time is paused, so a syncer that instead waits out [`sync::BLOCK_VERIFY_TIMEOUT`] and restarts
 /// fails here in milliseconds of wall-clock time.
 #[tokio::test(start_paused = true)]
-#[ignore = "known regression: an empty extension strands a partial checkpoint range"]
 async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
 ) -> Result<(), crate::BoxError> {
     let (
@@ -2231,6 +2231,7 @@ async fn empty_block_response_is_retryable_download_failure() {
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Height(0),
+        LegacySyncTrace::new(None),
     );
 
     let block0: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES

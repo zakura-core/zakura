@@ -581,7 +581,7 @@ impl HeaderSyncPeerMeters {
 pub(super) struct OutstandingRange {
     pub(super) request_id: HeaderSyncRequestId,
     pub(super) range: RangeRequest,
-    pub(super) deadline: Instant,
+    pub(super) deadline: Option<Instant>,
     pub(super) expected_max_count: u32,
     pub(super) clear_assignment_on_timeout: bool,
     pub(super) purpose: RangePurpose,

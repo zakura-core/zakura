@@ -28,8 +28,16 @@ pub(super) enum HeaderRequesterFailure {
     Encode,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) enum HeaderRequesterEvent {
+    Register {
+        peer: ZakuraPeerId,
+        session_id: u64,
+        generation: u64,
+        command: HeaderRequesterCommand,
+        request_id: HeaderSyncRequestId,
+        registered: tokio::sync::oneshot::Sender<()>,
+    },
     Sent {
         peer: ZakuraPeerId,
         session_id: u64,
@@ -42,6 +50,7 @@ pub(super) enum HeaderRequesterEvent {
         session_id: u64,
         generation: u64,
         command: HeaderRequesterCommand,
+        request_id: Option<HeaderSyncRequestId>,
         reason: HeaderRequesterFailure,
     },
     Stopped {
@@ -94,15 +103,65 @@ async fn run_header_requester(
             }
         };
 
+        let prepared = match session.prepare_get_headers(
+            command.range.start_height,
+            command.expected_max_count,
+            command.range.want_tree_aux_roots,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let reason = if matches!(error, OrderedSendError::Closed) {
+                    HeaderRequesterFailure::Closed
+                } else {
+                    HeaderRequesterFailure::Encode
+                };
+                if events
+                    .send(HeaderRequesterEvent::Failed {
+                        peer: peer.clone(),
+                        session_id,
+                        generation,
+                        command,
+                        request_id: None,
+                        reason,
+                    })
+                    .is_err()
+                    || reason == HeaderRequesterFailure::Closed
+                {
+                    return;
+                }
+                continue;
+            }
+        };
+        let request_id = prepared.request_id();
+        let (registered, registration) = tokio::sync::oneshot::channel();
+        if events
+            .send(HeaderRequesterEvent::Register {
+                peer: peer.clone(),
+                session_id,
+                generation,
+                command,
+                request_id,
+                registered,
+            })
+            .is_err()
+        {
+            return;
+        }
+        let registered = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = cancel.cancelled() => return,
+            registered = registration => registered,
+        };
+        if registered.is_err() {
+            return;
+        }
+
         let result = tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
             _ = cancel.cancelled() => return,
-            result = session.send_get_headers(
-                command.range.start_height,
-                command.expected_max_count,
-                command.range.want_tree_aux_roots,
-            ) => result,
+            result = prepared.send() => result,
         };
         match result {
             Ok(request_id) => {
@@ -131,6 +190,7 @@ async fn run_header_requester(
                         session_id,
                         generation,
                         command,
+                        request_id: Some(request_id),
                         reason,
                     })
                     .is_err()
@@ -222,7 +282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_send_reports_correlated_request_metadata() {
+    async fn request_waits_for_reactor_registration_before_publication() {
         let peer = peer(1);
         let (session, mut frames, _cancel) = session(peer.clone(), 1);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -235,22 +295,46 @@ mod tests {
             .try_send(command)
             .expect("requester command queue has capacity");
 
-        let request_id = match next_event(&mut events_rx).await {
+        let (request_id, registered) = match next_event(&mut events_rx).await {
+            HeaderRequesterEvent::Register {
+                peer: event_peer,
+                session_id,
+                generation,
+                command: registered_command,
+                request_id,
+                registered,
+            } => {
+                assert_eq!(event_peer, peer);
+                assert_eq!(session_id, TEST_SESSION_ID);
+                assert_eq!(generation, TEST_GENERATION);
+                assert_command_eq(registered_command, command);
+                (request_id, registered)
+            }
+            event => panic!("unexpected requester event: {event:?}"),
+        };
+        assert!(time::timeout(Duration::from_millis(20), frames.recv())
+            .await
+            .is_err());
+        registered
+            .send(())
+            .expect("requester waits for reactor registration");
+
+        match next_event(&mut events_rx).await {
             HeaderRequesterEvent::Sent {
                 peer: event_peer,
                 session_id,
                 generation,
                 command: sent,
-                request_id,
+                request_id: sent_request_id,
             } => {
                 assert_eq!(event_peer, peer);
                 assert_eq!(session_id, TEST_SESSION_ID);
                 assert_eq!(generation, TEST_GENERATION);
                 assert_command_eq(sent, command);
-                request_id
+                assert_eq!(sent_request_id, request_id);
             }
             event => panic!("unexpected requester event: {event:?}"),
-        };
+        }
         let frame = time::timeout(Duration::from_secs(1), frames.recv())
             .await
             .expect("request frame arrives before timeout")
@@ -299,12 +383,14 @@ mod tests {
                 session_id,
                 generation,
                 command: failed,
+                request_id,
                 reason,
             } => {
                 assert_eq!(event_peer, peer);
                 assert_eq!(session_id, TEST_SESSION_ID);
                 assert_eq!(generation, TEST_GENERATION);
                 assert_command_eq(failed, invalid);
+                assert_eq!(request_id, None);
                 assert_eq!(reason, HeaderRequesterFailure::Encode);
             }
             event => panic!("unexpected requester event: {event:?}"),
@@ -313,6 +399,20 @@ mod tests {
         requester
             .try_send(valid)
             .expect("requester remains available after an encode failure");
+        let registered = match next_event(&mut events_rx).await {
+            HeaderRequesterEvent::Register {
+                command: registered_command,
+                registered,
+                ..
+            } => {
+                assert_command_eq(registered_command, valid);
+                registered
+            }
+            event => panic!("unexpected requester event: {event:?}"),
+        };
+        registered
+            .send(())
+            .expect("requester waits for reactor registration");
         assert!(matches!(
             next_event(&mut events_rx).await,
             HeaderRequesterEvent::Sent { command: sent, .. }
@@ -350,18 +450,35 @@ mod tests {
             .try_send(command)
             .expect("requester command queue has capacity");
 
+        let registered = match next_event(&mut events_rx).await {
+            HeaderRequesterEvent::Register {
+                command: registered_command,
+                registered,
+                ..
+            } => {
+                assert_command_eq(registered_command, command);
+                registered
+            }
+            event => panic!("unexpected requester event: {event:?}"),
+        };
+        registered
+            .send(())
+            .expect("requester waits for reactor registration");
+
         match next_event(&mut events_rx).await {
             HeaderRequesterEvent::Failed {
                 peer: event_peer,
                 session_id,
                 generation,
                 command: failed,
+                request_id,
                 reason,
             } => {
                 assert_eq!(event_peer, peer);
                 assert_eq!(session_id, TEST_SESSION_ID);
                 assert_eq!(generation, TEST_GENERATION);
                 assert_command_eq(failed, command);
+                assert!(request_id.is_some());
                 assert_eq!(reason, HeaderRequesterFailure::Closed);
             }
             event => panic!("unexpected requester event: {event:?}"),

@@ -242,17 +242,13 @@ impl HeaderSyncPeerSession {
         .map(|()| request_id)
     }
 
-    /// Reserve response correlation and wait asynchronously for outbound capacity.
-    ///
-    /// The frame is encoded once before waiting. If this future is cancelled while
-    /// waiting, the reservation guard synchronously removes the request ID from the
-    /// peer pipe so it cannot consume a later response.
-    pub(super) async fn send_get_headers(
+    /// Prepare a correlated header request without making its frame visible to the peer.
+    pub(super) fn prepare_get_headers(
         &self,
         start_height: block::Height,
         count: u32,
         want_tree_aux_roots: bool,
-    ) -> Result<HeaderSyncRequestId, OrderedSendError> {
+    ) -> Result<PreparedGetHeaders, OrderedSendError> {
         let request_id = self.next_request_id()?;
         let expected =
             ExpectedHeadersResponse::new(request_id, start_height, count, want_tree_aux_roots)
@@ -265,15 +261,13 @@ impl HeaderSyncPeerSession {
         .encode_frame(Some(request_id))
         .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
 
-        let mut reservation =
-            ExpectedHeadersReservation::new(self.inner.commands.clone(), expected)?;
-        self.inner
-            .send
-            .send(frame)
-            .await
-            .map_err(|_| OrderedSendError::Closed)?;
-        reservation.disarm();
-        Ok(request_id)
+        let reservation = ExpectedHeadersReservation::new(self.inner.commands.clone(), expected)?;
+        Ok(PreparedGetHeaders {
+            request_id,
+            frame,
+            send: self.inner.send.clone(),
+            reservation,
+        })
     }
 
     /// Send a typed header range response with one advisory body-size hint and
@@ -313,6 +307,37 @@ impl HeaderSyncPeerSession {
             Err(mpsc::error::TrySendError::Full(_frame)) => Err(OrderedSendError::Full),
             Err(mpsc::error::TrySendError::Closed(_frame)) => Err(OrderedSendError::Closed),
         }
+    }
+}
+
+pub(super) struct PreparedGetHeaders {
+    request_id: HeaderSyncRequestId,
+    frame: Frame,
+    send: FramedSend,
+    reservation: ExpectedHeadersReservation,
+}
+
+impl PreparedGetHeaders {
+    pub(super) fn request_id(&self) -> HeaderSyncRequestId {
+        self.request_id
+    }
+
+    /// Wait for outbound capacity and publish the prepared frame.
+    ///
+    /// Dropping this future before publication synchronously cancels the pipe's
+    /// response reservation.
+    pub(super) async fn send(self) -> Result<HeaderSyncRequestId, OrderedSendError> {
+        let Self {
+            request_id,
+            frame,
+            send,
+            mut reservation,
+        } = self;
+        send.send(frame)
+            .await
+            .map_err(|_| OrderedSendError::Closed)?;
+        reservation.disarm();
+        Ok(request_id)
     }
 }
 

@@ -27,7 +27,9 @@ use zakura_chain::{
     },
     primitives::{ed25519, x25519, Groth16Proof},
     sapling,
-    serialization::{AtLeastOne, DateTime32, ZcashDeserialize, ZcashDeserializeInto},
+    serialization::{
+        AtLeastOne, DateTime32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+    },
     sprout,
     transaction::{
         arbitrary::{
@@ -413,6 +415,29 @@ fn ironwood_cross_address_flag_is_optional_after_nu6_3() {
     assert_eq!(
         check::orchard_cross_address_disabled(&ironwood_with_cross_address),
         Ok(())
+    );
+}
+
+#[test]
+fn ironwood_cross_address_only_is_not_a_spend_or_output_flag() {
+    let tx = v6_pool_flow_transaction(
+        None,
+        Some(ironwood_shielded_data(
+            0,
+            ironwood::Flags::ENABLE_CROSS_ADDRESS,
+        )),
+        vec![],
+    );
+
+    assert!(!tx.has_shielded_inputs());
+    assert!(!tx.has_shielded_outputs());
+    assert_eq!(
+        check::has_inputs_and_outputs(&tx),
+        Err(TransactionError::NoInputs)
+    );
+    assert_eq!(
+        check::has_enough_ironwood_flags(&tx),
+        Err(TransactionError::NotEnoughIronwoodFlags)
     );
 }
 
@@ -3122,6 +3147,162 @@ fn sapling_output_with_invalid_ephemeral_key_is_rejected() {
     });
 }
 
+/// A transaction whose Sapling output has an invalid (off-curve) value
+/// commitment is rejected by the verifier with `SmallOrder`.
+///
+/// Unlike the ephemeral-key regression above, this also round-trips the
+/// corrupted V4 transaction through serialization. That pins the lazy V4
+/// output path: the parser preserves the raw `cv` bytes, and the early
+/// semantic check rejects them before any state lookup.
+#[test]
+fn sapling_v4_output_with_invalid_value_commitment_is_rejected_after_roundtrip() {
+    let _init_guard = zakura_test::init();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        let (height, mut transaction) = test_transactions(&network)
+            .rev()
+            .filter(|(_, transaction)| {
+                !transaction.is_coinbase() && transaction.inputs().is_empty()
+            })
+            .find(|(_, transaction)| {
+                transaction.sapling_spends_per_anchor().next().is_none()
+                    && transaction.sapling_outputs().next().is_some()
+            })
+            .expect("a V4 transaction with Sapling outputs and no Sapling spends");
+
+        assert!(
+            matches!(transaction.as_ref(), Transaction::V4 { .. }),
+            "test vector must exercise the V4 output encoding"
+        );
+
+        corrupt_first_sapling_output_value_commitment(
+            Arc::get_mut(&mut transaction).expect("transaction only has one active reference"),
+        );
+
+        let serialized = transaction
+            .zcash_serialize_to_vec()
+            .expect("corrupted V4 transaction must serialize raw Sapling cv bytes");
+        let transaction = Arc::new(
+            serialized
+                .zcash_deserialize_into::<Transaction>()
+                .expect("lazy V4 output deserialization must preserve invalid cv bytes"),
+        );
+
+        assert!(
+            !transaction.sapling_point_encodings_are_valid(),
+            "the deferred Sapling point check must reject the round-tripped invalid cv"
+        );
+
+        let state_service =
+            service_fn(|_| async { unreachable!("State service should not be called") });
+        let verifier = Verifier::new_for_tests(&network, state_service);
+
+        let result = verifier
+            .oneshot(Request::Block {
+                transaction_hash: transaction.hash(),
+                transaction,
+                known_utxos: Arc::new(HashMap::new()),
+                known_outpoint_hashes: Arc::new(HashSet::new()),
+                height,
+                time: DateTime::<Utc>::MAX_UTC,
+            })
+            .await;
+
+        assert_eq!(
+            result,
+            Err(TransactionError::SmallOrder),
+            "a V4 Sapling output with an off-curve cv must be rejected with SmallOrder",
+        );
+    });
+}
+
+/// Transactions whose Sapling spend has an invalid (off-curve) value
+/// commitment are rejected by the verifier with `SmallOrder`.
+///
+/// This pins both spend encodings affected by lazy Sapling `cv` parsing:
+/// V4 stores the full `Spend<PerSpendAnchor>` inline, while V5 stores the
+/// `SpendPrefixInTransactionV5` fields separately. In both cases the parser
+/// preserves the raw bytes and the early semantic check rejects them before
+/// any state lookup.
+#[test]
+fn sapling_spends_with_invalid_value_commitments_are_rejected_after_roundtrip() {
+    let _init_guard = zakura_test::init();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        let v4 = test_transactions(&network)
+            .rev()
+            .filter(|(_, transaction)| {
+                !transaction.is_coinbase() && transaction.inputs().is_empty()
+            })
+            .find(|(_, transaction)| {
+                matches!(transaction.as_ref(), Transaction::V4 { .. })
+                    && transaction.sapling_spends_per_anchor().next().is_some()
+            })
+            .expect("a V4 transaction with Sapling spends");
+
+        let v5 = transactions_from_blocks(network.block_iter())
+            .rev()
+            .filter(|(_, transaction)| {
+                !transaction.is_coinbase() && transaction.inputs().is_empty()
+            })
+            .find(|(_, transaction)| {
+                matches!(transaction.as_ref(), Transaction::V5 { .. })
+                    && transaction.sapling_spends_per_anchor().next().is_some()
+            })
+            .expect("a V5 transaction with Sapling spends");
+
+        for (version, height, mut transaction) in [("V4", v4.0, v4.1), ("V5", v5.0, v5.1)] {
+            corrupt_first_sapling_spend_value_commitment(
+                Arc::get_mut(&mut transaction).expect("transaction only has one active reference"),
+            );
+
+            let serialized = transaction
+                .zcash_serialize_to_vec()
+                .expect("corrupted transaction must serialize raw Sapling cv bytes");
+            let transaction = Arc::new(
+                serialized
+                    .zcash_deserialize_into::<Transaction>()
+                    .expect("lazy spend deserialization must preserve invalid cv bytes"),
+            );
+            assert_eq!(
+                serialized,
+                transaction
+                    .zcash_serialize_to_vec()
+                    .expect("round-tripped transaction must reserialize"),
+                "lazy {version} spend cv bytes must round-trip exactly",
+            );
+
+            assert!(
+                !transaction.sapling_point_encodings_are_valid(),
+                "the deferred Sapling point check must reject the round-tripped {version} spend cv"
+            );
+
+            let state_service =
+                service_fn(|_| async { unreachable!("State service should not be called") });
+            let verifier = Verifier::new_for_tests(&network, state_service);
+
+            let result = verifier
+                .oneshot(Request::Block {
+                    transaction_hash: transaction.hash(),
+                    transaction,
+                    known_utxos: Arc::new(HashMap::new()),
+                    known_outpoint_hashes: Arc::new(HashSet::new()),
+                    height,
+                    time: DateTime::<Utc>::MAX_UTC,
+                })
+                .await;
+
+            assert_eq!(
+                result,
+                Err(TransactionError::SmallOrder),
+                "a {version} Sapling spend with an off-curve cv must be rejected with SmallOrder",
+            );
+        }
+    });
+}
+
 /// Replaces the first Sapling output's ephemeral key with an off-curve point,
 /// for `sapling_output_with_invalid_ephemeral_key_is_rejected`.
 fn corrupt_first_sapling_output_ephemeral_key(transaction: &mut Transaction) {
@@ -3141,6 +3322,46 @@ fn corrupt_first_sapling_output_ephemeral_key(transaction: &mut Transaction) {
     }
 }
 
+/// Replaces the first Sapling output's value commitment with off-curve bytes,
+/// for `sapling_v4_output_with_invalid_value_commitment_is_rejected_after_roundtrip`.
+fn corrupt_first_sapling_output_value_commitment(transaction: &mut Transaction) {
+    let bad_cv = [0xffu8; 32][..]
+        .zcash_deserialize_into::<sapling::ValueCommitment>()
+        .expect("deserialization defers point validation, so it stores the bytes");
+
+    match transaction {
+        Transaction::V4 {
+            sapling_shielded_data: Some(shielded_data),
+            ..
+        } => set_first_sapling_output_value_commitment(&mut shielded_data.transfers, bad_cv),
+        _ => panic!("expected a V4 transaction with Sapling data"),
+    }
+}
+
+/// Replaces the first Sapling spend's value commitment with off-curve bytes,
+/// for `sapling_spends_with_invalid_value_commitments_are_rejected_after_roundtrip`.
+fn corrupt_first_sapling_spend_value_commitment(transaction: &mut Transaction) {
+    let bad_cv = [0xffu8; 32][..]
+        .zcash_deserialize_into::<sapling::ValueCommitment>()
+        .expect("deserialization defers point validation, so it stores the bytes");
+
+    match transaction {
+        Transaction::V4 {
+            sapling_shielded_data: Some(shielded_data),
+            ..
+        } => set_first_sapling_spend_value_commitment(&mut shielded_data.transfers, bad_cv),
+        Transaction::V5 {
+            sapling_shielded_data: Some(shielded_data),
+            ..
+        } => set_first_sapling_spend_value_commitment(&mut shielded_data.transfers, bad_cv),
+        Transaction::V6 {
+            sapling_shielded_data: Some(shielded_data),
+            ..
+        } => set_first_sapling_spend_value_commitment(&mut shielded_data.transfers, bad_cv),
+        _ => panic!("expected a V4, V5, or V6 transaction with Sapling data"),
+    }
+}
+
 fn set_first_sapling_output_ephemeral_key<A: sapling::AnchorVariant + Clone>(
     transfers: &mut sapling::TransferData<A>,
     ephemeral_key: sapling::keys::EphemeralPublicKey,
@@ -3154,6 +3375,40 @@ fn set_first_sapling_output_ephemeral_key<A: sapling::AnchorVariant + Clone>(
         }
         sapling::TransferData::SpendsAndMaybeOutputs { maybe_outputs, .. } => {
             maybe_outputs[0].ephemeral_key = ephemeral_key;
+        }
+    }
+}
+
+fn set_first_sapling_output_value_commitment<A: sapling::AnchorVariant + Clone>(
+    transfers: &mut sapling::TransferData<A>,
+    value_commitment: sapling::ValueCommitment,
+) {
+    match transfers {
+        sapling::TransferData::JustOutputs { outputs } => {
+            let mut outputs_vec = outputs.as_slice().to_vec();
+            outputs_vec[0].cv = value_commitment;
+            *outputs = AtLeastOne::from_vec(outputs_vec)
+                .expect("replacing a field keeps at least one output");
+        }
+        sapling::TransferData::SpendsAndMaybeOutputs { maybe_outputs, .. } => {
+            maybe_outputs[0].cv = value_commitment;
+        }
+    }
+}
+
+fn set_first_sapling_spend_value_commitment<A: sapling::AnchorVariant + Clone>(
+    transfers: &mut sapling::TransferData<A>,
+    value_commitment: sapling::ValueCommitment,
+) {
+    match transfers {
+        sapling::TransferData::SpendsAndMaybeOutputs { spends, .. } => {
+            let mut spends_vec = spends.as_slice().to_vec();
+            spends_vec[0].cv = value_commitment;
+            *spends = AtLeastOne::from_vec(spends_vec)
+                .expect("replacing a field keeps at least one spend");
+        }
+        sapling::TransferData::JustOutputs { .. } => {
+            panic!("expected Sapling shielded data with spends")
         }
     }
 }

@@ -1946,6 +1946,89 @@ fn sapling_lazy_cv_epk_edge_cases() {
     );
 }
 
+/// The local Sapling binding-key helper stays fail-closed when it sees a lazy
+/// value commitment that has not passed semantic validation yet.
+///
+/// The verifier currently obtains the binding key from librustzcash instead of
+/// this helper, so this is not an acceptance path today. Keep the public helper
+/// fallible anyway: both spend and output commitments can now hold raw bytes
+/// until `Transaction::sapling_point_encodings_are_valid` runs.
+#[test]
+fn sapling_binding_verification_key_rejects_invalid_lazy_commitments() {
+    use group::Group;
+
+    use crate::{
+        amount::Amount,
+        at_least_one,
+        primitives::{
+            redjubjub::{Binding, Signature, SpendAuth},
+            Groth16Proof,
+        },
+        sapling::{
+            self,
+            keys::{EphemeralPublicKey, ValidatingKey},
+            shielded_data::{ShieldedData, TransferData},
+            EncryptedNote, Output, Spend, ValueCommitment, WrappedNoteKey,
+        },
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let valid = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
+    let invalid = [0xffu8; 32];
+    let rk = ValidatingKey::try_from(valid).expect("the Jubjub generator is a valid Sapling rk");
+
+    let output_bundle = |cv: [u8; 32]| ShieldedData::<sapling::SharedAnchor> {
+        value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+        transfers: TransferData::JustOutputs {
+            outputs: at_least_one![Output {
+                cv: ValueCommitment(cv),
+                cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32])
+                    .expect("zero bytes encode a valid extracted note commitment"),
+                ephemeral_key: EphemeralPublicKey(valid),
+                enc_ciphertext: EncryptedNote([0u8; 580]),
+                out_ciphertext: WrappedNoteKey([0u8; 80]),
+                zkproof: Groth16Proof([0u8; 192]),
+            }],
+        },
+        binding_sig: Signature::<Binding>::from([0u8; 64]),
+    };
+
+    let spend_bundle = |cv: [u8; 32]| ShieldedData::<sapling::PerSpendAnchor> {
+        value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+        transfers: TransferData::SpendsAndMaybeOutputs {
+            shared_anchor: sapling::FieldNotPresent,
+            spends: at_least_one![Spend {
+                cv: ValueCommitment(cv),
+                per_spend_anchor: sapling::tree::Root::default(),
+                nullifier: sapling::Nullifier::from([0u8; 32]),
+                rk: rk.clone(),
+                zkproof: Groth16Proof([0u8; 192]),
+                spend_auth_sig: Signature::<SpendAuth>::from([0u8; 64]),
+            }],
+            maybe_outputs: vec![],
+        },
+        binding_sig: Signature::<Binding>::from([0u8; 64]),
+    };
+
+    assert!(
+        output_bundle(valid).binding_verification_key().is_some(),
+        "a valid output commitment must still produce a binding key",
+    );
+    assert!(
+        spend_bundle(valid).binding_verification_key().is_some(),
+        "a valid spend commitment must still produce a binding key",
+    );
+    assert!(
+        output_bundle(invalid).binding_verification_key().is_none(),
+        "an invalid lazy output commitment must fail closed",
+    );
+    assert!(
+        spend_bundle(invalid).binding_verification_key().is_none(),
+        "an invalid lazy spend commitment must fail closed",
+    );
+}
+
 /// The semantic verifier's Sapling cv/epk not-small-order check rejects bad
 /// points.
 ///

@@ -465,3 +465,212 @@ impl RateMeter {
         self.next_allowed = now + self.interval;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zakura::ServicePeerDirection;
+
+    fn peer(byte: u8) -> ZakuraPeerId {
+        ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds")
+    }
+
+    fn range(start: u32, count: u32, priority: RangePriority) -> RangeRequest {
+        RangeRequest {
+            start_height: block::Height(start),
+            count,
+            anchor_hash: None,
+            finalized: false,
+            want_tree_aux_roots: true,
+            priority,
+        }
+    }
+
+    fn peer_state(byte: u8, advertised_tip: u32) -> (ZakuraPeerId, PeerHeaderState) {
+        let peer = peer(byte);
+        let (send, _recv) = crate::zakura::framed_channel(1);
+        let session = HeaderSyncPeerSession::from_parts_with_direction(
+            peer.clone(),
+            ServicePeerDirection::Inbound,
+            send,
+            CancellationToken::new(),
+        );
+        let interval = Duration::from_secs(1);
+        let mut state = PeerHeaderState::new(
+            session,
+            (block::Height(0), block::Hash([0; 32])),
+            DEFAULT_HS_RANGE,
+            DEFAULT_HS_MAX_INFLIGHT,
+            interval,
+            interval,
+            interval,
+        );
+        state.advertised_tip = block::Height(advertised_tip);
+        (peer, state)
+    }
+
+    #[test]
+    fn pending_and_active_ranges_are_deduplicated() {
+        let mut queue = HeaderWorkQueue::new();
+        let range = range(1, 2, RangePriority::Forward);
+        let (peer, state) = peer_state(1, 10);
+
+        queue.ensure_forward(range);
+        queue.ensure_forward(range);
+        assert_eq!(queue.pending_len(), 1);
+
+        let claimed = queue
+            .next_for_peer(&peer, &state)
+            .expect("peer can claim the pending range");
+        queue.mark_assigned(peer.clone(), claimed);
+        queue.ensure_forward(RangeRequest { count: 3, ..range });
+        assert_eq!(queue.pending_len(), 0);
+        assert!(matches!(
+            queue.state(range),
+            Some(HeaderWorkState::InFlight { peer: owner }) if owner == &peer
+        ));
+
+        queue.retry(range);
+        queue.retry(range);
+        assert_eq!(queue.pending_len(), 1);
+        assert_eq!(queue.next_for_peer(&peer, &state), Some(range));
+    }
+
+    #[test]
+    fn retry_avoidance_is_local_to_the_failed_peer() {
+        let mut queue = HeaderWorkQueue::new();
+        let range = range(1, 1, RangePriority::Forward);
+        let (failed_peer, failed_state) = peer_state(2, 10);
+        let (other_peer, other_state) = peer_state(3, 10);
+
+        queue.ensure_forward(range);
+        let claimed = queue
+            .next_for_peer(&failed_peer, &failed_state)
+            .expect("failed peer initially claims the range");
+        queue.mark_assigned(failed_peer.clone(), claimed);
+        queue.retry_avoiding(failed_peer.clone(), range);
+
+        assert!(queue.peer_retry_avoided(&failed_peer, failed_state.advertised_tip));
+        assert_eq!(queue.next_for_peer(&failed_peer, &failed_state), None);
+        assert_eq!(queue.next_for_peer(&other_peer, &other_state), Some(range));
+    }
+
+    #[test]
+    fn assignment_prefers_forward_work_but_skips_ranges_above_the_peer_tip() {
+        let mut queue = HeaderWorkQueue::new();
+        let forward = range(10, 2, RangePriority::Forward);
+        let backward = range(1, 2, RangePriority::Backward);
+        let (peer, mut state) = peer_state(4, 2);
+
+        queue.ensure_forward(forward);
+        queue.ensure_backward(backward);
+        assert_eq!(queue.next_for_peer(&peer, &state), Some(backward));
+
+        state.advertised_tip = block::Height(11);
+        assert_eq!(queue.next_for_peer(&peer, &state), Some(forward));
+    }
+
+    #[test]
+    fn covered_ranges_merge_and_prune_owned_work_except_commits() {
+        let mut queue = HeaderWorkQueue::new();
+        let owner = peer(5);
+        let pending = range(1, 1, RangePriority::Forward);
+        let in_flight = range(2, 1, RangePriority::Forward);
+        let committing = range(3, 1, RangePriority::Forward);
+
+        queue.ensure_forward(pending);
+        queue.mark_assigned(owner.clone(), in_flight);
+        queue.mark_assigned(owner.clone(), committing);
+        queue.mark_buffered(owner.clone(), committing);
+        queue.mark_committing(owner, 7, committing);
+
+        queue.mark_range_covered(block::Height(1), block::Height(2));
+        queue.mark_height_covered(block::Height(3));
+
+        assert_eq!(
+            queue.covered,
+            vec![CoveredRange {
+                start: block::Height(1),
+                end: block::Height(3),
+            }]
+        );
+        assert_eq!(queue.pending_len(), 0);
+        assert!(queue.state(in_flight).is_none());
+        assert!(matches!(
+            queue.state(committing),
+            Some(HeaderWorkState::Committing { session_id: 7, .. })
+        ));
+
+        queue.ensure_forward(pending);
+        assert_eq!(queue.pending_len(), 0);
+    }
+
+    #[test]
+    fn forgetting_a_peer_requeues_only_its_in_flight_work() {
+        let mut queue = HeaderWorkQueue::new();
+        let forgotten = peer(6);
+        let other = peer(7);
+        let in_flight = range(1, 1, RangePriority::Forward);
+        let buffered = range(2, 1, RangePriority::Forward);
+        let committing = range(3, 1, RangePriority::Forward);
+        let other_in_flight = range(4, 1, RangePriority::Forward);
+
+        queue.mark_assigned(forgotten.clone(), in_flight);
+        queue.mark_assigned(forgotten.clone(), buffered);
+        queue.mark_buffered(forgotten.clone(), buffered);
+        queue.mark_assigned(forgotten.clone(), committing);
+        queue.mark_buffered(forgotten.clone(), committing);
+        queue.mark_committing(forgotten.clone(), 9, committing);
+        queue.mark_assigned(other.clone(), other_in_flight);
+        queue.retry_avoidance.insert(
+            forgotten.clone(),
+            HashMap::from([(
+                (in_flight.start_height, in_flight.priority),
+                Instant::now() + HEADER_SYNC_RETRY_AVOIDANCE,
+            )]),
+        );
+
+        queue.forget_peer(&forgotten);
+
+        assert_eq!(
+            queue.forward.iter().copied().collect::<Vec<_>>(),
+            vec![in_flight]
+        );
+        assert!(matches!(
+            queue.state(buffered),
+            Some(HeaderWorkState::Buffered { peer }) if peer == &forgotten
+        ));
+        assert!(matches!(
+            queue.state(committing),
+            Some(HeaderWorkState::Committing { peer, session_id: 9 }) if peer == &forgotten
+        ));
+        assert!(matches!(
+            queue.state(other_in_flight),
+            Some(HeaderWorkState::InFlight { peer }) if peer == &other
+        ));
+        assert!(!queue.retry_avoidance.contains_key(&forgotten));
+    }
+
+    #[test]
+    fn narrowing_active_work_updates_start_deduplication() {
+        let mut queue = HeaderWorkQueue::new();
+        let owner = peer(8);
+        let original = range(1, 3, RangePriority::Forward);
+        let narrowed = range(2, 2, RangePriority::Forward);
+
+        queue.mark_assigned(owner.clone(), original);
+        queue.narrow_queued_range(original, narrowed);
+
+        assert!(queue.state(original).is_none());
+        assert!(matches!(
+            queue.state(narrowed),
+            Some(HeaderWorkState::InFlight { peer }) if peer == &owner
+        ));
+        queue.ensure_forward(original);
+        queue.ensure_forward(narrowed);
+        assert_eq!(
+            queue.forward.iter().copied().collect::<Vec<_>>(),
+            vec![original]
+        );
+    }
+}

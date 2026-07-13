@@ -125,6 +125,13 @@ impl HeaderSyncReactor {
                     };
                     self.handle_event(event).await;
                 }
+                event = self.requester_events.recv() => {
+                    let Some(event) = event else {
+                        exit_reason = "requester_event_channel_closed";
+                        break;
+                    };
+                    self.handle_requester_event(event).await;
+                }
                 event = self.events.recv() => {
                     let Some(event) = event else {
                         exit_reason = "events_channel_closed";
@@ -137,13 +144,6 @@ impl HeaderSyncReactor {
                     if let Some(permit) = permit {
                         self.drain_buffered_with_permit(Some(permit)).await;
                     }
-                }
-                event = self.requester_events.recv() => {
-                    let Some(event) = event else {
-                        exit_reason = "requester_event_channel_closed";
-                        break;
-                    };
-                    self.handle_requester_event(event).await;
                 }
                 changed = async {
                     match frontier_updates.as_mut() {
@@ -192,6 +192,33 @@ impl HeaderSyncReactor {
 
     async fn handle_requester_event(&mut self, event: HeaderRequesterEvent) {
         match event {
+            HeaderRequesterEvent::Register {
+                peer,
+                session_id,
+                generation,
+                command,
+                request_id,
+                registered,
+            } => {
+                if !self.is_current_requester(&peer, session_id, generation) {
+                    metrics::counter!("sync.header.request.late_registration").increment(1);
+                    return;
+                }
+                let Some(peer_state) = self.state.peers.get_mut(&peer) else {
+                    return;
+                };
+                peer_state.pending_request_sends =
+                    peer_state.pending_request_sends.saturating_sub(1);
+                peer_state.outstanding.push(OutstandingRange {
+                    request_id,
+                    range: command.range,
+                    deadline: None,
+                    expected_max_count: command.expected_max_count,
+                    clear_assignment_on_timeout: false,
+                    purpose: command.purpose,
+                });
+                let _ = registered.send(());
+            }
             HeaderRequesterEvent::Sent {
                 peer,
                 session_id,
@@ -206,16 +233,13 @@ impl HeaderSyncReactor {
                 let Some(peer_state) = self.state.peers.get_mut(&peer) else {
                     return;
                 };
-                peer_state.pending_request_sends =
-                    peer_state.pending_request_sends.saturating_sub(1);
-                peer_state.outstanding.push(OutstandingRange {
-                    request_id,
-                    range: command.range,
-                    deadline: Instant::now() + self.startup.request_timeout,
-                    expected_max_count: command.expected_max_count,
-                    clear_assignment_on_timeout: false,
-                    purpose: command.purpose,
-                });
+                if let Some(outstanding) = peer_state
+                    .outstanding
+                    .iter_mut()
+                    .find(|outstanding| outstanding.request_id == request_id)
+                {
+                    outstanding.deadline = Some(Instant::now() + self.startup.request_timeout);
+                }
                 let peer_cap = peer_state.max_headers_per_response;
                 metrics::counter!("sync.header.request.sent").increment(1);
                 self.trace_get_headers_sent(
@@ -245,6 +269,7 @@ impl HeaderSyncReactor {
                 session_id,
                 generation,
                 command,
+                request_id,
                 reason,
             } => {
                 if !self.is_current_requester(&peer, session_id, generation) {
@@ -252,8 +277,12 @@ impl HeaderSyncReactor {
                     return;
                 }
                 if let Some(peer_state) = self.state.peers.get_mut(&peer) {
-                    peer_state.pending_request_sends =
-                        peer_state.pending_request_sends.saturating_sub(1);
+                    if let Some(request_id) = request_id {
+                        let _ = peer_state.remove_outstanding_by_request_id(request_id);
+                    } else {
+                        peer_state.pending_request_sends =
+                            peer_state.pending_request_sends.saturating_sub(1);
+                    }
                 }
                 match command.purpose {
                     RangePurpose::Sync => self.state.schedule.retry(command.range),
@@ -1508,7 +1537,7 @@ impl HeaderSyncReactor {
             );
             if let Some(peer_state) = self.state.peers.get_mut(&peer) {
                 peer_state.outstanding.push(OutstandingRange {
-                    deadline,
+                    deadline: Some(deadline),
                     clear_assignment_on_timeout: true,
                     ..outstanding
                 });
@@ -2026,7 +2055,10 @@ impl HeaderSyncReactor {
         for peer in self.state.peers.values_mut() {
             let mut index = 0;
             while index < peer.outstanding.len() {
-                if peer.outstanding[index].deadline <= now {
+                if peer.outstanding[index]
+                    .deadline
+                    .is_some_and(|deadline| deadline <= now)
+                {
                     let outstanding = peer.outstanding.remove(index);
                     let peer_id = peer.session.peer_id().clone();
                     let _ = peer.session.retire_expected_headers(outstanding.request_id);
@@ -2070,12 +2102,13 @@ impl HeaderSyncReactor {
             deadline = deadline.min(retry);
         }
         for peer in self.state.peers.values() {
-            if let Some(request) = peer
+            if let Some(request_deadline) = peer
                 .outstanding
                 .iter()
-                .min_by_key(|request| request.deadline)
+                .filter_map(|request| request.deadline)
+                .min()
             {
-                deadline = deadline.min(request.deadline);
+                deadline = deadline.min(request_deadline);
             }
             let status_deadline = if peer.status_differs_from_last_sent(self.local_status()) {
                 peer.meters.unsolicited.next_allowed
@@ -2358,7 +2391,7 @@ impl HeaderSyncReactor {
         let outstanding = OutstandingRange {
             request_id,
             range,
-            deadline: Instant::now() + self.startup.request_timeout,
+            deadline: Some(Instant::now() + self.startup.request_timeout),
             expected_max_count: range.count,
             clear_assignment_on_timeout: false,
             purpose: RangePurpose::VctRepair { height, generation },

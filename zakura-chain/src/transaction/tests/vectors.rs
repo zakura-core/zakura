@@ -206,6 +206,106 @@ fn v5_orchard_cross_address_flag_fails_deserialization() {
     ));
 }
 
+/// V6 Orchard and Ironwood bundles must round-trip the `ENABLE_CROSS_ADDRESS`
+/// flag bit (which V5 reserves and rejects), while still rejecting the
+/// undefined flag bits 3..7.
+///
+/// The flags byte position is located by serializing the same transaction
+/// with and without the cross-address bit and diffing: exactly one byte may
+/// change.
+#[test]
+fn v6_orchard_style_flags_allow_cross_address_but_reject_reserved_bits() {
+    let _init_guard = zakura_test::init();
+
+    let shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+
+    let make_tx = |mut shielded_data: crate::orchard::ShieldedData, ironwood: bool| {
+        shielded_data
+            .flags
+            .insert(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
+
+        Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu6_3,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(1),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: (!ironwood).then_some(shielded_data.clone()),
+            ironwood_shielded_data: ironwood.then_some(shielded_data),
+        }
+    };
+
+    for ironwood in [false, true] {
+        let tx = make_tx(shielded_data.clone(), ironwood);
+        let cross_address_bytes = tx
+            .zcash_serialize_to_vec()
+            .expect("V6 Orchard-style formats allow the cross-address bit on the wire");
+        let parsed = Transaction::zcash_deserialize(&cross_address_bytes[..])
+            .expect("V6 Orchard-style cross-address flag must deserialize");
+        let parsed_flags = if ironwood {
+            parsed
+                .ironwood_shielded_data()
+                .expect("test transaction has Ironwood data")
+                .flags
+        } else {
+            parsed
+                .orchard_shielded_data()
+                .expect("test transaction has Orchard data")
+                .flags
+        };
+        assert!(parsed_flags.contains(crate::orchard::Flags::ENABLE_CROSS_ADDRESS));
+
+        let mut without_cross_address = tx;
+        let Transaction::V6 {
+            orchard_shielded_data,
+            ironwood_shielded_data,
+            ..
+        } = &mut without_cross_address
+        else {
+            unreachable!("test transaction is V6");
+        };
+        if ironwood {
+            ironwood_shielded_data
+                .as_mut()
+                .expect("test transaction has Ironwood data")
+                .flags
+                .remove(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
+        } else {
+            orchard_shielded_data
+                .as_mut()
+                .expect("test transaction has Orchard data")
+                .flags
+                .remove(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
+        }
+
+        let without_cross_address_bytes = without_cross_address
+            .zcash_serialize_to_vec()
+            .expect("V6 Orchard-style flags without cross-address must serialize");
+        let differing_indices: Vec<_> = cross_address_bytes
+            .iter()
+            .zip(&without_cross_address_bytes)
+            .enumerate()
+            .filter_map(|(index, (with, without))| (with != without).then_some(index))
+            .collect();
+        let [flags_index] = differing_indices.as_slice() else {
+            panic!("toggling the cross-address flag should change exactly one byte");
+        };
+
+        let mut reserved_bit_bytes = cross_address_bytes;
+        reserved_bit_bytes[*flags_index] |= 0b0000_1000;
+        let error = Transaction::zcash_deserialize(&reserved_bit_bytes[..])
+            .expect_err("V6 Orchard-style flags must reject reserved bits 3..7");
+        assert!(matches!(
+            error,
+            SerializationError::Parse("invalid reserved orchard flags")
+        ));
+    }
+}
+
 #[test]
 fn doesnt_deserialize_transaction_with_invalid_value_balance() {
     let _init_guard = zakura_test::init();
@@ -599,6 +699,36 @@ fn native_zip244_matches_test_vectors() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// V5 remains valid under the NU6.3 branch ID, even though NU6.3 also
+/// introduces V6 and changes Orchard bundle semantics. Keep the native
+/// ZIP-244 path pinned to the librustzcash oracle at that mixed boundary.
+#[test]
+fn native_zip244_matches_librustzcash_for_v5_nu6_3_orchard() {
+    let _init_guard = zakura_test::init();
+
+    let mut tx = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find(|transaction| transaction.orchard_shielded_data().is_some())
+        .expect("test vectors include a V5 Orchard transaction");
+
+    tx.update_network_upgrade(NetworkUpgrade::Nu6_3)
+        .expect("V5 transactions can carry the NU6.3 branch ID");
+
+    let (native_txid, native_auth_digest) = crate::transaction::zip244::txid_and_auth_digest(&tx)
+        .expect("V5 transactions have native ZIP-244 digests");
+    let (librustzcash_txid, librustzcash_auth_digest) =
+        crate::primitives::zcash_primitives::txid_and_auth_digest_via_librustzcash(&tx);
+
+    assert_eq!(
+        native_txid, librustzcash_txid,
+        "native V5 NU6.3 txid must match librustzcash"
+    );
+    assert_eq!(
+        native_auth_digest, librustzcash_auth_digest,
+        "native V5 NU6.3 auth digest must match librustzcash"
+    );
 }
 
 fn assert_native_zip244_matches_test_vector(
@@ -1261,6 +1391,55 @@ fn test_coinbase_script() -> Result<()> {
     Ok(())
 }
 
+/// The V6 version group ID must match librustzcash's finalized constant, both
+/// as a constant and in the serialized header bytes (fOverwintered | version,
+/// then the group ID, little-endian), and the former `0xffff_ffff`
+/// placeholder value must no longer deserialize.
+#[test]
+fn v6_version_group_id_matches_librustzcash_and_wire_format() {
+    use crate::parameters::TX_V6_VERSION_GROUP_ID;
+
+    let _init_guard = zakura_test::init();
+
+    assert_eq!(
+        TX_V6_VERSION_GROUP_ID,
+        zcash_protocol::constants::V6_VERSION_GROUP_ID,
+    );
+    assert_eq!(
+        TX_V6_VERSION_GROUP_ID,
+        zcash_primitives::transaction::TxVersion::V6.version_group_id(),
+    );
+
+    let tx = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+    };
+    let tx_bytes = tx
+        .zcash_serialize_to_vec()
+        .expect("an empty NU6.3 V6 transaction has a valid wire encoding");
+
+    assert_eq!(&tx_bytes[0..4], &[0x06, 0x00, 0x00, 0x80]);
+    assert_eq!(&tx_bytes[4..8], &[0x98, 0xb6, 0x84, 0xd8]);
+    assert_eq!(tx.version_group_id(), Some(TX_V6_VERSION_GROUP_ID));
+    tx.to_librustzcash(NetworkUpgrade::Nu6_3)
+        .expect("librustzcash must accept Zakura's finalized V6 header");
+
+    let mut placeholder_bytes = tx_bytes;
+    placeholder_bytes[4..8].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+    let error = Transaction::zcash_deserialize(&placeholder_bytes[..])
+        .expect_err("the former placeholder V6 version group ID must be rejected");
+    assert!(matches!(
+        error,
+        SerializationError::Parse("expected TX_V6_VERSION_GROUP_ID")
+    ));
+}
+
 #[test]
 fn v6_transactions_accept_nu6_3_and_later_branch_ids() {
     use crate::parameters::TX_V6_VERSION_GROUP_ID;
@@ -1322,6 +1501,83 @@ fn v6_transactions_accept_nu6_3_and_later_branch_ids() {
             assert_eq!(tx.zcash_serialize_to_vec().unwrap(), tx_bytes);
         }
     }
+}
+
+/// The V6 sighash precomputation path must preserve the separate Orchard and
+/// Ironwood bundle slots after the librustzcash round-trip.
+///
+/// Both fields use the same upstream `orchard::Bundle` concrete type and the
+/// same authorization mapper, so a swapped getter or accidental alias would
+/// otherwise send one pool's proof to the other pool's verifier.
+#[test]
+fn v6_sighasher_preserves_distinct_orchard_and_ironwood_bundle_slots() {
+    use crate::{ironwood, orchard};
+
+    let _init_guard = zakura_test::init();
+
+    let mut orchard_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+    let mut ironwood_data = orchard_data.clone();
+
+    let orchard_nullifier = [0u8; 32];
+    let mut ironwood_nullifier = [0u8; 32];
+    ironwood_nullifier[0] = 1;
+
+    let mut orchard_actions = orchard_data.actions.as_slice().to_vec();
+    orchard_actions[0].action.nullifier =
+        orchard::Nullifier::try_from(orchard_nullifier).expect("zero is a valid nullifier");
+    orchard_data.actions = orchard_actions
+        .try_into()
+        .expect("the test bundle has at least one action");
+
+    let mut ironwood_actions = ironwood_data.actions.as_slice().to_vec();
+    ironwood_actions[0].action.nullifier =
+        ironwood::Nullifier::try_from(ironwood_nullifier).expect("one is a valid nullifier");
+    ironwood_data.actions = ironwood_actions
+        .try_into()
+        .expect("the test bundle has at least one action");
+
+    let tx = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(orchard_data),
+        ironwood_shielded_data: Some(ironwood_data),
+    };
+
+    let sighasher = tx
+        .sighasher(NetworkUpgrade::Nu6_3, Arc::new(Vec::new()))
+        .expect("the mixed-pool V6 transaction converts to librustzcash");
+    let orchard_bundle = sighasher
+        .orchard_bundle()
+        .expect("the V6 transaction keeps its Orchard bundle");
+    let ironwood_bundle = sighasher
+        .ironwood_bundle()
+        .expect("the V6 transaction keeps its Ironwood bundle");
+
+    let parsed_orchard_nullifier = (*orchard_bundle
+        .actions()
+        .iter()
+        .next()
+        .expect("the Orchard bundle has at least one action")
+        .nullifier())
+    .to_bytes();
+    let parsed_ironwood_nullifier = (*ironwood_bundle
+        .actions()
+        .iter()
+        .next()
+        .expect("the Ironwood bundle has at least one action")
+        .nullifier())
+    .to_bytes();
+
+    assert_eq!(parsed_orchard_nullifier, orchard_nullifier);
+    assert_eq!(parsed_ironwood_nullifier, ironwood_nullifier);
+    assert_ne!(parsed_orchard_nullifier, parsed_ironwood_nullifier);
 }
 
 #[test]

@@ -1,7 +1,13 @@
 [package]
 # Crate metadata
 name = "zakura"
-version = "1.0.0-rc3"
+# When bumping this version, also update the `cargo install --git ... --tag`
+# line in the top-level README.md: it is this package's crates.io readme, so a
+# stale tag ships on the crate page. The pre-release-replacements rule in
+# [package.metadata.release] below does it automatically, but only under the
+# full `cargo release` flow (`cargo release version` skips the replace step) -
+# keep the two in sync when bumping by hand.
+version = "1.0.0-rc4"
 authors.workspace = true
 description = "Zakura, an independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true

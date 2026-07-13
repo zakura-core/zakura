@@ -275,3 +275,193 @@ impl NoteCommitmentTrees {
         Ok((ironwood, subtree_root))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use halo2::pasta::pallas;
+
+    use crate::{
+        block::{Header, Height},
+        parameters::{Network, NetworkUpgrade::Nu6_3},
+        serialization::ZcashDeserializeInto,
+        transaction::{arbitrary::v5_transactions, LockTime, Transaction},
+        transparent,
+    };
+
+    use super::*;
+
+    /// `update_trees_parallel` must feed each pool's note commitments to its
+    /// own tree, in transaction order, and must not touch unrelated trees.
+    ///
+    /// The block's two transactions carry the commitments `1` and `2` in
+    /// opposite pools, so a pool mix-up or reordering would change the
+    /// resulting Orchard or Ironwood tree root.
+    #[test]
+    fn parallel_block_update_keeps_orchard_and_ironwood_order_and_assignment() {
+        let _init_guard = zakura_test::init();
+
+        let mut orchard_data = Network::iter()
+            .flat_map(|network| v5_transactions(network.block_iter()))
+            .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+            .expect("test vectors include an Orchard transaction");
+        // Ironwood reuses the Orchard bundle encoding, so an Orchard test
+        // bundle can be cloned into the Ironwood slot of a V6 transaction.
+        let mut ironwood_data = orchard_data.clone();
+
+        let mut orchard_actions = orchard_data.actions.as_slice().to_vec();
+        orchard_actions.truncate(1);
+        orchard_actions[0].action.cm_x = pallas::Base::from(1);
+        orchard_data.actions = orchard_actions
+            .try_into()
+            .expect("the test bundle has at least one action");
+
+        let mut ironwood_actions = ironwood_data.actions.as_slice().to_vec();
+        ironwood_actions.truncate(1);
+        ironwood_actions[0].action.cm_x = pallas::Base::from(2);
+        ironwood_data.actions = ironwood_actions
+            .try_into()
+            .expect("the test bundle has at least one action");
+
+        let make_transaction =
+            |orchard_shielded_data: orchard::ShieldedData,
+             ironwood_shielded_data: ironwood::ShieldedData| {
+                Arc::new(Transaction::V6 {
+                    network_upgrade: Nu6_3,
+                    lock_time: LockTime::unlocked(),
+                    expiry_height: Height(1),
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    sapling_shielded_data: None,
+                    orchard_shielded_data: Some(orchard_shielded_data),
+                    ironwood_shielded_data: Some(ironwood_shielded_data),
+                })
+            };
+
+        let height = Height(123);
+        let coinbase = Arc::new(Transaction::V6 {
+            network_upgrade: Nu6_3,
+            lock_time: LockTime::unlocked(),
+            expiry_height: height,
+            inputs: vec![transparent::Input::Coinbase {
+                height,
+                data: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+        });
+        let header: Header = zakura_test::vectors::DUMMY_HEADER
+            .zcash_deserialize_into()
+            .expect("dummy header should deserialize");
+        let block = Arc::new(Block {
+            header: Arc::new(header),
+            transactions: vec![
+                coinbase,
+                make_transaction(orchard_data.clone(), ironwood_data.clone()),
+                make_transaction(ironwood_data, orchard_data),
+            ],
+        });
+
+        let orchard_commitments: Vec<_> = block.orchard_note_commitments().copied().collect();
+        let ironwood_commitments: Vec<_> = block.ironwood_note_commitments().copied().collect();
+        assert_eq!(
+            orchard_commitments,
+            [pallas::Base::from(1), pallas::Base::from(2)]
+        );
+        assert_eq!(
+            ironwood_commitments,
+            [pallas::Base::from(2), pallas::Base::from(1)]
+        );
+
+        let mut expected_orchard = orchard::tree::NoteCommitmentTree::default();
+        for commitment in &orchard_commitments {
+            expected_orchard
+                .append(*commitment)
+                .expect("two Orchard commitments fit in an empty tree");
+        }
+        let mut expected_ironwood = ironwood::tree::NoteCommitmentTree::default();
+        for commitment in &ironwood_commitments {
+            expected_ironwood
+                .append(*commitment)
+                .expect("two Ironwood commitments fit in an empty tree");
+        }
+        assert_ne!(expected_orchard.root(), expected_ironwood.root());
+
+        let mut trees = NoteCommitmentTrees::default();
+        let unchanged_sprout = trees.sprout.clone();
+        let unchanged_sapling = trees.sapling.clone();
+        trees
+            .update_trees_parallel(&block)
+            .expect("the mixed-pool block fits in empty trees");
+
+        assert_eq!(trees.sprout, unchanged_sprout);
+        assert_eq!(trees.sapling, unchanged_sapling);
+        assert_eq!(trees.orchard.root(), expected_orchard.root());
+        assert_eq!(trees.ironwood.root(), expected_ironwood.root());
+        assert_eq!(trees.orchard.count(), 2);
+        assert_eq!(trees.ironwood.count(), 2);
+        assert_eq!(trees.orchard_subtree, None);
+        assert_eq!(trees.ironwood_subtree, None);
+        assert!(!Arc::ptr_eq(&trees.orchard, &trees.ironwood));
+    }
+
+    /// Updating one pool's note commitment tree must not affect the other's,
+    /// even though the two pools share the same tree implementation and their
+    /// empty trees have equal roots.
+    #[test]
+    fn orchard_and_ironwood_trees_remain_independent() {
+        let mut trees = NoteCommitmentTrees::default();
+        let empty_orchard_root = trees.orchard.root();
+        let empty_ironwood_root = trees.ironwood.root();
+
+        assert_eq!(empty_orchard_root, empty_ironwood_root);
+        assert!(!Arc::ptr_eq(&trees.orchard, &trees.ironwood));
+
+        let (ironwood, ironwood_subtree) =
+            NoteCommitmentTrees::update_ironwood_note_commitment_tree(
+                trees.ironwood.clone(),
+                vec![pallas::Base::from(1)],
+            )
+            .expect("one Ironwood commitment fits in an empty tree");
+        trees.ironwood = ironwood;
+
+        assert_eq!(ironwood_subtree, None);
+        assert_eq!(trees.orchard.root(), empty_orchard_root);
+        assert_ne!(trees.ironwood.root(), empty_ironwood_root);
+
+        let ironwood_root = trees.ironwood.root();
+        let (orchard, orchard_subtree) = NoteCommitmentTrees::update_orchard_note_commitment_tree(
+            trees.orchard.clone(),
+            vec![pallas::Base::from(2)],
+        )
+        .expect("one Orchard commitment fits in an empty tree");
+        trees.orchard = orchard;
+
+        assert_eq!(orchard_subtree, None);
+        assert_eq!(trees.ironwood.root(), ironwood_root);
+        assert_ne!(trees.orchard.root(), trees.ironwood.root());
+    }
+
+    /// Tree errors must name the pool they came from: the `From` conversion
+    /// maps the shared inner error type to the Orchard variant, so Ironwood
+    /// errors must be constructed explicitly and display as Ironwood.
+    #[test]
+    fn orchard_and_ironwood_tree_errors_keep_their_pool_identity() {
+        let orchard_error =
+            NoteCommitmentTreeError::from(orchard::tree::NoteCommitmentTreeError::FullTree);
+        let ironwood_error =
+            NoteCommitmentTreeError::Ironwood(ironwood::tree::NoteCommitmentTreeError::FullTree);
+
+        assert!(matches!(orchard_error, NoteCommitmentTreeError::Orchard(_)));
+        assert!(matches!(
+            ironwood_error,
+            NoteCommitmentTreeError::Ironwood(_)
+        ));
+        assert_eq!(
+            ironwood_error.to_string(),
+            "ironwood error: The note commitment tree is full"
+        );
+    }
+}

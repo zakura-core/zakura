@@ -280,10 +280,10 @@ impl ConnectedAddr {
     /// TODO: remove the `get_` from these methods (Rust style avoids `get` prefixes)
     pub fn get_address_book_addr(&self) -> Option<PeerSocketAddr> {
         match self {
-            OutboundDirect { addr } | InboundDirect { addr } => Some(*addr),
+            OutboundDirect { addr } => Some(*addr),
             // TODO: consider using the canonical address of the peer to track
             //       outbound proxy connections
-            OutboundProxy { .. } | InboundProxy { .. } | Isolated => None,
+            InboundDirect { .. } | OutboundProxy { .. } | InboundProxy { .. } | Isolated => None,
         }
     }
 

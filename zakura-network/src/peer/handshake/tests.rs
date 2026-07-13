@@ -42,6 +42,58 @@ fn peer_addr(port: u16) -> PeerSocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port)).into()
 }
 
+#[test]
+fn connected_addr_address_book_addr_only_uses_outbound_direct() {
+    let outbound_addr = peer_addr(18233);
+    let inbound_addr = peer_addr(28233);
+    let proxy_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 38233));
+    let transient_local_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 48233));
+
+    assert_eq!(
+        ConnectedAddr::new_outbound_direct(outbound_addr).get_address_book_addr(),
+        Some(outbound_addr)
+    );
+    assert_eq!(
+        ConnectedAddr::new_inbound_direct(inbound_addr).get_address_book_addr(),
+        None
+    );
+    assert_eq!(
+        ConnectedAddr::new_outbound_proxy(proxy_addr, transient_local_addr).get_address_book_addr(),
+        None
+    );
+    assert_eq!(
+        ConnectedAddr::new_inbound_proxy(proxy_addr).get_address_book_addr(),
+        None
+    );
+    assert_eq!(ConnectedAddr::new_isolated().get_address_book_addr(), None);
+}
+
+#[test]
+fn connected_addr_transient_addr_identifies_open_non_isolated_connections() {
+    let outbound_addr = peer_addr(18233);
+    let inbound_addr = peer_addr(28233);
+    let proxy_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 38233));
+    let transient_local_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 48233));
+
+    assert_eq!(
+        ConnectedAddr::new_outbound_direct(outbound_addr).get_transient_addr(),
+        Some(outbound_addr)
+    );
+    assert_eq!(
+        ConnectedAddr::new_inbound_direct(inbound_addr).get_transient_addr(),
+        Some(inbound_addr)
+    );
+    assert_eq!(
+        ConnectedAddr::new_outbound_proxy(proxy_addr, transient_local_addr).get_transient_addr(),
+        Some(transient_local_addr.into())
+    );
+    assert_eq!(
+        ConnectedAddr::new_inbound_proxy(proxy_addr).get_transient_addr(),
+        Some(proxy_addr.into())
+    );
+    assert_eq!(ConnectedAddr::new_isolated().get_transient_addr(), None);
+}
+
 fn test_config(p2p_stack: P2pStack) -> Config {
     Config::for_test(p2p_stack)
 }

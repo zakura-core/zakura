@@ -262,9 +262,44 @@ impl HeaderWorkQueue {
         );
     }
 
-    pub(super) fn drop_pending_forward_through(&mut self, height: block::Height) {
-        self.forward.retain(|range| range.start_height > height);
+    pub(super) fn trim_pending_forward_through(
+        &mut self,
+        height: block::Height,
+        anchor_hash: block::Hash,
+    ) {
+        self.forward = self
+            .forward
+            .drain(..)
+            .filter_map(|range| {
+                if range.start_height <= height {
+                    range.suffix_after(height, anchor_hash)
+                } else {
+                    Some(range)
+                }
+            })
+            .collect();
         self.rebuild_start_indexes();
+    }
+
+    pub(super) fn clear_pending_anchor(
+        &mut self,
+        priority: RangePriority,
+        start_height: block::Height,
+        anchor_hash: block::Hash,
+    ) {
+        let queue = match priority {
+            RangePriority::Forward => &mut self.forward,
+            RangePriority::Backward => &mut self.backward,
+            RangePriority::Repair => return,
+        };
+        if let Some(range) = queue
+            .iter_mut()
+            .find(|range| range.start_height == start_height)
+        {
+            if range.anchor_hash == Some(anchor_hash) {
+                range.anchor_hash = None;
+            }
+        }
     }
 
     pub(super) fn clear_forward(&mut self) {
@@ -365,7 +400,12 @@ impl HeaderWorkQueue {
             .max()
     }
 
-    pub(super) fn next_retry_deadline(&self) -> Option<Instant> {
+    pub(super) fn next_retry_deadline(&mut self) -> Option<Instant> {
+        let now = Instant::now();
+        self.retry_avoidance.retain(|_, ranges| {
+            ranges.retain(|_, until| *until > now);
+            !ranges.is_empty()
+        });
         self.retry_avoidance
             .values()
             .flat_map(HashMap::values)
@@ -534,6 +574,127 @@ mod tests {
         queue.retry(range);
         assert_eq!(queue.pending_len(), 1);
         assert_eq!(queue.next_for_peer(&peer, &state), Some(range));
+    }
+
+    #[test]
+    fn partial_forward_coverage_preserves_the_interior_suffix() {
+        let mut queue = HeaderWorkQueue::new();
+        let first = range(1, 2, RangePriority::Forward);
+        let later = range(3, 2, RangePriority::Forward);
+        let anchor = block::Hash([9; 32]);
+        queue.ensure_forward(first);
+        queue.ensure_forward(later);
+
+        queue.trim_pending_forward_through(block::Height(1), anchor);
+
+        assert_eq!(
+            queue.forward.iter().copied().collect::<Vec<_>>(),
+            vec![
+                RangeRequest {
+                    start_height: block::Height(2),
+                    count: 1,
+                    anchor_hash: Some(anchor),
+                    ..first
+                },
+                later,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejected_prefix_clears_its_pending_suffix_anchor() {
+        let mut queue = HeaderWorkQueue::new();
+        let poisoned = block::Hash([7; 32]);
+        let suffix = RangeRequest {
+            anchor_hash: Some(poisoned),
+            ..range(3, 2, RangePriority::Backward)
+        };
+        queue.ensure_backward(suffix);
+
+        queue.clear_pending_anchor(RangePriority::Backward, suffix.start_height, poisoned);
+
+        assert_eq!(
+            queue.backward.front().and_then(|range| range.anchor_hash),
+            None
+        );
+    }
+
+    #[test]
+    fn expired_retry_avoidance_does_not_leave_a_past_deadline() {
+        let mut queue = HeaderWorkQueue::new();
+        queue.retry_avoidance.insert(
+            peer(2),
+            HashMap::from([(
+                (block::Height(1), RangePriority::Forward),
+                Instant::now() - Duration::from_millis(1),
+            )]),
+        );
+
+        assert_eq!(queue.next_retry_deadline(), None);
+        assert!(queue.retry_avoidance.is_empty());
+    }
+
+    #[test]
+    fn maximum_height_range_keeps_valid_queue_ownership() {
+        let mut queue = HeaderWorkQueue::new();
+        let range = range(u32::MAX, 1, RangePriority::Forward);
+        let (peer, state) = peer_state(3, u32::MAX);
+        queue.ensure_forward(range);
+
+        let claimed = queue
+            .next_for_peer(&peer, &state)
+            .expect("maximum-height work is assignable without overflow");
+        queue.mark_assigned(peer.clone(), claimed);
+        assert_eq!(claimed.end_height(), block::Height(u32::MAX));
+        assert!(matches!(
+            queue.state(range),
+            Some(HeaderWorkState::InFlight { peer: owner }) if owner == &peer
+        ));
+    }
+
+    #[test]
+    fn seen_hash_dedup_evicts_the_oldest_entry_at_capacity() {
+        let mut seen = HeaderHashDedup::default();
+        for value in 0..=HEADER_SYNC_SEEN_HASH_CAPACITY {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(
+                &u64::try_from(value)
+                    .expect("the test capacity fits in u64")
+                    .to_le_bytes(),
+            );
+            assert!(seen.insert(block::Hash(bytes)));
+        }
+
+        assert_eq!(seen.order.len(), HEADER_SYNC_SEEN_HASH_CAPACITY);
+        assert!(!seen.contains(&block::Hash([0; 32])));
+    }
+
+    #[test]
+    fn clearing_forward_work_preserves_backward_ownership_and_rebuilds_indexes() {
+        let mut queue = HeaderWorkQueue::new();
+        let forward_pending = range(1, 1, RangePriority::Forward);
+        let forward_active = range(2, 1, RangePriority::Forward);
+        let backward_pending = range(3, 1, RangePriority::Backward);
+        let backward_active = range(4, 1, RangePriority::Backward);
+        let owner = peer(4);
+        queue.ensure_forward(forward_pending);
+        queue.ensure_backward(backward_pending);
+        queue.mark_assigned(owner.clone(), forward_active);
+        queue.mark_assigned(owner.clone(), backward_active);
+        let old_epoch = queue.epoch;
+
+        queue.clear_forward();
+
+        assert_eq!(queue.epoch, old_epoch.wrapping_add(1));
+        assert_eq!(queue.forward, VecDeque::new());
+        assert!(queue.state(forward_active).is_none());
+        assert_eq!(queue.backward, VecDeque::from([backward_pending]));
+        assert!(matches!(
+            queue.state(backward_active),
+            Some(HeaderWorkState::InFlight { peer }) if peer == &owner
+        ));
+        queue.ensure_forward(forward_pending);
+        assert_eq!(queue.forward, VecDeque::from([forward_pending]));
     }
 
     #[test]

@@ -140,8 +140,7 @@ impl HeaderSyncCore {
         let mut anchor_hash = (batch_start == start).then_some(self.best_header_hash);
         while remaining > 0 {
             let mut batch_len = remaining.min(batch_count);
-            let batch_end = height_after_count(batch_start, batch_len)
-                .and_then(previous_height)
+            let batch_end = range_end_height(batch_start, batch_len)
                 .expect("bounded header work batch has an end height");
             if let Some(checkpoint) = checkpoints.min_height_in_range(batch_start..=batch_end) {
                 batch_len = count_between(batch_start, checkpoint);
@@ -209,8 +208,7 @@ impl HeaderSyncCore {
         let mut anchor_hash = (batch_start == start).then_some(frontier_hash);
         while remaining > 0 {
             let mut batch_len = remaining.min(batch_count);
-            let batch_end = height_after_count(batch_start, batch_len)
-                .and_then(previous_height)
+            let batch_end = range_end_height(batch_start, batch_len)
                 .expect("bounded backward work batch has an end height");
             if let Some(checkpoint) = checkpoints.min_height_in_range(batch_start..=batch_end) {
                 batch_len = count_between(batch_start, checkpoint);
@@ -585,6 +583,14 @@ pub(super) struct OutstandingRange {
     pub(super) expected_max_count: u32,
     pub(super) clear_assignment_on_timeout: bool,
     pub(super) purpose: RangePurpose,
+    pub(super) phase: OutstandingPhase,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum OutstandingPhase {
+    Registered,
+    Sent,
+    EmptyRetry,
 }
 
 #[derive(Clone, Debug)]
@@ -609,13 +615,30 @@ pub(super) struct RangeRequest {
 
 impl RangeRequest {
     pub(super) fn end_height(self) -> block::Height {
-        height_after_count(self.start_height, self.count)
-            .and_then(previous_height)
-            .expect("range request count is non-zero")
+        range_end_height(self.start_height, self.count)
+            .expect("range request is non-zero and clamped to the remaining height domain")
     }
 
     pub(super) fn is_within(self, start: block::Height, end: block::Height) -> bool {
         self.start_height >= start && self.end_height() <= end
+    }
+
+    pub(super) fn suffix_after(
+        self,
+        covered_through: block::Height,
+        anchor_hash: block::Hash,
+    ) -> Option<Self> {
+        let end_height = self.end_height();
+        if end_height <= covered_through {
+            return None;
+        }
+        let start_height = next_height(covered_through)?;
+        Some(Self {
+            start_height,
+            count: count_between(start_height, end_height),
+            anchor_hash: Some(anchor_hash),
+            ..self
+        })
     }
 }
 

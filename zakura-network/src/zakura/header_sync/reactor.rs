@@ -212,10 +212,11 @@ impl HeaderSyncReactor {
                 peer_state.outstanding.push(OutstandingRange {
                     request_id,
                     range: command.range,
-                    deadline: None,
+                    deadline: Some(Instant::now() + self.startup.request_timeout),
                     expected_max_count: command.expected_max_count,
                     clear_assignment_on_timeout: false,
                     purpose: command.purpose,
+                    phase: OutstandingPhase::Registered,
                 });
                 let _ = registered.send(());
             }
@@ -238,7 +239,10 @@ impl HeaderSyncReactor {
                     .iter_mut()
                     .find(|outstanding| outstanding.request_id == request_id)
                 {
-                    outstanding.deadline = Some(Instant::now() + self.startup.request_timeout);
+                    if outstanding.phase == OutstandingPhase::Registered {
+                        outstanding.deadline = Some(Instant::now() + self.startup.request_timeout);
+                        outstanding.phase = OutstandingPhase::Sent;
+                    }
                 }
                 let peer_cap = peer_state.max_headers_per_response;
                 metrics::counter!("sync.header.request.sent").increment(1);
@@ -801,7 +805,7 @@ impl HeaderSyncReactor {
         let _ = self.state.seen.insert(hash);
         self.update_verified_block_tip(height, hash);
         if height > self.state.best_header_tip {
-            self.reconcile_forward_coverage(height);
+            self.reconcile_forward_coverage(height, hash);
             self.publish_best_tip(height, hash).await;
             self.drain_buffered_with_permit(None).await;
         } else {
@@ -828,7 +832,7 @@ impl HeaderSyncReactor {
 
         self.update_verified_block_tip(height, hash);
         if height > self.state.best_header_tip {
-            self.reconcile_forward_coverage(height);
+            self.reconcile_forward_coverage(height, hash);
             self.publish_best_tip(height, hash).await;
             self.drain_buffered_with_permit(None).await;
         } else {
@@ -1062,6 +1066,14 @@ impl HeaderSyncReactor {
             .filter(|range| range.is_within(start_height, tip_height))
             .copied()
             .collect();
+        debug_assert!(
+            self.state.pending_commits.values().all(|range| {
+                range.end_height() < start_height
+                    || range.start_height > tip_height
+                    || range.is_within(start_height, tip_height)
+            }),
+            "a state commit completion covers every overlapping submitted header range in full"
+        );
         self.state
             .pending_commits
             .retain(|_, range| !range.is_within(start_height, tip_height));
@@ -1126,6 +1138,8 @@ impl HeaderSyncReactor {
             if range.priority == RangePriority::Forward
                 && range.start_height <= self.state.best_header_tip
             {
+                let suffix =
+                    range.suffix_after(self.state.best_header_tip, self.state.best_header_hash);
                 self.state.schedule.complete(range);
                 metrics::counter!(
                     "sync.header.work.covered",
@@ -1133,6 +1147,13 @@ impl HeaderSyncReactor {
                     "lane" => "forward"
                 )
                 .increment(1);
+                if let Some(suffix) = suffix {
+                    if kind == HeaderSyncCommitFailureKind::InvalidPeerRange {
+                        self.state.schedule.retry_avoiding(peer.clone(), suffix);
+                    } else {
+                        self.state.schedule.retry(suffix);
+                    }
+                }
                 self.schedule().await;
                 return;
             }
@@ -1539,6 +1560,7 @@ impl HeaderSyncReactor {
                 peer_state.outstanding.push(OutstandingRange {
                     deadline: Some(deadline),
                     clear_assignment_on_timeout: true,
+                    phase: OutstandingPhase::EmptyRetry,
                     ..outstanding
                 });
             }
@@ -1680,8 +1702,7 @@ impl HeaderSyncReactor {
             return;
         }
 
-        let end_height = height_after_count(outstanding.range.start_height, header_count)
-            .and_then(previous_height)
+        let end_height = range_end_height(outstanding.range.start_height, header_count)
             .expect("non-empty bounded range has an end height");
         if outstanding.range.finalized {
             let last_hash = headers
@@ -1787,6 +1808,19 @@ impl HeaderSyncReactor {
                     .buffered
                     .remove(&key)
                     .expect("candidate buffer exists until the reactor removes it");
+                if let (Some(suffix_start), Some(suffix_anchor)) = (
+                    next_height(buffered.range.end_height()),
+                    buffered
+                        .headers
+                        .last()
+                        .map(|header| block::Hash::from(header.as_ref())),
+                ) {
+                    self.state.schedule.clear_pending_anchor(
+                        buffered.range.priority,
+                        suffix_start,
+                        suffix_anchor,
+                    );
+                }
                 self.state
                     .schedule
                     .retry_avoiding(buffered.peer.clone(), buffered.range);
@@ -2052,6 +2086,7 @@ impl HeaderSyncReactor {
     async fn handle_timeouts(&mut self) {
         let now = Instant::now();
         let mut timed_out = Vec::new();
+        let mut blocked_sessions = HashSet::new();
         for peer in self.state.peers.values_mut() {
             let mut index = 0;
             while index < peer.outstanding.len() {
@@ -2062,6 +2097,10 @@ impl HeaderSyncReactor {
                     let outstanding = peer.outstanding.remove(index);
                     let peer_id = peer.session.peer_id().clone();
                     let _ = peer.session.retire_expected_headers(outstanding.request_id);
+                    if outstanding.phase == OutstandingPhase::Registered {
+                        peer.session.cancel_token().cancel();
+                        blocked_sessions.insert(peer_id.clone());
+                    }
                     timed_out.push((outstanding, peer_id));
                 } else {
                     index += 1;
@@ -2084,17 +2123,18 @@ impl HeaderSyncReactor {
                 }
             }
         }
+        for peer in blocked_sessions {
+            metrics::counter!("sync.header.request.registration_timeout").increment(1);
+            self.handle_peer_disconnected(peer);
+        }
         self.schedule().await;
     }
 
     fn empty_headers_retry_delay(&self) -> Duration {
-        self.startup
-            .request_timeout
-            .min(EMPTY_HEADERS_RETRY_DELAY)
-            .min(HEADER_SYNC_RETRY_AVOIDANCE)
+        self.startup.request_timeout.min(EMPTY_HEADERS_RETRY_DELAY)
     }
 
-    fn next_maintenance_deadline(&self) -> Instant {
+    fn next_maintenance_deadline(&mut self) -> Instant {
         let now = Instant::now();
         let mut deadline = now + Duration::from_secs(60 * 60);
 
@@ -2395,6 +2435,7 @@ impl HeaderSyncReactor {
             expected_max_count: range.count,
             clear_assignment_on_timeout: false,
             purpose: RangePurpose::VctRepair { height, generation },
+            phase: OutstandingPhase::Sent,
         };
         if let Some(peer) = self.state.peers.get_mut(&peer_id) {
             peer.outstanding.push(outstanding);
@@ -3326,14 +3367,16 @@ impl HeaderSyncReactor {
         }
     }
 
-    /// Drop forward work whose start is now below a newly durable contiguous tip.
+    /// Reconcile forward work whose start is now below a newly durable contiguous tip.
     ///
-    /// A partially covered wire or buffered range cannot keep its old start key:
-    /// ordered drain would never visit it after the tip moves. Retire the whole
-    /// descriptor and let lazy production recreate only the uncovered suffix.
-    /// State-admitted commits remain locally owned until their completion event.
-    fn reconcile_forward_coverage(&mut self, height: block::Height) {
-        self.state.schedule.drop_pending_forward_through(height);
+    /// A partially covered descriptor cannot keep its old start key because ordered
+    /// drain will never visit it after the tip moves. Preserve its uncovered suffix,
+    /// including already validated buffered headers. State-admitted commits remain
+    /// locally owned until their completion event.
+    fn reconcile_forward_coverage(&mut self, height: block::Height, hash: block::Hash) {
+        self.state
+            .schedule
+            .trim_pending_forward_through(height, hash);
 
         for peer in self.state.peers.values_mut() {
             let mut index = 0;
@@ -3346,6 +3389,9 @@ impl HeaderSyncReactor {
                     let outstanding = peer.outstanding.remove(index);
                     let _ = peer.session.retire_expected_headers(outstanding.request_id);
                     self.state.schedule.clear_assignment(outstanding.range);
+                    if let Some(suffix) = outstanding.range.suffix_after(height, hash) {
+                        self.state.schedule.ensure_forward(suffix);
+                    }
                     metrics::counter!(
                         "sync.header.work.covered",
                         "state" => "in_flight",
@@ -3368,8 +3414,27 @@ impl HeaderSyncReactor {
             })
             .collect();
         for key in buffered {
-            if let Some(buffered) = self.state.buffered.remove(&key) {
-                self.state.schedule.clear_assignment(buffered.range);
+            if let Some(mut buffered) = self.state.buffered.remove(&key) {
+                let original = buffered.range;
+                if let Some(suffix) = original.suffix_after(height, hash) {
+                    let covered_count = count_between(original.start_height, height);
+                    let covered_count = usize::try_from(covered_count)
+                        .expect("header range counts fit in usize on supported platforms");
+                    buffered.headers = buffered.headers.split_off(covered_count);
+                    if !buffered.body_sizes.is_empty() {
+                        buffered.body_sizes = buffered.body_sizes.split_off(covered_count);
+                    }
+                    if !buffered.tree_aux_roots.is_empty() {
+                        buffered.tree_aux_roots = buffered.tree_aux_roots.split_off(covered_count);
+                    }
+                    buffered.range = suffix;
+                    self.state.schedule.narrow_queued_range(original, suffix);
+                    self.state
+                        .buffered
+                        .insert((RangePriority::Forward, suffix.start_height), buffered);
+                } else {
+                    self.state.schedule.clear_assignment(original);
+                }
                 metrics::counter!(
                     "sync.header.work.covered",
                     "state" => "buffered",

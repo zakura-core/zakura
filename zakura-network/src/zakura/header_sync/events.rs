@@ -222,7 +222,7 @@ pub enum HeaderSyncEvent {
         /// Decoded header-sync message.
         msg: HeaderSyncMessage,
     },
-    /// Inbound `Headers` response with an optional request ID.
+    /// Inbound `Headers` response with its mandatory request ID.
     WireHeaders {
         /// Serving peer.
         peer: ZakuraPeerId,
@@ -237,7 +237,7 @@ pub enum HeaderSyncEvent {
         /// Per-height commitment roots, parallel to `headers`.
         tree_aux_roots: Vec<BlockCommitmentRoots>,
     },
-    /// Inbound `GetHeaders` request with an optional request ID.
+    /// Inbound `GetHeaders` request with its mandatory request ID.
     WireGetHeaders {
         /// Requesting peer.
         peer: ZakuraPeerId,

@@ -180,13 +180,9 @@ impl ServiceRegistry {
         let mut streams = Vec::new();
 
         for service in self.services_for_negotiated(negotiated) {
-            streams.extend(
-                service
-                    .streams()
-                    .iter()
-                    .copied()
-                    .filter(|stream| stream.mode == StreamMode::Ordered),
-            );
+            streams.extend(service.streams().iter().copied().filter(|stream| {
+                stream.mode == StreamMode::Ordered && negotiated & stream.capability != 0
+            }));
         }
 
         streams
@@ -211,13 +207,9 @@ impl ServiceRegistry {
                 continue;
             }
 
-            streams.extend(
-                service
-                    .streams()
-                    .iter()
-                    .copied()
-                    .filter(|stream| stream.mode == StreamMode::Ordered),
-            );
+            streams.extend(service.streams().iter().copied().filter(|stream| {
+                stream.mode == StreamMode::Ordered && negotiated & stream.capability != 0
+            }));
         }
 
         streams
@@ -243,13 +235,9 @@ impl ServiceRegistry {
         let mut streams = Vec::new();
 
         for service in self.services_for_negotiated(negotiated) {
-            streams.extend(
-                service
-                    .streams()
-                    .iter()
-                    .copied()
-                    .filter(|stream| stream.mode == StreamMode::RequestResponse),
-            );
+            streams.extend(service.streams().iter().copied().filter(|stream| {
+                stream.mode == StreamMode::RequestResponse && negotiated & stream.capability != 0
+            }));
         }
 
         streams
@@ -627,6 +615,46 @@ mod tests {
         let service_names: Vec<_> = services.iter().map(|service| service.name()).collect();
 
         assert_eq!(service_names, ["header", "discovery"]);
+    }
+
+    #[test]
+    fn stream_selection_filters_each_stream_by_negotiated_capability() {
+        let mut request_response_one = stream(7, 0b0001);
+        request_response_one.mode = StreamMode::RequestResponse;
+        let mut request_response_two = stream(8, 0b0010);
+        request_response_two.mode = StreamMode::RequestResponse;
+        let service = TestService::new(
+            "multi-capability",
+            vec![
+                stream(5, 0b0001),
+                stream(6, 0b0010),
+                request_response_one,
+                request_response_two,
+            ],
+        );
+        let registry =
+            ServiceRegistry::new(vec![service]).expect("stream kinds and capabilities are valid");
+        let peer = ZakuraPeerId::new(vec![8; 32]).expect("32-byte test peer id is valid");
+
+        let ordered_kinds: Vec<_> = registry
+            .ordered_streams_for_negotiated(0b0001)
+            .iter()
+            .map(|stream| stream.kind)
+            .collect();
+        let escalated_kinds: Vec<_> = registry
+            .ordered_streams_for_escalation(0b0001, &peer, ServicePeerDirection::Outbound)
+            .iter()
+            .map(|stream| stream.kind)
+            .collect();
+        let request_response_kinds: Vec<_> = registry
+            .request_response_streams_for_negotiated(0b0001)
+            .iter()
+            .map(|stream| stream.kind)
+            .collect();
+
+        assert_eq!(ordered_kinds, [5]);
+        assert_eq!(escalated_kinds, [5]);
+        assert_eq!(request_response_kinds, [7]);
     }
 
     #[test]

@@ -226,6 +226,55 @@ fn finalize_pops_from_best_chain_for_network(network: Network) -> Result<()> {
     Ok(())
 }
 
+/// Finalizing a shared root drops a side chain that contains only that root.
+#[test]
+fn finalize_drops_empty_side_chain() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    for network in Network::iter() {
+        finalize_drops_empty_side_chain_for_network(network)?;
+    }
+
+    Ok(())
+}
+
+fn finalize_drops_empty_side_chain_for_network(network: Network) -> Result<()> {
+    let root: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
+    let child = root.make_fake_child().set_work(10);
+
+    let root_chain = Chain::new(
+        &network,
+        Height(0),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        ValueBalance::fake_populated_pool(),
+    )
+    .push(root.clone().prepare().test_with_zero_spent_utxos())?;
+    let best_chain = root_chain
+        .clone()
+        .push(child.clone().prepare().test_with_zero_spent_utxos())?;
+
+    let mut state = NonFinalizedState::new(&network);
+    state.insert(Arc::new(root_chain));
+    state.insert(Arc::new(best_chain));
+    assert_eq!(state.chain_count(), 2);
+
+    let finalized = state.finalize().inner_block();
+
+    assert_eq!(root, finalized);
+    assert_eq!(state.chain_count(), 1);
+    assert_eq!(state.best_chain_len(), Some(1));
+    assert_eq!(
+        state.best_tip().map(|(_height, hash)| hash),
+        Some(child.hash())
+    );
+
+    Ok(())
+}
+
 #[test]
 fn invalidate_block_removes_block_and_descendants_from_chain() -> Result<()> {
     let _init_guard = zakura_test::init();

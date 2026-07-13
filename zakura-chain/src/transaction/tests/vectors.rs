@@ -2318,6 +2318,76 @@ fn sapling_point_encodings_check_rejects_bad_points() {
     check_transaction("V6", &make_v6);
 }
 
+/// The deferred Sapling point check also covers V4 spend commitments.
+///
+/// The lazy representation applies to spend `cv` as well as output `cv`/`epk`.
+/// V4 takes a distinct `PerSpendAnchor` branch, so keep a focused regression on
+/// that route rather than relying only on output-only V5/V6 coverage.
+#[test]
+fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
+    use group::Group;
+
+    use crate::{
+        amount::Amount,
+        at_least_one,
+        block::Height,
+        primitives::{
+            redjubjub::{Binding, Signature, SpendAuth},
+            Groth16Proof,
+        },
+        sapling::{
+            self,
+            keys::ValidatingKey,
+            shielded_data::{ShieldedData, TransferData},
+            Spend, ValueCommitment,
+        },
+        transaction::{LockTime, Transaction},
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let valid = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
+    let off_curve = [0xffu8; 32];
+    let rk = ValidatingKey::try_from(valid).expect("the Jubjub generator is a valid Sapling rk");
+
+    let make_v4 = |cv: [u8; 32]| -> Transaction {
+        let spend = Spend::<sapling::PerSpendAnchor> {
+            cv: ValueCommitment(cv),
+            per_spend_anchor: sapling::tree::Root::default(),
+            nullifier: sapling::Nullifier::from([0u8; 32]),
+            rk: rk.clone(),
+            zkproof: Groth16Proof([0u8; 192]),
+            spend_auth_sig: Signature::<SpendAuth>::from([0u8; 64]),
+        };
+
+        Transaction::V4 {
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![],
+            outputs: vec![],
+            joinsplit_data: None,
+            sapling_shielded_data: Some(ShieldedData::<sapling::PerSpendAnchor> {
+                value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+                transfers: TransferData::SpendsAndMaybeOutputs {
+                    shared_anchor: sapling::FieldNotPresent,
+                    spends: at_least_one![spend],
+                    maybe_outputs: vec![],
+                },
+                binding_sig: Signature::<Binding>::from([0u8; 64]),
+            }),
+        }
+    };
+
+    assert!(
+        make_v4(valid).sapling_point_encodings_are_valid(),
+        "a V4 spend with a valid cv must pass the deferred point check",
+    );
+    assert!(
+        !make_v4(off_curve).sapling_point_encodings_are_valid(),
+        "a V4 spend with an off-curve cv must fail the deferred point check",
+    );
+}
+
 /// The relocated Sapling `cv` / `epk` not-small-order checks accept exactly the
 /// same encodings as the librustzcash functions they mirror.
 ///

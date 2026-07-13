@@ -1,4 +1,4 @@
-//! State contextual verification and storage code for Zebra.
+//! State contextual verification and storage code for the Zakura node.
 //!
 //! # Correctness
 //!

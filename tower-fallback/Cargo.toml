@@ -1,18 +1,16 @@
 [package]
 name = "zakura-tower-fallback"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 authors.workspace = true
-description = "A Tower service combinator that sends requests to a first service, then retries processing on a second fallback service if the first service errors."
+description = "A Tower service combinator that sends requests to a first service, then retries processing on a second fallback service if the first service errors. Internal Zakura fork, published to support cargo install zakura"
 license.workspace = true
 repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-# TODO: decide if we want to use the Zebra readme and home page
-#readme = "../README.md"
-#homepage = "https://zfnd.org/zebra/"
+homepage.workspace = true
 # crates.io is limited to 5 keywords and categories
-keywords = ["tower", "batch"]
+keywords = ["tower", "fallback"]
 # Must be one of <https://crates.io/category_slugs>
 categories = ["algorithms", "asynchronous"]
 
@@ -28,7 +26,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-test = { path = "../zakura-test/", version = "1.0.0-rc2" }
+zakura-test = { path = "../zakura-test/", version = "1.0.0-rc3" }
 
 [lints]
 workspace = true

@@ -1,4 +1,4 @@
-//! Networking code for Zebra.
+//! Networking code for the Zakura node.
 //!
 //! ## Network Protocol Design
 //!

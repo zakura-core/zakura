@@ -1,8 +1,8 @@
 [package]
 name = "zakura-test"
-version = "1.0.0-rc2"
+version = "1.0.0-rc3"
 authors.workspace = true
-description = "Test harnesses and test vectors for Zebra"
+description = "Test harnesses and test vectors for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
 repository.workspace = true
 edition.workspace = true

@@ -93,7 +93,7 @@ pub const SERVICE_ID_DISCOVERY: &str = "zakura.discovery.v1";
 /// is retired, so a peer advertising only `v1` is not a header-sync candidate.
 pub const SERVICE_ID_HEADER_SYNC: &str = "zakura.header_sync.v2";
 /// Retired header-sync service id, kept only to keep a pre-upgrade peer's summaries
-/// wire-valid. Never advertised, never selected on.
+/// wire-valid. Never advertised, never selected on by itself.
 pub const SERVICE_ID_HEADER_SYNC_RETIRED: &str = "zakura.header_sync.v1";
 /// Native block-sync service id.
 pub const SERVICE_ID_BLOCK_SYNC: &str = "zakura.block_sync.v1";
@@ -107,8 +107,9 @@ pub const SERVICE_ID_SERVICE_DISCOVERY: &str = "zakura.service_discovery.v1";
 ///
 /// A pre-upgrade peer still sends this tag with the retired service id. Keeping the
 /// binding lets its `Services` messages validate, so retiring header-sync v6 does not
-/// tear down discovery with peers that have not upgraded. We never emit it, and a
-/// summary under this tag is not a header-sync candidate hint.
+/// tear down discovery with peers that have not upgraded. We never emit it, and the
+/// summary is advisory only when the peer independently advertises the current
+/// header-sync service.
 pub const SUMMARY_TAG_HEADER_SYNC_RETIRED: u16 = 1;
 /// Summary tag for [`DiscoveryServiceSummary`].
 pub const SUMMARY_TAG_DISCOVERY_V1: u16 = 2;
@@ -378,15 +379,20 @@ impl ServiceSummaryEnvelope {
         })
     }
 
-    /// Decode this envelope as a header-sync summary when its tag matches.
+    /// Decode this envelope as a header-sync summary when its tag/service pair matches.
     pub fn decode_header_sync(
         &self,
     ) -> Result<Option<HeaderSyncServiceSummary>, DiscoveryWireError> {
-        if self.summary_tag == SUMMARY_TAG_HEADER_SYNC {
-            decode_header_sync_summary(&self.summary_bytes).map(Some)
-        } else {
-            Ok(None)
+        let is_current_header_summary = self.summary_tag == SUMMARY_TAG_HEADER_SYNC
+            && self.service_id == ZakuraServiceId::header_sync();
+        let is_retired_header_summary = self.summary_tag == SUMMARY_TAG_HEADER_SYNC_RETIRED
+            && self.service_id == ZakuraServiceId::header_sync_retired();
+
+        if !is_current_header_summary && !is_retired_header_summary {
+            return Ok(None);
         }
+
+        decode_header_sync_summary(&self.summary_bytes).map(Some)
     }
 
     /// Decode this envelope as a discovery summary when its tag matches.
@@ -1292,7 +1298,8 @@ impl ZakuraActiveServiceEntry {
         self.live_summaries
             .iter()
             .filter(|summary| {
-                summary.service_id == *service && summary.expires_at_unix_secs > now_unix_secs
+                self.summary_advises_service(summary, service)
+                    && summary.expires_at_unix_secs > now_unix_secs
             })
             .map(ZakuraCachedLiveServiceSummary::preference_score)
             .max()
@@ -1300,8 +1307,9 @@ impl ZakuraActiveServiceEntry {
     }
 
     fn fresh_header_sync_summary(&self, now_unix_secs: u64) -> Option<HeaderSyncServiceSummary> {
+        let header_sync_service = ZakuraServiceId::header_sync();
         self.live_summaries.iter().find_map(|summary| {
-            if summary.service_id != ZakuraServiceId::header_sync()
+            if !self.summary_advises_service(summary, &header_sync_service)
                 || summary.expires_at_unix_secs <= now_unix_secs
             {
                 return None;
@@ -1313,6 +1321,20 @@ impl ZakuraActiveServiceEntry {
                 | ZakuraLiveServiceSummary::Unknown => None,
             }
         })
+    }
+
+    fn summary_advises_service(
+        &self,
+        summary: &ZakuraCachedLiveServiceSummary,
+        service: &ZakuraServiceId,
+    ) -> bool {
+        if summary.service_id == *service {
+            return true;
+        }
+
+        *service == ZakuraServiceId::header_sync()
+            && summary.service_id == ZakuraServiceId::header_sync_retired()
+            && self.services.contains(service)
     }
 
     fn fresh_block_sync_summary(&self, now_unix_secs: u64) -> Option<BlockSyncServiceSummary> {
@@ -4517,6 +4539,20 @@ mod tests {
         runtime_record_with_secret(&secret_key, sequence, service, addr)
     }
 
+    fn runtime_record_with_services(
+        sequence: u64,
+        services: Vec<ZakuraServiceId>,
+        addr: SocketAddr,
+    ) -> ZakuraNodeRecord {
+        let secret_key = secret_key();
+        let mut body = body(&secret_key);
+        body.sequence = sequence;
+        body.direct_addrs = vec![addr];
+        body.services = services;
+        body.expires_at_unix_secs = current_unix_secs() + DEFAULT_DISCOVERY_RECORD_TTL.as_secs();
+        ZakuraNodeRecord::sign(body, &secret_key).expect("runtime test record signs")
+    }
+
     fn runtime_record_with_secret(
         secret_key: &SecretKey,
         sequence: u64,
@@ -4607,6 +4643,17 @@ mod tests {
             inbound_slots_max: 10,
             outbound_slots_free: 4,
             outbound_slots_max: 11,
+        }
+    }
+
+    fn retired_header_sync_envelope(summary: &HeaderSyncServiceSummary) -> ServiceSummaryEnvelope {
+        let mut summary_bytes = Vec::new();
+        encode_header_sync_summary(summary, &mut summary_bytes)
+            .expect("test header summary encodes");
+        ServiceSummaryEnvelope {
+            service_id: ZakuraServiceId::header_sync_retired(),
+            summary_tag: SUMMARY_TAG_HEADER_SYNC_RETIRED,
+            summary_bytes,
         }
     }
 
@@ -5137,18 +5184,12 @@ mod tests {
     /// upgraded. A pre-upgrade peer still sends the retired tag with the retired
     /// service id; that pairing must stay wire-valid, or every `Services` exchange
     /// with such a peer fails as a protocol violation and takes discovery down with
-    /// it. The summary is accepted but is not a header-sync candidate hint, because
-    /// we cannot header-sync with that peer.
+    /// it. The payload remains a valid advisory summary for peers that independently
+    /// advertise the current header-sync service.
     #[test]
-    fn retired_header_sync_summary_from_a_pre_upgrade_peer_stays_valid() {
-        let mut summary_bytes = Vec::new();
-        encode_header_sync_summary(&header_summary(), &mut summary_bytes)
-            .expect("test header summary encodes");
-        let retired = ServiceSummaryEnvelope {
-            service_id: ZakuraServiceId::header_sync_retired(),
-            summary_tag: SUMMARY_TAG_HEADER_SYNC_RETIRED,
-            summary_bytes,
-        };
+    fn retired_header_sync_summary_from_a_pre_upgrade_peer_decodes_as_advisory() {
+        let summary = header_summary();
+        let retired = retired_header_sync_envelope(&summary);
 
         let encoded = services_message(vec![retired.clone()])
             .encode()
@@ -5162,8 +5203,8 @@ mod tests {
             retired
                 .decode_header_sync()
                 .expect("the retired payload is well-formed"),
-            None,
-            "a retired-generation summary is not a header-sync candidate hint"
+            Some(summary),
+            "a retired-generation summary remains an advisory payload"
         );
     }
 
@@ -7023,6 +7064,79 @@ mod tests {
 
         assert_eq!(candidates.connected[0], with_summary_id);
         assert!(candidates.connected.contains(&without_summary_id));
+    }
+
+    #[tokio::test]
+    async fn retired_header_summary_scores_only_dual_stack_header_sync_candidates() {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let now = current_unix_secs();
+        let v1_only = runtime_record_with(1, ZakuraServiceId::header_sync_retired(), test_addr(1));
+        let dual_stack = runtime_record_with_services(
+            2,
+            vec![
+                ZakuraServiceId::header_sync_retired(),
+                ZakuraServiceId::header_sync(),
+            ],
+            test_addr(2),
+        );
+        let current_only = runtime_record_with(3, ZakuraServiceId::header_sync(), test_addr(3));
+        let v1_only_id = v1_only.body.node_id;
+        let dual_stack_id = dual_stack.body.node_id;
+        let current_only_id = current_only.body.node_id;
+        connected_tx.send_replace(vec![
+            peer_id_for(v1_only_id),
+            peer_id_for(dual_stack_id),
+            peer_id_for(current_only_id),
+        ]);
+
+        for record in [v1_only, dual_stack, current_only] {
+            let node_id = record.body.node_id;
+            handle
+                .import_connected_peer_record(record, node_id)
+                .await
+                .expect("connected record imports");
+        }
+
+        let mut summary = header_summary();
+        summary.best_height = block::Height(20);
+        summary.inbound_slots_free = 8;
+        for node_id in [v1_only_id, dual_stack_id] {
+            handle
+                .import_connected_peer_services_at(
+                    first_party_services(
+                        node_id,
+                        now + 30,
+                        vec![retired_header_sync_envelope(&summary)],
+                    ),
+                    node_id,
+                    now,
+                )
+                .await
+                .expect("retired first-party header summary imports");
+        }
+
+        let generic = handle
+            .service_candidates(&ZakuraServiceId::header_sync(), false, &[])
+            .await;
+        assert_eq!(generic.connected[0], dual_stack_id);
+        assert!(generic.connected.contains(&current_only_id));
+        assert!(!generic.connected.contains(&v1_only_id));
+
+        let candidates = handle
+            .header_sync_candidates(
+                &ZakuraHeaderSyncCandidateState {
+                    target_height: block::Height(10),
+                    ..ZakuraHeaderSyncCandidateState::default()
+                },
+                false,
+                &[],
+            )
+            .await;
+
+        assert_eq!(candidates.connected[0], dual_stack_id);
+        assert!(candidates.connected.contains(&current_only_id));
+        assert!(!candidates.connected.contains(&v1_only_id));
     }
 
     #[tokio::test]

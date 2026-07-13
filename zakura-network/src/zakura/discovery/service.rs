@@ -768,6 +768,7 @@ mod tests {
     use super::*;
     use crate::zakura::discovery::protocol::{
         DiscoveryServiceSummary, ZakuraLiveServiceSummary, ZakuraNodeRecordBody,
+        SUMMARY_TAG_HEADER_SYNC_RETIRED,
     };
     use crate::zakura::{
         framed_channel, spawn_block_sync_reactor, spawn_header_sync_reactor, BlockSyncFrontiers,
@@ -1400,6 +1401,54 @@ mod tests {
         assert!(
             advisory_backoff_after_empty_headers(&mut fixture).await?,
             "first-party header SERVICES should emit a header-sync advisory event"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_party_retired_header_services_emit_header_sync_advisory(
+    ) -> Result<(), crate::BoxError> {
+        let mut fixture = spawn_header_advisory_fixture(35)?;
+        let summary = header_summary(block::Height(10));
+        let mut legacy_envelope = ServiceSummaryEnvelope::header_sync(&summary)?;
+        legacy_envelope.service_id = ZakuraServiceId::header_sync_retired();
+        legacy_envelope.summary_tag = SUMMARY_TAG_HEADER_SYNC_RETIRED;
+
+        send_discovery_message(
+            &fixture,
+            DiscoveryMessage::Services(Services {
+                node_id: fixture.peer_node_id,
+                expires_at_unix_secs: u64::MAX,
+                summaries: vec![legacy_envelope],
+            }),
+        )
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(cached) = fixture
+                    .discovery_handle
+                    .live_service_summaries(fixture.peer_node_id)
+                    .await
+                {
+                    if cached.iter().any(|cached_summary| {
+                        cached_summary.service_id == ZakuraServiceId::header_sync_retired()
+                            && cached_summary.summary
+                                == ZakuraLiveServiceSummary::HeaderSync(summary)
+                    }) {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retired first-party header summary is cached");
+
+        assert!(
+            advisory_backoff_after_empty_headers(&mut fixture).await?,
+            "retired first-party header SERVICES should emit a header-sync advisory event"
         );
 
         Ok(())

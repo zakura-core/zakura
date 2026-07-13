@@ -980,7 +980,7 @@ impl HeaderSyncReactor {
             return;
         }
         let send_result = peer_state.session.try_send_headers_with_sizes_and_roots(
-            Some(request_id),
+            request_id,
             headers,
             body_sizes,
             tree_aux_roots,

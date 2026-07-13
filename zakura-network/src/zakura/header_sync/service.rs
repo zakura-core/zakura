@@ -234,21 +234,11 @@ impl HeaderSyncPeerSession {
         .map(|()| request_id)
     }
 
-    /// Send a typed header range response.
-    pub fn try_send_headers(
-        &self,
-        headers: Vec<Arc<block::Header>>,
-    ) -> Result<(), OrderedSendError> {
-        let body_sizes = vec![0; headers.len()];
-        let tree_aux_roots = Vec::new();
-        self.try_send_headers_with_sizes_and_roots(None, headers, body_sizes, tree_aux_roots)
-    }
-
     /// Send a typed header range response with one advisory body-size hint and
     /// tree-aux root payload per header.
     pub fn try_send_headers_with_sizes_and_roots(
         &self,
-        request_id: Option<HeaderSyncRequestId>,
+        request_id: HeaderSyncRequestId,
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
         tree_aux_roots: Vec<BlockCommitmentRoots>,
@@ -259,7 +249,7 @@ impl HeaderSyncPeerSession {
                 body_sizes,
                 tree_aux_roots,
             },
-            request_id,
+            Some(request_id),
         )
     }
 

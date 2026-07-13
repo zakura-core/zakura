@@ -80,7 +80,7 @@ p2p_stack = "legacy"
 # TEMPORARY: validating the checkpoint-refill fix on the legacy-only node, which is
 # the one reproducing the stall. Do not merge; revert to the `main` default once the
 # fix lands.
-branch = "diag/obtain-tips-response"
+branch = "diag/known-block-probe"
 # The fix recovers from a range that cannot complete by tripping BLOCK_VERIFY_TIMEOUT
 # (480s) and re-downloading. That is longer than the default 600s reap/alert windows
 # allow for, so give the run room to demonstrate the recovery instead of being killed

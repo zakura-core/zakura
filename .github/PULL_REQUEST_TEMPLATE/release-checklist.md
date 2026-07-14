@@ -123,7 +123,6 @@ cargo release version --verbose --execute --allow-branch '*' -p zakura patch # [
       about to create, using the previous release tag as the base:
       `make pre-release RELEASE_TAG=v<version> BASE_TAG=v<previous-release-tag>`
       For example: `make pre-release RELEASE_TAG=v1.0.0 BASE_TAG=v1.0.0-rc5`
-      
 
 ## Update Crate Versions and Crate Change Logs
 

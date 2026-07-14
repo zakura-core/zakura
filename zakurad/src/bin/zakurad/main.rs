@@ -3,7 +3,7 @@
 use zakurad::application::{boot, APPLICATION};
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-const GLIBC_MALLOC_ARENA_MAX: i32 = 4;
+const GLIBC_MALLOC_ARENA_MAX: i32 = 16;
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[allow(

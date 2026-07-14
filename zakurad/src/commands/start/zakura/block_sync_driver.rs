@@ -1192,7 +1192,10 @@ where
 
     BlockApplyCompletion {
         class,
-        checkpoint_refresh_floor: (class == BlockApplyClass::Checkpoint
+        // Probe applies never reach state, so a delayed refresh only adds state reads and makes
+        // probe tests race the refresh timer.
+        checkpoint_refresh_floor: (throughput_probe.is_none()
+            && class == BlockApplyClass::Checkpoint
             && result == BlockApplyResult::Committed)
             .then(|| {
                 local_frontier

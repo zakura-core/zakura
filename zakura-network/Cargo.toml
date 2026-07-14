@@ -1,6 +1,6 @@
 [package]
 name = "zakura-network"
-version = "1.0.0"
+version = "1.0.0-rc6"
 authors.workspace = true
 description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal
@@ -93,8 +93,8 @@ howudoin = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
-zakura-chain = { path = "../zakura-chain", version = "1.0.0", features = ["async-error"] }
-zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc6", features = ["async-error"] }
+zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.0.0-rc6" }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -106,8 +106,8 @@ static_assertions = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 toml = { workspace = true }
 
-zakura-chain = { path = "../zakura-chain", version = "1.0.0", features = ["proptest-impl"] }
-zakura-test = { path = "../zakura-test/", version = "1.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc6", features = ["proptest-impl"] }
+zakura-test = { path = "../zakura-test/", version = "1.0.0-rc6" }
 
 [lints]
 workspace = true

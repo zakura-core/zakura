@@ -18,9 +18,10 @@ fn limit_glibc_malloc_arenas() {
     // SAFETY: this process-global allocator setting is configured before worker threads start.
     let configured = unsafe { libc::mallopt(libc::M_ARENA_MAX, GLIBC_MALLOC_ARENA_MAX) };
 
-    if configured == 0 {
-        eprintln!("warning: failed to limit glibc malloc arenas");
-    }
+    assert_ne!(
+        configured, 0,
+        "glibc accepts M_ARENA_MAX before worker threads start"
+    );
 }
 
 /// Process entry point for `zakurad`

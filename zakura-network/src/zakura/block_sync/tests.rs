@@ -5143,12 +5143,14 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
+    let (_admitted_tx, admitted) = watch::channel(HashSet::new());
     let handle = BlockSyncHandle {
         events,
         lifecycle,
         peers,
         status,
         candidates,
+        admitted,
         // No reactor wiring: `add_peer` drains inbound (no routine), and this test
         // only checks the lifecycle-bypass plumbing.
         routine_wiring: None,

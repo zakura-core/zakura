@@ -25,7 +25,7 @@ use crate::zakura::{
     CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncEvent, HeaderSyncHandle,
     OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServiceAdmissionDecision,
     ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId,
-    LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+    LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY,
 };
 
 #[cfg(test)]
@@ -231,7 +231,6 @@ impl Service for DiscoveryService {
         let service_cancel = discovery_session.cancel_token();
         let connection_cancel = peer.cancel_token();
         let close_cause = peer.close_cause();
-        let other_service_negotiated = has_other_negotiated_service(peer.negotiated);
         let (_peer_id, _stream_kind, recv, _send, _session_cancel) = session.into_parts();
 
         let handle = self.handle.clone();
@@ -285,7 +284,6 @@ impl Service for DiscoveryService {
                     service_cancel,
                     connection_cancel,
                     close_cause,
-                    other_service_negotiated,
                 });
             },
         );
@@ -311,7 +309,6 @@ struct DiscoveryExchangeStart {
     service_cancel: CancellationToken,
     connection_cancel: CancellationToken,
     close_cause: CloseCause,
-    other_service_negotiated: bool,
 }
 
 fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
@@ -326,11 +323,11 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         service_cancel,
         connection_cancel,
         close_cause,
-        other_service_negotiated,
     } = start;
     let peer_id = discovery_session.peer_id().clone();
     let progress = Arc::new(DiscoveryExchangeProgress::default());
     let source_header_sync = header_sync.clone();
+    let source_block_sync = block_sync.clone();
     let sink = DiscoverySink {
         handle: handle.clone(),
         header_sync,
@@ -399,8 +396,9 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
             if exchanged
                 && !peer_has_other_service_owner(
                     source_header_sync.as_ref(),
+                    source_block_sync.as_ref(),
                     peer_node_id,
-                    other_service_negotiated,
+                    &peer_id,
                 )
             {
                 source_close_cause.record("discovery_exchange_complete");
@@ -714,23 +712,16 @@ impl DiscoveryExchangeProgress {
 
 fn peer_has_other_service_owner(
     header_sync: Option<&HeaderSyncHandle>,
+    block_sync: Option<&BlockSyncHandle>,
     peer_node_id: NodeId,
-    other_service_negotiated: bool,
+    peer_id: &ZakuraPeerId,
 ) -> bool {
-    if other_service_negotiated {
-        return true;
-    }
-
     header_sync.is_some_and(|header_sync| {
         header_sync
             .candidate_state()
             .admitted_node_ids
             .contains(&peer_node_id)
-    })
-}
-
-fn has_other_negotiated_service(negotiated: u64) -> bool {
-    negotiated & !(ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC) != 0
+    }) || block_sync.is_some_and(|block_sync| block_sync.has_admitted_peer(peer_id))
 }
 
 /// Returns the iroh node id encoded by a discovery peer id, if it is a 32-byte
@@ -779,17 +770,6 @@ mod tests {
         MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
     };
     use zakura_chain::{block, parameters::Network};
-
-    #[test]
-    fn discovery_and_header_sync_do_not_count_as_another_service_owner() {
-        assert!(!has_other_negotiated_service(ZAKURA_CAP_DISCOVERY));
-        assert!(!has_other_negotiated_service(
-            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC
-        ));
-        assert!(has_other_negotiated_service(
-            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC | ZAKURA_CAP_BLOCK_SYNC
-        ));
-    }
 
     struct HeaderAdvisoryFixture {
         discovery_handle: ZakuraDiscoveryHandle,
@@ -1526,7 +1506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_only_short_lived_exchange_closes_connection_and_backs_off(
+    async fn discovery_exchange_closes_connection_when_block_sync_is_not_admitted(
     ) -> Result<(), crate::BoxError> {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
@@ -1559,7 +1539,7 @@ mod tests {
         service.add_peer(Peer::new(
             peer_id,
             None,
-            ZAKURA_CAP_DISCOVERY,
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_BLOCK_SYNC,
             streams,
             connection_cancel.clone(),
         ));
@@ -1569,7 +1549,7 @@ mod tests {
             .await?;
         tokio::time::timeout(Duration::from_secs(2), connection_cancel.cancelled())
             .await
-            .expect("discovery-only exchange closes the shared connection");
+            .expect("unadmitted block sync does not keep the shared connection alive");
         wait_for_discovery_inbound_peers(&handle, 0).await;
 
         connected_tx.send_replace(Vec::new());

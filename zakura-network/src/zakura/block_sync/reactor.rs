@@ -85,6 +85,7 @@ pub fn spawn_block_sync_reactor(
     let (peers_tx, peers_rx) = watch::channel(state.peer_snapshot(startup.config.peer_limits));
     let (status_tx, status_rx) = watch::channel(state.last_advertised_status);
     let (candidates_tx, candidates_rx) = watch::channel(ZakuraBlockSyncCandidateState::default());
+    let (admitted_tx, admitted_rx) = watch::channel(HashSet::new());
 
     // The Sequencer (commit pipeline) and the committed-throughput meter move out
     // of the reactor onto their own serial task (Sequencer task). Downloaded
@@ -157,6 +158,7 @@ pub fn spawn_block_sync_reactor(
         peers: peers_rx,
         status: status_rx,
         candidates: candidates_rx,
+        admitted: admitted_rx,
         routine_wiring: Some(routine_wiring),
     };
     let reactor = BlockSyncReactor {
@@ -178,6 +180,7 @@ pub fn spawn_block_sync_reactor(
         peers: peers_tx,
         status: status_tx,
         candidates: candidates_tx,
+        admitted: admitted_tx,
         sequencer_input: sequencer_input_tx,
         sequencer_input_bytes,
         sequencer_input_decoded_attributed_memory_bytes,
@@ -218,6 +221,7 @@ pub(super) struct BlockSyncReactor {
     peers: watch::Sender<ServicePeerSnapshot>,
     status: watch::Sender<BlockSyncStatus>,
     candidates: watch::Sender<ZakuraBlockSyncCandidateState>,
+    admitted: watch::Sender<HashSet<ZakuraPeerId>>,
     /// Bounded body channel to the Sequencer task. Only per-peer routines send
     /// downloaded bodies here; the reactor keeps a sender clone for diagnostics.
     sequencer_input: mpsc::Sender<SequencedBody>,
@@ -534,6 +538,9 @@ impl BlockSyncReactor {
         let _ = self
             .peers
             .send(self.state.peer_snapshot(self.startup.config.peer_limits));
+        let _ = self
+            .admitted
+            .send(self.state.peers.keys().cloned().collect());
     }
 
     fn publish_candidate_state(&self) {

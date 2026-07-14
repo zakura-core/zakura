@@ -135,6 +135,7 @@ pub struct BlockSyncHandle {
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) status: watch::Receiver<BlockSyncStatus>,
     pub(super) candidates: watch::Receiver<ZakuraBlockSyncCandidateState>,
+    pub(super) admitted: watch::Receiver<HashSet<ZakuraPeerId>>,
     /// Shared primitives every per-peer pipe-routine is wired with at spawn
     /// (`service::add_peer`). `None` for the inert/handle-less test constructors
     /// that never spawn routines.
@@ -218,6 +219,11 @@ impl BlockSyncHandle {
     /// Return the currently cached block-sync candidate-selection hints.
     pub fn candidate_state(&self) -> ZakuraBlockSyncCandidateState {
         self.candidates.borrow().clone()
+    }
+
+    /// Returns whether block sync has admitted `peer`.
+    pub(crate) fn has_admitted_peer(&self, peer: &ZakuraPeerId) -> bool {
+        self.admitted.borrow().contains(peer)
     }
 }
 

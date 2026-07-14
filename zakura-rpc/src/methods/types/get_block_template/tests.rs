@@ -100,6 +100,7 @@ fn coinbase() -> anyhow::Result<()> {
 #[test]
 fn coinbase_tag_and_limit() {
     use zcash_address::ZcashAddress;
+    use zcash_transparent::coinbase::{MAX_COINBASE_HEIGHT_LEN, MAX_COINBASE_SCRIPT_LEN};
 
     use crate::config::mining::{
         Config, ExtraCoinbaseData, MAX_USER_COINBASE_DATA_LEN, ZAKURA_COINBASE_MARKER,
@@ -111,6 +112,15 @@ fn coinbase_tag_and_limit() {
     // makes the config fail to load and the node refuse to start.
     assert!(ExtraCoinbaseData::try_from("x".repeat(MAX_USER_COINBASE_DATA_LEN)).is_ok());
     assert!(ExtraCoinbaseData::try_from("x".repeat(MAX_USER_COINBASE_DATA_LEN + 1)).is_err());
+    assert_eq!(
+        MAX_USER_COINBASE_DATA_LEN
+            + ZAKURA_COINBASE_MARKER.len()
+            + ZAKURA_COINBASE_SEPARATOR.len()
+            + 2
+            + MAX_COINBASE_HEIGHT_LEN,
+        MAX_COINBASE_SCRIPT_LEN,
+        "the configured data limit must reserve the worst-case height and OP_PUSHDATA1 bytes"
+    );
 
     let net = Network::Mainnet;
     let addr: ZcashAddress = default_miner_address(net.kind(), &MinerAddressType::Transparent)
@@ -147,6 +157,26 @@ fn coinbase_tag_and_limit() {
         [ZAKURA_COINBASE_MARKER, ZAKURA_COINBASE_SEPARATOR, "/pool/"]
             .concat()
             .as_bytes()
+    );
+
+    // Exercise the invariant behind `MinerParams::new`'s `expect` through the
+    // real coinbase builder at the maximum supported Zakura height.
+    let max_tag = ExtraCoinbaseData::try_from("x".repeat(MAX_USER_COINBASE_DATA_LEN))
+        .expect("maximum-length tag is valid");
+    let max_params = params(Some(max_tag)).expect("maximum-length tag fits miner params");
+    let max_coinbase =
+        TransactionTemplate::new_coinbase(&net, Height::MAX, &max_params, Amount::zero())
+            .expect("maximum-length tag fits a coinbase transaction")
+            .data()
+            .as_ref()
+            .zcash_deserialize_into::<Transaction>()
+            .expect("maximum-length coinbase transaction deserializes");
+    let coinbase_script = max_coinbase.inputs()[0]
+        .coinbase_script()
+        .expect("built coinbase input has a canonical script");
+    assert!(
+        coinbase_script.len() <= MAX_COINBASE_SCRIPT_LEN,
+        "maximum-length configured tag must keep the coinbase script within consensus limits"
     );
 }
 

@@ -1000,6 +1000,19 @@ fn p2sh_sigop_count_counts_redeem_script() -> Result<()> {
     Ok(())
 }
 
+/// A mismatched spent-output vector is an internal invariant violation, not a
+/// zero-sigop case. Keep this check active in release builds so a future caller
+/// cannot silently undercount block sigops by truncating `zip()`.
+#[test]
+#[should_panic(expected = "spent_outputs must align with transaction inputs for non-coinbase txs")]
+fn p2sh_sigop_count_rejects_mismatched_spent_outputs() {
+    let tx = SCRIPT_TX
+        .zcash_deserialize_into::<Transaction>()
+        .expect("test fixture deserializes");
+
+    let _ = p2sh_sigop_count(&tx, &[]);
+}
+
 /// Regression test: `p2sh_sigop_count` must agree with zcashd's
 /// `GetP2SHSigOpCount()` when the redeem script contains a "disabled" opcode such as
 /// `OP_CODESEPARATOR` (0xab).

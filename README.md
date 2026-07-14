@@ -1,4 +1,4 @@
-![Zakura logotype](book/theme/favicon.png)
+![Zakura logotype](book/theme/zakura-flower-v1.svg)
 
 ---
 

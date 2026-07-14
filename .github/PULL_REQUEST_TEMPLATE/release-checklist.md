@@ -37,6 +37,13 @@ These steps can be done a few days before the release, in the same PR:
 
 ## Change Log
 
+Changelog policy lives in
+[`CHANGELOG_GUIDELINES.md`](https://github.com/zakura-core/zakura/blob/main/CHANGELOG_GUIDELINES.md) —
+follow it if it and these steps ever disagree. In particular, `v1.0.0` and its
+release candidates take a single "Initial release" entry (already in place)
+and **skip** the draft-changelog steps below; they apply to releases after
+`v1.0.0`.
+
 **Important**: Any merge into `main` deletes any edits to the draft changelog.
 Once you are ready to tag a release, copy the draft changelog into `CHANGELOG.md`.
 
@@ -135,7 +142,10 @@ Check that the release will work:
         if the previous realase was yanked; you will have to determine the
         type of release manually.
   - [ ] Update the crate `CHANGELOG.md` listing the API changes or other
-        relevant information for a crate consumer. Use `public-api` to list all
+        relevant information for a crate consumer, per
+        [`CHANGELOG_GUIDELINES.md`](https://github.com/zakura-core/zakura/blob/main/CHANGELOG_GUIDELINES.md)
+        (crate changelogs move on the crate's own release cadence; for `v1.0.0`
+        they are a single "Initial release" entry). Use `public-api` to list all
         API changes: `cargo public-api diff latest -p <crate> -sss`. You can use
         e.g. copilot to turn it into a human-readable list, e.g. (write the output
         to `api.txt` beforehand):
@@ -201,9 +211,18 @@ The end of support height is calculated from the current blockchain height:
       workflow.
 - [ ] Run [`sync-confidence.yml`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml) manually for the release tag or release branch if sync validation is required after tagging.
 
-## Publish Release
+## Promote Release (stable releases only)
 
-- [ ] [Publish the release to GitHub](https://github.com/zakura-core/zakura/releases) by disabling 'pre-release', then clicking "Set as the latest release"
+Pre-releases are **never** promoted — see
+[Promotion and the "Latest" Release](https://github.com/zakura-core/zakura/blob/main/docs/release-tag-protection.md#promotion-and-the-latest-release).
+For a release candidate, skip this section: the release stays a pre-release
+from publication until deletion.
+
+- [ ] For a stable release, after `make sign-release` has run against the tag:
+      [edit the release](https://github.com/zakura-core/zakura/releases) to
+      disable 'pre-release' **and** check "Set as the latest release"
+      (`make_latest: true`) — both steps are explicit; nothing does this
+      automatically.
 
 ## Publish Crates
 

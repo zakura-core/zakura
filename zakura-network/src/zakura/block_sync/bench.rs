@@ -225,6 +225,7 @@ impl BenchBodyFeeder {
         let body = SequencedBody {
             height,
             hash,
+            previous_block_hash: block.header.previous_block_hash,
             body: BufferedBlockBody::Decoded(block),
             bytes,
             peer: self.bench_peer.clone(),

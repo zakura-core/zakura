@@ -96,6 +96,7 @@ pub(super) fn shed_top_for_floor_starvation(
 pub(super) struct SequencedBody {
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
+    pub(super) previous_block_hash: block::Hash,
     pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
     pub(super) peer: ZakuraPeerId,
@@ -381,6 +382,7 @@ impl SequencerTask {
         let outcome = match self.sequencer.accept_buffered_body(
             body.height,
             body.hash,
+            body.previous_block_hash,
             body.body,
             body.bytes,
             body.peer,

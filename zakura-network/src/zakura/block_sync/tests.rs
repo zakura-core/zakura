@@ -3369,7 +3369,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
     assert_eq!(
         released
             .iter()
-            .map(|(height, _, bytes, _)| (*height, *bytes))
+            .map(|drained| (drained.height, drained.bytes))
             .collect::<Vec<_>>(),
         vec![(block::Height(1), 100)]
     );
@@ -3388,7 +3388,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
     assert_eq!(
         released
             .iter()
-            .map(|(height, _, bytes, _)| (*height, *bytes))
+            .map(|drained| (drained.height, drained.bytes))
             .collect::<Vec<_>>(),
         vec![(block::Height(2), 200), (block::Height(3), 300)]
     );
@@ -3650,7 +3650,14 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
     );
 
     assert_eq!(
-        seq.accept_buffered_body(block::Height(2), block2.hash(), block2_body, 200, peer(0)),
+        seq.accept_buffered_body(
+            block::Height(2),
+            block2.hash(),
+            block2.header.previous_block_hash,
+            block2_body,
+            200,
+            peer(0)
+        ),
         AcceptOutcome::Buffered {
             covered: block::Height(2)
         }
@@ -3669,10 +3676,65 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
         vec![block::Height(1), block::Height(2)]
     );
     assert_eq!(seq.applying_hash(block::Height(2)), Some(block2.hash()));
+    // The backlogged body kept only its raw payload, so submission decodes the
+    // raw bytes (block2), not the dropped decoded copy (the distinguishable fork).
+    let submitted = seq
+        .prepare_submit(block::Height(2))
+        .expect("height 2 is applying");
+    assert_eq!(submitted.block.hash(), block2.hash());
     assert_ne!(
-        seq.applying_hash(block::Height(2)),
-        Some(distinguishable_decoded_block2.hash())
+        submitted.block.hash(),
+        distinguishable_decoded_block2.hash()
     );
+}
+
+#[test]
+fn sequencer_bounds_decoded_bodies_to_submission_window() {
+    // A deep contiguous backlog must not hold decoded blocks beyond the
+    // submission window: everything past the free submit slots stays as raw
+    // bytes until `prepare_submit` decodes it.
+    let limit = 2;
+    let mut seq = test_sequencer(0, limit);
+    let blocks = mainnet_blocks_1_to_3();
+
+    for (index, block) in blocks.iter().enumerate() {
+        let height = block::Height(index as u32 + 1);
+        let body =
+            BufferedBlockBody::from_decoded_block(block.clone(), Some(raw_block_payload(block)));
+        assert_eq!(
+            seq.accept_buffered_body(
+                height,
+                block.hash(),
+                block.header.previous_block_hash,
+                body,
+                100,
+                peer(0)
+            ),
+            AcceptOutcome::Buffered { covered: height }
+        );
+    }
+
+    assert_eq!(
+        seq.drain_ready_into_applying(),
+        vec![block::Height(1), block::Height(2), block::Height(3)]
+    );
+    assert_eq!(seq.applying_len(), 3);
+    assert!(
+        seq.decoded_applying_count() <= limit,
+        "decoded applying bodies ({}) exceed the submission window ({limit})",
+        seq.decoded_applying_count(),
+    );
+
+    // Submission decodes exactly the window; the backlog tail stays raw.
+    for height in seq.submittable_heights() {
+        seq.prepare_submit(height).expect("height is applying");
+    }
+    assert_eq!(seq.submitted_applying_count(), limit);
+    assert_eq!(seq.decoded_applying_count(), limit);
+
+    // Rolling a submission back also rolls its body out of the decode window.
+    seq.unsubmit(block::Height(1), 1);
+    assert_eq!(seq.decoded_applying_count(), limit - 1);
 }
 
 #[test]
@@ -4117,16 +4179,27 @@ fn sequencer_keeps_whole_body_for_contiguous_height() {
     );
     // Height 1 is the next contiguous height above the floor (0).
     assert_eq!(
-        seq.accept_buffered_body(block::Height(1), block1.hash(), body, 100, peer(0)),
+        seq.accept_buffered_body(
+            block::Height(1),
+            block1.hash(),
+            block1.header.previous_block_hash,
+            body,
+            100,
+            peer(0)
+        ),
         AcceptOutcome::Buffered {
             covered: block::Height(1)
         }
     );
     assert_eq!(seq.drain_ready_into_applying(), vec![block::Height(1)]);
-    // The kept decoded block drained in, not a re-decode of the raw payload.
+    // The drained body is inside the submission window, so the kept decoded
+    // block is submitted directly, not a re-decode of the raw payload.
+    let submitted = seq
+        .prepare_submit(block::Height(1))
+        .expect("height 1 is applying");
     assert_eq!(
-        seq.applying_hash(block::Height(1)),
-        Some(distinguishable_decoded_block1.hash())
+        submitted.block.hash(),
+        distinguishable_decoded_block1.hash()
     );
 }
 
@@ -4153,11 +4226,11 @@ fn reorder_fuzzes_arrival_order_as_parent_first() {
                 reorder.insert(block::Height(height), block.clone(), 100, peer(0)),
                 ReorderInsertResult::Inserted
             );
-            for (released, _, bytes, _) in reorder.drain_contiguous_prefix(tip) {
-                assert_eq!(released, block::Height(tip.0 + 1));
-                tip = released;
-                released_all.push(released);
-                budget.release(bytes);
+            for drained in reorder.drain_contiguous_prefix(tip) {
+                assert_eq!(drained.height, block::Height(tip.0 + 1));
+                tip = drained.height;
+                released_all.push(drained.height);
+                budget.release(drained.bytes);
             }
         }
 
@@ -4465,8 +4538,8 @@ fn budget_reservation_never_exceeds_max_and_only_shrinks_per_block() {
         // releases them.
         let mut floor = block::Height(0);
         let mut applied_bytes = 0;
-        for (_height, _block, bytes, _peer) in reorder.drain_contiguous_prefix(floor) {
-            applied_bytes += bytes;
+        for drained in reorder.drain_contiguous_prefix(floor) {
+            applied_bytes += drained.bytes;
             floor = block::Height(floor.0 + 1);
         }
         assert_eq!(applied_bytes, 700 + 800 + 900);

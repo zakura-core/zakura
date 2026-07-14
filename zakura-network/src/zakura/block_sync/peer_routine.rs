@@ -1394,9 +1394,17 @@ impl PeerRoutine {
         // the routine: a slow verifier blocks the task draining input, the bounded
         // input channel fills, and this routine blocks here — backpressure
         // isolated to this peer (the per-peer routines throughput win).
+        let previous_block_hash = block.header.previous_block_hash;
         let body = BufferedBlockBody::from_decoded_block(block, raw_block_payload);
-        self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
-            .await;
+        self.forward_body_to_sequencer(
+            height,
+            hash,
+            previous_block_hash,
+            body,
+            serialized_bytes,
+            body_permit,
+        )
+        .await;
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
     }
@@ -1423,6 +1431,7 @@ impl PeerRoutine {
         &self,
         height: block::Height,
         hash: block::Hash,
+        previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         serialized_bytes: u64,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
@@ -1432,6 +1441,7 @@ impl PeerRoutine {
         let body = SequencedBody {
             height,
             hash,
+            previous_block_hash,
             body,
             bytes: serialized_bytes,
             peer: self.peer.clone(),
@@ -1579,9 +1589,17 @@ impl PeerRoutine {
         // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
         self.window.credit_late_delivery();
 
+        let previous_block_hash = block.header.previous_block_hash;
         let body = BufferedBlockBody::from_decoded_block(block, raw_block_payload);
-        self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
-            .await;
+        self.forward_body_to_sequencer(
+            height,
+            hash,
+            previous_block_hash,
+            body,
+            serialized_bytes,
+            body_permit,
+        )
+        .await;
         true
     }
 

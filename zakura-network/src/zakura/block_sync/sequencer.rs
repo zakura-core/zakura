@@ -19,11 +19,20 @@ use super::{events::BlockApplyToken, reorder::*, state::*, *};
 
 /// A received body draining contiguously toward the verified tip, awaiting (or
 /// undergoing) verifier submission.
+///
+/// Bodies beyond the submission window are held in their serialized wire form
+/// (`BufferedBlockBody::RawFramePayload`) and only decoded at `prepare_submit`,
+/// so the decoded heap footprint of the apply backlog is bounded by the
+/// submission window instead of the whole backlog (the incident mode was tens
+/// of thousands of decoded bodies resident at once).
 #[derive(Clone, Debug)]
 pub(super) struct ApplyingBlock {
     pub(super) token: BlockApplyToken,
     pub(super) hash: block::Hash,
-    pub(super) block: Arc<block::Block>,
+    /// `previous_block_hash` captured at receipt, so reset-conflict checks never
+    /// need to decode a backlog body.
+    pub(super) previous_block_hash: block::Hash,
+    pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
     pub(super) submitted: bool,
     /// The peer that delivered this body, used to attribute an apply rejection
@@ -142,6 +151,16 @@ impl Sequencer {
         self.applying_buffered_bytes
     }
 
+    /// Number of `applying` bodies currently holding a decoded block, which the
+    /// bounded decode window keeps near `submitted_apply_limit`.
+    #[cfg(test)]
+    pub(super) fn decoded_applying_count(&self) -> usize {
+        self.applying
+            .values()
+            .filter(|applying| applying.body.is_decoded())
+            .count()
+    }
+
     /// Ground-truth recomputation of [`applying_buffered_bytes`], used by tests to
     /// assert the maintained counter never drifts.
     #[cfg(test)]
@@ -217,7 +236,7 @@ impl Sequencer {
     ) -> Option<block::Hash> {
         self.applying
             .get(&height)
-            .map(|applying| applying.block.header.previous_block_hash)
+            .map(|applying| applying.previous_block_hash)
     }
 
     pub(super) fn reorder_hash(&self, height: block::Height) -> Option<block::Hash> {
@@ -254,9 +273,11 @@ impl Sequencer {
         bytes: u64,
         source_peer: ZakuraPeerId,
     ) -> AcceptOutcome {
+        let previous_block_hash = block.header.previous_block_hash;
         self.accept_buffered_body(
             height,
             hash,
+            previous_block_hash,
             BufferedBlockBody::Decoded(block),
             bytes,
             source_peer,
@@ -267,6 +288,7 @@ impl Sequencer {
         &mut self,
         height: block::Height,
         hash: block::Hash,
+        previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         bytes: u64,
         source_peer: ZakuraPeerId,
@@ -293,7 +315,7 @@ impl Sequencer {
 
         match self
             .reorder
-            .insert_body(height, hash, body, bytes, source_peer)
+            .insert_body(height, hash, previous_block_hash, body, bytes, source_peer)
         {
             ReorderInsertResult::Inserted => AcceptOutcome::Buffered { covered: height },
             ReorderInsertResult::Duplicate => AcceptOutcome::Redundant {
@@ -307,28 +329,45 @@ impl Sequencer {
     /// Drain the contiguous reorder prefix above the floor into `applying`,
     /// advancing the floor. Returns the newly-covered heights so the reactor
     /// marks them covered in the download scheduler.
+    ///
+    /// Bodies stay in their buffered (usually serialized) form. The only
+    /// exception is the front of the drain that will be submitted immediately:
+    /// those keep an already-present decoded copy so the common steady-state
+    /// path (receive next block → drain → submit) never decodes twice. Bodies
+    /// past the free submission slots are demoted to raw bytes, so the decoded
+    /// backlog stays bounded by the submission window.
     pub(super) fn drain_ready_into_applying(&mut self) -> Vec<block::Height> {
         let released = self
             .reorder
             .drain_contiguous_prefix(self.body_download_floor);
+        let mut free_submit_slots = self
+            .submitted_apply_limit
+            .saturating_sub(self.applying.len());
         let mut covered = Vec::with_capacity(released.len());
-        for (height, block, bytes, source_peer) in released {
-            let hash = block.hash();
-            self.body_download_floor = height;
-            covered.push(height);
+        for drained in released {
+            let mut body = drained.body;
+            if free_submit_slots > 0 {
+                free_submit_slots -= 1;
+            } else {
+                body.retain_for_backlog_in_place();
+            }
+            self.body_download_floor = drained.height;
+            covered.push(drained.height);
             self.applying.insert(
-                height,
+                drained.height,
                 ApplyingBlock {
                     token: 0,
-                    hash,
-                    block,
-                    bytes,
+                    hash: drained.hash,
+                    previous_block_hash: drained.previous_block_hash,
+                    body,
+                    bytes: drained.bytes,
                     submitted: false,
-                    source_peer,
+                    source_peer: drained.source_peer,
                 },
             );
             // New bodies enter `applying` unsubmitted, so only the total grows.
-            self.applying_buffered_bytes = self.applying_buffered_bytes.saturating_add(bytes);
+            self.applying_buffered_bytes =
+                self.applying_buffered_bytes.saturating_add(drained.bytes);
         }
         covered
     }
@@ -354,18 +393,22 @@ impl Sequencer {
     /// Assign a token to `height`, mark it submitted, and return the dispatch
     /// item. `None` if the height is no longer applying (the token counter is
     /// not consumed in that case).
+    ///
+    /// Submission is the decode point: a body still held as raw bytes is decoded
+    /// here (and cached on the entry until apply-finished or unsubmit), so at
+    /// most `submitted_apply_limit` decoded bodies are resident at once.
     pub(super) fn prepare_submit(&mut self, height: block::Height) -> Option<SubmitItem> {
-        let block = self
-            .applying
-            .get(&height)
-            .map(|applying| applying.block.clone())?;
+        if !self.applying.contains_key(&height) {
+            return None;
+        }
         let token = self.next_apply_token();
-        let (hash, bytes, was_submitted) = {
+        let (hash, bytes, was_submitted, block) = {
             let applying = self.applying.get_mut(&height)?;
+            let block = applying.body.decoded_block();
             applying.token = token;
             let was_submitted = applying.submitted;
             applying.submitted = true;
-            (applying.hash, applying.bytes, was_submitted)
+            (applying.hash, applying.bytes, was_submitted, block)
         };
         if !was_submitted {
             self.submitted_applying_count = self.submitted_applying_count.saturating_add(1);
@@ -394,6 +437,9 @@ impl Sequencer {
             let was_submitted = applying.submitted;
             applying.token = 0;
             applying.submitted = false;
+            // The body leaves the decode window: drop the decoded copy so a
+            // rolled-back submission does not grow the decoded backlog.
+            applying.body.retain_for_backlog_in_place();
             was_submitted.then_some(applying.bytes)
         };
         if let Some(bytes) = unsubmitted_bytes {

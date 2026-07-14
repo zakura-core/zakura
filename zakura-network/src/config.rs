@@ -115,11 +115,11 @@ pub enum P2pStack {
     /// The legacy TCP Zcash P2P stack only.
     Legacy,
 
-    /// The native Zakura P2P v2 stack only.
+    /// The experimental native Zakura P2P v2 stack only.
     Zakura,
 
-    /// Both stacks: mutually capable peers are upgraded to Zakura P2P v2, and the legacy
-    /// stack stays available for peers that can't upgrade.
+    /// Both stacks: mutually capable peers are upgraded to the experimental Zakura P2P v2
+    /// stack, and the legacy stack stays available for peers that can't upgrade.
     Dual,
 }
 
@@ -280,8 +280,8 @@ pub struct Config {
     /// |---|---|
     /// | `"default"` | The configured network's binary default |
     /// | `"legacy"` | The legacy TCP Zcash P2P stack only |
-    /// | `"zakura"` | The native Zakura P2P v2 stack only |
-    /// | `"dual"` | Both stacks, with legacy fallback |
+    /// | `"zakura"` | The experimental native Zakura P2P v2 stack only |
+    /// | `"dual"` | Both stacks, enabling experimental v2 with legacy fallback |
     ///
     /// Leave this at `"default"` so Zakura can change the per-network default during upgrades.
     /// See [`P2pStack::resolve`] for the current defaults, and [`legacy_p2p`](Self::legacy_p2p)

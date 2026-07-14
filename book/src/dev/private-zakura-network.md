@@ -6,6 +6,8 @@ A node bootstraps from a few peers, but discovery and gossip then pull in the
 rest of the network, so two engineers testing different changes at the same time
 would otherwise collide.
 
+The Zakura v2 stack is [experimental](../user/p2p.md).
+
 A _private Zakura dev network_ (a "cohort") solves this without changing
 consensus. Set a tag in the config and a node only forms Zakura (v2) connections
 with peers that advertise the same tag. Public nodes and other cohorts ignore it,

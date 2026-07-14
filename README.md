@@ -11,6 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)
 
 - [Getting Started](#getting-started)
+  - [Installer](#installer)
   - [Docker](#docker)
   - [Manual Install](#manual-install)
 - [Documentation](#documentation)
@@ -29,8 +30,19 @@ Zakura is forked off of [Zebra](https://github.com/ZcashFoundation/zebra). This 
 
 ## Getting Started
 
-You can run Zakura using our [Docker
-image](https://hub.docker.com/r/valargroup/zakura/tags) or you can install it manually.
+### Installer
+
+The recommended way to install Zakura is with the interactive installer:
+
+```console
+curl -fsSL https://raw.githubusercontent.com/zakura-core/zakura/main/scripts/install-zakura.sh | bash
+```
+
+The installer can set up either standard Zakura or its
+[zcashd-compatible variant](book/src/user/zcashd-compat.md).
+
+You can also run Zakura using our [Docker
+image](https://hub.docker.com/r/valargroup/zakura/tags) or install it manually.
 
 ### Docker
 

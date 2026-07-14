@@ -147,22 +147,6 @@ fn is_block_frame(frame: &crate::zakura::Frame) -> bool {
     frame.payload.first().copied() == Some(MSG_BS_BLOCK)
 }
 
-fn release_counter_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
-    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
-    loop {
-        let next = current.saturating_sub(bytes);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
 /// Outcome classification for finishing an outstanding request.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Disposition {
@@ -236,6 +220,7 @@ pub(super) struct PeerRoutine {
     received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
     sequencer_input: mpsc::Sender<SequencedBody>,
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    sequencer_input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
     sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
     actions: mpsc::Sender<BlockSyncAction>,
     /// Shared routine→reactor channel for serving / status-advertise / re-query /
@@ -276,6 +261,7 @@ impl PeerRoutine {
         received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
         sequencer_input: mpsc::Sender<SequencedBody>,
         sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        sequencer_input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
         sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
         actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
@@ -312,6 +298,7 @@ impl PeerRoutine {
             received_throughput,
             sequencer_input,
             sequencer_input_bytes,
+            sequencer_input_decoded_deep_bytes,
             sequencer_control,
             actions,
             routine_to_reactor,
@@ -1231,6 +1218,20 @@ impl PeerRoutine {
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
         raw_block_payload: Option<Arc<[u8]>>,
     ) {
+        let decoded_deep_size_bytes = block.deep_owned_size_bytes();
+        // Metrics accepts f64 samples; these lossy conversions are observability-only.
+        metrics::histogram!(
+            "sync.block.body.decoded.deep_size_bytes",
+            "stage" => "peer"
+        )
+        .record(decoded_deep_size_bytes as f64);
+        if let Some(serialized_bytes) = body_wire_bytes.filter(|bytes| *bytes > 0) {
+            metrics::histogram!(
+                "sync.block.body.decoded.to_serialized_ratio",
+                "stage" => "peer"
+            )
+            .record(decoded_deep_size_bytes as f64 / serialized_bytes as f64);
+        }
         let hash = block.hash();
         let Some(height) = block.coinbase_height() else {
             self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
@@ -1248,6 +1249,7 @@ impl PeerRoutine {
                     body_wire_bytes,
                     body_permit,
                     raw_block_payload.clone(),
+                    decoded_deep_size_bytes,
                 )
                 .await
             {
@@ -1357,6 +1359,7 @@ impl PeerRoutine {
         self.trace_body_received(
             height,
             serialized_bytes,
+            decoded_deep_size_bytes,
             Some(request_start_height),
             Some(request_range_count),
             Some(request_elapsed_ms),
@@ -1394,7 +1397,11 @@ impl PeerRoutine {
         // the routine: a slow verifier blocks the task draining input, the bounded
         // input channel fills, and this routine blocks here — backpressure
         // isolated to this peer (the per-peer routines throughput win).
-        let body = BufferedBlockBody::from_decoded_block(block, raw_block_payload);
+        let body = BufferedBlockBody::from_measured_decoded_block(
+            block,
+            raw_block_payload,
+            decoded_deep_size_bytes,
+        );
         self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
             .await;
         // This body opened only this peer's slots; the want-work loop runs at the
@@ -1429,27 +1436,22 @@ impl PeerRoutine {
     ) {
         let received_at = Instant::now();
         let sequencer_send_started = Instant::now();
-        let body = SequencedBody {
+        let body = SequencedBody::new_queued(
             height,
             hash,
             body,
-            bytes: serialized_bytes,
-            peer: self.peer.clone(),
+            serialized_bytes,
+            self.peer.clone(),
             received_at,
-        };
+            self.sequencer_input_bytes.clone(),
+            self.sequencer_input_decoded_deep_bytes.clone(),
+        );
 
         let ok = if let Some(permit) = body_permit {
-            self.sequencer_input_bytes
-                .fetch_add(serialized_bytes, std::sync::atomic::Ordering::Relaxed);
             permit.send(body);
             true
         } else {
-            self.sequencer_input_bytes
-                .fetch_add(serialized_bytes, std::sync::atomic::Ordering::Relaxed);
             let send_result = self.sequencer_input.send(body).await;
-            if send_result.is_err() {
-                release_counter_bytes(&self.sequencer_input_bytes, serialized_bytes);
-            }
             send_result.is_ok()
         };
 
@@ -1460,6 +1462,7 @@ impl PeerRoutine {
     /// is currently reserved by another peer. Queued heights reserve their actual size
     /// before buffering; reserved in-flight heights settle the existing reservation to
     /// the actual held bytes.
+    #[allow(clippy::too_many_arguments)]
     async fn accept_unmatched_queued_body(
         &mut self,
         height: block::Height,
@@ -1468,6 +1471,7 @@ impl PeerRoutine {
         body_wire_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
         raw_block_payload: Option<Arc<[u8]>>,
+        decoded_deep_size_bytes: u64,
     ) -> bool {
         if self.work.hash_for_height(height) != Some(hash) {
             return false;
@@ -1562,7 +1566,14 @@ impl PeerRoutine {
         }
 
         self.record_received(serialized_bytes);
-        self.trace_body_received(height, serialized_bytes, None, None, None);
+        self.trace_body_received(
+            height,
+            serialized_bytes,
+            decoded_deep_size_bytes,
+            None,
+            None,
+            None,
+        );
 
         // A real, wanted body that no longer matches an outstanding request (typically
         // arrived just after its request timed out). Count it as block progress: resets
@@ -1579,7 +1590,11 @@ impl PeerRoutine {
         // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
         self.window.credit_late_delivery();
 
-        let body = BufferedBlockBody::from_decoded_block(block, raw_block_payload);
+        let body = BufferedBlockBody::from_measured_decoded_block(
+            block,
+            raw_block_payload,
+            decoded_deep_size_bytes,
+        );
         self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
             .await;
         true
@@ -2141,6 +2156,7 @@ impl PeerRoutine {
         &self,
         height: block::Height,
         serialized_bytes: u64,
+        decoded_deep_size_bytes: u64,
         request_start_height: Option<block::Height>,
         request_range_count: Option<u32>,
         request_elapsed_ms: Option<u64>,
@@ -2149,6 +2165,11 @@ impl PeerRoutine {
             bs_insert_peer(row, bs_trace::PEER, &self.peer);
             bs_insert_height(row, bs_trace::HEIGHT, height);
             bs_insert_u64(row, bs_trace::SERIALIZED_BYTES, serialized_bytes);
+            bs_insert_u64(
+                row,
+                bs_trace::DECODED_DEEP_SIZE_BYTES,
+                decoded_deep_size_bytes,
+            );
             bs_insert_u64(row, bs_trace::BUDGET_RESERVED_AFTER, self.budget.reserved());
             bs_insert_u64(
                 row,
@@ -2482,6 +2503,7 @@ mod tests {
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
             sequencer_input_tx,
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
             control_tx,
             actions_tx,
             routine_to_reactor_tx,
@@ -2579,6 +2601,7 @@ mod tests {
             Arc::new(PeerRegistry::new()),
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
             sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             control_tx,
             actions_tx,

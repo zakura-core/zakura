@@ -153,6 +153,7 @@ pub(super) struct RoutineWiring {
     pub(super) received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
     pub(super) sequencer_input: mpsc::Sender<super::sequencer_task::SequencedBody>,
     pub(super) sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) sequencer_input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
     pub(super) sequencer_control:
         mpsc::UnboundedSender<super::sequencer_task::SequencerControlInput>,
     pub(super) actions: mpsc::Sender<BlockSyncAction>,

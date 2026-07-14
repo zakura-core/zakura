@@ -27,6 +27,15 @@ pub(crate) struct InvariantReport {
     /// deserialized-memory factor this approximates peak resident cost — unlike
     /// `peak_budget_reserved`, it excludes reservations for bytes not yet received.
     pub(crate) peak_retained_pipeline_wire_bytes: u64,
+    /// Peak decoded deep-owned bytes attributed to the active body pipeline.
+    pub(crate) peak_active_pipeline_decoded_deep_bytes: u64,
+    /// Decoded deep-owned bytes in the last state sample before harness teardown.
+    ///
+    /// This can be nonzero because reaching the target ends the scenario before
+    /// the terminal task-drop view is emitted to the trace.
+    pub(crate) final_active_pipeline_decoded_deep_bytes: u64,
+    /// Every state row's decoded stage totals equal its aggregate pipeline total.
+    pub(crate) decoded_stage_totals_match: bool,
     /// Final reserved download bytes (leak detector once quiesced).
     pub(crate) final_budget_reserved: u64,
     /// Liveness-reaper / protocol-reject disconnects observed.
@@ -102,6 +111,23 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         .filter_map(|row| u64_field(row, "retained_pipeline_wire_bytes"))
         .max()
         .unwrap_or(0);
+    let peak_active_pipeline_decoded_deep_bytes = state_rows
+        .iter()
+        .filter_map(|row| u64_field(row, "active_pipeline_decoded_deep_bytes"))
+        .max()
+        .unwrap_or(0);
+    let final_active_pipeline_decoded_deep_bytes = state_rows
+        .iter()
+        .rev()
+        .find_map(|row| u64_field(row, "active_pipeline_decoded_deep_bytes"))
+        .unwrap_or(0);
+    let decoded_stage_totals_match = state_rows.iter().all(|row| {
+        let stage_total = u64_field(row, "sequencer_input_decoded_deep_bytes")
+            .unwrap_or(0)
+            .saturating_add(u64_field(row, "reorder_decoded_deep_bytes").unwrap_or(0))
+            .saturating_add(u64_field(row, "applying_decoded_deep_bytes").unwrap_or(0));
+        u64_field(row, "active_pipeline_decoded_deep_bytes") == Some(stage_total)
+    });
     let protocol_rejects = reader
         .table("block_sync")
         .count("block_peer_protocol_reject");
@@ -171,6 +197,9 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         max_outstanding,
         peak_budget_reserved,
         peak_retained_pipeline_wire_bytes,
+        peak_active_pipeline_decoded_deep_bytes,
+        final_active_pipeline_decoded_deep_bytes,
+        decoded_stage_totals_match,
         final_budget_reserved,
         protocol_rejects,
         total_requests,
@@ -254,6 +283,14 @@ pub(crate) fn assert_core(
     assert!(
         report.state_samples > 0,
         "run emitted no block_sync_state rows",
+    );
+    assert!(
+        report.decoded_stage_totals_match,
+        "decoded pipeline aggregate drifted from its stage totals",
+    );
+    assert!(
+        report.peak_active_pipeline_decoded_deep_bytes > 0,
+        "successful run never observed active decoded pipeline bytes",
     );
 
     // Per-peer windows respect the advertised inflight caps: aggregate in-flight must

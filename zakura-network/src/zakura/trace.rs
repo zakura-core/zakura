@@ -165,6 +165,16 @@ pub mod block_sync_trace {
     pub const ESTIMATED_BYTES: &str = "estimated_bytes";
     /// Serialized byte size of a received body.
     pub const SERIALIZED_BYTES: &str = "serialized_bytes";
+    /// Deep-owned decoded byte size of a block body.
+    pub const DECODED_DEEP_SIZE_BYTES: &str = "decoded_deep_size_bytes";
+    /// Decoded deep-owned bytes queued at the Sequencer input.
+    pub const SEQUENCER_INPUT_DECODED_DEEP_BYTES: &str = "sequencer_input_decoded_deep_bytes";
+    /// Decoded deep-owned bytes retained in the reorder buffer.
+    pub const REORDER_DECODED_DEEP_BYTES: &str = "reorder_decoded_deep_bytes";
+    /// Decoded deep-owned bytes retained in applying entries.
+    pub const APPLYING_DECODED_DEEP_BYTES: &str = "applying_decoded_deep_bytes";
+    /// Aggregate decoded deep-owned bytes in the active body pipeline.
+    pub const ACTIVE_PIPELINE_DECODED_DEEP_BYTES: &str = "active_pipeline_decoded_deep_bytes";
     /// End-to-end elapsed milliseconds for a traced operation.
     pub const ELAPSED_MS: &str = "elapsed_ms";
     /// Elapsed milliseconds before response frames were ready to send.

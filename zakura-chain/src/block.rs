@@ -8,7 +8,9 @@ use crate::{
     amount::{DeferredPoolBalanceChange, NegativeAllowed},
     block::merkle::{auth_digest_or_placeholder, AuthDataRoot},
     fmt::DisplayToDebug,
-    ironwood, orchard,
+    ironwood,
+    memory::{inline_size_bytes, vec_capacity_bytes, DeepOwnedSize},
+    orchard,
     parameters::{Network, NetworkUpgrade},
     sapling,
     serialization::TrustedPreallocate,
@@ -73,6 +75,33 @@ impl fmt::Display for Block {
 }
 
 impl Block {
+    /// Returns a deterministic attributed size for this decoded block's
+    /// Rust-visible object-graph payload.
+    ///
+    /// This includes the inline [`Block`], the [`Header`] pointee, the transaction
+    /// vector's capacity, each [`Transaction`] pointee, and all nested heap
+    /// allocation capacities. Shared `Arc` pointees are charged in full per
+    /// logical block/reference, so this is not a unique-allocation or exact RSS
+    /// measurement.
+    ///
+    /// This excludes allocator metadata and rounding, fragmentation, `Arc`
+    /// control blocks, temporary allocations, external library/runtime
+    /// overhead, and allocations made by downstream verifiers.
+    pub fn deep_owned_size_bytes(&self) -> u64 {
+        self.transactions
+            .iter()
+            .map(|transaction| {
+                inline_size_bytes::<Transaction>()
+                    .saturating_add(transaction.deep_owned_size_bytes())
+            })
+            .fold(
+                inline_size_bytes::<Self>()
+                    .saturating_add(inline_size_bytes::<Header>())
+                    .saturating_add(vec_capacity_bytes(&self.transactions)),
+                u64::saturating_add,
+            )
+    }
+
     /// Return the block height reported in the coinbase transaction, if any.
     ///
     /// Note

@@ -114,6 +114,73 @@ fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
 }
 
 #[test]
+fn deep_owned_size_counts_capacity_and_nested_transparent_allocations() {
+    fn allocation_bytes<T>(capacity: usize) -> u64 {
+        u64::try_from(capacity).unwrap() * u64::try_from(std::mem::size_of::<T>()).unwrap()
+    }
+
+    fn block_with_capacities(
+        transaction_capacity: usize,
+        input_capacity: usize,
+        coinbase_data_capacity: usize,
+        output_capacity: usize,
+    ) -> (Block, u64) {
+        let coinbase_data = Vec::with_capacity(coinbase_data_capacity);
+        let coinbase_data_bytes = allocation_bytes::<u8>(coinbase_data.capacity());
+
+        let mut inputs = Vec::with_capacity(input_capacity);
+        inputs.push(transparent::Input::Coinbase {
+            height: Height(1),
+            data: coinbase_data,
+            sequence: u32::MAX,
+        });
+        let input_bytes = allocation_bytes::<transparent::Input>(inputs.capacity());
+
+        let mut outputs = Vec::with_capacity(output_capacity);
+        outputs.push(transparent::Output::new(
+            Amount::zero(),
+            transparent::Script::new(&[]),
+        ));
+        let output_bytes = allocation_bytes::<transparent::Output>(outputs.capacity());
+
+        let transaction = Transaction::V1 {
+            inputs,
+            outputs,
+            lock_time: LockTime::unlocked(),
+        };
+        let mut transactions = Vec::with_capacity(transaction_capacity);
+        transactions.push(Arc::new(transaction));
+        let transaction_pointer_bytes =
+            allocation_bytes::<Arc<Transaction>>(transactions.capacity());
+
+        let header: Header = zakura_test::vectors::DUMMY_HEADER
+            .zcash_deserialize_into()
+            .expect("dummy header should deserialize");
+        let block = Block {
+            header: Arc::new(header),
+            transactions,
+        };
+        let expected = allocation_bytes::<Block>(1)
+            + allocation_bytes::<Header>(1)
+            + transaction_pointer_bytes
+            + allocation_bytes::<Transaction>(1)
+            + input_bytes
+            + coinbase_data_bytes
+            + output_bytes;
+
+        (block, expected)
+    }
+
+    let (compact, compact_expected) = block_with_capacities(1, 1, 0, 1);
+    let (reserved, reserved_expected) = block_with_capacities(4, 3, 17, 5);
+
+    assert_eq!(compact, reserved);
+    assert_eq!(compact.deep_owned_size_bytes(), compact_expected);
+    assert_eq!(reserved.deep_owned_size_bytes(), reserved_expected);
+    assert!(reserved.deep_owned_size_bytes() > compact.deep_owned_size_bytes());
+}
+
+#[test]
 fn blockheader_serialization() {
     let _init_guard = zakura_test::init();
 

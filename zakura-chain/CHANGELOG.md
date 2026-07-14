@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Block::deep_owned_size_bytes()` for deterministic decoded-block memory attribution.
 - `AT_OR_NEAR_TIP_THRESHOLD` and [`ChainTip::is_at_or_near_network_tip()`] for
   determining whether the node is within 5 blocks of the estimated network tip.
 - `ValueBalance` now has an Ironwood value-pool slot, with

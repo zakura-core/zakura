@@ -92,7 +92,7 @@ pub(super) fn shed_top_for_floor_starvation(
 /// to the commit pipeline. This is the only bounded Sequencer input: a slow
 /// verifier can backpressure body intake, but must not block apply/frontier
 /// control events that release budget and drive the next scheduling reaction.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct SequencedBody {
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
@@ -100,6 +100,84 @@ pub(super) struct SequencedBody {
     pub(super) bytes: u64,
     pub(super) peer: ZakuraPeerId,
     pub(super) received_at: Instant,
+    queue_accounting: SequencerInputAccounting,
+}
+
+impl SequencedBody {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_queued(
+        height: block::Height,
+        hash: block::Hash,
+        body: BufferedBlockBody,
+        bytes: u64,
+        peer: ZakuraPeerId,
+        received_at: Instant,
+        input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        let decoded_deep_size_bytes = body.decoded_deep_size_bytes();
+        Self {
+            height,
+            hash,
+            body,
+            bytes,
+            peer,
+            received_at,
+            queue_accounting: SequencerInputAccounting::new(
+                input_bytes,
+                bytes,
+                input_decoded_deep_bytes,
+                decoded_deep_size_bytes,
+            ),
+        }
+    }
+
+    /// Transfer this body out of queue ownership before processing it.
+    pub(super) fn leave_queue(&mut self) {
+        self.queue_accounting.release();
+    }
+}
+
+#[derive(Debug)]
+struct SequencerInputAccounting {
+    input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    bytes: u64,
+    input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
+    decoded_deep_size_bytes: u64,
+    active: bool,
+}
+
+impl SequencerInputAccounting {
+    fn new(
+        input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        bytes: u64,
+        input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
+        decoded_deep_size_bytes: u64,
+    ) -> Self {
+        add_atomic_bytes(&input_bytes, bytes);
+        add_atomic_bytes(&input_decoded_deep_bytes, decoded_deep_size_bytes);
+        Self {
+            input_bytes,
+            bytes,
+            input_decoded_deep_bytes,
+            decoded_deep_size_bytes,
+            active: true,
+        }
+    }
+
+    fn release(&mut self) {
+        if !std::mem::take(&mut self.active) {
+            return;
+        }
+        release_atomic_bytes(&self.input_bytes, self.bytes);
+        release_atomic_bytes(&self.input_decoded_deep_bytes, self.decoded_deep_size_bytes);
+    }
+}
+
+impl Drop for SequencerInputAccounting {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// Progress-critical Sequencer events forwarded by the reactor.
@@ -168,6 +246,10 @@ pub(super) struct SequencerView {
     pub(super) applying_len: u64,
     pub(super) reorder_buffered_bytes: u64,
     pub(super) applying_buffered_bytes: u64,
+    pub(super) sequencer_input_decoded_deep_bytes: u64,
+    pub(super) reorder_decoded_deep_bytes: u64,
+    pub(super) applying_decoded_deep_bytes: u64,
+    pub(super) active_pipeline_decoded_deep_bytes: u64,
     pub(super) unsubmitted_applying_count: u64,
     pub(super) submitted_applying_count: u64,
     pub(super) submitted_applying_bytes: u64,
@@ -188,6 +270,10 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
         applying_len: 0,
         reorder_buffered_bytes: 0,
         applying_buffered_bytes: 0,
+        sequencer_input_decoded_deep_bytes: 0,
+        reorder_decoded_deep_bytes: 0,
+        applying_decoded_deep_bytes: 0,
+        active_pipeline_decoded_deep_bytes: 0,
         unsubmitted_applying_count: 0,
         submitted_applying_count: 0,
         submitted_applying_bytes: 0,
@@ -215,9 +301,24 @@ pub(super) struct SequencerTask {
     body_input_rx: mpsc::Receiver<SequencedBody>,
     control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
     body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    body_input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
     view_tx: watch::Sender<SequencerView>,
     action_send_timeout: Duration,
     trace: ZakuraTrace,
+}
+
+impl Drop for SequencerTask {
+    fn drop(&mut self) {
+        self.body_input_rx.close();
+        while self.body_input_rx.try_recv().is_ok() {}
+
+        self.view_tx.send_modify(|view| {
+            view.reorder_decoded_deep_bytes = 0;
+            view.applying_decoded_deep_bytes = 0;
+            view.sequencer_input_decoded_deep_bytes = 0;
+            view.active_pipeline_decoded_deep_bytes = 0;
+        });
+    }
 }
 
 impl SequencerTask {
@@ -232,6 +333,7 @@ impl SequencerTask {
         body_input_rx: mpsc::Receiver<SequencedBody>,
         control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
         body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        body_input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
         view_tx: watch::Sender<SequencerView>,
         action_send_timeout: Duration,
         trace: ZakuraTrace,
@@ -249,6 +351,7 @@ impl SequencerTask {
             body_input_rx,
             control_input_rx,
             body_input_bytes,
+            body_input_decoded_deep_bytes,
             view_tx,
             action_send_timeout,
             trace,
@@ -283,9 +386,14 @@ impl SequencerTask {
 
                 body = self.body_input_rx.recv(), if body_open => {
                     match body {
-                        Some(body) => {
-                            self.release_body_input_bytes(body.bytes);
-                            self.handle_accept_body(body).await;
+                        Some(mut body) => {
+                            body.leave_queue();
+                            self.handle_accept_body(body);
+                            // Publish the synchronous queue → reorder/applying ownership
+                            // transfer before an action-channel send can await or time out.
+                            // This updates observability without waking scheduling watchers.
+                            self.publish_decoded_ownership_view();
+                            self.submit_pending_blocks().await;
                             shed_top_for_floor_starvation(
                                 &mut self.budget,
                                 &self.work,
@@ -355,28 +463,10 @@ impl SequencerTask {
         }
     }
 
-    fn release_body_input_bytes(&self, bytes: u64) {
-        let mut current = self
-            .body_input_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        loop {
-            let next = current.saturating_sub(bytes);
-            match self.body_input_bytes.compare_exchange_weak(
-                current,
-                next,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
     /// Body-acceptance tail: offer the body to the reorder buffer, release its
     /// bytes on a `Redundant` outcome, then drain the ready contiguous prefix into
     /// applying and submit it.
-    async fn handle_accept_body(&mut self, body: SequencedBody) {
+    fn handle_accept_body(&mut self, body: SequencedBody) {
         let queued_elapsed = body.received_at.elapsed();
         let outcome = match self.sequencer.accept_buffered_body(
             body.height,
@@ -392,7 +482,7 @@ impl SequencerTask {
             }
         };
         self.trace_body_accepted(body.height, queued_elapsed, outcome);
-        self.release_contiguous_blocks().await;
+        let _ = self.sequencer.drain_ready_into_applying();
     }
 
     /// Apply a verified-tip frontier advance: fold finalized height forward, drop
@@ -824,6 +914,14 @@ impl SequencerTask {
         self.committed_throughput.sample(Instant::now());
         let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
         let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
+        let sequencer_input_decoded_deep_bytes = self
+            .body_input_decoded_deep_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let reorder_decoded_deep_bytes = self.sequencer.reorder_decoded_deep_bytes();
+        let applying_decoded_deep_bytes = self.sequencer.applying_decoded_deep_bytes();
+        let active_pipeline_decoded_deep_bytes = sequencer_input_decoded_deep_bytes
+            .saturating_add(reorder_decoded_deep_bytes)
+            .saturating_add(applying_decoded_deep_bytes);
         let body_input_bytes = self
             .body_input_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -849,6 +947,10 @@ impl SequencerTask {
             applying_len: self.sequencer.applying_len() as u64,
             reorder_buffered_bytes,
             applying_buffered_bytes,
+            sequencer_input_decoded_deep_bytes,
+            reorder_decoded_deep_bytes,
+            applying_decoded_deep_bytes,
+            active_pipeline_decoded_deep_bytes,
             unsubmitted_applying_count: self.sequencer.unsubmitted_applying_count() as u64,
             submitted_applying_count: self.sequencer.submitted_applying_count() as u64,
             submitted_applying_bytes: self.sequencer.submitted_applying_bytes(),
@@ -866,6 +968,48 @@ impl SequencerTask {
         // a `start_paused` test clock, which auto-advances only once every task
         // parks. Keep the stored rates fresh, but notify only on a schedulable change.
         publish_sequencer_view(&self.view_tx, next);
+    }
+
+    fn publish_decoded_ownership_view(&self) {
+        let sequencer_input_decoded_deep_bytes = self
+            .body_input_decoded_deep_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let reorder_decoded_deep_bytes = self.sequencer.reorder_decoded_deep_bytes();
+        let applying_decoded_deep_bytes = self.sequencer.applying_decoded_deep_bytes();
+        let active_pipeline_decoded_deep_bytes = sequencer_input_decoded_deep_bytes
+            .saturating_add(reorder_decoded_deep_bytes)
+            .saturating_add(applying_decoded_deep_bytes);
+        self.view_tx.send_if_modified(|view| {
+            view.sequencer_input_decoded_deep_bytes = sequencer_input_decoded_deep_bytes;
+            view.reorder_decoded_deep_bytes = reorder_decoded_deep_bytes;
+            view.applying_decoded_deep_bytes = applying_decoded_deep_bytes;
+            view.active_pipeline_decoded_deep_bytes = active_pipeline_decoded_deep_bytes;
+            false
+        });
+    }
+}
+
+fn add_atomic_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
+    let _ = counter.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |current| Some(current.saturating_add(bytes)),
+    );
+}
+
+fn release_atomic_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
+    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(bytes);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
     }
 }
 
@@ -886,6 +1030,10 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
         let mut v = *v;
         v.committed_bytes_per_sec = 0;
         v.committed_blocks_per_sec = 0;
+        v.sequencer_input_decoded_deep_bytes = 0;
+        v.reorder_decoded_deep_bytes = 0;
+        v.applying_decoded_deep_bytes = 0;
+        v.active_pipeline_decoded_deep_bytes = 0;
         v
     };
     strip_rates(a) != strip_rates(b)
@@ -893,6 +1041,9 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use zakura_chain::serialization::ZcashDeserializeInto;
+    use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
+
     use super::*;
 
     fn test_view() -> SequencerView {
@@ -907,12 +1058,222 @@ mod tests {
             applying_len: 0,
             reorder_buffered_bytes: 0,
             applying_buffered_bytes: 0,
+            sequencer_input_decoded_deep_bytes: 0,
+            reorder_decoded_deep_bytes: 0,
+            applying_decoded_deep_bytes: 0,
+            active_pipeline_decoded_deep_bytes: 0,
             unsubmitted_applying_count: 0,
             submitted_applying_count: 0,
             submitted_applying_bytes: 0,
             committed_bytes_per_sec: 0,
             committed_blocks_per_sec: 0,
         }
+    }
+
+    fn test_block() -> Arc<block::Block> {
+        Arc::new(
+            BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .expect("block test vector parses"),
+        )
+    }
+
+    fn queued_test_body(
+        input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
+    ) -> SequencedBody {
+        let block = test_block();
+        SequencedBody::new_queued(
+            block::Height(1),
+            block.hash(),
+            BufferedBlockBody::from_decoded_block(block, None),
+            123,
+            ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid"),
+            Instant::now(),
+            input_bytes,
+            input_decoded_deep_bytes,
+        )
+    }
+
+    #[test]
+    fn sequenced_body_leave_and_drop_release_queue_counters_once() {
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_deep_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut body = queued_test_body(input_bytes.clone(), input_decoded_deep_bytes.clone());
+
+        assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 123);
+        assert!(input_decoded_deep_bytes.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+        body.leave_queue();
+        assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            input_decoded_deep_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        drop(body);
+        assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_send_drops_its_queue_accounting() {
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_deep_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (body_tx, mut body_rx) = mpsc::channel(1);
+        body_tx
+            .try_send(queued_test_body(
+                input_bytes.clone(),
+                input_decoded_deep_bytes.clone(),
+            ))
+            .expect("body channel has capacity");
+        let blocked_body = queued_test_body(input_bytes.clone(), input_decoded_deep_bytes.clone());
+        let blocked_send = tokio::spawn(async move { body_tx.send(blocked_body).await });
+        tokio::task::yield_now().await;
+        assert!(!blocked_send.is_finished());
+
+        blocked_send.abort();
+        let _ = blocked_send.await;
+        assert_eq!(
+            input_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            123,
+            "only the body already queued remains charged"
+        );
+
+        let mut queued = body_rx.recv().await.expect("first body remains queued");
+        queued.leave_queue();
+        assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            input_decoded_deep_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_receiver_with_live_permit_drops_queue_accounting() {
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_deep_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (body_tx, body_rx) = mpsc::channel(1);
+        let permit = body_tx
+            .reserve_owned()
+            .await
+            .expect("receiver is initially open");
+        drop(body_rx);
+
+        permit.send(queued_test_body(
+            input_bytes.clone(),
+            input_decoded_deep_bytes.clone(),
+        ));
+
+        assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            input_decoded_deep_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn handoff_publishes_applying_decoded_bytes_before_submission() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body_input_decoded_deep_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut body = queued_test_body(
+            body_input_bytes.clone(),
+            body_input_decoded_deep_bytes.clone(),
+        );
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, _actions_rx) = mpsc::channel(1);
+        let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            body_rx,
+            control_rx,
+            body_input_bytes,
+            body_input_decoded_deep_bytes,
+            view_tx,
+            Duration::from_secs(60),
+            ZakuraTrace::noop(),
+        );
+
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.publish_decoded_ownership_view();
+
+        let handoff = *view_rx.borrow();
+        assert_eq!(handoff.sequencer_input_decoded_deep_bytes, 0);
+        assert!(handoff.applying_decoded_deep_bytes > 0);
+        assert_eq!(handoff.reorder_decoded_deep_bytes, 0);
+        assert_eq!(
+            handoff.active_pipeline_decoded_deep_bytes,
+            handoff.applying_decoded_deep_bytes
+        );
+    }
+
+    #[test]
+    fn dropping_task_releases_queue_and_publishes_terminal_decoded_view() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let (body_tx, body_rx) = mpsc::channel(1);
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body_input_decoded_deep_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        body_tx
+            .try_send(queued_test_body(
+                body_input_bytes.clone(),
+                body_input_decoded_deep_bytes.clone(),
+            ))
+            .expect("body channel has capacity");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, _actions_rx) = mpsc::channel(1);
+        let mut initial = initial_view(frontiers);
+        initial.reorder_decoded_deep_bytes = 10;
+        initial.applying_decoded_deep_bytes = 20;
+        initial.active_pipeline_decoded_deep_bytes = body_input_decoded_deep_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(30);
+        let (view_tx, view_rx) = watch::channel(initial);
+        let task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(1),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            body_rx,
+            control_rx,
+            body_input_bytes.clone(),
+            body_input_decoded_deep_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+
+        drop(task);
+
+        assert_eq!(
+            body_input_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            body_input_decoded_deep_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let terminal = *view_rx.borrow();
+        assert_eq!(terminal.sequencer_input_decoded_deep_bytes, 0);
+        assert_eq!(terminal.reorder_decoded_deep_bytes, 0);
+        assert_eq!(terminal.applying_decoded_deep_bytes, 0);
+        assert_eq!(terminal.active_pipeline_decoded_deep_bytes, 0);
     }
 
     #[tokio::test(start_paused = true)]

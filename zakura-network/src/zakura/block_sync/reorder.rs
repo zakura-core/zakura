@@ -4,6 +4,7 @@ use super::{state::*, wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES, *};
 pub(crate) struct ReorderBuffer {
     blocks: BTreeMap<block::Height, BufferedBlock>,
     buffered_bytes: u64,
+    decoded_deep_bytes: u64,
 }
 
 impl ReorderBuffer {
@@ -11,11 +12,24 @@ impl ReorderBuffer {
         Self {
             blocks: BTreeMap::new(),
             buffered_bytes: 0,
+            decoded_deep_bytes: 0,
         }
     }
 
     pub(super) fn buffered_bytes(&self) -> u64 {
         self.buffered_bytes
+    }
+
+    pub(super) fn decoded_deep_bytes(&self) -> u64 {
+        self.decoded_deep_bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn decoded_deep_bytes_scanned(&self) -> u64 {
+        self.blocks
+            .values()
+            .map(|buffered| buffered.body.decoded_deep_size_bytes())
+            .fold(0u64, u64::saturating_add)
     }
 
     pub(super) fn len(&self) -> usize {
@@ -58,7 +72,7 @@ impl ReorderBuffer {
         self.insert_body(
             height,
             block.hash(),
-            BufferedBlockBody::Decoded(block),
+            BufferedBlockBody::from_decoded_block(block, None),
             bytes,
             source_peer,
         )
@@ -78,6 +92,7 @@ impl ReorderBuffer {
             return ReorderInsertResult::Duplicate;
         }
 
+        let decoded_deep_size_bytes = body.decoded_deep_size_bytes();
         self.blocks.insert(
             height,
             BufferedBlock {
@@ -88,13 +103,16 @@ impl ReorderBuffer {
             },
         );
         self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+        self.decoded_deep_bytes = self
+            .decoded_deep_bytes
+            .saturating_add(decoded_deep_size_bytes);
         ReorderInsertResult::Inserted
     }
 
     pub(super) fn drain_contiguous_prefix(
         &mut self,
         verified_block_tip: block::Height,
-    ) -> Vec<(block::Height, Arc<block::Block>, u64, ZakuraPeerId)> {
+    ) -> Vec<(block::Height, Arc<block::Block>, u64, u64, ZakuraPeerId)> {
         let mut released = Vec::new();
         let mut next = match next_height(verified_block_tip) {
             Some(next) => next,
@@ -103,10 +121,15 @@ impl ReorderBuffer {
 
         while let Some(buffered) = self.blocks.remove(&next) {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+            self.decoded_deep_bytes = self
+                .decoded_deep_bytes
+                .saturating_sub(buffered.body.decoded_deep_size_bytes());
+            let (block, decoded_deep_size_bytes) = buffered.body.into_block();
             released.push((
                 next,
-                buffered.body.into_block(),
+                block,
                 buffered.bytes,
+                decoded_deep_size_bytes,
                 buffered.source_peer,
             ));
             let Some(after) = next_height(next) else {
@@ -137,6 +160,9 @@ impl ReorderBuffer {
         for height in heights {
             if let Some(buffered) = self.blocks.remove(&height) {
                 self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+                self.decoded_deep_bytes = self
+                    .decoded_deep_bytes
+                    .saturating_sub(buffered.body.decoded_deep_size_bytes());
                 released = released.saturating_add(buffered.bytes);
             }
         }
@@ -154,6 +180,9 @@ impl ReorderBuffer {
         for height in heights {
             if let Some(buffered) = self.blocks.remove(&height) {
                 self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+                self.decoded_deep_bytes = self
+                    .decoded_deep_bytes
+                    .saturating_sub(buffered.body.decoded_deep_size_bytes());
                 released = released.saturating_add(buffered.bytes);
             }
         }
@@ -180,28 +209,60 @@ struct BufferedBlock {
 #[derive(Clone, Debug)]
 pub(super) enum BufferedBlockBody {
     RawFramePayload(Arc<[u8]>),
-    Decoded(Arc<block::Block>),
+    Decoded {
+        block: Arc<block::Block>,
+        decoded_deep_size_bytes: u64,
+    },
     DecodedWithRawFramePayload {
         block: Arc<block::Block>,
         raw_frame_payload: Arc<[u8]>,
+        decoded_deep_size_bytes: u64,
     },
 }
 
 impl BufferedBlockBody {
+    #[cfg(any(test, feature = "internal-bench"))]
     pub(super) fn from_decoded_block(
         block: Arc<block::Block>,
         raw_frame_payload: Option<Arc<[u8]>>,
+    ) -> Self {
+        let decoded_deep_size_bytes = block.deep_owned_size_bytes();
+        Self::from_measured_decoded_block(block, raw_frame_payload, decoded_deep_size_bytes)
+    }
+
+    pub(super) fn from_measured_decoded_block(
+        block: Arc<block::Block>,
+        raw_frame_payload: Option<Arc<[u8]>>,
+        decoded_deep_size_bytes: u64,
     ) -> Self {
         match raw_frame_payload {
             Some(raw_frame_payload) => BufferedBlockBody::DecodedWithRawFramePayload {
                 block,
                 raw_frame_payload,
+                decoded_deep_size_bytes,
             },
-            None => BufferedBlockBody::Decoded(block),
+            None => BufferedBlockBody::Decoded {
+                block,
+                decoded_deep_size_bytes,
+            },
         }
     }
 
-    // Drop the raw frame payload for the backlog.
+    pub(super) fn decoded_deep_size_bytes(&self) -> u64 {
+        match self {
+            BufferedBlockBody::RawFramePayload(_) => 0,
+            BufferedBlockBody::Decoded {
+                decoded_deep_size_bytes,
+                ..
+            }
+            | BufferedBlockBody::DecodedWithRawFramePayload {
+                decoded_deep_size_bytes,
+                ..
+            } => *decoded_deep_size_bytes,
+        }
+    }
+
+    // Drop the decoded body for the backlog.
     // This is used to save memory when the body is not the next block in the sequence.
     // DecodedWithRawFramePayload may hold the parsed block as well as the raw frame payload,
     // so we retain just the raw frame payload.
@@ -214,16 +275,39 @@ impl BufferedBlockBody {
         }
     }
 
-    fn into_block(self) -> Arc<block::Block> {
+    fn into_block(self) -> (Arc<block::Block>, u64) {
         match self {
-            BufferedBlockBody::Decoded(block) => block,
-            BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block,
+            BufferedBlockBody::Decoded {
+                block,
+                decoded_deep_size_bytes,
+            }
+            | BufferedBlockBody::DecodedWithRawFramePayload {
+                block,
+                decoded_deep_size_bytes,
+                ..
+            } => (block, decoded_deep_size_bytes),
             BufferedBlockBody::RawFramePayload(payload) => {
                 let mut reader = Cursor::new(&payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..]);
-                Arc::new(
+                let block = Arc::new(
                     block::Block::zcash_deserialize(&mut reader)
                         .expect("raw block bytes deserialize because the peer routine decoded them before buffering"),
+                );
+                let decoded_deep_size_bytes = block.deep_owned_size_bytes();
+                let serialized_bytes = payload.len().saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES);
+                // Metrics accepts f64 samples; these lossy conversions are observability-only.
+                metrics::histogram!(
+                    "sync.block.body.decoded.deep_size_bytes",
+                    "stage" => "reorder"
                 )
+                .record(decoded_deep_size_bytes as f64);
+                if serialized_bytes > 0 {
+                    metrics::histogram!(
+                        "sync.block.body.decoded.to_serialized_ratio",
+                        "stage" => "reorder"
+                    )
+                    .record(decoded_deep_size_bytes as f64 / serialized_bytes as f64);
+                }
+                (block, decoded_deep_size_bytes)
             }
         }
     }

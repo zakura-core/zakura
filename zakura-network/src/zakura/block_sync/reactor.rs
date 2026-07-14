@@ -104,6 +104,7 @@ pub fn spawn_block_sync_reactor(
         mpsc::channel(startup.config.submitted_apply_limit().max(1));
     let (sequencer_control_tx, sequencer_control_rx) = mpsc::unbounded_channel();
     let sequencer_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sequencer_input_decoded_deep_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
 
     let sequencer_task = SequencerTask::new(
@@ -116,6 +117,7 @@ pub fn spawn_block_sync_reactor(
         sequencer_body_input_rx,
         sequencer_control_rx,
         sequencer_input_bytes.clone(),
+        sequencer_input_decoded_deep_bytes.clone(),
         sequencer_view_tx,
         ACTION_SEND_TIMEOUT,
         startup.trace.clone(),
@@ -141,6 +143,7 @@ pub fn spawn_block_sync_reactor(
         received_throughput: state.received_throughput.clone(),
         sequencer_input: sequencer_input_tx.clone(),
         sequencer_input_bytes: sequencer_input_bytes.clone(),
+        sequencer_input_decoded_deep_bytes: sequencer_input_decoded_deep_bytes.clone(),
         sequencer_control: sequencer_control_tx.clone(),
         actions: actions_tx.clone(),
         routine_to_reactor: routine_to_reactor_tx,
@@ -177,6 +180,7 @@ pub fn spawn_block_sync_reactor(
         candidates: candidates_tx,
         sequencer_input: sequencer_input_tx,
         sequencer_input_bytes,
+        sequencer_input_decoded_deep_bytes,
         sequencer_control: sequencer_control_tx,
         sequencer_view: sequencer_view_rx,
     };
@@ -219,6 +223,8 @@ pub(super) struct BlockSyncReactor {
     sequencer_input: mpsc::Sender<SequencedBody>,
     /// Serialized bytes currently queued in [`Self::sequencer_input`].
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Decoded deep-owned bytes currently queued in [`Self::sequencer_input`].
+    sequencer_input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
     /// Non-blocking control channel to the Sequencer task. Frontier and apply
     /// progress must never wait behind downloaded body backlog.
     sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
@@ -1636,7 +1642,7 @@ impl BlockSyncReactor {
         let peers_with_status = include_diagnostics.then(|| self.registry.peers_with_status());
         // The commit-pipeline counters now live on the Sequencer task; read them
         // from the latest published view snapshot.
-        let view = self.last_view;
+        let view = *self.sequencer_view.borrow();
         let submitted_applies = view.submitted_applying_count;
         let (received_bytes_per_sec, received_blocks_per_sec) = self
             .state
@@ -1694,6 +1700,9 @@ impl BlockSyncReactor {
             let sequencer_input_queued_bytes = self
                 .sequencer_input_bytes
                 .load(std::sync::atomic::Ordering::Relaxed);
+            let sequencer_input_decoded_deep_bytes = self
+                .sequencer_input_decoded_deep_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
             let sequencer_input_max_capacity = self.sequencer_input.max_capacity();
             let sequencer_input_capacity = self.sequencer_input.capacity();
             let sequencer_input_queued_blocks =
@@ -1702,6 +1711,28 @@ impl BlockSyncReactor {
                 row,
                 "sequencer_input_queued_bytes",
                 sequencer_input_queued_bytes,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::SEQUENCER_INPUT_DECODED_DEEP_BYTES,
+                sequencer_input_decoded_deep_bytes,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::REORDER_DECODED_DEEP_BYTES,
+                view.reorder_decoded_deep_bytes,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::APPLYING_DECODED_DEEP_BYTES,
+                view.applying_decoded_deep_bytes,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::ACTIVE_PIPELINE_DECODED_DEEP_BYTES,
+                sequencer_input_decoded_deep_bytes
+                    .saturating_add(view.reorder_decoded_deep_bytes)
+                    .saturating_add(view.applying_decoded_deep_bytes),
             );
             bs_insert_u64(
                 row,
@@ -2121,6 +2152,10 @@ impl BlockSyncReactor {
     fn publish_metrics(&self) {
         // These lossy casts are metrics-only gauges; consensus and scheduling
         // continue to use the original integer values.
+        let view = *self.sequencer_view.borrow();
+        let sequencer_input_decoded_deep_bytes = self
+            .sequencer_input_decoded_deep_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
         metrics::gauge!("sync.block.best_header_tip.height")
             .set(self.state.best_header_tip.0 as f64);
         metrics::gauge!("sync.block.verified_tip.height").set(self.verified_block_tip.0 as f64);
@@ -2129,6 +2164,17 @@ impl BlockSyncReactor {
             .set(self.state.budget.reserved() as f64);
         metrics::gauge!("sync.block.reorder.buffered_bytes")
             .set(self.last_view.reorder_buffered_bytes as f64);
+        metrics::gauge!("sync.block.sequencer_input.decoded.deep_bytes")
+            .set(sequencer_input_decoded_deep_bytes as f64);
+        metrics::gauge!("sync.block.reorder.decoded.deep_bytes")
+            .set(view.reorder_decoded_deep_bytes as f64);
+        metrics::gauge!("sync.block.applying.decoded.deep_bytes")
+            .set(view.applying_decoded_deep_bytes as f64);
+        metrics::gauge!("sync.block.active_pipeline.decoded.deep_bytes").set(
+            sequencer_input_decoded_deep_bytes
+                .saturating_add(view.reorder_decoded_deep_bytes)
+                .saturating_add(view.applying_decoded_deep_bytes) as f64,
+        );
         metrics::gauge!("sync.block.applying").set(self.last_view.applying_len as f64);
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).

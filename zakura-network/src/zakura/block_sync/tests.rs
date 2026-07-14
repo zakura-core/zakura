@@ -3369,7 +3369,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
     assert_eq!(
         released
             .iter()
-            .map(|(height, _, bytes, _)| (*height, *bytes))
+            .map(|(height, _, bytes, _, _)| (*height, *bytes))
             .collect::<Vec<_>>(),
         vec![(block::Height(1), 100)]
     );
@@ -3388,7 +3388,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
     assert_eq!(
         released
             .iter()
-            .map(|(height, _, bytes, _)| (*height, *bytes))
+            .map(|(height, _, bytes, _, _)| (*height, *bytes))
             .collect::<Vec<_>>(),
         vec![(block::Height(2), 200), (block::Height(3), 300)]
     );
@@ -3410,9 +3410,14 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
     // the `Sequencer`, never touches the budget directly).
     budget.release(reorder.drop_from(block::Height(3)));
     assert_eq!(reorder.buffered_bytes(), 200);
+    assert_eq!(
+        reorder.decoded_deep_bytes(),
+        reorder.decoded_deep_bytes_scanned()
+    );
     assert_eq!(budget.reserved(), 200);
     budget.release(reorder.drop_through(block::Height(2)));
     assert_eq!(reorder.buffered_bytes(), 0);
+    assert_eq!(reorder.decoded_deep_bytes(), 0);
     assert_eq!(budget.reserved(), 0);
     assert!(budget.try_reserve(300));
     assert_eq!(
@@ -3426,6 +3431,7 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
     );
     budget.release(reorder.clear());
     assert_eq!(reorder.buffered_bytes(), 0);
+    assert_eq!(reorder.decoded_deep_bytes(), 0);
     assert_eq!(budget.reserved(), 0);
 }
 
@@ -3613,6 +3619,7 @@ fn sequencer_accept_body_buffers_then_reports_duplicate() {
     let mut seq = test_sequencer(0, 4);
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let hash = block.hash();
+    let decoded_deep_size_bytes = block.deep_owned_size_bytes();
     // First arrival above the floor buffers the body and reports its covered
     // height; the reorder buffer takes ownership of the reservation.
     assert_eq!(
@@ -3622,11 +3629,17 @@ fn sequencer_accept_body_buffers_then_reports_duplicate() {
         }
     );
     assert!(seq.reorder_contains(block::Height(1)));
+    assert_eq!(seq.reorder_decoded_deep_bytes(), decoded_deep_size_bytes);
     // A second arrival of the same buffered height is redundant; its bytes are
     // handed back for the reactor to release.
     assert_eq!(
         seq.accept_body(block::Height(1), hash, block, 100, peer(0)),
         AcceptOutcome::Redundant { release_bytes: 100 }
+    );
+    assert_eq!(seq.reorder_decoded_deep_bytes(), decoded_deep_size_bytes);
+    assert_eq!(
+        seq.reorder_decoded_deep_bytes(),
+        seq.reorder_decoded_deep_bytes_scanned()
     );
 }
 
@@ -3657,9 +3670,20 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
     );
     assert!(seq.drain_ready_into_applying().is_empty());
     assert!(seq.reorder_contains(block::Height(2)));
+    assert_eq!(seq.reorder_decoded_deep_bytes(), 0);
+    assert_eq!(
+        seq.reorder_decoded_deep_bytes(),
+        seq.reorder_decoded_deep_bytes_scanned()
+    );
 
     assert_eq!(
-        seq.accept_body(block::Height(1), block1.hash(), block1, 100, peer(0)),
+        seq.accept_body(
+            block::Height(1),
+            block1.hash(),
+            block1.clone(),
+            100,
+            peer(0),
+        ),
         AcceptOutcome::Buffered {
             covered: block::Height(1)
         }
@@ -3672,6 +3696,16 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
     assert_ne!(
         seq.applying_hash(block::Height(2)),
         Some(distinguishable_decoded_block2.hash())
+    );
+    assert_eq!(
+        seq.applying_decoded_deep_bytes(),
+        block1
+            .deep_owned_size_bytes()
+            .saturating_add(block2.deep_owned_size_bytes())
+    );
+    assert_eq!(
+        seq.applying_decoded_deep_bytes(),
+        seq.applying_decoded_deep_bytes_scanned()
     );
 }
 
@@ -3687,6 +3721,16 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
             seq.applying_buffered_bytes(),
             seq.applying_buffered_bytes_scanned(),
             "applying_buffered_bytes drifted after {label}"
+        );
+        assert_eq!(
+            seq.applying_decoded_deep_bytes(),
+            seq.applying_decoded_deep_bytes_scanned(),
+            "applying_decoded_deep_bytes drifted after {label}"
+        );
+        assert_eq!(
+            seq.reorder_decoded_deep_bytes(),
+            seq.reorder_decoded_deep_bytes_scanned(),
+            "reorder_decoded_deep_bytes drifted after {label}"
         );
         assert_eq!(
             seq.submitted_applying_count(),
@@ -3759,6 +3803,7 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
     assert_eq!(seq.applying_buffered_bytes(), 0);
     assert_eq!(seq.submitted_applying_count(), 0);
     assert_eq!(seq.submitted_applying_bytes(), 0);
+    assert_eq!(seq.applying_decoded_deep_bytes(), 0);
     check(&seq, "reset");
 }
 
@@ -4128,6 +4173,10 @@ fn sequencer_keeps_whole_body_for_contiguous_height() {
         seq.applying_hash(block::Height(1)),
         Some(distinguishable_decoded_block1.hash())
     );
+    assert_eq!(
+        seq.applying_decoded_deep_bytes(),
+        distinguishable_decoded_block1.deep_owned_size_bytes()
+    );
 }
 
 #[test]
@@ -4153,7 +4202,7 @@ fn reorder_fuzzes_arrival_order_as_parent_first() {
                 reorder.insert(block::Height(height), block.clone(), 100, peer(0)),
                 ReorderInsertResult::Inserted
             );
-            for (released, _, bytes, _) in reorder.drain_contiguous_prefix(tip) {
+            for (released, _, bytes, _, _) in reorder.drain_contiguous_prefix(tip) {
                 assert_eq!(released, block::Height(tip.0 + 1));
                 tip = released;
                 released_all.push(released);
@@ -4465,7 +4514,7 @@ fn budget_reservation_never_exceeds_max_and_only_shrinks_per_block() {
         // releases them.
         let mut floor = block::Height(0);
         let mut applied_bytes = 0;
-        for (_height, _block, bytes, _peer) in reorder.drain_contiguous_prefix(floor) {
+        for (_height, _block, bytes, _, _peer) in reorder.drain_contiguous_prefix(floor) {
             applied_bytes += bytes;
             floor = block::Height(floor.0 + 1);
         }

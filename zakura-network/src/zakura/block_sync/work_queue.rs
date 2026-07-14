@@ -17,9 +17,8 @@
 //!
 //! Internals are a brief `std::sync::Mutex` whose critical sections are tiny map
 //! splices held **never across `.await`** (the anti-block rule). `estimated_bytes`
-//! on a [`WorkItem`] is the block's size *estimate* (not its worst-case
-//! reservation); it exists only to carry the `SizeMismatch` tolerance check
-//! through to the reactor's receive path and request budget.
+//! on a [`WorkItem`] keeps the block's request-shaping estimate separate from
+//! its maximum-accepted resident reservation.
 
 use std::sync::Mutex as StdMutex;
 
@@ -36,13 +35,13 @@ pub(super) const DEFAULT_BS_SIZE_FLOOR_BYTES: u64 = 1024;
 pub(super) struct WorkItem {
     /// Expected hash of the block at this height (drives the response match).
     pub(super) hash: block::Hash,
-    /// The block's size estimate. Used for request budget reservation and the
-    /// receive-path `SizeMismatch` tolerance check.
+    /// The block's size estimate. Used for request shaping and the receive-path
+    /// `SizeMismatch` tolerance check.
     pub(super) estimated_bytes: u64,
     /// Current byte-budget charge owned by this height.
     ///
     /// Pending items normally have `Released`; issued-but-unreceived items have
-    /// `Reserved(estimate)`; received bodies held by the commit pipeline have
+    /// `Reserved(maximum accepted)`; received bodies held by the commit pipeline have
     /// `Held(actual)`. All terminal release paths go through this ledger so a
     /// stale local owner cannot release a charge that another path already
     /// returned.
@@ -103,6 +102,27 @@ fn estimate_bytes_with(estimate: BlockSizeEstimate, floor: u64) -> u64 {
         BlockSizeEstimate::Unknown => block::MAX_BLOCK_BYTES,
     };
     hinted.max(floor).min(block::MAX_BLOCK_BYTES)
+}
+
+/// Largest serialized body accepted for an estimated size.
+///
+/// The fixed percentage is a total-size multiplier (200 means 2×). The consensus
+/// block-size limit is the final authority, so reservations never exceed the
+/// largest valid serialized block.
+pub(super) fn maximum_accepted_body_bytes(estimated_bytes: u64) -> u64 {
+    const SIZE_DEVIATION_TOLERANCE_PERCENT: u64 = 200;
+
+    estimated_bytes
+        .saturating_mul(SIZE_DEVIATION_TOLERANCE_PERCENT)
+        .checked_div(100)
+        .unwrap_or(u64::MAX)
+        .min(block::MAX_BLOCK_BYTES)
+}
+
+impl WorkItem {
+    pub(super) fn maximum_accepted_bytes(self) -> u64 {
+        maximum_accepted_body_bytes(self.estimated_bytes)
+    }
 }
 
 /// The shared download work source. See the module docs for the invariants.
@@ -218,17 +238,21 @@ impl WorkQueue {
 
     /// Move up to `max_count` contiguous-ascending `pending` heights within
     /// `low..=high` from `pending` to `in_flight`, also stopping before the
-    /// sum of stored size estimates would exceed `max_estimated_bytes`.
+    /// either the sum of stored size estimates would exceed
+    /// `max_estimated_bytes`, or the sum of maximum accepted body reservations
+    /// would exceed `max_reservation_bytes`.
     ///
-    /// The estimate cap bounds the request's summed byte reservation. To
-    /// guarantee progress, the first eligible item is always taken when
-    /// `max_count > 0`, even if its estimate alone exceeds the cap.
+    /// The two caps independently bound request shaping and resident reservation.
+    /// The first item may exceed the estimate cap for progress, but may exceed the
+    /// reservation cap only for an explicit commit-window exemption.
     pub(super) fn take_in_range_budgeted(
         &self,
         low: block::Height,
         high: block::Height,
         max_count: usize,
         max_estimated_bytes: u64,
+        max_reservation_bytes: u64,
+        allow_first_reservation_overshoot: bool,
     ) -> Vec<(block::Height, WorkItem)> {
         // An empty count or inverted range is a caller bug, not a real "nothing to
         // take": every caller computes `low <= high` and a positive count before
@@ -245,6 +269,7 @@ impl WorkQueue {
         let mut inner = self.lock();
         let mut taken: Vec<(block::Height, WorkItem)> = Vec::new();
         let mut estimated_bytes = 0u64;
+        let mut reservation_bytes = 0u64;
         let mut next_expected: Option<block::Height> = None;
         for (height, item) in inner.pending.range(low..=high) {
             if let Some(expected) = next_expected {
@@ -254,12 +279,20 @@ impl WorkQueue {
             }
 
             let next_estimated_bytes = estimated_bytes.saturating_add(item.estimated_bytes);
-            if !taken.is_empty() && next_estimated_bytes > max_estimated_bytes {
+            let next_reservation_bytes =
+                reservation_bytes.saturating_add(item.maximum_accepted_bytes());
+            let estimate_over_cap = next_estimated_bytes > max_estimated_bytes;
+            let reservation_over_cap = next_reservation_bytes > max_reservation_bytes;
+            if (!taken.is_empty() && estimate_over_cap)
+                || (reservation_over_cap
+                    && (!taken.is_empty() || !allow_first_reservation_overshoot))
+            {
                 break;
             }
 
             taken.push((*height, *item));
             estimated_bytes = next_estimated_bytes;
+            reservation_bytes = next_reservation_bytes;
             if taken.len() >= max_count {
                 break;
             }
@@ -313,7 +346,7 @@ impl WorkQueue {
         }
     }
 
-    /// Mark already-taken heights as owning an estimated byte reservation.
+    /// Mark already-taken heights as owning their maximum accepted byte reservation.
     ///
     /// Returns the sum marked. The caller must have already admitted the same
     /// byte total through [`ByteBudget`](crate::zakura::transport::ByteBudget).
@@ -327,10 +360,11 @@ impl WorkQueue {
             if item.budget.current_charge() != 0 {
                 continue;
             }
-            item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
-            marked = marked.saturating_add(item.estimated_bytes);
+            let maximum_accepted_bytes = item.maximum_accepted_bytes();
+            item.budget = BlockBudgetLedger::reserved(maximum_accepted_bytes);
+            marked = marked.saturating_add(maximum_accepted_bytes);
         }
-        // Released (0) -> Reserved(estimate): the reserved total grows by exactly
+        // Released (0) -> Reserved(maximum accepted): the total grows by exactly
         // the bytes just marked.
         inner.reserved_bytes = inner.reserved_bytes.saturating_add(marked);
         marked
@@ -362,7 +396,7 @@ impl WorkQueue {
     /// Mark a height as directly held after the caller admitted `actual` bytes.
     ///
     /// Used for unmatched queued bodies, which did not have a prior request
-    /// estimate reservation.
+    /// reservation.
     pub(super) fn mark_held_direct(&self, height: block::Height, actual: u64) -> u64 {
         let mut inner = self.lock();
         if let Some(item) = inner.in_flight.get_mut(&height) {
@@ -384,7 +418,7 @@ impl WorkQueue {
         0
     }
 
-    /// Release *any* live charge (reserved estimate **or** held body bytes) for
+    /// Release *any* live charge (maximum-accepted reservation **or** held body bytes) for
     /// `heights`, exactly once. This is the non-Held-aware release: it hands back
     /// held-body bytes the Sequencer also owns, so production must never call it
     /// (see [`release_reserved_heights`](Self::release_reserved_heights) and
@@ -409,7 +443,7 @@ impl WorkQueue {
         released
     }
 
-    /// Release only the still-reserved size-estimate charges for `heights`,
+    /// Release only the still-reserved maximum-accepted charges for `heights`,
     /// exactly once, leaving each height in place.
     ///
     /// A height that already settled to `Held(actual)` is owned by the body
@@ -648,7 +682,7 @@ impl WorkQueue {
             })
     }
 
-    /// Sum of reserved request-estimate bytes across `pending` + `in_flight`.
+    /// Sum of maximum-accepted request reservations across `pending` + `in_flight`.
     ///
     /// O(1): returns the incrementally-maintained counter (see
     /// [`WorkQueueInner::reserved_bytes`]). This is on the sequencer's hot path via
@@ -738,6 +772,13 @@ impl WorkQueue {
 
     pub(super) fn pending_contains(&self, height: block::Height) -> bool {
         self.lock().pending.contains_key(&height)
+    }
+
+    pub(super) fn pending_maximum_accepted_bytes(&self, height: block::Height) -> Option<u64> {
+        self.lock()
+            .pending
+            .get(&height)
+            .map(|item| item.maximum_accepted_bytes())
     }
 
     pub(super) fn reserved_in_flight_charge(&self, height: block::Height) -> Option<u64> {

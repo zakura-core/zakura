@@ -2462,7 +2462,3 @@ fn set_block_reactor_active_connection_gauge(active_connections: usize) {
     metrics::gauge!("zakura.p2p.reactor.active_connections", "reactor" => "block_sync")
         .set(active_connections as f64);
 }
-
-pub(super) fn tolerated_bytes(reserved_bytes: u64, tolerance_percent: u32) -> u64 {
-    reserved_bytes.saturating_mul(u64::from(tolerance_percent.max(100))) / 100
-}

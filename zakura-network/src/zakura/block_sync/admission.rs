@@ -87,9 +87,14 @@ pub(super) struct AdmissionGrant {
     /// rides an exempt request; gated (above-window) grants pass the caller's
     /// servable ceiling through.
     pub(super) take_high: block::Height,
-    /// Authoritative summed-estimate byte cap for the take and its reservation.
-    /// Nothing downstream may substitute its own sizing.
-    pub(super) max_request_bytes: u64,
+    /// Summed estimate cap used for response sizing and congestion control.
+    pub(super) max_estimated_bytes: u64,
+    /// Summed maximum-accepted body cap used for resident reservation.
+    pub(super) max_reservation_bytes: u64,
+    /// Whether the first item may exceed the reservation cap.
+    ///
+    /// Only commit-window grants receive this liveness exemption.
+    pub(super) allow_first_reservation_overshoot: bool,
 }
 
 /// Return the highest start height that can be rescued by a floor request.
@@ -278,20 +283,19 @@ pub(super) fn admit(
     let priority = request_priority(snapshot.download_floor, start_height);
     let window_high = commit_window_high(&snapshot);
 
-    let (take_high, max_request_bytes) = if start_height <= window_high {
+    let (take_high, max_estimated_bytes, max_reservation_bytes) = if start_height <= window_high {
         // Exempt: liveness sizing, take clamped at the window top so the resident
         // gate's coverage of above-window heights is total.
         (
             servable_high.min(window_high),
             snapshot.budget_available.min(response_byte_cap),
+            snapshot.budget_available,
         )
     } else {
         if lookahead_over_budget(config, &snapshot) {
             return AdmissionOutcome::LookaheadAtCap;
         }
-        // Remaining memory headroom, expressed back in wire bytes for the response cap so a
-        // single response can't push resident memory past the budget. The next admitted body
-        // will usually become decoded soon, so it is sized as if it costs the decoded multiple.
+        // Remaining resident headroom expressed in serialized-body bytes.
         let remaining_wire_bytes = config
             .effective_max_reorder_lookahead_bytes()
             .saturating_sub(estimated_resident_pipeline_bytes(&snapshot))
@@ -301,25 +305,27 @@ pub(super) fn admit(
         }
         (
             servable_high,
-            snapshot
-                .budget_available
-                .min(remaining_wire_bytes)
-                .min(response_byte_cap),
+            response_byte_cap
+                .min(snapshot.budget_available)
+                .min(remaining_wire_bytes),
+            snapshot.budget_available.min(remaining_wire_bytes),
         )
     };
 
-    let max_request_bytes = if priority == RequestPriority::Floor {
-        max_request_bytes.max(1)
+    let (max_estimated_bytes, max_reservation_bytes) = if priority == RequestPriority::Floor {
+        (max_estimated_bytes.max(1), max_reservation_bytes.max(1))
     } else {
-        max_request_bytes
+        (max_estimated_bytes, max_reservation_bytes)
     };
-    if max_request_bytes == 0 {
+    if max_estimated_bytes == 0 || max_reservation_bytes == 0 {
         return AdmissionOutcome::InflightBudgetEmpty;
     }
     AdmissionOutcome::Admit(AdmissionGrant {
         priority,
         take_high,
-        max_request_bytes,
+        max_estimated_bytes,
+        max_reservation_bytes,
+        allow_first_reservation_overshoot: start_height <= window_high,
     })
 }
 

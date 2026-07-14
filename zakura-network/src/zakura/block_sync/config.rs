@@ -92,8 +92,6 @@ pub const DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN: Duration = Duration::from_secs(1
 pub const DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN: Duration = DEFAULT_BS_REQUEST_TIMEOUT;
 /// Default block-sync status refresh interval after local frontier changes.
 pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-/// Default tolerated size-hint deviation percentage before a peer is reported.
-pub const DEFAULT_BS_SIZE_DEVIATION_TOLERANCE: u32 = 200;
 /// Maximum peer-advertised aggregate byte target accepted per requested range.
 ///
 /// A range response is sent as one `Block` frame per body, and each body frame
@@ -264,8 +262,6 @@ pub struct ZakuraBlockSyncConfig {
     /// How often this node sends unsolicited status refreshes after local frontier changes.
     #[serde(with = "humantime_serde")]
     pub status_refresh_interval: Duration,
-    /// Percentage deviation from advertised body-size hints tolerated before soft scoring.
-    pub size_deviation_tolerance: u32,
     /// Steady-state cwnd as a percent of the measured bandwidth-delay product.
     pub bbr_cwnd_gain_percent: u32,
     /// ProbeBW up-probe pacing gain, percent. Reserved: the ProbeBW gain cycle is not
@@ -337,7 +333,6 @@ impl Default for ZakuraBlockSyncConfig {
             initial_block_probe_requests: DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS,
             max_requests_without_block_progress: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
             status_refresh_interval: DEFAULT_BS_STATUS_REFRESH_INTERVAL,
-            size_deviation_tolerance: DEFAULT_BS_SIZE_DEVIATION_TOLERANCE,
             bbr_cwnd_gain_percent: DEFAULT_BS_BBR_CWND_GAIN_PERCENT,
             bbr_probe_bw_gain_percent: DEFAULT_BS_BBR_PROBE_BW_GAIN_PERCENT,
             bbr_probe_rtt_interval: DEFAULT_BS_BBR_PROBE_RTT_INTERVAL,

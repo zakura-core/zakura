@@ -133,7 +133,6 @@ max_response_bytes = 33554432
 max_submitted_block_applies = 401
 no_progress_peer_cooldown = "3m"
 request_timeout = "8s"
-size_deviation_tolerance = 200
 status_refresh_interval = "30s"
 
 [network.zakura.block_sync.peer_limits]

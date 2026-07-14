@@ -11,6 +11,9 @@ Initial release of Zakura.
 
 ### Fixed
 
+- Block sync now reserves the maximum accepted body size before issuing requests,
+  preventing underestimated size hints from expanding the resident-memory budget.
+  The former `size_deviation_tolerance` setting has been replaced by a fixed 2× policy.
 - Pruned finalized blocks remain visible to chain-identity queries, including peer
   block-hash responses and RPC confirmation lookups, after their bodies are removed.
 

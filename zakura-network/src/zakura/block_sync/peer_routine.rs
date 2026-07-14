@@ -39,7 +39,6 @@ use super::{
     pipe::block_sync_guard,
     reactor::{
         block_sync_message_label, bs_insert_height, bs_insert_peer, bs_insert_str, bs_insert_u64,
-        tolerated_bytes,
     },
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
@@ -48,7 +47,7 @@ use super::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
         ThroughputMeter,
     },
-    work_queue::{WorkItem, WorkQueue, WorkReturnOutcome},
+    work_queue::{maximum_accepted_body_bytes, WorkItem, WorkQueue, WorkReturnOutcome},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
@@ -760,7 +759,9 @@ impl PeerRoutine {
                                 servable_low,
                                 grant.take_high,
                                 max_count,
-                                grant.max_request_bytes.min(floor_cwnd_cap).max(1),
+                                grant.max_estimated_bytes.min(floor_cwnd_cap).max(1),
+                                grant.max_reservation_bytes,
+                                grant.allow_first_reservation_overshoot,
                             );
                         }
                         AdmissionOutcome::LookaheadAtCap => break FillStop::LookaheadCap,
@@ -805,7 +806,9 @@ impl PeerRoutine {
                             servable_low,
                             grant.take_high,
                             max_count,
-                            grant.max_request_bytes.min(above_cwnd_cap),
+                            grant.max_estimated_bytes.min(above_cwnd_cap),
+                            grant.max_reservation_bytes,
+                            grant.allow_first_reservation_overshoot,
                         );
                     }
                     // A floor-priority start while the floor arm deferred to a
@@ -866,8 +869,11 @@ impl PeerRoutine {
             // funded as a floor reservation or given the short floor-rescue leash.
             let request_priority = classify_priority(view.download_floor, items[0].0);
 
-            let reserved_bytes = items.iter().fold(0u64, |acc, (_, item)| {
+            let estimated_bytes = items.iter().fold(0u64, |acc, (_, item)| {
                 acc.saturating_add(item.estimated_bytes)
+            });
+            let reserved_bytes = items.iter().fold(0u64, |acc, (_, item)| {
+                acc.saturating_add(item.maximum_accepted_bytes())
             });
             if !self
                 .reserve_request_budget(request_priority, reserved_bytes)
@@ -901,10 +907,10 @@ impl PeerRoutine {
                 start_height: items[0].0,
                 count,
                 anchor_hash: items[0].1.hash,
-                // The summed size-estimate reservation for this request (released
-                // on a send failure below); equals the sum of the per-height
-                // `expected_blocks` estimates.
-                estimated_bytes: reserved_bytes,
+                // The summed request-shaping estimate; equals the per-height
+                // `expected_blocks` estimates. The WorkQueue ledger separately
+                // owns the maximum-accepted reservation.
+                estimated_bytes,
                 expected_blocks: items
                     .iter()
                     .map(|(height, item)| ExpectedBlock {
@@ -952,7 +958,7 @@ impl PeerRoutine {
                 queued_at,
                 self.config.request_timeout,
                 self.config.effective_floor_rescue_timeout(),
-                reserved_bytes,
+                estimated_bytes,
                 // Filter BtlBw by the request's send time so a stale-high rate from a
                 // now-slow peer cannot tighten the deadline below what it can meet.
                 self.window.bbr_btlbw_bytes_per_sec(queued_at),
@@ -1187,7 +1193,7 @@ impl PeerRoutine {
     /// Drop this routine's outstanding requests whose whole range is at or below
     /// the download floor: their bodies have entered the commit pipeline or have
     /// already been verified, so
-    /// release the size-estimate reservation still held for any unreceived heights
+    /// release the maximum-accepted reservation still held for any unreceived heights
     /// and free the slot. No heights return to the queue (they are committed,
     /// below the floor, GC'd from the WorkQueue). A partially-committed request
     /// (suffix still above the floor) is left so its remaining bodies keep their
@@ -1317,8 +1323,7 @@ impl PeerRoutine {
                 }
             },
         };
-        if serialized_bytes > tolerated_bytes(estimated_bytes, self.config.size_deviation_tolerance)
-        {
+        if serialized_bytes > maximum_accepted_body_bytes(estimated_bytes) {
             self.report_misbehavior(BlockSyncMisbehavior::SizeMismatch)
                 .await;
             self.finish_outstanding_at(index, Disposition::RetryOriginal);
@@ -1327,10 +1332,8 @@ impl PeerRoutine {
 
         metrics::counter!("sync.block.body.received").increment(1);
         self.record_received(serialized_bytes);
-        // The block reserved its size estimate at send time; settle to the actual
-        // size. When the body is no larger than its estimate this frees the
-        // slack; when it is larger (a stale/under-advertised hint) this charges
-        // the overshoot so held bodies are never under-counted.
+        // The block reserved its maximum accepted size at send time; settle to
+        // actual bytes, releasing any slack.
         // `mark_received` then stops `reserved_bytes()` counting this height; the
         // only bytes still held are the `serialized_bytes` carried into the reorder
         // buffer.
@@ -1495,17 +1498,24 @@ impl PeerRoutine {
         };
 
         let reserved_in_flight = self.work.reserved_in_flight_charge(height);
-        let is_pending = self.work.pending_contains(height);
-        if reserved_in_flight.is_none() && !is_pending {
+        let pending_maximum_accepted = self.work.pending_maximum_accepted_bytes(height);
+        if reserved_in_flight.is_none() && pending_maximum_accepted.is_none() {
             return false;
         }
 
-        if is_pending {
+        if let Some(maximum_accepted_bytes) = pending_maximum_accepted {
+            if serialized_bytes > maximum_accepted_bytes {
+                self.report_misbehavior(BlockSyncMisbehavior::SizeMismatch)
+                    .await;
+                return true;
+            }
             let sequencer_view = *self.sequencer_view.borrow();
             let snapshot = self.admission_snapshot(&sequencer_view);
             let admitted_bytes =
                 match admit(&self.config, snapshot, height, height, serialized_bytes) {
-                    AdmissionOutcome::Admit(grant) => grant.max_request_bytes,
+                    AdmissionOutcome::Admit(grant) => {
+                        grant.max_estimated_bytes.min(grant.max_reservation_bytes)
+                    }
                     AdmissionOutcome::LookaheadAtCap | AdmissionOutcome::InflightBudgetEmpty => {
                         tracing::debug!(
                             peer = ?self.peer,
@@ -1530,7 +1540,7 @@ impl PeerRoutine {
             // This queued height owns no prior reservation: reserve its actual size
             // before buffering. If the budget is genuinely full of other legitimate
             // bodies, skip buffering (the height stays queued for retry with its own
-            // size-estimate reservation, so no valid body is lost overall).
+            // maximum-accepted reservation, so no valid body is lost overall).
             if !self.budget.try_reserve(serialized_bytes) {
                 tracing::debug!(
                     peer = ?self.peer,
@@ -1551,6 +1561,14 @@ impl PeerRoutine {
             // peer: convert the active request reservation into held bytes and settle
             // only the delta, instead of discarding a valid body because another peer
             // currently owns the request slot.
+            let Some(maximum_accepted_bytes) = reserved_in_flight else {
+                return false;
+            };
+            if serialized_bytes > maximum_accepted_bytes {
+                self.report_misbehavior(BlockSyncMisbehavior::SizeMismatch)
+                    .await;
+                return true;
+            }
             let Some(delta) = self
                 .work
                 .settle_active_reserved_height(height, serialized_bytes)
@@ -1744,7 +1762,7 @@ impl PeerRoutine {
         }
         let released_heights: Vec<_> = outstanding_unreceived_through(outstanding, tip).collect();
         let _ = outstanding.mark_received_through(tip);
-        // Held-aware: release only the still-reserved estimate for the committed
+        // Held-aware: release only the still-reserved maximum accepted size for the committed
         // prefix; a height a competing peer delivered late is owned by the
         // Sequencer, so it is left in place instead of double-released.
         let released_bytes = self.work.release_reserved_heights(released_heights);
@@ -1777,7 +1795,7 @@ impl PeerRoutine {
                 // Every requested height was received and buffered; nothing
                 // returns to the queue (buffered heights stay in `in_flight`
                 // until the floor commits past them). Release any residual
-                // reserved estimate (normally none once complete).
+                // maximum-accepted reservation (normally none once complete).
                 let released = self
                     .work
                     .release_reserved_heights(unreceived_heights(&outstanding));
@@ -2591,7 +2609,7 @@ mod tests {
         routine.servable_low = block::Height(1);
         routine.servable_high = block::Height(10);
 
-        // One fill pass: the routine reserves height 1's estimate and sends its
+        // One fill pass: the routine reserves height 1's maximum accepted size and sends its
         // request, creating an outstanding claim for a still-reserved height.
         timeout(Duration::from_secs(5), routine.try_fill())
             .await
@@ -2601,16 +2619,16 @@ mod tests {
             "height 1 is reserved and outstanding after the fill"
         );
         assert!(!work.pending_contains(block::Height(1)));
-        assert_eq!(budget_probe.reserved(), 1_000);
+        assert_eq!(budget_probe.reserved(), 2_000);
         assert_eq!(routine.window.outstanding.len(), 1);
 
         // A competing peer delivers height 1 first: settle the shared reservation to
-        // `Held(actual)`. The estimate matches the actual, so the budget is unchanged
-        // and now holds the body's actual bytes.
+        // `Held(actual)`, releasing the maximum-accepted reservation slack.
         let delta = work
             .settle_active_reserved_height(block::Height(1), 1_000)
             .expect("height 1 still owns its active reservation");
-        assert_eq!(delta, 0);
+        assert_eq!(delta, -1_000);
+        routine.apply_budget_delta(delta);
         assert_eq!(budget_probe.reserved(), 1_000);
 
         // Tear the routine down while it still lists height 1 as unreceived. `Drop`

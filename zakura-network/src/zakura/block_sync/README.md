@@ -81,12 +81,12 @@ height is just another gated height.
 
 ### Decision table
 
-| Condition | Outcome | `take_high` | `max_request_bytes` |
-| --- | --- | --- | --- |
-| `start ≤ verified_tip + 401` (in-window) | always `Admit` | `min(servable_high, window_top)` | `min(budget_available, response_byte_cap)`; Floor priority floors it at 1 |
-| `start > window` and gate full (bytes **or** blocks), or wire headroom rounds to 0 | `LookaheadAtCap` | — | — |
-| `start > window`, gate open | `Admit` | `servable_high` | `min(budget_available, remaining_wire, response_byte_cap)` |
-| any admitted sizing that still comes to 0 bytes (in-flight budget spent, non-floor) | `InflightBudgetEmpty` | — | — |
+| Condition | Outcome | `take_high` | Estimate cap | Reservation cap |
+| --- | --- | --- | --- | --- |
+| `start ≤ verified_tip + 401` (in-window) | always `Admit` | `min(servable_high, window_top)` | `min(response_byte_cap, budget_available)` | `budget_available`; Floor priority floors it at 1 |
+| `start > window` and gate full (bytes **or** blocks), or wire headroom rounds to 0 | `LookaheadAtCap` | — | — | — |
+| `start > window`, gate open | `Admit` | `servable_high` | `min(response_byte_cap, budget_available, remaining_wire)` | `min(budget_available, remaining_wire)` |
+| either admitted cap is 0 (non-floor) | `InflightBudgetEmpty` | — | — | — |
 
 where `remaining_wire = (effective_budget − estimated_resident) / DESERIALIZED_MEM_FACTOR`
 — the remaining memory headroom expressed back in wire bytes, so one admitted response
@@ -112,7 +112,13 @@ _eventual_ decoded cost, `wire_bytes × DESERIALIZED_MEM_FACTOR` (= 4):
 | `reorder_buffered_bytes` | wire-retained | the reorder→applying drain decodes the whole contiguous prefix unconditionally the moment a gap fills, with no admission re-gate |
 | `applying_buffered_bytes` | decoded `Arc<Block>` | already resident at the decoded multiple |
 | `sequencer_input_queued_bytes` | decoded | already resident |
-| `reserved_above_floor_bytes` | not received yet | in-flight bodies land and decode the same way; charging them 0× makes the landing wave invisible until it is already resident |
+| `reserved_above_floor_bytes` | not received yet | each height reserves the largest body accepted by the fixed 2× estimate policy, capped at the consensus block maximum |
+
+Request shaping still uses the advertised estimate. Resident accounting instead uses
+the fixed policy `min(estimate × 2, MAX_BLOCK_BYTES)`. Receipt replaces that
+maximum-accepted reservation with actual serialized bytes, so every accepted body can
+only preserve or reduce the aggregate charge. A full wave of underestimated responses
+therefore cannot expand beyond its reservations.
 
 Two gates, checked together in `lookahead_over_budget`:
 
@@ -124,9 +130,9 @@ Two gates, checked together in `lookahead_over_budget`:
   overhead dominates; never needed operator tuning, so it is a constant, not a
   config knob).
 
-This is separate from the **in-flight wire budget** (`max_inflight_block_bytes`,
-default 6 GiB, tracked by `ByteBudget`): that bounds bytes concurrently on the wire;
-the look-ahead gate bounds bytes _retained_ by the pipeline.
+The shared `ByteBudget` (`max_inflight_block_bytes`, default 6 GiB) carries the same
+maximum-accepted reservation until receipt and then the actual retained body charge.
+The look-ahead gate applies the decoded-memory factor and a smaller speculative cap.
 
 ### Config clamps
 
@@ -142,7 +148,7 @@ Resident memory plateaus near
 **`effective budget + one worst-case commit window`** (401 × `MAX_BLOCK_BYTES` × 4
 ≈ 3.2 GB), plus bounded transients:
 
-- the floor's first-item progress margin (≤ one block per request — see liveness below);
+- the commit window's first-item progress margin (≤ one block per request — see liveness below);
 - a single in-window response can exceed the byte gate by up to
   `response_byte_cap × 4` (in-window sizing is by the in-flight budget, for liveness);
 - concurrent peer routines admit against per-iteration snapshots, so a simultaneous
@@ -156,9 +162,10 @@ retained wire 807.7–807.9 MB → ×4 = 3.231 GB, +0.7% over budget.
 
 1. **Commit-window heights are always fundable**, on both lanes, regardless of the
    look-ahead gates — a pinned checkpoint range can always assemble.
-2. **Floor grants never size below one byte**, and `take_in_range_budgeted` always
-   takes its first item regardless of the byte cap — so the floor block is taken even
-   when the in-flight budget is exactly full, reaching the floor funding path…
+2. **Floor grants never size below one byte**, and a commit-window grant lets
+   `take_in_range_budgeted` take its first item past the reservation cap — so the
+   floor block reaches the funding path even when the in-flight budget is exactly
+   full. Above-window work never receives this exemption.
 3. **…which can shed to fund.** `reserve_request_budget`'s Floor path awaits
    `FundFloorReservation`: an above-floor reorder body is shed (returned to pending)
    to free bytes for the floor block. The floor is therefore never starved by

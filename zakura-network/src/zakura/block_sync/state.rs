@@ -891,7 +891,7 @@ impl OutstandingBlockRange {
 ///
 /// The shared [`ByteBudget`] is just the atomic sink. This ledger owns the
 /// lifecycle arithmetic for one requested height:
-/// `Reserved(estimate) -> Held(actual) -> Released`.
+/// `Reserved(maximum accepted) -> Held(actual) -> Released`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum BlockBudgetLedger {
     Reserved(u64),
@@ -900,8 +900,8 @@ pub(super) enum BlockBudgetLedger {
 }
 
 impl BlockBudgetLedger {
-    pub(super) fn reserved(estimate: u64) -> Self {
-        Self::Reserved(estimate)
+    pub(super) fn reserved(maximum_accepted: u64) -> Self {
+        Self::Reserved(maximum_accepted)
     }
 
     pub(super) fn current_charge(self) -> u64 {

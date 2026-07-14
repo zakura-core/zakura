@@ -93,7 +93,6 @@ max_inflight_requests = 4
 max_response_bytes = 33554432
 replace_legacy_syncer = false
 request_timeout = "30s"
-size_deviation_tolerance = 200
 status_refresh_interval = "30s"
 
 [network.zakura.block_sync.peer_limits]

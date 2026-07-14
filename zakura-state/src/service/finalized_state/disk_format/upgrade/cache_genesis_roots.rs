@@ -84,19 +84,20 @@ pub fn quick_check(db: &ZakuraDb) -> Result<(), String> {
     // A fast-sync commit can set the VCT marker after the `is_vct_synced()`
     // check above but before these tree reads. In that case the readers return
     // `None` for the absent per-height trees, and this genesis-root check no
-    // longer applies. Non-VCT databases still panic on genuinely missing genesis
-    // trees inside the readers.
+    // longer applies. Recheck the marker on each `None`: Sprout anchor lookup
+    // also returns `None` for a genuinely missing non-VCT anchor, which must not
+    // be mistaken for the race.
     let sprout_genesis_tree = sprout::tree::NoteCommitmentTree::default();
     let Some(sprout_genesis_tree) = db.sprout_tree_by_anchor(&sprout_genesis_tree.root()) else {
-        return Ok(());
+        return missing_genesis_tree_or_vct_race(db, "sprout");
     };
     let sprout_tip_tree = db.sprout_tree_for_tip();
 
     let Some(sapling_genesis_tree) = db.sapling_tree_by_height(&Height(0)) else {
-        return Ok(());
+        return missing_genesis_tree_or_vct_race(db, "sapling");
     };
     let Some(orchard_genesis_tree) = db.orchard_tree_by_height(&Height(0)) else {
-        return Ok(());
+        return missing_genesis_tree_or_vct_race(db, "orchard");
     };
 
     // Check the entire format before returning any errors.
@@ -128,6 +129,14 @@ pub fn quick_check(db: &ZakuraDb) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn missing_genesis_tree_or_vct_race(db: &ZakuraDb, pool: &'static str) -> Result<(), String> {
+    if db.is_vct_synced() {
+        Ok(())
+    } else {
+        Err(format!("missing {pool} genesis tree in non-VCT database"))
+    }
 }
 
 /// Detailed check that all trees have cached roots.
@@ -196,4 +205,78 @@ pub fn detailed_check(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use zakura_chain::{
+        block::Block, orchard, parameters::Network, sapling, serialization::ZcashDeserializeInto,
+    };
+
+    use crate::{
+        constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+        request::{FinalizedBlock, Treestate},
+        service::finalized_state::STATE_COLUMN_FAMILIES_IN_CODE,
+        CheckpointVerifiedBlock, Config,
+    };
+
+    use super::*;
+
+    fn db_with_genesis_trees() -> ZakuraDb {
+        let db = ZakuraDb::new(
+            &Config::ephemeral(),
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &Network::Mainnet,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .expect("opening an ephemeral finalized state database should succeed");
+        let genesis = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("mainnet genesis block deserializes");
+        let finalized = FinalizedBlock::from_checkpoint_verified(
+            CheckpointVerifiedBlock::from(genesis),
+            Treestate::default(),
+        );
+
+        let mut batch = DiskWriteBatch::new();
+        batch
+            .prepare_block_header_and_transaction_data_batch(&db, &finalized, true, None)
+            .expect("genesis header and transaction rows are valid");
+        batch.update_sprout_tree(&db, &sprout::tree::NoteCommitmentTree::default());
+        batch.create_sapling_tree(
+            &db,
+            &Height::MIN,
+            &sapling::tree::NoteCommitmentTree::default(),
+        );
+        batch.create_orchard_tree(
+            &db,
+            &Height::MIN,
+            &orchard::tree::NoteCommitmentTree::default(),
+        );
+        db.write_batch(batch)
+            .expect("genesis-format rows write successfully");
+
+        db
+    }
+
+    #[test]
+    fn quick_check_rejects_missing_sprout_genesis_anchor_without_vct_marker() {
+        let db = db_with_genesis_trees();
+        assert!(quick_check(&db).is_ok());
+
+        let mut batch = DiskWriteBatch::new();
+        batch.delete_sprout_anchor(&db, &sprout::tree::NoteCommitmentTree::default().root());
+        db.write_batch(batch)
+            .expect("deleting the test Sprout anchor succeeds");
+
+        let error = quick_check(&db).expect_err("missing non-VCT Sprout anchor must fail");
+        assert_eq!(error, "missing sprout genesis tree in non-VCT database");
+    }
 }

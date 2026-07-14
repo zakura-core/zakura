@@ -118,3 +118,18 @@ fn history_tree_parts_round_trips_current_width() {
     assert_eq!(parsed.current_height, Height(9));
     assert_eq!(parsed.as_bytes(), bytes);
 }
+
+/// A truncated current-width row must not be reinterpreted as a complete legacy row.
+///
+/// The first four bytes of the Ironwood amount sit where the legacy layout stored the block size,
+/// so accepting this length would silently lose the Ironwood pool and manufacture a size.
+#[test]
+#[should_panic(expected = "invalid block info format length")]
+fn block_info_rejects_truncated_ironwood_value_pools() {
+    let ironwood_amount =
+        zakura_chain::amount::Amount::<NonNegative>::try_from(7).expect("7 zatoshi is valid");
+    let block_info = BlockInfo::new(ValueBalance::from_ironwood_amount(ironwood_amount), 123);
+    let bytes = block_info.as_bytes();
+
+    BlockInfo::from_bytes(&bytes[..48]);
+}

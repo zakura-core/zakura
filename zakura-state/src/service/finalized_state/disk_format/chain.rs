@@ -175,8 +175,11 @@ impl FromDisk for BlockInfo {
 
         let bytes = bytes.as_ref();
 
-        // We want to be forward-compatible, so this must work even if the
-        // size of the buffer is larger than expected.
+        // We want to be forward-compatible with extensions of the current format,
+        // so this must work even if the size of the buffer is larger than expected.
+        // Lengths between the legacy and current formats are incomplete rows, not
+        // forward-compatible extensions: accepting them as legacy would interpret
+        // the first Ironwood amount bytes as the block size.
         match bytes.len() {
             IRONWOOD_BLOCK_INFO_LEN.. => {
                 let value_pools =
@@ -189,7 +192,7 @@ impl FromDisk for BlockInfo {
                 );
                 BlockInfo::new(value_pools, size)
             }
-            NU6_1_BLOCK_INFO_LEN.. => {
+            NU6_1_BLOCK_INFO_LEN => {
                 let value_pools =
                     ValueBalance::<NonNegative>::from_bytes(&bytes[..NU6_1_VALUE_BALANCE_LEN])
                         .expect("must work for 40 bytes");
@@ -200,7 +203,7 @@ impl FromDisk for BlockInfo {
                 );
                 BlockInfo::new(value_pools, size)
             }
-            _ => panic!("invalid format"),
+            _ => panic!("invalid block info format length: {}", bytes.len()),
         }
     }
 }

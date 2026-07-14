@@ -90,7 +90,7 @@ impl FromDisk for orchard::tree::Root {
 /// The per-height Sapling and Orchard note-commitment roots, as stored in the
 /// `commitment_roots_by_height` index (keyed by [`Height`]).
 ///
-/// Every node persists this 64-byte value for each committed block — including a
+/// Every node persists this value for each committed block — including a
 /// verified-commitment-trees fast-synced node, which folds these roots in but writes no
 /// per-height note-commitment trees. It lets such a node still serve the `tree_aux`
 /// `BlockRoots` read from a compact index rather than from the (absent) trees.
@@ -118,11 +118,18 @@ pub struct CommitmentRootsByHeight {
     pub ironwood_tx: u64,
 }
 
+/// Rows written before the auth-data root was added.
+const PRE_AUTH_DATA_ROOTS_DISK_BYTES: usize = 64;
+/// Rows written before Ironwood roots and shielded transaction counts were added.
+const PRE_IRONWOOD_ROOTS_DISK_BYTES: usize = 96;
+/// Rows written by the current format.
+const CURRENT_ROOTS_DISK_BYTES: usize = 152;
+
 impl IntoDisk for CommitmentRootsByHeight {
-    type Bytes = [u8; 152];
+    type Bytes = [u8; CURRENT_ROOTS_DISK_BYTES];
 
     fn as_bytes(&self) -> Self::Bytes {
-        let mut out = [0u8; 152];
+        let mut out = [0u8; CURRENT_ROOTS_DISK_BYTES];
         out[..32].copy_from_slice(&IntoDisk::as_bytes(&self.sapling));
         out[32..64].copy_from_slice(&IntoDisk::as_bytes(&self.orchard));
         out[64..96].copy_from_slice(&<[u8; 32]>::from(self.auth_data_root));
@@ -141,28 +148,39 @@ impl FromDisk for CommitmentRootsByHeight {
         // this database version (64 bytes pre-auth-data, 96 bytes pre-ironwood/counts): the
         // missing fields decode as empty/zero, so the writer falls back to the body-wait path
         // for those heights until they are re-served with full data. New rows are 152 bytes.
-        let auth_data_root = if bytes.len() >= 96 {
+        //
+        // Partial rows between those complete layouts are corruption, not a compatible older
+        // format. Reject them before a truncated current row can be silently interpreted as an
+        // older row with defaulted Ironwood roots/counts.
+        match bytes.len() {
+            PRE_AUTH_DATA_ROOTS_DISK_BYTES | PRE_IRONWOOD_ROOTS_DISK_BYTES => {}
+            CURRENT_ROOTS_DISK_BYTES.. => {}
+            len => panic!("invalid commitment roots format length: {len}"),
+        }
+
+        let auth_data_root = if bytes.len() >= PRE_IRONWOOD_ROOTS_DISK_BYTES {
             let mut auth_data_root = [0u8; 32];
             auth_data_root.copy_from_slice(&bytes[64..96]);
             AuthDataRoot::from(auth_data_root)
         } else {
             AuthDataRoot::from([0u8; 32])
         };
-        let (ironwood, sapling_tx, orchard_tx, ironwood_tx) = if bytes.len() >= 152 {
-            (
-                ironwood::tree::Root::from_bytes(&bytes[96..128]),
-                u64::from_be_bytes(bytes[128..136].try_into().expect("8 bytes")),
-                u64::from_be_bytes(bytes[136..144].try_into().expect("8 bytes")),
-                u64::from_be_bytes(bytes[144..152].try_into().expect("8 bytes")),
-            )
-        } else {
-            (
-                ironwood::tree::NoteCommitmentTree::default().root(),
-                0,
-                0,
-                0,
-            )
-        };
+        let (ironwood, sapling_tx, orchard_tx, ironwood_tx) =
+            if bytes.len() >= CURRENT_ROOTS_DISK_BYTES {
+                (
+                    ironwood::tree::Root::from_bytes(&bytes[96..128]),
+                    u64::from_be_bytes(bytes[128..136].try_into().expect("8 bytes")),
+                    u64::from_be_bytes(bytes[136..144].try_into().expect("8 bytes")),
+                    u64::from_be_bytes(bytes[144..152].try_into().expect("8 bytes")),
+                )
+            } else {
+                (
+                    ironwood::tree::NoteCommitmentTree::default().root(),
+                    0,
+                    0,
+                    0,
+                )
+            };
         CommitmentRootsByHeight {
             sapling: sapling::tree::Root::from_bytes(&bytes[..32]),
             orchard: orchard::tree::Root::from_bytes(&bytes[32..64]),
@@ -174,6 +192,9 @@ impl FromDisk for CommitmentRootsByHeight {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 impl IntoDisk for NoteCommitmentSubtreeIndex {
     type Bytes = [u8; 2];

@@ -7,29 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [3.0.0] - 2026-03-12
-
-### Breaking Changes
-
-- `mock_service::MockService::expect_no_requests` now returns `()` instead of its previous return type.
-
-## [2.0.0] - 2025-10-15
-
-Test utilities were streamlined and Orchard vector fixtures were reorganized as an effort to
-use `orchard::bundle::BatchValidator` in the transaction verifier ([#9308](https://github.com/ZcashFoundation/zebra/pull/9308)).
-
-## Breaking Changes
-
-- `MockService::expect_no_requests` now returns `()` (it previously returned a value).
-- Removed now-unused test data ([#9308](https://github.com/ZcashFoundation/zebra/pull/9308))
-
-## [1.0.1] - 2025-08-07
-
-## Changed
-
-- Clippy fixes
-
-## [1.0.0] - 2025-07-11
+## [1.0.0] - 2026-07-14
 
 First "stable" release. However, be advised that the API may still greatly
 change so major version bumps can be common.
+
+## Pre-fork history
+
+This crate was forked from Zebra at v5.0.0. Earlier history is available in the
+[upstream changelog](https://github.com/ZcashFoundation/zebra/blob/v5.0.0/zebra-test/CHANGELOG.md).

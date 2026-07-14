@@ -22,14 +22,14 @@ pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_412_800;
 ///
 /// - Zebra will exit with a panic if the current tip height is bigger than the
 ///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
-/// - Currently set to 18 days
+/// - Currently set to 7 days
 ///
 /// Note: this is for the initial release of v1.0.0
 /// since we are aiming for a follow-up stable release in a few weeks
-pub const EOS_PANIC_AFTER: u32 = 18;
+pub const EOS_PANIC_AFTER: u32 = 7;
 
 /// The number of days before the end of support where Zebra will display warnings.
-pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 5;
+pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;
 
 /// A string which is part of the panic that will be displayed if Zebra halts.
 pub const EOS_PANIC_MESSAGE_HEADER: &str = "Zakura refuses to run";

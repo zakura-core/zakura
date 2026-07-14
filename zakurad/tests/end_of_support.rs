@@ -7,7 +7,9 @@ use std::time::Duration;
 use color_eyre::eyre::Result;
 
 use zakura_chain::{block::Height, chain_tip::mock::MockChainTip, parameters::Network};
-use zakurad::components::sync::end_of_support::{self, EOS_PANIC_AFTER, ESTIMATED_RELEASE_HEIGHT};
+use zakurad::components::sync::end_of_support::{
+    self, EOS_PANIC_AFTER, EOS_WARN_AFTER, EOS_WARN_MESSAGE_HEADER, ESTIMATED_RELEASE_HEIGHT,
+};
 
 // Estimated blocks per day with the current 75 seconds block spacing.
 const ESTIMATED_BLOCKS_PER_DAY: u32 = 1152;
@@ -37,7 +39,7 @@ fn end_of_support_function() {
     assert!(logs_contain("Zakura release is supported"));
 
     // We are in warn range
-    let warn = ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * 1152) - (3 * ESTIMATED_BLOCKS_PER_DAY);
+    let warn = ESTIMATED_RELEASE_HEIGHT + (EOS_WARN_AFTER * ESTIMATED_BLOCKS_PER_DAY) + 1;
 
     end_of_support::check(Height(warn), &Network::Mainnet);
     assert!(logs_contain(
@@ -64,9 +66,7 @@ fn end_of_support_date() {
     assert!(logs_contain(
         "Checking if Zakura release is inside support range ..."
     ));
-    assert!(!logs_contain(
-        "Your Zakura release is too old and it will stop running in"
-    ));
+    assert!(!logs_contain(EOS_WARN_MESSAGE_HEADER));
 }
 
 /// Check that the end of support task is working.

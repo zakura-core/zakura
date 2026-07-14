@@ -16,6 +16,10 @@ test a fresh genesis-to-tip sync from the latest `origin/main` build:
 Each node runs a local systemd controller. GitHub Actions installs and audits the
 controller, but it does not hold an SSH session open during the long sync.
 
+The dual-stack and Zakura/v2-only nodes exercise the [experimental Zakura P2P
+v2 stack](../../book/src/user/p2p.md); this fleet is test infrastructure, not an
+assertion that the native stack is production-hardened.
+
 ## Lifecycle
 
 `zakura-continuous-sync.service` runs

@@ -115,8 +115,8 @@ fn document_network_p2p_config(config: &str) -> String {
     let comments = [
         "# The peer-to-peer stack to run:",
         "# - \"legacy\": the legacy TCP Zcash P2P stack only.",
-        "# - \"zakura\": the native Zakura P2P v2 stack only.",
-        "# - \"dual\": both stacks, with legacy fallback.",
+        "# - \"zakura\": the experimental native Zakura P2P v2 stack only.",
+        "# - \"dual\": both stacks, enabling experimental v2 with legacy fallback.",
         "# - \"default\": Zakura's default for this network, which can change between",
         "#   releases. Currently \"legacy\" on Mainnet, and \"dual\" everywhere else.",
     ]

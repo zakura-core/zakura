@@ -2,6 +2,10 @@
 
 Plan: `/home/evan/src/valar/art/inbox/zakura_p2p/00.0_iroh_dependency.md`
 
+> **Status:** This decision contributes to the [experimental Zakura P2P v2
+> stack](../../../book/src/user/p2p.md); it does not indicate production
+> hardening.
+
 ## Decision
 
 Zakura pins `iroh = "=0.92.0"` in the workspace with `default-features = false`.

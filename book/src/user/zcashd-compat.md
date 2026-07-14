@@ -211,6 +211,10 @@ legacy Zcash P2P protocol. Every `network.p2p_stack` value runs it except
 `"zakura"`. Do not enable state pruning on the fronting Zakura — a pruned node does
 not advertise `NODE_NETWORK` and zcashd will not sync from it.
 
+The `"zakura"` and `"dual"` modes enable the [experimental Zakura P2P v2
+stack](./p2p.md); zcashd itself continues to use the legacy connection in dual
+mode.
+
 > [!WARNING]
 > When the fronting Zakura runs in Docker with a published P2P port, all
 > connections arriving through `docker-proxy` (including a sidecar zcashd

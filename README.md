@@ -32,7 +32,7 @@ Zakura is forked off of [Zebra](https://github.com/ZcashFoundation/zebra). This 
 
 ## Getting Started
 
-There are several ways to install the node software. Install from an interactive installer, crates.io, source or Docker.
+There are several ways to install the node software. Install from an interactive installer which downloads the binary, Docker, source or crates.
 
 ### Installer
 
@@ -44,14 +44,6 @@ curl -fsSL https://raw.githubusercontent.com/zakura-core/zakura/main/scripts/ins
 
 The installer can set up either standard Zakura or its
 [zcashd-compatible variant](book/src/user/zcashd-compat.md).
-
-### Crates.io
-
-Install from [crates.io](https://crates.io/crates/zakura) with
-
-```console
-cargo install zakura
-```
 
 ### Docker
 

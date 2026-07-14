@@ -743,6 +743,45 @@ fn known_block_reports_finalized_block_after_body_pruned() {
 }
 
 #[test]
+fn best_chain_hash_reads_survive_finalized_body_pruning() {
+    let _init_guard = zakura_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+
+    write_full_block_header_and_transactions(&state, block1.clone());
+
+    let tx_by_loc = state.db.cf_handle("tx_by_loc").unwrap();
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_delete_range(
+        &tx_by_loc,
+        TransactionLocation::min_for_height(Height(1)),
+        TransactionLocation::min_for_height(Height(2)),
+    );
+    state.db.write(batch).expect("body prune writes");
+
+    assert!(!state.contains_body_at_height(Height(1)));
+    assert_eq!(state.height(block1.hash()), Some(Height(1)));
+
+    let no_chain = Option::<Arc<crate::service::non_finalized_state::Chain>>::None;
+    assert_eq!(
+        read::depth(no_chain.clone(), &state, block1.hash()),
+        Some(0)
+    );
+    assert_eq!(
+        read::hash_by_height(no_chain.clone(), &state, Height(1)),
+        Some(block1.hash()),
+    );
+    assert!(read::find::chain_contains_hash(
+        no_chain.clone(),
+        &state,
+        block1.hash()
+    ));
+    assert_eq!(
+        read::find_chain_headers(no_chain, &state, vec![genesis.hash()], None, 1),
+        vec![block1.header.clone()],
+    );
+}
+
+#[test]
 fn header_range_commit_rejects_finalized_or_body_conflicts() {
     let _init_guard = zakura_test::init();
     let (state, genesis, block1) = mainnet_state_with_genesis();

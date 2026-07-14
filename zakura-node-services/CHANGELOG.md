@@ -7,88 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- `mempool::Request::QueueFromPeer` now queues `Vec<Gossip>` as
-  `transactions`, instead of only transaction IDs, so peer-pushed transactions
-  can be verified directly while still using per-peer mempool admission caps.
-
-## [7.0.0] - 2026-06-02
-
-### Changed
-
-- Update to `zebra-chain` 9.0.0 (NU6.2 support). No other changes to this crate.
-
-## [6.0.0] - 2026-05-28
-
-### Added
-
-- `mempool::Request::QueueFromPeer { txids: HashSet<UnminedTxId>, source: SocketAddr }`
-  variant, used to attribute mempool advertisements to the announcing peer for
-  per-peer queue caps
-  ([GHSA-4fc2-h7jh-287c](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-4fc2-h7jh-287c)).
-
-### Changed
-
-- `zebra-chain` dependency bumped to `8.0.0`. Consumers of re-exported
-  `zebra-chain` items inherit that crate's breaking changes.
-
-## [5.0.0] - 2026-05-01
-
-### Changed
-
-- `zebra-chain` bumped to `7.0.0`. No direct public-API changes in this crate,
-  but consumers of re-exported `zebra-chain` items (e.g. `constants` from
-  `parameters::checkpoint`) inherit that crate's breaking changes.
-
-## [4.0.0] - 2026-03-12
-
-### Breaking Changes
-
-- `zebra-chain` dependency bumped to `6.0.0`.
-
-### Added
-
-- Added `Request::UnspentOutput`, `Response::TransparentOutput` and `CreatedOrSpent` to the mempool service.
-
-## [3.0.0] - 2026-02-05
-
-### Breaking Changes
-
-- `zebra-chain` dependency bumped to `5.0.0`.
-
-## [2.1.2] - 2026-01-21 - Yanked
-
-This should have been a major release, see 4.0.0.
-
-Dependencies updated.
-
-## [2.1.1] - 2025-11-28
-
-No API changes; internal dependencies updated.
-
-## [2.1.0] - 2025-11-17
-
-### Added
-
-- Added helper traits for types implementing tower services ([#10010](https://github.com/ZcashFoundation/zebra/pull/10010))
-
-## [2.0.0] - 2025-10-15
-
-Added support for `getmempoolinfo` RPC method ([#9870](https://github.com/ZcashFoundation/zebra/pull/9870)).
-
-### Breaking Changes
-
-- Added `Request::QueueStats` and `Response::QueueStats` variants.
-- Removed `constants` module.
-
-## [1.0.1] - 2025-08-07
-
-### Changed
-
-- Bumped `zebra-chain` to `2.0.0`.
-
-## [1.0.0] - 2025-07-11
+## [1.0.0] - 2026-07-14
 
 First "stable" release. However, be advised that the API may still greatly
 change so major version bumps can be common.
+
+## Pre-fork history
+
+This crate was forked from Zebra at v5.0.0. Earlier history is available in the
+[upstream changelog](https://github.com/ZcashFoundation/zebra/blob/v5.0.0/zebra-node-services/CHANGELOG.md).

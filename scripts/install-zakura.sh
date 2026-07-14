@@ -40,7 +40,11 @@ INSTALL_PROFILE=""
 MODE=""
 NETWORK="Mainnet"
 ZCASHD_DEFAULT_DATADIR="${HOME}/.zcash"
-ZAKURA_STANDALONE_STATE_DIR="/mnt/data/zakura-state"
+if [[ -d /mnt ]]; then
+  ZAKURA_STANDALONE_STATE_DIR="/mnt/data/zakura-state"
+else
+  ZAKURA_STANDALONE_STATE_DIR="$ZAKURA_DEFAULT_CACHE_DIR"
+fi
 ZAKURA_STANDALONE_INSTALL_DIR="${HOME}/.local/zakura"
 ZAKURA_STANDALONE_CACHE_DIR="${HOME}/.cache/zakura"
 ZAKURA_COMPAT_INSTALL_DIR="${HOME}/.local/zcashd-compat"
@@ -2232,10 +2236,9 @@ default_p2p_port() {
   esac
 }
 
-# The standalone default (/mnt/data/zakura-state) is only usable by root on a
-# stock cloud image, so run the same capacity- and permission-aware search the
-# zcashd-compat profile uses. A large writable volume still wins; otherwise this
-# lands on ~/.cache/zakura instead of a path the user cannot create.
+# Run the same capacity- and permission-aware search the zcashd-compat profile
+# uses. A large writable volume still wins; otherwise keep the initial default:
+# /mnt/data/zakura-state when /mnt exists, or Zakura's platform cache directory.
 default_recommend_datadir_defaults() {
   if ((ZAKURA_STATE_DIR_SET)); then
     return

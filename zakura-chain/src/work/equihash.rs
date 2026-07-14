@@ -94,9 +94,9 @@ impl Solution {
     /// the attacker-controlled solution length. A solution whose variant does
     /// not match the parameters `network` requires is rejected: Mainnet and
     /// Testnet require the memory-hard `(200, 9)` [`Solution::Common`]
-    /// solution, and the toy `(48, 5)` [`Solution::Regtest`] solution is only
-    /// accepted on Regtest. This prevents a peer from downgrading the proof of
-    /// work by choosing the on-wire solution length.
+    /// solution, while Regtest requires the toy `(48, 5)`
+    /// [`Solution::Regtest`] solution. This prevents a peer from changing the
+    /// proof-of-work parameters by choosing the on-wire solution length.
     #[allow(clippy::unwrap_in_result)]
     pub fn check(&self, header: &Header, network: &Network) -> Result<(), Error> {
         // TODO:
@@ -106,15 +106,13 @@ impl Solution {
             // Mainnet and Testnet require the memory-hard (200, 9) parameters,
             // encoded as a 1344-byte `Common` solution.
             (false, Solution::Common(_)) => (200, 9),
-            // Regtest accepts either the toy (48, 5) solution used by its
-            // genesis block or a full (200, 9) solution from a miner.
-            (true, Solution::Common(_)) => (200, 9),
+            // Regtest requires the toy (48, 5) parameters used by zcashd.
             (true, Solution::Regtest(_)) => (REGTEST_N, REGTEST_K),
-            // A 36-byte `Regtest`-shaped solution is not a valid proof of work
-            // on Mainnet or Testnet. Reject it before selecting parameters, so
-            // the attacker-controlled solution length cannot downgrade the PoW
-            // to the trivial (48, 5) parameter set.
-            (false, Solution::Regtest(_)) => {
+            // Reject a solution variant that does not match the active
+            // network before selecting parameters. Otherwise the
+            // attacker-controlled solution length could change the PoW
+            // parameter set.
+            (false, Solution::Regtest(_)) | (true, Solution::Common(_)) => {
                 return Err(Error::InvalidSolutionSize {
                     network: network.clone(),
                 })

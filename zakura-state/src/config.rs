@@ -10,7 +10,7 @@ use std::{
 
 use semver::Version;
 use serde::{
-    de::{self, IgnoredAny, MapAccess, Visitor},
+    de::{self, MapAccess, Visitor},
     Deserialize, Deserializer, Serialize,
 };
 use tokio::task::{spawn_blocking, JoinHandle};
@@ -362,6 +362,10 @@ impl From<StorageModeSerde> for StorageMode {
 
 struct StorageModeVisitor;
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyArchiveConfig {}
+
 impl<'de> Visitor<'de> for StorageModeVisitor {
     type Value = StorageMode;
 
@@ -390,7 +394,7 @@ impl<'de> Visitor<'de> for StorageModeVisitor {
 
         let storage_mode = match key.as_str() {
             "archive" => {
-                map.next_value::<IgnoredAny>()?;
+                let _ = map.next_value::<EmptyArchiveConfig>()?;
                 StorageMode::Archive
             }
             "pruned" => StorageMode::Pruned(map.next_value()?),
@@ -473,6 +477,25 @@ mod tests {
         let archive: Config = toml::from_str(r#"storage_mode = "archive""#)
             .expect("archive storage mode deserializes from a string");
         assert_eq!(archive.storage_mode, StorageMode::Archive);
+        assert!(
+            archive.checkpoint_sync && archive.vct_fast_sync,
+            "serde defaults preserve the internal checkpoint/VCT mirrors until zakurad overwrites them"
+        );
+
+        let archive_table: Config = toml::from_str("[storage_mode.archive]")
+            .expect("an empty archive storage mode table deserializes");
+        assert_eq!(archive_table.storage_mode, StorageMode::Archive);
+
+        assert!(
+            toml::from_str::<Config>(
+                r#"
+                [storage_mode.archive]
+                tx_retention = 6000
+                "#,
+            )
+            .is_err(),
+            "archive mode must not silently ignore pruned-only or misspelled settings"
+        );
 
         let repair_enabled: Config =
             toml::from_str(r#"repair_zakura_header_store_on_startup = true"#)

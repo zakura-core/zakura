@@ -5,8 +5,7 @@ operator-facing setup guide, see
 [`book/src/dev/private-zakura-network.md`](../../../book/src/dev/private-zakura-network.md).
 
 The native Zakura P2P v2 stack is
-[experimental](../../../book/src/user/p2p.md). Cohort isolation is a development
-tool and does not address the stack's known DoS risks.
+[experimental](../../../book/src/user/p2p.md).
 
 ## What it does
 

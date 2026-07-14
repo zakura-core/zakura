@@ -3,8 +3,7 @@
 Plan: `/home/evan/src/valar/art/inbox/zakura_p2p/01.b_test_tooling.md`
 
 > **Status:** This tooling supports the [experimental Zakura P2P v2
-> stack](../../../book/src/user/p2p.md); passing these tests does not indicate
-> production hardening.
+> stack](../../../book/src/user/p2p.md).
 
 ## Applied in This Fix
 

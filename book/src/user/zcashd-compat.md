@@ -206,14 +206,14 @@ manage_zcashd = false
 block_gossip_peer_ips = ["127.0.0.1"]
 ```
 
-zcashd-compat mode requires the legacy Zcash P2P stack, because zcashd speaks the
-legacy Zcash P2P protocol. Every `network.p2p_stack` value runs it except
-`"zakura"`. Do not enable state pruning on the fronting Zakura — a pruned node does
-not advertise `NODE_NETWORK` and zcashd will not sync from it.
+zcashd only connects to Zakura using the legacy Zcash P2P protocol. The fronting
+Zakura must therefore use `network.p2p_stack = "legacy"` or `"dual"`; Zakura
+refuses to start zcashd-compat mode with the `"zakura"`-only setting. The
+`"dual"` setting also enables the [experimental Zakura P2P v2 stack](./p2p.md),
+but the zcashd sidecar still connects over Zakura's legacy listener.
 
-The `"zakura"` and `"dual"` modes enable the [experimental Zakura P2P v2
-stack](./p2p.md); zcashd itself continues to use the legacy connection in dual
-mode.
+Do not enable state pruning on the fronting Zakura — a pruned node does not
+advertise `NODE_NETWORK` and zcashd will not sync from it.
 
 > [!WARNING]
 > When the fronting Zakura runs in Docker with a published P2P port, all

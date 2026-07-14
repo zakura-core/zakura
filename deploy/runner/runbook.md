@@ -7,8 +7,7 @@ feature, PR #262), so other engineers churning the public fleet can't perturb a
 run. Background: `book/src/dev/private-zakura-network.md`.
 
 This benchmark intentionally exercises the [experimental Zakura P2P v2
-stack](../../book/src/user/p2p.md). Its isolation improves measurement
-repeatability but does not remove the native stack's known DoS risks.
+stack](../../book/src/user/p2p.md).
 
 Everything lives in `/root/zakura/deploy/runner/` (untracked local tooling).
 `perf.sh` is the entry point — it wraps the deployer and the run/analyze scripts.

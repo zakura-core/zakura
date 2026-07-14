@@ -11,6 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)
 
 - [Getting Started](#getting-started)
+  - [Installer](#installer)
   - [Docker](#docker)
   - [Manual Install](#manual-install)
 - [Documentation](#documentation)
@@ -22,17 +23,32 @@
 
 Zakura is forked off of [Zebra](https://github.com/ZcashFoundation/zebra). This first release brings major improvements over existing Zcash node software:
 
-- Performance: Blockchain sync is nearly 5× faster than Zebra. Block execution is notably faster than Zebra on worst case sandblast attacks as well.
+- Performance: Blockchain sync is nearly 5× faster than Zebra. Block execution is notably faster than Zebra, especially on worst case sandblast attacks.
 - Pruning and snapshots: Native block pruning with configurable retention cuts disk usage substantially. We also publish snapshots (~11 GB pruned) that let you bootstrap a node 680× faster than syncing over the standard P2P network. See [here](https://zakura.com/snapshots/)
-- zcashd compatibility: A compatibility mode reproduces the legacy zcashd RPC interface, so existing wallets and integrations keep working.
-- Experimental P2P v2: We are building a new P2P transport layer for Zakura nodes, currently off by default on Mainnet. The goals are sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol. The native stack has known DoS risks and is not yet production-hardened; see its [current tradeoffs and exit criteria](book/src/user/p2p.md).
+- [zcashd compatibility](book/src/user/zcashd-compat.md): A compatibility mode
+  reproduces the legacy zcashd RPC interface, so existing wallets and
+  integrations keep working.
+- Experimental P2P v2: We are building a new P2P transport layer for Zakura nodes, currently off by default on Mainnet. The goals are sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol. The v2 stack has known DoS risks and is not yet production-hardened; see its [current tradeoffs and production readiness criteria](book/src/user/p2p.md).
 
 ## Getting Started
 
-You can run Zakura using our [Docker
-image](https://hub.docker.com/r/valargroup/zakura/tags) or you can install it manually.
+There are several ways to install the node software. Install from an interactive installer which downloads the binary, Docker, source or crates.
+
+### Installer
+
+The simplest way to install Zakura on a new machine, is using the interactive installer:
+
+```console
+curl -fsSL https://raw.githubusercontent.com/zakura-core/zakura/main/scripts/install-zakura.sh | bash
+```
+
+The installer can set up either standard Zakura or its
+[zcashd-compatible variant](book/src/user/zcashd-compat.md).
 
 ### Docker
+
+You can run Zakura using our [Docker
+image](https://hub.docker.com/r/valargroup/zakura/tags) or install it manually.
 
 This command will run our latest release, and sync it to the tip:
 
@@ -136,7 +152,7 @@ triage new issues and we will respond. We maintain a list of known issues in the
 [Troubleshooting](book/src/user/troubleshooting.md) section of
 the book.
 
-If you want to chat with us, use the project discussion channels linked from the Zakura repository.
+If you want to chat with us, use the github issues for now.
 
 ## Security
 

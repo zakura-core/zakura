@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Pruned nodes no longer advertise retained block hashes in legacy `getblocks`
   responses when their corresponding block bodies are unavailable.
+- Native header sync now skips Equihash and difficulty-filter checks for
+  configured Testnets with `disable_pow = true`, not only Regtest.
 
 ## [3.0.0-rc0] - 2026-07-19
 

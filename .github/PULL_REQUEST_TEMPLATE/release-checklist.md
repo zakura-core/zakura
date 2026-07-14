@@ -207,17 +207,17 @@ The end of support height is calculated from the current blockchain height:
 
 ## Publish Crates
 
-- [ ] [Run `cargo login`](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio)
-- [ ] It is recommended that the following step be run from a fresh checkout of
-      the repo, to avoid accidentally publishing files like e.g. logs that might
-      be lingering around
-- [ ] Publish the crates to crates.io; edit the list to only include the crates that
-      have been changed, but keep their overall order:
+Stable releases publish the crate graph automatically: the `Publish crates to
+crates.io` job in the same Create release run uses crates.io Trusted
+Publishing (no `cargo login`, no long-lived token) and publishes from the
+exact tagged commit. It skips crates whose version is already on crates.io,
+so re-running the workflow resumes a partial publish. See
+[`docs/release-tag-protection.md`](https://github.com/zakura-core/zakura/blob/main/docs/release-tag-protection.md#cratesio-trusted-publishing).
 
-```
-for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakura-tower-batch-control zakura-node-services zakura-script zakura-state zakura-consensus zakura-network zakura-rpc zakura-utils zakura; do cargo release publish --verbose --execute -p $c; done
-```
-
+- [ ] After promoting the release, approve the `crates-io` environment
+      deployment on the Create release run.
+- [ ] Check the job log: unchanged crates are skipped as already published,
+      and every selected crate is at the release version.
 - [ ] Check that Zakura can be installed from `crates.io`:
       `cargo install --locked --force --version <version> zakura && ~/.cargo/bin/zakurad`
       and put the output in a comment on the PR.

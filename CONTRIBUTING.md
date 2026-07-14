@@ -35,7 +35,7 @@ Check out the [help wanted][hw] or [good first issue][gfi] labels if you're look
 
 Zakura enforces code quality through review. For the full list of architecture rules, code patterns, testing requirements, and security considerations, see [`AGENTS.md`](AGENTS.md). The key points:
 
-- **Build checks**: Run `cargo fmt` and the relevant `cargo clippy` and `cargo test` commands
+- **Build requirements**: Run `cargo fmt` and the relevant `cargo clippy` and `cargo test` commands
 - **Architecture**: Dependencies flow downward only; `zakura-chain` is sync-only
 - **Error handling**: Use `thiserror`; `expect()` messages explain why the invariant holds
 - **Async**: CPU-heavy work in `spawn_blocking`; all waits need timeouts

@@ -19,7 +19,10 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 
 base_tag="${BASE_TAG:-}"
 if [ -z "$base_tag" ]; then
-  base_tag="$(git -C "$repo_root" describe --tags --match 'v*' --abbrev=0 HEAD)"
+if ! base_tag="$(git -C "$repo_root" describe --tags --match 'v*' --abbrev=0 HEAD 2>/dev/null)"; then
+    echo "ERROR: no v* release tag found; pass BASE_TAG explicitly." >&2
+    exit 1
+  fi
 fi
 
 if ! git -C "$repo_root" rev-parse --verify --quiet "${base_tag}^{commit}" >/dev/null; then

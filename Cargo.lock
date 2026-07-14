@@ -8792,6 +8792,7 @@ dependencies = [
  "insta",
  "jsonrpsee-types",
  "lazy_static",
+ "libc",
  "log",
  "metrics",
  "metrics-exporter-prometheus",

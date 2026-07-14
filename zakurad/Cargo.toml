@@ -342,3 +342,6 @@ development = [
 
 [lints]
 workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2.186"

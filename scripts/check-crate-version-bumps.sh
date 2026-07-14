@@ -48,6 +48,7 @@ while IFS=$'\t' read -r crate manifest_path current_version; do
 
   if ! git -C "$repo_root" cat-file -e "${base_tag}:${manifest_rel}" 2>/dev/null; then
     if ! git -C "$repo_root" diff --quiet "$base_tag" -- "$crate_dir"; then
+      printf 'Changed publishable crate: %s (new -> %s)\n' "$crate" "$current_version"
       printf 'NOTICE: %s is new since %s; choose an initial publish version intentionally.\n' "$crate" "$base_tag" >&2
       new_count=$((new_count + 1))
     fi
@@ -63,6 +64,9 @@ while IFS=$'\t' read -r crate manifest_path current_version; do
     git -C "$repo_root" show "${base_tag}:${manifest_rel}" \
       | awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }'
   )"
+
+  printf 'Changed publishable crate: %s (%s -> %s)\n' \
+    "$crate" "${base_version:-unknown}" "$current_version"
 
   if [ -z "$base_version" ]; then
     echo "WARNING: could not read ${crate}'s package version at ${base_tag}." >&2

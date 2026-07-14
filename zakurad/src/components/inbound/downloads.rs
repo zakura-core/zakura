@@ -464,11 +464,11 @@ where
 
     fn is_consensus_invalid_block_error(error: &BoxError) -> bool {
         error
-            .downcast_ref::<zebra_consensus::VerifyBlockError>()
+            .downcast_ref::<zakura_consensus::VerifyBlockError>()
             .is_some()
             || matches!(
-                error.downcast_ref::<zebra_consensus::RouterError>(),
-                Some(zebra_consensus::RouterError::Block { .. })
+                error.downcast_ref::<zakura_consensus::RouterError>(),
+                Some(zakura_consensus::RouterError::Block { .. })
             )
     }
 
@@ -1113,7 +1113,7 @@ mod tests {
     async fn duplicate_block_advertiser_is_retried_after_malformed_first_response(
     ) -> Result<(), BoxError> {
         let block: Arc<block::Block> =
-            zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
         let hash = block.hash();
         let first_peer =
             zn::zakura::ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds");
@@ -1145,13 +1145,14 @@ mod tests {
             }
         }));
 
-        let verifier =
-            BoxCloneService::new(service_fn(|request: zebra_consensus::Request| async move {
-                let zebra_consensus::Request::Commit(block) = request else {
+        let verifier = BoxCloneService::new(service_fn(
+            |request: zakura_consensus::Request| async move {
+                let zakura_consensus::Request::Commit(block) = request else {
                     return Err("unexpected verifier request".into());
                 };
                 Ok(block.hash())
-            }));
+            },
+        ));
 
         let (_tip_sender, latest_chain_tip, _tip_change) =
             zs::ChainTipSender::new(None, &Network::Mainnet);
@@ -1195,7 +1196,7 @@ mod tests {
     async fn duplicate_block_advertiser_is_not_retried_after_consensus_invalid_response(
     ) -> Result<(), BoxError> {
         let block: Arc<block::Block> =
-            zebra_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
         let hash = block.hash();
         let first_peer =
             zn::zakura::ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds");
@@ -1232,10 +1233,10 @@ mod tests {
         }));
 
         let verifier = BoxCloneService::new(service_fn(
-            |_request: zebra_consensus::Request| async move {
-                Err(BoxError::from(zebra_consensus::RouterError::from(
-                    zebra_consensus::VerifyBlockError::Block {
-                        source: zebra_consensus::BlockError::NoTransactions,
+            |_request: zakura_consensus::Request| async move {
+                Err(BoxError::from(zakura_consensus::RouterError::from(
+                    zakura_consensus::VerifyBlockError::Block {
+                        source: zakura_consensus::BlockError::NoTransactions,
                     },
                 )))
             },

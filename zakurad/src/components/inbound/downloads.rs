@@ -1,7 +1,7 @@
 //! A download stream that handles gossiped blocks from peers.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::IpAddr,
     pin::Pin,
     sync::Arc,
@@ -70,6 +70,14 @@ struct DownloadTask {
     advertiser: Option<AdvertiserSource>,
 }
 
+struct DownloadTaskServices<'a, ZN, ZV, ZS> {
+    network: &'a ZN,
+    verifier: &'a ZV,
+    state: &'a ZS,
+    latest_chain_tip: &'a zs::LatestChainTip,
+    full_verify_concurrency_limit: usize,
+}
+
 /// The maximum number of concurrent inbound download and verify tasks.
 /// Also used as the maximum lookahead limit, before block verification.
 ///
@@ -108,6 +116,11 @@ pub const MAX_INBOUND_CONCURRENCY: usize = 200;
 /// historical one-in-flight per-IP bound; crawler/sync-driven downloads have no
 /// advertiser source and are not counted against this cap.
 pub const MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER: usize = 5;
+
+/// Maximum alternate advertisers remembered for a gossiped block already being
+/// downloaded. Bounded so duplicate `inv` floods cannot grow memory without
+/// also passing normal inbound admission limits.
+const MAX_BLOCK_ADVERTISER_FALLBACKS: usize = 8;
 
 /// The action taken in response to a peer's gossiped block hash.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -173,7 +186,14 @@ where
     /// Cancellation handles for active tasks in [`Self::pending`], keyed by block
     /// hash. The optional source is recorded so completion can clear
     /// [`Self::source_counts`] and [`Self::source_locks`].
-    cancel_handles: HashMap<block::Hash, (oneshot::Sender<()>, Option<AdvertiserSource>)>,
+    cancel_handles: HashMap<
+        block::Hash,
+        (
+            oneshot::Sender<()>,
+            Option<AdvertiserSource>,
+            VecDeque<zn::PeerSource>,
+        ),
+    >,
 
     /// Fair source-local verification gates for admitted downloads.
     ///
@@ -210,29 +230,72 @@ where
         // task is scheduled for wakeup when the next task becomes ready.
         //
         // TODO: this would be cleaner with poll_map (#2693)
-        if let Some(join_result) = ready!(this.pending.as_mut().poll_next(cx)) {
+        'poll: loop {
+            let Some(join_result) = ready!(this.pending.as_mut().poll_next(cx)) else {
+                return Poll::Ready(None);
+            };
+
             let (result, hash) =
                 match join_result.expect("block download and verify tasks must not panic") {
                     Ok(hash) => (Ok(hash), hash),
                     Err((e, hash, advertiser_addr)) => (Err((e, advertiser_addr)), hash),
                 };
-            if let Some((_, Some(source))) = this.cancel_handles.remove(&hash) {
-                let source_count = this
-                    .source_counts
-                    .get_mut(&source)
-                    .expect("source count is inserted when a download task is admitted");
-                *source_count = source_count
-                    .checked_sub(1)
-                    .expect("source count is positive while a download task is admitted");
 
-                if *source_count == 0 {
-                    this.source_counts.remove(&source);
-                    this.source_locks.remove(&source);
+            let Some((_, source, mut fallbacks)) = this.cancel_handles.remove(&hash) else {
+                return Poll::Ready(Some(result));
+            };
+
+            if let Some(source) = source {
+                Self::release_source_slot(this.source_counts, this.source_locks, source);
+            }
+
+            if let Err((error, _advertiser_addr)) = &result {
+                if !Self::is_consensus_invalid_block_error(error) {
+                    while let Some(fallback_source) = fallbacks.pop_front() {
+                        let fallback_advertiser = AdvertiserSource::from(fallback_source.clone());
+                        let source_count = this
+                            .source_counts
+                            .get(&fallback_advertiser)
+                            .copied()
+                            .unwrap_or_default();
+                        let source_limit =
+                            fallback_advertiser.max_in_flight(*this.full_verify_concurrency_limit);
+
+                        if source_count >= source_limit {
+                            metrics::counter!(
+                                "gossip.fallback.source.queue.dropped.block.hash.count"
+                            )
+                            .increment(1);
+                            continue;
+                        }
+
+                        let download = DownloadTask {
+                            hash,
+                            advertiser: Some(fallback_advertiser),
+                            download_source: Some(fallback_source),
+                        };
+                        Self::spawn_download_task_projected(
+                            this.pending.as_ref().get_ref(),
+                            this.cancel_handles,
+                            this.source_locks,
+                            this.source_counts,
+                            DownloadTaskServices {
+                                network: this.network,
+                                verifier: this.verifier,
+                                state: this.state,
+                                latest_chain_tip: this.latest_chain_tip,
+                                full_verify_concurrency_limit: *this.full_verify_concurrency_limit,
+                            },
+                            download,
+                            fallbacks,
+                        );
+                        metrics::counter!("gossip.fallback.retry.block.hash.count").increment(1);
+                        continue 'poll;
+                    }
                 }
             }
-            Poll::Ready(Some(result))
-        } else {
-            Poll::Ready(None)
+
+            return Poll::Ready(Some(result));
         }
     }
 
@@ -295,12 +358,29 @@ where
         hash: block::Hash,
         download_source: Option<zn::PeerSource>,
     ) -> DownloadAction {
-        if self.cancel_handles.contains_key(&hash) {
+        if let Some((_cancel, active_source, fallbacks)) = self.cancel_handles.get_mut(&hash) {
+            if let Some(source) = download_source {
+                let source_key = AdvertiserSource::from(source.clone());
+                let is_active_source = active_source.as_ref() == Some(&source_key);
+                let already_fallback = fallbacks
+                    .iter()
+                    .any(|fallback| AdvertiserSource::from(fallback.clone()) == source_key);
+
+                if !is_active_source
+                    && !already_fallback
+                    && fallbacks.len() < MAX_BLOCK_ADVERTISER_FALLBACKS
+                {
+                    fallbacks.push_back(source);
+                    metrics::counter!("gossip.fallback.advertiser.recorded.block.hash.count")
+                        .increment(1);
+                }
+            }
+
             debug!(
                 ?hash,
                 queue_len = self.queue_len(),
                 concurrency_limit = self.full_verify_concurrency_limit,
-                "block hash already queued for inbound download: ignored block",
+                "block hash already queued for inbound download: recorded fallback if useful",
             );
 
             metrics::gauge!("gossip.queued.block.count").set(self.queue_len() as f64);
@@ -351,7 +431,7 @@ where
             download_source,
         };
 
-        self.spawn_download_task(download);
+        self.spawn_download_task(download, VecDeque::new());
 
         debug!(
             ?hash,
@@ -364,11 +444,74 @@ where
         DownloadAction::AddedToQueue
     }
 
+    fn release_source_slot(
+        source_counts: &mut HashMap<AdvertiserSource, usize>,
+        source_locks: &mut HashMap<AdvertiserSource, Arc<Mutex<()>>>,
+        source: AdvertiserSource,
+    ) {
+        let source_count = source_counts
+            .get_mut(&source)
+            .expect("source count is inserted when a download task is admitted");
+        *source_count = source_count
+            .checked_sub(1)
+            .expect("source count is positive while a download task is admitted");
+
+        if *source_count == 0 {
+            source_counts.remove(&source);
+            source_locks.remove(&source);
+        }
+    }
+
+    fn is_consensus_invalid_block_error(error: &BoxError) -> bool {
+        error
+            .downcast_ref::<zakura_consensus::VerifyBlockError>()
+            .is_some()
+            || matches!(
+                error.downcast_ref::<zakura_consensus::RouterError>(),
+                Some(zakura_consensus::RouterError::Block { .. })
+            )
+    }
+
     fn queue_len(&self) -> usize {
         self.pending.len()
     }
 
-    fn spawn_download_task(&mut self, download: DownloadTask) {
+    fn spawn_download_task(&mut self, download: DownloadTask, fallbacks: VecDeque<zn::PeerSource>) {
+        Self::spawn_download_task_projected(
+            &self.pending,
+            &mut self.cancel_handles,
+            &mut self.source_locks,
+            &mut self.source_counts,
+            DownloadTaskServices {
+                network: &self.network,
+                verifier: &self.verifier,
+                state: &self.state,
+                latest_chain_tip: &self.latest_chain_tip,
+                full_verify_concurrency_limit: self.full_verify_concurrency_limit,
+            },
+            download,
+            fallbacks,
+        );
+    }
+
+    fn spawn_download_task_projected(
+        pending: &FuturesUnordered<
+            JoinHandle<Result<block::Hash, (BoxError, block::Hash, Option<PeerSocketAddr>)>>,
+        >,
+        cancel_handles: &mut HashMap<
+            block::Hash,
+            (
+                oneshot::Sender<()>,
+                Option<AdvertiserSource>,
+                VecDeque<zn::PeerSource>,
+            ),
+        >,
+        source_locks: &mut HashMap<AdvertiserSource, Arc<Mutex<()>>>,
+        source_counts: &mut HashMap<AdvertiserSource, usize>,
+        services: DownloadTaskServices<'_, ZN, ZV, ZS>,
+        download: DownloadTask,
+        fallbacks: VecDeque<zn::PeerSource>,
+    ) {
         let DownloadTask {
             hash,
             download_source,
@@ -376,8 +519,8 @@ where
         } = download;
 
         let source_lock = advertiser.as_ref().map(|source| {
-            *self.source_counts.entry(source.clone()).or_default() += 1;
-            self.source_locks
+            *source_counts.entry(source.clone()).or_default() += 1;
+            source_locks
                 .entry(source.clone())
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
@@ -386,11 +529,11 @@ where
         // This oneshot is used to signal cancellation to the download task.
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
-        let network = self.network.clone();
-        let verifier = self.verifier.clone();
-        let state = self.state.clone();
-        let latest_chain_tip = self.latest_chain_tip.clone();
-        let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
+        let network = services.network.clone();
+        let verifier = services.verifier.clone();
+        let state = services.state.clone();
+        let latest_chain_tip = services.latest_chain_tip.clone();
+        let full_verify_concurrency_limit = services.full_verify_concurrency_limit;
 
         let fut = async move {
             // Check if the full block body is already in the state. `KnownBlock`
@@ -570,10 +713,10 @@ where
             }
         });
 
-        self.pending.push(task);
+        pending.push(task);
         assert!(
-            self.cancel_handles
-                .insert(hash, (cancel_tx, advertiser))
+            cancel_handles
+                .insert(hash, (cancel_tx, advertiser, fallbacks))
                 .is_none(),
             "blocks are only queued once"
         );
@@ -584,7 +727,12 @@ where
 mod tests {
     use super::*;
     use futures::StreamExt as _;
-    use std::{collections::HashSet, future, time::Duration};
+    use std::{
+        collections::HashSet,
+        future,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
     use tower::{service_fn, util::BoxCloneService};
     use zakura_chain::{parameters::Network, serialization::ZcashDeserializeInto};
     use zakura_network::InventoryResponse::Available;
@@ -959,6 +1107,180 @@ mod tests {
             }
         );
         poll_task.abort();
+    }
+
+    #[tokio::test]
+    async fn duplicate_block_advertiser_is_retried_after_malformed_first_response(
+    ) -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let first_peer =
+            zn::zakura::ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds");
+        let fallback_peer =
+            zn::zakura::ZakuraPeerId::new(vec![8; 32]).expect("test peer id is within bounds");
+
+        let block_for_network = block.clone();
+        let first_peer_for_network = first_peer.clone();
+        let fallback_peer_for_network = fallback_peer.clone();
+        let network = BoxCloneService::new(service_fn(move |request: zn::Request| {
+            let block = block_for_network.clone();
+            let first_peer = first_peer_for_network.clone();
+            let fallback_peer = fallback_peer_for_network.clone();
+
+            async move {
+                let zn::Request::BlocksByHashFrom { source, .. } = request else {
+                    return Err("expected source-aware block download".into());
+                };
+
+                match source {
+                    zn::PeerSource::Zakura(peer_id) if peer_id == first_peer => {
+                        Ok(zn::Response::Blocks(Vec::new()))
+                    }
+                    zn::PeerSource::Zakura(peer_id) if peer_id == fallback_peer => {
+                        Ok(zn::Response::Blocks(vec![Available((block, None))]))
+                    }
+                    other => Err(format!("unexpected source: {other:?}").into()),
+                }
+            }
+        }));
+
+        let verifier = BoxCloneService::new(service_fn(
+            |request: zakura_consensus::Request| async move {
+                let zakura_consensus::Request::Commit(block) = request else {
+                    return Err("unexpected verifier request".into());
+                };
+                Ok(block.hash())
+            },
+        ));
+
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let mut downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            network,
+            verifier,
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(zn::PeerSource::Zakura(first_peer))),
+            DownloadAction::AddedToQueue,
+        );
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(zn::PeerSource::Zakura(fallback_peer))),
+            DownloadAction::AlreadyQueued,
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("fallback download completes")
+            .expect("downloads stream is open")
+            .expect("fallback download succeeds");
+        assert_eq!(result, hash);
+        assert_eq!(downloads.queue_len(), 0);
+        assert!(downloads.cancel_handles.is_empty());
+        assert!(downloads.source_counts.is_empty());
+        assert!(downloads.source_locks.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_block_advertiser_is_not_retried_after_consensus_invalid_response(
+    ) -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let first_peer =
+            zn::zakura::ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds");
+        let fallback_peer =
+            zn::zakura::ZakuraPeerId::new(vec![8; 32]).expect("test peer id is within bounds");
+        let network_requests = Arc::new(AtomicUsize::new(0));
+
+        let block_for_network = block.clone();
+        let first_peer_for_network = first_peer.clone();
+        let fallback_peer_for_network = fallback_peer.clone();
+        let network_requests_for_network = network_requests.clone();
+        let network = BoxCloneService::new(service_fn(move |request: zn::Request| {
+            let block = block_for_network.clone();
+            let first_peer = first_peer_for_network.clone();
+            let fallback_peer = fallback_peer_for_network.clone();
+            let network_requests = network_requests_for_network.clone();
+
+            async move {
+                network_requests.fetch_add(1, Ordering::SeqCst);
+                let zn::Request::BlocksByHashFrom { source, .. } = request else {
+                    return Err("expected source-aware block download".into());
+                };
+
+                match source {
+                    zn::PeerSource::Zakura(peer_id) if peer_id == first_peer => {
+                        Ok(zn::Response::Blocks(vec![Available((block, None))]))
+                    }
+                    zn::PeerSource::Zakura(peer_id) if peer_id == fallback_peer => {
+                        Err("consensus-invalid blocks must not be retried from fallbacks".into())
+                    }
+                    other => Err(format!("unexpected source: {other:?}").into()),
+                }
+            }
+        }));
+
+        let verifier = BoxCloneService::new(service_fn(
+            |_request: zakura_consensus::Request| async move {
+                Err(BoxError::from(zakura_consensus::RouterError::from(
+                    zakura_consensus::VerifyBlockError::Block {
+                        source: zakura_consensus::BlockError::NoTransactions,
+                    },
+                )))
+            },
+        ));
+
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let mut downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            network,
+            verifier,
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(zn::PeerSource::Zakura(first_peer))),
+            DownloadAction::AddedToQueue,
+        );
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(zn::PeerSource::Zakura(fallback_peer))),
+            DownloadAction::AlreadyQueued,
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("consensus-invalid download completes")
+            .expect("downloads stream is open");
+        assert!(result.is_err());
+        assert_eq!(
+            network_requests.load(Ordering::SeqCst),
+            1,
+            "consensus-invalid blocks must not be retried from fallback advertisers",
+        );
+        assert!(downloads.cancel_handles.is_empty());
+        assert!(downloads.source_counts.is_empty());
+        assert!(downloads.source_locks.is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]

@@ -159,7 +159,7 @@ comparison-interpreter = ["zakura-script/comparison-interpreter"]
 
 [dependencies]
 zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc3" }
-zakura-consensus = { path = "../zakura-consensus", version = "1.0.0-rc3" }
+zakura-consensus = { path = "../zakura-consensus", version = "1.0.0-rc5" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.0.0-rc3" }
 zakura-network = { path = "../zakura-network", version = "1.0.0-rc5" }
 zakura-node-services = { path = "../zakura-node-services", version = "1.0.0-rc3", features = ["rpc-client"] }
@@ -313,7 +313,7 @@ proptest-derive = { workspace = true }
 color-eyre = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc3", features = ["proptest-impl"] }
-zakura-consensus = { path = "../zakura-consensus", version = "1.0.0-rc3", features = ["proptest-impl"] }
+zakura-consensus = { path = "../zakura-consensus", version = "1.0.0-rc5", features = ["proptest-impl"] }
 zakura-network = { path = "../zakura-network", version = "1.0.0-rc5", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "1.0.0-rc5", features = ["proptest-impl"] }
 

@@ -1,6 +1,6 @@
 [package]
 name = "zakura-consensus"
-version = "1.0.0-rc3"
+version = "1.0.0-rc5"
 authors.workspace = true
 description = "Implementation of Zcash consensus checks for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true

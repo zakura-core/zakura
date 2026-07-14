@@ -8925,7 +8925,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "1.0.0-rc3"
+version = "1.0.0-rc5"
 dependencies = [
  "bellman",
  "blake2b_simd",

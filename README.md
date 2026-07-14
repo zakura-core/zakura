@@ -1,4 +1,6 @@
-![Zakura logotype](book/theme/zakura-flower-v1.svg)
+<p align="center">
+  <img src="book/theme/zakura-flower-v1.svg" alt="Zakura logo" width="160">
+</p>
 
 ---
 

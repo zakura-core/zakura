@@ -4,7 +4,10 @@ use super::{
     error::*,
     events::*,
     reactor::*,
-    state::{VctRootRepair, VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME},
+    state::{
+        OutstandingPhase, OutstandingRange, RangePriority, RangePurpose, RangeRequest,
+        VctRootRepair, VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME,
+    },
     validation::*,
     wire::*,
 };
@@ -3497,6 +3500,56 @@ fn peer_state_suppresses_redundant_status_until_session_reset() {
 }
 
 #[test]
+fn response_before_publication_completion_is_not_reinstalled() {
+    let (send, _recv) = crate::zakura::framed_channel(1);
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        peer(81),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    let mut peer_state = super::state::PeerHeaderState::new(
+        session,
+        (block::Height(0), block::Hash([0; 32])),
+        DEFAULT_HS_RANGE,
+        DEFAULT_HS_MAX_INFLIGHT,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+    );
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero request ID");
+    let range = RangeRequest {
+        start_height: block::Height(1),
+        count: 1,
+        anchor_hash: None,
+        finalized: false,
+        want_tree_aux_roots: true,
+        priority: RangePriority::Forward,
+    };
+    peer_state.outstanding.push(OutstandingRange {
+        request_id,
+        range,
+        deadline: Instant::now() + std::time::Duration::from_secs(1),
+        purpose: RangePurpose::Sync,
+        phase: OutstandingPhase::Publishing,
+    });
+
+    let _response = peer_state
+        .remove_outstanding_by_request_id(request_id)
+        .expect("response consumes the publishing request");
+    complete_request_publication(
+        &mut peer_state,
+        request_id,
+        Instant::now() + std::time::Duration::from_secs(2),
+    );
+
+    assert!(
+        peer_state.outstanding.is_empty(),
+        "the later successful completion must not recreate a consumed request"
+    );
+}
+
+#[test]
 fn completed_v7_inbound_request_id_cannot_be_reused() {
     let (send, _recv) = crate::zakura::framed_channel(32);
     let session = HeaderSyncPeerSession::from_parts_with_direction(
@@ -6041,6 +6094,11 @@ async fn peer_requester_waits_for_outbound_capacity_without_reencoding_or_pollin
     )
     .await
     .is_err());
+    assert_eq!(
+        gauge_value("sync.header.work.in_flight.count"),
+        1.0,
+        "the reactor assigns the range before transport publication can complete"
+    );
     let _status_frame = recv.recv().await.expect("initial status frame is queued");
 
     let (request_peer, _, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
@@ -6049,7 +6107,8 @@ async fn peer_requester_waits_for_outbound_capacity_without_reencoding_or_pollin
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn registered_request_times_out_while_waiting_for_outbound_capacity() {
+async fn publishing_request_times_out_while_waiting_for_outbound_capacity() {
+    let metrics = metric_snapshot(&["sync.header.request.publication_timeout"]);
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_with_timeout(
         network.clone(),
@@ -6085,9 +6144,70 @@ async fn registered_request_times_out_while_waiting_for_outbound_capacity() {
         blocked_cancel.cancelled(),
     )
     .await
-    .expect("a registered-but-unsent request cancels its blocked session");
+    .expect("a publishing request cancels its blocked session");
+    assert_metric_incremented(&metrics, "sync.header.request.publication_timeout");
 
     let replacement = peer(206);
+    connect_peer(&fixture, replacement.clone()).await;
+    advertise_tip(
+        &fixture,
+        replacement.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+    let (retry_peer, _, retry_start, retry_count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(retry_peer, replacement);
+    assert_eq!((retry_start, retry_count), (block::Height(1), 1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn transport_closure_retries_work_and_disconnects_requester() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let failed_peer = peer(207);
+    let (send, recv) = crate::zakura::framed_channel(1);
+    let failed_session = HeaderSyncPeerSession::from_parts_with_direction(
+        failed_peer.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    drop(recv);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(failed_session))
+        .await
+        .unwrap();
+    advertise_tip(
+        &fixture,
+        failed_peer.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while {
+            let snapshot = fixture.handle.peer_snapshot();
+            snapshot.inbound_peers + snapshot.outbound_peers != 0
+        } {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("closed transport stops its requester and removes the peer");
+
+    let replacement = peer(208);
     connect_peer(&fixture, replacement.clone()).await;
     advertise_tip(
         &fixture,

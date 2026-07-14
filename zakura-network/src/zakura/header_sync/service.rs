@@ -823,6 +823,10 @@ impl Sink for HeaderSyncPassthroughSink {
 #[cfg(test)]
 mod request_id_tests {
     use super::*;
+    use crate::zakura::header_sync::{
+        requester::HeaderRequesterCommand,
+        state::{RangePriority, RangeRequest},
+    };
 
     #[test]
     fn request_id_exhaustion_remains_fail_closed() {
@@ -971,5 +975,49 @@ mod request_id_tests {
             HeaderSyncRequestId::new(1).expect("non-zero id")
         );
         assert_eq!(session.inner.next_request_id.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn requester_queue_failure_cancels_prepared_expectation() {
+        let (send, _recv) = crate::zakura::framed_channel(1);
+        let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+        let peer_id = ZakuraPeerId::new(vec![5; 32]).expect("test peer id is valid");
+        let session = HeaderSyncPeerSession::from_parts_with_direction_and_commands(
+            peer_id,
+            1,
+            ServicePeerDirection::Outbound,
+            send,
+            CancellationToken::new(),
+            Some(commands_tx),
+        );
+        let range = RangeRequest {
+            start_height: block::Height(1),
+            count: 1,
+            anchor_hash: None,
+            finalized: false,
+            want_tree_aux_roots: true,
+            priority: RangePriority::Forward,
+        };
+        let prepared = session
+            .prepare_get_headers(range.start_height, range.count, range.want_tree_aux_roots)
+            .expect("valid test request is prepared");
+        let reserved = match commands_rx.try_recv().expect("reservation is published") {
+            HeaderSyncPeerCommand::Reserve(expected) => expected,
+            command => panic!("expected reservation command, got {command:?}"),
+        };
+        let (requester_tx, requester_rx) = mpsc::channel(1);
+        drop(requester_rx);
+
+        let rejected = match requester_tx.try_send(HeaderRequesterCommand { range, prepared }) {
+            Err(mpsc::error::TrySendError::Closed(command)) => command,
+            _ => panic!("closed requester queue rejects the prepared command"),
+        };
+        drop(rejected);
+
+        let cancelled = match commands_rx.try_recv().expect("cancellation is published") {
+            HeaderSyncPeerCommand::Cancel(expected) => expected,
+            command => panic!("expected cancellation command, got {command:?}"),
+        };
+        assert_eq!(cancelled, reserved);
     }
 }

@@ -178,6 +178,11 @@ impl From<CommitHeaderRangeError> for CommitBlockError {
 pub struct CommitSemanticallyVerifiedError(#[from] CommitBlockError);
 
 impl CommitSemanticallyVerifiedError {
+    /// Returns the [`CommitBlockError`] describing why the commit failed.
+    pub fn inner(&self) -> &CommitBlockError {
+        &self.0
+    }
+
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&KnownBlock> {
         self.0.duplicate_location()
@@ -219,6 +224,11 @@ impl<E: std::error::Error + 'static> From<BoxError> for LayeredStateError<E> {
 pub struct CommitCheckpointVerifiedError(#[from] CommitBlockError);
 
 impl CommitCheckpointVerifiedError {
+    /// Returns the [`CommitBlockError`] describing why the commit failed.
+    pub fn inner(&self) -> &CommitBlockError {
+        &self.0
+    }
+
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&KnownBlock> {
         self.0.duplicate_location()

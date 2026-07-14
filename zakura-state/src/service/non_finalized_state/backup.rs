@@ -252,7 +252,7 @@ fn read_non_finalized_blocks_from_backup<'a>(
     list_backup_dir_entries(backup_dir_path)
         // It's okay to leave the file here, the backup task will delete it as long as
         // the block is not added to the non-finalized state.
-        .filter(|&(block_hash, _)| !finalized_state.contains_hash(block_hash))
+        .filter(|&(block_hash, _)| finalized_state.height(block_hash).is_none())
         .filter_map(|(block_hash, file_path)| match std::fs::read(file_path) {
             Ok(block_bytes) => Some((block_hash, block_bytes)),
             Err(err) => {

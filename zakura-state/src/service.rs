@@ -824,7 +824,7 @@ impl StateService {
         if self
             .read_service
             .db
-            .contains_body_at_height(semantically_verified.height)
+            .contains_height(semantically_verified.height)
         {
             let (rsp_tx, rsp_rx) = oneshot::channel();
             let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(

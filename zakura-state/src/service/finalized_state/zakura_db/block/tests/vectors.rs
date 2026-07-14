@@ -132,7 +132,7 @@ fn header_range_commit_keeps_body_availability_separate() {
         vec![Height(1)],
     );
 
-    assert!(!state.contains_hash(block1.hash()));
+    assert_eq!(state.height(block1.hash()), None);
     assert!(!state.contains_body_at_height(Height(1)));
     assert!(state.block(Height(1).into()).is_none());
     assert!(state
@@ -732,12 +732,10 @@ fn known_block_reports_finalized_block_after_body_pruned() {
     );
     state.db.write(batch).expect("body prune writes");
 
-    // The body-availability predicate (what KnownBlock used before the fix) now
-    // reports the block as absent...
+    // Body availability and finalized chain identity remain distinct after pruning.
     assert!(!state.contains_body_at_height(Height(1)));
-    assert!(!state.contains_hash(block1.hash()));
+    assert_eq!(state.height(block1.hash()), Some(Height(1)));
 
-    // ...but KnownBlock still reports it as a known finalized block.
     assert_eq!(
         read::finalized_state_contains_block_hash(&state, block1.hash()),
         Some(crate::KnownBlock::Finalized),
@@ -1108,20 +1106,19 @@ fn header_range_rows_and_tip_survive_reopen_without_body_availability() {
             (Height(2), block2.hash(), block2.header.clone()),
         ],
     );
-    assert!(!reopened.contains_hash(block2.hash()));
-    assert_eq!(reopened.body_hash(Height(2)), None);
+    assert_eq!(reopened.height(block2.hash()), None);
     assert!(reopened.block(Height(2).into()).is_none());
 }
 
 #[test]
-fn block_facing_hash_by_height_requires_body_availability() {
+fn verified_hash_by_height_excludes_provisional_headers() {
     let _init_guard = zakura_test::init();
     let (state, genesis, block1) = mainnet_state_with_genesis();
 
     commit_header_range(&state, genesis.hash(), std::slice::from_ref(&block1.header));
 
     assert_eq!(state.hash(Height(1)), None);
-    assert_eq!(state.body_hash(Height(1)), None);
+    assert_eq!(state.height(block1.hash()), None);
     assert_eq!(
         read::hash_by_height(
             Option::<Arc<crate::service::non_finalized_state::Chain>>::None,
@@ -1145,7 +1142,6 @@ fn full_block_commit_over_identical_header_only_row_is_noop_for_header_indexes()
 
     assert_eq!(state.hash(Height(1)), None);
     assert_eq!(state.height(block1.hash()), None);
-    assert!(!state.contains_hash(block1.hash()));
     assert_eq!(
         state.headers_by_height_range(Height(1), 2),
         vec![(Height(1), block1.hash(), block1.header.clone())],
@@ -1155,7 +1151,6 @@ fn full_block_commit_over_identical_header_only_row_is_noop_for_header_indexes()
 
     assert_eq!(state.hash(Height(1)), Some(block1.hash()));
     assert_eq!(state.height(block1.hash()), Some(Height(1)));
-    assert!(state.contains_hash(block1.hash()));
     assert_eq!(
         state.headers_by_height_range(Height(1), 2),
         vec![(Height(1), block1.hash(), block1.header.clone())],
@@ -1183,7 +1178,7 @@ fn full_block_commit_overwrites_conflicting_header_only_rows() {
     assert_eq!(state.height(alternate_block2_hash), None);
     assert_eq!(state.height(alternate_block3_hash), None);
     assert_eq!(state.best_header_tip(), Some((Height(2), block2.hash())));
-    assert!(state.contains_hash(block2.hash()));
+    assert_eq!(state.height(block2.hash()), Some(Height(2)));
     assert!(state.block(block2.hash().into()).is_some());
     assert!(state.block(alternate_block2_hash.into()).is_none());
 }

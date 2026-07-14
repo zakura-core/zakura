@@ -24,7 +24,9 @@ use crate::{
     service::{
         finalized_state::{disk_db::DiskWriteBatch, FinalizedState},
         non_finalized_state::Chain,
-        read::find::{block_locator, chain_contains_hash},
+        read::find::{
+            block_locator, chain_contains_hash, depth, find_chain_hashes, hash_by_height,
+        },
     },
     Config, ContextuallyVerifiedBlock, PruningConfig, RollbackFinalizedStateError,
     RollbackFinalizedStateOptions, SemanticallyVerifiedBlock,
@@ -611,7 +613,7 @@ fn checkpoint_retention_skips_old_raw_transactions_in_pruned_mode() {
 }
 
 #[test]
-fn block_locator_uses_retained_hashes_when_checkpoint_bodies_are_skipped() {
+fn chain_identity_uses_retained_hashes_when_checkpoint_bodies_are_skipped() {
     let _init_guard = zakura_test::init();
     let network = Mainnet;
     let config = pruned_config();
@@ -622,16 +624,32 @@ fn block_locator_uses_retained_hashes_when_checkpoint_bodies_are_skipped() {
     let (tip_height, tip_hash) = state.db.tip().expect("test state has a finalized tip");
 
     assert_eq!(tip_height, Height(TEST_BLOCKS));
-    assert_eq!(state.db.body_hash(tip_height), None);
+    assert!(!state.db.contains_body_at_height(tip_height));
     assert_eq!(state.db.hash(tip_height), Some(tip_hash));
-    assert!(!state.db.contains_hash(tip_hash));
+    assert_eq!(state.db.height(tip_hash), Some(tip_height));
 
     let no_chain = Option::<Arc<Chain>>::None;
+    assert_eq!(
+        hash_by_height(no_chain.clone(), &state.db, tip_height),
+        Some(tip_hash)
+    );
+    assert_eq!(depth(no_chain.clone(), &state.db, tip_hash), Some(0));
+    assert!(chain_contains_hash(no_chain.clone(), &state.db, tip_hash));
+
     let locator = block_locator(no_chain.clone(), &state.db)
         .expect("a finalized tip produces a block locator");
-
     assert_eq!(locator.first(), Some(&tip_hash));
-    assert!(chain_contains_hash(no_chain, &state.db, tip_hash));
+
+    let genesis_hash = state
+        .db
+        .hash(Height::MIN)
+        .expect("test state has a finalized genesis block");
+    let hashes = find_chain_hashes(no_chain, &state.db, vec![genesis_hash], None, 500);
+    assert_eq!(
+        hashes.len(),
+        usize::try_from(TEST_BLOCKS).expect("test block count fits in usize")
+    );
+    assert_eq!(hashes.last(), Some(&tip_hash));
 }
 
 #[test]

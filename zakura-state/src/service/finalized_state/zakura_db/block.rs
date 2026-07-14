@@ -273,20 +273,6 @@ impl ZakuraDb {
         self.db.zs_get(&hash_by_height, &height)
     }
 
-    /// Returns the hash for `height` only if a full block body is present.
-    pub fn body_hash(&self, height: block::Height) -> Option<block::Hash> {
-        self.contains_body_at_height(height)
-            .then(|| self.hash(height))
-            .flatten()
-    }
-
-    /// Returns `true` if `hash` is present in the finalized state.
-    #[allow(clippy::unwrap_in_result)]
-    pub fn contains_hash(&self, hash: block::Hash) -> bool {
-        self.height(hash)
-            .is_some_and(|height| self.contains_body_at_height(height))
-    }
-
     /// Returns the height of the given block if it exists.
     #[allow(clippy::unwrap_in_result)]
     pub fn height(&self, hash: block::Hash) -> Option<block::Height> {

@@ -142,6 +142,31 @@ jobs:
       - name: Run network-dependent acceptance tests
         run: cargo nextest run --profile zakura-network-dependent --locked --features default-release-binaries --no-fail-fast
 
+  pruned-storage:
+    name: pruned storage acceptance test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
+        with:
+          toolchain: stable
+          cache-key: pruned-storage
+          cache-on-failure: true
+      - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
+        with:
+          tool: cargo-nextest
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Run pruned storage acceptance test
+        run: cargo nextest run --profile zakura-pruned-storage --locked --features default-release-binaries --no-fail-fast
+
   check-no-git-dependencies:
     name: Check no git dependencies
     permissions:
@@ -178,6 +203,7 @@ jobs:
       - unit-tests
       - zakura-config
       - network-dependent
+      - pruned-storage
       - check-no-git-dependencies
     timeout-minutes: 30
     steps:
@@ -187,4 +213,4 @@ jobs:
           jobs: ${{ toJSON(needs) }}
           # The release-only dependency check is skipped outside its event scope.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies
+          allowed-skips: check-no-git-dependencies, pruned-storage

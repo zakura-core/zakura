@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 Initial release of Zakura.
 
+### Fixed
+
+- Pruned finalized blocks remain visible to chain-identity queries, including peer
+  block-hash responses and RPC confirmation lookups, after their bodies are removed.
+
 Zakura is a fork of the Zcash Foundation's
 [Zebra](https://github.com/ZcashFoundation/zebra), forked at Zebra v5.0.0. For
 the history of this codebase before the fork, see

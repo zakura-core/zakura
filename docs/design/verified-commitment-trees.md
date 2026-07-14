@@ -393,9 +393,12 @@ The ZIP-221 MMR does not authenticate everything, so three gaps are closed by di
 
 A block's own commitment check `C(X, T_{X-1})` is the _identical_ computation the previous
 fast block already ran as its look-ahead one commit earlier. The committer caches the
-look-ahead result as `(next_height, next_hash)` and skips a block's own check when the prior
-look-ahead validated exactly it. The guard is hash identity and heights are monotonic, so a
-stale or cloned cache entry can never cause a false skip. Steady state drops from two
+look-ahead result as `(next_height, next_hash, next_auth_data_root)` and skips a block's own
+check when the prior look-ahead validated exactly it. Below NU5 the auth-data-root component is
+unused because it is not an input to the header commitment; at NU5 and later it binds a
+header-only successor witness to the later body, so a same-header body with different
+authorizing data cannot reuse the earlier prevalidation. Heights are monotonic, so a stale or
+cloned cache entry can never cause a false skip. Steady state drops from two
 commitment checks per block to one (legacy parity) while still attesting every root before it
 is persisted. A non-last checkpoint height fast block with no buffered successor is deferred by the write
 worker until the successor arrives; the checkpoint last checkpoint height is the only no-successor fast commit
@@ -429,7 +432,8 @@ logic. For a checkpoint-verified block at `height`:
    - apply the direct below-Heartwood/below-NU5/below-Nu6_3 checks (§6.1);
    - build a candidate history tree with the roots folded in (`HistoryTree::push`);
    - **verify-before-commit:** either check the buffered successor's commitment against the
-     candidate (the one-block-lag confirmation) and cache `(height+1, next_hash)` as
+     candidate (the one-block-lag confirmation) and cache
+     `(height+1, next_hash, next_auth_data_root)` as
      pre-validated, or, at the checkpoint last checkpoint height only, verify the embedded final
      frontiers — including Ironwood — against this height's roots; a failure means _this_
      height's root is bad → reject and evict (§8);

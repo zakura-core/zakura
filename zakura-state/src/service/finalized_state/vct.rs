@@ -326,10 +326,16 @@ pub(crate) struct VctCommitState {
     /// - legacy Zebra checkpoint sync
     source: Option<Arc<VctState>>,
 
-    /// `(height, hash)` of the next block already validated by the previous fast
-    /// commit's look-ahead, so its own commitment check can be skipped. Guarded by
-    /// hash identity, so a stale or cloned value can't cause an incorrect skip.
-    prevalidated_next: Option<(block::Height, block::Hash)>,
+    /// `(height, hash, auth_data_root)` of the next block already validated by
+    /// the previous fast commit's look-ahead, so its own commitment check can
+    /// be skipped.
+    ///
+    /// The auth-data root is `None` below NU5, where it is not an input to the
+    /// block commitment. At NU5 and later it must stay paired with the header
+    /// hash: a header-only successor witness carries this root separately from
+    /// the later body, and a same-header body with different authorizing data
+    /// must not reuse the earlier prevalidation.
+    prevalidated_next: Option<(block::Height, block::Hash, Option<AuthDataRoot>)>,
 
     /// `true` while a vct sync is in-progress below the last checkpoint height.
     /// During this time, we do not reconstruct per-height note-commitment trees.
@@ -362,14 +368,20 @@ impl VctCommitState {
     }
 
     /// The cached successor prevalidation, if any.
-    pub(super) fn prevalidated_next(&self) -> Option<(block::Height, block::Hash)> {
+    pub(super) fn prevalidated_next(
+        &self,
+    ) -> Option<(block::Height, block::Hash, Option<AuthDataRoot>)> {
         self.prevalidated_next
     }
 
-    /// Caches the next block's `(height, hash)` as already validated by this
-    /// fast commit's look-ahead.
-    pub(super) fn mark_prevalidated(&mut self, height: block::Height, hash: block::Hash) {
-        self.prevalidated_next = Some((height, hash));
+    /// Caches the next block as already validated by this fast commit's look-ahead.
+    pub(super) fn mark_prevalidated(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        auth_data_root: Option<AuthDataRoot>,
+    ) {
+        self.prevalidated_next = Some((height, hash, auth_data_root));
     }
 
     /// Clears any cached successor prevalidation.
@@ -380,7 +392,10 @@ impl VctCommitState {
     /// Test-only: overwrites the cached successor prevalidation, so tests can
     /// install a stale or forged entry to exercise the dedup's guard checks.
     #[cfg(test)]
-    pub(super) fn set_prevalidated_next(&mut self, next: Option<(block::Height, block::Hash)>) {
+    pub(super) fn set_prevalidated_next(
+        &mut self,
+        next: Option<(block::Height, block::Hash, Option<AuthDataRoot>)>,
+    ) {
         self.prevalidated_next = next;
     }
 

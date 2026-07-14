@@ -48,6 +48,7 @@ The installer can set up either standard Zakura or its
 ### Crates.io
 
 Install from [crates.io](https://crates.io/crates/zakura) with
+
 ```console
 cargo install zakura
 ```

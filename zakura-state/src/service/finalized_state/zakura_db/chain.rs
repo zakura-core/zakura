@@ -18,7 +18,7 @@ use std::{
 
 use zakura_chain::{
     amount::NonNegative,
-    block::Height,
+    block::{Block, Height},
     block_info::BlockInfo,
     history_tree::HistoryTree,
     serialization::{CompactSizeMessage, ZcashSerialize as _},
@@ -36,6 +36,31 @@ use crate::{
     },
     HashOrHeight, ValidateContextError,
 };
+
+/// Returns the serialized wire size of `block`.
+///
+/// This is equivalent to [`Block::zcash_serialized_size`], but sums independent
+/// transaction sizes in parallel for large blocks.
+fn serialized_block_size(block: &Block) -> usize {
+    let transactions = &block.transactions;
+    let transactions_size: usize = if transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
+        use rayon::prelude::*;
+        transactions
+            .par_iter()
+            .map(|transaction| transaction.zcash_serialized_size())
+            .sum()
+    } else {
+        transactions
+            .iter()
+            .map(|transaction| transaction.zcash_serialized_size())
+            .sum()
+    };
+    let tx_count_size = CompactSizeMessage::try_from(transactions.len())
+        .expect("block must have a valid transaction count")
+        .zcash_serialized_size();
+
+    block.header.zcash_serialized_size() + tx_count_size + transactions_size
+}
 
 /// The name of the History Tree column family.
 ///
@@ -306,33 +331,51 @@ impl DiskWriteBatch {
         // Only fan out to rayon once the block has enough transactions to
         // amortize the fork-join cost; small blocks sum sequentially (see
         // PARALLEL_BLOCK_TX_THRESHOLD).
-        let block_size = {
-            let transactions = &finalized.block.transactions;
-            let transactions_size: usize =
-                if transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
-                    use rayon::prelude::*;
-                    transactions
-                        .par_iter()
-                        .map(|transaction| transaction.zcash_serialized_size())
-                        .sum()
-                } else {
-                    transactions
-                        .iter()
-                        .map(|transaction| transaction.zcash_serialized_size())
-                        .sum()
-                };
-            let tx_count_size = CompactSizeMessage::try_from(transactions.len())
-                .expect("block must have a valid transaction count")
-                .zcash_serialized_size();
-
-            finalized.block.header.zcash_serialized_size() + tx_count_size + transactions_size
-        };
+        let block_size = u32::try_from(serialized_block_size(&finalized.block))
+            .expect("verified blocks are bounded by MAX_BLOCK_BYTES, which fits in u32");
 
         let _ = db.block_info_cf().with_batch_for_writing(self).zs_insert(
             &finalized.height,
-            &BlockInfo::new(new_value_pool, block_size as u32),
+            &BlockInfo::new(new_value_pool, block_size),
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    fn block_with_transaction_count(transaction_count: usize) -> Block {
+        let mut block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("mainnet genesis test vector deserializes");
+        let coinbase = block.transactions[0].clone();
+        block.transactions = vec![coinbase; transaction_count];
+        block
+    }
+
+    #[test]
+    fn serialized_block_size_matches_wire_size_across_parallel_and_compact_size_boundaries() {
+        let _init_guard = zakura_test::init();
+
+        for transaction_count in [
+            1,
+            super::super::PARALLEL_BLOCK_TX_THRESHOLD - 1,
+            super::super::PARALLEL_BLOCK_TX_THRESHOLD,
+            252,
+            253,
+        ] {
+            let block = block_with_transaction_count(transaction_count);
+
+            assert_eq!(
+                serialized_block_size(&block),
+                block.zcash_serialized_size(),
+                "serialized block size must match at transaction count {transaction_count}"
+            );
+        }
     }
 }

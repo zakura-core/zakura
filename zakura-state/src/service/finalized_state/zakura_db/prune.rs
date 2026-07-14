@@ -276,10 +276,14 @@ fn raw_transaction_data_available(
     from: block::Height,
     until: block::Height,
 ) -> bool {
-    matches!(
-        raw_transaction_height_ranges(db, from, until).as_slice(),
-        [range] if *range == (from, until)
-    )
+    // This is only called when the current pruning marker is above `until`, so
+    // `ZakuraDb::block()` treats each height as potentially pruned and verifies
+    // that its raw transaction count matches the retained hash index. Requiring
+    // full block reconstruction prevents a partially missing body from being
+    // reclassified as retained history when the marker is moved backwards.
+    (from.0..until.0)
+        .map(block::Height)
+        .all(|height| db.block(height.into()).is_some())
 }
 
 fn raw_transaction_height_ranges(
@@ -334,9 +338,10 @@ mod tests {
 
     use zakura_chain::{
         block::Block, parameters::Network::Mainnet, serialization::ZcashDeserializeInto,
+        transaction,
     };
 
-    use crate::service::finalized_state::FinalizedState;
+    use crate::service::finalized_state::{disk_db::WriteDisk, FinalizedState};
 
     /// The number of leading blocks committed by the database-backed prune tests.
     const TEST_BLOCKS: u32 = 9;
@@ -548,6 +553,48 @@ mod tests {
 
         let error = pruning_summary(&state.db, &PruneFinalizedStateOptions { tx_retention: 6 })
             .expect_err("missing transaction data cannot be restored");
+
+        assert!(matches!(
+            error,
+            PruneFinalizedStateError::AlreadyPrunedBeyondRetention {
+                current: block::Height(5),
+                requested: Some(block::Height(4)),
+            }
+        ));
+    }
+
+    #[test]
+    fn pruning_summary_refuses_marker_correction_for_partial_raw_body() {
+        let _init_guard = zakura_test::init();
+        let state = new_state_with_blocks();
+
+        // Simulate a stale marker plus a partially missing retained body. Height 4
+        // still has its coinbase raw row, but its retained hash index claims a
+        // second transaction body that is absent from `tx_by_loc`.
+        let hash_by_tx_loc = state.db.db().cf_handle("hash_by_tx_loc").unwrap();
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(
+            &hash_by_tx_loc,
+            TransactionLocation::from_index(block::Height(4), 1),
+            transaction::Hash([0x42; 32]),
+        );
+        batch.prepare_pruning_marker_batch(&state.db, block::Height(5));
+        state
+            .db
+            .write_batch(batch)
+            .expect("synthetic partial body writes");
+
+        assert!(
+            state.db.contains_body_at_height(block::Height(4)),
+            "the first raw row still makes the partial body look present"
+        );
+        assert!(
+            state.db.block(block::Height(4).into()).is_none(),
+            "the marker-aware block read rejects the incomplete transaction set"
+        );
+
+        let error = pruning_summary(&state.db, &PruneFinalizedStateOptions { tx_retention: 6 })
+            .expect_err("a partial body cannot justify moving the marker backwards");
 
         assert!(matches!(
             error,

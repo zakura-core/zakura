@@ -17,9 +17,7 @@ use zakura_chain::{
         subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
         Network, NetworkUpgrade,
     },
-    sapling,
-    subtree::NoteCommitmentSubtreeIndex,
-    transaction,
+    sapling, transaction,
     transparent::{self, Input},
     value_balance::ValueBalance,
 };
@@ -661,10 +659,6 @@ fn deferred_pool_balance_change(
     height: Height,
     network: &Network,
 ) -> Result<Option<DeferredPoolBalanceChange>, RollbackFinalizedStateError> {
-    if height <= network.slow_start_interval() {
-        return Ok(None);
-    }
-
     let deferred_amount = funding_stream_values(height, network, block_subsidy(height, network)?)?
         .remove(&FundingStreamReceiver::Deferred)
         .unwrap_or_default()
@@ -1038,15 +1032,15 @@ fn prune_tree_indexes(
     // database does not serve roots for heights it no longer holds.
     batch.delete_range_commitment_roots_by_height(db, &Height(target_height.0 + 1), &Height::MAX);
 
-    // Delete every sapling/orchard/ironwood subtree whose notes extend past the target height. Subtree
-    // indexes are read back from the database and number far fewer than `u16::MAX`, so `index.0 + 1`
-    // (the exclusive end of the single-index delete range) cannot overflow.
+    // Delete every sapling/orchard/ironwood subtree whose notes extend past the target height.
+    // Delete exact keys rather than constructing a one-key half-open range: `u16::MAX` is a
+    // supported subtree index, so `index + 1` would wrap in release builds.
     for (index, _) in db
         .sapling_subtree_list_by_index_range(..)
         .into_iter()
         .filter(|(_, subtree)| subtree.end_height > target_height)
     {
-        batch.delete_range_sapling_subtree(db, index, NoteCommitmentSubtreeIndex(index.0 + 1));
+        batch.delete_sapling_subtree(db, index);
     }
 
     for (index, _) in db
@@ -1054,7 +1048,7 @@ fn prune_tree_indexes(
         .into_iter()
         .filter(|(_, subtree)| subtree.end_height > target_height)
     {
-        batch.delete_range_orchard_subtree(db, index, NoteCommitmentSubtreeIndex(index.0 + 1));
+        batch.delete_orchard_subtree(db, index);
     }
 
     for (index, _) in db
@@ -1062,7 +1056,7 @@ fn prune_tree_indexes(
         .into_iter()
         .filter(|(_, subtree)| subtree.end_height > target_height)
     {
-        batch.delete_range_ironwood_subtree(db, index, NoteCommitmentSubtreeIndex(index.0 + 1));
+        batch.delete_ironwood_subtree(db, index);
     }
 
     // Sprout has no by-height anchor index, so enumerate every anchor and drop the ones not seen
@@ -1162,7 +1156,11 @@ fn clear_backup_dir(path: &PathBuf) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    use zakura_chain::parameters::testnet::{
+        ConfiguredActivationHeights, ConfiguredLockboxDisbursement, Parameters as TestnetParameters,
+    };
     use zakura_chain::serialization::ZcashDeserializeInto;
+    use zakura_chain::subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeIndex};
 
     use crate::service::finalized_state::disk_format::RawBytes;
 
@@ -1325,6 +1323,105 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Height(1), Height(2)],
             "rollback truncates the serving index above the target"
+        );
+    }
+
+    #[test]
+    fn prune_tree_indexes_deletes_max_subtree_index() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+
+        let sapling_node = sapling_crypto::Node::from_bytes([0; 32]).expect("dummy sapling node");
+        let orchard_node = orchard::tree::Node::default();
+        let ironwood_node = ironwood::tree::Node::default();
+        let max_index = NoteCommitmentSubtreeIndex(u16::MAX);
+
+        let mut batch = DiskWriteBatch::new();
+        batch.insert_sapling_subtree(
+            &db,
+            &NoteCommitmentSubtree::new(0u16, Height(2), sapling_node),
+        );
+        batch.insert_sapling_subtree(
+            &db,
+            &NoteCommitmentSubtree::new(max_index, Height(3), sapling_node),
+        );
+        batch.insert_orchard_subtree(
+            &db,
+            &NoteCommitmentSubtree::new(0u16, Height(2), orchard_node),
+        );
+        batch.insert_orchard_subtree(
+            &db,
+            &NoteCommitmentSubtree::new(max_index, Height(3), orchard_node),
+        );
+        batch.insert_ironwood_subtree(
+            &db,
+            &NoteCommitmentSubtree::new(0u16, Height(2), ironwood_node),
+        );
+        batch.insert_ironwood_subtree(
+            &db,
+            &NoteCommitmentSubtree::new(max_index, Height(3), ironwood_node),
+        );
+        db.write_batch(batch)
+            .expect("seeding synthetic max-index subtrees succeeds");
+
+        let mut batch = DiskWriteBatch::new();
+        prune_tree_indexes(&db, &mut batch, Height(2), &None);
+        db.write_batch(batch)
+            .expect("pruning synthetic max-index subtrees succeeds");
+
+        assert_eq!(
+            db.sapling_subtree_list_by_index_range(..)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![NoteCommitmentSubtreeIndex(0)]
+        );
+        assert_eq!(
+            db.orchard_subtree_list_by_index_range(..)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![NoteCommitmentSubtreeIndex(0)]
+        );
+        assert_eq!(
+            db.ironwood_subtree_list_by_index_range(..)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![NoteCommitmentSubtreeIndex(0)]
+        );
+    }
+
+    #[test]
+    fn deferred_pool_balance_change_keeps_lockbox_disbursement_during_slow_start() {
+        let height = Height(10);
+        let network = TestnetParameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                blossom: Some(1),
+                canopy: Some(1),
+                nu5: Some(1),
+                nu6: Some(1),
+                nu6_1: Some(height.0),
+                ..Default::default()
+            })
+            .expect("configured activation heights are valid")
+            .clear_funding_streams()
+            .with_slow_start_interval(Height(11))
+            .with_lockbox_disbursements(vec![ConfiguredLockboxDisbursement {
+                address: "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz".to_string(),
+                amount: Amount::try_from(1).expect("valid test amount"),
+            }])
+            .to_network()
+            .expect("configured network is valid");
+
+        assert_eq!(
+            deferred_pool_balance_change(height, &network)
+                .expect("configured lockbox amount fits in the deferred pool"),
+            Some(DeferredPoolBalanceChange::new(
+                Amount::<zakura_chain::amount::NegativeAllowed>::try_from(-1)
+                    .expect("valid negative test amount"),
+            )),
+            "rollback backup metadata must match consensus even when NU6.1 activates during slow start"
         );
     }
 

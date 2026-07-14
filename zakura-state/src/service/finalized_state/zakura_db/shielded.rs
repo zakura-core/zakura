@@ -1123,6 +1123,19 @@ impl DiskWriteBatch {
         self.zs_delete(&sapling_anchors, anchor);
     }
 
+    /// Deletes the Sapling subtree at the given [`NoteCommitmentSubtreeIndex`].
+    pub fn delete_sapling_subtree(
+        &mut self,
+        zakura_db: &ZakuraDb,
+        index: NoteCommitmentSubtreeIndex,
+    ) {
+        let sapling_subtree_cf = zakura_db
+            .db
+            .cf_handle("sapling_note_commitment_subtree")
+            .unwrap();
+        self.zs_delete(&sapling_subtree_cf, index);
+    }
+
     /// Deletes the range of Sapling subtrees at the given [`NoteCommitmentSubtreeIndex`]es.
     /// Doesn't delete the upper bound.
     pub fn delete_range_sapling_subtree(
@@ -1247,6 +1260,19 @@ impl DiskWriteBatch {
         self.zs_delete(&orchard_anchors, anchor);
     }
 
+    /// Deletes the Orchard subtree at the given [`NoteCommitmentSubtreeIndex`].
+    pub fn delete_orchard_subtree(
+        &mut self,
+        zakura_db: &ZakuraDb,
+        index: NoteCommitmentSubtreeIndex,
+    ) {
+        let orchard_subtree_cf = zakura_db
+            .db
+            .cf_handle("orchard_note_commitment_subtree")
+            .unwrap();
+        self.zs_delete(&orchard_subtree_cf, index);
+    }
+
     /// Deletes the range of Orchard subtrees at the given [`NoteCommitmentSubtreeIndex`]es.
     /// Doesn't delete the upper bound.
     pub fn delete_range_orchard_subtree(
@@ -1277,6 +1303,19 @@ impl DiskWriteBatch {
     pub fn delete_ironwood_anchor(&mut self, zakura_db: &ZakuraDb, anchor: &ironwood::tree::Root) {
         let ironwood_anchors = zakura_db.db.cf_handle("ironwood_anchors").unwrap();
         self.zs_delete(&ironwood_anchors, anchor);
+    }
+
+    /// Deletes the Ironwood subtree at the given [`NoteCommitmentSubtreeIndex`].
+    pub fn delete_ironwood_subtree(
+        &mut self,
+        zakura_db: &ZakuraDb,
+        index: NoteCommitmentSubtreeIndex,
+    ) {
+        let ironwood_subtree_cf = zakura_db
+            .db
+            .cf_handle("ironwood_note_commitment_subtree")
+            .unwrap();
+        self.zs_delete(&ironwood_subtree_cf, index);
     }
 
     /// Deletes the range of Ironwood subtrees at the given [`NoteCommitmentSubtreeIndex`]es.

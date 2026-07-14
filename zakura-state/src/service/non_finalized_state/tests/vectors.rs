@@ -346,8 +346,8 @@ fn new_invalidate_test_state(network: &Network) -> (NonFinalizedState, Finalized
 /// Invalidating the non-finalized root of a tracked chain previously called
 /// `BTreeSet::remove(&chain)`, which compared the stored chain against
 /// itself via `Chain::cmp` and reached an `unreachable!()` for matching tip
-/// hashes. The root branch now retains by tip hash and the call returns
-/// successfully without panicking.
+/// hashes. The root branch now retains chains that do not contain the root
+/// hash, so the call returns successfully without panicking.
 #[test]
 fn invalidating_non_finalized_root_does_not_panic() {
     let _init_guard = zakura_test::init();
@@ -373,6 +373,43 @@ fn invalidating_non_finalized_root_does_not_panic() {
         state.best_chain().is_none(),
         "invalidating the root should leave no live non-finalized chain"
     );
+}
+
+/// A non-finalized root can be shared by multiple sibling forks. Invalidating
+/// that root must remove every live fork containing it, not only the best fork
+/// selected to populate the invalidation record.
+#[test]
+fn invalidating_shared_non_finalized_root_removes_all_forks() {
+    let _init_guard = zakura_test::init();
+
+    let network = Network::Mainnet;
+    let block1: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
+    let block2a = block1.make_fake_child().set_work(10);
+    let block2b = block1.make_fake_child().set_work(11);
+
+    let (mut state, finalized_state) = new_invalidate_test_state(&network);
+
+    state
+        .commit_new_chain(block1.clone().prepare(), &finalized_state)
+        .expect("fake root block should commit to an empty non-finalized state");
+    state
+        .commit_block(block2a.clone().prepare(), &finalized_state)
+        .expect("first fork tip should extend the root chain");
+    state
+        .commit_block(block2b.clone().prepare(), &finalized_state)
+        .expect("second fork tip should fork from the root chain");
+
+    state
+        .invalidate_block(block1.hash())
+        .expect("invalidating a shared root should remove every descendant fork");
+
+    assert!(
+        state.best_chain().is_none(),
+        "invalidating a shared root should leave no live non-finalized chain"
+    );
+    assert!(!state.any_chain_contains(&block1.hash()));
+    assert!(!state.any_chain_contains(&block2a.hash()));
+    assert!(!state.any_chain_contains(&block2b.hash()));
 }
 
 /// Regression test for https://github.com/ZcashFoundation/zebra/issues/10586.

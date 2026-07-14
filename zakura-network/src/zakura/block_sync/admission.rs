@@ -18,18 +18,20 @@ const ABOVE_FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
 /// two seconds of transfer time.
 const FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 1024 * 1024;
 
-/// Estimated resident-memory multiple of a buffered block body's serialized size.
+/// Estimated resident-memory multiple of a *decoded* block body's serialized size.
 ///
 /// Decoded bodies (`Arc<Block>`, `sequencer::ApplyingBlock`) have an in-memory footprint
 /// several times their wire/serialized size. The look-ahead budget must bound that *resident*
 /// cost, not the wire bytes, or a small-block backlog blows past the intended memory ceiling.
 ///
-/// Applied to every look-ahead pool at its *eventual* decoded cost — including the
-/// wire-retained reorder backlog and outstanding reservations — because the
-/// reorder→applying drain decodes without re-consulting admission; see
+/// Applied only to the pools that actually hold decoded blocks: the sequencer
+/// input channel (bodies decoded by the peer routine, bounded by the channel
+/// depth) and the submitted decode window (bodies decoded at `prepare_submit`,
+/// bounded by `submitted_apply_limit`). The reorder backlog and the applying
+/// backlog beyond the submission window retain only serialized wire bytes
+/// (`BufferedBlockBody::retain_for_backlog`), so they are charged at ×1; see
 /// [`estimated_resident_pipeline_bytes`].
 ///
-// TODO(ZCA-750): replace this flat factor with a precise per-block heap-size estimate.
 // The factor is a deliberately conservative calibration from the measured ~3.3–4x
 // wire→resident ratio; it is an approximation, not a true per-block size.
 pub const DESERIALIZED_MEM_FACTOR: u64 = 4;
@@ -47,6 +49,9 @@ pub(super) struct AdmissionSnapshot {
     pub(super) applying_buffered_bytes: u64,
     pub(super) applying_buffered_blocks: u64,
     pub(super) sequencer_input_queued_bytes: u64,
+    /// Wire bytes of `applying` bodies currently submitted to the verifier: the
+    /// decode window, the only applying bodies holding a decoded copy.
+    pub(super) submitted_applying_bytes: u64,
     pub(super) reserved_above_floor_bytes: u64,
     pub(super) reserved_above_floor_blocks: u64,
     pub(super) budget_available: u64,
@@ -218,16 +223,26 @@ impl AdmissionSnapshot {
 /// Estimated resident memory of block bodies retained by, or already committed
 /// to enter, the pipeline.
 ///
-/// Charge all pools at decoded cost (`× DESERIALIZED_MEM_FACTOR`). Applying and
-/// sequencer queues already hold decoded blocks; reorder and reserved bytes may
-/// still be wire/in-flight, but a gap-fill can decode them into applying without
-/// another admission check.
+/// Serialized pools (reorder backlog, applying backlog past the decode window,
+/// and outstanding reservations) cost their wire bytes. Decoded pools cost the
+/// decoded multiple on top: the sequencer input channel (bodies arrive decoded
+/// from the peer routine, bounded by the channel depth) and the submitted
+/// decode window (decoded at `prepare_submit`, bounded by
+/// `submitted_apply_limit`). Both decoded pools are structurally bounded, so
+/// the deep backlog — the pool that actually scales with look-ahead depth — is
+/// charged at its true serialized cost instead of a flat decoded multiple.
 fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
-    snapshot
+    let serialized = snapshot
         .retained()
         .wire_bytes()
-        .saturating_add(snapshot.reserved_above_floor_bytes)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR)
+        .saturating_add(snapshot.reserved_above_floor_bytes);
+    // Decoded copies exist alongside their retained raw payloads, so the extra
+    // decoded cost is the full decoded multiple on top of the ×1 wire charge.
+    let decoded = snapshot
+        .sequencer_input_queued_bytes
+        .saturating_add(snapshot.submitted_applying_bytes)
+        .saturating_mul(DESERIALIZED_MEM_FACTOR);
+    serialized.saturating_add(decoded)
 }
 
 fn held_blocks(snapshot: &AdmissionSnapshot) -> u64 {
@@ -289,13 +304,16 @@ pub(super) fn admit(
         if lookahead_over_budget(config, &snapshot) {
             return AdmissionOutcome::LookaheadAtCap;
         }
-        // Remaining memory headroom, expressed back in wire bytes for the response cap so a
-        // single response can't push resident memory past the budget. The next admitted body
-        // will usually become decoded soon, so it is sized as if it costs the decoded multiple.
+        // Remaining memory headroom. Admitted bodies are retained serialized
+        // (×1) until they reach the bounded decode window, so headroom converts
+        // to wire bytes directly. A body transiently costs the decoded multiple
+        // while queued in the bounded sequencer input channel; that spike is
+        // capped by the channel depth and the live `sequencer_input_queued_bytes`
+        // charge, the same class of bounded overshoot as a single in-window
+        // response exceeding the byte gate.
         let remaining_wire_bytes = config
             .effective_max_reorder_lookahead_bytes()
-            .saturating_sub(estimated_resident_pipeline_bytes(&snapshot))
-            / DESERIALIZED_MEM_FACTOR;
+            .saturating_sub(estimated_resident_pipeline_bytes(&snapshot));
         if remaining_wire_bytes == 0 {
             return AdmissionOutcome::LookaheadAtCap;
         }
@@ -427,6 +445,7 @@ mod tests {
             applying_buffered_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR - BS_PER_BLOCK_WORST_CASE_BYTES,
             applying_buffered_blocks: u64::from(range_blocks) - 1,
             sequencer_input_queued_bytes: 0,
+            submitted_applying_bytes: 0,
             reserved_above_floor_bytes: 0,
             reserved_above_floor_blocks: 0,
             budget_available: config.max_inflight_block_bytes,

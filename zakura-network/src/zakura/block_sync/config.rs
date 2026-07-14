@@ -41,15 +41,18 @@ pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 pub const BS_PER_BLOCK_WORST_CASE_BYTES: u64 = block::MAX_BLOCK_BYTES;
 /// Default cap on the estimated *resident* memory of the look-ahead pipeline.
 ///
-/// Denominated in resident bytes, not wire bytes: admission compares it against the
-/// retained and in-flight wire bytes scaled by `DESERIALIZED_MEM_FACTOR` (see
-/// `admission::estimated_resident_pipeline_bytes`), so the default admits roughly a
-/// quarter of its nominal value in wire bytes. The numeric value is kept aligned with
-/// the in-flight wire budget minus one advertised response, which under the resident
-/// interpretation yields a deep (~1.5 GiB wire) look-ahead buffer.
+/// Denominated in resident bytes: admission charges serialized pools (reorder,
+/// the applying backlog past the decode window, reservations) at their wire
+/// size and the two structurally bounded decoded pools (sequencer input
+/// channel, submitted decode window) at `× DESERIALIZED_MEM_FACTOR` (see
+/// `admission::estimated_resident_pipeline_bytes`). The default equals the
+/// worst-case resident cost of one fully-submitted checkpoint range (the
+/// clamp floor in [`ZakuraBlockSyncConfig::clamp_reorder_lookahead_to_floor`]),
+/// so the budget always admits one range while bounding the speculative
+/// backlog to the same order of magnitude.
 pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 =
-    // `DEFAULT_BS_MAX_RESPONSE_BYTES` is a `u32`, so widening to `u64` is lossless.
-    DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES - DEFAULT_BS_MAX_RESPONSE_BYTES as u64;
+    // ~802 MB wire × 4 ≈ 3.2 GB resident; cannot overflow (see the floor const).
+    BS_CHECKPOINT_RANGE_BYTE_FLOOR * super::admission::DESERIALIZED_MEM_FACTOR;
 /// Minimum submitted block applies required to resolve one checkpoint range.
 ///
 /// The checkpoint verifier resolves a checkpoint window only after the whole

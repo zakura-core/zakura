@@ -1543,6 +1543,7 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
+        submitted_applying_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 40_000_000,
@@ -1589,8 +1590,8 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         above.priority,
         super::admission::RequestPriority::AboveFloor
     );
-    // Remaining headroom is measured in resident memory: (500 - 100*4) / 4 = 25 wire bytes.
-    assert_eq!(above.max_request_bytes, 25);
+    // Remaining headroom is wire-denominated: 500 - 100 = 400 wire bytes.
+    assert_eq!(above.max_request_bytes, 400);
 }
 
 #[test]
@@ -1608,6 +1609,7 @@ fn admission_counts_inflight_to_sequencer_bytes() {
         applying_buffered_bytes: 200,
         applying_buffered_blocks: 1,
         sequencer_input_queued_bytes: 600,
+        submitted_applying_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1642,6 +1644,7 @@ fn total_resident_plateaus_under_commit_stall() {
         applying_buffered_bytes: 700,
         applying_buffered_blocks: 1,
         sequencer_input_queued_bytes: 0,
+        submitted_applying_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1676,6 +1679,7 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
         applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
+        submitted_applying_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1710,11 +1714,10 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
 
 #[test]
 fn outstanding_reservations_are_charged_at_the_resident_multiple() {
-    // Regression for the reserved-0× hole: outstanding above-floor reservations land and
-    // decode like every other pool, so they must be pre-charged at the resident multiple.
-    // Charging them nothing makes in-flight volume invisible to the byte gate until it is
-    // already resident — in a commit stall the pipeline could fill the whole in-flight wire
-    // budget and then decode ×factor past the plateau.
+    // Regression for the reserved-0× hole: outstanding above-floor reservations land as
+    // retained wire bytes like every other serialized pool, so they must be pre-charged
+    // at their wire size. Charging them nothing makes in-flight volume invisible to the
+    // byte gate until it is already resident.
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
@@ -1728,11 +1731,12 @@ fn outstanding_reservations_are_charged_at_the_resident_multiple() {
         applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
-        reserved_above_floor_bytes: 700,
+        submitted_applying_bytes: 0,
+        reserved_above_floor_bytes: 1_100,
         reserved_above_floor_blocks: 1,
         budget_available: 64_000_000,
     };
-    // Reservations alone fill the budget: 700 * 4 = 2_800 >= 1_000, so both the speculative
+    // Reservations alone fill the budget: 1_100 >= 1_000, so both the speculative
     // lane and an escalated floor block above the commit window are refused.
     assert_eq!(
         admit_grant(
@@ -1784,16 +1788,17 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
         // Large enough that the byte (memory) cap, not the block cap, is what bites here.
         ..ZakuraBlockSyncConfig::default()
     };
-    // Commit stalled far below the download floor; applying holds a full budget of bodies:
-    // 300 serialized * DESERIALIZED_MEM_FACTOR (4) = 1_200 resident >= 1_000 budget.
+    // Commit stalled far below the download floor; applying holds a full budget of
+    // serialized backlog bodies: 1_200 wire bytes >= 1_000 budget.
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(1_000),
         verified_block_tip: block::Height(10),
         reorder_buffered_bytes: 0,
         reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 300,
+        applying_buffered_bytes: 1_200,
         applying_buffered_blocks: 990,
         sequencer_input_queued_bytes: 0,
+        submitted_applying_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1872,6 +1877,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
         applying_buffered_bytes: 300,
         applying_buffered_blocks: 10,
         sequencer_input_queued_bytes: 0,
+        submitted_applying_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1908,7 +1914,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
     assert_eq!(grant.take_high, block::Height(411));
 
     // An above-window start with headroom extends to the servable ceiling, sized by the
-    // remaining resident headroom in wire bytes: (1_000 - 0) / 4 = 250.
+    // remaining wire-denominated headroom: 1_000 - 0 = 1_000.
     let grant = admit_grant(
         &config,
         open,
@@ -1918,7 +1924,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
     )
     .expect("an above-window start is admitted below the cap");
     assert_eq!(grant.take_high, block::Height(10_000));
-    assert_eq!(grant.max_request_bytes, 250);
+    assert_eq!(grant.max_request_bytes, 1_000);
 }
 
 #[test]
@@ -1941,9 +1947,10 @@ fn commit_window_stays_fundable_at_exact_floor() {
     let range_blocks = u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
         .expect("checkpoint range block count fits in u32");
 
-    // verified_tip pinned at 0; applying holds all but the last worst-case range block, plus
+    // verified_tip pinned at 0; applying holds all but the last worst-case range block —
+    // all submitted during checkpoint sync, so charged at the decoded multiple — plus
     // next-range contamination in reorder and outstanding reservations. The byte gate is
-    // full: resident (8 MiB + 800 MB + 4 MB) * 4 >= 3_208_000_000.
+    // full: 8 MiB + 800 MB + 4 MB serialized + 800 MB * 4 decoded >= 3_208_000_000.
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(range_blocks - 1),
         verified_block_tip: block::Height(0),
@@ -1952,6 +1959,7 @@ fn commit_window_stays_fundable_at_exact_floor() {
         applying_buffered_bytes: 800_000_000,
         applying_buffered_blocks: u64::from(range_blocks) - 1,
         sequencer_input_queued_bytes: 0,
+        submitted_applying_bytes: 800_000_000,
         reserved_above_floor_bytes: 4_000_000,
         reserved_above_floor_blocks: 2,
         budget_available: 2_000_000,
@@ -4378,6 +4386,7 @@ proptest::proptest! {
             applying_buffered_bytes: applying_bytes,
             applying_buffered_blocks: applying_blocks,
             sequencer_input_queued_bytes: input_bytes,
+            submitted_applying_bytes: 0,
             reserved_above_floor_bytes: reserved_bytes,
             reserved_above_floor_blocks: reserved_blocks,
             budget_available: 64_000_000,

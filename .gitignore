@@ -162,7 +162,8 @@ zakura-rpc/qa/cache/
 # Lychee link checker cache
 .lycheecache
 /.agent-shell/
-.claude/
+.claude/*
+!.claude/skills
 local_data/**
 
 # fuzzing artifacts

@@ -31,9 +31,10 @@
 #      nothing, so this exercises the production Mainnet-from-0 / catch-up path,
 #   8. a non-finalized reorg converges with no block-sync byte-budget leak.
 #
-# No image is built: each container runs the HOST-built zakurad binary
-# bind-mounted into debian:trixie-slim. If the binary is missing it is built
-# here (debug; fine for regtest). Override with ZAKURAD_BIN=/path/to/zakurad.
+# Each container runs a zakurad binary bind-mounted into debian:trixie-slim.
+# Linux hosts use the host-built debug binary. On macOS, the harness builds and
+# caches a Linux release artifact because a Mach-O host binary cannot run in the
+# Linux container. Override with ZAKURAD_BIN=/path/to/a/Linux/zakurad.
 #
 # Usage: docker/zakura-regtest-e2e/run.sh
 set -euo pipefail
@@ -171,13 +172,30 @@ command -v docker >/dev/null || fail "docker is required"
 command -v jq >/dev/null || fail "jq is required to parse RPC responses"
 command -v python3 >/dev/null || fail "python3 is required to run the trace oracle"
 
-# Ensure a host-built zakurad binary exists; build it (debug) if not.
-ZAKURAD_BIN="${ZAKURAD_BIN:-${REPO_DIR}/target/debug/zakurad}"
+# Ensure a container-compatible zakurad binary exists. Docker Desktop runs Linux
+# containers on macOS, so its bind-mounted executable must be Linux too.
+if [[ -z "${ZAKURAD_BIN:-}" && "$(uname -s)" == "Darwin" ]]; then
+  ZAKURAD_BIN="${REPO_DIR}/target/zakura-regtest-e2e-linux/zakurad"
+  log "building cached Linux zakurad for Docker Desktop"
+  mkdir -p "$(dirname "${ZAKURAD_BIN}")"
+  docker build \
+    --file "${REPO_DIR}/docker/ubuntu-package.Dockerfile" \
+    --target artifact \
+    --output "type=local,dest=$(dirname "${ZAKURAD_BIN}")" \
+    "${REPO_DIR}"
+else
+  ZAKURAD_BIN="${ZAKURAD_BIN:-${REPO_DIR}/target/debug/zakurad}"
+fi
 if [[ ! -x "${ZAKURAD_BIN}" ]]; then
   log "building host zakurad (debug) — no in-container build"
   ( cd "${REPO_DIR}" && CXXFLAGS="-include cstdint" cargo build -p zakura --bin zakurad )
 fi
 [[ -x "${ZAKURAD_BIN}" ]] || fail "zakurad binary not found at ${ZAKURAD_BIN}"
+docker run --rm \
+  -v "${ZAKURAD_BIN}:/usr/local/bin/zakurad:ro" \
+  debian:trixie-slim \
+  /usr/local/bin/zakurad --version >/dev/null 2>&1 \
+  || fail "zakurad binary is not executable in the Linux container: ${ZAKURAD_BIN}"
 export ZAKURAD_BIN
 ZAKURA_E2E_TRACE_DIR="${ZAKURA_E2E_TRACE_DIR:-/tmp/zakura-regtest-e2e-traces-${RUN_LABEL}}"
 export ZAKURA_E2E_TRACE_DIR
@@ -343,18 +361,47 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Fetch localhost-only node endpoints from inside node1's Linux network
+# namespace. Docker Desktop does not expose host-network container ports to the
+# macOS host unless its optional host-networking feature is enabled.
+container_http() {
+  local port="$1" path="$2" payload="$3" max_time="$4"
+  docker exec zakura-node-1 perl -MIO::Socket::INET -e '
+    my ($port, $path, $payload, $timeout) = @ARGV;
+    $SIG{ALRM} = sub { exit 28 };
+    alarm $timeout;
+    my $socket = IO::Socket::INET->new(
+      PeerAddr => "127.0.0.1",
+      PeerPort => $port,
+      Proto => "tcp",
+      Timeout => $timeout,
+    ) or exit 1;
+    my $method = length($payload) ? "POST" : "GET";
+    my $headers = "Host: 127.0.0.1\r\nConnection: close\r\n";
+    if (length($payload)) {
+      $headers .= "Content-Type: application/json\r\nContent-Length: " . length($payload) . "\r\n";
+    }
+    print {$socket} "$method $path HTTP/1.1\r\n$headers\r\n$payload";
+    my $response = do { local $/; <$socket> };
+    $response =~ /\AHTTP\/\S+ 2\d\d[^\r\n]*\r?\n.*?\r?\n\r?\n(.*)\z/s or exit 1;
+    print $1;
+  ' "${port}" "${path}" "${payload}" "${max_time}"
+}
+
 # rpc <port> <method> [json-params] [max-time-seconds] -> raw JSON-RPC response
 rpc() {
   local port="$1" method="$2" params="${3:-[]}" max_time="${4:-10}"
-  curl -s --max-time "${max_time}" -H 'content-type: application/json' \
-    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"${method}\",\"params\":${params}}" \
-    "http://127.0.0.1:${port}/"
+  container_http \
+    "${port}" \
+    "/" \
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"${method}\",\"params\":${params}}" \
+    "${max_time}"
 }
 
 # metric <port> <name> -> counter value (0 if absent)
 metric() {
   local port="$1" name="$2"
-  curl -s --max-time 5 "http://127.0.0.1:${port}/metrics" 2>/dev/null \
+  container_http "${port}" "/metrics" "" 5 2>/dev/null \
     | awk -v n="${name}" '$1==n {v=$2} END {print (v==""?0:v)}'
 }
 
@@ -637,11 +684,23 @@ run_restart_matrix() {
   restart_node2_at_height_then_catch_up "${near_tip_gap_height}" "near-tip-1000-gap" "${target}"
 }
 
-log "starting cluster (host-built binary, no image build)"
-docker compose -f "${COMPOSE_FILE}" up -d
+log "starting bootstrap node"
+docker compose -f "${COMPOSE_FILE}" up -d zakura-node-1
 
-log "waiting for RPC readiness"
+log "waiting for bootstrap node readiness"
 wait_ready 18232 node1
+
+# `depends_on` only controls container start order, not application readiness.
+# Wait for node1 to finish opening its legacy listener before its initial peers
+# dial it, otherwise a fast peer can get ConnectionRefused and remain in address
+# backoff for the entire test.
+log "starting peer nodes"
+docker compose -f "${COMPOSE_FILE}" up -d \
+  zakura-node-2 \
+  zakura-node-3 \
+  zakura-node-4
+
+log "waiting for peer RPC readiness"
 wait_ready 18332 node2
 wait_ready 18432 node3
 wait_ready 18532 node4
@@ -719,8 +778,10 @@ done
 # proves node2 fetched genesis from a peer over Zakura.
 deadline=$((SECONDS + READY_TIMEOUT)); n2_bootstrapped=0
 while (( SECONDS < deadline )); do
+  # Consume all log output: with pipefail, grep -q can close the pipe early and
+  # turn Docker's resulting SIGPIPE into a false-negative pipeline status.
   if docker compose -f "${COMPOSE_FILE}" logs zakura-node-2 2>/dev/null \
-    | grep -q "starting genesis block download and verify"; then
+    | grep -F "starting genesis block download and verify" >/dev/null; then
     n2_bootstrapped=1; break
   fi
   sleep 2

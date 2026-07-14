@@ -707,16 +707,6 @@ jobs:
           - The release workflow built the archive and calculated this checksum.
           - The published installer was generated with the same checksum.
 
-          ### AI Disclosure
-
-          - [x] No AI tools were used in this automatically generated PR.
-
-          ### PR Checklist
-
-          - [x] The PR title follows conventional commits format.
-          - [x] The change is limited to generated release metadata.
-          - [x] The solution is validated by the release workflow.
-          - [x] Documentation and changelogs do not require changes.
           EOF
           )"
 

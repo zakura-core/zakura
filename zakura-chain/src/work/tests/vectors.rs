@@ -57,6 +57,9 @@ fn equihash_solution_test_vectors_are_valid() -> color_eyre::eyre::Result<()> {
 static EQUIHASH_SIZE_TESTS: &[usize] = &[
     0,
     1,
+    REGTEST_SOLUTION_SIZE - 1,
+    REGTEST_SOLUTION_SIZE,
+    REGTEST_SOLUTION_SIZE + 1,
     SOLUTION_SIZE - 1,
     SOLUTION_SIZE,
     SOLUTION_SIZE + 1,
@@ -71,18 +74,34 @@ fn equihash_solution_size_field() {
     for size in EQUIHASH_SIZE_TESTS.iter().copied() {
         let mut data = Vec::new();
 
-        let size: CompactSizeMessage = size
+        let compact_size: CompactSizeMessage = size
             .try_into()
             .expect("test size fits in MAX_PROTOCOL_MESSAGE_LEN");
-        size.zcash_serialize(&mut data)
+        compact_size
+            .zcash_serialize(&mut data)
             .expect("CompactSize should serialize");
         data.resize(data.len() + SOLUTION_SIZE, 0);
 
         let result = Solution::zcash_deserialize(data.as_slice());
-        if size == SOLUTION_SIZE.try_into().unwrap() {
-            result.expect("Correct size field in EquihashSolution should deserialize");
-        } else {
-            result.expect_err("Wrong size field in EquihashSolution should fail on deserialize");
+        match size {
+            REGTEST_SOLUTION_SIZE => assert!(
+                matches!(
+                    result.expect("Regtest size field in EquihashSolution should deserialize"),
+                    Solution::Regtest(_),
+                ),
+                "Regtest size field should deserialize as a Regtest solution",
+            ),
+            SOLUTION_SIZE => assert!(
+                matches!(
+                    result.expect("Common size field in EquihashSolution should deserialize"),
+                    Solution::Common(_),
+                ),
+                "Common size field should deserialize as a Common solution",
+            ),
+            _ => {
+                result
+                    .expect_err("Wrong size field in EquihashSolution should fail on deserialize");
+            }
         }
     }
 }

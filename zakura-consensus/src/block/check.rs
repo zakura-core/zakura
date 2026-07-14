@@ -165,10 +165,7 @@ pub fn subsidy_is_valid(
     net: &Network,
     expected_block_subsidy: Amount<NonNegative>,
 ) -> Result<DeferredPoolBalanceChange, BlockError> {
-    if expected_block_subsidy.is_zero() {
-        return Ok(DeferredPoolBalanceChange::zero());
-    }
-
+    // Zero subsidy does not disable NU6.1's one-time lockbox disbursement rule.
     let height = block.coinbase_height().ok_or(SubsidyError::NoCoinbase)?;
 
     let mut coinbase_outputs: MultiSet<Output> = block

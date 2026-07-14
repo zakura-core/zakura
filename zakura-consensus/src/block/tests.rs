@@ -19,7 +19,7 @@ use zakura_chain::{
     orchard,
     parameters::{
         subsidy::block_subsidy,
-        testnet::{ConfiguredActivationHeights, Parameters},
+        testnet::{ConfiguredActivationHeights, ConfiguredLockboxDisbursement, Parameters},
         NetworkUpgrade,
     },
     primitives::Halo2Proof,
@@ -379,12 +379,92 @@ fn local_genesis_nu6_3_activation_has_satisfiable_lockbox_rule() -> Result<(), R
     let expected_block_subsidy =
         block_subsidy(height, &network).expect("the local activation height has a block subsidy");
 
-    // `subsidy_is_valid` skips all checks (including the lockbox rule) for a
-    // zero subsidy, which would make this test vacuous.
+    // Keep this fixture representative of a funded activation block; the
+    // zero-subsidy lockbox edge is covered separately below.
     assert!(!expected_block_subsidy.is_zero());
     assert_eq!(
         subsidy_is_valid(&block, &network, expected_block_subsidy)?,
         DeferredPoolBalanceChange::zero()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn zero_subsidy_does_not_skip_nu6_1_lockbox_outputs() -> Result<(), Report> {
+    let height = Height(100_000_000);
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(1),
+            nu5: Some(1),
+            nu6: Some(1),
+            nu6_1: Some(height.0),
+            ..Default::default()
+        })
+        .expect("failed to set activation heights")
+        .clear_funding_streams()
+        .with_lockbox_disbursements(vec![ConfiguredLockboxDisbursement {
+            address: "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz".to_string(),
+            amount: Amount::try_from(1).expect("valid test amount"),
+        }])
+        .to_network()
+        .expect("failed to build configured network");
+    let expected_block_subsidy =
+        block_subsidy(height, &network).expect("valid block subsidy at test height");
+    assert!(expected_block_subsidy.is_zero());
+    let lockbox_disbursements = network.lockbox_disbursements(height);
+    let [(lockbox_address, lockbox_amount)] = lockbox_disbursements.as_slice() else {
+        panic!("the test network configures one lockbox disbursement output");
+    };
+
+    let genesis = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+        .expect("genesis block should deserialize");
+    let block = |outputs| Block {
+        header: genesis.header.clone(),
+        transactions: vec![Arc::new(Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu6_1,
+            lock_time: LockTime::unlocked(),
+            expiry_height: height,
+            inputs: vec![transparent::Input::Coinbase {
+                height,
+                data: vec![],
+                sequence: u32::MAX,
+            }],
+            outputs,
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        })],
+    };
+
+    assert_eq!(
+        subsidy_is_valid(&block(vec![]), &network, expected_block_subsidy),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::OneTimeLockboxDisbursementNotFound,
+        )))
+    );
+    let block_with_disbursement = block(vec![transparent::Output::new(
+        *lockbox_amount,
+        lockbox_address.script(),
+    )]);
+    let deferred_pool_balance_change =
+        subsidy_is_valid(&block_with_disbursement, &network, expected_block_subsidy)?;
+    assert_eq!(
+        deferred_pool_balance_change,
+        DeferredPoolBalanceChange::new(
+            Amount::<NegativeAllowed>::try_from(-1).expect("valid test amount"),
+        )
+    );
+    assert_eq!(
+        check::miner_fees_are_valid(
+            check::coinbase_is_first(&block_with_disbursement)?.as_ref(),
+            height,
+            Amount::zero(),
+            expected_block_subsidy,
+            deferred_pool_balance_change,
+            &network,
+        ),
+        Ok(())
     );
 
     Ok(())
@@ -852,7 +932,7 @@ fn miner_fees_validation_includes_ironwood_balance() {
         .expect("failed to build configured network");
     let height = Height(1);
     let output_value = Amount::try_from(10).expect("valid test amount");
-    let coinbase_tx = Transaction::V6 {
+    let coinbase_tx = |ironwood_value_balance| Transaction::V6 {
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::Height(Height(0)),
         expiry_height: height,
@@ -867,12 +947,13 @@ fn miner_fees_validation_includes_ironwood_balance() {
         }],
         sapling_shielded_data: None,
         orchard_shielded_data: None,
-        ironwood_shielded_data: Some(ironwood_shielded_data(1)),
+        ironwood_shielded_data: Some(ironwood_shielded_data(ironwood_value_balance)),
     };
+    let coinbase_with_withdrawal = coinbase_tx(1);
 
     assert_eq!(
         check::miner_fees_are_valid(
-            &coinbase_tx,
+            &coinbase_with_withdrawal,
             height,
             Amount::zero(),
             output_value,
@@ -886,10 +967,38 @@ fn miner_fees_validation_includes_ironwood_balance() {
 
     assert_eq!(
         check::miner_fees_are_valid(
-            &coinbase_tx,
+            &coinbase_with_withdrawal,
             height,
             Amount::zero(),
             Amount::try_from(9).expect("valid test amount"),
+            DeferredPoolBalanceChange::zero(),
+            &network,
+        ),
+        Ok(())
+    );
+
+    let coinbase_with_deposit = coinbase_tx(-1);
+
+    assert_eq!(
+        check::miner_fees_are_valid(
+            &coinbase_with_deposit,
+            height,
+            Amount::zero(),
+            output_value,
+            DeferredPoolBalanceChange::zero(),
+            &network,
+        ),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::InvalidMinerFees,
+        )))
+    );
+
+    assert_eq!(
+        check::miner_fees_are_valid(
+            &coinbase_with_deposit,
+            height,
+            Amount::zero(),
+            Amount::try_from(11).expect("valid test amount"),
             DeferredPoolBalanceChange::zero(),
             &network,
         ),

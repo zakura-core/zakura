@@ -427,6 +427,10 @@ pub fn p2sh_input_sigop_count(
 /// in `tx`. If the lengths differ, `zip()` silently truncates the longer iterator, causing an
 /// incorrect (undercount) result.
 ///
+/// # Panics
+///
+/// Panics if a non-coinbase transaction is passed a misaligned `spent_outputs` slice.
+///
 /// [`GetP2SHSigOpCount()`]: https://github.com/zcash/zcash/blob/v6.11.0/src/main.cpp#L840-L852
 pub fn p2sh_sigop_count(
     tx: &zakura_chain::transaction::Transaction,
@@ -436,7 +440,7 @@ pub fn p2sh_sigop_count(
         return 0;
     }
 
-    debug_assert_eq!(
+    assert_eq!(
         tx.inputs().len(),
         spent_outputs.len(),
         "spent_outputs must align with transaction inputs for non-coinbase txs"

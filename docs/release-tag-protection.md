@@ -40,6 +40,12 @@ variable and secret. Allow deployments from the `main` branch and tags matching
 installer metadata update pull request. It is separate so tag deployment rules
 or approvals cannot block post-release automation.
 
+Configure a third environment named `crates-io` with required reviewers and
+deployments allowed from the `main` branch only. It holds no variables or
+secrets: it exists so the crates.io Trusted Publishing configuration can be
+restricted to it, and so a human controls when the registry publish happens
+(see [crates.io Trusted Publishing](#cratesio-trusted-publishing)).
+
 The app private key is a credential. Store its source copy in the team's secret
 manager and do not commit it or paste it into issues, pull requests, or logs.
 
@@ -76,6 +82,11 @@ ruleset administration must remain limited.
 6. Confirm that `Release binaries` starts from the new tag, skips rebuilding
    the existing assets, publishes the Docker images, and opens the installer
    metadata update pull request.
+7. For stable (non-hyphenated) tags only: after the release has been tested,
+   signed, and promoted, approve the `crates-io` environment deployment on
+   the same run. The workflow publishes the crate graph to crates.io from
+   the tagged commit (see
+   [crates.io Trusted Publishing](#cratesio-trusted-publishing)).
 
 The workflow always builds the commit selected when it was dispatched, even if
 `main` advances before approval. It is safe to rerun after a partial failure:
@@ -85,3 +96,49 @@ elsewhere. Every release is initially a pre-release; promotion remains a manual
 GitHub step after testing and signing. Existing Docker behavior is unchanged:
 a non-hyphenated stable tag moves the Docker `latest` aliases during the
 tag-triggered workflow, before that GitHub promotion.
+
+## crates.io Trusted Publishing
+
+Stable releases publish the crate graph to crates.io from the `Publish crates
+to crates.io` job in the same `Create release` run, so the tag and the
+registry artifacts always come from one commit. (The `v1.0.0-rc3` crates were
+published by hand from a different commit than the one eventually tagged —
+the exact skew this design removes.) Pre-releases never reach crates.io: the
+job only exists on non-hyphenated tags.
+
+Publishing authenticates with [crates.io Trusted
+Publishing](https://crates.io/docs/trusted-publishing): the job exchanges a
+GitHub OIDC token for a temporary (30-minute) registry token, so no
+long-lived `cargo login` token is stored anywhere. A crate owner must
+configure each publishable crate once, under **Settings > Trusted Publishing**
+on crates.io:
+
+- Repository owner `zakura-core`, repository name `zakura`
+- Workflow filename `create-release.yml`
+- Environment `crates-io`
+
+Pinning the environment means a registry token can only be minted by a job
+that passed the `crates-io` reviewer gate. New crates must be reserved on
+crates.io and given this configuration before they can release; the publish
+plan fails with instructions if a publishable workspace crate is missing from
+the registry.
+
+How the job works (`scripts/publish-crates.sh`):
+
+1. **Plan.** Every workspace crate without `publish = false` is checked
+   against the sparse index. Versions already on the index are skipped —
+   this is what makes re-running the workflow resume a partially-published
+   graph — and every crate still to publish must carry the release version.
+2. **Verify.** The selected crates are packaged with their verify builds
+   _before_ any registry token exists; the builds take longer than the
+   30-minute token lifetime. Expect this stage to take a while.
+3. **Publish.** A fresh token is minted and the crates are published in one
+   dependency-ordered `cargo publish` invocation (with `--no-verify`, since
+   verification just happened). The script refuses to publish pre-release
+   versions regardless of how it is invoked.
+
+Approve the `crates-io` deployment only after the release has been tested,
+signed, and promoted: registry publishes cannot be rolled back, only yanked.
+Two operational notes: an unapproved deployment expires after 30 days, and a
+run left waiting on this approval blocks the `create-release` concurrency
+group — reject the deployment if a new release must be cut first.

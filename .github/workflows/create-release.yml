@@ -1,6 +1,8 @@
 # This workflow is the only supported path for creating v* release tags.
 # It builds and verifies every release asset before a protected environment
 # allows the release GitHub App to publish a draft and create the immutable tag.
+# For stable (non-hyphenated) tags it then publishes the crate graph to
+# crates.io from that same commit, behind a second environment approval.
 name: Create release
 
 on:
@@ -311,3 +313,56 @@ jobs:
               --jq '.html_url'
           )"
           echo "Published ${html_url}; tag ${RELEASE_TAG} now points to ${TARGET_SHA}."
+
+  publish-crates:
+    name: Publish crates to crates.io
+    runs-on: ubuntu-latest
+    needs: [validate, publish]
+    # Pre-releases never reach crates.io, so hyphenated tags skip this job
+    # entirely and no crates-io deployment approval is requested for them.
+    if: ${{ !contains(needs.validate.outputs.release_tag, '-') }}
+    # The crates-io environment holds no secrets: it exists so the crates.io
+    # Trusted Publishing configuration can require this environment, and so
+    # its reviewer controls *when* the registry publish happens. Approve it
+    # after the release has been tested, signed, and promoted — registry
+    # publishes cannot be rolled back, only yanked.
+    environment: crates-io
+    permissions:
+      contents: read
+      # Required to mint the temporary crates.io token via OIDC.
+      id-token: write
+    steps:
+      # The same commit the tag points to: the registry artifacts and the
+      # tag must never come from different SHAs.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.target_sha }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
+        with:
+          # Registry artifacts must not be assembled from cached build output.
+          cache: false
+
+      # Skips versions that are already on the index, so re-running the
+      # workflow resumes a partially-published graph instead of failing.
+      - name: Select unpublished crates
+        id: select
+        run: ./scripts/publish-crates.sh plan
+
+      # Package and verify-build before minting the registry token: the
+      # builds take longer than the 30-minute token lifetime.
+      - name: Package and verify selected crates
+        if: ${{ steps.select.outputs.count != '0' }}
+        run: ./scripts/publish-crates.sh verify
+
+      - name: Mint crates.io Trusted Publishing token
+        if: ${{ steps.select.outputs.count != '0' }}
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 #v1.0.5
+
+      - name: Publish selected crates
+        if: ${{ steps.select.outputs.count != '0' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: ./scripts/publish-crates.sh publish

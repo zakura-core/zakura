@@ -72,7 +72,8 @@ impl Runnable for GenerateCmd {
 
         // this avoids a ValueAfterTable error
         // https://github.com/alexcrichton/toml-rs/issues/145
-        let conf = toml::Value::try_from(default_config).unwrap();
+        let mut conf = toml::Value::try_from(default_config).unwrap();
+        remove_experimental_sync_config(&mut conf);
         let conf = toml::to_string_pretty(&conf).expect("default config should be serializable");
         output += &document_network_p2p_config(&conf);
         match self.output_file {
@@ -88,6 +89,24 @@ impl Runnable for GenerateCmd {
             }
         }
     }
+}
+
+/// Omit unstable native sync tuning knobs from the generated config skeleton.
+///
+/// The fields remain deserializable for advanced overrides, while absent
+/// sections use their defaults from code.
+fn remove_experimental_sync_config(config: &mut toml::Value) {
+    let Some(zakura) = config
+        .get_mut("network")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|network| network.get_mut("zakura"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return;
+    };
+
+    zakura.remove("block_sync");
+    zakura.remove("header_sync");
 }
 
 fn document_network_p2p_config(config: &str) -> String {
@@ -115,8 +134,8 @@ fn document_network_p2p_config(config: &str) -> String {
     let comments = [
         "# The peer-to-peer stack to run:",
         "# - \"legacy\": the legacy TCP Zcash P2P stack only.",
-        "# - \"zakura\": the native Zakura P2P v2 stack only.",
-        "# - \"dual\": both stacks, with legacy fallback.",
+        "# - \"zakura\": the experimental native Zakura P2P v2 stack only.",
+        "# - \"dual\": both stacks, enabling experimental v2 with legacy fallback.",
         "# - \"default\": Zakura's default for this network, which can change between",
         "#   releases. Currently \"legacy\" on Mainnet, and \"dual\" everywhere else.",
     ]
@@ -129,4 +148,36 @@ fn document_network_p2p_config(config: &str) -> String {
         output.push('\n');
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_config_omits_experimental_sync_config_and_uses_defaults() {
+        let default_config = ZakuradConfig::default();
+        let mut config = toml::Value::try_from(&default_config).unwrap();
+
+        remove_experimental_sync_config(&mut config);
+
+        let zakura = config
+            .get("network")
+            .and_then(|network| network.get("zakura"))
+            .expect("default config contains the native Zakura section");
+        assert!(zakura.get("block_sync").is_none());
+        assert!(zakura.get("header_sync").is_none());
+        assert!(zakura.get("bootstrap_peers").is_some());
+
+        let config = toml::to_string_pretty(&config).unwrap();
+        let parsed: ZakuradConfig = toml::from_str(&config).unwrap();
+        assert_eq!(
+            parsed.network.zakura.block_sync,
+            default_config.network.zakura.block_sync
+        );
+        assert_eq!(
+            parsed.network.zakura.header_sync,
+            default_config.network.zakura.header_sync
+        );
+    }
 }

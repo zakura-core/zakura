@@ -13,7 +13,7 @@ use zakura_chain::{
 use crate::application::release_version;
 
 /// The estimated height that this release will be published.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_409_600;
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_412_800;
 
 /// The maximum number of days after `ESTIMATED_RELEASE_HEIGHT` where a Zebra server will run
 /// without halting.
@@ -22,17 +22,20 @@ pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_409_600;
 ///
 /// - Zebra will exit with a panic if the current tip height is bigger than the
 ///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
-/// - Currently set to 15 weeks.
-pub const EOS_PANIC_AFTER: u32 = 105;
+/// - Currently set to 18 days
+///
+/// Note: this is for the initial release of v1.0.0
+/// since we are aiming for a follow-up stable release in a few weeks
+pub const EOS_PANIC_AFTER: u32 = 18;
 
 /// The number of days before the end of support where Zebra will display warnings.
-pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 14;
+pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 5;
 
 /// A string which is part of the panic that will be displayed if Zebra halts.
-pub const EOS_PANIC_MESSAGE_HEADER: &str = "Zebra refuses to run";
+pub const EOS_PANIC_MESSAGE_HEADER: &str = "Zakura refuses to run";
 
 /// A string which is part of the warning that will be displayed if Zebra release is close to halting.
-pub const EOS_WARN_MESSAGE_HEADER: &str = "Your Zebra release is too old and it will stop running";
+pub const EOS_WARN_MESSAGE_HEADER: &str = "Your Zakura release is too old and it will stop running";
 
 /// The amount of time between end of support checks.
 const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -63,7 +66,7 @@ pub async fn start(
 
 /// Check if the current release is too old and panic if so.
 pub fn check(tip_height: Height, network: &Network) {
-    info!("Checking if Zebra release is inside support range ...");
+    info!("Checking if Zakura release is inside support range ...");
 
     // Get the current block spacing
     let target_block_spacing = NetworkUpgrade::target_spacing_for_height(network, tip_height);

@@ -106,6 +106,9 @@ volume at `/mnt/data`; legacy `/mnt/<node-name>-data` paths are compatibility
 symlinks only. The compat Zakura process uses the same snapshot layout on its
 host.
 
+The `"dual"` setting enables the [experimental Zakura P2P v2
+stack](../../book/src/user/p2p.md) alongside the legacy stack.
+
 The workflow also refreshes a simple fleet status dashboard on
 `zakura-testnet-1`:
 

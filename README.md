@@ -1,4 +1,6 @@
-![Zakura logotype](book/theme/favicon.png)
+<p align="center">
+  <img src="book/theme/zakura-flower-v1.svg" alt="Zakura logo" width="160">
+</p>
 
 ---
 
@@ -23,7 +25,7 @@ Zakura is forked off of [Zebra](https://github.com/ZcashFoundation/zebra). This 
 - Performance: Blockchain sync is nearly 5× faster than Zebra. Block execution is notably faster than Zebra on worst case sandblast attacks as well.
 - Pruning and snapshots: Native block pruning with configurable retention cuts disk usage substantially. We also publish snapshots (~11 GB pruned) that let you bootstrap a node 680× faster than syncing over the standard P2P network. See [here](https://zakura.com/snapshots/)
 - zcashd compatibility: A compatibility mode reproduces the legacy zcashd RPC interface, so existing wallets and integrations keep working.
-- Alpha of a v2 p2p layer: We are building a new P2P transport layer for Zakura nodes, currently off by default. The goals: sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol with strict DoS resistance built in.
+- Experimental P2P v2: We are building a new P2P transport layer for Zakura nodes, currently off by default on Mainnet. The goals are sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol. The native stack has known DoS risks and is not yet production-hardened; see its [current tradeoffs and exit criteria](book/src/user/p2p.md).
 
 ## Getting Started
 
@@ -101,7 +103,7 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.0.0-rc4 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.0.0 zakura
 ```
 
 You can start Zakura by running

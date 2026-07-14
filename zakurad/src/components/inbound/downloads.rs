@@ -250,7 +250,7 @@ where
             }
 
             if let Err((error, _advertiser_addr)) = &result {
-                if !Self::is_consensus_invalid_block_error(error) {
+                if !Self::is_source_independent_block_error(error) {
                     while let Some(fallback_source) = fallbacks.pop_front() {
                         let fallback_advertiser = AdvertiserSource::from(fallback_source.clone());
                         let source_count = this
@@ -462,14 +462,15 @@ where
         }
     }
 
-    fn is_consensus_invalid_block_error(error: &BoxError) -> bool {
-        error
-            .downcast_ref::<zakura_consensus::VerifyBlockError>()
-            .is_some()
-            || matches!(
-                error.downcast_ref::<zakura_consensus::RouterError>(),
-                Some(zakura_consensus::RouterError::Block { .. })
-            )
+    fn is_source_independent_block_error(error: &BoxError) -> bool {
+        matches!(
+            error.downcast_ref::<zakura_consensus::RouterError>(),
+            Some(zakura_consensus::RouterError::Checkpoint { source })
+                if matches!(
+                    source.as_ref(),
+                    zakura_consensus::VerifyCheckpointError::UnexpectedSideChain { .. }
+                )
+        )
     }
 
     fn queue_len(&self) -> usize {
@@ -1193,8 +1194,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_block_advertiser_is_not_retried_after_consensus_invalid_response(
-    ) -> Result<(), BoxError> {
+    async fn duplicate_block_advertiser_is_retried_after_invalid_block_body() -> Result<(), BoxError>
+    {
         let block: Arc<block::Block> =
             zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
         let hash = block.hash();
@@ -1203,44 +1204,45 @@ mod tests {
         let fallback_peer =
             zn::zakura::ZakuraPeerId::new(vec![8; 32]).expect("test peer id is within bounds");
         let network_requests = Arc::new(AtomicUsize::new(0));
+        let verifier_requests = Arc::new(AtomicUsize::new(0));
 
         let block_for_network = block.clone();
-        let first_peer_for_network = first_peer.clone();
-        let fallback_peer_for_network = fallback_peer.clone();
         let network_requests_for_network = network_requests.clone();
         let network = BoxCloneService::new(service_fn(move |request: zn::Request| {
             let block = block_for_network.clone();
-            let first_peer = first_peer_for_network.clone();
-            let fallback_peer = fallback_peer_for_network.clone();
             let network_requests = network_requests_for_network.clone();
 
             async move {
                 network_requests.fetch_add(1, Ordering::SeqCst);
-                let zn::Request::BlocksByHashFrom { source, .. } = request else {
+                let zn::Request::BlocksByHashFrom { .. } = request else {
                     return Err("expected source-aware block download".into());
                 };
 
-                match source {
-                    zn::PeerSource::Zakura(peer_id) if peer_id == first_peer => {
-                        Ok(zn::Response::Blocks(vec![Available((block, None))]))
-                    }
-                    zn::PeerSource::Zakura(peer_id) if peer_id == fallback_peer => {
-                        Err("consensus-invalid blocks must not be retried from fallbacks".into())
-                    }
-                    other => Err(format!("unexpected source: {other:?}").into()),
-                }
+                Ok(zn::Response::Blocks(vec![Available((block, None))]))
             }
         }));
 
-        let verifier = BoxCloneService::new(service_fn(
-            |_request: zakura_consensus::Request| async move {
-                Err(BoxError::from(zakura_consensus::RouterError::from(
-                    zakura_consensus::VerifyBlockError::Block {
-                        source: zakura_consensus::BlockError::NoTransactions,
-                    },
-                )))
-            },
-        ));
+        let verifier_requests_for_verifier = verifier_requests.clone();
+        let verifier =
+            BoxCloneService::new(service_fn(move |request: zakura_consensus::Request| {
+                let verifier_requests = verifier_requests_for_verifier.clone();
+
+                async move {
+                    let zakura_consensus::Request::Commit(block) = request else {
+                        return Err("unexpected verifier request".into());
+                    };
+
+                    if verifier_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(BoxError::from(zakura_consensus::RouterError::from(
+                            zakura_consensus::VerifyBlockError::Block {
+                                source: zakura_consensus::BlockError::NoTransactions,
+                            },
+                        )))
+                    } else {
+                        Ok(block.hash())
+                    }
+                }
+            }));
 
         let (_tip_sender, latest_chain_tip, _tip_change) =
             zs::ChainTipSender::new(None, &Network::Mainnet);
@@ -1268,19 +1270,133 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
             .await
-            .expect("consensus-invalid download completes")
-            .expect("downloads stream is open");
-        assert!(result.is_err());
+            .expect("fallback download completes")
+            .expect("downloads stream is open")
+            .expect("fallback block body succeeds");
+        assert_eq!(result, hash);
         assert_eq!(
             network_requests.load(Ordering::SeqCst),
-            1,
-            "consensus-invalid blocks must not be retried from fallback advertisers",
+            2,
+            "a different peer can return a valid body for the same header hash",
+        );
+        assert_eq!(verifier_requests.load(Ordering::SeqCst), 2);
+        assert!(downloads.cancel_handles.is_empty());
+        assert!(downloads.source_counts.is_empty());
+        assert!(downloads.source_locks.is_empty());
+
+        Ok(())
+    }
+
+    async fn assert_checkpoint_error_fallback(
+        verifier_error: zakura_consensus::VerifyCheckpointError,
+        should_retry: bool,
+    ) -> Result<(), BoxError> {
+        let block: Arc<block::Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let first_peer =
+            zn::zakura::ZakuraPeerId::new(vec![7; 32]).expect("test peer id is within bounds");
+        let fallback_peer =
+            zn::zakura::ZakuraPeerId::new(vec![8; 32]).expect("test peer id is within bounds");
+        let network_requests = Arc::new(AtomicUsize::new(0));
+
+        let block_for_network = block.clone();
+        let network_requests_for_network = network_requests.clone();
+        let network = BoxCloneService::new(service_fn(move |request: zn::Request| {
+            let block = block_for_network.clone();
+            let network_requests = network_requests_for_network.clone();
+
+            async move {
+                network_requests.fetch_add(1, Ordering::SeqCst);
+                let zn::Request::BlocksByHashFrom { .. } = request else {
+                    return Err("expected source-aware block download".into());
+                };
+
+                Ok(zn::Response::Blocks(vec![Available((block, None))]))
+            }
+        }));
+
+        let verifier_error = Arc::new(Mutex::new(Some(verifier_error)));
+        let verifier =
+            BoxCloneService::new(service_fn(move |request: zakura_consensus::Request| {
+                let verifier_error = verifier_error.clone();
+
+                async move {
+                    let zakura_consensus::Request::Commit(block) = request else {
+                        return Err("unexpected verifier request".into());
+                    };
+
+                    if let Some(error) = verifier_error.lock().await.take() {
+                        Err(BoxError::from(zakura_consensus::RouterError::from(error)))
+                    } else {
+                        Ok(block.hash())
+                    }
+                }
+            }));
+
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let mut downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            network,
+            verifier,
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(zn::PeerSource::Zakura(first_peer))),
+            DownloadAction::AddedToQueue,
+        );
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(zn::PeerSource::Zakura(fallback_peer))),
+            DownloadAction::AlreadyQueued,
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("checkpoint verifier result completes")
+            .expect("downloads stream is open");
+
+        if should_retry {
+            assert_eq!(result.expect("transient checkpoint error is retried"), hash);
+        } else {
+            assert!(result.is_err(), "source-independent failure is returned");
+        }
+        assert_eq!(
+            network_requests.load(Ordering::SeqCst),
+            if should_retry { 2 } else { 1 },
         );
         assert!(downloads.cancel_handles.is_empty());
         assert!(downloads.source_counts.is_empty());
         assert!(downloads.source_locks.is_empty());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_block_advertiser_is_not_retried_after_source_independent_checkpoint_error(
+    ) -> Result<(), BoxError> {
+        assert_checkpoint_error_fallback(
+            zakura_consensus::VerifyCheckpointError::UnexpectedSideChain {
+                expected: hash(1),
+                found: hash(2),
+            },
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn duplicate_block_advertiser_is_retried_after_transient_checkpoint_response(
+    ) -> Result<(), BoxError> {
+        assert_checkpoint_error_fallback(zakura_consensus::VerifyCheckpointError::Dropped, true)
+            .await
     }
 
     #[tokio::test]

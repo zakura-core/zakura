@@ -27,6 +27,7 @@ use crate::{
         connection::{overload_drop_connection_probability, Connection, State},
         ClientRequest, ErrorSlot,
     },
+    peer_set::ActiveConnectionCounter,
     protocol::external::Message,
     types::Nonce,
     PeerError, Request, Response,
@@ -108,6 +109,54 @@ async fn connection_run_loop_spawn_ok() {
     connection_join_handle.abort();
     let outbound_message = peer_outbound_messages.next().await;
     assert_eq!(outbound_message, None);
+}
+
+/// Test that a peer writer which never closes cannot retain a failed connection.
+#[tokio::test]
+async fn connection_shutdown_times_out_stalled_peer_tx_close() {
+    let _init_guard = zakura_test::init();
+
+    tokio::time::pause();
+
+    let mut active_connections = ActiveConnectionCounter::new_counter();
+    let connection_tracker = active_connections.track_connection();
+    let (connection, client_tx, shared_error_slot) =
+        super::new_never_closing_test_connection::<crate::BoxError>(connection_tracker);
+
+    // Closing the peer receiver fails the connection immediately.
+    let (peer_tx, peer_rx) = mpsc::channel(1);
+    drop(peer_tx);
+
+    let mut connection_task = tokio::spawn(connection.run(peer_rx));
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        shared_error_slot
+            .try_get_error()
+            .expect("peer stream closure must fail the connection")
+            .inner_debug(),
+        "ConnectionClosed",
+    );
+    assert!(
+        client_tx.is_closed(),
+        "failed connections must close client work before flushing the peer writer"
+    );
+    assert!(
+        matches!(futures::poll!(&mut connection_task), Poll::Pending),
+        "stalled close must wait for its timeout"
+    );
+
+    tokio::time::advance(REQUEST_TIMEOUT).await;
+
+    assert!(
+        connection_task.await.is_ok(),
+        "connection must finish after the peer writer close timeout"
+    );
+    assert_eq!(
+        active_connections.update_count(),
+        0,
+        "finished connections must release their connection tracker"
+    );
 }
 
 /// Test that the connection run loop works as a spawned task with messages in and out

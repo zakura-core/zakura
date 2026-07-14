@@ -1735,16 +1735,15 @@ where
     /// If the connection has errored already, re-use the original error.
     /// Otherwise, fail the connection with `error`.
     async fn shutdown_async(&mut self, error: impl Into<SharedPeerError>) {
-        // Close async channels first, so other tasks can start shutting down.
-        // There's nothing we can do about errors while shutting down, and some errors are expected.
-        //
-        // TODO: close peer_tx and peer_rx in shutdown() and Drop, after:
-        // - using channels instead of streams/sinks?
-        // - exposing the underlying implementation rather than using generics and closures?
-        // - adding peer_rx to the connection struct (optional)
-        let _ = self.peer_tx.close().await;
-
+        // Mark the connection as failed before awaiting a best-effort writer close.
+        // A peer that stops receiving data can block flushing the writer, but
+        // must not keep the client, peer set, or connection tracker alive indefinitely.
         self.shutdown(error);
+
+        // There's nothing we can do about errors while shutting down, and some errors are expected.
+        // `PeerTx::close` has the same timeout as sends, so this cannot delay
+        // dropping the connection indefinitely.
+        let _ = self.peer_tx.close().await;
     }
 
     /// Marks the peer as having failed with `error`, and performs connection cleanup.

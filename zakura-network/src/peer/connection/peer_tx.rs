@@ -33,8 +33,13 @@ where
     }
 
     /// Flush any remaining output and close this [`PeerTx`], if necessary.
-    pub async fn close(&mut self) -> Result<(), SerializationError> {
-        self.inner.close().await
+    ///
+    /// Returns a timeout error if flushing takes too long.
+    pub async fn close(&mut self) -> Result<(), PeerError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, self.inner.close())
+            .await
+            .map_err(|_| PeerError::ConnectionSendTimeout)?
+            .map_err(Into::into)
     }
 }
 
@@ -53,6 +58,6 @@ where
 {
     fn drop(&mut self) {
         // Do a last-ditch close attempt on the sink
-        self.close().now_or_never();
+        self.inner.close().now_or_never();
     }
 }

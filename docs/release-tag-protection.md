@@ -81,7 +81,34 @@ The workflow always builds the commit selected when it was dispatched, even if
 `main` advances before approval. It is safe to rerun after a partial failure:
 it reuses an unpublished draft or exits successfully for a release already
 published from the expected commit. It refuses to reuse a tag that points
-elsewhere. Every release is initially a pre-release; promotion remains a manual
-GitHub step after testing and signing. Existing Docker behavior is unchanged:
-a non-hyphenated stable tag moves the Docker `latest` aliases during the
-tag-triggered workflow, before that GitHub promotion.
+elsewhere. Every release is initially a pre-release; see
+[Promotion and the "Latest" release](#promotion-and-the-latest-release) for
+when and how a release is promoted.
+
+## Promotion and the "Latest" Release
+
+Both release workflows publish every release with `prerelease: true`, whatever
+the tag looks like — nothing promotes a release automatically. Promotion is a
+deliberate manual step, governed by this convention:
+
+- **Pre-releases are never promoted.** Hyphenated tags (`v1.0.0-rc4`) stay
+  pre-releases from publication until deletion. `v1.0.0-rc3` is the cautionary
+  tale: it was hand-promoted, external instructions adopted
+  `releases/latest/download/...` URLs, and deleting the release left those
+  links as dangling 404s. Pre-release artifacts are removed before the next
+  stable release as a matter of policy, so a promoted pre-release always
+  becomes a dangling "Latest" eventually.
+- **The first "Latest" release is `v1.0.0`.** Until it exists,
+  `releases/latest` intentionally returns 404. Any published download
+  instructions must use versioned URLs (`releases/download/<tag>/...`) until
+  the first stable release is promoted.
+- **Stable releases are promoted after testing and signing.** Once
+  `make sign-release` has run against the tag, edit the release: clear the
+  pre-release flag _and_ check **Set as the latest release** (`make_latest:
+  true` via the API). Do both explicitly — the "Latest" badge never points at
+  a pre-release, and an unpromoted stable release leaves the repository with
+  no "Latest" release at all.
+- **Expect brief Docker skew.** The tag-triggered workflow moves the Docker
+  `latest` aliases automatically for non-hyphenated tags, before the manual
+  GitHub promotion. A short window where the Docker `latest` alias is ahead
+  of the GitHub "Latest" release is normal.

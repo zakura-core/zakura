@@ -105,8 +105,14 @@ impl FromHex for ValueCommitment {
         // Convert from big-endian (display) to little-endian (internal)
         bytes.reverse();
 
-        Self::zcash_deserialize(io::Cursor::new(&bytes))
-            .map_err(|_| FromHexError::InvalidStringLength)
+        let commitment = Self::zcash_deserialize(io::Cursor::new(&bytes))
+            .map_err(|_| FromHexError::InvalidStringLength)?;
+
+        if commitment.is_valid_not_small_order() {
+            Ok(commitment)
+        } else {
+            Err(FromHexError::InvalidStringLength)
+        }
     }
 }
 
@@ -118,7 +124,17 @@ impl From<jubjub::ExtendedPoint> for ValueCommitment {
     ///
     /// Panics if the given point does not correspond to a valid ValueCommitment.
     fn from(extended_point: jubjub::ExtendedPoint) -> Self {
-        ValueCommitment(jubjub::AffinePoint::from(extended_point).to_bytes())
+        let bytes = jubjub::AffinePoint::from(extended_point).to_bytes();
+
+        assert!(
+            bool::from(
+                sapling_crypto::value::ValueCommitment::from_bytes_not_small_order(&bytes)
+                    .is_some(),
+            ),
+            "ValueCommitment::from requires a canonical non-small-order point",
+        );
+
+        ValueCommitment(bytes)
     }
 }
 

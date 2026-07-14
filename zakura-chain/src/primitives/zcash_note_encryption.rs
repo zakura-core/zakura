@@ -158,6 +158,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decrypts_successfully_checks_v6_orchard_and_ironwood_slots_independently() {
+        let mut vectors = zakura_test::vectors::ORCHARD_NOTE_ENCRYPTION_ZERO_VECTOR.iter();
+        let orchard_vector = vectors.next().expect("test vectors are non-empty");
+        let ironwood_vector = vectors.next().expect("test vectors have multiple entries");
+        let orchard_v2 =
+            local_shielded_data_from_action(&v2_action_from_test_vector(orchard_vector));
+        let orchard_v3 =
+            local_shielded_data_from_action(&v3_action_from_test_vector(orchard_vector));
+        let ironwood_v2 =
+            local_shielded_data_from_action(&v2_action_from_test_vector(ironwood_vector));
+        let ironwood_v3 =
+            local_shielded_data_from_action(&v3_action_from_test_vector(ironwood_vector));
+        let network = nu6_3_network();
+        let height = Height(1);
+
+        assert!(
+            super::decrypts_successfully(
+                &v6_coinbase(height, Some(orchard_v2.clone()), Some(ironwood_v3.clone())),
+                &network,
+                height,
+            ),
+            "V6 recovery must accept an Orchard V2 output and an Ironwood V3 output together",
+        );
+        assert!(
+            !super::decrypts_successfully(
+                &v6_coinbase(height, Some(orchard_v3), Some(ironwood_v3)),
+                &network,
+                height,
+            ),
+            "a valid Ironwood output must not hide an Orchard slot using the V3 domain",
+        );
+        assert!(
+            !super::decrypts_successfully(
+                &v6_coinbase(height, Some(orchard_v2), Some(ironwood_v2)),
+                &network,
+                height,
+            ),
+            "a valid Orchard output must not hide an Ironwood slot using the V2 domain",
+        );
+    }
+
     fn v2_action_from_test_vector(v: &zakura_test::vectors::TestVector) -> Action<()> {
         Action::from_parts(
             Nullifier::from_bytes(&v.rho).expect("test vector has a valid nullifier"),

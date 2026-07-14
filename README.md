@@ -28,7 +28,7 @@ Zakura is forked off of [Zebra](https://github.com/ZcashFoundation/zebra). This 
 - [zcashd compatibility](book/src/user/zcashd-compat.md): A compatibility mode
   reproduces the legacy zcashd RPC interface, so existing wallets and
   integrations keep working.
-- Experimental P2P v2: We are building a new P2P transport layer for Zakura nodes, currently off by default on Mainnet. The goals are sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol. The v2 stack has known DoS risks and is not yet production-hardened; see its [current tradeoffs and production readyness criteria](book/src/user/p2p.md).
+- Experimental P2P v2: We are building a new P2P transport layer for Zakura nodes, currently off by default on Mainnet. The goals are sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol. The v2 stack has known DoS risks and is not yet production-hardened; see its [current tradeoffs and production readiness criteria](book/src/user/p2p.md).
 
 ## Getting Started
 

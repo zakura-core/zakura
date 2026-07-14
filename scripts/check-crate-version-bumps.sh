@@ -63,6 +63,8 @@ while IFS=$'\t' read -r crate manifest_path current_version; do
   fi
 
   changed_count=$((changed_count + 1))
+# Assumes [package] has a literal version before any other version key;
+  # manifests using version.workspace = true would need different parsing.
   base_version="$(
     git -C "$repo_root" show "${base_tag}:${manifest_rel}" \
       | awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }'

@@ -419,6 +419,10 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
         .expect_request(zs::Request::KnownBlock(hashes[1]))
         .await
         .respond(zs::Response::KnownBlock(None));
+    state_service
+        .expect_request(zs::Request::KnownBlock(hashes[2]))
+        .await
+        .respond(zs::Response::KnownBlock(None));
     for _ in 0..(sync::FANOUT - 1) {
         peer_set
             .expect_request(zn::Request::FindBlocks {
@@ -507,6 +511,12 @@ async fn incomplete_checkpoint_range_refreshes_tips_without_verifier_timeout(
         .expect_request(zs::Request::KnownBlock(hashes[1]))
         .await
         .respond(zs::Response::KnownBlock(None));
+    for hash in &hashes[2..=4] {
+        state_service
+            .expect_request(zs::Request::KnownBlock(*hash))
+            .await
+            .respond(zs::Response::KnownBlock(None));
+    }
     for _ in 0..(sync::FANOUT - 1) {
         peer_set
             .expect_request(zn::Request::FindBlocks {

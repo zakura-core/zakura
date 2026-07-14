@@ -5,6 +5,10 @@
 # This check is advisory: documentation-only or test-only crate changes might
 # not require publishing, and crate versions intentionally advance on their own
 # cadence. Run it locally before release dispatch so missed bumps are visible.
+# It does not query the registry, so it cannot detect different content already
+# published under the same name and version. It also only checks changes inside
+# each crate directory, missing workspace-level changes that affect packaging.
+# Publish-time registry content validation remains the hard-error gate.
 #
 # Usage:
 #   ./scripts/check-crate-version-bumps.sh
@@ -19,7 +23,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 
 base_tag="${BASE_TAG:-}"
 if [ -z "$base_tag" ]; then
-if ! base_tag="$(git -C "$repo_root" describe --tags --match 'v*' --abbrev=0 HEAD 2>/dev/null)"; then
+  if ! base_tag="$(git -C "$repo_root" describe --tags --match 'v*' --abbrev=0 HEAD 2>/dev/null)"; then
     echo "ERROR: no v* release tag found; pass BASE_TAG explicitly." >&2
     exit 1
   fi
@@ -63,7 +67,7 @@ while IFS=$'\t' read -r crate manifest_path current_version; do
   fi
 
   changed_count=$((changed_count + 1))
-# Assumes [package] has a literal version before any other version key;
+  # Assumes [package] has a literal version before any other version key;
   # manifests using version.workspace = true would need different parsing.
   base_version="$(
     git -C "$repo_root" show "${base_tag}:${manifest_rel}" \

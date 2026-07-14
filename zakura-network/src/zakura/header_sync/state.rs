@@ -1,5 +1,11 @@
 use super::{
-    error::*, events::*, requester::HeaderRequesterHandle, validation::*, wire::*, work_queue::*, *,
+    error::*,
+    events::*,
+    requester::{HeaderRequesterHandle, HeaderRequesterIdentity},
+    validation::*,
+    wire::*,
+    work_queue::*,
+    *,
 };
 use crate::zakura::{
     HeaderSyncServiceSummary, ServicePeerDirection, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
@@ -424,8 +430,7 @@ pub(super) struct PeerHeaderState {
     /// which the peer's inbound rate limiter would otherwise treat as spam.
     pub(super) last_sent_status: Option<HeaderSyncStatus>,
     pub(super) outstanding: Vec<OutstandingRange>,
-    pub(super) pending_request_sends: usize,
-    pub(super) requester_generation: u64,
+    pub(super) requester_identity: Option<HeaderRequesterIdentity>,
     pub(super) requester: Option<HeaderRequesterHandle>,
     pub(super) meters: HeaderSyncPeerMeters,
     pub(super) served_headers_inflight: u16,
@@ -455,8 +460,7 @@ impl PeerHeaderState {
             last_received_status_at: None,
             last_sent_status: None,
             outstanding: Vec::new(),
-            pending_request_sends: 0,
-            requester_generation: 0,
+            requester_identity: None,
             requester: None,
             meters: HeaderSyncPeerMeters::new(
                 status_refresh_interval,
@@ -470,11 +474,7 @@ impl PeerHeaderState {
     }
 
     pub(super) fn available_slots(&self) -> usize {
-        usize::from(self.max_inflight_requests).saturating_sub(
-            self.outstanding
-                .len()
-                .saturating_add(self.pending_request_sends),
-        )
+        usize::from(self.max_inflight_requests).saturating_sub(self.outstanding.len())
     }
 
     pub(super) fn remove_outstanding_by_request_id(
@@ -579,17 +579,15 @@ impl HeaderSyncPeerMeters {
 pub(super) struct OutstandingRange {
     pub(super) request_id: HeaderSyncRequestId,
     pub(super) range: RangeRequest,
-    pub(super) deadline: Option<Instant>,
-    pub(super) expected_max_count: u32,
-    pub(super) clear_assignment_on_timeout: bool,
+    pub(super) deadline: Instant,
     pub(super) purpose: RangePurpose,
     pub(super) phase: OutstandingPhase,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum OutstandingPhase {
-    Registered,
-    Sent,
+    Publishing,
+    AwaitingResponse,
     EmptyRetry,
 }
 

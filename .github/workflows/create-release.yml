@@ -45,7 +45,9 @@ jobs:
             exit 1
           fi
 
-          ./scripts/check-release-version.sh "$RELEASE_TAG"
+          make pre-release \
+            RELEASE_TAG="$RELEASE_TAG" \
+            PRE_RELEASE_WARN_CRATE_VERSION_BUMPS=0
 
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"

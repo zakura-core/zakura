@@ -119,8 +119,8 @@ version.
 cargo release version --verbose --execute --allow-branch '*' -p zakura patch # [ major | minor ]
 ```
 
-- [ ] On the release commit, check that the version matches the tag you are
-      about to create: `./scripts/check-release-version.sh v<version>`
+- [ ] On the release commit, run the pre-release checks for the tag you are
+      about to create: `make pre-release RELEASE_TAG=v<version> BASE_TAG=v<version>`
 
 ## Update Crate Versions and Crate Change Logs
 
@@ -129,8 +129,10 @@ and make sure you're a member of owners group.
 
 Check that the release will work:
 
-- [ ] Determine which crates require release. Run `git diff --stat <previous_tag>`
-      and enumerate the crates that had changes.
+- [ ] Review the changed-crate version advisory from `make pre-release`. It
+      warns when publishable crates changed since the latest release tag without
+      a package version bump. This warning is local-only and advisory; unchanged
+      crates are not bumped or published.
 - [ ] Update (or install) `semver-checks`: `cargo +stable install cargo-semver-checks --locked`
 - [ ] Update (or install) `public-api`: `cargo +stable install cargo-public-api --locked`
 - [ ] For each crate that requires a release:

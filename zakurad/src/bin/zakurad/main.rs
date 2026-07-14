@@ -6,6 +6,10 @@ use zakurad::application::{boot, APPLICATION};
 const GLIBC_MALLOC_ARENA_MAX: i32 = 4;
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(
+    unsafe_code,
+    reason = "calling glibc mallopt is required to bound allocator arena retention"
+)]
 fn limit_glibc_malloc_arenas() {
     if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
         return;

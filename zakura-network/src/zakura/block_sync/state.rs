@@ -201,6 +201,19 @@ impl BlockSyncHandle {
         *self.peers.borrow()
     }
 
+    /// Park `peer` for `cooldown`, exactly as the no-progress liveness deadline
+    /// does when it evicts an unproductive block-sync peer.
+    #[cfg(test)]
+    pub(crate) fn park_peer_for_test(&self, peer: &ZakuraPeerId, cooldown: std::time::Duration) {
+        let wiring = self
+            .routine_wiring
+            .as_ref()
+            .expect("a handle from spawn_block_sync_reactor always carries routine wiring");
+        wiring
+            .registry
+            .park_peer_until(peer, std::time::Instant::now() + cooldown);
+    }
+
     /// Subscribe to local block-sync status advertisements.
     pub fn subscribe_status(&self) -> watch::Receiver<BlockSyncStatus> {
         self.status.clone()

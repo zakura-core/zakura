@@ -1494,6 +1494,58 @@ fn ordered_stream_reopen_backoff(attempts: u32) -> Duration {
         .min(ORDERED_STREAM_REOPEN_BACKOFF_CAP)
 }
 
+/// Whether this side may open `kind` itself.
+///
+/// The initiator proactively opens every ordered stream it wants. Block sync is
+/// symmetric -- the responder opens it too, so a two-way block-sync channel
+/// exists regardless of who dialled -- and a kind both sides open is resolved by
+/// the collision tiebreak in the accept loop. In-process tests use one stream-6
+/// session per connection so local harnesses avoid the symmetric collision path.
+fn may_open_ordered_stream(kind: u16, is_initiator: bool) -> bool {
+    is_initiator || (!cfg!(test) && kind == ZAKURA_STREAM_BLOCK_SYNC)
+}
+
+/// Whether a `false` from [`Service::wants_peer`] for `kind` means "not right
+/// now" rather than "not on this connection".
+///
+/// Block sync withholds a peer for two reasons that both clear on their own
+/// while the connection stays up: it parks a peer that missed its no-progress
+/// liveness deadline for a cooldown (180s by default), and it caps concurrent
+/// block-sync peers per direction. The transport asks for demand exactly once,
+/// at connection setup, so on `false` the block-sync stream is dropped for the
+/// entire life of the connection -- and because the connection itself stays
+/// healthy (header sync and discovery keep riding it) nothing redials, so there
+/// is no new setup to ask again. A peer parked after eviction and redialled ~30s
+/// later, well inside its 180s cooldown, is therefore refused block sync
+/// permanently; with every peer eventually parked, block sync settles at zero
+/// peers with work pending and body sync stalls for good while header sync
+/// happily tracks the tip.
+///
+/// Re-check demand for these kinds until the service takes the peer.
+fn ordered_stream_demand_is_transient(kind: u16) -> bool {
+    kind == ZAKURA_STREAM_BLOCK_SYNC
+}
+
+/// Schedule a delayed reopen/demand re-check of one ordered stream kind.
+///
+/// The delay backs off per consecutive attempt so neither a failing local open
+/// nor a service that stays undemanding can spin the connection loop.
+fn schedule_ordered_stream_reopen(
+    reopen_tx: &mpsc::UnboundedSender<Stream>,
+    attempts: &mut HashMap<u16, u32>,
+    stream: Stream,
+) -> Duration {
+    let attempt = attempts.entry(stream.kind).or_insert(0);
+    let delay = ordered_stream_reopen_backoff(*attempt);
+    *attempt = attempt.saturating_add(1);
+    let reopen = reopen_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let _ = reopen.send(stream);
+    });
+    delay
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum InboundMessageAdmission {
     Admit,
@@ -1962,11 +2014,7 @@ impl ZakuraProtocolHandler {
             .registry
             .ordered_streams_for_escalation(accepted_capabilities, &peer_id, context.direction)
             .into_iter()
-            .filter(|stream| {
-                // In-process tests use one stream-6 session per connection so
-                // local harnesses avoid exercising the symmetric collision path.
-                context.is_initiator || (!cfg!(test) && stream.kind == ZAKURA_STREAM_BLOCK_SYNC)
-            })
+            .filter(|stream| may_open_ordered_stream(stream.kind, context.is_initiator))
             .collect();
         let request_response_stream_count = self
             .registry
@@ -1993,6 +2041,22 @@ impl ZakuraProtocolHandler {
             close_cause.record("resource_queue_split");
             connection_token.cancel();
         }
+        // Ordered streams this side is entitled to open, whose owning service has
+        // no demand for this peer *right now*, but whose demand is transient. The
+        // setup check below is the transport's only question, so these would
+        // otherwise stay dark for the life of the connection; re-check them until
+        // the service takes the peer.
+        let withheld_transient_streams: Vec<Stream> = negotiated_ordered_streams
+            .iter()
+            .copied()
+            .filter(|stream| {
+                ordered_stream_demand_is_transient(stream.kind)
+                    && may_open_ordered_stream(stream.kind, context.is_initiator)
+                    && !ordered_streams
+                        .iter()
+                        .any(|opened| opened.kind == stream.kind)
+            })
+            .collect();
         let selected_ordered_streams: HashMap<u16, Stream> = negotiated_ordered_streams
             .iter()
             .map(|stream| (stream.kind, *stream))
@@ -2093,6 +2157,22 @@ impl ZakuraProtocolHandler {
             }
         }
 
+        if !connection_token.is_cancelled() {
+            for stream in withheld_transient_streams {
+                let delay = schedule_ordered_stream_reopen(
+                    &ordered_stream_reopen_tx,
+                    &mut ordered_stream_reopen_attempts,
+                    stream,
+                );
+                debug!(
+                    ?peer_id,
+                    stream_kind = stream.kind,
+                    ?delay,
+                    "service has no demand for this peer yet; scheduling an ordered stream demand re-check"
+                );
+            }
+        }
+
         loop {
             tokio::select! {
                 biased;
@@ -2116,11 +2196,11 @@ impl ZakuraProtocolHandler {
                         context.is_initiator,
                         connection_token.is_cancelled(),
                     ) {
-                        let attempts = ordered_stream_reopen_attempts
-                            .entry(exited.stream.kind)
-                            .or_insert(0);
-                        let delay = ordered_stream_reopen_backoff(*attempts);
-                        *attempts = attempts.saturating_add(1);
+                        let delay = schedule_ordered_stream_reopen(
+                            &ordered_stream_reopen_tx,
+                            &mut ordered_stream_reopen_attempts,
+                            exited.stream,
+                        );
                         debug!(
                             stream_kind = exited.stream.kind,
                             stream_version = exited.stream.version,
@@ -2128,25 +2208,36 @@ impl ZakuraProtocolHandler {
                             ?delay,
                             "scheduling Zakura ordered stream reopen"
                         );
-                        let reopen = ordered_stream_reopen_tx.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(delay).await;
-                            let _ = reopen.send(exited.stream);
-                        });
                     }
                 }
                 Some(stream) = ordered_stream_reopen_rx.recv() => {
                     if connection_token.is_cancelled()
-                        || !context.is_initiator
+                        || !may_open_ordered_stream(stream.kind, context.is_initiator)
                         || opened_kinds.contains(&stream.kind)
+                        || accepted_ordered_kinds.contains(&stream.kind)
                         || selected_ordered_streams.get(&stream.kind) != Some(&stream)
-                        || !self.registry.wants_ordered_stream(
-                            stream.kind,
-                            accepted_capabilities,
-                            &peer_id,
-                            context.direction,
-                        )
                     {
+                        continue;
+                    }
+
+                    if !self.registry.wants_ordered_stream(
+                        stream.kind,
+                        accepted_capabilities,
+                        &peer_id,
+                        context.direction,
+                    ) {
+                        // Still no demand. For a kind whose demand is transient
+                        // (block sync's peer park and per-direction peer cap both
+                        // lapse on their own) keep asking: this is the only path
+                        // that can open the stream without a redial, and the
+                        // connection is healthy enough that no redial is coming.
+                        if ordered_stream_demand_is_transient(stream.kind) {
+                            schedule_ordered_stream_reopen(
+                                &ordered_stream_reopen_tx,
+                                &mut ordered_stream_reopen_attempts,
+                                stream,
+                            );
+                        }
                         continue;
                     }
 
@@ -2195,22 +2286,17 @@ impl ZakuraProtocolHandler {
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
                         Err(error) => {
-                            let attempts = ordered_stream_reopen_attempts
-                                .entry(stream.kind)
-                                .or_insert(0);
-                            let delay = ordered_stream_reopen_backoff(*attempts);
-                            *attempts = attempts.saturating_add(1);
+                            let delay = schedule_ordered_stream_reopen(
+                                &ordered_stream_reopen_tx,
+                                &mut ordered_stream_reopen_attempts,
+                                stream,
+                            );
                             debug!(
                                 ?error,
                                 stream_kind = stream.kind,
                                 ?delay,
                                 "retrying Zakura ordered stream reopen after local failure"
                             );
-                            let reopen = ordered_stream_reopen_tx.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(delay).await;
-                                let _ = reopen.send(stream);
-                            });
                         }
                     }
                 }
@@ -2332,7 +2418,26 @@ impl ZakuraProtocolHandler {
                                         stream_kind = kind,
                                         "locally parking ordered service stream because the service has no demand"
                                     );
+                                    // We are not adopting it after all, so this kind
+                                    // is free again -- both for a later re-offer by
+                                    // the peer and for the demand re-check below.
+                                    accepted_ordered_kinds.remove(&kind);
                                     admitted.cancel_token.cancel();
+                                    // The refusal is only about demand *right now*.
+                                    // If this kind's demand is transient and we may
+                                    // open it ourselves, re-check until the service
+                                    // takes the peer, rather than leaving the stream
+                                    // dark for the life of the connection.
+                                    if ordered_stream_demand_is_transient(kind)
+                                        && may_open_ordered_stream(kind, context.is_initiator)
+                                        && selected_ordered_streams.contains_key(&kind)
+                                    {
+                                        schedule_ordered_stream_reopen(
+                                            &ordered_stream_reopen_tx,
+                                            &mut ordered_stream_reopen_attempts,
+                                            selected_ordered_streams[&kind],
+                                        );
+                                    }
                                     continue;
                                 }
 
@@ -4771,7 +4876,7 @@ mod tests {
         protocol::internal::{InventoryResponse, Response},
         zakura::{
             legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
-            testkit::LocalEndpointFactory,
+            testkit::{await_until, LocalEndpointFactory, ZakuraTestNode},
             HeaderSyncEvent, HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession,
             HeaderSyncRequestId, HeaderSyncStatus, ServicePeerLimits, ZakuraDiscoveryConfig,
             ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, LOCAL_MAX_MESSAGE_BYTES,
@@ -6724,6 +6829,111 @@ mod tests {
             ordered_stream_reopen_backoff(u32::MAX),
             ORDERED_STREAM_REOPEN_BACKOFF_CAP
         );
+    }
+
+    #[test]
+    fn only_block_sync_demand_is_treated_as_transient() {
+        // Block sync withholds a peer for reasons that lapse on their own (the
+        // no-progress park, the per-direction peer cap), so `false` there means
+        // "not yet" and must be re-checked.
+        assert!(ordered_stream_demand_is_transient(ZAKURA_STREAM_BLOCK_SYNC));
+        // Every other service's `false` is a standing decision for this
+        // connection -- re-checking would poll a service that will not change
+        // its mind.
+        for kind in [
+            LEGACY_GOSSIP_STREAM_KIND,
+            LEGACY_REQUEST_STREAM_KIND,
+            DISCOVERY_STREAM_KIND,
+            HEADER_SYNC_STREAM_KIND,
+        ] {
+            assert!(
+                !ordered_stream_demand_is_transient(kind),
+                "stream kind {kind} must not be re-checked for demand"
+            );
+        }
+    }
+
+    /// Regression for the mainnet dual-stack body-sync stall on
+    /// `temp-zakura-sync-test-7` (2026-07-14, run
+    /// `20260714T073939Z-cca353fd1287`): body sync froze at height 2,725,606 for
+    /// 10 minutes with 54,670 blocks of pending work and 6.4 GB of free download
+    /// budget, while header sync happily tracked the tip at 3,411,947. Block sync
+    /// had decayed to `peers: 0` -- permanently.
+    ///
+    /// The cause is entirely in the transport. Block sync evicts a peer that
+    /// missed its no-progress liveness deadline and parks it for
+    /// `no_progress_peer_cooldown` (180s). The transport knows nothing about that
+    /// park and redials the peer ~30s later, well inside the cooldown. At
+    /// connection setup the transport asks block sync once whether it wants the
+    /// peer; it is still parked, so the block-sync stream is withheld -- and that
+    /// decision was never revisited. The connection itself stays up and healthy
+    /// (header sync and discovery keep riding it, which is exactly why headers
+    /// kept reaching the tip), so no redial follows, so there is no new setup to
+    /// ask again; and when the park lapsed nothing re-offered the stream. Every
+    /// block-sync peer was eventually evicted this way, so block sync ended at
+    /// zero peers on a node holding live connections to those very peers.
+    ///
+    /// This drives the real `serve_connection` over a real local QUIC connection
+    /// with the real `BlockSyncService`, parking the peer exactly as the liveness
+    /// deadline does. The park must defer the stream, not lose it: once the
+    /// cooldown lapses on a still-live connection, block sync must get its stream
+    /// without waiting for a redial that is never coming.
+    #[tokio::test]
+    async fn parked_block_sync_peer_gets_a_stream_when_its_cooldown_lapses() -> Result<(), BoxError>
+    {
+        const COOLDOWN: Duration = Duration::from_secs(3);
+
+        let _guard = zakura_test::init();
+
+        let genesis =
+            Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
+        let anchor = (block::Height(0), genesis.hash());
+        let frontiers = HeaderSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: genesis.hash(),
+        };
+        let node = |seed| {
+            ZakuraTestNode::builder(seed)
+                .header_sync_driver(Config::default().network, anchor, frontiers, Some(anchor))
+                .spawn()
+        };
+        let dialer = node(140).await?;
+        let listener = node(141).await?;
+
+        let listener_peer =
+            ZakuraPeerId::new(listener.node_addr().await.node_id.as_bytes().to_vec())?;
+        let block_sync = dialer
+            .block_sync()
+            .expect("the header-sync driver spawns the block-sync reactor");
+
+        // The peer just missed its no-progress liveness deadline: block sync
+        // evicts and parks it. The transport's redial lands inside the cooldown.
+        block_sync.park_peer_for_test(&listener_peer, COOLDOWN);
+        dialer
+            .connect_native(&listener, Duration::from_secs(10))
+            .await?;
+
+        // The park is in force, so block sync is withheld from this connection.
+        assert_eq!(
+            block_sync.peer_snapshot().outbound_peers,
+            0,
+            "a parked peer must not be given a block-sync stream while its cooldown runs",
+        );
+
+        // The cooldown lapses while the connection stays up. Nothing will redial
+        // -- the connection is healthy -- so the only way block sync ever gets
+        // this peer back is for the transport to re-check its demand.
+        await_until(
+            "block sync opens a stream to the peer whose park expired",
+            Duration::from_secs(30),
+            || block_sync.peer_snapshot().outbound_peers == 1,
+        )
+        .await?;
+
+        dialer.shutdown().await;
+        listener.shutdown().await;
+        Ok(())
     }
 
     #[tokio::test]

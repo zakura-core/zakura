@@ -1,6 +1,6 @@
 [package]
 name = "zakura-state"
-version = "1.0.0-rc3"
+version = "1.0.0-rc5"
 authors.workspace = true
 description = "State contextual verification and storage code for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true

@@ -91,7 +91,7 @@ Both release workflows publish every release with `prerelease: true`, whatever
 the tag looks like — nothing promotes a release automatically. Promotion is a
 deliberate manual step, governed by this convention:
 
-- **Pre-releases are never promoted.** Hyphenated tags (`v1.0.0-rc4`) stay
+- **Pre-releases are never promoted.** Hyphenated tags (`v1.0.0-rc5`) stay
   pre-releases from publication until deletion. `v1.0.0-rc3` is the cautionary
   tale: it was hand-promoted, external instructions adopted
   `releases/latest/download/...` URLs, and deleting the release left those

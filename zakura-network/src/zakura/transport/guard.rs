@@ -147,28 +147,13 @@ impl ByteBudget {
         }
     }
 
-    /// Settle an estimated reservation to the actual bytes now held.
-    ///
-    /// If `actual` is smaller, this releases slack. If it is larger, this charges
-    /// the overshoot so held bodies are never under-counted.
-    #[cfg(test)]
-    pub(crate) fn settle(&mut self, reserved: u64, actual: u64) {
-        if actual > reserved {
-            self.charge(actual - reserved);
-        } else {
-            self.release(reserved - actual);
-        }
-    }
-
     /// Audit the shared counter against an externally-derived expected value.
     ///
-    /// The expected value can be a cross-task snapshot, so transient handoff
-    /// skew is recorded as a metric rather than emitted as a warning.
-    ///
-    /// Returns `true` when the budget matches.
+    /// Handoff ordering can transiently leave the budget above the source
+    /// ledger; only a shortfall proves a double release or lost charge.
     pub(crate) fn audit(&self, expected: u64, _context: &'static str) -> bool {
         let actual = self.reserved();
-        let ok = actual == expected;
+        let ok = actual >= expected;
         if !ok {
             metrics::counter!("sync.block.budget.audit_drift").increment(1);
         }
@@ -353,20 +338,15 @@ mod tests {
     }
 
     #[test]
-    fn byte_budget_settles_estimates_to_actuals() {
+    fn byte_budget_charge_overdrafts_past_the_max() {
         let mut budget = ByteBudget::new(1_000);
-        assert!(budget.try_reserve(300));
-        budget.settle(300, 200);
-        assert_eq!(budget.reserved(), 200);
-
-        assert!(budget.try_reserve(300));
-        budget.settle(300, 300);
-        assert_eq!(budget.reserved(), 500);
-
-        assert!(budget.try_reserve(300));
-        budget.settle(300, 450);
-        assert_eq!(budget.reserved(), 950);
-        assert_eq!(budget.available(), 50);
+        assert!(budget.try_reserve(900));
+        budget.charge(300);
+        assert_eq!(budget.reserved(), 1_200);
+        assert_eq!(budget.available(), 0);
+        assert!(!budget.try_reserve(1));
+        budget.release(1_200);
+        assert_eq!(budget.reserved(), 0);
     }
 
     // A `ByteBudget` is cloned and shared across the block-sync Sequencer and every

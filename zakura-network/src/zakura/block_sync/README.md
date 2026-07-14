@@ -45,7 +45,7 @@ while anything anchored to the verified tip is pinned until real progress commit
 | Purpose | unblock the contiguous prefix so the committer keeps moving | fill the look-ahead buffer so the bursty committer never starves |
 | Candidate selection | first pending in `[servable_low, min(servable_high, floor_high)]`, only if this peer is the preferred floor carrier | first pending in the peer's servable range, only when the floor arm produced nothing |
 | cwnd slots | may borrow up to `floor_bypass_slots` (default 2) beyond a saturated cwnd — bypass slots fund the floor **only** | normal cwnd slots only |
-| Byte funding | may **block**: `reserve_request_budget`'s floor path can shed an above-floor reorder body to fund the floor (`FundFloorReservation`) — reachable even at zero in-flight budget | non-blocking `try_reserve`; refused if the in-flight budget is spent |
+| Byte funding | never refused: `reserve_request_budget`'s floor path overdrafts the in-flight budget by at most one request when `try_reserve` fails — reachable even at zero in-flight budget | non-blocking `try_reserve`; refused if the in-flight budget is spent |
 | Request deadline | short fixed leash (`floor_rescue_timeout`, default 2 s); on expiry the height is rescued to a faster carrier, the peer is retry-avoided but **not** disconnected | `request_timeout` (default 8 s) + expected transfer time (`estimated_bytes / measured BtlBw`, rate floored at 256 KiB/s) — patient, since it never gates the floor |
 
 **Floor carrier preference:** the floor rides the fastest servable peer. Before taking
@@ -63,6 +63,13 @@ snapshot, start_height, servable_high, response_byte_cap)`. It is the single aut
 for the commit-window exemption, the resident-memory gate, and request sizing — the
 fill loop feeds its grant verbatim to the work queue and may not substitute its own
 sizing.
+
+The one deliberate exception is `admission::admit_received_body`, the retention-only
+gate for a body that is already downloaded (the unmatched-fallthrough path). A received
+body consumes no request budget, so it applies the same commit-window exemption and
+resident gate but never consults `budget_available` — a wire budget saturated by
+outstanding requests must not force an already-paid-for body to be dropped and
+re-downloaded.
 
 ### The commit window
 
@@ -116,17 +123,20 @@ _eventual_ decoded cost, `wire_bytes × DESERIALIZED_MEM_FACTOR` (= 4):
 
 Two gates, checked together in `lookahead_over_budget`:
 
-- **Byte gate:** `estimated_resident ≥ effective_max_reorder_lookahead_bytes`, where
-  `effective = min(max_reorder_lookahead_bytes, max_inflight_block_bytes × 4)`.
+- **Byte gate:** `estimated_resident ≥ effective_max_reorder_lookahead_bytes`
+  (= `max_reorder_lookahead_bytes`; the request budget no longer caps it, since
+  the request cap does not imply retention).
 - **Block gate (defense in depth):** reorder + applying + reserved block counts
   `≥ LOOKAHEAD_BLOCK_HARD_CAP` (a fixed 262,144 — it binds before the byte gate
   only for tiny bodies averaging under ~6.1 KB wire, where per-entry bookkeeping
   overhead dominates; never needed operator tuning, so it is a constant, not a
   config knob).
 
-This is separate from the **in-flight wire budget** (`max_inflight_block_bytes`,
-default 6 GiB, tracked by `ByteBudget`): that bounds bytes concurrently on the wire;
-the look-ahead gate bounds bytes _retained_ by the pipeline.
+This is separate from the **in-flight request budget** (`max_inflight_block_bytes`,
+default 6 GiB, tracked by `ByteBudget`): that bounds outstanding request
+reservations — charged at issuance, released at receipt (or timeout/watchdog/
+reset/floor GC) — while the look-ahead gate is the single authority over bytes
+_retained_ by the pipeline.
 
 ### Config clamps
 
@@ -158,12 +168,13 @@ retained wire 807.7–807.9 MB → ×4 = 3.231 GB, +0.7% over budget.
    look-ahead gates — a pinned checkpoint range can always assemble.
 2. **Floor grants never size below one byte**, and `take_in_range_budgeted` always
    takes its first item regardless of the byte cap — so the floor block is taken even
-   when the in-flight budget is exactly full, reaching the floor funding path…
-3. **…which can shed to fund.** `reserve_request_budget`'s Floor path awaits
-   `FundFloorReservation`: an above-floor reorder body is shed (returned to pending)
-   to free bytes for the floor block. The floor is therefore never starved by
-   speculative work, and this path is deliberately independent of the in-flight byte
-   budget.
+   when the in-flight budget is exactly full, reaching the floor reservation path…
+3. **…which overdrafts instead of waiting.** When `try_reserve` fails,
+   `reserve_request_budget`'s Floor path charges the reservation past the max — a
+   bounded overshoot of at most one request (the WorkQueue single-owner invariant
+   permits one floor reservation globally), repaid through the normal release
+   discipline. The floor is therefore never starved by speculative work, with no
+   cross-task funding round trip.
 4. **In-window floor liveness never depends on budget size** — the clamps only stop
    sub-range configs from thrashing the speculative lane.
 
@@ -191,8 +202,8 @@ borrowed a bypass slot.
 
 | Knob | Default | Notes |
 | --- | --- | --- |
-| `max_reorder_lookahead_bytes` | ~6.4 GB | **resident-denominated** (compared against wire × 4); effective value capped at `max_inflight_block_bytes × 4`; clamped up to ~3.208 GB |
-| `max_inflight_block_bytes` | 6 GiB | in-flight wire budget (separate from the resident gate) |
+| `max_reorder_lookahead_bytes` | ~6.4 GB | **resident-denominated** (compared against wire × 4); clamped up to ~3.208 GB |
+| `max_inflight_block_bytes` | 6 GiB | outstanding-request wire budget, released at receipt (separate from the resident gate) |
 | `max_blocks_per_response` | 1 | count cap per request (effective = min of both sides' advertisements, hard max 128) |
 | `floor_bypass_slots` | 2 | extra slots past a saturated cwnd, floor lane only |
 | `request_timeout` / `floor_rescue_timeout` | 8 s / 2 s | above-floor base deadline / floor rescue leash |

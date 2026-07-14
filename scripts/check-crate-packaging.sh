@@ -74,6 +74,8 @@ cargo package --locked $VERIFY_FLAG "${package_args[@]}"
 # crates.io rejects archives over 10 MiB.
 max_bytes=$((10 * 1024 * 1024))
 
+echo
+echo "Package archive sizes:"
 failed=0
 for crate in "${PUBLISH_ORDER[@]}"; do
   version="$(jq -r --arg crate "$crate" '.packages[] | select(.name == $crate) | .version' <<<"$metadata")"
@@ -102,4 +104,5 @@ if [ "$failed" -ne 0 ]; then
   exit 1
 fi
 
+echo
 echo "All ${#PUBLISH_ORDER[@]} crates package cleanly."

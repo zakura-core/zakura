@@ -31,6 +31,10 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
+        with:
+          toolchain: stable
+
       - name: Validate source, tag, and package version
         id: validate
         env:
@@ -45,7 +49,9 @@ jobs:
             exit 1
           fi
 
-          ./scripts/check-release-version.sh "$RELEASE_TAG"
+          make pre-release \
+            RELEASE_TAG="$RELEASE_TAG" \
+            PRE_RELEASE_WARN_CRATE_VERSION_BUMPS=0
 
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"

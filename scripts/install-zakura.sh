@@ -40,16 +40,11 @@ INSTALL_PROFILE=""
 MODE=""
 NETWORK="Mainnet"
 ZCASHD_DEFAULT_DATADIR="${HOME}/.zcash"
-if [[ -d /mnt ]]; then
-  ZAKURA_STANDALONE_STATE_DIR="/mnt/data/zakura-state"
-else
-  ZAKURA_STANDALONE_STATE_DIR="$ZAKURA_DEFAULT_CACHE_DIR"
-fi
 ZAKURA_STANDALONE_INSTALL_DIR="${HOME}/.local/zakura"
 ZAKURA_STANDALONE_CACHE_DIR="${HOME}/.cache/zakura"
 ZAKURA_COMPAT_INSTALL_DIR="${HOME}/.local/zcashd-compat"
 ZAKURA_COMPAT_CACHE_DIR="${HOME}/.cache/zcashd-compat"
-ZAKURA_STATE_DIR="$ZAKURA_STANDALONE_STATE_DIR"
+ZAKURA_STATE_DIR="$ZAKURA_DEFAULT_CACHE_DIR"
 ZAKURA_IDENTITY_DIR="$ZAKURA_DEFAULT_IDENTITY_DIR"
 ZCASHD_DATADIR="$ZCASHD_DEFAULT_DATADIR"
 INSTALL_DIR="$ZAKURA_STANDALONE_INSTALL_DIR"
@@ -2236,9 +2231,9 @@ default_p2p_port() {
   esac
 }
 
-# Run the same capacity- and permission-aware search the zcashd-compat profile
-# uses. A large writable volume still wins; otherwise keep the initial default:
-# /mnt/data/zakura-state when /mnt exists, or Zakura's platform cache directory.
+# Use the same default and capacity- and permission-aware search as the
+# zcashd-compat profile. An existing state directory wins; if ~/.cache/zakura
+# is unsuitable, select a writable volume with enough capacity.
 default_recommend_datadir_defaults() {
   if ((ZAKURA_STATE_DIR_SET)); then
     return
@@ -2248,7 +2243,7 @@ default_recommend_datadir_defaults() {
   min_bytes="$(disk_standalone_min_bytes)"
 
   SYNTHETIC_INSTALL_MIN_BYTES="$min_bytes"
-  ZAKURA_STATE_DIR="$(compat_recommend_zakura_state_dir "$ZAKURA_STANDALONE_STATE_DIR" "$min_bytes")"
+  ZAKURA_STATE_DIR="$(compat_recommend_zakura_state_dir "$ZAKURA_DEFAULT_CACHE_DIR" "$min_bytes")"
   unset SYNTHETIC_INSTALL_MIN_BYTES
 }
 

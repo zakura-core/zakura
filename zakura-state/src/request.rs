@@ -1424,6 +1424,8 @@ pub enum ReadRequest {
     /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
     /// with the per-block commitment roots for the requested heights, in ascending height
     /// order. May return fewer than `count` roots if the node does not hold the whole range.
+    /// The response is capped by
+    /// [`MAX_HEADER_SYNC_HEIGHT_RANGE`](crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE).
     BlockRoots {
         /// First requested height.
         start_height: block::Height,
@@ -1463,7 +1465,8 @@ pub enum ReadRequest {
 
     /// Returns contiguous committed blocks by height, in ascending order.
     ///
-    /// The response stops before the first height without a committed body.
+    /// The response stops before the first height without a committed body and is
+    /// capped by [`MAX_HEADER_SYNC_HEIGHT_RANGE`](crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE).
     BlocksByHeightRange {
         /// First height to read.
         start: block::Height,

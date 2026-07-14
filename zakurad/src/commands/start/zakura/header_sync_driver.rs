@@ -94,7 +94,8 @@ where
             zakura_state::ReadRequest,
             Response = zakura_state::ReadResponse,
             Error = zakura_state::BoxError,
-        > + Send
+        > + Clone
+        + Send
         + 'static,
     ReadState::Future: Send + 'static,
 {
@@ -102,32 +103,49 @@ where
         return Ok(best_header_tip);
     }
 
-    let Ok(start_height) = verified_block_tip.0.next() else {
+    let Ok(mut start_height) = verified_block_tip.0.next() else {
         return Ok(verified_block_tip);
     };
     let best_header_height = best_header_tip.0;
     let verified_block_height = verified_block_tip.0;
-    let count = best_header_height
+    let mut remaining = best_header_height
         .0
         .checked_sub(verified_block_height.0)
         .ok_or_else(|| eyre!("best header tip is unexpectedly below verified block tip"))?;
-    let roots = match read_state
-        .oneshot(zakura_state::ReadRequest::BlockRoots {
-            start_height,
-            count,
-        })
-        .await
-        .map_err(|error| eyre!("{error}"))?
-    {
-        zakura_state::ReadResponse::BlockRoots(roots) => roots,
-        response => Err(eyre!("unexpected BlockRoots response: {response:?}"))?,
-    };
 
-    if block_roots_cover_range(start_height, count, &roots) {
-        Ok(best_header_tip)
-    } else {
-        Ok(verified_block_tip)
+    while remaining > 0 {
+        let count = remaining.min(zakura_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE);
+        let roots = match read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::BlockRoots {
+                start_height,
+                count,
+            })
+            .await
+            .map_err(|error| eyre!("{error}"))?
+        {
+            zakura_state::ReadResponse::BlockRoots(roots) => roots,
+            response => Err(eyre!("unexpected BlockRoots response: {response:?}"))?,
+        };
+
+        if !block_roots_cover_range(start_height, count, &roots) {
+            return Ok(verified_block_tip);
+        }
+
+        remaining = remaining
+            .checked_sub(count)
+            .expect("root coverage chunk count is bounded by the remaining range");
+        if remaining == 0 {
+            break;
+        }
+
+        let Some(next_start_height) = start_height.0.checked_add(count).map(block::Height) else {
+            return Ok(verified_block_tip);
+        };
+        start_height = next_start_height;
     }
+
+    Ok(best_header_tip)
 }
 
 pub(crate) async fn root_covered_query_best_header_tip<ReadState>(

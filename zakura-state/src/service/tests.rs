@@ -26,10 +26,11 @@ use zakura_test::{prelude::*, transcript::Transcript};
 
 use crate::{
     arbitrary::Prepare,
+    constants::MAX_HEADER_SYNC_HEIGHT_RANGE,
     init_test,
     service::{
-        arbitrary::populated_state, chain_tip::TipAction, headers_by_height_range,
-        non_finalized_state::Chain, read, StateService,
+        arbitrary::populated_state, capped_height_range, chain_tip::TipAction,
+        headers_by_height_range, non_finalized_state::Chain, read, StateService,
     },
     tests::{
         setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
@@ -859,6 +860,22 @@ async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<
     );
 
     Ok(())
+}
+
+#[test]
+fn capped_height_range_enforces_max_native_range() {
+    let heights: Vec<_> = capped_height_range(Height(1), u32::MAX).collect();
+
+    assert_eq!(
+        heights.len(),
+        usize::try_from(MAX_HEADER_SYNC_HEIGHT_RANGE).expect("range cap fits in usize"),
+    );
+    assert_eq!(heights.first(), Some(&Height(1)));
+    assert_eq!(heights.last(), Some(&Height(MAX_HEADER_SYNC_HEIGHT_RANGE)));
+    assert_eq!(
+        capped_height_range(Height(u32::MAX), u32::MAX).collect::<Vec<_>>(),
+        vec![Height(u32::MAX)],
+    );
 }
 
 #[test]

@@ -1640,6 +1640,11 @@ where
     roots
 }
 
+fn capped_height_range(start: block::Height, count: u32) -> impl Iterator<Item = block::Height> {
+    (0..count.min(MAX_HEADER_SYNC_HEIGHT_RANGE))
+        .map_while(move |offset| start.0.checked_add(offset).map(block::Height))
+}
+
 impl Service<ReadRequest> for ReadStateService {
     type Response = ReadResponse;
     type Error = BoxError;
@@ -1933,16 +1938,10 @@ impl Service<ReadRequest> for ReadStateService {
 
             ReadRequest::BlocksByHeightRange { start, count } => {
                 let best_chain = state.latest_best_chain();
-                let blocks = (0..count)
-                    .map_while(|offset| {
-                        start
-                            .0
-                            .checked_add(offset)
-                            .map(block::Height)
-                            .and_then(|height| {
-                                read::block_and_size(best_chain.clone(), &state.db, height.into())
-                                    .map(|(block, size)| (height, block, size))
-                            })
+                let blocks = capped_height_range(start, count)
+                    .map_while(|height| {
+                        read::block_and_size(best_chain.clone(), &state.db, height.into())
+                            .map(|(block, size)| (height, block, size))
                     })
                     .collect();
 

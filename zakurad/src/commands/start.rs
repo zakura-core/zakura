@@ -1911,6 +1911,69 @@ mod zakura_header_sync_driver_tests {
         );
     }
 
+    #[tokio::test]
+    async fn query_best_header_tip_chunks_root_coverage_reads() {
+        let verified_tip = (block::Height(0), block::Hash([0; 32]));
+        let count = zakura_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE + 2;
+        let durable_header_tip = (block::Height(count), block::Hash([2; 32]));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let read_state = {
+            let requests = Arc::clone(&requests);
+            service_fn(move |request: zakura_state::ReadRequest| {
+                let requests = Arc::clone(&requests);
+                async move {
+                    match request {
+                        zakura_state::ReadRequest::Tip => Ok::<_, zakura_state::BoxError>(
+                            zakura_state::ReadResponse::Tip(Some(verified_tip)),
+                        ),
+                        zakura_state::ReadRequest::BlockRoots {
+                            start_height,
+                            count,
+                        } => {
+                            requests
+                                .lock()
+                                .expect("request capture mutex is not poisoned")
+                                .push((start_height, count));
+                            let roots = (0..count)
+                                .filter_map(|offset| {
+                                    start_height
+                                        .0
+                                        .checked_add(offset)
+                                        .map(|height| root_at(block::Height(height)))
+                                })
+                                .collect();
+                            Ok(zakura_state::ReadResponse::BlockRoots(roots))
+                        }
+                        request => panic!("unexpected read request: {request:?}"),
+                    }
+                }
+            })
+        };
+
+        assert_eq!(
+            root_covered_query_best_header_tip(read_state, durable_header_tip)
+                .await
+                .expect("chunked root coverage query succeeds"),
+            durable_header_tip
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .expect("request capture mutex is not poisoned")
+                .as_slice(),
+            &[
+                (
+                    block::Height(1),
+                    zakura_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE,
+                ),
+                (
+                    block::Height(zakura_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE + 1),
+                    2,
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn block_verify_error_duplicate_classifier_detects_router_and_block_errors() {
         let hash = block::Hash([1; 32]);

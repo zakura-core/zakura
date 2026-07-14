@@ -11,6 +11,8 @@ Initial release of Zakura.
 
 ### Fixed
 
+- Native Zakura header sync now honors `disable_pow = true` on configured
+  Testnets, matching semantic and checkpoint block verification.
 - Pruned finalized blocks remain visible to chain-identity queries, including peer
   block-hash responses and RPC confirmation lookups, after their bodies are removed.
 

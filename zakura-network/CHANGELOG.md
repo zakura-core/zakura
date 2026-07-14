@@ -165,6 +165,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Native header sync now skips Equihash and difficulty-filter checks for
+  configured Testnets with `disable_pow = true`, not only Regtest.
 - Legacy peer-set stall tracking no longer disconnects peers for empty
   `FindBlocks` or `FindHeaders` responses when Zebra is at or near the network
   tip.

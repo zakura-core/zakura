@@ -253,15 +253,16 @@ pub(super) fn validate_solution_sizes(
     headers: &[Arc<block::Header>],
     network: &Network,
 ) -> Result<(), HeaderSyncWireError> {
-    let expect_regtest = network
-        .parameters()
-        .is_some_and(|parameters| parameters.is_regtest());
+    // PoW-disabled networks do not assign consensus meaning to either
+    // parseable solution variant. Keep native header sync aligned with block
+    // verification, which skips Equihash checks entirely in this mode.
+    if network.disable_pow() {
+        return Ok(());
+    }
+
     for header in headers {
-        match (expect_regtest, header.solution) {
-            (true, equihash::Solution::Regtest(_))
-            | (true, equihash::Solution::Common(_))
-            | (false, equihash::Solution::Common(_)) => {}
-            _ => return Err(HeaderSyncWireError::WrongEquihashSolutionSize),
+        if !matches!(header.solution, equihash::Solution::Common(_)) {
+            return Err(HeaderSyncWireError::WrongEquihashSolutionSize);
         }
     }
     Ok(())
@@ -279,10 +280,9 @@ pub(super) fn validate_pow_blocking(
     headers: &[Arc<block::Header>],
     network: &Network,
 ) -> Result<(), HeaderSyncWireError> {
-    let skip_pow_filter = network
-        .parameters()
-        .is_some_and(|parameters| parameters.is_regtest());
-    if skip_pow_filter {
+    // Custom testnets can disable PoW without using Regtest parameters. Keep
+    // native header sync aligned with semantic and checkpoint verification.
+    if network.disable_pow() {
         return Ok(());
     }
 

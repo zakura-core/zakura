@@ -11,7 +11,9 @@ description: >-
 
 Use the repository's
 `.github/PULL_REQUEST_TEMPLATE/release-checklist.md` as the canonical checklist.
-This skill adds the Zakura-specific checks that are easy to miss.
+Release policy (tag protection, promotion, retention) is canonical in
+`docs/release-tag-protection.md`; this skill points at policy rather than
+defining it, and adds the Zakura-specific checks that are easy to miss.
 
 ## Safety
 
@@ -21,7 +23,9 @@ This skill adds the Zakura-specific checks that are easy to miss.
 - Dispatch releases only from merged `main`.
 - Never create a `v*` tag manually. `create-release.yml` is the only supported
   tag creation path.
-- Do not promote a release candidate from pre-release to Latest.
+- Do not promote a release candidate from pre-release to Latest. Published
+  release candidates stay up as pre-releases; removing one is an owner-level
+  decision, never part of a release flow.
 
 ## Gather release context
 
@@ -54,6 +58,11 @@ git diff --stat <previous-tag>
 
 Always update the `zakura` package version in `zakurad/Cargo.toml`; release
 binaries self-report `CARGO_PKG_VERSION`.
+
+Stable releases always publish to crates.io. Release candidates decide
+per-release: a crates.io-publishing release candidate bumps all changed
+crates like a stable release; a GitHub-only release candidate bumps only
+`zakura`.
 
 For crates.io publishing:
 
@@ -93,7 +102,10 @@ ZAKURA_COMPAT_DOCKER_IMAGE
 
 Normally leave the complete metadata for the latest published release intact
 until the next release exists. The raw-main installer is a documented install
-route, and an all-zero or mismatched checksum breaks it.
+route, and an all-zero or mismatched checksum breaks it. Caveat: when the
+pinned release is itself scheduled for deletion (the pre-1.0.0 release
+candidates), an intact pin still ends up dangling — staging placeholder
+metadata with a clean failure mode is the better trade there.
 
 The release workflow does not need source placeholders: it rewrites all four
 values in the published installer and opens a follow-up PR with the real
@@ -141,10 +153,11 @@ checks and why.
   classification, follow-up work, and AI disclosure.
 - Verify the release graph independently; a green ordinary PR build does not
   prove crates.io packaging.
-- Confirm the root changelog or a separate draft contains concrete release notes
-  for every user-visible change since the previous release.
-- Audit the checklist against `docs/release-tag-protection.md`; ignore or fix any
-  stale instruction to promote a hyphenated RC tag to Latest.
+- Post-1.0.0 releases only: confirm the root changelog or a separate draft
+  contains concrete release notes for every user-visible change since the
+  previous release. Through 1.0.0 the changelogs are frozen — 1.0.0 ships
+  "Initial release" only, for the root and every crate changelog.
+- Audit the checklist against `docs/release-tag-protection.md`.
 - Wait for required human approval and all enabled CI checks.
 
 ## Publish
@@ -164,7 +177,8 @@ The workflow must:
 2. build and verify assets before tag creation
 3. wait for approval of the `release` environment
 4. create the immutable tag and GitHub pre-release
-5. publish release assets and Docker images
+5. publish the release assets; the tag push then triggers
+   `release-binaries.yml`, which publishes the Docker images
 
 Do not retry from an unmerged branch. A version mismatch failure means `main`
 still has the previous package version.

@@ -203,7 +203,7 @@ The end of support height is calculated from the current blockchain height:
 
 ## Publish Release
 
-- [ ] [Publish the release to GitHub](https://github.com/zakura-core/zakura/releases) by disabling 'pre-release', then clicking "Set as the latest release"
+- [ ] Stable releases only, after `make sign-release`: [promote the release](https://github.com/zakura-core/zakura/releases) by clearing 'pre-release' **and** checking "Set as the latest release" (see `docs/release-tag-protection.md`). Release candidates are never promoted and stay pre-releases.
 
 ## Publish Crates
 

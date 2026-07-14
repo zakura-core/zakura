@@ -29,7 +29,7 @@ pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_412_800;
 pub const EOS_PANIC_AFTER: u32 = 8;
 
 /// The number of days before the end of support where Zebra will display warnings.
-pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 2;
+pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;
 
 /// A string which is part of the panic that will be displayed if Zebra halts.
 pub const EOS_PANIC_MESSAGE_HEADER: &str = "Zakura refuses to run";

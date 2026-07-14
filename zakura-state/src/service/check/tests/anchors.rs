@@ -5,11 +5,12 @@ use std::{ops::Deref, sync::Arc};
 use zakura_chain::{
     amount::Amount,
     block::{Block, Height},
+    parameters::{Network, NetworkUpgrade},
     primitives::Groth16Proof,
     sapling,
     serialization::ZcashDeserializeInto,
     sprout::{self, JoinSplit},
-    transaction::{JoinSplitData, LockTime, Transaction, UnminedTx},
+    transaction::{arbitrary::v5_transactions, JoinSplitData, LockTime, Transaction, UnminedTx},
 };
 
 use crate::{
@@ -340,4 +341,66 @@ fn check_sapling_anchors() {
     );
 }
 
-// TODO: create tests for orchard and ironwood anchors
+#[test]
+fn ironwood_anchors_do_not_use_orchard_anchor_namespace() {
+    let _init_guard = zakura_test::init();
+
+    let (finalized_state, non_finalized_state, _genesis) = new_state_with_mainnet_genesis();
+    let ironwood_shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .filter_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .find(|shielded_data| {
+            !finalized_state
+                .db
+                .contains_ironwood_anchor(&shielded_data.shared_anchor)
+        })
+        .expect("test vectors include an Orchard anchor not present at genesis");
+    let shared_anchor = ironwood_shielded_data.shared_anchor;
+    let transaction = Arc::new(Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood_shielded_data),
+    });
+    let unmined_tx = UnminedTx::from(&transaction);
+
+    let mut batch = DiskWriteBatch::new();
+    batch.insert_orchard_anchor(&finalized_state.db, &shared_anchor);
+    finalized_state
+        .write_batch(batch)
+        .expect("unexpected I/O error");
+
+    let result = tx_anchors_refer_to_final_treestates(
+        &finalized_state.db,
+        non_finalized_state.best_chain(),
+        &unmined_tx,
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(ValidateContextError::UnknownIronwoodAnchor { anchor, .. })
+                if anchor == shared_anchor
+        ),
+        "an Orchard anchor must not satisfy an Ironwood spend: {result:?}",
+    );
+
+    let mut batch = DiskWriteBatch::new();
+    batch.insert_ironwood_anchor(&finalized_state.db, &shared_anchor);
+    finalized_state
+        .write_batch(batch)
+        .expect("unexpected I/O error");
+
+    assert_eq!(
+        tx_anchors_refer_to_final_treestates(
+            &finalized_state.db,
+            non_finalized_state.best_chain(),
+            &unmined_tx,
+        ),
+        Ok(())
+    );
+}

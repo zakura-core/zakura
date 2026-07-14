@@ -412,10 +412,9 @@ construction_ — but the public API previously let it be desynced after constru
 (`pub auth_data_root`, `DerefMut`, both re-exported). A holder could swap the block while
 keeping a stale root, and a header matching the stale root would finalize a block without
 proving the header binds the block's actual authorizing data. The (block, auth-data-root) pair
-is now locked together: `auth_data_root` is `pub(crate)`, `CheckpointVerifiedBlock` drops
-`DerefMut`, the one legitimately-post-set field goes through
-`set_deferred_pool_balance_change`, and the semantic verifier builds blocks through
-`from_semantic_data` (auth-data root left unset). Compile-time enforced (fix in commit #192).
+is now locked together: `CheckpointVerifiedBlock` drops `DerefMut`, and the checkpoint
+verifier can only fill the optional cache through `with_precomputed_auth_data_root`, which
+computes the value from that same wrapped block rather than accepting arbitrary bytes.
 
 ## 7. The fast commit path and checkpoint last checkpoint height
 

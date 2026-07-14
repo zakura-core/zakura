@@ -1106,6 +1106,140 @@ async fn mempool_request_with_unmined_output_spends_is_accepted() {
     );
 }
 
+#[tokio::test]
+async fn mempool_mixed_chain_and_unmined_spends_preserve_input_order() {
+    let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
+    let mempool: MockService<_, _, _, _> = MockService::build().for_prop_tests();
+    let (mempool_setup_tx, mempool_setup_rx) = tokio::sync::oneshot::channel();
+    let verifier = Verifier::new(&Network::Mainnet, state.clone(), mempool_setup_rx);
+    mempool_setup_tx
+        .send(mempool.clone())
+        .ok()
+        .expect("send should succeed");
+
+    let height = NetworkUpgrade::Canopy
+        .activation_height(&Network::Mainnet)
+        .expect("Canopy activation height is specified");
+    let fund_height = (height - 1).expect("fake source fund block height is too small");
+
+    const OP_TRUE: u8 = 0x51;
+    const OP_2: u8 = 0x52;
+    const OP_TRUE_HASH160: [u8; 20] = [
+        0xda, 0x17, 0x45, 0xe9, 0xb5, 0x49, 0xbd, 0x0b, 0xfa, 0x1a, 0x56, 0x99, 0x71, 0xc7, 0x7e,
+        0xba, 0x30, 0xcd, 0x5a, 0x4b,
+    ];
+    const OP_2_HASH160: [u8; 20] = [
+        0x69, 0xd7, 0xef, 0x8f, 0x42, 0xa2, 0x5e, 0x87, 0x91, 0xbb, 0x37, 0xd5, 0xfb, 0x48, 0x45,
+        0x6f, 0x10, 0x2a, 0x3c, 0xb9,
+    ];
+
+    let (mempool_input, mempool_output, mempool_known_utxos) =
+        mock_transparent_transfer_with_p2sh_redeem_script(
+            fund_height,
+            true,
+            0,
+            Amount::try_from(10_001).expect("valid amount"),
+            OP_TRUE,
+            OP_TRUE_HASH160,
+        );
+    let (chain_input, chain_output, chain_known_utxos) =
+        mock_transparent_transfer_with_p2sh_redeem_script(
+            fund_height,
+            true,
+            1,
+            Amount::try_from(10_001).expect("valid amount"),
+            OP_2,
+            OP_2_HASH160,
+        );
+
+    let tx = Transaction::V4 {
+        inputs: vec![mempool_input, chain_input],
+        outputs: vec![mempool_output, chain_output],
+        lock_time: LockTime::min_lock_time_timestamp(),
+        expiry_height: height,
+        joinsplit_data: None,
+        sapling_shielded_data: None,
+    };
+
+    let mempool_outpoint = tx.inputs()[0].outpoint().expect("first input is a prevout");
+    let chain_outpoint = tx.inputs()[1]
+        .outpoint()
+        .expect("second input is a prevout");
+
+    tokio::spawn(async move {
+        state
+            .expect_request(zakura_state::Request::BestChainNextMedianTimePast)
+            .await
+            .expect("verifier should call mock state service with correct request")
+            .respond(zakura_state::Response::BestChainNextMedianTimePast(
+                DateTime32::MAX,
+            ));
+
+        state
+            .expect_request(zakura_state::Request::UnspentBestChainUtxo(
+                mempool_outpoint,
+            ))
+            .await
+            .expect("verifier should call mock state service with correct request")
+            .respond(zakura_state::Response::UnspentBestChainUtxo(None));
+
+        state
+            .expect_request(zakura_state::Request::UnspentBestChainUtxo(chain_outpoint))
+            .await
+            .expect("verifier should call mock state service with correct request")
+            .respond(zakura_state::Response::UnspentBestChainUtxo(
+                chain_known_utxos
+                    .get(&chain_outpoint)
+                    .map(|utxo| utxo.utxo.clone()),
+            ));
+
+        state
+            .expect_request_that(|req| {
+                matches!(
+                    req,
+                    zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+                )
+            })
+            .await
+            .expect("verifier should call mock state service with correct request")
+            .respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
+    });
+
+    let mut mempool_clone = mempool.clone();
+    tokio::spawn(async move {
+        mempool_clone
+            .expect_request(mempool::Request::AwaitOutput(mempool_outpoint))
+            .await
+            .expect("verifier should call mock mempool service with correct request")
+            .respond(mempool::Response::UnspentOutput(
+                mempool_known_utxos
+                    .get(&mempool_outpoint)
+                    .expect("mempool outpoint should exist in known_utxos")
+                    .utxo
+                    .output
+                    .clone(),
+            ));
+    });
+
+    let verifier_response = verifier
+        .oneshot(Request::Mempool {
+            transaction: tx.into(),
+            height,
+        })
+        .await
+        .expect("mixed state and mempool spends should verify");
+
+    let crate::transaction::Response::Mempool {
+        transaction: _,
+        spent_mempool_outpoints,
+    } = verifier_response
+    else {
+        panic!("unexpected response variant from transaction verifier for Mempool request")
+    };
+
+    assert_eq!(spent_mempool_outpoints, vec![mempool_outpoint]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dont_skip_verification_of_block_transactions_in_mempool() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -4130,21 +4264,44 @@ fn mock_transparent_transfer(
     transparent::Output,
     HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
 ) {
-    // A standard, signature-free P2SH input that the script interpreter accepts. The redeem
-    // script is OP_TRUE, so the spend is valid without a signature, while the spent output is a
-    // standard P2SH `scriptPubKey`. This lets the input pass the mempool `AreInputsStandard`
-    // gate (`check::mempool_standard_input_scripts`) that now runs before script verification,
-    // as well as the interpreter itself.
     const OP_TRUE: u8 = 0x51;
-    // `scriptSig`: a single push of the OP_TRUE redeem script (push-only, one stack item).
-    let accepting_unlock_script = transparent::Script::new(&[0x01, OP_TRUE]);
-    // `scriptPubKey`: OP_HASH160 <HASH160(OP_TRUE)> OP_EQUAL. The 20-byte hash is precomputed
-    // (RIPEMD160(SHA256([OP_TRUE]))) so the P2SH hash check passes during verification.
-    let mut p2sh_lock_bytes = vec![0xa9, 0x14];
-    p2sh_lock_bytes.extend_from_slice(&[
+    const OP_TRUE_HASH160: [u8; 20] = [
         0xda, 0x17, 0x45, 0xe9, 0xb5, 0x49, 0xbd, 0x0b, 0xfa, 0x1a, 0x56, 0x99, 0x71, 0xc7, 0x7e,
         0xba, 0x30, 0xcd, 0x5a, 0x4b,
-    ]);
+    ];
+
+    mock_transparent_transfer_with_p2sh_redeem_script(
+        previous_utxo_height,
+        script_should_succeed,
+        outpoint_index,
+        previous_output_value,
+        OP_TRUE,
+        OP_TRUE_HASH160,
+    )
+}
+
+fn mock_transparent_transfer_with_p2sh_redeem_script(
+    previous_utxo_height: block::Height,
+    script_should_succeed: bool,
+    outpoint_index: u32,
+    previous_output_value: Amount<NonNegative>,
+    redeem_script_opcode: u8,
+    redeem_script_hash160: [u8; 20],
+) -> (
+    transparent::Input,
+    transparent::Output,
+    HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+) {
+    // A standard, signature-free P2SH input that the script interpreter accepts. The redeem
+    // script is a true-valued opcode, so the spend is valid without a signature, while the spent
+    // output is a standard P2SH `scriptPubKey`. This lets the input pass the mempool `AreInputsStandard`
+    // gate (`check::mempool_standard_input_scripts`) that now runs before script verification,
+    // as well as the interpreter itself.
+    // `scriptSig`: a single push of the redeem script (push-only, one stack item).
+    let accepting_unlock_script = transparent::Script::new(&[0x01, redeem_script_opcode]);
+    // `scriptPubKey`: OP_HASH160 <HASH160(redeem script)> OP_EQUAL.
+    let mut p2sh_lock_bytes = vec![0xa9, 0x14];
+    p2sh_lock_bytes.extend_from_slice(&redeem_script_hash160);
     p2sh_lock_bytes.push(0x87);
     let accepting_lock_script = transparent::Script::new(&p2sh_lock_bytes);
     // A script with a single opcode that rejects the transaction (OP_FALSE). Only used for block

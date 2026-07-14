@@ -615,11 +615,6 @@ where
                     sigops: sigops.saturating_add(cached_ffi_transaction.p2sh_sigops()),
                 },
                 Request::Mempool { transaction: tx, .. } => {
-                    // TODO: `spent_outputs` may not align with `tx.inputs()` when a transaction
-                    // spends both chain and mempool UTXOs (mempool outputs are appended last by
-                    // `spent_utxos()`), causing policy checks to pair the wrong input with
-                    // the wrong spent output.
-                    // https://github.com/ZcashFoundation/zebra/issues/10346
                     let spent_outputs = cached_ffi_transaction.all_previous_outputs().clone();
                     let transaction = VerifiedUnminedTx::new(
                         tx,

@@ -1152,11 +1152,12 @@ where
             if req_block.block.auth_data_root.is_none()
                 && NetworkUpgrade::current(&network, req_block.block.height) >= NetworkUpgrade::Nu5
             {
-                let block = req_block.block.block.clone();
-                if let Ok(auth_data_root) =
-                    tokio::task::spawn_blocking(move || block.auth_data_root()).await
+                let block = req_block.block.clone();
+                if let Ok(block) =
+                    tokio::task::spawn_blocking(move || block.with_precomputed_auth_data_root())
+                        .await
                 {
-                    req_block.block.auth_data_root = Some(auth_data_root);
+                    req_block.block = block;
                 }
             }
 

@@ -106,56 +106,6 @@ max_pending_handshakes = 32
 message_rate_per_second = 2048
 stream_open_rate_per_second = 32
 
-[network.zakura.block_sync]
-bbr_cwnd_gain_percent = 300
-bbr_cwnd_unit = "bytes"
-bbr_delay_gradient_percent = 150
-bbr_delivery_rate_window = "10s"
-bbr_min_cwnd = 4
-bbr_min_cwnd_bytes = 2524288
-bbr_probe_bw_gain_percent = 125
-bbr_probe_rtt_duration = "200ms"
-bbr_probe_rtt_interval = "10s"
-bbr_reliability_weight_percent = 100
-bbr_rtprop_window = "10s"
-bbr_startup_growth_percent = 200
-floor_bypass_slots = 2
-floor_peer_avoid_cooldown = "8s"
-floor_rescue_timeout = "2s"
-initial_block_probe_requests = 1
-initial_inflight_requests = 64
-max_blocks_per_response = 1
-max_inflight_block_bytes = 6442450944
-max_inflight_requests = 32000
-max_reorder_lookahead_bytes = 6408896512
-max_requests_without_block_progress = 64
-max_response_bytes = 33554432
-max_submitted_block_applies = 401
-no_progress_peer_cooldown = "3m"
-request_timeout = "8s"
-size_deviation_tolerance = 200
-status_refresh_interval = "30s"
-
-[network.zakura.block_sync.peer_limits]
-inbound_queue_depth = 128
-max_inbound_peers = 256
-max_outbound_peers = 256
-max_pending_escalations = 32
-outbound_queue_depth = 128
-
-[network.zakura.header_sync]
-accept_new_blocks = true
-max_headers_per_response = 1000
-max_inflight_requests = 10
-status_refresh_interval = "30s"
-
-[network.zakura.header_sync.peer_limits]
-inbound_queue_depth = 128
-max_inbound_peers = 256
-max_outbound_peers = 256
-max_pending_escalations = 32
-outbound_queue_depth = 128
-
 [rpc]
 cookie_dir = "cache_dir"
 cookie_file_name = ".cookie"

@@ -8,7 +8,8 @@ If the diff or PR description is incomplete, ask questions before making strong 
 
 Before reviewing code quality, check that:
 
-- The description explains the motivation, solution, and testing when relevant
+- For fixes, the description identifies the root cause and explains how the solution addresses it
+- The test description explains how coverage exercises the affected behavior, rather than only listing commands
 - The PR title follows conventional commits
 
 Ask for missing context only when it is needed to review the change.

@@ -84,6 +84,10 @@ PR body requirements:
 - Start the PR body with one concise confidence line:
   `AI Confidence: <confidence_percent>% - <short merge-safety recommendation>`.
 - Use concise sections: Motivation, Solution, Tests, Follow-up Work, Revert Plan.
+- For fixes, identify the root cause in the Solution section and explain how the
+  adapted change addresses it.
+- In the Tests section, explain how validation exercises the affected behavior;
+  do not only list commands.
 - Include the source as prose such as `upstream PR 10676`; do not write
   `#10676`, `owner/repo#10676`, or GitHub PR/issue URLs.
 - Include `Upstream-Zebra-PR: <number>` and `Upstream-Zebra-Merge: <sha>` as

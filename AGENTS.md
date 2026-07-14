@@ -5,10 +5,9 @@
 
 # Working in This Repository
 
-- Zakura is a validator node. Features such as wallets, block explorers, and mining pools are out of scope.
 - Keep changes focused and avoid unrelated refactors.
 - Run formatting and the checks relevant to the code you changed.
-- Explain the motivation, solution, and test evidence in the PR description.
+- For fixes, explain the root cause, how the solution addresses it, and how the tests exercise the affected behavior.
 
 ## Project Structure & Module Organization
 
@@ -50,7 +49,7 @@ cargo nextest run --profile sync-large-checkpoints-empty
 ## Commit & Pull Request Guidelines
 
 - PR titles must follow [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) (PRs are squash-merged — the PR title becomes the commit message)
-- Use `.github/pull_request_template.md` and include the motivation, solution summary, and test evidence.
+- Use `.github/pull_request_template.md`. For fixes, connect the root cause to both the solution and the test coverage.
 - For user-visible changes, update `CHANGELOG.md` per `CHANGELOG_GUIDELINES.md`.
 
 ## Project Overview

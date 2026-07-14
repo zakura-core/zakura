@@ -411,10 +411,9 @@ mod tests {
     /// During checkpoint sync, `verified_tip`
     /// stays pinned to the previous checkpoint until the whole range (up to
     /// `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` blocks) is co-resident. The whole range
-    /// is commit-window exempt, and the resident budget under a legal 1 GiB in-flight
-    /// budget must also leave gated headroom just above the window (the earlier
-    /// `min(max_reorder, max_inflight)` collapsed the resident budget to the 1 GiB *wire*
-    /// value, admitting only ~256 MB of wire bodies).
+    /// is commit-window exempt, so it assembles regardless of the gated budget; the
+    /// budget under a legal 1 GiB in-flight budget must also leave gated headroom just
+    /// above the window.
     #[test]
     fn checkpoint_range_fits_under_one_gib_inflight_budget() {
         use super::super::config::{
@@ -426,13 +425,6 @@ mod tests {
             max_inflight_block_bytes: 1024 * 1024 * 1024,
             ..ZakuraBlockSyncConfig::default()
         };
-        let range_resident = BS_CHECKPOINT_RANGE_BYTE_FLOOR.saturating_mul(DESERIALIZED_MEM_FACTOR);
-        assert!(
-            config.effective_max_reorder_lookahead_bytes() >= range_resident,
-            "effective resident look-ahead ({}) must hold one checkpoint range ({})",
-            config.effective_max_reorder_lookahead_bytes(),
-            range_resident,
-        );
 
         // One block short of a full co-resident range, with `verified_tip` pinned at 0.
         let range_blocks = u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
@@ -465,8 +457,9 @@ mod tests {
             "the final block of a checkpoint range must be admissible under a 1 GiB in-flight budget",
         );
         // The first height above the window is memory-gated but must still have headroom
-        // under this budget: (802 MB - 2 MB) * 4 resident < 4 GiB effective. This keeps the
-        // assertion non-vacuous now that the whole range is window-exempt.
+        // under this budget: ~800 MB of serialized applying bytes (charged at wire size)
+        // sit below the 1.5 GiB default resident budget. This keeps the assertion
+        // non-vacuous now that the whole range is window-exempt.
         assert!(
             matches!(
                 admit(
@@ -487,13 +480,10 @@ mod tests {
     fn clamp_reorder_lookahead_floors_sub_range_configs() {
         use super::super::config::BS_CHECKPOINT_RANGE_BYTE_FLOOR;
         let mut config = ZakuraBlockSyncConfig {
-            max_reorder_lookahead_bytes: 1024 * 1024, // 1 MiB resident, far below one range
+            max_reorder_lookahead_bytes: 1024 * 1024, // 1 MiB, far below one range of wire bytes
             ..ZakuraBlockSyncConfig::default()
         };
         config.clamp_reorder_lookahead_to_floor();
-        assert!(
-            config.max_reorder_lookahead_bytes
-                >= BS_CHECKPOINT_RANGE_BYTE_FLOOR.saturating_mul(DESERIALIZED_MEM_FACTOR)
-        );
+        assert!(config.max_reorder_lookahead_bytes >= BS_CHECKPOINT_RANGE_BYTE_FLOOR);
     }
 }

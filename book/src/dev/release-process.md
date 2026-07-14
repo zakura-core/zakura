@@ -50,7 +50,8 @@ You can update to any version of Zakura, provided that the following criteria ar
 - The version you want to update _to_ is supported.
 - The version you want to update _from_ is within one major version of the version you want to upgrade to.
 
-See [Keeping Up-to-Date](guide/updating "Updating your projects") for more information about updating your Zakura projects to the most recent version.
+See [Building and Installing Zakura](../user/install.md) for instructions on
+installing the most recent version.
 
 <a id="previews"></a>
 
@@ -65,7 +66,7 @@ We let you preview what's coming by providing Release Candidate \(`rc`\) pre-rel
 
 ### Distribution tags
 
-Zakura's tagging relates directly to versions published on Docker. We will reference these [Docker Hub distribution tags](https://hub.docker.com/r/valaroman/zakura/tags) throughout:
+Zakura's tagging relates directly to versions published on Docker. We will reference these [Docker Hub distribution tags](https://hub.docker.com/r/valargroup/zakura/tags) throughout:
 
 | Tag    | Description                                                                                         |
 | :----- | :-------------------------------------------------------------------------------------------------- |

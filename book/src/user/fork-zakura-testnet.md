@@ -83,7 +83,7 @@ Here we are making changes to create an isolated network version of Zakura. In a
 - Make fixes needed to compile.
 - Ignore how far we are from the tip in get block template: `zakura-rpc/src/methods/get_block_template_rpcs/get_block_template.rs`
 
-Unclean test commit for Zakura: [Zakura commit](https://github.com/zakura-core/zakura/commit/d05af154c897d4820999fcb968b7b62d10b26aa8)
+Unclean test commit from upstream: [Zebra commit](https://github.com/ZcashFoundation/zebra/commit/d05af154c897d4820999fcb968b7b62d10b26aa8)
 
 Make sure you can build the `zakurad` binary after the changes with `cargo build --release`
 

@@ -25,6 +25,9 @@ exclude = [
     "^https://dashboard.mergify.com/",
     # IACR eprint server returns 403 to automated link checkers
     "^https://eprint\\.iacr\\.org/",
+    # Zcash ZIP and Tachyon CDNs return Cloudflare 521 to automated checkers.
+    "^https://zips\\.z\\.cash/",
+    "^https://tachyon\\.z\\.cash/",
     # Tor's GitLab returns 403 to automated link checkers
     "^https://gitlab\\.torproject\\.org/",
 

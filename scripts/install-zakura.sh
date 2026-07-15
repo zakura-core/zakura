@@ -25,7 +25,7 @@ ZAKURA_RELEASE_TAG="v1.0.0"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
 # Replaced with the archive checksum by release-binaries.yml before publishing.
-ZAKURA_ARCHIVE_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
+ZAKURA_ARCHIVE_SHA256="19faee68cb442b943a432cd84705e615f753eb4dcbd190416302e256ad3df9df"
 ZAKURA_MEMBER="./bin/zakurad"
 ZAKURA_DOCKER_IMAGE="zakuracore/zakura:1.0.0"
 ZAKURA_COMPAT_DOCKER_IMAGE="zakuracore/zakura:zcashd-compat-1.0.0"

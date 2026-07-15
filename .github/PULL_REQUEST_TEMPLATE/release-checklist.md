@@ -8,8 +8,6 @@ assignees: ""
 
 # Prepare for the Release
 
-- [ ] Make sure there has been [at least one successful sync-confidence run on `main`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml?query=branch%3Amain) since the last state change, or start a manual sync-confidence run.
-
 # Checkpoints
 
 For performance and security, we want to update the Zakura checkpoints in every release.
@@ -213,7 +211,6 @@ The end of support height is calculated from the current blockchain height:
   - [ ] [release-binaries.yml](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush)
 - [ ] Review and merge the installer metadata update PR opened by the release
       workflow.
-- [ ] Run [`sync-confidence.yml`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml) manually for the release tag or release branch if sync validation is required after tagging.
 
 ## Promote Release (stable releases only)
 

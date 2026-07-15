@@ -232,10 +232,3 @@ For a fresh Ubuntu x86_64 host:
   restarts.
 - Secrets are read from host env files or GitHub secrets and are never written to
   repository-managed templates.
-
-## Relationship to Other Sync Workflows
-
-This fleet is permanent and destructive on its own dedicated hosts. It differs
-from `.github/workflows/do-sync-test.yml`, which creates an ephemeral DigitalOcean
-droplet, restores a cached state, runs a bounded sync-confidence window, and
-destroys the droplet.

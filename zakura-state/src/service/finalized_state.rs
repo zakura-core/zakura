@@ -23,7 +23,10 @@ use std::{
 };
 
 use zakura_chain::{
-    block, ironwood, orchard, parallel::tree::NoteCommitmentTrees, parameters::Network, sapling,
+    block, ironwood, orchard,
+    parallel::tree::NoteCommitmentTrees,
+    parameters::{Network, NetworkUpgrade},
+    sapling,
 };
 use zakura_db::{
     block::{RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT},
@@ -760,8 +763,15 @@ impl FinalizedState {
                             links
                         });
 
-                        let is_prevalidated =
-                            self.vct.prevalidated_next() == Some((height, block_hash));
+                        // NU5+ block hashes do not commit to authorizing data. Include the
+                        // body's auth-data root when matching a header-only prevalidation.
+                        let block_auth_data_root = (NetworkUpgrade::current(&network, height)
+                            >= NetworkUpgrade::Nu5)
+                            .then(|| {
+                                precomputed_auth_data_root.unwrap_or_else(|| block.auth_data_root())
+                            });
+                        let is_prevalidated = self.vct.prevalidated_next()
+                            == Some((height, block_hash, block_auth_data_root));
                         if is_prevalidated {
                             if let Some(v) = self.vct.source() {
                                 v.record_prevalidated();
@@ -812,8 +822,16 @@ impl FinalizedState {
                             })?;
 
                         if let Some(next_vct_block) = &next_vct_block {
-                            self.vct
-                                .mark_prevalidated(next_vct_block.height, next_vct_block.hash);
+                            let next_auth_data_root =
+                                (NetworkUpgrade::current(&network, next_vct_block.height)
+                                    >= NetworkUpgrade::Nu5)
+                                    .then_some(next_vct_block.auth_data_root)
+                                    .flatten();
+                            self.vct.mark_prevalidated(
+                                next_vct_block.height,
+                                next_vct_block.hash,
+                                next_auth_data_root,
+                            );
                         } else if self
                             .vct
                             .source()

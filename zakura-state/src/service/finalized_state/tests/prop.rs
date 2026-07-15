@@ -1876,7 +1876,11 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             let stale_hash = blocks[seed + 1].hash;
             prop_assert_ne!(stale_hash, blocks[seed + 3].hash, "stale hash must differ from the real block");
             fast.vct
-                .set_prevalidated_next(Some((Height((seed + 3) as u32), stale_hash)));
+                .set_prevalidated_next(Some((
+                    Height((seed + 3) as u32),
+                    stale_hash,
+                    Some(blocks[seed + 3].block.auth_data_root()),
+                )));
             commit(&mut fast, seed + 3);
             prop_assert_eq!(fast.vct_prevalidated_count(), 1, "a stale cache entry (wrong hash) must not cause a false skip");
 
@@ -1894,7 +1898,11 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                 "the forged wrapper hash must differ from the bad block's real hash",
             );
             fast.vct
-                .set_prevalidated_next(Some((Height((seed + 4) as u32), forged_wrapper_hash)));
+                .set_prevalidated_next(Some((
+                    Height((seed + 4) as u32),
+                    forged_wrapper_hash,
+                    Some(blocks[seed + 4].block.auth_data_root()),
+                )));
             let forged = CheckpointVerifiedBlock::with_hash(bad_block, forged_wrapper_hash);
             let error = fast
                 .commit_finalized_direct(forged.into(), None, None, "vct forged wrapper hash")

@@ -6057,6 +6057,7 @@ async fn full_action_queue_preserves_buffer_until_commit_capacity_returns() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn peer_requester_waits_for_outbound_capacity_without_reencoding_or_polling() {
+    header_sync_metrics_recorder();
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),

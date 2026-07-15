@@ -1817,9 +1817,59 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             prop_assert_eq!(fast.vct_prevalidated_count(), 0, "the first fast block runs its own commitment check");
 
             // Second fast block: its predecessor's look-ahead already validated it,
-            // so the own check is skipped — the dedup engages.
-            commit(&mut fast, seed + 2);
+            // so the own check is skipped — the dedup engages. Use a header-only
+            // successor, as production does when header sync is ahead of body sync.
+            let cv = CheckpointVerifiedBlock::from(blocks[seed + 2].block.clone());
+            let header_only_successor = NextVctBlock::from_header(
+                blocks[seed + 3].block.header.clone(),
+                Height((seed + 3) as u32),
+                blocks[seed + 3].block.auth_data_root(),
+            );
+            fast.commit_finalized_direct(
+                cv.into(),
+                None,
+                Some(header_only_successor),
+                "vct dedup header-only successor",
+            )
+            .expect("verified fast commit succeeds");
             prop_assert_eq!(fast.vct_prevalidated_count(), 1, "the second fast block skips its redundant own commitment check");
+
+            // ZIP-244 transaction IDs do not commit to authorizing data, so this
+            // later body has the same header hash as the witness but a different
+            // cached auth-data root. It must run its own commitment check rather
+            // than reuse the header-only witness's prevalidation.
+            let mut mismatched = CheckpointVerifiedBlock::from(blocks[seed + 3].block.clone());
+            let mismatched_auth_data_root =
+                zakura_chain::block::merkle::AuthDataRoot::from([0x42; 32]);
+            prop_assert_ne!(
+                mismatched.auth_data_root,
+                Some(mismatched_auth_data_root),
+                "the test needs a different auth-data root",
+            );
+            mismatched.0.auth_data_root = Some(mismatched_auth_data_root);
+
+            let error = fast
+                .commit_finalized_direct(
+                    mismatched.into(),
+                    None,
+                    None,
+                    "vct mismatched auth-data root",
+                )
+                .expect_err("a mismatched body must not reuse header-only prevalidation");
+            prop_assert!(
+                format!("{error:?}").contains("VctSuppliedRootUnavailable"),
+                "the mismatched body must fail its own commitment check, got: {error:?}",
+            );
+            prop_assert_eq!(
+                fast.vct_prevalidated_count(),
+                1,
+                "a mismatched auth-data root must not increment the prevalidated count",
+            );
+            prop_assert_eq!(
+                fast.db.finalized_tip_height(),
+                Some(Height((seed + 2) as u32)),
+                "the rejected body must leave finalized state untouched",
+            );
 
             // Stale-cache guard: overwrite the cache with the correct height but the
             // hash of a *different* block. The next commit must NOT skip.

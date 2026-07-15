@@ -282,6 +282,17 @@ pub struct SemanticallyVerifiedBlock {
 /// Note: The difference between a `CheckpointVerifiedBlock` and a `ContextuallyVerifiedBlock` is
 /// that the `CheckpointVerifier` doesn't bind the transaction authorizing data to the
 /// `ChainHistoryBlockTxAuthCommitmentHash`, but the `NonFinalizedState` and `FinalizedState` do.
+///
+/// The wrapped block and any cached authorizing-data root must not be changed independently:
+///
+/// ```compile_fail
+/// use zakura_chain::block::merkle::AuthDataRoot;
+/// use zakura_state::CheckpointVerifiedBlock;
+///
+/// fn replace_cached_root(mut block: CheckpointVerifiedBlock, root: AuthDataRoot) {
+///     block.auth_data_root = Some(root);
+/// }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointVerifiedBlock(pub(crate) SemanticallyVerifiedBlock);
 

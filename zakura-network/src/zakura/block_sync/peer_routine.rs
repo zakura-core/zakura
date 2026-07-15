@@ -663,7 +663,9 @@ impl PeerRoutine {
         .min();
         match earliest {
             // Floor the wait at the deadline so a far-future request still wakes
-            // promptly; an already-due deadline wakes immediately.
+            // promptly; an already-due deadline wakes immediately so `handle_deadlines`
+            // can process and clear it (a due deadline it does not clear would
+            // busy-spin the loop — see `handle_deadlines`).
             Some(deadline) => time::sleep(deadline.saturating_duration_since(now)),
             None => time::sleep(Duration::from_secs(3600)),
         }
@@ -913,10 +915,16 @@ impl PeerRoutine {
                 .work
                 .mark_reserved(items.iter().map(|(height, _)| *height));
             if marked != reserved_bytes {
-                self.budget.release(reserved_bytes);
-                let _ = self
+                // Release only what is still reserved, mirroring the sibling unwinds
+                // below. A competing peer's late body may have settled one of these
+                // taken heights to `Held(actual)` during the reserve await; that
+                // height's estimate now belongs to the held body (the Sequencer
+                // releases it on commit), so releasing the fixed `reserved_bytes`
+                // here would double-release it and under-count the byte budget.
+                let released = self
                     .work
                     .release_reserved_and_return_items(items.iter().map(|(height, _)| *height));
+                self.budget.release(released);
                 break FillStop::Internal;
             }
 
@@ -1183,11 +1191,20 @@ impl PeerRoutine {
     // ===================== own-timeout arm (ports `expire_due_timeouts`) =====
 
     async fn handle_deadlines(&mut self, now: Instant) -> Result<(), SinkReject> {
-        // Prune here because a full outbound queue skips `try_fill`; leaving an
-        // expired deadline would make the select loop busy-spin.
+        // A watchdog retirement may have landed since the last reconcile; fold it in
+        // before expiring timeouts so a request the reactor already retired (and
+        // returned to the queue) is not re-processed here as a local timeout, which
+        // would release/return a reservation another peer may now own.
+        self.reconcile_registry_retirements(now);
+        // Prune expired deadlines here because a full outbound queue skips
+        // `try_fill` (the other prune site). `earliest_deadline_sleep` includes
+        // both retired-tombstone correlation deadlines and retry-avoid deadlines
+        // unfiltered, so a due one left in place resolves the timeout arm at zero
+        // delay every iteration and busy-spins the loop until outbound drains.
         if self.window.prune_expired_retired(now) {
             self.window.disarm_liveness_after_progress_if_idle();
         }
+        self.retry_avoid.retain(|_, until| *until > now);
         let rescued_timed_out = self.expire_due_timeouts(now);
         if rescued_timed_out && self.session.outbound_capacity() > 0 {
             self.try_fill().await;
@@ -3111,6 +3128,66 @@ mod tests {
         assert!(
             routine.window.block_liveness_deadline.is_none(),
             "an idle proven peer disarms once its expired tombstone is pruned"
+        );
+    }
+
+    /// The deadline arm must also prune expired retry-avoid entries. They feed
+    /// `earliest_deadline_sleep` unfiltered but are otherwise pruned only in
+    /// `try_fill`, which the loop skips while the outbound queue is full — so a due
+    /// entry left in place would resolve the timeout arm at zero delay and busy-spin.
+    #[tokio::test]
+    async fn deadline_arm_prunes_expired_retry_avoid_entries() {
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+
+        let cancel = CancellationToken::new();
+        let (out_send, _out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![6u8; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let (actions_tx, _actions_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+
+        let mut routine = PeerRoutine::new(
+            peer,
+            session,
+            in_recv,
+            config,
+            0,
+            budget,
+            work,
+            Arc::new(PeerRegistry::new()),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            control_tx,
+            actions_tx,
+            routine_to_reactor_tx,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+
+        let now = Instant::now();
+        // An already-expired retry-avoid entry, as a full outbound queue would leave
+        // it (no `try_fill` to prune it).
+        routine
+            .retry_avoid
+            .insert(block::Height(5), now - Duration::from_secs(1));
+
+        assert!(routine.handle_deadlines(now).await.is_ok());
+        assert!(
+            routine.retry_avoid.is_empty(),
+            "the deadline arm must drop expired retry-avoid entries so \
+             `earliest_deadline_sleep` stops returning an already-due deadline"
         );
     }
 

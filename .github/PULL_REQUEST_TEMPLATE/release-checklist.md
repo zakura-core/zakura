@@ -117,6 +117,18 @@ version.
 cargo release version --verbose --execute --allow-branch '*' -p zakura patch # [ major | minor ]
 ```
 
+- [ ] Generate and commit the stored config for the new version — the
+      `last_config_is_stored` acceptance test derives the expected filename
+      from the package version and fails without it:
+
+```sh
+cargo build --bin zakurad &&
+./target/debug/zakurad generate |
+sed 's/cache_dir = ".*"/cache_dir = "cache_dir"/' |
+sed 's/identity_dir = ".*"/identity_dir = "identity_dir"/' \
+  > zakurad/tests/common/configs/v<version>.toml
+```
+
 - [ ] On the release commit, run the pre-release checks for the tag you are
       about to create, using the previous release tag as the base:
       `make pre-release RELEASE_TAG=v<version> BASE_TAG=v<previous-release-tag>`

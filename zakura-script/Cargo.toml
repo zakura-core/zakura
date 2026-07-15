@@ -1,6 +1,6 @@
 [package]
 name = "zakura-script"
-version = "1.0.0"
+version = "1.0.0-rc6"
 authors.workspace = true
 description = "Zakura script verification wrapping zcashd's zcash_script library. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -26,7 +26,7 @@ comparison-interpreter = []
 libzcash_script = { workspace = true }
 zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
-zakura-chain = { path = "../zakura-chain", version = "1.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "1.0.0-rc6" }
 
 rand = { workspace = true }
 thiserror = { workspace = true }
@@ -37,7 +37,7 @@ lazy_static = { workspace = true }
 ripemd = { workspace = true }
 secp256k1 = { workspace = true }
 sha2 = { workspace = true }
-zakura-test = { path = "../zakura-test", version = "1.0.0" }
+zakura-test = { path = "../zakura-test", version = "1.0.0-rc6" }
 
 [lints]
 workspace = true

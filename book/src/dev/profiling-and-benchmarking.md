@@ -110,4 +110,4 @@ Note that:
   To speed the build process up, you can link RocksDB dynamically, as described
   in the section on [building Zakura][building-zakura].
 
-[building-zakura]: install.md#building-zakura
+[building-zakura]: ../user/install.md#building-zakura

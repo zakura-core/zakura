@@ -1,4 +1,4 @@
-# Lychee link checker configuration for Zebra
+# Lychee link checker configuration for Zakura
 # https://github.com/lycheeverse/lychee
 
 # Exclude patterns
@@ -9,8 +9,6 @@ exclude = [
     "^https?://localhost",
     "^https?://127\\.0\\.0\\.1",
     "^https?://0\\.0\\.0\\.0",
-    # Local file references
-    "^file://",
     # Placeholder URLs
     "^https?://example\\.com",
     # Rate-limited or auth-required
@@ -27,6 +25,15 @@ exclude = [
     "^https://dashboard.mergify.com/",
     # IACR eprint server returns 403 to automated link checkers
     "^https://eprint\\.iacr\\.org/",
+    # Tor's GitLab returns 403 to automated link checkers
+    "^https://gitlab\\.torproject\\.org/",
+
+    # These routes will become available when the Zakura website launches.
+    "^https://zakura\\.com/",
+    "^https://zakura-core\\.github\\.io/zakura/",
+
+    # Remove after the stable Zakura crates have been published to docs.rs.
+    "^https://docs\\.rs/zakura(?:-[a-z0-9-]+)?/latest/",
 
     # Dead upstream links in historical audit document (zebra-dependencies-for-audit.md)
     "^https://github.com/iqlusioninc/abscissa/tree/develop",
@@ -41,6 +48,8 @@ exclude_path = [
     "book/mermaid.min.js",
     "zakura-rpc/qa/rpc-tests",
     "supply-chain",
+    # Contains intentionally unresolved ADR filename placeholders.
+    "docs/decisions/template.md",
     # CHANGELOG contains historical references to deprecated URLs
     "CHANGELOG.md",
 ]
@@ -65,7 +74,7 @@ max_cache_age = "7d"
 max_concurrency = 8
 
 # User agent string
-user_agent = "lychee/0.14 (Zakura link checker; https://github.com/zakura-core/zakura)"
+user_agent = "lychee/0.24 (Zakura link checker; https://github.com/zakura-core/zakura)"
 
 # Skip checking mail addresses
 include_mail = false

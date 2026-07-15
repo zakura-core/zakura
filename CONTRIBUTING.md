@@ -8,7 +8,7 @@
 
 ## Running and Debugging
 
-See the [user documentation](https://github.com/zakura-core/zakura/user.html) for details on
+See the [user documentation](book/src/user.md) for details on
 how to build, run, and instrument Zakura.
 
 ## Bug Reports

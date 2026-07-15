@@ -6,11 +6,11 @@ There are a few bugs in Zakura that we're still working on fixing:
 
 - [Progress bar estimates can become extremely large](https://github.com/console-rs/indicatif/issues/556). This may be improved in recent versions of the progress bar library.
 
-- Zakura currently gossips and connects to [private IP addresses](https://en.wikipedia.org/wiki/IP_address#Private_addresses), we want to [disable private IPs but provide a config (#3117)](https://github.com/zakura-core/zakura/issues/3117) in an upcoming release
+- Zakura currently gossips and connects to [private IP addresses](https://en.wikipedia.org/wiki/IP_address#Private_addresses). See the inherited [Zebra issue #3117](https://github.com/ZcashFoundation/zebra/issues/3117) for background.
 
-- Block download and verification sometimes times out during Zakura's initial sync [#5709](https://github.com/zakura-core/zakura/issues/5709). The full sync still finishes reasonably quickly.
+- Block download and verification sometimes times out during Zakura's initial sync. See the inherited [Zebra issue #5709](https://github.com/ZcashFoundation/zebra/issues/5709) for background. The full sync still finishes reasonably quickly.
 
-- Experimental Tor support is disabled until Zakura upgrades to the latest `arti-client`. [#8328](https://github.com/zakura-core/zakura/issues/8328#issuecomment-1969989648)
+- Experimental Tor support is disabled until Zakura upgrades to the latest `arti-client`. See the inherited [Zebra issue #8328](https://github.com/ZcashFoundation/zebra/issues/8328#issuecomment-1969989648) for background.
 
 ## Memory Issues
 

@@ -1826,7 +1826,11 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             let stale_hash = blocks[seed + 1].hash;
             prop_assert_ne!(stale_hash, blocks[seed + 3].hash, "stale hash must differ from the real block");
             fast.vct
-                .set_prevalidated_next(Some((Height((seed + 3) as u32), stale_hash)));
+                .set_prevalidated_next(Some((
+                    Height((seed + 3) as u32),
+                    stale_hash,
+                    Some(blocks[seed + 3].block.auth_data_root()),
+                )));
             commit(&mut fast, seed + 3);
             prop_assert_eq!(fast.vct_prevalidated_count(), 1, "a stale cache entry (wrong hash) must not cause a false skip");
 
@@ -1844,7 +1848,11 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                 "the forged wrapper hash must differ from the bad block's real hash",
             );
             fast.vct
-                .set_prevalidated_next(Some((Height((seed + 4) as u32), forged_wrapper_hash)));
+                .set_prevalidated_next(Some((
+                    Height((seed + 4) as u32),
+                    forged_wrapper_hash,
+                    Some(blocks[seed + 4].block.auth_data_root()),
+                )));
             let forged = CheckpointVerifiedBlock::with_hash(bad_block, forged_wrapper_hash);
             let error = fast
                 .commit_finalized_direct(forged.into(), None, None, "vct forged wrapper hash")
@@ -1862,6 +1870,135 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                 fast.db.finalized_tip_height(),
                 Some(Height((seed + 3) as u32)),
                 "the rejected forged block must leave finalized state untouched",
+            );
+    });
+
+    Ok(())
+}
+
+/// A header-only successor witness can only prevalidate a later body when the
+/// body uses the same NU5+ auth-data root that the witness supplied. The block
+/// hash alone is insufficient because ZIP-244 excludes authorizing data from
+/// transaction IDs: a same-header body can carry different authorizing data,
+/// and the checkpoint verifier deliberately leaves the header/auth-root binding
+/// to finalized commit.
+#[test]
+fn vct_header_only_prevalidation_binds_nu5_auth_data_root() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    let network = ParametersBuilder::default()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(10),
+            sapling: Some(15),
+            blossom: Some(20),
+            heartwood: Some(25),
+            canopy: Some(30),
+            nu5: Some(35),
+            nu6: Some(40),
+            nu6_1: Some(45),
+            nu6_2: Some(47),
+            nu6_3: Some(48),
+            nu7: Some(50),
+        })
+        .expect("failed to set activation heights")
+        .extend_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let ledger_strategy =
+        LedgerState::genesis_strategy(Some(network), None::<NetworkUpgrade>, None, false);
+
+    proptest!(ProptestConfig::with_cases(1),
+        |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
+            let blocks: Vec<_> = chain.iter().collect();
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0 as usize;
+            let seed = nu5 - 2;
+            let first_fast = seed + 1;
+            let target = seed + 2;
+            prop_assert!(blocks.len() > target + 1, "generated chain unexpectedly short");
+
+            let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            let mut fixture = std::collections::HashMap::new();
+            for (i, prepared) in blocks.iter().take(target + 1).enumerate() {
+                let cv = CheckpointVerifiedBlock::from(prepared.block.clone());
+                let (_h, trees) = legacy
+                    .commit_finalized_direct(cv.into(), None, None, "vct auth-root legacy")
+                    .unwrap();
+                if i > seed {
+                    fixture.insert(
+                        i as u32,
+                        (
+                            trees.sapling.root(),
+                            trees.orchard.root(),
+                            zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                        ),
+                    );
+                }
+            }
+
+            let mut fast = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            enable_vct_test_fixture_source(&mut fast, fixture);
+
+            for i in 0..=seed {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = next_vct_block(blocks[i + 1].block.clone());
+                fast.commit_finalized_direct(cv.into(), None, next, "vct auth-root seed")
+                    .expect("legacy-prefix commits succeed");
+            }
+
+            // Use a header-only witness for `target`, as production does when
+            // header sync is ahead of body sync. It carries the real auth root,
+            // so the previous fast block may safely authenticate its roots.
+            let cv = CheckpointVerifiedBlock::from(blocks[first_fast].block.clone());
+            let header_only_successor = NextVctBlock::from_header(
+                blocks[target].block.header.clone(),
+                Height(target as u32),
+                blocks[target].block.auth_data_root(),
+            );
+            fast.commit_finalized_direct(
+                cv.into(),
+                None,
+                Some(header_only_successor),
+                "vct auth-root header-only prevalidation",
+            )
+            .expect("the first fast block commits with a header-only successor");
+            prop_assert_eq!(fast.vct_prevalidated_count(), 0, "the first fast block runs its own check");
+
+            // This private-field mutation models the later checkpoint wrapper
+            // for a same-header body whose authorizing data differs from the
+            // header-only witness. If the dedup key were only (height, hash),
+            // finalized commit would skip the only check that rejects it.
+            let mut mismatched = CheckpointVerifiedBlock::from(blocks[target].block.clone());
+            let mismatched_auth_data_root =
+                zakura_chain::block::merkle::AuthDataRoot::from([0x42; 32]);
+            prop_assert_ne!(
+                mismatched.auth_data_root,
+                Some(mismatched_auth_data_root),
+                "the test needs a different auth-data root",
+            );
+            mismatched.0.auth_data_root = Some(mismatched_auth_data_root);
+
+            let error = fast
+                .commit_finalized_direct(
+                    mismatched.into(),
+                    None,
+                    None,
+                    "vct auth-root mismatched body",
+                )
+                .expect_err("a body with a different auth-data root must not reuse header-only prevalidation");
+            prop_assert!(
+                format!("{error:?}").contains("VctSuppliedRootUnavailable"),
+                "the mismatched body must fail its own commitment check, got: {error:?}",
+            );
+            prop_assert_eq!(
+                fast.vct_prevalidated_count(),
+                0,
+                "the mismatched auth-data root must not increment the prevalidated count",
+            );
+            prop_assert_eq!(
+                fast.db.finalized_tip_height(),
+                Some(Height(first_fast as u32)),
+                "the rejected body must leave finalized state untouched",
             );
     });
 

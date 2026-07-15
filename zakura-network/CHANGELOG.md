@@ -9,13 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The Zakura connection loop now re-checks block-sync demand for a connected peer
-  instead of asking once at connection setup. Block sync withholds a peer while it
-  is parked (the no-progress liveness cooldown, 180s by default) and while its
-  per-direction peer cap is full; both lapse on their own, but the setup-time check
-  was the transport's only question, so a peer redialled inside its cooldown was
-  refused a block-sync stream for the whole life of the connection -- with no redial
-  coming, because the connection stayed healthy under header sync and discovery.
+- Block-sync no-progress liveness now parks only the local block-sync session rather
+  than classifying the peer as protocol-invalid and closing the shared connection.
+  Ordered-stream demand is now a temporary, advisory decision for every service:
+  the transport re-checks it with bounded backoff and re-offers a session after a
+  cooldown or capacity limit clears, without requiring a transport redial. Stream
+  opening and collision policy is declared by each stream rather than hard-coded by
+  stream kind in the connection loop.
 - Contained panics while decoding peer-controlled legacy messages to the
   affected connection, which is disconnected through the normal peer failure
   path.

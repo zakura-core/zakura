@@ -13,12 +13,12 @@ Initial release of Zakura.
 
 - Pruned finalized blocks remain visible to chain-identity queries, including peer
   block-hash responses and RPC confirmation lookups, after their bodies are removed.
-- Fixed a permanent block-sync stall on the Zakura P2P stack. A peer that block sync
-  parked after missing its no-progress liveness deadline was refused a block-sync
-  stream when the transport redialled it inside the cooldown, and that refusal was
-  never revisited -- so the peer stayed block-sync-dark for the life of the
-  connection. With every peer eventually parked, block sync settled at zero peers and
-  body sync stopped for good while header sync kept tracking the tip.
+- Fixed a permanent block-sync stall on the Zakura P2P stack. Block sync now parks
+  only its local service session when a peer misses the no-progress liveness
+  deadline, preserving sibling services on the shared connection. The transport
+  also re-checks temporary demand refusals for every negotiated ordered service, so
+  a session is re-offered after its cooldown or capacity limit clears without
+  requiring a transport redial.
 
 Zakura is a fork of the Zcash Foundation's
 [Zebra](https://github.com/ZcashFoundation/zebra), forked at Zebra v5.0.0. For

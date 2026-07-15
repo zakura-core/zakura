@@ -7,7 +7,7 @@ use std::{
 
 use thiserror::Error;
 
-use super::{Frame, Peer, Service, SinkReject, Stream, StreamMode};
+use super::{Frame, Peer, Service, SinkReject, Stream};
 use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId};
 
 /// Errors returned while building a [`ServiceRegistry`].
@@ -180,9 +180,13 @@ impl ServiceRegistry {
         let mut streams = Vec::new();
 
         for service in self.services_for_negotiated(negotiated) {
-            streams.extend(service.streams().iter().copied().filter(|stream| {
-                stream.mode == StreamMode::Ordered && negotiated & stream.capability != 0
-            }));
+            streams.extend(
+                service
+                    .streams()
+                    .iter()
+                    .copied()
+                    .filter(|stream| stream.is_ordered() && negotiated & stream.capability != 0),
+            );
         }
 
         streams
@@ -190,10 +194,10 @@ impl ServiceRegistry {
 
     /// Ordered streams that should be lazily escalated for this peer now.
     ///
-    /// The connection initiator is the only side that proactively opens ordered
-    /// service streams. This demand check narrows the negotiated capabilities to
-    /// services that currently have local interest and room; the owning reactor
-    /// still makes the final admission decision after the typed session arrives.
+    /// The connection loop applies each returned stream's declared opening policy.
+    /// This demand check narrows the negotiated capabilities to services that
+    /// currently have local interest and room; the owning reactor still makes the
+    /// final admission decision after the typed session arrives.
     pub fn ordered_streams_for_escalation(
         &self,
         negotiated: u64,
@@ -207,9 +211,13 @@ impl ServiceRegistry {
                 continue;
             }
 
-            streams.extend(service.streams().iter().copied().filter(|stream| {
-                stream.mode == StreamMode::Ordered && negotiated & stream.capability != 0
-            }));
+            streams.extend(
+                service
+                    .streams()
+                    .iter()
+                    .copied()
+                    .filter(|stream| stream.is_ordered() && negotiated & stream.capability != 0),
+            );
         }
 
         streams
@@ -236,7 +244,7 @@ impl ServiceRegistry {
 
         for service in self.services_for_negotiated(negotiated) {
             streams.extend(service.streams().iter().copied().filter(|stream| {
-                stream.mode == StreamMode::RequestResponse && negotiated & stream.capability != 0
+                stream.is_request_response() && negotiated & stream.capability != 0
             }));
         }
 
@@ -403,7 +411,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::zakura::{framed_channel, Peer, Stream, StreamMode, ZakuraPeerId};
+    use crate::zakura::{
+        framed_channel, OrderedStreamOpening, Peer, Stream, StreamMode, ZakuraPeerId,
+    };
 
     #[derive(Debug)]
     struct TestService {
@@ -506,7 +516,9 @@ mod tests {
             version: 1,
             frame_cap: 1024,
             capability,
-            mode: StreamMode::Ordered,
+            mode: StreamMode::Ordered {
+                opening: OrderedStreamOpening::Initiator,
+            },
         }
     }
 

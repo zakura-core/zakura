@@ -12,9 +12,9 @@ use tokio_util::sync::CancellationToken;
 use super::{events::*, pipe::*, wire::*, *};
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, Flow, Frame, FramedRecv, FramedSend,
-    OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServicePeerDirection, SessionGuard,
-    Sink, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId, ZakuraSupervisorHandle,
-    ZAKURA_CAP_HEADER_SYNC,
+    OrderedSendError, OrderedStreamOpening, Peer, PeerStreamSession, Pipe, Service,
+    ServicePeerDirection, SessionGuard, Sink, SinkReject, Stream, StreamMode, ZakuraConnId,
+    ZakuraPeerId, ZakuraSupervisorHandle, ZAKURA_CAP_HEADER_SYNC,
 };
 
 const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
@@ -26,7 +26,9 @@ const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     // local message cap in header_sync::wire.
     frame_cap: (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32,
     capability: ZAKURA_CAP_HEADER_SYNC,
-    mode: StreamMode::Ordered,
+    mode: StreamMode::Ordered {
+        opening: OrderedStreamOpening::Initiator,
+    },
 }];
 
 /// Service-declared streams for native header sync.

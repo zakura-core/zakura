@@ -20,9 +20,24 @@ pub type BoxRunFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StreamMode {
     /// A long-lived ordered stream between connected peers.
-    Ordered,
+    Ordered {
+        /// Which side of a connection may proactively open this stream.
+        opening: OrderedStreamOpening,
+    },
     /// A short-lived request/response stream opened per request.
     RequestResponse,
+}
+
+/// Opening policy for a long-lived ordered stream.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum OrderedStreamOpening {
+    /// Only the peer that initiated the underlying connection opens the stream.
+    Initiator,
+    /// Either peer may open the stream when its local service has demand.
+    ///
+    /// If both peers open it concurrently, the transport's deterministic
+    /// collision tiebreak selects one physical stream for both services.
+    EitherPeer,
 }
 
 /// A service-declared Zakura stream.
@@ -38,6 +53,31 @@ pub struct Stream {
     pub capability: u64,
     /// Stream lifetime and opening semantics.
     pub mode: StreamMode,
+}
+
+impl Stream {
+    /// Return whether this is a long-lived ordered stream.
+    pub(crate) fn is_ordered(self) -> bool {
+        matches!(self.mode, StreamMode::Ordered { .. })
+    }
+
+    /// Return whether this is a short-lived request/response stream.
+    pub(crate) fn is_request_response(self) -> bool {
+        self.mode == StreamMode::RequestResponse
+    }
+
+    /// Return whether this side may proactively open this ordered stream.
+    pub(crate) fn may_open_ordered(self, is_connection_initiator: bool) -> bool {
+        match self.mode {
+            StreamMode::Ordered {
+                opening: OrderedStreamOpening::Initiator,
+            } => is_connection_initiator,
+            StreamMode::Ordered {
+                opening: OrderedStreamOpening::EitherPeer,
+            } => true,
+            StreamMode::RequestResponse => false,
+        }
+    }
 }
 
 /// Transport state for one ordered service stream.
@@ -311,9 +351,13 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     /// local room/interest state; remote first-party summary preference is
     /// applied upstream before dialing or escalation selection.
     ///
-    /// The service remains authoritative at [`Service::add_peer`], where it
-    /// can still reject or locally park a session if its state changed
-    /// concurrently.
+    /// A `false` result is temporary: local capacity, usefulness, or retry
+    /// backoff can change while the underlying connection remains healthy. For
+    /// ordered streams this check is repeated with bounded backoff until the
+    /// service accepts a session or the connection closes.
+    ///
+    /// The service remains authoritative at [`Service::add_peer`], where it can
+    /// still reject or locally park a session if its state changed concurrently.
     fn wants_peer(
         &self,
         _peer: &ZakuraPeerId,

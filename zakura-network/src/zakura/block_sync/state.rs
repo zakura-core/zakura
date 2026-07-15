@@ -347,7 +347,7 @@ pub(super) struct DownloadWindow {
 pub(super) enum LivenessOutcome {
     Ok,
     Disarm,
-    Disconnect,
+    Park,
 }
 
 impl DownloadWindow {
@@ -716,7 +716,7 @@ impl DownloadWindow {
         self.clear_liveness_if_idle();
     }
 
-    /// Push the block-liveness deadline out by `timeout` when a would-be disconnect is
+    /// Push the block-liveness deadline out by `timeout` when a would-be park is
     /// attributable to *local* outbound backpressure, not the peer: while our outbound queue
     /// is full the routine stops draining inbound, so a useful body may be sitting unread.
     /// Avoids punishing the peer for our own write-side congestion.
@@ -737,7 +737,7 @@ impl DownloadWindow {
                 LivenessOutcome::Disarm
             }
             Some(deadline) if now < deadline => LivenessOutcome::Ok,
-            Some(_) => LivenessOutcome::Disconnect,
+            Some(_) => LivenessOutcome::Park,
         }
     }
 

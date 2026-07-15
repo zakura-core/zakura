@@ -21,10 +21,10 @@ use super::{
 };
 use crate::zakura::{
     framed_channel,
-    testkit::{TraceCapture, TraceValue},
-    ChainFrontier, FramedRecv, FramedSend, Frontier, FrontierChange, FrontierUpdate, Peer, Service,
-    ServicePeerSnapshot, ServiceRegistry, StreamMode, ZakuraBlockSyncCandidateState,
-    ZakuraSyncExchange,
+    testkit::{await_until, TraceCapture, TraceValue},
+    ChainFrontier, FramedRecv, FramedSend, Frontier, FrontierChange, FrontierUpdate,
+    OrderedStreamOpening, Peer, Service, ServicePeerSnapshot, ServiceRegistry, StreamMode,
+    ZakuraBlockSyncCandidateState, ZakuraSyncExchange,
 };
 use zakura_chain::{
     fmt::HexDebug,
@@ -496,7 +496,7 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
 }
 
 #[test]
-fn block_liveness_disconnects_silent_active_peer_after_default_timeout() {
+fn block_liveness_parks_silent_active_peer_after_default_timeout() {
     let config = ZakuraBlockSyncConfig::default();
     let timeout = config.effective_liveness_timeout();
     assert_eq!(timeout, Duration::from_secs(32));
@@ -510,10 +510,7 @@ fn block_liveness_disconnects_silent_active_peer_after_default_timeout() {
         window.check_liveness(now + timeout - Duration::from_millis(1)),
         LivenessOutcome::Ok
     );
-    assert_eq!(
-        window.check_liveness(now + timeout),
-        LivenessOutcome::Disconnect
-    );
+    assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Park);
 }
 
 /// The defensive `Disarm` arm in `check_liveness`: a block-liveness deadline that exists
@@ -583,7 +580,7 @@ fn block_liveness_progress_before_deadline_keeps_peer_alive() {
 }
 
 #[test]
-fn block_liveness_disconnects_silent_peer_after_outstanding_drains() {
+fn block_liveness_parks_silent_peer_after_outstanding_drains() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
     let mut window = download_window();
@@ -594,10 +591,7 @@ fn block_liveness_disconnects_silent_peer_after_outstanding_drains() {
     window.disarm_liveness_after_progress_if_idle();
 
     assert_eq!(window.block_liveness_deadline, Some(now + timeout));
-    assert_eq!(
-        window.check_liveness(now + timeout),
-        LivenessOutcome::Disconnect
-    );
+    assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Park);
 }
 
 #[test]
@@ -757,7 +751,7 @@ fn view_reset_preserves_proof_but_reclears_streak() {
 }
 
 #[test]
-fn backpressure_extends_liveness_instead_of_disconnecting() {
+fn backpressure_extends_liveness_instead_of_parking() {
     // Regression for the outbound-backpressure false disconnect: when the routine's
     // outbound queue is full it stops draining inbound, so a would-be liveness
     // disconnect is attributable to our own write-side congestion, not the peer.
@@ -773,7 +767,7 @@ fn backpressure_extends_liveness_instead_of_disconnecting() {
     window.arm_liveness(now, timeout);
     assert_eq!(
         window.check_liveness(now + timeout),
-        LivenessOutcome::Disconnect,
+        LivenessOutcome::Park,
         "the deadline has expired: without backpressure this disconnects",
     );
 
@@ -786,7 +780,7 @@ fn backpressure_extends_liveness_instead_of_disconnecting() {
     // body arrived), the peer is still disconnected.
     assert_eq!(
         window.check_liveness(extended_at + timeout),
-        LivenessOutcome::Disconnect,
+        LivenessOutcome::Park,
     );
 }
 
@@ -2942,9 +2936,9 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
 }
 
 #[tokio::test]
-async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
+async fn block_liveness_parks_silent_session_without_disconnect() {
     let mut capture =
-        TraceCapture::for_test("block_liveness_disconnects_silent_peer_and_traces_reason")
+        TraceCapture::for_test("block_liveness_parks_silent_session_without_disconnect")
             .expect("trace capture initializes");
     let mut config = immediate_body_download_config();
     config.request_timeout = Duration::from_millis(400);
@@ -3014,9 +3008,21 @@ async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
     assert_eq!(start_height, block::Height(1));
     assert_eq!(count, 1);
 
-    tokio::time::timeout(Duration::from_secs(3), connection_cancel.cancelled())
-        .await
-        .expect("silent active peer is disconnected by block-progress liveness");
+    await_until(
+        "silent peer's block-sync session is locally parked",
+        Duration::from_secs(3),
+        || handle.peer_snapshot().outbound_peers == 0,
+    )
+    .await
+    .expect("silent block-sync session is parked by block-progress liveness");
+    assert!(
+        !connection_cancel.is_cancelled(),
+        "block-sync liveness must preserve the shared transport connection",
+    );
+    assert!(
+        !service.wants_peer(&peer, ZAKURA_CAP_BLOCK_SYNC, ServicePeerDirection::Outbound,),
+        "the parked peer must be withheld during its block-sync cooldown",
+    );
 
     capture.flush().await;
     let reader = capture.reader().expect("trace rows load");
@@ -3029,7 +3035,7 @@ async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
         ],
     );
     reader.table("block_sync").assert_row(
-        bs_trace::BLOCK_PEER_PROTOCOL_REJECT,
+        bs_trace::BLOCK_PEER_PARKED,
         &[(
             bs_trace::REASON,
             TraceValue::Str("block_sync_no_block_progress"),
@@ -3046,7 +3052,7 @@ async fn block_liveness_credits_late_unmatched_body_and_keeps_peer() {
     // through the unmatched-queued path — must be credited with block progress and
     // kept. Before the fix, `accept_unmatched_queued_body` buffered the useful body
     // without resetting the no-progress streak or proving the peer, so the peer was
-    // disconnected at the liveness deadline despite delivering the block we accepted.
+    // parked at the liveness deadline despite delivering the block we accepted.
     let mut config = immediate_body_download_config();
     // Short request/floor-rescue leash so the probe times out fast; the liveness
     // deadline (request_timeout * 4 = 1.2s) is what a false disconnect would trip.
@@ -4627,7 +4633,12 @@ fn block_sync_stream_declares_kind_capability_version_and_frame_cap() {
     assert_eq!(stream.kind, ZAKURA_STREAM_BLOCK_SYNC);
     assert_eq!(stream.version, ZAKURA_BLOCK_SYNC_STREAM_VERSION);
     assert_eq!(stream.capability, ZAKURA_CAP_BLOCK_SYNC);
-    assert_eq!(stream.mode, StreamMode::Ordered);
+    assert_eq!(
+        stream.mode,
+        StreamMode::Ordered {
+            opening: OrderedStreamOpening::EitherPeer,
+        }
+    );
     assert_eq!(stream.frame_cap, MAX_BS_FRAME_BYTES);
 }
 

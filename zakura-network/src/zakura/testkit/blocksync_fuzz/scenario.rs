@@ -60,8 +60,8 @@ pub(crate) struct IdleGap {
 /// A mid-run change to how a peer serves, applied once the peer has been connected for
 /// `at`. Models a peer that was healthy and then degrades partway through a sync — the
 /// two cases the failure mechanism must distinguish: a peer that *wedges* (goes silent,
-/// must be disconnected) versus one that becomes *radically slower* but keeps delivering
-/// (must be kept, only weaker).
+/// whose block-sync session must be parked) versus one that becomes *radically slower*
+/// but keeps delivering (must be kept, only weaker).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Degrade {
     /// Elapsed time since this peer connected after which `mode` takes effect.
@@ -73,18 +73,20 @@ pub(crate) struct Degrade {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DegradeMode {
     /// Silently drop every subsequent request (the peer keeps *reading* our requests but
-    /// never answers). The node must seal it off and disconnect it via the liveness timer.
+    /// never answers). The node must seal it off and park the session via the liveness
+    /// timer.
     GoSilent,
     /// Stop reading our stream entirely and answer nothing — a truly wedged connection.
     /// Because the peer no longer drains our bounded outbound queue, the node's
     /// `outbound_capacity()` falls to zero and stays there. This is the case the old
     /// liveness escape excused indefinitely (extend-while-outbound-full), letting a
-    /// non-reading peer avoid disconnect until the transport idle timeout (~180 s). The
-    /// node must now disconnect it at the liveness deadline regardless of outbound state.
+    /// non-reading peer avoid action until the transport idle timeout (~180 s). The
+    /// node must now park its block-sync session at the liveness deadline regardless
+    /// of outbound state.
     Wedge,
     /// Switch to a finite serve bandwidth (bytes/sec) behind a fixed base RTT: the peer
     /// keeps delivering but far more slowly. The node must keep it (its cwnd/params just
-    /// shrink), not disconnect it.
+    /// shrink), not park it.
     SlowTo {
         base_rtt: Duration,
         bandwidth_bytes_per_sec: u64,

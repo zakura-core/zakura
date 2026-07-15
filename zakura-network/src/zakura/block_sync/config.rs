@@ -80,7 +80,7 @@ pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// the contiguous download floor wait on a slow peer. Far tighter than the base
 /// `request_timeout`, which governs patient above-floor speculation instead.
 pub const DEFAULT_BS_FLOOR_RESCUE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Request-timeout windows allowed before block-progress liveness disconnects.
+/// Request-timeout windows allowed before block-progress liveness parks a session.
 const BLOCK_PROGRESS_TIMEOUT_REQUESTS: u32 = 4;
 /// Default `GetBlocks` probes sent to a new peer before it proves block-body progress.
 pub const DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS: u32 = 1;
@@ -250,7 +250,7 @@ pub struct ZakuraBlockSyncConfig {
     /// carrier. Clamped positive and never above `request_timeout`.
     #[serde(with = "humantime_serde")]
     pub floor_rescue_timeout: Duration,
-    /// How long to keep a peer disconnected after it makes no accepted block progress.
+    /// How long to withhold a block-sync session after it makes no accepted block progress.
     #[serde(with = "humantime_serde")]
     pub no_progress_peer_cooldown: Duration,
     /// `GetBlocks` requests an unproven peer may receive before its first accepted body,
@@ -259,7 +259,7 @@ pub struct ZakuraBlockSyncConfig {
     pub initial_block_probe_requests: u32,
     /// After a peer has proven progress, the cap on requests without an accepted body;
     /// past it the peer gets no more work until it makes progress or the liveness
-    /// deadline disconnects it.
+    /// deadline parks its block-sync session.
     pub max_requests_without_block_progress: u32,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
     #[serde(with = "humantime_serde")]

@@ -266,8 +266,8 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_CONNECTED: &str = "block_peer_connected";
     /// Block-sync peer disconnected from the reactor.
     pub const BLOCK_PEER_DISCONNECTED: &str = "block_peer_disconnected";
-    /// Block-sync peer rejected for a protocol/liveness reason.
-    pub const BLOCK_PEER_PROTOCOL_REJECT: &str = "block_peer_protocol_reject";
+    /// Block-sync service session locally parked for a liveness reason.
+    pub const BLOCK_PEER_PARKED: &str = "block_peer_parked";
     /// Body range request sent to a peer.
     pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
     /// Reactor accepted an inbound event.

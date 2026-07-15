@@ -23,9 +23,9 @@ use tokio_util::sync::CancellationToken;
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
     CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncEvent, HeaderSyncHandle,
-    OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServiceAdmissionDecision,
-    ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId,
-    LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+    OrderedSendError, OrderedStreamOpening, Peer, PeerStreamSession, Pipe, Service,
+    ServiceAdmissionDecision, ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId,
+    ZakuraPeerId, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
 };
 
 #[cfg(test)]
@@ -48,7 +48,9 @@ const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
     // authoritative inbound cap is app_frame_cap_for_stream_kind.
     frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
     capability: ZAKURA_CAP_DISCOVERY,
-    mode: StreamMode::Ordered,
+    mode: StreamMode::Ordered {
+        opening: OrderedStreamOpening::Initiator,
+    },
 }];
 
 /// Service-declared streams for native discovery.

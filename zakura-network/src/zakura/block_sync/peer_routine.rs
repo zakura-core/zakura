@@ -123,13 +123,13 @@ impl FillStop {
         }
     }
 }
-const CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
+const PARK_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
 
-/// Whether a due block-liveness deadline gets one bounded grace instead of disconnecting.
+/// Whether a due block-liveness deadline gets one bounded grace instead of parking the session.
 /// Granted only for *our own* transient outbound write congestion: outbound full **and**
 /// continuously full for less than `request_timeout`. A peer that stopped reading holds
 /// our outbound full indefinitely, so once the full stretch reaches `request_timeout` the
-/// grace is denied and the peer is disconnected — it can no longer dodge the timer by
+/// grace is denied and the session is parked — it can no longer dodge the timer by
 /// refusing to read (the previous unbounded `outbound_capacity() == 0 → extend` escape let
 /// a wedged peer survive to the ~180 s transport idle timeout).
 fn liveness_grace_allowed(
@@ -249,7 +249,7 @@ pub(super) struct PeerRoutine {
     /// When our outbound queue to this peer *first* filled in the current continuous full
     /// stretch (`None` while it has capacity). Lets the liveness check tell transient local
     /// write congestion (just filled) from a peer that stopped reading for `request_timeout`
-    /// — the latter is disconnected at the liveness deadline rather than excused indefinitely.
+    /// — the latter is parked at the liveness deadline rather than excused indefinitely.
     outbound_full_since: Option<Instant>,
 
     /// Cancellation: the peer's service session token. Fires on disconnect, park,
@@ -360,7 +360,7 @@ impl PeerRoutine {
             // Track the start of the current continuous outbound-full stretch so the
             // liveness check can bound the write-congestion grace: a peer that stopped
             // reading holds this full until `outbound_full_since` ages past
-            // `request_timeout`, at which point it is disconnected rather than excused.
+            // `request_timeout`, at which point it is parked rather than excused.
             if outbound_queue_has_capacity {
                 self.outbound_full_since = None;
             } else if self.outbound_full_since.is_none() {
@@ -1146,7 +1146,7 @@ impl PeerRoutine {
                 self.window.clear_liveness_if_idle();
                 Ok(())
             }
-            LivenessOutcome::Disconnect
+            LivenessOutcome::Park
                 if liveness_grace_allowed(
                     self.session.outbound_capacity() == 0,
                     self.outbound_full_since,
@@ -1160,26 +1160,26 @@ impl PeerRoutine {
                 // frames (`if outbound_queue_has_capacity`), so a block the peer already sent
                 // may be waiting behind our write side. Grant one short, BOUNDED grace. This
                 // is the *only* liveness extension: a peer that stopped reading holds outbound
-                // full past `request_timeout`, falls through to the disconnect arm, and is
-                // disconnected at the liveness deadline — it cannot dodge the timer.
+                // full past `request_timeout`, falls through to the park arm, and is
+                // parked at the liveness deadline — it cannot dodge the timer.
                 self.window
                     .extend_liveness_deadline(now, self.config.request_timeout);
                 Ok(())
             }
-            LivenessOutcome::Disconnect => {
+            LivenessOutcome::Park => {
                 let error =
                     "block-sync peer made no accepted block progress before liveness deadline";
                 self.registry.park_peer_until(
                     &self.peer,
                     now + self.config.effective_no_progress_peer_cooldown(),
                 );
-                self.trace_protocol_reject_liveness(error);
+                self.trace_liveness_park(error);
                 tracing::debug!(
                     peer = ?self.peer,
                     outstanding = self.window.outstanding.len(),
-                    "disconnecting Zakura block-sync peer after no accepted block progress"
+                    "parking Zakura block-sync session after no accepted block progress"
                 );
-                Err(SinkReject::protocol(error))
+                Err(SinkReject::local(error))
             }
         }
     }
@@ -1952,12 +1952,12 @@ impl PeerRoutine {
         });
     }
 
-    fn trace_protocol_reject_liveness(&self, error: &str) {
-        self.emit(bs_trace::BLOCK_PEER_PROTOCOL_REJECT, |row| {
+    fn trace_liveness_park(&self, error: &str) {
+        self.emit(bs_trace::BLOCK_PEER_PARKED, |row| {
             bs_insert_peer(row, bs_trace::PEER, &self.peer);
             row.insert(
                 bs_trace::REASON.to_string(),
-                serde_json::Value::String(CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS.to_string()),
+                serde_json::Value::String(PARK_BLOCK_SYNC_NO_BLOCK_PROGRESS.to_string()),
             );
             row.insert(
                 bs_trace::ERROR.to_string(),
@@ -2649,7 +2649,7 @@ mod tests {
         ));
 
         // Outbound has been full for a full `request_timeout` (the peer has stopped
-        // reading): NO grace — the peer is disconnected at the liveness deadline.
+        // reading): NO grace — the session is parked at the liveness deadline.
         let sustained = now - request_timeout;
         assert!(!super::liveness_grace_allowed(
             true,
@@ -2665,7 +2665,7 @@ mod tests {
             request_timeout
         ));
 
-        // Outbound has capacity (not full): the escape does not apply — disconnects normally.
+        // Outbound has capacity (not full): the escape does not apply — parks normally.
         assert!(!super::liveness_grace_allowed(
             false,
             Some(fresh),

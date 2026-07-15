@@ -1,13 +1,217 @@
-# Zakura block-sync download scheduling: lanes, look-ahead, and the memory budget
+# Zakura block sync
 
-Developer notes for the admission/backpressure design in this module — the floor vs
+This module downloads block bodies after header sync has identified the chain to
+follow. It coordinates multiple peers, keeps memory bounded, preserves peer-specific
+accountability, and hands one winning body for each height to the commit pipeline.
+
+This guide starts with the runtime components and request state transitions. The
+[detailed scheduling and memory design](#detailed-scheduling-and-memory-design) follows
+after the system overview.
+
+## Runtime components
+
+| Component | Scope | Responsibility |
+| --- | --- | --- |
+| [`service.rs`](service.rs) and [`pipe.rs`](pipe.rs) | per stream | Admit a block-sync stream and connect its framed transport to a peer routine |
+| [`peer_routine.rs`](peer_routine.rs) | per peer | Select work, send requests, match responses, maintain liveness, and publish active claims |
+| `DownloadWindow` in [`state.rs`](state.rs) | per peer | Congestion control, request limits, and peer liveness |
+| `OutstandingRequests` in [`outstanding.rs`](outstanding.rs) | per peer | Own the full `Active` and `Retired` request records |
+| [`peer_registry.rs`](peer_registry.rs) | shared | Publish active claims for cross-peer scheduling and floor-watchdog decisions |
+| [`work_queue.rs`](work_queue.rs) | shared | Own each needed height exactly once as pending or in flight |
+| [`reactor.rs`](reactor.rs) | shared | Manage peers, global events, metrics, and floor-watchdog recovery |
+| [`sequencer_task.rs`](sequencer_task.rs) | shared | Reorder downloaded bodies, submit a contiguous prefix, and publish pipeline progress |
+| `ByteBudget` | shared | Bound the bytes reserved by requests and held by downloaded bodies |
+
+The key ownership rule is:
+
+> `PeerRoutine` owns the lifetime of a peer's request, `PeerRegistry` exposes only
+> its active scheduling claims, and `WorkQueue` owns the global height and byte
+> transition.
+
+No one structure is a complete view of the system:
+
+- `OutstandingRequests` answers, "What did this peer receive from us, and what
+  responses can still arrive?"
+- `PeerRegistry` answers, "Which peers currently own active claims that global
+  scheduling should consider?"
+- `WorkQueue` answers, "Is this height pending, reserved by a request, or already
+  held by the commit pipeline?"
+
+## Request lifecycle
+
+A request is identified locally by a monotonically increasing
+`BlockRequestToken`. Together with the peer's routine generation, this token prevents
+a stale watchdog observation from cancelling a newer request. Stream version 2 does
+not carry this token on the wire; inbound bodies are matched by height and terminators
+by start height.
+
+```text
+                         normal response completes
+                        ┌──────────────────────────→ Closed
+                        │
+Created ─────────────→ Active
+                        │
+                        ├─ covered by download floor ─┐
+                        ├─ request timeout ───────────┼→ Retired
+                        └─ floor watchdog ────────────┘     │
+                                                          ├─ matching response completes
+                                                          ├─ matching terminator arrives
+                                                          └─ correlation deadline expires
+                                                                     │
+                                                                     ▼
+                                                                   Closed
+```
+
+### Active
+
+An active request is still part of scheduling. It:
+
+- consumes a peer request slot and BBR in-flight capacity;
+- owns estimated byte reservations for its unreceived heights;
+- is published by height in `PeerRegistry`;
+- contributes to `PeerRegistry::total_unreceived()`;
+- can be claimed by the floor watchdog; and
+- is cleaned up through `WorkQueue` if the routine exits.
+
+### Retired
+
+A retired request no longer owns scheduling resources, but the request was already
+sent and its response can still arrive. It therefore remains as a bounded correlation
+record. It:
+
+- consumes no active slot or active reserved-byte count;
+- is absent from `PeerRegistry`'s active height map;
+- is ignored by global demand and floor-watchdog accounting;
+- is retained for inbound body and terminator matching;
+- remains relevant to peer liveness and diagnostics; and
+- is not returned or released again when the routine exits.
+
+`OutstandingRequests` maintains cached active count, retired count, and active reserved
+bytes. Its mutation methods update these values together and assert that they still
+match the underlying entries in debug and test builds.
+
+### Retirement reasons
+
+| Reason | Initiator | Scheduling effect | Correlation effect |
+| --- | --- | --- | --- |
+| `Covered` | peer routine | The whole range is at or below the download floor; remaining estimates are released without returning obsolete heights | Keep the original request long enough to classify its late response |
+| `RequestTimeout` | peer routine | Return unreceived heights to `WorkQueue`, release their estimates, and temporarily bias this peer away from taking them again | Keep the request so useful late bodies can still be recognized |
+| `FloorWatchdog` | reactor, then peer routine | Atomically retire the full token in `PeerRegistry`, return its heights, and release their reservations | Notify the owning routine, which converts its local active request to a retired record |
+
+## Height and byte lifecycle
+
+The request lifecycle is peer-local. The corresponding height and byte lifecycle is
+global and lives in `WorkQueue`:
+
+```text
+Pending
+  │ take + reserve estimate
+  ▼
+In flight: Reserved(estimate)
+  │ accepted body
+  ▼
+In flight: Held(actual)
+  │ commit / reset cleanup
+  ▼
+Released
+```
+
+A timeout or watchdog takes the other branch:
+
+```text
+In flight: Reserved(estimate)
+  │ release reservation + return work
+  ▼
+Pending
+```
+
+`BlockBudgetLedger` makes the byte transition explicit:
+`Reserved(estimate) -> Held(actual) -> Released`. Each transition returns the exact
+budget delta for the caller to apply to `ByteBudget`.
+
+Late bodies use `WorkQueue::claim_late_body()`. Classification and mutation happen
+under one queue lock, so two peers racing to supply the same retired height cannot both
+win. The first accepted body changes the height to `Held(actual)`; later callers see
+that it is already held or no longer available.
+
+## Common interaction paths
+
+### Normal request and response
+
+1. A peer routine takes a servable range from `WorkQueue`.
+2. It reserves the estimated bytes in `ByteBudget`.
+3. It creates an active `OutstandingBlockRange`, assigns a request token, arms peer
+   liveness, and publishes active heights to `PeerRegistry`.
+4. It sends `GetBlocks` to the peer.
+5. For each matching body, it validates the expected hash and size.
+6. `WorkQueue` settles `Reserved(estimate)` to `Held(actual)`.
+7. The routine records peer progress and forwards the body to the sequencer.
+8. A complete request is removed. The sequencer eventually commits the body and
+   releases its held bytes.
+
+### Another peer supplies the body first
+
+1. Peer A still has an active wire request.
+2. Peer B supplies the needed body, and the download floor advances past A's range.
+3. Peer A's routine changes the request from active to `Covered`.
+4. A's request stops consuming slots, registry claims, and reserved bytes.
+5. The retired record remains because A can still send the response already in flight.
+
+This separation prevents global progress from erasing peer-local response and liveness
+state.
+
+### Floor-watchdog recovery
+
+1. The reactor snapshots expired claims for the next missing floor height.
+2. `PeerRegistry::retire_outstanding_claim()` compares the peer generation and request
+   token with the current claim.
+3. If they still match, the registry removes every active height belonging to that
+   request and records its token as retired.
+4. The reactor returns those heights to `WorkQueue` and releases their reservations.
+5. The owning peer routine drains the retired-token notification and changes its local
+   request to `FloorWatchdog`.
+
+The generation and token checks make this operation compare-and-swap-like: a stale
+watchdog snapshot cannot retire a replacement routine or a newer request for the same
+height. The registry also filters retired tokens from routine publications until the
+routine has reconciled them, preventing temporary resurrection of a cancelled claim.
+
+## Active versus retired visibility
+
+| Operation | Active | Retired |
+| --- | --- | --- |
+| Peer slots and BBR in-flight accounting | yes | no |
+| Active reserved-byte accounting | yes | no |
+| Registry publication and global unreceived count | yes | no |
+| Floor-watchdog claims | yes | no |
+| Drop-time `WorkQueue` cleanup | yes | no |
+| Inbound response matching | yes | yes |
+| Correlation timeout cleanup | no | yes |
+| Peer liveness and diagnostics | yes | yes |
+
+## Core invariants
+
+When changing this subsystem, preserve these rules:
+
+1. A height has at most one winning `WorkQueue` owner.
+2. Every byte is charged, settled, and released exactly once.
+3. Retiring a request removes it from active scheduling without pretending the wire
+   request was cancelled.
+4. Shared registry claims contain active requests only.
+5. A watchdog action must match both routine generation and request token.
+6. Late-body acceptance is atomic with the `WorkQueue` ownership transition.
+7. Only accepted block progress resets peer no-progress accounting.
+8. Destructive local view resets do not count as peer failure.
+
+## Detailed scheduling and memory design
+
+The rest of this document describes the admission and backpressure design: floor versus
 above-floor request lanes, the commit-window exemption, the resident-memory look-ahead
-budget, and the liveness rules that hold them together. Code anchors:
-[`admission.rs`](admission.rs) (the pure decision logic), [`peer_routine.rs`](peer_routine.rs)
-(the per-peer fill loop that consumes it), [`config.rs`](config.rs) (budgets, floors,
-clamps).
+budget, and the liveness rules that hold them together. The main code anchors are
+[`admission.rs`](admission.rs), [`peer_routine.rs`](peer_routine.rs), and
+[`config.rs`](config.rs).
 
-## Pipeline overview
+### Pipeline overview
 
 Header sync runs far ahead of block bodies. Body download is driven by one **fill loop
 per connected peer** (`PeerRoutine::try_fill`), all pulling from a shared `WorkQueue` of

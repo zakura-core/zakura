@@ -26,7 +26,10 @@ use std::sync::Mutex as StdMutex;
 use tokio::sync::Notify;
 use zakura_chain::block;
 
-use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
+use super::{
+    request::BlockSizeEstimate,
+    state::{BlockBudgetLedger, ByteBudget},
+};
 
 /// Lower clamp on a body-size estimate.
 pub(super) const DEFAULT_BS_SIZE_FLOOR_BYTES: u64 = 1024;
@@ -72,6 +75,17 @@ pub(super) struct WorkReturnOutcome {
     pub(super) min_height: Option<block::Height>,
     /// Highest height considered by the cleanup.
     pub(super) max_height: Option<block::Height>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum LateBodyClaim {
+    ClaimedPending,
+    SettledReserved(i128),
+    AlreadyHeld,
+    Missing,
+    BudgetFull,
+    PendingAdmissionRequired,
+    HashMismatch,
 }
 
 #[derive(Debug)]
@@ -181,6 +195,7 @@ impl WorkQueue {
     /// to a single `BlockRangeRequest`. `high` is the caller's `servable_high`
     /// and is **NOT** clamped to the floor (the download floor is never an upper
     /// bound on the fetch). Returns empty if nothing is eligible.
+    #[cfg(test)]
     pub(super) fn take_in_range(
         &self,
         low: block::Height,
@@ -359,10 +374,65 @@ impl WorkQueue {
         Some(delta)
     }
 
+    /// Atomically claim a late body against the current WorkQueue owner.
+    ///
+    /// This combines the pending/reserved classification with its state
+    /// transition so two peer routines cannot both decide they won the same
+    /// height and forward duplicate bodies.
+    pub(super) fn claim_late_body(
+        &self,
+        height: block::Height,
+        expected_hash: block::Hash,
+        actual: u64,
+        budget: &mut ByteBudget,
+        pending_admitted: bool,
+    ) -> LateBodyClaim {
+        let mut inner = self.lock();
+        if let Some(item) = inner.in_flight.get_mut(&height) {
+            if item.hash != expected_hash {
+                return LateBodyClaim::HashMismatch;
+            }
+            if item.budget.is_reserved() {
+                let reserved_before = item.budget.reserved_charge();
+                let delta = item.budget.settle(actual);
+                inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
+                return LateBodyClaim::SettledReserved(delta);
+            }
+            return LateBodyClaim::AlreadyHeld;
+        }
+
+        if inner
+            .pending
+            .get(&height)
+            .is_some_and(|item| item.hash != expected_hash)
+        {
+            return LateBodyClaim::HashMismatch;
+        }
+        let Some(mut item) = inner.pending.remove(&height) else {
+            return LateBodyClaim::Missing;
+        };
+        if !pending_admitted {
+            inner.pending.insert(height, item);
+            return LateBodyClaim::PendingAdmissionRequired;
+        }
+        if !budget.try_reserve(actual) {
+            inner.pending.insert(height, item);
+            return LateBodyClaim::BudgetFull;
+        }
+        let reserved_before = item.budget.reserved_charge();
+        let previous_charge = item.budget.release();
+        item.budget = BlockBudgetLedger::Held(actual);
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
+        inner.in_flight.insert(height, item);
+        budget.release(previous_charge);
+        LateBodyClaim::ClaimedPending
+    }
+
     /// Mark a height as directly held after the caller admitted `actual` bytes.
     ///
     /// Used for unmatched queued bodies, which did not have a prior request
     /// estimate reservation.
+    #[cfg(test)]
     pub(super) fn mark_held_direct(&self, height: block::Height, actual: u64) -> u64 {
         let mut inner = self.lock();
         if let Some(item) = inner.in_flight.get_mut(&height) {

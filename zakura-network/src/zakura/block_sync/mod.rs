@@ -37,6 +37,7 @@ mod bench;
 mod config;
 mod error;
 mod events;
+mod outstanding;
 mod peer_registry;
 mod peer_routine;
 mod pipe;

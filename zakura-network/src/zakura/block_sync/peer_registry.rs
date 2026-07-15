@@ -21,7 +21,7 @@
 //! misbehavior state.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Mutex as StdMutex,
     time::Instant,
 };
@@ -30,6 +30,7 @@ use zakura_chain::block;
 
 use super::{
     config::{clamp_advertised_blocks, clamp_advertised_inflight, clamp_advertised_response_bytes},
+    outstanding::BlockRequestToken,
     state::EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER,
     BlockSyncStatus, ServicePeerDirection, ZakuraPeerId,
 };
@@ -58,6 +59,9 @@ pub(super) struct Entry {
     pub(super) slots: SlotDiagnostics,
     /// Heights this peer may not re-take after a floor-watchdog cancellation.
     pub(super) floor_watchdog_avoid: BTreeMap<block::Height, Instant>,
+    /// Request tokens atomically retired by the reactor's floor watchdog but not
+    /// yet reconciled by the owning routine.
+    pub(super) retired_requests: HashSet<BlockRequestToken>,
     /// Monotonic generation bumped each time a routine is (re)spawned for this
     /// peer. A cancelled routine's async `Drop` only clears outstanding when the
     /// generation still matches, so an old Drop racing a reset respawn cannot wipe
@@ -82,6 +86,7 @@ impl Entry {
             outstanding: BTreeMap::new(),
             slots: SlotDiagnostics::default(),
             floor_watchdog_avoid: BTreeMap::new(),
+            retired_requests: HashSet::new(),
             generation,
         }
     }
@@ -101,6 +106,7 @@ pub(super) struct SlotDiagnostics {
 /// Published metadata for one unreceived outstanding height.
 #[derive(Copy, Clone, Debug)]
 pub(super) struct OutstandingMeta {
+    pub(super) request_token: BlockRequestToken,
     pub(super) hash: block::Hash,
     pub(super) estimated_bytes: u64,
     pub(super) queued_at: Instant,
@@ -111,6 +117,7 @@ pub(super) struct OutstandingMeta {
 #[derive(Clone, Debug)]
 pub(super) struct OutstandingClaim {
     pub(super) peer: ZakuraPeerId,
+    pub(super) generation: u64,
     pub(super) height: block::Height,
     pub(super) meta: OutstandingMeta,
 }
@@ -187,6 +194,7 @@ impl PeerRegistry {
                 entry.direction = direction;
                 entry.outstanding.clear();
                 entry.floor_watchdog_avoid.clear();
+                entry.retired_requests.clear();
                 entry.generation = generation;
             })
             .or_insert_with(|| Entry::new(direction, config, generation));
@@ -230,11 +238,12 @@ impl PeerRegistry {
         &self,
         peer: &ZakuraPeerId,
         generation: u64,
-        outstanding: BTreeMap<block::Height, OutstandingMeta>,
+        mut outstanding: BTreeMap<block::Height, OutstandingMeta>,
     ) {
         let mut peers = self.lock();
         if let Some(entry) = peers.get_mut(peer) {
             if entry.generation == generation {
+                outstanding.retain(|_, meta| !entry.retired_requests.contains(&meta.request_token));
                 entry.outstanding = outstanding;
             }
         }
@@ -503,6 +512,7 @@ impl PeerRegistry {
             .filter_map(|(peer, entry)| {
                 entry.outstanding.get(&height).map(|meta| OutstandingClaim {
                     peer: peer.clone(),
+                    generation: entry.generation,
                     height,
                     meta: *meta,
                 })
@@ -510,12 +520,53 @@ impl PeerRegistry {
             .collect()
     }
 
-    /// Remove a published outstanding claim for `height` from `peer`.
-    pub(super) fn clear_outstanding_height(&self, peer: &ZakuraPeerId, height: block::Height) {
+    /// Atomically retire the request owning `claim` if the peer generation and
+    /// request token still match. Returns every active height removed for that
+    /// request so the caller can release its WorkQueue ownership exactly once.
+    pub(super) fn retire_outstanding_claim(
+        &self,
+        claim: &OutstandingClaim,
+    ) -> Vec<(block::Height, OutstandingMeta)> {
         let mut peers = self.lock();
-        if let Some(entry) = peers.get_mut(peer) {
-            entry.outstanding.remove(&height);
+        let Some(entry) = peers.get_mut(&claim.peer) else {
+            return Vec::new();
+        };
+        if entry.generation != claim.generation
+            || entry
+                .outstanding
+                .get(&claim.height)
+                .is_none_or(|meta| meta.request_token != claim.meta.request_token)
+        {
+            return Vec::new();
         }
+
+        let token = claim.meta.request_token;
+        let heights: Vec<_> = entry
+            .outstanding
+            .iter()
+            .filter_map(|(height, meta)| (meta.request_token == token).then_some((*height, *meta)))
+            .collect();
+        for (height, _) in &heights {
+            entry.outstanding.remove(height);
+        }
+        entry.retired_requests.insert(token);
+        heights
+    }
+
+    /// Drain floor-watchdog retirement notifications for the current routine.
+    pub(super) fn take_retired_request_tokens(
+        &self,
+        peer: &ZakuraPeerId,
+        generation: u64,
+    ) -> Vec<BlockRequestToken> {
+        let mut peers = self.lock();
+        let Some(entry) = peers.get_mut(peer) else {
+            return Vec::new();
+        };
+        if entry.generation != generation {
+            return Vec::new();
+        }
+        entry.retired_requests.drain().collect()
     }
 
     /// Hard-exclude this peer from re-taking `height` until `until` after the
@@ -797,5 +848,101 @@ mod floor_bias_tests {
 
         assert!(reg.is_peer_parked(&peer, now));
         assert!(!reg.is_peer_parked(&peer, now + std::time::Duration::from_secs(2)));
+    }
+
+    fn outstanding_meta(request_token: BlockRequestToken) -> OutstandingMeta {
+        let now = Instant::now();
+        let hash_byte = u8::try_from(request_token).expect("test request tokens fit in u8");
+        OutstandingMeta {
+            request_token,
+            hash: block::Hash([hash_byte; 32]),
+            estimated_bytes: 1,
+            queued_at: now,
+            deadline: now + std::time::Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn stale_watchdog_claim_cannot_retire_newer_request() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let peer = peer(1);
+        let generation = reg.admit(&peer, ServicePeerDirection::Outbound, &config);
+
+        reg.set_outstanding(
+            &peer,
+            generation,
+            BTreeMap::from([(block::Height(1), outstanding_meta(1))]),
+        );
+        let stale = reg.outstanding_claims_at(block::Height(1)).remove(0);
+        reg.set_outstanding(
+            &peer,
+            generation,
+            BTreeMap::from([(block::Height(1), outstanding_meta(2))]),
+        );
+
+        assert!(reg.retire_outstanding_claim(&stale).is_empty());
+        assert!(reg.peer_has_outstanding_height(&peer, block::Height(1)));
+    }
+
+    #[test]
+    fn stale_watchdog_generation_cannot_retire_replacement_routine() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let peer = peer(1);
+        let old_generation = reg.admit(&peer, ServicePeerDirection::Outbound, &config);
+        reg.set_outstanding(
+            &peer,
+            old_generation,
+            BTreeMap::from([(block::Height(1), outstanding_meta(1))]),
+        );
+        let stale = reg.outstanding_claims_at(block::Height(1)).remove(0);
+
+        let new_generation = reg.admit(&peer, ServicePeerDirection::Outbound, &config);
+        reg.set_outstanding(
+            &peer,
+            new_generation,
+            BTreeMap::from([(block::Height(1), outstanding_meta(1))]),
+        );
+
+        assert!(reg.retire_outstanding_claim(&stale).is_empty());
+        assert!(reg.peer_has_outstanding_height(&peer, block::Height(1)));
+    }
+
+    #[test]
+    fn retired_request_cannot_be_republished_before_routine_reconciliation() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let peer = peer(1);
+        let generation = reg.admit(&peer, ServicePeerDirection::Outbound, &config);
+        let meta = outstanding_meta(7);
+
+        reg.set_outstanding(
+            &peer,
+            generation,
+            BTreeMap::from([
+                (block::Height(1), meta),
+                (
+                    block::Height(2),
+                    OutstandingMeta {
+                        hash: block::Hash([2; 32]),
+                        ..meta
+                    },
+                ),
+            ]),
+        );
+        let claim = reg.outstanding_claims_at(block::Height(1)).remove(0);
+        assert_eq!(reg.retire_outstanding_claim(&claim).len(), 2);
+
+        reg.set_outstanding(
+            &peer,
+            generation,
+            BTreeMap::from([(block::Height(1), meta)]),
+        );
+        assert!(
+            !reg.peer_has_outstanding_height(&peer, block::Height(1)),
+            "publication must not resurrect a token retired by the watchdog"
+        );
+        assert_eq!(reg.take_retired_request_tokens(&peer, generation), vec![7]);
     }
 }

@@ -391,8 +391,10 @@ impl BlockSyncReactor {
                 continue;
             }
 
-            self.registry
-                .clear_outstanding_height(&claim.peer, claim.height);
+            let retired = self.registry.retire_outstanding_claim(&claim);
+            if retired.is_empty() {
+                continue;
+            }
             if servable_peers > 2 {
                 self.registry.avoid_floor_height_until(
                     &claim.peer,
@@ -400,15 +402,22 @@ impl BlockSyncReactor {
                     now + self.startup.config.effective_floor_peer_avoid_cooldown(),
                 );
             }
+            let retired_heights: Vec<_> = retired.iter().map(|(height, _)| *height).collect();
             let released = self
                 .state
                 .work_queue
-                .release_reserved_and_return_items_detailed([claim.height]);
+                .release_reserved_and_return_items_detailed(retired_heights);
             self.state.budget.release(released.released_bytes);
             self.emit_trace(bs_trace::BLOCK_FLOOR_WATCHDOG_CANCELLED, |row| {
                 bs_insert_peer(row, bs_trace::PEER, &claim.peer);
                 bs_insert_height(row, bs_trace::HEIGHT, claim.height);
                 bs_insert_u64(row, bs_trace::ESTIMATED_BYTES, claim.meta.estimated_bytes);
+                bs_insert_u64(row, "request_token", claim.meta.request_token);
+                bs_insert_u64(
+                    row,
+                    "retired_request_heights",
+                    u64::try_from(retired.len()).unwrap_or(u64::MAX),
+                );
                 bs_insert_u64(row, "released_bytes", released.released_bytes);
                 bs_insert_u64(row, "returned_count", released.returned_count);
                 bs_insert_u64(row, "already_pending_count", released.already_pending_count);

@@ -13,11 +13,13 @@ use super::{
         DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
         MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
+    outstanding::*,
     reactor::node_id_from_block_peer_id,
     reorder::*,
     request::*,
     sequencer::*,
     state::*,
+    work_queue::{LateBodyClaim, WorkQueue},
 };
 use crate::zakura::{
     framed_channel,
@@ -451,6 +453,8 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(height).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
+        token: 1,
+        state: OutstandingRequestState::Active,
         request: BlockRangeRequest {
             start_height: block::Height(height),
             count: 1,
@@ -467,6 +471,7 @@ fn window_request(height: u32) -> OutstandingBlockRange {
         delivery_snapshot: test_delivery_snapshot(now),
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
+        late_reliability_credited: false,
     }
 }
 
@@ -474,6 +479,8 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(start).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
+        token: 1,
+        state: OutstandingRequestState::Active,
         request: BlockRangeRequest {
             start_height: block::Height(start),
             count,
@@ -492,7 +499,232 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
         delivery_snapshot: test_delivery_snapshot(now),
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
+        late_reliability_credited: false,
     }
+}
+
+#[test]
+fn retired_request_does_not_consume_active_window_or_bytes() {
+    let mut window = download_window();
+    let initial_slots = window.available_slots();
+    window.outstanding.push(window_request(1));
+
+    assert_eq!(window.active_len(), 1);
+    assert!(window.has_outstanding_height(block::Height(1)));
+    assert_eq!(window.bbr_inflight_bytes(), 1);
+    assert_eq!(window.available_slots(), initial_slots.saturating_sub(1));
+
+    let now = Instant::now();
+    assert!(window.outstanding.retire(
+        0,
+        RetirementReason::Covered,
+        now,
+        now + Duration::from_secs(1),
+    ));
+
+    assert_eq!(window.active_len(), 0);
+    assert!(
+        window.has_outstanding_height(block::Height(1)),
+        "retired correlation state blocks ambiguous same-peer overlap"
+    );
+    assert_eq!(window.bbr_inflight_bytes(), 0);
+    assert_eq!(window.available_slots(), initial_slots);
+}
+
+#[test]
+fn outstanding_request_counters_survive_mixed_state_transitions() {
+    let mut outstanding = OutstandingRequests::new();
+    let base = Instant::now();
+    let mut seed = 0x9e37_79b9_u64;
+    let mut next_token = 1u64;
+
+    for step in 0..10_000u32 {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        match seed % 7 {
+            0 | 1 => {
+                let height = 1 + (step % 200);
+                let mut request = window_request(height);
+                request.token = next_token;
+                next_token = next_token.saturating_add(1);
+                outstanding.insert(request);
+            }
+            2 if !outstanding.is_empty() => {
+                let index = usize::try_from(seed).unwrap_or(usize::MAX) % outstanding.len();
+                let _ = outstanding.retire(
+                    index,
+                    RetirementReason::RequestTimeout,
+                    base,
+                    base + Duration::from_millis(2),
+                );
+            }
+            3 if !outstanding.is_empty() => {
+                let index = usize::try_from(seed).unwrap_or(usize::MAX) % outstanding.len();
+                if let Some(request) = outstanding.get(index) {
+                    let height = request.request.start_height;
+                    outstanding.mark_received(index, height);
+                }
+            }
+            4 if !outstanding.is_empty() => {
+                let index = usize::try_from(seed).unwrap_or(usize::MAX) % outstanding.len();
+                let _ = outstanding.remove(index);
+            }
+            5 => {
+                let _ = outstanding.prune_expired_retired(base + Duration::from_millis(3));
+            }
+            6 if !outstanding.is_empty() => {
+                let index = usize::try_from(seed).unwrap_or(usize::MAX) % outstanding.len();
+                outstanding.record_body_bytes(index, 10);
+                let _ = outstanding.take_late_reliability_credit(index);
+            }
+            _ => {}
+        }
+        outstanding.assert_invariants();
+    }
+}
+
+#[test]
+fn timed_out_request_gets_one_late_reliability_credit() {
+    let now = Instant::now();
+    let mut outstanding = window_request_range(1, 3);
+    assert!(outstanding.retire(
+        RetirementReason::RequestTimeout,
+        now,
+        now + Duration::from_secs(1),
+    ));
+
+    assert!(outstanding.take_late_reliability_credit());
+    assert!(
+        !outstanding.take_late_reliability_credit(),
+        "a multi-block request is charged and credited once per request"
+    );
+}
+
+#[test]
+fn late_pending_body_requires_admission_at_atomic_claim() {
+    let queue = WorkQueue::new(block::Height(0));
+    queue.set_estimate_floor_for_tests(1);
+    assert_eq!(
+        queue.extend([(
+            block::Height(1),
+            block::Hash([1; 32]),
+            BlockSizeEstimate::Advertised(100),
+        )]),
+        1,
+    );
+    let mut budget = ByteBudget::new(1_000);
+
+    assert_eq!(
+        queue.claim_late_body(
+            block::Height(1),
+            block::Hash([2; 32]),
+            80,
+            &mut budget,
+            true,
+        ),
+        LateBodyClaim::HashMismatch
+    );
+    assert!(queue.pending_contains(block::Height(1)));
+    assert_eq!(budget.reserved(), 0);
+
+    assert_eq!(
+        queue.claim_late_body(
+            block::Height(1),
+            block::Hash([1; 32]),
+            80,
+            &mut budget,
+            false,
+        ),
+        LateBodyClaim::PendingAdmissionRequired
+    );
+    assert!(queue.pending_contains(block::Height(1)));
+    assert_eq!(budget.reserved(), 0);
+
+    assert_eq!(
+        queue.claim_late_body(
+            block::Height(1),
+            block::Hash([1; 32]),
+            80,
+            &mut budget,
+            true,
+        ),
+        LateBodyClaim::ClaimedPending
+    );
+    assert!(!queue.pending_contains(block::Height(1)));
+    assert_eq!(budget.reserved(), 80);
+}
+
+#[test]
+fn late_body_claim_has_exactly_one_winner() {
+    let queue = Arc::new(WorkQueue::new(block::Height(0)));
+    queue.set_estimate_floor_for_tests(1);
+    assert_eq!(
+        queue.extend([(
+            block::Height(1),
+            block::Hash([1; 32]),
+            BlockSizeEstimate::Advertised(100),
+        )]),
+        1,
+    );
+    let budget = ByteBudget::new(1_000);
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+
+    let outcomes = std::thread::scope(|scope| {
+        let first_queue = Arc::clone(&queue);
+        let mut first_budget = budget.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first = scope.spawn(move || {
+            first_barrier.wait();
+            first_queue.claim_late_body(
+                block::Height(1),
+                block::Hash([1; 32]),
+                80,
+                &mut first_budget,
+                true,
+            )
+        });
+
+        let second_queue = Arc::clone(&queue);
+        let mut second_budget = budget.clone();
+        let second_barrier = Arc::clone(&barrier);
+        let second = scope.spawn(move || {
+            second_barrier.wait();
+            second_queue.claim_late_body(
+                block::Height(1),
+                block::Hash([1; 32]),
+                80,
+                &mut second_budget,
+                true,
+            )
+        });
+
+        barrier.wait();
+        [
+            first
+                .join()
+                .expect("first late-body claimant does not panic"),
+            second
+                .join()
+                .expect("second late-body claimant does not panic"),
+        ]
+    });
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == LateBodyClaim::ClaimedPending)
+            .count(),
+        1,
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == LateBodyClaim::AlreadyHeld)
+            .count(),
+        1,
+    );
+    assert_eq!(budget.reserved(), 80);
+    assert!(queue.in_flight_contains(block::Height(1)));
+    assert!(!queue.pending_contains(block::Height(1)));
 }
 
 #[test]
@@ -3040,13 +3272,11 @@ async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
 }
 
 #[tokio::test]
-async fn block_liveness_credits_late_unmatched_body_and_keeps_peer() {
+async fn block_liveness_credits_late_retired_body_and_keeps_peer() {
     // Regression: a peer whose probe times out but that then delivers the body late
-    // — after its own outstanding request was already removed, so the body arrives
-    // through the unmatched-queued path — must be credited with block progress and
-    // kept. Before the fix, `accept_unmatched_queued_body` buffered the useful body
-    // without resetting the no-progress streak or proving the peer, so the peer was
-    // disconnected at the liveness deadline despite delivering the block we accepted.
+    // must keep the retired request as a correlation tombstone, salvage the body
+    // through the queued-height path, and credit peer progress without creating a
+    // second budget charge or submission.
     let mut config = immediate_body_download_config();
     // Short request/floor-rescue leash so the probe times out fast; the liveness
     // deadline (request_timeout * 4 = 1.2s) is what a false disconnect would trip.
@@ -3120,8 +3350,8 @@ async fn block_liveness_credits_late_unmatched_body_and_keeps_peer() {
     // queue and, being unproven, the peer is now gated at its one-probe cap.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // The body arrives late, matching no outstanding request → the unmatched-queued
-    // path buffers and forwards it.
+    // The body arrives late, matches the retired request, and is salvaged from
+    // the queued-height path.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[0].clone())
@@ -4208,12 +4438,15 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
     assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     OutstandingBlockRange {
+        token: 1,
+        state: OutstandingRequestState::Active,
         request,
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
+        late_reliability_credited: false,
     }
 }
 
@@ -4581,12 +4814,15 @@ fn underestimated_body_is_buffered_and_charges_budget_delta() {
     assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
+        token: 1,
+        state: OutstandingRequestState::Active,
         request,
         queued_at: now,
         deadline: now,
         delivery_snapshot: test_delivery_snapshot(now),
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
+        late_reliability_credited: false,
     };
     assert_eq!(budget.reserved(), hint);
 

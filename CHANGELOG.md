@@ -5,6 +5,13 @@ All notable changes to Zakura are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Fixed
+
+- Block sync now preserves peer accountability when duplicate requests become
+  obsolete, without disconnecting healthy peers during local pipeline stalls.
+
 ## [1.0.0] - 2026-07-15
 
 Initial release of Zakura.

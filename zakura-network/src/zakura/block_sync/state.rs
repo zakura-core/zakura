@@ -1,7 +1,9 @@
 use super::{
     bbr::{rounded_usize, BbrState},
     config::*,
-    request::*,
+    outstanding::{
+        BlockRequestToken, DeliverySnapshot, OutstandingBlockRange, OutstandingRequests,
+    },
     work_queue::WorkQueue,
     *,
 };
@@ -307,7 +309,8 @@ impl BlockSyncState {
 #[derive(Clone, Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
-    pub(super) outstanding: Vec<OutstandingBlockRange>,
+    pub(super) outstanding: OutstandingRequests,
+    next_request_token: BlockRequestToken,
     /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller. Under
     /// [`CwndUnit::Bytes`] the cwnd is itself a byte budget sourced from header size
     /// hints (no fixed per-request byte weight), so there is no `nominal_request_bytes`.
@@ -341,7 +344,8 @@ impl DownloadWindow {
     pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
         Self {
             max_inflight_requests: config.advertised_max_inflight_requests(),
-            outstanding: Vec::new(),
+            outstanding: OutstandingRequests::new(),
+            next_request_token: 1,
             bbr: BbrState::new(config),
             cwnd_unit: config.bbr_cwnd_unit,
             startup_request_cap: usize::try_from(config.initial_inflight_requests)
@@ -381,8 +385,8 @@ impl DownloadWindow {
         // started before the byte queue had actually drained and the RTprop sample could
         // still be contended.
         let inflight = match self.cwnd_unit {
-            // `outstanding.len()` (a `usize` request count) widens to `u64` losslessly.
-            CwndUnit::Blocks => self.outstanding.len() as u64,
+            // `active_len()` (a `usize` request count) widens to `u64` losslessly.
+            CwndUnit::Blocks => self.active_len() as u64,
             CwndUnit::Bytes => self.outstanding_reserved_bytes(),
         };
         self.bbr
@@ -416,7 +420,7 @@ impl DownloadWindow {
     /// per-block worst case when nothing is outstanding. Used only for diagnostics and
     /// the floor-bypass byte bonus, never for admission.
     fn representative_body_bytes(&self) -> u64 {
-        let outstanding = self.outstanding.len() as u64;
+        let outstanding = self.active_len() as u64;
         if outstanding == 0 {
             return block::MAX_BLOCK_BYTES;
         }
@@ -522,7 +526,7 @@ impl DownloadWindow {
                     .effective_cwnd()
                     .saturating_add(bonus)
                     .min(hard_cap);
-                cwnd_slots.saturating_sub(self.outstanding.len())
+                cwnd_slots.saturating_sub(self.active_len())
             }
             CwndUnit::Bytes => {
                 // The peer's advertised request-count cap still binds in byte mode: a peer
@@ -530,7 +534,7 @@ impl DownloadWindow {
                 // advertised it will service, however much byte headroom the cwnd still
                 // shows. Once the request count reaches the hard cap there is no slot,
                 // regardless of bytes — mirroring the blocks-unit ceiling (review fix F2).
-                let outstanding = self.outstanding.len();
+                let outstanding = self.active_len();
                 if outstanding >= hard_cap {
                     return 0;
                 }
@@ -605,9 +609,7 @@ impl DownloadWindow {
     /// estimates of heights not yet received). Recomputed on demand — the byte unit is
     /// experimental; a hot path would maintain a running counter instead.
     fn outstanding_reserved_bytes(&self) -> u64 {
-        self.outstanding.iter().fold(0u64, |acc, range| {
-            acc.saturating_add(range.reserved_bytes())
-        })
+        self.outstanding.active_reserved_bytes()
     }
 
     /// Record `timed_out` requests that expired without a body. Applies the BBR cwnd dip
@@ -734,16 +736,63 @@ impl DownloadWindow {
             .min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER)
     }
 
+    pub(super) fn next_request_token(&mut self) -> BlockRequestToken {
+        let token = self.next_request_token;
+        self.next_request_token = self
+            .next_request_token
+            .checked_add(1)
+            .expect("a peer cannot issue u64::MAX block requests in one session");
+        token
+    }
+
+    pub(super) fn active_len(&self) -> usize {
+        self.outstanding.active_len()
+    }
+
+    pub(super) fn retired_len(&self) -> usize {
+        self.outstanding.retired_len()
+    }
+
+    pub(super) fn active_iter(&self) -> impl Iterator<Item = &OutstandingBlockRange> {
+        self.outstanding.active_iter()
+    }
+
+    pub(super) fn retired_index_for_height(&self, height: block::Height) -> Option<usize> {
+        self.outstanding.iter().position(|outstanding| {
+            outstanding.is_retired() && outstanding.request.contains(height)
+        })
+    }
+
+    pub(super) fn retired_index_for_start(&self, start_height: block::Height) -> Option<usize> {
+        self.outstanding.iter().position(|outstanding| {
+            outstanding.is_retired() && outstanding.request.start_height == start_height
+        })
+    }
+
+    pub(super) fn has_outstanding_height(&self, height: block::Height) -> bool {
+        self.outstanding
+            .iter()
+            .any(|outstanding| outstanding.request.contains(height))
+    }
+
     pub(super) fn outstanding_index_for_height(&self, height: block::Height) -> Option<usize> {
         self.outstanding
             .iter()
-            .position(|outstanding| outstanding.request.contains(height))
+            .position(|outstanding| outstanding.is_active() && outstanding.request.contains(height))
+            .or_else(|| self.retired_index_for_height(height))
     }
 
     pub(super) fn outstanding_index_for_start(&self, start_height: block::Height) -> Option<usize> {
         self.outstanding
             .iter()
-            .position(|outstanding| outstanding.request.start_height == start_height)
+            .position(|outstanding| {
+                outstanding.is_active() && outstanding.request.start_height == start_height
+            })
+            .or_else(|| self.retired_index_for_start(start_height))
+    }
+
+    pub(super) fn prune_expired_retired(&mut self, now: Instant) -> bool {
+        self.outstanding.prune_expired_retired(now) > 0
     }
 }
 
@@ -811,82 +860,6 @@ impl PeerBlockState {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct OutstandingBlockRange {
-    pub(super) request: BlockRangeRequest,
-    pub(super) queued_at: Instant,
-    pub(super) deadline: Instant,
-    pub(super) delivery_snapshot: DeliverySnapshot,
-    pub(super) delivered_bytes: u64,
-    pub(super) received: ReceivedBlockTracker,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub(super) struct DeliverySnapshot {
-    pub(super) delivered: u64,
-    pub(super) delivered_at: Instant,
-}
-
-impl OutstandingBlockRange {
-    /// Bytes still reserved for this request: the sum of the per-height size
-    /// estimates for every requested height not yet received. Each received body
-    /// shrinks its estimate toward the actual size, so releasing this (on
-    /// timeout/disconnect/short response) never over-releases bytes already handed
-    /// to the reorder buffer.
-    pub(super) fn reserved_bytes(&self) -> u64 {
-        self.request
-            .expected_blocks
-            .iter()
-            .filter(|expected| !self.has_received(expected.height))
-            .fold(0u64, |acc, expected| {
-                acc.saturating_add(expected.estimated_bytes)
-            })
-    }
-
-    pub(super) fn estimated_bytes_for_height(&self, height: block::Height) -> Option<u64> {
-        self.request.estimated_bytes_for_height(height)
-    }
-
-    pub(super) fn has_received(&self, height: block::Height) -> bool {
-        self.request
-            .offset_for_height(height)
-            .is_some_and(|offset| self.received.contains_offset(offset))
-    }
-
-    pub(super) fn mark_received(&mut self, height: block::Height) {
-        if let Some(offset) = self.request.offset_for_height(height) {
-            self.received.insert_offset(offset);
-        }
-    }
-
-    pub(super) fn record_body_bytes(&mut self, bytes: u64) {
-        self.delivered_bytes = self.delivered_bytes.saturating_add(bytes);
-    }
-
-    /// Mark every requested height at or below `tip` as received and return the
-    /// sum of the per-height size estimates those newly-received heights still
-    /// held, so the caller releases exactly the reservation those heights held.
-    pub(super) fn mark_received_through(&mut self, tip: block::Height) -> u64 {
-        self.request
-            .expected_blocks
-            .iter()
-            .filter(|expected| {
-                expected.height <= tip
-                    && self
-                        .request
-                        .offset_for_height(expected.height)
-                        .is_some_and(|offset| self.received.insert_offset(offset))
-            })
-            .fold(0u64, |acc, expected| {
-                acc.saturating_add(expected.estimated_bytes)
-            })
-    }
-
-    pub(super) fn is_complete(&self) -> bool {
-        self.received.len() == self.request.expected_blocks.len()
-    }
-}
-
 /// Pure per-height byte-accounting state.
 ///
 /// The shared [`ByteBudget`] is just the atomic sink. This ledger owns the
@@ -950,50 +923,6 @@ impl BlockBudgetLedger {
         let charge = self.current_charge();
         *self = Self::Released;
         charge
-    }
-}
-
-/// Number of distinct request offsets the [`ReceivedBlockTracker`] bitset can hold —
-/// one per bit of its `u128`.
-const RECEIVED_TRACKER_OFFSET_CAPACITY: u32 = u128::BITS;
-
-// A request range carries one received-offset bit per requested height (offsets
-// `0..count`). If the advertised block-count cap ever exceeded the bitset width,
-// `bit_for_offset` would return `None` for the overflowing heights, so they could
-// never be marked received, `is_complete()` would be unreachable, and the range would
-// wedge (its reservation never released). Couple the two so a future cap bump that
-// outgrows the bitset fails to compile instead of silently wedging.
-const _: () = assert!(MAX_BS_BLOCKS_PER_REQUEST <= RECEIVED_TRACKER_OFFSET_CAPACITY);
-
-#[derive(Clone, Debug, Default)]
-pub(super) struct ReceivedBlockTracker {
-    bits: u128,
-    count: usize,
-}
-
-impl ReceivedBlockTracker {
-    pub(super) fn len(&self) -> usize {
-        self.count
-    }
-
-    fn contains_offset(&self, offset: u32) -> bool {
-        Self::bit_for_offset(offset).is_some_and(|bit| self.bits & bit != 0)
-    }
-
-    fn insert_offset(&mut self, offset: u32) -> bool {
-        let Some(bit) = Self::bit_for_offset(offset) else {
-            return false;
-        };
-        if self.bits & bit != 0 {
-            return false;
-        }
-        self.bits |= bit;
-        self.count = self.count.saturating_add(1);
-        true
-    }
-
-    fn bit_for_offset(offset: u32) -> Option<u128> {
-        1u128.checked_shl(offset)
     }
 }
 

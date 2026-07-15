@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use super::{
     config::{CwndUnit, ZakuraBlockSyncConfig},
-    state::DeliverySnapshot,
+    outstanding::DeliverySnapshot,
 };
 
 /// BBR-lite multiplicative cwnd dip applied on a real request timeout,
@@ -610,8 +610,9 @@ impl BbrState {
 #[cfg(test)]
 mod bbr_tests {
     use super::super::{
+        outstanding::{OutstandingBlockRange, OutstandingRequestState, ReceivedBlockTracker},
         request::{BlockRangeRequest, ExpectedBlock},
-        state::{DownloadWindow, OutstandingBlockRange, ReceivedBlockTracker},
+        state::DownloadWindow,
     };
     use super::*;
     use zakura_chain::block;
@@ -1029,7 +1030,10 @@ mod bbr_tests {
     fn fill_outstanding(window: &mut DownloadWindow, n: usize) {
         let now = Instant::now();
         for _ in 0..n {
+            let token = window.next_request_token();
             window.outstanding.push(OutstandingBlockRange {
+                token,
+                state: OutstandingRequestState::Active,
                 request: BlockRangeRequest {
                     start_height: block::Height(0),
                     count: 1,
@@ -1042,6 +1046,7 @@ mod bbr_tests {
                 delivery_snapshot: window.delivery_snapshot(now),
                 delivered_bytes: 0,
                 received: ReceivedBlockTracker::default(),
+                late_reliability_credited: false,
             });
         }
     }
@@ -1133,7 +1138,10 @@ mod bbr_tests {
         for i in 0..count {
             // A `u32` index; the test count is tiny so the cast is safe.
             let height = block::Height(1 + i as u32);
+            let token = window.next_request_token();
             window.outstanding.push(OutstandingBlockRange {
+                token,
+                state: OutstandingRequestState::Active,
                 request: BlockRangeRequest {
                     start_height: height,
                     count: 1,
@@ -1150,6 +1158,7 @@ mod bbr_tests {
                 delivery_snapshot: window.delivery_snapshot(now),
                 delivered_bytes: 0,
                 received: ReceivedBlockTracker::default(),
+                late_reliability_credited: false,
             });
         }
     }

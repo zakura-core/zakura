@@ -1439,6 +1439,7 @@ impl PeerRoutine {
         // `mark_received` then stops `reserved_bytes()` counting this height; the
         // only bytes still held are the `serialized_bytes` carried into the reorder
         // buffer.
+        let reset_epoch = self.sequencer_view.borrow().reset_epoch;
         let Some(delta) = self
             .work
             .settle_active_reserved_height(height, serialized_bytes)
@@ -1501,8 +1502,15 @@ impl PeerRoutine {
         // input channel fills, and this routine blocks here — backpressure
         // isolated to this peer (the per-peer routines throughput win).
         let body = BufferedBlockBody::from_decoded_block(block, raw_block_payload);
-        self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
-            .await;
+        self.forward_body_to_sequencer(
+            height,
+            hash,
+            body,
+            serialized_bytes,
+            reset_epoch,
+            body_permit,
+        )
+        .await;
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
     }
@@ -1579,6 +1587,7 @@ impl PeerRoutine {
         hash: block::Hash,
         body: BufferedBlockBody,
         serialized_bytes: u64,
+        reset_epoch: u64,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
     ) {
         let received_at = Instant::now();
@@ -1590,6 +1599,7 @@ impl PeerRoutine {
             bytes: serialized_bytes,
             peer: self.peer.clone(),
             received_at,
+            reset_epoch,
         };
 
         let ok = if let Some(permit) = body_permit {
@@ -1681,6 +1691,7 @@ impl PeerRoutine {
             return UnmatchedBodyOutcome::NotHandled;
         }
 
+        let reset_epoch = self.sequencer_view.borrow().reset_epoch;
         let mut pending_admitted = false;
         loop {
             if is_pending
@@ -1741,8 +1752,15 @@ impl PeerRoutine {
         self.window
             .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
         let body = BufferedBlockBody::from_decoded_block(block, raw_block_payload);
-        self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
-            .await;
+        self.forward_body_to_sequencer(
+            height,
+            hash,
+            body,
+            serialized_bytes,
+            reset_epoch,
+            body_permit,
+        )
+        .await;
         UnmatchedBodyOutcome::Accepted
     }
 

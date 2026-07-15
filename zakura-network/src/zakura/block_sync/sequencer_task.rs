@@ -100,6 +100,10 @@ pub(super) struct SequencedBody {
     pub(super) bytes: u64,
     pub(super) peer: ZakuraPeerId,
     pub(super) received_at: Instant,
+    /// Destructive-reset epoch under which the peer routine claimed this body's
+    /// WorkQueue ownership. A reset can overtake the bounded body channel, so the
+    /// Sequencer must reject bodies from an older ownership epoch.
+    pub(super) reset_epoch: u64,
 }
 
 /// Progress-critical Sequencer events forwarded by the reactor.
@@ -378,6 +382,18 @@ impl SequencerTask {
     /// applying and submit it.
     async fn handle_accept_body(&mut self, body: SequencedBody) {
         let queued_elapsed = body.received_at.elapsed();
+        if body.reset_epoch != self.reset_epoch {
+            // A destructive reset cleared the WorkQueue claim and all successor
+            // buffers before this body reached the front of the bounded channel.
+            // Its held byte charge is intentionally not released by
+            // `WorkQueue::reset_above`: ownership travelled with this queued body,
+            // so release it here without touching replacement work at the same
+            // height.
+            self.budget.release(body.bytes);
+            metrics::counter!("sync.block.body.stale_reset_epoch").increment(1);
+            self.trace_body_accepted(body.height, queued_elapsed, "stale_reset_epoch");
+            return;
+        }
         let outcome = match self.sequencer.accept_buffered_body(
             body.height,
             body.hash,
@@ -519,9 +535,13 @@ impl SequencerTask {
             .sequencer
             .reset_to(frontiers.verified_block_tip, remember_released_applies);
         self.budget.release(released);
-        // Drop every download work item above the reset target (their buffers
-        // were cleared by `reset_to`); the reactor's `query_needed_blocks`
-        // re-fills.
+        // Remove obsolete work through a forward reset target, then drop every
+        // successor above it. Together these clear the whole old ownership view:
+        // bodies already held by the Sequencer were released by `reset_to`, while
+        // queued bodies carry the old reset epoch and release their own held
+        // charge when the body-input loop reaches them.
+        let released = self.work.advance_floor(self.sequencer.floor());
+        self.budget.release(released);
         let released = self.work.reset_above(self.sequencer.floor());
         self.budget.release(released);
         // A destructive reset: bump the epoch so the reactor drops *all*
@@ -946,5 +966,82 @@ mod tests {
             .await
             .expect("sequencer view sender is still live");
         assert_eq!(*view_rx.borrow(), schedulable);
+    }
+
+    #[tokio::test]
+    async fn destructive_reset_rejects_queued_body_from_old_epoch() {
+        let startup_frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let reset_frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: block::Hash([9; 32]),
+        };
+        let height = block::Height(1);
+        let hash = block::Hash([1; 32]);
+        let mut budget = ByteBudget::new(1_024);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        assert_eq!(
+            work.extend([(height, hash, BlockSizeEstimate::Advertised(64))]),
+            1
+        );
+        assert_eq!(work.take_in_range(height, height, 1).len(), 1);
+        assert_eq!(work.mark_reserved([height]), 64);
+        assert!(budget.try_reserve(64));
+        assert_eq!(work.settle_active_reserved_height(height, 64), Some(0));
+        let budget_view = budget.clone();
+        let work_view = Arc::clone(&work);
+        let (actions_tx, _actions_rx) = mpsc::channel(1);
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (view_tx, _view_rx) = watch::channel(initial_view(startup_frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            budget,
+            work,
+            actions_tx,
+            ThroughputMeter::new(Instant::now()),
+            startup_frontiers,
+            body_rx,
+            control_rx,
+            body_input_bytes,
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+
+        task.handle_frontier_reset(reset_frontiers, false, false, false)
+            .await;
+        assert_eq!(task.reset_epoch, 1);
+        assert!(
+            !work_view.in_flight_contains(height),
+            "destructive reset must remove the old held WorkQueue claim"
+        );
+
+        task.handle_accept_body(SequencedBody {
+            height,
+            hash,
+            body: BufferedBlockBody::RawFramePayload(Arc::from([])),
+            bytes: 64,
+            peer: ZakuraPeerId::new(vec![1; 32]).expect("32-byte test peer id is valid"),
+            received_at: Instant::now(),
+            reset_epoch: 0,
+        })
+        .await;
+
+        assert_eq!(
+            budget_view.reserved(),
+            0,
+            "stale queued body must release its held byte charge"
+        );
+        assert!(
+            !task.sequencer.reorder_contains(height),
+            "body claimed before the reset must not enter the new-fork reorder buffer"
+        );
     }
 }

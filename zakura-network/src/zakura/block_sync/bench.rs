@@ -229,6 +229,7 @@ impl BenchBodyFeeder {
             bytes,
             peer: self.bench_peer.clone(),
             received_at: Instant::now(),
+            reset_epoch: 0,
         };
         // Mirror the peer routine's byte accounting: reserve before send, release on
         // failure (the task decrements as it drains/applies).

@@ -54,8 +54,10 @@ exclude_path = [
     "CHANGELOG.md",
 ]
 
-# Accept these HTTP status codes as valid
-accept = ["200", "204", "206", "301", "302", "307", "308", "429"]
+# Accept these HTTP status codes as valid. 202 is included because z.cash and
+# zfnd.org intermittently return "202 Accepted" to automated checkers (CDN bot
+# protection) — the link is not broken, the content just wasn't served.
+accept = ["200", "202", "204", "206", "301", "302", "307", "308", "429"]
 
 # Timeout for requests (seconds)
 timeout = 30

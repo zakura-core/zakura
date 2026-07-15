@@ -124,10 +124,15 @@ cargo release version --verbose --execute --allow-branch '*' -p zakura patch # [
 ```sh
 cargo build --bin zakurad &&
 ./target/debug/zakurad generate |
-sed 's/cache_dir = ".*"/cache_dir = "cache_dir"/' |
-sed 's/identity_dir = ".*"/identity_dir = "identity_dir"/' \
+sed "s#${XDG_CACHE_HOME:-$HOME/.cache}/zakura#cache_dir#g" |
+sed "s#$HOME/.zakura#identity_dir#g" \
   > zakurad/tests/common/configs/v<version>.toml
 ```
+
+      The replacements are global path-string substitutions, mirroring
+      `last_config_is_stored` — the default cache path also appears in
+      fields other than `cache_dir` (for example `cookie_dir`), so
+      per-field rewrites produce a snapshot the test rejects.
 
 - [ ] On the release commit, run the pre-release checks for the tag you are
       about to create, using the previous release tag as the base:

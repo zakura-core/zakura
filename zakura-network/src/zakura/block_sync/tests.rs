@@ -14,6 +14,7 @@ use super::{
         MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
     outstanding::*,
+    peer_registry::PeerRegistry,
     reactor::node_id_from_block_peer_id,
     reorder::*,
     request::*,
@@ -2376,36 +2377,70 @@ fn watchdog_after_held_settle_releases_once() {
 }
 
 #[test]
-fn late_delivery_after_watchdog_cancellation_does_not_resurrect_released_claim() {
+fn watchdog_between_registry_check_and_settlement_preserves_late_body() {
+    let height = block::Height(1);
+    let hash = block::Hash([1; 32]);
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
+    let taken = queue.take_in_range(height, height, 1);
     assert_eq!(taken.len(), 1);
     assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    assert_eq!(queue.mark_reserved([height]), 100);
 
-    let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)]);
+    let registry = PeerRegistry::new();
+    let peer = peer(0x41);
+    let config = ZakuraBlockSyncConfig::default();
+    let generation = registry.admit(&peer, ServicePeerDirection::Outbound, &config);
+    let now = Instant::now();
+    registry.set_outstanding(
+        &peer,
+        generation,
+        std::collections::BTreeMap::from([(
+            height,
+            super::peer_registry::OutstandingMeta {
+                request_token: 7,
+                hash,
+                estimated_bytes: 100,
+                queued_at: now,
+                deadline: now,
+            },
+        )]),
+    );
+
+    // Body handling observes the live registry claim, then pauses. The watchdog
+    // wins the controlled interleaving and retires/requeues the request.
+    assert!(registry.peer_has_outstanding_height(&peer, height));
+    let claim = registry
+        .outstanding_claims_at(height)
+        .pop()
+        .expect("the published floor claim exists");
+    let retired = registry.retire_outstanding_claim(&claim);
+    assert_eq!(retired.len(), 1);
+
+    let outcome = queue.release_reserved_and_return_items_detailed([height]);
     let watchdog_released = outcome.released_bytes;
     budget.release(watchdog_released);
     assert_eq!(outcome.returned_count, 1);
     assert_eq!(outcome.held_count, 0);
     assert_eq!(outcome.missing_count, 0);
     assert_eq!(budget.reserved(), 0);
-    assert!(queue.pending_contains(block::Height(1)));
+    assert!(queue.pending_contains(height));
 
-    let duplicate =
-        queue.release_reserved_and_return_items_detailed([block::Height(1), block::Height(2)]);
-    assert_eq!(duplicate.already_pending_count, 1);
-    assert_eq!(duplicate.missing_count, 1);
-    assert_eq!(duplicate.min_height, Some(block::Height(1)));
-    assert_eq!(duplicate.max_height, Some(block::Height(2)));
-
+    // The old active-only settlement reports no reservation. The authoritative
+    // late claim must instead reacquire the pending height and hold the valid body.
+    assert_eq!(queue.settle_active_reserved_height(height, 80), None,);
     assert_eq!(
-        queue.settle_active_reserved_height(block::Height(1), 80),
-        None,
-        "a late body cannot settle a claim the watchdog already released"
+        queue.claim_late_body(height, hash, 80, &mut budget, true),
+        LateBodyClaim::ClaimedPending,
     );
-    assert_eq!(budget.reserved(), 0);
+    assert_eq!(budget.reserved(), 80);
+    assert!(!queue.pending_contains(height));
+    assert!(queue.in_flight_contains(height));
+    assert_eq!(
+        registry.take_retired_request_tokens(&peer, generation),
+        vec![7],
+        "the watchdog retirement remains available for peer accountability"
+    );
 }
 
 #[test]

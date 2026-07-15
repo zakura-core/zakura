@@ -326,6 +326,7 @@ impl PeerRegistry {
     }
 
     /// Whether this exact peer still owns an outstanding claim for `height`.
+    #[cfg(test)]
     pub(super) fn peer_has_outstanding_height(
         &self,
         peer: &ZakuraPeerId,

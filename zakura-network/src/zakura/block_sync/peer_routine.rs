@@ -1385,18 +1385,6 @@ impl PeerRoutine {
                 .await;
             return;
         }
-        if !self
-            .registry
-            .peer_has_outstanding_height(&self.peer, height)
-        {
-            tracing::debug!(
-                peer = ?self.peer,
-                ?height,
-                "ignoring late block-sync body for a claim cancelled by the floor watchdog"
-            );
-            self.finish_outstanding_at(index, Disposition::RetryMissing);
-            return;
-        }
         let estimated_bytes = outstanding.estimated_bytes_for_height(height).unwrap_or(0);
         let request_start_height = outstanding.request.start_height;
         let request_range_count = outstanding.request.count;
@@ -1440,26 +1428,55 @@ impl PeerRoutine {
         // only bytes still held are the `serialized_bytes` carried into the reorder
         // buffer.
         let reset_epoch = self.sequencer_view.borrow().reset_epoch;
-        let Some(delta) = self
-            .work
-            .settle_active_reserved_height(height, serialized_bytes)
-        else {
-            // The reservation is gone: a competing peer already delivered this
-            // height first (first-completion-wins), a watchdog released it, or it
-            // committed past the floor. In every case the body is already in the
-            // commit pipeline, so mark it received rather than re-queuing it — a
-            // retry here would phantom-re-fetch a body we already hold, and any
-            // release belongs to whoever settled it, not to this stale claim.
-            tracing::debug!(
-                peer = ?self.peer,
-                ?height,
-                serialized_bytes,
-                "block-sync body already settled by another peer; marking received"
-            );
-            self.accept_already_settled_height(index, height);
+        let Some(claim) = self.claim_received_body(height, hash, serialized_bytes) else {
+            self.reconcile_registry_retirements(Instant::now());
             return;
         };
-        self.apply_budget_delta(delta);
+        match claim {
+            LateBodyClaim::SettledReserved(delta) => self.apply_budget_delta(delta),
+            LateBodyClaim::ClaimedPending => {
+                metrics::counter!("sync.block.response.watchdog_late_accepted").increment(1);
+            }
+            LateBodyClaim::AlreadyHeld => {
+                self.reconcile_registry_retirements(Instant::now());
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?height,
+                    serialized_bytes,
+                    "block-sync body already settled by another peer; marking received"
+                );
+                self.accept_already_settled_height(index, height);
+                return;
+            }
+            LateBodyClaim::BudgetFull => {
+                self.reconcile_registry_retirements(Instant::now());
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?height,
+                    serialized_bytes,
+                    "not buffering late block-sync body; height stays queued for retry"
+                );
+                return;
+            }
+            LateBodyClaim::Missing | LateBodyClaim::HashMismatch => {
+                self.reconcile_registry_retirements(Instant::now());
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?height,
+                    "not buffering block-sync body no longer owned by the work queue"
+                );
+                return;
+            }
+            LateBodyClaim::PendingAdmissionRequired => {
+                unreachable!("claim_received_body resolves pending admission")
+            }
+        }
+
+        // The watchdog publishes its retirement before returning WorkQueue
+        // ownership. Reconcile again after the authoritative claim so a watchdog
+        // interleaving during body processing still records the local request's
+        // correlation-tombstone state and timeout accountability.
+        self.reconcile_registry_retirements(Instant::now());
         self.trace_body_received(
             height,
             serialized_bytes,
@@ -1474,22 +1491,28 @@ impl PeerRoutine {
             .outstanding
             .record_body_bytes(index, serialized_bytes);
         self.window.outstanding.mark_received(index, height);
+        let retired = self.window.outstanding[index].is_retired();
+        if retired && self.window.outstanding.take_late_reliability_credit(index) {
+            self.window.credit_late_delivery();
+        }
         let completed = if self.window.outstanding.is_complete(index) {
             Some(self.window.outstanding.remove(index))
         } else {
             None
         };
-        if let Some(outstanding) = &completed {
-            // Feed the BBR estimators on request completion: the round-trip (RTprop)
-            // and the per-ack delivery rate (BtlBw) for this request's block count and
-            // delivered bytes.
-            self.window.record_delivery(
-                Instant::now(),
-                request_elapsed,
-                request_range_count,
-                outstanding.delivered_bytes,
-                delivery_snapshot,
-            );
+        if !retired {
+            if let Some(outstanding) = &completed {
+                // Feed the BBR estimators on request completion: the round-trip (RTprop)
+                // and the per-ack delivery rate (BtlBw) for this request's block count and
+                // delivered bytes.
+                self.window.record_delivery(
+                    Instant::now(),
+                    request_elapsed,
+                    request_range_count,
+                    outstanding.delivered_bytes,
+                    delivery_snapshot,
+                );
+            }
         }
         if let Some(outstanding) = completed {
             self.finish_detached(outstanding, Disposition::Satisfied);
@@ -1647,6 +1670,34 @@ impl PeerRoutine {
         true
     }
 
+    /// Atomically settle the current reservation or claim a height that the
+    /// watchdog returned to `pending` while this body was being processed.
+    fn claim_received_body(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        serialized_bytes: u64,
+    ) -> Option<LateBodyClaim> {
+        let mut pending_admitted = false;
+        loop {
+            match self.work.claim_late_body(
+                height,
+                hash,
+                serialized_bytes,
+                &mut self.budget,
+                pending_admitted,
+            ) {
+                LateBodyClaim::PendingAdmissionRequired => {
+                    if !self.admit_late_pending_body(height, serialized_bytes) {
+                        return None;
+                    }
+                    pending_admitted = true;
+                }
+                outcome => return Some(outcome),
+            }
+        }
+    }
+
     /// Accept a wanted unmatched body whose original requester is gone or whose height
     /// is currently reserved by another peer. Queued heights reserve their actual size
     /// before buffering; reserved in-flight heights settle the existing reservation to
@@ -1685,58 +1736,32 @@ impl PeerRoutine {
             },
         };
 
-        let is_pending = self.work.pending_contains(height);
-        if !is_pending && self.work.reserved_in_flight_charge(height).is_none() {
-            return UnmatchedBodyOutcome::NotHandled;
-        }
-
         let reset_epoch = self.sequencer_view.borrow().reset_epoch;
-        let mut pending_admitted = false;
-        loop {
-            if is_pending
-                && !pending_admitted
-                && !self.admit_late_pending_body(height, serialized_bytes)
-            {
+        match self.claim_received_body(height, hash, serialized_bytes) {
+            Some(LateBodyClaim::ClaimedPending) => {
+                metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
+            }
+            Some(LateBodyClaim::SettledReserved(delta)) => {
+                self.apply_budget_delta(delta);
+                metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
+            }
+            Some(LateBodyClaim::BudgetFull) => {
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?height,
+                    serialized_bytes,
+                    "not buffering unmatched queued block-sync body; height stays queued for retry"
+                );
                 return UnmatchedBodyOutcome::Handled;
             }
-            pending_admitted |= is_pending;
-
-            match self.work.claim_late_body(
-                height,
-                hash,
-                serialized_bytes,
-                &mut self.budget,
-                pending_admitted,
-            ) {
-                LateBodyClaim::ClaimedPending => {
-                    metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
-                    break;
-                }
-                LateBodyClaim::SettledReserved(delta) => {
-                    self.apply_budget_delta(delta);
-                    metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
-                    break;
-                }
-                LateBodyClaim::BudgetFull => {
-                    tracing::debug!(
-                        peer = ?self.peer,
-                        ?height,
-                        serialized_bytes,
-                        "not buffering unmatched queued block-sync body; height stays queued for retry"
-                    );
-                    return UnmatchedBodyOutcome::Handled;
-                }
-                LateBodyClaim::PendingAdmissionRequired => {
-                    if !self.admit_late_pending_body(height, serialized_bytes) {
-                        return UnmatchedBodyOutcome::Handled;
-                    }
-                    pending_admitted = true;
-                }
-                LateBodyClaim::AlreadyHeld => return UnmatchedBodyOutcome::Handled,
-                LateBodyClaim::Missing | LateBodyClaim::HashMismatch => {
-                    return UnmatchedBodyOutcome::NotHandled;
-                }
+            Some(LateBodyClaim::AlreadyHeld) => return UnmatchedBodyOutcome::Handled,
+            Some(LateBodyClaim::Missing | LateBodyClaim::HashMismatch) => {
+                return UnmatchedBodyOutcome::NotHandled;
             }
+            Some(LateBodyClaim::PendingAdmissionRequired) => {
+                unreachable!("claim_received_body resolves pending admission")
+            }
+            None => return UnmatchedBodyOutcome::Handled,
         }
 
         self.record_received(serialized_bytes);
@@ -2005,14 +2030,10 @@ impl PeerRoutine {
         }
     }
 
-    /// A body arrived for a request this peer owns, but its height was already
-    /// settled by a competing peer (first-completion-wins), released by a
-    /// watchdog, or committed past the floor — so `settle_active_reserved_height`
-    /// returned `None`. The body is already in the commit pipeline: record the
-    /// height as received so the request can complete without re-queuing a body we
-    /// already hold, and without touching the budget (the settling path owns those
-    /// bytes). Count it as block progress since a real wanted body did arrive on
-    /// this peer's stream.
+    /// A body arrived for a request this peer owns, but another body already won
+    /// the WorkQueue claim and entered the commit pipeline. Record the height as
+    /// received without touching the winner's budget charge. Count it as block
+    /// progress since this peer also delivered the expected body.
     fn accept_already_settled_height(&mut self, index: usize, height: block::Height) {
         self.window
             .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());

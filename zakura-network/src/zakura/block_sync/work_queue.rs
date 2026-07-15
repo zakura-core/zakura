@@ -356,6 +356,7 @@ impl WorkQueue {
     /// Returns `None` when a central watchdog or local timeout already released
     /// and returned the height. Late bodies from that superseded claim must not
     /// resurrect a second charge.
+    #[cfg(test)]
     pub(super) fn settle_active_reserved_height(
         &self,
         height: block::Height,
@@ -808,14 +809,6 @@ impl WorkQueue {
 
     pub(super) fn pending_contains(&self, height: block::Height) -> bool {
         self.lock().pending.contains_key(&height)
-    }
-
-    pub(super) fn reserved_in_flight_charge(&self, height: block::Height) -> Option<u64> {
-        self.lock().in_flight.get(&height).and_then(|item| {
-            item.budget
-                .is_reserved()
-                .then(|| item.budget.reserved_charge())
-        })
     }
 
     pub(super) fn in_flight_contains(&self, height: block::Height) -> bool {

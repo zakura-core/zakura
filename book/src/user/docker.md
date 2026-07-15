@@ -5,14 +5,14 @@ The foundation maintains a Docker infrastructure for deploying and testing Zakur
 ## Quick Start
 
 To get Zakura quickly up and running, you can use an off-the-rack image from
-[Docker Hub](https://hub.docker.com/r/valargroup/zakura/tags):
+[Docker Hub](https://hub.docker.com/r/zakuracore/zakura/tags):
 
 ```shell
 docker run -d \
   --name zakura \
   -p 8233:8233 \
   -v zakurad-cache:/home/zakura/.cache/zakura \
-  valargroup/zakura
+  zakuracore/zakura
 ```
 
 The `-p 8233:8233` flag publishes Zakura's P2P port so other Zcash nodes can

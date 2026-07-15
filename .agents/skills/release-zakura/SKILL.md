@@ -38,8 +38,6 @@ Determine:
   three
 - changed crates since each crate's last published version
 - the release tracking issue and checkpoint plan
-- the latest successful main-branch sync-confidence run after relevant state or
-  checkpoint changes
 
 Do not infer the crate publish set only from the previous GitHub tag. A binary
 release may have skipped crates.io publishing.
@@ -136,8 +134,6 @@ Also:
 - confirm the package preflight rebuilds packaged archives, not just workspace
   sources
 - confirm checkpoints are current or record an explicit rapid-RC waiver
-- require successful main-branch sync-confidence evidence after the latest
-  relevant state or checkpoint change
 
 Follow the repository's risk policy for additional Rust checks. Report skipped
 checks and why.
@@ -196,8 +192,6 @@ still has the previous package version.
 - Replace the boilerplate GitHub release body with concrete notes from the final
   changelog or approved release-note draft.
 - Keep release candidates marked as pre-releases.
-- Run sync-confidence validation when the release scope or operator plan
-  requires it.
 
 ## Review output
 

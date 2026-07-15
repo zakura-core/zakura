@@ -202,9 +202,6 @@ fn one_zatoshi() -> Amount<NonNegative> {
 
 #[allow(clippy::print_stdout)]
 fn print_result(transaction_count: usize, block_bytes: usize, elapsed: Duration) {
-    let entries = transaction_count
-        .checked_mul(transaction_count)
-        .expect("benchmark entry count fits in usize");
     let transaction_count: u32 = transaction_count
         .try_into()
         .expect("benchmark transaction count fits in u32");
@@ -212,7 +209,7 @@ fn print_result(transaction_count: usize, block_bytes: usize, elapsed: Duration)
 
     println!(
         "transactions={transaction_count} block_bytes={block_bytes} \
-         map_entries_per_phase={entries} elapsed_seconds={:.3} transactions_per_second={:.1}",
+         input_lookups={transaction_count} elapsed_seconds={:.3} transactions_per_second={:.1}",
         elapsed.as_secs_f64(),
         transactions_per_second,
     );

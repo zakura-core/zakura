@@ -1,6 +1,6 @@
 # Mining with Zakura in Docker
 
-Zakura's [Docker images](https://hub.docker.com/r/valargroup/zakura/tags) can be used
+Zakura's [Docker images](https://hub.docker.com/r/zakuracore/zakura/tags) can be used
 for your mining operations. If you don't have Docker, see the [manual
 configuration instructions](mining.md).
 
@@ -13,7 +13,7 @@ docker run -d --name zakura_local \
   -p 8233:8233 \
   -p 8232:8232 \
   -v zakurad-cache:/home/zakura/.cache/zakura \
-  valargroup/zakura:latest
+  zakuracore/zakura:latest
 ```
 
 This command starts a container on Mainnet and binds the P2P port (8233) and
@@ -49,7 +49,7 @@ docker run -d --name zakura_local \
   -p 18233:18233 \
   -p 18232:18232 \
   -v zakurad-cache:/home/zakura/.cache/zakura \
-  valargroup/zakura:latest
+  zakuracore/zakura:latest
 ```
 
 will start a container on Testnet and bind the P2P port (18233) and the RPC port

@@ -48,7 +48,7 @@ The installer can set up either standard Zakura or its
 ### Docker
 
 You can run Zakura using our [Docker
-image](https://hub.docker.com/r/valargroup/zakura/tags) or install it manually.
+image](https://hub.docker.com/r/zakuracore/zakura/tags) or install it manually.
 
 This command will run our latest release, and sync it to the tip:
 
@@ -57,7 +57,7 @@ docker run -d \
   --name zakura \
   -p 8233:8233 \
   -v zakurad-cache:/home/zakura/.cache/zakura \
-  valargroup/zakura:latest
+  zakuracore/zakura:latest
 ```
 
 The `-p 8233:8233` flag exposes the P2P port so other Zcash nodes can connect to

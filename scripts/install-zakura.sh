@@ -17,9 +17,9 @@ ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_REL
 # Replaced with the archive checksum by release-binaries.yml before publishing.
 ZAKURA_ARCHIVE_SHA256="57e46e2078e2f1f92a4896c82b2444fe6f3aa1f4ad1c365325241311ed581d4f"
 ZAKURA_MEMBER="./bin/zakurad"
-ZAKURA_DOCKER_IMAGE="valargroup/zakura:1.0.0-rc6"
-ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-1.0.0-rc6"
-ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
+ZAKURA_DOCKER_IMAGE="zakuracore/zakura:1.0.0-rc6"
+ZAKURA_COMPAT_DOCKER_IMAGE="zakuracore/zakura:zcashd-compat-1.0.0-rc6"
+ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="zakuracore/zakura:zcashd-compat-latest"
 ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
 # Persistent Zakura iroh identity (NodeId secret). Kept outside the state cache so
 # snapshots do not clone a node's long-term identity. Matches zakura-network's

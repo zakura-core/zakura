@@ -262,8 +262,8 @@ for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakur
   - [ ] Confirm the workflow logs show the expected `/usr/local/bin/zcashd --version` for the zcashd-compat linux/amd64 image variant.
 - [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush).
 - [ ] Confirm `release-binaries.yml` published `zakurad-<tag>-linux-x86_64.tar.gz`, `zakurad-<tag>-linux-aarch64.tar.gz`, `zakurad-manifest-<tag>.json`, `install-zakura.sh`, and `SHA256SUMS.txt` to the GitHub release.
-- [ ] Wait for the new tag in the [Docker Hub zakura space](https://hub.docker.com/r/valargroup/zakura/tags)
-- [ ] Confirm `valargroup/zakura:<version>` includes `linux/amd64` and `linux/arm64`, and `valargroup/zakura:zcashd-compat-<version>` includes only `linux/amd64`.
+- [ ] Wait for the new tag in the [Docker Hub zakura space](https://hub.docker.com/r/zakuracore/zakura/tags)
+- [ ] Confirm `zakuracore/zakura:<version>` includes `linux/amd64` and `linux/arm64`, and `zakuracore/zakura:zcashd-compat-<version>` includes only `linux/amd64`.
 - [ ] Un-freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zakura/queues) using Mergify.
 - [ ] Remove `do-not-merge` from the PRs you added it to
 

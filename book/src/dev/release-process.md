@@ -66,7 +66,7 @@ We let you preview what's coming by providing Release Candidate \(`rc`\) pre-rel
 
 ### Distribution tags
 
-Zakura's tagging relates directly to versions published on Docker. We will reference these [Docker Hub distribution tags](https://hub.docker.com/r/valargroup/zakura/tags) throughout:
+Zakura's tagging relates directly to versions published on Docker. We will reference these [Docker Hub distribution tags](https://hub.docker.com/r/zakuracore/zakura/tags) throughout:
 
 | Tag    | Description                                                                                         |
 | :----- | :-------------------------------------------------------------------------------------------------- |

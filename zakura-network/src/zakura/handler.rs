@@ -1606,6 +1606,16 @@ pub struct ZakuraProtocolHandler {
     endpoint: Option<Endpoint>,
 }
 
+fn random_stream_session_seed() -> u64 {
+    let mut rng = OsRng;
+    loop {
+        let seed = rng.next_u64();
+        if seed != 0 {
+            return seed;
+        }
+    }
+}
+
 /// Resolve the inbound peer's UDP source IP from the endpoint's node map so the
 /// per-IP connection cap can be enforced for Router-accepted connections.
 ///
@@ -1711,7 +1721,10 @@ impl ZakuraProtocolHandler {
             registry,
             trace,
             next_conn_id: Arc::new(AtomicU64::new(1)),
-            next_stream_id: Arc::new(AtomicU64::new(1)),
+            // Stream session IDs are local correlation generations, not wire
+            // sequence numbers. A random process seed prevents preserved traces
+            // and late completions from colliding after a node restart.
+            next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
             shutdown: CancellationToken::new(),

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-07-14
+## [1.0.0] - 2026-07-15
 
 First "stable" release. However, be advised that the API may still greatly
 change so major version bumps can be common.

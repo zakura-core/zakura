@@ -90,8 +90,11 @@ See `install-zakura.sh --help` for the full list, including `--dry-run`.
 ## The sidecar zcashd build
 
 Use the sidecar `zcashd` build from
-[valargroup/zcashd](https://github.com/valargroup/zcashd). The installer and Zakura's embedded download both pin its release archives by
-SHA256. It differs from stock `zcash/zcash` in three ways:
+[valargroup/zcashd](https://github.com/valargroup/zcashd). The installer and
+Zakura's embedded download both pin its release archives by SHA256. The
+split-container mode uses the
+[zakuracore/zcashd v1.0.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
+It differs from stock `zcash/zcash` in three ways:
 
 1. **P2P sidecar mode is hard-locked.** The binary refuses to start unless
    exactly one `-connect=<zakura-address>` peer is configured. It never opens a

@@ -182,3 +182,30 @@ fn real_regtest_solution_is_bound_to_regtest_parameters() {
         );
     }
 }
+
+/// Regression test for the reverse network-parameter mismatch.
+///
+/// A known-valid Mainnet `(200, 9)` proof must not be accepted under Regtest's
+/// `(48, 5)` parameters.
+#[test]
+fn real_common_solution_is_rejected_on_regtest() {
+    let _init_guard = zakura_test::init();
+
+    let block = Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
+        .expect("block test vector should deserialize");
+    let header = block.header.as_ref();
+    let regtest = Network::new_regtest(Default::default());
+
+    header
+        .solution
+        .check(header, &Network::Mainnet)
+        .expect("the hard-coded Mainnet solution must verify on Mainnet");
+
+    assert!(
+        matches!(
+            header.solution.check(header, &regtest),
+            Err(Error::InvalidSolutionSize { .. }),
+        ),
+        "a real Common proof must not verify on Regtest",
+    );
+}

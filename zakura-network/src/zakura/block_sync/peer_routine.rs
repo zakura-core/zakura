@@ -1237,7 +1237,7 @@ impl PeerRoutine {
             // Other peer satisfied requests below the floor.
             // Clear this peer's liveness deadline when no requests remain.
             // Unanswered requests expire separately via `expire_due_timeouts`.
-            self.window.clear_liveness_if_idle(); 
+            self.window.clear_liveness_if_idle();
         }
     }
 

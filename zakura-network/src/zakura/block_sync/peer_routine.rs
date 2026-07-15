@@ -1547,10 +1547,9 @@ impl PeerRoutine {
                 raw_block_payload,
             )
             .await;
-        if outcome != UnmatchedBodyOutcome::Accepted {
-            self.window
-                .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
-        } else if self.window.outstanding.take_late_reliability_credit(index) {
+        if outcome == UnmatchedBodyOutcome::Accepted
+            && self.window.outstanding.take_late_reliability_credit(index)
+        {
             self.window.credit_late_delivery();
         }
 
@@ -2620,7 +2619,8 @@ mod tests {
     use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
-    use zakura_chain::block;
+    use zakura_chain::{block, serialization::ZcashDeserializeInto};
+    use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
     use super::super::outstanding::{
         OutstandingBlockRange, OutstandingRequestState, ReceivedBlockTracker, RetirementReason,
@@ -3223,6 +3223,113 @@ mod tests {
         assert_eq!(
             routine.window.block_liveness_deadline, liveness_deadline,
             "a retired terminator must not erase peer accountability"
+        );
+    }
+
+    /// A body that matches a retired request but cannot be salvaged is only a
+    /// correlated response, not accepted block progress. It must not prove the
+    /// peer, reset its no-progress request count, or extend its liveness.
+    #[tokio::test]
+    async fn discarded_retired_body_does_not_credit_block_progress() {
+        let block: Arc<block::Block> = Arc::new(
+            BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .expect("block vector parses"),
+        );
+        let height = block
+            .coinbase_height()
+            .expect("mainnet block one has a coinbase height");
+        let hash = block.hash();
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        // Deliberately leave the WorkQueue empty so the matching retired body
+        // cannot be claimed and `accept_unmatched_queued_body` returns NotHandled.
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+
+        let cancel = CancellationToken::new();
+        let (out_send, _out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![10u8; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let (actions_tx, _actions_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+
+        let mut routine = PeerRoutine::new(
+            peer,
+            session,
+            in_recv,
+            config,
+            0,
+            budget,
+            work,
+            Arc::new(PeerRegistry::new()),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            control_tx,
+            actions_tx,
+            routine_to_reactor_tx,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+        routine.received_status = true;
+        routine.servable_low = height;
+        routine.servable_high = height;
+
+        let now = Instant::now();
+        let liveness_timeout = Duration::from_secs(60);
+        routine.window.arm_liveness(now, liveness_timeout);
+        routine.window.outstanding.push(OutstandingBlockRange {
+            token: 1,
+            state: OutstandingRequestState::Retired {
+                reason: RetirementReason::RequestTimeout,
+                retired_at: now,
+                correlation_deadline: now + liveness_timeout,
+            },
+            request: BlockRangeRequest {
+                start_height: height,
+                count: 1,
+                anchor_hash: hash,
+                estimated_bytes: 0,
+                expected_blocks: vec![ExpectedBlock {
+                    height,
+                    hash,
+                    estimated_bytes: 0,
+                }],
+            },
+            queued_at: now,
+            deadline: now,
+            delivery_snapshot: routine.window.delivery_snapshot(now),
+            delivered_bytes: 0,
+            received: ReceivedBlockTracker::default(),
+            late_reliability_credited: false,
+        });
+
+        let no_progress_requests = routine.window.requests_without_block_progress;
+        let liveness_deadline = routine.window.block_liveness_deadline;
+        routine
+            .handle_retired_body(0, height, hash, block, None, None, None)
+            .await;
+
+        assert_eq!(
+            routine.window.requests_without_block_progress, no_progress_requests,
+            "a discarded retired body must not reset no-progress request accounting"
+        );
+        assert_eq!(
+            routine.window.block_liveness_deadline, liveness_deadline,
+            "a discarded retired body must not extend or disarm peer liveness"
+        );
+        assert!(
+            !routine.window.has_block_progress(),
+            "a discarded retired body must not prove the peer"
         );
     }
 

@@ -545,6 +545,11 @@ pub(super) struct HeaderSyncPeerMeters {
     pub(super) unsolicited: RateMeter,
     pub(super) inbound_status: RateMeter,
     pub(super) inbound_new_block: RateMeter,
+    /// Paces retries after the peer's outbound queue rejects a status.
+    ///
+    /// This deadline is separate from `unsolicited` and `keepalive` because
+    /// those meters record statuses that were successfully published.
+    pub(super) status_publication_retry_at: Option<Instant>,
     /// Gates redundant keepalive status sends.
     ///
     /// Floored above the remote's inbound status minimum interval so a
@@ -570,6 +575,7 @@ impl HeaderSyncPeerMeters {
             unsolicited: RateMeter::new(status_refresh_interval),
             inbound_status: RateMeter::new(inbound_status_min_interval),
             inbound_new_block: RateMeter::new(inbound_new_block_min_interval),
+            status_publication_retry_at: None,
             keepalive,
         }
     }

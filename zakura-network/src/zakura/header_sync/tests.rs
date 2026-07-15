@@ -3609,9 +3609,11 @@ async fn reconnect_resends_initial_status_after_session_reset() {
     ));
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn retries_initial_status_after_full_outbound_queue() {
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn failed_status_publication_is_retry_paced() {
+    header_sync_metrics_recorder();
     let send_failed_before = metric_value("sync.header.peer.status.send_failed");
+    let mut capture = TraceCapture::for_test("failed_status_publication_is_retry_paced").unwrap();
     let network = regtest_network();
     let mut startup = startup_for(
         network.clone(),
@@ -3620,7 +3622,8 @@ async fn retries_initial_status_after_full_outbound_queue() {
     );
     startup.range_state_actions_enabled = false;
     startup.request_timeout = std::time::Duration::from_millis(10);
-    startup.status_refresh_interval = std::time::Duration::from_millis(10);
+    startup.status_refresh_interval = std::time::Duration::from_secs(10);
+    startup.trace = ZakuraTrace::new(capture.tracer(), "status-publication-retry");
     let fixture = spawn_test_reactor(startup);
     let peer_id = peer(74);
     let (send, mut recv) = crate::zakura::framed_channel(1);
@@ -3654,7 +3657,22 @@ async fn retries_initial_status_after_full_outbound_queue() {
     .await
     .expect("peer is admitted while outbound queue is full");
 
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    capture.flush().await;
+    assert!(
+        capture
+            .reader()
+            .unwrap()
+            .table(HEADER_SYNC_TABLE.table())
+            .count(hs_trace::HEADER_MAINTENANCE_WAKEUP)
+            <= 1,
+        "a failed status publication must not make maintenance spin"
+    );
+
     let _ = recv.recv().await.expect("filler frame drains");
+    tokio::time::advance(STATUS_PUBLICATION_RETRY_DELAY).await;
     let frame = tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
         .await
         .expect("status retry arrives")
@@ -3669,6 +3687,7 @@ async fn retries_initial_status_after_full_outbound_queue() {
         metric_value("sync.header.peer.status.send_failed") > send_failed_before,
         "a full outbound queue must increment the header-sync Status send-failure counter"
     );
+    let _ = capture.finish().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]

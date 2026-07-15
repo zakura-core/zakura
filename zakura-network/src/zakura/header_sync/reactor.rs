@@ -2147,6 +2147,10 @@ impl HeaderSyncReactor {
                     .next_allowed
                     .max(peer.meters.unsolicited.next_allowed)
             };
+            let status_deadline = peer
+                .meters
+                .status_publication_retry_at
+                .map_or(status_deadline, |retry_at| status_deadline.max(retry_at));
             deadline = deadline.min(status_deadline);
         }
         if let Some(repair) = self.state.repair.as_ref() {
@@ -2494,6 +2498,7 @@ impl HeaderSyncReactor {
             Ok(()) => {
                 if let Some(peer_state) = self.state.peers.get_mut(peer) {
                     peer_state.record_sent_status(status);
+                    peer_state.meters.status_publication_retry_at = None;
                 }
                 metrics::counter!("sync.header.peer.status.sent").increment(1);
                 self.trace_status_sent(peer, status);
@@ -2506,6 +2511,10 @@ impl HeaderSyncReactor {
                 true
             }
             Err(error) => {
+                if let Some(peer_state) = self.state.peers.get_mut(peer) {
+                    peer_state.meters.status_publication_retry_at =
+                        Some(Instant::now() + STATUS_PUBLICATION_RETRY_DELAY);
+                }
                 metrics::counter!("sync.header.peer.status.send_failed").increment(1);
                 tracing::debug!(?peer, ?error, "failed to queue Zakura header-sync Status");
                 self.trace_queue_send_failed(
@@ -2578,8 +2587,8 @@ impl HeaderSyncReactor {
     /// unchanged: the connection freshness reaper only counts inbound messages,
     /// so without this two peers idle at the same tip reap their healthy
     /// connection every idle window. A failed send does not mark the meter, so
-    /// a peer whose initial status was lost to a dead session is retried on the
-    /// next tick instead of staying connected-but-mute.
+    /// a peer whose initial status was lost to a dead session is retried after
+    /// a short publication backoff instead of staying connected-but-mute.
     fn refresh_statuses(&mut self) {
         let now = Instant::now();
         let status = self.local_status();
@@ -2592,7 +2601,12 @@ impl HeaderSyncReactor {
             .peers
             .iter()
             .filter(|(_peer_id, peer)| {
-                peer.status_differs_from_last_sent(status) && peer.meters.unsolicited.is_ready(now)
+                peer.status_differs_from_last_sent(status)
+                    && peer.meters.unsolicited.is_ready(now)
+                    && peer
+                        .meters
+                        .status_publication_retry_at
+                        .is_none_or(|retry_at| now >= retry_at)
             })
             .map(|(peer_id, _peer)| peer_id.clone())
             .collect();
@@ -2609,6 +2623,10 @@ impl HeaderSyncReactor {
                 !peer.status_differs_from_last_sent(status)
                     && peer.meters.keepalive.is_ready(now)
                     && peer.meters.unsolicited.is_ready(now)
+                    && peer
+                        .meters
+                        .status_publication_retry_at
+                        .is_none_or(|retry_at| now >= retry_at)
             })
             .map(|(peer_id, _peer)| peer_id.clone())
             .collect();
@@ -2638,6 +2656,13 @@ impl HeaderSyncReactor {
                     return None;
                 }
                 if !peer.meters.unsolicited.is_ready(now) {
+                    return None;
+                }
+                if peer
+                    .meters
+                    .status_publication_retry_at
+                    .is_some_and(|retry_at| now < retry_at)
+                {
                     return None;
                 }
                 Some(peer_id.clone())

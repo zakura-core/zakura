@@ -156,6 +156,15 @@ pub const MIN_CONCURRENCY_LIMIT: usize = 1;
 /// See [`MIN_CHECKPOINT_CONCURRENCY_LIMIT`] for details.
 pub const MAX_TIPS_RESPONSE_HASH_COUNT: usize = 500;
 
+/// Returns true if a `FindBlocks` response has the protocol maximum number of
+/// block hashes or fewer.
+///
+/// This rejects oversized generic `inv` messages before they can inflate the
+/// syncer's discovered-hash reserve.
+fn has_valid_tips_response_hash_count(hashes: &[block::Hash]) -> bool {
+    hashes.len() <= MAX_TIPS_RESPONSE_HASH_COUNT
+}
+
 /// Start asking peers for more block hashes before we run out of hashes to download.
 ///
 /// The syncer keeps a list of block hashes it has learned from `FindBlocks`
@@ -1555,6 +1564,15 @@ where
                 .map_err::<Report, _>(|e| eyre!(e))
             {
                 Ok(zn::Response::BlockHashes(hashes)) => {
+                    if !has_valid_tips_response_hash_count(&hashes) {
+                        debug!(
+                            hashes.len = hashes.len(),
+                            max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
+                            "discarding oversized FindBlocks response"
+                        );
+                        continue;
+                    }
+
                     trace!(?hashes);
 
                     // zcashd sometimes appends an unrelated hash at the start
@@ -1717,6 +1735,15 @@ where
                     .map_err::<Report, _>(|e| eyre!(e))
                 {
                     Ok(zn::Response::BlockHashes(hashes)) => {
+                        if !has_valid_tips_response_hash_count(&hashes) {
+                            debug!(
+                                hashes.len = hashes.len(),
+                                max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
+                                "discarding oversized FindBlocks response"
+                            );
+                            continue;
+                        }
+
                         debug!(first = ?hashes.first(), len = ?hashes.len());
                         trace!(?hashes);
 

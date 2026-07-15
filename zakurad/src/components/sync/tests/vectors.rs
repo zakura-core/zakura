@@ -68,6 +68,21 @@ const MAX_SERVICE_REQUEST_DELAY: Duration = Duration::from_millis(1000);
 /// unrelated failure. These tests pause time, so a long delay costs no wall-clock time.
 const STALLED_SERVICE_REQUEST_DELAY: Duration = Duration::from_secs(30 * 60);
 
+#[test]
+fn oversized_find_blocks_response_is_rejected() {
+    let hash = block::Hash([0; 32]);
+
+    assert!(sync::has_valid_tips_response_hash_count(&vec![
+        hash;
+        sync::MAX_TIPS_RESPONSE_HASH_COUNT
+    ]));
+    assert!(!sync::has_valid_tips_response_hash_count(&vec![
+        hash;
+        sync::MAX_TIPS_RESPONSE_HASH_COUNT
+            + 1
+    ]));
+}
+
 /// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips.
 ///
 /// This test also makes sure that the syncer downloads blocks in order.

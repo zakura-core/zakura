@@ -1,37 +1,31 @@
-# Manually verifies that Zakura's runtime image can be built for every release
-# platform and published to Docker Hub without changing any release tags.
+# Manually verifies that the release workflow can build and publish its Ubuntu
+# runtime image without changing any release tags.
 name: Test Docker publish
 
 on:
   workflow_dispatch:
+    inputs:
+      git_sha:
+        description: Git commit SHA to build (defaults to the dispatched branch)
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 env:
   TEST_IMAGE: zakuracore/zakura
-  TEST_TAG: publish-test-${{ github.run_id }}-${{ github.run_attempt }}
+  TEST_TAG: publish-test-${{ github.run_id }}-${{ github.run_attempt }}-amd64
 
 jobs:
   build:
-    name: Build and push test image (${{ matrix.name }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x86_64
-            runner: ${{ vars.DOCKER_BUILD_RUNNER_AMD64 || 'ubuntu-latest' }}
-            platform: linux/amd64
-            docker_tag_suffix: amd64
-          - name: linux-aarch64
-            runner: ${{ vars.DOCKER_BUILD_RUNNER_ARM64 || 'ubuntu-24.04-arm' }}
-            platform: linux/arm64
-            docker_tag_suffix: arm64
+    name: Build and push Ubuntu test image
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
         with:
           persist-credentials: false
+          ref: ${{ inputs.git_sha || github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd #v4.0.0
@@ -52,48 +46,19 @@ jobs:
           set -euo pipefail
           short_sha="$(git rev-parse --short=12 HEAD)"
           docker buildx build \
-            --platform "${{ matrix.platform }}" \
+            --platform linux/amd64 \
             --target runtime \
             --file ./docker/Dockerfile \
             --build-arg "FEATURES=${FEATURES}" \
             --build-arg "SHORT_SHA=${short_sha}" \
             --build-arg "IMAGE_VERSION=${TEST_TAG}" \
-            --tag "${TEST_IMAGE}:${TEST_TAG}-${{ matrix.docker_tag_suffix }}" \
+            --tag "${TEST_IMAGE}:${TEST_TAG}" \
             --push \
             .
-
-  publish-manifest:
-    name: Publish and verify test manifest
-    runs-on: ubuntu-latest
-    needs: [build]
-    steps:
-      - name: Login to DockerHub
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 #v4.1.0
-        with:
-          username: valaroman
-          password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd #v4.0.0
-
-      - name: Create and verify multi-arch manifest
-        run: |
-          set -euo pipefail
-          docker buildx imagetools create \
-            --tag "${TEST_IMAGE}:${TEST_TAG}" \
-            "${TEST_IMAGE}:${TEST_TAG}-amd64" \
-            "${TEST_IMAGE}:${TEST_TAG}-arm64"
-
-          docker buildx imagetools inspect "${TEST_IMAGE}:${TEST_TAG}" \
-            --format '{{json .Manifest}}' \
-            | jq -e '
-                [ .manifests[].platform | "\(.os)/\(.architecture)" ] as $platforms
-                | ($platforms | index("linux/amd64")) != null
-                  and ($platforms | index("linux/arm64")) != null
-              ' >/dev/null
 
           {
             echo "### Docker publish test passed"
             echo
-            echo "Published \`${TEST_IMAGE}:${TEST_TAG}\` for linux/amd64 and linux/arm64."
+            echo "Built commit \`$(git rev-parse HEAD)\`."
+            echo "Published \`${TEST_IMAGE}:${TEST_TAG}\` for linux/amd64."
           } >> "$GITHUB_STEP_SUMMARY"

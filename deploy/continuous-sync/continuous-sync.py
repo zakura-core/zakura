@@ -91,6 +91,22 @@ def utc_stamp(ts: int | None = None) -> str:
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(ts or now()))
 
 
+def format_duration(seconds: int) -> str:
+    seconds = max(0, seconds)
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
 def load_config(path: Path) -> Config:
     with path.open("rb") as config_file:
         raw = tomllib.load(config_file)
@@ -579,12 +595,20 @@ def cleanup_retention(config: Config, active_run: Path | None = None) -> None:
 
 def completion_text(config: Config, run_state: dict[str, Any]) -> str:
     p = config.policy
-    return f":white_check_mark: Zakura sync complete: {p.hostname} | {policy_mode(p)} | {ssh_target(p)}"
+    duration = format_duration(int(run_state["sync_duration_seconds"]))
+    return (
+        f":white_check_mark: Zakura sync complete: {p.hostname} | {policy_mode(p)} | "
+        f"{ssh_target(p)} | sync time: {duration}"
+    )
 
 
 def failure_text(config: Config, run_state: dict[str, Any], reason: str) -> str:
     p = config.policy
-    return f":rotating_light: Zakura failed: {p.hostname} | {policy_mode(p)} | {ssh_target(p)}"
+    duration = format_duration(int(run_state["time_to_failure_seconds"]))
+    return (
+        f":rotating_light: Zakura failed: {p.hostname} | {policy_mode(p)} | "
+        f"{ssh_target(p)} | time to failure: {duration}"
+    )
 
 
 def policy_mode(policy: Policy) -> str:
@@ -609,7 +633,8 @@ def short_reason(reason: str, limit: int = 96) -> str:
 def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[str, Any]:
     preflight(config)
     sha = resolve_sha(config)
-    run_id = f"{utc_stamp()}-{sha[:12]}"
+    started_at = now()
+    run_id = f"{utc_stamp(started_at)}-{sha[:12]}"
     run_dir = config.paths.runs_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     run_state: dict[str, Any] = {
@@ -617,7 +642,8 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
         "run_id": run_id,
         "sha": sha,
         "phase": "building",
-        "started_at": utc_stamp(),
+        "started_at": utc_stamp(started_at),
+        "started_at_epoch": started_at,
         "mode": config.policy.mode_label,
         "p2p_stack": config.policy.p2p_stack,
         "run_dir": str(run_dir),
@@ -639,7 +665,14 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
     render_config(config, run_dir)
     config.paths.log_file.write_text("", encoding="utf-8")
 
-    run_state["phase"] = "syncing"
+    sync_started_at = now()
+    run_state.update(
+        {
+            "phase": "syncing",
+            "sync_started_at": utc_stamp(sync_started_at),
+            "sync_started_at_epoch": sync_started_at,
+        }
+    )
     write_run_json(run_dir, run_state)
     state.update({"phase": "syncing", "running_sha": sha, "current_run": run_id})
     save_state(state_path, state)
@@ -650,8 +683,16 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
         stop_service(config)
         archive_run_log(config, run_dir)
 
-    completed_at = utc_stamp()
-    run_state.update({"phase": "complete", "completed_at": completed_at})
+    completed_at_epoch = now()
+    completed_at = utc_stamp(completed_at_epoch)
+    run_state.update(
+        {
+            "phase": "complete",
+            "completed_at": completed_at,
+            "completed_at_epoch": completed_at_epoch,
+            "sync_duration_seconds": max(0, completed_at_epoch - sync_started_at),
+        }
+    )
     write_run_json(run_dir, run_state)
     state.update(
         {
@@ -670,8 +711,20 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
 
 
 def halt(config: Config, state_path: Path, state: dict[str, Any], run_state: dict[str, Any], reason: str) -> None:
-    failed_at = utc_stamp()
-    run_state.update({"phase": "failed", "failed_at": failed_at, "failure": reason})
+    failed_at_epoch = now()
+    failed_at = utc_stamp(failed_at_epoch)
+    timing_started_at = int(
+        run_state.get("sync_started_at_epoch", run_state.get("started_at_epoch", failed_at_epoch))
+    )
+    run_state.update(
+        {
+            "phase": "failed",
+            "failed_at": failed_at,
+            "failed_at_epoch": failed_at_epoch,
+            "time_to_failure_seconds": max(0, failed_at_epoch - timing_started_at),
+            "failure": reason,
+        }
+    )
     run_dir = Path(str(run_state.get("run_dir") or config.paths.runs_dir / "unknown"))
     if run_dir.exists():
         write_run_json(run_dir, run_state)

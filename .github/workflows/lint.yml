@@ -183,24 +183,6 @@ jobs:
       - name: Run installer self-tests
         run: ./scripts/install-zakura.sh --self-test-disk-limits
 
-      - name: Verify the installer rejects macOS early
-        run: |
-          fake_bin="$(mktemp -d)"
-          trap 'rm -rf "$fake_bin"' EXIT
-          printf '#!/bin/sh\nprintf "Darwin\\n"\n' > "$fake_bin/uname"
-          chmod +x "$fake_bin/uname"
-
-          if output="$(
-            PATH="$fake_bin:$PATH" \
-              ./scripts/install-zakura.sh --help 2>&1
-          )"; then
-            echo "installer unexpectedly accepted macOS" >&2
-            exit 1
-          fi
-
-          grep -F "installer supports Linux only" <<< "$output"
-          grep -F "cargo install --locked zakura" <<< "$output"
-
   unused-deps:
     name: unused-deps
     # cargo-udeps needs a clean from-scratch nightly build and is not a

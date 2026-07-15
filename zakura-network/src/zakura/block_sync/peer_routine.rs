@@ -1183,6 +1183,11 @@ impl PeerRoutine {
     // ===================== own-timeout arm (ports `expire_due_timeouts`) =====
 
     async fn handle_deadlines(&mut self, now: Instant) -> Result<(), SinkReject> {
+        // Prune here because a full outbound queue skips `try_fill`; leaving an
+        // expired deadline would make the select loop busy-spin.
+        if self.window.prune_expired_retired(now) {
+            self.window.disarm_liveness_after_progress_if_idle();
+        }
         let rescued_timed_out = self.expire_due_timeouts(now);
         if rescued_timed_out && self.session.outbound_capacity() > 0 {
             self.try_fill().await;
@@ -2971,6 +2976,102 @@ mod tests {
                 .await
                 .is_err(),
             "a retired tombstone must prevent ambiguous same-peer reissue"
+        );
+    }
+
+    /// The deadline arm must prune expired retired tombstones itself: while the
+    /// outbound queue is full the loop skips `try_fill` (the only other prune
+    /// site), so an expired correlation deadline left in place would hold
+    /// `earliest_deadline_sleep` at zero and busy-spin the select loop.
+    #[tokio::test]
+    async fn deadline_arm_prunes_expired_retired_tombstones() {
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+
+        let cancel = CancellationToken::new();
+        let (out_send, _out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let (actions_tx, _actions_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+
+        let mut routine = PeerRoutine::new(
+            peer,
+            session,
+            in_recv,
+            config,
+            0,
+            budget,
+            work,
+            Arc::new(PeerRegistry::new()),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            control_tx,
+            actions_tx,
+            routine_to_reactor_tx,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+
+        let now = Instant::now();
+        // A proven peer: it delivered a body after its last request was armed...
+        routine
+            .window
+            .arm_liveness(now - Duration::from_secs(60), Duration::from_secs(300));
+        routine.window.outstanding.push(OutstandingBlockRange {
+            token: 1,
+            state: OutstandingRequestState::Active,
+            request: BlockRangeRequest {
+                start_height: block::Height(1),
+                count: 1,
+                anchor_hash: block::Hash([1; 32]),
+                estimated_bytes: 0,
+                expected_blocks: vec![ExpectedBlock {
+                    height: block::Height(1),
+                    hash: block::Hash([1; 32]),
+                    estimated_bytes: 0,
+                }],
+            },
+            queued_at: now - Duration::from_secs(60),
+            deadline: now + Duration::from_secs(60),
+            delivery_snapshot: routine
+                .window
+                .delivery_snapshot(now - Duration::from_secs(60)),
+            delivered_bytes: 0,
+            received: ReceivedBlockTracker::default(),
+            late_reliability_credited: false,
+        });
+        routine
+            .window
+            .note_block_progress(now - Duration::from_secs(30), Duration::from_secs(300));
+        // ...and its covered request's correlation window has already expired.
+        assert!(routine.window.outstanding.retire(
+            0,
+            RetirementReason::Covered,
+            now - Duration::from_secs(10),
+            now - Duration::from_secs(1),
+        ));
+
+        assert!(routine.handle_deadlines(now).await.is_ok());
+        assert!(
+            routine.window.outstanding.is_empty(),
+            "the deadline arm must prune the expired tombstone so \
+             `earliest_deadline_sleep` stops returning an already-due deadline"
+        );
+        assert!(
+            routine.window.block_liveness_deadline.is_none(),
+            "an idle proven peer disarms once its expired tombstone is pruned"
         );
     }
 

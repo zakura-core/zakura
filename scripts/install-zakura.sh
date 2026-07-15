@@ -2,6 +2,16 @@
 # Install or prepare commands for Zakura's operating modes.
 set -euo pipefail
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  cat >&2 <<'EOF'
+Zakura's installer supports Linux only and cannot run on macOS.
+
+On macOS, install Zakura from crates.io instead:
+  cargo install --locked zakura
+EOF
+  exit 1
+fi
+
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
   SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"

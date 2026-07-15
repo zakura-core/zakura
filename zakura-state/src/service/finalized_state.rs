@@ -770,6 +770,44 @@ impl FinalizedState {
                             .then(|| {
                                 precomputed_auth_data_root.unwrap_or_else(|| block.auth_data_root())
                             });
+
+                        // A successful look-ahead check authenticates both this header and
+                        // its NU5+ auth-data root. A same-header body with a different root
+                        // can never become valid by replacing the supplied note-commitment
+                        // roots, so reject the body without evicting those roots or entering
+                        // the write loop's retry path.
+                        if let (
+                            Some((
+                                prevalidated_height,
+                                prevalidated_hash,
+                                Some(expected_auth_data_root),
+                            )),
+                            Some(actual_auth_data_root),
+                        ) = (self.vct.prevalidated_next(), block_auth_data_root)
+                        {
+                            if prevalidated_height == height
+                                && prevalidated_hash == block_hash
+                                && expected_auth_data_root != actual_auth_data_root
+                            {
+                                metrics::counter!("state.vct.block.auth_data_root_mismatch.count")
+                                    .increment(1);
+                                tracing::warn!(
+                                    ?height,
+                                    ?block_hash,
+                                    ?expected_auth_data_root,
+                                    ?actual_auth_data_root,
+                                    "VCT: checkpoint body auth-data root differs from its \
+                                     authenticated header prevalidation"
+                                );
+                                return Err(ValidateContextError::VctBlockAuthDataRootMismatch {
+                                    height,
+                                    expected: expected_auth_data_root,
+                                    actual: actual_auth_data_root,
+                                }
+                                .into());
+                            }
+                        }
+
                         let is_prevalidated = self.vct.prevalidated_next()
                             == Some((height, block_hash, block_auth_data_root));
                         if is_prevalidated {

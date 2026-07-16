@@ -146,7 +146,7 @@ pub(super) fn complete_request_publication(
     }
 }
 
-struct HeaderResponseCompletionGuard {
+pub(super) struct HeaderResponseCompletionGuard {
     completions: mpsc::UnboundedSender<HeaderSyncEvent>,
     completion: HeaderRangeResponseToken,
     peer: ZakuraPeerId,
@@ -161,7 +161,7 @@ struct HeaderResponseCompletionGuard {
 
 impl HeaderResponseCompletionGuard {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(super) fn new(
         completions: mpsc::UnboundedSender<HeaderSyncEvent>,
         completion: HeaderRangeResponseToken,
         peer: ZakuraPeerId,
@@ -217,6 +217,76 @@ impl Drop for HeaderResponseCompletionGuard {
             self.send(0, HeaderRangeServeResult::TaskPanic);
         }
     }
+}
+
+/// Enqueues a prepared header-range response on `session`, reporting completion through `guard`.
+///
+/// Takes `guard` already built so the caller constructs it before spawning this future. A task the
+/// runtime drops before its first poll never runs this body, and only an existing guard still
+/// reports completion from `Drop`; building the guard here would drop the response token unfinished
+/// and park the driver's `HeaderRangeResponseToken::finished` wait forever, holding its read permit.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_prepared_header_response(
+    mut guard: HeaderResponseCompletionGuard,
+    session: HeaderSyncPeerSession,
+    headers: Vec<Arc<block::Header>>,
+    body_sizes: Vec<u32>,
+    tree_aux_roots: Vec<BlockCommitmentRoots>,
+    returned_count: u32,
+    result: HeaderRangeServeResult,
+    deadline: Instant,
+    queue_capacity: usize,
+    queue_max_capacity: usize,
+) {
+    let outbound_started = Instant::now();
+    let (returned_count, result) = match time::timeout_at(
+        deadline,
+        session.send_headers_with_sizes_and_roots(
+            guard.request_id,
+            headers,
+            body_sizes,
+            tree_aux_roots,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => (returned_count, result),
+        Ok(Err(error)) => {
+            metrics::counter!(
+                "sync.header.response.failed",
+                "reason" => ordered_send_error_label(&error)
+            )
+            .increment(1);
+            tracing::debug!(
+                peer = ?guard.peer,
+                start_height = ?guard.start_height,
+                requested_count = guard.requested_count,
+                ?error,
+                queue_capacity,
+                queue_max_capacity,
+                "failed to queue Zakura header-sync Headers response"
+            );
+            (
+                0,
+                if matches!(error, OrderedSendError::Closed) {
+                    HeaderRangeServeResult::StreamClosed
+                } else {
+                    HeaderRangeServeResult::InvalidPreparedResponse
+                },
+            )
+        }
+        Err(_) => {
+            metrics::counter!(
+                "sync.header.response.failed",
+                "reason" => "outbound_timeout"
+            )
+            .increment(1);
+            (0, HeaderRangeServeResult::OutboundTimeout)
+        }
+    };
+    metrics::histogram!("sync.header.serve.outbound_enqueue_seconds")
+        .record(outbound_started.elapsed().as_secs_f64());
+    guard.finish(returned_count, result);
 }
 
 impl HeaderSyncReactor {
@@ -1383,7 +1453,6 @@ impl HeaderSyncReactor {
             result = HeaderRangeServeResult::InvalidPreparedResponse;
         };
         let returned_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
-        let served_tree_aux_roots = TreeAuxTraceSummary::new(&tree_aux_roots);
         let session = peer_state.session.clone();
         if !peer_state.served_header_request_ids.contains(&request_id) {
             completion.finish();
@@ -1392,70 +1461,32 @@ impl HeaderSyncReactor {
         }
         let queue_capacity = session.outbound_capacity();
         let queue_max_capacity = session.outbound_max_capacity();
-        let completions = self.lifecycle_events.clone();
-        tokio::spawn(async move {
-            let mut guard = HeaderResponseCompletionGuard::new(
-                completions,
-                completion,
-                peer.clone(),
-                session.session_id(),
-                request_id,
-                start_height,
-                requested_count,
-                want_tree_aux_roots,
-                roots_complete,
-            );
-            let outbound_started = Instant::now();
-            let (returned_count, result) = match time::timeout_at(
-                deadline,
-                session.send_headers_with_sizes_and_roots(
-                    request_id,
-                    headers,
-                    body_sizes,
-                    tree_aux_roots,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(())) => (returned_count, result),
-                Ok(Err(error)) => {
-                    metrics::counter!(
-                        "sync.header.response.failed",
-                        "reason" => ordered_send_error_label(&error)
-                    )
-                    .increment(1);
-                    tracing::debug!(
-                        ?peer,
-                        ?start_height,
-                        requested_count,
-                        ?error,
-                        queue_capacity,
-                        queue_max_capacity,
-                        "failed to queue Zakura header-sync Headers response"
-                    );
-                    (
-                        0,
-                        if matches!(error, OrderedSendError::Closed) {
-                            HeaderRangeServeResult::StreamClosed
-                        } else {
-                            HeaderRangeServeResult::InvalidPreparedResponse
-                        },
-                    )
-                }
-                Err(_) => {
-                    metrics::counter!(
-                        "sync.header.response.failed",
-                        "reason" => "outbound_timeout"
-                    )
-                    .increment(1);
-                    (0, HeaderRangeServeResult::OutboundTimeout)
-                }
-            };
-            metrics::histogram!("sync.header.serve.outbound_enqueue_seconds")
-                .record(outbound_started.elapsed().as_secs_f64());
-            let _ = served_tree_aux_roots;
-            guard.finish(returned_count, result);
-        });
+        // Build the guard here rather than inside the task: a task the runtime drops before its
+        // first poll never runs its body, and only an already-built guard reports completion from
+        // `Drop`. See `send_prepared_header_response`.
+        let guard = HeaderResponseCompletionGuard::new(
+            self.lifecycle_events.clone(),
+            completion,
+            peer,
+            session.session_id(),
+            request_id,
+            start_height,
+            requested_count,
+            want_tree_aux_roots,
+            roots_complete,
+        );
+        tokio::spawn(send_prepared_header_response(
+            guard,
+            session,
+            headers,
+            body_sizes,
+            tree_aux_roots,
+            returned_count,
+            result,
+            deadline,
+            queue_capacity,
+            queue_max_capacity,
+        ));
     }
 
     async fn handle_wire_message(&mut self, peer: ZakuraPeerId, msg: HeaderSyncMessage) {

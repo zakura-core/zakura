@@ -311,6 +311,70 @@ fn prepared_roots_complete_is_decided_before_a_rejection_empties_the_response() 
     assert!(!prepared_roots_complete(true, block::Height(1), 2, &roots));
 }
 
+/// The runtime drops a spawned task without polling it when it shuts down. The response token
+/// has no `Drop` of its own, so a body that builds its own completion guard would never build
+/// one, and the driver waiting on `HeaderRangeResponseToken::finished` would park forever
+/// holding its read permit. Building the guard before the spawn makes the drop report instead.
+#[tokio::test(flavor = "current_thread")]
+async fn a_response_send_dropped_before_its_first_poll_still_reports_completion() {
+    let peer_id = peer(211);
+    let (send, _recv) = crate::zakura::framed_channel(8);
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    let (completions, mut completions_recv) = mpsc::unbounded_channel();
+    let completion = HeaderRangeResponseToken::new();
+    let request_id = HeaderSyncRequestId::new(11).expect("non-zero id");
+    let guard = HeaderResponseCompletionGuard::new(
+        completions,
+        completion.clone(),
+        peer_id,
+        session.session_id(),
+        request_id,
+        block::Height(1),
+        1,
+        true,
+        true,
+    );
+
+    // The future owns the guard from the moment it is created, before any poll.
+    let response_send = send_prepared_header_response(
+        guard,
+        session,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        0,
+        HeaderRangeServeResult::Success,
+        Instant::now() + HEADER_SYNC_SERVE_DEADLINE,
+        8,
+        8,
+    );
+    drop(response_send);
+
+    // The driver's wait resolves rather than parking.
+    tokio::time::timeout(std::time::Duration::from_secs(1), completion.finished())
+        .await
+        .expect("dropping the send releases the response token");
+
+    match completions_recv.try_recv().expect("completion is reported") {
+        HeaderSyncEvent::HeaderRangeResponseFinished {
+            request_id: finished_id,
+            returned_count,
+            result,
+            ..
+        } => {
+            assert_eq!(finished_id, request_id);
+            assert_eq!(returned_count, 0);
+            assert_eq!(result, HeaderRangeServeResult::TaskPanic);
+        }
+        event => panic!("unexpected event: {event:?}"),
+    }
+}
+
 fn test_header_height(header: &block::Header) -> block::Height {
     let hash = block::Hash::from(header);
     [

@@ -506,6 +506,30 @@ fn startup_new_is_passive_until_local_hooks_are_wired() {
     assert!(!startup.inbound_new_block_acceptance_enabled);
 }
 
+#[test]
+fn startup_new_uses_configured_status_refresh_interval() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let status_refresh_interval = std::time::Duration::from_secs(17);
+    let startup = HeaderSyncStartup::new(
+        network,
+        anchor,
+        HeaderSyncFrontiers {
+            finalized_height: anchor.0,
+            verified_block_tip: anchor.0,
+            verified_block_hash: anchor.1,
+        },
+        Some(anchor),
+        ZakuraHeaderSyncConfig {
+            status_refresh_interval,
+            ..ZakuraHeaderSyncConfig::default()
+        },
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+
+    assert_eq!(startup.status_refresh_interval, status_refresh_interval);
+}
+
 fn startup_with_timeout(
     network: Network,
     anchor: (block::Height, block::Hash),
@@ -1772,6 +1796,28 @@ fn vct_repair_episode_enforces_attempt_and_time_bounds() {
     assert!(timed.exhausted);
     assert!(!timed.refresh_exhausted(now));
     assert!(!timed.can_attempt(now));
+}
+
+#[test]
+fn vct_repair_maintenance_ignores_retry_deadline_during_attempt() {
+    let mut repair = VctRootRepair::new(
+        block::Height(1),
+        1,
+        Network::Mainnet.genesis_hash(),
+        vec![(
+            block::Height(1),
+            mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+        )],
+    )
+    .expect("single-header handoff repair is valid");
+    let retry_deadline = repair.next_attempt_at;
+    let repair_deadline = repair.started_at + VCT_ROOT_REPAIR_MAX_WALL_TIME;
+
+    assert_eq!(repair.next_maintenance_deadline(), retry_deadline);
+
+    repair.mark_attempt(peer(129));
+
+    assert_eq!(repair.next_maintenance_deadline(), repair_deadline);
 }
 
 #[test]

@@ -189,10 +189,30 @@ Two gates, checked together in `lookahead_over_budget`:
   overhead dominates; never needed operator tuning, so it is a constant, not a
   config knob).
 
-### The bound
+### Soft-target peak model
 
-The configured value is a soft admission target, not a hard memory ceiling.
-Retained body memory consists of the target plus these overshoot sources:
+The configured value is intentionally a soft admission target, not a hard
+memory ceiling. Before issuing normal above-window work, each request atomically
+reserves its estimated serialized bytes against the same tracker that owns exact
+body charges. The separate 6 GiB wire budget therefore cannot become 6 GiB of
+unaccounted speculative retained-memory liability: above-window requests must
+fit both budgets.
+
+On receipt, the estimate is reconciled to the body's real retained
+representation:
+
+`exact retained bytes = raw payload allocation + attributed decoded allocation`
+
+The decoded term is omitted after a body is reduced to raw backlog form, and the
+raw term is omitted when only the decoded block remains. Reconciliation is
+allowed to cross the 1.5 GiB target; retaining an already downloaded valid body
+and applying backpressure to subsequent requests is preferred to discarding it.
+
+The default 200% size tolerance bounds accepted serialized bytes to twice their
+estimate, but it does not bound decoded object-graph expansion.
+
+The operational peak model is therefore the soft target plus these controlled
+overshoot sources:
 
 - estimate reconciliation, whose aggregate growth is exact retained bytes minus
   reserved estimate bytes but has no fixed multiplier while decoded expansion
@@ -206,7 +226,9 @@ estimate reconciliation is not numerically bounded beyond the decoded block
 representations that can be produced from protocol-valid bodies. This is
 deterministic Rust object-graph accounting, not process RSS. Allocator metadata,
 fragmentation, runtime overhead, and verifier allocations remain outside the
-charge.
+charge. A deployment that requires a strict process-memory ceiling must enforce
+that separately; this target is designed to pace look-ahead while allowing
+bounded pipeline progress.
 
 ## Liveness rules (why sync cannot wedge)
 

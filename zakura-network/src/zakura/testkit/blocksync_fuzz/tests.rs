@@ -42,6 +42,63 @@ fn max_retained_body_bytes(blocks: u32, seed: u64, target_block_bytes: usize) ->
         .unwrap_or(0)
 }
 
+/// The most bodies that can be in flight at once across every peer in a scenario.
+///
+/// Each peer is capped at its advertised `max_inflight_requests`, and each request
+/// carries at most the smaller of the peer's and our own `max_blocks_per_response`
+/// bodies. Uses the advertised cap directly, as `assert_core`'s `outstanding_bound`
+/// does; the `MAX_BS_INFLIGHT_REQUESTS` hard clamp sits far above any scenario's.
+fn max_inflight_bodies(scenario: &Scenario) -> u64 {
+    scenario
+        .peers
+        .iter()
+        .map(|peer| {
+            let requests = u64::from(peer.max_inflight_requests);
+            let blocks = u64::from(
+                peer.max_blocks_per_response
+                    .min(scenario.config.max_blocks_per_response),
+            );
+            requests.saturating_mul(blocks)
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+/// The worst-case peak retained memory a scenario can reach, derived from the
+/// admission gate rather than chosen by hand.
+///
+/// The retained-memory tracker's limit is `max_reorder_lookahead_bytes` (call it `L`),
+/// and above-window requests reserve against it with an atomic `try_reserve_many`, so
+/// the gated lane alone can never exceed `L`. Every byte above `L` comes from one of
+/// exactly two paths that charge without consulting the limit:
+///
+/// 1. **Commit-window bodies.** Heights within `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES`
+///    of the *verified* tip are exempt from the look-ahead gate and take no reservation
+///    at issue (`peer_routine` filters them out of the reservation), so at receipt they
+///    charge unconditionally. One exempt span can be co-resident: `span x max_body`.
+///
+/// 2. **Reconciliation growth.** An above-window request reserves its *estimated* wire
+///    size and, at receipt, resizes that same charge to the exact retained size (decoded
+///    attributed memory + raw payload). The resize does not re-consult the limit, so
+///    each in-flight body can add up to its full retained size on top of `L`.
+///
+/// In practice term 1 dominates by two orders of magnitude: the commit-window exemption,
+/// not `L`, is what actually sizes block-sync's resident memory.
+///
+/// This is a ceiling, not a prediction. It assumes every in-flight body reconciles from
+/// nothing to the corpus's largest body at the same instant, while a full exempt span is
+/// simultaneously resident.
+fn derived_retained_memory_bound(scenario: &Scenario, max_body_bytes: u64) -> u64 {
+    let commit_window =
+        (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64).saturating_mul(max_body_bytes);
+    let reconciliation_growth = max_inflight_bodies(scenario).saturating_mul(max_body_bytes);
+
+    scenario
+        .config
+        .max_reorder_lookahead_bytes
+        .saturating_add(commit_window)
+        .saturating_add(reconciliation_growth)
+}
+
 /// Run a scenario, flush its trace, assert the core invariants, and return the outcome
 /// + report. `outstanding_slack` absorbs brief over-counts at request boundaries.
 async fn run_checked(
@@ -909,26 +966,23 @@ async fn fuzz_commit_stall() {
         }),
     };
     scenario.deadline = Duration::from_secs(60);
+    // Derived from the scenario, so compute it before the run consumes it.
+    let max_body_bytes = max_retained_body_bytes(blocks, 0x57ea_000c, body_bytes);
+    let inflight_bodies = max_inflight_bodies(&scenario);
+    let bound = derived_retained_memory_bound(&scenario, max_body_bytes);
     let (_, report) = run_checked("fuzz_commit_stall", scenario, 64).await;
 
-    // Budget plus exact bodies in the commit window and a bounded arrival margin.
-    let max_body_bytes = max_retained_body_bytes(blocks, 0x57ea_000c, body_bytes);
-    let window_slack =
-        (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64).saturating_mul(max_body_bytes);
-    let margin = max_body_bytes.saturating_mul(128);
     let peak_retained_resident = report.peak_retained_memory_bytes;
-    let bound = resident_budget
-        .saturating_add(window_slack)
-        .saturating_add(margin);
     assert!(
         peak_retained_resident <= bound,
-        "peak retained resident cost {} must stay within the {} B budget \
-         (+{} B bounded-window allowance, +{} B arrival margin); the apply backlog is bounded by \
-         the resident gate, not unbounded by the commit stall",
+        "peak retained resident cost {} exceeded the derived ceiling {} (look-ahead budget \
+         {} B, {} in-flight bodies, max body {} B); the apply backlog is bounded by the \
+         resident gate, not unbounded by the commit stall",
         peak_retained_resident,
+        bound,
         resident_budget,
-        window_slack,
-        margin,
+        inflight_bodies,
+        max_body_bytes,
     );
     // Ensure the bound is exercised.
     assert!(
@@ -981,28 +1035,25 @@ async fn fuzz_commit_stall_resident_plateau() {
         }),
     };
     scenario.deadline = Duration::from_secs(120);
+    let max_body_bytes = max_retained_body_bytes(blocks, 0x57ea_000d, body_bytes);
+    let inflight_bodies = max_inflight_bodies(&scenario);
+    let bound = derived_retained_memory_bound(&scenario, max_body_bytes);
     let (_, report) = run_checked("fuzz_commit_stall_resident_plateau", scenario, 64).await;
 
     // Peak retained memory stays within the budget, plus exact commit/submission
     // window bodies and a bounded in-flight arrival margin. A gate regression (the
     // escalator, or reservations invisible to the byte gate) drives retention toward
     // the full ~150 MB resident chain instead.
-    let max_body_bytes = max_retained_body_bytes(blocks, 0x57ea_000d, body_bytes);
-    let window_slack =
-        (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64).saturating_mul(max_body_bytes);
-    let margin = max_body_bytes.saturating_mul(128);
     let peak_retained_resident = report.peak_retained_memory_bytes;
-    let bound = resident_budget
-        .saturating_add(window_slack)
-        .saturating_add(margin);
     assert!(
         peak_retained_resident <= bound,
-        "peak retained resident cost {} must stay within the {} B budget \
-         (+{} B bounded-window allowance, +{} B arrival margin)",
+        "peak retained resident cost {} exceeded the derived ceiling {} \
+         (look-ahead budget {} B, {} in-flight bodies, max body {} B)",
         peak_retained_resident,
+        bound,
         resident_budget,
-        window_slack,
-        margin,
+        inflight_bodies,
+        max_body_bytes,
     );
     // Non-vacuous: the stall actually pushed retention past the gated budget alone, so
     // the bound above is doing real work.
@@ -1017,7 +1068,8 @@ async fn fuzz_commit_stall_resident_plateau() {
         peak_retained_pipeline_wire_bytes = report.peak_retained_pipeline_wire_bytes,
         peak_retained_resident,
         resident_budget,
-        window_slack,
+        bound,
+        inflight_bodies,
         "commit_stall resident-plateau observation",
     );
 }
@@ -1061,6 +1113,9 @@ async fn fuzz_commit_stall_resident_plateau_multiblock() {
         }),
     };
     scenario.deadline = Duration::from_secs(120);
+    let max_body_bytes = max_retained_body_bytes(blocks, 0x57ea_000e, body_bytes);
+    let inflight_bodies = max_inflight_bodies(&scenario);
+    let bound = derived_retained_memory_bound(&scenario, max_body_bytes);
     let (_, report) = run_checked(
         "fuzz_commit_stall_resident_plateau_multiblock",
         scenario,
@@ -1072,22 +1127,16 @@ async fn fuzz_commit_stall_resident_plateau_multiblock() {
     // window bodies + a bounded in-flight arrival margin. A take-geometry regression (an exempt
     // multi-block take extending above the window sized by the in-flight budget) drives
     // retention toward the full ~150 MB resident chain instead.
-    let max_body_bytes = max_retained_body_bytes(blocks, 0x57ea_000e, body_bytes);
-    let window_slack =
-        (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64).saturating_mul(max_body_bytes);
-    let margin = max_body_bytes.saturating_mul(128);
     let peak_retained_resident = report.peak_retained_memory_bytes;
-    let bound = resident_budget
-        .saturating_add(window_slack)
-        .saturating_add(margin);
     assert!(
         peak_retained_resident <= bound,
-        "peak retained resident cost {} must stay within the {} B budget \
-         (+{} B bounded-window allowance, +{} B arrival margin) with multi-block responses",
+        "peak retained resident cost {} exceeded the derived ceiling {} (look-ahead budget \
+         {} B, {} in-flight bodies, max body {} B) with multi-block responses",
         peak_retained_resident,
+        bound,
         resident_budget,
-        window_slack,
-        margin,
+        inflight_bodies,
+        max_body_bytes,
     );
     assert!(
         peak_retained_resident >= resident_budget / 2,
@@ -1100,7 +1149,8 @@ async fn fuzz_commit_stall_resident_plateau_multiblock() {
         peak_retained_pipeline_wire_bytes = report.peak_retained_pipeline_wire_bytes,
         peak_retained_resident,
         resident_budget,
-        window_slack,
+        bound,
+        inflight_bodies,
         "commit_stall multi-block resident-plateau observation",
     );
 }

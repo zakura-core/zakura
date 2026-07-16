@@ -2,6 +2,16 @@
 # Install or prepare commands for Zakura's operating modes.
 set -euo pipefail
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  cat >&2 <<'EOF'
+Zakura's installer supports Linux only and cannot run on macOS.
+
+On macOS, install Zakura from crates.io instead:
+  cargo install --locked zakura
+EOF
+  exit 1
+fi
+
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
   SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
@@ -11,15 +21,15 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZAKURA_RELEASE_TAG="v1.0.0-rc5"
+ZAKURA_RELEASE_TAG="v1.0.0"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
 # Replaced with the archive checksum by release-binaries.yml before publishing.
-ZAKURA_ARCHIVE_SHA256="e32c99edf33190fb2ba48b4a2c70e7b45738764adb9b542780418e75ac21b46b"
+ZAKURA_ARCHIVE_SHA256="19faee68cb442b943a432cd84705e615f753eb4dcbd190416302e256ad3df9df"
 ZAKURA_MEMBER="./bin/zakurad"
-ZAKURA_DOCKER_IMAGE="valargroup/zakura:1.0.0-rc5"
-ZAKURA_COMPAT_DOCKER_IMAGE="valargroup/zakura:zcashd-compat-1.0.0-rc5"
-ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="valargroup/zakura:zcashd-compat-latest"
+ZAKURA_DOCKER_IMAGE="zakuracore/zakura:1.0.0"
+ZAKURA_COMPAT_DOCKER_IMAGE="zakuracore/zakura:zcashd-compat-1.0.0"
+ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="zakuracore/zakura:zcashd-compat-latest"
 ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
 # Persistent Zakura iroh identity (NodeId secret). Kept outside the state cache so
 # snapshots do not clone a node's long-term identity. Matches zakura-network's
@@ -31,21 +41,20 @@ ZAKURA_DOCKER_IDENTITY_DIR="/home/zebra/.zakura"
 
 MANIFEST_PATH="$REPO_ROOT/zakurad/zcashd-compat-manifest.json"
 TARGET_TRIPLE="x86_64-pc-linux-gnu"
-ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v1.0.0-compat-rc3/zcashd-zebra-compat-v1.0.0-compat-rc3-linux-x86_64.tar.gz"
+ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v1.0.0/zcashd-zebra-compat-v1.0.0-linux-x86_64.tar.gz"
 ZCASHD_RUNTIME_ARCHIVE_SHA256="b861ea94215647a69a944ded7c9d6c7c3dfd836e54e3e194103242935e6879f2"
 ZCASHD_RUNTIME_ARCHIVE_MEMBER_BINARY_PATH="./bin/zcashd"
-ZCASHD_DEFAULT_DOCKER_IMAGE="valargroup/zcashd:v1.0.0-compat-rc3"
+ZCASHD_DEFAULT_DOCKER_IMAGE="zakuracore/zcashd:v1.0.0"
 
 INSTALL_PROFILE=""
 MODE=""
 NETWORK="Mainnet"
 ZCASHD_DEFAULT_DATADIR="${HOME}/.zcash"
-ZAKURA_STANDALONE_STATE_DIR="/mnt/data/zakura-state"
 ZAKURA_STANDALONE_INSTALL_DIR="${HOME}/.local/zakura"
 ZAKURA_STANDALONE_CACHE_DIR="${HOME}/.cache/zakura"
 ZAKURA_COMPAT_INSTALL_DIR="${HOME}/.local/zcashd-compat"
 ZAKURA_COMPAT_CACHE_DIR="${HOME}/.cache/zcashd-compat"
-ZAKURA_STATE_DIR="$ZAKURA_STANDALONE_STATE_DIR"
+ZAKURA_STATE_DIR="$ZAKURA_DEFAULT_CACHE_DIR"
 ZAKURA_IDENTITY_DIR="$ZAKURA_DEFAULT_IDENTITY_DIR"
 ZCASHD_DATADIR="$ZCASHD_DEFAULT_DATADIR"
 INSTALL_DIR="$ZAKURA_STANDALONE_INSTALL_DIR"
@@ -2232,10 +2241,9 @@ default_p2p_port() {
   esac
 }
 
-# The standalone default (/mnt/data/zakura-state) is only usable by root on a
-# stock cloud image, so run the same capacity- and permission-aware search the
-# zcashd-compat profile uses. A large writable volume still wins; otherwise this
-# lands on ~/.cache/zakura instead of a path the user cannot create.
+# Use the same default and capacity- and permission-aware search as the
+# zcashd-compat profile. An existing state directory wins; if ~/.cache/zakura
+# is unsuitable, select a writable volume with enough capacity.
 default_recommend_datadir_defaults() {
   if ((ZAKURA_STATE_DIR_SET)); then
     return
@@ -2245,7 +2253,7 @@ default_recommend_datadir_defaults() {
   min_bytes="$(disk_standalone_min_bytes)"
 
   SYNTHETIC_INSTALL_MIN_BYTES="$min_bytes"
-  ZAKURA_STATE_DIR="$(compat_recommend_zakura_state_dir "$ZAKURA_STANDALONE_STATE_DIR" "$min_bytes")"
+  ZAKURA_STATE_DIR="$(compat_recommend_zakura_state_dir "$ZAKURA_DEFAULT_CACHE_DIR" "$min_bytes")"
   unset SYNTHETIC_INSTALL_MIN_BYTES
 }
 

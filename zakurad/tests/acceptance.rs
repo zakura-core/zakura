@@ -222,20 +222,6 @@ use crate::common::regtest::MiningRpcMethods;
 /// This limit only applies to some tests.
 pub const MAX_ASYNC_BLOCKING_TIME: Duration = zakura_test::mock_service::DEFAULT_MAX_REQUEST_DELAY;
 
-/// Stop height for the `pre-nu62` sync-confidence window.
-///
-/// 5,000 blocks above the top mainnet checkpoint (3,358,006) and 1,594 blocks
-/// below the NU6.2 mainnet activation height (3,364,600), so the window exercises
-/// NU6.1-era consensus rules under full validation without crossing the soft fork.
-const SYNC_RANGE_PRE_NU62_STOP_HEIGHT: block::Height = block::Height(3_363_006);
-
-/// Stop height for the `post-nu62` sync-confidence window.
-///
-/// 5,000 blocks above the window start (3,375,000), which is ~10k blocks above the
-/// NU6.2 mainnet activation height (3,364,600), so the window exercises current
-/// post-NU6.2 consensus rules under full validation.
-const SYNC_RANGE_POST_NU62_STOP_HEIGHT: block::Height = block::Height(3_380_000);
-
 #[test]
 fn generate_no_args() -> Result<()> {
     let _init_guard = zakura_test::init();
@@ -1400,71 +1386,6 @@ fn sync_past_mandatory_checkpoint_testnet() -> Result<()> {
     sync_past_mandatory_checkpoint(network)
 }
 
-/// Sync a fixed window of mainnet blocks from a cached state with full (semantic)
-/// validation, stopping at `stop_height`.
-///
-/// The cached state must already be synced to the window's start height — in CI it
-/// is restored from a pruned snapshot in Spaces (produced out-of-band by
-/// `make-sync-confidence-snapshots.sh`). Because
-/// both sync-confidence windows lie above the top compiled checkpoint (3,358,006),
-/// every block in the window is contextually verified, so this asserts the run
-/// finishes with a `contextually-verified` commit at `stop_height`.
-#[tracing::instrument]
-fn sync_confidence_range(stop_height: block::Height) -> Result<()> {
-    let network = Mainnet;
-    let full_validation_stop_regex =
-        format!("{STOP_AT_HEIGHT_REGEX}.*commit contextually-verified request");
-
-    create_cached_database_height(
-        &network,
-        stop_height,
-        // Full validation: do not use the optional checkpoints.
-        false,
-        // The sync-confidence snapshots are pruned, so the consumer must open the
-        // database in pruned storage mode (archive mode refuses a pruned database).
-        zakura_state::StorageMode::Pruned(zakura_state::PruningConfig {
-            tx_retention: zakura_state::constants::min_pruning_retention(&network),
-        }),
-        &full_validation_stop_regex,
-    )
-}
-
-/// Full-validation sync of ~5k mainnet blocks ending just below NU6.2, from a
-/// cached state at the top mainnet checkpoint.
-///
-/// Skipped unless `TEST_SYNC_RANGE` is set. Runs in CI on merge to `main`
-/// via the `sync-range-pre-nu62` nextest profile.
-#[allow(dead_code)]
-#[test]
-fn sync_range_pre_nu62() -> Result<()> {
-    if std::env::var("TEST_SYNC_RANGE").is_err() {
-        tracing::warn!(
-            "Skipped sync_range_pre_nu62, set the TEST_SYNC_RANGE environmental variable to run the test"
-        );
-        return Ok(());
-    }
-    let _init_guard = zakura_test::init();
-    sync_confidence_range(SYNC_RANGE_PRE_NU62_STOP_HEIGHT)
-}
-
-/// Full-validation sync of ~5k mainnet blocks above NU6.2, from a cached state at
-/// height 3,375,000.
-///
-/// Skipped unless `TEST_SYNC_RANGE` is set. Runs in CI on merge to `main`
-/// via the `sync-range-post-nu62` nextest profile.
-#[allow(dead_code)]
-#[test]
-fn sync_range_post_nu62() -> Result<()> {
-    if std::env::var("TEST_SYNC_RANGE").is_err() {
-        tracing::warn!(
-            "Skipped sync_range_post_nu62, set the TEST_SYNC_RANGE environmental variable to run the test"
-        );
-        return Ok(());
-    }
-    let _init_guard = zakura_test::init();
-    sync_confidence_range(SYNC_RANGE_POST_NU62_STOP_HEIGHT)
-}
-
 /// Test if `zakurad` can fully sync the chain on mainnet.
 ///
 /// This test takes a long time to run, so we don't run it by default. This test is only executed
@@ -1761,9 +1682,8 @@ async fn rpc_endpoint_client_content_type() -> Result<()> {
         return Ok(());
     }
 
-    // Write a configuration that has RPC listen_addr set
-    // [Note on port conflict](#Note on port conflict)
-    let mut config = random_known_rpc_port_config(true, &Mainnet)?;
+    // Let the OS assign the RPC port to avoid races with parallel tests.
+    let mut config = os_assigned_rpc_port_config(true, &Mainnet)?;
 
     let dir = testdir()?.with_config(&mut config)?;
     let mut child = dir.spawn_child(args!["start"])?;

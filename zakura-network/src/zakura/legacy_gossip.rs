@@ -41,9 +41,9 @@ use crate::{
 
 use super::{
     spawn_supervised_peer_task, trace::peer_label as trace_peer_label, BoxRunFuture, Frame,
-    FramedSend, OrderedSendError, OrderedStreamOpening, Peer, RequestResponseService,
-    Service as ZakuraService, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerHandle,
-    ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES, LEGACY_REQUEST_TABLE,
+    FramedSend, OrderedSendError, Peer, RequestResponseService, Service as ZakuraService,
+    SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerHandle, ZakuraPeerId,
+    ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES, LEGACY_REQUEST_TABLE,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
@@ -140,9 +140,7 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
         // authoritative inbound cap is app_frame_cap_for_stream_kind.
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
-        mode: StreamMode::Ordered {
-            opening: OrderedStreamOpening::Initiator,
-        },
+        mode: StreamMode::Ordered,
     },
     Stream {
         kind: ZAKURA_STREAM_LEGACY_REQUESTS,

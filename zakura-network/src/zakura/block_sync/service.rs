@@ -1,8 +1,8 @@
 use super::{config::*, events::*, wire::*, *};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError,
-    OrderedStreamOpening, Peer, PeerStreamSession, Service, SinkReject, Stream, StreamMode,
-    ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
+    PeerStreamSession, Service, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId,
+    FRAME_HEADER_BYTES,
 };
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -25,9 +25,7 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
     frame_cap: MAX_BS_FRAME_BYTES,
     capability: ZAKURA_CAP_BLOCK_SYNC,
-    mode: StreamMode::Ordered {
-        opening: OrderedStreamOpening::EitherPeer,
-    },
+    mode: StreamMode::Ordered,
 }];
 
 /// Service-declared streams for native block sync.
@@ -521,7 +519,7 @@ impl Service for BlockSyncService {
                             wiring.received_throughput,
                             wiring.sequencer_input,
                             wiring.sequencer_input_bytes,
-                            wiring.sequencer_control,
+                            wiring.sequencer_input_decoded_attributed_memory_bytes,
                             wiring.actions,
                             wiring.routine_to_reactor,
                             wiring.view,

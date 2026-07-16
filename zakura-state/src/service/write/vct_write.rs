@@ -11,7 +11,7 @@ use tracing::info;
 use zakura_chain::block::Height;
 
 use crate::service::{
-    finalized_state::{FinalizedState, NextVctBlock},
+    finalized_state::FinalizedState,
     queued_blocks::QueuedCheckpointVerified,
     write::{VctRootRepairState, VctRootRepairStatus},
 };
@@ -22,13 +22,13 @@ use crate::service::{
 const VCT_ROOT_RETRY_WAIT: Duration = Duration::from_millis(500);
 
 /// Delay between retryable VCT await-successor commit attempts. Shorter than
-/// [`VCT_ROOT_RETRY_WAIT`]: the root is already cached and only the next block needs to be
-/// downloaded into the look-ahead, so a tighter poll keeps the one-block commit lag small.
+/// [`VCT_ROOT_RETRY_WAIT`]: the root is already cached and only the next header needs to be
+/// stored, so a tighter poll keeps the one-block commit lag small.
 const VCT_AWAIT_SUCCESSOR_WAIT: Duration = Duration::from_millis(20);
 
 /// How long a single checkpoint height may stay stuck on a retryable VCT root stall before
 /// the committer escalates to an error-level log and a `state.vct.root.stalled.height` gauge.
-/// Transient waits (a successor still downloading, a fanout re-delivery still in flight)
+/// Transient waits (a successor header still downloading, a fanout re-delivery still in flight)
 /// clear well within this; staying stuck past it means no verifiable root is available for a
 /// height the frozen frontier requires, and — by design — the committer will not recompute
 /// against the stale frontier, so the node cannot advance. Surfacing that loudly is the
@@ -140,14 +140,6 @@ impl VctWriteManager {
                 },
             }
         }
-    }
-
-    /// The buffered successor block's header data, used to verify the
-    /// current block's supplied vct roots before trusting them.
-    pub(super) fn next_vct_block(&self) -> Option<NextVctBlock> {
-        self.lookahead
-            .front()
-            .map(|next| NextVctBlock::from_block(next.0.block.clone(), next.0.auth_data_root))
     }
 
     /// A successful commit clears any vct root stall: logs recovery and

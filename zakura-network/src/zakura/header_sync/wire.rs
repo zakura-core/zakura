@@ -45,8 +45,10 @@ pub(super) const HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES: usize =
     4 + 32 + 32 + 32 + 8 + 8 + 8 + 32;
 pub(super) const COMMON_HEADER_BYTES: usize = 1_487;
 pub(super) const REGTEST_HEADER_BYTES: usize = 177;
-pub(super) const HEADER_SYNC_FANOUT: usize = 3;
 pub(super) const LOCAL_MAX_HS_INFLIGHT_PER_PEER: u16 = 16;
+pub(super) const HEADER_SYNC_MAX_RESIDENT_BATCHES: u32 = 16;
+pub(super) const HEADER_SYNC_RETRY_AVOIDANCE: Duration = Duration::from_millis(50);
+pub(super) const STATUS_PUBLICATION_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub(super) const HEADER_SYNC_SEEN_HASH_CAPACITY: usize = 4096;
 pub(super) const DEFAULT_HS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const EMPTY_HEADERS_RETRY_DELAY: Duration = Duration::from_secs(1);

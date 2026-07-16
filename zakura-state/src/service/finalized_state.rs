@@ -23,7 +23,10 @@ use std::{
 };
 
 use zakura_chain::{
-    block, ironwood, orchard, parallel::tree::NoteCommitmentTrees, parameters::Network, sapling,
+    block, ironwood, orchard,
+    parallel::tree::NoteCommitmentTrees,
+    parameters::{Network, NetworkUpgrade},
+    sapling,
 };
 use zakura_db::{
     block::{RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT},
@@ -744,8 +747,8 @@ impl FinalizedState {
                         // different parent tree, so verifying against it would fail and
                         // wrongly evict a good supplied root. Treat a non-linking witness
                         // as absent, so the await-successor deferral below handles it. The
-                        // write worker only buffers direct successors, so this should
-                        // never fire.
+                        // header-store lookup only returns direct successors, so this
+                        // should never fire in production.
                         let next_vct_block = next_vct_block.filter(|next_vct_block| {
                             let links = next_vct_block.header.previous_block_hash == block_hash;
                             if !links {
@@ -760,8 +763,53 @@ impl FinalizedState {
                             links
                         });
 
-                        let is_prevalidated =
-                            self.vct.prevalidated_next() == Some((height, block_hash));
+                        // NU5+ block hashes do not commit to authorizing data. Include the
+                        // body's auth-data root when matching a header-only prevalidation.
+                        let block_auth_data_root = (NetworkUpgrade::current(&network, height)
+                            >= NetworkUpgrade::Nu5)
+                            .then(|| {
+                                precomputed_auth_data_root.unwrap_or_else(|| block.auth_data_root())
+                            });
+
+                        // A successful look-ahead check authenticates both this header and
+                        // its NU5+ auth-data root. A same-header body with a different root
+                        // can never become valid by replacing the supplied note-commitment
+                        // roots, so reject the body without evicting those roots or entering
+                        // the write loop's retry path.
+                        if let (
+                            Some((
+                                prevalidated_height,
+                                prevalidated_hash,
+                                Some(expected_auth_data_root),
+                            )),
+                            Some(actual_auth_data_root),
+                        ) = (self.vct.prevalidated_next(), block_auth_data_root)
+                        {
+                            if prevalidated_height == height
+                                && prevalidated_hash == block_hash
+                                && expected_auth_data_root != actual_auth_data_root
+                            {
+                                metrics::counter!("state.vct.block.auth_data_root_mismatch.count")
+                                    .increment(1);
+                                tracing::warn!(
+                                    ?height,
+                                    ?block_hash,
+                                    ?expected_auth_data_root,
+                                    ?actual_auth_data_root,
+                                    "VCT: checkpoint body auth-data root differs from its \
+                                     authenticated header prevalidation"
+                                );
+                                return Err(ValidateContextError::VctBlockAuthDataRootMismatch {
+                                    height,
+                                    expected: expected_auth_data_root,
+                                    actual: actual_auth_data_root,
+                                }
+                                .into());
+                            }
+                        }
+
+                        let is_prevalidated = self.vct.prevalidated_next()
+                            == Some((height, block_hash, block_auth_data_root));
                         if is_prevalidated {
                             if let Some(v) = self.vct.source() {
                                 v.record_prevalidated();
@@ -806,14 +854,31 @@ impl FinalizedState {
                                     verification_items,
                                 )
                             })
-                            .map_err(|(_fail_height, error)| {
+                            .map_err(|failure| {
                                 self.vct.clear_prevalidated_next();
-                                self.vct_reject_supplied_root(height, error)
+                                match failure {
+                                    commitment_aux_verify::CommitmentRootVerificationError::CurrentBlock {
+                                        error,
+                                        ..
+                                    } => error.into(),
+                                    commitment_aux_verify::CommitmentRootVerificationError::SuppliedRoot {
+                                        error,
+                                        ..
+                                    } => self.vct_reject_supplied_root(height, error),
+                                }
                             })?;
 
                         if let Some(next_vct_block) = &next_vct_block {
-                            self.vct
-                                .mark_prevalidated(next_vct_block.height, next_vct_block.hash);
+                            let next_auth_data_root =
+                                (NetworkUpgrade::current(&network, next_vct_block.height)
+                                    >= NetworkUpgrade::Nu5)
+                                    .then_some(next_vct_block.auth_data_root)
+                                    .flatten();
+                            self.vct.mark_prevalidated(
+                                next_vct_block.height,
+                                next_vct_block.hash,
+                                next_auth_data_root,
+                            );
                         } else if self
                             .vct
                             .source()
@@ -1125,7 +1190,7 @@ impl FinalizedState {
         self.vct.clear_prevalidated_next();
     }
 
-    /// `true` when committing `height` on the fast path needs a buffered successor before
+    /// `true` when committing `height` on the fast path needs a stored successor header before
     /// it can safely persist this block's supplied roots.
     ///
     /// Only untrusted peer-supplied roots at or above Heartwood require this. The

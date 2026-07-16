@@ -41,7 +41,9 @@ use zcash_protocol::consensus;
 use crate::parameters::TX_V6_VERSION_GROUP_ID;
 use crate::{
     amount::{Amount, Error as AmountError, NegativeAllowed, NonNegative},
-    block, ironwood, orchard,
+    block, ironwood,
+    memory::{vec_capacity_bytes, AttributedMemorySize},
+    orchard,
     parameters::{
         Network, NetworkUpgrade, OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID,
         TX_V5_VERSION_GROUP_ID,
@@ -172,6 +174,112 @@ pub enum Transaction {
     },
 }
 
+impl AttributedMemorySize for Transaction {
+    fn attributed_memory_size_bytes(&self) -> u64 {
+        use Transaction::*;
+
+        let (inputs, outputs, shielded_size) = match self {
+            V1 {
+                inputs, outputs, ..
+            } => (inputs, outputs, 0),
+            V2 {
+                inputs,
+                outputs,
+                joinsplit_data,
+                ..
+            }
+            | V3 {
+                inputs,
+                outputs,
+                joinsplit_data,
+                ..
+            } => (
+                inputs,
+                outputs,
+                joinsplit_data
+                    .as_ref()
+                    .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
+            ),
+            V4 {
+                inputs,
+                outputs,
+                joinsplit_data,
+                sapling_shielded_data,
+                ..
+            } => (
+                inputs,
+                outputs,
+                joinsplit_data
+                    .as_ref()
+                    .map_or(0, AttributedMemorySize::attributed_memory_size_bytes)
+                    .saturating_add(
+                        sapling_shielded_data
+                            .as_ref()
+                            .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
+                    ),
+            ),
+            V5 {
+                inputs,
+                outputs,
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ..
+            } => (
+                inputs,
+                outputs,
+                sapling_shielded_data
+                    .as_ref()
+                    .map_or(0, AttributedMemorySize::attributed_memory_size_bytes)
+                    .saturating_add(
+                        orchard_shielded_data
+                            .as_ref()
+                            .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
+                    ),
+            ),
+            V6 {
+                inputs,
+                outputs,
+                sapling_shielded_data,
+                orchard_shielded_data,
+                ironwood_shielded_data,
+                ..
+            } => (
+                inputs,
+                outputs,
+                sapling_shielded_data
+                    .as_ref()
+                    .map_or(0, AttributedMemorySize::attributed_memory_size_bytes)
+                    .saturating_add(
+                        orchard_shielded_data
+                            .as_ref()
+                            .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
+                    )
+                    .saturating_add(
+                        ironwood_shielded_data
+                            .as_ref()
+                            .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
+                    ),
+            ),
+        };
+
+        vec_capacity_bytes(inputs)
+            .saturating_add(
+                inputs
+                    .iter()
+                    .map(AttributedMemorySize::attributed_memory_size_bytes)
+                    .fold(0u64, u64::saturating_add),
+            )
+            .saturating_add(vec_capacity_bytes(outputs))
+            .saturating_add(
+                outputs
+                    .iter()
+                    .map(AttributedMemorySize::attributed_memory_size_bytes)
+                    .fold(0u64, u64::saturating_add),
+            )
+            .saturating_add(shielded_size)
+    }
+}
+
 impl fmt::Display for Transaction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut fmter = f.debug_struct("Transaction");
@@ -284,7 +392,8 @@ impl Transaction {
     }
 
     /// Compute this transaction's ID (txid) and ZIP-244 authorizing-data digest
-    /// together, sharing the librustzcash conversion used by both computations.
+    /// together, sharing the native ZIP-244 decomposition used by both
+    /// computations.
     ///
     /// Returns `None` for the auth digest of pre-v5 transactions.
     pub fn txid_and_auth_digest(&self) -> (Hash, Option<AuthDigest>) {

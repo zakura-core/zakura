@@ -459,22 +459,19 @@ impl WriteBlockWorkerTask {
             // block's supplied roots against the successor's header.
             vct_write_manager.fill_successor(finalized_block_write_receiver, &ordered_block);
 
-            // Prefer a buffered body successor, but fall back to the already-validated
-            // Zakura header store. Requiring the body here creates a circular dependency
-            // at checkpoint boundaries: H waits for H+1 while H+1 cannot be submitted
-            // until its entire checkpoint range is verified.
+            // Fast VCT commits use the already-validated Zakura header store as their
+            // successor witness. A checkpoint-verified body is not sufficient: NU5+
+            // block hashes do not bind authorizing data, so an altered same-hash body
+            // could supply the wrong auth-data root and make a valid current root look
+            // invalid. The buffered body remains in the look-ahead for its own commit.
             let needs_vct_successor =
                 finalized_state.vct_fast_needs_successor(ordered_block.0.height);
-            let next_vct_block = vct_write_manager.next_vct_block().or_else(|| {
-                if needs_vct_successor {
-                    finalized_state.vct_successor_from_header_store(
-                        ordered_block.0.height,
-                        ordered_block.0.hash,
-                    )
-                } else {
-                    None
-                }
-            });
+            let next_vct_block = if needs_vct_successor {
+                finalized_state
+                    .vct_successor_from_header_store(ordered_block.0.height, ordered_block.0.hash)
+            } else {
+                None
+            };
 
             if needs_vct_successor && next_vct_block.is_none() {
                 let height = ordered_block.0.height;
@@ -518,12 +515,11 @@ impl WriteBlockWorkerTask {
                 }
                 Err((ordered_block, error)) => {
                     // Retryable VCT root stalls (an absent/evicted root, or one not yet
-                    // verifiable for lack of a buffered successor) park-and-retry the same
+                    // verifiable for lack of a stored successor header) park-and-retry the same
                     // block in place rather than resetting the queue. An absent root can only
                     // be filled by a re-delivery of its header range (roots are not
                     // individually re-requested), so it polls slowly; an await-successor
-                    // stall just waits for the next block to be downloaded into the
-                    // look-ahead, so it polls faster.
+                    // stall just waits for the next header to be stored, so it polls faster.
                     if let Some(height) = error.vct_retryable_height() {
                         let root_unavailable = error.vct_supplied_root_unavailable_height();
 

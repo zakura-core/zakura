@@ -26,10 +26,14 @@ jobs:
       release_tag: ${{ steps.validate.outputs.release_tag }}
       target_sha: ${{ steps.validate.outputs.target_sha }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
 
       - name: Validate source, tag, and package version
         id: validate
@@ -45,7 +49,9 @@ jobs:
             exit 1
           fi
 
-          ./scripts/check-release-version.sh "$RELEASE_TAG"
+          make pre-release \
+            RELEASE_TAG="$RELEASE_TAG" \
+            PRE_RELEASE_WARN_CRATE_VERSION_BUMPS=0
 
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"

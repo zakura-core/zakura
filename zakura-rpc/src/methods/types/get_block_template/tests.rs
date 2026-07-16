@@ -11,6 +11,7 @@ use zakura_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 
 use zakura_chain::{
     block::Height,
+    local_genesis::generate_local_testnet_with_funded_keys,
     parameters::{
         subsidy::FundingStreamReceiver::{Deferred, Ecc, MajorGrants, ZcashFoundation},
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
@@ -18,6 +19,7 @@ use zakura_chain::{
     },
     serialization::ZcashDeserializeInto,
     transaction::Transaction,
+    transparent,
 };
 
 use crate::client::TransactionTemplate;
@@ -95,11 +97,49 @@ fn coinbase() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The coinbase built for a local testnet's activation block must include the
+/// network's configured zero-value lockbox marker output, so a mining node
+/// can produce a block that satisfies the one-time ZIP-271 disbursement rule.
+#[test]
+fn local_genesis_activation_coinbase_includes_lockbox_marker() -> anyhow::Result<()> {
+    let generated = generate_local_testnet_with_funded_keys(
+        vec!["alice".to_string(), "bob".to_string()],
+        Default::default(),
+    )
+    .map_err(|error| anyhow!(error.to_string()))?;
+    let net = generated.network;
+    let height = NetworkUpgrade::Nu6_3
+        .activation_height(&net)
+        .expect("the default local network activates NU6.3");
+    let miner_params = MinerParams::from(
+        Address::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Transparent),
+        )
+        .ok_or(anyhow!("hard-coded address must be valid"))?,
+    );
+    let transaction =
+        TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero())?
+            .data()
+            .as_ref()
+            .zcash_deserialize_into::<Transaction>()?;
+    let lockbox_disbursements = net.lockbox_disbursements(height);
+    let [(lockbox_address, lockbox_amount)] = lockbox_disbursements.as_slice() else {
+        return Err(anyhow!("local network must have one lockbox marker"));
+    };
+    let lockbox_output = transparent::Output::new(*lockbox_amount, lockbox_address.script());
+
+    assert!(transaction.outputs().contains(&lockbox_output));
+
+    Ok(())
+}
+
 /// The Zakura marker is always prepended, and `extra_coinbase_data` can't exceed
 /// the limit.
 #[test]
 fn coinbase_tag_and_limit() {
     use zcash_address::ZcashAddress;
+    use zcash_transparent::coinbase::{MAX_COINBASE_HEIGHT_LEN, MAX_COINBASE_SCRIPT_LEN};
 
     use crate::config::mining::{
         Config, ExtraCoinbaseData, MAX_USER_COINBASE_DATA_LEN, ZAKURA_COINBASE_MARKER,
@@ -111,6 +151,15 @@ fn coinbase_tag_and_limit() {
     // makes the config fail to load and the node refuse to start.
     assert!(ExtraCoinbaseData::try_from("x".repeat(MAX_USER_COINBASE_DATA_LEN)).is_ok());
     assert!(ExtraCoinbaseData::try_from("x".repeat(MAX_USER_COINBASE_DATA_LEN + 1)).is_err());
+    assert_eq!(
+        MAX_USER_COINBASE_DATA_LEN
+            + ZAKURA_COINBASE_MARKER.len()
+            + ZAKURA_COINBASE_SEPARATOR.len()
+            + 2
+            + MAX_COINBASE_HEIGHT_LEN,
+        MAX_COINBASE_SCRIPT_LEN,
+        "the configured data limit must reserve the worst-case height and OP_PUSHDATA1 bytes"
+    );
 
     let net = Network::Mainnet;
     let addr: ZcashAddress = default_miner_address(net.kind(), &MinerAddressType::Transparent)
@@ -147,6 +196,26 @@ fn coinbase_tag_and_limit() {
         [ZAKURA_COINBASE_MARKER, ZAKURA_COINBASE_SEPARATOR, "/pool/"]
             .concat()
             .as_bytes()
+    );
+
+    // Exercise the invariant behind `MinerParams::new`'s `expect` through the
+    // real coinbase builder at the maximum supported Zakura height.
+    let max_tag = ExtraCoinbaseData::try_from("x".repeat(MAX_USER_COINBASE_DATA_LEN))
+        .expect("maximum-length tag is valid");
+    let max_params = params(Some(max_tag)).expect("maximum-length tag fits miner params");
+    let max_coinbase =
+        TransactionTemplate::new_coinbase(&net, Height::MAX, &max_params, Amount::zero())
+            .expect("maximum-length tag fits a coinbase transaction")
+            .data()
+            .as_ref()
+            .zcash_deserialize_into::<Transaction>()
+            .expect("maximum-length coinbase transaction deserializes");
+    let coinbase_script = max_coinbase.inputs()[0]
+        .coinbase_script()
+        .expect("built coinbase input has a canonical script");
+    assert!(
+        coinbase_script.len() <= MAX_COINBASE_SCRIPT_LEN,
+        "maximum-length configured tag must keep the coinbase script within consensus limits"
     );
 }
 

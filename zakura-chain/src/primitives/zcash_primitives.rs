@@ -540,7 +540,8 @@ pub(crate) fn auth_digest(tx: &Transaction) -> AuthDigest {
 }
 
 /// Compute both the transaction ID (txid) and the ZIP-244 authorizing-data
-/// commitment of a v5+ transaction from a single `librustzcash` conversion.
+/// commitment of a v5+ transaction from a shared native ZIP-244
+/// decomposition, falling back to `librustzcash` for unsupported versions.
 ///
 /// # Panics
 ///

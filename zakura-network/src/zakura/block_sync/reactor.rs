@@ -73,11 +73,10 @@ pub fn spawn_block_sync_reactor(
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
     // Size the action channel so the Sequencer can dispatch a full checkpoint
     // window of `SubmitBlock`s (`submitted_apply_limit`) plus the query/misbehavior
-    // spare pool. The byte
-    // budget — not this channel — bounds in-flight body memory, and `SubmitBlock`
-    // only carries an `Arc<Block>` already accounted in `applying`, so the larger
-    // channel costs negligible memory while removing a head-of-line stall that
-    // throttled body intake behind commit submission.
+    // spare pool. The resident look-ahead gate — not this channel — bounds body
+    // memory, and `SubmitBlock` only carries an `Arc<Block>` already accounted in
+    // `applying`, so the larger channel costs negligible memory while removing a
+    // head-of-line stall that throttled body intake behind commit submission.
     let actions_capacity = startup
         .config
         .submitted_apply_limit()
@@ -104,6 +103,8 @@ pub fn spawn_block_sync_reactor(
         mpsc::channel(startup.config.submitted_apply_limit().max(1));
     let (sequencer_control_tx, sequencer_control_rx) = mpsc::unbounded_channel();
     let sequencer_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sequencer_input_decoded_attributed_memory_bytes =
+        Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
 
     let sequencer_task = SequencerTask::new(
@@ -116,6 +117,7 @@ pub fn spawn_block_sync_reactor(
         sequencer_body_input_rx,
         sequencer_control_rx,
         sequencer_input_bytes.clone(),
+        sequencer_input_decoded_attributed_memory_bytes.clone(),
         sequencer_view_tx,
         ACTION_SEND_TIMEOUT,
         startup.trace.clone(),
@@ -141,7 +143,8 @@ pub fn spawn_block_sync_reactor(
         received_throughput: state.received_throughput.clone(),
         sequencer_input: sequencer_input_tx.clone(),
         sequencer_input_bytes: sequencer_input_bytes.clone(),
-        sequencer_control: sequencer_control_tx.clone(),
+        sequencer_input_decoded_attributed_memory_bytes:
+            sequencer_input_decoded_attributed_memory_bytes.clone(),
         actions: actions_tx.clone(),
         routine_to_reactor: routine_to_reactor_tx,
         view: sequencer_view_rx.clone(),
@@ -177,6 +180,7 @@ pub fn spawn_block_sync_reactor(
         candidates: candidates_tx,
         sequencer_input: sequencer_input_tx,
         sequencer_input_bytes,
+        sequencer_input_decoded_attributed_memory_bytes,
         sequencer_control: sequencer_control_tx,
         sequencer_view: sequencer_view_rx,
     };
@@ -219,6 +223,8 @@ pub(super) struct BlockSyncReactor {
     sequencer_input: mpsc::Sender<SequencedBody>,
     /// Serialized bytes currently queued in [`Self::sequencer_input`].
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Decoded attributed-memory bytes currently queued in [`Self::sequencer_input`].
+    sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
     /// Non-blocking control channel to the Sequencer task. Frontier and apply
     /// progress must never wait behind downloaded body backlog.
     sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
@@ -412,7 +418,6 @@ impl BlockSyncReactor {
                 bs_insert_u64(row, "released_bytes", released.released_bytes);
                 bs_insert_u64(row, "returned_count", released.returned_count);
                 bs_insert_u64(row, "already_pending_count", released.already_pending_count);
-                bs_insert_u64(row, "held_count", released.held_count);
                 bs_insert_u64(row, "released_count", released.released_count);
                 bs_insert_u64(row, "missing_count", released.missing_count);
                 bs_insert_u64(
@@ -850,10 +855,9 @@ impl BlockSyncReactor {
         } else if tip_advanced {
             // A non-destructive frontier advance does NOT respawn and does NOT
             // proactively drop outstanding through the tip: a still-open request
-            // for a now-committed height releases its budget on delivery (Sequencer
-            // `Redundant`) or on its own timeout, so there is no leak, only a
-            // slightly later release. Trace the change
-            // only when the tip actually moved.
+            // for a now-committed height releases its reservation on delivery or
+            // on its own timeout, so there is no leak, only a slightly later
+            // release. Trace the change only when the tip actually moved.
             self.trace_frontiers_changed(view.verified_tip);
         }
         self.prune_needed_below_floor();
@@ -1142,8 +1146,8 @@ impl BlockSyncReactor {
         local_frontier: Option<BlockSyncFrontiers>,
     ) {
         // The whole commit-pipeline body (token validate, embedded local-frontier
-        // advance, applying removal, budget release, throughput record, rollback +
-        // misbehavior, drain + submit) runs on the Sequencer task. The reactor
+        // advance, applying removal, throughput record, rollback + misbehavior,
+        // drain + submit) runs on the Sequencer task. The reactor
         // forwards the completion and reacts to the resulting progress view
         // (serving/status/query/schedule) on the `view` arm.
         self.trace_apply_finished(height, token, result, self.state.budget.reserved());
@@ -1278,10 +1282,10 @@ impl BlockSyncReactor {
         // bounded by the in-flight byte budget and per-peer slots, not by how fast
         // commit/verify drains. Including reorder/applying here would pace
         // downloads to commit speed: a slow commit lets those buffers grow, the
-        // low-water gate stops refilling, and `outstanding` collapses. The byte
-        // budget already bounds memory because reorder/applying hold their
-        // reservation until apply-finish, so downloads may legitimately run far
-        // ahead of commit up to that budget.
+        // low-water gate stops refilling, and `outstanding` collapses. Memory is
+        // already bounded because the resident look-ahead gate counts retained
+        // reorder/applying bodies, so downloads may legitimately run far ahead of
+        // commit up to that budget.
         self.state
             .work_queue
             .pending_len()
@@ -1637,7 +1641,7 @@ impl BlockSyncReactor {
         // The commit-pipeline counters now live on the Sequencer task; read them
         // from the latest published view snapshot.
         let view = self.last_view;
-        let submitted_applies = view.submitted_applying_count;
+        let submitted_applies = view.in_flight_submission_count;
         let (received_bytes_per_sec, received_blocks_per_sec) = self
             .state
             .received_throughput
@@ -1694,6 +1698,9 @@ impl BlockSyncReactor {
             let sequencer_input_queued_bytes = self
                 .sequencer_input_bytes
                 .load(std::sync::atomic::Ordering::Relaxed);
+            let sequencer_input_decoded_attributed_memory_bytes = self
+                .sequencer_input_decoded_attributed_memory_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
             let sequencer_input_max_capacity = self.sequencer_input.max_capacity();
             let sequencer_input_capacity = self.sequencer_input.capacity();
             let sequencer_input_queued_blocks =
@@ -1702,6 +1709,28 @@ impl BlockSyncReactor {
                 row,
                 "sequencer_input_queued_bytes",
                 sequencer_input_queued_bytes,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::SEQUENCER_INPUT_DECODED_ATTRIBUTED_MEMORY_BYTES,
+                sequencer_input_decoded_attributed_memory_bytes,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::REORDER_DECODED_ATTRIBUTED_MEMORY_BYTES,
+                view.reorder_decoded_attributed_memory_bytes,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::APPLYING_DECODED_ATTRIBUTED_MEMORY_BYTES,
+                view.applying_decoded_attributed_memory_bytes,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::ACTIVE_PIPELINE_DECODED_ATTRIBUTED_MEMORY_BYTES,
+                sequencer_input_decoded_attributed_memory_bytes
+                    .saturating_add(view.reorder_decoded_attributed_memory_bytes)
+                    .saturating_add(view.applying_decoded_attributed_memory_bytes),
             );
             bs_insert_u64(
                 row,
@@ -1727,8 +1756,8 @@ impl BlockSyncReactor {
             );
             bs_insert_u64(
                 row,
-                "submitted_applying_bytes",
-                view.submitted_applying_bytes,
+                "in_flight_submission_bytes",
+                view.in_flight_submission_bytes,
             );
             bs_insert_u64(
                 row,
@@ -2121,6 +2150,10 @@ impl BlockSyncReactor {
     fn publish_metrics(&self) {
         // These lossy casts are metrics-only gauges; consensus and scheduling
         // continue to use the original integer values.
+        let view = *self.sequencer_view.borrow();
+        let sequencer_input_decoded_attributed_memory_bytes = self
+            .sequencer_input_decoded_attributed_memory_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
         metrics::gauge!("sync.block.best_header_tip.height")
             .set(self.state.best_header_tip.0 as f64);
         metrics::gauge!("sync.block.verified_tip.height").set(self.verified_block_tip.0 as f64);
@@ -2129,6 +2162,17 @@ impl BlockSyncReactor {
             .set(self.state.budget.reserved() as f64);
         metrics::gauge!("sync.block.reorder.buffered_bytes")
             .set(self.last_view.reorder_buffered_bytes as f64);
+        metrics::gauge!("sync.block.sequencer_input.decoded.attributed_memory_bytes")
+            .set(sequencer_input_decoded_attributed_memory_bytes as f64);
+        metrics::gauge!("sync.block.reorder.decoded.attributed_memory_bytes")
+            .set(view.reorder_decoded_attributed_memory_bytes as f64);
+        metrics::gauge!("sync.block.applying.decoded.attributed_memory_bytes")
+            .set(view.applying_decoded_attributed_memory_bytes as f64);
+        metrics::gauge!("sync.block.active_pipeline.decoded.attributed_memory_bytes").set(
+            sequencer_input_decoded_attributed_memory_bytes
+                .saturating_add(view.reorder_decoded_attributed_memory_bytes)
+                .saturating_add(view.applying_decoded_attributed_memory_bytes) as f64,
+        );
         metrics::gauge!("sync.block.applying").set(self.last_view.applying_len as f64);
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).
@@ -2168,11 +2212,26 @@ impl BlockSyncReactor {
     /// stalled driver wedge the reactor. Returns `true` only if the action was
     /// accepted.
     fn dispatch_action(&self, action: BlockSyncAction) -> bool {
+        let action_label = action.metric_label();
+        let queue_depth = self
+            .actions
+            .max_capacity()
+            .saturating_sub(self.actions.capacity());
+        // Metrics accepts f64 samples; this lossy conversion is observability-only.
+        metrics::histogram!(
+            "sync.block.action.queue.depth",
+            "action" => action_label
+        )
+        .record(queue_depth as f64);
         self.trace_action_dispatched(&action);
         match self.actions.try_send(action) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                metrics::counter!("sync.block.action.send_queue_full").increment(1);
+                metrics::counter!(
+                    "sync.block.action.send_queue_full",
+                    "action" => action_label
+                )
+                .increment(1);
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
@@ -2189,8 +2248,7 @@ impl BlockSyncReactor {
         // lifecycle draining whenever the action driver was slow. `try_send` keeps
         // the reactor live.
         let action = BlockSyncAction::Misbehavior { peer, reason };
-        self.trace_action_dispatched(&action);
-        if self.actions.try_send(action).is_err() {
+        if !self.dispatch_action(action) {
             metrics::counter!("sync.block.peer.violation.action_dropped").increment(1);
         }
     }

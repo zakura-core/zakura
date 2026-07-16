@@ -15,6 +15,7 @@
 //! byte budget, and work queue directly and emit `SubmitBlock`/`Misbehavior`
 //! actions on the same channel the reactor uses.
 
+use super::super::trace::queue_send_trace as qs_trace;
 use super::{
     events::*,
     reactor::{bs_insert_height, bs_insert_str, bs_insert_u64},
@@ -25,89 +26,115 @@ use super::{
     *,
 };
 
-/// Favor the lowest needed height over the speculative high tail.
-///
-/// While the byte budget cannot fund even one worst-case request yet the lowest
-/// needed height (pending or outstanding) sits *below* the highest buffered body,
-/// drop that top body: release its bytes to the budget and return its height to
-/// `pending` (it was held, hence in `work.in_flight` per the `held ⟺ in_flight`
-/// invariant) for later re-fetch. Because another top can always be shed, a low
-/// retry never blocks on budget; the floor can never wedge behind a full buffer,
-/// and under a stall the speculative tail is shed and the chain fills bottom-up,
-/// which also bounds the reorder backlog. The rescue path is purely demand-driven:
-/// it runs inline after each accepted body and synchronously when a floor requester
-/// needs budget through [`SequencerControlInput::FundFloorReservation`]. Returns
-/// whether it shed anything.
-pub(super) fn shed_top_until_available(
-    budget: &mut ByteBudget,
-    work: &WorkQueue,
-    sequencer: &mut Sequencer,
-    target_available: u64,
-) -> bool {
-    let mut shed_any = false;
-    while budget.available() < target_available {
-        let lowest_needed = match (work.min_pending(), work.min_in_flight()) {
-            (Some(pending), Some(in_flight)) => pending.min(in_flight),
-            (Some(pending), None) => pending,
-            (None, Some(in_flight)) => in_flight,
-            (None, None) => break,
-        };
-        let Some(top) = sequencer.reorder_max_height() else {
-            break;
-        };
-        // Only shed a body that sits above a starved lower height: we trade a
-        // far-from-floor body for the ability to fetch a nearer, higher-value one.
-        if lowest_needed >= top {
-            break;
-        }
-        let freed = sequencer.drop_reorder_from(top);
-        if freed == 0 {
-            break;
-        }
-        let released = work.release_and_return_items([top]);
-        debug_assert!(
-            released == 0 || released == freed,
-            "shed reorder release must match the per-height budget ledger when present"
-        );
-        budget.release(if released == 0 { freed } else { released });
-        shed_any = true;
-    }
-    shed_any
-}
-
-pub(super) fn shed_top_for_floor_starvation(
-    budget: &mut ByteBudget,
-    work: &WorkQueue,
-    sequencer: &mut Sequencer,
-) -> bool {
-    shed_top_until_available(
-        budget,
-        work,
-        sequencer,
-        super::config::BS_PER_BLOCK_WORST_CASE_BYTES,
-    )
-}
+/// Delay before retrying a verifier submission that could not enter the shared
+/// action channel.
+const SUBMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// A received body a peer routine matched (or accepted unmatched) and forwards
 /// to the commit pipeline. This is the only bounded Sequencer input: a slow
 /// verifier can backpressure body intake, but must not block apply/frontier
 /// control events that release budget and drive the next scheduling reaction.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct SequencedBody {
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
+    pub(super) previous_block_hash: block::Hash,
     pub(super) body: BufferedBlockBody,
     pub(super) bytes: u64,
     pub(super) peer: ZakuraPeerId,
     pub(super) received_at: Instant,
+    queue_accounting: SequencerInputAccounting,
+}
+
+impl SequencedBody {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_queued(
+        height: block::Height,
+        hash: block::Hash,
+        previous_block_hash: block::Hash,
+        body: BufferedBlockBody,
+        bytes: u64,
+        peer: ZakuraPeerId,
+        received_at: Instant,
+        input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        let decoded_attributed_memory_size_bytes = body.decoded_attributed_memory_size_bytes();
+        Self {
+            height,
+            hash,
+            previous_block_hash,
+            body,
+            bytes,
+            peer,
+            received_at,
+            queue_accounting: SequencerInputAccounting::new(
+                input_bytes,
+                bytes,
+                input_decoded_attributed_memory_bytes,
+                decoded_attributed_memory_size_bytes,
+            ),
+        }
+    }
+
+    /// Transfer this body out of queue ownership before processing it.
+    pub(super) fn leave_queue(&mut self) {
+        self.queue_accounting.release();
+    }
+}
+
+#[derive(Debug)]
+struct SequencerInputAccounting {
+    input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    bytes: u64,
+    input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    decoded_attributed_memory_size_bytes: u64,
+    active: bool,
+}
+
+impl SequencerInputAccounting {
+    fn new(
+        input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        bytes: u64,
+        input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+        decoded_attributed_memory_size_bytes: u64,
+    ) -> Self {
+        add_atomic_bytes(&input_bytes, bytes);
+        add_atomic_bytes(
+            &input_decoded_attributed_memory_bytes,
+            decoded_attributed_memory_size_bytes,
+        );
+        Self {
+            input_bytes,
+            bytes,
+            input_decoded_attributed_memory_bytes,
+            decoded_attributed_memory_size_bytes,
+            active: true,
+        }
+    }
+
+    fn release(&mut self) {
+        if !std::mem::take(&mut self.active) {
+            return;
+        }
+        release_atomic_bytes(&self.input_bytes, self.bytes);
+        release_atomic_bytes(
+            &self.input_decoded_attributed_memory_bytes,
+            self.decoded_attributed_memory_size_bytes,
+        );
+    }
+}
+
+impl Drop for SequencerInputAccounting {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// Progress-critical Sequencer events forwarded by the reactor.
 ///
-/// These events must not sit behind downloaded bodies. `ApplyFinished` releases
-/// budget and verifier slots, and frontier/reset events can release or discard
-/// stale body work. They are locally generated and tiny, so they use a separate
-/// unbounded channel and are prioritized by the Sequencer task.
+/// These locally-generated events must not sit behind downloaded bodies, so
+/// they use a separate prioritized channel.
 #[derive(Debug)]
 pub(super) enum SequencerControlInput {
     /// A verified-tip advance (frontier growth/commit).
@@ -137,12 +164,6 @@ pub(super) enum SequencerControlInput {
         result: BlockApplyResult,
         local_frontier: Option<BlockSyncFrontiers>,
     },
-    /// Synchronously pop the speculative high tail until a floor request can
-    /// reserve `needed_bytes`, then wake the requester to retry the reservation.
-    FundFloorReservation {
-        needed_bytes: u64,
-        reply: oneshot::Sender<bool>,
-    },
 }
 
 /// The progress view the reactor reacts to. A `watch` (latest-wins) send never
@@ -168,9 +189,15 @@ pub(super) struct SequencerView {
     pub(super) applying_len: u64,
     pub(super) reorder_buffered_bytes: u64,
     pub(super) applying_buffered_bytes: u64,
+    pub(super) sequencer_input_decoded_attributed_memory_bytes: u64,
+    pub(super) reorder_decoded_attributed_memory_bytes: u64,
+    pub(super) applying_decoded_attributed_memory_bytes: u64,
+    pub(super) active_pipeline_decoded_attributed_memory_bytes: u64,
     pub(super) unsubmitted_applying_count: u64,
-    pub(super) submitted_applying_count: u64,
-    pub(super) submitted_applying_bytes: u64,
+    /// Submitted decoded bodies awaiting matching completion, including entries
+    /// detached from `applying` but still retained by the driver.
+    pub(super) in_flight_submission_count: u64,
+    pub(super) in_flight_submission_bytes: u64,
     pub(super) committed_bytes_per_sec: u64,
     pub(super) committed_blocks_per_sec: u64,
 }
@@ -188,9 +215,13 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
         applying_len: 0,
         reorder_buffered_bytes: 0,
         applying_buffered_bytes: 0,
+        sequencer_input_decoded_attributed_memory_bytes: 0,
+        reorder_decoded_attributed_memory_bytes: 0,
+        applying_decoded_attributed_memory_bytes: 0,
+        active_pipeline_decoded_attributed_memory_bytes: 0,
         unsubmitted_applying_count: 0,
-        submitted_applying_count: 0,
-        submitted_applying_bytes: 0,
+        in_flight_submission_count: 0,
+        in_flight_submission_bytes: 0,
         committed_bytes_per_sec: 0,
         committed_blocks_per_sec: 0,
     }
@@ -214,10 +245,28 @@ pub(super) struct SequencerTask {
     reaction_epoch: u64,
     body_input_rx: mpsc::Receiver<SequencedBody>,
     control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
-    body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    _body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
     view_tx: watch::Sender<SequencerView>,
     action_send_timeout: Duration,
+    submission_retry_at: Option<time::Instant>,
+    submission_retry_started_at: Option<time::Instant>,
+    submission_retry_attempt: u64,
     trace: ZakuraTrace,
+}
+
+impl Drop for SequencerTask {
+    fn drop(&mut self) {
+        self.body_input_rx.close();
+        while self.body_input_rx.try_recv().is_ok() {}
+
+        self.view_tx.send_modify(|view| {
+            view.reorder_decoded_attributed_memory_bytes = 0;
+            view.applying_decoded_attributed_memory_bytes = 0;
+            view.sequencer_input_decoded_attributed_memory_bytes = 0;
+            view.active_pipeline_decoded_attributed_memory_bytes = 0;
+        });
+    }
 }
 
 impl SequencerTask {
@@ -232,6 +281,7 @@ impl SequencerTask {
         body_input_rx: mpsc::Receiver<SequencedBody>,
         control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
         body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
         view_tx: watch::Sender<SequencerView>,
         action_send_timeout: Duration,
         trace: ZakuraTrace,
@@ -248,9 +298,13 @@ impl SequencerTask {
             reaction_epoch: 0,
             body_input_rx,
             control_input_rx,
-            body_input_bytes,
+            _body_input_bytes: body_input_bytes,
+            body_input_decoded_attributed_memory_bytes,
             view_tx,
             action_send_timeout,
+            submission_retry_at: None,
+            submission_retry_started_at: None,
+            submission_retry_attempt: 0,
             trace,
         }
     }
@@ -262,9 +316,10 @@ impl SequencerTask {
         let mut control_open = true;
         let mut body_open = true;
         loop {
-            if !control_open && !body_open {
+            if !control_open && !body_open && self.submission_retry_at.is_none() {
                 break;
             }
+            let submission_retry_at = self.submission_retry_at;
             tokio::select! {
                 biased;
 
@@ -281,16 +336,24 @@ impl SequencerTask {
                     }
                 }
 
+                _ = time::sleep_until(submission_retry_at.unwrap_or_else(time::Instant::now)),
+                    if submission_retry_at.is_some() =>
+                {
+                    self.submission_retry_at = None;
+                    self.submit_pending_blocks().await;
+                    self.publish_view();
+                }
+
                 body = self.body_input_rx.recv(), if body_open => {
                     match body {
-                        Some(body) => {
-                            self.release_body_input_bytes(body.bytes);
-                            self.handle_accept_body(body).await;
-                            shed_top_for_floor_starvation(
-                                &mut self.budget,
-                                &self.work,
-                                &mut self.sequencer,
-                            );
+                        Some(mut body) => {
+                            body.leave_queue();
+                            self.handle_accept_body(body);
+                            // Publish the synchronous queue → reorder/applying ownership
+                            // transfer before an action-channel send can await or time out.
+                            // This updates observability without waking scheduling watchers.
+                            self.publish_decoded_ownership_view();
+                            self.submit_pending_blocks().await;
                             self.publish_view();
                         }
                         None => body_open = false,
@@ -336,63 +399,32 @@ impl SequencerTask {
                 result,
                 local_frontier,
             } => {
-                self.handle_apply_finished(token, height, hash, result, local_frontier)
-                    .await
-            }
-            SequencerControlInput::FundFloorReservation {
-                needed_bytes,
-                reply,
-            } => {
-                let shed = shed_top_until_available(
-                    &mut self.budget,
-                    &self.work,
-                    &mut self.sequencer,
-                    needed_bytes,
-                );
-                let _ = reply.send(self.budget.available() >= needed_bytes);
-                shed
+                let needs_reaction = self
+                    .handle_apply_finished(token, height, hash, result, local_frontier)
+                    .await;
+                self.submit_pending_blocks().await;
+                needs_reaction
             }
         }
     }
 
-    fn release_body_input_bytes(&self, bytes: u64) {
-        let mut current = self
-            .body_input_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        loop {
-            let next = current.saturating_sub(bytes);
-            match self.body_input_bytes.compare_exchange_weak(
-                current,
-                next,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
-    /// Body-acceptance tail: offer the body to the reorder buffer, release its
-    /// bytes on a `Redundant` outcome, then drain the ready contiguous prefix into
-    /// applying and submit it.
-    async fn handle_accept_body(&mut self, body: SequencedBody) {
+    /// Body-acceptance tail: offer the body to the reorder buffer, then drain the
+    /// ready contiguous prefix into applying.
+    fn handle_accept_body(&mut self, body: SequencedBody) {
         let queued_elapsed = body.received_at.elapsed();
         let outcome = match self.sequencer.accept_buffered_body(
             body.height,
             body.hash,
+            body.previous_block_hash,
             body.body,
             body.bytes,
             body.peer,
         ) {
             AcceptOutcome::Buffered { .. } => "buffered",
-            AcceptOutcome::Redundant { release_bytes } => {
-                self.budget.release(release_bytes);
-                "redundant"
-            }
+            AcceptOutcome::Redundant { .. } => "redundant",
         };
         self.trace_body_accepted(body.height, queued_elapsed, outcome);
-        self.release_contiguous_blocks().await;
+        let _ = self.sequencer.drain_ready_into_applying();
     }
 
     /// Apply a verified-tip frontier advance: fold finalized height forward, drop
@@ -416,7 +448,6 @@ impl SequencerTask {
         let advance = self
             .sequencer
             .advance_verified_tip(frontiers.verified_block_tip, release_applied);
-        self.budget.release(advance.release_bytes);
         if advance.changed {
             let released = self.work.advance_floor(frontiers.verified_block_tip);
             self.budget.release(released);
@@ -512,16 +543,11 @@ impl SequencerTask {
         self.finalized_height = frontiers.finalized_height;
         self.verified_block_hash = frontiers.verified_block_hash;
 
-        // The Sequencer pins its verified tip and floor to the reset target and
-        // clears the reorder/applying buffers, returning the freed bytes for
-        // release.
-        let released = self
+        // Retained bodies do not charge the request budget.
+        let _ = self
             .sequencer
             .reset_to(frontiers.verified_block_tip, remember_released_applies);
-        self.budget.release(released);
-        // Drop every download work item above the reset target (their buffers
-        // were cleared by `reset_to`); the reactor's `query_needed_blocks`
-        // re-fills.
+        // Return unreceived request reservations above the reset target.
         let released = self.work.reset_above(self.sequencer.floor());
         self.budget.release(released);
         // A destructive reset: bump the epoch so the reactor drops *all*
@@ -529,8 +555,8 @@ impl SequencerTask {
         self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
-    /// Handle a verifier apply completion: release the body's bytes and verifier
-    /// slot, fold in any embedded `local_frontier` as a frontier advance with
+    /// Handle a verifier apply completion: release its verifier slot, fold in
+    /// any embedded `local_frontier` as a frontier advance with
     /// `release_applied: false`, and on a rejection roll the floor back below the
     /// bad block so its range is re-requestable. Returns whether the reactor needs
     /// its serving/query/schedule reaction (the view reaction runs that tail).
@@ -543,15 +569,15 @@ impl SequencerTask {
         local_frontier: Option<BlockSyncFrontiers>,
     ) -> bool {
         // A stale completion (no live applying entry, or token/hash mismatch)
-        // only decrements the submitted-apply record and returns; there is no
-        // query/schedule tail here, so it needs no reaction.
+        // releases only its exact token-aware in-flight-submission charge and
+        // returns; there is no query/schedule tail here, so it needs no reaction.
         let Some((applying_token, applying_hash)) = self.sequencer.applying_token_hash(height)
         else {
-            self.sequencer.decrement_submitted_apply(height, hash);
+            self.sequencer.finish_submission(token, height, hash);
             return false;
         };
         if applying_hash != hash || applying_token != token {
-            self.sequencer.decrement_submitted_apply(height, hash);
+            self.sequencer.finish_submission(token, height, hash);
             return false;
         }
 
@@ -572,7 +598,11 @@ impl SequencerTask {
         if matches!(result, BlockApplyResult::Duplicate) && self.sequencer.verified_tip() < height {
             // Stale duplicate for a height we have not verified to: the reactor
             // needs the serving/query tail only when the accepted local frontier
-            // actually advanced serving.
+            // actually advanced serving. The body stays attached until a later
+            // frontier update removes it, but the driver has released its decoded
+            // copy, so release the token-aware decode-window charge now.
+            self.sequencer
+                .finish_attached_submission(token, height, hash);
             return accepted_local_frontier.is_some();
         }
         let applying = self
@@ -580,13 +610,12 @@ impl SequencerTask {
             .remove_applying(height)
             .expect("applying entry exists because it was just checked");
 
-        self.budget.release(applying.bytes);
         // A `Committed` result is a body that newly extended the chain; count it
         // toward commit throughput (the apply rate the download path is racing).
         if matches!(result, BlockApplyResult::Committed) {
             self.committed_throughput.record(applying.bytes);
         }
-        self.sequencer.decrement_submitted_apply(height, hash);
+        self.sequencer.finish_submission(token, height, hash);
         match result {
             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
             BlockApplyResult::Rejected | BlockApplyResult::TimedOut
@@ -596,13 +625,11 @@ impl SequencerTask {
                 // reorder), roll the floor back below it, and drop the WorkQueue
                 // entries above the rolled-back floor so the heights are
                 // re-requestable (the reactor's `query_needed_blocks` re-fills).
-                let released = self.sequencer.release_applying_blocks_from(height);
-                self.budget.release(released);
+                let _ = self.sequencer.release_applying_blocks_from(height);
                 self.sequencer.reset_floor_below(height);
                 let released = self.work.reset_above(self.sequencer.floor());
                 self.budget.release(released);
-                let dropped = self.sequencer.drop_reorder_from(height);
-                self.budget.release(dropped);
+                let _ = self.sequencer.drop_reorder_from(height);
                 // A `Rejected` result means consensus found the body invalid.
                 // Attribute it to the delivering peer so repeat offenders are
                 // scored and eventually disconnected. `TimedOut` is a local apply
@@ -618,10 +645,9 @@ impl SequencerTask {
             BlockApplyResult::Rejected | BlockApplyResult::TimedOut => {}
         }
         if let Some(frontiers) = accepted_local_frontier {
-            let released = self
+            let _ = self
                 .sequencer
                 .release_applied_through(frontiers.verified_block_tip);
-            self.budget.release(released);
         }
 
         self.release_contiguous_blocks().await;
@@ -635,21 +661,64 @@ impl SequencerTask {
     }
 
     async fn submit_pending_blocks(&mut self) {
-        for height in self.sequencer.submittable_heights() {
+        let submittable_heights = self.sequencer.submittable_heights();
+        if submittable_heights.is_empty() {
+            if self.sequencer.unsubmitted_applying_count() == 0 {
+                self.submission_retry_at = None;
+                self.submission_retry_started_at = None;
+                self.submission_retry_attempt = 0;
+            } else if self.submission_retry_started_at.is_some()
+                && self.submission_retry_at.is_none()
+                && !self.actions.is_closed()
+            {
+                self.submission_retry_at = Some(time::Instant::now() + SUBMISSION_RETRY_DELAY);
+            }
+            return;
+        }
+
+        self.submission_retry_at = None;
+        for height in submittable_heights {
             let Some(item) = self.sequencer.prepare_submit(height) else {
                 continue;
             };
 
             metrics::counter!("sync.block.submit.sent").increment(1);
-            if !self
+            let queue_depth = self
+                .actions
+                .max_capacity()
+                .saturating_sub(self.actions.capacity());
+            // Metrics accepts f64 samples; this lossy conversion is observability-only.
+            metrics::histogram!(
+                "sync.block.action.queue.depth",
+                "action" => "submit_block"
+            )
+            .record(queue_depth as f64);
+            let send_started = time::Instant::now();
+            let sent = self
                 .send_action(BlockSyncAction::SubmitBlock {
                     token: item.token,
                     block: item.block,
                 })
-                .await
-            {
+                .await;
+            metrics::histogram!("sync.block.submit.queue_wait_seconds")
+                .record(send_started.elapsed().as_secs_f64());
+            if !sent {
                 self.sequencer.unsubmit(item.height, item.token);
+                if !self.actions.is_closed() {
+                    let now = time::Instant::now();
+                    self.submission_retry_started_at.get_or_insert(now);
+                    self.submission_retry_attempt = self.submission_retry_attempt.saturating_add(1);
+                    self.submission_retry_at = Some(now + SUBMISSION_RETRY_DELAY);
+                    metrics::counter!("sync.block.submit.retry.scheduled").increment(1);
+                    self.trace_submission_retry_scheduled(item.height);
+                }
                 return;
+            }
+            if let Some(started_at) = self.submission_retry_started_at.take() {
+                metrics::counter!("sync.block.submit.retry.succeeded").increment(1);
+                metrics::histogram!("sync.block.submit.retry.delay_seconds")
+                    .record(started_at.elapsed().as_secs_f64());
+                self.submission_retry_attempt = 0;
             }
             self.sequencer
                 .record_submitted_apply(item.height, item.hash);
@@ -665,6 +734,38 @@ impl SequencerTask {
             );
             bs_insert_height(row, bs_trace::HEIGHT, height);
             bs_insert_u64(row, bs_trace::APPLY_TOKEN, token);
+        });
+    }
+
+    fn trace_submission_retry_scheduled(&self, height: block::Height) {
+        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
+            bs_insert_str(
+                row,
+                bs_trace::EVENT,
+                bs_trace::BLOCK_BODY_SUBMISSION_RETRY_SCHEDULED,
+            );
+            bs_insert_height(row, bs_trace::HEIGHT, height);
+            bs_insert_u64(
+                row,
+                qs_trace::QUEUE_CAPACITY,
+                u64::try_from(self.actions.capacity()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                qs_trace::QUEUE_MAX_CAPACITY,
+                u64::try_from(self.actions.max_capacity()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                "in_flight_submission_count",
+                u64::try_from(self.sequencer.in_flight_submission_count()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                "unsubmitted_applying_count",
+                u64::try_from(self.sequencer.unsubmitted_applying_count()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(row, "retry_attempt", self.submission_retry_attempt);
         });
     }
 
@@ -799,10 +900,10 @@ impl SequencerTask {
             return true;
         };
 
-        self.sequencer
-            .applying_previous_block_hash(next)
-            .map(|previous_block_hash| previous_block_hash == anchor_hash)
-            .unwrap_or(true)
+        direct_successor_links_to_anchor(
+            self.sequencer.applying_previous_block_hash(next),
+            anchor_hash,
+        )
     }
 
     async fn send_action(&self, action: BlockSyncAction) -> bool {
@@ -810,11 +911,16 @@ impl SequencerTask {
         // verifier blocks the task here, stopping it from draining `input`. The
         // timeout matches the reactor's `dispatch_action` so a permanently
         // stalled driver does not wedge the pipeline forever.
+        let action_label = action.metric_label();
         match time::timeout(self.action_send_timeout, self.actions.send(action)).await {
             Ok(Ok(())) => true,
             Ok(Err(_)) => false,
             Err(_) => {
-                metrics::counter!("sync.block.action.send_timeout").increment(1);
+                metrics::counter!(
+                    "sync.block.action.send_timeout",
+                    "action" => action_label
+                )
+                .increment(1);
                 false
             }
         }
@@ -824,20 +930,20 @@ impl SequencerTask {
         self.committed_throughput.sample(Instant::now());
         let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
         let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
-        let body_input_bytes = self
-            .body_input_bytes
+        let sequencer_input_decoded_attributed_memory_bytes = self
+            .body_input_decoded_attributed_memory_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
-        // Cross-layer drift check: the independently-maintained `ByteBudget` total
-        // must equal the sum of the component counters. `work.reserved_bytes()` is
-        // now an O(1) counter, so this runs on every event without a work-queue scan.
-        let expected_budget = self
-            .work
-            .reserved_bytes()
-            .saturating_add(reorder_buffered_bytes)
-            .saturating_add(applying_buffered_bytes)
-            .saturating_add(body_input_bytes);
+        let reorder_decoded_attributed_memory_bytes =
+            self.sequencer.reorder_decoded_attributed_memory_bytes();
+        let applying_decoded_attributed_memory_bytes =
+            self.sequencer.applying_decoded_attributed_memory_bytes();
+        let active_pipeline_decoded_attributed_memory_bytes =
+            sequencer_input_decoded_attributed_memory_bytes
+                .saturating_add(reorder_decoded_attributed_memory_bytes)
+                .saturating_add(applying_decoded_attributed_memory_bytes);
+        // Retained bodies do not charge the request budget.
         self.budget
-            .audit(expected_budget, "block-sync sequencer view");
+            .audit(self.work.reserved_bytes(), "block-sync sequencer view");
         let next = SequencerView {
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,
@@ -849,24 +955,83 @@ impl SequencerTask {
             applying_len: self.sequencer.applying_len() as u64,
             reorder_buffered_bytes,
             applying_buffered_bytes,
+            sequencer_input_decoded_attributed_memory_bytes,
+            reorder_decoded_attributed_memory_bytes,
+            applying_decoded_attributed_memory_bytes,
+            active_pipeline_decoded_attributed_memory_bytes,
             unsubmitted_applying_count: self.sequencer.unsubmitted_applying_count() as u64,
-            submitted_applying_count: self.sequencer.submitted_applying_count() as u64,
-            submitted_applying_bytes: self.sequencer.submitted_applying_bytes(),
+            in_flight_submission_count: self.sequencer.in_flight_submission_count() as u64,
+            in_flight_submission_bytes: self.sequencer.in_flight_submission_bytes(),
             committed_bytes_per_sec: self.committed_throughput.bytes_per_sec(),
             committed_blocks_per_sec: self.committed_throughput.blocks_per_sec(),
         };
         // Only wake watchers (the reactor + every per-peer routine) when a field
         // they schedule against actually changed. The two committed_*_per_sec rates
-        // are observability-only; without this guard a no-op control input — e.g. a
-        // `FundFloorReservation` that shed nothing while the byte budget is pinned —
-        // still publishes an otherwise-identical view and re-wakes the requesting
-        // routine's `sequencer_view.changed()` arm into an immediate refill retry.
+        // are observability-only; without this guard a stale or duplicate
+        // `ApplyFinished` input can publish an otherwise-identical view and re-wake
+        // every routine's `sequencer_view.changed()` arm into an immediate refill
+        // retry.
         // That is a timer-free reactor<->sequencer<->routine busy-spin: it wastes a
         // core (and starves progress under CI load) on a real clock and fully wedges
         // a `start_paused` test clock, which auto-advances only once every task
         // parks. Keep the stored rates fresh, but notify only on a schedulable change.
         publish_sequencer_view(&self.view_tx, next);
     }
+
+    fn publish_decoded_ownership_view(&self) {
+        let sequencer_input_decoded_attributed_memory_bytes = self
+            .body_input_decoded_attributed_memory_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let reorder_decoded_attributed_memory_bytes =
+            self.sequencer.reorder_decoded_attributed_memory_bytes();
+        let applying_decoded_attributed_memory_bytes =
+            self.sequencer.applying_decoded_attributed_memory_bytes();
+        let active_pipeline_decoded_attributed_memory_bytes =
+            sequencer_input_decoded_attributed_memory_bytes
+                .saturating_add(reorder_decoded_attributed_memory_bytes)
+                .saturating_add(applying_decoded_attributed_memory_bytes);
+        self.view_tx.send_if_modified(|view| {
+            view.sequencer_input_decoded_attributed_memory_bytes =
+                sequencer_input_decoded_attributed_memory_bytes;
+            view.reorder_decoded_attributed_memory_bytes = reorder_decoded_attributed_memory_bytes;
+            view.applying_decoded_attributed_memory_bytes =
+                applying_decoded_attributed_memory_bytes;
+            view.active_pipeline_decoded_attributed_memory_bytes =
+                active_pipeline_decoded_attributed_memory_bytes;
+            false
+        });
+    }
+}
+
+fn add_atomic_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
+    let _ = counter.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |current| Some(current.saturating_add(bytes)),
+    );
+}
+
+fn release_atomic_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
+    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(bytes);
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn direct_successor_links_to_anchor(
+    previous_block_hash: Option<block::Hash>,
+    anchor_hash: block::Hash,
+) -> bool {
+    previous_block_hash.is_some_and(|hash| hash == anchor_hash)
 }
 
 fn publish_sequencer_view(view_tx: &watch::Sender<SequencerView>, next: SequencerView) {
@@ -886,6 +1051,10 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
         let mut v = *v;
         v.committed_bytes_per_sec = 0;
         v.committed_blocks_per_sec = 0;
+        v.sequencer_input_decoded_attributed_memory_bytes = 0;
+        v.reorder_decoded_attributed_memory_bytes = 0;
+        v.applying_decoded_attributed_memory_bytes = 0;
+        v.active_pipeline_decoded_attributed_memory_bytes = 0;
         v
     };
     strip_rates(a) != strip_rates(b)
@@ -893,7 +1062,25 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use zakura_chain::serialization::ZcashDeserializeInto;
+    use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
+
     use super::*;
+
+    #[test]
+    fn missing_direct_successor_cannot_prove_reset_anchor() {
+        let anchor_hash = block::Hash([1; 32]);
+
+        assert!(direct_successor_links_to_anchor(
+            Some(anchor_hash),
+            anchor_hash
+        ));
+        assert!(!direct_successor_links_to_anchor(
+            Some(block::Hash([2; 32])),
+            anchor_hash
+        ));
+        assert!(!direct_successor_links_to_anchor(None, anchor_hash));
+    }
 
     fn test_view() -> SequencerView {
         SequencerView {
@@ -907,12 +1094,306 @@ mod tests {
             applying_len: 0,
             reorder_buffered_bytes: 0,
             applying_buffered_bytes: 0,
+            sequencer_input_decoded_attributed_memory_bytes: 0,
+            reorder_decoded_attributed_memory_bytes: 0,
+            applying_decoded_attributed_memory_bytes: 0,
+            active_pipeline_decoded_attributed_memory_bytes: 0,
             unsubmitted_applying_count: 0,
-            submitted_applying_count: 0,
-            submitted_applying_bytes: 0,
+            in_flight_submission_count: 0,
+            in_flight_submission_bytes: 0,
             committed_bytes_per_sec: 0,
             committed_blocks_per_sec: 0,
         }
+    }
+
+    fn test_block() -> Arc<block::Block> {
+        Arc::new(
+            BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .expect("block test vector parses"),
+        )
+    }
+
+    fn queued_test_body(
+        input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    ) -> SequencedBody {
+        let block = test_block();
+        let previous_block_hash = block.header.previous_block_hash;
+        SequencedBody::new_queued(
+            block::Height(1),
+            block.hash(),
+            previous_block_hash,
+            BufferedBlockBody::from_decoded_block(block, None),
+            123,
+            ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid"),
+            Instant::now(),
+            input_bytes,
+            input_decoded_attributed_memory_bytes,
+        )
+    }
+
+    #[test]
+    fn sequenced_body_leave_and_drop_release_queue_counters_once() {
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut body = queued_test_body(
+            input_bytes.clone(),
+            input_decoded_attributed_memory_bytes.clone(),
+        );
+
+        assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 123);
+        assert!(
+            input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed) > 0
+        );
+
+        body.leave_queue();
+        assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        drop(body);
+        assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_send_drops_its_queue_accounting() {
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (body_tx, mut body_rx) = mpsc::channel(1);
+        body_tx
+            .try_send(queued_test_body(
+                input_bytes.clone(),
+                input_decoded_attributed_memory_bytes.clone(),
+            ))
+            .expect("body channel has capacity");
+        let blocked_body = queued_test_body(
+            input_bytes.clone(),
+            input_decoded_attributed_memory_bytes.clone(),
+        );
+        let blocked_send = tokio::spawn(async move { body_tx.send(blocked_body).await });
+        tokio::task::yield_now().await;
+        assert!(!blocked_send.is_finished());
+
+        blocked_send.abort();
+        let _ = blocked_send.await;
+        assert_eq!(
+            input_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            123,
+            "only the body already queued remains charged"
+        );
+
+        let mut queued = body_rx.recv().await.expect("first body remains queued");
+        queued.leave_queue();
+        assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_receiver_with_live_permit_drops_queue_accounting() {
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (body_tx, body_rx) = mpsc::channel(1);
+        let permit = body_tx
+            .reserve_owned()
+            .await
+            .expect("receiver is initially open");
+        drop(body_rx);
+
+        permit.send(queued_test_body(
+            input_bytes.clone(),
+            input_decoded_attributed_memory_bytes.clone(),
+        ));
+
+        assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submission_retries_after_action_channel_capacity_returns() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body_input_decoded_attributed_memory_bytes =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, mut actions_rx) = mpsc::channel(1);
+        actions
+            .try_send(BlockSyncAction::QueryNeededBlocks {
+                from: block::Height(1),
+                limit: 1,
+                best_header_tip: block::Height(1),
+            })
+            .expect("test fills the action channel");
+        let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+        let task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            body_rx,
+            control_rx,
+            body_input_bytes.clone(),
+            body_input_decoded_attributed_memory_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+        let task = tokio::spawn(task.run());
+
+        body_tx
+            .send(queued_test_body(
+                body_input_bytes,
+                body_input_decoded_attributed_memory_bytes,
+            ))
+            .await
+            .expect("body queues");
+
+        time::timeout(Duration::from_secs(2), async {
+            while view_rx.borrow_and_update().unsubmitted_applying_count == 0 {
+                view_rx
+                    .changed()
+                    .await
+                    .expect("sequencer view remains live");
+            }
+        })
+        .await
+        .expect("initial submission times out");
+
+        assert!(matches!(
+            actions_rx.recv().await,
+            Some(BlockSyncAction::QueryNeededBlocks { .. })
+        ));
+
+        let retried = time::timeout(Duration::from_secs(1), actions_rx.recv())
+            .await
+            .expect("submission is retried after capacity returns")
+            .expect("action channel remains live");
+        assert!(matches!(retried, BlockSyncAction::SubmitBlock { .. }));
+
+        task.abort();
+    }
+
+    #[test]
+    fn handoff_publishes_applying_decoded_bytes_before_submission() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body_input_decoded_attributed_memory_bytes =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut body = queued_test_body(
+            body_input_bytes.clone(),
+            body_input_decoded_attributed_memory_bytes.clone(),
+        );
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, _actions_rx) = mpsc::channel(1);
+        let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            body_rx,
+            control_rx,
+            body_input_bytes,
+            body_input_decoded_attributed_memory_bytes,
+            view_tx,
+            Duration::from_secs(60),
+            ZakuraTrace::noop(),
+        );
+
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.publish_decoded_ownership_view();
+
+        let handoff = *view_rx.borrow();
+        assert_eq!(handoff.sequencer_input_decoded_attributed_memory_bytes, 0);
+        assert!(handoff.applying_decoded_attributed_memory_bytes > 0);
+        assert_eq!(handoff.reorder_decoded_attributed_memory_bytes, 0);
+        assert_eq!(
+            handoff.active_pipeline_decoded_attributed_memory_bytes,
+            handoff.applying_decoded_attributed_memory_bytes
+        );
+    }
+
+    #[test]
+    fn dropping_task_releases_queue_and_publishes_terminal_decoded_view() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let (body_tx, body_rx) = mpsc::channel(1);
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body_input_decoded_attributed_memory_bytes =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        body_tx
+            .try_send(queued_test_body(
+                body_input_bytes.clone(),
+                body_input_decoded_attributed_memory_bytes.clone(),
+            ))
+            .expect("body channel has capacity");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, _actions_rx) = mpsc::channel(1);
+        let mut initial = initial_view(frontiers);
+        initial.reorder_decoded_attributed_memory_bytes = 10;
+        initial.applying_decoded_attributed_memory_bytes = 20;
+        initial.active_pipeline_decoded_attributed_memory_bytes =
+            body_input_decoded_attributed_memory_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(30);
+        let (view_tx, view_rx) = watch::channel(initial);
+        let task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(1),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            body_rx,
+            control_rx,
+            body_input_bytes.clone(),
+            body_input_decoded_attributed_memory_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+
+        drop(task);
+
+        assert_eq!(
+            body_input_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            body_input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let terminal = *view_rx.borrow();
+        assert_eq!(terminal.sequencer_input_decoded_attributed_memory_bytes, 0);
+        assert_eq!(terminal.reorder_decoded_attributed_memory_bytes, 0);
+        assert_eq!(terminal.applying_decoded_attributed_memory_bytes, 0);
+        assert_eq!(terminal.active_pipeline_decoded_attributed_memory_bytes, 0);
     }
 
     #[tokio::test(start_paused = true)]

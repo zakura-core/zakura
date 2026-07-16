@@ -24,9 +24,6 @@ reaper within 24 hours.
 
 ## Prerequisites
 
-Reuses the sync-confidence DO credentials (see
-`docs/sync-confidence-do-setup.md` — no new secrets):
-
 - Secrets: `DIGITALOCEAN_ACCESS_TOKEN`, `DO_SSH_PRIVATE_KEY`.
 - Variables: `DO_SSH_KEY_FINGERPRINT`.
 - Optional variable overrides for the bake's snapshot sources:

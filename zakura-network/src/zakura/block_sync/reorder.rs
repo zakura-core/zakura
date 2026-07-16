@@ -4,6 +4,7 @@ use super::{state::*, wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES, *};
 pub(crate) struct ReorderBuffer {
     blocks: BTreeMap<block::Height, BufferedBlock>,
     buffered_bytes: u64,
+    decoded_attributed_memory_bytes: u64,
 }
 
 impl ReorderBuffer {
@@ -11,6 +12,7 @@ impl ReorderBuffer {
         Self {
             blocks: BTreeMap::new(),
             buffered_bytes: 0,
+            decoded_attributed_memory_bytes: 0,
         }
     }
 
@@ -18,15 +20,20 @@ impl ReorderBuffer {
         self.buffered_bytes
     }
 
-    pub(super) fn len(&self) -> usize {
-        self.blocks.len()
+    pub(super) fn decoded_attributed_memory_bytes(&self) -> u64 {
+        self.decoded_attributed_memory_bytes
     }
 
-    /// Highest buffered height, if any. The shed-for-floor-starvation path drops
-    /// this (the body furthest from the committed floor) to free budget for a
-    /// lower, commit-unblocking request.
-    pub(super) fn max_height(&self) -> Option<block::Height> {
-        self.blocks.keys().next_back().copied()
+    #[cfg(test)]
+    pub(super) fn decoded_attributed_memory_bytes_scanned(&self) -> u64 {
+        self.blocks
+            .values()
+            .map(|buffered| buffered.body.decoded_attributed_memory_size_bytes())
+            .fold(0u64, u64::saturating_add)
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.blocks.len()
     }
 
     pub(super) fn contains(&self, height: block::Height) -> bool {
@@ -41,12 +48,10 @@ impl ReorderBuffer {
         self.blocks.get(&height).map(|buffered| buffered.hash)
     }
 
-    /// Buffer a received body that already owns its `bytes` reservation.
+    /// Buffer a received body with its wire `bytes` size.
     ///
-    /// The caller reserved worst-case bytes for this height at send time and
-    /// shrank that reservation to `bytes` on receipt, so the reorder buffer takes
-    /// ownership of the existing reservation without touching the budget and can
-    /// never fail on budget. A `Duplicate` height is left to the caller to release.
+    /// Retained bodies carry no wire-budget charge (the resident look-ahead gate
+    /// bounds them via `buffered_bytes`), so an insert can never fail on budget.
     #[cfg(test)]
     pub(super) fn insert(
         &mut self,
@@ -55,10 +60,12 @@ impl ReorderBuffer {
         bytes: u64,
         source_peer: ZakuraPeerId,
     ) -> ReorderInsertResult {
+        let previous_block_hash = block.header.previous_block_hash;
         self.insert_body(
             height,
             block.hash(),
-            BufferedBlockBody::Decoded(block),
+            previous_block_hash,
+            BufferedBlockBody::from_decoded_block(block, None),
             bytes,
             source_peer,
         )
@@ -70,6 +77,7 @@ impl ReorderBuffer {
         &mut self,
         height: block::Height,
         hash: block::Hash,
+        previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         bytes: u64,
         source_peer: ZakuraPeerId,
@@ -78,23 +86,28 @@ impl ReorderBuffer {
             return ReorderInsertResult::Duplicate;
         }
 
+        let decoded_attributed_memory_size_bytes = body.decoded_attributed_memory_size_bytes();
         self.blocks.insert(
             height,
             BufferedBlock {
                 hash,
+                previous_block_hash,
                 body,
                 bytes,
                 source_peer,
             },
         );
         self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+        self.decoded_attributed_memory_bytes = self
+            .decoded_attributed_memory_bytes
+            .saturating_add(decoded_attributed_memory_size_bytes);
         ReorderInsertResult::Inserted
     }
 
     pub(super) fn drain_contiguous_prefix(
         &mut self,
         verified_block_tip: block::Height,
-    ) -> Vec<(block::Height, Arc<block::Block>, u64, ZakuraPeerId)> {
+    ) -> Vec<DrainedBlock> {
         let mut released = Vec::new();
         let mut next = match next_height(verified_block_tip) {
             Some(next) => next,
@@ -103,12 +116,17 @@ impl ReorderBuffer {
 
         while let Some(buffered) = self.blocks.remove(&next) {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
-            released.push((
-                next,
-                buffered.body.into_block(),
-                buffered.bytes,
-                buffered.source_peer,
-            ));
+            self.decoded_attributed_memory_bytes = self
+                .decoded_attributed_memory_bytes
+                .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());
+            released.push(DrainedBlock {
+                height: next,
+                hash: buffered.hash,
+                previous_block_hash: buffered.previous_block_hash,
+                body: buffered.body,
+                bytes: buffered.bytes,
+                source_peer: buffered.source_peer,
+            });
             let Some(after) = next_height(next) else {
                 break;
             };
@@ -118,10 +136,8 @@ impl ReorderBuffer {
         released
     }
 
-    /// Drop every buffered body and return the total bytes they held, so the
-    /// caller releases exactly that reservation. The reorder buffer is owned by
-    /// the `Sequencer`, which does not touch the byte budget; it returns the
-    /// freed bytes to the reactor instead.
+    /// Drop every buffered body and return the total bytes they held (the
+    /// retained-size accounting the resident view reads; not a budget charge).
     pub(crate) fn clear(&mut self) -> u64 {
         self.drop_from(block::Height::MIN)
     }
@@ -137,6 +153,9 @@ impl ReorderBuffer {
         for height in heights {
             if let Some(buffered) = self.blocks.remove(&height) {
                 self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+                self.decoded_attributed_memory_bytes = self
+                    .decoded_attributed_memory_bytes
+                    .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());
                 released = released.saturating_add(buffered.bytes);
             }
         }
@@ -154,6 +173,9 @@ impl ReorderBuffer {
         for height in heights {
             if let Some(buffered) = self.blocks.remove(&height) {
                 self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+                self.decoded_attributed_memory_bytes = self
+                    .decoded_attributed_memory_bytes
+                    .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());
                 released = released.saturating_add(buffered.bytes);
             }
         }
@@ -167,9 +189,23 @@ pub(super) enum ReorderInsertResult {
     Duplicate,
 }
 
+/// One block released from the contiguous reorder prefix, still in whatever
+/// buffered form it was held in (raw bytes for backlog entries), so draining
+/// into `applying` never forces a decode.
+#[derive(Clone, Debug)]
+pub(super) struct DrainedBlock {
+    pub(super) height: block::Height,
+    pub(super) hash: block::Hash,
+    pub(super) previous_block_hash: block::Hash,
+    pub(super) body: BufferedBlockBody,
+    pub(super) bytes: u64,
+    pub(super) source_peer: ZakuraPeerId,
+}
+
 #[derive(Clone, Debug)]
 struct BufferedBlock {
     hash: block::Hash,
+    previous_block_hash: block::Hash,
     body: BufferedBlockBody,
     bytes: u64,
     /// The peer that delivered this body, so an apply rejection can be attributed
@@ -180,28 +216,64 @@ struct BufferedBlock {
 #[derive(Clone, Debug)]
 pub(super) enum BufferedBlockBody {
     RawFramePayload(Arc<[u8]>),
-    Decoded(Arc<block::Block>),
+    Decoded {
+        block: Arc<block::Block>,
+        decoded_attributed_memory_size_bytes: u64,
+    },
     DecodedWithRawFramePayload {
         block: Arc<block::Block>,
         raw_frame_payload: Arc<[u8]>,
+        decoded_attributed_memory_size_bytes: u64,
     },
 }
 
 impl BufferedBlockBody {
+    #[cfg(any(test, feature = "internal-bench"))]
     pub(super) fn from_decoded_block(
         block: Arc<block::Block>,
         raw_frame_payload: Option<Arc<[u8]>>,
+    ) -> Self {
+        let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
+        Self::from_measured_decoded_block(
+            block,
+            raw_frame_payload,
+            decoded_attributed_memory_size_bytes,
+        )
+    }
+
+    pub(super) fn from_measured_decoded_block(
+        block: Arc<block::Block>,
+        raw_frame_payload: Option<Arc<[u8]>>,
+        decoded_attributed_memory_size_bytes: u64,
     ) -> Self {
         match raw_frame_payload {
             Some(raw_frame_payload) => BufferedBlockBody::DecodedWithRawFramePayload {
                 block,
                 raw_frame_payload,
+                decoded_attributed_memory_size_bytes,
             },
-            None => BufferedBlockBody::Decoded(block),
+            None => BufferedBlockBody::Decoded {
+                block,
+                decoded_attributed_memory_size_bytes,
+            },
         }
     }
 
-    // Drop the raw frame payload for the backlog.
+    pub(super) fn decoded_attributed_memory_size_bytes(&self) -> u64 {
+        match self {
+            BufferedBlockBody::RawFramePayload(_) => 0,
+            BufferedBlockBody::Decoded {
+                decoded_attributed_memory_size_bytes,
+                ..
+            }
+            | BufferedBlockBody::DecodedWithRawFramePayload {
+                decoded_attributed_memory_size_bytes,
+                ..
+            } => *decoded_attributed_memory_size_bytes,
+        }
+    }
+
+    // Drop the decoded body for the backlog.
     // This is used to save memory when the body is not the next block in the sequence.
     // DecodedWithRawFramePayload may hold the parsed block as well as the raw frame payload,
     // so we retain just the raw frame payload.
@@ -214,17 +286,62 @@ impl BufferedBlockBody {
         }
     }
 
-    fn into_block(self) -> Arc<block::Block> {
+    /// In-place [`Self::retain_for_backlog`]: drop the decoded copy when raw
+    /// bytes are retained, so a body leaving the bounded decode window releases
+    /// its decoded heap footprint.
+    pub(super) fn retain_for_backlog_in_place(&mut self) {
+        if let BufferedBlockBody::DecodedWithRawFramePayload {
+            raw_frame_payload, ..
+        } = self
+        {
+            *self = BufferedBlockBody::RawFramePayload(raw_frame_payload.clone());
+        }
+    }
+
+    /// Whether this body currently holds a decoded block.
+    #[cfg(test)]
+    pub(super) fn is_decoded(&self) -> bool {
+        !matches!(self, BufferedBlockBody::RawFramePayload(_))
+    }
+
+    /// Return the decoded block, decoding from the retained raw bytes if needed
+    /// and caching the decoded copy in place (the entry enters the decode
+    /// window; `retain_for_backlog_in_place` is the matching downgrade).
+    pub(super) fn decoded_block(&mut self) -> Arc<block::Block> {
         match self {
-            BufferedBlockBody::Decoded(block) => block,
-            BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block,
+            BufferedBlockBody::Decoded { block, .. }
+            | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block.clone(),
             BufferedBlockBody::RawFramePayload(payload) => {
-                let mut reader = Cursor::new(&payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..]);
-                Arc::new(
-                    block::Block::zcash_deserialize(&mut reader)
-                        .expect("raw block bytes deserialize because the peer routine decoded them before buffering"),
+                let block = decode_raw_frame_payload(payload);
+                let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
+                let serialized_bytes = payload.len().saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES);
+                // Metrics accepts f64 samples; these lossy conversions are observability-only.
+                metrics::histogram!(
+                    "sync.block.body.decoded.attributed_memory_size_bytes",
+                    "stage" => "reorder"
                 )
+                .record(decoded_attributed_memory_size_bytes as f64);
+                if serialized_bytes > 0 {
+                    metrics::histogram!(
+                        "sync.block.body.decoded.to_serialized_ratio",
+                        "stage" => "reorder"
+                    )
+                    .record(decoded_attributed_memory_size_bytes as f64 / serialized_bytes as f64);
+                }
+                *self = BufferedBlockBody::DecodedWithRawFramePayload {
+                    block: block.clone(),
+                    raw_frame_payload: payload.clone(),
+                    decoded_attributed_memory_size_bytes,
+                };
+                block
             }
         }
     }
+}
+
+fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> Arc<block::Block> {
+    let mut reader = Cursor::new(&payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..]);
+    Arc::new(block::Block::zcash_deserialize(&mut reader).expect(
+        "raw block bytes deserialize because the peer routine decoded them before buffering",
+    ))
 }

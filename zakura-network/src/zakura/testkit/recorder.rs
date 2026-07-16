@@ -119,7 +119,11 @@ impl Service for InboundRecorder {
     }
 
     fn add_peer(&self, mut peer: Peer) {
-        for stream in self.streams().iter().filter(|stream| stream.is_ordered()) {
+        for stream in self
+            .streams()
+            .iter()
+            .filter(|stream| matches!(stream.mode, crate::zakura::StreamMode::Ordered))
+        {
             let Some((mut recv, _send)) = peer.take_stream(stream.kind) else {
                 continue;
             };

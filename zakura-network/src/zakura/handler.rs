@@ -1406,9 +1406,9 @@ struct ConnectionServeContext {
     direction: ServicePeerDirection,
     transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
     /// Whether this node wins same-kind ordered-stream collisions on this
-    /// connection. A stream whose declaration permits either peer to open can
-    /// arrive twice; the winner keeps its own stream and the loser adopts the
-    /// peer's. Computed from the node ids so the two ends always agree:
+    /// connection. Block sync can be opened by either peer, so it can arrive
+    /// twice; the winner keeps its own stream and the loser adopts the peer's.
+    /// Computed from the node ids so the two ends always agree:
     /// `local_node_id < remote_node_id`.
     i_open_collision_winner: bool,
     conn: ZakuraConnTrace,
@@ -1421,8 +1421,8 @@ struct RegisteredConnectionServeContext {
     connection_token: CancellationToken,
     close_cause: CloseCause,
     accepted_capabilities: u64,
-    /// Whether this side dialed the connection. Each ordered stream's declared
-    /// opening policy uses this role to decide whether this side may open it.
+    /// Whether this side dialed the connection. The initiator opens ordinary
+    /// ordered streams; either side may open block sync.
     is_initiator: bool,
     /// See [`ConnectionServeContext::i_open_collision_winner`].
     i_open_collision_winner: bool,
@@ -1464,18 +1464,26 @@ struct OrderedStreamExit {
     opened_locally: bool,
 }
 
-/// Whether an exited ordered stream should be reopened on the same connection.
+/// Whether this side may open `kind` itself.
 ///
+/// The initiator opens ordinary ordered streams. Block sync is symmetric, so
+/// either side may open it and simultaneous offers use the connection's
+/// deterministic collision tiebreak.
+fn may_open_ordered_stream(kind: u16, is_initiator: bool) -> bool {
+    is_initiator || kind == ZAKURA_STREAM_BLOCK_SYNC
+}
+
 /// An ordered service session can be locally parked while its connection and
-/// sibling services remain healthy. Any side entitled by the stream declaration
-/// to open a replacement keeps offering one with bounded backoff. Concurrent
-/// offers are resolved by the same collision tiebreak as initial setup.
+/// sibling services remain healthy. Any side entitled by the transport policy
+/// to open a replacement keeps offering one with bounded backoff.
 fn should_reopen_ordered_stream(
     exited: OrderedStreamExit,
     is_initiator: bool,
     connection_cancelled: bool,
 ) -> bool {
-    exited.stream.may_open_ordered(is_initiator) && !connection_cancelled
+    exited.stream.mode == StreamMode::Ordered
+        && may_open_ordered_stream(exited.stream.kind, is_initiator)
+        && !connection_cancelled
 }
 
 /// Exponential reopen delay for one ordered stream kind, capped so a
@@ -1619,6 +1627,16 @@ pub struct ZakuraProtocolHandler {
     endpoint: Option<Endpoint>,
 }
 
+fn random_stream_session_seed() -> u64 {
+    let mut rng = OsRng;
+    loop {
+        let seed = rng.next_u64();
+        if seed != 0 {
+            return seed;
+        }
+    }
+}
+
 /// Resolve the inbound peer's UDP source IP from the endpoint's node map so the
 /// per-IP connection cap can be enforced for Router-accepted connections.
 ///
@@ -1724,7 +1742,10 @@ impl ZakuraProtocolHandler {
             registry,
             trace,
             next_conn_id: Arc::new(AtomicU64::new(1)),
-            next_stream_id: Arc::new(AtomicU64::new(1)),
+            // Stream session IDs are local correlation generations, not wire
+            // sequence numbers. A random process seed prevents preserved traces
+            // and late completions from colliding after a node restart.
+            next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
             shutdown: CancellationToken::new(),
@@ -1965,14 +1986,14 @@ impl ZakuraProtocolHandler {
         let negotiated_ordered_streams = self
             .registry
             .ordered_streams_for_negotiated(accepted_capabilities);
-        // Each stream declaration says which side may proactively open it. A
-        // service's demand check is only a current snapshot, so every locally
+        // The initiator opens ordinary ordered streams; block sync is symmetric.
+        // A service's demand check is only a current snapshot, so every locally
         // openable negotiated stream remains eligible for a later re-check.
         let ordered_streams: Vec<Stream> = self
             .registry
             .ordered_streams_for_escalation(accepted_capabilities, &peer_id, context.direction)
             .into_iter()
-            .filter(|stream| stream.may_open_ordered(context.is_initiator))
+            .filter(|stream| may_open_ordered_stream(stream.kind, context.is_initiator))
             .collect();
         let request_response_stream_count = self
             .registry
@@ -2007,7 +2028,7 @@ impl ZakuraProtocolHandler {
             .iter()
             .copied()
             .filter(|stream| {
-                stream.may_open_ordered(context.is_initiator)
+                may_open_ordered_stream(stream.kind, context.is_initiator)
                     && !ordered_streams
                         .iter()
                         .any(|opened| opened.kind == stream.kind)
@@ -2168,7 +2189,7 @@ impl ZakuraProtocolHandler {
                 }
                 Some(stream) = ordered_stream_reopen_rx.recv() => {
                     if connection_token.is_cancelled()
-                        || !stream.may_open_ordered(context.is_initiator)
+                        || !may_open_ordered_stream(stream.kind, context.is_initiator)
                         || opened_kinds.contains(&stream.kind)
                         || accepted_ordered_kinds.contains(&stream.kind)
                         || selected_ordered_streams.get(&stream.kind) != Some(&stream)
@@ -2298,12 +2319,10 @@ impl ZakuraProtocolHandler {
                                     connection_token.cancel();
                                     continue;
                                 }
-                                let stream = selected_ordered_streams[&kind];
-
                                 // Reject a stream opened by a peer whose
                                 // connection role is not entitled to open this
-                                // declared kind, even if it races our own offer.
-                                if !stream.may_open_ordered(!context.is_initiator) {
+                                // kind, even if it races our own offer.
+                                if !may_open_ordered_stream(kind, !context.is_initiator) {
                                     debug!(
                                         stream_kind = kind,
                                         "closing peer after unexpected ordered stream"
@@ -2368,7 +2387,7 @@ impl ZakuraProtocolHandler {
                                     // If this side may open the stream, re-check its
                                     // local demand. Otherwise the entitled remote
                                     // opener observes the parked stream and retries.
-                                    if stream.may_open_ordered(context.is_initiator)
+                                    if may_open_ordered_stream(kind, context.is_initiator)
                                         && selected_ordered_streams.contains_key(&kind)
                                     {
                                         schedule_ordered_stream_reopen(
@@ -4817,10 +4836,10 @@ mod tests {
             legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
             testkit::{await_until, LocalEndpointFactory, ZakuraTestNode},
             HeaderSyncEvent, HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession,
-            HeaderSyncRequestId, HeaderSyncStatus, OrderedStreamOpening, ServicePeerLimits,
-            ZakuraDiscoveryConfig, ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig,
-            LOCAL_MAX_MESSAGE_BYTES, MAX_HS_MESSAGE_BYTES, MSG_HS_STATUS, ZAKURA_CAP_DISCOVERY,
-            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
+            HeaderSyncRequestId, HeaderSyncStatus, ServicePeerLimits, ZakuraDiscoveryConfig,
+            ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, LOCAL_MAX_MESSAGE_BYTES,
+            MAX_HS_MESSAGE_BYTES, MSG_HS_STATUS, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP,
         },
         P2pStack,
     };
@@ -5352,9 +5371,7 @@ mod tests {
             version: 1,
             frame_cap: 1024,
             capability: ZAKURA_CAP_LEGACY_GOSSIP,
-            mode: StreamMode::Ordered {
-                opening: OrderedStreamOpening::Initiator,
-            },
+            mode: StreamMode::Ordered,
         };
         let service = GenerationGuardedRecordingService::new(vec![stream]);
         let registry = Arc::new(
@@ -5469,9 +5486,7 @@ mod tests {
             version: 1,
             frame_cap: 1024,
             capability: ZAKURA_CAP_LEGACY_GOSSIP,
-            mode: StreamMode::Ordered {
-                opening: OrderedStreamOpening::Initiator,
-            },
+            mode: StreamMode::Ordered,
         };
         let service = GenerationGuardedRecordingService::new(vec![stream]);
         let registry = Arc::new(
@@ -6717,17 +6732,15 @@ mod tests {
         Ok(())
     }
 
-    /// Reopen policy follows the stream declaration rather than a service kind.
+    /// Reopen policy follows the transport's opening roles.
     #[test]
-    fn ordered_stream_reopen_follows_declared_opening_policy() {
+    fn ordered_stream_reopen_follows_transport_opening_policy() {
         let initiator_opened = Stream {
-            kind: 100,
+            kind: ZAKURA_STREAM_HEADER_SYNC,
             version: 1,
             frame_cap: 1,
             capability: ZAKURA_CAP_HEADER_SYNC,
-            mode: StreamMode::Ordered {
-                opening: OrderedStreamOpening::Initiator,
-            },
+            mode: StreamMode::Ordered,
         };
         let exit = OrderedStreamExit {
             stream: initiator_opened,
@@ -6751,10 +6764,7 @@ mod tests {
 
         let either_peer = OrderedStreamExit {
             stream: Stream {
-                kind: 101,
-                mode: StreamMode::Ordered {
-                    opening: OrderedStreamOpening::EitherPeer,
-                },
+                kind: ZAKURA_STREAM_BLOCK_SYNC,
                 ..initiator_opened
             },
             ..exit
@@ -6959,9 +6969,7 @@ mod tests {
             version: ZAKURA_STREAM_VERSION_1,
             frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
             capability: ZAKURA_CAP_DISCOVERY,
-            mode: StreamMode::Ordered {
-                opening: OrderedStreamOpening::Initiator,
-            },
+            mode: StreamMode::Ordered,
         };
         let mut workers = JoinSet::new();
         let (ordered_stream_exit_tx, mut ordered_stream_exit_rx) = mpsc::unbounded_channel();
@@ -7821,9 +7829,7 @@ mod tests {
                     version: ZAKURA_STREAM_VERSION_1,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_LEGACY_GOSSIP,
-                    mode: StreamMode::Ordered {
-                        opening: OrderedStreamOpening::Initiator,
-                    },
+                    mode: StreamMode::Ordered,
                 },
                 Stream {
                     kind: LEGACY_REQUEST_STREAM_KIND,
@@ -7837,27 +7843,21 @@ mod tests {
                     version: ZAKURA_STREAM_VERSION_1,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_DISCOVERY,
-                    mode: StreamMode::Ordered {
-                        opening: OrderedStreamOpening::Initiator,
-                    },
+                    mode: StreamMode::Ordered,
                 },
                 Stream {
                     kind: HEADER_SYNC_STREAM_KIND,
                     version: ZAKURA_STREAM_VERSION_7,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_HEADER_SYNC,
-                    mode: StreamMode::Ordered {
-                        opening: OrderedStreamOpening::Initiator,
-                    },
+                    mode: StreamMode::Ordered,
                 },
                 Stream {
                     kind: ZAKURA_STREAM_BLOCK_SYNC,
                     version: ZAKURA_STREAM_VERSION_1,
                     frame_cap: MAX_BS_FRAME_BYTES,
                     capability: crate::zakura::ZAKURA_CAP_BLOCK_SYNC,
-                    mode: StreamMode::Ordered {
-                        opening: OrderedStreamOpening::EitherPeer,
-                    },
+                    mode: StreamMode::Ordered,
                 },
             ],
         }) as Arc<dyn Service>])

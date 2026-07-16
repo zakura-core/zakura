@@ -165,6 +165,20 @@ pub mod block_sync_trace {
     pub const ESTIMATED_BYTES: &str = "estimated_bytes";
     /// Serialized byte size of a received body.
     pub const SERIALIZED_BYTES: &str = "serialized_bytes";
+    /// Attributed decoded-memory size of a block body.
+    pub const DECODED_ATTRIBUTED_MEMORY_SIZE_BYTES: &str = "decoded_attributed_memory_size_bytes";
+    /// Decoded attributed-memory bytes queued at the Sequencer input.
+    pub const SEQUENCER_INPUT_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
+        "sequencer_input_decoded_attributed_memory_bytes";
+    /// Decoded attributed-memory bytes retained in the reorder buffer.
+    pub const REORDER_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
+        "reorder_decoded_attributed_memory_bytes";
+    /// Decoded attributed-memory bytes retained in applying entries.
+    pub const APPLYING_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
+        "applying_decoded_attributed_memory_bytes";
+    /// Aggregate decoded attributed-memory bytes in the active body pipeline.
+    pub const ACTIVE_PIPELINE_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
+        "active_pipeline_decoded_attributed_memory_bytes";
     /// End-to-end elapsed milliseconds for a traced operation.
     pub const ELAPSED_MS: &str = "elapsed_ms";
     /// Elapsed milliseconds before response frames were ready to send.
@@ -290,6 +304,8 @@ pub mod block_sync_trace {
     pub const BLOCK_SEQUENCER_CONTROL_SENT: &str = "block_sequencer_control_sent";
     /// Body submitted to the verifier for commit.
     pub const BLOCK_BODY_SUBMITTED: &str = "block_body_submitted";
+    /// Verifier submission could not enter the shared action channel.
+    pub const BLOCK_BODY_SUBMISSION_RETRY_SCHEDULED: &str = "block_body_submission_retry_scheduled";
     /// Verifier finished applying a submitted body.
     pub const BLOCK_APPLY_FINISHED: &str = "block_apply_finished";
     /// Peer reported a requested range as unavailable.
@@ -446,6 +462,8 @@ pub mod header_sync_trace {
     pub const HEADER_FRONTIER_REANCHORED: &str = "header_frontier_reanchored";
     /// Missing block bodies reported.
     pub const HEADER_MISSING_BODIES_REPORTED: &str = "header_missing_bodies_reported";
+    /// The reactor woke because a real retry, timeout, or status deadline expired.
+    pub const HEADER_MAINTENANCE_WAKEUP: &str = "header_maintenance_wakeup";
 }
 
 /// Shared commit/frontier adapter trace event names and field keys.

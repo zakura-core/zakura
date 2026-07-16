@@ -134,6 +134,18 @@ pub enum BlockSyncAction {
     },
 }
 
+impl BlockSyncAction {
+    /// Stable low-cardinality label for action-channel metrics.
+    pub(super) fn metric_label(&self) -> &'static str {
+        match self {
+            Self::QueryNeededBlocks { .. } => "query_needed_blocks",
+            Self::QueryBlocksByHeightRange { .. } => "query_blocks_by_height_range",
+            Self::SubmitBlock { .. } => "submit_block",
+            Self::Misbehavior { .. } => "misbehavior",
+        }
+    }
+}
+
 /// Block-sync peer-accounting violations.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BlockSyncMisbehavior {

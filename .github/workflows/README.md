@@ -153,7 +153,6 @@ _The diagram above illustrates the parallel execution patterns in our CI/CD syst
 - **Release Binaries** (`release-binaries.yml`): Stage or publish release artifacts and Docker images
 - **Release Drafter** (`release-drafter.yml`): Automates release notes
 - **Integration Tests on GCP** (`zfnd-ci-integration-tests-gcp.yml`): Stateful tests, cached disks, lwd flows
-- **Sync Confidence** (`sync-confidence.yml`): Full-validation sync of fixed pre/post-NU6.2 mainnet ranges on ephemeral DigitalOcean droplets (nyc3) restoring cached state from Spaces. The automatic `push` and `schedule` triggers are currently disabled (manual dispatch only) until `main` ships DB format 28.3.0 and matching snapshots. See `docs/sync-confidence-do-setup.md`.
 - **Upstream PR Sync Pilot** (`upstream-sync.yml`): Manual one-PR upstream discovery, Codex adaptation, and draft PR creation for fork maintenance
 
 ### Supporting/Re-usable Workflows
@@ -163,7 +162,6 @@ _The diagram above illustrates the parallel execution patterns in our CI/CD syst
 - **Deploy integration tests** (`zfnd-deploy-integration-tests-gcp.yml`): Orchestrates GCP VMs and test runs
 - **Deploy nodes** (`zfnd-deploy-nodes-gcp.yml`): Provision long-lived nodes
 - **Delete GCP resources** (`zfnd-delete-gcp-resources.yml`): Cleanup utilities
-- **DO sync test** (`do-sync-test.yml`): Reusable - provisions one ephemeral DO droplet, restores a pruned cached state from Spaces, runs a sync-confidence window, then deletes the droplet.
 - Helper scripts in `.github/workflows/scripts/` used by the above
 
 ## Test Execution Strategy

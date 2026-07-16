@@ -40,8 +40,18 @@ type SaplingTree = Arc<zakura_chain::sapling::tree::NoteCommitmentTree>;
 type OrchardTree = Arc<zakura_chain::orchard::tree::NoteCommitmentTree>;
 type SproutTree = Arc<zakura_chain::sprout::tree::NoteCommitmentTree>;
 
+fn vct_successor_header(block: Arc<Block>) -> NextVctBlock {
+    NextVctBlock::from_header(
+        block.header.clone(),
+        block
+            .coinbase_height()
+            .expect("prepared successor blocks have a coinbase height"),
+        block.auth_data_root(),
+    )
+}
+
 fn next_vct_block(block: Arc<Block>) -> Option<NextVctBlock> {
-    Some(NextVctBlock::from_block(block, None))
+    Some(vct_successor_header(block))
 }
 
 #[test]
@@ -393,7 +403,7 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
 /// sets + history root) as the legacy recompute path across all upgrade boundaries,
 /// and a wrong fixture root is rejected (verify-before-commit) rather than persisted.
 /// Exercises: a below-Heartwood seed, history-tree creation at Heartwood, the NU5
-/// V1->V2 transition, verify-ahead against the buffered successor, trusted fixture tip
+/// V1->V2 transition, verify-ahead against the successor header, trusted fixture tip
 /// commits without a successor, and rejection of a corrupted root.
 #[test]
 #[allow(clippy::needless_range_loop)] // the loops index blocks[i+1] and the fixture by height
@@ -649,7 +659,7 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < last)
-                    .then(|| NextVctBlock::from_block(blocks[i + 1].block.clone(), None));
+                    .then(|| vct_successor_header(blocks[i + 1].block.clone()));
                 match fast.commit_finalized_direct(cv.into(), None, next, "vct hole fast") {
                     Ok(_) => {}
                     Err(error) => {
@@ -774,7 +784,7 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
 }
 
 /// An *untrusted* (peer) source must never commit a fast block whose own supplied root has
-/// no buffered successor to confirm it against the header chain. A block's roots are only
+/// no successor header to confirm it against the header chain. A block's roots are only
 /// committed by the next block's header (the one-block lag), so committing at the sync tip
 /// would persist a root checked only one block later — irreversibly, once on disk. A wrong
 /// tip root would then wedge the sync with no recovery (the failure surfaces at the next
@@ -867,7 +877,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             }
             prop_assert_eq!(fast.db.finalized_tip_height(), Some(Height((tip_target - 1) as u32)));
 
-            // The tip target with no buffered successor must defer, not commit: its own
+            // The tip target with no successor header must defer, not commit: its own
             // (correct) root is not yet confirmed, and the peer source is untrusted.
             prop_assert!(
                 fast.vct_fast_needs_successor(Height(tip_target as u32)),
@@ -1364,7 +1374,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < last)
-                    .then(|| NextVctBlock::from_block(blocks[i + 1].block.clone(), None));
+                    .then(|| vct_successor_header(blocks[i + 1].block.clone()));
                 fast.commit_finalized_direct(cv.into(), None, next, "vct fast handoff")
                     .expect("verified fast commit succeeds");
             }
@@ -1443,7 +1453,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < last)
-                    .then(|| NextVctBlock::from_block(blocks[i + 1].block.clone(), None));
+                    .then(|| vct_successor_header(blocks[i + 1].block.clone()));
                 match bad_handoff.commit_finalized_direct(cv.into(), None, next, "vct bad handoff") {
                     Ok(_) => {}
                     Err(error) => {
@@ -1500,7 +1510,7 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < last)
-                    .then(|| NextVctBlock::from_block(blocks[i + 1].block.clone(), None));
+                    .then(|| vct_successor_header(blocks[i + 1].block.clone()));
                 match bad_ironwood_handoff.commit_finalized_direct(cv.into(), None, next, "vct bad ironwood handoff") {
                     Ok(_) => {}
                     Err(error) => {
@@ -1628,7 +1638,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
                 for i in 0..=handoff_index {
                     let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                     let next = (i < handoff_index)
-                        .then(|| NextVctBlock::from_block(blocks[i + 1].block.clone(), None));
+                        .then(|| vct_successor_header(blocks[i + 1].block.clone()));
                     fast.commit_finalized_direct(cv.into(), None, next, "vct switch fast prefix")
                         .expect("verified fast prefix commits");
                 }
@@ -1705,7 +1715,7 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             for i in (seed + 1)..=post_handoff_tip {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let next = (i < post_handoff_tip)
-                    .then(|| NextVctBlock::from_block(blocks[i + 1].block.clone(), None));
+                    .then(|| vct_successor_header(blocks[i + 1].block.clone()));
                 fast_suffix
                     .commit_finalized_direct(cv.into(), None, next, "vct switch fast suffix")
                     .expect("fast suffix commits after manual prefix");
@@ -1768,10 +1778,11 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0 as usize;
 
-            // Seed just before NU5, then operate on four consecutive fast blocks so
-            // the forged-wrapper regression exercises `hashBlockCommitments`.
+            // Seed just before NU5, then operate on five consecutive fast blocks so
+            // the auth-data and forged-wrapper regressions exercise
+            // `hashBlockCommitments`.
             let seed = nu5 - 2;
-            let last = seed + 4;
+            let last = seed + 5;
             prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
 
             // Legacy pass to record the correct per-block roots as the fixture.
@@ -1816,18 +1827,172 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             commit(&mut fast, seed + 1);
             prop_assert_eq!(fast.vct_prevalidated_count(), 0, "the first fast block runs its own commitment check");
 
-            // Second fast block: its predecessor's look-ahead already validated it,
-            // so the own check is skipped — the dedup engages.
-            commit(&mut fast, seed + 2);
+            // ZIP-244 transaction IDs do not commit to authorizing data. Mutate
+            // a transparent unlocking script as an untrusted peer can, producing
+            // a body with the expected header hash and transaction ID but a
+            // different auth-data root. (Coinbase scripts are a special case:
+            // they are bound by the mined transaction ID.)
+            let honest_block = blocks[seed + 3].block.clone();
+            let mut hostile_block = (*honest_block).clone();
+            let (transaction_index, input_index) = honest_block
+                .transactions
+                .iter()
+                .enumerate()
+                .find_map(|(transaction_index, transaction)| {
+                    transaction
+                        .inputs()
+                        .iter()
+                        .position(|input| {
+                            matches!(input, zakura_chain::transparent::Input::PrevOut { .. })
+                        })
+                        .map(|input_index| (transaction_index, input_index))
+                })
+                .expect("the generated NU5 block must contain a transparent spend");
+            let hostile_transaction =
+                Arc::make_mut(&mut hostile_block.transactions[transaction_index]);
+            let zakura_chain::transparent::Input::PrevOut { unlock_script, .. } =
+                &mut hostile_transaction.inputs_mut()[input_index]
+            else {
+                unreachable!("the selected input is a transparent spend");
+            };
+            *unlock_script = zakura_chain::transparent::Script::new(&[0x42]);
+            let hostile_block = Arc::new(hostile_block);
+
+            prop_assert_eq!(
+                hostile_block.hash(),
+                honest_block.hash(),
+                "authorizing-data malleation must preserve the block hash",
+            );
+            prop_assert_eq!(
+                hostile_block.transactions[transaction_index].hash(),
+                honest_block.transactions[transaction_index].hash(),
+                "ZIP-244 transaction IDs must not bind transparent unlocking scripts",
+            );
+            prop_assert_ne!(
+                hostile_block.auth_data_root(),
+                honest_block.auth_data_root(),
+                "the hostile body must have a different auth-data root",
+            );
+
+            // Store the canonical successor header and its precomputed auth-data root,
+            // as header sync does before body sync. The separately constructed malformed
+            // same-hash body must not supply this witness. Using only the stored header
+            // preserves the valid root at `seed + 2` and the prevalidation dedup.
+            let header_heights =
+                Height((seed + 2) as u32)..=Height((seed + 3) as u32);
+            let header_roots =
+                commitment_aux::produce_block_roots(&legacy.db, header_heights);
+            for prepared in &blocks[(seed + 2)..=(seed + 3)] {
+                fast.db
+                    .seed_zakura_header_from_committed_block(
+                        prepared
+                            .block
+                            .coinbase_height()
+                            .expect("prepared successor blocks have a coinbase height"),
+                        &prepared.block,
+                    )
+                    .expect("the canonical successor header is stored");
+            }
+            fast.db
+                .insert_zakura_header_commitment_roots(header_roots)
+                .expect("the canonical successor roots are stored");
+
+            let cv = CheckpointVerifiedBlock::from(blocks[seed + 2].block.clone());
+            let stored_successor = fast
+                .vct_successor_from_header_store(
+                    Height((seed + 2) as u32),
+                    blocks[seed + 2].hash,
+                )
+                .expect("header sync stored the canonical successor witness");
+            fast.commit_finalized_direct(
+                cv.into(),
+                None,
+                Some(stored_successor),
+                "vct header-only successor with malformed body available",
+            )
+            .expect("the stored successor witness preserves the valid current root");
             prop_assert_eq!(fast.vct_prevalidated_count(), 1, "the second fast block skips its redundant own commitment check");
+
+            let mismatched = CheckpointVerifiedBlock::from(hostile_block.clone());
+
+            let error = fast
+                .commit_finalized_direct(
+                    mismatched.into(),
+                    None,
+                    None,
+                    "vct mismatched auth-data root",
+                )
+                .expect_err("a mismatched body must not reuse header-only prevalidation");
+            prop_assert!(
+                format!("{error:?}").contains("VctBlockAuthDataRootMismatch"),
+                "the mismatched body must be classified as invalid, got: {error:?}",
+            );
+            prop_assert_eq!(
+                error.vct_retryable_height(),
+                None,
+                "the write loop must not park and retry an irreparably invalid body",
+            );
+            prop_assert_eq!(
+                fast.vct_prevalidated_count(),
+                1,
+                "a mismatched auth-data root must not increment the prevalidated count",
+            );
+            prop_assert_eq!(
+                fast.db.finalized_tip_height(),
+                Some(Height((seed + 2) as u32)),
+                "the rejected body must leave finalized state untouched",
+            );
+
+            // A write-loop reset clears the prevalidation cache. The same invalid
+            // body must still be a hard error: replacing the supplied roots cannot
+            // repair a body whose auth data does not match its header commitment.
+            fast.clear_vct_prevalidated_next();
+            let mismatched_without_cache = CheckpointVerifiedBlock::from(hostile_block);
+            let error = fast
+                .commit_finalized_direct(
+                    mismatched_without_cache.into(),
+                    None,
+                    None,
+                    "vct mismatched auth-data root without prevalidation",
+                )
+                .expect_err("an invalid body must not become retryable when the cache is empty");
+            prop_assert!(
+                format!("{error:?}").contains("InvalidBlockCommitment"),
+                "the cache-empty mismatch must remain a block error, got: {error:?}",
+            );
+            prop_assert_eq!(
+                error.vct_retryable_height(),
+                None,
+                "the write loop must reset rather than park the invalid body",
+            );
+            prop_assert_eq!(
+                fast.db.finalized_tip_height(),
+                Some(Height((seed + 2) as u32)),
+                "the cache-empty rejected body must leave finalized state untouched",
+            );
+
+            // Rejecting either form of the invalid body must not evict the
+            // authenticated VCT roots. A subsequently downloaded honest body
+            // with the same hash can therefore commit and let checkpoint sync
+            // continue.
+            commit(&mut fast, seed + 3);
+            prop_assert_eq!(
+                fast.db.finalized_tip_height(),
+                Some(Height((seed + 3) as u32)),
+                "the honest same-hash body must commit after the hostile body is rejected",
+            );
 
             // Stale-cache guard: overwrite the cache with the correct height but the
             // hash of a *different* block. The next commit must NOT skip.
             let stale_hash = blocks[seed + 1].hash;
-            prop_assert_ne!(stale_hash, blocks[seed + 3].hash, "stale hash must differ from the real block");
+            prop_assert_ne!(stale_hash, blocks[seed + 4].hash, "stale hash must differ from the real block");
             fast.vct
-                .set_prevalidated_next(Some((Height((seed + 3) as u32), stale_hash)));
-            commit(&mut fast, seed + 3);
+                .set_prevalidated_next(Some((
+                    Height((seed + 4) as u32),
+                    stale_hash,
+                    Some(blocks[seed + 4].block.auth_data_root()),
+                )));
+            commit(&mut fast, seed + 4);
             prop_assert_eq!(fast.vct_prevalidated_count(), 1, "a stale cache entry (wrong hash) must not cause a false skip");
 
             // Public wrapper-hash guard: the stale cache records a real look-ahead
@@ -1836,7 +2001,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             // The skip must compare the cache against the wrapped block's real hash,
             // not the wrapper hash, so the bad commitment is checked and rejected.
             let forged_wrapper_hash = blocks[seed + 2].hash;
-            let bad_block = blocks[seed + 4].block.clone().set_block_commitment([0x42; 32]);
+            let bad_block = blocks[seed + 5].block.clone().set_block_commitment([0x42; 32]);
             let bad_block_hash = bad_block.hash();
             prop_assert_ne!(
                 forged_wrapper_hash,
@@ -1844,14 +2009,23 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                 "the forged wrapper hash must differ from the bad block's real hash",
             );
             fast.vct
-                .set_prevalidated_next(Some((Height((seed + 4) as u32), forged_wrapper_hash)));
+                .set_prevalidated_next(Some((
+                    Height((seed + 5) as u32),
+                    forged_wrapper_hash,
+                    Some(blocks[seed + 5].block.auth_data_root()),
+                )));
             let forged = CheckpointVerifiedBlock::with_hash(bad_block, forged_wrapper_hash);
             let error = fast
                 .commit_finalized_direct(forged.into(), None, None, "vct forged wrapper hash")
                 .expect_err("a forged wrapper hash must not skip the bad block's own commitment check");
             prop_assert!(
-                format!("{error:?}").contains("VctSuppliedRootUnavailable"),
+                format!("{error:?}").contains("InvalidBlockCommitment"),
                 "the forged wrapper hash path must reject the bad commitment, got: {error:?}",
+            );
+            prop_assert_eq!(
+                error.vct_retryable_height(),
+                None,
+                "a forged block commitment must not be retried as a supplied-root failure",
             );
             prop_assert_eq!(
                 fast.vct_prevalidated_count(),
@@ -1860,7 +2034,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             );
             prop_assert_eq!(
                 fast.db.finalized_tip_height(),
-                Some(Height((seed + 3) as u32)),
+                Some(Height((seed + 4) as u32)),
                 "the rejected forged block must leave finalized state untouched",
             );
     });

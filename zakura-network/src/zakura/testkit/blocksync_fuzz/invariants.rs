@@ -20,13 +20,23 @@ pub(crate) struct InvariantReport {
     pub(crate) state_samples: usize,
     /// Peak aggregate in-flight requests across all peers.
     pub(crate) max_outstanding: u64,
-    /// Peak reserved download bytes (memory pressure).
+    /// Peak reserved outstanding-request bytes (wire-limiter pressure; received
+    /// bodies release their reservation, so this excludes retained bodies).
     pub(crate) peak_budget_reserved: u64,
     /// Peak retained pipeline wire bytes (`sequencer_input + reorder + applying`), the
     /// wire-byte footprint of bodies actually held in memory. Multiplied by the
     /// deserialized-memory factor this approximates peak resident cost — unlike
     /// `peak_budget_reserved`, it excludes reservations for bytes not yet received.
     pub(crate) peak_retained_pipeline_wire_bytes: u64,
+    /// Peak decoded attributed-memory bytes attributed to the active body pipeline.
+    pub(crate) peak_active_pipeline_decoded_attributed_memory_bytes: u64,
+    /// Decoded attributed-memory bytes in the last state sample before harness teardown.
+    ///
+    /// This can be nonzero because reaching the target ends the scenario before
+    /// the terminal task-drop view is emitted to the trace.
+    pub(crate) final_active_pipeline_decoded_attributed_memory_bytes: u64,
+    /// Every state row's decoded stage totals equal its aggregate pipeline total.
+    pub(crate) decoded_stage_totals_match: bool,
     /// Final reserved download bytes (leak detector once quiesced).
     pub(crate) final_budget_reserved: u64,
     /// Protocol-invalid service rejects observed.
@@ -104,6 +114,25 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         .filter_map(|row| u64_field(row, "retained_pipeline_wire_bytes"))
         .max()
         .unwrap_or(0);
+    let peak_active_pipeline_decoded_attributed_memory_bytes = state_rows
+        .iter()
+        .filter_map(|row| u64_field(row, "active_pipeline_decoded_attributed_memory_bytes"))
+        .max()
+        .unwrap_or(0);
+    let final_active_pipeline_decoded_attributed_memory_bytes = state_rows
+        .iter()
+        .rev()
+        .find_map(|row| u64_field(row, "active_pipeline_decoded_attributed_memory_bytes"))
+        .unwrap_or(0);
+    let decoded_stage_totals_match = state_rows.iter().all(|row| {
+        let stage_total = u64_field(row, "sequencer_input_decoded_attributed_memory_bytes")
+            .unwrap_or(0)
+            .saturating_add(u64_field(row, "reorder_decoded_attributed_memory_bytes").unwrap_or(0))
+            .saturating_add(
+                u64_field(row, "applying_decoded_attributed_memory_bytes").unwrap_or(0),
+            );
+        u64_field(row, "active_pipeline_decoded_attributed_memory_bytes") == Some(stage_total)
+    });
     let protocol_rejects = reader
         .table("block_sync")
         .count("block_peer_protocol_reject");
@@ -174,6 +203,9 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         max_outstanding,
         peak_budget_reserved,
         peak_retained_pipeline_wire_bytes,
+        peak_active_pipeline_decoded_attributed_memory_bytes,
+        final_active_pipeline_decoded_attributed_memory_bytes,
+        decoded_stage_totals_match,
         final_budget_reserved,
         protocol_rejects,
         session_parks,
@@ -261,6 +293,14 @@ pub(crate) fn assert_core(
         report.state_samples > 0,
         "run emitted no block_sync_state rows",
     );
+    assert!(
+        report.decoded_stage_totals_match,
+        "decoded pipeline aggregate drifted from its stage totals",
+    );
+    assert!(
+        report.peak_active_pipeline_decoded_attributed_memory_bytes > 0,
+        "successful run never observed active decoded pipeline bytes",
+    );
 
     // Per-peer windows respect the advertised inflight caps: aggregate in-flight must
     // not exceed the sum of per-peer advertised `max_inflight_requests`.
@@ -277,17 +317,27 @@ pub(crate) fn assert_core(
         outstanding_bound,
     );
 
-    // The global byte budget is never over-committed: peak reserved download bytes
-    // (in-flight + reorder + applying) must stay within the configured ceiling. Every
-    // per-peer routine reserves against the same CAS-guarded `ByteBudget`, so this must
-    // hold no matter how many peers race — the memory bound the spec requires. Vacuous
-    // only for scenarios that set an effectively unbounded budget (`u64::MAX`); the
-    // tight-ceiling scenarios make it bite.
+    // The request budget permits at most one floor-request overdraft.
+    let overdraft_slack = scenario.config.floor_request_byte_reservation();
     assert!(
-        report.peak_budget_reserved <= scenario.config.max_inflight_block_bytes,
-        "peak reserved bytes {} exceeded the global in-flight byte budget {}",
+        report.peak_budget_reserved
+            <= scenario
+                .config
+                .max_inflight_block_bytes
+                .saturating_add(overdraft_slack),
+        "peak reserved bytes {} exceeded the in-flight request budget {} (+{} floor-overdraft slack)",
         report.peak_budget_reserved,
         scenario.config.max_inflight_block_bytes,
+        overdraft_slack,
+    );
+
+    // The final snapshot can race one receipt handoff.
+    assert!(
+        report.final_budget_reserved <= overdraft_slack,
+        "reserved request bytes {} must drain to zero at quiescence (allowing one \
+         in-flight receipt release, <= {})",
+        report.final_budget_reserved,
+        overdraft_slack,
     );
 }
 

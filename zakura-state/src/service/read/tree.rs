@@ -188,10 +188,12 @@ where
 {
     use std::ops::Bound::*;
 
-    let start_index = match range.start_bound().cloned() {
-        Included(start_index) => start_index,
-        Excluded(start_index) => (start_index.0 + 1).into(),
-        Unbounded => 0.into(),
+    let Some(start_index) = (match range.start_bound().cloned() {
+        Included(start_index) => Some(start_index),
+        Excluded(start_index) => start_index.0.checked_add(1).map(Into::into),
+        Unbounded => Some(0.into()),
+    }) else {
+        return BTreeMap::new();
     };
 
     // # Correctness

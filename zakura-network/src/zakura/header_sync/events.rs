@@ -163,8 +163,6 @@ pub enum HeaderSyncEvent {
         height: block::Height,
         /// Committed block hash.
         hash: block::Hash,
-        /// Committed block header. Transient only; not retained by runtime state.
-        header: Arc<block::Header>,
     },
     /// The node's block pipeline accepted an inbound `NewBlock` body.
     NewBlockAccepted {
@@ -207,7 +205,8 @@ pub enum HeaderSyncEvent {
         /// Rejected block hash.
         hash: block::Hash,
     },
-    /// Compatibility/test inbound header-sync message without a session generation.
+    /// Test-only inbound header-sync message without a session generation.
+    #[cfg(test)]
     WireMessage {
         /// Serving peer.
         peer: ZakuraPeerId,
@@ -359,6 +358,7 @@ impl HeaderSyncEvent {
             Self::NewBlockDuplicate { .. } => "new_block_duplicate",
             Self::NewBlockAcceptedNonBestChain { .. } => "new_block_accepted_non_best_chain",
             Self::NewBlockRejected { .. } => "new_block_rejected",
+            #[cfg(test)]
             Self::WireMessage { .. } => "wire_message",
             Self::SessionWireMessage { .. } => "session_wire_message",
             Self::WireHeaders { .. } => "wire_headers",

@@ -97,6 +97,12 @@ enum RequesterEventOutcome {
     Schedule,
 }
 
+#[derive(Copy, Clone, Debug)]
+enum BestTipPublication {
+    Advanced,
+    Reanchored { old: (block::Height, block::Hash) },
+}
+
 pub(super) fn complete_request_publication(
     peer: &mut PeerHeaderState,
     request_id: HeaderSyncRequestId,
@@ -311,11 +317,9 @@ impl HeaderSyncReactor {
             HeaderSyncEvent::AdvisoryHeaderSummary { peer, summary } => {
                 self.handle_advisory_header_summary(peer, summary)
             }
-            HeaderSyncEvent::FullBlockCommitted {
-                height,
-                hash,
-                header: _,
-            } => self.handle_full_block_committed(height, hash).await,
+            HeaderSyncEvent::FullBlockCommitted { height, hash } => {
+                self.handle_full_block_committed(height, hash).await
+            }
             HeaderSyncEvent::NewBlockAccepted {
                 peer,
                 height,
@@ -334,6 +338,7 @@ impl HeaderSyncReactor {
             HeaderSyncEvent::NewBlockRejected { peer, hash } => {
                 self.handle_new_block_rejected(peer, hash).await
             }
+            #[cfg(test)]
             HeaderSyncEvent::WireMessage { peer, msg } => {
                 self.handle_wire_message(peer, msg).await;
             }
@@ -799,7 +804,8 @@ impl HeaderSyncReactor {
         self.update_verified_block_tip(height, hash);
         if height > self.state.best_header_tip {
             self.reconcile_forward_coverage(height, hash);
-            self.publish_best_tip(height, hash).await;
+            self.publish_best_tip(height, hash, BestTipPublication::Advanced)
+                .await;
             self.drain_buffered_with_permit(None).await;
         } else {
             self.state.schedule.mark_height_covered(height);
@@ -826,7 +832,8 @@ impl HeaderSyncReactor {
         self.update_verified_block_tip(height, hash);
         if height > self.state.best_header_tip {
             self.reconcile_forward_coverage(height, hash);
-            self.publish_best_tip(height, hash).await;
+            self.publish_best_tip(height, hash, BestTipPublication::Advanced)
+                .await;
             self.drain_buffered_with_permit(None).await;
         } else {
             self.state.schedule.mark_height_covered(height);
@@ -1090,13 +1097,14 @@ impl HeaderSyncReactor {
         // startup. In that path start==tip, so covered-range side effects are bounded.
         self.cancel_covered_outstanding();
         if tip_height > self.state.best_header_tip {
-            self.publish_best_tip(tip_height, tip_hash).await;
+            self.publish_best_tip(tip_height, tip_hash, BestTipPublication::Advanced)
+                .await;
         }
         if completed_backward {
             self.state.backward_frontier = Some((tip_height, tip_hash));
         }
-        self.drain_buffered_forward().await;
-        self.drain_buffered_backward().await;
+        self.drain_buffered_with_permit(None).await;
+        self.drain_buffered_with_permit(None).await;
         self.notify_body_gaps().await;
         self.schedule().await;
     }
@@ -1772,14 +1780,6 @@ impl HeaderSyncReactor {
         self.schedule().await;
     }
 
-    async fn drain_buffered_forward(&mut self) {
-        self.drain_buffered_with_permit(None).await;
-    }
-
-    async fn drain_buffered_backward(&mut self) {
-        self.drain_buffered_with_permit(None).await;
-    }
-
     async fn drain_buffered_with_permit(
         &mut self,
         mut reserved: Option<mpsc::OwnedPermit<HeaderSyncAction>>,
@@ -2072,7 +2072,14 @@ impl HeaderSyncReactor {
             .pending_commits
             .retain(|_, range| range.priority != RangePriority::Forward);
         self.cancel_forward_outstanding();
-        self.publish_best_tip_reanchored(height, hash).await;
+        self.publish_best_tip(
+            height,
+            hash,
+            BestTipPublication::Reanchored {
+                old: (self.state.best_header_tip, self.state.best_header_hash),
+            },
+        )
+        .await;
     }
 
     async fn handle_timeouts(&mut self) {
@@ -2541,30 +2548,29 @@ impl HeaderSyncReactor {
         true
     }
 
-    async fn publish_best_tip(&mut self, height: block::Height, hash: block::Hash) {
+    async fn publish_best_tip(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        publication: BestTipPublication,
+    ) {
         self.state.best_header_tip = height;
         self.state.best_header_hash = hash;
         self.state.last_header_progress_at = Instant::now();
         metrics::gauge!("sync.header.best_tip.height").set(height.0 as f64);
-        self.trace_frontier_advanced(height, hash);
+        match publication {
+            BestTipPublication::Advanced => self.trace_frontier_advanced(height, hash),
+            BestTipPublication::Reanchored { .. } => self.trace_frontier_reanchored(height, hash),
+        }
         let _ = self.tip.send((height, hash));
-        let _ = self.dispatch_action(HeaderSyncAction::HeaderAdvanced { height, hash });
-        self.publish_candidate_state();
-        self.broadcast_status_refresh().await;
-    }
-
-    async fn publish_best_tip_reanchored(&mut self, height: block::Height, hash: block::Hash) {
-        let old = (self.state.best_header_tip, self.state.best_header_hash);
-        self.state.best_header_tip = height;
-        self.state.best_header_hash = hash;
-        self.state.last_header_progress_at = Instant::now();
-        metrics::gauge!("sync.header.best_tip.height").set(height.0 as f64);
-        self.trace_frontier_reanchored(height, hash);
-        let _ = self.tip.send((height, hash));
-        let _ = self.dispatch_action(HeaderSyncAction::HeaderReanchored {
-            old,
-            new: (height, hash),
-        });
+        let action = match publication {
+            BestTipPublication::Advanced => HeaderSyncAction::HeaderAdvanced { height, hash },
+            BestTipPublication::Reanchored { old } => HeaderSyncAction::HeaderReanchored {
+                old,
+                new: (height, hash),
+            },
+        };
+        let _ = self.dispatch_action(action);
         self.publish_candidate_state();
         self.broadcast_status_refresh().await;
     }
@@ -2770,6 +2776,7 @@ impl HeaderSyncReactor {
                 insert_peer(row, hs_trace::PEER, peer);
                 insert_hash(row, hs_trace::HASH, *hash);
             }
+            #[cfg(test)]
             HeaderSyncEvent::WireMessage { peer, msg } => {
                 insert_optional_str(row, hs_trace::KIND, Some("wire_message"));
                 insert_optional_str(row, hs_trace::REASON, Some(header_sync_message_label(msg)));

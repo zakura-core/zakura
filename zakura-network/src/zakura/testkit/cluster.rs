@@ -783,7 +783,6 @@ mod tests {
                 .send(HeaderSyncEvent::FullBlockCommitted {
                     height,
                     hash: block.hash(),
-                    header: block.header.clone(),
                 })
                 .await
                 .unwrap();

@@ -304,6 +304,8 @@ pub mod block_sync_trace {
     pub const BLOCK_SEQUENCER_CONTROL_SENT: &str = "block_sequencer_control_sent";
     /// Body submitted to the verifier for commit.
     pub const BLOCK_BODY_SUBMITTED: &str = "block_body_submitted";
+    /// Verifier submission could not enter the shared action channel.
+    pub const BLOCK_BODY_SUBMISSION_RETRY_SCHEDULED: &str = "block_body_submission_retry_scheduled";
     /// Verifier finished applying a submitted body.
     pub const BLOCK_APPLY_FINISHED: &str = "block_apply_finished";
     /// Peer reported a requested range as unavailable.

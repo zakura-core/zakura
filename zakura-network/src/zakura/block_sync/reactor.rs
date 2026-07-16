@@ -2212,11 +2212,26 @@ impl BlockSyncReactor {
     /// stalled driver wedge the reactor. Returns `true` only if the action was
     /// accepted.
     fn dispatch_action(&self, action: BlockSyncAction) -> bool {
+        let action_label = action.metric_label();
+        let queue_depth = self
+            .actions
+            .max_capacity()
+            .saturating_sub(self.actions.capacity());
+        // Metrics accepts f64 samples; this lossy conversion is observability-only.
+        metrics::histogram!(
+            "sync.block.action.queue.depth",
+            "action" => action_label
+        )
+        .record(queue_depth as f64);
         self.trace_action_dispatched(&action);
         match self.actions.try_send(action) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                metrics::counter!("sync.block.action.send_queue_full").increment(1);
+                metrics::counter!(
+                    "sync.block.action.send_queue_full",
+                    "action" => action_label
+                )
+                .increment(1);
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
@@ -2233,8 +2248,7 @@ impl BlockSyncReactor {
         // lifecycle draining whenever the action driver was slow. `try_send` keeps
         // the reactor live.
         let action = BlockSyncAction::Misbehavior { peer, reason };
-        self.trace_action_dispatched(&action);
-        if self.actions.try_send(action).is_err() {
+        if !self.dispatch_action(action) {
             metrics::counter!("sync.block.peer.violation.action_dropped").increment(1);
         }
     }

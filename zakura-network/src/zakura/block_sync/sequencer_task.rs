@@ -15,6 +15,7 @@
 //! byte budget, and work queue directly and emit `SubmitBlock`/`Misbehavior`
 //! actions on the same channel the reactor uses.
 
+use super::super::trace::queue_send_trace as qs_trace;
 use super::{
     events::*,
     reactor::{bs_insert_height, bs_insert_str, bs_insert_u64},
@@ -24,6 +25,10 @@ use super::{
     work_queue::WorkQueue,
     *,
 };
+
+/// Delay before retrying a verifier submission that could not enter the shared
+/// action channel.
+const SUBMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// A received body a peer routine matched (or accepted unmatched) and forwards
 /// to the commit pipeline. This is the only bounded Sequencer input: a slow
@@ -244,6 +249,9 @@ pub(super) struct SequencerTask {
     body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
     view_tx: watch::Sender<SequencerView>,
     action_send_timeout: Duration,
+    submission_retry_at: Option<time::Instant>,
+    submission_retry_started_at: Option<time::Instant>,
+    submission_retry_attempt: u64,
     trace: ZakuraTrace,
 }
 
@@ -294,6 +302,9 @@ impl SequencerTask {
             body_input_decoded_attributed_memory_bytes,
             view_tx,
             action_send_timeout,
+            submission_retry_at: None,
+            submission_retry_started_at: None,
+            submission_retry_attempt: 0,
             trace,
         }
     }
@@ -305,9 +316,10 @@ impl SequencerTask {
         let mut control_open = true;
         let mut body_open = true;
         loop {
-            if !control_open && !body_open {
+            if !control_open && !body_open && self.submission_retry_at.is_none() {
                 break;
             }
+            let submission_retry_at = self.submission_retry_at;
             tokio::select! {
                 biased;
 
@@ -322,6 +334,14 @@ impl SequencerTask {
                         }
                         None => control_open = false,
                     }
+                }
+
+                _ = time::sleep_until(submission_retry_at.unwrap_or_else(time::Instant::now)),
+                    if submission_retry_at.is_some() =>
+                {
+                    self.submission_retry_at = None;
+                    self.submit_pending_blocks().await;
+                    self.publish_view();
                 }
 
                 body = self.body_input_rx.recv(), if body_open => {
@@ -638,21 +658,64 @@ impl SequencerTask {
     }
 
     async fn submit_pending_blocks(&mut self) {
-        for height in self.sequencer.submittable_heights() {
+        let submittable_heights = self.sequencer.submittable_heights();
+        if submittable_heights.is_empty() {
+            if self.sequencer.unsubmitted_applying_count() == 0 {
+                self.submission_retry_at = None;
+                self.submission_retry_started_at = None;
+                self.submission_retry_attempt = 0;
+            } else if self.submission_retry_started_at.is_some()
+                && self.submission_retry_at.is_none()
+                && !self.actions.is_closed()
+            {
+                self.submission_retry_at = Some(time::Instant::now() + SUBMISSION_RETRY_DELAY);
+            }
+            return;
+        }
+
+        self.submission_retry_at = None;
+        for height in submittable_heights {
             let Some(item) = self.sequencer.prepare_submit(height) else {
                 continue;
             };
 
             metrics::counter!("sync.block.submit.sent").increment(1);
-            if !self
+            let queue_depth = self
+                .actions
+                .max_capacity()
+                .saturating_sub(self.actions.capacity());
+            // Metrics accepts f64 samples; this lossy conversion is observability-only.
+            metrics::histogram!(
+                "sync.block.action.queue.depth",
+                "action" => "submit_block"
+            )
+            .record(queue_depth as f64);
+            let send_started = time::Instant::now();
+            let sent = self
                 .send_action(BlockSyncAction::SubmitBlock {
                     token: item.token,
                     block: item.block,
                 })
-                .await
-            {
+                .await;
+            metrics::histogram!("sync.block.submit.queue_wait_seconds")
+                .record(send_started.elapsed().as_secs_f64());
+            if !sent {
                 self.sequencer.unsubmit(item.height, item.token);
+                if !self.actions.is_closed() {
+                    let now = time::Instant::now();
+                    self.submission_retry_started_at.get_or_insert(now);
+                    self.submission_retry_attempt = self.submission_retry_attempt.saturating_add(1);
+                    self.submission_retry_at = Some(now + SUBMISSION_RETRY_DELAY);
+                    metrics::counter!("sync.block.submit.retry.scheduled").increment(1);
+                    self.trace_submission_retry_scheduled(item.height);
+                }
                 return;
+            }
+            if let Some(started_at) = self.submission_retry_started_at.take() {
+                metrics::counter!("sync.block.submit.retry.succeeded").increment(1);
+                metrics::histogram!("sync.block.submit.retry.delay_seconds")
+                    .record(started_at.elapsed().as_secs_f64());
+                self.submission_retry_attempt = 0;
             }
             self.sequencer
                 .record_submitted_apply(item.height, item.hash);
@@ -668,6 +731,38 @@ impl SequencerTask {
             );
             bs_insert_height(row, bs_trace::HEIGHT, height);
             bs_insert_u64(row, bs_trace::APPLY_TOKEN, token);
+        });
+    }
+
+    fn trace_submission_retry_scheduled(&self, height: block::Height) {
+        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
+            bs_insert_str(
+                row,
+                bs_trace::EVENT,
+                bs_trace::BLOCK_BODY_SUBMISSION_RETRY_SCHEDULED,
+            );
+            bs_insert_height(row, bs_trace::HEIGHT, height);
+            bs_insert_u64(
+                row,
+                qs_trace::QUEUE_CAPACITY,
+                u64::try_from(self.actions.capacity()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                qs_trace::QUEUE_MAX_CAPACITY,
+                u64::try_from(self.actions.max_capacity()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                "in_flight_submission_count",
+                u64::try_from(self.sequencer.in_flight_submission_count()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                "unsubmitted_applying_count",
+                u64::try_from(self.sequencer.unsubmitted_applying_count()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(row, "retry_attempt", self.submission_retry_attempt);
         });
     }
 
@@ -813,11 +908,16 @@ impl SequencerTask {
         // verifier blocks the task here, stopping it from draining `input`. The
         // timeout matches the reactor's `dispatch_action` so a permanently
         // stalled driver does not wedge the pipeline forever.
+        let action_label = action.metric_label();
         match time::timeout(self.action_send_timeout, self.actions.send(action)).await {
             Ok(Ok(())) => true,
             Ok(Err(_)) => false,
             Err(_) => {
-                metrics::counter!("sync.block.action.send_timeout").increment(1);
+                metrics::counter!(
+                    "sync.block.action.send_timeout",
+                    "action" => action_label
+                )
+                .increment(1);
                 false
             }
         }
@@ -1112,6 +1212,77 @@ mod tests {
             input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submission_retries_after_action_channel_capacity_returns() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body_input_decoded_attributed_memory_bytes =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, mut actions_rx) = mpsc::channel(1);
+        actions
+            .try_send(BlockSyncAction::QueryNeededBlocks {
+                from: block::Height(1),
+                limit: 1,
+                best_header_tip: block::Height(1),
+            })
+            .expect("test fills the action channel");
+        let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+        let task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            body_rx,
+            control_rx,
+            body_input_bytes.clone(),
+            body_input_decoded_attributed_memory_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+        let task = tokio::spawn(task.run());
+
+        body_tx
+            .send(queued_test_body(
+                body_input_bytes,
+                body_input_decoded_attributed_memory_bytes,
+            ))
+            .await
+            .expect("body queues");
+
+        time::timeout(Duration::from_secs(2), async {
+            while view_rx.borrow_and_update().unsubmitted_applying_count == 0 {
+                view_rx
+                    .changed()
+                    .await
+                    .expect("sequencer view remains live");
+            }
+        })
+        .await
+        .expect("initial submission times out");
+
+        assert!(matches!(
+            actions_rx.recv().await,
+            Some(BlockSyncAction::QueryNeededBlocks { .. })
+        ));
+
+        let retried = time::timeout(Duration::from_secs(1), actions_rx.recv())
+            .await
+            .expect("submission is retried after capacity returns")
+            .expect("action channel remains live");
+        assert!(matches!(retried, BlockSyncAction::SubmitBlock { .. }));
+
+        task.abort();
     }
 
     #[test]

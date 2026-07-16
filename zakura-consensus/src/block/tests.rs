@@ -15,6 +15,7 @@ use zakura_chain::{
         },
         Block, Height,
     },
+    local_genesis::generate_local_testnet_with_funded_keys,
     orchard,
     parameters::{
         subsidy::block_subsidy,
@@ -323,6 +324,68 @@ fn subsidy_is_valid_for_network(network: Network) -> Result<(), Report> {
                 .expect("subsidies should pass for this block");
         }
     }
+
+    Ok(())
+}
+
+/// A generated local testnet's NU6.3 activation block must be able to satisfy
+/// the ZIP-271 lockbox-disbursement subsidy rule.
+///
+/// NU6.1's activation height falls through to the shared activation height of
+/// the local network, so `subsidy_is_valid` demands its one-time disbursement
+/// outputs there. The generated network configures a zero-value P2SH marker
+/// for this, so a coinbase that pays that marker must pass with no deferred
+/// pool change.
+#[test]
+fn local_genesis_nu6_3_activation_has_satisfiable_lockbox_rule() -> Result<(), Report> {
+    let generated = generate_local_testnet_with_funded_keys(
+        vec!["alice".to_string(), "bob".to_string()],
+        Default::default(),
+    )
+    .map_err(|error| eyre!(error.to_string()))?;
+    let network = generated.network;
+    let height = NetworkUpgrade::Nu6_3
+        .activation_height(&network)
+        .expect("the default local network activates NU6.3");
+    let lockbox_disbursements = network.lockbox_disbursements(height);
+    let [(lockbox_address, lockbox_amount)] = lockbox_disbursements.as_slice() else {
+        panic!("the local network configures one lockbox marker output");
+    };
+    let coinbase = Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: height,
+        inputs: vec![zakura_chain::transparent::Input::Coinbase {
+            height,
+            data: b"local activation".to_vec(),
+            sequence: 0,
+        }],
+        outputs: vec![zakura_chain::transparent::Output::new(
+            *lockbox_amount,
+            lockbox_address.script(),
+        )],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    let block = Block {
+        header: generated
+            .blocks
+            .last()
+            .expect("the generated chain contains genesis")
+            .header
+            .clone(),
+        transactions: vec![Arc::new(coinbase)],
+    };
+    let expected_block_subsidy =
+        block_subsidy(height, &network).expect("the local activation height has a block subsidy");
+
+    // `subsidy_is_valid` skips all checks (including the lockbox rule) for a
+    // zero subsidy, which would make this test vacuous.
+    assert!(!expected_block_subsidy.is_zero());
+    assert_eq!(
+        subsidy_is_valid(&block, &network, expected_block_subsidy)?,
+        DeferredPoolBalanceChange::zero()
+    );
 
     Ok(())
 }

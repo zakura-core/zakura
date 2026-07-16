@@ -1768,10 +1768,11 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             let blocks: Vec<_> = chain.iter().collect();
             let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0 as usize;
 
-            // Seed just before NU5, then operate on four consecutive fast blocks so
-            // the forged-wrapper regression exercises `hashBlockCommitments`.
+            // Seed just before NU5, then operate on five consecutive fast blocks so
+            // the auth-data and forged-wrapper regressions exercise
+            // `hashBlockCommitments`.
             let seed = nu5 - 2;
-            let last = seed + 4;
+            let last = seed + 5;
             prop_assert!(blocks.len() > last + 1, "generated chain unexpectedly short");
 
             // Legacy pass to record the correct per-block roots as the fixture.
@@ -1817,17 +1818,123 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             prop_assert_eq!(fast.vct_prevalidated_count(), 0, "the first fast block runs its own commitment check");
 
             // Second fast block: its predecessor's look-ahead already validated it,
-            // so the own check is skipped — the dedup engages.
-            commit(&mut fast, seed + 2);
+            // so the own check is skipped — the dedup engages. Use a header-only
+            // successor, as production does when header sync is ahead of body sync.
+            let cv = CheckpointVerifiedBlock::from(blocks[seed + 2].block.clone());
+            let header_only_successor = NextVctBlock::from_header(
+                blocks[seed + 3].block.header.clone(),
+                Height((seed + 3) as u32),
+                blocks[seed + 3].block.auth_data_root(),
+            );
+            fast.commit_finalized_direct(
+                cv.into(),
+                None,
+                Some(header_only_successor),
+                "vct dedup header-only successor",
+            )
+            .expect("verified fast commit succeeds");
             prop_assert_eq!(fast.vct_prevalidated_count(), 1, "the second fast block skips its redundant own commitment check");
+
+            // ZIP-244 transaction IDs do not commit to authorizing data. Mutate
+            // a transparent unlocking script as an untrusted peer can, producing
+            // a body with the expected header hash and transaction ID but a
+            // different auth-data root. (Coinbase scripts are a special case:
+            // they are bound by the mined transaction ID.)
+            let honest_block = blocks[seed + 3].block.clone();
+            let mut hostile_block = (*honest_block).clone();
+            let (transaction_index, input_index) = honest_block
+                .transactions
+                .iter()
+                .enumerate()
+                .find_map(|(transaction_index, transaction)| {
+                    transaction
+                        .inputs()
+                        .iter()
+                        .position(|input| {
+                            matches!(input, zakura_chain::transparent::Input::PrevOut { .. })
+                        })
+                        .map(|input_index| (transaction_index, input_index))
+                })
+                .expect("the generated NU5 block must contain a transparent spend");
+            let hostile_transaction =
+                Arc::make_mut(&mut hostile_block.transactions[transaction_index]);
+            let zakura_chain::transparent::Input::PrevOut { unlock_script, .. } =
+                &mut hostile_transaction.inputs_mut()[input_index]
+            else {
+                unreachable!("the selected input is a transparent spend");
+            };
+            *unlock_script = zakura_chain::transparent::Script::new(&[0x42]);
+            let hostile_block = Arc::new(hostile_block);
+
+            prop_assert_eq!(
+                hostile_block.hash(),
+                honest_block.hash(),
+                "authorizing-data malleation must preserve the block hash",
+            );
+            prop_assert_eq!(
+                hostile_block.transactions[transaction_index].hash(),
+                honest_block.transactions[transaction_index].hash(),
+                "ZIP-244 transaction IDs must not bind transparent unlocking scripts",
+            );
+            prop_assert_ne!(
+                hostile_block.auth_data_root(),
+                honest_block.auth_data_root(),
+                "the hostile body must have a different auth-data root",
+            );
+
+            let mismatched = CheckpointVerifiedBlock::from(hostile_block);
+
+            let error = fast
+                .commit_finalized_direct(
+                    mismatched.into(),
+                    None,
+                    None,
+                    "vct mismatched auth-data root",
+                )
+                .expect_err("a mismatched body must not reuse header-only prevalidation");
+            prop_assert!(
+                format!("{error:?}").contains("VctBlockAuthDataRootMismatch"),
+                "the mismatched body must be classified as invalid, got: {error:?}",
+            );
+            prop_assert_eq!(
+                error.vct_retryable_height(),
+                None,
+                "the write loop must not park and retry an irreparably invalid body",
+            );
+            prop_assert_eq!(
+                fast.vct_prevalidated_count(),
+                1,
+                "a mismatched auth-data root must not increment the prevalidated count",
+            );
+            prop_assert_eq!(
+                fast.db.finalized_tip_height(),
+                Some(Height((seed + 2) as u32)),
+                "the rejected body must leave finalized state untouched",
+            );
+
+            // Rejecting an invalid body must not evict the authenticated VCT
+            // roots. A subsequently downloaded honest body with the same hash
+            // can therefore commit after the write loop's hard-error reset and
+            // let checkpoint sync continue.
+            fast.clear_vct_prevalidated_next();
+            commit(&mut fast, seed + 3);
+            prop_assert_eq!(
+                fast.db.finalized_tip_height(),
+                Some(Height((seed + 3) as u32)),
+                "the honest same-hash body must commit after the hostile body is rejected",
+            );
 
             // Stale-cache guard: overwrite the cache with the correct height but the
             // hash of a *different* block. The next commit must NOT skip.
             let stale_hash = blocks[seed + 1].hash;
-            prop_assert_ne!(stale_hash, blocks[seed + 3].hash, "stale hash must differ from the real block");
+            prop_assert_ne!(stale_hash, blocks[seed + 4].hash, "stale hash must differ from the real block");
             fast.vct
-                .set_prevalidated_next(Some((Height((seed + 3) as u32), stale_hash)));
-            commit(&mut fast, seed + 3);
+                .set_prevalidated_next(Some((
+                    Height((seed + 4) as u32),
+                    stale_hash,
+                    Some(blocks[seed + 4].block.auth_data_root()),
+                )));
+            commit(&mut fast, seed + 4);
             prop_assert_eq!(fast.vct_prevalidated_count(), 1, "a stale cache entry (wrong hash) must not cause a false skip");
 
             // Public wrapper-hash guard: the stale cache records a real look-ahead
@@ -1836,7 +1943,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             // The skip must compare the cache against the wrapped block's real hash,
             // not the wrapper hash, so the bad commitment is checked and rejected.
             let forged_wrapper_hash = blocks[seed + 2].hash;
-            let bad_block = blocks[seed + 4].block.clone().set_block_commitment([0x42; 32]);
+            let bad_block = blocks[seed + 5].block.clone().set_block_commitment([0x42; 32]);
             let bad_block_hash = bad_block.hash();
             prop_assert_ne!(
                 forged_wrapper_hash,
@@ -1844,7 +1951,11 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                 "the forged wrapper hash must differ from the bad block's real hash",
             );
             fast.vct
-                .set_prevalidated_next(Some((Height((seed + 4) as u32), forged_wrapper_hash)));
+                .set_prevalidated_next(Some((
+                    Height((seed + 5) as u32),
+                    forged_wrapper_hash,
+                    Some(blocks[seed + 5].block.auth_data_root()),
+                )));
             let forged = CheckpointVerifiedBlock::with_hash(bad_block, forged_wrapper_hash);
             let error = fast
                 .commit_finalized_direct(forged.into(), None, None, "vct forged wrapper hash")
@@ -1860,7 +1971,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             );
             prop_assert_eq!(
                 fast.db.finalized_tip_height(),
-                Some(Height((seed + 3) as u32)),
+                Some(Height((seed + 4) as u32)),
                 "the rejected forged block must leave finalized state untouched",
             );
     });

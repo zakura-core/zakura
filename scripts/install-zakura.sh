@@ -2,6 +2,16 @@
 # Install or prepare commands for Zakura's operating modes.
 set -euo pipefail
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  cat >&2 <<'EOF'
+Zakura's installer supports Linux only and cannot run on macOS.
+
+On macOS, install Zakura from crates.io instead:
+  cargo install --locked zakura
+EOF
+  exit 1
+fi
+
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
   SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
@@ -11,14 +21,14 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZAKURA_RELEASE_TAG="v1.0.0-rc6"
+ZAKURA_RELEASE_TAG="v1.0.0"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
 # Replaced with the archive checksum by release-binaries.yml before publishing.
-ZAKURA_ARCHIVE_SHA256="57e46e2078e2f1f92a4896c82b2444fe6f3aa1f4ad1c365325241311ed581d4f"
+ZAKURA_ARCHIVE_SHA256="19faee68cb442b943a432cd84705e615f753eb4dcbd190416302e256ad3df9df"
 ZAKURA_MEMBER="./bin/zakurad"
-ZAKURA_DOCKER_IMAGE="zakuracore/zakura:1.0.0-rc6"
-ZAKURA_COMPAT_DOCKER_IMAGE="zakuracore/zakura:zcashd-compat-1.0.0-rc6"
+ZAKURA_DOCKER_IMAGE="zakuracore/zakura:1.0.0"
+ZAKURA_COMPAT_DOCKER_IMAGE="zakuracore/zakura:zcashd-compat-1.0.0"
 ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="zakuracore/zakura:zcashd-compat-latest"
 ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
 # Persistent Zakura iroh identity (NodeId secret). Kept outside the state cache so
@@ -34,7 +44,7 @@ TARGET_TRIPLE="x86_64-pc-linux-gnu"
 ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v1.0.0/zcashd-zebra-compat-v1.0.0-linux-x86_64.tar.gz"
 ZCASHD_RUNTIME_ARCHIVE_SHA256="b861ea94215647a69a944ded7c9d6c7c3dfd836e54e3e194103242935e6879f2"
 ZCASHD_RUNTIME_ARCHIVE_MEMBER_BINARY_PATH="./bin/zcashd"
-ZCASHD_DEFAULT_DOCKER_IMAGE="valargroup/zcashd:v1.0.0"
+ZCASHD_DEFAULT_DOCKER_IMAGE="zakuracore/zcashd:v1.0.0"
 
 INSTALL_PROFILE=""
 MODE=""

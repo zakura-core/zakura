@@ -28,16 +28,16 @@ pub const DEFAULT_BS_INITIAL_INFLIGHT: u32 = 64;
 pub const MAX_BS_INFLIGHT_REQUESTS: u32 = 32_768;
 /// Default total response byte target advertised per range response.
 pub const DEFAULT_BS_MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
-/// Default global byte budget reserved for later block-download scheduling.
+/// Default global byte budget for outstanding block-request reservations.
 pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 /// Worst-case serialized bytes reserved per requested block body.
 ///
-/// Block-sync reserves this much per requested block at send time and only ever
-/// shrinks the reservation toward the actual serialized size on receipt, so a
-/// valid, already-downloaded body is never discarded for a full budget. Each
+/// Block-sync reserves a per-block size estimate at send time (this worst case
+/// when no hint is known) and releases it when the body arrives, so a valid,
+/// already-downloaded body is never discarded against the request budget. Each
 /// body arrives in its own `Block` frame bounded by [`block::MAX_BLOCK_BYTES`]
 /// at decode (`MAX_BS_MESSAGE_BYTES > MAX_BLOCK_BYTES`), so the actual size can
-/// never exceed this worst case and the shrink is always non-negative.
+/// never exceed this worst case.
 pub const BS_PER_BLOCK_WORST_CASE_BYTES: u64 = block::MAX_BLOCK_BYTES;
 /// Default cap on the estimated *resident* memory of the look-ahead pipeline.
 ///
@@ -62,15 +62,13 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 = 1536 * 1024 * 1024;
 /// maximum checkpoint gap plus the boundary block in flight.
 pub const MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES: usize =
     zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
-/// The byte budget required to hold one full worst-case checkpoint range in
-/// flight.
+/// The byte size of one full worst-case checkpoint range held in flight.
 ///
 /// The checkpoint verifier resolves a block's commit only once the entire
-/// contiguous range to the next checkpoint has been submitted, and every
-/// submitted body stays reserved against `max_inflight_block_bytes` until it is
-/// durable. A budget that cannot hold a whole worst-case range can never
-/// complete one: the verifier never commits, nothing becomes durable, and no
-/// bytes are ever released.
+/// contiguous range to the next checkpoint has been submitted, so the whole
+/// range must be co-resident. This floor sizes the resident look-ahead clamp
+/// (`clamp_reorder_lookahead_to_floor`); checkpoint-range liveness itself comes
+/// from the commit-window admission exemption.
 pub const BS_CHECKPOINT_RANGE_BYTE_FLOOR: u64 =
     // `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` is `MAX_CHECKPOINT_HEIGHT_GAP + 1`
     // (= 401), which fits `u64` losslessly; the product (~802 MB) cannot overflow.
@@ -237,9 +235,12 @@ pub struct ZakuraBlockSyncConfig {
     pub initial_inflight_requests: u32,
     /// Maximum total response bytes this node advertises per `GetBlocks` response.
     pub max_response_bytes: u32,
-    /// Maximum estimated bytes reserved for in-flight and buffered block bodies.
+    /// Maximum estimated bytes reserved for outstanding block-body requests: a
+    /// DoS/pacing bound on in-flight wire data, released at receipt. Received
+    /// bodies are bounded by `max_reorder_lookahead_bytes` instead.
     pub max_inflight_block_bytes: u64,
-    /// Maximum speculative body bytes held above the download floor.
+    /// Maximum estimated *resident* memory of look-ahead block bodies retained
+    /// by the download pipeline (wire bytes × `DESERIALIZED_MEM_FACTOR`).
     pub max_reorder_lookahead_bytes: u64,
     /// How long to avoid reassigning an expired floor height to the same peer.
     #[serde(with = "humantime_serde")]
@@ -382,16 +383,14 @@ impl ZakuraBlockSyncConfig {
             .max(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
     }
 
-    /// Return the speculative look-ahead byte cap clamped to the global budget.
+    /// Return the resident look-ahead byte cap.
+    ///
+    /// Currently the raw configured value; kept as an accessor for the semantic
+    /// seam with the clamp interplay. The outstanding-request cap
+    /// (`max_inflight_block_bytes`) no longer implies retention, so it must not
+    /// silently shrink this memory budget.
     pub fn effective_max_reorder_lookahead_bytes(&self) -> u64 {
-        // This is a resident-memory budget: admission counts each pool's wire bytes scaled by
-        // `DESERIALIZED_MEM_FACTOR`. Cap it against the resident equivalent of the in-flight
-        // wire budget, not raw `max_inflight_block_bytes`, so look-ahead depth is not
-        // unnecessarily starved.
-        self.max_reorder_lookahead_bytes.min(
-            self.max_inflight_block_bytes
-                .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR),
-        )
+        self.max_reorder_lookahead_bytes
     }
 
     /// Return the floor avoid cooldown clamped to a positive duration.
@@ -467,32 +466,6 @@ impl ZakuraBlockSyncConfig {
         Ok(())
     }
 
-    /// Raise `max_inflight_block_bytes` up to the checkpoint-range floor when it
-    /// is configured below it, warning once.
-    ///
-    /// A positive budget below [`BS_CHECKPOINT_RANGE_BYTE_FLOOR`] cannot hold one
-    /// full worst-case checkpoint range. The checkpoint verifier only commits a
-    /// range once the whole range is submitted, and every submitted body stays
-    /// reserved against the budget until it is durable, so a budget below the
-    /// floor would deadlock: the verifier never commits, nothing becomes durable,
-    /// and no bytes are ever released. Rather than refuse to start -- which would
-    /// break older configs that set a smaller budget -- clamp the budget up to the
-    /// floor and warn. Zero is left untouched so [`validate`](Self::validate)
-    /// still rejects it as an explicit misconfiguration.
-    pub fn clamp_inflight_block_bytes_to_floor(&mut self) {
-        if self.max_inflight_block_bytes > 0
-            && self.max_inflight_block_bytes < BS_CHECKPOINT_RANGE_BYTE_FLOOR
-        {
-            tracing::warn!(
-                configured_max_inflight_block_bytes = self.max_inflight_block_bytes,
-                checkpoint_range_byte_floor = BS_CHECKPOINT_RANGE_BYTE_FLOOR,
-                "zakura.block_sync.max_inflight_block_bytes is below the checkpoint-range \
-                 floor; clamping it up so checkpoint sync cannot deadlock",
-            );
-            self.max_inflight_block_bytes = BS_CHECKPOINT_RANGE_BYTE_FLOOR;
-        }
-    }
-
     /// Clamp the resident look-ahead budget up to one worst-case checkpoint range
     /// of wire bytes.
     ///
@@ -514,6 +487,27 @@ impl ZakuraBlockSyncConfig {
                  checkpoint-range wire floor; clamping it up so checkpoint sync cannot deadlock",
             );
             self.max_reorder_lookahead_bytes = range_wire_floor;
+        }
+    }
+
+    /// Clamp a positive but sub-floor-request `max_inflight_block_bytes` up to
+    /// just above one floor request.
+    ///
+    /// `validate()` requires the outstanding-request budget to cover at least
+    /// one floor request (the bounded floor overdraft repays against it).
+    /// Rather than refuse to start — which would break older configs written
+    /// when the field also bounded retention and small values were clamped —
+    /// raise the budget to the smallest valid value and warn.
+    pub fn clamp_inflight_block_bytes_to_request_floor(&mut self) {
+        let request_floor = self.floor_request_byte_reservation();
+        if self.max_inflight_block_bytes > 0 && self.max_inflight_block_bytes <= request_floor {
+            tracing::warn!(
+                configured_max_inflight_block_bytes = self.max_inflight_block_bytes,
+                floor_request_byte_reservation = request_floor,
+                "zakura.block_sync.max_inflight_block_bytes cannot cover one floor \
+                 request; clamping it up so the node can start",
+            );
+            self.max_inflight_block_bytes = request_floor.saturating_add(1);
         }
     }
 

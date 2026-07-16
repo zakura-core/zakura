@@ -22,7 +22,7 @@ use crate::{
     request::{CheckpointVerifiedBlock, FinalizableBlock, FinalizedBlock, Treestate},
     rollback_finalized_state,
     service::{
-        finalized_state::{disk_db::DiskWriteBatch, FinalizedState},
+        finalized_state::{disk_db::DiskWriteBatch, serve_block_roots, FinalizedState},
         non_finalized_state::Chain,
         read::find::{
             block_locator, chain_contains_hash, depth, find_chain_hashes, hash_by_height,
@@ -1128,6 +1128,33 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
         state.db.lowest_retained_height(),
         Some(Height(4)),
         "lowest retained height advanced to the exclusive prune bound"
+    );
+}
+
+#[test]
+fn pruned_block_bodies_stop_tree_derived_root_serving() {
+    let _init_guard = zakura_test::init();
+    let network = Mainnet;
+    let state = new_state_with_blocks(&Config::ephemeral(), &network);
+
+    let mut batch = DiskWriteBatch::new();
+    batch.prepare_prune_batch(&state.db, Height(1), Height(4));
+    // Model a database upgraded after these blocks were committed: historical
+    // heights below this marker are served from trees instead of the roots index.
+    batch.update_vct_upgrade_marker(&state.db, Height(TEST_BLOCKS + 1));
+    state.db.write_batch(batch).expect("prune batch writes");
+
+    assert!(
+        state.db.sapling_tree_by_height(&Height(1)).is_some(),
+        "pruning retains the tree used by the historical roots producer"
+    );
+    assert!(
+        state.db.block(Height(1).into()).is_none(),
+        "pruning removes the body needed for auxiliary root metadata"
+    );
+    assert!(
+        serve_block_roots(&state.db, Height(1)..=Height(3)).is_empty(),
+        "root serving stops instead of fabricating counts and an auth-data root"
     );
 }
 

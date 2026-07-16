@@ -2,7 +2,7 @@
 
 use std::{
     cmp::min,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{self, Cursor, Read, Write},
     sync::Arc,
     time::Duration,
@@ -37,13 +37,14 @@ mod error;
 mod events;
 mod pipe;
 mod reactor;
-mod scheduler;
+mod requester;
 mod service;
 mod state;
 #[cfg(test)]
 mod tests;
 mod validation;
 mod wire;
+mod work_queue;
 
 pub use config::{
     clamp_header_sync_request_count, header_sync_count_by_byte_budget,

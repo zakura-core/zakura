@@ -14,15 +14,16 @@ use rand::{
 };
 
 use zakura_chain::{
-    amount::Amount,
+    amount::{self, Amount},
     block::{Height, MAX_BLOCK_BYTES},
     parameters::Network,
-    serialization::{CompactSizeMessage, TrustedPreallocate, ZcashSerialize},
+    serialization::{CompactSizeMessage, TrustedPreallocate, ZcashDeserializeInto, ZcashSerialize},
     transaction::{self, zip317::BLOCK_UNPAID_ACTION_LIMIT, VerifiedUnminedTx},
     work::equihash::Solution,
 };
 use zakura_consensus::MAX_BLOCK_SIGOPS;
 use zakura_node_services::mempool::TransactionDependencies;
+use zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN;
 
 use crate::methods::types::transaction::TransactionTemplate;
 
@@ -62,12 +63,41 @@ fn block_template_overhead_bytes(net: &Network) -> usize {
     header_bytes + transaction_count_bytes
 }
 
+/// Returns the maximum serialized coinbase size after a pool appends its tag.
+fn max_coinbase_bytes(fake_coinbase: &TransactionTemplate<amount::NegativeOrZero>) -> usize {
+    let coinbase: transaction::Transaction = fake_coinbase
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("a generated coinbase template is structurally valid");
+    let coinbase_script_len = coinbase
+        .inputs()
+        .first()
+        .and_then(|input| input.coinbase_script())
+        .expect("a generated coinbase has one canonical coinbase input")
+        .len();
+
+    // Coinbase scripts are at most 100 bytes, so appending tag bytes does not
+    // change the one-byte CompactSize prefix.
+    let remaining_coinbase_script_bytes = MAX_COINBASE_SCRIPT_LEN
+        .checked_sub(coinbase_script_len)
+        .expect("a generated coinbase script is within the consensus limit");
+
+    fake_coinbase
+        .data
+        .as_ref()
+        .len()
+        .checked_add(remaining_coinbase_script_bytes)
+        .expect("the maximum serialized coinbase size fits in memory")
+}
+
 /// Selects mempool transactions for block production according to [ZIP-317],
 /// using a fake coinbase transaction and the mempool.
 ///
-/// The fake coinbase transaction's serialized size and sigops must be at least as large
-/// as the real coinbase transaction. (The real coinbase transaction depends on the total
-/// fees from the transactions returned by this function.)
+/// The reserved maximum coinbase transaction size and the fake coinbase sigops
+/// must be at least as large as the real coinbase transaction. (The real
+/// coinbase transaction depends on the total fees from the transactions
+/// returned by this function.)
 ///
 /// Returns selected transactions from `mempool_txs`.
 ///
@@ -103,7 +133,7 @@ pub fn select_mempool_transactions(
     // Set up limit tracking
     let max_block_bytes: usize = MAX_BLOCK_BYTES.try_into().expect("fits in memory");
     let reserved_block_bytes = block_template_overhead_bytes(net)
-        .checked_add(fake_coinbase_tx.data.as_ref().len())
+        .checked_add(max_coinbase_bytes(&fake_coinbase_tx))
         .expect("block template byte reservation fits in memory");
     let mut remaining_block_bytes = max_block_bytes
         .checked_sub(reserved_block_bytes)

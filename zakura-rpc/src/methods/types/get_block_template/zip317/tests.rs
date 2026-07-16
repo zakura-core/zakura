@@ -16,7 +16,7 @@ use zakura_node_services::mempool::TransactionDependencies;
 
 use crate::methods::types::{get_block_template::MinerParams, transaction::TransactionTemplate};
 
-use super::{block_template_overhead_bytes, select_mempool_transactions};
+use super::{block_template_overhead_bytes, max_coinbase_bytes, select_mempool_transactions};
 
 #[test]
 fn reserves_network_specific_header_and_transaction_count_sizes() {
@@ -27,7 +27,7 @@ fn reserves_network_specific_header_and_transaction_count_sizes() {
 }
 
 #[test]
-fn reserves_serialized_block_overhead() {
+fn reserves_serialized_block_and_pool_tag_overhead() {
     let network = Network::Mainnet;
     let height = Height(1_000_000);
     let miner_params =
@@ -35,10 +35,14 @@ fn reserves_serialized_block_overhead() {
     let fake_coinbase =
         TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero())
             .expect("test coinbase template is valid");
+    assert!(
+        max_coinbase_bytes(&fake_coinbase) > fake_coinbase.data.as_ref().len(),
+        "the test coinbase leaves room for a pool tag",
+    );
     let max_block_bytes = usize::try_from(MAX_BLOCK_BYTES).expect("fits in memory");
     let max_mempool_transaction_bytes = max_block_bytes
         - block_template_overhead_bytes(&network)
-        - fake_coinbase.data.as_ref().len();
+        - max_coinbase_bytes(&fake_coinbase);
 
     let template_transactions = |transaction_size| {
         let mut transaction = network

@@ -48,6 +48,16 @@ fn reservation_owner(generation: u64, request_token: BlockRequestToken) -> Reser
     }
 }
 
+fn take_owned(
+    queue: &WorkQueue,
+    low: block::Height,
+    high: block::Height,
+    max: usize,
+    owner: ReservationOwner,
+) -> Vec<(block::Height, work_queue::WorkItem)> {
+    queue.take_in_range_budgeted_owned(low, high, max, u64::MAX, owner)
+}
+
 fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
     Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
 }
@@ -625,6 +635,7 @@ fn late_pending_body_requires_admission_at_atomic_claim() {
         queue.claim_late_body(
             block::Height(1),
             block::Hash([2; 32]),
+            block::Hash([0; 32]),
             80,
             &mut budget,
             true,
@@ -638,6 +649,7 @@ fn late_pending_body_requires_admission_at_atomic_claim() {
         queue.claim_late_body(
             block::Height(1),
             block::Hash([1; 32]),
+            block::Hash([0; 32]),
             80,
             &mut budget,
             false,
@@ -651,11 +663,12 @@ fn late_pending_body_requires_admission_at_atomic_claim() {
         queue.claim_late_body(
             block::Height(1),
             block::Hash([1; 32]),
+            block::Hash([0; 32]),
             80,
             &mut budget,
             true,
         ),
-        LateBodyClaim::ClaimedPending
+        LateBodyClaim::ClaimedPending(0)
     );
     assert!(!queue.pending_contains(block::Height(1)));
     assert_eq!(budget.reserved(), 80);
@@ -685,6 +698,7 @@ fn late_body_claim_has_exactly_one_winner() {
             first_queue.claim_late_body(
                 block::Height(1),
                 block::Hash([1; 32]),
+                block::Hash([0; 32]),
                 80,
                 &mut first_budget,
                 true,
@@ -699,6 +713,7 @@ fn late_body_claim_has_exactly_one_winner() {
             second_queue.claim_late_body(
                 block::Height(1),
                 block::Hash([1; 32]),
+                block::Hash([0; 32]),
                 80,
                 &mut second_budget,
                 true,
@@ -719,7 +734,7 @@ fn late_body_claim_has_exactly_one_winner() {
     assert_eq!(
         outcomes
             .iter()
-            .filter(|outcome| **outcome == LateBodyClaim::ClaimedPending)
+            .filter(|outcome| **outcome == LateBodyClaim::ClaimedPending(0))
             .count(),
         1,
     );
@@ -733,6 +748,103 @@ fn late_body_claim_has_exactly_one_winner() {
     assert_eq!(budget.reserved(), 80);
     assert!(queue.in_flight_contains(block::Height(1)));
     assert!(!queue.pending_contains(block::Height(1)));
+}
+
+#[test]
+fn destructive_reset_and_claim_are_atomic_in_both_lock_orderings() {
+    let height = block::Height(1);
+    let hash = block::Hash([1; 32]);
+
+    // Claim wins the mutex: it captures epoch 0, then the reset bumps to epoch 1
+    // and removes that old ownership before either operation returns.
+    {
+        let queue = Arc::new(WorkQueue::new(block::Height(0)));
+        queue.set_estimate_floor_for_tests(1);
+        assert_eq!(
+            queue.extend([(height, hash, BlockSizeEstimate::Advertised(100))]),
+            1
+        );
+        let locked = Arc::new(std::sync::Barrier::new(2));
+        let proceed = Arc::new(std::sync::Barrier::new(2));
+        let (claim, reset) = std::thread::scope(|scope| {
+            let claim_queue = Arc::clone(&queue);
+            let claim_locked = Arc::clone(&locked);
+            let claim_proceed = Arc::clone(&proceed);
+            let claim = scope.spawn(move || {
+                let mut budget = ByteBudget::new(1_000);
+                claim_queue.claim_late_body_with_lock_hook(
+                    height,
+                    hash,
+                    block::Hash([0; 32]),
+                    80,
+                    &mut budget,
+                    true,
+                    || {
+                        claim_locked.wait();
+                        claim_proceed.wait();
+                    },
+                )
+            });
+            locked.wait();
+            let reset_queue = Arc::clone(&queue);
+            let reset = scope.spawn(move || reset_queue.destructive_reset_above(block::Height(0)));
+            proceed.wait();
+            (
+                claim.join().expect("claim thread does not panic"),
+                reset.join().expect("reset thread does not panic"),
+            )
+        });
+
+        assert_eq!(claim, LateBodyClaim::ClaimedPending(0));
+        assert_eq!(reset.1, 1);
+        assert!(!queue.in_flight_contains(height));
+    }
+
+    // Reset wins the mutex: it clears the pending old-epoch item and bumps the
+    // epoch before the competing claim can classify ownership.
+    {
+        let queue = Arc::new(WorkQueue::new(block::Height(0)));
+        queue.set_estimate_floor_for_tests(1);
+        assert_eq!(
+            queue.extend([(height, hash, BlockSizeEstimate::Advertised(100))]),
+            1
+        );
+        let locked = Arc::new(std::sync::Barrier::new(2));
+        let proceed = Arc::new(std::sync::Barrier::new(2));
+        let (reset, claim) = std::thread::scope(|scope| {
+            let reset_queue = Arc::clone(&queue);
+            let reset_locked = Arc::clone(&locked);
+            let reset_proceed = Arc::clone(&proceed);
+            let reset = scope.spawn(move || {
+                reset_queue.destructive_reset_above_with_lock_hook(block::Height(0), || {
+                    reset_locked.wait();
+                    reset_proceed.wait();
+                })
+            });
+            locked.wait();
+            let claim_queue = Arc::clone(&queue);
+            let claim = scope.spawn(move || {
+                let mut budget = ByteBudget::new(1_000);
+                claim_queue.claim_late_body(
+                    height,
+                    hash,
+                    block::Hash([0; 32]),
+                    80,
+                    &mut budget,
+                    true,
+                )
+            });
+            proceed.wait();
+            (
+                reset.join().expect("reset thread does not panic"),
+                claim.join().expect("claim thread does not panic"),
+            )
+        });
+
+        assert_eq!(reset.1, 1);
+        assert_eq!(claim, LateBodyClaim::Missing);
+        assert!(!queue.in_flight_contains(height));
+    }
 }
 
 #[test]
@@ -2235,7 +2347,7 @@ fn work_queue_force_cancel_and_owner_timeout_release_once() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
     let owner = reservation_owner(1, 1);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
+    let taken = take_owned(&queue, block::Height(1), block::Height(1), 1, owner);
     assert_eq!(taken.len(), 1);
     assert!(budget.try_reserve(100));
     assert_eq!(queue.mark_reserved([block::Height(1)], owner), 100);
@@ -2275,7 +2387,7 @@ fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
     check("seed");
 
     // take + mark_reserved: Released -> Reserved.
-    let taken = queue.take_in_range(block::Height(1), block::Height(6), 6);
+    let taken = take_owned(&queue, block::Height(1), block::Height(6), 6, owner);
     assert_eq!(taken.len(), 6);
     assert_eq!(queue.mark_reserved((1..=6).map(block::Height), owner), 600);
     assert_eq!(queue.reserved_bytes(), 600);
@@ -2331,9 +2443,10 @@ fn work_queue_advance_floor_drops_only_committed_prefix() {
         (1..=10).map(|h| needed(h, BlockSizeEstimate::Advertised(100))),
     );
     // Reserve a contiguous run so we can see the reservation accounting on GC.
-    let _ = queue.take_in_range(block::Height(1), block::Height(10), 10);
+    let owner = reservation_owner(1, 1);
+    let _ = take_owned(&queue, block::Height(1), block::Height(10), 10, owner);
     assert_eq!(
-        queue.mark_reserved((1..=10).map(block::Height), reservation_owner(1, 1)),
+        queue.mark_reserved((1..=10).map(block::Height), owner),
         1000
     );
 
@@ -2359,7 +2472,7 @@ fn watchdog_after_held_settle_releases_once() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
     let owner = reservation_owner(1, 1);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
+    let taken = take_owned(&queue, block::Height(1), block::Height(1), 1, owner);
     assert_eq!(taken.len(), 1);
     assert!(budget.try_reserve(100));
     assert_eq!(queue.mark_reserved([block::Height(1)], owner), 100);
@@ -2400,7 +2513,7 @@ fn watchdog_between_registry_check_and_settlement_preserves_late_body() {
     let owner = reservation_owner(generation, 7);
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(height, height, 1);
+    let taken = take_owned(&queue, height, height, 1, owner);
     assert_eq!(taken.len(), 1);
     assert!(budget.try_reserve(100));
     assert_eq!(queue.mark_reserved([height], owner), 100);
@@ -2443,8 +2556,8 @@ fn watchdog_between_registry_check_and_settlement_preserves_late_body() {
     // late claim must instead reacquire the pending height and hold the valid body.
     assert_eq!(queue.settle_active_reserved_height(height, 80), None,);
     assert_eq!(
-        queue.claim_late_body(height, hash, 80, &mut budget, true),
-        LateBodyClaim::ClaimedPending,
+        queue.claim_late_body(height, hash, block::Hash([0; 32]), 80, &mut budget, true,),
+        LateBodyClaim::ClaimedPending(0),
     );
     assert_eq!(budget.reserved(), 80);
     assert!(!queue.pending_contains(height));
@@ -2483,7 +2596,7 @@ fn stale_watchdog_cleanup_cannot_release_replacement_reservation() {
         )]),
     );
 
-    assert_eq!(queue.take_in_range(height, height, 1).len(), 1);
+    assert_eq!(take_owned(&queue, height, height, 1, old_owner).len(), 1);
     assert!(budget.try_reserve(100));
     assert_eq!(queue.mark_reserved([height], old_owner), 100);
 
@@ -2498,7 +2611,10 @@ fn stale_watchdog_cleanup_cannot_release_replacement_reservation() {
         registry.admit(&replacement_peer, ServicePeerDirection::Outbound, &config);
     assert_ne!(replacement_generation, old_generation);
     let replacement_owner = reservation_owner(replacement_generation, old_owner.request_token);
-    assert_eq!(queue.take_in_range(height, height, 1).len(), 1);
+    assert_eq!(
+        take_owned(&queue, height, height, 1, replacement_owner).len(),
+        1
+    );
     assert!(budget.try_reserve(100));
     assert_eq!(queue.mark_reserved([height], replacement_owner), 100);
 
@@ -2530,13 +2646,11 @@ fn stale_watchdog_cleanup_cannot_release_replacement_reservation() {
 fn mark_held_direct_does_not_orphan_a_charge() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
+    let owner = reservation_owner(1, 1);
+    let taken = take_owned(&queue, block::Height(1), block::Height(1), 1, owner);
     assert_eq!(taken.len(), 1);
     assert!(budget.try_reserve(100));
-    assert_eq!(
-        queue.mark_reserved([block::Height(1)], reservation_owner(1, 1)),
-        100
-    );
+    assert_eq!(queue.mark_reserved([block::Height(1)], owner), 100);
 
     assert!(budget.try_reserve(80));
     let old_charge = queue.mark_held_direct(block::Height(1), 80);
@@ -2560,14 +2674,12 @@ fn release_reserved_mixed_reserved_held_conserves_budget() {
         ],
     );
     let mut budget = ByteBudget::new(1_000);
-    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
+    let owner = reservation_owner(1, 1);
+    let taken = take_owned(&queue, block::Height(1), block::Height(2), 2, owner);
     assert_eq!(taken.len(), 2);
     assert!(budget.try_reserve(200));
     assert_eq!(
-        queue.mark_reserved(
-            [block::Height(1), block::Height(2)],
-            reservation_owner(1, 1),
-        ),
+        queue.mark_reserved([block::Height(1), block::Height(2)], owner,),
         200
     );
 
@@ -2608,7 +2720,7 @@ fn release_reserved_heights_skips_held_body_owned_by_sequencer() {
     );
     let mut budget = ByteBudget::new(1_000);
     let owner = reservation_owner(1, 1);
-    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
+    let taken = take_owned(&queue, block::Height(1), block::Height(2), 2, owner);
     assert_eq!(taken.len(), 2);
     assert!(budget.try_reserve(200));
     assert_eq!(
@@ -3515,6 +3627,246 @@ async fn block_liveness_credits_late_retired_body_and_keeps_peer() {
             .is_err(),
         "a peer that delivered an accepted (late) body must not be parked as silent",
     );
+
+    reactor_task.abort();
+}
+
+/// The exile side of the liveness boundary that
+/// [`block_liveness_credits_late_retired_body_and_keeps_peer`] guards from the
+/// keep side: a peer whose only "delivery" is a body for a height another source
+/// already committed contributes nothing, so the discarded body must NOT reset its
+/// no-progress accounting or re-arm its liveness deadline. Without that guard a peer
+/// could farm liveness indefinitely by replaying valid-but-obsolete bodies.
+#[tokio::test]
+async fn block_liveness_discarded_retired_body_does_not_rescue_silent_peer() {
+    let mut config = immediate_body_download_config();
+    // Short leash so the probe times out fast and the liveness deadline
+    // (request_timeout * 4) still lands inside the test window.
+    config.request_timeout = Duration::from_millis(300);
+    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+
+    let blocks = mainnet_blocks_1_to_3();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let peer = peer(0x54);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    let connection_cancel = CancellationToken::new();
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        connection_cancel.clone(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::Status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(1),
+            tip_hash: blocks[0].hash(),
+            max_blocks_per_response: 1,
+            max_inflight_requests: 1,
+            max_response_bytes: MAX_BS_RESPONSE_BYTES,
+        }),
+    )
+    .await;
+
+    tip_tx
+        .send((block::Height(1), blocks[0].hash()))
+        .expect("tip watch is live");
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
+        .await
+        .expect("needed metadata queues");
+
+    // The peer receives one probe (its unproven one-request cap), arming liveness.
+    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+
+    // Let the probe time out (height 1 retires as a correlation tombstone).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // A different source commits height 1: the frontier grows past it, so the work
+    // queue no longer owns the height and a body for it can no longer be salvaged.
+    handle
+        .send(BlockSyncEvent::ChainTipGrow(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        }))
+        .await
+        .expect("frontier grow event queues");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while handle.local_status().servable_high != block::Height(1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("frontier grow advances the committed floor past height 1");
+
+    // The peer now delivers the (valid but already-committed) body. It matches the
+    // retired tombstone by hash but cannot be salvaged, so it must be discarded.
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[0].clone())).await;
+
+    // Non-vacuous: the discarded body was delivered while the peer was still
+    // connected, so it had the chance to (wrongly) rescue liveness.
+    assert!(
+        !connection_cancel.is_cancelled(),
+        "the peer must still be connected when it delivers the obsolete body"
+    );
+
+    // The discarded body did not reset no-progress accounting, so the peer is still
+    // exiled at its liveness deadline.
+    tokio::time::timeout(Duration::from_secs(3), connection_cancel.cancelled())
+        .await
+        .expect("a peer whose only delivery is discarded must reach its liveness deadline");
+
+    reactor_task.abort();
+}
+
+/// First-completion-wins across peers: after one peer times out on a height and a
+/// second peer delivers it, a late duplicate from the first peer must be discarded
+/// gracefully — submitted exactly once, no double budget charge, and no misbehavior
+/// charged against the peer that merely lost the race. This exercises the
+/// single-owner work queue and the hash-bound late-body settlement end to end.
+#[tokio::test]
+async fn cross_peer_first_completion_submits_once_and_forgives_late_duplicate() {
+    let mut config = immediate_body_download_config();
+    config.request_timeout = Duration::from_millis(300);
+    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+
+    let blocks = mainnet_blocks_1_to_3();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let status = || BlockSyncStatus {
+        servable_low: block::Height(1),
+        servable_high: block::Height(1),
+        tip_hash: blocks[0].hash(),
+        max_blocks_per_response: 1,
+        max_inflight_requests: 1,
+        max_response_bytes: MAX_BS_RESPONSE_BYTES,
+    };
+    let (peer_a, a_in, mut a_out) =
+        connect_peer_with_status_message(&service, &mut actions, 0x41, status()).await;
+    let (peer_b, b_in, mut b_out) =
+        connect_peer_with_status_message(&service, &mut actions, 0x42, status()).await;
+    let inbounds = HashMap::from([(peer_a.clone(), a_in), (peer_b.clone(), b_in)]);
+
+    tip_tx
+        .send((block::Height(1), blocks[0].hash()))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { .. }
+    ) {}
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
+        .await
+        .expect("needed metadata queues");
+
+    // The single needed height is owned by exactly one peer. Whichever peer is
+    // offered it first is the "straggler" that will time out; the other is the peer
+    // that ultimately delivers.
+    let mut outbound_by_peer: Vec<(ZakuraPeerId, &mut FramedRecv)> =
+        vec![(peer_a.clone(), &mut a_out), (peer_b.clone(), &mut b_out)];
+    let (straggler, start_height, count) = wait_for_getblocks_across(&mut outbound_by_peer).await;
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+    let deliverer = if straggler == peer_a {
+        peer_b.clone()
+    } else {
+        peer_a.clone()
+    };
+
+    // The straggler holds its request until it times out; the height re-queues and
+    // is offered to the deliverer, which supplies the body.
+    let (offered, _, _) = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_getblocks_across(&mut outbound_by_peer),
+    )
+    .await
+    .expect("the timed-out height must re-queue and be offered to the other peer");
+    assert_eq!(
+        offered, deliverer,
+        "the re-queued height must go to the peer that did not just fail it"
+    );
+    send_inbound(
+        inbounds.get(&deliverer).expect("deliverer inbound"),
+        BlockSyncMessage::Block(blocks[0].clone()),
+    )
+    .await;
+
+    let submitted = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match next_action(&mut actions).await {
+                BlockSyncAction::SubmitBlock { block, .. } => break block.hash(),
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("the delivered body is submitted");
+    assert_eq!(submitted, blocks[0].hash());
+
+    // The straggler now delivers the same body late. It matches the height by hash
+    // but the work queue no longer needs it, so it must be discarded, never
+    // re-submitted, and never charged as misbehavior.
+    send_inbound(
+        inbounds.get(&straggler).expect("straggler inbound"),
+        BlockSyncMessage::Block(blocks[0].clone()),
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    loop {
+        match tokio::time::timeout_at(deadline, actions.recv()).await {
+            Err(_) => break,
+            Ok(Some(BlockSyncAction::SubmitBlock { block, .. })) => {
+                panic!("late duplicate must not resubmit: {:?}", block.hash());
+            }
+            Ok(Some(BlockSyncAction::Misbehavior { peer, reason })) => {
+                assert_ne!(
+                    peer, straggler,
+                    "a valid-but-late duplicate must not be charged as misbehavior ({reason:?})"
+                );
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+        }
+    }
 
     reactor_task.abort();
 }
@@ -8847,6 +9199,129 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
             }
             BlockSyncAction::QueryNeededBlocks { .. }
             | BlockSyncAction::QueryBlocksByHeightRange { .. } => {}
+        }
+    }
+
+    reactor_task.abort();
+}
+
+/// The destructive mirror of `reactor_forward_reset_preserves_buffered_successor_body`:
+/// when a forward reset lands on a *conflicting* fork (the peer still has an
+/// outstanding request at the reset tip expecting the old hash), the held successor
+/// body is on the abandoned fork and must be dropped — never submitted — and the new
+/// fork re-downloaded. This guards the growth-vs-reorg classification from
+/// over-preserving a held successor across a genuine reorg.
+#[tokio::test]
+async fn reactor_conflicting_forward_reset_drops_held_successor_and_redownloads() {
+    let mut config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        ..immediate_body_download_config()
+    };
+    config.peer_limits.outbound_queue_depth = 16;
+    let blocks = mainnet_blocks_1_to_3();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(1), blocks[0].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        74,
+        block::Height(3),
+        blocks[2].hash(),
+        1,
+        u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES * 2).unwrap_or(u32::MAX),
+    )
+    .await;
+
+    tip_tx
+        .send((block::Height(3), blocks[2].hash()))
+        .expect("tip watch is live");
+    while !matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks {
+            from: block::Height(2),
+            best_header_tip: block::Height(3),
+            ..
+        }
+    ) {}
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            block_meta(&blocks[1]),
+            block_meta(&blocks[2]),
+        ]))
+        .await
+        .expect("old-fork needed metadata queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(2), 2)
+    );
+
+    // The successor (height 3) arrives out of order and is held; height 2 is still
+    // unreceived, so the request stays outstanding and expects the old-fork hash at
+    // the reset tip. No `BlocksDone`: the outstanding request is what makes the reorg
+    // at the tip visible to the classifier.
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[2].clone())).await;
+
+    // A destructive reset advances the tip to height 2 on a *different* fork.
+    let fork_tip_hash = block::Hash([0x92; 32]);
+    handle
+        .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(2),
+            verified_block_hash: fork_tip_hash,
+        }))
+        .await
+        .expect("conflicting reset event queues");
+
+    // The stale successor must never be submitted; the node must re-download the new
+    // fork instead. Re-supply new-fork successor metadata on every query (idempotent, as in
+    // `reactor_reset_mid_download_drops_stale_anchors_and_releases_budget`) and wait
+    // for the height-3 re-request that proves the held successor was dropped. Height
+    // 2 is the reset's verified tip, so it is intentionally below the new floor.
+    let new_fork_meta = vec![BlockSyncBlockMeta {
+        height: block::Height(3),
+        hash: block::Hash([0x93; 32]),
+        size: BlockSizeEstimate::Advertised(10_000),
+    }];
+    loop {
+        tokio::select! {
+            biased;
+            frame = outbound_rx.recv() => {
+                let frame = frame.expect("outbound channel is live");
+                match BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes") {
+                    BlockSyncMessage::GetBlocks { start_height: block::Height(3), .. } => break,
+                    BlockSyncMessage::GetBlocks { .. } | BlockSyncMessage::Status(_) => {}
+                    msg => panic!("unexpected outbound message after conflicting reset: {msg:?}"),
+                }
+            }
+            action = actions.recv() => {
+                match action.expect("action channel is live") {
+                    BlockSyncAction::SubmitBlock { block, .. } => assert_ne!(
+                        block.hash(),
+                        blocks[2].hash(),
+                        "a held successor on the abandoned fork must never be submitted"
+                    ),
+                    BlockSyncAction::QueryNeededBlocks { .. } => {
+                        handle
+                            .send(BlockSyncEvent::NeededBlocks(new_fork_meta.clone()))
+                            .await
+                            .expect("new-fork needed metadata queues");
+                    }
+                    BlockSyncAction::QueryBlocksByHeightRange { .. } => {}
+                    action => panic!("unexpected action after conflicting reset: {action:?}"),
+                }
+            }
         }
     }
 

@@ -758,6 +758,7 @@ impl PeerRoutine {
                 in_bypass,
             );
             let mut items = Vec::new();
+            let mut reservation_owner = None;
             if floor_arm_allowed && servable_low <= floor_high {
                 if let Some(floor_start) = self
                     .work
@@ -785,12 +786,15 @@ impl PeerRoutine {
                                 .window
                                 .cwnd_byte_headroom_at(floor_bonus, now)
                                 .unwrap_or(u64::MAX);
-                            items = self.work.take_in_range_budgeted(
+                            let owner = self.next_reservation_owner();
+                            items = self.work.take_in_range_budgeted_owned(
                                 servable_low,
                                 grant.take_high,
                                 max_count,
                                 grant.max_request_bytes.min(floor_cwnd_cap).max(1),
+                                owner,
                             );
+                            reservation_owner = (!items.is_empty()).then_some(owner);
                         }
                         AdmissionOutcome::LookaheadAtCap => break FillStop::LookaheadCap,
                         // Unreachable for floor-priority starts (their cap is floored
@@ -830,12 +834,15 @@ impl PeerRoutine {
                             .window
                             .cwnd_byte_headroom_at(0, now)
                             .unwrap_or(u64::MAX);
-                        items = self.work.take_in_range_budgeted(
+                        let owner = self.next_reservation_owner();
+                        items = self.work.take_in_range_budgeted_owned(
                             servable_low,
                             grant.take_high,
                             max_count,
                             grant.max_request_bytes.min(above_cwnd_cap),
+                            owner,
                         );
+                        reservation_owner = (!items.is_empty()).then_some(owner);
                     }
                     // A floor-priority start while the floor arm deferred to a
                     // preferred carrier: leave the take to that peer (falls through
@@ -851,6 +858,8 @@ impl PeerRoutine {
             if items.is_empty() {
                 break FillStop::NoWork;
             }
+            let reservation_owner =
+                reservation_owner.expect("a non-empty production take has an assigned owner");
             // Peer-local retry bias: if the contiguous chunk we just took leads
             // with heights this routine recently *failed* (RangeUnavailable /
             // timeout / send-failure), quietly put those back so another peer can
@@ -871,11 +880,11 @@ impl PeerRoutine {
                     Some(0) => {}
                     Some(index) => {
                         let avoided: Vec<_> = items.drain(..index).map(|(h, _)| h).collect();
-                        self.work.return_items_quiet(avoided);
+                        self.work.return_items_quiet(avoided, reservation_owner);
                     }
                     None => {
                         let avoided: Vec<_> = items.iter().map(|(h, _)| *h).collect();
-                        self.work.return_items_quiet(avoided);
+                        self.work.return_items_quiet(avoided, reservation_owner);
                         break FillStop::RetryAvoid;
                     }
                 }
@@ -884,7 +893,7 @@ impl PeerRoutine {
                 .iter()
                 .any(|(height, _)| self.window.has_outstanding_height(*height))
             {
-                self.return_taken_items(&items);
+                self.return_taken_items(&items, reservation_owner);
                 break FillStop::RetryAvoid;
             }
             self.trace_work_taken(servable_low, servable_high, items.len());
@@ -909,29 +918,25 @@ impl PeerRoutine {
                 .reserve_request_budget(request_priority, reserved_bytes)
                 .await
             {
-                self.return_taken_items(&items);
+                self.return_taken_items(&items, reservation_owner);
                 break FillStop::Budget;
             }
-            let request_token = self.window.next_request_token();
-            let reservation_owner = ReservationOwner {
-                generation: self.generation,
-                request_token,
-            };
             let marked = self
                 .work
                 .mark_reserved(items.iter().map(|(height, _)| *height), reservation_owner);
             if marked != reserved_bytes {
-                // Release only what is still reserved, mirroring the sibling unwinds
-                // below. A competing peer's late body may have settled one of these
-                // taken heights to `Held(actual)` during the reserve await; that
-                // height's estimate now belongs to the held body (the Sequencer
-                // releases it on commit), so releasing the fixed `reserved_bytes`
-                // here would double-release it and under-count the byte budget.
-                let released = self.work.release_reserved_and_return_items(
+                // Release both parts of the failed two-phase reservation: bytes
+                // admitted globally but never attached to this owner, plus this
+                // owner's still-reserved queue entries. Held/replacement entries
+                // remain untouched by the owner-aware queue cleanup.
+                release_failed_request_reservation(
+                    &self.work,
+                    &mut self.budget,
                     items.iter().map(|(height, _)| *height),
                     reservation_owner,
+                    reserved_bytes,
+                    marked,
                 );
-                self.budget.release(released);
                 break FillStop::Internal;
             }
 
@@ -965,6 +970,7 @@ impl PeerRoutine {
             };
 
             let queued_at = Instant::now();
+            let request_token = reservation_owner.request_token;
             let msg = BlockSyncMessage::GetBlocks {
                 start_height: request.start_height,
                 count: request.count,
@@ -1134,9 +1140,16 @@ impl PeerRoutine {
     /// (budget race / send failure). Quiet (no notify): the returning routine must
     /// not re-wake its own want-work arm into a take/return spin, and any other
     /// peer waiting on budget capacity is woken by the matching `budget.release`.
-    fn return_taken_items(&self, items: &[(block::Height, WorkItem)]) {
+    fn return_taken_items(&self, items: &[(block::Height, WorkItem)], owner: ReservationOwner) {
         self.work
-            .return_items_quiet(items.iter().map(|(height, _)| *height));
+            .return_items_quiet(items.iter().map(|(height, _)| *height), owner);
+    }
+
+    fn next_reservation_owner(&mut self) -> ReservationOwner {
+        ReservationOwner {
+            generation: self.generation,
+            request_token: self.window.next_request_token(),
+        }
     }
 
     /// Record heights this routine just returned on a failure so it will not
@@ -1456,15 +1469,21 @@ impl PeerRoutine {
         // `mark_received` then stops `reserved_bytes()` counting this height; the
         // only bytes still held are the `serialized_bytes` carried into the reorder
         // buffer.
-        let reset_epoch = self.sequencer_view.borrow().reset_epoch;
-        let Some(claim) = self.claim_received_body(height, hash, serialized_bytes) else {
+        let previous_block_hash = block.header.previous_block_hash;
+        let Some(claim) =
+            self.claim_received_body(height, hash, previous_block_hash, serialized_bytes)
+        else {
             self.reconcile_registry_retirements(Instant::now());
             return;
         };
-        match claim {
-            LateBodyClaim::SettledReserved(delta) => self.apply_budget_delta(delta),
-            LateBodyClaim::ClaimedPending => {
+        let reset_epoch = match claim {
+            LateBodyClaim::SettledReserved { delta, reset_epoch } => {
+                self.apply_budget_delta(delta);
+                reset_epoch
+            }
+            LateBodyClaim::ClaimedPending(reset_epoch) => {
                 metrics::counter!("sync.block.response.watchdog_late_accepted").increment(1);
+                reset_epoch
             }
             LateBodyClaim::AlreadyHeld => {
                 self.reconcile_registry_retirements(Instant::now());
@@ -1499,7 +1518,7 @@ impl PeerRoutine {
             LateBodyClaim::PendingAdmissionRequired => {
                 unreachable!("claim_received_body resolves pending admission")
             }
-        }
+        };
 
         // The watchdog publishes its retirement before returning WorkQueue
         // ownership. Reconcile again after the authoritative claim so a watchdog
@@ -1599,17 +1618,15 @@ impl PeerRoutine {
                 raw_block_payload,
             )
             .await;
-        if outcome == UnmatchedBodyOutcome::Accepted
-            && self.window.outstanding.take_late_reliability_credit(index)
-        {
-            self.window.credit_late_delivery();
-        }
-
-        self.window.outstanding.mark_received(index, height);
-        let completed = self.window.outstanding.is_complete(index);
-        if completed {
-            self.window.outstanding.remove(index);
-            self.window.disarm_liveness_after_progress_if_idle();
+        if outcome == UnmatchedBodyOutcome::Accepted {
+            if self.window.outstanding.take_late_reliability_credit(index) {
+                self.window.credit_late_delivery();
+            }
+            self.window.outstanding.mark_received(index, height);
+            if self.window.outstanding.is_complete(index) {
+                self.window.outstanding.remove(index);
+                self.window.disarm_liveness_after_progress_if_idle();
+            }
         }
         self.publish_outstanding();
     }
@@ -1705,6 +1722,7 @@ impl PeerRoutine {
         &mut self,
         height: block::Height,
         hash: block::Hash,
+        previous_block_hash: block::Hash,
         serialized_bytes: u64,
     ) -> Option<LateBodyClaim> {
         let mut pending_admitted = false;
@@ -1712,6 +1730,7 @@ impl PeerRoutine {
             match self.work.claim_late_body(
                 height,
                 hash,
+                previous_block_hash,
                 serialized_bytes,
                 &mut self.budget,
                 pending_admitted,
@@ -1765,14 +1784,21 @@ impl PeerRoutine {
             },
         };
 
-        let reset_epoch = self.sequencer_view.borrow().reset_epoch;
-        match self.claim_received_body(height, hash, serialized_bytes) {
-            Some(LateBodyClaim::ClaimedPending) => {
+        let previous_block_hash = block.header.previous_block_hash;
+        let reset_epoch = match self.claim_received_body(
+            height,
+            hash,
+            previous_block_hash,
+            serialized_bytes,
+        ) {
+            Some(LateBodyClaim::ClaimedPending(reset_epoch)) => {
                 metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
+                reset_epoch
             }
-            Some(LateBodyClaim::SettledReserved(delta)) => {
+            Some(LateBodyClaim::SettledReserved { delta, reset_epoch }) => {
                 self.apply_budget_delta(delta);
                 metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
+                reset_epoch
             }
             Some(LateBodyClaim::BudgetFull) => {
                 tracing::debug!(
@@ -1791,7 +1817,7 @@ impl PeerRoutine {
                 unreachable!("claim_received_body resolves pending admission")
             }
             None => return UnmatchedBodyOutcome::Handled,
-        }
+        };
 
         self.record_received(serialized_bytes);
         self.trace_body_received(height, serialized_bytes, None, None, None);
@@ -1899,6 +1925,11 @@ impl PeerRoutine {
 
     async fn handle_blocks_done(&mut self, start_height: block::Height) {
         self.reconcile_registry_retirements(Instant::now());
+        if let Some(index) = self.window.retired_index_for_start(start_height) {
+            self.window.outstanding.remove(index);
+            self.publish_outstanding();
+            return;
+        }
         let Some(index) = self.window.outstanding_index_for_start(start_height) else {
             if self.ignore_stale_response(start_height, "terminator").await {
                 return;
@@ -1919,11 +1950,6 @@ impl PeerRoutine {
                 .await;
             return;
         };
-        if self.window.outstanding[index].is_retired() {
-            self.window.outstanding.remove(index);
-            self.publish_outstanding();
-            return;
-        }
         let disposition = self.stale_adjusted_disposition(index, Disposition::RetryMissing);
         self.charge_short_response_reliability(index, disposition);
         self.finish_outstanding_at(index, disposition);
@@ -1931,6 +1957,11 @@ impl PeerRoutine {
 
     async fn handle_range_unavailable(&mut self, start_height: block::Height) {
         self.reconcile_registry_retirements(Instant::now());
+        if let Some(index) = self.window.retired_index_for_start(start_height) {
+            self.window.outstanding.remove(index);
+            self.publish_outstanding();
+            return;
+        }
         let Some(index) = self.window.outstanding_index_for_start(start_height) else {
             if self
                 .ignore_stale_response(start_height, "unavailable range")
@@ -1947,11 +1978,6 @@ impl PeerRoutine {
             Some(outstanding.request.count),
             Some(elapsed_ms_u64(outstanding.queued_at.elapsed())),
         );
-        if outstanding.is_retired() {
-            self.window.outstanding.remove(index);
-            self.publish_outstanding();
-            return;
-        }
         let disposition = self.stale_adjusted_disposition(index, Disposition::RetryOriginal);
         self.charge_short_response_reliability(index, disposition);
         self.finish_outstanding_at(index, disposition);
@@ -2605,6 +2631,26 @@ fn reservation_owner(generation: u64, outstanding: &OutstandingBlockRange) -> Re
     }
 }
 
+/// Unwind a global request admission that could not be fully attached to its
+/// owner in the work queue.
+///
+/// `admitted_bytes - marked_bytes` was charged to the shared budget but never
+/// entered a queue ledger. The owner-aware queue release returns the remainder
+/// only when it still belongs to this request; replacements and held bodies are
+/// left untouched.
+fn release_failed_request_reservation(
+    work: &WorkQueue,
+    budget: &mut super::state::ByteBudget,
+    heights: impl IntoIterator<Item = block::Height>,
+    owner: ReservationOwner,
+    admitted_bytes: u64,
+    marked_bytes: u64,
+) {
+    let unattached_bytes = admitted_bytes.saturating_sub(marked_bytes);
+    let released_bytes = work.release_reserved_and_return_items(heights, owner);
+    budget.release(unattached_bytes.saturating_add(released_bytes));
+}
+
 /// The still-unreceived heights of an outstanding request (the ones that return
 /// to `pending` on retry/timeout — never the received-and-buffered ones, which
 /// stay claimed in `work.in_flight`).
@@ -2693,12 +2739,101 @@ mod tests {
     use super::super::request::{BlockRangeRequest, ExpectedBlock};
     use super::super::sequencer_task::{initial_view, SequencerControlInput};
     use super::super::state::{ByteBudget, LivenessOutcome, ThroughputMeter};
-    use super::super::work_queue::WorkQueue;
+    use super::super::work_queue::{ReservationOwner, WorkQueue};
     use super::super::{BlockSyncFrontiers, BlockSyncPeerSession, ZakuraBlockSyncConfig};
-    use super::PeerRoutine;
+    use super::{release_failed_request_reservation, PeerRoutine};
     use crate::zakura::framed_channel;
     use crate::zakura::trace::ZakuraTrace;
     use crate::zakura::ZakuraPeerId;
+
+    #[test]
+    fn pre_reservation_aba_cleanup_preserves_budget_and_replacement_owner() {
+        let work = WorkQueue::new(block::Height(0));
+        let mut budget = ByteBudget::new(8_192);
+        let height = block::Height(1);
+        let old_estimate = 1_024;
+        let replacement_estimate = 2_048;
+        let old_owner = ReservationOwner {
+            generation: 1,
+            request_token: 1,
+        };
+        let replacement_owner = ReservationOwner {
+            generation: 2,
+            request_token: 1,
+        };
+
+        assert_eq!(
+            work.extend([(
+                height,
+                block::Hash([1; 32]),
+                BlockSizeEstimate::Advertised(old_estimate),
+            )]),
+            1
+        );
+        assert_eq!(
+            work.take_in_range_budgeted_owned(height, height, 1, u64::MAX, old_owner,)
+                .len(),
+            1
+        );
+
+        // While the old routine is waiting for global admission, a destructive
+        // reset removes its unfunded take and repopulates the same height.
+        assert_eq!(work.reset_above(block::Height(0)), 0);
+        assert_eq!(
+            work.extend([(
+                height,
+                block::Hash([2; 32]),
+                BlockSizeEstimate::Advertised(replacement_estimate),
+            )]),
+            1
+        );
+        assert_eq!(
+            work.take_in_range_budgeted_owned(height, height, 1, u64::MAX, replacement_owner,)
+                .len(),
+            1
+        );
+        assert!(budget.try_reserve(u64::from(replacement_estimate)));
+        assert_eq!(
+            work.mark_reserved([height], replacement_owner),
+            u64::from(replacement_estimate)
+        );
+
+        // The old admission then completes. Its owner-bound mark must reject the
+        // replacement, and its unwind must release exactly the unattached old
+        // admission without returning or uncharging replacement work.
+        assert!(budget.try_reserve(u64::from(old_estimate)));
+        let marked = work.mark_reserved([height], old_owner);
+        assert_eq!(marked, 0);
+        release_failed_request_reservation(
+            &work,
+            &mut budget,
+            [height],
+            old_owner,
+            u64::from(old_estimate),
+            marked,
+        );
+
+        assert!(work.in_flight_contains(height));
+        assert!(!work.pending_contains(height));
+        assert_eq!(
+            work.reserved_bytes(),
+            u64::from(replacement_estimate),
+            "the queue must retain exactly the replacement charge"
+        );
+        assert_eq!(
+            budget.reserved(),
+            u64::from(replacement_estimate),
+            "the global budget must retain exactly the replacement charge"
+        );
+
+        assert_eq!(
+            work.release_reserved_and_return_items([height], replacement_owner),
+            u64::from(replacement_estimate)
+        );
+        budget.release(u64::from(replacement_estimate));
+        assert_eq!(work.reserved_bytes(), 0);
+        assert_eq!(budget.reserved(), 0);
+    }
 
     /// A floor request whose byte reservation cannot be met must still reach the
     /// sequencer's floor-funding path so the rescue shed can free room — even when the
@@ -3092,7 +3227,7 @@ mod tests {
             config,
             0,
             budget,
-            work,
+            Arc::clone(&work),
             Arc::new(PeerRegistry::new()),
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
             sequencer_input_tx,
@@ -3349,11 +3484,11 @@ mod tests {
         );
     }
 
-    /// A body that matches a retired request but cannot be salvaged is only a
-    /// correlated response, not accepted block progress. It must not prove the
-    /// peer, reset its no-progress request count, or extend its liveness.
+    /// A discarded body retains the retired request as a correlation tombstone.
+    /// That tombstone blocks ambiguous same-peer reissue until the old response's
+    /// terminator consumes it, after which the normal fill path can reissue.
     #[tokio::test]
-    async fn discarded_retired_body_does_not_credit_block_progress() {
+    async fn discarded_retired_body_tombstone_blocks_reissue_until_terminator() {
         let block: Arc<block::Block> = Arc::new(
             BLOCK_MAINNET_1_BYTES
                 .zcash_deserialize_into()
@@ -3370,7 +3505,7 @@ mod tests {
         let work = Arc::new(WorkQueue::new(block::Height(0)));
 
         let cancel = CancellationToken::new();
-        let (out_send, _out_recv) = framed_channel(16);
+        let (out_send, mut out_recv) = framed_channel(16);
         let (_in_send, in_recv) = framed_channel(16);
         let peer = ZakuraPeerId::new(vec![10u8; 32]).expect("test peer id is within bounds");
         let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
@@ -3391,7 +3526,7 @@ mod tests {
             config,
             0,
             budget,
-            work,
+            Arc::clone(&work),
             Arc::new(PeerRegistry::new()),
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
             sequencer_input_tx,
@@ -3409,11 +3544,10 @@ mod tests {
 
         let now = Instant::now();
         let liveness_timeout = Duration::from_secs(60);
-        routine.window.arm_liveness(now, liveness_timeout);
         routine.window.outstanding.push(OutstandingBlockRange {
             token: 1,
             state: OutstandingRequestState::Retired {
-                reason: RetirementReason::RequestTimeout,
+                reason: RetirementReason::FloorWatchdog,
                 retired_at: now,
                 correlation_deadline: now + liveness_timeout,
             },
@@ -3454,6 +3588,44 @@ mod tests {
             !routine.window.has_block_progress(),
             "a discarded retired body must not prove the peer"
         );
+        assert_eq!(
+            routine.window.retired_len(),
+            1,
+            "discarding the body must retain its correlation tombstone"
+        );
+
+        assert_eq!(
+            work.extend([(height, hash, BlockSizeEstimate::Advertised(1_000))]),
+            1
+        );
+        routine.try_fill().await;
+        assert!(work.pending_contains(height));
+        assert!(
+            timeout(Duration::from_millis(20), out_recv.recv())
+                .await
+                .is_err(),
+            "the retained tombstone must block same-peer reissue"
+        );
+
+        // The old terminator closes the tombstone. Only then can the normal fill
+        // path claim and reissue the same range.
+        routine.handle_blocks_done(height).await;
+        assert_eq!(routine.window.retired_len(), 0);
+        assert!(routine.window.outstanding.is_empty());
+        assert!(work.pending_contains(height));
+        routine.try_fill().await;
+        assert!(
+            work.in_flight_contains(height),
+            "the normal fill path must claim the range after tombstone removal"
+        );
+        assert!(
+            timeout(Duration::from_millis(100), out_recv.recv())
+                .await
+                .expect("reissue is sent after the tombstone is removed")
+                .is_some(),
+            "the same range must become issuable after its old terminator"
+        );
+        assert_eq!(routine.window.active_len(), 1);
     }
 
     /// A global apply backlog is not peer-specific evidence, so it cannot excuse

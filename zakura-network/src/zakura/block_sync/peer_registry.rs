@@ -346,19 +346,6 @@ impl PeerRegistry {
         peers.values().map(|entry| entry.outstanding.len()).sum()
     }
 
-    /// Whether any peer has an outstanding request reaching height `at_or_above`
-    /// (the `peer_has_successor_after` half of the reset decision). Reads the
-    /// registry's per-height outstanding set across peers.
-    pub(super) fn any_outstanding_at_or_above(&self, at_or_above: block::Height) -> bool {
-        let peers = self.lock();
-        peers.values().any(|entry| {
-            entry
-                .outstanding
-                .keys()
-                .any(|height| *height >= at_or_above)
-        })
-    }
-
     /// Whether any peer has an outstanding request whose expected hash at `height`
     /// differs from `hash` (the peer-outstanding clause of
     /// `reset_tip_conflicts_with_local_work`).

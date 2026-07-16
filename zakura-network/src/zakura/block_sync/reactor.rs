@@ -764,22 +764,11 @@ impl BlockSyncReactor {
         preserve_active_successors: bool,
     ) {
         self.pending_needed_query = None;
-        // Reactor-owned prep: precompute the two peer-outstanding-derived halves
-        // of the reset decision (the reactor owns peer state; the task ORs them
-        // with its Sequencer-internal predicates). The `verified_tip()`/`floor()`
-        // reads in the original decision are NOT recomputed here: the task owns
-        // them and makes the destructive-vs-growth call against its own
-        // authoritative copy.
+        // Reactor-owned prep: precompute the peer-outstanding conflict predicate.
+        // Outstanding successor requests are deliberately not preservation
+        // evidence: only an exact downloaded H+1 body can prove the reset hash is
+        // its parent.
         let tip = frontiers.verified_block_tip;
-        // peer `outstanding` lives in the routines, mirrored into the registry
-        // (per-peer *unreceived* in-flight heights). The reactor reads it from the
-        // registry to precompute the two peer-derived halves of the reset
-        // decision. Received-and-buffered heights are caught by the Sequencer's own
-        // reorder/applying predicates, so reading only unreceived heights here is a
-        // benign (correct) narrowing of the original expected-blocks scan.
-        let peer_has_successor_after = next_height(tip)
-            .map(|next| self.registry.any_outstanding_at_or_above(next))
-            .unwrap_or(false);
         let peer_outstanding_conflicts_at_tip = self
             .registry
             .any_outstanding_conflicts_at(tip, frontiers.verified_block_hash);
@@ -795,7 +784,6 @@ impl BlockSyncReactor {
             .send(SequencerControlInput::FrontierReset {
                 frontiers,
                 preserve_active_successors,
-                peer_has_successor_after,
                 peer_outstanding_conflicts_at_tip,
             });
         self.trace_sequencer_control_send(

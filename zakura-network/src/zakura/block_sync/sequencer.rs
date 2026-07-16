@@ -200,24 +200,21 @@ impl Sequencer {
             .is_some_and(|entries| entries.iter().any(|(entry_hash, _)| *entry_hash == hash))
     }
 
-    /// Whether any reorder/applying/submitted body sits at or above `height`,
-    /// used by the reactor to decide whether a reset is anchored by active
-    /// successor work.
-    pub(super) fn has_buffered_at_or_above(&self, height: block::Height) -> bool {
-        self.reorder.contains_at_or_above(height)
-            || self.applying.range(height..).next().is_some()
-            || self.submitted_applies.range(height..).next().is_some()
-    }
-
-    /// `previous_block_hash` of a held `applying` body, for deciding whether a
-    /// reset orphans an already-submitted successor.
-    pub(super) fn applying_previous_block_hash(
+    /// Whether the exact buffered/applying body at `height` links to `parent_hash`.
+    ///
+    /// Submitted bodies remain in `applying` until their completion is handled,
+    /// so this covers reorder, applying, and submitted bodies without treating a
+    /// hash-only submitted-completion record as ancestry evidence.
+    pub(super) fn body_links_to_parent(
         &self,
         height: block::Height,
-    ) -> Option<block::Hash> {
-        self.applying
-            .get(&height)
-            .map(|applying| applying.block.header.previous_block_hash)
+        parent_hash: block::Hash,
+    ) -> bool {
+        self.reorder.previous_block_hash(height).or_else(|| {
+            self.applying
+                .get(&height)
+                .map(|applying| applying.block.header.previous_block_hash)
+        }) == Some(parent_hash)
     }
 
     pub(super) fn reorder_hash(&self, height: block::Height) -> Option<block::Hash> {

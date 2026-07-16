@@ -14,7 +14,7 @@
 //! skip all the network tests by setting the `SKIP_NETWORK_TESTS` environmental variable.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -45,7 +45,7 @@ use crate::{
         set::MorePeers,
         ActiveConnectionCounter, CandidateSet, ConnectionTracker,
     },
-    protocol::types::PeerServices,
+    protocol::{external::canonical_socket_addr, types::PeerServices},
     AddressBook, BoxError, Config, PeerSocketAddr, Request, Response,
 };
 
@@ -975,8 +975,11 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
         return;
     }
 
-    let public_ip = Ipv4Addr::LOCALHOST;
-    let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
+    #[cfg(target_os = "macos")]
+    let public_ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    #[cfg(not(target_os = "macos"))]
+    let public_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let zcashd_compat_ip = zcashd_compat_test_ip();
     let (peer_tracker_tx, mut peer_tracker_rx) = mpsc::unbounded();
 
     let success_stay_open_inbound_handshaker =
@@ -1006,7 +1009,7 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
         });
 
     let mut config = Config {
-        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        listen_addr: zcashd_compat_test_listen_addr(),
         peerset_initial_target_size: 2,
         max_connections_per_ip: usize::MAX,
         ..Config::default()
@@ -1077,7 +1080,7 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
         return;
     }
 
-    let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
+    let zcashd_compat_ip = zcashd_compat_test_ip();
     let success_disconnect_inbound_handshaker =
         service_fn(|req: HandshakeRequest<TcpStream>| async move {
             let HandshakeRequest {
@@ -1150,7 +1153,7 @@ async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
         return;
     }
 
-    let zcashd_compat_ip = Ipv4Addr::new(127, 0, 0, 2);
+    let zcashd_compat_ip = zcashd_compat_test_ip();
     let unreachable_inbound_handshaker = service_fn(|_| async {
         unreachable!("banned zcashd-compat peer should never reach the handshaker")
     });
@@ -1904,11 +1907,42 @@ where
     (config, peerset_rx)
 }
 
-async fn connect_from(source_ip: Ipv4Addr, listen_addr: SocketAddr) -> TcpStream {
-    let socket = TcpSocket::new_v4().expect("test should create an IPv4 TCP socket");
+fn zcashd_compat_test_ip() -> Ipv4Addr {
+    if cfg!(target_os = "macos") {
+        Ipv4Addr::LOCALHOST
+    } else {
+        Ipv4Addr::new(127, 0, 0, 2)
+    }
+}
+
+fn zcashd_compat_test_listen_addr() -> SocketAddr {
+    if cfg!(target_os = "macos") {
+        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
+    } else {
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)
+    }
+}
+
+async fn connect_from(source_ip: impl Into<IpAddr>, listen_addr: SocketAddr) -> TcpStream {
+    let source_ip = source_ip.into();
+    let socket = match source_ip {
+        IpAddr::V4(_) => TcpSocket::new_v4().expect("test should create an IPv4 TCP socket"),
+        IpAddr::V6(_) => TcpSocket::new_v6().expect("test should create an IPv6 TCP socket"),
+    };
     socket
-        .bind(SocketAddr::new(source_ip.into(), 0))
+        .bind(SocketAddr::new(source_ip, 0))
         .expect("test should bind to a loopback source address");
+
+    let listen_addr = match source_ip {
+        IpAddr::V4(_) if listen_addr.is_ipv6() => {
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), listen_addr.port())
+        }
+        IpAddr::V6(_) if listen_addr.ip().is_unspecified() => {
+            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), listen_addr.port())
+        }
+        _ => listen_addr,
+    };
+
     socket
         .connect(listen_addr)
         .await
@@ -1917,15 +1951,11 @@ async fn connect_from(source_ip: Ipv4Addr, listen_addr: SocketAddr) -> TcpStream
 
 fn drain_accepted_inbound_ips(
     peer_tracker_rx: &mut mpsc::UnboundedReceiver<(IpAddr, TcpStream, ConnectionTracker)>,
-) -> Vec<Ipv4Addr> {
+) -> Vec<IpAddr> {
     let mut accepted_ips = Vec::new();
 
     while let Ok((ip, peer_connection, peer_tracker)) = peer_tracker_rx.try_recv() {
-        let IpAddr::V4(ip) = ip else {
-            panic!("zcashd-compat listener tests only use IPv4 peers");
-        };
-
-        accepted_ips.push(ip);
+        accepted_ips.push(canonical_socket_addr(SocketAddr::new(ip, 0)).ip());
         std::mem::drop(peer_connection);
         std::mem::drop(peer_tracker);
     }

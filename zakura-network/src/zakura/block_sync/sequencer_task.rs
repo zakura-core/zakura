@@ -26,7 +26,7 @@ use super::{
 };
 
 #[cfg(test)]
-use super::work_queue::ReservationOwner;
+use super::work_queue::{LateBodyClaim, ReservationOwner};
 
 /// Favor the lowest needed height over the speculative high tail.
 ///
@@ -122,16 +122,11 @@ pub(super) enum SequencerControlInput {
         frontiers: BlockSyncFrontiers,
         release_applied: bool,
     },
-    /// A chain-tip reset (reorg/checkpoint/coalesced update). The two `peer_*`
-    /// bools are the peer-outstanding-derived halves of the reset decision,
-    /// precomputed by the reactor (which owns peer state); the task ORs them with
-    /// its own Sequencer-internal predicates.
+    /// A chain-tip reset (reorg/checkpoint/coalesced update). The peer conflict
+    /// predicate is precomputed by the reactor, which owns peer state.
     FrontierReset {
         frontiers: BlockSyncFrontiers,
         preserve_active_successors: bool,
-        /// `peers.any(outstanding.end_height() >= tip+1)` — half of
-        /// `has_active_successor_after`.
-        peer_has_successor_after: bool,
         /// `peers.any(outstanding.expected_hash(tip) is Some(h) && h != hash)` —
         /// the peer-outstanding clause of `reset_tip_conflicts_with_local_work`.
         peer_outstanding_conflicts_at_tip: bool,
@@ -324,13 +319,11 @@ impl SequencerTask {
             SequencerControlInput::FrontierReset {
                 frontiers,
                 preserve_active_successors,
-                peer_has_successor_after,
                 peer_outstanding_conflicts_at_tip,
             } => {
                 self.handle_frontier_reset(
                     frontiers,
                     preserve_active_successors,
-                    peer_has_successor_after,
                     peer_outstanding_conflicts_at_tip,
                 )
                 .await;
@@ -445,13 +438,12 @@ impl SequencerTask {
 
     /// Handle a chain-tip reset: classify it as growth (treat as an advance) or a
     /// destructive reorg (pin tip/floor to the target, clear successor buffers, and
-    /// bump the reset epoch). The peer-outstanding clauses of the decision arrive as
-    /// the precomputed `peer_*` bools, since the reactor owns peer state.
+    /// bump the reset epoch). The peer-outstanding conflict predicate arrives
+    /// precomputed because the reactor owns peer state.
     async fn handle_frontier_reset(
         &mut self,
         frontiers: BlockSyncFrontiers,
         preserve_active_successors: bool,
-        peer_has_successor_after: bool,
         peer_outstanding_conflicts_at_tip: bool,
     ) {
         let reset_tip_matches_local_work = !self.reset_tip_conflicts_with_local_work(
@@ -461,24 +453,21 @@ impl SequencerTask {
         );
 
         // State can report a forward `Reset` while checkpoint commits advance
-        // under already-submitted or still-downloading successor bodies. Treat
-        // that as verified growth once it is inside our submitted/downloaded
-        // floor, or when we already have successor work in flight. Keep fork
-        // resets destructive when they are not anchored by active successor
-        // work.
+        // under an already-downloaded successor body. Preserve only when the
+        // exact H+1 body proves it extends the reset hash; a floor position,
+        // higher buffered body, or outstanding peer request does not prove
+        // ancestry.
         if frontiers.verified_block_tip > self.sequencer.verified_tip()
-            && (frontiers.verified_block_tip <= self.sequencer.floor()
-                || self.has_active_successor_after(
-                    frontiers.verified_block_tip,
-                    peer_has_successor_after,
-                ))
+            && self.exact_successor_links_to_anchor(
+                frontiers.verified_block_tip,
+                frontiers.verified_block_hash,
+            )
             && reset_tip_matches_local_work
         {
             self.trace_frontier_reset_classified(
                 "growth",
                 &frontiers,
                 preserve_active_successors,
-                peer_has_successor_after,
                 peer_outstanding_conflicts_at_tip,
                 reset_tip_matches_local_work,
             );
@@ -498,9 +487,7 @@ impl SequencerTask {
         if preserve_active_successors
             && frontiers.verified_block_tip < self.sequencer.floor()
             && reset_tip_matches_local_work
-            && self
-                .has_active_successor_after(frontiers.verified_block_tip, peer_has_successor_after)
-            && self.active_successor_links_to_anchor(
+            && self.exact_successor_links_to_anchor(
                 frontiers.verified_block_tip,
                 frontiers.verified_block_hash,
             )
@@ -509,7 +496,6 @@ impl SequencerTask {
                 "preserved_stale",
                 &frontiers,
                 preserve_active_successors,
-                peer_has_successor_after,
                 peer_outstanding_conflicts_at_tip,
                 reset_tip_matches_local_work,
             );
@@ -521,7 +507,6 @@ impl SequencerTask {
             "destructive",
             &frontiers,
             preserve_active_successors,
-            peer_has_successor_after,
             peer_outstanding_conflicts_at_tip,
             reset_tip_matches_local_work,
         );
@@ -545,11 +530,11 @@ impl SequencerTask {
         // charge when the body-input loop reaches them.
         let released = self.work.advance_floor(self.sequencer.floor());
         self.budget.release(released);
-        let released = self.work.reset_above(self.sequencer.floor());
+        let (released, reset_epoch) = self.work.destructive_reset_above(self.sequencer.floor());
         self.budget.release(released);
-        // A destructive reset: bump the epoch so the reactor drops *all*
-        // outstanding requests (not just those through the tip).
-        self.reset_epoch = self.reset_epoch.saturating_add(1);
+        // Publish the epoch advanced atomically with clearing WorkQueue ownership,
+        // so claims cannot observe a mixed old-owner/new-epoch state.
+        self.reset_epoch = reset_epoch;
     }
 
     /// Handle a verifier apply completion: release the body's bytes and verifier
@@ -622,8 +607,10 @@ impl SequencerTask {
                 let released = self.sequencer.release_applying_blocks_from(height);
                 self.budget.release(released);
                 self.sequencer.reset_floor_below(height);
-                let released = self.work.reset_above(self.sequencer.floor());
+                let (released, reset_epoch) =
+                    self.work.destructive_reset_above(self.sequencer.floor());
                 self.budget.release(released);
+                self.reset_epoch = reset_epoch;
                 let dropped = self.sequencer.drop_reorder_from(height);
                 self.budget.release(dropped);
                 // A `Rejected` result means consensus found the body invalid.
@@ -716,7 +703,6 @@ impl SequencerTask {
         classification: &'static str,
         frontiers: &BlockSyncFrontiers,
         preserve_active_successors: bool,
-        peer_has_successor_after: bool,
         peer_outstanding_conflicts_at_tip: bool,
         reset_tip_matches_local_work: bool,
     ) {
@@ -741,11 +727,6 @@ impl SequencerTask {
             );
             bs_insert_u64(
                 row,
-                "peer_has_successor_after",
-                u64::from(peer_has_successor_after),
-            );
-            bs_insert_u64(
-                row,
                 "peer_outstanding_conflicts_at_tip",
                 u64::from(peer_outstanding_conflicts_at_tip),
             );
@@ -756,11 +737,11 @@ impl SequencerTask {
             );
             bs_insert_u64(
                 row,
-                "has_local_successor_after",
-                u64::from(
-                    next_height(frontiers.verified_block_tip)
-                        .is_some_and(|next| self.sequencer.has_buffered_at_or_above(next)),
-                ),
+                "exact_successor_links_to_anchor",
+                u64::from(self.exact_successor_links_to_anchor(
+                    frontiers.verified_block_tip,
+                    frontiers.verified_block_hash,
+                )),
             );
         });
     }
@@ -801,36 +782,17 @@ impl SequencerTask {
         false
     }
 
-    fn has_active_successor_after(
-        &self,
-        height: block::Height,
-        peer_has_successor_after: bool,
-    ) -> bool {
-        let Some(next) = next_height(height) else {
-            return false;
-        };
-
-        // A successor is active while buffered, requested from a peer, or in flight
-        // from the work queue. Include in-flight bodies so a forward advance does not
-        // mistake a completed request for a reorg and discard its body.
-        self.sequencer.has_buffered_at_or_above(next)
-            || peer_has_successor_after
-            || self.work.max_in_flight().is_some_and(|max| max >= next)
-    }
-
-    fn active_successor_links_to_anchor(
+    fn exact_successor_links_to_anchor(
         &self,
         height: block::Height,
         anchor_hash: block::Hash,
     ) -> bool {
         let Some(next) = next_height(height) else {
-            return true;
+            return false;
         };
 
-        self.sequencer
-            .applying_previous_block_hash(next)
-            .map(|previous_block_hash| previous_block_hash == anchor_hash)
-            .unwrap_or(true)
+        self.sequencer.body_links_to_parent(next, anchor_hash)
+            || self.work.held_successor_links_to(next, anchor_hash)
     }
 
     async fn send_action(&self, action: BlockSyncAction) -> bool {
@@ -988,7 +950,7 @@ mod tests {
             verified_block_tip: block::Height(1),
             verified_block_hash: block::Hash([9; 32]),
         };
-        let height = block::Height(1);
+        let height = block::Height(3);
         let hash = block::Hash([1; 32]);
         let mut budget = ByteBudget::new(1_024);
         let work = Arc::new(WorkQueue::new(block::Height(0)));
@@ -997,19 +959,21 @@ mod tests {
             work.extend([(height, hash, BlockSizeEstimate::Advertised(64))]),
             1
         );
-        assert_eq!(work.take_in_range(height, height, 1).len(), 1);
+        let owner = ReservationOwner {
+            generation: 1,
+            request_token: 1,
+        };
         assert_eq!(
-            work.mark_reserved(
-                [height],
-                ReservationOwner {
-                    generation: 1,
-                    request_token: 1,
-                },
-            ),
-            64
+            work.take_in_range_budgeted_owned(height, height, 1, u64::MAX, owner)
+                .len(),
+            1
         );
+        assert_eq!(work.mark_reserved([height], owner), 64);
         assert!(budget.try_reserve(64));
-        assert_eq!(work.settle_active_reserved_height(height, 64), Some(0));
+        let claim = work.claim_late_body(height, hash, block::Hash([0; 32]), 64, &mut budget, true);
+        let LateBodyClaim::SettledReserved { reset_epoch, .. } = claim else {
+            panic!("reserved body claim must settle");
+        };
         let budget_view = budget.clone();
         let work_view = Arc::clone(&work);
         let (actions_tx, _actions_rx) = mpsc::channel(1);
@@ -1032,7 +996,7 @@ mod tests {
             ZakuraTrace::noop(),
         );
 
-        task.handle_frontier_reset(reset_frontiers, false, false, false)
+        task.handle_frontier_reset(reset_frontiers, false, false)
             .await;
         assert_eq!(task.reset_epoch, 1);
         assert!(
@@ -1047,7 +1011,7 @@ mod tests {
             bytes: 64,
             peer: ZakuraPeerId::new(vec![1; 32]).expect("32-byte test peer id is valid"),
             received_at: Instant::now(),
-            reset_epoch: 0,
+            reset_epoch,
         })
         .await;
 
@@ -1059,6 +1023,41 @@ mod tests {
         assert!(
             !task.sequencer.reorder_contains(height),
             "body claimed before the reset must not enter the new-fork reorder buffer"
+        );
+
+        let replacement_hash = block::Hash([2; 32]);
+        assert_eq!(
+            work_view.extend([(height, replacement_hash, BlockSizeEstimate::Advertised(64),)]),
+            1
+        );
+        let replacement_claim = work_view.claim_late_body(
+            height,
+            replacement_hash,
+            reset_frontiers.verified_block_hash,
+            64,
+            &mut task.budget,
+            true,
+        );
+        let LateBodyClaim::ClaimedPending(replacement_epoch) = replacement_claim else {
+            panic!("replacement work must be claimable after the reset");
+        };
+        assert_eq!(replacement_epoch, task.reset_epoch);
+
+        task.handle_accept_body(SequencedBody {
+            height,
+            hash: replacement_hash,
+            body: BufferedBlockBody::RawFramePayload(Arc::from([])),
+            bytes: 64,
+            peer: ZakuraPeerId::new(vec![2; 32]).expect("32-byte test peer id is valid"),
+            received_at: Instant::now(),
+            reset_epoch: replacement_epoch,
+        })
+        .await;
+
+        assert_eq!(
+            task.sequencer.reorder_hash(height),
+            Some(replacement_hash),
+            "a replacement claimed under the new epoch must enter the reorder pipeline"
         );
     }
 
@@ -1090,19 +1089,31 @@ mod tests {
             work.extend([(successor, successor_hash, BlockSizeEstimate::Advertised(64))]),
             1
         );
-        assert_eq!(work.take_in_range(successor, successor, 1).len(), 1);
+        let owner = ReservationOwner {
+            generation: 1,
+            request_token: 1,
+        };
         assert_eq!(
-            work.mark_reserved(
-                [successor],
-                ReservationOwner {
-                    generation: 1,
-                    request_token: 1,
-                },
-            ),
-            64
+            work.take_in_range_budgeted_owned(successor, successor, 1, u64::MAX, owner)
+                .len(),
+            1
         );
+        assert_eq!(work.mark_reserved([successor], owner), 64);
         assert!(budget.try_reserve(64));
-        assert_eq!(work.settle_active_reserved_height(successor, 64), Some(0));
+        assert_eq!(
+            work.claim_late_body(
+                successor,
+                successor_hash,
+                reset_frontiers.verified_block_hash,
+                64,
+                &mut budget,
+                true,
+            ),
+            LateBodyClaim::SettledReserved {
+                delta: 0,
+                reset_epoch: 0,
+            }
+        );
         let work_view = Arc::clone(&work);
         let (actions_tx, _actions_rx) = mpsc::channel(1);
         let (_body_tx, body_rx) = mpsc::channel(1);
@@ -1124,7 +1135,7 @@ mod tests {
             ZakuraTrace::noop(),
         );
 
-        task.handle_frontier_reset(reset_frontiers, false, false, false)
+        task.handle_frontier_reset(reset_frontiers, false, false)
             .await;
 
         // The classification is the fix: no epoch bump means a body still carrying
@@ -1139,6 +1150,84 @@ mod tests {
         assert!(
             work_view.in_flight_contains(successor),
             "growth must preserve the held successor claim rather than reset_above it"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_reset_with_conflicting_held_successor_is_destructive() {
+        let startup_frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: block::Hash([1; 32]),
+        };
+        let reset_frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(2),
+            verified_block_hash: block::Hash([2; 32]),
+        };
+        let successor = block::Height(3);
+        let successor_hash = block::Hash([3; 32]);
+        let mut budget = ByteBudget::new(1_024);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        assert_eq!(
+            work.extend([(successor, successor_hash, BlockSizeEstimate::Advertised(64))]),
+            1
+        );
+        let owner = ReservationOwner {
+            generation: 1,
+            request_token: 1,
+        };
+        assert_eq!(
+            work.take_in_range_budgeted_owned(successor, successor, 1, u64::MAX, owner)
+                .len(),
+            1
+        );
+        assert_eq!(work.mark_reserved([successor], owner), 64);
+        assert!(budget.try_reserve(64));
+        assert_eq!(
+            work.claim_late_body(
+                successor,
+                successor_hash,
+                block::Hash([8; 32]),
+                64,
+                &mut budget,
+                true,
+            ),
+            LateBodyClaim::SettledReserved {
+                delta: 0,
+                reset_epoch: 0,
+            }
+        );
+
+        let work_view = Arc::clone(&work);
+        let (actions_tx, _actions_rx) = mpsc::channel(1);
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (view_tx, _view_rx) = watch::channel(initial_view(startup_frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            budget,
+            work,
+            actions_tx,
+            ThroughputMeter::new(Instant::now()),
+            startup_frontiers,
+            body_rx,
+            control_rx,
+            body_input_bytes,
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+
+        task.handle_frontier_reset(reset_frontiers, false, false)
+            .await;
+
+        assert_eq!(task.reset_epoch, 1);
+        assert!(
+            !work_view.in_flight_contains(successor),
+            "a held successor with the wrong parent hash must be cleared"
         );
     }
 }

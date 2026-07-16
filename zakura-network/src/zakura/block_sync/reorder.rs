@@ -33,12 +33,14 @@ impl ReorderBuffer {
         self.blocks.contains_key(&height)
     }
 
-    pub(super) fn contains_at_or_above(&self, height: block::Height) -> bool {
-        self.blocks.range(height..).next().is_some()
-    }
-
     pub(super) fn hash(&self, height: block::Height) -> Option<block::Hash> {
         self.blocks.get(&height).map(|buffered| buffered.hash)
+    }
+
+    pub(super) fn previous_block_hash(&self, height: block::Height) -> Option<block::Hash> {
+        self.blocks
+            .get(&height)
+            .map(|buffered| buffered.body.previous_block_hash())
     }
 
     /// Buffer a received body that already owns its `bytes` reservation.
@@ -211,6 +213,24 @@ impl BufferedBlockBody {
                 raw_frame_payload, ..
             } => BufferedBlockBody::RawFramePayload(raw_frame_payload),
             body => body,
+        }
+    }
+
+    fn previous_block_hash(&self) -> block::Hash {
+        match self {
+            BufferedBlockBody::Decoded(block)
+            | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => {
+                block.header.previous_block_hash
+            }
+            BufferedBlockBody::RawFramePayload(payload) => {
+                let mut reader = Cursor::new(&payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..]);
+                block::Block::zcash_deserialize(&mut reader)
+                    .expect(
+                        "raw block bytes deserialize because the peer routine decoded them before buffering",
+                    )
+                    .header
+                    .previous_block_hash
+            }
         }
     }
 

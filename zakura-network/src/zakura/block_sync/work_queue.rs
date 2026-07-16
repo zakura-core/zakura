@@ -61,10 +61,14 @@ pub(super) struct WorkItem {
     /// stale local owner cannot release a charge that another path already
     /// returned.
     pub(super) budget: BlockBudgetLedger,
-    /// Request allowed to release a `Reserved` charge.
+    /// Request that owns this in-flight item across budget admission and release.
     ///
-    /// Cleared whenever the item becomes pending, held, or otherwise released.
+    /// Assigned atomically with `pending -> in_flight`, before the issuing routine
+    /// can await budget funding. Cleared whenever the item becomes pending, held,
+    /// or otherwise released.
     pub(super) reservation_owner: Option<ReservationOwner>,
+    /// Previous-block hash of a body after this item transitions to `Held`.
+    pub(super) held_previous_block_hash: Option<block::Hash>,
 }
 
 /// Diagnostics for an attempted `in_flight -> pending` retry transition.
@@ -96,8 +100,8 @@ pub(super) struct WorkReturnOutcome {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum LateBodyClaim {
-    ClaimedPending,
-    SettledReserved(i128),
+    ClaimedPending(u64),
+    SettledReserved { delta: i128, reset_epoch: u64 },
     AlreadyHeld,
     Missing,
     BudgetFull,
@@ -116,6 +120,8 @@ struct WorkQueueInner {
     /// item, maintained incrementally at each ledger transition so
     /// [`WorkQueue::reserved_bytes`]
     reserved_bytes: u64,
+    /// Destructive-reset generation captured atomically by successful claims.
+    reset_epoch: u64,
 }
 
 impl WorkQueueInner {
@@ -152,6 +158,7 @@ impl WorkQueue {
                 floor,
                 floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
                 reserved_bytes: 0,
+                reset_epoch: 0,
             }),
             available: Notify::new(),
         }
@@ -195,6 +202,7 @@ impl WorkQueue {
                         estimated_bytes,
                         budget: BlockBudgetLedger::Released,
                         reservation_owner: None,
+                        held_previous_block_hash: None,
                     },
                 );
                 inserted += 1;
@@ -256,12 +264,45 @@ impl WorkQueue {
     /// The estimate cap bounds the request's summed byte reservation. To
     /// guarantee progress, the first eligible item is always taken when
     /// `max_count > 0`, even if its estimate alone exceeds the cap.
+    #[cfg(test)]
     pub(super) fn take_in_range_budgeted(
         &self,
         low: block::Height,
         high: block::Height,
         max_count: usize,
         max_estimated_bytes: u64,
+    ) -> Vec<(block::Height, WorkItem)> {
+        self.take_in_range_budgeted_with_owner(low, high, max_count, max_estimated_bytes, None)
+    }
+
+    /// Budgeted take that atomically binds the resulting in-flight items to `owner`.
+    ///
+    /// The owner is assigned in the same queue critical section as the take so an
+    /// async budget wait cannot later mutate an ABA replacement at the same height.
+    pub(super) fn take_in_range_budgeted_owned(
+        &self,
+        low: block::Height,
+        high: block::Height,
+        max_count: usize,
+        max_estimated_bytes: u64,
+        owner: ReservationOwner,
+    ) -> Vec<(block::Height, WorkItem)> {
+        self.take_in_range_budgeted_with_owner(
+            low,
+            high,
+            max_count,
+            max_estimated_bytes,
+            Some(owner),
+        )
+    }
+
+    fn take_in_range_budgeted_with_owner(
+        &self,
+        low: block::Height,
+        high: block::Height,
+        max_count: usize,
+        max_estimated_bytes: u64,
+        owner: Option<ReservationOwner>,
     ) -> Vec<(block::Height, WorkItem)> {
         // An empty count or inverted range is a caller bug, not a real "nothing to
         // take": every caller computes `low <= high` and a positive count before
@@ -291,7 +332,9 @@ impl WorkQueue {
                 break;
             }
 
-            taken.push((*height, *item));
+            let mut item = *item;
+            item.reservation_owner = owner;
+            taken.push((*height, item));
             estimated_bytes = next_estimated_bytes;
             if taken.len() >= max_count {
                 break;
@@ -318,7 +361,8 @@ impl WorkQueue {
         {
             let mut inner = self.lock();
             for height in heights {
-                if let Some(item) = inner.in_flight.remove(&height) {
+                if let Some(mut item) = inner.in_flight.remove(&height) {
+                    item.held_previous_block_hash = None;
                     inner.pending.insert(height, item);
                     moved = true;
                 }
@@ -329,7 +373,7 @@ impl WorkQueue {
         }
     }
 
-    /// Like `return_items` but **does not** notify waiters.
+    /// Return owner-matching, not-yet-funded items without notifying waiters.
     ///
     /// Used by a peer routine to put back a chunk it took but chose not to issue
     /// (e.g. the heights are in its own short retry-avoid window after it just
@@ -337,16 +381,28 @@ impl WorkQueue {
     /// freshly-registered `available` future and busy-loop the want-work arm
     /// (a self-wake spin); other peers were already woken by the original failure
     /// `return_items`, so suppressing the notify only affects the caller.
-    pub(super) fn return_items_quiet(&self, heights: impl IntoIterator<Item = block::Height>) {
+    pub(super) fn return_items_quiet(
+        &self,
+        heights: impl IntoIterator<Item = block::Height>,
+        owner: ReservationOwner,
+    ) {
         let mut inner = self.lock();
         for height in heights {
-            if let Some(item) = inner.in_flight.remove(&height) {
+            let owned_and_unfunded = inner.in_flight.get(&height).is_some_and(|item| {
+                item.reservation_owner == Some(owner) && item.budget.current_charge() == 0
+            });
+            if owned_and_unfunded {
+                let mut item = inner
+                    .in_flight
+                    .remove(&height)
+                    .expect("owned in-flight item exists because it was just checked");
+                item.reservation_owner = None;
                 inner.pending.insert(height, item);
             }
         }
     }
 
-    /// Mark already-taken heights as owning an estimated byte reservation.
+    /// Fund already-taken heights owned by `owner` with their estimated byte reservation.
     ///
     /// Returns the sum marked. The caller must have already admitted the same
     /// byte total through [`ByteBudget`](crate::zakura::transport::ByteBudget).
@@ -361,11 +417,10 @@ impl WorkQueue {
             let Some(item) = inner.in_flight.get_mut(&height) else {
                 continue;
             };
-            if item.budget.current_charge() != 0 {
+            if item.budget.current_charge() != 0 || item.reservation_owner != Some(owner) {
                 continue;
             }
             item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
-            item.reservation_owner = Some(owner);
             marked = marked.saturating_add(item.estimated_bytes);
         }
         // Released (0) -> Reserved(estimate): the reserved total grows by exactly
@@ -409,11 +464,58 @@ impl WorkQueue {
         &self,
         height: block::Height,
         expected_hash: block::Hash,
+        previous_block_hash: block::Hash,
         actual: u64,
         budget: &mut ByteBudget,
         pending_admitted: bool,
     ) -> LateBodyClaim {
         let mut inner = self.lock();
+        Self::claim_late_body_locked(
+            &mut inner,
+            height,
+            expected_hash,
+            previous_block_hash,
+            actual,
+            budget,
+            pending_admitted,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn claim_late_body_with_lock_hook(
+        &self,
+        height: block::Height,
+        expected_hash: block::Hash,
+        previous_block_hash: block::Hash,
+        actual: u64,
+        budget: &mut ByteBudget,
+        pending_admitted: bool,
+        lock_hook: impl FnOnce(),
+    ) -> LateBodyClaim {
+        let mut inner = self.lock();
+        lock_hook();
+        Self::claim_late_body_locked(
+            &mut inner,
+            height,
+            expected_hash,
+            previous_block_hash,
+            actual,
+            budget,
+            pending_admitted,
+        )
+    }
+
+    fn claim_late_body_locked(
+        inner: &mut WorkQueueInner,
+        height: block::Height,
+        expected_hash: block::Hash,
+        previous_block_hash: block::Hash,
+        actual: u64,
+        budget: &mut ByteBudget,
+        pending_admitted: bool,
+    ) -> LateBodyClaim {
+        let reset_epoch = inner.reset_epoch;
         if let Some(item) = inner.in_flight.get_mut(&height) {
             if item.hash != expected_hash {
                 return LateBodyClaim::HashMismatch;
@@ -422,8 +524,9 @@ impl WorkQueue {
                 let reserved_before = item.budget.reserved_charge();
                 let delta = item.budget.settle(actual);
                 item.reservation_owner = None;
+                item.held_previous_block_hash = Some(previous_block_hash);
                 inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
-                return LateBodyClaim::SettledReserved(delta);
+                return LateBodyClaim::SettledReserved { delta, reset_epoch };
             }
             return LateBodyClaim::AlreadyHeld;
         }
@@ -450,10 +553,11 @@ impl WorkQueue {
         let previous_charge = item.budget.release();
         item.budget = BlockBudgetLedger::Held(actual);
         item.reservation_owner = None;
+        item.held_previous_block_hash = Some(previous_block_hash);
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
         inner.in_flight.insert(height, item);
         budget.release(previous_charge);
-        LateBodyClaim::ClaimedPending
+        LateBodyClaim::ClaimedPending(reset_epoch)
     }
 
     /// Mark a height as directly held after the caller admitted `actual` bytes.
@@ -469,6 +573,7 @@ impl WorkQueue {
             let previous_charge = item.budget.release();
             item.budget = BlockBudgetLedger::Held(actual);
             item.reservation_owner = None;
+            item.held_previous_block_hash = None;
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
             return previous_charge;
         }
@@ -477,6 +582,7 @@ impl WorkQueue {
             let previous_charge = item.budget.release();
             item.budget = BlockBudgetLedger::Held(actual);
             item.reservation_owner = None;
+            item.held_previous_block_hash = None;
             inner.in_flight.insert(height, item);
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
             return previous_charge;
@@ -561,6 +667,7 @@ impl WorkQueue {
                         reserved_removed.saturating_add(item.budget.reserved_charge());
                     released = released.saturating_add(item.budget.release());
                     item.reservation_owner = None;
+                    item.held_previous_block_hash = None;
                     inner.pending.insert(height, item);
                     moved = true;
                 }
@@ -642,6 +749,7 @@ impl WorkQueue {
                 outcome.released_bytes =
                     outcome.released_bytes.saturating_add(item.budget.release());
                 item.reservation_owner = None;
+                item.held_previous_block_hash = None;
                 outcome.returned_count = outcome.returned_count.saturating_add(1);
                 inner.pending.insert(height, item);
                 moved = true;
@@ -700,8 +808,39 @@ impl WorkQueue {
     ///
     /// Returns request-estimate bytes still reserved for unreceived heights, as
     /// in [`advance_floor`](Self::advance_floor).
+    #[cfg(test)]
     pub(super) fn reset_above(&self, floor: block::Height) -> u64 {
         let mut inner = self.lock();
+        Self::reset_above_locked(&mut inner, floor)
+    }
+
+    /// Clear successor ownership and bump the claim epoch atomically.
+    pub(super) fn destructive_reset_above(&self, floor: block::Height) -> (u64, u64) {
+        let mut inner = self.lock();
+        Self::destructive_reset_above_locked(&mut inner, floor)
+    }
+
+    #[cfg(test)]
+    pub(super) fn destructive_reset_above_with_lock_hook(
+        &self,
+        floor: block::Height,
+        lock_hook: impl FnOnce(),
+    ) -> (u64, u64) {
+        let mut inner = self.lock();
+        lock_hook();
+        Self::destructive_reset_above_locked(&mut inner, floor)
+    }
+
+    fn destructive_reset_above_locked(
+        inner: &mut WorkQueueInner,
+        floor: block::Height,
+    ) -> (u64, u64) {
+        inner.reset_epoch = inner.reset_epoch.saturating_add(1);
+        let released = Self::reset_above_locked(inner, floor);
+        (released, inner.reset_epoch)
+    }
+
+    fn reset_above_locked(inner: &mut WorkQueueInner, floor: block::Height) -> u64 {
         inner.floor = floor;
         // Pop only the `> floor` suffix from each map (O(removed · log n)); see the
         // note in `advance_floor` on why a full-map `retain` is too expensive here.
@@ -826,6 +965,18 @@ impl WorkQueue {
 
     pub(super) fn max_in_flight(&self) -> Option<block::Height> {
         self.lock().in_flight.keys().next_back().copied()
+    }
+
+    /// Returns true only for the exact held successor linked to `anchor_hash`.
+    pub(super) fn held_successor_links_to(
+        &self,
+        successor: block::Height,
+        anchor_hash: block::Hash,
+    ) -> bool {
+        self.lock().in_flight.get(&successor).is_some_and(|item| {
+            matches!(item.budget, BlockBudgetLedger::Held(_))
+                && item.held_previous_block_hash == Some(anchor_hash)
+        })
     }
 
     pub(super) fn max_claimed(&self) -> Option<block::Height> {

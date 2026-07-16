@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Block::attributed_memory_size_bytes()` for deterministic decoded-block memory attribution.
+
 ## [1.0.0] - 2026-07-15
 
 First "stable" release. However, be advised that the API may still greatly

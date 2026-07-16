@@ -13,6 +13,7 @@ use reddsa::{orchard::Binding, orchard::SpendAuth, Signature};
 use crate::{
     amount::{Amount, NegativeAllowed},
     block::MAX_BLOCK_BYTES,
+    memory::{bounded_vec_capacity_bytes, vec_capacity_bytes, AttributedMemorySize},
     orchard::{tree, Action, Nullifier, ValueCommitment},
     primitives::Halo2Proof,
     serialization::{
@@ -54,6 +55,12 @@ pub struct ShieldedData {
     /// A signature on the transaction `sighash`.
     /// Denoted as `bindingSigOrchard` in the spec.
     pub binding_sig: Signature<Binding>,
+}
+
+impl AttributedMemorySize for ShieldedData {
+    fn attributed_memory_size_bytes(&self) -> u64 {
+        bounded_vec_capacity_bytes(&self.actions).saturating_add(vec_capacity_bytes(&self.proof.0))
+    }
 }
 
 impl fmt::Display for ShieldedData {

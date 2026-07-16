@@ -42,6 +42,10 @@ async fn run_checked(
         max_outstanding = report.max_outstanding,
         peak_budget_reserved = report.peak_budget_reserved,
         final_budget_reserved = report.final_budget_reserved,
+        peak_active_pipeline_decoded_attributed_memory_bytes =
+            report.peak_active_pipeline_decoded_attributed_memory_bytes,
+        final_active_pipeline_decoded_attributed_memory_bytes =
+            report.final_active_pipeline_decoded_attributed_memory_bytes,
         protocol_rejects = report.protocol_rejects,
         floor_bypass_requests = report.floor_bypass_requests,
         total_requests = report.total_requests,

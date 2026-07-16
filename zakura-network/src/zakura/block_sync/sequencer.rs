@@ -72,7 +72,12 @@ pub(super) struct SubmitItem {
 struct InFlightSubmission {
     height: block::Height,
     hash: block::Hash,
+    /// Serialized block size received from the wire.
     bytes: u64,
+    /// Deterministic size attributed to the decoded block's Rust object graph.
+    decoded_attributed_memory_bytes: u64,
+    /// The block left `applying`, but the driver can still retain its decoded `Arc<Block>`.
+    detached: bool,
 }
 
 /// Sequencer half of a verified-tip advance (frontier growth/commit).
@@ -102,6 +107,8 @@ pub(super) struct Sequencer {
     /// by the driver. `attached_submission_count` is only the submitted subset
     /// still in `applying`, used to derive the unsubmitted applying count.
     applying_buffered_bytes: u64,
+    applying_decoded_attributed_memory_bytes: u64,
+    detached_submission_decoded_attributed_memory_bytes: u64,
     attached_submission_count: usize,
     in_flight_submission_count: usize,
     in_flight_submission_bytes: u64,
@@ -122,6 +129,8 @@ impl Sequencer {
             in_flight_submissions: BTreeMap::new(),
             next_apply_token: 1,
             applying_buffered_bytes: 0,
+            applying_decoded_attributed_memory_bytes: 0,
+            detached_submission_decoded_attributed_memory_bytes: 0,
             attached_submission_count: 0,
             in_flight_submission_count: 0,
             in_flight_submission_bytes: 0,
@@ -168,6 +177,27 @@ impl Sequencer {
         self.applying_buffered_bytes
     }
 
+    pub(super) fn applying_decoded_attributed_memory_bytes(&self) -> u64 {
+        self.applying_decoded_attributed_memory_bytes
+            .saturating_add(self.detached_submission_decoded_attributed_memory_bytes)
+    }
+
+    #[cfg(test)]
+    pub(super) fn applying_decoded_attributed_memory_bytes_scanned(&self) -> u64 {
+        let attached = self
+            .applying
+            .values()
+            .map(|applying| applying.body.decoded_attributed_memory_size_bytes())
+            .fold(0u64, u64::saturating_add);
+        let detached = self
+            .in_flight_submissions
+            .values()
+            .filter(|submission| submission.detached)
+            .map(|submission| submission.decoded_attributed_memory_bytes)
+            .fold(0u64, u64::saturating_add);
+        attached.saturating_add(detached)
+    }
+
     /// Number of `applying` bodies currently holding a decoded block, which the
     /// bounded decode window keeps near `submitted_apply_limit`.
     #[cfg(test)]
@@ -190,6 +220,15 @@ impl Sequencer {
 
     pub(super) fn reorder_buffered_bytes(&self) -> u64 {
         self.reorder.buffered_bytes()
+    }
+
+    pub(super) fn reorder_decoded_attributed_memory_bytes(&self) -> u64 {
+        self.reorder.decoded_attributed_memory_bytes()
+    }
+
+    #[cfg(test)]
+    pub(super) fn reorder_decoded_attributed_memory_bytes_scanned(&self) -> u64 {
+        self.reorder.decoded_attributed_memory_bytes_scanned()
     }
 
     pub(super) fn unsubmitted_applying_count(&self) -> usize {
@@ -294,7 +333,7 @@ impl Sequencer {
             height,
             hash,
             previous_block_hash,
-            BufferedBlockBody::Decoded(block),
+            BufferedBlockBody::from_decoded_block(block, None),
             bytes,
             source_peer,
         )
@@ -369,6 +408,7 @@ impl Sequencer {
             }
             self.body_download_floor = drained.height;
             covered.push(drained.height);
+            let decoded_attributed_memory_size_bytes = body.decoded_attributed_memory_size_bytes();
             self.applying.insert(
                 drained.height,
                 ApplyingBlock {
@@ -384,6 +424,9 @@ impl Sequencer {
             // New bodies enter `applying` unsubmitted, so only the total grows.
             self.applying_buffered_bytes =
                 self.applying_buffered_bytes.saturating_add(drained.bytes);
+            self.applying_decoded_attributed_memory_bytes = self
+                .applying_decoded_attributed_memory_bytes
+                .saturating_add(decoded_attributed_memory_size_bytes);
         }
         covered
     }
@@ -422,13 +465,30 @@ impl Sequencer {
             return None;
         }
         let token = self.next_apply_token();
-        let (hash, bytes, block) = {
+        let (
+            hash,
+            bytes,
+            block,
+            decoded_attributed_memory_size_bytes,
+            newly_decoded_attributed_memory_bytes,
+        ) = {
             let applying = self.applying.get_mut(&height)?;
+            let decoded_before = applying.body.decoded_attributed_memory_size_bytes();
             let block = applying.body.decoded_block();
+            let decoded_after = applying.body.decoded_attributed_memory_size_bytes();
             applying.token = token;
             applying.submitted = true;
-            (applying.hash, applying.bytes, block)
+            (
+                applying.hash,
+                applying.bytes,
+                block,
+                decoded_after,
+                decoded_after.saturating_sub(decoded_before),
+            )
         };
+        self.applying_decoded_attributed_memory_bytes = self
+            .applying_decoded_attributed_memory_bytes
+            .saturating_add(newly_decoded_attributed_memory_bytes);
         self.attached_submission_count = self.attached_submission_count.saturating_add(1);
         self.in_flight_submissions.insert(
             token,
@@ -436,6 +496,8 @@ impl Sequencer {
                 height,
                 hash,
                 bytes,
+                decoded_attributed_memory_bytes: decoded_attributed_memory_size_bytes,
+                detached: false,
             },
         );
         self.in_flight_submission_count = self.in_flight_submission_count.saturating_add(1);
@@ -465,11 +527,20 @@ impl Sequencer {
             applying.submitted = false;
             // The body leaves the decode window: drop the decoded copy so a
             // rolled-back submission does not grow the decoded backlog.
+            let decoded_before = applying.body.decoded_attributed_memory_size_bytes();
             applying.body.retain_for_backlog_in_place();
-            was_submitted.then_some((applying.hash, applying.bytes))
+            let decoded_after = applying.body.decoded_attributed_memory_size_bytes();
+            was_submitted.then_some((
+                applying.hash,
+                applying.bytes,
+                decoded_before.saturating_sub(decoded_after),
+            ))
         };
-        if let Some((hash, bytes)) = unsubmitted {
+        if let Some((hash, bytes, decoded_attributed_memory_size_bytes)) = unsubmitted {
             self.attached_submission_count = self.attached_submission_count.saturating_sub(1);
+            self.applying_decoded_attributed_memory_bytes = self
+                .applying_decoded_attributed_memory_bytes
+                .saturating_sub(decoded_attributed_memory_size_bytes);
             self.release_in_flight_submission(token, height, hash, bytes);
         }
     }
@@ -526,9 +597,16 @@ impl Sequencer {
             return false;
         }
         let bytes = submission.bytes;
+        let decoded_attributed_memory_bytes = submission.decoded_attributed_memory_bytes;
+        let detached = submission.detached;
         self.in_flight_submissions.remove(&token);
         self.in_flight_submission_count = self.in_flight_submission_count.saturating_sub(1);
         self.in_flight_submission_bytes = self.in_flight_submission_bytes.saturating_sub(bytes);
+        if detached {
+            self.detached_submission_decoded_attributed_memory_bytes = self
+                .detached_submission_decoded_attributed_memory_bytes
+                .saturating_sub(decoded_attributed_memory_bytes);
+        }
         self.decrement_submitted_apply(height, hash);
         true
     }
@@ -558,7 +636,12 @@ impl Sequencer {
         if applying.token != token || applying.hash != hash || !applying.submitted {
             return false;
         }
+        let decoded_before = applying.body.decoded_attributed_memory_size_bytes();
         applying.body.retain_for_backlog_in_place();
+        let decoded_after = applying.body.decoded_attributed_memory_size_bytes();
+        self.applying_decoded_attributed_memory_bytes = self
+            .applying_decoded_attributed_memory_bytes
+            .saturating_sub(decoded_before.saturating_sub(decoded_after));
         self.finish_submission(token, height, hash)
     }
 
@@ -576,9 +659,17 @@ impl Sequencer {
                 submission.height == height && submission.hash == hash && submission.bytes == bytes
             });
         if matches {
-            self.in_flight_submissions.remove(&token);
+            let submission = self
+                .in_flight_submissions
+                .remove(&token)
+                .expect("submission exists because it matched above");
             self.in_flight_submission_count = self.in_flight_submission_count.saturating_sub(1);
             self.in_flight_submission_bytes = self.in_flight_submission_bytes.saturating_sub(bytes);
+            if submission.detached {
+                self.detached_submission_decoded_attributed_memory_bytes = self
+                    .detached_submission_decoded_attributed_memory_bytes
+                    .saturating_sub(submission.decoded_attributed_memory_bytes);
+            }
         }
     }
 
@@ -619,9 +710,21 @@ impl Sequencer {
 
     pub(super) fn remove_applying(&mut self, height: block::Height) -> Option<ApplyingBlock> {
         let removed = self.applying.remove(&height)?;
+        let decoded_attributed_memory_bytes = removed.body.decoded_attributed_memory_size_bytes();
         self.applying_buffered_bytes = self.applying_buffered_bytes.saturating_sub(removed.bytes);
+        self.applying_decoded_attributed_memory_bytes = self
+            .applying_decoded_attributed_memory_bytes
+            .saturating_sub(decoded_attributed_memory_bytes);
         if removed.submitted {
             self.attached_submission_count = self.attached_submission_count.saturating_sub(1);
+            if let Some(submission) = self.in_flight_submissions.get_mut(&removed.token) {
+                if !submission.detached {
+                    submission.detached = true;
+                    self.detached_submission_decoded_attributed_memory_bytes = self
+                        .detached_submission_decoded_attributed_memory_bytes
+                        .saturating_add(submission.decoded_attributed_memory_bytes);
+                }
+            }
         }
         Some(removed)
     }
@@ -723,11 +826,22 @@ impl Sequencer {
 
     fn release_all_applying_for_reset(&mut self, keep_submitted_applies: bool) -> u64 {
         let released = self.applying.values().map(|applying| applying.bytes).sum();
+        for applying in self.applying.values().filter(|applying| applying.submitted) {
+            if let Some(submission) = self.in_flight_submissions.get_mut(&applying.token) {
+                if !submission.detached {
+                    submission.detached = true;
+                    self.detached_submission_decoded_attributed_memory_bytes = self
+                        .detached_submission_decoded_attributed_memory_bytes
+                        .saturating_add(submission.decoded_attributed_memory_bytes);
+                }
+            }
+        }
         if !keep_submitted_applies {
             self.submitted_applies.clear();
         }
         self.applying.clear();
         self.applying_buffered_bytes = 0;
+        self.applying_decoded_attributed_memory_bytes = 0;
         self.attached_submission_count = 0;
         released
     }

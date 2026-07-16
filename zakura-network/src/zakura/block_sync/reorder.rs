@@ -4,6 +4,7 @@ use super::{state::*, wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES, *};
 pub(crate) struct ReorderBuffer {
     blocks: BTreeMap<block::Height, BufferedBlock>,
     buffered_bytes: u64,
+    decoded_attributed_memory_bytes: u64,
 }
 
 impl ReorderBuffer {
@@ -11,11 +12,24 @@ impl ReorderBuffer {
         Self {
             blocks: BTreeMap::new(),
             buffered_bytes: 0,
+            decoded_attributed_memory_bytes: 0,
         }
     }
 
     pub(super) fn buffered_bytes(&self) -> u64 {
         self.buffered_bytes
+    }
+
+    pub(super) fn decoded_attributed_memory_bytes(&self) -> u64 {
+        self.decoded_attributed_memory_bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn decoded_attributed_memory_bytes_scanned(&self) -> u64 {
+        self.blocks
+            .values()
+            .map(|buffered| buffered.body.decoded_attributed_memory_size_bytes())
+            .fold(0u64, u64::saturating_add)
     }
 
     pub(super) fn len(&self) -> usize {
@@ -48,11 +62,12 @@ impl ReorderBuffer {
         bytes: u64,
         source_peer: ZakuraPeerId,
     ) -> ReorderInsertResult {
+        let previous_block_hash = block.header.previous_block_hash;
         self.insert_body(
             height,
             block.hash(),
-            block.header.previous_block_hash,
-            BufferedBlockBody::Decoded(block),
+            previous_block_hash,
+            BufferedBlockBody::from_decoded_block(block, None),
             bytes,
             source_peer,
         )
@@ -73,6 +88,7 @@ impl ReorderBuffer {
             return ReorderInsertResult::Duplicate;
         }
 
+        let decoded_attributed_memory_size_bytes = body.decoded_attributed_memory_size_bytes();
         self.blocks.insert(
             height,
             BufferedBlock {
@@ -84,6 +100,9 @@ impl ReorderBuffer {
             },
         );
         self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+        self.decoded_attributed_memory_bytes = self
+            .decoded_attributed_memory_bytes
+            .saturating_add(decoded_attributed_memory_size_bytes);
         ReorderInsertResult::Inserted
     }
 
@@ -99,6 +118,9 @@ impl ReorderBuffer {
 
         while let Some(buffered) = self.blocks.remove(&next) {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+            self.decoded_attributed_memory_bytes = self
+                .decoded_attributed_memory_bytes
+                .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());
             released.push(DrainedBlock {
                 height: next,
                 hash: buffered.hash,
@@ -133,6 +155,9 @@ impl ReorderBuffer {
         for height in heights {
             if let Some(buffered) = self.blocks.remove(&height) {
                 self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+                self.decoded_attributed_memory_bytes = self
+                    .decoded_attributed_memory_bytes
+                    .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());
                 released = released.saturating_add(buffered.bytes);
             }
         }
@@ -150,6 +175,9 @@ impl ReorderBuffer {
         for height in heights {
             if let Some(buffered) = self.blocks.remove(&height) {
                 self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
+                self.decoded_attributed_memory_bytes = self
+                    .decoded_attributed_memory_bytes
+                    .saturating_sub(buffered.body.decoded_attributed_memory_size_bytes());
                 released = released.saturating_add(buffered.bytes);
             }
         }
@@ -190,28 +218,64 @@ struct BufferedBlock {
 #[derive(Clone, Debug)]
 pub(super) enum BufferedBlockBody {
     RawFramePayload(Arc<[u8]>),
-    Decoded(Arc<block::Block>),
+    Decoded {
+        block: Arc<block::Block>,
+        decoded_attributed_memory_size_bytes: u64,
+    },
     DecodedWithRawFramePayload {
         block: Arc<block::Block>,
         raw_frame_payload: Arc<[u8]>,
+        decoded_attributed_memory_size_bytes: u64,
     },
 }
 
 impl BufferedBlockBody {
+    #[cfg(any(test, feature = "internal-bench"))]
     pub(super) fn from_decoded_block(
         block: Arc<block::Block>,
         raw_frame_payload: Option<Arc<[u8]>>,
+    ) -> Self {
+        let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
+        Self::from_measured_decoded_block(
+            block,
+            raw_frame_payload,
+            decoded_attributed_memory_size_bytes,
+        )
+    }
+
+    pub(super) fn from_measured_decoded_block(
+        block: Arc<block::Block>,
+        raw_frame_payload: Option<Arc<[u8]>>,
+        decoded_attributed_memory_size_bytes: u64,
     ) -> Self {
         match raw_frame_payload {
             Some(raw_frame_payload) => BufferedBlockBody::DecodedWithRawFramePayload {
                 block,
                 raw_frame_payload,
+                decoded_attributed_memory_size_bytes,
             },
-            None => BufferedBlockBody::Decoded(block),
+            None => BufferedBlockBody::Decoded {
+                block,
+                decoded_attributed_memory_size_bytes,
+            },
         }
     }
 
-    // Drop the raw frame payload for the backlog.
+    pub(super) fn decoded_attributed_memory_size_bytes(&self) -> u64 {
+        match self {
+            BufferedBlockBody::RawFramePayload(_) => 0,
+            BufferedBlockBody::Decoded {
+                decoded_attributed_memory_size_bytes,
+                ..
+            }
+            | BufferedBlockBody::DecodedWithRawFramePayload {
+                decoded_attributed_memory_size_bytes,
+                ..
+            } => *decoded_attributed_memory_size_bytes,
+        }
+    }
+
+    // Drop the decoded body for the backlog.
     // This is used to save memory when the body is not the next block in the sequence.
     // DecodedWithRawFramePayload may hold the parsed block as well as the raw frame payload,
     // so we retain just the raw frame payload.
@@ -247,13 +311,29 @@ impl BufferedBlockBody {
     /// window; `retain_for_backlog_in_place` is the matching downgrade).
     pub(super) fn decoded_block(&mut self) -> Arc<block::Block> {
         match self {
-            BufferedBlockBody::Decoded(block) => block.clone(),
-            BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block.clone(),
+            BufferedBlockBody::Decoded { block, .. }
+            | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block.clone(),
             BufferedBlockBody::RawFramePayload(payload) => {
                 let block = decode_raw_frame_payload(payload);
+                let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
+                let serialized_bytes = payload.len().saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES);
+                // Metrics accepts f64 samples; these lossy conversions are observability-only.
+                metrics::histogram!(
+                    "sync.block.body.decoded.attributed_memory_size_bytes",
+                    "stage" => "reorder"
+                )
+                .record(decoded_attributed_memory_size_bytes as f64);
+                if serialized_bytes > 0 {
+                    metrics::histogram!(
+                        "sync.block.body.decoded.to_serialized_ratio",
+                        "stage" => "reorder"
+                    )
+                    .record(decoded_attributed_memory_size_bytes as f64 / serialized_bytes as f64);
+                }
                 *self = BufferedBlockBody::DecodedWithRawFramePayload {
                     block: block.clone(),
                     raw_frame_payload: payload.clone(),
+                    decoded_attributed_memory_size_bytes,
                 };
                 block
             }

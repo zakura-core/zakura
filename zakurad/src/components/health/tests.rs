@@ -221,3 +221,81 @@ async fn rate_limiting_drops_bursts() {
 
     task.abort();
 }
+
+#[tokio::test]
+async fn idle_connections_time_out() {
+    let cfg = config_for(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+    let (_, chain_tip_metrics_receiver) = ChainTipMetrics::channel();
+    let (task, addr) = init(
+        cfg,
+        Network::Mainnet,
+        chain_tip_metrics_receiver,
+        MockSyncStatus::default(),
+        peers_with_count(1),
+    )
+    .await;
+    let addr = addr.expect("server bound addr");
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect ok");
+    tokio::time::sleep(HEALTH_CONNECTION_TIMEOUT + Duration::from_millis(100)).await;
+
+    let mut byte = [0];
+    let read_result = timeout(Duration::from_secs(1), stream.read(&mut byte))
+        .await
+        .expect("server should close an idle connection");
+    assert!(
+        matches!(read_result, Ok(0) | Err(_)),
+        "idle connection should be closed, got {read_result:?}"
+    );
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn active_connections_are_bounded() {
+    let cfg = config_for(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+    let (_, chain_tip_metrics_receiver) = ChainTipMetrics::channel();
+    let (task, addr) = init(
+        cfg,
+        Network::Mainnet,
+        chain_tip_metrics_receiver,
+        MockSyncStatus::default(),
+        peers_with_count(1),
+    )
+    .await;
+    let addr = addr.expect("server bound addr");
+
+    let mut held_connections = Vec::new();
+    for _ in 0..MAX_ACTIVE_HEALTH_CONNECTIONS {
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect ok");
+        stream.write_all(b"G").await.expect("partial write ok");
+        held_connections.push(stream);
+    }
+
+    // Give the server time to accept the partial requests and reserve every
+    // active connection slot.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut rejected = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("TCP handshake can complete before application rejection");
+    rejected
+        .write_all(b"GET /healthy HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .ok();
+    let mut response = Vec::new();
+    let read_result = timeout(Duration::from_secs(1), rejected.read_to_end(&mut response))
+        .await
+        .expect("excess connection should be dropped promptly");
+    assert!(
+        read_result.is_err() || response.is_empty(),
+        "excess connection must not receive a health response"
+    );
+
+    drop(held_connections);
+    task.abort();
+}

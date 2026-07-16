@@ -17,7 +17,9 @@ use super::{
     reorder::*,
     request::*,
     sequencer::*,
+    sequencer_task::{initial_view, SequencedBody, SequencerControlInput, SequencerTask},
     state::*,
+    work_queue::WorkQueue,
 };
 use crate::zakura::{
     framed_channel,
@@ -3712,6 +3714,194 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.in_flight_submission_bytes(), 0);
     check(&seq, "reset");
+}
+
+#[tokio::test]
+async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() {
+    const BLOCK_COUNT: u32 = 403;
+    const CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
+    const MISSING_SUBMISSION_TIMEOUT: Duration = Duration::from_millis(100);
+
+    let submission_limit = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
+    let submission_limit_u64 =
+        u64::try_from(submission_limit).expect("the checkpoint submission limit fits in u64");
+    let body_channel_capacity = usize::try_from(BLOCK_COUNT).expect("403 test bodies fit in usize");
+    assert_eq!(submission_limit, 401);
+
+    let blocks = fake_sequential_blocks(BLOCK_COUNT);
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let body_input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (body_tx, body_rx) = mpsc::channel(body_channel_capacity);
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + 128);
+    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+    let task = SequencerTask::new(
+        Sequencer::new(block::Height(0), submission_limit),
+        ByteBudget::new(1),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        body_rx,
+        control_rx,
+        body_input_bytes.clone(),
+        body_input_decoded_attributed_memory_bytes.clone(),
+        view_tx,
+        CHANNEL_TIMEOUT,
+        ZakuraTrace::noop(),
+    );
+    let task = tokio::spawn(task.run());
+
+    for (index, block) in blocks.iter().enumerate() {
+        let height =
+            block::Height(u32::try_from(index + 1).expect("403 test block indices fit in u32"));
+        body_tx
+            .send(SequencedBody::new_queued(
+                height,
+                block.hash(),
+                block.header.previous_block_hash,
+                BufferedBlockBody::from_decoded_block(
+                    block.clone(),
+                    Some(raw_block_payload(block)),
+                ),
+                u64::from(block_size(block)),
+                peer(1),
+                Instant::now(),
+                body_input_bytes.clone(),
+                body_input_decoded_attributed_memory_bytes.clone(),
+            ))
+            .await
+            .expect("sequencer body channel remains live");
+    }
+
+    time::timeout(CHANNEL_TIMEOUT, async {
+        loop {
+            let view = *view_rx.borrow_and_update();
+            if view.applying_len == u64::from(BLOCK_COUNT)
+                && view.in_flight_submission_count == submission_limit_u64
+                && view.unsubmitted_applying_count == 2
+            {
+                break;
+            }
+            view_rx
+                .changed()
+                .await
+                .expect("sequencer view remains live");
+        }
+    })
+    .await
+    .expect("all bodies reach applying and fill the initial submission window");
+
+    let mut initial_submissions = Vec::with_capacity(submission_limit);
+    while initial_submissions.len() < submission_limit {
+        let action = time::timeout(CHANNEL_TIMEOUT, actions_rx.recv())
+            .await
+            .expect("initial submission action arrives")
+            .expect("sequencer action channel remains live");
+        match action {
+            BlockSyncAction::SubmitBlock { token, block } => {
+                initial_submissions.push((token, block));
+            }
+            action => panic!("unexpected action before initial submissions complete: {action:?}"),
+        }
+    }
+    for (index, (_, block)) in initial_submissions.iter().enumerate() {
+        assert_eq!(
+            block.coinbase_height(),
+            Some(block::Height(
+                u32::try_from(index + 1).expect("401 submission indices fit in u32")
+            )),
+            "initial submissions must be ordered through the full checkpoint window",
+        );
+    }
+
+    let (token_1, block_1) = &initial_submissions[0];
+    control_tx
+        .send(SequencerControlInput::ApplyFinished {
+            token: *token_1,
+            height: block::Height(1),
+            hash: block_1.hash(),
+            result: BlockApplyResult::Committed,
+            local_frontier: Some(BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(3),
+                verified_block_hash: blocks[2].hash(),
+            }),
+        })
+        .expect("height 1 completion queues");
+
+    let block_402 = match time::timeout(CHANNEL_TIMEOUT, actions_rx.recv())
+        .await
+        .expect("height 402 submission arrives")
+        .expect("sequencer action channel remains live")
+    {
+        BlockSyncAction::SubmitBlock { block, .. } => block,
+        action => panic!("unexpected action before height 402 submission: {action:?}"),
+    };
+    assert_eq!(block_402.coinbase_height(), Some(block::Height(402)));
+
+    for (height, (token, block)) in [
+        (block::Height(2), &initial_submissions[1]),
+        (block::Height(3), &initial_submissions[2]),
+    ] {
+        control_tx
+            .send(SequencerControlInput::ApplyFinished {
+                token: *token,
+                height,
+                hash: block.hash(),
+                result: BlockApplyResult::Committed,
+                local_frontier: Some(BlockSyncFrontiers {
+                    finalized_height: block::Height(0),
+                    verified_block_tip: block::Height(3),
+                    verified_block_hash: blocks[2].hash(),
+                }),
+            })
+            .expect("stale checkpoint completion queues");
+    }
+
+    let submit_403 = time::timeout(MISSING_SUBMISSION_TIMEOUT, async {
+        loop {
+            let action = actions_rx
+                .recv()
+                .await
+                .expect("sequencer action channel remains live");
+            if let BlockSyncAction::SubmitBlock { block, .. } = action {
+                assert_eq!(block.coinbase_height(), Some(block::Height(403)));
+                break;
+            }
+        }
+    })
+    .await;
+    let diagnostic = *view_rx.borrow();
+    assert!(
+        submit_403.is_ok(),
+        "height 403 must refill the checkpoint submission window; \
+         in_flight_submission_count = {}, unsubmitted_applying_count = {}",
+        diagnostic.in_flight_submission_count,
+        diagnostic.unsubmitted_applying_count,
+    );
+
+    time::timeout(CHANNEL_TIMEOUT, async {
+        loop {
+            let view = *view_rx.borrow_and_update();
+            if view.in_flight_submission_count == 400 && view.unsubmitted_applying_count == 0 {
+                break;
+            }
+            view_rx
+                .changed()
+                .await
+                .expect("sequencer view remains live");
+        }
+    })
+    .await
+    .expect("stale completions settle with a refilled checkpoint submission window");
+
+    task.abort();
 }
 
 #[test]

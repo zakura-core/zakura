@@ -1004,14 +1004,21 @@ wait_block_count_equal 18332 "${reorg_base}" node2
 if strict_upgrade; then
   wait_block_count_equal 18532 "${reorg_base}" node4
 fi
-rpc 18232 generate "[2]" | jq -e '.result | length == 2' >/dev/null \
-  || fail "generate RPC failed on node1 after invalidating old tip"
-target=$(block_count 18232)
-wait_block_count_at_least 18332 "${target}" node2
-wait_block_count_at_least 18432 "${target}" node3
-if strict_upgrade; then
-  wait_block_count_at_least 18532 "${target}" node4
-fi
+# Mine each replacement only after the legacy peer commits its parent. If both
+# are mined together, node3 can receive the child inventory while its parent is
+# still downloading. Its next legacy FindBlocks response then has only that one
+# remaining hash, which the legacy syncer deliberately ignores, leaving node3
+# stuck one block behind despite repeated inventories for the child.
+for replacement in 1 2; do
+  rpc 18232 generate "[1]" | jq -e '.result | length == 1' >/dev/null \
+    || fail "generate RPC failed for replacement block ${replacement} after invalidating old tip"
+  target=$(block_count 18232)
+  wait_block_count_at_least 18332 "${target}" "node2 replacement ${replacement}"
+  wait_block_count_at_least 18432 "${target}" "node3 replacement ${replacement}"
+  if strict_upgrade; then
+    wait_block_count_at_least 18532 "${target}" "node4 replacement ${replacement}"
+  fi
+done
 wait_zakura_body_frontiers_at_tip "${target}" "post-reorg"
 wait_metric_at_least 19001 sync_block_reorg_reset 1 node1
 wait_metric_at_least 19002 sync_block_reorg_reset 1 node2

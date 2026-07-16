@@ -605,9 +605,11 @@ def completion_text(config: Config, run_state: dict[str, Any]) -> str:
 def failure_text(config: Config, run_state: dict[str, Any], reason: str) -> str:
     p = config.policy
     duration = format_duration(int(run_state["time_to_failure_seconds"]))
+    height = run_state.get("height")
+    height_text = str(height) if isinstance(height, int) else "unknown"
     return (
         f":rotating_light: Zakura failed: {p.hostname} | {policy_mode(p)} | "
-        f"{ssh_target(p)} | time to failure: {duration}"
+        f"{ssh_target(p)} | time to failure: {duration} | height: {height_text}"
     )
 
 

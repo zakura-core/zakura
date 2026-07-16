@@ -345,16 +345,23 @@ class ContinuousSyncTests(unittest.TestCase):
 
         text = sync.failure_text(
             config,
-            {"sha": "abcdef", "time_to_failure_seconds": 3723},
+            {"sha": "abcdef", "time_to_failure_seconds": 3723, "height": 2584406},
             "boom",
         )
 
         self.assertEqual(
             text,
             ":rotating_light: Zakura failed: temp-zakura-sync-test-3 | legacy | "
-            "root@134.209.49.92 | time to failure: 1h 2m 3s",
+            "root@134.209.49.92 | time to failure: 1h 2m 3s | height: 2584406",
         )
         self.assertNotIn("\n", text)
+
+    def test_controller_failure_slack_text_handles_unknown_height(self):
+        config = make_config(Path("/tmp"))
+
+        text = sync.failure_text(config, {"time_to_failure_seconds": 5}, "boom")
+
+        self.assertIn("time to failure: 5s | height: unknown", text)
 
     def test_completion_slack_text_includes_sync_duration(self):
         config = make_config(

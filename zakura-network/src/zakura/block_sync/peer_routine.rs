@@ -1949,6 +1949,7 @@ impl PeerRoutine {
         if let Some(index) = self.window.retired_index_for_start(start_height) {
             self.window.outstanding.remove(index);
             self.publish_outstanding();
+            self.window.disarm_liveness_after_progress_if_idle();
             return;
         }
         let Some(index) = self.window.outstanding_index_for_start(start_height) else {
@@ -1981,6 +1982,7 @@ impl PeerRoutine {
         if let Some(index) = self.window.retired_index_for_start(start_height) {
             self.window.outstanding.remove(index);
             self.publish_outstanding();
+            self.window.disarm_liveness_after_progress_if_idle();
             return;
         }
         let Some(index) = self.window.outstanding_index_for_start(start_height) else {
@@ -2061,6 +2063,7 @@ impl PeerRoutine {
     fn finish_detached(&mut self, outstanding: OutstandingBlockRange, disposition: Disposition) {
         if outstanding.is_retired() {
             self.publish_outstanding();
+            self.window.disarm_liveness_after_progress_if_idle();
             return;
         }
         // Every release path below is Held-aware: a height a competing peer
@@ -2104,9 +2107,7 @@ impl PeerRoutine {
             }
         }
         self.publish_outstanding();
-        if disposition == Disposition::Satisfied {
-            self.window.disarm_liveness_after_progress_if_idle();
-        }
+        self.window.disarm_liveness_after_progress_if_idle();
     }
 
     /// A body arrived for a request this peer owns, but another body already won
@@ -2762,7 +2763,7 @@ mod tests {
     use super::super::state::{ByteBudget, LivenessOutcome, ThroughputMeter};
     use super::super::work_queue::{ReservationOwner, WorkQueue};
     use super::super::{BlockSyncFrontiers, BlockSyncPeerSession, ZakuraBlockSyncConfig};
-    use super::{release_failed_request_reservation, PeerRoutine};
+    use super::{release_failed_request_reservation, Disposition, PeerRoutine};
     use crate::zakura::framed_channel;
     use crate::zakura::trace::ZakuraTrace;
     use crate::zakura::{ServicePeerDirection, ZakuraPeerId};
@@ -3525,7 +3526,7 @@ mod tests {
     /// Floor-GC retires a request from active scheduling while preserving its
     /// peer-accountability deadline.
     #[tokio::test]
-    async fn floor_gc_retires_request_and_preserves_liveness_deadline() {
+    async fn floor_gc_retired_terminator_uses_accepted_progress_for_liveness() {
         let config = ZakuraBlockSyncConfig::default();
         let budget = ByteBudget::new(1_000_000);
         let work = Arc::new(WorkQueue::new(block::Height(0)));
@@ -3616,6 +3617,7 @@ mod tests {
         });
 
         routine.gc_committed_outstanding();
+        let retired_request = routine.window.outstanding[0].clone();
 
         assert_eq!(
             routine.window.active_len(),
@@ -3652,6 +3654,43 @@ mod tests {
         assert_eq!(
             routine.window.block_liveness_deadline, liveness_deadline,
             "a retired terminator must not erase peer accountability"
+        );
+
+        // If accepted progress happened after the latest request, removing the
+        // final correlation tombstone must not leave that proven peer subject to
+        // a stale deadline.
+        routine.window.outstanding.push(retired_request.clone());
+        routine.window.arm_liveness(now, liveness);
+        routine
+            .window
+            .note_block_progress(now + Duration::from_millis(1), liveness);
+        routine.handle_blocks_done(block::Height(99)).await;
+        assert!(routine.window.outstanding.is_empty());
+        assert_eq!(
+            routine.window.block_liveness_deadline, None,
+            "closing the final retired tombstone must disarm liveness after accepted progress"
+        );
+        assert_eq!(
+            routine.window.check_liveness(now + liveness),
+            LivenessOutcome::Ok
+        );
+
+        // Retry dispositions, including short responses, remove active requests
+        // through `finish_detached` and need the same causal disarm.
+        let retry_at = now + Duration::from_secs(1);
+        let mut retrying_request = retired_request;
+        retrying_request.token = 2;
+        retrying_request.state = OutstandingRequestState::Active;
+        routine.window.outstanding.push(retrying_request);
+        routine.window.arm_liveness(retry_at, liveness);
+        routine
+            .window
+            .note_block_progress(retry_at + Duration::from_millis(1), liveness);
+        routine.finish_outstanding_at(0, Disposition::RetryMissing);
+        assert!(routine.window.outstanding.is_empty());
+        assert_eq!(
+            routine.window.block_liveness_deadline, None,
+            "retry cleanup must disarm liveness after accepted progress"
         );
     }
 

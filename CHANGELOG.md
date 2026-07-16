@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Kept valid internal-miner work running across mempool-only block template
+  updates.
 - Prevent initial sync from stalling at checkpoint boundaries by refilling the
   verifier submission window after stale apply completions.
 

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The state service now accepts children of a block that was accepted and has the same
+  block header hash (due to [ZIP-244](https://zips.z.cash/zip-0244)) as a block that
+  was previously rejected
+  ([GHSA-8gxx-hc65-vv82](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-8gxx-hc65-vv82)).
+
 ## [3.0.0-rc1] - 2026-07-19
 
 ### Changed

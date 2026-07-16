@@ -1640,8 +1640,8 @@ impl BlockSyncReactor {
         let peers_with_status = include_diagnostics.then(|| self.registry.peers_with_status());
         // The commit-pipeline counters now live on the Sequencer task; read them
         // from the latest published view snapshot.
-        let view = *self.sequencer_view.borrow();
-        let submitted_applies = view.submitted_applying_count;
+        let view = self.last_view;
+        let submitted_applies = view.in_flight_submission_count;
         let (received_bytes_per_sec, received_blocks_per_sec) = self
             .state
             .received_throughput
@@ -1756,8 +1756,8 @@ impl BlockSyncReactor {
             );
             bs_insert_u64(
                 row,
-                "submitted_applying_bytes",
-                view.submitted_applying_bytes,
+                "in_flight_submission_bytes",
+                view.in_flight_submission_bytes,
             );
             bs_insert_u64(
                 row,

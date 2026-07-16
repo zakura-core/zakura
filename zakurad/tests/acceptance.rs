@@ -1682,9 +1682,8 @@ async fn rpc_endpoint_client_content_type() -> Result<()> {
         return Ok(());
     }
 
-    // Write a configuration that has RPC listen_addr set
-    // [Note on port conflict](#Note on port conflict)
-    let mut config = random_known_rpc_port_config(true, &Mainnet)?;
+    // Let the OS assign the RPC port to avoid races with parallel tests.
+    let mut config = os_assigned_rpc_port_config(true, &Mainnet)?;
 
     let dir = testdir()?.with_config(&mut config)?;
     let mut child = dir.spawn_child(args!["start"])?;

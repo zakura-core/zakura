@@ -41,16 +41,19 @@ pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 pub const BS_PER_BLOCK_WORST_CASE_BYTES: u64 = block::MAX_BLOCK_BYTES;
 /// Default cap on the estimated *resident* memory of the look-ahead pipeline.
 ///
-/// Denominated in resident bytes, not wire bytes: admission compares it against the
-/// retained and in-flight wire bytes scaled by `DESERIALIZED_MEM_FACTOR` (see
-/// `admission::estimated_resident_pipeline_bytes`), so the default admits roughly a
-/// quarter of its nominal value in wire bytes (a deep ~1.5 GiB wire look-ahead).
-/// The retention budget is independent of the request cap
-/// (`max_inflight_block_bytes` bounds outstanding requests, not retained bodies);
-/// the numeric value below is only historically derived from it.
-pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 =
-    // `DEFAULT_BS_MAX_RESPONSE_BYTES` is a `u32`, so widening to `u64` is lossless.
-    DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES - DEFAULT_BS_MAX_RESPONSE_BYTES as u64;
+/// Denominated in resident bytes: admission charges serialized pools (reorder,
+/// the applying backlog past the decode window, reservations) at their wire
+/// size and the two structurally bounded decoded pools (sequencer input
+/// channel, submitted decode window) at `× DESERIALIZED_MEM_FACTOR` (see
+/// `admission::estimated_resident_pipeline_bytes`). Because backlog bodies
+/// stay serialized, this is (to close approximation) the byte ceiling of the
+/// speculative backlog itself, and total process RSS tracks it plus an
+/// era-independent overhead — so the default is chosen as a memory target, not
+/// derived from the wire budget. 1.5 GiB holds roughly a minute of worst-case
+/// committed throughput (~70 MB/s) of look-ahead, nearly two checkpoint ranges
+/// of maximum-size blocks, and multiple hours of typical-era backlog: deeper
+/// speculation buys nothing the committer can consume.
+pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 = 1536 * 1024 * 1024;
 /// Minimum submitted block applies required to resolve one checkpoint range.
 ///
 /// The checkpoint verifier resolves a checkpoint window only after the whole
@@ -64,9 +67,8 @@ pub const MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES: usize =
 /// The checkpoint verifier resolves a block's commit only once the entire
 /// contiguous range to the next checkpoint has been submitted, so the whole
 /// range must be co-resident. This floor sizes the resident look-ahead clamp
-/// (`clamp_reorder_lookahead_to_floor`) and `validate()`'s lower bound on the
-/// request budget, so a configuration can never make a full range
-/// unassemblable.
+/// (`clamp_reorder_lookahead_to_floor`); checkpoint-range liveness itself comes
+/// from the commit-window admission exemption.
 pub const BS_CHECKPOINT_RANGE_BYTE_FLOOR: u64 =
     // `MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES` is `MAX_CHECKPOINT_HEIGHT_GAP + 1`
     // (= 401), which fits `u64` losslessly; the product (~802 MB) cannot overflow.
@@ -238,7 +240,9 @@ pub struct ZakuraBlockSyncConfig {
     /// bodies are bounded by `max_reorder_lookahead_bytes` instead.
     pub max_inflight_block_bytes: u64,
     /// Maximum estimated *resident* memory of look-ahead block bodies retained
-    /// by the download pipeline (wire bytes × `DESERIALIZED_MEM_FACTOR`).
+    /// by the download pipeline. Serialized backlog and reservations are charged
+    /// at wire size; decoded input/submission windows add
+    /// `DESERIALIZED_MEM_FACTOR` times their wire size.
     pub max_reorder_lookahead_bytes: u64,
     /// How long to avoid reassigning an expired floor height to the same peer.
     #[serde(with = "humantime_serde")]
@@ -464,24 +468,27 @@ impl ZakuraBlockSyncConfig {
         Ok(())
     }
 
-    /// Clamp the resident look-ahead budget up to one worst-case checkpoint range.
+    /// Clamp the resident look-ahead budget up to one worst-case checkpoint range
+    /// of wire bytes.
     ///
     /// This is defense-in-depth for the speculative above-window lane: checkpoint
     /// sync liveness already comes from the commit-window admission exemption, but
     /// a sub-range byte budget would reject nearly all gated look-ahead work.
+    /// Serialized pools are charged at wire size, so the floor is the range's
+    /// wire bytes, not its decoded multiple: the bounded decode window's cost is
+    /// carried by the exempt lane, which bypasses this budget entirely.
     pub fn clamp_reorder_lookahead_to_floor(&mut self) {
-        let resident_range_floor = BS_CHECKPOINT_RANGE_BYTE_FLOOR
-            .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR);
+        let range_wire_floor = BS_CHECKPOINT_RANGE_BYTE_FLOOR;
         if self.max_reorder_lookahead_bytes > 0
-            && self.max_reorder_lookahead_bytes < resident_range_floor
+            && self.max_reorder_lookahead_bytes < range_wire_floor
         {
             tracing::warn!(
                 configured_max_reorder_lookahead_bytes = self.max_reorder_lookahead_bytes,
-                resident_checkpoint_range_floor = resident_range_floor,
-                "zakura.block_sync.max_reorder_lookahead_bytes is below the resident \
-                 checkpoint-range floor; clamping it up so checkpoint sync cannot deadlock",
+                checkpoint_range_wire_floor = range_wire_floor,
+                "zakura.block_sync.max_reorder_lookahead_bytes is below the \
+                 checkpoint-range wire floor; clamping it up so checkpoint sync cannot deadlock",
             );
-            self.max_reorder_lookahead_bytes = resident_range_floor;
+            self.max_reorder_lookahead_bytes = range_wire_floor;
         }
     }
 

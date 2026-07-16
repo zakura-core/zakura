@@ -17,10 +17,11 @@ it:
 ```text
 WorkQueue (pending heights)
   → in-flight request (reserved bytes, outstanding)
-    → reorder buffer (out-of-order arrivals, wire-retained)
-      → applying pool (contiguous prefix, decoded Arc<Block>)
-        → sequencer input channel (decoded, awaiting submit)
-          → checkpoint/semantic verifier → commit (verified tip advances)
+    → sequencer input channel (wire payload plus transient peer-decoded block)
+      → reorder buffer (out-of-order arrivals, wire-retained)
+        → applying pool (contiguous; backlog wire-retained)
+          → bounded submission window (decoded Arc<Block>)
+            → checkpoint/semantic verifier → commit (verified tip advances)
 ```
 
 Two heights anchor every scheduling decision:
@@ -95,9 +96,10 @@ height is just another gated height.
 | `start > window`, gate open | `Admit` | `servable_high` | `min(budget_available, remaining_wire, response_byte_cap)` |
 | any admitted sizing that still comes to 0 bytes (in-flight budget spent, non-floor) | `InflightBudgetEmpty` | — | — |
 
-where `remaining_wire = (effective_budget − estimated_resident) / DESERIALIZED_MEM_FACTOR`
-— the remaining memory headroom expressed back in wire bytes, so one admitted response
-cannot push resident memory past the budget once it lands and decodes.
+where `remaining_wire = effective_budget − estimated_resident`. Admitted bodies remain
+serialized until they enter the bounded submission window, so one byte of remaining
+headroom funds one wire byte. The transient decoded input copy is bounded by the
+sequencer channel and appears in the next resident snapshot.
 
 **Takes never span the window boundary.** An exempt (in-window) grant is clamped at the
 window top, so a single multi-block request can never carry both exempt in-window blocks
@@ -110,16 +112,17 @@ production default of one block per response this split never occurs.
 
 ### Resident accounting
 
-The look-ahead budget bounds **estimated resident memory**, not wire bytes. Decoded
-bodies occupy roughly 3.3–4× their serialized size, so every pool is charged at its
-_eventual_ decoded cost, `wire_bytes × DESERIALIZED_MEM_FACTOR` (= 4):
+The look-ahead budget bounds **estimated resident memory**. Backlog bodies remain in
+their serialized wire form and are decoded only inside the bounded verifier submission
+window. Accounting therefore follows each pool's actual representation:
 
-| Pool (snapshot field) | Actual retention today | Charged at ×4 because… |
+| Pool (snapshot field) | Representation | Charge |
 | --- | --- | --- |
-| `reorder_buffered_bytes` | wire-retained | the reorder→applying drain decodes the whole contiguous prefix unconditionally the moment a gap fills, with no admission re-gate |
-| `applying_buffered_bytes` | decoded `Arc<Block>` | already resident at the decoded multiple |
-| `sequencer_input_queued_bytes` | decoded | already resident |
-| `reserved_above_floor_bytes` | not received yet | in-flight bodies land and decode the same way; charging them 0× makes the landing wave invisible until it is already resident |
+| `reorder_buffered_bytes` | serialized | wire bytes |
+| unsubmitted `applying_buffered_bytes` | serialized | wire bytes |
+| `sequencer_input_queued_bytes` | serialized payload plus decoded block | wire bytes plus `wire × DESERIALIZED_MEM_FACTOR` |
+| `in_flight_submission_bytes` | submitted decoded block, including detached submissions awaiting completion | `wire × DESERIALIZED_MEM_FACTOR`, plus the applying wire charge while attached |
+| `reserved_above_floor_bytes` | not received yet | estimated wire bytes |
 
 Two gates, checked together in `lookahead_over_budget`:
 
@@ -141,26 +144,24 @@ _retained_ by the pipeline.
 ### Config clamps
 
 At config load (`clamp_reorder_lookahead_to_floor`, serde path only), sub-range budgets
-are raised to one worst-case checkpoint range — `BS_CHECKPOINT_RANGE_BYTE_FLOOR × 4`
-(401 × 2 MB × 4 ≈ 3.208 GB) bytes and 401 blocks — with a warning. The clamps are
+are raised to one worst-case serialized checkpoint range —
+`BS_CHECKPOINT_RANGE_BYTE_FLOOR` (401 × 2 MB ≈ 802 MB) — with a warning. The clamp is
 defense-in-depth _sizing_ only: liveness is guaranteed by the commit-window exemption,
 not by budget size. Zero config values are rejected.
 
 ### The bound
 
-Resident memory plateaus near
-**`effective budget + one worst-case commit window`** (401 × `MAX_BLOCK_BYTES` × 4
-≈ 3.2 GB), plus bounded transients:
+Resident memory plateaus near **`effective budget + the bounded decode window`**, plus
+process overhead and bounded transients. At the default 401-block submission window,
+the worst-case decoded contribution is approximately
+401 × `MAX_BLOCK_BYTES` × `DESERIALIZED_MEM_FACTOR` ≈ 3.2 GB:
 
 - the floor's first-item progress margin (≤ one block per request — see liveness below);
-- a single in-window response can exceed the byte gate by up to
-  `response_byte_cap × 4` (in-window sizing is by the in-flight budget, for liveness);
+- a single in-window response can exceed the byte gate by up to its decoded resident
+  cost (in-window sizing is by the in-flight budget, for liveness);
 - concurrent peer routines admit against per-iteration snapshots, so a simultaneous
   wake can transiently over-admit by roughly one response per racing runtime worker
   before the reservations land in the next iteration's snapshot.
-
-Measured (mainnet 100K-height runs, 3 GB configured budget clamped to 3.208 GB): peak
-retained wire 807.7–807.9 MB → ×4 = 3.231 GB, +0.7% over budget.
 
 ## Liveness rules (why sync cannot wedge)
 
@@ -202,7 +203,7 @@ borrowed a bypass slot.
 
 | Knob | Default | Notes |
 | --- | --- | --- |
-| `max_reorder_lookahead_bytes` | ~6.4 GB | **resident-denominated** (compared against wire × 4); clamped up to ~3.208 GB |
+| `max_reorder_lookahead_bytes` | 1.5 GiB | resident-memory target; serialized pools are charged at wire size and decoded windows at the calibrated multiple; clamped up to ~802 MB |
 | `max_inflight_block_bytes` | 6 GiB | outstanding-request wire budget, released at receipt (separate from the resident gate) |
 | `max_blocks_per_response` | 1 | count cap per request (effective = min of both sides' advertisements, hard max 128) |
 | `floor_bypass_slots` | 2 | extra slots past a saturated cwnd, floor lane only |
@@ -211,19 +212,14 @@ borrowed a bypass slot.
 
 ## Known limitations and follow-ups
 
-- **Flat ×4 factor.** `DESERIALIZED_MEM_FACTOR` is a calibrated approximation of the
+- **Decoded-memory factor.** `DESERIALIZED_MEM_FACTOR` is a calibrated approximation of the
   measured ~3.3–4× wire→decoded ratio, not a per-block heap measure. Replacing it with
   a precise per-block resident estimate is tracked as
   [ZCA-750](https://linear.app/zcale/issue/ZCA-750).
-- **Conservative memory accounting reduces look-ahead.** Reorder blocks kept in
-  wire form, and reservations for blocks we have not received yet, are charged at
-  the decoded-memory estimate (`wire bytes × 4`). During reservation-heavy bursts,
-  that means the look-ahead budget admits about a quarter of its nominal size in
-  wire bytes. A better follow-up is **decode-at-submit**: keep bodies in wire form
-  until they enter the submit window, then decode them there. Once each pool has a
-  fixed representation, we can safely charge serialized pools near `×1` and
-  decoded/applying pools near `×4`.
-  `estimated_resident_pipeline_bytes` is the single edit point.
+- **Decoded accounting remains approximate.** Serialized pools are charged exactly
+  at wire size, but the bounded input and submission windows still use the calibrated
+  factor rather than a precise heap measurement.
+  `estimated_resident_pipeline_bytes` is the single calibration point.
 - **Window-boundary split.** With `max_blocks_per_response > 1`, a run straddling the
   commit window costs one extra request per crossing (the price of the never-span
   rule). Irrelevant at the default of 1.

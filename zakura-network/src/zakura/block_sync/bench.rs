@@ -229,10 +229,12 @@ impl BenchBodyFeeder {
         block: Arc<Block>,
         bytes: u64,
     ) -> bool {
+        let previous_block_hash = block.header.previous_block_hash;
         let body = BufferedBlockBody::from_decoded_block(block, None);
         let body = SequencedBody::new_queued(
             height,
             hash,
+            previous_block_hash,
             body,
             bytes,
             self.bench_peer.clone(),
@@ -302,7 +304,7 @@ impl BenchCommitter {
             bs_insert_u64(
                 row,
                 bs_trace::SUBMITTED_APPLIES,
-                view.submitted_applying_count,
+                view.in_flight_submission_count,
             );
             bs_insert_u64(row, "applying_buffered_bytes", view.applying_buffered_bytes);
             bs_insert_u64(row, "reorder_buffered_bytes", view.reorder_buffered_bytes);

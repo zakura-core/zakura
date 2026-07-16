@@ -7,14 +7,16 @@ use std::time::Duration;
 use color_eyre::eyre::Result;
 
 use zakura_chain::{block::Height, chain_tip::mock::MockChainTip, parameters::Network};
-use zakurad::components::sync::end_of_support::{self, EOS_PANIC_AFTER, ESTIMATED_RELEASE_HEIGHT};
+use zakurad::components::sync::end_of_support::{
+    self, EOS_PANIC_AFTER, EOS_WARN_AFTER, EOS_WARN_MESSAGE_HEADER, ESTIMATED_RELEASE_HEIGHT,
+};
 
 // Estimated blocks per day with the current 75 seconds block spacing.
 const ESTIMATED_BLOCKS_PER_DAY: u32 = 1152;
 
 /// Test that the `end_of_support` function is working as expected.
 #[test]
-#[should_panic(expected = "Zebra refuses to run if the release date is older than")]
+#[should_panic(expected = "Zakura refuses to run if the release date is older than")]
 fn end_of_support_panic() {
     // We are in panic
     let panic = ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY) + 1;
@@ -32,19 +34,19 @@ fn end_of_support_function() {
 
     end_of_support::check(Height(no_warn), &Network::Mainnet);
     assert!(logs_contain(
-        "Checking if Zebra release is inside support range ..."
+        "Checking if Zakura release is inside support range ..."
     ));
     assert!(logs_contain("Zakura release is supported"));
 
     // We are in warn range
-    let warn = ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * 1152) - (3 * ESTIMATED_BLOCKS_PER_DAY);
+    let warn = ESTIMATED_RELEASE_HEIGHT + (EOS_WARN_AFTER * ESTIMATED_BLOCKS_PER_DAY) + 1;
 
     end_of_support::check(Height(warn), &Network::Mainnet);
     assert!(logs_contain(
-        "Checking if Zebra release is inside support range ..."
+        "Checking if Zakura release is inside support range ..."
     ));
     assert!(logs_contain(
-        "Your Zebra release is too old and it will stop running at block"
+        "Your Zakura release is too old and it will stop running at block"
     ));
 
     // Panic is tested in `end_of_support_panic`
@@ -62,11 +64,9 @@ fn end_of_support_date() {
 
     end_of_support::check(higher_checkpoint, &Network::Mainnet);
     assert!(logs_contain(
-        "Checking if Zebra release is inside support range ..."
+        "Checking if Zakura release is inside support range ..."
     ));
-    assert!(!logs_contain(
-        "Your Zebra release is too old and it will stop running in"
-    ));
+    assert!(!logs_contain(EOS_WARN_MESSAGE_HEADER));
 }
 
 /// Check that the end of support task is working.
@@ -85,7 +85,7 @@ async fn end_of_support_task() -> Result<()> {
         );
 
     assert!(logs_contain(
-        "Checking if Zebra release is inside support range ..."
+        "Checking if Zakura release is inside support range ..."
     ));
 
     assert!(logs_contain("Zakura release is supported"));

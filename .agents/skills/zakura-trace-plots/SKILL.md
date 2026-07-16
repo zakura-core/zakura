@@ -10,13 +10,13 @@ description: Generate metrics-aware plots and summaries from Zebra Zakura perf t
 When the user gives a Zakura `trace_dir`, generate plots with:
 
 ```bash
-python3 .cursor/skills/zakura-trace-plots/scripts/plot_zakura_traces.py TRACE_DIR --out-dir perf-artifacts
+python3 .agents/skills/zakura-trace-plots/scripts/plot_zakura_traces.py TRACE_DIR --out-dir perf-artifacts
 ```
 
 If the matching feed-run CSV is not auto-detected, pass it explicitly:
 
 ```bash
-python3 .cursor/skills/zakura-trace-plots/scripts/plot_zakura_traces.py TRACE_DIR --csv /root/wal-bench/feedrun-r1.csv --out-dir perf-artifacts
+python3 .agents/skills/zakura-trace-plots/scripts/plot_zakura_traces.py TRACE_DIR --csv /root/wal-bench/feedrun-r1.csv --out-dir perf-artifacts
 ```
 
 ## What To Plot

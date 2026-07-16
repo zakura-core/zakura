@@ -11,7 +11,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    ops::RangeBounds,
+    ops::{Bound, RangeBounds},
     sync::Arc,
 };
 
@@ -220,19 +220,45 @@ impl ZakuraDb {
         &self,
         range: impl RangeBounds<block::Height>,
     ) -> Vec<BlockCommitmentRoots> {
+        let Some(tip_height) = self.finalized_tip_height() else {
+            return Vec::new();
+        };
+        let Some(start_height) = (match range.start_bound() {
+            Bound::Included(height) => Some(*height),
+            Bound::Excluded(height) => height.next().ok(),
+            Bound::Unbounded => Some(block::Height::MIN),
+        }) else {
+            return Vec::new();
+        };
+        let Some(end_height) = (match range.end_bound() {
+            Bound::Included(height) => Some(*height),
+            Bound::Excluded(height) => height.previous().ok(),
+            Bound::Unbounded => Some(tip_height),
+        }) else {
+            return Vec::new();
+        };
+        let end_height = end_height.min(tip_height);
+        if start_height > end_height {
+            return Vec::new();
+        }
+
         let mut roots = Vec::new();
 
-        for (height, sapling) in self.sapling_tree_by_height_range(range) {
+        // The per-height tree column families are sparse: they only store a row
+        // when that pool's tree changes. Resolve each requested finalized height
+        // through the backwards tree lookup instead of iterating those sparse
+        // rows as if they were a contiguous block-height index.
+        for raw_height in start_height.0..=end_height.0 {
+            let height = block::Height(raw_height);
+            let Some(sapling) = self.sapling_tree_by_height(&height) else {
+                break;
+            };
             let Some(orchard) = self.orchard_tree_by_height(&height) else {
                 break;
             };
-            // The `unwrap_or_else` default is never reached in practice: the Sapling/Orchard
-            // lookups above already `break` for any height `ironwood_tree_by_height` would
-            // return `None` for (above the tip, or a fast-synced database's absent band).
-            let ironwood_root = self
-                .ironwood_tree_by_height(&height)
-                .map(|tree| tree.root())
-                .unwrap_or_else(|| ironwood::tree::NoteCommitmentTree::default().root());
+            let Some(ironwood) = self.ironwood_tree_by_height(&height) else {
+                break;
+            };
 
             let Some(block) = self.block(height.into()) else {
                 break;
@@ -248,7 +274,7 @@ impl ZakuraDb {
                 height,
                 sapling_root: sapling.root(),
                 orchard_root: orchard.root(),
-                ironwood_root,
+                ironwood_root: ironwood.root(),
                 sapling_tx,
                 orchard_tx,
                 ironwood_tx,

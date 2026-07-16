@@ -10,7 +10,7 @@ description: Create shareable zip archives from Zebra Zakura perf trace director
 When the user gives a Zakura `trace_dir`, create a shareable archive with:
 
 ```bash
-python3 .cursor/skills/zakura-trace-zip/scripts/zip_zakura_traces.py TRACE_DIR --out-dir perf-artifacts
+python3 .agents/skills/zakura-trace-zip/scripts/zip_zakura_traces.py TRACE_DIR --out-dir perf-artifacts
 ```
 
 Default output:
@@ -26,7 +26,7 @@ The zip preserves the trace directory as the top-level folder inside the archive
 Use `--output PATH` to choose the exact zip path:
 
 ```bash
-python3 .cursor/skills/zakura-trace-zip/scripts/zip_zakura_traces.py /mnt/roman-dev-2-data/feedrun-r1-traces --output perf-artifacts/feedrun-r1-traces.zip
+python3 .agents/skills/zakura-trace-zip/scripts/zip_zakura_traces.py /mnt/roman-dev-2-data/feedrun-r1-traces --output perf-artifacts/feedrun-r1-traces.zip
 ```
 
 Use `--force` to overwrite an existing archive.

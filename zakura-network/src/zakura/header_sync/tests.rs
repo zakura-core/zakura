@@ -4,7 +4,10 @@ use super::{
     error::*,
     events::*,
     reactor::*,
-    state::{VctRootRepair, VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME},
+    state::{
+        OutstandingPhase, OutstandingRange, RangePriority, RangePurpose, RangeRequest,
+        VctRootRepair, VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME,
+    },
     validation::*,
     wire::*,
 };
@@ -2352,6 +2355,10 @@ async fn vct_repair_scheduler_requires_an_idle_peer() {
     .await;
     let (requested_peer, _request_id, _, _) = next_outbound_get_headers(&mut fixture.actions).await;
     assert_eq!(requested_peer, busy_peer);
+    while tokio::time::timeout(std::time::Duration::from_millis(25), fixture.actions.recv())
+        .await
+        .is_ok()
+    {}
 
     fixture.handle.send(mainnet_repair_event(1)).await.unwrap();
     advertise_tip(
@@ -2436,7 +2443,7 @@ async fn status_updates_peer_caps_and_scheduler_respects_them() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_assigns_only_current_forward_range_before_progress() {
+async fn scheduler_fills_v7_outstanding_request_slots() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -2456,28 +2463,34 @@ async fn scheduler_assigns_only_current_forward_range_before_progress() {
     )
     .await;
 
-    let mut get_headers_count = 0;
+    let mut starts = HashSet::new();
     while let Ok(Some(action)) = tokio::time::timeout(
         std::time::Duration::from_millis(100),
         fixture.actions.recv(),
     )
     .await
     {
-        if matches!(
-            action,
-            HeaderSyncAction::SendMessage {
-                peer,
-                msg: HeaderSyncMessage::GetHeaders { .. },
-                ..
-            } if peer == peer_id
-        ) {
-            get_headers_count += 1;
+        if let HeaderSyncAction::SendMessage {
+            peer,
+            msg:
+                HeaderSyncMessage::GetHeaders {
+                    start_height,
+                    count,
+                    ..
+                },
+            ..
+        } = action
+        {
+            if peer == peer_id {
+                assert_eq!(count, 2);
+                assert!(starts.insert(start_height));
+            }
         }
     }
 
-    // The peer has many inflight slots, but only the current forward range is
-    // queued until committed progress advances the frontier.
-    assert_eq!(get_headers_count, 1);
+    assert_eq!(starts.len(), 10);
+    assert_eq!(starts.iter().copied().min(), Some(block::Height(1)));
+    assert_eq!(starts.iter().copied().max(), Some(block::Height(19)));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2570,7 +2583,7 @@ async fn scheduler_uses_inflight_slots_and_matches_reverse_response_ids() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_fans_out_same_forward_range_to_three_peers() {
+async fn work_queue_assigns_each_forward_range_to_one_peer() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -2585,7 +2598,7 @@ async fn scheduler_fans_out_same_forward_range_to_three_peers() {
     }
 
     let mut requested = HashSet::new();
-    while requested.len() < HEADER_SYNC_FANOUT {
+    while requested.is_empty() {
         if let HeaderSyncAction::SendMessage {
             peer,
             msg:
@@ -2603,34 +2616,29 @@ async fn scheduler_fans_out_same_forward_range_to_three_peers() {
         }
     }
 
-    assert_eq!(requested.len(), HEADER_SYNC_FANOUT);
+    assert_eq!(requested.len(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
+async fn covered_outstanding_range_does_not_commit_late_response() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
         (block::Height(0), network.genesis_hash()),
         None,
     ));
-    let peers = [peer(33), peer(34)];
+    let peer_id = peer(33);
     let start = block::Height(1);
     let tip = block::Height(2);
 
-    for peer_id in peers.clone() {
-        connect_peer(&fixture, peer_id.clone()).await;
-        advertise_tip(&fixture, peer_id, block::Height(0), tip, 2, 1).await;
-    }
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id.clone(), block::Height(0), tip, 2, 1).await;
 
-    let mut requests = HashMap::new();
-    while requests.len() < peers.len() {
-        let (peer, request_id, start_height, count) =
-            next_outbound_get_headers(&mut fixture.actions).await;
-        assert_eq!(start_height, start);
-        assert_eq!(count, 2);
-        requests.insert(peer, request_id);
-    }
+    let (requested_peer, request_id, start_height, count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, peer_id);
+    assert_eq!(start_height, start);
+    assert_eq!(count, 2);
 
     fixture
         .handle
@@ -2642,152 +2650,25 @@ async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
         .await
         .unwrap();
 
-    for peer_id in peers {
-        send_headers(
-            &fixture,
-            &peer_id,
-            requests[&peer_id],
-            headers_message_from(
-                start,
-                vec![
-                    mainnet_header(&BLOCK_MAINNET_1_BYTES),
-                    mainnet_header(&BLOCK_MAINNET_2_BYTES),
-                ],
-            ),
-        )
-        .await;
-    }
+    send_headers(
+        &fixture,
+        &peer_id,
+        request_id,
+        headers_message_from(
+            start,
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+        ),
+    )
+    .await;
 
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
-/// Hedged responses can double-commit, and that must stay benign.
-///
-/// The scheduler fans one range out to several peers, and `pending_commits` is keyed per
-/// `(peer, start_height, count)`, so the commit dispatch does not check for an overlapping
-/// pending commit from another peer. Redundant outstanding ranges are only cancelled in
-/// `handle_header_range_committed`, once the state writer confirms. Two responses that land
-/// inside that window therefore each dispatch their own `CommitHeaderRange`.
-///
-/// That is harmless *today*: the state writer treats an identical header at a height as a
-/// non-conflict, so the second commit revalidates and rewrites the same rows and returns
-/// `Ok`; the duplicate committed event is idempotent in the reactor; and the tip only
-/// publishes on a strictly higher height. Neither honest peer is scored.
-///
-/// The property holds only because of those downstream details, so it is tested at both
-/// layers: the state writer's half (re-committing an identical range succeeds) is covered by
-/// `header_range_commit_merges_same_header_advertised_body_size_by_max` in `zakura-state`,
-/// and this test covers the reactor's half. If `commit_header_range` starts rejecting an
-/// already-present range, or a conflict error is reclassified as scoring, honest hedged peers
-/// would be scored for misbehavior; these two tests are what catch that.
 #[tokio::test(flavor = "current_thread")]
-async fn hedged_double_commit_does_not_score_peers_or_publish_the_tip_twice() {
-    // A checkpoint at height 3 with the range starting at 4: above the checkpoint, so the
-    // range is non-finalized and gets hedged, while the mainnet header still validates.
-    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
-    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
-    let start = block::Height(4);
-    let header = mainnet_header(&BLOCK_MAINNET_4_BYTES);
-    let tip_hash = block::Hash::from(header.as_ref());
-    let mut fixture = spawn_test_reactor(startup_for(
-        network.clone(),
-        (block::Height(0), network.genesis_hash()),
-        Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peers = [peer(43), peer(44)];
-
-    for peer_id in peers.clone() {
-        connect_peer(&fixture, peer_id.clone()).await;
-        advertise_tip(&fixture, peer_id, block::Height(0), start, 1, 1).await;
-    }
-
-    // The same range is hedged across both peers.
-    let mut requests = HashMap::new();
-    while requests.len() < peers.len() {
-        let (peer, request_id, start_height, count) =
-            next_outbound_get_headers(&mut fixture.actions).await;
-        assert_eq!(start_height, start);
-        assert_eq!(count, 1);
-        requests.insert(peer, request_id);
-    }
-
-    // Both answer before either commit is confirmed, so both outstandings are still live.
-    for peer_id in peers.clone() {
-        send_headers(
-            &fixture,
-            &peer_id,
-            requests[&peer_id],
-            headers_message(vec![header.clone()]),
-        )
-        .await;
-    }
-
-    // Each response dispatches its own commit: the race is real, and neither peer is scored.
-    let mut committed_peers = Vec::new();
-    while committed_peers.len() < peers.len() {
-        match next_non_query_action(&mut fixture.actions).await {
-            HeaderSyncAction::CommitHeaderRange {
-                peer, start_height, ..
-            } => {
-                assert_eq!(start_height, start);
-                committed_peers.push(peer);
-            }
-            HeaderSyncAction::Misbehavior { peer, reason } => {
-                panic!("an honest hedged peer must not be scored: {peer:?} {reason:?}")
-            }
-            _ => {}
-        }
-    }
-    committed_peers.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    let mut expected_peers = peers.to_vec();
-    expected_peers.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    assert_eq!(
-        committed_peers, expected_peers,
-        "both hedged responses should dispatch their own commit"
-    );
-
-    // The state writer confirms both: rewriting an identical range succeeds.
-    for _ in 0..peers.len() {
-        fixture
-            .handle
-            .send(HeaderSyncEvent::HeaderRangeCommitted {
-                start_height: start,
-                tip_height: start,
-                tip_hash,
-            })
-            .await
-            .unwrap();
-    }
-
-    // The duplicate commit neither scores a peer nor republishes the frontier.
-    let mut advanced = 0;
-    while let Ok(Some(action)) = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        fixture.actions.recv(),
-    )
-    .await
-    {
-        match action {
-            HeaderSyncAction::HeaderAdvanced { height, hash } => {
-                assert_eq!(height, start);
-                assert_eq!(hash, tip_hash);
-                advanced += 1;
-            }
-            HeaderSyncAction::Misbehavior { peer, reason } => {
-                panic!("a duplicate commit must not score {peer:?}: {reason:?}")
-            }
-            _ => {}
-        }
-    }
-    assert_eq!(
-        advanced, 1,
-        "a duplicate commit at the same tip must not republish the header frontier"
-    );
-    assert_eq!(fixture.handle.best_header_tip(), (start, tip_hash));
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
+async fn work_queue_splits_large_ranges_without_duplicate_ownership() {
     let network = Network::Mainnet;
     let first_checkpoint = network
         .checkpoint_list()
@@ -2828,7 +2709,7 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
         .await;
     }
 
-    let mut requested = HashSet::new();
+    let mut requested = HashMap::new();
     while let Ok(Some(action)) = tokio::time::timeout(
         std::time::Duration::from_millis(100),
         fixture.actions.recv(),
@@ -2846,48 +2727,16 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
             ..
         } = action
         {
-            assert_eq!(start_height, start);
-            assert_eq!(count, clamped_count);
+            assert!(count <= clamped_count);
+            assert!(count > 0);
             assert!(
-                requested.insert(peer),
-                "scheduler must not duplicate a clamped chunk for one peer"
+                requested.insert(start_height, peer).is_none(),
+                "work queue must not assign one clamped chunk to multiple peers"
             );
         }
     }
-    assert_eq!(requested.len(), HEADER_SYNC_FANOUT);
-
-    let chunk_tip = height_after_count(start, clamped_count)
-        .and_then(previous_height)
-        .expect("clamped range has a tip");
-    fixture
-        .handle
-        .send(HeaderSyncEvent::HeaderRangeCommitted {
-            start_height: start,
-            tip_height: chunk_tip,
-            tip_hash: block::Hash([4; 32]),
-        })
-        .await
-        .unwrap();
-
-    loop {
-        if let HeaderSyncAction::SendMessage {
-            msg:
-                HeaderSyncMessage::GetHeaders {
-                    start_height,
-                    count,
-                    want_tree_aux_roots: true,
-                },
-            ..
-        } = next_non_query_action(&mut fixture.actions).await
-        {
-            assert_eq!(
-                start_height,
-                next_height(chunk_tip).expect("committed chunk tip has successor")
-            );
-            assert_eq!(count, clamped_count);
-            break;
-        }
-    }
+    assert_eq!(requested.len(), peers.len());
+    assert_eq!(requested.keys().copied().min(), Some(start));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3252,6 +3101,75 @@ async fn matching_headers_are_statelessly_validated_before_commit() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn truncated_finalized_suffix_still_checks_its_checkpoint_hash() {
+    let headers = [
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+        mainnet_header(&BLOCK_MAINNET_3_BYTES),
+    ];
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), block::Hash([9; 32]));
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(207);
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(3),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+    let prefix_id = next_get_headers_request_id(&mut fixture.actions).await;
+    send_headers(
+        &fixture,
+        &peer_id,
+        prefix_id,
+        headers_message(headers[..2].to_vec()),
+    )
+    .await;
+    loop {
+        if matches!(
+            next_non_query_action(&mut fixture.actions).await,
+            HeaderSyncAction::CommitHeaderRange { .. }
+        ) {
+            break;
+        }
+    }
+    let (_, suffix_id, suffix_start, suffix_count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((suffix_start, suffix_count), (block::Height(3), 1));
+    send_headers(
+        &fixture,
+        &peer_id,
+        suffix_id,
+        headers_message_from(block::Height(3), vec![headers[2].clone()]),
+    )
+    .await;
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior {
+                peer,
+                reason: HeaderSyncMisbehavior::InvalidRange,
+            } => {
+                assert_eq!(peer, peer_id);
+                break;
+            }
+            HeaderSyncAction::CommitHeaderRange {
+                start_height: block::Height(3),
+                ..
+            } => panic!("a truncated suffix with the wrong checkpoint hash was committed"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn invalid_async_header_commit_failure_reports_peer_disconnect() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
@@ -3582,6 +3500,56 @@ fn peer_state_suppresses_redundant_status_until_session_reset() {
 }
 
 #[test]
+fn response_before_publication_completion_is_not_reinstalled() {
+    let (send, _recv) = crate::zakura::framed_channel(1);
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        peer(81),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    let mut peer_state = super::state::PeerHeaderState::new(
+        session,
+        (block::Height(0), block::Hash([0; 32])),
+        DEFAULT_HS_RANGE,
+        DEFAULT_HS_MAX_INFLIGHT,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
+    );
+    let request_id = HeaderSyncRequestId::new(1).expect("non-zero request ID");
+    let range = RangeRequest {
+        start_height: block::Height(1),
+        count: 1,
+        anchor_hash: None,
+        finalized: false,
+        want_tree_aux_roots: true,
+        priority: RangePriority::Forward,
+    };
+    peer_state.outstanding.push(OutstandingRange {
+        request_id,
+        range,
+        deadline: Instant::now() + std::time::Duration::from_secs(1),
+        purpose: RangePurpose::Sync,
+        phase: OutstandingPhase::Publishing,
+    });
+
+    let _response = peer_state
+        .remove_outstanding_by_request_id(request_id)
+        .expect("response consumes the publishing request");
+    complete_request_publication(
+        &mut peer_state,
+        request_id,
+        Instant::now() + std::time::Duration::from_secs(2),
+    );
+
+    assert!(
+        peer_state.outstanding.is_empty(),
+        "the later successful completion must not recreate a consumed request"
+    );
+}
+
+#[test]
 fn completed_v7_inbound_request_id_cannot_be_reused() {
     let (send, _recv) = crate::zakura::framed_channel(32);
     let session = HeaderSyncPeerSession::from_parts_with_direction(
@@ -3641,9 +3609,11 @@ async fn reconnect_resends_initial_status_after_session_reset() {
     ));
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn retries_initial_status_after_full_outbound_queue() {
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn failed_status_publication_is_retry_paced() {
+    header_sync_metrics_recorder();
     let send_failed_before = metric_value("sync.header.peer.status.send_failed");
+    let mut capture = TraceCapture::for_test("failed_status_publication_is_retry_paced").unwrap();
     let network = regtest_network();
     let mut startup = startup_for(
         network.clone(),
@@ -3652,7 +3622,8 @@ async fn retries_initial_status_after_full_outbound_queue() {
     );
     startup.range_state_actions_enabled = false;
     startup.request_timeout = std::time::Duration::from_millis(10);
-    startup.status_refresh_interval = std::time::Duration::from_millis(10);
+    startup.status_refresh_interval = std::time::Duration::from_secs(10);
+    startup.trace = ZakuraTrace::new(capture.tracer(), "status-publication-retry");
     let fixture = spawn_test_reactor(startup);
     let peer_id = peer(74);
     let (send, mut recv) = crate::zakura::framed_channel(1);
@@ -3686,7 +3657,22 @@ async fn retries_initial_status_after_full_outbound_queue() {
     .await
     .expect("peer is admitted while outbound queue is full");
 
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    capture.flush().await;
+    assert!(
+        capture
+            .reader()
+            .unwrap()
+            .table(HEADER_SYNC_TABLE.table())
+            .count(hs_trace::HEADER_MAINTENANCE_WAKEUP)
+            <= 1,
+        "a failed status publication must not make maintenance spin"
+    );
+
     let _ = recv.recv().await.expect("filler frame drains");
+    tokio::time::advance(STATUS_PUBLICATION_RETRY_DELAY).await;
     let frame = tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
         .await
         .expect("status retry arrives")
@@ -3701,6 +3687,7 @@ async fn retries_initial_status_after_full_outbound_queue() {
         metric_value("sync.header.peer.status.send_failed") > send_failed_before,
         "a full outbound queue must increment the header-sync Status send-failure counter"
     );
+    let _ = capture.finish().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -5267,7 +5254,7 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_violation_recor
         Some((first_checkpoint, checkpoint_hash)),
     );
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
-    let fixture = spawn_test_reactor(startup);
+    let mut fixture = spawn_test_reactor(startup);
     let peer_id = peer(55);
 
     connect_peer(&fixture, peer_id.clone()).await;
@@ -5280,6 +5267,7 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_violation_recor
         1,
     )
     .await;
+    let _ = next_get_headers_request_id(&mut fixture.actions).await;
     fixture
         .handle
         .send(HeaderSyncEvent::FullBlockCommitted {
@@ -5484,10 +5472,10 @@ async fn header_sync_metrics_record_status_range_new_block_dedup_and_violation()
 /// so there is no reactor-level unsolicited case to exercise here.
 async fn empty_headers_for_outstanding_range_retries_without_disconnect() {
     let network = regtest_network();
-    let mut fixture = spawn_test_reactor(startup_with_timeout(
+    let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
         (block::Height(0), network.genesis_hash()),
-        std::time::Duration::from_millis(20),
+        None,
     ));
     let peer_id = peer(9);
 
@@ -5503,6 +5491,24 @@ async fn empty_headers_for_outstanding_range_retries_without_disconnect() {
     .await;
     let request_id = next_get_headers_request_id(&mut fixture.actions).await;
     send_headers(&fixture, &peer_id, request_id, headers_message(Vec::new())).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            loop {
+                if matches!(
+                    next_non_query_action(&mut fixture.actions).await,
+                    HeaderSyncAction::SendMessage {
+                        msg: HeaderSyncMessage::GetHeaders { .. },
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_err(),
+        "empty responses use the one-second retry delay rather than the 50ms peer-avoidance delay"
+    );
     // Periodic keepalive Status sends may interleave with the retry; the
     // property under test is that the range retries without a disconnect.
     loop {
@@ -5521,6 +5527,786 @@ async fn empty_headers_for_outstanding_range_retries_without_disconnect() {
             ),
         }
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_silent_peer_retries_the_same_missing_range_indefinitely() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_with_timeout(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        std::time::Duration::from_millis(5),
+    ));
+    let peer_id = peer(90);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+
+    for _ in 0..3 {
+        let (request_peer, _request_id, start, count) =
+            next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(request_peer, peer_id);
+        assert_eq!(start, block::Height(1));
+        assert_eq!(count, 1);
+        // Silence: let the request deadline expire. The work queue must return
+        // the claim and make it eligible again after the short peer-local delay.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn commit_failure_after_source_disconnect_retries_without_blocking_the_lane() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(3), checkpoint_hash)),
+    ));
+    let first_peer = peer(140);
+    let second_peer = peer(141);
+
+    for peer_id in [&first_peer, &second_peer] {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id.clone(),
+            block::Height(0),
+            block::Height(4),
+            1,
+            1,
+        )
+        .await;
+    }
+    let (source, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(source, first_peer);
+    assert_eq!((start, count), (block::Height(4), 1));
+    send_headers(
+        &fixture,
+        &source,
+        request_id,
+        headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+    )
+    .await;
+    loop {
+        if matches!(
+            next_non_query_action(&mut fixture.actions).await,
+            HeaderSyncAction::CommitHeaderRange { .. }
+        ) {
+            break;
+        }
+    }
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerDisconnected(first_peer.clone()))
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitFailed {
+            peer: first_peer,
+            session_id: 0,
+            start_height: start,
+            count,
+            kind: HeaderSyncCommitFailureKind::Local,
+        })
+        .await
+        .unwrap();
+
+    let (retry_peer, _, retry_start, retry_count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(retry_peer, second_peer);
+    assert_eq!((retry_start, retry_count), (start, count));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn partial_full_block_coverage_retires_old_request_and_requests_suffix() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(142);
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(2),
+        2,
+        1,
+    )
+    .await;
+    let (_, old_request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((start, count), (block::Height(1), 2));
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: block::Height(1),
+            hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        })
+        .await
+        .unwrap();
+
+    let (_, _, retry_start, retry_count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((retry_start, retry_count), (block::Height(2), 1));
+    send_headers(
+        &fixture,
+        &peer_id,
+        old_request_id,
+        headers_message_from(
+            block::Height(1),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_1_BYTES),
+                mainnet_header(&BLOCK_MAINNET_2_BYTES),
+            ],
+        ),
+    )
+    .await;
+    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn partial_coverage_recreates_an_interior_hole_before_a_later_batch() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(202);
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id, block::Height(0), block::Height(4), 2, 2).await;
+
+    let mut requests = Vec::new();
+    while requests.len() < 2 {
+        let (_, _, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+        requests.push((start, count));
+    }
+    requests.sort_unstable();
+    assert_eq!(requests, vec![(block::Height(1), 2), (block::Height(3), 2)]);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: block::Height(1),
+            hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        })
+        .await
+        .unwrap();
+
+    let (_, _, retry_start, retry_count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((retry_start, retry_count), (block::Height(2), 1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn partial_coverage_trims_and_commits_an_already_buffered_suffix() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(203);
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(4),
+        2,
+        2,
+    )
+    .await;
+
+    let mut requests = HashMap::new();
+    while requests.len() < 2 {
+        let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(count, 2);
+        requests.insert(start, request_id);
+    }
+    send_headers(
+        &fixture,
+        &peer_id,
+        requests[&block::Height(3)],
+        headers_message_from(
+            block::Height(3),
+            vec![
+                mainnet_header(&BLOCK_MAINNET_3_BYTES),
+                mainnet_header(&BLOCK_MAINNET_4_BYTES),
+            ],
+        ),
+    )
+    .await;
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: block::Height(3),
+            hash: mainnet_block(&BLOCK_MAINNET_3_BYTES).hash(),
+            header: mainnet_header(&BLOCK_MAINNET_3_BYTES),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        if let HeaderSyncAction::CommitHeaderRange {
+            start_height,
+            headers,
+            ..
+        } = next_non_query_action(&mut fixture.actions).await
+        {
+            assert_eq!(start_height, block::Height(4));
+            assert_eq!(headers, vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]);
+            break;
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn partially_covered_failed_commit_requeues_its_uncovered_suffix() {
+    let headers = [
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+        mainnet_header(&BLOCK_MAINNET_3_BYTES),
+    ];
+    let checkpoint_hash = block::Hash::from(headers[2].as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(204);
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(3),
+        3,
+        1,
+    )
+    .await;
+    let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    send_headers(
+        &fixture,
+        &peer_id,
+        request_id,
+        finalized_headers_message(headers.to_vec()),
+    )
+    .await;
+    loop {
+        if matches!(
+            next_non_query_action(&mut fixture.actions).await,
+            HeaderSyncAction::CommitHeaderRange { .. }
+        ) {
+            break;
+        }
+    }
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: block::Height(1),
+            hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        })
+        .await
+        .unwrap();
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitFailed {
+            peer: peer_id,
+            session_id: 0,
+            start_height: start,
+            count,
+            kind: HeaderSyncCommitFailureKind::Local,
+        })
+        .await
+        .unwrap();
+
+    let (_, _, retry_start, retry_count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((retry_start, retry_count), (block::Height(2), 2));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn buffered_successor_drains_after_full_block_covers_its_predecessor() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(143);
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(2),
+        1,
+        2,
+    )
+    .await;
+
+    let mut requests = HashMap::new();
+    while requests.len() < 2 {
+        let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(count, 1);
+        requests.insert(start, request_id);
+    }
+    send_headers(
+        &fixture,
+        &peer_id,
+        requests[&block::Height(2)],
+        headers_message_from(
+            block::Height(2),
+            vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)],
+        ),
+    )
+    .await;
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: block::Height(1),
+            hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange {
+                start_height,
+                headers,
+                ..
+            } => {
+                assert_eq!(start_height, block::Height(2));
+                assert_eq!(headers.len(), 1);
+                break;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ordered_drain_rejects_a_buffered_range_on_the_wrong_fork() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(208);
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(3),
+        1,
+        2,
+    )
+    .await;
+    let mut requests = HashMap::new();
+    while requests.len() < 2 {
+        let (_, request_id, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(count, 1);
+        requests.insert(start, request_id);
+    }
+
+    // Block 3 is internally/statelessly valid and has no wire-time anchor for
+    // the height-2 batch, but it does not follow the eventual height-1 block.
+    send_headers(
+        &fixture,
+        &peer_id,
+        requests[&block::Height(2)],
+        headers_message_from(
+            block::Height(2),
+            vec![mainnet_header(&BLOCK_MAINNET_3_BYTES)],
+        ),
+    )
+    .await;
+    send_headers(
+        &fixture,
+        &peer_id,
+        requests[&block::Height(1)],
+        headers_message_from(
+            block::Height(1),
+            vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+        ),
+    )
+    .await;
+    loop {
+        if matches!(
+            next_non_query_action(&mut fixture.actions).await,
+            HeaderSyncAction::CommitHeaderRange {
+                start_height: block::Height(1),
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: block::Height(1),
+            tip_height: block::Height(1),
+            tip_hash: block::Hash::from(mainnet_header(&BLOCK_MAINNET_1_BYTES).as_ref()),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior {
+                peer,
+                reason: HeaderSyncMisbehavior::InvalidRange,
+            } => {
+                assert_eq!(peer, peer_id);
+                break;
+            }
+            HeaderSyncAction::CommitHeaderRange {
+                start_height: block::Height(2),
+                ..
+            } => panic!("ordered drain committed a buffered range on the wrong fork"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_action_queue_preserves_buffer_until_commit_capacity_returns() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(3), checkpoint_hash)),
+    ));
+    let source = peer(200);
+    connect_peer(&fixture, source.clone()).await;
+    advertise_tip(
+        &fixture,
+        source.clone(),
+        block::Height(0),
+        block::Height(4),
+        1,
+        1,
+    )
+    .await;
+    let (_, request_id, _, _) = next_outbound_get_headers(&mut fixture.actions).await;
+
+    for id in 0..128 {
+        connect_peer(&fixture, peer(id)).await;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while fixture.actions.len() < 128 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer status actions fill the action queue");
+    assert_eq!(
+        fixture.actions.len(),
+        128,
+        "test must saturate action queue"
+    );
+    send_headers(
+        &fixture,
+        &source,
+        request_id,
+        headers_message(vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while gauge_value("sync.header.work.buffered.count") != 1.0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the reactor reaches commit admission while its action queue is full");
+    assert_eq!(gauge_value("sync.header.work.buffered.count"), 1.0);
+    assert_eq!(fixture.actions.len(), 128, "commit admission stays blocked");
+
+    // Freeing one action slot is the only wakeup. The capacity waiter must
+    // admit the preserved buffer without requiring another peer event.
+    let _ = fixture
+        .actions
+        .recv()
+        .await
+        .expect("status action fills queue");
+    tokio::task::yield_now().await;
+    for _ in 0..129 {
+        if let HeaderSyncAction::CommitHeaderRange {
+            peer,
+            start_height,
+            headers,
+            ..
+        } = next_action(&mut fixture.actions).await
+        {
+            assert_eq!(peer, source);
+            assert_eq!(start_height, block::Height(4));
+            assert_eq!(headers.len(), 1);
+            assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+            return;
+        }
+    }
+    panic!("preserved header buffer was not committed after action capacity returned");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn peer_requester_waits_for_outbound_capacity_without_reencoding_or_polling() {
+    header_sync_metrics_recorder();
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(201);
+    let (send, mut recv) = crate::zakura::framed_channel(1);
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        peer_id.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .unwrap();
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+
+    // The initial Status occupies the only real outbound slot. The requester
+    // owns the range descriptor but must not publish a sent request yet.
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(20),
+        next_outbound_get_headers(&mut fixture.actions),
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        gauge_value("sync.header.work.in_flight.count"),
+        1.0,
+        "the reactor assigns the range before transport publication can complete"
+    );
+    let _status_frame = recv.recv().await.expect("initial status frame is queued");
+
+    let (request_peer, _, start, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(request_peer, peer_id);
+    assert_eq!((start, count), (block::Height(1), 1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn publishing_request_times_out_while_waiting_for_outbound_capacity() {
+    let metrics = metric_snapshot(&["sync.header.request.publication_timeout"]);
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_with_timeout(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        std::time::Duration::from_millis(50),
+    ));
+    let blocked_peer = peer(205);
+    let (send, _recv) = crate::zakura::framed_channel(1);
+    let blocked_cancel = CancellationToken::new();
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        blocked_peer.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        blocked_cancel.clone(),
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .unwrap();
+    advertise_tip(
+        &fixture,
+        blocked_peer,
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        blocked_cancel.cancelled(),
+    )
+    .await
+    .expect("a publishing request cancels its blocked session");
+    assert_metric_incremented(&metrics, "sync.header.request.publication_timeout");
+
+    let replacement = peer(206);
+    connect_peer(&fixture, replacement.clone()).await;
+    advertise_tip(
+        &fixture,
+        replacement.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+    let (retry_peer, _, retry_start, retry_count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(retry_peer, replacement);
+    assert_eq!((retry_start, retry_count), (block::Height(1), 1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn transport_closure_retries_work_and_disconnects_requester() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let failed_peer = peer(207);
+    let (send, recv) = crate::zakura::framed_channel(1);
+    let failed_session = HeaderSyncPeerSession::from_parts_with_direction(
+        failed_peer.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    drop(recv);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(failed_session))
+        .await
+        .unwrap();
+    advertise_tip(
+        &fixture,
+        failed_peer.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while {
+            let snapshot = fixture.handle.peer_snapshot();
+            snapshot.inbound_peers + snapshot.outbound_peers != 0
+        } {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("closed transport stops its requester and removes the peer");
+
+    let replacement = peer(208);
+    connect_peer(&fixture, replacement.clone()).await;
+    advertise_tip(
+        &fixture,
+        replacement.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+    let (retry_peer, _, retry_start, retry_count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(retry_peer, replacement);
+    assert_eq!((retry_start, retry_count), (block::Height(1), 1));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn idle_reactor_does_not_create_a_permanent_maintenance_tick() {
+    let mut capture =
+        TraceCapture::for_test("idle_reactor_does_not_create_a_permanent_maintenance_tick")
+            .unwrap();
+    let network = regtest_network();
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    startup.trace = ZakuraTrace::new(capture.tracer(), "idle-reactor");
+    let _fixture = spawn_test_reactor(startup);
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+
+    capture.flush().await;
+    let reader = capture.reader().unwrap();
+    assert_eq!(
+        reader
+            .table(HEADER_SYNC_TABLE.table())
+            .count(hs_trace::HEADER_MAINTENANCE_WAKEUP),
+        0,
+        "an idle reactor should sleep until real work or maintenance is due"
+    );
+    let _ = capture.finish().await.unwrap();
+}
+
+#[test]
+fn work_queue_transitions_have_one_explicit_owner() {
+    use super::state::{RangePriority, RangeRequest};
+    use super::work_queue::{HeaderWorkQueue, HeaderWorkState};
+
+    let owner = peer(144);
+    let range = RangeRequest {
+        start_height: block::Height(1),
+        count: 2,
+        anchor_hash: Some(block::Hash([1; 32])),
+        finalized: false,
+        want_tree_aux_roots: true,
+        priority: RangePriority::Forward,
+    };
+    let mut queue = HeaderWorkQueue::new();
+    queue.ensure_forward(range);
+    let pending = queue.forward.pop_front().expect("range is pending");
+    queue.mark_assigned(owner.clone(), pending);
+    assert!(matches!(
+        queue.state(range),
+        Some(HeaderWorkState::InFlight { peer }) if peer == &owner
+    ));
+    queue.mark_buffered(owner.clone(), range);
+    assert!(matches!(
+        queue.state(range),
+        Some(HeaderWorkState::Buffered { peer }) if peer == &owner
+    ));
+    queue.mark_committing(owner.clone(), 7, range);
+    assert!(matches!(
+        queue.state(range),
+        Some(HeaderWorkState::Committing { peer, session_id: 7 }) if peer == &owner
+    ));
+    queue.complete(range);
+    assert!(queue.state(range).is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -5759,7 +6545,7 @@ async fn forward_genesis_backfill_reaches_checkpoint_before_finalized_commit() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn truncated_finalized_backfill_is_rejected_before_commit() {
+async fn truncated_finalized_backfill_commits_valid_prefix_and_requeues_suffix() {
     let headers = [
         mainnet_header(&BLOCK_MAINNET_1_BYTES),
         mainnet_header(&BLOCK_MAINNET_2_BYTES),
@@ -5795,12 +6581,24 @@ async fn truncated_finalized_backfill_is_rejected_before_commit() {
     .await;
 
     match next_non_query_action(&mut fixture.actions).await {
-        HeaderSyncAction::Misbehavior { peer, reason } => {
+        HeaderSyncAction::CommitHeaderRange {
+            peer,
+            start_height,
+            headers,
+            finalized,
+            ..
+        } => {
             assert_eq!(peer, peer_id);
-            assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+            assert_eq!(start_height, block::Height(1));
+            assert_eq!(headers.len(), 2);
+            assert!(finalized);
         }
         action => panic!("unexpected action: {action:?}"),
     }
+    let (suffix_peer, _, suffix_start, suffix_count) =
+        next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(suffix_peer, peer_id);
+    assert_eq!((suffix_start, suffix_count), (block::Height(3), 1));
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 

@@ -854,10 +854,11 @@ impl ZcashSerialize for Transaction {
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
+                // V6 Orchard still reserves bit 2; only the Ironwood slot below permits it.
                 serialize_optional_orchard_shielded_data_with_flags(
                     orchard_shielded_data,
                     &mut writer,
-                    ALLOW_CROSS_ADDRESS_BIT,
+                    !ALLOW_CROSS_ADDRESS_BIT,
                 )?;
 
                 // A bundle of fields denoted in the spec as `nActionsIronwood`,
@@ -1204,9 +1205,10 @@ impl ZcashDeserialize for Transaction {
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
+                // V6 Orchard still reserves bit 2; only the Ironwood slot below permits it.
                 let orchard_shielded_data = deserialize_orchard_shielded_data_with_flags(
                     &mut limited_reader,
-                    ALLOW_CROSS_ADDRESS_BIT,
+                    !ALLOW_CROSS_ADDRESS_BIT,
                 )?;
 
                 // A bundle of fields denoted in the spec as `nActionsIronwood`,

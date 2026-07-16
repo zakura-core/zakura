@@ -57,6 +57,6 @@ repository at the tagged commit, and has not been modified since.
 
 ## Docker images
 
-The Docker images on Docker Hub (`valargroup/zakura`) are not yet signed;
+The Docker images on Docker Hub (`zakuracore/zakura`) are not yet signed;
 verify the binary archives above, or build images from source. Image signing
 is planned follow-up work.

@@ -8,8 +8,6 @@ assignees: ""
 
 # Prepare for the Release
 
-- [ ] Make sure there has been [at least one successful sync-confidence run on `main`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml?query=branch%3Amain) since the last state change, or start a manual sync-confidence run.
-
 # Checkpoints
 
 For performance and security, we want to update the Zakura checkpoints in every release.
@@ -36,6 +34,13 @@ Here's how we make sure we got everything:
 These steps can be done a few days before the release, in the same PR:
 
 ## Change Log
+
+Changelog policy lives in
+[`CHANGELOG_GUIDELINES.md`](https://github.com/zakura-core/zakura/blob/main/CHANGELOG_GUIDELINES.md) —
+follow it if it and these steps ever disagree. In particular, `v1.0.0` and its
+release candidates take a single "Initial release" entry (already in place)
+and **skip** the draft-changelog steps below; they apply to releases after
+`v1.0.0`.
 
 **Important**: Any merge into `main` deletes any edits to the draft changelog.
 Once you are ready to tag a release, copy the draft changelog into `CHANGELOG.md`.
@@ -112,8 +117,27 @@ version.
 cargo release version --verbose --execute --allow-branch '*' -p zakura patch # [ major | minor ]
 ```
 
-- [ ] On the release commit, check that the version matches the tag you are
-      about to create: `./scripts/check-release-version.sh v<version>`
+- [ ] Generate and commit the stored config for the new version — the
+      `last_config_is_stored` acceptance test derives the expected filename
+      from the package version and fails without it:
+
+```sh
+cargo build --bin zakurad &&
+./target/debug/zakurad generate |
+sed "s#${XDG_CACHE_HOME:-$HOME/.cache}/zakura#cache_dir#g" |
+sed "s#$HOME/.zakura#identity_dir#g" \
+  > zakurad/tests/common/configs/v<version>.toml
+```
+
+      The replacements are global path-string substitutions, mirroring
+      `last_config_is_stored` — the default cache path also appears in
+      fields other than `cache_dir` (for example `cookie_dir`), so
+      per-field rewrites produce a snapshot the test rejects.
+
+- [ ] On the release commit, run the pre-release checks for the tag you are
+      about to create, using the previous release tag as the base:
+      `make pre-release RELEASE_TAG=v<version> BASE_TAG=v<previous-release-tag>`
+      For example: `make pre-release RELEASE_TAG=v1.0.0 BASE_TAG=v1.0.0-rc5`
 
 ## Update Crate Versions and Crate Change Logs
 
@@ -122,8 +146,10 @@ and make sure you're a member of owners group.
 
 Check that the release will work:
 
-- [ ] Determine which crates require release. Run `git diff --stat <previous_tag>`
-      and enumerate the crates that had changes.
+- [ ] Review the changed-crate version advisory from `make pre-release`. It
+      warns when publishable crates changed since the latest release tag without
+      a package version bump. This warning is local-only and advisory; unchanged
+      crates are not bumped or published.
 - [ ] Update (or install) `semver-checks`: `cargo +stable install cargo-semver-checks --locked`
 - [ ] Update (or install) `public-api`: `cargo +stable install cargo-public-api --locked`
 - [ ] For each crate that requires a release:
@@ -135,7 +161,10 @@ Check that the release will work:
         if the previous realase was yanked; you will have to determine the
         type of release manually.
   - [ ] Update the crate `CHANGELOG.md` listing the API changes or other
-        relevant information for a crate consumer. Use `public-api` to list all
+        relevant information for a crate consumer, per
+        [`CHANGELOG_GUIDELINES.md`](https://github.com/zakura-core/zakura/blob/main/CHANGELOG_GUIDELINES.md)
+        (crate changelogs move on the crate's own release cadence; for `v1.0.0`
+        they are a single "Initial release" entry). Use `public-api` to list all
         API changes: `cargo public-api diff latest -p <crate> -sss`. You can use
         e.g. copilot to turn it into a human-readable list, e.g. (write the output
         to `api.txt` beforehand):
@@ -199,11 +228,19 @@ The end of support height is calculated from the current blockchain height:
   - [ ] [release-binaries.yml](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush)
 - [ ] Review and merge the installer metadata update PR opened by the release
       workflow.
-- [ ] Run [`sync-confidence.yml`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml) manually for the release tag or release branch if sync validation is required after tagging.
 
-## Publish Release
+## Promote Release (stable releases only)
 
-- [ ] [Publish the release to GitHub](https://github.com/zakura-core/zakura/releases) by disabling 'pre-release', then clicking "Set as the latest release"
+Pre-releases are **never** promoted — see
+[Promotion and the "Latest" Release](https://github.com/zakura-core/zakura/blob/main/docs/release-tag-protection.md#promotion-and-the-latest-release).
+For a release candidate, skip this section: the release stays a pre-release
+from publication until deletion.
+
+- [ ] For a stable release, after `make sign-release` has run against the tag:
+      [edit the release](https://github.com/zakura-core/zakura/releases) to
+      disable 'pre-release' **and** check "Set as the latest release"
+      (`make_latest: true`) — both steps are explicit; nothing does this
+      automatically.
 
 ## Publish Crates
 
@@ -230,8 +267,8 @@ for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakur
   - [ ] Confirm the workflow logs show the expected `/usr/local/bin/zcashd --version` for the zcashd-compat linux/amd64 image variant.
 - [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush).
 - [ ] Confirm `release-binaries.yml` published `zakurad-<tag>-linux-x86_64.tar.gz`, `zakurad-<tag>-linux-aarch64.tar.gz`, `zakurad-manifest-<tag>.json`, `install-zakura.sh`, and `SHA256SUMS.txt` to the GitHub release.
-- [ ] Wait for the new tag in the [Docker Hub zakura space](https://hub.docker.com/r/valargroup/zakura/tags)
-- [ ] Confirm `valargroup/zakura:<version>` includes `linux/amd64` and `linux/arm64`, and `valargroup/zakura:zcashd-compat-<version>` includes only `linux/amd64`.
+- [ ] Wait for the new tag in the [Docker Hub zakura space](https://hub.docker.com/r/zakuracore/zakura/tags)
+- [ ] Confirm `zakuracore/zakura:<version>` includes `linux/amd64` and `linux/arm64`, and `zakuracore/zakura:zcashd-compat-<version>` includes only `linux/amd64`.
 - [ ] Un-freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zakura/queues) using Mergify.
 - [ ] Remove `do-not-merge` from the PRs you added it to
 

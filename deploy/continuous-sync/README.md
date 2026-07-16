@@ -16,6 +16,9 @@ test a fresh genesis-to-tip sync from the latest `origin/main` build:
 Each node runs a local systemd controller. GitHub Actions installs and audits the
 controller, but it does not hold an SSH session open during the long sync.
 
+The dual-stack and Zakura/v2-only nodes exercise the [experimental Zakura P2P
+v2 stack](../../book/src/user/p2p.md).
+
 ## Lifecycle
 
 `zakura-continuous-sync.service` runs
@@ -229,10 +232,3 @@ For a fresh Ubuntu x86_64 host:
   restarts.
 - Secrets are read from host env files or GitHub secrets and are never written to
   repository-managed templates.
-
-## Relationship to Other Sync Workflows
-
-This fleet is permanent and destructive on its own dedicated hosts. It differs
-from `.github/workflows/do-sync-test.yml`, which creates an ephemeral DigitalOcean
-droplet, restores a cached state, runs a bounded sync-confidence window, and
-destroys the droplet.

@@ -11,19 +11,6 @@ assignees: ""
 These release steps can be done a week before the release, in separate PRs.
 They can be skipped for urgent releases.
 
-## Sync Confidence Test
-
-To check consensus correctness, we want to test that the state format is valid through the sync-confidence ranges. (Format upgrades are tested in CI on each PR.)
-
-- [ ] Make sure there has been [at least one successful sync-confidence run](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml?query=branch%3Amain) since the last state change, or
-- [ ] Start a manual workflow run of [`sync-confidence.yml`](https://github.com/zakura-core/zakura/actions/workflows/sync-confidence.yml) from `main`.
-
-State format changes can be made in `zakura-state` or `zakura-chain`. The state format can be changed by data that is sent to the state, data created within the state using `zakura-chain`, or serialization formats in `zakura-state` or `zakura-chain`.
-
-After the test has been started, or if it has finished already:
-
-- [ ] Ask for a state code freeze in Slack. The freeze lasts until the release has been published.
-
 ## Checkpoints
 
 For performance and security, we want to update the Zakura checkpoints in every release.

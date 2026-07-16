@@ -43,7 +43,8 @@ use super::zakura_db::transparent::{
 #[allow(unused_imports)]
 use super::{TypedColumnFamily, WriteTypedBatch};
 
-#[cfg(any(test, feature = "proptest-impl"))]
+// These helpers expose the raw RocksDB handle, so they must remain test-only.
+#[cfg(test)]
 mod tests;
 
 /// The [`rocksdb::ThreadMode`] used by the database.

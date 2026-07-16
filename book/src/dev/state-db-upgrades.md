@@ -112,13 +112,13 @@ To write to a legacy batch, then write it to the database, you can use
 `take_batch_for_writing(batch).write_batch()`.
 
 During database upgrades, you might need to access the same column family using different types.
-[Define a type](https://github.com/zakura-core/zakura/pull/8115/files#diff-ba689ca6516946a903da62153652d91dc1bb3d0100bcf08698cb3f38ead57734R36-R53)
-and [convenience method](https://github.com/zakura-core/zakura/pull/8115/files#diff-ba689ca6516946a903da62153652d91dc1bb3d0100bcf08698cb3f38ead57734R69-R87)
+[Define a type](https://github.com/ZcashFoundation/zebra/pull/8115/files#diff-ba689ca6516946a903da62153652d91dc1bb3d0100bcf08698cb3f38ead57734R36-R53)
+and [convenience method](https://github.com/ZcashFoundation/zebra/pull/8115/files#diff-ba689ca6516946a903da62153652d91dc1bb3d0100bcf08698cb3f38ead57734R69-R87)
 for each legacy type, and use them during the upgrade.
 
 Some full examples of legacy code conversions, and the typed column family implementation itself
-are in [PR #8112](https://github.com/zakura-core/zakura/pull/8112/files) and
-[PR #8115](https://github.com/zakura-core/zakura/pull/8115/files).
+are in [Zebra PR #8112](https://github.com/ZcashFoundation/zebra/pull/8112/files) and
+[Zebra PR #8115](https://github.com/ZcashFoundation/zebra/pull/8115/files).
 
 ## Current Implementation
 

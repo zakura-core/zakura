@@ -65,7 +65,15 @@ follow semver, depending on the thing being fixed.
 - [ ] Checkout the hotfix release branch
 - [ ] [Run `cargo login`](https://github.com/zakura-core/zakura/dev/crate-owners.html#logging-in-to-cratesio)
 - [ ] Run `cargo clean` in the zakura repo
-- [ ] Publish the crates to crates.io: `cargo release publish --verbose --workspace --execute --allow-branch {hotfix-release-branch}`
+- [ ] Publish the changed crates to crates.io; edit the list to only include
+      the crates that have been changed (`git diff --stat <previous-tag>`),
+      but keep their overall order — unchanged crates are not bumped or
+      published:
+
+```
+for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakura-tower-batch-control zakura-node-services zakura-script zakura-state zakura-consensus zakura-network zakura-rpc zakura-utils zakura; do cargo release publish --verbose --execute --allow-branch {hotfix-release-branch} -p $c; done
+```
+
 - [ ] Check that the published version of Zakura can be installed from `crates.io`:
       `cargo install --locked --force --version 2.minor.patch zakura && ~/.cargo/bin/zakurad`
       and put the output in a comment on the PR.

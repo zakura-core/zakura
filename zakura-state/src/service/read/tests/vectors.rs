@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 use zakura_chain::{
     block::{Block, Height},
-    orchard,
+    ironwood, orchard,
     parameters::Network::*,
     serialization::ZcashDeserializeInto,
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
@@ -24,7 +24,7 @@ use crate::{
     service::{
         finalized_state::{DiskWriteBatch, ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE},
         non_finalized_state::Chain,
-        read::{orchard_subtrees, sapling_subtrees},
+        read::{ironwood_subtrees, orchard_subtrees, sapling_subtrees},
     },
     Config, ReadRequest, ReadResponse,
 };
@@ -332,6 +332,83 @@ async fn test_orchard_subtrees() -> Result<()> {
     assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
 
     Ok(())
+}
+
+/// Tests if Zebra combines the Ironwood note commitment subtrees from the finalized and
+/// non-finalized states correctly.
+#[tokio::test]
+async fn test_ironwood_subtrees() -> Result<()> {
+    let dummy_subtree_root = ironwood::tree::Node::default();
+
+    // Prepare the finalized state.
+    let db_subtree = NoteCommitmentSubtree::new(0, Height(1), dummy_subtree_root);
+
+    let db = new_ephemeral_db();
+    let mut db_batch = DiskWriteBatch::new();
+    db_batch.insert_ironwood_subtree(&db, &db_subtree);
+    db.write(db_batch)
+        .expect("Writing a batch with an Ironwood subtree should succeed.");
+
+    // Prepare the non-finalized state.
+    let chain_subtree = NoteCommitmentSubtree::new(1, Height(3), dummy_subtree_root);
+    let mut chain = Chain::default();
+    chain.insert_ironwood_subtree(chain_subtree);
+    let chain = Some(Arc::new(chain));
+
+    // At this point, we have one Ironwood subtree in the finalized state and one Ironwood subtree in
+    // the non-finalized state.
+
+    // Retrieve only the first subtree and check its properties.
+    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..1.into());
+    let mut subtrees = subtrees.iter();
+    assert_eq!(subtrees.len(), 1);
+    assert!(subtrees_eq(subtrees.next().unwrap(), &db_subtree));
+
+    // Retrieve both subtrees using a limit and check their properties.
+    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..2.into());
+    let mut subtrees = subtrees.iter();
+    assert_eq!(subtrees.len(), 2);
+    assert!(subtrees_eq(subtrees.next().unwrap(), &db_subtree));
+    assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
+
+    // Retrieve both subtrees without using a limit and check their properties.
+    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(0)..);
+    let mut subtrees = subtrees.iter();
+    assert_eq!(subtrees.len(), 2);
+    assert!(subtrees_eq(subtrees.next().unwrap(), &db_subtree));
+    assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
+
+    // Retrieve only the second subtree and check its properties.
+    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..2.into());
+    let mut subtrees = subtrees.iter();
+    assert_eq!(subtrees.len(), 1);
+    assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
+
+    // Retrieve only the second subtree, using a limit that would allow for more trees if they were
+    // present, and check its properties.
+    let subtrees = ironwood_subtrees(chain.clone(), &db, NoteCommitmentSubtreeIndex(1)..3.into());
+    let mut subtrees = subtrees.iter();
+    assert_eq!(subtrees.len(), 1);
+    assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
+
+    // Retrieve only the second subtree, without using any limit, and check its properties.
+    let subtrees = ironwood_subtrees(chain, &db, NoteCommitmentSubtreeIndex(1)..);
+    let mut subtrees = subtrees.iter();
+    assert_eq!(subtrees.len(), 1);
+    assert!(subtrees_eq(subtrees.next().unwrap(), &chain_subtree));
+
+    Ok(())
+}
+
+#[test]
+fn excluded_max_subtree_range_is_empty() {
+    use std::ops::Bound::*;
+
+    let db = new_ephemeral_db();
+    let no_chain = Option::<Arc<Chain>>::None;
+    let range = (Excluded(NoteCommitmentSubtreeIndex(u16::MAX)), Unbounded);
+
+    assert!(sapling_subtrees(no_chain, &db, range).is_empty());
 }
 
 /// Returns test cases for the empty state and missing blocks.

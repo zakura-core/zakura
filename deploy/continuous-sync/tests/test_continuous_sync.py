@@ -343,13 +343,59 @@ class ContinuousSyncTests(unittest.TestCase):
             ),
         )
 
-        text = sync.failure_text(config, {"sha": "abcdef"}, "boom")
+        text = sync.failure_text(
+            config,
+            {"sha": "abcdef", "time_to_failure_seconds": 3723},
+            "boom",
+        )
 
         self.assertEqual(
             text,
-            ":rotating_light: Zakura failed: temp-zakura-sync-test-3 | legacy | root@134.209.49.92",
+            ":rotating_light: Zakura failed: temp-zakura-sync-test-3 | legacy | "
+            "root@134.209.49.92 | time to failure: 1h 2m 3s",
         )
         self.assertNotIn("\n", text)
+
+    def test_completion_slack_text_includes_sync_duration(self):
+        config = make_config(
+            Path("/tmp"),
+            policy=sync.Policy(
+                hostname="temp-zakura-sync-test-2",
+                p2p_stack="zakura",
+                public_ip="138.197.218.91",
+            ),
+        )
+
+        text = sync.completion_text(config, {"sync_duration_seconds": 90061})
+
+        self.assertEqual(
+            text,
+            ":white_check_mark: Zakura sync complete: temp-zakura-sync-test-2 | v2p2p | "
+            "root@138.197.218.91 | sync time: 1d 1h 1m 1s",
+        )
+
+    def test_halt_records_time_to_failure_at_failure_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = make_config(tmp_path)
+            state_path = config.paths.state_dir / "state.json"
+            run_dir = config.paths.runs_dir / "current"
+            run_dir.mkdir(parents=True)
+            run_state = {
+                "run_dir": str(run_dir),
+                "sync_started_at_epoch": 1000,
+            }
+
+            with (
+                patch.object(sync, "now", return_value=1305),
+                patch.object(sync, "post_slack") as post_slack,
+            ):
+                sync.halt(config, state_path, {}, run_state, "boom")
+
+            self.assertEqual(run_state["failed_at_epoch"], 1305)
+            self.assertEqual(run_state["time_to_failure_seconds"], 305)
+            posted_state = post_slack.call_args.args[1]
+            self.assertIn("time to failure: 5m 5s", posted_state)
 
 
 def make_config(tmp_path: Path, **overrides):

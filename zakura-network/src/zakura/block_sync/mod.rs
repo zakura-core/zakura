@@ -43,6 +43,7 @@ mod pipe;
 mod reactor;
 mod reorder;
 mod request;
+mod retained_memory;
 mod sequencer;
 mod sequencer_task;
 mod service;
@@ -52,10 +53,6 @@ mod tests;
 mod wire;
 mod work_queue;
 
-// The remaining consumers of these two internal constants are the same-crate
-// fuzz-testkit test modules; the re-exports only exist for test builds.
-#[cfg(test)]
-pub(crate) use admission::DESERIALIZED_MEM_FACTOR;
 #[cfg(feature = "internal-bench")]
 pub use bench::{
     spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchSequencerHandle, BenchSubmissions,

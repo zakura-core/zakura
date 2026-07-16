@@ -1234,7 +1234,6 @@ impl<'de> Deserialize<'de> for Config {
         zakura
             .block_sync
             .clamp_inflight_block_bytes_to_request_floor();
-        zakura.block_sync.clamp_reorder_lookahead_to_floor();
         zakura.block_sync.validate().map_err(|error| {
             de::Error::custom(format!("invalid zakura.block_sync config: {error}"))
         })?;

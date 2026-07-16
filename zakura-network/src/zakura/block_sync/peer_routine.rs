@@ -32,7 +32,7 @@ use super::super::trace::{
 use super::events::RoutineToReactor;
 use super::{
     admission::{
-        admit, admit_received_body, floor_rescue_high, request_deadline,
+        admit, admit_received_body, floor_rescue_high, is_commit_window_exempt, request_deadline,
         request_priority as classify_priority, AdmissionOutcome, AdmissionSnapshot,
         RequestPriority,
     },
@@ -242,6 +242,7 @@ pub(super) struct PeerRoutine {
     sequencer_input: mpsc::Sender<SequencedBody>,
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    retained_memory: super::retained_memory::RetainedBodyMemoryTracker,
     actions: mpsc::Sender<BlockSyncAction>,
     /// Shared routine→reactor channel for serving / status-advertise / re-query /
     /// serving-misbehavior. `try_send` (bounded, never-wedging) so a busy reactor
@@ -282,6 +283,7 @@ impl PeerRoutine {
         sequencer_input: mpsc::Sender<SequencedBody>,
         sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
         sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+        retained_memory: super::retained_memory::RetainedBodyMemoryTracker,
         actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
         sequencer_view: watch::Receiver<SequencerView>,
@@ -318,6 +320,7 @@ impl PeerRoutine {
             sequencer_input,
             sequencer_input_bytes,
             sequencer_input_decoded_attributed_memory_bytes,
+            retained_memory,
             actions,
             routine_to_reactor,
             sequencer_view,
@@ -339,6 +342,7 @@ impl PeerRoutine {
         // `self.work`.
         let budget = self.budget.clone();
         let work = self.work.clone();
+        let retained_memory = self.retained_memory.clone();
         // The per-connection oversize guard applied to inbound frames at ingress.
         let mut guard = block_sync_guard();
         // Per-peer BBR heartbeat cadence. `Skip` so a routine busy past a tick emits one
@@ -346,17 +350,20 @@ impl PeerRoutine {
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
         bbr_trace_ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
-            // missed-wake safety: register both `Notify`s via
-            // `Notified::enable()` BEFORE the fill attempt. The budget/work
+            // Missed-wake safety: register all `Notify`s via
+            // `Notified::enable()` BEFORE the fill attempt. These
             // `Notify`s use `notify_waiters` (no stored permit), so a
             // release/extend that lands between the fill-check and the await
             // would be lost if we registered after — the routine would stall.
             let capacity = budget.subscribe_capacity().notified();
             let available = work.subscribe_available().notified();
+            let retained_capacity = retained_memory.subscribe_capacity().notified();
             tokio::pin!(capacity);
             tokio::pin!(available);
+            tokio::pin!(retained_capacity);
             Notified::enable(capacity.as_mut());
             Notified::enable(available.as_mut());
+            Notified::enable(retained_capacity.as_mut());
 
             if self.session.outbound_capacity() > 0 {
                 self.try_fill().await;
@@ -406,6 +413,9 @@ impl PeerRoutine {
                 }
                 _ = &mut available => {
                     self.trace_wake("work_added");
+                }
+                _ = &mut retained_capacity => {
+                    self.trace_wake("retained_capacity");
                 }
                 _ = bbr_trace_ticks.tick() => self.trace_bbr_sample(),
                 _ = &mut outbound_queue_poll, if !outbound_queue_has_capacity => {}
@@ -874,18 +884,44 @@ impl PeerRoutine {
             let reserved_bytes = items.iter().fold(0u64, |acc, (_, item)| {
                 acc.saturating_add(item.estimated_bytes)
             });
+            // Atomically reserve the retained-memory headroom represented by
+            // every above-window body before issuing the request. The admission
+            // snapshot sizes the take, while these tracker reservations close
+            // races with other peer routines using the same snapshot.
+            let in_flight_memory_specs: Vec<_> = items
+                .iter()
+                .filter(|(height, _)| !is_commit_window_exempt(&snapshot, *height))
+                .map(|(height, item)| (*height, item.estimated_bytes))
+                .collect();
+            let in_flight_memory_bytes: Vec<_> = in_flight_memory_specs
+                .iter()
+                .map(|(_, bytes)| *bytes)
+                .collect();
+            let Some(in_flight_memory_reservations) = self
+                .retained_memory
+                .try_reserve_many(&in_flight_memory_bytes)
+            else {
+                self.return_taken_items(&items);
+                break FillStop::LookaheadCap;
+            };
+            let mut in_flight_memory_by_height: BTreeMap<_, _> = in_flight_memory_specs
+                .into_iter()
+                .map(|(height, _)| height)
+                .zip(in_flight_memory_reservations)
+                .collect();
             if !self.reserve_request_budget(request_priority, reserved_bytes) {
                 self.return_taken_items(&items);
                 break FillStop::Budget;
             }
-            let marked = self
-                .work
-                .mark_reserved(items.iter().map(|(height, _)| *height));
-            if marked != reserved_bytes {
+            let issued = items.iter().map(|(height, _)| {
+                let in_flight_memory_reservation = in_flight_memory_by_height.remove(height);
+                (*height, in_flight_memory_reservation)
+            });
+            // Commit both resource ledgers under one work-queue lock, so reset,
+            // watchdog, and competing receipt paths see either all or none.
+            if self.work.mark_issued(issued) != Some(reserved_bytes) {
                 self.budget.release(reserved_bytes);
-                let _ = self
-                    .work
-                    .release_reserved_and_return_items(items.iter().map(|(height, _)| *height));
+                self.return_taken_items(&items);
                 break FillStop::Internal;
             }
 
@@ -1009,20 +1045,13 @@ impl PeerRoutine {
     }
 
     fn admission_snapshot(&self, view: &SequencerView) -> AdmissionSnapshot {
-        let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
-            self.work.reserved_above(view.download_floor);
+        let (_, reserved_above_floor_blocks) = self.work.reserved_above(view.download_floor);
         AdmissionSnapshot {
             download_floor: view.download_floor,
             verified_block_tip: view.verified_tip,
-            reorder_buffered_bytes: view.reorder_buffered_bytes,
+            retained_memory_bytes: self.retained_memory.used(),
             reorder_buffered_blocks: view.reorder_len,
-            applying_buffered_bytes: view.applying_buffered_bytes,
             applying_buffered_blocks: view.applying_len,
-            sequencer_input_queued_bytes: self
-                .sequencer_input_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            in_flight_submission_bytes: view.in_flight_submission_bytes,
-            reserved_above_floor_bytes,
             reserved_above_floor_blocks,
             budget_available: self.budget.available(),
         }
@@ -1313,7 +1342,7 @@ impl PeerRoutine {
         self.record_received(serialized_bytes);
         // End the request reservation at receipt, but release its bytes only
         // after the body is visible to the resident-memory accounting.
-        let Some(reserved_estimate) = self.work.release_active_reserved_height(height) else {
+        let Some(reservation) = self.work.release_active_reserved_height(height) else {
             tracing::debug!(
                 peer = ?self.peer,
                 ?height,
@@ -1367,11 +1396,22 @@ impl PeerRoutine {
         // input channel fills, and this routine blocks here — backpressure
         // isolated to this peer (the per-peer routines throughput win).
         let previous_block_hash = block.header.previous_block_hash;
-        let body = BufferedBlockBody::from_measured_decoded_block(
-            block,
-            raw_block_payload,
-            decoded_attributed_memory_size_bytes,
-        );
+        let body = match reservation.in_flight_memory_reservation {
+            Some(in_flight_memory_reservation) => {
+                BufferedBlockBody::from_decoded_block_reconciling_memory_reservation(
+                    block,
+                    raw_block_payload,
+                    decoded_attributed_memory_size_bytes,
+                    in_flight_memory_reservation,
+                )
+            }
+            None => BufferedBlockBody::from_measured_decoded_block(
+                block,
+                raw_block_payload,
+                decoded_attributed_memory_size_bytes,
+                &self.retained_memory,
+            ),
+        };
         self.forward_body_to_sequencer(
             height,
             hash,
@@ -1381,7 +1421,7 @@ impl PeerRoutine {
             body_permit,
         )
         .await;
-        self.budget.release(reserved_estimate);
+        self.budget.release(reservation.request_bytes);
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
     }
@@ -1484,21 +1524,37 @@ impl PeerRoutine {
             return false;
         }
 
-        // The reservation this arrival ended (an active competing request, or a
-        // stale charge on the claimed height); released after the forward below.
-        let ended_reservation = if is_pending {
+        let decoded_attributed_memory_size_bytes =
+            record_decoded_memory_size(&block, body_wire_bytes);
+        let retained_memory_size_bytes = BufferedBlockBody::decoded_retained_memory_size_bytes(
+            decoded_attributed_memory_size_bytes,
+            raw_block_payload.as_ref(),
+        );
+        let previous_block_hash = block.header.previous_block_hash;
+
+        // Pending unmatched bodies were not covered by an earlier request
+        // admission. Reserve their exact retained charge atomically. Commit-window
+        // bodies remain exempt for checkpoint liveness.
+        let pending_is_exempt = if is_pending {
             let sequencer_view = *self.sequencer_view.borrow();
             let snapshot = self.admission_snapshot(&sequencer_view);
-            if !admit_received_body(&self.config, &snapshot, height, serialized_bytes) {
+            if !admit_received_body(&self.config, &snapshot, height, retained_memory_size_bytes) {
                 tracing::debug!(
                     peer = ?self.peer,
                     ?height,
-                    serialized_bytes,
+                    retained_memory_size_bytes,
                     "not buffering unmatched queued block-sync body at look-ahead cap"
                 );
                 return true;
             }
+            is_commit_window_exempt(&snapshot, height)
+        } else {
+            false
+        };
 
+        // The reservation this arrival ended (an active competing request, or a
+        // stale charge on the claimed height); released after the forward below.
+        let ended_reservation = if is_pending {
             // Claim this height into `in_flight` so it leaves `pending`; if it is
             // already `in_flight` the take is a no-op and the Sequencer drops the
             // later duplicate. The received body charges no request budget, but any
@@ -1518,8 +1574,41 @@ impl PeerRoutine {
             estimate
         };
 
-        let decoded_attributed_memory_size_bytes =
-            record_decoded_memory_size(&block, body_wire_bytes);
+        let body = match ended_reservation.in_flight_memory_reservation {
+            Some(in_flight_memory_reservation) => {
+                BufferedBlockBody::from_decoded_block_reconciling_memory_reservation(
+                    block,
+                    raw_block_payload,
+                    decoded_attributed_memory_size_bytes,
+                    in_flight_memory_reservation,
+                )
+            }
+            None if is_pending && !pending_is_exempt => {
+                let Some(body) = BufferedBlockBody::try_from_decoded_block(
+                    block,
+                    raw_block_payload,
+                    decoded_attributed_memory_size_bytes,
+                    &self.retained_memory,
+                ) else {
+                    tracing::debug!(
+                        peer = ?self.peer,
+                        ?height,
+                        retained_memory_size_bytes,
+                        "lost concurrent retained-memory admission race"
+                    );
+                    self.work.return_items([height]);
+                    return true;
+                };
+                body
+            }
+            None => BufferedBlockBody::from_measured_decoded_block(
+                block,
+                raw_block_payload,
+                decoded_attributed_memory_size_bytes,
+                &self.retained_memory,
+            ),
+        };
+
         self.record_received(serialized_bytes);
         self.trace_body_received(
             height,
@@ -1545,12 +1634,6 @@ impl PeerRoutine {
         // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
         self.window.credit_late_delivery();
 
-        let previous_block_hash = block.header.previous_block_hash;
-        let body = BufferedBlockBody::from_measured_decoded_block(
-            block,
-            raw_block_payload,
-            decoded_attributed_memory_size_bytes,
-        );
         self.forward_body_to_sequencer(
             height,
             hash,
@@ -1564,7 +1647,7 @@ impl PeerRoutine {
         // `sequencer_input_bytes`, mirroring the matched receipt path above, so
         // the bytes are never invisible to both the limiter and the resident
         // snapshot.
-        self.budget.release(ended_reservation);
+        self.budget.release(ended_reservation.request_bytes);
         true
     }
 
@@ -2438,6 +2521,7 @@ mod tests {
             sequencer_input_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            crate::zakura::block_sync::retained_memory::RetainedBodyMemoryTracker::new(u64::MAX),
             actions_tx,
             routine_to_reactor_tx,
             view_rx,
@@ -2529,6 +2613,7 @@ mod tests {
             sequencer_input_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            crate::zakura::block_sync::retained_memory::RetainedBodyMemoryTracker::new(u64::MAX),
             actions_tx,
             routine_to_reactor_tx,
             view_rx,
@@ -2558,7 +2643,7 @@ mod tests {
         let estimate = work
             .release_active_reserved_height(block::Height(1))
             .expect("height 1 still owns its active reservation");
-        assert_eq!(estimate, 1_000);
+        assert_eq!(estimate.request_bytes, 1_000);
         assert_eq!(budget_probe.reserved(), 1_000);
 
         // Tear the routine down while it still lists height 1 as unreceived. `Drop`

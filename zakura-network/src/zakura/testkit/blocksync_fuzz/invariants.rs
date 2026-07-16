@@ -23,11 +23,14 @@ pub(crate) struct InvariantReport {
     /// Peak reserved outstanding-request bytes (wire-limiter pressure; received
     /// bodies release their reservation, so this excludes retained bodies).
     pub(crate) peak_budget_reserved: u64,
-    /// Peak retained pipeline wire bytes (`sequencer_input + reorder + applying`), the
-    /// wire-byte footprint of bodies actually held in memory. Multiplied by the
-    /// deserialized-memory factor this approximates peak resident cost — unlike
-    /// `peak_budget_reserved`, it excludes reservations for bytes not yet received.
+    /// Peak retained pipeline wire bytes, retained as a diagnostic.
     pub(crate) peak_retained_pipeline_wire_bytes: u64,
+    /// Peak authoritative retained body memory.
+    pub(crate) peak_retained_memory_bytes: u64,
+    /// Authoritative retained body memory after reactor and harness teardown.
+    pub(crate) final_retained_memory_bytes: u64,
+    /// Peak retained body memory above the configured soft cap.
+    pub(crate) peak_retained_memory_overshoot_bytes: u64,
     /// Peak decoded attributed-memory bytes attributed to the active body pipeline.
     pub(crate) peak_active_pipeline_decoded_attributed_memory_bytes: u64,
     /// Decoded attributed-memory bytes in the last state sample before harness teardown.
@@ -83,8 +86,8 @@ pub(crate) struct InvariantReport {
     pub(crate) final_reliability_permille: u64,
 }
 
-/// Extract the report from a flushed trace reader.
-pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
+/// Extract the report from a flushed trace reader and the post-teardown live counter.
+pub(crate) fn report(reader: &TraceReader, final_retained_memory_bytes: u64) -> InvariantReport {
     let state_rows: Vec<&Value> = reader
         .table("block_sync")
         .rows()
@@ -110,6 +113,16 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
     let peak_retained_pipeline_wire_bytes = state_rows
         .iter()
         .filter_map(|row| u64_field(row, "retained_pipeline_wire_bytes"))
+        .max()
+        .unwrap_or(0);
+    let peak_retained_memory_bytes = state_rows
+        .iter()
+        .filter_map(|row| u64_field(row, "retained_memory_bytes"))
+        .max()
+        .unwrap_or(0);
+    let peak_retained_memory_overshoot_bytes = state_rows
+        .iter()
+        .filter_map(|row| u64_field(row, "retained_memory_overshoot_bytes"))
         .max()
         .unwrap_or(0);
     let peak_active_pipeline_decoded_attributed_memory_bytes = state_rows
@@ -200,6 +213,9 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         max_outstanding,
         peak_budget_reserved,
         peak_retained_pipeline_wire_bytes,
+        peak_retained_memory_bytes,
+        final_retained_memory_bytes,
+        peak_retained_memory_overshoot_bytes,
         peak_active_pipeline_decoded_attributed_memory_bytes,
         final_active_pipeline_decoded_attributed_memory_bytes,
         decoded_stage_totals_match,
@@ -216,6 +232,14 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         final_cwnd_bytes,
         final_reliability_permille,
     }
+}
+
+/// Assert that every RAII retained-body charge was released during teardown.
+pub(crate) fn assert_retained_memory_drained(report: &InvariantReport) {
+    assert_eq!(
+        report.final_retained_memory_bytes, 0,
+        "retained body memory must drain to zero after teardown",
+    );
 }
 
 fn max_unproven_requests_without_block_progress(reader: &TraceReader) -> u64 {
@@ -295,6 +319,7 @@ pub(crate) fn assert_core(
         report.peak_active_pipeline_decoded_attributed_memory_bytes > 0,
         "successful run never observed active decoded pipeline bytes",
     );
+    assert_retained_memory_drained(report);
 
     // Per-peer windows respect the advertised inflight caps: aggregate in-flight must
     // not exceed the sum of per-peer advertised `max_inflight_requests`.

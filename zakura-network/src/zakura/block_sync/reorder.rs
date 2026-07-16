@@ -1,6 +1,11 @@
-use super::{state::*, wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES, *};
+use super::{
+    retained_memory::{InFlightMemoryReservation, RetainedBodyMemoryTracker, RetainedCharge},
+    state::*,
+    wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES,
+    *,
+};
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ReorderBuffer {
     blocks: BTreeMap<block::Height, BufferedBlock>,
     buffered_bytes: u64,
@@ -192,7 +197,7 @@ pub(super) enum ReorderInsertResult {
 /// One block released from the contiguous reorder prefix, still in whatever
 /// buffered form it was held in (raw bytes for backlog entries), so draining
 /// into `applying` never forces a decode.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct DrainedBlock {
     pub(super) height: block::Height,
     pub(super) hash: block::Hash,
@@ -202,7 +207,7 @@ pub(super) struct DrainedBlock {
     pub(super) source_peer: ZakuraPeerId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct BufferedBlock {
     hash: block::Hash,
     previous_block_hash: block::Hash,
@@ -213,8 +218,14 @@ struct BufferedBlock {
     source_peer: ZakuraPeerId,
 }
 
-#[derive(Clone, Debug)]
-pub(super) enum BufferedBlockBody {
+#[derive(Debug)]
+pub(super) struct BufferedBlockBody {
+    representation: BufferedBlockRepresentation,
+    retained_charge: RetainedCharge,
+}
+
+#[derive(Debug)]
+enum BufferedBlockRepresentation {
     RawFramePayload(Arc<[u8]>),
     Decoded {
         block: Arc<block::Block>,
@@ -234,10 +245,12 @@ impl BufferedBlockBody {
         raw_frame_payload: Option<Arc<[u8]>>,
     ) -> Self {
         let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
+        let retained_memory = RetainedBodyMemoryTracker::new(u64::MAX);
         Self::from_measured_decoded_block(
             block,
             raw_frame_payload,
             decoded_attributed_memory_size_bytes,
+            &retained_memory,
         )
     }
 
@@ -245,74 +258,190 @@ impl BufferedBlockBody {
         block: Arc<block::Block>,
         raw_frame_payload: Option<Arc<[u8]>>,
         decoded_attributed_memory_size_bytes: u64,
+        retained_memory: &RetainedBodyMemoryTracker,
     ) -> Self {
-        match raw_frame_payload {
-            Some(raw_frame_payload) => BufferedBlockBody::DecodedWithRawFramePayload {
+        let retained_bytes = Self::decoded_retained_memory_size_bytes(
+            decoded_attributed_memory_size_bytes,
+            raw_frame_payload.as_ref(),
+        );
+        let retained_charge = retained_memory.charge(retained_bytes);
+        Self::from_parts(
+            block,
+            raw_frame_payload,
+            decoded_attributed_memory_size_bytes,
+            retained_charge,
+        )
+    }
+
+    /// Constructs a decoded body and reconciles the request's memory reservation
+    /// to the exact retained size of the decoded block and optional raw payload.
+    pub(super) fn from_decoded_block_reconciling_memory_reservation(
+        block: Arc<block::Block>,
+        raw_frame_payload: Option<Arc<[u8]>>,
+        decoded_attributed_memory_size_bytes: u64,
+        in_flight_memory_reservation: InFlightMemoryReservation,
+    ) -> Self {
+        let retained_bytes = Self::decoded_retained_memory_size_bytes(
+            decoded_attributed_memory_size_bytes,
+            raw_frame_payload.as_ref(),
+        );
+        let retained_charge = in_flight_memory_reservation.reconcile_exact(retained_bytes);
+        Self::from_parts(
+            block,
+            raw_frame_payload,
+            decoded_attributed_memory_size_bytes,
+            retained_charge,
+        )
+    }
+
+    pub(super) fn try_from_decoded_block(
+        block: Arc<block::Block>,
+        raw_frame_payload: Option<Arc<[u8]>>,
+        decoded_attributed_memory_size_bytes: u64,
+        retained_memory: &RetainedBodyMemoryTracker,
+    ) -> Option<Self> {
+        let retained_bytes = Self::decoded_retained_memory_size_bytes(
+            decoded_attributed_memory_size_bytes,
+            raw_frame_payload.as_ref(),
+        );
+        let retained_charge = retained_memory.try_charge(retained_bytes)?;
+        Some(Self::from_parts(
+            block,
+            raw_frame_payload,
+            decoded_attributed_memory_size_bytes,
+            retained_charge,
+        ))
+    }
+
+    pub(super) fn decoded_retained_memory_size_bytes(
+        decoded_attributed_memory_size_bytes: u64,
+        raw_frame_payload: Option<&Arc<[u8]>>,
+    ) -> u64 {
+        decoded_attributed_memory_size_bytes
+            .saturating_add(raw_frame_payload.map_or(0, raw_payload_bytes))
+    }
+
+    fn from_parts(
+        block: Arc<block::Block>,
+        raw_frame_payload: Option<Arc<[u8]>>,
+        decoded_attributed_memory_size_bytes: u64,
+        retained_charge: RetainedCharge,
+    ) -> Self {
+        let representation = match raw_frame_payload {
+            Some(raw_frame_payload) => BufferedBlockRepresentation::DecodedWithRawFramePayload {
                 block,
                 raw_frame_payload,
                 decoded_attributed_memory_size_bytes,
             },
-            None => BufferedBlockBody::Decoded {
+            None => BufferedBlockRepresentation::Decoded {
                 block,
                 decoded_attributed_memory_size_bytes,
             },
+        };
+        Self {
+            representation,
+            retained_charge,
         }
     }
 
     pub(super) fn decoded_attributed_memory_size_bytes(&self) -> u64 {
-        match self {
-            BufferedBlockBody::RawFramePayload(_) => 0,
-            BufferedBlockBody::Decoded {
+        match &self.representation {
+            BufferedBlockRepresentation::RawFramePayload(_) => 0,
+            BufferedBlockRepresentation::Decoded {
                 decoded_attributed_memory_size_bytes,
                 ..
             }
-            | BufferedBlockBody::DecodedWithRawFramePayload {
+            | BufferedBlockRepresentation::DecodedWithRawFramePayload {
                 decoded_attributed_memory_size_bytes,
                 ..
             } => *decoded_attributed_memory_size_bytes,
         }
     }
 
+    pub(super) fn retained_charge(&self) -> RetainedCharge {
+        self.retained_charge.clone()
+    }
+
     // Drop the decoded body for the backlog.
     // This is used to save memory when the body is not the next block in the sequence.
     // DecodedWithRawFramePayload may hold the parsed block as well as the raw frame payload,
     // so we retain just the raw frame payload.
-    pub(super) fn retain_for_backlog(self) -> Self {
-        match self {
-            BufferedBlockBody::DecodedWithRawFramePayload {
-                raw_frame_payload, ..
-            } => BufferedBlockBody::RawFramePayload(raw_frame_payload),
-            body => body,
-        }
+    pub(super) fn retain_for_backlog(mut self) -> Self {
+        self.retain_for_backlog_in_place();
+        self
     }
 
     /// In-place [`Self::retain_for_backlog`]: drop the decoded copy when raw
     /// bytes are retained, so a body leaving the bounded decode window releases
     /// its decoded heap footprint.
     pub(super) fn retain_for_backlog_in_place(&mut self) {
-        if let BufferedBlockBody::DecodedWithRawFramePayload {
+        if let BufferedBlockRepresentation::DecodedWithRawFramePayload {
             raw_frame_payload, ..
-        } = self
+        } = &self.representation
         {
-            *self = BufferedBlockBody::RawFramePayload(raw_frame_payload.clone());
+            let raw_frame_payload = raw_frame_payload.clone();
+            self.representation = BufferedBlockRepresentation::RawFramePayload(raw_frame_payload);
+            self.retained_charge
+                .resize(self.representation_retained_memory_size_bytes());
+        }
+    }
+
+    /// Keep only the decoded allocation represented by an in-flight submission.
+    pub(super) fn retain_for_driver_in_place(&mut self) {
+        if let BufferedBlockRepresentation::DecodedWithRawFramePayload {
+            block,
+            decoded_attributed_memory_size_bytes,
+            ..
+        } = &self.representation
+        {
+            let block = block.clone();
+            let decoded_attributed_memory_size_bytes = *decoded_attributed_memory_size_bytes;
+            self.representation = BufferedBlockRepresentation::Decoded {
+                block,
+                decoded_attributed_memory_size_bytes,
+            };
+            self.retained_charge
+                .resize(self.representation_retained_memory_size_bytes());
+        }
+    }
+
+    fn representation_retained_memory_size_bytes(&self) -> u64 {
+        match &self.representation {
+            BufferedBlockRepresentation::RawFramePayload(payload) => raw_payload_bytes(payload),
+            BufferedBlockRepresentation::Decoded {
+                decoded_attributed_memory_size_bytes,
+                ..
+            } => *decoded_attributed_memory_size_bytes,
+            BufferedBlockRepresentation::DecodedWithRawFramePayload {
+                raw_frame_payload,
+                decoded_attributed_memory_size_bytes,
+                ..
+            } => raw_payload_bytes(raw_frame_payload)
+                .saturating_add(*decoded_attributed_memory_size_bytes),
         }
     }
 
     /// Whether this body currently holds a decoded block.
     #[cfg(test)]
     pub(super) fn is_decoded(&self) -> bool {
-        !matches!(self, BufferedBlockBody::RawFramePayload(_))
+        !matches!(
+            self.representation,
+            BufferedBlockRepresentation::RawFramePayload(_)
+        )
     }
 
     /// Return the decoded block, decoding from the retained raw bytes if needed
     /// and caching the decoded copy in place (the entry enters the decode
     /// window; `retain_for_backlog_in_place` is the matching downgrade).
     pub(super) fn decoded_block(&mut self) -> Arc<block::Block> {
-        match self {
-            BufferedBlockBody::Decoded { block, .. }
-            | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block.clone(),
-            BufferedBlockBody::RawFramePayload(payload) => {
-                let block = decode_raw_frame_payload(payload);
+        match &self.representation {
+            BufferedBlockRepresentation::Decoded { block, .. }
+            | BufferedBlockRepresentation::DecodedWithRawFramePayload { block, .. } => {
+                block.clone()
+            }
+            BufferedBlockRepresentation::RawFramePayload(payload) => {
+                let payload = payload.clone();
+                let block = decode_raw_frame_payload(&payload);
                 let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
                 let serialized_bytes = payload.len().saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES);
                 // Metrics accepts f64 samples; these lossy conversions are observability-only.
@@ -328,15 +457,23 @@ impl BufferedBlockBody {
                     )
                     .record(decoded_attributed_memory_size_bytes as f64 / serialized_bytes as f64);
                 }
-                *self = BufferedBlockBody::DecodedWithRawFramePayload {
+                self.retained_charge.resize(
+                    raw_payload_bytes(&payload)
+                        .saturating_add(decoded_attributed_memory_size_bytes),
+                );
+                self.representation = BufferedBlockRepresentation::DecodedWithRawFramePayload {
                     block: block.clone(),
-                    raw_frame_payload: payload.clone(),
+                    raw_frame_payload: payload,
                     decoded_attributed_memory_size_bytes,
                 };
                 block
             }
         }
     }
+}
+
+fn raw_payload_bytes(payload: &Arc<[u8]>) -> u64 {
+    u64::try_from(payload.len()).unwrap_or(u64::MAX)
 }
 
 fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> Arc<block::Block> {

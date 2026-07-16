@@ -105,6 +105,9 @@ pub fn spawn_block_sync_reactor(
     let sequencer_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sequencer_input_decoded_attributed_memory_bytes =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let retained_memory = super::retained_memory::RetainedBodyMemoryTracker::new(
+        startup.config.effective_max_reorder_lookahead_bytes(),
+    );
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
 
     let sequencer_task = SequencerTask::new(
@@ -145,6 +148,7 @@ pub fn spawn_block_sync_reactor(
         sequencer_input_bytes: sequencer_input_bytes.clone(),
         sequencer_input_decoded_attributed_memory_bytes:
             sequencer_input_decoded_attributed_memory_bytes.clone(),
+        retained_memory: retained_memory.clone(),
         actions: actions_tx.clone(),
         routine_to_reactor: routine_to_reactor_tx,
         view: sequencer_view_rx.clone(),
@@ -181,6 +185,7 @@ pub fn spawn_block_sync_reactor(
         sequencer_input: sequencer_input_tx,
         sequencer_input_bytes,
         sequencer_input_decoded_attributed_memory_bytes,
+        retained_memory,
         sequencer_control: sequencer_control_tx,
         sequencer_view: sequencer_view_rx,
     };
@@ -225,6 +230,8 @@ pub(super) struct BlockSyncReactor {
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     /// Decoded attributed-memory bytes currently queued in [`Self::sequencer_input`].
     sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Exact retained body memory used by admission.
+    retained_memory: super::retained_memory::RetainedBodyMemoryTracker,
     /// Non-blocking control channel to the Sequencer task. Frontier and apply
     /// progress must never wait behind downloaded body backlog.
     sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
@@ -1762,12 +1769,19 @@ impl BlockSyncReactor {
             bs_insert_u64(
                 row,
                 "retained_pipeline_wire_bytes",
-                super::admission::RetainedPipelineBytes {
-                    reorder_buffered_bytes: view.reorder_buffered_bytes,
-                    applying_buffered_bytes: view.applying_buffered_bytes,
-                    sequencer_input_queued_bytes,
-                }
-                .wire_bytes(),
+                view.reorder_buffered_bytes
+                    .saturating_add(view.applying_buffered_bytes)
+                    .saturating_add(sequencer_input_queued_bytes),
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::RETAINED_MEMORY_BYTES,
+                self.retained_memory.used(),
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::RETAINED_MEMORY_OVERSHOOT_BYTES,
+                self.retained_memory.overshoot(),
             );
             bs_insert_u64(row, bs_trace::PEERS, self.state.peers.len() as u64);
             if let Some(peers_with_status) = peers_with_status {
@@ -2173,6 +2187,9 @@ impl BlockSyncReactor {
                 .saturating_add(view.reorder_decoded_attributed_memory_bytes)
                 .saturating_add(view.applying_decoded_attributed_memory_bytes) as f64,
         );
+        metrics::gauge!("sync.block.retained_memory.bytes").set(self.retained_memory.used() as f64);
+        metrics::gauge!("sync.block.retained_memory.overshoot_bytes")
+            .set(self.retained_memory.overshoot() as f64);
         metrics::gauge!("sync.block.applying").set(self.last_view.applying_len as f64);
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).

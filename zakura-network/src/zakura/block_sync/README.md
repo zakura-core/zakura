@@ -4,8 +4,7 @@ Developer notes for the admission/backpressure design in this module — the flo
 above-floor request lanes, the commit-window exemption, the resident-memory look-ahead
 budget, and the liveness rules that hold them together. Code anchors:
 [`admission.rs`](admission.rs) (the pure decision logic), [`peer_routine.rs`](peer_routine.rs)
-(the per-peer fill loop that consumes it), [`config.rs`](config.rs) (budgets, floors,
-clamps).
+(the per-peer fill loop that consumes it), and [`config.rs`](config.rs) (budgets and floors).
 
 ## Pipeline overview
 
@@ -92,14 +91,9 @@ height is just another gated height.
 | Condition | Outcome | `take_high` | `max_request_bytes` |
 | --- | --- | --- | --- |
 | `start ≤ verified_tip + 401` (in-window) | always `Admit` | `min(servable_high, window_top)` | `min(budget_available, response_byte_cap)`; Floor priority floors it at 1 |
-| `start > window` and gate full (bytes **or** blocks), or wire headroom rounds to 0 | `LookaheadAtCap` | — | — |
-| `start > window`, gate open | `Admit` | `servable_high` | `min(budget_available, remaining_wire, response_byte_cap)` |
+| `start > window` and gate full (bytes **or** blocks) | `LookaheadAtCap` | — | — |
+| `start > window`, gate open | `Admit` | `servable_high` | `min(budget_available, response_byte_cap, remaining_retained_headroom)` |
 | any admitted sizing that still comes to 0 bytes (in-flight budget spent, non-floor) | `InflightBudgetEmpty` | — | — |
-
-where `remaining_wire = effective_budget − estimated_resident`. Admitted bodies remain
-serialized until they enter the bounded submission window, so one byte of remaining
-headroom funds one wire byte. The transient decoded input copy is bounded by the
-sequencer channel and appears in the next resident snapshot.
 
 **Takes never span the window boundary.** An exempt (in-window) grant is clamped at the
 window top, so a single multi-block request can never carry both exempt in-window blocks
@@ -110,74 +104,123 @@ production default of one block per response this split never occurs.
 
 ## The memory budget
 
-### Resident accounting
+### Two independent byte budgets
 
-The look-ahead budget bounds **estimated resident memory**. Backlog bodies remain in
-their serialized wire form and are decoded only inside the bounded verifier submission
-window. Accounting therefore follows each pool's actual representation:
+Block sync limits two different resources:
 
-| Pool (snapshot field) | Representation | Charge |
-| --- | --- | --- |
-| `reorder_buffered_bytes` | serialized | wire bytes |
-| unsubmitted `applying_buffered_bytes` | serialized | wire bytes |
-| `sequencer_input_queued_bytes` | serialized payload plus decoded block | wire bytes plus `wire × DESERIALIZED_MEM_FACTOR` |
-| `in_flight_submission_bytes` | submitted decoded block, including detached submissions awaiting completion | `wire × DESERIALIZED_MEM_FACTOR`, plus the applying wire charge while attached |
-| `reserved_above_floor_bytes` | not received yet | estimated wire bytes |
+- `max_inflight_block_bytes` (default 6 GiB, tracked by `ByteBudget`) bounds
+  estimated serialized bytes requested from peers but not received yet. It is
+  a wire-pacing and denial-of-service bound.
+- `max_reorder_lookahead_bytes` (default 1.5 GiB, tracked by
+  `RetainedBodyMemoryTracker`) is the admission target for the sum of retained
+  body memory and estimated memory headroom promised to outstanding
+  above-window requests.
+
+These budgets cannot be merged: their limits, units, and lifetimes differ. The
+wire reservation ends when a body arrives; its memory reservation becomes the
+body's retained charge and remains until the pipeline drops its final owner.
+
+### Retained accounting and ownership
+
+`RetainedBodyMemoryTracker` is the memory-admission authority. Its single atomic
+`used` total includes both:
+
+1. `InFlightMemoryReservation`s for above-window requests; and
+2. exact `RetainedCharge`s owned by bodies already in the pipeline.
+
+Consequently, concurrent peer routines cannot observe and spend the same free
+headroom. Every accepted body owns an RAII charge that follows it through input,
+reorder, applying, and detached submission ownership:
+
+| Representation | Charge |
+| --- | --- |
+| raw payload | retained `Arc<[u8]>` length |
+| decoded block | `Block::attributed_memory_size_bytes()` |
+| decoded block plus raw payload | both charges |
+
+Changing representation resizes the same charge. Dropping the final owner releases it,
+notifies routines waiting for capacity, and makes the headroom immediately reusable.
+Error, duplicate, reset, and shutdown paths therefore cannot leak retained accounting.
+
+### Request reservation lifecycle
+
+For each above-window request:
+
+1. `admit` performs a cheap snapshot check and sizes the take by the smallest of
+   wire-budget availability, peer response capacity, and remaining retained
+   headroom.
+2. After selecting concrete heights, `try_reserve_many` atomically reserves the
+   entire request's memory estimates. It is all-or-none, closing races between
+   peer routines that used the same snapshot.
+3. `WorkQueue::mark_issued` commits the request-byte ledger and per-height memory
+   reservations under one lock. Reset, watchdog, and competing-response paths
+   therefore see either the whole issued request or none of it.
+4. On receipt, `WorkQueue` transfers the height's memory reservation to
+   `BufferedBlockBody`. `reconcile_exact` resizes it to the measured raw payload
+   allocation plus `Block::attributed_memory_size_bytes()`. Growth is added to
+   the global total before it is published locally, so admission never observes
+   a transient undercount.
+5. Timeout, short response, send failure, watchdog, reset, floor GC, and
+   disconnect remove unreceived reservations from `WorkQueue`. RAII releases
+   their headroom exactly once.
+
+The request estimate is not claimed to be the exact decoded size. For reservations
+that arrive together, reconciliation changes the tracked total by
+`sum(exact retained bytes) - sum(reserved estimate bytes)`, where each exact
+charge is the raw allocation plus attributed decoded memory. The default 200%
+size tolerance limits an accepted serialized body to twice its estimate, but
+there is no enforced maximum decoded-to-serialized expansion ratio. Consequently,
+the 1.5 GiB setting has no fixed worst-case overshoot multiplier. Once growth
+makes the total reach or exceed the target, subsequent above-window reservation
+attempts fail until retained charges are released.
+
+This is still stronger than accounting only against the separate 6 GiB wire
+budget: every outstanding speculative request consumes estimated retained
+headroom before issuance, and its exact charge remains visible after receipt.
 
 Two gates, checked together in `lookahead_over_budget`:
 
-- **Byte gate:** `estimated_resident ≥ effective_max_reorder_lookahead_bytes`
-  (= `max_reorder_lookahead_bytes`; the request budget no longer caps it, since
-  the request cap does not imply retention).
+- **Byte gate:** retained bodies plus outstanding above-window memory
+  reservations `≥ effective_max_reorder_lookahead_bytes`
+  (= `max_reorder_lookahead_bytes`).
 - **Block gate (defense in depth):** reorder + applying + reserved block counts
   `≥ LOOKAHEAD_BLOCK_HARD_CAP` (a fixed 262,144 — it binds before the byte gate
   only for tiny bodies averaging under ~6.1 KB wire, where per-entry bookkeeping
   overhead dominates; never needed operator tuning, so it is a constant, not a
   config knob).
 
-This is separate from the **in-flight request budget** (`max_inflight_block_bytes`,
-default 6 GiB, tracked by `ByteBudget`): that bounds outstanding request
-reservations — charged at issuance, released at receipt (or timeout/watchdog/
-reset/floor GC) — while the look-ahead gate is the single authority over bytes
-_retained_ by the pipeline.
-
-### Config clamps
-
-At config load (`clamp_reorder_lookahead_to_floor`, serde path only), sub-range budgets
-are raised to one worst-case serialized checkpoint range —
-`BS_CHECKPOINT_RANGE_BYTE_FLOOR` (401 × 2 MB ≈ 802 MB) — with a warning. The clamp is
-defense-in-depth _sizing_ only: liveness is guaranteed by the commit-window exemption,
-not by budget size. Zero config values are rejected.
-
 ### The bound
 
-Resident memory plateaus near **`effective budget + the bounded decode window`**, plus
-process overhead and bounded transients. At the default 401-block submission window,
-the worst-case decoded contribution is approximately
-401 × `MAX_BLOCK_BYTES` × `DESERIALIZED_MEM_FACTOR` ≈ 3.2 GB:
+The configured value is a soft admission target, not a hard memory ceiling.
+Retained body memory consists of the target plus these overshoot sources:
 
-- the floor's first-item progress margin (≤ one block per request — see liveness below);
-- a single in-window response can exceed the byte gate by up to its decoded resident
-  cost (in-window sizing is by the in-flight budget, for liveness);
-- concurrent peer routines admit against per-iteration snapshots, so a simultaneous
-  wake can transiently over-admit by roughly one response per racing runtime worker
-  before the reservations land in the next iteration's snapshot.
+- estimate reconciliation, whose aggregate growth is exact retained bytes minus
+  reserved estimate bytes but has no fixed multiplier while decoded expansion
+  remains uncapped;
+- commit-window bodies, which remain exempt for checkpoint liveness;
+- raw bodies entering the configured verifier submission window and gaining a
+  decoded representation.
+
+The commit window and submission decode window are independently count-bounded;
+estimate reconciliation is not numerically bounded beyond the decoded block
+representations that can be produced from protocol-valid bodies. This is
+deterministic Rust object-graph accounting, not process RSS. Allocator metadata,
+fragmentation, runtime overhead, and verifier allocations remain outside the
+charge.
 
 ## Liveness rules (why sync cannot wedge)
 
 1. **Commit-window heights are always fundable**, on both lanes, regardless of the
    look-ahead gates — a pinned checkpoint range can always assemble.
-2. **Floor grants never size below one byte**, and `take_in_range_budgeted` always
-   takes its first item regardless of the byte cap — so the floor block is taken even
-   when the in-flight budget is exactly full, reaching the floor reservation path…
-3. **…which overdrafts instead of waiting.** When `try_reserve` fails,
-   `reserve_request_budget`'s Floor path charges the reservation past the max — a
-   bounded overshoot of at most one request (the WorkQueue single-owner invariant
-   permits one floor reservation globally), repaid through the normal release
-   discipline. The floor is therefore never starved by speculative work, with no
-   cross-task funding round trip.
-4. **In-window floor liveness never depends on budget size** — the clamps only stop
-   sub-range configs from thrashing the speculative lane.
+2. **Floor grants never size below one byte**, so a full wire-request budget
+   cannot prevent the floor from reaching the request-budget reservation path.
+3. **The floor may overdraft only the wire-request budget.** When
+   `ByteBudget::try_reserve` fails, `reserve_request_budget` charges at most one
+   floor request past the limit. Normal receipt or cancellation repays it.
+4. **The floor does not bypass retained-memory admission above the commit
+   window.** If an above-window floor take cannot reserve memory headroom, it is
+   returned to the queue until retained capacity is released. Commit-window
+   progress remains exempt and advances the verified-tip-anchored window.
 
 ## Observability
 
@@ -197,13 +240,15 @@ Every fill pass ends with a typed stop reason (`FillStop`), emitted as the
 The `sync.block.backlog.at_cap` gauge is latched to 1 whenever a pass stops on
 `lookahead_cap` (from any lane, including bypass) and reset to 0 on a successful
 above-floor grant. `sync.block.request.floor_bypass` counts floor requests that
-borrowed a bypass slot.
+borrowed a bypass slot. Trace and metric fields named `retained_memory_bytes`
+report the authoritative admission total: retained body charges plus outstanding
+above-window memory reservations.
 
 ## Key config knobs (defaults)
 
 | Knob | Default | Notes |
 | --- | --- | --- |
-| `max_reorder_lookahead_bytes` | 1.5 GiB | resident-memory target; serialized pools are charged at wire size and decoded windows at the calibrated multiple; clamped up to ~802 MB |
+| `max_reorder_lookahead_bytes` | 1.5 GiB | soft cap on retained body charges plus above-window memory reservations |
 | `max_inflight_block_bytes` | 6 GiB | outstanding-request wire budget, released at receipt (separate from the resident gate) |
 | `max_blocks_per_response` | 1 | count cap per request (effective = min of both sides' advertisements, hard max 128) |
 | `floor_bypass_slots` | 2 | extra slots past a saturated cwnd, floor lane only |
@@ -212,14 +257,8 @@ borrowed a bypass slot.
 
 ## Known limitations and follow-ups
 
-- **Decoded-memory factor.** `DESERIALIZED_MEM_FACTOR` is a calibrated approximation of the
-  measured ~3.3–4× wire→decoded ratio, not a per-block heap measure. Replacing it with
-  a precise per-block resident estimate is tracked as
-  [ZCA-750](https://linear.app/zcale/issue/ZCA-750).
-- **Decoded accounting remains approximate.** Serialized pools are charged exactly
-  at wire size, but the bounded input and submission windows still use the calibrated
-  factor rather than a precise heap measurement.
-  `estimated_resident_pipeline_bytes` is the single calibration point.
+- **Attributed memory is not RSS.** It excludes allocator and runtime overhead, and
+  shared allocations are attributed according to the block sizing contract.
 - **Window-boundary split.** With `max_blocks_per_response > 1`, a run straddling the
   commit window costs one extra request per crossing (the price of the never-span
   rule). Irrelevant at the default of 1.

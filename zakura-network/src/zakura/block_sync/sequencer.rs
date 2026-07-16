@@ -16,7 +16,7 @@
 //! Keeping the Sequencer free of download-side state is what lets it run on its
 //! own serial task ([`super::sequencer_task`]), off the reactor's thread.
 
-use super::{events::BlockApplyToken, reorder::*, state::*, *};
+use super::{events::BlockApplyToken, reorder::*, retained_memory::RetainedCharge, state::*, *};
 
 /// A received body draining contiguously toward the verified tip, awaiting (or
 /// undergoing) verifier submission.
@@ -26,7 +26,7 @@ use super::{events::BlockApplyToken, reorder::*, state::*, *};
 /// so the decoded heap footprint of the apply backlog is bounded by the
 /// submission window instead of the whole backlog (the incident mode was tens
 /// of thousands of decoded bodies resident at once).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct ApplyingBlock {
     pub(super) token: BlockApplyToken,
     pub(super) hash: block::Hash,
@@ -68,7 +68,7 @@ pub(super) struct SubmitItem {
 ///
 /// The driver can retain the matching `Arc<Block>` after the body is detached
 /// from `applying`, so this record lives until the exact completion arrives.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct InFlightSubmission {
     height: block::Height,
     hash: block::Hash,
@@ -76,6 +76,8 @@ struct InFlightSubmission {
     bytes: u64,
     /// Deterministic size attributed to the decoded block's Rust object graph.
     decoded_attributed_memory_bytes: u64,
+    /// Keeps the decoded body charged while the driver can retain its `Arc<Block>`.
+    _retained_charge: RetainedCharge,
     /// The block left `applying`, but the driver can still retain its decoded `Arc<Block>`.
     detached: bool,
 }
@@ -93,7 +95,7 @@ pub(super) struct AdvanceOutcome {
 }
 
 /// The reorder → applying → submit → apply-finished commit pipeline.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct Sequencer {
     reorder: ReorderBuffer,
     applying: BTreeMap<block::Height, ApplyingBlock>,
@@ -472,6 +474,7 @@ impl Sequencer {
             hash,
             bytes,
             block,
+            retained_charge,
             decoded_attributed_memory_size_bytes,
             newly_decoded_attributed_memory_bytes,
         ) = {
@@ -485,6 +488,7 @@ impl Sequencer {
                 applying.hash,
                 applying.bytes,
                 block,
+                applying.body.retained_charge(),
                 decoded_after,
                 decoded_after.saturating_sub(decoded_before),
             )
@@ -500,6 +504,7 @@ impl Sequencer {
                 hash,
                 bytes,
                 decoded_attributed_memory_bytes: decoded_attributed_memory_size_bytes,
+                _retained_charge: retained_charge,
                 detached: false,
             },
         );
@@ -599,16 +604,18 @@ impl Sequencer {
         if submission.height != height || submission.hash != hash {
             return false;
         }
-        let bytes = submission.bytes;
-        let decoded_attributed_memory_bytes = submission.decoded_attributed_memory_bytes;
-        let detached = submission.detached;
-        self.in_flight_submissions.remove(&token);
+        let submission = self
+            .in_flight_submissions
+            .remove(&token)
+            .expect("submission exists because it matched above");
         self.in_flight_submission_count = self.in_flight_submission_count.saturating_sub(1);
-        self.in_flight_submission_bytes = self.in_flight_submission_bytes.saturating_sub(bytes);
-        if detached {
+        self.in_flight_submission_bytes = self
+            .in_flight_submission_bytes
+            .saturating_sub(submission.bytes);
+        if submission.detached {
             self.detached_submission_decoded_attributed_memory_bytes = self
                 .detached_submission_decoded_attributed_memory_bytes
-                .saturating_sub(decoded_attributed_memory_bytes);
+                .saturating_sub(submission.decoded_attributed_memory_bytes);
         }
         self.decrement_submitted_apply(height, hash);
         true
@@ -712,13 +719,14 @@ impl Sequencer {
     }
 
     pub(super) fn remove_applying(&mut self, height: block::Height) -> Option<ApplyingBlock> {
-        let removed = self.applying.remove(&height)?;
+        let mut removed = self.applying.remove(&height)?;
         let decoded_attributed_memory_bytes = removed.body.decoded_attributed_memory_size_bytes();
         self.applying_buffered_bytes = self.applying_buffered_bytes.saturating_sub(removed.bytes);
         self.applying_decoded_attributed_memory_bytes = self
             .applying_decoded_attributed_memory_bytes
             .saturating_sub(decoded_attributed_memory_bytes);
         if removed.submitted {
+            removed.body.retain_for_driver_in_place();
             self.attached_submission_count = self.attached_submission_count.saturating_sub(1);
             if let Some(submission) = self.in_flight_submissions.get_mut(&removed.token) {
                 if !submission.detached {
@@ -829,7 +837,12 @@ impl Sequencer {
 
     fn release_all_applying_for_reset(&mut self, keep_submitted_applies: bool) -> u64 {
         let released = self.applying.values().map(|applying| applying.bytes).sum();
-        for applying in self.applying.values().filter(|applying| applying.submitted) {
+        for applying in self
+            .applying
+            .values_mut()
+            .filter(|applying| applying.submitted)
+        {
+            applying.body.retain_for_driver_in_place();
             if let Some(submission) = self.in_flight_submissions.get_mut(&applying.token) {
                 if !submission.detached {
                     submission.detached = true;

@@ -26,7 +26,10 @@ use std::sync::Mutex as StdMutex;
 use tokio::sync::Notify;
 use zakura_chain::block;
 
-use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
+use super::{
+    request::BlockSizeEstimate, retained_memory::InFlightMemoryReservation,
+    state::BlockBudgetLedger,
+};
 
 /// Lower clamp on a body-size estimate.
 pub(super) const DEFAULT_BS_SIZE_FLOOR_BYTES: u64 = 1024;
@@ -62,10 +65,21 @@ pub(super) struct WorkReturnOutcome {
     pub(super) max_height: Option<block::Height>,
 }
 
+/// Request resources transferred out of the work queue when a body arrives.
+#[derive(Debug)]
+pub(super) struct SettledRequestReservation {
+    pub(super) request_bytes: u64,
+    pub(super) in_flight_memory_reservation: Option<InFlightMemoryReservation>,
+}
+
 #[derive(Debug)]
 struct WorkQueueInner {
     pending: std::collections::BTreeMap<block::Height, WorkItem>,
     in_flight: std::collections::BTreeMap<block::Height, WorkItem>,
+    /// Above-window in-flight memory reservations, keyed by height.
+    /// Removing an entry without reconciling it releases the reservation.
+    in_flight_memory_reservations:
+        std::collections::BTreeMap<block::Height, InFlightMemoryReservation>,
     floor: block::Height,
     /// Floor clamp for size estimates (overridable for tests).
     floor_estimate_bytes: u64,
@@ -106,6 +120,7 @@ impl WorkQueue {
             inner: StdMutex::new(WorkQueueInner {
                 pending: std::collections::BTreeMap::new(),
                 in_flight: std::collections::BTreeMap::new(),
+                in_flight_memory_reservations: std::collections::BTreeMap::new(),
                 floor,
                 floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
                 reserved_bytes: 0,
@@ -267,7 +282,6 @@ impl WorkQueue {
     /// Move each given height `in_flight → pending`, preserving its stored
     /// [`WorkItem`]. Heights not currently `in_flight` are skipped (idempotent).
     /// Wakes waiters if anything moved.
-    #[cfg(test)]
     pub(super) fn return_items(&self, heights: impl IntoIterator<Item = block::Height>) {
         let mut moved = false;
         {
@@ -305,27 +319,56 @@ impl WorkQueue {
     ///
     /// Returns the sum marked. The caller must have already admitted the same
     /// byte total through [`ByteBudget`](crate::zakura::transport::ByteBudget).
+    #[cfg(test)]
     pub(super) fn mark_reserved(&self, heights: impl IntoIterator<Item = block::Height>) -> u64 {
-        let mut marked = 0u64;
-        let mut inner = self.lock();
-        for height in heights {
-            let Some(item) = inner.in_flight.get_mut(&height) else {
-                continue;
-            };
-            if item.budget.is_reserved() {
-                continue;
-            }
-            item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
-            marked = marked.saturating_add(item.estimated_bytes);
-        }
-        // Released (0) -> Reserved(estimate): the reserved total grows by exactly
-        // the bytes just marked.
-        inner.reserved_bytes = inner.reserved_bytes.saturating_add(marked);
-        marked
+        self.mark_issued(heights.into_iter().map(|height| (height, None)))
+            .unwrap_or(0)
     }
 
-    /// End an active request reservation at receipt.
-    pub(super) fn release_active_reserved_height(&self, height: block::Height) -> Option<u64> {
+    /// Atomically mark one request's heights as issued and attach any
+    /// above-window in-flight memory reservations.
+    ///
+    /// Returns the summed request-byte reservation. If any height changed state
+    /// or appears twice, nothing is marked and all supplied in-flight memory reservations
+    /// are dropped.
+    pub(super) fn mark_issued(
+        &self,
+        reservations: impl IntoIterator<Item = (block::Height, Option<InFlightMemoryReservation>)>,
+    ) -> Option<u64> {
+        let reservations: Vec<_> = reservations.into_iter().collect();
+        let mut inner = self.lock();
+        let mut unique = std::collections::BTreeSet::new();
+        for (height, _) in &reservations {
+            let item = inner.in_flight.get(height)?;
+            if item.budget.is_reserved()
+                || inner.in_flight_memory_reservations.contains_key(height)
+                || !unique.insert(*height)
+            {
+                return None;
+            }
+        }
+
+        let mut marked = 0u64;
+        for (height, maybe_in_flight_memory_reservation) in reservations {
+            let item = inner.in_flight.get_mut(&height)?;
+            item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
+            marked = marked.saturating_add(item.estimated_bytes);
+            if let Some(in_flight_memory_reservation) = maybe_in_flight_memory_reservation {
+                inner
+                    .in_flight_memory_reservations
+                    .insert(height, in_flight_memory_reservation);
+            }
+        }
+        inner.reserved_bytes = inner.reserved_bytes.saturating_add(marked);
+        Some(marked)
+    }
+
+    /// End an active request reservation at receipt, transferring any retained
+    /// headroom reservation to the caller for exact reconciliation.
+    pub(super) fn release_active_reserved_height(
+        &self,
+        height: block::Height,
+    ) -> Option<SettledRequestReservation> {
         let mut inner = self.lock();
         let released = {
             let item = inner.in_flight.get_mut(&height)?;
@@ -335,24 +378,31 @@ impl WorkQueue {
             item.budget.release_reserved()
         };
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
-        Some(released)
+        Some(SettledRequestReservation {
+            request_bytes: released,
+            in_flight_memory_reservation: inner.in_flight_memory_reservations.remove(&height),
+        })
     }
 
     /// Claim a received height and end any request reservation it owned.
-    pub(super) fn claim_received(&self, height: block::Height) -> u64 {
+    pub(super) fn claim_received(&self, height: block::Height) -> SettledRequestReservation {
         let mut inner = self.lock();
-        if let Some(item) = inner.in_flight.get_mut(&height) {
+        let request_bytes = if let Some(item) = inner.in_flight.get_mut(&height) {
             let released = item.budget.release_reserved();
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
-            return released;
-        }
-        if let Some(mut item) = inner.pending.remove(&height) {
+            released
+        } else if let Some(mut item) = inner.pending.remove(&height) {
             let released = item.budget.release_reserved();
             inner.in_flight.insert(height, item);
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
-            return released;
+            released
+        } else {
+            0
+        };
+        SettledRequestReservation {
+            request_bytes,
+            in_flight_memory_reservation: inner.in_flight_memory_reservations.remove(&height),
         }
-        0
     }
 
     /// Release active request reservations, leaving received heights in place.
@@ -368,6 +418,7 @@ impl WorkQueue {
             } else if let Some(item) = inner.pending.get_mut(&height) {
                 released = released.saturating_add(item.budget.release_reserved());
             }
+            inner.in_flight_memory_reservations.remove(&height);
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
         released
@@ -386,6 +437,7 @@ impl WorkQueue {
             for height in heights {
                 if let Some(mut item) = inner.in_flight.remove(&height) {
                     released = released.saturating_add(item.budget.release_reserved());
+                    inner.in_flight_memory_reservations.remove(&height);
                     inner.pending.insert(height, item);
                     moved = true;
                 }
@@ -451,6 +503,7 @@ impl WorkQueue {
                 outcome.released_bytes = outcome
                     .released_bytes
                     .saturating_add(item.budget.release_reserved());
+                inner.in_flight_memory_reservations.remove(&height);
                 outcome.returned_count = outcome.returned_count.saturating_add(1);
                 inner.pending.insert(height, item);
                 moved = true;
@@ -487,6 +540,7 @@ impl WorkQueue {
                 .pop_first()
                 .expect("first_key_value returned Some");
             released = released.saturating_add(item.budget.release_reserved());
+            inner.in_flight_memory_reservations.remove(&height);
         }
         while let Some((&height, _)) = inner.in_flight.first_key_value() {
             if height > floor {
@@ -497,6 +551,7 @@ impl WorkQueue {
                 .pop_first()
                 .expect("first_key_value returned Some");
             released = released.saturating_add(item.budget.release_reserved());
+            inner.in_flight_memory_reservations.remove(&height);
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
         released
@@ -523,6 +578,7 @@ impl WorkQueue {
                 .pop_last()
                 .expect("last_key_value returned Some");
             released = released.saturating_add(item.budget.release_reserved());
+            inner.in_flight_memory_reservations.remove(&height);
         }
         while let Some((&height, _)) = inner.in_flight.last_key_value() {
             if height <= floor {
@@ -533,6 +589,7 @@ impl WorkQueue {
                 .pop_last()
                 .expect("last_key_value returned Some");
             released = released.saturating_add(item.budget.release_reserved());
+            inner.in_flight_memory_reservations.remove(&height);
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
         released

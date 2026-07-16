@@ -179,6 +179,10 @@ pub mod block_sync_trace {
     /// Aggregate decoded attributed-memory bytes in the active body pipeline.
     pub const ACTIVE_PIPELINE_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
         "active_pipeline_decoded_attributed_memory_bytes";
+    /// Authoritative retained body-memory total used by admission.
+    pub const RETAINED_MEMORY_BYTES: &str = "retained_memory_bytes";
+    /// Retained body memory above the configured soft cap.
+    pub const RETAINED_MEMORY_OVERSHOOT_BYTES: &str = "retained_memory_overshoot_bytes";
     /// End-to-end elapsed milliseconds for a traced operation.
     pub const ELAPSED_MS: &str = "elapsed_ms";
     /// Elapsed milliseconds before response frames were ready to send.

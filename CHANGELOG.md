@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Block-sync admission now tracks each retained raw payload and decoded block
+  directly instead of estimating decoded memory with a flat wire-size multiplier.
 - Block-sync now keeps its apply backlog in serialized wire form and decodes
   bodies only for the verifier submission window, so decoded memory is bounded
   regardless of backlog depth. Admission accounting charges serialized pools at

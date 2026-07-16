@@ -38,7 +38,8 @@ mod scenario;
 mod tests;
 
 pub(crate) use invariants::{
-    assert_core as assert_core_invariants, report as invariant_report, InvariantReport,
+    assert_core as assert_core_invariants, assert_retained_memory_drained,
+    report as invariant_report, InvariantReport,
 };
 
 pub(crate) use scenario::*;
@@ -89,6 +90,7 @@ pub(crate) async fn run_scenario(
     startup.shutdown = shutdown.clone();
 
     let (handle, actions, reactor_task) = crate::zakura::spawn_block_sync_reactor(startup);
+    let retained_memory_used = handle.retained_memory_probe();
 
     let (committed_tx, mut committed_rx) = watch::channel(block::Height(0));
 
@@ -156,10 +158,22 @@ pub(crate) async fn run_scenario(
     .map(|height| *height);
     let committed_tip = reached.unwrap_or_else(|| *committed_rx.borrow());
     running.stop().await;
+    drop(handle);
+
+    // Reactor shutdown closes the sequencer channels, but the independently spawned
+    // sequencer and peer routines can need a few scheduler turns to drop their final
+    // queued/detached body owners. Keep only the counter probe alive while they settle.
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while retained_memory_used() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
 
     Ok(FuzzOutcome {
         committed_tip,
         target,
+        final_retained_memory_bytes: retained_memory_used(),
     })
 }
 

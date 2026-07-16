@@ -154,6 +154,7 @@ pub(super) struct RoutineWiring {
     pub(super) sequencer_input: mpsc::Sender<super::sequencer_task::SequencedBody>,
     pub(super) sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     pub(super) sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) retained_memory: super::retained_memory::RetainedBodyMemoryTracker,
     pub(super) actions: mpsc::Sender<BlockSyncAction>,
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
     pub(super) view: watch::Receiver<super::sequencer_task::SequencerView>,
@@ -218,6 +219,19 @@ impl BlockSyncHandle {
     /// Return the currently cached block-sync candidate-selection hints.
     pub fn candidate_state(&self) -> ZakuraBlockSyncCandidateState {
         self.candidates.borrow().clone()
+    }
+
+    /// Return a test-only probe that keeps the retained-memory counter alive after
+    /// every reactor, routine, and sequencer owner has been torn down.
+    #[cfg(any(test, feature = "zakura-testkit"))]
+    pub(crate) fn retained_memory_probe(&self) -> impl Fn() -> u64 + Clone + Send + 'static {
+        let retained_memory = self
+            .routine_wiring
+            .as_ref()
+            .expect("spawned block-sync handles have routine wiring")
+            .retained_memory
+            .clone();
+        move || retained_memory.used()
     }
 }
 

@@ -18,24 +18,6 @@ const ABOVE_FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
 /// two seconds of transfer time.
 const FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 1024 * 1024;
 
-/// Estimated resident-memory multiple of a *decoded* block body's serialized size.
-///
-/// Decoded bodies (`Arc<Block>`, `sequencer::ApplyingBlock`) have an in-memory footprint
-/// several times their wire/serialized size. The look-ahead budget must bound that *resident*
-/// cost, not the wire bytes, or a small-block backlog blows past the intended memory ceiling.
-///
-/// Applied only to the pools that actually hold decoded blocks: the sequencer
-/// input channel (bodies decoded by the peer routine, bounded by the channel
-/// depth) and the submitted decode window (bodies decoded at `prepare_submit`,
-/// bounded by `submitted_apply_limit`). The reorder backlog and the applying
-/// backlog beyond the submission window retain only serialized wire bytes
-/// (`BufferedBlockBody::retain_for_backlog`), so they are charged at ×1; see
-/// [`estimated_resident_pipeline_bytes`].
-///
-// The factor is a deliberately conservative calibration from the measured ~3.3–4x
-// wire→resident ratio; it is an approximation, not a true per-block size.
-pub const DESERIALIZED_MEM_FACTOR: u64 = 4;
-
 /// Pure inputs for deciding whether a block request may consume budget.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct AdmissionSnapshot {
@@ -44,15 +26,11 @@ pub(super) struct AdmissionSnapshot {
     /// commit window) are always fundable (liveness), so a pinned checkpoint range can
     /// assemble and commit can drain the pipeline; everything else is memory-gated.
     pub(super) verified_block_tip: block::Height,
-    pub(super) reorder_buffered_bytes: u64,
+    /// Retained body memory plus outstanding above-window headroom reservations,
+    /// atomically maintained across request and pipeline stages.
+    pub(super) retained_memory_bytes: u64,
     pub(super) reorder_buffered_blocks: u64,
-    pub(super) applying_buffered_bytes: u64,
     pub(super) applying_buffered_blocks: u64,
-    pub(super) sequencer_input_queued_bytes: u64,
-    /// Wire bytes of decoded submissions the driver can still retain, including
-    /// bodies detached from `applying` while their completion is pending.
-    pub(super) in_flight_submission_bytes: u64,
-    pub(super) reserved_above_floor_bytes: u64,
     pub(super) reserved_above_floor_blocks: u64,
     pub(super) budget_available: u64,
 }
@@ -70,8 +48,7 @@ pub(super) enum RequestPriority {
 pub(super) enum AdmissionOutcome {
     Admit(AdmissionGrant),
     /// The start height is above the commit window and the resident look-ahead
-    /// gate (byte budget or block cap) is full, or the remaining wire headroom
-    /// rounds to zero.
+    /// gate (byte budget or block cap) is full.
     LookaheadAtCap,
     /// The look-ahead gate has headroom but zero bytes are fundable right now
     /// (the in-flight request budget is spent). Never returned for floor-priority
@@ -169,10 +146,8 @@ const COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS: u32 = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_
 ///
 /// Defense-in-depth on the map/bookkeeping size only; the resident-memory
 /// budget is the primary bound on buffered bodies. This cap binds before the
-/// byte gate only when the average retained body is smaller than
-/// `effective_budget / (DESERIALIZED_MEM_FACTOR × 262_144)` wire bytes
-/// (~6.1 KB at the default budget), i.e. for tiny early-chain bodies whose
-/// per-entry bookkeeping overhead the flat resident factor does not model.
+/// byte gate only for tiny early-chain bodies whose per-entry bookkeeping
+/// overhead the retained-body accounting does not model.
 pub(super) const LOOKAHEAD_BLOCK_HARD_CAP: u64 = 262_144;
 
 /// Highest height exempt from look-ahead backpressure: the top of the commit window
@@ -190,61 +165,8 @@ fn commit_window_high(snapshot: &AdmissionSnapshot) -> block::Height {
     )
 }
 
-/// Wire bytes of block bodies retained by the pipeline: the single formula
-/// behind the `retained_pipeline_wire_bytes` trace field and the resident
-/// estimate, so every emitter and gate agrees on what "retained" means.
-#[derive(Copy, Clone, Debug)]
-pub(super) struct RetainedPipelineBytes {
-    pub(super) reorder_buffered_bytes: u64,
-    pub(super) applying_buffered_bytes: u64,
-    pub(super) sequencer_input_queued_bytes: u64,
-}
-
-impl RetainedPipelineBytes {
-    /// Total wire bytes of retained bodies (the `retained_pipeline_wire_bytes`
-    /// trace field).
-    pub(super) fn wire_bytes(self) -> u64 {
-        self.reorder_buffered_bytes
-            .saturating_add(self.applying_buffered_bytes)
-            .saturating_add(self.sequencer_input_queued_bytes)
-    }
-}
-
-impl AdmissionSnapshot {
-    fn retained(&self) -> RetainedPipelineBytes {
-        RetainedPipelineBytes {
-            reorder_buffered_bytes: self.reorder_buffered_bytes,
-            applying_buffered_bytes: self.applying_buffered_bytes,
-            sequencer_input_queued_bytes: self.sequencer_input_queued_bytes,
-        }
-    }
-}
-
-/// Estimated resident memory of block bodies retained by, or already committed
-/// to enter, the pipeline.
-///
-/// Serialized pools (reorder backlog, applying backlog, and outstanding
-/// reservations) cost their wire bytes while retained. Decoded pools add the
-/// decoded multiple: the sequencer input channel (bodies arrive decoded from
-/// the peer routine, bounded by the channel depth) and in-flight submissions
-/// (decoded at `prepare_submit`, charged through their exact completion even
-/// after detachment, and bounded by `submitted_apply_limit`). A detached
-/// submission no longer contributes applying wire bytes, but its decoded
-/// charge remains. Both decoded pools are structurally bounded, so
-/// the deep backlog — the pool that actually scales with look-ahead depth — is
-/// charged at its true serialized cost instead of a flat decoded multiple.
-fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
-    let serialized = snapshot
-        .retained()
-        .wire_bytes()
-        .saturating_add(snapshot.reserved_above_floor_bytes);
-    // Decoded copies exist alongside their retained raw payloads, so the extra
-    // decoded cost is the full decoded multiple on top of the ×1 wire charge.
-    let decoded = snapshot
-        .sequencer_input_queued_bytes
-        .saturating_add(snapshot.in_flight_submission_bytes)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    serialized.saturating_add(decoded)
+pub(super) fn is_commit_window_exempt(snapshot: &AdmissionSnapshot, height: block::Height) -> bool {
+    height <= commit_window_high(snapshot)
 }
 
 fn held_blocks(snapshot: &AdmissionSnapshot) -> u64 {
@@ -256,23 +178,17 @@ fn held_blocks(snapshot: &AdmissionSnapshot) -> u64 {
 
 /// Whether the resident-memory look-ahead budget (or the block cap) is already full.
 fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSnapshot) -> bool {
-    estimated_resident_pipeline_bytes(snapshot) >= config.effective_max_reorder_lookahead_bytes()
+    snapshot.retained_memory_bytes >= config.effective_max_reorder_lookahead_bytes()
         || held_blocks(snapshot) >= LOOKAHEAD_BLOCK_HARD_CAP
 }
 
-/// Remaining resident look-ahead headroom, expressed in wire bytes.
-///
-/// Admitted bodies are retained serialized until they reach the bounded decode
-/// window, so each byte of headroom funds one wire byte. The transient decoded
-/// sequencer-input copy is bounded by the input channel and charged by the live
-/// snapshot once queued.
-fn remaining_lookahead_wire_bytes(
+fn remaining_retained_memory_bytes(
     config: &ZakuraBlockSyncConfig,
     snapshot: &AdmissionSnapshot,
 ) -> u64 {
     config
         .effective_max_reorder_lookahead_bytes()
-        .saturating_sub(estimated_resident_pipeline_bytes(snapshot))
+        .saturating_sub(snapshot.retained_memory_bytes)
 }
 
 /// Retention-only admission for a body that is already downloaded.
@@ -285,13 +201,13 @@ pub(super) fn admit_received_body(
     config: &ZakuraBlockSyncConfig,
     snapshot: &AdmissionSnapshot,
     height: block::Height,
-    serialized_bytes: u64,
+    retained_memory_bytes: u64,
 ) -> bool {
-    if height <= commit_window_high(snapshot) {
+    if is_commit_window_exempt(snapshot, height) {
         return true;
     }
     !lookahead_over_budget(config, snapshot)
-        && serialized_bytes <= remaining_lookahead_wire_bytes(config, snapshot)
+        && retained_memory_bytes <= remaining_retained_memory_bytes(config, snapshot)
 }
 
 /// Plans one contiguous take starting at `start_height`: the single authority for
@@ -311,10 +227,8 @@ pub(super) fn admit_received_body(
 /// Gating the floor lane (with only the commit window exempt) is what bounds the
 /// applying queue: the download floor advances on every download, so a floor exemption
 /// tied to it escalates unboundedly ahead of commit. Anchoring the exemption to the
-/// verified tip caps the pipeline to the look-ahead budget plus one worst-case window
-/// (`COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS × MAX_BLOCK_BYTES × DESERIALIZED_MEM_FACTOR`
-/// ≈ 3.2 GB; a single in-window response can also exceed the byte gate by up to the
-/// response cap × the factor) regardless of how far headers/downloads run ahead.
+/// verified tip caps the pipeline to the look-ahead budget plus the bounded
+/// commit window and bodies already admitted by the in-flight request budget.
 ///
 /// Floor-priority requests are never blocked just because the request budget is exactly
 /// full. If the lowest missing block is needed to let commit move forward, it can still
@@ -341,16 +255,12 @@ pub(super) fn admit(
         if lookahead_over_budget(config, &snapshot) {
             return AdmissionOutcome::LookaheadAtCap;
         }
-        let remaining_wire_bytes = remaining_lookahead_wire_bytes(config, &snapshot);
-        if remaining_wire_bytes == 0 {
-            return AdmissionOutcome::LookaheadAtCap;
-        }
         (
             servable_high,
             snapshot
                 .budget_available
-                .min(remaining_wire_bytes)
-                .min(response_byte_cap),
+                .min(response_byte_cap)
+                .min(remaining_retained_memory_bytes(config, &snapshot)),
         )
     };
 
@@ -460,13 +370,9 @@ mod tests {
         let snapshot = AdmissionSnapshot {
             download_floor: block::Height(range_blocks - 1),
             verified_block_tip: block::Height(0),
-            reorder_buffered_bytes: 0,
+            retained_memory_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR - BS_PER_BLOCK_WORST_CASE_BYTES,
             reorder_buffered_blocks: 0,
-            applying_buffered_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR - BS_PER_BLOCK_WORST_CASE_BYTES,
             applying_buffered_blocks: u64::from(range_blocks) - 1,
-            sequencer_input_queued_bytes: 0,
-            in_flight_submission_bytes: 0,
-            reserved_above_floor_bytes: 0,
             reserved_above_floor_blocks: 0,
             budget_available: config.max_inflight_block_bytes,
         };
@@ -501,17 +407,5 @@ mod tests {
             ),
             "the first gated height above the commit window must still be admissible",
         );
-    }
-
-    /// A sub-range configured budget is clamped up so checkpoint sync cannot wedge.
-    #[test]
-    fn clamp_reorder_lookahead_floors_sub_range_configs() {
-        use super::super::config::BS_CHECKPOINT_RANGE_BYTE_FLOOR;
-        let mut config = ZakuraBlockSyncConfig {
-            max_reorder_lookahead_bytes: 1024 * 1024, // 1 MiB, far below one range of wire bytes
-            ..ZakuraBlockSyncConfig::default()
-        };
-        config.clamp_reorder_lookahead_to_floor();
-        assert!(config.max_reorder_lookahead_bytes >= BS_CHECKPOINT_RANGE_BYTE_FLOOR);
     }
 }

@@ -344,6 +344,8 @@ pub(crate) struct FuzzOutcome {
     pub(crate) committed_tip: block::Height,
     /// The target the corpus defined.
     pub(crate) target: block::Height,
+    /// Authoritative retained body memory after full harness teardown.
+    pub(crate) final_retained_memory_bytes: u64,
 }
 
 impl FuzzOutcome {

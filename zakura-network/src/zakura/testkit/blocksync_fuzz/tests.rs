@@ -10,13 +10,37 @@ use std::time::Duration;
 use zakura_chain::block;
 
 use super::{
-    assert_core_invariants, fuzz_config, invariant_report, run_scenario, run_trace,
-    CommitBurstStall, CommitProfile, Degrade, DegradeMode, FuzzOutcome, IdleGap, InvariantReport,
-    LatencyDist, PeerSpec, Scenario, ServeProfile, TipEvent, TipEventKind,
+    assert_core_invariants, assert_retained_memory_drained, fuzz_config, invariant_report,
+    run_scenario, run_trace, CommitBurstStall, CommitProfile, Degrade, DegradeMode, FuzzOutcome,
+    IdleGap, InvariantReport, LatencyDist, PeerSpec, Scenario, ServeProfile, SyntheticBlockCorpus,
+    SyntheticBlockShape, TipEvent, TipEventKind,
 };
-use crate::zakura::{
-    ZakuraBlockSyncConfig, DESERIALIZED_MEM_FACTOR, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
-};
+use crate::zakura::{ZakuraBlockSyncConfig, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES};
+
+fn max_retained_body_bytes(blocks: u32, seed: u64, target_block_bytes: usize) -> u64 {
+    let corpus = SyntheticBlockCorpus::generate(
+        blocks,
+        seed,
+        SyntheticBlockShape {
+            target_block_bytes: Some(target_block_bytes),
+        },
+    );
+
+    (1..=blocks)
+        .filter_map(|height| {
+            let height = block::Height(height);
+            let block = corpus.block_at(height)?;
+            let wire_bytes = u64::try_from(corpus.size_at(height)?).ok()?;
+            Some(
+                block
+                    .attributed_memory_size_bytes()
+                    .saturating_add(wire_bytes)
+                    .saturating_add(16),
+            )
+        })
+        .max()
+        .unwrap_or(0)
+}
 
 /// Run a scenario, flush its trace, assert the core invariants, and return the outcome
 /// + report. `outstanding_slack` absorbs brief over-counts at request boundaries.
@@ -33,7 +57,7 @@ async fn run_checked(
     let reader = capture
         .reader()
         .expect("trace reader loads the flushed run");
-    let report = invariant_report(&reader);
+    let report = invariant_report(&reader, outcome.final_retained_memory_bytes);
     tracing::info!(
         scenario = name,
         committed = outcome.committed_tip.0,
@@ -42,6 +66,7 @@ async fn run_checked(
         max_outstanding = report.max_outstanding,
         peak_budget_reserved = report.peak_budget_reserved,
         final_budget_reserved = report.final_budget_reserved,
+        final_retained_memory_bytes = report.final_retained_memory_bytes,
         peak_active_pipeline_decoded_attributed_memory_bytes =
             report.peak_active_pipeline_decoded_attributed_memory_bytes,
         final_active_pipeline_decoded_attributed_memory_bytes =
@@ -496,15 +521,16 @@ async fn fuzz_peer_that_stops_reading_is_disconnected() {
     // assert the disconnect directly from the report.
     let (mut capture, trace) =
         run_trace("fuzz_peer_that_stops_reading_is_disconnected").expect("trace capture opens");
-    let _outcome = run_scenario(&scenario, trace)
+    let outcome = run_scenario(&scenario, trace)
         .await
         .expect("scenario runs without harness error");
     capture.flush().await;
     let reader = capture
         .reader()
         .expect("trace reader loads the flushed run");
-    let report = invariant_report(&reader);
+    let report = invariant_report(&reader, outcome.final_retained_memory_bytes);
     capture.finish().await.expect("capture discards cleanly");
+    assert_retained_memory_drained(&report);
 
     // The wedged, non-reading peer must be disconnected — even though our outbound to it is
     // full (its stream unread). With the old unbounded escape this is 0 (extend forever until
@@ -858,7 +884,7 @@ async fn fuzz_commit_stall() {
     let body_bytes = 32 * 1024usize;
     // A sub-range resident budget forces retention backpressure in the test harness.
     let byte_ceiling: u64 = 2 * 1024 * 1024;
-    let resident_budget = byte_ceiling * DESERIALIZED_MEM_FACTOR;
+    let resident_budget = byte_ceiling;
     let config = ZakuraBlockSyncConfig {
         max_reorder_lookahead_bytes: resident_budget,
         max_blocks_per_response: 1,
@@ -885,23 +911,19 @@ async fn fuzz_commit_stall() {
     scenario.deadline = Duration::from_secs(60);
     let (_, report) = run_checked("fuzz_commit_stall", scenario, 64).await;
 
-    // Budget plus the commit-window exemption and request-boundary margin.
-    let window_slack = (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64)
-        .saturating_mul(body_bytes as u64)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let margin = (body_bytes as u64)
-        .saturating_mul(16)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let peak_retained_resident = report
-        .peak_retained_pipeline_wire_bytes
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
+    // Budget plus exact bodies in the commit window and a bounded arrival margin.
+    let max_body_bytes = max_retained_body_bytes(blocks, 0x57ea_000c, body_bytes);
+    let window_slack =
+        (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64).saturating_mul(max_body_bytes);
+    let margin = max_body_bytes.saturating_mul(128);
+    let peak_retained_resident = report.peak_retained_memory_bytes;
     let bound = resident_budget
         .saturating_add(window_slack)
         .saturating_add(margin);
     assert!(
         peak_retained_resident <= bound,
         "peak retained resident cost {} must stay within the {} B budget \
-         (+{} B commit-window slack, +{} B margin); the apply backlog is bounded by \
+         (+{} B bounded-window allowance, +{} B arrival margin); the apply backlog is bounded by \
          the resident gate, not unbounded by the commit stall",
         peak_retained_resident,
         resident_budget,
@@ -919,27 +941,21 @@ async fn fuzz_commit_stall() {
     tracing::info!(
         peak_retained_pipeline_wire_bytes = report.peak_retained_pipeline_wire_bytes,
         peak_retained_resident,
+        peak_retained_memory_overshoot_bytes = report.peak_retained_memory_overshoot_bytes,
         final_budget_reserved = report.final_budget_reserved,
         resident_budget,
         "commit_stall retention backpressure observation",
     );
 }
 
-/// The retained-resident plateau under a commit stall. The
-/// resident look-ahead gate must hold the retained pipeline (sequencer input + reorder +
-/// applying, at the decoded multiple) near the configured budget plus at most one
-/// commit-window worth of exempt bodies — never growing toward the whole chain the way
-/// the pre-gate escalator did. The chain is longer than the exempt window so the gate
-/// genuinely binds, and the in-flight wire budget is left roomy so the *resident* gate,
-/// not the wire budget, is what bounds retention.
+/// The retained-memory plateau under a commit stall. The gate holds exact body
+/// charges near the configured budget plus bounded commit/submission windows and
+/// in-flight arrivals, never growing toward the whole chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_commit_stall_resident_plateau() {
     let blocks = 1_200;
     let body_bytes = 32 * 1024usize;
-    // Resident budget: 8 MiB = 2 MiB of retained wire at the ×4 multiple (~64 bodies of
-    // gated retention), far below the ~37.5 MB chain. (The fuzzer reactor path does not
-    // call the config clamps, so a sub-checkpoint-range budget is usable here; the mock
-    // committer needs no checkpoint batch.)
+    // A deliberately small soft cap, far below the full synthetic chain.
     let resident_budget: u64 = 8 * 1024 * 1024;
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64 * 1024 * 1024,
@@ -967,28 +983,22 @@ async fn fuzz_commit_stall_resident_plateau() {
     scenario.deadline = Duration::from_secs(120);
     let (_, report) = run_checked("fuzz_commit_stall_resident_plateau", scenario, 64).await;
 
-    // Peak retained resident cost stays within the budget, plus the commit-window
-    // exemption (one checkpoint range of bodies above the verified tip bypasses the
-    // gate) and a small request-boundary margin. A gate regression (the
+    // Peak retained memory stays within the budget, plus exact commit/submission
+    // window bodies and a bounded in-flight arrival margin. A gate regression (the
     // escalator, or reservations invisible to the byte gate) drives retention toward
     // the full ~150 MB resident chain instead.
-    // `usize → u64` widenings are lossless on all supported (64-bit) targets.
-    let window_slack = (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64)
-        .saturating_mul(body_bytes as u64)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let margin = (body_bytes as u64)
-        .saturating_mul(16)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let peak_retained_resident = report
-        .peak_retained_pipeline_wire_bytes
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
+    let max_body_bytes = max_retained_body_bytes(blocks, 0x57ea_000d, body_bytes);
+    let window_slack =
+        (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64).saturating_mul(max_body_bytes);
+    let margin = max_body_bytes.saturating_mul(128);
+    let peak_retained_resident = report.peak_retained_memory_bytes;
     let bound = resident_budget
         .saturating_add(window_slack)
         .saturating_add(margin);
     assert!(
         peak_retained_resident <= bound,
         "peak retained resident cost {} must stay within the {} B budget \
-         (+{} B commit-window slack, +{} B margin)",
+         (+{} B bounded-window allowance, +{} B arrival margin)",
         peak_retained_resident,
         resident_budget,
         window_slack,
@@ -1018,7 +1028,7 @@ async fn fuzz_commit_stall_resident_plateau() {
 /// above-window heights past a full resident gate if the take geometry were sized by the
 /// in-flight budget instead of clamped at the window top (`admit`'s never-span-the-
 /// boundary rule). This is end-to-end coverage of the multi-block regime; the bound's
-/// commit-window slack is larger than a per-crossing overshoot at this block size, so
+/// bounded-window allowance is larger than a per-crossing overshoot at this block size, so
 /// the *pin* for the take geometry itself is the unit test
 /// `exempt_take_never_spans_the_commit_window_boundary` and the `admit` proptest.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1058,27 +1068,22 @@ async fn fuzz_commit_stall_resident_plateau_multiblock() {
     )
     .await;
 
-    // Same bound as the single-block plateau: budget + one commit window of exempt
-    // bodies + a small request-boundary margin. A take-geometry regression (an exempt
+    // Same bound as the single-block plateau: budget + exact commit/submission
+    // window bodies + a bounded in-flight arrival margin. A take-geometry regression (an exempt
     // multi-block take extending above the window sized by the in-flight budget) drives
     // retention toward the full ~150 MB resident chain instead.
-    // `usize → u64` widenings are lossless on all supported (64-bit) targets.
-    let window_slack = (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64)
-        .saturating_mul(body_bytes as u64)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let margin = (body_bytes as u64)
-        .saturating_mul(16)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let peak_retained_resident = report
-        .peak_retained_pipeline_wire_bytes
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
+    let max_body_bytes = max_retained_body_bytes(blocks, 0x57ea_000e, body_bytes);
+    let window_slack =
+        (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64).saturating_mul(max_body_bytes);
+    let margin = max_body_bytes.saturating_mul(128);
+    let peak_retained_resident = report.peak_retained_memory_bytes;
     let bound = resident_budget
         .saturating_add(window_slack)
         .saturating_add(margin);
     assert!(
         peak_retained_resident <= bound,
         "peak retained resident cost {} must stay within the {} B budget \
-         (+{} B commit-window slack, +{} B margin) with multi-block responses",
+         (+{} B bounded-window allowance, +{} B arrival margin) with multi-block responses",
         peak_retained_resident,
         resident_budget,
         window_slack,

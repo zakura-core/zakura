@@ -40,6 +40,13 @@ fn peer(byte: u8) -> ZakuraPeerId {
     ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds")
 }
 
+fn try_reserve_retained_memory(
+    memory: &retained_memory::RetainedBodyMemoryTracker,
+    bytes: u64,
+) -> Option<retained_memory::InFlightMemoryReservation> {
+    memory.try_reserve_many(&[bytes])?.pop()
+}
+
 fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
     Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
 }
@@ -1526,13 +1533,9 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
         verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 500,
+        retained_memory_bytes: 500,
         reorder_buffered_blocks: 1,
-        applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 40_000_000,
     };
@@ -1562,7 +1565,7 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
     );
 
     let under_cap = super::admission::AdmissionSnapshot {
-        reorder_buffered_bytes: 100,
+        retained_memory_bytes: 100,
         budget_available: 40_000_000,
         ..snapshot
     };
@@ -1578,12 +1581,14 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         above.priority,
         super::admission::RequestPriority::AboveFloor
     );
-    // Remaining headroom is wire-denominated: 500 - 100 = 400 wire bytes.
-    assert_eq!(above.max_request_bytes, 400);
+    assert_eq!(
+        above.max_request_bytes, 400,
+        "above-window sizing is capped by remaining retained headroom"
+    );
 }
 
 #[test]
-fn admission_counts_inflight_to_sequencer_bytes() {
+fn admission_counts_exact_retained_memory() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
@@ -1592,13 +1597,9 @@ fn admission_counts_inflight_to_sequencer_bytes() {
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
         verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 200,
+        retained_memory_bytes: 1_000,
         reorder_buffered_blocks: 1,
-        applying_buffered_bytes: 200,
         applying_buffered_blocks: 1,
-        sequencer_input_queued_bytes: 600,
-        in_flight_submission_bytes: 0,
-        reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
     };
@@ -1627,13 +1628,9 @@ fn total_resident_plateaus_under_commit_stall() {
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
         verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 300,
+        retained_memory_bytes: 1_000,
         reorder_buffered_blocks: 1,
-        applying_buffered_bytes: 700,
         applying_buffered_blocks: 1,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
     };
@@ -1662,13 +1659,9 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
     let capped = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
         verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 1_000,
+        retained_memory_bytes: 1_000,
         reorder_buffered_blocks: 1,
-        applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
     };
@@ -1701,11 +1694,7 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
 }
 
 #[test]
-fn outstanding_reservations_are_charged_at_wire_size() {
-    // Regression for the reserved-0× hole: outstanding above-floor reservations land as
-    // retained wire bytes like every other serialized pool, so they must be pre-charged
-    // at their wire size. Charging them nothing makes in-flight volume invisible to the
-    // byte gate until it is already resident.
+fn outstanding_reservations_consume_retained_memory_headroom() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
@@ -1714,42 +1703,21 @@ fn outstanding_reservations_are_charged_at_wire_size() {
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(600),
         verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 0,
+        // The tracker includes the outstanding height's in-flight memory reservation.
+        retained_memory_bytes: 1_000,
         reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        reserved_above_floor_bytes: 1_100,
         reserved_above_floor_blocks: 1,
         budget_available: 64_000_000,
     };
-    // Reservations alone fill the budget: 1_100 >= 1_000, so both the speculative
-    // lane and an escalated floor block above the commit window are refused.
-    assert_eq!(
-        admit_grant(
-            &config,
-            snapshot,
-            block::Height(602),
-            block::Height(602),
-            u64::MAX
-        ),
-        None,
-        "outstanding reservations must count against the resident budget",
-    );
-    assert!(
-        matches!(
-            super::admission::admit(
-                &config,
-                snapshot,
-                block::Height(601),
-                block::Height(601),
-                u64::MAX
-            ),
-            super::admission::AdmissionOutcome::LookaheadAtCap
-        ),
-        "an escalated floor take above the commit window is refused on reserved bytes alone",
-    );
+    assert!(admit_grant(
+        &config,
+        snapshot,
+        block::Height(602),
+        block::Height(602),
+        u64::MAX
+    )
+    .is_none());
     // The commit window stays exempt so the committer can always drain.
     let window = admit_grant(
         &config,
@@ -1781,13 +1749,9 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(1_000),
         verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 0,
+        retained_memory_bytes: 1_200,
         reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 1_200,
         applying_buffered_blocks: 990,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
     };
@@ -1860,13 +1824,9 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
     let full = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
         verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 0,
+        retained_memory_bytes: 1_000,
         reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 1_000,
         applying_buffered_blocks: 10,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
     };
@@ -1887,7 +1847,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
 
     // Same clamp with the gate open: no exempt take ever spans the boundary.
     let open = super::admission::AdmissionSnapshot {
-        applying_buffered_bytes: 0,
+        retained_memory_bytes: 0,
         applying_buffered_blocks: 0,
         ..full
     };
@@ -1901,8 +1861,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
     .expect("an in-window start is fundable with the gate open");
     assert_eq!(grant.take_high, block::Height(411));
 
-    // An above-window start with headroom extends to the servable ceiling, sized by the
-    // remaining wire-denominated headroom: 1_000 - 0 = 1_000.
+    // An above-window start with headroom extends to the servable ceiling.
     let grant = admit_grant(
         &config,
         open,
@@ -1916,22 +1875,17 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
 }
 
 #[test]
-fn commit_window_stays_fundable_at_exact_floor() {
-    // Regression for the exact-fit clamp deadlock: a config clamped to the checkpoint-range
-    // floors used to leave zero margin, so one next-range reorder body or reservation pushed
-    // the gate over budget and the range-completing block was refused — checkpoint sync
-    // wedged. With the whole commit window exempt, the active range assembles regardless of
-    // how full the gate is.
+fn commit_window_stays_fundable_at_tiny_cap() {
+    // The commit window assembles regardless of the configured retained-memory cap.
     use super::config::{
         BS_CHECKPOINT_RANGE_BYTE_FLOOR, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     };
 
-    let mut config = ZakuraBlockSyncConfig {
+    let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
         max_reorder_lookahead_bytes: 1,
         ..ZakuraBlockSyncConfig::default()
     };
-    config.clamp_reorder_lookahead_to_floor();
     let range_blocks = u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
         .expect("checkpoint range block count fits in u32");
 
@@ -1942,13 +1896,9 @@ fn commit_window_stays_fundable_at_exact_floor() {
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(range_blocks - 1),
         verified_block_tip: block::Height(0),
-        reorder_buffered_bytes: 8_388_608,
+        retained_memory_bytes: config.effective_max_reorder_lookahead_bytes(),
         reorder_buffered_blocks: 4,
-        applying_buffered_bytes: 800_000_000,
         applying_buffered_blocks: u64::from(range_blocks) - 1,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 800_000_000,
-        reserved_above_floor_bytes: 4_000_000,
         reserved_above_floor_blocks: 2,
         budget_available: 2_000_000,
     };
@@ -2037,14 +1987,17 @@ fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
 
     // receipt: Reserved -> Released drops the reservation for height 1.
     assert_eq!(
-        queue.release_active_reserved_height(block::Height(1)),
-        Some(100),
+        queue
+            .release_active_reserved_height(block::Height(1))
+            .expect("height 1 is reserved")
+            .request_bytes,
+        100,
     );
     assert_eq!(queue.reserved_bytes(), 500);
     check("release_active_reserved_height");
 
     // claim_received: Reserved -> Released drops height 2's reservation.
-    assert_eq!(queue.claim_received(block::Height(2)), 100);
+    assert_eq!(queue.claim_received(block::Height(2)).request_bytes, 100);
     assert_eq!(queue.reserved_bytes(), 400);
     check("claim_received");
 
@@ -2121,13 +2074,97 @@ fn receipt_releases_wire_reservation_while_body_retained() {
     let reserved_estimate = queue
         .release_active_reserved_height(block::Height(1))
         .expect("active reserved height releases at receipt");
-    assert_eq!(reserved_estimate, 100);
-    budget.release(reserved_estimate);
+    assert_eq!(reserved_estimate.request_bytes, 100);
+    budget.release(reserved_estimate.request_bytes);
     assert_eq!(queue.reserved_bytes(), 0);
     assert_eq!(budget.reserved(), 0);
     assert!(
         queue.in_flight_contains(block::Height(1)),
         "the received height stays claimed; the body handoff owns it"
+    );
+}
+
+#[test]
+fn work_queue_transfers_in_flight_memory_reservation_at_receipt() {
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
+    let memory = super::retained_memory::RetainedBodyMemoryTracker::new(1_000);
+    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
+    assert_eq!(taken.len(), 1);
+    let in_flight_memory_reservation =
+        try_reserve_retained_memory(&memory, 100).expect("100 bytes fit");
+    assert_eq!(
+        queue.mark_issued([(block::Height(1), Some(in_flight_memory_reservation))]),
+        Some(100)
+    );
+    assert_eq!(memory.used(), 100);
+
+    let settled = queue
+        .release_active_reserved_height(block::Height(1))
+        .expect("active reservation transfers at receipt");
+    assert_eq!(settled.request_bytes, 100);
+    let charge = settled
+        .in_flight_memory_reservation
+        .expect("above-window request owns retained headroom")
+        .reconcile_exact(150);
+    assert_eq!(memory.used(), 150);
+    drop(charge);
+    assert_eq!(memory.used(), 0);
+}
+
+#[test]
+fn returning_request_releases_in_flight_memory_reservation() {
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
+    let memory = super::retained_memory::RetainedBodyMemoryTracker::new(1_000);
+    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
+    assert_eq!(taken.len(), 1);
+    let in_flight_memory_reservation =
+        try_reserve_retained_memory(&memory, 100).expect("100 bytes fit");
+    assert_eq!(
+        queue.mark_issued([(block::Height(1), Some(in_flight_memory_reservation))]),
+        Some(100)
+    );
+    assert_eq!(memory.used(), 100);
+
+    assert_eq!(
+        queue.release_reserved_and_return_items([block::Height(1)]),
+        100
+    );
+    assert_eq!(memory.used(), 0);
+    assert!(queue.pending_contains(block::Height(1)));
+}
+
+#[test]
+fn work_queue_request_marking_is_all_or_none() {
+    let queue = work_queue_with(
+        0,
+        [
+            needed(1, BlockSizeEstimate::Advertised(100)),
+            needed(2, BlockSizeEstimate::Advertised(100)),
+        ],
+    );
+    let memory = super::retained_memory::RetainedBodyMemoryTracker::new(1_000);
+    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
+    assert_eq!(taken.len(), 2);
+    let mut reservations = memory
+        .try_reserve_many(&[100, 100])
+        .expect("whole request fits")
+        .into_iter();
+
+    // Simulate floor GC racing issuance after the take but before ledger commit.
+    assert_eq!(queue.advance_floor(block::Height(1)), 0);
+    assert_eq!(
+        queue.mark_issued([
+            (block::Height(1), reservations.next()),
+            (block::Height(2), reservations.next()),
+        ]),
+        None
+    );
+    assert_eq!(queue.reserved_bytes(), 0);
+    assert_eq!(memory.used(), 0, "failed issue drops all headroom");
+    assert_eq!(
+        queue.release_reserved_heights([block::Height(2)]),
+        0,
+        "the surviving height was not partially marked"
     );
 }
 
@@ -2145,7 +2182,7 @@ fn floor_watchdog_skips_received_heights() {
     let reserved_estimate = queue
         .release_active_reserved_height(block::Height(1))
         .expect("active reserved height releases at receipt");
-    budget.release(reserved_estimate);
+    budget.release(reserved_estimate.request_bytes);
     assert_eq!(budget.reserved(), 0);
 
     let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)]);
@@ -2192,9 +2229,10 @@ fn late_body_does_not_resurrect_charge() {
     assert_eq!(duplicate.min_height, Some(block::Height(1)));
     assert_eq!(duplicate.max_height, Some(block::Height(2)));
 
-    assert_eq!(
-        queue.release_active_reserved_height(block::Height(1)),
-        None,
+    assert!(
+        queue
+            .release_active_reserved_height(block::Height(1))
+            .is_none(),
         "a late body cannot release a claim the watchdog already released"
     );
     assert_eq!(budget.reserved(), 0);
@@ -2212,8 +2250,8 @@ fn claim_received_does_not_orphan_a_charge() {
     assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
 
     let old_charge = queue.claim_received(block::Height(1));
-    budget.release(old_charge);
-    assert_eq!(old_charge, 100);
+    budget.release(old_charge.request_bytes);
+    assert_eq!(old_charge.request_bytes, 100);
     assert_eq!(budget.reserved(), 0);
 
     let released = queue.release_reserved_heights([block::Height(1)]);
@@ -2244,8 +2282,8 @@ fn release_reserved_mixed_received_and_reserved_conserves_budget() {
     let reserved_estimate = queue
         .release_active_reserved_height(block::Height(1))
         .expect("active height releases at receipt");
-    assert_eq!(reserved_estimate, 100);
-    budget.release(reserved_estimate);
+    assert_eq!(reserved_estimate.request_bytes, 100);
+    budget.release(reserved_estimate.request_bytes);
     assert_eq!(budget.reserved(), 100);
 
     // Floor GC releases only the still-reserved (unreceived) height 2.
@@ -2289,8 +2327,8 @@ fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
     let estimate = queue
         .release_active_reserved_height(block::Height(1))
         .expect("height 1 is reserved");
-    assert_eq!(estimate, 100);
-    budget.release(estimate);
+    assert_eq!(estimate.request_bytes, 100);
+    budget.release(estimate.request_bytes);
     assert_eq!(budget.reserved(), 100);
 
     // GC both heights: only the still-reserved height 2 releases. The received
@@ -3444,6 +3482,118 @@ fn reorder_drains_only_contiguous_prefix_and_reports_dropped_bytes() {
     assert_eq!(reorder.decoded_attributed_memory_bytes(), 0);
 }
 
+#[test]
+fn retained_body_charge_tracks_representation_and_last_owner() {
+    let memory = super::retained_memory::RetainedBodyMemoryTracker::new(u64::MAX);
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let raw = raw_block_payload(&block);
+    let decoded_bytes = block.attributed_memory_size_bytes();
+    let raw_bytes = u64::try_from(raw.len()).expect("test payload length fits u64");
+
+    let mut body =
+        BufferedBlockBody::from_measured_decoded_block(block, Some(raw), decoded_bytes, &memory);
+    assert_eq!(memory.used(), raw_bytes.saturating_add(decoded_bytes));
+
+    body.retain_for_backlog_in_place();
+    assert_eq!(memory.used(), raw_bytes);
+
+    let _ = body.decoded_block();
+    assert_eq!(memory.used(), raw_bytes.saturating_add(decoded_bytes));
+
+    let clone = body.retained_charge();
+    drop(body);
+    assert_eq!(memory.used(), raw_bytes.saturating_add(decoded_bytes));
+    drop(clone);
+    assert_eq!(memory.used(), 0);
+}
+
+#[test]
+fn retained_charge_releases_on_duplicate_and_reset() {
+    let memory = super::retained_memory::RetainedBodyMemoryTracker::new(u64::MAX);
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let decoded_bytes = block.attributed_memory_size_bytes();
+    let mut sequencer = test_sequencer(0, 1);
+
+    for expected in [
+        AcceptOutcome::Buffered {
+            covered: block::Height(1),
+        },
+        AcceptOutcome::Redundant { release_bytes: 100 },
+    ] {
+        let body = BufferedBlockBody::from_measured_decoded_block(
+            block.clone(),
+            None,
+            decoded_bytes,
+            &memory,
+        );
+        assert_eq!(
+            sequencer.accept_buffered_body(
+                block::Height(1),
+                block.hash(),
+                block.header.previous_block_hash,
+                body,
+                100,
+                peer(0),
+            ),
+            expected,
+        );
+    }
+
+    assert_eq!(memory.used(), decoded_bytes);
+    sequencer.reset_to(block::Height(0), false);
+    assert_eq!(memory.used(), 0);
+}
+
+#[test]
+fn retained_charge_follows_unsubmit_and_detached_completion() {
+    let memory = super::retained_memory::RetainedBodyMemoryTracker::new(u64::MAX);
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let raw = raw_block_payload(&block);
+    let raw_bytes = u64::try_from(raw.len()).expect("test payload length fits u64");
+    let decoded_bytes = block.attributed_memory_size_bytes();
+    let mut sequencer = test_sequencer(0, 1);
+
+    let body = BufferedBlockBody::from_measured_decoded_block(
+        block.clone(),
+        Some(raw),
+        decoded_bytes,
+        &memory,
+    );
+    assert_eq!(
+        sequencer.accept_buffered_body(
+            block::Height(1),
+            block.hash(),
+            block.header.previous_block_hash,
+            body,
+            100,
+            peer(0),
+        ),
+        AcceptOutcome::Buffered {
+            covered: block::Height(1),
+        },
+    );
+    sequencer.drain_ready_into_applying();
+
+    let first = sequencer
+        .prepare_submit(block::Height(1))
+        .expect("height 1 submits");
+    let (first_height, first_token) = (first.height, first.token);
+    drop(first);
+    sequencer.unsubmit(first_height, first_token);
+    assert_eq!(memory.used(), raw_bytes);
+
+    let second = sequencer
+        .prepare_submit(block::Height(1))
+        .expect("height 1 resubmits");
+    let (second_height, second_hash, second_token) = (second.height, second.hash, second.token);
+    drop(second);
+    sequencer.record_submitted_apply(second_height, second_hash);
+    sequencer.release_applied_through(block::Height(1));
+    assert_eq!(memory.used(), decoded_bytes);
+    assert!(sequencer.finish_submission(second_token, second_height, second_hash));
+    assert_eq!(memory.used(), 0);
+}
+
 // ---- Sequencer commit pipeline ----
 
 fn test_sequencer(verified_tip: u32, submitted_apply_limit: usize) -> Sequencer {
@@ -4558,13 +4708,9 @@ fn received_body_admission_ignores_request_budget() {
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(600),
         verified_block_tip: block::Height(10),
-        reorder_buffered_bytes: 0,
+        retained_memory_bytes: 0,
         reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
-        sequencer_input_queued_bytes: 0,
-        in_flight_submission_bytes: 0,
-        reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         // Outstanding requests have spent the entire in-flight budget.
         budget_available: 0,
@@ -4598,10 +4744,7 @@ proptest::proptest! {
 
     #[test]
     fn admit_respects_lookahead_bounds(
-        reorder_bytes in 0u64..2_000,
-        applying_bytes in 0u64..2_000,
-        input_bytes in 0u64..2_000,
-        reserved_bytes in 0u64..2_000,
+        retained_memory_bytes in 0u64..2_000,
         // Occasionally saturate the hard block cap so the count-gate arm below
         // stays non-vacuous (ordinary counts never approach 262,144).
         reorder_blocks in proptest::prop_oneof![
@@ -4621,24 +4764,12 @@ proptest::proptest! {
         let snapshot = super::admission::AdmissionSnapshot {
             download_floor: block::Height(600),
             verified_block_tip: block::Height(10),
-            reorder_buffered_bytes: reorder_bytes,
+            retained_memory_bytes,
             reorder_buffered_blocks: reorder_blocks,
-            applying_buffered_bytes: applying_bytes,
             applying_buffered_blocks: applying_blocks,
-            sequencer_input_queued_bytes: input_bytes,
-            in_flight_submission_bytes: 0,
-            reserved_above_floor_bytes: reserved_bytes,
             reserved_above_floor_blocks: reserved_blocks,
             budget_available: 64_000_000,
         };
-        // Serialized pools are charged at wire size. The sequencer input also
-        // carries a decoded copy, so it pays the decoded multiple in addition.
-        let factor = super::admission::DESERIALIZED_MEM_FACTOR;
-        let estimated_resident = reorder_bytes
-            .saturating_add(applying_bytes)
-            .saturating_add(input_bytes)
-            .saturating_add(reserved_bytes)
-            .saturating_add(input_bytes.saturating_mul(factor));
         let held_blocks = reorder_blocks
             .saturating_add(applying_blocks)
             .saturating_add(reserved_blocks);
@@ -4650,28 +4781,20 @@ proptest::proptest! {
             block::Height(100_000),
             1_000,
         );
-        if estimated_resident >= effective
+        if retained_memory_bytes >= effective
             || held_blocks >= super::admission::LOOKAHEAD_BLOCK_HARD_CAP
-            || effective - estimated_resident == 0
         {
             prop_assert_eq!(above, super::admission::AdmissionOutcome::LookaheadAtCap);
         } else {
-            // A gated request funds min(budget, remaining wire headroom,
-            // response cap); admitted backlog bodies remain serialized.
-            let remaining_wire = effective - estimated_resident;
-            let expected = snapshot.budget_available.min(remaining_wire).min(1_000);
+            let expected = snapshot
+                .budget_available
+                .min(1_000)
+                .min(effective.saturating_sub(retained_memory_bytes));
             match above {
                 super::admission::AdmissionOutcome::Admit(grant) => {
                     prop_assert_eq!(grant.max_request_bytes, expected);
                     // Gated grants pass the servable ceiling through unchanged.
                     prop_assert_eq!(grant.take_high, block::Height(100_000));
-                    // The new reservation is charged at wire size, so one grant
-                    // cannot push the resident estimate past the budget.
-                    prop_assert!(
-                        estimated_resident
-                            .saturating_add(grant.max_request_bytes)
-                            <= effective
-                    );
                 }
                 other => prop_assert!(false, "expected a gated grant, got {:?}", other),
             }
@@ -5865,26 +5988,30 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
     reactor_task.abort();
 }
 
-/// A stalled commit must not pace downloads. The refill low-water mark counts
-/// only the download pipeline (`queued` + `outstanding`), never the commit
+/// A stalled commit must not pace commit-window downloads, even after an exempt
+/// retained body overshoots the look-ahead memory cap. The refill low-water mark
+/// counts only the download pipeline (`queued` + `outstanding`), never the commit
 /// pipeline (`reorder` + `applying`), so a block stuck in `applying` (submitted
 /// but never apply-finished) does not stop the reactor from re-querying and
-/// downloading higher heights — downloads run ahead of commit, bounded only by
-/// the in-flight byte budget.
+/// downloading higher commit-window heights.
 ///
 /// A/B: before the decoupling, block 1 held in `applying` satisfies the
 /// low-water mark (sized to one block here), so the reactor never issues the
-/// second `QueryNeededBlocks` and this test times out waiting for it.
+/// second `QueryNeededBlocks`. Before empty reservations bypassed the cap check,
+/// issuance then rejected height 2 because block 1 had overshot the one-byte
+/// retained-memory cap. Either regression makes this test time out.
 #[tokio::test]
-async fn reactor_downloads_run_ahead_of_stalled_commit() {
+async fn reactor_commit_window_downloads_run_ahead_while_retained_memory_is_over_cap() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
     // Low-water mark = 1 status peer * advertised inflight (1) * advertised
     // blocks-per-response (1) = 1 block, so a single block held in the commit
-    // pipeline is enough to (before the fix) satisfy it. The default 4 GiB byte
-    // budget stays far from binding for these tiny blocks.
+    // pipeline is enough to (before the fix) satisfy it. A one-byte retained
+    // memory cap guarantees that the first exempt body leaves the tracker over
+    // limit while it is held in `applying`.
     config.max_inflight_requests = 1;
     config.max_blocks_per_response = 1;
+    config.max_reorder_lookahead_bytes = 1;
 
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
@@ -5955,7 +6082,8 @@ async fn reactor_downloads_run_ahead_of_stalled_commit() {
     // download floor advanced to 1 on submit, but `queued` and `outstanding`
     // are both empty. A header-tip bump must still make the reactor re-query
     // and download height 2 — the download pipeline is empty even though the
-    // commit pipeline is not.
+    // commit pipeline is not. Height 2 is also commit-window exempt, so its
+    // empty retained-memory reservation must succeed despite the overshoot.
     tip_tx
         .send((block::Height(4), block::Hash([4; 32])))
         .expect("tip watch is live");

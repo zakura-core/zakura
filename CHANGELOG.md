@@ -11,6 +11,10 @@ Initial release of Zakura.
 
 ### Fixed
 
+- Pruned finalized blocks remain visible to chain-identity queries, including peer
+  block-hash responses and RPC confirmation lookups, after their bodies are removed.
+- Stop pruned nodes from serving fabricated zero transaction counts and auth-data
+  roots when a historical block body is unavailable during Zakura header sync.
 - Header sync now keeps timed-out ranges in a bounded, single-owner work queue,
   retries them indefinitely with short peer-local avoidance, and commits
   pipelined responses in height order.

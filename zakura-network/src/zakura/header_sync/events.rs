@@ -56,6 +56,7 @@ impl HeaderSyncStartup {
         config: ZakuraHeaderSyncConfig,
         max_frame_bytes: u32,
     ) -> Self {
+        let status_refresh_interval = config.status_refresh_interval;
         Self {
             network,
             anchor,
@@ -65,7 +66,7 @@ impl HeaderSyncStartup {
             config,
             max_frame_bytes,
             request_timeout: DEFAULT_HS_REQUEST_TIMEOUT,
-            status_refresh_interval: DEFAULT_HS_STATUS_REFRESH_INTERVAL,
+            status_refresh_interval,
             trace: ZakuraTrace::noop(),
             shutdown: CancellationToken::new(),
             range_state_actions_enabled: false,
@@ -162,8 +163,6 @@ pub enum HeaderSyncEvent {
         height: block::Height,
         /// Committed block hash.
         hash: block::Hash,
-        /// Committed block header. Transient only; not retained by runtime state.
-        header: Arc<block::Header>,
     },
     /// The node's block pipeline accepted an inbound `NewBlock` body.
     NewBlockAccepted {
@@ -206,7 +205,8 @@ pub enum HeaderSyncEvent {
         /// Rejected block hash.
         hash: block::Hash,
     },
-    /// Compatibility/test inbound header-sync message without a session generation.
+    /// Test-only inbound header-sync message without a session generation.
+    #[cfg(test)]
     WireMessage {
         /// Serving peer.
         peer: ZakuraPeerId,
@@ -358,6 +358,7 @@ impl HeaderSyncEvent {
             Self::NewBlockDuplicate { .. } => "new_block_duplicate",
             Self::NewBlockAcceptedNonBestChain { .. } => "new_block_accepted_non_best_chain",
             Self::NewBlockRejected { .. } => "new_block_rejected",
+            #[cfg(test)]
             Self::WireMessage { .. } => "wire_message",
             Self::SessionWireMessage { .. } => "session_wire_message",
             Self::WireHeaders { .. } => "wire_headers",

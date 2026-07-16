@@ -3220,7 +3220,6 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.zakura.header_sync.clone(),
         limits.max_frame_bytes,
     );
-    startup.status_refresh_interval = config.zakura.header_sync.status_refresh_interval;
     startup.trace = trace.clone();
     startup.frontier_updates = sync_frontier
         .as_ref()

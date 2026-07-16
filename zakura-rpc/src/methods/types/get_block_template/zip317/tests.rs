@@ -5,12 +5,67 @@
 use zcash_keys::address::Address;
 use zcash_transparent::address::TransparentAddress;
 
-use zakura_chain::{block::Height, parameters::Network, transaction, transparent::OutPoint};
+use zakura_chain::{
+    amount::Amount,
+    block::{Height, MAX_BLOCK_BYTES},
+    parameters::Network,
+    transaction,
+    transparent::OutPoint,
+};
 use zakura_node_services::mempool::TransactionDependencies;
 
-use crate::methods::types::get_block_template::MinerParams;
+use crate::methods::types::{get_block_template::MinerParams, transaction::TransactionTemplate};
 
-use super::select_mempool_transactions;
+use super::{block_template_overhead_bytes, select_mempool_transactions};
+
+#[test]
+fn reserves_network_specific_header_and_transaction_count_sizes() {
+    let regtest = Network::new_regtest(Default::default());
+
+    assert_eq!(block_template_overhead_bytes(&Network::Mainnet), 1_490);
+    assert_eq!(block_template_overhead_bytes(&regtest), 180);
+}
+
+#[test]
+fn reserves_serialized_block_overhead() {
+    let network = Network::Mainnet;
+    let height = Height(1_000_000);
+    let miner_params =
+        MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
+    let fake_coinbase =
+        TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero())
+            .expect("test coinbase template is valid");
+    let max_block_bytes = usize::try_from(MAX_BLOCK_BYTES).expect("fits in memory");
+    let max_mempool_transaction_bytes = max_block_bytes
+        - block_template_overhead_bytes(&network)
+        - fake_coinbase.data.as_ref().len();
+
+    let template_transactions = |transaction_size| {
+        let mut transaction = network
+            .unmined_transactions_in_blocks(..)
+            .next()
+            .expect("test network has an unmined transaction");
+        transaction.transaction.size = transaction_size;
+
+        select_mempool_transactions(
+            &network,
+            height,
+            &miner_params,
+            vec![transaction],
+            TransactionDependencies::default(),
+        )
+    };
+
+    assert_eq!(
+        template_transactions(max_mempool_transaction_bytes).len(),
+        1,
+        "a transaction that exactly fills the safe block budget is selected",
+    );
+    assert!(
+        template_transactions(max_mempool_transaction_bytes + 1).is_empty(),
+        "a transaction that only fits when block overhead is omitted is rejected",
+    );
+}
 
 #[test]
 fn excludes_tx_with_unselected_dependencies() {

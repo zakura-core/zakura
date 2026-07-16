@@ -263,6 +263,7 @@ for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakur
 
 - [ ] Confirm the pinned zcashd compat manifest is ready before publishing:
   - [ ] Update [`zakurad/zcashd-compat-manifest.json`](https://github.com/zakura-core/zakura/blob/main/zakurad/zcashd-compat-manifest.json) to the intended `zcashd` compat release (it is the single source of truth: zakurad embeds it at compile time and CI/Docker builds read it directly).
+  - [ ] Record SHA-256 digests for both the release archive and the extracted `./bin/zcashd` executable in the manifest.
   - [ ] Confirm the manifest contains only the `x86_64-pc-linux-gnu` artifact before publishing zcashd-compat Docker images.
   - [ ] Confirm the workflow logs show the expected `/usr/local/bin/zcashd --version` for the zcashd-compat linux/amd64 image variant.
 - [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush).

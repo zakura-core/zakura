@@ -84,6 +84,7 @@ validate_manifest() {
       | select(.target_triple == $target)
       | .runtime_archive_url
       and .runtime_archive_sha256
+      and .runtime_binary_sha256
       and .runtime_archive_member_binary_path
     ' "$manifest" >/dev/null
   done < <(jq -r '.artifacts[].target_triple' "$manifest")
@@ -167,10 +168,11 @@ prepare_build_context() {
   local manifest="$1"
   local target_triple="$2"
   local context_dir="$3"
-  local url sha256 member_path archive_path extract_dir work_dir binary_source binary_dest
+  local url archive_sha256 binary_sha256 member_path archive_path extract_dir work_dir binary_source binary_dest
 
   url="$(artifact_field "$manifest" "$target_triple" "runtime_archive_url")"
-  sha256="$(artifact_field "$manifest" "$target_triple" "runtime_archive_sha256")"
+  archive_sha256="$(artifact_field "$manifest" "$target_triple" "runtime_archive_sha256")"
+  binary_sha256="$(artifact_field "$manifest" "$target_triple" "runtime_binary_sha256")"
   member_path="$(artifact_field "$manifest" "$target_triple" "runtime_archive_member_binary_path")"
 
   work_dir="$(mktemp -d)"
@@ -180,7 +182,7 @@ prepare_build_context() {
   extract_dir="$work_dir/extracted"
 
   curl -fsSL "$url" -o "$archive_path"
-  echo "$sha256  $archive_path" | sha256sum -c -
+  echo "$archive_sha256  $archive_path" | sha256sum -c -
   mkdir -p "$extract_dir"
   tar -xzf "$archive_path" -C "$extract_dir"
 
@@ -189,6 +191,7 @@ prepare_build_context() {
     echo "expected executable missing from zcashd compat archive: $member_path" >&2
     exit 1
   fi
+  echo "$binary_sha256  $binary_source" | sha256sum -c -
 
   rm -rf "$context_dir"
   binary_dest="$context_dir/bin/zcashd"

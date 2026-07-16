@@ -119,12 +119,10 @@ pub(super) fn cached_managed_zcashd_binary_is_current(
         return Ok(None);
     };
 
-    let provenance_path = binary_path.with_file_name("zcashd.sha256");
-
-    Ok(Some(
-        binary_path.is_file()
-            && provenance_matches(&provenance_path, &artifact.runtime_archive_sha256)?,
-    ))
+    Ok(Some(sha256_matches_file(
+        &binary_path,
+        &artifact.runtime_binary_sha256,
+    )?))
 }
 
 fn resolve_managed_zcashd_binary_from_manifest(
@@ -150,10 +148,7 @@ fn resolve_managed_zcashd_binary_from_manifest(
     fs::create_dir_all(&cache_dir)?;
 
     let binary_path = cache_dir.join("zcashd");
-    let provenance_path = cache_dir.join("zcashd.sha256");
-    if binary_path.is_file()
-        && provenance_matches(&provenance_path, &artifact.runtime_archive_sha256)?
-    {
+    if sha256_matches_file(&binary_path, &artifact.runtime_binary_sha256)? {
         return Ok(binary_path);
     }
 
@@ -164,9 +159,7 @@ fn resolve_managed_zcashd_binary_from_manifest(
     )?;
 
     // Re-check after acquiring the lock.
-    if binary_path.is_file()
-        && provenance_matches(&provenance_path, &artifact.runtime_archive_sha256)?
-    {
+    if sha256_matches_file(&binary_path, &artifact.runtime_binary_sha256)? {
         return Ok(binary_path);
     }
 
@@ -188,6 +181,13 @@ fn resolve_managed_zcashd_binary_from_manifest(
         &artifact.runtime_archive_member_binary_path,
         extracted_temp.path(),
     )?;
+    let binary_sha256 = sha256_hex_file(extracted_temp.path())?;
+    if binary_sha256 != artifact.runtime_binary_sha256 {
+        return Err(eyre!(
+            "managed zcashd binary hash mismatch for target {target}: expected {}, got {binary_sha256}",
+            artifact.runtime_binary_sha256
+        ));
+    }
     make_executable(extracted_temp.path())?;
     extracted_temp.persist(&binary_path).map_err(|err| {
         eyre!(
@@ -196,11 +196,6 @@ fn resolve_managed_zcashd_binary_from_manifest(
             err.error
         )
     })?;
-    fs::write(
-        &provenance_path,
-        format!("{}\n", artifact.runtime_archive_sha256),
-    )?;
-
     Ok(binary_path)
 }
 
@@ -318,16 +313,13 @@ fn normalize_member_path(path: &str) -> String {
     path.trim_start_matches("./").to_string()
 }
 
-/// Returns `true` if `path` exists and stores exactly `expected_sha256`.
-fn provenance_matches(path: &Path, expected_sha256: &str) -> Result<bool, Report> {
+/// Returns `true` if `path` exists and its SHA256 is exactly `expected_sha256`.
+fn sha256_matches_file(path: &Path, expected_sha256: &str) -> Result<bool, Report> {
     if !path.is_file() {
         return Ok(false);
     }
 
-    let value = fs::read_to_string(path)
-        .map(|content| content.trim().to_string())
-        .unwrap_or_default();
-    Ok(value == expected_sha256)
+    Ok(sha256_hex_file(path)? == expected_sha256)
 }
 
 /// Computes the lowercase hex SHA256 digest for `path`.
@@ -527,13 +519,14 @@ mod tests {
     };
 
     use flate2::{write::GzEncoder, Compression};
+    use sha2::{Digest, Sha256};
     use tar::Builder;
     use tempfile::tempdir;
 
     use super::{
-        acquire_lock, effective_zcashd_source, normalize_member_path, provenance_matches,
-        resolve_managed_zcashd_binary_from_manifest, sha256_hex_file, zcashd_target_triple, Config,
-        ZcashdBinarySource,
+        acquire_lock, effective_zcashd_source, normalize_member_path,
+        resolve_managed_zcashd_binary_from_manifest, sha256_hex_file, sha256_matches_file,
+        zcashd_target_triple, Config, ZcashdBinarySource,
     };
     use crate::components::zcashd_compat::{
         ConfigZcashdBinarySource, ZcashdReleaseArtifact, ZcashdReleaseManifest,
@@ -589,23 +582,28 @@ mod tests {
     }
 
     #[test]
-    fn provenance_matches_handles_missing_and_present_files() {
+    fn sha256_matches_file_rejects_replaced_cached_binary() {
         let temp = tempdir().expect("tempdir should exist");
-        let path = temp.path().join("sha.txt");
+        let path = temp.path().join("zcashd");
 
         assert!(
-            !provenance_matches(&path, "abc").expect("missing file should not match"),
-            "missing provenance should not match"
+            !sha256_matches_file(&path, "abc").expect("missing file should not match"),
+            "missing binary should not match"
         );
 
-        std::fs::write(&path, "abc\n").expect("provenance file should write");
+        std::fs::write(&path, "expected binary").expect("cached binary should write");
+        let expected_sha256 = sha256_hex_file(&path).expect("binary hash should compute");
         assert!(
-            provenance_matches(&path, "abc").expect("matching provenance should succeed"),
-            "written provenance should match"
+            sha256_matches_file(&path, &expected_sha256)
+                .expect("matching binary hash should succeed"),
+            "cached binary should match its expected hash"
         );
+
+        std::fs::write(&path, "replaced binary").expect("cached binary should replace");
         assert!(
-            !provenance_matches(&path, "def").expect("mismatched provenance should succeed"),
-            "different expected hash should not match"
+            !sha256_matches_file(&path, &expected_sha256)
+                .expect("replaced binary hash should succeed"),
+            "replaced cached binary should not match"
         );
     }
 
@@ -691,6 +689,8 @@ mod tests {
                 runtime_archive_url: "http://example.com/zcashd.tar.gz".to_string(),
                 runtime_archive_sha256:
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                runtime_binary_sha256:
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
                 runtime_archive_member_binary_path: "./bin/zcashd".to_string(),
             }],
         };
@@ -704,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_resolver_downloads_and_installs_from_http_archive() {
+    fn managed_resolver_replaces_cached_binary_when_its_hash_mismatches() {
         let Some(target) = zcashd_target_triple() else {
             return;
         };
@@ -738,19 +738,21 @@ mod tests {
             .expect("listener should have local address");
         let payload = archive_bytes.clone();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("one client should connect");
-            let mut request_buf = [0u8; 1024];
-            let _ = stream.read(&mut request_buf);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                payload.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("response headers should write");
-            stream
-                .write_all(&payload)
-                .expect("response body should write");
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("client should connect");
+                let mut request_buf = [0u8; 1024];
+                let _ = stream.read(&mut request_buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response headers should write");
+                stream
+                    .write_all(&payload)
+                    .expect("response body should write");
+            }
         });
 
         let local_http_url = format!("http://{address}/zcashd-compat.tar.gz");
@@ -758,6 +760,7 @@ mod tests {
             target_triple: target.to_string(),
             runtime_archive_url: local_http_url,
             runtime_archive_sha256: archive_sha256,
+            runtime_binary_sha256: format!("{:x}", Sha256::digest(binary_contents)),
             runtime_archive_member_binary_path: "./bin/zcashd".to_string(),
         };
         let manifest = ZcashdReleaseManifest {
@@ -769,6 +772,13 @@ mod tests {
             .expect("managed resolver should install zcashd");
         let installed = std::fs::read(&resolved).expect("installed zcashd should be readable");
         assert_eq!(installed, binary_contents);
+
+        std::fs::write(&resolved, "replaced binary").expect("cached binary should replace");
+        let resolved_again = resolve_managed_zcashd_binary_from_manifest(&manifest, temp.path())
+            .expect("managed resolver should replace the cached binary");
+        let reinstalled =
+            std::fs::read(&resolved_again).expect("reinstalled zcashd should be readable");
+        assert_eq!(reinstalled, binary_contents);
 
         server.join().expect("server thread should exit cleanly");
     }

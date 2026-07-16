@@ -36,6 +36,7 @@ ZCASHD_COMPAT_TARGET_TRIPLE ?= x86_64-pc-linux-gnu
 ZCASHD_COMPAT_RELEASE_TAG ?= $(shell jq -er '.release_tag' $(ZCASHD_COMPAT_MANIFEST))
 ZCASHD_COMPAT_URL ?= $(shell jq -er --arg target '$(ZCASHD_COMPAT_TARGET_TRIPLE)' '.artifacts[] | select(.target_triple == $$target) | .runtime_archive_url' $(ZCASHD_COMPAT_MANIFEST))
 ZCASHD_COMPAT_SHA256 ?= $(shell jq -er --arg target '$(ZCASHD_COMPAT_TARGET_TRIPLE)' '.artifacts[] | select(.target_triple == $$target) | .runtime_archive_sha256' $(ZCASHD_COMPAT_MANIFEST))
+ZCASHD_COMPAT_BINARY_SHA256 ?= $(shell jq -er --arg target '$(ZCASHD_COMPAT_TARGET_TRIPLE)' '.artifacts[] | select(.target_triple == $$target) | .runtime_binary_sha256' $(ZCASHD_COMPAT_MANIFEST))
 ZCASHD_COMPAT_ARTIFACT_DIR ?= $(CURDIR)/target/zcashd-compat
 ZCASHD_COMPAT_ARCHIVE_PATH ?= $(ZCASHD_COMPAT_ARTIFACT_DIR)/zcashd-compat.tar.gz
 ZCASHD_COMPAT_EXTRACT_DIR ?= $(ZCASHD_COMPAT_ARTIFACT_DIR)/extracted
@@ -59,6 +60,7 @@ compat-zcashd-prepare:
 		mkdir -p "$(ZCASHD_COMPAT_EXTRACT_DIR)"; \
 		tar -xzf "$(ZCASHD_COMPAT_ARCHIVE_PATH)" -C "$(ZCASHD_COMPAT_EXTRACT_DIR)"; \
 		test -x "$(ZCASHD_COMPAT_EXTRACT_DIR)/bin/zcashd"; \
+		echo "$(ZCASHD_COMPAT_BINARY_SHA256)  $(ZCASHD_COMPAT_EXTRACT_DIR)/bin/zcashd" | sha256sum -c -; \
 	fi
 
 compat-docker-build: compat-zcashd-prepare

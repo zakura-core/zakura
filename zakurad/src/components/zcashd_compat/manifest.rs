@@ -34,6 +34,8 @@ pub struct ZcashdReleaseArtifact {
     pub runtime_archive_url: String,
     /// SHA256 hex digest of the runtime archive.
     pub runtime_archive_sha256: String,
+    /// SHA256 hex digest of the extracted `zcashd` executable.
+    pub runtime_binary_sha256: String,
     /// Runtime archive member path that points to the `zcashd` executable.
     pub runtime_archive_member_binary_path: String,
 }
@@ -88,20 +90,22 @@ mod tests {
                 "managed zcashd artifact URL must be https: {}",
                 artifact.runtime_archive_url
             );
-            assert_eq!(
-                artifact.runtime_archive_sha256.len(),
-                64,
-                "artifact SHA256 must be 64 hex chars for target {}",
-                artifact.target_triple
-            );
-            assert!(
-                artifact
-                    .runtime_archive_sha256
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit()),
-                "artifact SHA256 contains non-hex characters for target {}",
-                artifact.target_triple
-            );
+            for digest in [
+                &artifact.runtime_archive_sha256,
+                &artifact.runtime_binary_sha256,
+            ] {
+                assert_eq!(
+                    digest.len(),
+                    64,
+                    "artifact SHA256 must be 64 hex chars for target {}",
+                    artifact.target_triple
+                );
+                assert!(
+                    digest.chars().all(|c| c.is_ascii_hexdigit()),
+                    "artifact SHA256 contains non-hex characters for target {}",
+                    artifact.target_triple
+                );
+            }
         }
     }
 }

@@ -50,8 +50,6 @@ fn checkpoint_list_multiple() -> Result<(), BoxError> {
     for b in &[
         &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..],
         &zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..],
-        &zakura_test::vectors::BLOCK_MAINNET_415000_BYTES[..],
-        &zakura_test::vectors::BLOCK_MAINNET_434873_BYTES[..],
     ] {
         let block = Arc::<Block>::zcash_deserialize(*b)?;
         let hash = block.hash();
@@ -67,6 +65,40 @@ fn checkpoint_list_multiple() -> Result<(), BoxError> {
     let _ = CheckpointList::from_list(checkpoint_list)?;
 
     Ok(())
+}
+
+/// Checkpoint height gaps must not exceed [`MAX_CHECKPOINT_HEIGHT_GAP`].
+#[test]
+fn checkpoint_list_height_gap_limit() {
+    let _init_guard = zakura_test::init();
+
+    let max_gap = u32::try_from(MAX_CHECKPOINT_HEIGHT_GAP)
+        .expect("maximum checkpoint height gap fits in u32");
+    let second_height = max_gap
+        .checked_mul(2)
+        .expect("test checkpoint height fits in u32");
+    let oversized_second_height = second_height
+        .checked_add(1)
+        .expect("test checkpoint height fits in u32");
+
+    CheckpointList::from_list([
+        (block::Height(0), block::Hash([1; 32])),
+        (block::Height(max_gap), block::Hash([2; 32])),
+        (block::Height(second_height), block::Hash([3; 32])),
+    ])
+    .expect("checkpoint height gaps at the maximum must be valid");
+
+    let error = CheckpointList::from_list([
+        (block::Height(0), block::Hash([1; 32])),
+        (block::Height(max_gap), block::Hash([2; 32])),
+        (block::Height(oversized_second_height), block::Hash([3; 32])),
+    ])
+    .expect_err("checkpoint height gaps above the maximum must fail");
+
+    assert!(
+        error.to_string().contains("checkpoint height gap"),
+        "unexpected checkpoint height gap error: {error}",
+    );
 }
 
 /// Make sure that an empty checkpoint list fails

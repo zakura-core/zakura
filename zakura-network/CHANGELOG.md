@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Regtest configuration now reports checkpoint-genesis mismatches as invalid
+  configuration instead of constructing inconsistent network parameters.
+
 ## [2.0.0] - 2026-07-17
 
 ### Breaking Changes

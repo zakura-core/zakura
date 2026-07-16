@@ -645,6 +645,21 @@ fn configured_regtest_checkpoints_preserve_regtest_identity() {
 }
 
 #[test]
+fn configured_regtest_rejects_testnet_checkpoints() {
+    let _init_guard = zakura_test::init();
+
+    let error = toml::from_str::<Config>("network = { params = { checkpoints = true } }")
+        .expect_err("Regtest must reject the default Testnet checkpoint list");
+
+    assert!(
+        error
+            .to_string()
+            .contains("first checkpoint hash must match genesis hash"),
+        "unexpected Regtest checkpoint error: {error}",
+    );
+}
+
+#[test]
 fn zakura_bootstrap_peers_parse_in_nested_config() {
     let _init_guard = zakura_test::init();
 

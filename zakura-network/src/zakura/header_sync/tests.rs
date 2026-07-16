@@ -2818,6 +2818,7 @@ async fn forward_ranges_below_checkpoint_handoff_request_tree_aux_roots() {
         .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![
             (block::Height(0), Network::Mainnet.genesis_hash()),
             (block::Height(400), block::Hash([4; 32])),
+            (block::Height(800), block::Hash([8; 32])),
             (block::Height(1_200), block::Hash([12; 32])),
         ]))
         .expect("custom checkpoints are valid")
@@ -2860,7 +2861,7 @@ async fn forward_ranges_below_checkpoint_handoff_request_tree_aux_roots() {
         } = next_non_query_action(&mut fixture.actions).await
         {
             assert_eq!(start_height, block::Height(401));
-            assert_eq!(count, 600);
+            assert_eq!(count, 400);
             assert!(
                 want_tree_aux_roots,
                 "header ranges below the checkpoint handoff should carry roots"
@@ -2875,7 +2876,7 @@ async fn forward_ranges_below_checkpoint_handoff_request_tree_aux_roots() {
         hs_trace::HEADER_GET_HEADERS_SENT,
         &[
             (hs_trace::RANGE_START, TraceValue::U64(401)),
-            (hs_trace::RANGE_COUNT, TraceValue::U64(600)),
+            (hs_trace::RANGE_COUNT, TraceValue::U64(400)),
             (hs_trace::FINALIZED, TraceValue::Bool(false)),
             (hs_trace::WANT_TREE_AUX_ROOTS, TraceValue::Bool(true)),
             (hs_trace::RANGE_PRIORITY, TraceValue::Str("forward")),

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Reject configured checkpoint lists with gaps larger than the bounded sync
+  pipeline, and reject Regtest checkpoint lists whose height-0 hash does not
+  match the Regtest genesis hash.
 - Database format upgrades now finish before startup exposes the finalized
   state database; only configured periodic format checks continue in the
   background.

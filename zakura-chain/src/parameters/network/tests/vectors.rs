@@ -1,17 +1,21 @@
 //! Fixed test vectors for the network consensus parameters.
 
+use std::io::Write;
+
 use zcash_protocol::consensus::{self as zp_consensus, NetworkConstants as _, Parameters};
 
 use crate::{
     amount::{Amount, NonNegative},
     block::Height,
     parameters::{
+        checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP,
         network::error::ParametersBuilderError,
         subsidy::{self, block_subsidy, funding_stream_values, FundingStreamReceiver},
         testnet::{
-            self, ConfiguredActivationHeights, ConfiguredFundingStreamRecipient,
-            ConfiguredFundingStreams, ConfiguredLockboxDisbursement, RegtestParameters,
-            MAX_NETWORK_NAME_LENGTH, RESERVED_NETWORK_NAMES,
+            self, ConfiguredActivationHeights, ConfiguredCheckpoints,
+            ConfiguredFundingStreamRecipient, ConfiguredFundingStreams,
+            ConfiguredLockboxDisbursement, RegtestParameters, MAX_NETWORK_NAME_LENGTH,
+            RESERVED_NETWORK_NAMES,
         },
         ConsensusBranchId, Network, NetworkKind, NetworkUpgrade, MAINNET_ACTIVATION_HEIGHTS,
         TESTNET_ACTIVATION_HEIGHTS,
@@ -388,6 +392,78 @@ fn regtest_preserves_optional_nu6_3_activation() {
         Some(&NetworkUpgrade::Nu6_3),
         "the configured NU6.3 height must remain explicit"
     );
+}
+
+#[test]
+fn configured_checkpoints_reject_excessive_height_gaps() {
+    let network = Network::new_default_testnet();
+    let minimum_oversized_height = Height(
+        u32::try_from(MAX_CHECKPOINT_HEIGHT_GAP)
+            .expect("maximum checkpoint height gap fits in u32")
+            .checked_add(1)
+            .expect("test checkpoint height fits in u32"),
+    );
+    let distant_height = network
+        .mandatory_checkpoint_height()
+        .max(minimum_oversized_height);
+    let checkpoints = vec![
+        (Height(0), network.genesis_hash()),
+        (distant_height, crate::block::Hash([0x42; 32])),
+    ];
+
+    let inline_error = testnet::Parameters::build()
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(checkpoints.clone()))
+        .and_then(|builder| builder.to_network())
+        .expect_err("inline checkpoints with an oversized height gap must fail");
+    assert_eq!(
+        inline_error,
+        ParametersBuilderError::InvalidCustomCheckpoints,
+    );
+
+    let mut checkpoint_file =
+        tempfile::NamedTempFile::new().expect("temporary checkpoint file should be created");
+    for (height, hash) in checkpoints {
+        writeln!(checkpoint_file, "{} {hash}", height.0)
+            .expect("test checkpoint should be written");
+    }
+    checkpoint_file
+        .flush()
+        .expect("test checkpoints should be flushed");
+    let checkpoint_path = checkpoint_file.path().to_path_buf();
+
+    let file_error = testnet::Parameters::build()
+        .with_checkpoints(ConfiguredCheckpoints::Path(checkpoint_path.clone()))
+        .and_then(|builder| builder.to_network())
+        .expect_err("file checkpoints with an oversized height gap must fail");
+    match file_error {
+        ParametersBuilderError::FailedToParseCheckpointFile { path_buf, err } => {
+            assert_eq!(path_buf, checkpoint_path);
+            assert!(
+                err.contains("checkpoint height gap"),
+                "unexpected checkpoint height gap error: {err}",
+            );
+        }
+        error => panic!("unexpected checkpoint file error: {error}"),
+    }
+}
+
+#[test]
+fn regtest_rejects_checkpoint_genesis_mismatch() {
+    let testnet_genesis = Network::new_default_testnet().genesis_hash();
+    let mismatched_checkpoints = [
+        ConfiguredCheckpoints::Default(true),
+        ConfiguredCheckpoints::HeightsAndHashes(vec![(Height(0), testnet_genesis)]),
+    ];
+
+    for checkpoints in mismatched_checkpoints {
+        let error = testnet::Parameters::new_regtest(RegtestParameters {
+            checkpoints: Some(checkpoints),
+            ..Default::default()
+        })
+        .expect_err("Regtest checkpoints must use the Regtest genesis hash");
+
+        assert_eq!(error, ParametersBuilderError::CheckpointGenesisMismatch,);
+    }
 }
 
 /// Checks that configured testnet names are validated and used correctly.

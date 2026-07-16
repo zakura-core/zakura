@@ -1142,7 +1142,7 @@ impl<'de> Deserialize<'de> for Config {
                 build_configured_testnet::<D>(*params, &initial_testnet_peers)?
             }
             (DNetwork::ConfiguredRegtest { params, .. }, _) => {
-                Network::new_regtest(build_regtest_params(*params))
+                build_configured_regtest::<D>(*params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Mainnet), _) => Network::Mainnet,
             (DNetwork::DefaultForKind(NetworkKind::Testnet), Some(params)) => {
@@ -1152,7 +1152,7 @@ impl<'de> Deserialize<'de> for Config {
                 Network::new_default_testnet()
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), Some(params)) => {
-                Network::new_regtest(build_regtest_params(params))
+                build_configured_regtest::<D>(params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
                 Network::new_regtest(Default::default())
@@ -1415,6 +1415,16 @@ where
     } else {
         Ok(params_builder.to_network().map_err(de::Error::custom)?)
     }
+}
+
+fn build_configured_regtest<'de, D>(params: DTestnetParameters) -> Result<Network, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let params = testnet::Parameters::new_regtest(build_regtest_params(params))
+        .map_err(de::Error::custom)?;
+
+    Ok(Network::new_configured_testnet(params))
 }
 
 fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {

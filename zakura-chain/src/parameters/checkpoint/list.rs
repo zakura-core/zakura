@@ -12,7 +12,11 @@ use std::{
     sync::Arc,
 };
 
-use crate::{block, parameters::Network, BoxError};
+use crate::{
+    block,
+    parameters::{checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP, Network},
+    BoxError,
+};
 
 #[cfg(test)]
 mod tests;
@@ -103,6 +107,7 @@ impl FromStr for CheckpointList {
     /// `block::Hash`, separated by a single space.
     ///
     /// Assumes that the provided genesis checkpoint is correct.
+    /// See [`CheckpointList::from_list`] for the structural requirements.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut checkpoint_list: Vec<(block::Height, block::Hash)> = Vec::new();
 
@@ -120,8 +125,10 @@ impl CheckpointList {
     /// Assumes that the provided genesis checkpoint is correct.
     ///
     /// Checkpoint heights and checkpoint hashes must be unique.
+    /// Adjacent checkpoint heights must be no more than
+    /// [`MAX_CHECKPOINT_HEIGHT_GAP`] apart.
     /// There must be a checkpoint for a genesis block at block::Height 0.
-    /// (All other checkpoints are optional.)
+    /// A list containing only that genesis checkpoint is valid.
     pub fn from_list(
         list: impl IntoIterator<Item = (block::Height, block::Hash)>,
     ) -> Result<Self, BoxError> {
@@ -160,6 +167,23 @@ impl CheckpointList {
         let checkpoints = CheckpointList(checkpoints);
         if checkpoints.max_height() > block::Height::MAX {
             Err("checkpoint list contains invalid checkpoint: checkpoint height is greater than the maximum block height")?;
+        }
+
+        let max_height_gap = block::HeightDiff::try_from(MAX_CHECKPOINT_HEIGHT_GAP)?;
+        let mut heights = checkpoints.0.keys().copied();
+        let mut previous_height = heights
+            .next()
+            .expect("checkpoint lists contain a genesis checkpoint");
+        for height in heights {
+            let height_gap = height - previous_height;
+            if height_gap > max_height_gap {
+                return Err(format!(
+                    "checkpoint height gap exceeds maximum: {height:?} - \
+                     {previous_height:?} = {height_gap}, maximum is {max_height_gap}",
+                )
+                .into());
+            }
+            previous_height = height;
         }
 
         Ok(checkpoints)

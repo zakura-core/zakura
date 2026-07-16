@@ -737,10 +737,31 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
     }
 
     // Make a checkpoint list containing all the blocks
-    let checkpoint_list: BTreeMap<block::Height, block::Hash> = checkpoint_data
+    let mut checkpoint_list: BTreeMap<block::Height, block::Hash> = checkpoint_data
         .iter()
         .map(|(_block, height, hash)| (*height, *hash))
         .collect();
+
+    // Preserve the checkpoint height-gap invariant while leaving the two high
+    // blocks incomplete, so their requests remain pending until verifier drop.
+    let max_height = checkpoint_data
+        .iter()
+        .map(|(_block, height, _hash)| *height)
+        .max()
+        .expect("checkpoint test data is not empty");
+    let max_height_gap = u32::try_from(MAX_CHECKPOINT_HEIGHT_GAP)
+        .expect("maximum checkpoint height gap fits in u32");
+    let mut bridge_height = max_height_gap;
+    while bridge_height < max_height.0 {
+        let mut bridge_hash = [0; 32];
+        bridge_hash[..4].copy_from_slice(&bridge_height.to_le_bytes());
+        checkpoint_list
+            .entry(block::Height(bridge_height))
+            .or_insert(block::Hash(bridge_hash));
+        bridge_height = bridge_height
+            .checked_add(max_height_gap)
+            .expect("test checkpoint height fits in u32");
+    }
 
     let state_service = zakura_state::init_test(&Mainnet).await;
     let mut checkpoint_verifier =

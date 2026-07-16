@@ -887,8 +887,18 @@ impl ParametersBuilder {
         Network::new_configured_testnet(self.clone().finish())
     }
 
+    /// Checks that the genesis checkpoint matches this builder's genesis hash.
+    fn validate_checkpoint_genesis(&self) -> Result<(), ParametersBuilderError> {
+        if self.checkpoints.hash(Height(0)) != Some(self.genesis_hash) {
+            return Err(ParametersBuilderError::CheckpointGenesisMismatch);
+        }
+
+        Ok(())
+    }
+
     /// Checks funding streams and converts the builder to a configured [`Network::Testnet`]
     pub fn to_network(self) -> Result<Network, ParametersBuilderError> {
+        self.validate_checkpoint_genesis()?;
         let network = self.to_network_unchecked();
 
         // Final check that the configured funding streams will be valid for these Testnet parameters.
@@ -897,10 +907,7 @@ impl ParametersBuilder {
             check_funding_stream_address_period(fs, &network);
         }
 
-        // Final check that the configured checkpoints are valid for this network.
-        if network.checkpoint_list().hash(Height(0)) != Some(network.genesis_hash()) {
-            return Err(ParametersBuilderError::CheckpointGenesisMismatch);
-        }
+        // Final check that the configured checkpoints cover the mandatory height.
         if network.checkpoint_list().max_height() < network.mandatory_checkpoint_height() {
             return Err(ParametersBuilderError::InsufficientCheckpointCoverage);
         }
@@ -1052,6 +1059,8 @@ impl Parameters {
         if Some(true) == extend_funding_stream_addresses_as_required {
             parameters = parameters.extend_funding_streams();
         }
+
+        parameters.validate_checkpoint_genesis()?;
 
         Ok(Self {
             network_name: "Regtest".to_string(),

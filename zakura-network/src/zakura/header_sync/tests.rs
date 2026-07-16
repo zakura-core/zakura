@@ -5691,6 +5691,107 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_violation_recor
     let _ = capture.finish().await.unwrap();
 }
 
+/// Completeness is read off the response as prepared, before the rejection below it empties the
+/// vectors. Deciding afterwards reports every failure as a complete serve, because empty roots
+/// trivially match empty headers -- and the driver already empties the vectors it rejects, so
+/// that is the common case, not a corner one.
+///
+/// The pure-function tests cannot catch this: moving the call back below the clear leaves them
+/// green. This asserts the value the reactor actually emits.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rejected_response_is_never_traced_as_a_complete_serve() {
+    let network = regtest_network();
+    let mut capture =
+        TraceCapture::for_test("a_rejected_response_is_never_traced_as_a_complete_serve").unwrap();
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let mut fixture = spawn_test_reactor(startup);
+    let requester = peer(213);
+    let (send, mut recv) = crate::zakura::framed_channel(8);
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        requester.clone(),
+        ServicePeerDirection::Inbound,
+        send,
+        CancellationToken::new(),
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
+        .await
+        .expect("initial status arrives")
+        .expect("v7 stream stays open");
+    advertise_tip(
+        &fixture,
+        requester.clone(),
+        block::Height(0),
+        block::Height(0),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    // Ask for roots, so a complete serve is one that carries them.
+    let request_id = HeaderSyncRequestId::new(21).expect("non-zero id");
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireGetHeaders {
+            peer: requester.clone(),
+            session_id: 0,
+            request_id,
+            start_height: block::Height(1),
+            count: 1,
+            want_tree_aux_roots: true,
+        })
+        .await
+        .unwrap();
+    let _ = next_query_headers_action(&mut fixture.actions).await;
+
+    // What the driver sends when it rejects a read for incomplete roots: the vectors are
+    // already cleared, and only `result` still says the serve failed.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeResponseReady {
+            peer: requester.clone(),
+            session_id: 0,
+            request_id,
+            start_height: block::Height(1),
+            requested_count: 1,
+            want_tree_aux_roots: true,
+            headers: Vec::new(),
+            body_sizes: Vec::new(),
+            tree_aux_roots: Vec::new(),
+            deadline: Instant::now() + HEADER_SYNC_SERVE_DEADLINE,
+            completion: HeaderRangeResponseToken::new(),
+            result: HeaderRangeServeResult::IncompleteRoots,
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    capture.flush().await;
+    let reader = capture.reader().unwrap();
+    let header_sync = reader.table(HEADER_SYNC_TABLE.table());
+    header_sync.assert_row(
+        hs_trace::HEADER_HEADERS_SERVED,
+        &[
+            (
+                hs_trace::RESULT,
+                TraceValue::Str(HeaderRangeServeResult::IncompleteRoots.label()),
+            ),
+            (hs_trace::ROOTS_COMPLETE, TraceValue::Bool(false)),
+        ],
+    );
+
+    let _ = capture.finish().await.unwrap();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn header_sync_metrics_record_status_range_new_block_dedup_and_violation() {
     let metrics = [

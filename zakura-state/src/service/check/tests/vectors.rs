@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration};
 use zakura_chain::{
     block::{merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError},
     history_tree::HistoryTree,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{Network, NetworkUpgrade, POW_AVERAGING_WINDOW},
     sapling,
     serialization::ZcashDeserializeInto,
     work::difficulty::ParameterDifficulty,
@@ -254,6 +254,36 @@ fn short_context_early_height_uses_pow_limit_threshold() {
     .expected_difficulty_threshold();
 
     assert_eq!(expected, network.target_difficulty_limit().to_compact());
+}
+
+#[test]
+fn full_context_at_averaging_window_height_uses_pow_limit_threshold() {
+    let _init_guard = zakura_test::init();
+
+    let network = Network::Mainnet;
+    let previous_block_height = block::Height(
+        u32::try_from(POW_AVERAGING_WINDOW - 1).expect("averaging window fits in u32"),
+    );
+    let candidate_height = previous_block_height
+        .next()
+        .expect("test candidate height is valid");
+    let candidate_time = DateTime::from_timestamp(10_000, 0).expect("test timestamp is in-range");
+    let target_spacing = NetworkUpgrade::target_spacing_for_height(&network, candidate_height);
+    let difficulty = network.target_difficulty_limit().to_compact();
+    let context = (0..POW_AVERAGING_WINDOW).map(|offset| {
+        let offset = i32::try_from(offset + 1).expect("test offset fits in i32");
+        (difficulty, candidate_time - target_spacing * offset)
+    });
+
+    let expected = difficulty::AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        previous_block_height,
+        &network,
+        context,
+    )
+    .expected_difficulty_threshold();
+
+    assert_eq!(expected, difficulty);
 }
 
 fn daa_context(

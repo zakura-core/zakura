@@ -4,7 +4,7 @@ use std::{fmt, io};
 
 use hex::{FromHex, FromHexError, ToHex};
 
-use crate::memory::{vec_capacity_bytes, DeepOwnedSize};
+use crate::memory::{vec_capacity_bytes, AttributedMemorySize};
 use crate::serialization::{
     zcash_serialize_bytes, SerializationError, ZcashDeserialize, ZcashSerialize,
 };
@@ -43,8 +43,8 @@ impl Script {
     }
 }
 
-impl DeepOwnedSize for Script {
-    fn deep_owned_size_bytes(&self) -> u64 {
+impl AttributedMemorySize for Script {
+    fn attributed_memory_size_bytes(&self) -> u64 {
         vec_capacity_bytes(&self.0)
     }
 }

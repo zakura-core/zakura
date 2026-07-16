@@ -1,4 +1,4 @@
-//! Internal helpers for deterministic owned-memory sizing.
+//! Internal helpers for deterministic attributed-memory sizing.
 
 use std::mem::size_of;
 
@@ -6,10 +6,14 @@ use crate::BoundedVec;
 
 /// Reports heap allocations owned below an inline value.
 ///
+/// "Attributed" means each logical owner is charged for the allocations it can
+/// reach, even when shared ownership means the physical allocation is not unique.
+/// This is deterministic accounting, not an exact process RSS measurement.
+///
 /// Implementations exclude `size_of::<Self>()`; the owner of a value accounts
 /// for its inline storage.
-pub(crate) trait DeepOwnedSize {
-    fn deep_owned_size_bytes(&self) -> u64;
+pub(crate) trait AttributedMemorySize {
+    fn attributed_memory_size_bytes(&self) -> u64;
 }
 
 /// Returns the inline size of `T`, saturating if `usize` is wider than `u64`.

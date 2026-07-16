@@ -26,7 +26,7 @@ pub(super) struct ApplyingBlock {
     pub(super) hash: block::Hash,
     pub(super) block: Arc<block::Block>,
     pub(super) bytes: u64,
-    pub(super) decoded_deep_size_bytes: u64,
+    pub(super) decoded_attributed_memory_size_bytes: u64,
     pub(super) submitted: bool,
     /// The peer that delivered this body, used to attribute an apply rejection
     /// for misbehavior scoring.
@@ -83,7 +83,7 @@ pub(super) struct Sequencer {
     /// `applying.len() - submitted_applying_count`. Tests assert these never drift
     /// from a full scan.
     applying_buffered_bytes: u64,
-    applying_decoded_deep_bytes: u64,
+    applying_decoded_attributed_memory_bytes: u64,
     submitted_applying_count: usize,
     submitted_applying_bytes: u64,
 
@@ -102,7 +102,7 @@ impl Sequencer {
             submitted_applies: BTreeMap::new(),
             next_apply_token: 1,
             applying_buffered_bytes: 0,
-            applying_decoded_deep_bytes: 0,
+            applying_decoded_attributed_memory_bytes: 0,
             submitted_applying_count: 0,
             submitted_applying_bytes: 0,
             body_download_floor: verified_block_tip,
@@ -148,15 +148,15 @@ impl Sequencer {
         self.applying_buffered_bytes
     }
 
-    pub(super) fn applying_decoded_deep_bytes(&self) -> u64 {
-        self.applying_decoded_deep_bytes
+    pub(super) fn applying_decoded_attributed_memory_bytes(&self) -> u64 {
+        self.applying_decoded_attributed_memory_bytes
     }
 
     #[cfg(test)]
-    pub(super) fn applying_decoded_deep_bytes_scanned(&self) -> u64 {
+    pub(super) fn applying_decoded_attributed_memory_bytes_scanned(&self) -> u64 {
         self.applying
             .values()
-            .map(|applying| applying.decoded_deep_size_bytes)
+            .map(|applying| applying.decoded_attributed_memory_size_bytes)
             .fold(0u64, u64::saturating_add)
     }
 
@@ -174,13 +174,13 @@ impl Sequencer {
         self.reorder.buffered_bytes()
     }
 
-    pub(super) fn reorder_decoded_deep_bytes(&self) -> u64 {
-        self.reorder.decoded_deep_bytes()
+    pub(super) fn reorder_decoded_attributed_memory_bytes(&self) -> u64 {
+        self.reorder.decoded_attributed_memory_bytes()
     }
 
     #[cfg(test)]
-    pub(super) fn reorder_decoded_deep_bytes_scanned(&self) -> u64 {
-        self.reorder.decoded_deep_bytes_scanned()
+    pub(super) fn reorder_decoded_attributed_memory_bytes_scanned(&self) -> u64 {
+        self.reorder.decoded_attributed_memory_bytes_scanned()
     }
 
     pub(super) fn unsubmitted_applying_count(&self) -> usize {
@@ -334,7 +334,7 @@ impl Sequencer {
             .reorder
             .drain_contiguous_prefix(self.body_download_floor);
         let mut covered = Vec::with_capacity(released.len());
-        for (height, block, bytes, decoded_deep_size_bytes, source_peer) in released {
+        for (height, block, bytes, decoded_attributed_memory_size_bytes, source_peer) in released {
             let hash = block.hash();
             self.body_download_floor = height;
             covered.push(height);
@@ -345,16 +345,16 @@ impl Sequencer {
                     hash,
                     block,
                     bytes,
-                    decoded_deep_size_bytes,
+                    decoded_attributed_memory_size_bytes,
                     submitted: false,
                     source_peer,
                 },
             );
             // New bodies enter `applying` unsubmitted, so only the total grows.
             self.applying_buffered_bytes = self.applying_buffered_bytes.saturating_add(bytes);
-            self.applying_decoded_deep_bytes = self
-                .applying_decoded_deep_bytes
-                .saturating_add(decoded_deep_size_bytes);
+            self.applying_decoded_attributed_memory_bytes = self
+                .applying_decoded_attributed_memory_bytes
+                .saturating_add(decoded_attributed_memory_size_bytes);
         }
         covered
     }
@@ -503,9 +503,9 @@ impl Sequencer {
     pub(super) fn remove_applying(&mut self, height: block::Height) -> Option<ApplyingBlock> {
         let removed = self.applying.remove(&height)?;
         self.applying_buffered_bytes = self.applying_buffered_bytes.saturating_sub(removed.bytes);
-        self.applying_decoded_deep_bytes = self
-            .applying_decoded_deep_bytes
-            .saturating_sub(removed.decoded_deep_size_bytes);
+        self.applying_decoded_attributed_memory_bytes = self
+            .applying_decoded_attributed_memory_bytes
+            .saturating_sub(removed.decoded_attributed_memory_size_bytes);
         if removed.submitted {
             self.submitted_applying_count = self.submitted_applying_count.saturating_sub(1);
             self.submitted_applying_bytes =
@@ -611,7 +611,7 @@ impl Sequencer {
         }
         self.applying.clear();
         self.applying_buffered_bytes = 0;
-        self.applying_decoded_deep_bytes = 0;
+        self.applying_decoded_attributed_memory_bytes = 0;
         self.submitted_applying_count = 0;
         self.submitted_applying_bytes = 0;
         released

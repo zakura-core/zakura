@@ -15,7 +15,7 @@ use zcash_transparent::{address::TransparentAddress, bundle::TxOut};
 use crate::{
     amount::{Amount, NonNegative},
     block,
-    memory::{vec_capacity_bytes, DeepOwnedSize},
+    memory::{vec_capacity_bytes, AttributedMemorySize},
     parameters::Network,
     serialization::ZcashSerialize,
     transaction,
@@ -128,10 +128,10 @@ pub enum Input {
     },
 }
 
-impl DeepOwnedSize for Input {
-    fn deep_owned_size_bytes(&self) -> u64 {
+impl AttributedMemorySize for Input {
+    fn attributed_memory_size_bytes(&self) -> u64 {
         match self {
-            Input::PrevOut { unlock_script, .. } => unlock_script.deep_owned_size_bytes(),
+            Input::PrevOut { unlock_script, .. } => unlock_script.attributed_memory_size_bytes(),
             Input::Coinbase { data, .. } => vec_capacity_bytes(data),
         }
     }
@@ -346,9 +346,9 @@ pub struct Output {
     pub lock_script: Script,
 }
 
-impl DeepOwnedSize for Output {
-    fn deep_owned_size_bytes(&self) -> u64 {
-        self.lock_script.deep_owned_size_bytes()
+impl AttributedMemorySize for Output {
+    fn attributed_memory_size_bytes(&self) -> u64 {
+        self.lock_script.attributed_memory_size_bytes()
     }
 }
 

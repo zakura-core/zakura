@@ -17,7 +17,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     amount::Amount,
-    memory::{bounded_vec_capacity_bytes, vec_capacity_bytes, DeepOwnedSize},
+    memory::{bounded_vec_capacity_bytes, vec_capacity_bytes, AttributedMemorySize},
     primitives::{
         redjubjub::{Binding, Signature},
         Groth16Proof,
@@ -169,20 +169,20 @@ where
     },
 }
 
-impl<AnchorV> DeepOwnedSize for ShieldedData<AnchorV>
+impl<AnchorV> AttributedMemorySize for ShieldedData<AnchorV>
 where
     AnchorV: AnchorVariant + Clone,
 {
-    fn deep_owned_size_bytes(&self) -> u64 {
-        self.transfers.deep_owned_size_bytes()
+    fn attributed_memory_size_bytes(&self) -> u64 {
+        self.transfers.attributed_memory_size_bytes()
     }
 }
 
-impl<AnchorV> DeepOwnedSize for TransferData<AnchorV>
+impl<AnchorV> AttributedMemorySize for TransferData<AnchorV>
 where
     AnchorV: AnchorVariant + Clone,
 {
-    fn deep_owned_size_bytes(&self) -> u64 {
+    fn attributed_memory_size_bytes(&self) -> u64 {
         match self {
             TransferData::SpendsAndMaybeOutputs {
                 spends,

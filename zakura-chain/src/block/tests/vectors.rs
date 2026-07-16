@@ -317,7 +317,7 @@ fn nu6_3_uses_post_nu5_block_commitment_format() {
 }
 
 #[test]
-fn deep_owned_size_counts_capacity_and_nested_transparent_allocations() {
+fn attributed_memory_size_counts_capacity_and_nested_transparent_allocations() {
     fn allocation_bytes<T>(capacity: usize) -> u64 {
         u64::try_from(capacity).unwrap() * u64::try_from(std::mem::size_of::<T>()).unwrap()
     }
@@ -378,9 +378,9 @@ fn deep_owned_size_counts_capacity_and_nested_transparent_allocations() {
     let (reserved, reserved_expected) = block_with_capacities(4, 3, 17, 5);
 
     assert_eq!(compact, reserved);
-    assert_eq!(compact.deep_owned_size_bytes(), compact_expected);
-    assert_eq!(reserved.deep_owned_size_bytes(), reserved_expected);
-    assert!(reserved.deep_owned_size_bytes() > compact.deep_owned_size_bytes());
+    assert_eq!(compact.attributed_memory_size_bytes(), compact_expected);
+    assert_eq!(reserved.attributed_memory_size_bytes(), reserved_expected);
+    assert!(reserved.attributed_memory_size_bytes() > compact.attributed_memory_size_bytes());
 }
 
 #[test]

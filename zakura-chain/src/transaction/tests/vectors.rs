@@ -9,7 +9,7 @@ use std::io::ErrorKind;
 
 use crate::{
     block::{Block, Height, MAX_BLOCK_BYTES},
-    memory::DeepOwnedSize,
+    memory::AttributedMemorySize,
     parameters::Network,
     primitives::zcash_primitives::PrecomputedTxData,
     serialization::{SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
@@ -37,7 +37,7 @@ lazy_static! {
 }
 
 #[test]
-fn deep_owned_size_counts_orchard_proof_capacity() {
+fn attributed_memory_size_counts_orchard_proof_capacity() {
     let template = Network::iter()
         .flat_map(|network| v5_transactions(network.block_iter()))
         .find(|transaction| transaction.orchard_shielded_data().is_some())
@@ -71,8 +71,8 @@ fn deep_owned_size_counts_orchard_proof_capacity() {
     assert!(proof_capacity(&reserved) > proof_capacity(&compact));
     assert_eq!(
         reserved
-            .deep_owned_size_bytes()
-            .saturating_sub(compact.deep_owned_size_bytes()),
+            .attributed_memory_size_bytes()
+            .saturating_sub(compact.attributed_memory_size_bytes()),
         u64::try_from(proof_capacity(&reserved) - proof_capacity(&compact)).unwrap()
     );
 }

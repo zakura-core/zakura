@@ -13,7 +13,7 @@ use reddsa::{orchard::Binding, orchard::SpendAuth, Signature};
 use crate::{
     amount::{Amount, NegativeAllowed},
     block::MAX_BLOCK_BYTES,
-    memory::{bounded_vec_capacity_bytes, vec_capacity_bytes, DeepOwnedSize},
+    memory::{bounded_vec_capacity_bytes, vec_capacity_bytes, AttributedMemorySize},
     orchard::{tree, Action, Nullifier, ValueCommitment},
     primitives::Halo2Proof,
     serialization::{
@@ -57,8 +57,8 @@ pub struct ShieldedData {
     pub binding_sig: Signature<Binding>,
 }
 
-impl DeepOwnedSize for ShieldedData {
-    fn deep_owned_size_bytes(&self) -> u64 {
+impl AttributedMemorySize for ShieldedData {
+    fn attributed_memory_size_bytes(&self) -> u64 {
         bounded_vec_capacity_bytes(&self.actions).saturating_add(vec_capacity_bytes(&self.proof.0))
     }
 }

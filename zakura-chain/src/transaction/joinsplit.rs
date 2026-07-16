@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     amount::{self, Amount, NegativeAllowed},
     fmt::HexDebug,
-    memory::{vec_capacity_bytes, DeepOwnedSize},
+    memory::{vec_capacity_bytes, AttributedMemorySize},
     primitives::{ed25519, ZkSnarkProof},
     sprout::{self, JoinSplit, Nullifier},
 };
@@ -50,8 +50,8 @@ pub struct JoinSplitData<P: ZkSnarkProof> {
     pub sig: ed25519::Signature,
 }
 
-impl<P: ZkSnarkProof> DeepOwnedSize for JoinSplitData<P> {
-    fn deep_owned_size_bytes(&self) -> u64 {
+impl<P: ZkSnarkProof> AttributedMemorySize for JoinSplitData<P> {
+    fn attributed_memory_size_bytes(&self) -> u64 {
         vec_capacity_bytes(&self.rest)
     }
 }

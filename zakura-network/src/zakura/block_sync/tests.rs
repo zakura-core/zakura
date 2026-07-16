@@ -3414,12 +3414,12 @@ fn reorder_drains_only_contiguous_prefix_and_reports_dropped_bytes() {
     assert_eq!(reorder.drop_from(block::Height(3)), 300);
     assert_eq!(reorder.buffered_bytes(), 200);
     assert_eq!(
-        reorder.decoded_deep_bytes(),
-        reorder.decoded_deep_bytes_scanned()
+        reorder.decoded_attributed_memory_bytes(),
+        reorder.decoded_attributed_memory_bytes_scanned()
     );
     assert_eq!(reorder.drop_through(block::Height(2)), 200);
     assert_eq!(reorder.buffered_bytes(), 0);
-    assert_eq!(reorder.decoded_deep_bytes(), 0);
+    assert_eq!(reorder.decoded_attributed_memory_bytes(), 0);
     assert_eq!(
         reorder.insert(
             block::Height(3),
@@ -3431,7 +3431,7 @@ fn reorder_drains_only_contiguous_prefix_and_reports_dropped_bytes() {
     );
     assert_eq!(reorder.clear(), 300);
     assert_eq!(reorder.buffered_bytes(), 0);
-    assert_eq!(reorder.decoded_deep_bytes(), 0);
+    assert_eq!(reorder.decoded_attributed_memory_bytes(), 0);
 }
 
 // ---- Sequencer commit pipeline ----
@@ -3445,7 +3445,7 @@ fn sequencer_accept_body_buffers_then_reports_duplicate() {
     let mut seq = test_sequencer(0, 4);
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let hash = block.hash();
-    let decoded_deep_size_bytes = block.deep_owned_size_bytes();
+    let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
     // First arrival above the floor buffers the body and reports its covered
     // height; the reorder buffer takes ownership of the reservation.
     assert_eq!(
@@ -3455,17 +3455,23 @@ fn sequencer_accept_body_buffers_then_reports_duplicate() {
         }
     );
     assert!(seq.reorder_contains(block::Height(1)));
-    assert_eq!(seq.reorder_decoded_deep_bytes(), decoded_deep_size_bytes);
+    assert_eq!(
+        seq.reorder_decoded_attributed_memory_bytes(),
+        decoded_attributed_memory_size_bytes
+    );
     // A second arrival of the same buffered height is redundant; its bytes are
     // handed back for the reactor to release.
     assert_eq!(
         seq.accept_body(block::Height(1), hash, block, 100, peer(0)),
         AcceptOutcome::Redundant { release_bytes: 100 }
     );
-    assert_eq!(seq.reorder_decoded_deep_bytes(), decoded_deep_size_bytes);
     assert_eq!(
-        seq.reorder_decoded_deep_bytes(),
-        seq.reorder_decoded_deep_bytes_scanned()
+        seq.reorder_decoded_attributed_memory_bytes(),
+        decoded_attributed_memory_size_bytes
+    );
+    assert_eq!(
+        seq.reorder_decoded_attributed_memory_bytes(),
+        seq.reorder_decoded_attributed_memory_bytes_scanned()
     );
 }
 
@@ -3496,10 +3502,10 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
     );
     assert!(seq.drain_ready_into_applying().is_empty());
     assert!(seq.reorder_contains(block::Height(2)));
-    assert_eq!(seq.reorder_decoded_deep_bytes(), 0);
+    assert_eq!(seq.reorder_decoded_attributed_memory_bytes(), 0);
     assert_eq!(
-        seq.reorder_decoded_deep_bytes(),
-        seq.reorder_decoded_deep_bytes_scanned()
+        seq.reorder_decoded_attributed_memory_bytes(),
+        seq.reorder_decoded_attributed_memory_bytes_scanned()
     );
 
     assert_eq!(
@@ -3524,14 +3530,14 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
         Some(distinguishable_decoded_block2.hash())
     );
     assert_eq!(
-        seq.applying_decoded_deep_bytes(),
+        seq.applying_decoded_attributed_memory_bytes(),
         block1
-            .deep_owned_size_bytes()
-            .saturating_add(block2.deep_owned_size_bytes())
+            .attributed_memory_size_bytes()
+            .saturating_add(block2.attributed_memory_size_bytes())
     );
     assert_eq!(
-        seq.applying_decoded_deep_bytes(),
-        seq.applying_decoded_deep_bytes_scanned()
+        seq.applying_decoded_attributed_memory_bytes(),
+        seq.applying_decoded_attributed_memory_bytes_scanned()
     );
 }
 
@@ -3549,14 +3555,14 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
             "applying_buffered_bytes drifted after {label}"
         );
         assert_eq!(
-            seq.applying_decoded_deep_bytes(),
-            seq.applying_decoded_deep_bytes_scanned(),
-            "applying_decoded_deep_bytes drifted after {label}"
+            seq.applying_decoded_attributed_memory_bytes(),
+            seq.applying_decoded_attributed_memory_bytes_scanned(),
+            "applying_decoded_attributed_memory_bytes drifted after {label}"
         );
         assert_eq!(
-            seq.reorder_decoded_deep_bytes(),
-            seq.reorder_decoded_deep_bytes_scanned(),
-            "reorder_decoded_deep_bytes drifted after {label}"
+            seq.reorder_decoded_attributed_memory_bytes(),
+            seq.reorder_decoded_attributed_memory_bytes_scanned(),
+            "reorder_decoded_attributed_memory_bytes drifted after {label}"
         );
         assert_eq!(
             seq.submitted_applying_count(),
@@ -3629,7 +3635,7 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
     assert_eq!(seq.applying_buffered_bytes(), 0);
     assert_eq!(seq.submitted_applying_count(), 0);
     assert_eq!(seq.submitted_applying_bytes(), 0);
-    assert_eq!(seq.applying_decoded_deep_bytes(), 0);
+    assert_eq!(seq.applying_decoded_attributed_memory_bytes(), 0);
     check(&seq, "reset");
 }
 
@@ -3963,8 +3969,8 @@ fn sequencer_keeps_whole_body_for_contiguous_height() {
         Some(distinguishable_decoded_block1.hash())
     );
     assert_eq!(
-        seq.applying_decoded_deep_bytes(),
-        distinguishable_decoded_block1.deep_owned_size_bytes()
+        seq.applying_decoded_attributed_memory_bytes(),
+        distinguishable_decoded_block1.attributed_memory_size_bytes()
     );
 }
 

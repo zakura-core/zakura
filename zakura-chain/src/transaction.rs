@@ -42,7 +42,7 @@ use crate::parameters::TX_V6_VERSION_GROUP_ID;
 use crate::{
     amount::{Amount, Error as AmountError, NegativeAllowed, NonNegative},
     block, ironwood,
-    memory::{vec_capacity_bytes, DeepOwnedSize},
+    memory::{vec_capacity_bytes, AttributedMemorySize},
     orchard,
     parameters::{
         Network, NetworkUpgrade, OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID,
@@ -174,8 +174,8 @@ pub enum Transaction {
     },
 }
 
-impl DeepOwnedSize for Transaction {
-    fn deep_owned_size_bytes(&self) -> u64 {
+impl AttributedMemorySize for Transaction {
+    fn attributed_memory_size_bytes(&self) -> u64 {
         use Transaction::*;
 
         let (inputs, outputs, shielded_size) = match self {
@@ -198,7 +198,7 @@ impl DeepOwnedSize for Transaction {
                 outputs,
                 joinsplit_data
                     .as_ref()
-                    .map_or(0, DeepOwnedSize::deep_owned_size_bytes),
+                    .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
             ),
             V4 {
                 inputs,
@@ -211,11 +211,11 @@ impl DeepOwnedSize for Transaction {
                 outputs,
                 joinsplit_data
                     .as_ref()
-                    .map_or(0, DeepOwnedSize::deep_owned_size_bytes)
+                    .map_or(0, AttributedMemorySize::attributed_memory_size_bytes)
                     .saturating_add(
                         sapling_shielded_data
                             .as_ref()
-                            .map_or(0, DeepOwnedSize::deep_owned_size_bytes),
+                            .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
                     ),
             ),
             V5 {
@@ -229,11 +229,11 @@ impl DeepOwnedSize for Transaction {
                 outputs,
                 sapling_shielded_data
                     .as_ref()
-                    .map_or(0, DeepOwnedSize::deep_owned_size_bytes)
+                    .map_or(0, AttributedMemorySize::attributed_memory_size_bytes)
                     .saturating_add(
                         orchard_shielded_data
                             .as_ref()
-                            .map_or(0, DeepOwnedSize::deep_owned_size_bytes),
+                            .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
                     ),
             ),
             V6 {
@@ -248,16 +248,16 @@ impl DeepOwnedSize for Transaction {
                 outputs,
                 sapling_shielded_data
                     .as_ref()
-                    .map_or(0, DeepOwnedSize::deep_owned_size_bytes)
+                    .map_or(0, AttributedMemorySize::attributed_memory_size_bytes)
                     .saturating_add(
                         orchard_shielded_data
                             .as_ref()
-                            .map_or(0, DeepOwnedSize::deep_owned_size_bytes),
+                            .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
                     )
                     .saturating_add(
                         ironwood_shielded_data
                             .as_ref()
-                            .map_or(0, DeepOwnedSize::deep_owned_size_bytes),
+                            .map_or(0, AttributedMemorySize::attributed_memory_size_bytes),
                     ),
             ),
         };
@@ -266,14 +266,14 @@ impl DeepOwnedSize for Transaction {
             .saturating_add(
                 inputs
                     .iter()
-                    .map(DeepOwnedSize::deep_owned_size_bytes)
+                    .map(AttributedMemorySize::attributed_memory_size_bytes)
                     .fold(0u64, u64::saturating_add),
             )
             .saturating_add(vec_capacity_bytes(outputs))
             .saturating_add(
                 outputs
                     .iter()
-                    .map(DeepOwnedSize::deep_owned_size_bytes)
+                    .map(AttributedMemorySize::attributed_memory_size_bytes)
                     .fold(0u64, u64::saturating_add),
             )
             .saturating_add(shielded_size)

@@ -28,13 +28,13 @@ pub(crate) struct InvariantReport {
     /// deserialized-memory factor this approximates peak resident cost — unlike
     /// `peak_budget_reserved`, it excludes reservations for bytes not yet received.
     pub(crate) peak_retained_pipeline_wire_bytes: u64,
-    /// Peak decoded deep-owned bytes attributed to the active body pipeline.
-    pub(crate) peak_active_pipeline_decoded_deep_bytes: u64,
-    /// Decoded deep-owned bytes in the last state sample before harness teardown.
+    /// Peak decoded attributed-memory bytes attributed to the active body pipeline.
+    pub(crate) peak_active_pipeline_decoded_attributed_memory_bytes: u64,
+    /// Decoded attributed-memory bytes in the last state sample before harness teardown.
     ///
     /// This can be nonzero because reaching the target ends the scenario before
     /// the terminal task-drop view is emitted to the trace.
-    pub(crate) final_active_pipeline_decoded_deep_bytes: u64,
+    pub(crate) final_active_pipeline_decoded_attributed_memory_bytes: u64,
     /// Every state row's decoded stage totals equal its aggregate pipeline total.
     pub(crate) decoded_stage_totals_match: bool,
     /// Final reserved download bytes (leak detector once quiesced).
@@ -112,22 +112,24 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         .filter_map(|row| u64_field(row, "retained_pipeline_wire_bytes"))
         .max()
         .unwrap_or(0);
-    let peak_active_pipeline_decoded_deep_bytes = state_rows
+    let peak_active_pipeline_decoded_attributed_memory_bytes = state_rows
         .iter()
-        .filter_map(|row| u64_field(row, "active_pipeline_decoded_deep_bytes"))
+        .filter_map(|row| u64_field(row, "active_pipeline_decoded_attributed_memory_bytes"))
         .max()
         .unwrap_or(0);
-    let final_active_pipeline_decoded_deep_bytes = state_rows
+    let final_active_pipeline_decoded_attributed_memory_bytes = state_rows
         .iter()
         .rev()
-        .find_map(|row| u64_field(row, "active_pipeline_decoded_deep_bytes"))
+        .find_map(|row| u64_field(row, "active_pipeline_decoded_attributed_memory_bytes"))
         .unwrap_or(0);
     let decoded_stage_totals_match = state_rows.iter().all(|row| {
-        let stage_total = u64_field(row, "sequencer_input_decoded_deep_bytes")
+        let stage_total = u64_field(row, "sequencer_input_decoded_attributed_memory_bytes")
             .unwrap_or(0)
-            .saturating_add(u64_field(row, "reorder_decoded_deep_bytes").unwrap_or(0))
-            .saturating_add(u64_field(row, "applying_decoded_deep_bytes").unwrap_or(0));
-        u64_field(row, "active_pipeline_decoded_deep_bytes") == Some(stage_total)
+            .saturating_add(u64_field(row, "reorder_decoded_attributed_memory_bytes").unwrap_or(0))
+            .saturating_add(
+                u64_field(row, "applying_decoded_attributed_memory_bytes").unwrap_or(0),
+            );
+        u64_field(row, "active_pipeline_decoded_attributed_memory_bytes") == Some(stage_total)
     });
     let protocol_rejects = reader
         .table("block_sync")
@@ -198,8 +200,8 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         max_outstanding,
         peak_budget_reserved,
         peak_retained_pipeline_wire_bytes,
-        peak_active_pipeline_decoded_deep_bytes,
-        final_active_pipeline_decoded_deep_bytes,
+        peak_active_pipeline_decoded_attributed_memory_bytes,
+        final_active_pipeline_decoded_attributed_memory_bytes,
         decoded_stage_totals_match,
         final_budget_reserved,
         protocol_rejects,
@@ -290,7 +292,7 @@ pub(crate) fn assert_core(
         "decoded pipeline aggregate drifted from its stage totals",
     );
     assert!(
-        report.peak_active_pipeline_decoded_deep_bytes > 0,
+        report.peak_active_pipeline_decoded_attributed_memory_bytes > 0,
         "successful run never observed active decoded pipeline bytes",
     );
 

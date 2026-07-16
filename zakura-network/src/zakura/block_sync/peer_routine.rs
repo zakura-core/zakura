@@ -221,7 +221,7 @@ pub(super) struct PeerRoutine {
     received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
     sequencer_input: mpsc::Sender<SequencedBody>,
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-    sequencer_input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
+    sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
     actions: mpsc::Sender<BlockSyncAction>,
     /// Shared routine→reactor channel for serving / status-advertise / re-query /
     /// serving-misbehavior. `try_send` (bounded, never-wedging) so a busy reactor
@@ -261,7 +261,7 @@ impl PeerRoutine {
         received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
         sequencer_input: mpsc::Sender<SequencedBody>,
         sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-        sequencer_input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
+        sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
         actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
         sequencer_view: watch::Receiver<SequencerView>,
@@ -297,7 +297,7 @@ impl PeerRoutine {
             received_throughput,
             sequencer_input,
             sequencer_input_bytes,
-            sequencer_input_decoded_deep_bytes,
+            sequencer_input_decoded_attributed_memory_bytes,
             actions,
             routine_to_reactor,
             sequencer_view,
@@ -1194,19 +1194,19 @@ impl PeerRoutine {
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
         raw_block_payload: Option<Arc<[u8]>>,
     ) {
-        let decoded_deep_size_bytes = block.deep_owned_size_bytes();
+        let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
         // Metrics accepts f64 samples; these lossy conversions are observability-only.
         metrics::histogram!(
-            "sync.block.body.decoded.deep_size_bytes",
+            "sync.block.body.decoded.attributed_memory_size_bytes",
             "stage" => "peer"
         )
-        .record(decoded_deep_size_bytes as f64);
+        .record(decoded_attributed_memory_size_bytes as f64);
         if let Some(serialized_bytes) = body_wire_bytes.filter(|bytes| *bytes > 0) {
             metrics::histogram!(
                 "sync.block.body.decoded.to_serialized_ratio",
                 "stage" => "peer"
             )
-            .record(decoded_deep_size_bytes as f64 / serialized_bytes as f64);
+            .record(decoded_attributed_memory_size_bytes as f64 / serialized_bytes as f64);
         }
         let hash = block.hash();
         let Some(height) = block.coinbase_height() else {
@@ -1225,7 +1225,7 @@ impl PeerRoutine {
                     body_wire_bytes,
                     body_permit,
                     raw_block_payload.clone(),
-                    decoded_deep_size_bytes,
+                    decoded_attributed_memory_size_bytes,
                 )
                 .await
             {
@@ -1320,7 +1320,7 @@ impl PeerRoutine {
         self.trace_body_received(
             height,
             serialized_bytes,
-            decoded_deep_size_bytes,
+            decoded_attributed_memory_size_bytes,
             Some(request_start_height),
             Some(request_range_count),
             Some(request_elapsed_ms),
@@ -1361,7 +1361,7 @@ impl PeerRoutine {
         let body = BufferedBlockBody::from_measured_decoded_block(
             block,
             raw_block_payload,
-            decoded_deep_size_bytes,
+            decoded_attributed_memory_size_bytes,
         );
         self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
             .await;
@@ -1406,7 +1406,7 @@ impl PeerRoutine {
             self.peer.clone(),
             received_at,
             self.sequencer_input_bytes.clone(),
-            self.sequencer_input_decoded_deep_bytes.clone(),
+            self.sequencer_input_decoded_attributed_memory_bytes.clone(),
         );
 
         let ok = if let Some(permit) = body_permit {
@@ -1434,7 +1434,7 @@ impl PeerRoutine {
         body_wire_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
         raw_block_payload: Option<Arc<[u8]>>,
-        decoded_deep_size_bytes: u64,
+        decoded_attributed_memory_size_bytes: u64,
     ) -> bool {
         if self.work.hash_for_height(height) != Some(hash) {
             return false;
@@ -1505,7 +1505,7 @@ impl PeerRoutine {
         self.trace_body_received(
             height,
             serialized_bytes,
-            decoded_deep_size_bytes,
+            decoded_attributed_memory_size_bytes,
             None,
             None,
             None,
@@ -1529,7 +1529,7 @@ impl PeerRoutine {
         let body = BufferedBlockBody::from_measured_decoded_block(
             block,
             raw_block_payload,
-            decoded_deep_size_bytes,
+            decoded_attributed_memory_size_bytes,
         );
         self.forward_body_to_sequencer(height, hash, body, serialized_bytes, body_permit)
             .await;
@@ -2076,7 +2076,7 @@ impl PeerRoutine {
         &self,
         height: block::Height,
         serialized_bytes: u64,
-        decoded_deep_size_bytes: u64,
+        decoded_attributed_memory_size_bytes: u64,
         request_start_height: Option<block::Height>,
         request_range_count: Option<u32>,
         request_elapsed_ms: Option<u64>,
@@ -2087,8 +2087,8 @@ impl PeerRoutine {
             bs_insert_u64(row, bs_trace::SERIALIZED_BYTES, serialized_bytes);
             bs_insert_u64(
                 row,
-                bs_trace::DECODED_DEEP_SIZE_BYTES,
-                decoded_deep_size_bytes,
+                bs_trace::DECODED_ATTRIBUTED_MEMORY_SIZE_BYTES,
+                decoded_attributed_memory_size_bytes,
             );
             bs_insert_u64(row, bs_trace::BUDGET_RESERVED_AFTER, self.budget.reserved());
             bs_insert_u64(

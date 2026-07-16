@@ -9,7 +9,7 @@ use crate::{
     block::merkle::{auth_digest_or_placeholder, AuthDataRoot},
     fmt::DisplayToDebug,
     ironwood,
-    memory::{inline_size_bytes, vec_capacity_bytes, DeepOwnedSize},
+    memory::{inline_size_bytes, vec_capacity_bytes, AttributedMemorySize},
     orchard,
     parameters::{Network, NetworkUpgrade},
     sapling,
@@ -87,12 +87,12 @@ impl Block {
     /// This excludes allocator metadata and rounding, fragmentation, `Arc`
     /// control blocks, temporary allocations, external library/runtime
     /// overhead, and allocations made by downstream verifiers.
-    pub fn deep_owned_size_bytes(&self) -> u64 {
+    pub fn attributed_memory_size_bytes(&self) -> u64 {
         self.transactions
             .iter()
             .map(|transaction| {
                 inline_size_bytes::<Transaction>()
-                    .saturating_add(transaction.deep_owned_size_bytes())
+                    .saturating_add(transaction.attributed_memory_size_bytes())
             })
             .fold(
                 inline_size_bytes::<Self>()

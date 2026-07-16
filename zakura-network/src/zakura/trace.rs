@@ -165,16 +165,20 @@ pub mod block_sync_trace {
     pub const ESTIMATED_BYTES: &str = "estimated_bytes";
     /// Serialized byte size of a received body.
     pub const SERIALIZED_BYTES: &str = "serialized_bytes";
-    /// Deep-owned decoded byte size of a block body.
-    pub const DECODED_DEEP_SIZE_BYTES: &str = "decoded_deep_size_bytes";
-    /// Decoded deep-owned bytes queued at the Sequencer input.
-    pub const SEQUENCER_INPUT_DECODED_DEEP_BYTES: &str = "sequencer_input_decoded_deep_bytes";
-    /// Decoded deep-owned bytes retained in the reorder buffer.
-    pub const REORDER_DECODED_DEEP_BYTES: &str = "reorder_decoded_deep_bytes";
-    /// Decoded deep-owned bytes retained in applying entries.
-    pub const APPLYING_DECODED_DEEP_BYTES: &str = "applying_decoded_deep_bytes";
-    /// Aggregate decoded deep-owned bytes in the active body pipeline.
-    pub const ACTIVE_PIPELINE_DECODED_DEEP_BYTES: &str = "active_pipeline_decoded_deep_bytes";
+    /// Attributed decoded-memory size of a block body.
+    pub const DECODED_ATTRIBUTED_MEMORY_SIZE_BYTES: &str = "decoded_attributed_memory_size_bytes";
+    /// Decoded attributed-memory bytes queued at the Sequencer input.
+    pub const SEQUENCER_INPUT_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
+        "sequencer_input_decoded_attributed_memory_bytes";
+    /// Decoded attributed-memory bytes retained in the reorder buffer.
+    pub const REORDER_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
+        "reorder_decoded_attributed_memory_bytes";
+    /// Decoded attributed-memory bytes retained in applying entries.
+    pub const APPLYING_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
+        "applying_decoded_attributed_memory_bytes";
+    /// Aggregate decoded attributed-memory bytes in the active body pipeline.
+    pub const ACTIVE_PIPELINE_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
+        "active_pipeline_decoded_attributed_memory_bytes";
     /// End-to-end elapsed milliseconds for a traced operation.
     pub const ELAPSED_MS: &str = "elapsed_ms";
     /// Elapsed milliseconds before response frames were ready to send.

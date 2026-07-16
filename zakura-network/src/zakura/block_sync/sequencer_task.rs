@@ -50,9 +50,9 @@ impl SequencedBody {
         peer: ZakuraPeerId,
         received_at: Instant,
         input_bytes: Arc<std::sync::atomic::AtomicU64>,
-        input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
-        let decoded_deep_size_bytes = body.decoded_deep_size_bytes();
+        let decoded_attributed_memory_size_bytes = body.decoded_attributed_memory_size_bytes();
         Self {
             height,
             hash,
@@ -63,8 +63,8 @@ impl SequencedBody {
             queue_accounting: SequencerInputAccounting::new(
                 input_bytes,
                 bytes,
-                input_decoded_deep_bytes,
-                decoded_deep_size_bytes,
+                input_decoded_attributed_memory_bytes,
+                decoded_attributed_memory_size_bytes,
             ),
         }
     }
@@ -79,8 +79,8 @@ impl SequencedBody {
 struct SequencerInputAccounting {
     input_bytes: Arc<std::sync::atomic::AtomicU64>,
     bytes: u64,
-    input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
-    decoded_deep_size_bytes: u64,
+    input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    decoded_attributed_memory_size_bytes: u64,
     active: bool,
 }
 
@@ -88,16 +88,19 @@ impl SequencerInputAccounting {
     fn new(
         input_bytes: Arc<std::sync::atomic::AtomicU64>,
         bytes: u64,
-        input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
-        decoded_deep_size_bytes: u64,
+        input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+        decoded_attributed_memory_size_bytes: u64,
     ) -> Self {
         add_atomic_bytes(&input_bytes, bytes);
-        add_atomic_bytes(&input_decoded_deep_bytes, decoded_deep_size_bytes);
+        add_atomic_bytes(
+            &input_decoded_attributed_memory_bytes,
+            decoded_attributed_memory_size_bytes,
+        );
         Self {
             input_bytes,
             bytes,
-            input_decoded_deep_bytes,
-            decoded_deep_size_bytes,
+            input_decoded_attributed_memory_bytes,
+            decoded_attributed_memory_size_bytes,
             active: true,
         }
     }
@@ -107,7 +110,10 @@ impl SequencerInputAccounting {
             return;
         }
         release_atomic_bytes(&self.input_bytes, self.bytes);
-        release_atomic_bytes(&self.input_decoded_deep_bytes, self.decoded_deep_size_bytes);
+        release_atomic_bytes(
+            &self.input_decoded_attributed_memory_bytes,
+            self.decoded_attributed_memory_size_bytes,
+        );
     }
 }
 
@@ -175,10 +181,10 @@ pub(super) struct SequencerView {
     pub(super) applying_len: u64,
     pub(super) reorder_buffered_bytes: u64,
     pub(super) applying_buffered_bytes: u64,
-    pub(super) sequencer_input_decoded_deep_bytes: u64,
-    pub(super) reorder_decoded_deep_bytes: u64,
-    pub(super) applying_decoded_deep_bytes: u64,
-    pub(super) active_pipeline_decoded_deep_bytes: u64,
+    pub(super) sequencer_input_decoded_attributed_memory_bytes: u64,
+    pub(super) reorder_decoded_attributed_memory_bytes: u64,
+    pub(super) applying_decoded_attributed_memory_bytes: u64,
+    pub(super) active_pipeline_decoded_attributed_memory_bytes: u64,
     pub(super) unsubmitted_applying_count: u64,
     pub(super) submitted_applying_count: u64,
     pub(super) submitted_applying_bytes: u64,
@@ -199,10 +205,10 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
         applying_len: 0,
         reorder_buffered_bytes: 0,
         applying_buffered_bytes: 0,
-        sequencer_input_decoded_deep_bytes: 0,
-        reorder_decoded_deep_bytes: 0,
-        applying_decoded_deep_bytes: 0,
-        active_pipeline_decoded_deep_bytes: 0,
+        sequencer_input_decoded_attributed_memory_bytes: 0,
+        reorder_decoded_attributed_memory_bytes: 0,
+        applying_decoded_attributed_memory_bytes: 0,
+        active_pipeline_decoded_attributed_memory_bytes: 0,
         unsubmitted_applying_count: 0,
         submitted_applying_count: 0,
         submitted_applying_bytes: 0,
@@ -230,7 +236,7 @@ pub(super) struct SequencerTask {
     body_input_rx: mpsc::Receiver<SequencedBody>,
     control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
     _body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-    body_input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
+    body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
     view_tx: watch::Sender<SequencerView>,
     action_send_timeout: Duration,
     trace: ZakuraTrace,
@@ -242,10 +248,10 @@ impl Drop for SequencerTask {
         while self.body_input_rx.try_recv().is_ok() {}
 
         self.view_tx.send_modify(|view| {
-            view.reorder_decoded_deep_bytes = 0;
-            view.applying_decoded_deep_bytes = 0;
-            view.sequencer_input_decoded_deep_bytes = 0;
-            view.active_pipeline_decoded_deep_bytes = 0;
+            view.reorder_decoded_attributed_memory_bytes = 0;
+            view.applying_decoded_attributed_memory_bytes = 0;
+            view.sequencer_input_decoded_attributed_memory_bytes = 0;
+            view.active_pipeline_decoded_attributed_memory_bytes = 0;
         });
     }
 }
@@ -262,7 +268,7 @@ impl SequencerTask {
         body_input_rx: mpsc::Receiver<SequencedBody>,
         control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
         body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-        body_input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
+        body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
         view_tx: watch::Sender<SequencerView>,
         action_send_timeout: Duration,
         trace: ZakuraTrace,
@@ -280,7 +286,7 @@ impl SequencerTask {
             body_input_rx,
             control_input_rx,
             _body_input_bytes: body_input_bytes,
-            body_input_decoded_deep_bytes,
+            body_input_decoded_attributed_memory_bytes,
             view_tx,
             action_send_timeout,
             trace,
@@ -811,14 +817,17 @@ impl SequencerTask {
         self.committed_throughput.sample(Instant::now());
         let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
         let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
-        let sequencer_input_decoded_deep_bytes = self
-            .body_input_decoded_deep_bytes
+        let sequencer_input_decoded_attributed_memory_bytes = self
+            .body_input_decoded_attributed_memory_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
-        let reorder_decoded_deep_bytes = self.sequencer.reorder_decoded_deep_bytes();
-        let applying_decoded_deep_bytes = self.sequencer.applying_decoded_deep_bytes();
-        let active_pipeline_decoded_deep_bytes = sequencer_input_decoded_deep_bytes
-            .saturating_add(reorder_decoded_deep_bytes)
-            .saturating_add(applying_decoded_deep_bytes);
+        let reorder_decoded_attributed_memory_bytes =
+            self.sequencer.reorder_decoded_attributed_memory_bytes();
+        let applying_decoded_attributed_memory_bytes =
+            self.sequencer.applying_decoded_attributed_memory_bytes();
+        let active_pipeline_decoded_attributed_memory_bytes =
+            sequencer_input_decoded_attributed_memory_bytes
+                .saturating_add(reorder_decoded_attributed_memory_bytes)
+                .saturating_add(applying_decoded_attributed_memory_bytes);
         // Retained bodies do not charge the request budget.
         self.budget
             .audit(self.work.reserved_bytes(), "block-sync sequencer view");
@@ -833,10 +842,10 @@ impl SequencerTask {
             applying_len: self.sequencer.applying_len() as u64,
             reorder_buffered_bytes,
             applying_buffered_bytes,
-            sequencer_input_decoded_deep_bytes,
-            reorder_decoded_deep_bytes,
-            applying_decoded_deep_bytes,
-            active_pipeline_decoded_deep_bytes,
+            sequencer_input_decoded_attributed_memory_bytes,
+            reorder_decoded_attributed_memory_bytes,
+            applying_decoded_attributed_memory_bytes,
+            active_pipeline_decoded_attributed_memory_bytes,
             unsubmitted_applying_count: self.sequencer.unsubmitted_applying_count() as u64,
             submitted_applying_count: self.sequencer.submitted_applying_count() as u64,
             submitted_applying_bytes: self.sequencer.submitted_applying_bytes(),
@@ -857,19 +866,25 @@ impl SequencerTask {
     }
 
     fn publish_decoded_ownership_view(&self) {
-        let sequencer_input_decoded_deep_bytes = self
-            .body_input_decoded_deep_bytes
+        let sequencer_input_decoded_attributed_memory_bytes = self
+            .body_input_decoded_attributed_memory_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
-        let reorder_decoded_deep_bytes = self.sequencer.reorder_decoded_deep_bytes();
-        let applying_decoded_deep_bytes = self.sequencer.applying_decoded_deep_bytes();
-        let active_pipeline_decoded_deep_bytes = sequencer_input_decoded_deep_bytes
-            .saturating_add(reorder_decoded_deep_bytes)
-            .saturating_add(applying_decoded_deep_bytes);
+        let reorder_decoded_attributed_memory_bytes =
+            self.sequencer.reorder_decoded_attributed_memory_bytes();
+        let applying_decoded_attributed_memory_bytes =
+            self.sequencer.applying_decoded_attributed_memory_bytes();
+        let active_pipeline_decoded_attributed_memory_bytes =
+            sequencer_input_decoded_attributed_memory_bytes
+                .saturating_add(reorder_decoded_attributed_memory_bytes)
+                .saturating_add(applying_decoded_attributed_memory_bytes);
         self.view_tx.send_if_modified(|view| {
-            view.sequencer_input_decoded_deep_bytes = sequencer_input_decoded_deep_bytes;
-            view.reorder_decoded_deep_bytes = reorder_decoded_deep_bytes;
-            view.applying_decoded_deep_bytes = applying_decoded_deep_bytes;
-            view.active_pipeline_decoded_deep_bytes = active_pipeline_decoded_deep_bytes;
+            view.sequencer_input_decoded_attributed_memory_bytes =
+                sequencer_input_decoded_attributed_memory_bytes;
+            view.reorder_decoded_attributed_memory_bytes = reorder_decoded_attributed_memory_bytes;
+            view.applying_decoded_attributed_memory_bytes =
+                applying_decoded_attributed_memory_bytes;
+            view.active_pipeline_decoded_attributed_memory_bytes =
+                active_pipeline_decoded_attributed_memory_bytes;
             false
         });
     }
@@ -916,10 +931,10 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
         let mut v = *v;
         v.committed_bytes_per_sec = 0;
         v.committed_blocks_per_sec = 0;
-        v.sequencer_input_decoded_deep_bytes = 0;
-        v.reorder_decoded_deep_bytes = 0;
-        v.applying_decoded_deep_bytes = 0;
-        v.active_pipeline_decoded_deep_bytes = 0;
+        v.sequencer_input_decoded_attributed_memory_bytes = 0;
+        v.reorder_decoded_attributed_memory_bytes = 0;
+        v.applying_decoded_attributed_memory_bytes = 0;
+        v.active_pipeline_decoded_attributed_memory_bytes = 0;
         v
     };
     strip_rates(a) != strip_rates(b)
@@ -944,10 +959,10 @@ mod tests {
             applying_len: 0,
             reorder_buffered_bytes: 0,
             applying_buffered_bytes: 0,
-            sequencer_input_decoded_deep_bytes: 0,
-            reorder_decoded_deep_bytes: 0,
-            applying_decoded_deep_bytes: 0,
-            active_pipeline_decoded_deep_bytes: 0,
+            sequencer_input_decoded_attributed_memory_bytes: 0,
+            reorder_decoded_attributed_memory_bytes: 0,
+            applying_decoded_attributed_memory_bytes: 0,
+            active_pipeline_decoded_attributed_memory_bytes: 0,
             unsubmitted_applying_count: 0,
             submitted_applying_count: 0,
             submitted_applying_bytes: 0,
@@ -966,7 +981,7 @@ mod tests {
 
     fn queued_test_body(
         input_bytes: Arc<std::sync::atomic::AtomicU64>,
-        input_decoded_deep_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
     ) -> SequencedBody {
         let block = test_block();
         SequencedBody::new_queued(
@@ -977,23 +992,28 @@ mod tests {
             ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid"),
             Instant::now(),
             input_bytes,
-            input_decoded_deep_bytes,
+            input_decoded_attributed_memory_bytes,
         )
     }
 
     #[test]
     fn sequenced_body_leave_and_drop_release_queue_counters_once() {
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let input_decoded_deep_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let mut body = queued_test_body(input_bytes.clone(), input_decoded_deep_bytes.clone());
+        let input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut body = queued_test_body(
+            input_bytes.clone(),
+            input_decoded_attributed_memory_bytes.clone(),
+        );
 
         assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 123);
-        assert!(input_decoded_deep_bytes.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(
+            input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed) > 0
+        );
 
         body.leave_queue();
         assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(
-            input_decoded_deep_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
 
@@ -1004,15 +1024,18 @@ mod tests {
     #[tokio::test]
     async fn cancelled_send_drops_its_queue_accounting() {
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let input_decoded_deep_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (body_tx, mut body_rx) = mpsc::channel(1);
         body_tx
             .try_send(queued_test_body(
                 input_bytes.clone(),
-                input_decoded_deep_bytes.clone(),
+                input_decoded_attributed_memory_bytes.clone(),
             ))
             .expect("body channel has capacity");
-        let blocked_body = queued_test_body(input_bytes.clone(), input_decoded_deep_bytes.clone());
+        let blocked_body = queued_test_body(
+            input_bytes.clone(),
+            input_decoded_attributed_memory_bytes.clone(),
+        );
         let blocked_send = tokio::spawn(async move { body_tx.send(blocked_body).await });
         tokio::task::yield_now().await;
         assert!(!blocked_send.is_finished());
@@ -1029,7 +1052,7 @@ mod tests {
         queued.leave_queue();
         assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(
-            input_decoded_deep_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
     }
@@ -1037,7 +1060,7 @@ mod tests {
     #[tokio::test]
     async fn closed_receiver_with_live_permit_drops_queue_accounting() {
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let input_decoded_deep_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (body_tx, body_rx) = mpsc::channel(1);
         let permit = body_tx
             .reserve_owned()
@@ -1047,12 +1070,12 @@ mod tests {
 
         permit.send(queued_test_body(
             input_bytes.clone(),
-            input_decoded_deep_bytes.clone(),
+            input_decoded_attributed_memory_bytes.clone(),
         ));
 
         assert_eq!(input_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(
-            input_decoded_deep_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
     }
@@ -1065,10 +1088,11 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         };
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let body_input_decoded_deep_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body_input_decoded_attributed_memory_bytes =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut body = queued_test_body(
             body_input_bytes.clone(),
-            body_input_decoded_deep_bytes.clone(),
+            body_input_decoded_attributed_memory_bytes.clone(),
         );
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
@@ -1084,7 +1108,7 @@ mod tests {
             body_rx,
             control_rx,
             body_input_bytes,
-            body_input_decoded_deep_bytes,
+            body_input_decoded_attributed_memory_bytes,
             view_tx,
             Duration::from_secs(60),
             ZakuraTrace::noop(),
@@ -1095,12 +1119,12 @@ mod tests {
         task.publish_decoded_ownership_view();
 
         let handoff = *view_rx.borrow();
-        assert_eq!(handoff.sequencer_input_decoded_deep_bytes, 0);
-        assert!(handoff.applying_decoded_deep_bytes > 0);
-        assert_eq!(handoff.reorder_decoded_deep_bytes, 0);
+        assert_eq!(handoff.sequencer_input_decoded_attributed_memory_bytes, 0);
+        assert!(handoff.applying_decoded_attributed_memory_bytes > 0);
+        assert_eq!(handoff.reorder_decoded_attributed_memory_bytes, 0);
         assert_eq!(
-            handoff.active_pipeline_decoded_deep_bytes,
-            handoff.applying_decoded_deep_bytes
+            handoff.active_pipeline_decoded_attributed_memory_bytes,
+            handoff.applying_decoded_attributed_memory_bytes
         );
     }
 
@@ -1113,21 +1137,23 @@ mod tests {
         };
         let (body_tx, body_rx) = mpsc::channel(1);
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let body_input_decoded_deep_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body_input_decoded_attributed_memory_bytes =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
         body_tx
             .try_send(queued_test_body(
                 body_input_bytes.clone(),
-                body_input_decoded_deep_bytes.clone(),
+                body_input_decoded_attributed_memory_bytes.clone(),
             ))
             .expect("body channel has capacity");
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
         let mut initial = initial_view(frontiers);
-        initial.reorder_decoded_deep_bytes = 10;
-        initial.applying_decoded_deep_bytes = 20;
-        initial.active_pipeline_decoded_deep_bytes = body_input_decoded_deep_bytes
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(30);
+        initial.reorder_decoded_attributed_memory_bytes = 10;
+        initial.applying_decoded_attributed_memory_bytes = 20;
+        initial.active_pipeline_decoded_attributed_memory_bytes =
+            body_input_decoded_attributed_memory_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(30);
         let (view_tx, view_rx) = watch::channel(initial);
         let task = SequencerTask::new(
             Sequencer::new(block::Height(0), 1),
@@ -1139,7 +1165,7 @@ mod tests {
             body_rx,
             control_rx,
             body_input_bytes.clone(),
-            body_input_decoded_deep_bytes.clone(),
+            body_input_decoded_attributed_memory_bytes.clone(),
             view_tx,
             Duration::from_secs(1),
             ZakuraTrace::noop(),
@@ -1152,14 +1178,14 @@ mod tests {
             0
         );
         assert_eq!(
-            body_input_decoded_deep_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            body_input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
         let terminal = *view_rx.borrow();
-        assert_eq!(terminal.sequencer_input_decoded_deep_bytes, 0);
-        assert_eq!(terminal.reorder_decoded_deep_bytes, 0);
-        assert_eq!(terminal.applying_decoded_deep_bytes, 0);
-        assert_eq!(terminal.active_pipeline_decoded_deep_bytes, 0);
+        assert_eq!(terminal.sequencer_input_decoded_attributed_memory_bytes, 0);
+        assert_eq!(terminal.reorder_decoded_attributed_memory_bytes, 0);
+        assert_eq!(terminal.applying_decoded_attributed_memory_bytes, 0);
+        assert_eq!(terminal.active_pipeline_decoded_attributed_memory_bytes, 0);
     }
 
     #[tokio::test(start_paused = true)]

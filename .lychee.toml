@@ -27,6 +27,9 @@ exclude = [
     "^https://eprint\\.iacr\\.org/",
     # Tor's GitLab returns 403 to automated link checkers
     "^https://gitlab\\.torproject\\.org/",
+    # Zcash-hosted sites intermittently return Cloudflare 521 responses to CI
+    "^https://tachyon\\.z\\.cash/",
+    "^https://zips\\.z\\.cash/",
 
     # These routes will become available when the Zakura website launches.
     "^https://zakura\\.com/",
@@ -54,10 +57,10 @@ exclude_path = [
     "CHANGELOG.md",
 ]
 
-# Accept these HTTP status codes as valid. 202 and 521 are included because
-# Zcash-hosted sites intermittently return them to automated checkers (CDN bot
+# Accept these HTTP status codes as valid. 202 is included because z.cash and
+# zfnd.org intermittently return "202 Accepted" to automated checkers (CDN bot
 # protection) — the link is not broken, the content just wasn't served.
-accept = ["200", "202", "204", "206", "301", "302", "307", "308", "429", "521"]
+accept = ["200", "202", "204", "206", "301", "302", "307", "308", "429"]
 
 # Timeout for requests (seconds)
 timeout = 30

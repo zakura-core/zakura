@@ -9,6 +9,7 @@ use std::io::ErrorKind;
 
 use crate::{
     block::{Block, Height, MAX_BLOCK_BYTES},
+    memory::AttributedMemorySize,
     parameters::Network,
     primitives::zcash_primitives::PrecomputedTxData,
     serialization::{SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
@@ -33,6 +34,47 @@ lazy_static! {
         sapling_shielded_data: None,
         orchard_shielded_data: None,
     };
+}
+
+#[test]
+fn attributed_memory_size_counts_orchard_proof_capacity() {
+    let template = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find(|transaction| transaction.orchard_shielded_data().is_some())
+        .expect("test vectors include an Orchard transaction");
+    let mut compact = template.clone();
+    let mut reserved = template;
+
+    let proof_capacity = |transaction: &Transaction| {
+        transaction
+            .orchard_shielded_data()
+            .expect("selected transaction has Orchard data")
+            .proof
+            .0
+            .capacity()
+    };
+    compact
+        .orchard_shielded_data_mut()
+        .expect("selected transaction has Orchard data")
+        .proof
+        .0
+        .shrink_to_fit();
+    let reserved_proof = &mut reserved
+        .orchard_shielded_data_mut()
+        .expect("selected transaction has Orchard data")
+        .proof
+        .0;
+    reserved_proof.shrink_to_fit();
+    reserved_proof.reserve(1024);
+
+    assert_eq!(compact, reserved);
+    assert!(proof_capacity(&reserved) > proof_capacity(&compact));
+    assert_eq!(
+        reserved
+            .attributed_memory_size_bytes()
+            .saturating_sub(compact.attributed_memory_size_bytes()),
+        u64::try_from(proof_capacity(&reserved) - proof_capacity(&compact)).unwrap()
+    );
 }
 
 /// Build a mock output list for pre-V5 transactions, with (index+1)

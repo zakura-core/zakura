@@ -93,6 +93,7 @@ pub struct BenchSequencerHandle {
 pub struct BenchBodyFeeder {
     body_input: mpsc::Sender<SequencedBody>,
     body_input_bytes: Arc<AtomicU64>,
+    body_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     bench_peer: ZakuraPeerId,
 }
 
@@ -107,6 +108,7 @@ pub struct BenchCommitter {
     view: watch::Receiver<SequencerView>,
     /// Bytes currently queued in the sequencer body-input channel
     body_input_bytes: Arc<AtomicU64>,
+    body_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     // A clone of the sequencer's trace emitter, so the bench driver can write the
     // periodic `block_sync_state` snapshot rows the full reactor emits in production
     // (the rows the zakura-trace-plots skill consumes).
@@ -165,6 +167,7 @@ pub fn spawn_bench_sequencer(
     let (body_input_tx, body_input_rx) = mpsc::channel(limit);
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let body_input_bytes = Arc::new(AtomicU64::new(0));
+    let body_input_decoded_attributed_memory_bytes = Arc::new(AtomicU64::new(0));
     let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
 
     let task = SequencerTask::new(
@@ -177,6 +180,7 @@ pub fn spawn_bench_sequencer(
         body_input_rx,
         control_rx,
         body_input_bytes.clone(),
+        body_input_decoded_attributed_memory_bytes.clone(),
         view_tx,
         BENCH_ACTION_SEND_TIMEOUT,
         trace.clone(),
@@ -187,6 +191,8 @@ pub fn spawn_bench_sequencer(
         feeder: BenchBodyFeeder {
             body_input: body_input_tx,
             body_input_bytes: body_input_bytes.clone(),
+            body_input_decoded_attributed_memory_bytes: body_input_decoded_attributed_memory_bytes
+                .clone(),
             bench_peer: ZakuraPeerId::new(vec![0xB1; 32]).expect("32-byte bench peer id is valid"),
         },
         submissions: BenchSubmissions {
@@ -196,6 +202,7 @@ pub fn spawn_bench_sequencer(
             control: control_tx,
             view: view_rx,
             body_input_bytes,
+            body_input_decoded_attributed_memory_bytes,
             trace,
             finalized_height,
             trace_guard,
@@ -222,23 +229,20 @@ impl BenchBodyFeeder {
         block: Arc<Block>,
         bytes: u64,
     ) -> bool {
-        let body = SequencedBody {
+        let previous_block_hash = block.header.previous_block_hash;
+        let body = BufferedBlockBody::from_decoded_block(block, None);
+        let body = SequencedBody::new_queued(
             height,
             hash,
-            previous_block_hash: block.header.previous_block_hash,
-            body: BufferedBlockBody::Decoded(block),
+            previous_block_hash,
+            body,
             bytes,
-            peer: self.bench_peer.clone(),
-            received_at: Instant::now(),
-        };
-        // Mirror the peer routine's byte accounting: reserve before send, release on
-        // failure (the task decrements as it drains/applies).
-        self.body_input_bytes.fetch_add(bytes, Ordering::Relaxed);
-        if self.body_input.send(body).await.is_err() {
-            self.body_input_bytes.fetch_sub(bytes, Ordering::Relaxed);
-            return false;
-        }
-        true
+            self.bench_peer.clone(),
+            Instant::now(),
+            self.body_input_bytes.clone(),
+            self.body_input_decoded_attributed_memory_bytes.clone(),
+        );
+        self.body_input.send(body).await.is_ok()
     }
 }
 
@@ -286,6 +290,9 @@ impl BenchCommitter {
     /// a no-op when tracing is disabled. Call it on a cadence from the bench driver.
     pub fn emit_state_snapshot(&self) {
         let view = *self.view.borrow();
+        let sequencer_input_decoded_attributed_memory_bytes = self
+            .body_input_decoded_attributed_memory_bytes
+            .load(Ordering::Relaxed);
         self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
             row.insert(
                 bs_trace::EVENT.to_string(),
@@ -301,6 +308,28 @@ impl BenchCommitter {
             );
             bs_insert_u64(row, "applying_buffered_bytes", view.applying_buffered_bytes);
             bs_insert_u64(row, "reorder_buffered_bytes", view.reorder_buffered_bytes);
+            bs_insert_u64(
+                row,
+                bs_trace::SEQUENCER_INPUT_DECODED_ATTRIBUTED_MEMORY_BYTES,
+                sequencer_input_decoded_attributed_memory_bytes,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::REORDER_DECODED_ATTRIBUTED_MEMORY_BYTES,
+                view.reorder_decoded_attributed_memory_bytes,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::APPLYING_DECODED_ATTRIBUTED_MEMORY_BYTES,
+                view.applying_decoded_attributed_memory_bytes,
+            );
+            bs_insert_u64(
+                row,
+                bs_trace::ACTIVE_PIPELINE_DECODED_ATTRIBUTED_MEMORY_BYTES,
+                sequencer_input_decoded_attributed_memory_bytes
+                    .saturating_add(view.reorder_decoded_attributed_memory_bytes)
+                    .saturating_add(view.applying_decoded_attributed_memory_bytes),
+            );
             bs_insert_u64(
                 row,
                 "retained_pipeline_wire_bytes",

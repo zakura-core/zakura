@@ -4,6 +4,7 @@ use std::{fmt, io};
 
 use hex::{FromHex, FromHexError, ToHex};
 
+use crate::memory::{vec_capacity_bytes, AttributedMemorySize};
 use crate::serialization::{
     zcash_serialize_bytes, SerializationError, ZcashDeserialize, ZcashSerialize,
 };
@@ -39,6 +40,12 @@ impl Script {
     /// and `zcash_deserialize` to create byte data with a length prefix.
     pub fn as_raw_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl AttributedMemorySize for Script {
+    fn attributed_memory_size_bytes(&self) -> u64 {
+        vec_capacity_bytes(&self.0)
     }
 }
 

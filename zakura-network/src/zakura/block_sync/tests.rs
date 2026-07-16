@@ -3421,8 +3421,13 @@ fn reorder_drains_only_contiguous_prefix_and_reports_dropped_bytes() {
     // held, keeping `buffered_bytes` consistent for the resident view.
     assert_eq!(reorder.drop_from(block::Height(3)), 300);
     assert_eq!(reorder.buffered_bytes(), 200);
+    assert_eq!(
+        reorder.decoded_attributed_memory_bytes(),
+        reorder.decoded_attributed_memory_bytes_scanned()
+    );
     assert_eq!(reorder.drop_through(block::Height(2)), 200);
     assert_eq!(reorder.buffered_bytes(), 0);
+    assert_eq!(reorder.decoded_attributed_memory_bytes(), 0);
     assert_eq!(
         reorder.insert(
             block::Height(3),
@@ -3434,6 +3439,7 @@ fn reorder_drains_only_contiguous_prefix_and_reports_dropped_bytes() {
     );
     assert_eq!(reorder.clear(), 300);
     assert_eq!(reorder.buffered_bytes(), 0);
+    assert_eq!(reorder.decoded_attributed_memory_bytes(), 0);
 }
 
 // ---- Sequencer commit pipeline ----
@@ -3447,6 +3453,7 @@ fn sequencer_accept_body_buffers_then_reports_duplicate() {
     let mut seq = test_sequencer(0, 4);
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let hash = block.hash();
+    let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
     // First arrival above the floor buffers the body and reports its covered
     // height; the reorder buffer takes ownership of the reservation.
     assert_eq!(
@@ -3456,11 +3463,23 @@ fn sequencer_accept_body_buffers_then_reports_duplicate() {
         }
     );
     assert!(seq.reorder_contains(block::Height(1)));
+    assert_eq!(
+        seq.reorder_decoded_attributed_memory_bytes(),
+        decoded_attributed_memory_size_bytes
+    );
     // A second arrival of the same buffered height is redundant; its bytes are
     // handed back for the reactor to release.
     assert_eq!(
         seq.accept_body(block::Height(1), hash, block, 100, peer(0)),
         AcceptOutcome::Redundant { release_bytes: 100 }
+    );
+    assert_eq!(
+        seq.reorder_decoded_attributed_memory_bytes(),
+        decoded_attributed_memory_size_bytes
+    );
+    assert_eq!(
+        seq.reorder_decoded_attributed_memory_bytes(),
+        seq.reorder_decoded_attributed_memory_bytes_scanned()
     );
 }
 
@@ -3498,9 +3517,20 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
     );
     assert!(seq.drain_ready_into_applying().is_empty());
     assert!(seq.reorder_contains(block::Height(2)));
+    assert_eq!(seq.reorder_decoded_attributed_memory_bytes(), 0);
+    assert_eq!(
+        seq.reorder_decoded_attributed_memory_bytes(),
+        seq.reorder_decoded_attributed_memory_bytes_scanned()
+    );
 
     assert_eq!(
-        seq.accept_body(block::Height(1), block1.hash(), block1, 100, peer(0)),
+        seq.accept_body(
+            block::Height(1),
+            block1.hash(),
+            block1.clone(),
+            100,
+            peer(0),
+        ),
         AcceptOutcome::Buffered {
             covered: block::Height(1)
         }
@@ -3519,6 +3549,16 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
     assert_ne!(
         submitted.block.hash(),
         distinguishable_decoded_block2.hash()
+    );
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        block1
+            .attributed_memory_size_bytes()
+            .saturating_add(block2.attributed_memory_size_bytes())
+    );
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        seq.applying_decoded_attributed_memory_bytes_scanned()
     );
 }
 
@@ -3583,6 +3623,16 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
             seq.applying_buffered_bytes(),
             seq.applying_buffered_bytes_scanned(),
             "applying_buffered_bytes drifted after {label}"
+        );
+        assert_eq!(
+            seq.applying_decoded_attributed_memory_bytes(),
+            seq.applying_decoded_attributed_memory_bytes_scanned(),
+            "applying_decoded_attributed_memory_bytes drifted after {label}"
+        );
+        assert_eq!(
+            seq.reorder_decoded_attributed_memory_bytes(),
+            seq.reorder_decoded_attributed_memory_bytes_scanned(),
+            "reorder_decoded_attributed_memory_bytes drifted after {label}"
         );
         assert_eq!(
             seq.in_flight_submission_count(),
@@ -3658,6 +3708,7 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
     // Reset drops all applying state; there are no in-flight submissions left.
     seq.reset_to(block::Height(0), false);
     assert_eq!(seq.applying_buffered_bytes(), 0);
+    assert_eq!(seq.applying_decoded_attributed_memory_bytes(), 0);
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.in_flight_submission_bytes(), 0);
     check(&seq, "reset");
@@ -3800,6 +3851,15 @@ fn sequencer_records_and_decrements_submitted_applies() {
 fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completion() {
     let mut seq = test_sequencer(0, 1);
     let blocks = mainnet_blocks_1_to_3();
+    let decoded_attributed_memory_bytes = blocks
+        .iter()
+        .map(|block| block.attributed_memory_size_bytes())
+        .fold(0u64, u64::saturating_add);
+    let remaining_decoded_attributed_memory_bytes = blocks
+        .iter()
+        .skip(1)
+        .map(|block| block.attributed_memory_size_bytes())
+        .fold(0u64, u64::saturating_add);
     for (index, block) in blocks.iter().enumerate() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
@@ -3811,6 +3871,10 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
         .expect("height 1 is applying");
     seq.record_submitted_apply(item.height, item.hash);
     assert!(seq.submitted_contains(block::Height(1)));
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        decoded_attributed_memory_bytes
+    );
     assert!(
         seq.submittable_heights().is_empty(),
         "submitted-apply window is full"
@@ -3819,6 +3883,11 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
     assert_eq!(seq.release_applied_through(block::Height(1)), 100);
     assert!(!seq.submitted_contains(block::Height(1)));
     assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        decoded_attributed_memory_bytes,
+        "detached driver-owned decoded memory remains charged"
+    );
     assert!(
         seq.submittable_heights().is_empty(),
         "detached driver submission still occupies the decode window"
@@ -3826,8 +3895,16 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
 
     assert!(!seq.finish_submission(item.token, item.height, block::Hash([99; 32])));
     assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        decoded_attributed_memory_bytes
+    );
     assert!(seq.finish_submission(item.token, item.height, item.hash));
     assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        remaining_decoded_attributed_memory_bytes
+    );
     assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
 }
 
@@ -3895,6 +3972,11 @@ fn sequencer_reset_clears_buffers_and_pins_floor_and_tip() {
 fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions() {
     let mut seq = test_sequencer(0, 2);
     let blocks = mainnet_blocks_1_to_3();
+    let decoded_attributed_memory_bytes = blocks
+        .iter()
+        .take(2)
+        .map(|block| block.attributed_memory_size_bytes())
+        .fold(0u64, u64::saturating_add);
     for (index, block) in blocks.iter().take(2).enumerate() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
@@ -3918,6 +4000,11 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
     assert_eq!(seq.applying_len(), 0);
     assert_eq!(seq.in_flight_submission_count(), 2);
     assert_eq!(seq.in_flight_submission_bytes(), 200);
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        decoded_attributed_memory_bytes,
+        "reset must retain detached driver-owned decoded memory charges"
+    );
 
     for (index, block) in blocks.iter().take(2).enumerate() {
         let replacement = forked_block(block, 100 + index as u8);
@@ -3929,6 +4016,8 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         seq.submittable_heights().is_empty(),
         "replacement bodies must not exceed the live decode window"
     );
+    let decoded_attributed_memory_bytes_before_completion =
+        seq.applying_decoded_attributed_memory_bytes();
 
     let first = &old_items[0];
     assert!(
@@ -3936,13 +4025,27 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         "a mismatched completion must not release a detached charge"
     );
     assert_eq!(seq.in_flight_submission_count(), 2);
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        decoded_attributed_memory_bytes_before_completion
+    );
     assert!(seq.finish_submission(first.token, first.height, first.hash));
     assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        decoded_attributed_memory_bytes_before_completion
+            .saturating_sub(blocks[0].attributed_memory_size_bytes())
+    );
     assert_eq!(seq.submittable_heights().len(), 1);
 
     let second = &old_items[1];
     assert!(seq.finish_submission(second.token, second.height, second.hash));
     assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        decoded_attributed_memory_bytes_before_completion
+            .saturating_sub(decoded_attributed_memory_bytes)
+    );
     assert_eq!(seq.submittable_heights().len(), 2);
 }
 
@@ -4110,6 +4213,10 @@ fn sequencer_keeps_whole_body_for_contiguous_height() {
     assert_eq!(
         submitted.block.hash(),
         distinguishable_decoded_block1.hash()
+    );
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        distinguishable_decoded_block1.attributed_memory_size_bytes()
     );
 }
 

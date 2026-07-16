@@ -15,6 +15,7 @@ use zcash_transparent::{address::TransparentAddress, bundle::TxOut};
 use crate::{
     amount::{Amount, NonNegative},
     block,
+    memory::{vec_capacity_bytes, AttributedMemorySize},
     parameters::Network,
     serialization::ZcashSerialize,
     transaction,
@@ -125,6 +126,15 @@ pub enum Input {
         /// The sequence number for the output.
         sequence: u32,
     },
+}
+
+impl AttributedMemorySize for Input {
+    fn attributed_memory_size_bytes(&self) -> u64 {
+        match self {
+            Input::PrevOut { unlock_script, .. } => unlock_script.attributed_memory_size_bytes(),
+            Input::Coinbase { data, .. } => vec_capacity_bytes(data),
+        }
+    }
 }
 
 impl fmt::Display for Input {
@@ -334,6 +344,12 @@ pub struct Output {
 
     /// The lock script defines the conditions under which this output can be spent.
     pub lock_script: Script,
+}
+
+impl AttributedMemorySize for Output {
+    fn attributed_memory_size_bytes(&self) -> u64 {
+        self.lock_script.attributed_memory_size_bytes()
+    }
 }
 
 impl Output {

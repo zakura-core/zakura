@@ -30,6 +30,7 @@ pub mod fmt;
 pub mod history_tree;
 pub mod ironwood;
 pub mod local_genesis;
+mod memory;
 pub mod orchard;
 pub mod parallel;
 pub mod parameters;

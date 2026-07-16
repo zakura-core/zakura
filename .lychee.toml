@@ -30,6 +30,8 @@ exclude = [
     "^https://tachyon\\.z\\.cash/",
     # Tor's GitLab returns 403 to automated link checkers
     "^https://gitlab\\.torproject\\.org/",
+    # The ZIP site returns 521 to GitHub-hosted automated link checkers
+    "^https://zips\\.z\\.cash/",
 
     # These routes will become available when the Zakura website launches.
     "^https://zakura\\.com/",

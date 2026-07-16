@@ -155,8 +155,6 @@ pub(super) struct RoutineWiring {
     pub(super) received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
     pub(super) sequencer_input: mpsc::Sender<super::sequencer_task::SequencedBody>,
     pub(super) sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-    pub(super) sequencer_control:
-        mpsc::UnboundedSender<super::sequencer_task::SequencerControlInput>,
     pub(super) actions: mpsc::Sender<BlockSyncAction>,
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
     pub(super) view: watch::Receiver<super::sequencer_task::SequencerView>,
@@ -771,10 +769,17 @@ impl DownloadWindow {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn has_outstanding_height(&self, height: block::Height) -> bool {
         self.outstanding
             .iter()
             .any(|outstanding| outstanding.request.contains(height))
+    }
+
+    pub(super) fn has_outstanding_start(&self, start_height: block::Height) -> bool {
+        self.outstanding
+            .iter()
+            .any(|outstanding| outstanding.request.start_height == start_height)
     }
 
     pub(super) fn outstanding_index_for_height(&self, height: block::Height) -> Option<usize> {
@@ -865,12 +870,12 @@ impl PeerBlockState {
 /// Pure per-height byte-accounting state.
 ///
 /// The shared [`ByteBudget`] is just the atomic sink. This ledger owns the
+/// Per-height request reservation: `Reserved(estimate) -> Released`.
 /// lifecycle arithmetic for one requested height:
-/// `Reserved(estimate) -> Held(actual) -> Released`.
+/// `Reserved(estimate) -> Released`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum BlockBudgetLedger {
     Reserved(u64),
-    Held(u64),
     Released,
 }
 
@@ -879,26 +884,10 @@ impl BlockBudgetLedger {
         Self::Reserved(estimate)
     }
 
-    pub(super) fn current_charge(self) -> u64 {
-        match self {
-            Self::Reserved(bytes) | Self::Held(bytes) => bytes,
-            Self::Released => 0,
-        }
-    }
-
-    pub(super) fn release_reserved(&mut self) -> u64 {
-        let released = match *self {
-            Self::Reserved(bytes) => bytes,
-            Self::Held(_) | Self::Released => 0,
-        };
-        *self = Self::Released;
-        released
-    }
-
     pub(super) fn reserved_charge(self) -> u64 {
         match self {
             Self::Reserved(bytes) => bytes,
-            Self::Held(_) | Self::Released => 0,
+            Self::Released => 0,
         }
     }
 
@@ -906,25 +895,11 @@ impl BlockBudgetLedger {
         matches!(self, Self::Reserved(_))
     }
 
-    /// Move a reserved height to held bytes and return the signed budget delta.
-    ///
-    /// Positive means charge more bytes; negative means release bytes.
-    pub(super) fn settle(&mut self, actual: u64) -> i128 {
-        match *self {
-            Self::Reserved(reserved) => {
-                *self = Self::Held(actual);
-                i128::from(actual) - i128::from(reserved)
-            }
-            Self::Released => 0,
-            Self::Held(_) => 0,
-        }
-    }
-
-    /// Release the current charge exactly once.
-    pub(super) fn release(&mut self) -> u64 {
-        let charge = self.current_charge();
+    /// Release the reserved estimate exactly once, returning the released bytes.
+    pub(super) fn release_reserved(&mut self) -> u64 {
+        let released = self.reserved_charge();
         *self = Self::Released;
-        charge
+        released
     }
 }
 

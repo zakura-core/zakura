@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- Block-sync now keeps its apply backlog in serialized wire form and decodes
+  bodies only for the verifier submission window, so decoded memory is bounded
+  regardless of backlog depth. Admission accounting charges serialized pools at
+  wire size, and the default look-ahead budget is a 1.5 GiB memory target:
+  initial-sync memory no longer grows with block era
+  ([#190](https://github.com/zakura-core/zakura/pull/190)). The
+  `MALLOC_ARENA_MAX` mitigation from
+  [#148](https://github.com/zakura-core/zakura/pull/148) remains as the
+  complementary allocator-retention layer.
+
 ### Fixed
 
 - Fixed block sync so obsolete in-flight requests no longer disconnect healthy
@@ -19,6 +31,10 @@ Initial release of Zakura.
 
 ### Fixed
 
+- Pruned finalized blocks remain visible to chain-identity queries, including peer
+  block-hash responses and RPC confirmation lookups, after their bodies are removed.
+- Stop pruned nodes from serving fabricated zero transaction counts and auth-data
+  roots when a historical block body is unavailable during Zakura header sync.
 - Header sync now keeps timed-out ranges in a bounded, single-owner work queue,
   retries them indefinitely with short peer-local avoidance, and commits
   pipelined responses in height order.

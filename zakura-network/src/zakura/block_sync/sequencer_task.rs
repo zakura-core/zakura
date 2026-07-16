@@ -702,11 +702,17 @@ impl SequencerTask {
             || self.work.held_successor_links_to(next, anchor_hash)
     }
 
-    async fn send_action(&self, action: BlockSyncAction) -> bool {
+    async fn send_action(&mut self, action: BlockSyncAction) -> bool {
         // `SubmitBlock` is the intended verifier-backpressure point: a slow
         // verifier blocks the task here, stopping it from draining `input`. The
         // timeout matches the reactor's `dispatch_action` so a permanently
         // stalled driver does not wedge the pipeline forever.
+        //
+        // Publish after any mutation that led to this action and before awaiting
+        // channel capacity. In particular, a rejection clears applying/submission
+        // ownership before reporting peer misbehavior; the reactor's admission
+        // snapshot must not retain that stale ownership while this send blocks.
+        self.publish_view();
         match time::timeout(self.action_send_timeout, self.actions.send(action)).await {
             Ok(Ok(())) => true,
             Ok(Err(_)) => false,
@@ -1117,6 +1123,106 @@ mod tests {
             actions_rx.recv().await.is_none(),
             "the stale successor must not be submitted after predecessor rollback"
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_rejection_action_publishes_released_ownership() {
+        let block: Arc<block::Block> = Arc::new(
+            BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .expect("block 1 vector parses"),
+        );
+        let height = block::Height(1);
+        let hash = block.hash();
+        let peer = ZakuraPeerId::new(vec![4; 32]).expect("32-byte test peer id is valid");
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+
+        let mut sequencer = Sequencer::new(block::Height(0), 1);
+        assert_eq!(
+            sequencer.accept_body(height, hash, block, 64, peer.clone()),
+            AcceptOutcome::Buffered { covered: height }
+        );
+        assert_eq!(sequencer.drain_ready_into_applying(), vec![height]);
+        let submission = sequencer
+            .prepare_submit(height)
+            .expect("contiguous block is submittable");
+        sequencer.record_submitted_apply(height, submission.hash);
+
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        let (actions_tx, mut actions_rx) = mpsc::channel(1);
+        actions_tx
+            .send(BlockSyncAction::Misbehavior {
+                peer: peer.clone(),
+                reason: BlockSyncMisbehavior::MalformedMessage,
+            })
+            .await
+            .expect("test fills the action channel");
+        let (body_tx, body_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+        let mut task = SequencerTask::new(
+            sequencer,
+            ByteBudget::new(1_024),
+            work,
+            actions_tx,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            body_rx,
+            control_rx,
+            body_input_bytes,
+            view_tx,
+            Duration::from_secs(60),
+            ZakuraTrace::noop(),
+        );
+        task.publish_view();
+        let initial_ownership = *view_rx.borrow_and_update();
+        assert_eq!(initial_ownership.applying_len, 1);
+        assert_eq!(initial_ownership.in_flight_submission_count, 1);
+
+        control_tx
+            .send(SequencerControlInput::ApplyFinished {
+                token: submission.token,
+                height,
+                hash: submission.hash,
+                result: BlockApplyResult::Rejected,
+                local_frontier: None,
+            })
+            .expect("rejection control input queues");
+        drop(control_tx);
+        drop(body_tx);
+        let task = tokio::spawn(task.run());
+
+        time::timeout(Duration::from_secs(1), view_rx.changed())
+            .await
+            .expect("ownership view publishes while action send is blocked")
+            .expect("sequencer view sender stays live");
+        let blocked_view = *view_rx.borrow();
+        assert_eq!(blocked_view.reset_epoch, 1);
+        assert_eq!(blocked_view.applying_len, 0);
+        assert_eq!(blocked_view.applying_buffered_bytes, 0);
+        assert_eq!(blocked_view.in_flight_submission_count, 0);
+        assert_eq!(blocked_view.in_flight_submission_bytes, 0);
+
+        assert!(matches!(
+            actions_rx.recv().await,
+            Some(BlockSyncAction::Misbehavior {
+                reason: BlockSyncMisbehavior::MalformedMessage,
+                ..
+            })
+        ));
+        assert!(matches!(
+            actions_rx.recv().await,
+            Some(BlockSyncAction::Misbehavior {
+                peer: source,
+                reason: BlockSyncMisbehavior::InvalidBlock,
+            }) if source == peer
+        ));
+        task.await.expect("sequencer task exits cleanly");
     }
 
     #[tokio::test]

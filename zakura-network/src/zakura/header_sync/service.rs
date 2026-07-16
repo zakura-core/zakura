@@ -4,11 +4,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
     },
+    time::Instant,
 };
 
 use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
 
+use super::state::HEADER_SYNC_ADVISORY_BACKOFF;
 use super::{events::*, pipe::*, wire::*, *};
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, Flow, Frame, FramedRecv, FramedSend,
@@ -528,17 +530,13 @@ impl Service for HeaderSyncService {
         let Some(node_id) = header_peer_node_id(peer) else {
             return OrderedSessionDemand::Retire;
         };
-        let mut candidates = self.header_sync.subscribe_candidate_state();
-        if candidates
-            .borrow_and_update()
+        if self
+            .header_sync
+            .candidate_state()
             .backed_off_node_ids
             .contains(&node_id)
         {
-            return OrderedSessionDemand::WaitForChange(Box::pin(async move {
-                if candidates.changed().await.is_err() {
-                    std::future::pending::<()>().await;
-                }
-            }));
+            return OrderedSessionDemand::RetryAt(Instant::now() + HEADER_SYNC_ADVISORY_BACKOFF);
         }
 
         OrderedSessionDemand::OpenNow

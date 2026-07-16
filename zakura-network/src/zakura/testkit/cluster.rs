@@ -2769,9 +2769,34 @@ mod tests {
         limits.max_pending_handshakes = 4;
         limits.max_open_streams = 16;
         limits.max_inbound_queue_depth = 1;
-        let victim = ZakuraTestNode::builder(18).limits(limits).spawn().await?;
+        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let header_sync_config = ZakuraHeaderSyncConfig {
+            peer_limits: ServicePeerLimits {
+                max_inbound_peers: 0,
+                ..ServicePeerLimits::default()
+            },
+            ..ZakuraHeaderSyncConfig::default()
+        };
+        let victim = ZakuraTestNode::builder(18)
+            .limits(limits)
+            .header_sync_driver(
+                e2e_network([]),
+                anchor,
+                HeaderSyncFrontiers {
+                    finalized_height: anchor.0,
+                    verified_block_tip: anchor.0,
+                    verified_block_hash: anchor.1,
+                },
+                Some(anchor),
+            )
+            .header_sync_config(header_sync_config)
+            .spawn()
+            .await?;
         let peer_set = victim.supervisor().subscribe();
 
+        // The peer negotiates legacy gossip and header sync, but only gossip
+        // initially has demand because header sync has no inbound slots. The
+        // aggregate queue limit must still reserve one entry for both kinds.
         let first = HostilePeer::connect_native(&victim, 19).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(

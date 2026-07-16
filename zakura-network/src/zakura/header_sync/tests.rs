@@ -6,7 +6,8 @@ use super::{
     reactor::*,
     state::{
         OutstandingPhase, OutstandingRange, RangePriority, RangePurpose, RangeRequest,
-        VctRootRepair, VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME,
+        VctRootRepair, HEADER_SYNC_ADVISORY_BACKOFF, VCT_ROOT_REPAIR_BACKOFFS,
+        VCT_ROOT_REPAIR_MAX_WALL_TIME,
     },
     validation::*,
     wire::*,
@@ -14,8 +15,9 @@ use super::{
 use crate::zakura::{
     framed_channel,
     testkit::{TraceCapture, TraceValue},
-    FramedSend, HeaderSyncServiceSummary, Peer, Service, ServicePeerDirection, ServicePeerLimits,
-    ServicePeerSnapshot, ZakuraConnId, ZakuraHeaderSyncCandidateState, ZAKURA_CAP_HEADER_SYNC,
+    FramedSend, HeaderSyncServiceSummary, OrderedSessionDemand, Peer, Service,
+    ServicePeerDirection, ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId,
+    ZakuraHeaderSyncCandidateState, ZAKURA_CAP_HEADER_SYNC,
 };
 use chrono::Duration;
 use metrics::{
@@ -1012,6 +1014,67 @@ fn test_header_sync_handle() -> (HeaderSyncHandle, mpsc::UnboundedReceiver<Heade
         },
         lifecycle_rx,
     )
+}
+
+#[test]
+fn ordered_session_demand_bounds_advisory_backoff_and_waits_for_slots() {
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    let handle = HeaderSyncHandle {
+        events,
+        lifecycle,
+        tip,
+        peers,
+        candidates,
+    };
+    let service = HeaderSyncService::new(handle);
+    let (peer, node_id) = node_peer();
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState {
+        backed_off_node_ids: vec![node_id],
+        ..ZakuraHeaderSyncCandidateState::default()
+    });
+
+    let before = std::time::Instant::now();
+    let demand = service.ordered_session_demand(
+        1,
+        &peer,
+        ZAKURA_CAP_HEADER_SYNC,
+        ServicePeerDirection::Outbound,
+    );
+    let OrderedSessionDemand::RetryAt(retry_at) = demand else {
+        panic!("an advisory-backed-off candidate must use a bounded retry");
+    };
+    let after = std::time::Instant::now();
+    assert!(retry_at >= before + HEADER_SYNC_ADVISORY_BACKOFF);
+    assert!(retry_at <= after + HEADER_SYNC_ADVISORY_BACKOFF);
+
+    candidates_tx.send_replace(ZakuraHeaderSyncCandidateState::default());
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow
+    ));
+
+    peers_tx.send_replace(ServicePeerSnapshot {
+        outbound_slots_free: 0,
+        ..ServicePeerSnapshot::default()
+    });
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::WaitForChange(_)
+    ));
 }
 
 fn header_sync_peer_with_conn(

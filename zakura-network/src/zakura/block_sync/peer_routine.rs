@@ -49,7 +49,7 @@ use super::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
         ThroughputMeter,
     },
-    work_queue::{WorkItem, WorkQueue, WorkReturnOutcome},
+    work_queue::{UnmatchedBodyClaimOutcome, WorkItem, WorkQueue, WorkReturnOutcome},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
@@ -1352,6 +1352,7 @@ impl PeerRoutine {
             self.accept_already_settled_height(index, height);
             return;
         };
+        let _budget_guard = self.budget.release_guard(reservation.request_bytes);
         let decoded_attributed_memory_size_bytes =
             record_decoded_memory_size(&block, body_wire_bytes);
         self.trace_body_received(
@@ -1421,7 +1422,6 @@ impl PeerRoutine {
             body_permit,
         )
         .await;
-        self.budget.release(reservation.request_bytes);
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
     }
@@ -1452,7 +1452,7 @@ impl PeerRoutine {
         body: BufferedBlockBody,
         serialized_bytes: u64,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
-    ) {
+    ) -> bool {
         let received_at = Instant::now();
         let sequencer_send_started = Instant::now();
         let body = SequencedBody::new_queued(
@@ -1476,6 +1476,7 @@ impl PeerRoutine {
         };
 
         self.trace_body_sequencer_sent(height, sequencer_send_started.elapsed(), ok);
+        ok
     }
 
     /// Accept a wanted unmatched body whose original requester is gone or whose
@@ -1518,12 +1519,6 @@ impl PeerRoutine {
             },
         };
 
-        let reserved_in_flight = self.work.reserved_in_flight_charge(height);
-        let is_pending = self.work.pending_contains(height);
-        if reserved_in_flight.is_none() && !is_pending {
-            return false;
-        }
-
         let decoded_attributed_memory_size_bytes =
             record_decoded_memory_size(&block, body_wire_bytes);
         let retained_memory_size_bytes = BufferedBlockBody::decoded_retained_memory_size_bytes(
@@ -1532,10 +1527,20 @@ impl PeerRoutine {
         );
         let previous_block_hash = block.header.previous_block_hash;
 
+        let claim = match self.work.claim_unmatched_body(height, hash) {
+            UnmatchedBodyClaimOutcome::Claimed(claim) => claim,
+            UnmatchedBodyClaimOutcome::AlreadyClaimed => return true,
+            UnmatchedBodyClaimOutcome::NotWanted => return false,
+        };
+        let _budget_guard = self.budget.release_guard(claim.request_bytes());
+        // Declared after the budget guard so rollback runs before transferred
+        // request bytes are released on any early return or cancellation.
+        let mut claim = claim;
+
         // Pending unmatched bodies were not covered by an earlier request
         // admission. Reserve their exact retained charge atomically. Commit-window
         // bodies remain exempt for checkpoint liveness.
-        let pending_is_exempt = if is_pending {
+        let pending_is_exempt = if claim.pending_at_claim() {
             let sequencer_view = *self.sequencer_view.borrow();
             let snapshot = self.admission_snapshot(&sequencer_view);
             if !admit_received_body(&self.config, &snapshot, height, retained_memory_size_bytes) {
@@ -1552,29 +1557,13 @@ impl PeerRoutine {
             false
         };
 
-        // The reservation this arrival ended (an active competing request, or a
-        // stale charge on the claimed height); released after the forward below.
-        let ended_reservation = if is_pending {
-            // Claim this height into `in_flight` so it leaves `pending`; if it is
-            // already `in_flight` the take is a no-op and the Sequencer drops the
-            // later duplicate. The received body charges no request budget, but any
-            // stale request reservation the height still owned is released below.
-            let _ = self.work.take_in_range(height, height, 1);
+        if claim.pending_at_claim() {
             metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
-            self.work.claim_received(height)
         } else {
-            // First-completion-wins for a timed-out height already re-issued to
-            // another peer: this arrival ends that request's reservation instead of
-            // discarding a valid body because another peer currently owns the
-            // request slot.
-            let Some(estimate) = self.work.release_active_reserved_height(height) else {
-                return false;
-            };
             metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
-            estimate
-        };
+        }
 
-        let body = match ended_reservation.in_flight_memory_reservation {
+        let body = match claim.take_memory_reservation() {
             Some(in_flight_memory_reservation) => {
                 BufferedBlockBody::from_decoded_block_reconciling_memory_reservation(
                     block,
@@ -1583,7 +1572,7 @@ impl PeerRoutine {
                     in_flight_memory_reservation,
                 )
             }
-            None if is_pending && !pending_is_exempt => {
+            None if claim.pending_at_claim() && !pending_is_exempt => {
                 let Some(body) = BufferedBlockBody::try_from_decoded_block(
                     block,
                     raw_block_payload,
@@ -1596,7 +1585,6 @@ impl PeerRoutine {
                         retained_memory_size_bytes,
                         "lost concurrent retained-memory admission race"
                     );
-                    self.work.return_items([height]);
                     return true;
                 };
                 body
@@ -1634,20 +1622,19 @@ impl PeerRoutine {
         // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
         self.window.credit_late_delivery();
 
-        self.forward_body_to_sequencer(
-            height,
-            hash,
-            previous_block_hash,
-            body,
-            serialized_bytes,
-            body_permit,
-        )
-        .await;
-        // Release the ended reservation only now that the body is counted in
-        // `sequencer_input_bytes`, mirroring the matched receipt path above, so
-        // the bytes are never invisible to both the limiter and the resident
-        // snapshot.
-        self.budget.release(ended_reservation.request_bytes);
+        let forwarded = self
+            .forward_body_to_sequencer(
+                height,
+                hash,
+                previous_block_hash,
+                body,
+                serialized_bytes,
+                body_permit,
+            )
+            .await;
+        if forwarded {
+            claim.commit();
+        }
         true
     }
 

@@ -38,6 +38,20 @@ pub(crate) struct ByteBudget {
     inner: Arc<ByteBudgetInner>,
 }
 
+/// Transferred byte-budget ownership that releases automatically on drop.
+#[derive(Debug)]
+#[must_use = "the guard must remain alive while the transferred bytes are in use"]
+pub(crate) struct ByteBudgetReleaseGuard {
+    budget: ByteBudget,
+    bytes: u64,
+}
+
+impl Drop for ByteBudgetReleaseGuard {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
 #[derive(Debug)]
 struct ByteBudgetInner {
     max_bytes: u64,
@@ -73,6 +87,14 @@ impl ByteBudget {
 
     pub(crate) fn reserved(&self) -> u64 {
         self.inner.reserved_bytes.load(Ordering::Acquire)
+    }
+
+    /// Own already-reserved bytes and release them when the returned guard drops.
+    pub(crate) fn release_guard(&self, bytes: u64) -> ByteBudgetReleaseGuard {
+        ByteBudgetReleaseGuard {
+            budget: self.clone(),
+            bytes,
+        }
     }
 
     /// Reserve `bytes` against the shared counter, or fail if the budget cannot
@@ -333,6 +355,17 @@ mod tests {
         assert!(!budget.try_reserve(601));
         assert_eq!(budget.reserved(), 400);
         budget.release(400);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[test]
+    fn byte_budget_release_guard_releases_on_early_drop() {
+        let mut budget = ByteBudget::new(1_000);
+        assert!(budget.try_reserve(400));
+        {
+            let _guard = budget.release_guard(400);
+            assert_eq!(budget.reserved(), 400);
+        }
         assert_eq!(budget.reserved(), 0);
     }
 

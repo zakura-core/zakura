@@ -19,7 +19,7 @@ use super::{
     sequencer::*,
     sequencer_task::{initial_view, SequencedBody, SequencerControlInput, SequencerTask},
     state::*,
-    work_queue::WorkQueue,
+    work_queue::{UnmatchedBodyClaimOutcome, WorkQueue},
 };
 use crate::zakura::{
     framed_channel,
@@ -2258,6 +2258,165 @@ fn claim_received_does_not_orphan_a_charge() {
     budget.release(released);
     assert_eq!(released, 0, "a received height owns no further charge");
     assert_eq!(budget.reserved(), 0);
+}
+
+#[test]
+fn unmatched_body_claim_has_exclusive_requeue_ownership() {
+    let queue = Arc::new(work_queue_with(
+        0,
+        [needed(1, BlockSizeEstimate::Advertised(100))],
+    ));
+    let hash = block::Hash([1; 32]);
+
+    let claim = match queue.claim_unmatched_body(block::Height(1), hash) {
+        UnmatchedBodyClaimOutcome::Claimed(claim) => claim,
+        outcome => panic!("first unmatched body must claim pending work: {outcome:?}"),
+    };
+    assert!(claim.pending_at_claim());
+    assert!(matches!(
+        queue.claim_unmatched_body(block::Height(1), hash),
+        UnmatchedBodyClaimOutcome::AlreadyClaimed
+    ));
+    assert_eq!(
+        queue.mark_issued([(block::Height(1), None)]),
+        None,
+        "issuance cannot overwrite a received claim"
+    );
+
+    queue.return_items([block::Height(1)]);
+    assert!(
+        !queue.pending_contains(block::Height(1)),
+        "generic cleanup cannot return a received claim"
+    );
+
+    drop(claim);
+    assert!(
+        queue.pending_contains(block::Height(1)),
+        "only the owning guard can roll its claim back"
+    );
+
+    let claim = match queue.claim_unmatched_body(block::Height(1), hash) {
+        UnmatchedBodyClaimOutcome::Claimed(claim) => claim,
+        outcome => panic!("rolled-back work must be claimable again: {outcome:?}"),
+    };
+    claim.commit();
+    assert!(!queue.pending_contains(block::Height(1)));
+    assert!(matches!(
+        queue.claim_unmatched_body(block::Height(1), hash),
+        UnmatchedBodyClaimOutcome::AlreadyClaimed
+    ));
+}
+
+#[test]
+fn concurrent_unmatched_body_claims_have_one_winner() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Barrier,
+    };
+
+    let queue = Arc::new(work_queue_with(
+        0,
+        [needed(1, BlockSizeEstimate::Advertised(100))],
+    ));
+    let start = Arc::new(Barrier::new(2));
+    let claimed = Arc::new(AtomicUsize::new(0));
+    let already_claimed = Arc::new(AtomicUsize::new(0));
+    let mut threads = Vec::new();
+
+    for _ in 0..2 {
+        let queue = queue.clone();
+        let start = start.clone();
+        let claimed = claimed.clone();
+        let already_claimed = already_claimed.clone();
+        threads.push(std::thread::spawn(move || {
+            start.wait();
+            match queue.claim_unmatched_body(block::Height(1), block::Hash([1; 32])) {
+                UnmatchedBodyClaimOutcome::Claimed(claim) => {
+                    claimed.fetch_add(1, Ordering::Relaxed);
+                    claim.commit();
+                }
+                UnmatchedBodyClaimOutcome::AlreadyClaimed => {
+                    already_claimed.fetch_add(1, Ordering::Relaxed);
+                }
+                UnmatchedBodyClaimOutcome::NotWanted => {
+                    panic!("the shared pending height must remain wanted")
+                }
+            }
+        }));
+    }
+    for thread in threads {
+        thread.join().expect("claiming thread must not panic");
+    }
+
+    assert_eq!(claimed.load(Ordering::Relaxed), 1);
+    assert_eq!(already_claimed.load(Ordering::Relaxed), 1);
+    assert!(!queue.pending_contains(block::Height(1)));
+}
+
+#[test]
+fn unmatched_body_claim_transfers_issued_budget_once() {
+    let queue = Arc::new(work_queue_with(
+        0,
+        [needed(1, BlockSizeEstimate::Advertised(100))],
+    ));
+    let mut budget = ByteBudget::new(1_000);
+    assert_eq!(
+        queue
+            .take_in_range(block::Height(1), block::Height(1), 1)
+            .len(),
+        1
+    );
+    assert!(budget.try_reserve(100));
+    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+
+    let claim = match queue.claim_unmatched_body(block::Height(1), block::Hash([1; 32])) {
+        UnmatchedBodyClaimOutcome::Claimed(claim) => claim,
+        outcome => panic!("issued work must be claimable: {outcome:?}"),
+    };
+    assert!(!claim.pending_at_claim());
+    assert_eq!(claim.request_bytes(), 100);
+    let budget_guard = budget.release_guard(claim.request_bytes());
+    assert!(matches!(
+        queue.claim_unmatched_body(block::Height(1), block::Hash([1; 32])),
+        UnmatchedBodyClaimOutcome::AlreadyClaimed
+    ));
+    assert_eq!(queue.reserved_bytes(), 0);
+    assert_eq!(budget.reserved(), 100);
+
+    drop(budget_guard);
+    assert_eq!(budget.reserved(), 0);
+    drop(claim);
+    assert!(queue.pending_contains(block::Height(1)));
+}
+
+#[test]
+fn stale_unmatched_claim_cannot_return_readded_work() {
+    let queue = Arc::new(work_queue_with(
+        0,
+        [needed(1, BlockSizeEstimate::Advertised(100))],
+    ));
+    let hash = block::Hash([1; 32]);
+    let stale_claim = match queue.claim_unmatched_body(block::Height(1), hash) {
+        UnmatchedBodyClaimOutcome::Claimed(claim) => claim,
+        outcome => panic!("pending work must be claimable: {outcome:?}"),
+    };
+
+    queue.reset_above(block::Height(0));
+    assert_eq!(
+        queue.extend([needed(1, BlockSizeEstimate::Advertised(100))]),
+        1
+    );
+    let current_claim = match queue.claim_unmatched_body(block::Height(1), hash) {
+        UnmatchedBodyClaimOutcome::Claimed(claim) => claim,
+        outcome => panic!("re-added work must receive a new claim: {outcome:?}"),
+    };
+
+    drop(stale_claim);
+    assert!(
+        !queue.pending_contains(block::Height(1)),
+        "the stale token must not roll back the current claim"
+    );
+    current_claim.commit();
 }
 
 #[test]

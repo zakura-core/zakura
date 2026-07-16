@@ -6,11 +6,12 @@
 //! API the caller drives from its own per-peer state (see the ):
 //!
 //! - a height is in **exactly one** of `{below-floor (gone), pending, in_flight}`;
-//! - [`take_in_range`](WorkQueue::take_in_range) moves a contiguous-ascending run
+//! - [`take_in_range_budgeted`](WorkQueue::take_in_range_budgeted) moves a contiguous-ascending run
 //!   `pending → in_flight` (so one taken chunk maps to one `BlockRangeRequest`),
 //!   bounded only by the caller's servable range and a count cap — never by how
 //!   far above the download floor the heights already are;
-//! - only `return_items` (timeout/disconnect retry) and
+//! - only retry/reset transitions such as
+//!   [`release_reserved_and_return_items`](WorkQueue::release_reserved_and_return_items) and
 //!   [`reset_above`](WorkQueue::reset_above) move `in_flight → pending`;
 //! - [`advance_floor`](WorkQueue::advance_floor) is garbage collection only — the
 //!   download floor never throttles the fetch decision.
@@ -21,7 +22,7 @@
 //! reservation); it exists only to carry the `SizeMismatch` tolerance check
 //! through to the reactor's receive path and request budget.
 
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::Notify;
 use zakura_chain::block;
@@ -72,10 +73,65 @@ pub(super) struct SettledRequestReservation {
     pub(super) in_flight_memory_reservation: Option<InFlightMemoryReservation>,
 }
 
+/// Result of atomically claiming an unmatched body response.
+#[derive(Debug)]
+pub(super) enum UnmatchedBodyClaimOutcome {
+    /// This caller exclusively owns the received height.
+    Claimed(UnmatchedBodyClaim),
+    /// Another response already owns this height.
+    AlreadyClaimed,
+    /// The height is absent, has a different hash, or is not currently claimable.
+    NotWanted,
+}
+
+/// Exclusive ownership of an unmatched body response.
+///
+/// Unless committed after sequencer handoff, dropping this guard returns the
+/// matching claim to `pending`. The token prevents a stale guard from returning
+/// a reset and subsequently re-added height.
+#[derive(Debug)]
+pub(super) struct UnmatchedBodyClaim {
+    work: Arc<WorkQueue>,
+    height: block::Height,
+    token: u64,
+    pending_at_claim: bool,
+    reservation: SettledRequestReservation,
+    committed: bool,
+}
+
+impl UnmatchedBodyClaim {
+    pub(super) fn pending_at_claim(&self) -> bool {
+        self.pending_at_claim
+    }
+
+    pub(super) fn request_bytes(&self) -> u64 {
+        self.reservation.request_bytes
+    }
+
+    pub(super) fn take_memory_reservation(&mut self) -> Option<InFlightMemoryReservation> {
+        self.reservation.in_flight_memory_reservation.take()
+    }
+
+    pub(super) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for UnmatchedBodyClaim {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.work.rollback_unmatched_claim(self.height, self.token);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct WorkQueueInner {
     pending: std::collections::BTreeMap<block::Height, WorkItem>,
     in_flight: std::collections::BTreeMap<block::Height, WorkItem>,
+    /// Heights exclusively owned by accepted unmatched responses.
+    received_claims: std::collections::BTreeMap<block::Height, u64>,
+    next_received_claim: u64,
     /// Above-window in-flight memory reservations, keyed by height.
     /// Removing an entry without reconciling it releases the reservation.
     in_flight_memory_reservations:
@@ -120,6 +176,8 @@ impl WorkQueue {
             inner: StdMutex::new(WorkQueueInner {
                 pending: std::collections::BTreeMap::new(),
                 in_flight: std::collections::BTreeMap::new(),
+                received_claims: std::collections::BTreeMap::new(),
+                next_received_claim: 1,
                 in_flight_memory_reservations: std::collections::BTreeMap::new(),
                 floor,
                 floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
@@ -184,6 +242,7 @@ impl WorkQueue {
     /// to a single `BlockRangeRequest`. `high` is the caller's `servable_high`
     /// and is **NOT** clamped to the floor (the download floor is never an upper
     /// bound on the fetch). Returns empty if nothing is eligible.
+    #[cfg(test)]
     pub(super) fn take_in_range(
         &self,
         low: block::Height,
@@ -282,11 +341,15 @@ impl WorkQueue {
     /// Move each given height `in_flight → pending`, preserving its stored
     /// [`WorkItem`]. Heights not currently `in_flight` are skipped (idempotent).
     /// Wakes waiters if anything moved.
+    #[cfg(test)]
     pub(super) fn return_items(&self, heights: impl IntoIterator<Item = block::Height>) {
         let mut moved = false;
         {
             let mut inner = self.lock();
             for height in heights {
+                if inner.received_claims.contains_key(&height) {
+                    continue;
+                }
                 if let Some(item) = inner.in_flight.remove(&height) {
                     inner.pending.insert(height, item);
                     moved = true;
@@ -309,6 +372,9 @@ impl WorkQueue {
     pub(super) fn return_items_quiet(&self, heights: impl IntoIterator<Item = block::Height>) {
         let mut inner = self.lock();
         for height in heights {
+            if inner.received_claims.contains_key(&height) {
+                continue;
+            }
             if let Some(item) = inner.in_flight.remove(&height) {
                 inner.pending.insert(height, item);
             }
@@ -342,6 +408,7 @@ impl WorkQueue {
             let item = inner.in_flight.get(height)?;
             if item.budget.is_reserved()
                 || inner.in_flight_memory_reservations.contains_key(height)
+                || inner.received_claims.contains_key(height)
                 || !unique.insert(*height)
             {
                 return None;
@@ -384,7 +451,99 @@ impl WorkQueue {
         })
     }
 
+    /// Atomically claims an unmatched body whose height and hash are still wanted.
+    ///
+    /// Returns an exclusive guard after moving pending work to in-flight and
+    /// transferring its request and memory reservations to the guard. Returns
+    /// [`UnmatchedBodyClaimOutcome::AlreadyClaimed`] when another unmatched body
+    /// owns the height, or [`UnmatchedBodyClaimOutcome::NotWanted`] when the work
+    /// is absent, has a different hash, or is in-flight without an active request.
+    ///
+    /// Dropping the guard without committing it makes work above the current
+    /// floor pending again.
+    pub(super) fn claim_unmatched_body(
+        self: &Arc<Self>,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> UnmatchedBodyClaimOutcome {
+        let mut inner = self.lock();
+
+        let expected_hash = inner
+            .pending
+            .get(&height)
+            .or_else(|| inner.in_flight.get(&height))
+            .map(|item| item.hash);
+        if expected_hash != Some(hash) {
+            return UnmatchedBodyClaimOutcome::NotWanted;
+        }
+        if inner.received_claims.contains_key(&height) {
+            return UnmatchedBodyClaimOutcome::AlreadyClaimed;
+        }
+
+        let (pending_at_claim, request_bytes) =
+            if let Some(mut item) = inner.pending.remove(&height) {
+                let released = item.budget.release_reserved();
+                inner.in_flight.insert(height, item);
+                (true, released)
+            } else {
+                let Some(item) = inner.in_flight.get_mut(&height) else {
+                    return UnmatchedBodyClaimOutcome::NotWanted;
+                };
+                if !item.budget.is_reserved() {
+                    return UnmatchedBodyClaimOutcome::NotWanted;
+                }
+                (false, item.budget.release_reserved())
+            };
+
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(request_bytes);
+        let in_flight_memory_reservation = inner.in_flight_memory_reservations.remove(&height);
+        let token = inner.next_received_claim;
+        inner.next_received_claim = inner
+            .next_received_claim
+            .checked_add(1)
+            .expect("a u64 claim sequence cannot be exhausted by live block responses");
+        inner.received_claims.insert(height, token);
+
+        UnmatchedBodyClaimOutcome::Claimed(UnmatchedBodyClaim {
+            work: self.clone(),
+            height,
+            token,
+            pending_at_claim,
+            reservation: SettledRequestReservation {
+                request_bytes,
+                in_flight_memory_reservation,
+            },
+            committed: false,
+        })
+    }
+
+    /// Releases the matching live claim and returns its work to `pending`.
+    ///
+    /// Stale tokens, missing work, and work at or below the floor are ignored.
+    /// Waiters are notified only when work becomes pending again.
+    fn rollback_unmatched_claim(&self, height: block::Height, token: u64) {
+        let moved = {
+            let mut inner = self.lock();
+            if inner.received_claims.get(&height) != Some(&token) {
+                return;
+            }
+            inner.received_claims.remove(&height);
+            let Some(item) = inner.in_flight.remove(&height) else {
+                return;
+            };
+            if height <= inner.floor {
+                return;
+            }
+            inner.pending.insert(height, item);
+            true
+        };
+        if moved {
+            self.available.notify_waiters();
+        }
+    }
+
     /// Claim a received height and end any request reservation it owned.
+    #[cfg(test)]
     pub(super) fn claim_received(&self, height: block::Height) -> SettledRequestReservation {
         let mut inner = self.lock();
         let request_bytes = if let Some(item) = inner.in_flight.get_mut(&height) {
@@ -436,6 +595,7 @@ impl WorkQueue {
             let mut inner = self.lock();
             for height in heights {
                 if let Some(mut item) = inner.in_flight.remove(&height) {
+                    inner.received_claims.remove(&height);
                     released = released.saturating_add(item.budget.release_reserved());
                     inner.in_flight_memory_reservations.remove(&height);
                     inner.pending.insert(height, item);
@@ -489,6 +649,10 @@ impl WorkQueue {
                     }
                     continue;
                 };
+                if inner.received_claims.contains_key(&height) {
+                    outcome.released_count = outcome.released_count.saturating_add(1);
+                    continue;
+                }
                 match item.budget {
                     BlockBudgetLedger::Released => {
                         outcome.released_count = outcome.released_count.saturating_add(1);
@@ -550,6 +714,7 @@ impl WorkQueue {
                 .in_flight
                 .pop_first()
                 .expect("first_key_value returned Some");
+            inner.received_claims.remove(&height);
             released = released.saturating_add(item.budget.release_reserved());
             inner.in_flight_memory_reservations.remove(&height);
         }
@@ -588,6 +753,7 @@ impl WorkQueue {
                 .in_flight
                 .pop_last()
                 .expect("last_key_value returned Some");
+            inner.received_claims.remove(&height);
             released = released.saturating_add(item.budget.release_reserved());
             inner.in_flight_memory_reservations.remove(&height);
         }
@@ -712,14 +878,6 @@ impl WorkQueue {
 
     pub(super) fn pending_contains(&self, height: block::Height) -> bool {
         self.lock().pending.contains_key(&height)
-    }
-
-    pub(super) fn reserved_in_flight_charge(&self, height: block::Height) -> Option<u64> {
-        self.lock().in_flight.get(&height).and_then(|item| {
-            item.budget
-                .is_reserved()
-                .then(|| item.budget.reserved_charge())
-        })
     }
 
     pub(super) fn in_flight_contains(&self, height: block::Height) -> bool {

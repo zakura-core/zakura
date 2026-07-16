@@ -1,6 +1,7 @@
-# Zakura dependencies
+# Historical Zebra audit dependencies
 
-This is a list of production Rust code that is in scope and out of scope for Zakura's first audit.
+This inherited document records the scope of Zebra's first audit. It is not a
+security audit of Zakura or its subsequent changes.
 
 Test code, deployment configurations, and other configuration files in the `zakura` repository are out of scope. Due to the way we've created the `audit-v1.0.0-rc.0` tag, tests might not compile, run, or pass.
 
@@ -12,16 +13,16 @@ Test code, deployment configurations, and other configuration files in the `zaku
 
 | Name | Version | Notes
 |------| ------- | -----
-| tower-batch | [audit-v1.0.0-rc.0](https://github.com/zakura-core/zakura/tree/audit-v1.0.0-rc.0/tower-batch/src) |
-| tower-fallback | [audit-v1.0.0-rc.0](https://github.com/zakura-core/zakura/tree/audit-v1.0.0-rc.0/tower-fallback/src) |
-| zakura-chain | [audit-v1.0.0-rc.0](https://github.com/zakura-core/zakura/tree/audit-v1.0.0-rc.0/zakura-chain/src) |
-| zakura-consensus | [audit-v1.0.0-rc.0](https://github.com/zakura-core/zakura/tree/audit-v1.0.0-rc.0/zakura-consensus/src) |
-| zakura-network | [audit-v1.0.0-rc.0](https://github.com/zakura-core/zakura/tree/audit-v1.0.0-rc.0/zakura-network/src) |
-| zakura-node-services | [audit-v1.0.0-rc.0](https://github.com/zakura-core/zakura/tree/audit-v1.0.0-rc.0/zakura-node-services/src) |
-| zakura-rpc | [audit-v1.0.0-rc.0](https://github.com/zakura-core/zakura/tree/audit-v1.0.0-rc.0/zakura-rpc/src) |
-| zakura-script | [audit-v1.0.0-rc.0](https://github.com/zakura-core/zakura/tree/audit-v1.0.0-rc.0/zakura-script/src) |
-| zakura-state | [audit-v1.0.0-rc.0](https://github.com/zakura-core/zakura/tree/audit-v1.0.0-rc.0/zakura-state/src) |
-| zakurad | [audit-v1.0.0-rc.0](https://github.com/zakura-core/zakura/tree/audit-v1.0.0-rc.0/zakurad/src) |
+| tower-batch | [audit-v1.0.0-rc.0](https://github.com/ZcashFoundation/zebra/tree/audit-v1.0.0-rc.0/tower-batch/src) |
+| tower-fallback | [audit-v1.0.0-rc.0](https://github.com/ZcashFoundation/zebra/tree/audit-v1.0.0-rc.0/tower-fallback/src) |
+| zebra-chain | [audit-v1.0.0-rc.0](https://github.com/ZcashFoundation/zebra/tree/audit-v1.0.0-rc.0/zebra-chain/src) |
+| zebra-consensus | [audit-v1.0.0-rc.0](https://github.com/ZcashFoundation/zebra/tree/audit-v1.0.0-rc.0/zebra-consensus/src) |
+| zebra-network | [audit-v1.0.0-rc.0](https://github.com/ZcashFoundation/zebra/tree/audit-v1.0.0-rc.0/zebra-network/src) |
+| zebra-node-services | [audit-v1.0.0-rc.0](https://github.com/ZcashFoundation/zebra/tree/audit-v1.0.0-rc.0/zebra-node-services/src) |
+| zebra-rpc | [audit-v1.0.0-rc.0](https://github.com/ZcashFoundation/zebra/tree/audit-v1.0.0-rc.0/zebra-rpc/src) |
+| zebra-script | [audit-v1.0.0-rc.0](https://github.com/ZcashFoundation/zebra/tree/audit-v1.0.0-rc.0/zebra-script/src) |
+| zebra-state | [audit-v1.0.0-rc.0](https://github.com/ZcashFoundation/zebra/tree/audit-v1.0.0-rc.0/zebra-state/src) |
+| zebrad | [audit-v1.0.0-rc.0](https://github.com/ZcashFoundation/zebra/tree/audit-v1.0.0-rc.0/zebrad/src) |
 
 ### Zcash/ZF dependencies
 
@@ -37,7 +38,7 @@ Test code, deployment configurations, and other configuration files in the `zaku
 
 | Name | Version | Notes
 |------| ------- | -----
-| zakura-utils | audit-v1.0.0-rc.0 | <i>Only the [zakura-checkpoints](https://github.com/zakura-core/zakura/tree/audit-v1.0.0-rc.0/zakura-utils/src/bin/zakura-checkpoints) utility needs to be audited.</i>
+| zebra-utils | audit-v1.0.0-rc.0 | <i>Only the [zebra-checkpoints](https://github.com/ZcashFoundation/zebra/tree/audit-v1.0.0-rc.0/zebra-utils/src/bin/zebra-checkpoints) utility needs to be audited.</i>
 
 ### Zcash/ZF dependencies
 
@@ -48,19 +49,23 @@ Test code, deployment configurations, and other configuration files in the `zaku
 | redjubjub | [0.5.0](https://github.com/ZcashFoundation/redjubjub/tree/0.5.0/src) | [jp](https://github.com/ZcashFoundation/redjubjub/raw/main/zcash-frost-audit-report-20210323.pdf) <i>(FROST only)</i> | <b><i>Optional</i></b><br><i>All files should be audited EXCEPT:<br />- the [signing code](https://github.com/ZcashFoundation/redjubjub/blob/0.5.0/src/signing_key.rs)<br /> - the [FROST code](https://github.com/ZcashFoundation/redjubjub/blob/0.5.0/src/frost.rs), and<br />- the FROST messages [module](https://github.com/ZcashFoundation/redjubjub/blob/0.5.0/src/messages.rs) and [directory](https://github.com/ZcashFoundation/redjubjub/blob/0.5.0/src/messages)</i>
 | reddsa | [0.4.0](https://github.com/ZcashFoundation/reddsa/tree/0.4.0/src) | [jp](https://github.com/ZcashFoundation/redjubjub/raw/main/zcash-frost-audit-report-20210323.pdf) <i>(FROST only)</i> | <b><i>Optional</i></b><br><i>This code was moved from `zakura/zakura-chain/src/primitives/redpallas` into a separate crate after the Zakura `v1.0.0-rc.0` release. A previous version of this code was audited as the `redjubjub` crate.<br />All files should be audited EXCEPT:<br />- the [signing code](https://github.com/ZcashFoundation/reddsa/blob/0.4.0/src/signing_key.rs), and<br />- the [Sapling code](https://github.com/ZcashFoundation/reddsa/blob/0.4.0/src/sapling.rs)</i>
 
-Note: there are duplicate `zcash_primitives`, `zcash_proofs`, and `reddsa` dependencies in Zakura's audit and development branches, [this will get fixed](https://github.com/zakura-core/zakura/issues/6107) after the `zcashd` 5.4.0 release.
+Note: there were duplicate `zcash_primitives`, `zcash_proofs`, and `reddsa`
+dependencies in Zebra's audit and development branches. See
+[Zebra issue #6107](https://github.com/ZcashFoundation/zebra/issues/6107).
 
 ---
 
 ## Not Included
 
-The changes in these PRs are out of scope for the audit. When the Zakura team checks for bugs that have already been fixed, we can check these PRs, and any changes after commit [c4032e2b](https://github.com/zakura-core/zakura/commit/c4032e2b7f6dbee8a9480d3c978c70a3cfc3332c).
+The changes in these PRs were out of scope for the audit. When checking for bugs
+that have already been fixed, consult these PRs and changes after
+[Zebra commit c4032e2b](https://github.com/ZcashFoundation/zebra/commit/c4032e2b7f6dbee8a9480d3c978c70a3cfc3332c).
 
 The following consensus, security, and functional changes are in Zakura's development branch, but they are not included in the `audit-v1.0.0-rc.0` tag, because they caused too many merge conflicts:
 
-- [fix(sync): Pause new downloads when Zakura reaches the lookahead limit #5561](https://github.com/zakura-core/zakura/pull/5561)
-- [fix(rpc): Shut down the RPC server properly when Zakura shuts down #5591](https://github.com/zakura-core/zakura/pull/5591)
-- [refactor(state): Make implementation of block consensus rules clearer #5915](https://github.com/zakura-core/zakura/pull/5915)
+- [fix(sync): Pause new downloads when Zebra reaches the lookahead limit #5561](https://github.com/ZcashFoundation/zebra/pull/5561)
+- [fix(rpc): Shut down the RPC server properly when Zebra shuts down #5591](https://github.com/ZcashFoundation/zebra/pull/5591)
+- [refactor(state): Make implementation of block consensus rules clearer #5915](https://github.com/ZcashFoundation/zebra/pull/5915)
 
 ---
 
@@ -70,7 +75,9 @@ The following list of dependencies is out of scope for the audit.
 
 Please ignore the dependency versions in these tables, some of them are outdated. All versions of these dependencies are out of scope.
 
-The latest versions of Zakura's dependencies are in [`Cargo.lock`](https://github.com/zakura-core/zakura/tree/audit-v1.0.0-rc.0/Cargo.lock), including transitive dependencies. They can be viewed using `cargo tree`.
+The audited versions of Zebra's dependencies are in
+[`Cargo.lock`](https://github.com/ZcashFoundation/zebra/blob/audit-v1.0.0-rc.0/Cargo.lock),
+including transitive dependencies. They can be viewed using `cargo tree`.
 
 Click the triangle for details:
 <details>

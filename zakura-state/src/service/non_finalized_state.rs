@@ -379,9 +379,8 @@ impl NonFinalizedState {
         };
 
         let invalidated_blocks = if chain.non_finalized_root_hash() == block_hash {
-            let chain_tip_hash = chain.non_finalized_tip_hash();
             self.chain_set
-                .retain(|chain| chain.non_finalized_tip_hash() != chain_tip_hash);
+                .retain(|chain| !chain.contains_block_hash(block_hash));
             chain.blocks.values().cloned().collect()
         } else {
             let (new_chain, invalidated_blocks) = chain

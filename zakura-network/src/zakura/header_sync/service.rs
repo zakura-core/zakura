@@ -242,6 +242,34 @@ impl HeaderSyncPeerSession {
         .map(|()| request_id)
     }
 
+    /// Prepare a correlated header request without making its frame visible to the peer.
+    pub(super) fn prepare_get_headers(
+        &self,
+        start_height: block::Height,
+        count: u32,
+        want_tree_aux_roots: bool,
+    ) -> Result<PreparedGetHeaders, OrderedSendError> {
+        let request_id = self.next_request_id()?;
+        let expected =
+            ExpectedHeadersResponse::new(request_id, start_height, count, want_tree_aux_roots)
+                .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+        let frame = HeaderSyncMessage::GetHeaders {
+            start_height,
+            count,
+            want_tree_aux_roots,
+        }
+        .encode_frame(Some(request_id))
+        .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+
+        let reservation = ExpectedHeadersReservation::new(self.inner.commands.clone(), expected)?;
+        Ok(PreparedGetHeaders {
+            request_id,
+            frame,
+            send: self.inner.send.clone(),
+            reservation,
+        })
+    }
+
     /// Send a typed header range response with one advisory body-size hint and
     /// tree-aux root payload per header.
     pub fn try_send_headers_with_sizes_and_roots(
@@ -278,6 +306,75 @@ impl HeaderSyncPeerSession {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_frame)) => Err(OrderedSendError::Full),
             Err(mpsc::error::TrySendError::Closed(_frame)) => Err(OrderedSendError::Closed),
+        }
+    }
+}
+
+pub(super) struct PreparedGetHeaders {
+    request_id: HeaderSyncRequestId,
+    frame: Frame,
+    send: FramedSend,
+    reservation: ExpectedHeadersReservation,
+}
+
+impl PreparedGetHeaders {
+    pub(super) fn request_id(&self) -> HeaderSyncRequestId {
+        self.request_id
+    }
+
+    /// Wait for outbound capacity and publish the prepared frame.
+    ///
+    /// Dropping this future before publication synchronously cancels the pipe's
+    /// response reservation.
+    pub(super) async fn send(self) -> Result<HeaderSyncRequestId, OrderedSendError> {
+        let Self {
+            request_id,
+            frame,
+            send,
+            mut reservation,
+        } = self;
+        send.send(frame)
+            .await
+            .map_err(|_| OrderedSendError::Closed)?;
+        reservation.disarm();
+        Ok(request_id)
+    }
+}
+
+struct ExpectedHeadersReservation {
+    commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
+    expected: ExpectedHeadersResponse,
+    armed: bool,
+}
+
+impl ExpectedHeadersReservation {
+    fn new(
+        commands: Option<mpsc::UnboundedSender<HeaderSyncPeerCommand>>,
+        expected: ExpectedHeadersResponse,
+    ) -> Result<Self, OrderedSendError> {
+        if let Some(commands) = &commands {
+            commands
+                .send(HeaderSyncPeerCommand::Reserve(expected))
+                .map_err(|_| OrderedSendError::Closed)?;
+        }
+        Ok(Self {
+            commands,
+            expected,
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ExpectedHeadersReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(commands) = &self.commands {
+                let _ = commands.send(HeaderSyncPeerCommand::Cancel(self.expected));
+            }
         }
     }
 }
@@ -726,6 +823,10 @@ impl Sink for HeaderSyncPassthroughSink {
 #[cfg(test)]
 mod request_id_tests {
     use super::*;
+    use crate::zakura::header_sync::{
+        requester::HeaderRequesterCommand,
+        state::{RangePriority, RangeRequest},
+    };
 
     #[test]
     fn request_id_exhaustion_remains_fail_closed() {
@@ -874,5 +975,49 @@ mod request_id_tests {
             HeaderSyncRequestId::new(1).expect("non-zero id")
         );
         assert_eq!(session.inner.next_request_id.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn requester_queue_failure_cancels_prepared_expectation() {
+        let (send, _recv) = crate::zakura::framed_channel(1);
+        let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+        let peer_id = ZakuraPeerId::new(vec![5; 32]).expect("test peer id is valid");
+        let session = HeaderSyncPeerSession::from_parts_with_direction_and_commands(
+            peer_id,
+            1,
+            ServicePeerDirection::Outbound,
+            send,
+            CancellationToken::new(),
+            Some(commands_tx),
+        );
+        let range = RangeRequest {
+            start_height: block::Height(1),
+            count: 1,
+            anchor_hash: None,
+            finalized: false,
+            want_tree_aux_roots: true,
+            priority: RangePriority::Forward,
+        };
+        let prepared = session
+            .prepare_get_headers(range.start_height, range.count, range.want_tree_aux_roots)
+            .expect("valid test request is prepared");
+        let reserved = match commands_rx.try_recv().expect("reservation is published") {
+            HeaderSyncPeerCommand::Reserve(expected) => expected,
+            command => panic!("expected reservation command, got {command:?}"),
+        };
+        let (requester_tx, requester_rx) = mpsc::channel(1);
+        drop(requester_rx);
+
+        let rejected = match requester_tx.try_send(HeaderRequesterCommand { range, prepared }) {
+            Err(mpsc::error::TrySendError::Closed(command)) => command,
+            _ => panic!("closed requester queue rejects the prepared command"),
+        };
+        drop(rejected);
+
+        let cancelled = match commands_rx.try_recv().expect("cancellation is published") {
+            HeaderSyncPeerCommand::Cancel(expected) => expected,
+            command => panic!("expected cancellation command, got {command:?}"),
+        };
+        assert_eq!(cancelled, reserved);
     }
 }

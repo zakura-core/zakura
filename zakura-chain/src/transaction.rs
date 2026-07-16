@@ -284,7 +284,8 @@ impl Transaction {
     }
 
     /// Compute this transaction's ID (txid) and ZIP-244 authorizing-data digest
-    /// together, sharing the librustzcash conversion used by both computations.
+    /// together, sharing the native ZIP-244 decomposition used by both
+    /// computations.
     ///
     /// Returns `None` for the auth digest of pre-v5 transactions.
     pub fn txid_and_auth_digest(&self) -> (Hash, Option<AuthDigest>) {

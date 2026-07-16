@@ -1,4 +1,6 @@
-![Zakura logotype](book/theme/favicon.png)
+<p align="center">
+  <img src="book/theme/zakura-flower-v1.svg" alt="Zakura logo" width="160">
+</p>
 
 ---
 
@@ -9,6 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)
 
 - [Getting Started](#getting-started)
+  - [Installer](#installer)
   - [Docker](#docker)
   - [Manual Install](#manual-install)
 - [Documentation](#documentation)
@@ -16,30 +19,47 @@
 - [Security](#security)
 - [License](#license)
 
-[Zakura](https://github.com/zakura-core/zakura/) is a fully consensus compatible Zcash full node written in Rust, built for scale. We dream of the future where Zcash can power the worlds payments. Mastercard and Visa give a lower bound, we have to first hit 50k TPS of capacity. With ongoing cryptographic optimizations to the Zcash protocol, from [Project Tachyon](https://tachyon.z.cash/) and [Valargroup](https://valargroup.dev), this implies consensus must be capable of at least 100MB/s of block data. The starting point today is 28 KB/s. Zakura builds for this future.
+[Zakura](https://github.com/zakura-core/zakura/) is a consensus-compatible Zcash full node written in Rust, built for scale. Supporting payments at global scale requires on the order of 50k TPS, which translates to consensus processing at least 100 MB/s of block data. Today's chain peaks at 28 KB/s. With cryptographic optimizations to the Zcash protocol underway in [Project Tachyon](https://tachyon.z.cash/) and at [Valargroup](https://valargroup.dev), Zakura is the node implementation built to close that gap.
 
-Zakura is forked off of [Zebra](https://github.com/ZcashFoundation/zebra). This first release brings major improvements over existing Zcash node software:
+Zakura is forked from [Zebra](https://github.com/ZcashFoundation/zebra). This first release brings major improvements over existing Zcash node software:
 
-- Performance: Blockchain sync is nearly 5× faster than Zebra. Block execution is notably faster than Zebra on worst case sandblast attacks as well.
-- Pruning and snapshots: Native block pruning with configurable retention cuts disk usage substantially. We also publish snapshots (~11 GB pruned) that let you bootstrap a node 680× faster than syncing over the standard P2P network. See [here](https://zakura.com/snapshots/)
-- zcashd compatibility: A compatibility mode reproduces the legacy zcashd RPC interface, so existing wallets and integrations keep working.
-- Alpha of a v2 p2p layer: We are building a new P2P transport layer for Zakura nodes, currently off by default. The goals: sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol with strict DoS resistance built in.
+- Performance: Blockchain sync is nearly 5× faster than Zebra. Block execution is notably faster than Zebra, especially on worst-case sandblast attacks.
+- Pruning and snapshots: Native block pruning with configurable retention lets you operate a full node with substantially less disk space. We also publish snapshots (~11 GB pruned) that let you bootstrap a node 680× faster than syncing over the standard P2P network. See the [snapshots page](https://zakura.com/snapshots/).
+- [zcashd compatibility](book/src/user/zcashd-compat.md): A compatibility mode
+  reproduces the legacy zcashd RPC interface, so existing wallets and
+  integrations keep working.
+- Experimental P2P v2: We are building a new P2P transport layer for Zakura nodes, currently off by default on Mainnet. The goals are sub-500ms worst-case block propagation, mempool aggregation (used in Tachyon), sync at the speed of your bandwidth, and a future-proofed gossip protocol. The v2 stack has known DoS risks and is not yet production-hardened; see its [current tradeoffs and production readiness criteria](book/src/user/p2p.md).
 
 ## Getting Started
 
-You can run Zakura using our [Docker
-image](https://hub.docker.com/r/valargroup/zakura/tags) or you can install it manually.
+There are several ways to install the node software: an interactive installer that downloads the binary, Docker, or building from source or crates.io.
+
+### Installer
+
+The simplest way to install Zakura on a new machine is using the interactive installer:
+
+```console
+curl -fsSL https://raw.githubusercontent.com/zakura-core/zakura/main/scripts/install-zakura.sh | bash
+```
+
+The installer can set up either standard Zakura or its
+[zcashd-compatible variant](book/src/user/zcashd-compat.md).
 
 ### Docker
 
-This command will run our latest release, and sync it to the tip:
+You can run Zakura using our [Docker
+image](https://hub.docker.com/r/zakuracore/zakura/tags) or install it manually.
+The zcashd-compatible split-container mode uses the
+[zakuracore/zcashd:v1.0.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
+
+This command will run our latest release and sync it to the tip:
 
 ```sh
 docker run -d \
   --name zakura \
   -p 8233:8233 \
   -v zakurad-cache:/home/zakura/.cache/zakura \
-  valargroup/zakura:latest
+  zakuracore/zakura:latest
 ```
 
 The `-p 8233:8233` flag exposes the P2P port so other Zcash nodes can connect to
@@ -65,7 +85,7 @@ compiler. Below are quick summaries for installing these dependencies.
 2. Install Zakura's build dependencies:
    - **libclang**, which is a library that comes under various names, typically
      `libclang`, `libclang-dev`, `llvm`, or `llvm-dev`;
-   - **clang** or another C++ compiler (`g++,` which is for all platforms or
+   - **clang** or another C++ compiler (`g++`, which is for all platforms, or
      `Xcode`, which is for macOS);
    - **[`protoc`](https://grpc.io/docs/protoc-installation/)** (optional).
 
@@ -101,7 +121,7 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.0.0-rc4 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.0.0 zakura
 ```
 
 You can start Zakura by running
@@ -113,7 +133,7 @@ zakurad start
 Refer to the [Building and Installing
 Zakura](book/src/user/install.md) and [Running
 Zakura](book/src/user/run.md) sections in the book for enabling
-optional features, detailed configuration and further details.
+optional features, detailed configuration, and further details.
 
 ## Documentation
 
@@ -134,7 +154,7 @@ triage new issues and we will respond. We maintain a list of known issues in the
 [Troubleshooting](book/src/user/troubleshooting.md) section of
 the book.
 
-If you want to chat with us, use the project discussion channels linked from the Zakura repository.
+If you want to chat with us, use the GitHub issues for now.
 
 ## Security
 

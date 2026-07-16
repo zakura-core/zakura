@@ -3,33 +3,11 @@
 > This file is read by AI coding agents (Claude Code, GitHub Copilot, Cursor, Devin, etc.).
 > It provides project context and contribution policies.
 
-# Before You Contribute
+# Working in This Repository
 
-**Every PR to Zakura requires human review.** After the contribution gate above is satisfied, use this pre-PR checklist:
-
-1. Confirm scope: Zakura is a validator node. Avoid out-of-scope features like wallets, block explorers, or mining pools.
-2. Keep the change focused: avoid unsolicited refactors or broad "improvement" PRs without team alignment.
-3. Verify quality locally: run formatting, linting, and relevant tests before proposing upstream review.
-4. Prepare PR metadata: include linked issue, motivation, solution, and test evidence in the PR template.
-5. If AI was used, disclose tool and scope in the PR description.
-
-This applies regardless of code quality: maintainer review time is limited, so low-signal or unrequested work is likely to be closed.
-
-## What Will Get a PR Closed
-
-The contribution gate already defines discussion/issue requirements. Additional common closure reasons:
-
-- Issue exists but has no response from a Zakura team member (creating an issue and immediately opening a PR does not count as discussion)
-- Trivial changes (typo fixes, minor formatting) without team request
-- Refactors or "improvements" nobody asked for
-- Streams of PRs without prior discussion of the overall plan
-- Features outside Zakura's scope (wallets, block explorers, mining pools — these belong in [Zaino](https://github.com/zingolabs/zaino), [Zallet](https://github.com/zcash/wallet), or [librustzcash](https://github.com/zcash/librustzcash))
-- Missing test evidence for behavior changes
-- Inability to explain the logic or design tradeoffs of the changes when asked
-
-## AI Disclosure
-
-If AI tools were used to write code, tests, or PR descriptions, disclose this in the PR description. Specify the tool and scope (e.g., "Used Claude for test boilerplate"). The contributor is the sole responsible author — "the AI generated it" is not a justification during review.
+- Keep changes focused and avoid unrelated refactors.
+- Run formatting and the checks relevant to the code you changed.
+- For fixes, explain the root cause, how the solution addresses it, and how the tests exercise the affected behavior.
 
 ## Project Structure & Module Organization
 
@@ -43,13 +21,13 @@ Code is primarily in each crate's `src/`; integration tests are in `*/tests/`; m
 
 ## Build, Test, and Development Commands
 
-All of these must pass before submitting a PR:
+Choose checks that are proportional to the change. Workspace-wide commands are useful for broad or cross-crate changes:
 
 ```bash
 # Optional full build check
 cargo build --workspace --locked
 
-# All three must pass before any PR
+# Formatting, linting, and workspace tests
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -71,9 +49,7 @@ cargo nextest run --profile sync-large-checkpoints-empty
 ## Commit & Pull Request Guidelines
 
 - PR titles must follow [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) (PRs are squash-merged — the PR title becomes the commit message)
-- Do not add `Co-Authored-By` tags for AI tools
-- Do not add "Generated with [tool]" footers
-- Use `.github/pull_request_template.md` and include: motivation, solution summary, test evidence, issue link (`Closes #...`), and AI disclosure.
+- Use `.github/pull_request_template.md`. For fixes, connect the root cause to both the solution and the test coverage.
 - For user-visible changes, update `CHANGELOG.md` per `CHANGELOG_GUIDELINES.md`.
 
 ## Project Overview

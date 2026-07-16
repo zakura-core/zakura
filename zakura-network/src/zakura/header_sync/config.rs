@@ -55,7 +55,11 @@ impl Default for HeaderSyncStatus {
 pub struct ZakuraHeaderSyncConfig {
     /// Maximum headers this node advertises per `GetHeaders` response.
     pub max_headers_per_response: u32,
-    /// Maximum concurrent `GetHeaders` requests this node advertises per peer.
+    /// Maximum concurrent `GetHeaders` requests per peer.
+    ///
+    /// This is both the inbound limit advertised to remote peers and the local
+    /// outbound requester ceiling. The effective requester limit is the minimum
+    /// of this value, the peer's advertisement, and the hard protocol cap of 16.
     pub max_inflight_requests: u16,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
     #[serde(with = "humantime_serde")]

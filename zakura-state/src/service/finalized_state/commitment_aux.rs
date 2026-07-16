@@ -12,10 +12,10 @@ use std::{
 };
 
 use thiserror::Error;
-use zakura_chain::{
-    block::{self, merkle::AuthDataRoot},
-    ironwood, orchard, sapling, sprout,
-};
+use zakura_chain::{block, ironwood, orchard, sapling, sprout};
+
+#[cfg(test)]
+use zakura_chain::block::merkle::AuthDataRoot;
 
 use super::{FromDisk, IntoDisk, ZakuraDb};
 
@@ -464,32 +464,29 @@ pub(crate) fn produce_block_roots(
         // `ironwood_root_or_empty`'s doc comment).
         let ironwood_root = ironwood_root_or_empty(db.ironwood_tree_by_height(&height));
         // Below the upgrade height the serving index does not exist, so derive the
-        // auth-data root and the shielded tx-counts from the locally stored block (this
-        // archival node holds the body for these heights). Zero only if the body is somehow
-        // absent, in which case the recipient simply re-fetches from a node that has it.
-        let block = db.block(height.into());
-        let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) =
-            if let Some(block) = block.as_ref() {
-                (
-                    block.sapling_transactions_count(),
-                    block.orchard_transactions_count(),
-                    block.ironwood_transactions_count(),
-                    block.auth_data_root(),
-                )
-            } else {
-                metrics::counter!("state.block_roots.zero_aux_fallback").increment(1);
-                static ZERO_AUX_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-                let occurrences = ZERO_AUX_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1;
-                if occurrences.is_power_of_two() {
-                    tracing::error!(
-                        ?height,
-                        occurrences,
-                        "serving tree-aux roots with zero transaction counts and auth-data root \
-                         because the finalized block body is unavailable"
-                    );
-                }
-                (0, 0, 0, AuthDataRoot::from([0u8; 32]))
-            };
+        // auth-data root and shielded transaction counts from the stored block body.
+        // Pruned nodes can retain these trees after deleting the body. Stop at the first
+        // missing body so callers never mistake fabricated zero metadata for a complete
+        // payload.
+        let Some(block) = db.block(height.into()) else {
+            metrics::counter!("state.block_roots.missing_body").increment(1);
+            static MISSING_BODIES: AtomicU64 = AtomicU64::new(0);
+            let occurrences = MISSING_BODIES.fetch_add(1, Ordering::Relaxed) + 1;
+            if occurrences.is_power_of_two() {
+                tracing::error!(
+                    ?height,
+                    occurrences,
+                    "stopping tree-aux root serving because the finalized block body is unavailable"
+                );
+            }
+            break;
+        };
+        let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = (
+            block.sapling_transactions_count(),
+            block.orchard_transactions_count(),
+            block.ironwood_transactions_count(),
+            block.auth_data_root(),
+        );
         roots.push(BlockCommitmentRoots {
             height,
             sapling_root: sapling.root(),
@@ -579,10 +576,11 @@ pub fn produce_final_frontiers_bytes(
 
 #[cfg(test)]
 mod tests {
-    use zakura_chain::{ironwood, parameters::Network};
+    use zakura_chain::{ironwood, parameters::Network, serialization::ZcashDeserializeInto};
 
     use crate::{
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+        request::{CheckpointVerifiedBlock, FinalizedBlock, Treestate},
         service::finalized_state::{
             disk_db::WriteDisk, DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE,
         },
@@ -645,6 +643,26 @@ mod tests {
         db.write_batch(batch).expect("seeding trees succeeds");
     }
 
+    fn seed_block_bodies(db: &ZakuraDb, heights: impl IntoIterator<Item = u32>) {
+        let blocks = Network::Mainnet.blockchain_map();
+        for height in heights {
+            let block: Arc<block::Block> = blocks
+                .get(&height)
+                .expect("block height has test data")
+                .zcash_deserialize_into()
+                .expect("test data deserializes");
+            let finalized = FinalizedBlock::from_checkpoint_verified(
+                CheckpointVerifiedBlock::from(block),
+                Treestate::default(),
+            );
+            let mut batch = DiskWriteBatch::new();
+            batch
+                .prepare_block_header_and_transaction_data_batch(db, &finalized, true, None)
+                .expect("test block header and transactions are valid");
+            db.write_batch(batch).expect("seeding block body succeeds");
+        }
+    }
+
     fn seed_sprout_tree(db: &ZakuraDb, tree: &sprout::tree::NoteCommitmentTree) {
         let mut batch = DiskWriteBatch::new();
         batch.update_sprout_tree(db, tree);
@@ -690,15 +708,21 @@ mod tests {
     }
 
     fn expected_tree_roots(height: u32) -> BlockCommitmentRoots {
+        let block: Arc<block::Block> = Network::Mainnet
+            .blockchain_map()
+            .get(&height)
+            .expect("block height has test data")
+            .zcash_deserialize_into()
+            .expect("test data deserializes");
         BlockCommitmentRoots {
             height: block::Height(height),
             sapling_root: sapling_tree(u64::from(height)).root(),
             orchard_root: orchard_tree(u64::from(height)).root(),
             ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
-            sapling_tx: 0,
-            orchard_tx: 0,
-            ironwood_tx: 0,
-            auth_data_root: AuthDataRoot::from([0; 32]),
+            sapling_tx: block.sapling_transactions_count(),
+            orchard_tx: block.orchard_transactions_count(),
+            ironwood_tx: block.ironwood_transactions_count(),
+            auth_data_root: block.auth_data_root(),
         }
     }
 
@@ -721,6 +745,7 @@ mod tests {
     fn produce_block_roots_derives_contiguous_tree_roots() {
         let _init_guard = zakura_test::init();
         let db = ephemeral_mainnet_db();
+        seed_block_bodies(&db, [1, 2]);
         seed_trees(&db, [1, 2]);
         seed_finalized_tip(&db, block::Height(2));
 
@@ -774,6 +799,7 @@ mod tests {
     fn produce_block_roots_reads_real_ironwood_tree_when_present() {
         let _init_guard = zakura_test::init();
         let db = ephemeral_mainnet_db();
+        seed_block_bodies(&db, [1]);
         seed_trees(&db, [1]);
         let non_empty_ironwood = non_empty_ironwood_tree(7);
         let non_empty_root = non_empty_ironwood.root();
@@ -799,6 +825,7 @@ mod tests {
     fn serve_block_roots_without_upgrade_marker_uses_tree_fallback() {
         let _init_guard = zakura_test::init();
         let db = ephemeral_mainnet_db();
+        seed_block_bodies(&db, [1, 2]);
         seed_trees(&db, [1, 2]);
         seed_index_roots(&db, [1, 2]);
         seed_finalized_tip(&db, block::Height(2));
@@ -816,6 +843,7 @@ mod tests {
     fn serve_block_roots_stitches_trees_to_index_at_upgrade() {
         let _init_guard = zakura_test::init();
         let db = ephemeral_mainnet_db();
+        seed_block_bodies(&db, [1, 2]);
         seed_trees(&db, [1, 2]);
         seed_index_roots(&db, [3, 4]);
         seed_finalized_tip(&db, block::Height(4));
@@ -839,6 +867,7 @@ mod tests {
     fn serve_block_roots_does_not_cross_short_tree_prefix_below_upgrade() {
         let _init_guard = zakura_test::init();
         let db = ephemeral_mainnet_db();
+        seed_block_bodies(&db, [1]);
         seed_trees(&db, [1]);
         seed_index_roots(&db, [3, 4]);
         seed_finalized_tip(&db, block::Height(1));

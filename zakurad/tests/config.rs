@@ -9,6 +9,7 @@
 use std::{env, fs, io::Write, path::PathBuf, sync::Mutex};
 
 use tempfile::{Builder, TempDir};
+use zakura_chain::{block::Height, parameters::NetworkUpgrade};
 use zakura_network::zakura::{DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP};
 use zakurad::components::{
     tracing::{Config as TracingConfig, InnerConfig as TracingInnerConfig, ProgressConfig},
@@ -150,6 +151,35 @@ endpoint_addr = "127.0.0.1:9999"
     assert_eq!(
         config.metrics.endpoint_addr.unwrap().to_string(),
         "127.0.0.1:9999"
+    );
+}
+
+/// The NU6.3 activation height must be configurable from a zakurad config
+/// file. The serde key contains a dot ("NU6.3"), so the TOML key must be
+/// quoted — this pins the exact spelling an operator has to write.
+#[test]
+fn config_loads_quoted_nu6_3_activation_height() {
+    let _env = EnvGuard::new();
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config_path = temp_dir.path().join("nu6_3_config.toml");
+
+    let test_config = r#"
+[network]
+network = "Regtest"
+
+[network.testnet_parameters.activation_heights]
+"NU6.3" = 23
+"#;
+
+    fs::write(&config_path, test_config).expect("write test config");
+
+    let config = ZakuradConfig::load(Some(config_path)).expect("load NU6.3 config from file");
+
+    assert_eq!(
+        NetworkUpgrade::Nu6_3.activation_height(&config.network.network),
+        Some(Height(23)),
+        "the exact dotted TOML key must configure the requested NU6.3 height"
     );
 }
 

@@ -206,6 +206,128 @@ fn v5_orchard_cross_address_flag_fails_deserialization() {
     ));
 }
 
+/// V6 Orchard keeps the cross-address bit reserved on the wire, even though
+/// V6 Ironwood uses the same internal `Flags` type and permits that bit.
+#[test]
+fn v6_orchard_cross_address_flag_fails_serialization_and_deserialization() {
+    let _init_guard = zakura_test::init();
+
+    let mut shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+
+    let make_tx = |shielded_data: crate::orchard::ShieldedData| Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(shielded_data),
+        ironwood_shielded_data: None,
+    };
+
+    let valid_bytes = make_tx(shielded_data.clone())
+        .zcash_serialize_to_vec()
+        .expect("V6 Orchard flags without cross-address must serialize");
+
+    let mut toggled = shielded_data.clone();
+    toggled.flags.toggle(crate::orchard::Flags::ENABLE_SPENDS);
+    let toggled_bytes = make_tx(toggled)
+        .zcash_serialize_to_vec()
+        .expect("V6 Orchard spend flag should serialize");
+    let differing_indices: Vec<_> = valid_bytes
+        .iter()
+        .zip(&toggled_bytes)
+        .enumerate()
+        .filter_map(|(index, (original, toggled))| (original != toggled).then_some(index))
+        .collect();
+    let [flags_index] = differing_indices.as_slice() else {
+        panic!("toggling the V6 Orchard spend flag should change exactly one byte");
+    };
+
+    shielded_data
+        .flags
+        .insert(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
+    let error = make_tx(shielded_data)
+        .zcash_serialize_to_vec()
+        .expect_err("V6 Orchard flags must reject reserved cross-address bit");
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+
+    let mut malformed_bytes = valid_bytes;
+    malformed_bytes[*flags_index] |= crate::orchard::Flags::ENABLE_CROSS_ADDRESS.bits();
+    let error = Transaction::zcash_deserialize(&malformed_bytes[..])
+        .expect_err("V6 Orchard flags must reject reserved cross-address bit");
+    assert!(matches!(
+        error,
+        SerializationError::Parse("invalid reserved orchard flags")
+    ));
+}
+
+/// V6 Ironwood must round-trip `ENABLE_CROSS_ADDRESS`, while still rejecting
+/// undefined flag bits 3..7.
+#[test]
+fn v6_ironwood_cross_address_flag_round_trips_and_rejects_reserved_bits() {
+    let _init_guard = zakura_test::init();
+
+    let mut shielded_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+    shielded_data
+        .flags
+        .insert(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
+
+    let make_tx = |shielded_data: crate::ironwood::ShieldedData| Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(shielded_data),
+    };
+
+    let tx = make_tx(shielded_data.clone());
+    let cross_address_bytes = tx
+        .zcash_serialize_to_vec()
+        .expect("V6 Ironwood must allow the cross-address bit on the wire");
+    let parsed = Transaction::zcash_deserialize(&cross_address_bytes[..])
+        .expect("V6 Ironwood cross-address flag must deserialize");
+    assert!(parsed
+        .ironwood_shielded_data()
+        .expect("test transaction has Ironwood data")
+        .flags
+        .contains(crate::orchard::Flags::ENABLE_CROSS_ADDRESS));
+
+    shielded_data
+        .flags
+        .remove(crate::orchard::Flags::ENABLE_CROSS_ADDRESS);
+    let without_cross_address_bytes = make_tx(shielded_data)
+        .zcash_serialize_to_vec()
+        .expect("V6 Ironwood flags without cross-address must serialize");
+    let differing_indices: Vec<_> = cross_address_bytes
+        .iter()
+        .zip(&without_cross_address_bytes)
+        .enumerate()
+        .filter_map(|(index, (with, without))| (with != without).then_some(index))
+        .collect();
+    let [flags_index] = differing_indices.as_slice() else {
+        panic!("toggling the V6 Ironwood cross-address flag should change exactly one byte");
+    };
+
+    let mut reserved_bit_bytes = cross_address_bytes;
+    reserved_bit_bytes[*flags_index] |= 0b0000_1000;
+    let error = Transaction::zcash_deserialize(&reserved_bit_bytes[..])
+        .expect_err("V6 Ironwood flags must reject reserved bits 3..7");
+    assert!(matches!(
+        error,
+        SerializationError::Parse("invalid reserved orchard flags")
+    ));
+}
+
 #[test]
 fn doesnt_deserialize_transaction_with_invalid_value_balance() {
     let _init_guard = zakura_test::init();
@@ -599,6 +721,36 @@ fn native_zip244_matches_test_vectors() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// V5 remains valid under the NU6.3 branch ID, even though NU6.3 also
+/// introduces V6 and changes Orchard bundle semantics. Keep the native
+/// ZIP-244 path pinned to the librustzcash oracle at that mixed boundary.
+#[test]
+fn native_zip244_matches_librustzcash_for_v5_nu6_3_orchard() {
+    let _init_guard = zakura_test::init();
+
+    let mut tx = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find(|transaction| transaction.orchard_shielded_data().is_some())
+        .expect("test vectors include a V5 Orchard transaction");
+
+    tx.update_network_upgrade(NetworkUpgrade::Nu6_3)
+        .expect("V5 transactions can carry the NU6.3 branch ID");
+
+    let (native_txid, native_auth_digest) = crate::transaction::zip244::txid_and_auth_digest(&tx)
+        .expect("V5 transactions have native ZIP-244 digests");
+    let (librustzcash_txid, librustzcash_auth_digest) =
+        crate::primitives::zcash_primitives::txid_and_auth_digest_via_librustzcash(&tx);
+
+    assert_eq!(
+        native_txid, librustzcash_txid,
+        "native V5 NU6.3 txid must match librustzcash"
+    );
+    assert_eq!(
+        native_auth_digest, librustzcash_auth_digest,
+        "native V5 NU6.3 auth digest must match librustzcash"
+    );
 }
 
 fn assert_native_zip244_matches_test_vector(
@@ -1261,6 +1413,55 @@ fn test_coinbase_script() -> Result<()> {
     Ok(())
 }
 
+/// The V6 version group ID must match librustzcash's finalized constant, both
+/// as a constant and in the serialized header bytes (fOverwintered | version,
+/// then the group ID, little-endian), and the former `0xffff_ffff`
+/// placeholder value must no longer deserialize.
+#[test]
+fn v6_version_group_id_matches_librustzcash_and_wire_format() {
+    use crate::parameters::TX_V6_VERSION_GROUP_ID;
+
+    let _init_guard = zakura_test::init();
+
+    assert_eq!(
+        TX_V6_VERSION_GROUP_ID,
+        zcash_protocol::constants::V6_VERSION_GROUP_ID,
+    );
+    assert_eq!(
+        TX_V6_VERSION_GROUP_ID,
+        zcash_primitives::transaction::TxVersion::V6.version_group_id(),
+    );
+
+    let tx = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: None,
+    };
+    let tx_bytes = tx
+        .zcash_serialize_to_vec()
+        .expect("an empty NU6.3 V6 transaction has a valid wire encoding");
+
+    assert_eq!(&tx_bytes[0..4], &[0x06, 0x00, 0x00, 0x80]);
+    assert_eq!(&tx_bytes[4..8], &[0x98, 0xb6, 0x84, 0xd8]);
+    assert_eq!(tx.version_group_id(), Some(TX_V6_VERSION_GROUP_ID));
+    tx.to_librustzcash(NetworkUpgrade::Nu6_3)
+        .expect("librustzcash must accept Zakura's finalized V6 header");
+
+    let mut placeholder_bytes = tx_bytes;
+    placeholder_bytes[4..8].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+    let error = Transaction::zcash_deserialize(&placeholder_bytes[..])
+        .expect_err("the former placeholder V6 version group ID must be rejected");
+    assert!(matches!(
+        error,
+        SerializationError::Parse("expected TX_V6_VERSION_GROUP_ID")
+    ));
+}
+
 #[test]
 fn v6_transactions_accept_nu6_3_and_later_branch_ids() {
     use crate::parameters::TX_V6_VERSION_GROUP_ID;
@@ -1322,6 +1523,83 @@ fn v6_transactions_accept_nu6_3_and_later_branch_ids() {
             assert_eq!(tx.zcash_serialize_to_vec().unwrap(), tx_bytes);
         }
     }
+}
+
+/// The V6 sighash precomputation path must preserve the separate Orchard and
+/// Ironwood bundle slots after the librustzcash round-trip.
+///
+/// Both fields use the same upstream `orchard::Bundle` concrete type and the
+/// same authorization mapper, so a swapped getter or accidental alias would
+/// otherwise send one pool's proof to the other pool's verifier.
+#[test]
+fn v6_sighasher_preserves_distinct_orchard_and_ironwood_bundle_slots() {
+    use crate::{ironwood, orchard};
+
+    let _init_guard = zakura_test::init();
+
+    let mut orchard_data = Network::iter()
+        .flat_map(|network| v5_transactions(network.block_iter()))
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include an Orchard transaction");
+    let mut ironwood_data = orchard_data.clone();
+
+    let orchard_nullifier = [0u8; 32];
+    let mut ironwood_nullifier = [0u8; 32];
+    ironwood_nullifier[0] = 1;
+
+    let mut orchard_actions = orchard_data.actions.as_slice().to_vec();
+    orchard_actions[0].action.nullifier =
+        orchard::Nullifier::try_from(orchard_nullifier).expect("zero is a valid nullifier");
+    orchard_data.actions = orchard_actions
+        .try_into()
+        .expect("the test bundle has at least one action");
+
+    let mut ironwood_actions = ironwood_data.actions.as_slice().to_vec();
+    ironwood_actions[0].action.nullifier =
+        ironwood::Nullifier::try_from(ironwood_nullifier).expect("one is a valid nullifier");
+    ironwood_data.actions = ironwood_actions
+        .try_into()
+        .expect("the test bundle has at least one action");
+
+    let tx = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(orchard_data),
+        ironwood_shielded_data: Some(ironwood_data),
+    };
+
+    let sighasher = tx
+        .sighasher(NetworkUpgrade::Nu6_3, Arc::new(Vec::new()))
+        .expect("the mixed-pool V6 transaction converts to librustzcash");
+    let orchard_bundle = sighasher
+        .orchard_bundle()
+        .expect("the V6 transaction keeps its Orchard bundle");
+    let ironwood_bundle = sighasher
+        .ironwood_bundle()
+        .expect("the V6 transaction keeps its Ironwood bundle");
+
+    let parsed_orchard_nullifier = (*orchard_bundle
+        .actions()
+        .iter()
+        .next()
+        .expect("the Orchard bundle has at least one action")
+        .nullifier())
+    .to_bytes();
+    let parsed_ironwood_nullifier = (*ironwood_bundle
+        .actions()
+        .iter()
+        .next()
+        .expect("the Ironwood bundle has at least one action")
+        .nullifier())
+    .to_bytes();
+
+    assert_eq!(parsed_orchard_nullifier, orchard_nullifier);
+    assert_eq!(parsed_ironwood_nullifier, ironwood_nullifier);
+    assert_ne!(parsed_orchard_nullifier, parsed_ironwood_nullifier);
 }
 
 #[test]
@@ -1946,6 +2224,211 @@ fn sapling_lazy_cv_epk_edge_cases() {
     );
 }
 
+/// Native ZIP-244 hashing must stay byte-oriented for lazy Sapling points.
+///
+/// Checkpoint hashing and pre-verification mempool IDs are computed before
+/// semantic point validation. An off-curve Sapling commitment must therefore
+/// still produce a deterministic V5/V6 `UnminedTx` ID, while the later
+/// librustzcash conversion remains fail-closed.
+#[test]
+fn native_zip244_hashes_invalid_lazy_sapling_points_before_semantic_rejection() {
+    use group::Group;
+
+    use crate::{
+        amount::Amount,
+        at_least_one,
+        block::Height,
+        parameters::NetworkUpgrade,
+        primitives::{
+            redjubjub::{Binding, Signature},
+            Groth16Proof,
+        },
+        sapling::{
+            self,
+            keys::EphemeralPublicKey,
+            shielded_data::{ShieldedData, TransferData},
+            EncryptedNote, Output, ValueCommitment, WrappedNoteKey,
+        },
+        serialization::{ZcashDeserializeInto, ZcashSerialize},
+        transaction::{LockTime, Transaction, UnminedTx},
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let off_curve = [0xffu8; 32];
+    let other_off_curve = [0xfeu8; 32];
+    assert!(
+        bool::from(jubjub::AffinePoint::from_bytes(off_curve).is_none()),
+        "0xff..ff must not be a valid Jubjub point encoding",
+    );
+    assert!(
+        bool::from(jubjub::AffinePoint::from_bytes(other_off_curve).is_none()),
+        "0xfe..fe must not be a valid Jubjub point encoding",
+    );
+    let valid_epk = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
+
+    let shielded_data = |cv: [u8; 32]| ShieldedData::<sapling::SharedAnchor> {
+        value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+        transfers: TransferData::JustOutputs {
+            outputs: at_least_one![Output {
+                cv: ValueCommitment(cv),
+                cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32])
+                    .expect("zero bytes encode a valid extracted note commitment"),
+                ephemeral_key: EphemeralPublicKey(valid_epk),
+                enc_ciphertext: EncryptedNote([0u8; 580]),
+                out_ciphertext: WrappedNoteKey([0u8; 80]),
+                zkproof: Groth16Proof([0u8; 192]),
+            }],
+        },
+        binding_sig: Signature::<Binding>::from([0u8; 64]),
+    };
+
+    let make_transactions = |cv: [u8; 32]| {
+        [
+            Transaction::V5 {
+                network_upgrade: NetworkUpgrade::Nu5,
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(0),
+                inputs: vec![],
+                outputs: vec![],
+                sapling_shielded_data: Some(shielded_data(cv)),
+                orchard_shielded_data: None,
+            },
+            Transaction::V6 {
+                network_upgrade: NetworkUpgrade::Nu6_3,
+                lock_time: LockTime::unlocked(),
+                expiry_height: Height(0),
+                inputs: vec![],
+                outputs: vec![],
+                sapling_shielded_data: Some(shielded_data(cv)),
+                orchard_shielded_data: None,
+                ironwood_shielded_data: None,
+            },
+        ]
+    };
+
+    for (tx, changed_tx) in make_transactions(off_curve)
+        .into_iter()
+        .zip(make_transactions(other_off_curve))
+    {
+        let network_upgrade = tx
+            .network_upgrade()
+            .expect("V5/V6 transactions carry a network upgrade");
+        let parsed: Transaction = tx
+            .zcash_serialize_to_vec()
+            .expect("crafted transaction must serialize")
+            .zcash_deserialize_into()
+            .expect("lazy Sapling point bytes must deserialize");
+        let changed_parsed: Transaction = changed_tx
+            .zcash_serialize_to_vec()
+            .expect("crafted transaction must serialize")
+            .zcash_deserialize_into()
+            .expect("lazy Sapling point bytes must deserialize");
+
+        assert!(
+            !parsed.sapling_point_encodings_are_valid(),
+            "off-curve Sapling cv must fail deferred semantic validation",
+        );
+        assert!(
+            parsed.to_librustzcash(network_upgrade).is_err(),
+            "off-curve Sapling cv must fail librustzcash conversion",
+        );
+
+        let unmined = UnminedTx::from(parsed.clone());
+        let (txid, auth_digest) = parsed.txid_and_auth_digest();
+        assert_eq!(unmined.id.mined_id(), txid);
+        assert_eq!(unmined.id.auth_digest(), auth_digest);
+        assert_ne!(
+            txid,
+            changed_parsed.hash(),
+            "native txid must commit to the raw lazy Sapling cv bytes",
+        );
+    }
+}
+
+/// The local Sapling binding-key helper stays fail-closed when it sees a lazy
+/// value commitment that has not passed semantic validation yet.
+///
+/// The verifier currently obtains the binding key from librustzcash instead of
+/// this helper, so this is not an acceptance path today. Keep the public helper
+/// fallible anyway: both spend and output commitments can now hold raw bytes
+/// until `Transaction::sapling_point_encodings_are_valid` runs.
+#[test]
+fn sapling_binding_verification_key_rejects_invalid_lazy_commitments() {
+    use group::Group;
+
+    use crate::{
+        amount::Amount,
+        at_least_one,
+        primitives::{
+            redjubjub::{Binding, Signature, SpendAuth},
+            Groth16Proof,
+        },
+        sapling::{
+            self,
+            keys::{EphemeralPublicKey, ValidatingKey},
+            shielded_data::{ShieldedData, TransferData},
+            EncryptedNote, Output, Spend, ValueCommitment, WrappedNoteKey,
+        },
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let valid = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
+    let invalid = [0xffu8; 32];
+    let rk = ValidatingKey::try_from(valid).expect("the Jubjub generator is a valid Sapling rk");
+
+    let output_bundle = |cv: [u8; 32]| ShieldedData::<sapling::SharedAnchor> {
+        value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+        transfers: TransferData::JustOutputs {
+            outputs: at_least_one![Output {
+                cv: ValueCommitment(cv),
+                cm_u: sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[0u8; 32])
+                    .expect("zero bytes encode a valid extracted note commitment"),
+                ephemeral_key: EphemeralPublicKey(valid),
+                enc_ciphertext: EncryptedNote([0u8; 580]),
+                out_ciphertext: WrappedNoteKey([0u8; 80]),
+                zkproof: Groth16Proof([0u8; 192]),
+            }],
+        },
+        binding_sig: Signature::<Binding>::from([0u8; 64]),
+    };
+
+    let spend_bundle = |cv: [u8; 32]| ShieldedData::<sapling::PerSpendAnchor> {
+        value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+        transfers: TransferData::SpendsAndMaybeOutputs {
+            shared_anchor: sapling::FieldNotPresent,
+            spends: at_least_one![Spend {
+                cv: ValueCommitment(cv),
+                per_spend_anchor: sapling::tree::Root::default(),
+                nullifier: sapling::Nullifier::from([0u8; 32]),
+                rk: rk.clone(),
+                zkproof: Groth16Proof([0u8; 192]),
+                spend_auth_sig: Signature::<SpendAuth>::from([0u8; 64]),
+            }],
+            maybe_outputs: vec![],
+        },
+        binding_sig: Signature::<Binding>::from([0u8; 64]),
+    };
+
+    assert!(
+        output_bundle(valid).binding_verification_key().is_some(),
+        "a valid output commitment must still produce a binding key",
+    );
+    assert!(
+        spend_bundle(valid).binding_verification_key().is_some(),
+        "a valid spend commitment must still produce a binding key",
+    );
+    assert!(
+        output_bundle(invalid).binding_verification_key().is_none(),
+        "an invalid lazy output commitment must fail closed",
+    );
+    assert!(
+        spend_bundle(invalid).binding_verification_key().is_none(),
+        "an invalid lazy spend commitment must fail closed",
+    );
+}
+
 /// The semantic verifier's Sapling cv/epk not-small-order check rejects bad
 /// points.
 ///
@@ -2060,6 +2543,76 @@ fn sapling_point_encodings_check_rejects_bad_points() {
     };
 
     check_transaction("V6", &make_v6);
+}
+
+/// The deferred Sapling point check also covers V4 spend commitments.
+///
+/// The lazy representation applies to spend `cv` as well as output `cv`/`epk`.
+/// V4 takes a distinct `PerSpendAnchor` branch, so keep a focused regression on
+/// that route rather than relying only on output-only V5/V6 coverage.
+#[test]
+fn sapling_point_encodings_check_rejects_bad_v4_spend_cv() {
+    use group::Group;
+
+    use crate::{
+        amount::Amount,
+        at_least_one,
+        block::Height,
+        primitives::{
+            redjubjub::{Binding, Signature, SpendAuth},
+            Groth16Proof,
+        },
+        sapling::{
+            self,
+            keys::ValidatingKey,
+            shielded_data::{ShieldedData, TransferData},
+            Spend, ValueCommitment,
+        },
+        transaction::{LockTime, Transaction},
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let valid = jubjub::AffinePoint::from(jubjub::ExtendedPoint::generator()).to_bytes();
+    let off_curve = [0xffu8; 32];
+    let rk = ValidatingKey::try_from(valid).expect("the Jubjub generator is a valid Sapling rk");
+
+    let make_v4 = |cv: [u8; 32]| -> Transaction {
+        let spend = Spend::<sapling::PerSpendAnchor> {
+            cv: ValueCommitment(cv),
+            per_spend_anchor: sapling::tree::Root::default(),
+            nullifier: sapling::Nullifier::from([0u8; 32]),
+            rk: rk.clone(),
+            zkproof: Groth16Proof([0u8; 192]),
+            spend_auth_sig: Signature::<SpendAuth>::from([0u8; 64]),
+        };
+
+        Transaction::V4 {
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![],
+            outputs: vec![],
+            joinsplit_data: None,
+            sapling_shielded_data: Some(ShieldedData::<sapling::PerSpendAnchor> {
+                value_balance: Amount::try_from(0).expect("zero is a valid amount"),
+                transfers: TransferData::SpendsAndMaybeOutputs {
+                    shared_anchor: sapling::FieldNotPresent,
+                    spends: at_least_one![spend],
+                    maybe_outputs: vec![],
+                },
+                binding_sig: Signature::<Binding>::from([0u8; 64]),
+            }),
+        }
+    };
+
+    assert!(
+        make_v4(valid).sapling_point_encodings_are_valid(),
+        "a V4 spend with a valid cv must pass the deferred point check",
+    );
+    assert!(
+        !make_v4(off_curve).sapling_point_encodings_are_valid(),
+        "a V4 spend with an off-curve cv must fail the deferred point check",
+    );
 }
 
 /// The relocated Sapling `cv` / `epk` not-small-order checks accept exactly the

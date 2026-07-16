@@ -1,5 +1,5 @@
 use crate::{
-    block::{Block, MAX_BLOCK_BYTES},
+    block::{genesis::regtest_genesis_block, Block, MAX_BLOCK_BYTES},
     parameters::Network,
     serialization::{
         CompactSizeMessage, SerializationError, ZcashDeserialize, ZcashDeserializeInto,
@@ -156,5 +156,56 @@ fn regtest_solution_is_rejected_off_regtest() {
             Err(Error::InvalidSolutionSize { .. }),
         ),
         "a Regtest solution must be accepted for verification on Regtest",
+    );
+}
+
+#[test]
+fn real_regtest_solution_is_bound_to_regtest_parameters() {
+    let _init_guard = zakura_test::init();
+
+    let block = regtest_genesis_block();
+    let header = block.header.as_ref();
+    let regtest = Network::new_regtest(Default::default());
+
+    header
+        .solution
+        .check(header, &regtest)
+        .expect("the hard-coded Regtest genesis solution must verify on Regtest");
+
+    for network in [Network::Mainnet, Network::new_default_testnet()] {
+        assert!(
+            matches!(
+                header.solution.check(header, &network),
+                Err(Error::InvalidSolutionSize { .. }),
+            ),
+            "a real Regtest proof must not verify on {network}",
+        );
+    }
+}
+
+/// Regression test for the reverse network-parameter mismatch.
+///
+/// A known-valid Mainnet `(200, 9)` proof must not be accepted under Regtest's
+/// `(48, 5)` parameters.
+#[test]
+fn real_common_solution_is_rejected_on_regtest() {
+    let _init_guard = zakura_test::init();
+
+    let block = Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
+        .expect("block test vector should deserialize");
+    let header = block.header.as_ref();
+    let regtest = Network::new_regtest(Default::default());
+
+    header
+        .solution
+        .check(header, &Network::Mainnet)
+        .expect("the hard-coded Mainnet solution must verify on Mainnet");
+
+    assert!(
+        matches!(
+            header.solution.check(header, &regtest),
+            Err(Error::InvalidSolutionSize { .. }),
+        ),
+        "a real Common proof must not verify on Regtest",
     );
 }

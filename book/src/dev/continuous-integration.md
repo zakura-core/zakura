@@ -11,12 +11,12 @@ see the [CI/CD Architecture documentation](https://github.com/zakura-core/zakura
 
 ## Integration Tests
 
-On every PR change, Zakura runs [these Docker tests](https://github.com/zakura-core/zakura/blob/main/.github/workflows/zfnd-ci-integration-tests-gcp.yml):
+On relevant PR changes, Zakura runs [its end-to-end test workflow](https://github.com/zakura-core/zakura/blob/main/.github/workflows/zakura-e2e.yml), including:
 
-- Zakura update syncs from a cached state Google Cloud tip image
-- lightwalletd full syncs from a cached state Google Cloud tip image
-- lightwalletd update syncs from a cached state Google Cloud tip image
-- lightwalletd integration with Zakura JSON-RPC and Light Wallet gRPC calls
+- a Zakura regtest end-to-end gate
+- a multi-node testkit integration test
+- block-sync fuzz scenarios after merges to `main`
+- longer multi-node modes on a schedule or on demand
 
 When a PR is merged to the `main` branch, we also run a Zakura full sync test from genesis.
 Some of our builds and tests are repeated on the `main` branch, due to:
@@ -129,7 +129,7 @@ Admin:
 GitHub doesn't allow PRs from forked repositories to have access to our repository secret keys, even after we approve their CI.
 This means that Google Cloud CI fails on these PRs.
 
-Until we [fix this CI bug](https://github.com/zakura-core/zakura/issues/4529), we can merge external PRs by:
+Until the inherited [Zebra CI bug](https://github.com/ZcashFoundation/zebra/issues/4529) is resolved, we can merge external PRs by:
 
 1. Reviewing the code to make sure it won't give our secret keys to anyone
 2. Pushing a copy of the branch to the Zakura repository
@@ -210,7 +210,7 @@ To fix a CI sync timeout, follow these steps until the timeouts are fixed:
 2. [Update Zakura's checkpoints](https://github.com/zakura-core/zakura/blob/main/zakura-utils/README.md#zakura-checkpoints)
 3. If a Rust test fails with "command did not log any matches for the given regex, within the ... timeout":
 
-   a. If it's the full sync test, [increase the full sync timeout](https://github.com/zakura-core/zakura/pull/5129/files)
+   a. If it's the full sync test, use [Zebra PR #5129](https://github.com/ZcashFoundation/zebra/pull/5129/files) as an example of increasing the timeout.
 
    b. If it's an update sync test, [increase the update sync timeouts](https://github.com/zakura-core/zakura/commit/9fb87425b76ba3747985ea2f22043ff0276a03bd#diff-92f93c26e696014d82c3dc1dbf385c669aa61aa292f44848f52167ab747cb6f6R51)
 
@@ -224,7 +224,7 @@ You can view Zakura's entire dependency tree using `cargo tree`. It can also sho
 To fix duplicate dependencies, follow these steps until the duplicate dependencies are fixed:
 
 1. Check for updates to the crates mentioned in the `Check deny.toml bans` logs, and try doing them in the same PR.
-   For an example, see [PR #5009](https://github.com/zakura-core/zakura/pull/5009#issuecomment-1232488943).
+   For an example, see [Zebra PR #5009](https://github.com/ZcashFoundation/zebra/pull/5009#issuecomment-1232488943).
 
    a. Check for open dependabot PRs, and
 
@@ -234,7 +234,7 @@ To fix duplicate dependencies, follow these steps until the duplicate dependenci
 
    a. Check for features that Zakura activates in its `Cargo.toml` files, and try turning them off, then
 
-   b. Try adding `default-features = false` to Zakura's dependencies (see [PR #4082](https://github.com/zakura-core/zakura/pull/4082/files)).
+   b. Try adding `default-features = false` to Zakura's dependencies (see [Zebra PR #4082](https://github.com/ZcashFoundation/zebra/pull/4082/files)).
 
 3. If there are still duplicate dependencies, add or update `skip-tree` in [`deny.toml`](https://github.com/zakura-core/zakura/blob/main/deny.toml):
 
@@ -244,7 +244,7 @@ To fix duplicate dependencies, follow these steps until the duplicate dependenci
 
    c. Add a comment about why the dependency exception is needed: what was the direct Zakura dependency that caused it?
 
-   d. For an example, see [PR #4890](https://github.com/zakura-core/zakura/pull/4890/files).
+   d. For an example, see [Zebra PR #4890](https://github.com/ZcashFoundation/zebra/pull/4890/files).
 
 4. Repeat step 3 until the dependency warnings are fixed. Adding a single `skip-tree` exception can resolve multiple warnings.
 
@@ -256,10 +256,9 @@ To fix duplicate dependencies, follow these steps until the duplicate dependenci
 
 ### Fixing Disk Full Errors
 
-If the Docker cached state disks are full, increase the disk sizes in:
-
-- [zfnd-deploy-integration-tests-gcp.yml](https://github.com/zakura-core/zakura/blob/main/.github/workflows/zfnd-deploy-integration-tests-gcp.yml)
-- [zfnd-deploy-nodes-gcp.yml](https://github.com/zakura-core/zakura/blob/main/.github/workflows/zfnd-deploy-nodes-gcp.yml)
+If a PR test node's state volume is full, increase the volume size in the
+[PR-node bake workflow](https://github.com/zakura-core/zakura/blob/main/.github/workflows/zakura-pr-node-bake.yml)
+and create a new snapshot.
 
 If the GitHub Actions disks are full, follow these steps until the errors are fixed:
 
@@ -297,7 +296,7 @@ If it looks like a failure might be temporary, try re-running all the jobs on th
 Here are some of the rare and temporary errors that should be retried:
 
 - Docker: "buildx failed with ... cannot reuse body, request must be retried"
-- Failure in `local_listener_fixed_port_localhost_addr_v4` Rust test, mention [ticket #4999](https://github.com/zakura-core/zakura/issues/4999) on the PR
+- Failure in `local_listener_fixed_port_localhost_addr_v4` Rust test; the inherited [Zebra issue #4999](https://github.com/ZcashFoundation/zebra/issues/4999) has additional context.
 - any network connection or download failures
 
 We track some rare errors using tickets, so we know if they are becoming more common and we need to fix them.

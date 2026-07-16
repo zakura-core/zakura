@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    ops::{Add, Deref, DerefMut, RangeInclusive},
+    ops::{Add, Deref, RangeInclusive},
     pin::Pin,
     sync::Arc,
 };
@@ -282,6 +282,17 @@ pub struct SemanticallyVerifiedBlock {
 /// Note: The difference between a `CheckpointVerifiedBlock` and a `ContextuallyVerifiedBlock` is
 /// that the `CheckpointVerifier` doesn't bind the transaction authorizing data to the
 /// `ChainHistoryBlockTxAuthCommitmentHash`, but the `NonFinalizedState` and `FinalizedState` do.
+///
+/// The wrapped block and any cached authorizing-data root must not be changed independently:
+///
+/// ```compile_fail
+/// use zakura_chain::block::merkle::AuthDataRoot;
+/// use zakura_state::CheckpointVerifiedBlock;
+///
+/// fn replace_cached_root(mut block: CheckpointVerifiedBlock, root: AuthDataRoot) {
+///     block.auth_data_root = Some(root);
+/// }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointVerifiedBlock(pub(crate) SemanticallyVerifiedBlock);
 
@@ -541,7 +552,7 @@ impl CheckpointVerifiedBlock {
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
     ) -> Self {
         let mut block = Self::with_hash(block.clone(), hash.unwrap_or(block.hash()));
-        block.deferred_pool_balance_change = deferred_pool_balance_change;
+        block.0.deferred_pool_balance_change = deferred_pool_balance_change;
         block
     }
     /// Creates a block that's ready to be committed to the finalized state,
@@ -565,6 +576,15 @@ impl CheckpointVerifiedBlock {
             deferred_pool_balance_change: None,
             auth_data_root: None,
         })
+    }
+
+    /// Returns this checkpoint block with an auth-data root computed from its wrapped block.
+    ///
+    /// Computing the root internally prevents callers from pairing a cached root with a
+    /// different block.
+    pub fn with_precomputed_auth_data_root(mut self) -> Self {
+        self.0.auth_data_root = Some(self.0.block.auth_data_root());
+        self
     }
 }
 
@@ -669,6 +689,24 @@ mod tests {
         assert_eq!(transaction_hashes.as_ref(), expected_transaction_hashes);
         assert_eq!(auth_data_root, block.auth_data_root());
     }
+
+    #[test]
+    fn checkpoint_precomputed_auth_data_root_matches_its_block() {
+        let _init_guard = zakura_test::init();
+
+        let block = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+                .zcash_deserialize_into::<Block>()
+                .expect("NU5 mainnet block deserializes"),
+        );
+        let checkpoint = CheckpointVerifiedBlock::with_hash(block.clone(), block.hash());
+
+        assert!(checkpoint.auth_data_root.is_none());
+
+        let checkpoint = checkpoint.with_precomputed_auth_data_root();
+
+        assert_eq!(checkpoint.auth_data_root, Some(block.auth_data_root()));
+    }
 }
 
 impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
@@ -712,11 +750,6 @@ impl Deref for CheckpointVerifiedBlock {
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-impl DerefMut for CheckpointVerifiedBlock {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
     }
 }
 

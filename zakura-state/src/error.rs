@@ -571,6 +571,17 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     VctSuppliedRootAwaitingSuccessor { height: block::Height },
 
+    #[error(
+        "checkpoint block at {height:?} has authorizing-data root {actual:?}, but its cached \
+         header prevalidation requires {expected:?}"
+    )]
+    #[non_exhaustive]
+    VctBlockAuthDataRootMismatch {
+        height: block::Height,
+        expected: block::merkle::AuthDataRoot,
+        actual: block::merkle::AuthDataRoot,
+    },
+
     #[error("block height {candidate_height:?} is lower than the current finalized height {finalized_tip_height:?}")]
     #[non_exhaustive]
     OrphanedBlock {

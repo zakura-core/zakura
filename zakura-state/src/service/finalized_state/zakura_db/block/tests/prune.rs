@@ -1192,6 +1192,53 @@ fn pruned_block_bodies_stop_header_sync_range_root_serving() {
     );
 }
 
+/// The fallback shares one transaction iterator across the range and advances it only for the
+/// heights it derives. A height whose roots the index already holds must not leave that
+/// iterator parked on its own transactions, or the next height to derive would build its roots
+/// from the wrong block's body.
+#[test]
+fn header_sync_range_derives_roots_after_skipping_indexed_heights() {
+    let _init_guard = zakura_test::init();
+    let network = Mainnet;
+    let state = new_state_with_blocks(&Config::ephemeral(), &network);
+
+    let mut batch = DiskWriteBatch::new();
+    // Model a database upgraded after these blocks were committed, so heights below the
+    // marker are derived from trees rather than read from the serving index.
+    batch.update_vct_upgrade_marker(&state.db, Height(TEST_BLOCKS + 1));
+    state.db.write_batch(batch).expect("upgrade marker writes");
+
+    let expected: Vec<_> = state
+        .db
+        .header_sync_range_snapshot(Height(1), 3, true)
+        .into_iter()
+        .map(|row| row.commitment_roots)
+        .collect();
+    assert!(
+        expected.iter().all(|roots| roots.is_some()),
+        "committing a block records its roots in the serving index"
+    );
+
+    // Drop only the middle height's index row, so the range skips height 1, derives height 2
+    // from its body, then skips height 3.
+    state
+        .db
+        .delete_zakura_header_commitment_roots([Height(2)])
+        .expect("roots index row is removed");
+
+    let derived: Vec<_> = state
+        .db
+        .header_sync_range_snapshot(Height(1), 3, true)
+        .into_iter()
+        .map(|row| row.commitment_roots)
+        .collect();
+
+    assert_eq!(
+        derived, expected,
+        "the derived height matches the roots the index recorded for that same height"
+    );
+}
+
 #[test]
 #[should_panic(expected = "pruned")]
 fn reopening_pruned_database_in_archive_mode_panics() {

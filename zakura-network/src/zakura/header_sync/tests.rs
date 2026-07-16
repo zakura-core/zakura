@@ -285,12 +285,30 @@ fn prepared_roots_complete_matches_what_the_request_asked_for() {
     // headers-only response incomplete.
     assert!(prepared_roots_complete(false, block::Height(1), 3, &[]));
 
+    // Roots nobody asked for are rejected, so they are not a complete serve either.
+    assert!(!prepared_roots_complete(false, block::Height(1), 3, &roots));
+
     // Roots covering every header, at the requested heights, are complete.
     assert!(prepared_roots_complete(true, block::Height(1), 2, &roots));
 
     // Too few roots for the headers returned, or roots for the wrong heights, are not.
     assert!(!prepared_roots_complete(true, block::Height(1), 3, &roots));
     assert!(!prepared_roots_complete(true, block::Height(5), 2, &roots));
+}
+
+/// Completeness must be read off the response as prepared. A rejection empties the vectors,
+/// and empty roots trivially match empty headers, so deciding afterwards reports a rejected
+/// response as a complete serve.
+#[test]
+fn prepared_roots_complete_is_decided_before_a_rejection_empties_the_response() {
+    let roots = [root_at(block::Height(1))];
+
+    // The state of a response that wanted roots but was emptied by a rejection. Reading
+    // completeness from it claims the serve was complete.
+    assert!(prepared_roots_complete(true, block::Height(1), 0, &[]));
+
+    // Read from the same response before it is emptied, the incomplete roots are visible.
+    assert!(!prepared_roots_complete(true, block::Height(1), 2, &roots));
 }
 
 fn test_header_height(header: &block::Header) -> block::Height {

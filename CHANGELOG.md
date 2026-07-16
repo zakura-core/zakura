@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Prevent initial sync from stalling at checkpoint boundaries by refilling the
   verifier submission window after stale apply completions.
+- Header-range serving now uses one bulk state read, a bounded concurrent read
+  pool, correlated empty failure responses, and deadline-bounded asynchronous
+  outbound enqueueing.
 
 ### Changed
 
@@ -37,9 +40,6 @@ Initial release of Zakura.
 - Header sync now keeps timed-out ranges in a bounded, single-owner work queue,
   retries them indefinitely with short peer-local avoidance, and commits
   pipelined responses in height order.
-- Header-range serving now uses one bulk state read, a bounded concurrent read
-  pool, correlated empty failure responses, and deadline-bounded asynchronous
-  outbound enqueueing.
 
 Zakura is a fork of the Zcash Foundation's
 [Zebra](https://github.com/ZcashFoundation/zebra), forked at Zebra v5.0.0. For

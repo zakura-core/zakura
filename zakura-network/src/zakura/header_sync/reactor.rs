@@ -109,19 +109,24 @@ enum BestTipPublication {
 
 /// Returns whether a prepared response carries the tree-aux roots its request asked for.
 ///
-/// Callers must decide this before rejecting a response, because a rejection empties the
-/// vectors and equal empty lengths satisfy the checks below. A request that wants no roots is
-/// vacuously complete, matching how the serving path defines it.
+/// Callers must decide this before rejecting a response: a rejection empties the vectors, and
+/// equal empty lengths satisfy the checks below, so a rejected response would report itself
+/// complete.
 pub(super) fn prepared_roots_complete(
     want_tree_aux_roots: bool,
     start_height: block::Height,
     headers_len: usize,
     tree_aux_roots: &[BlockCommitmentRoots],
 ) -> bool {
-    !want_tree_aux_roots
-        || validate_tree_aux_roots_len(headers_len, tree_aux_roots.len())
-            .and_then(|()| validate_tree_aux_root_heights(start_height, tree_aux_roots))
-            .is_ok()
+    // A request that wants no roots is satisfied only by a response carrying none. Roots it
+    // never asked for are rejected below, so they are not a complete serve either.
+    if !want_tree_aux_roots {
+        return tree_aux_roots.is_empty();
+    }
+
+    validate_tree_aux_roots_len(headers_len, tree_aux_roots.len())
+        .and_then(|()| validate_tree_aux_root_heights(start_height, tree_aux_roots))
+        .is_ok()
 }
 
 pub(super) fn complete_request_publication(
@@ -1349,14 +1354,17 @@ impl HeaderSyncReactor {
             completion.finish();
             return;
         };
-        // Decide completeness from the prepared response, before any rejection below empties
-        // the vectors.
-        let roots_complete = prepared_roots_complete(
-            want_tree_aux_roots,
-            start_height,
-            headers.len(),
-            &tree_aux_roots,
-        );
+        // Judge only a response that reached us intact, and judge it before the rejection
+        // below empties the vectors. A response the driver already rejected arrives with its
+        // vectors cleared, and empty roots trivially match empty headers, so both orderings
+        // would otherwise report the failure as a complete serve.
+        let roots_complete = matches!(result, HeaderRangeServeResult::Success)
+            && prepared_roots_complete(
+                want_tree_aux_roots,
+                start_height,
+                headers.len(),
+                &tree_aux_roots,
+            );
 
         if validate_body_sizes_len(headers.len(), body_sizes.len()).is_err() {
             headers.clear();

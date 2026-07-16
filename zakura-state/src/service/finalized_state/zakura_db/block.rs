@@ -187,11 +187,15 @@ fn fill_header_sync_fallback_roots(
             ironwood = ironwood_updates.next().map(|(_, tree)| tree);
         }
 
-        // Decide whether this height needs a derived root before reading any of its body.
-        // Deriving is confined to a prefix of the range: the rows ascend, and only heights
-        // at or below the finalized tip and below the upgrade marker qualify. Rows that skip
-        // therefore leave the transaction iterator parked, so a request that needs one root
-        // reads one block body rather than the whole range's.
+        // Decide whether this height needs a derived root before reading any of its body, so
+        // a range that needs one root reads one block body instead of all of them.
+        //
+        // Skipping without draining is safe because `rows` ascends without duplicates (the
+        // caller steps by one and stops at the first gap) and `transactions` ascends by
+        // height. A drain for height `h` consumes exactly the entries at or below `h` and
+        // parks at the first entry above it, so every entry a later row needs is still
+        // pending no matter which rows skipped. The skip loop below then discards whatever
+        // the skipped rows left behind.
         if row.commitment_roots.is_some() {
             continue;
         }

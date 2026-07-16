@@ -39,6 +39,8 @@ pub(super) enum RetirementReason {
     RequestTimeout,
     /// The reactor cancelled an expired floor claim to let another peer retry it.
     FloorWatchdog,
+    /// A destructive view reset cancelled the request's scheduling ownership.
+    ViewReset,
 }
 
 /// Scheduling and late-response correlation state for a sent request.

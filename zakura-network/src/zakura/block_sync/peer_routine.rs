@@ -578,11 +578,11 @@ impl PeerRoutine {
     }
 
     /// React to a committed-view change: refresh the floor/tip the routine reads,
-    /// and on a destructive `reset_epoch` bump clear this routine's outstanding
-    /// **in place** (return unreceived heights to `work.pending`, release their
-    /// budget, clear the registry outstanding, drop retry-avoid) and re-fan from
-    /// the post-`reset_above` `WorkQueue`. The transport is never torn down:
-    /// reset clears outstanding work in place instead of respawning the routine.
+    /// and on a destructive `reset_epoch` bump retire this routine's active
+    /// outstanding **in place** (return unreceived heights to `work.pending`,
+    /// release their budget, clear the registry outstanding, drop retry-avoid)
+    /// while preserving bounded response-correlation tombstones, then re-fan from
+    /// the post-`reset_above` `WorkQueue`. The transport is never torn down.
     fn on_view_changed(&mut self) {
         let reset_epoch = self.sequencer_view.borrow().reset_epoch;
         if reset_epoch == self.last_reset_epoch {
@@ -597,12 +597,25 @@ impl PeerRoutine {
         // The Sequencer already pinned its floor/tip and `work.reset_above`'d the
         // dropped successor heights. Return our unreceived outstanding to
         // `work.pending` (a no-op for heights already dropped from `in_flight` by
-        // `reset_above`) and release their reservations exactly once.
-        let outstanding = self.window.outstanding.drain_all();
-        for outstanding in outstanding {
-            if outstanding.is_retired() {
-                continue;
-            }
+        // `reset_above`) and release their reservations exactly once. Preserve
+        // existing retired records unchanged: a late terminator must still close
+        // its old correlation window before this peer can safely receive a reissue.
+        let now = Instant::now();
+        let correlation_deadline = self.retirement_deadline(now);
+        let active_indices: Vec<_> = self
+            .window
+            .outstanding
+            .iter()
+            .enumerate()
+            .filter_map(|(index, outstanding)| outstanding.is_active().then_some(index))
+            .collect();
+        for index in active_indices {
+            let outstanding = self
+                .window
+                .outstanding
+                .get(index)
+                .expect("active index exists because reset does not remove records")
+                .clone();
             let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
             let outcome = self.work.release_reserved_and_return_items_detailed(
                 unreceived.iter().copied(),
@@ -610,13 +623,21 @@ impl PeerRoutine {
             );
             self.budget.release(outcome.released_bytes);
             self.trace_work_returned("view_reset", &outstanding, unreceived.len(), outcome);
+            let retired = self.window.outstanding.retire(
+                index,
+                RetirementReason::ViewReset,
+                now,
+                correlation_deadline,
+            );
+            debug_assert!(retired, "collected active request must retire exactly once");
         }
         self.retry_avoid.clear();
-        // Clear our (now-empty) registry outstanding and refresh slot diagnostics.
+        // Publish zero active ownership while keeping local retired tombstones.
         self.publish_outstanding();
         // A destructive reset pulled this peer's outstanding on our initiative, so its
-        // no-progress probe streak must not stay charged: reset it (and clear the idle
-        // liveness deadline) so an unproven peer whose only probe was in flight at the
+        // no-progress probe streak must not stay charged: reset it and explicitly
+        // disarm liveness (retained tombstones keep the collection non-empty) so an
+        // unproven peer whose only probe was in flight at the
         // reset can probe again instead of wedging at its cap.
         self.window.note_view_reset();
         // Ping the producer immediately: `reset_above` emptied `pending`, and the
@@ -2744,7 +2765,7 @@ mod tests {
     use super::{release_failed_request_reservation, PeerRoutine};
     use crate::zakura::framed_channel;
     use crate::zakura::trace::ZakuraTrace;
-    use crate::zakura::ZakuraPeerId;
+    use crate::zakura::{ServicePeerDirection, ZakuraPeerId};
 
     #[test]
     fn pre_reservation_aba_cleanup_preserves_budget_and_replacement_owner() {
@@ -3193,6 +3214,156 @@ mod tests {
                 .is_err(),
             "a retired tombstone must prevent ambiguous same-peer reissue"
         );
+    }
+
+    #[tokio::test]
+    async fn view_reset_quarantines_old_terminator_until_reissue_is_safe() {
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        let budget_probe = budget.clone();
+        let height = block::Height(1);
+        let hash = block::Hash([1; 32]);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        assert_eq!(
+            work.extend([(height, hash, BlockSizeEstimate::Advertised(1_000))]),
+            1,
+        );
+
+        let cancel = CancellationToken::new();
+        let (out_send, mut out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![11u8; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let registry = Arc::new(PeerRegistry::new());
+        let generation = registry.admit(&peer, ServicePeerDirection::Outbound, &config);
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let (actions_tx, _actions_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+
+        let mut routine = PeerRoutine::new(
+            peer.clone(),
+            session,
+            in_recv,
+            config,
+            generation,
+            budget,
+            Arc::clone(&work),
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            control_tx,
+            actions_tx,
+            routine_to_reactor_tx,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+        routine.received_status = true;
+        routine.servable_low = height;
+        routine.servable_high = height;
+
+        timeout(Duration::from_secs(5), routine.try_fill())
+            .await
+            .expect("initial fill completes");
+        assert!(timeout(Duration::from_millis(100), out_recv.recv())
+            .await
+            .expect("initial request is sent")
+            .is_some());
+        assert_eq!(routine.window.active_len(), 1);
+        assert!(registry.peer_has_outstanding_height(&peer, height));
+        assert_eq!(budget_probe.reserved(), 1_000);
+
+        let preexisting_retired_state = OutstandingRequestState::Retired {
+            reason: RetirementReason::FloorWatchdog,
+            retired_at: Instant::now() - Duration::from_secs(1),
+            correlation_deadline: Instant::now() + Duration::from_secs(300),
+        };
+        routine.window.outstanding.push(OutstandingBlockRange {
+            token: u64::MAX,
+            state: preexisting_retired_state,
+            request: BlockRangeRequest {
+                start_height: block::Height(2),
+                count: 1,
+                anchor_hash: block::Hash([2; 32]),
+                estimated_bytes: 0,
+                expected_blocks: vec![ExpectedBlock {
+                    height: block::Height(2),
+                    hash: block::Hash([2; 32]),
+                    estimated_bytes: 0,
+                }],
+            },
+            queued_at: Instant::now(),
+            deadline: Instant::now(),
+            delivery_snapshot: routine.window.delivery_snapshot(Instant::now()),
+            delivered_bytes: 0,
+            received: ReceivedBlockTracker::default(),
+            late_reliability_credited: false,
+        });
+
+        view_tx.send_modify(|view| {
+            view.reset_epoch = view.reset_epoch.saturating_add(1);
+        });
+        routine.on_view_changed();
+
+        assert_eq!(routine.window.active_len(), 0);
+        assert_eq!(routine.window.retired_len(), 2);
+        assert_eq!(routine.window.outstanding.active_reserved_bytes(), 0);
+        assert_eq!(budget_probe.reserved(), 0);
+        assert!(work.pending_contains(height));
+        assert!(!registry.peer_has_outstanding_height(&peer, height));
+        assert!(
+            routine.window.block_liveness_deadline.is_none(),
+            "reset must disarm liveness even though retained tombstones keep the collection non-empty"
+        );
+        assert_eq!(
+            routine
+                .window
+                .outstanding
+                .iter()
+                .find(|outstanding| outstanding.token == u64::MAX)
+                .expect("pre-existing tombstone survives reset")
+                .state,
+            preexisting_retired_state,
+            "reset must preserve a pre-existing tombstone's state and deadline unchanged"
+        );
+        assert_eq!(
+            routine
+                .window
+                .outstanding
+                .iter()
+                .find(|outstanding| outstanding.request.start_height == height)
+                .expect("reset request remains correlated")
+                .retirement_reason(),
+            Some(RetirementReason::ViewReset)
+        );
+
+        routine.try_fill().await;
+        assert!(work.pending_contains(height));
+        assert!(
+            timeout(Duration::from_millis(20), out_recv.recv())
+                .await
+                .is_err(),
+            "the reset tombstone must quarantine the old terminator before reissue"
+        );
+
+        routine.handle_blocks_done(height).await;
+        assert_eq!(routine.window.retired_len(), 1);
+        routine.try_fill().await;
+        assert!(timeout(Duration::from_millis(100), out_recv.recv())
+            .await
+            .expect("reissue is sent after the old terminator closes its tombstone")
+            .is_some());
+        assert_eq!(routine.window.active_len(), 1);
+        assert_eq!(routine.window.retired_len(), 1);
+        assert!(registry.peer_has_outstanding_height(&peer, height));
     }
 
     /// The deadline arm must prune expired retired tombstones itself: while the

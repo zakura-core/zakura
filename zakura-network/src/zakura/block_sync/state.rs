@@ -702,7 +702,9 @@ impl DownloadWindow {
     /// deadline, so nothing would disconnect it). Proof state (`last_block_at`) is preserved.
     pub(super) fn note_view_reset(&mut self) {
         self.requests_without_block_progress = 0;
-        self.clear_liveness_if_idle();
+        // Retired correlation tombstones survive the reset, so total collection
+        // emptiness no longer indicates whether the reset left active work.
+        self.block_liveness_deadline = None;
     }
 
     /// Push the block-liveness deadline out by `timeout` when a would-be disconnect is

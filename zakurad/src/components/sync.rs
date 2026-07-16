@@ -156,10 +156,13 @@ pub const MIN_CONCURRENCY_LIMIT: usize = 1;
 /// See [`MIN_CHECKPOINT_CONCURRENCY_LIMIT`] for details.
 pub const MAX_TIPS_RESPONSE_HASH_COUNT: usize = 500;
 
-/// Returns true if a `FindBlocks` response has the protocol maximum number of
+/// Returns true if a `FindBlocks` hash list has the protocol maximum number of
 /// block hashes or fewer.
 ///
-/// This rejects oversized generic `inv` messages before they can inflate the
+/// Callers that discard zcashd's extra trailing hash must apply this check to
+/// the hashes that remain after stripping. That way a 501-hash zcashd response
+/// (500 chain hashes plus one appended hash) is accepted as 500 usable hashes,
+/// while larger responses are still rejected before they can inflate the
 /// syncer's discovered-hash reserve.
 fn has_valid_tips_response_hash_count(hashes: &[block::Hash]) -> bool {
     hashes.len() <= MAX_TIPS_RESPONSE_HASH_COUNT
@@ -1564,15 +1567,6 @@ where
                 .map_err::<Report, _>(|e| eyre!(e))
             {
                 Ok(zn::Response::BlockHashes(hashes)) => {
-                    if !has_valid_tips_response_hash_count(&hashes) {
-                        debug!(
-                            hashes.len = hashes.len(),
-                            max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
-                            "discarding oversized FindBlocks response"
-                        );
-                        continue;
-                    }
-
                     trace!(?hashes);
 
                     // zcashd sometimes appends an unrelated hash at the start
@@ -1603,6 +1597,18 @@ where
                         }
                     };
                     if hashes.is_empty() {
+                        continue;
+                    }
+
+                    // Apply the count guard after stripping zcashd's trailing
+                    // hash so a full 500-hash chain plus one appended hash is
+                    // still usable.
+                    if !has_valid_tips_response_hash_count(hashes) {
+                        debug!(
+                            hashes.len = hashes.len(),
+                            max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
+                            "discarding oversized FindBlocks response"
+                        );
                         continue;
                     }
 
@@ -1735,15 +1741,6 @@ where
                     .map_err::<Report, _>(|e| eyre!(e))
                 {
                     Ok(zn::Response::BlockHashes(hashes)) => {
-                        if !has_valid_tips_response_hash_count(&hashes) {
-                            debug!(
-                                hashes.len = hashes.len(),
-                                max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
-                                "discarding oversized FindBlocks response"
-                            );
-                            continue;
-                        }
-
                         debug!(first = ?hashes.first(), len = ?hashes.len());
                         trace!(?hashes);
 
@@ -1792,6 +1789,18 @@ where
                             [] => continue,
                             [rest @ .., _last] => rest,
                         };
+
+                        // Apply the count guard after stripping the trailing
+                        // hash so a full 500-hash chain plus one appended hash
+                        // is still usable.
+                        if !has_valid_tips_response_hash_count(unknown_hashes) {
+                            debug!(
+                                hashes.len = unknown_hashes.len(),
+                                max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
+                                "discarding oversized FindBlocks response"
+                            );
+                            continue;
+                        }
 
                         let new_tip = if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
                             CheckedTip {

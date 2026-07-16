@@ -1528,16 +1528,24 @@ where
         let disk_row = disk_rows.next_if(|row| row.height == height);
         let row = chain
             .as_ref()
-            .and_then(|chain| chain.as_ref().block(height.into()))
-            .map(|block| crate::HeaderSyncRangeEntry {
-                height,
-                hash: block.hash,
-                header: block.block.header.clone(),
-                body_size: Some(
-                    u32::try_from(block.block.zcash_serialized_size())
-                        .expect("serialized consensus blocks are bounded below u32::MAX"),
-                ),
-                commitment_roots: None,
+            .map(|chain| chain.as_ref())
+            .and_then(|chain| {
+                let block = chain.block(height.into())?;
+                Some(crate::HeaderSyncRangeEntry {
+                    height,
+                    hash: block.hash,
+                    header: block.block.header.clone(),
+                    body_size: Some(
+                        u32::try_from(block.block.zcash_serialized_size())
+                            .expect("serialized consensus blocks are bounded below u32::MAX"),
+                    ),
+                    // Derive this height's roots from the chain that already holds it, so a
+                    // range reaching the non-finalized tip does not send the fallback below
+                    // back over the whole range for the few heights it covers.
+                    commitment_roots: include_roots
+                        .then(|| chain_commitment_roots(chain, height))
+                        .flatten(),
+                })
             })
             .or(disk_row);
         let Some(row) = row else {
@@ -1609,6 +1617,28 @@ where
         .collect()
 }
 
+/// Returns the commitment roots for `height` from a non-finalized `chain`.
+///
+/// Yields `None` unless the chain holds every input the roots are derived from, so callers stop
+/// rather than serve fabricated transaction counts and an all-zero auth-data root.
+fn chain_commitment_roots(chain: &Chain, height: block::Height) -> Option<BlockCommitmentRoots> {
+    let sapling = chain.sapling_tree(height.into())?;
+    let orchard = chain.orchard_tree(height.into())?;
+    let ironwood = chain.ironwood_tree(height.into())?;
+    let block = chain.block(height.into())?;
+
+    Some(BlockCommitmentRoots {
+        height,
+        sapling_root: sapling.root(),
+        orchard_root: orchard.root(),
+        ironwood_root: ironwood.root(),
+        sapling_tx: block.block.sapling_transactions_count(),
+        orchard_tx: block.block.orchard_transactions_count(),
+        ironwood_tx: block.block.ironwood_transactions_count(),
+        auth_data_root: block.block.auth_data_root(),
+    })
+}
+
 fn block_roots_by_height_range<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -1650,38 +1680,17 @@ where
             break;
         };
 
-        let root =
-            if finalized_tip.is_some_and(|finalized_tip| height <= finalized_tip) {
-                finalized_roots.get(&height).cloned()
-            } else if let Some(chain) = chain
-                .as_ref()
-                .map(|chain| chain.as_ref())
-                .filter(|chain| chain.contains_block_height(height))
-            {
-                match (
-                    chain.sapling_tree(height.into()),
-                    chain.orchard_tree(height.into()),
-                    chain.ironwood_tree(height.into()),
-                ) {
-                    // A chain that reports this height also holds the block. Yield no roots rather
-                    // than serve fabricated counts and an all-zero auth-data root if it does not.
-                    (Some(sapling), Some(orchard), Some(ironwood)) => chain
-                        .block(height.into())
-                        .map(|block| BlockCommitmentRoots {
-                            height,
-                            sapling_root: sapling.root(),
-                            orchard_root: orchard.root(),
-                            ironwood_root: ironwood.root(),
-                            sapling_tx: block.block.sapling_transactions_count(),
-                            orchard_tx: block.block.orchard_transactions_count(),
-                            ironwood_tx: block.block.ironwood_transactions_count(),
-                            auth_data_root: block.block.auth_data_root(),
-                        }),
-                    _ => None,
-                }
-            } else {
-                provisional_roots.get(&height).cloned()
-            };
+        let root = if finalized_tip.is_some_and(|finalized_tip| height <= finalized_tip) {
+            finalized_roots.get(&height).cloned()
+        } else if let Some(chain) = chain
+            .as_ref()
+            .map(|chain| chain.as_ref())
+            .filter(|chain| chain.contains_block_height(height))
+        {
+            chain_commitment_roots(chain, height)
+        } else {
+            provisional_roots.get(&height).cloned()
+        };
 
         let Some(root) = root else {
             break;

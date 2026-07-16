@@ -276,6 +276,23 @@ fn root_at(height: block::Height) -> BlockCommitmentRoots {
     }
 }
 
+#[test]
+fn prepared_roots_complete_matches_what_the_request_asked_for() {
+    let roots = [root_at(block::Height(1)), root_at(block::Height(2))];
+
+    // A request that wants no roots is satisfied by a response carrying none. The serving
+    // path defines completeness the same way, so reporting otherwise marked every successful
+    // headers-only response incomplete.
+    assert!(prepared_roots_complete(false, block::Height(1), 3, &[]));
+
+    // Roots covering every header, at the requested heights, are complete.
+    assert!(prepared_roots_complete(true, block::Height(1), 2, &roots));
+
+    // Too few roots for the headers returned, or roots for the wrong heights, are not.
+    assert!(!prepared_roots_complete(true, block::Height(1), 3, &roots));
+    assert!(!prepared_roots_complete(true, block::Height(5), 2, &roots));
+}
+
 fn test_header_height(header: &block::Header) -> block::Height {
     let hash = block::Hash::from(header);
     [

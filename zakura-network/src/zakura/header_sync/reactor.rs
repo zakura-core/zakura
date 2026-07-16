@@ -107,6 +107,23 @@ enum BestTipPublication {
     Reanchored { old: (block::Height, block::Hash) },
 }
 
+/// Returns whether a prepared response carries the tree-aux roots its request asked for.
+///
+/// Callers must decide this before rejecting a response, because a rejection empties the
+/// vectors and equal empty lengths satisfy the checks below. A request that wants no roots is
+/// vacuously complete, matching how the serving path defines it.
+pub(super) fn prepared_roots_complete(
+    want_tree_aux_roots: bool,
+    start_height: block::Height,
+    headers_len: usize,
+    tree_aux_roots: &[BlockCommitmentRoots],
+) -> bool {
+    !want_tree_aux_roots
+        || validate_tree_aux_roots_len(headers_len, tree_aux_roots.len())
+            .and_then(|()| validate_tree_aux_root_heights(start_height, tree_aux_roots))
+            .is_ok()
+}
+
 pub(super) fn complete_request_publication(
     peer: &mut PeerHeaderState,
     request_id: HeaderSyncRequestId,
@@ -1332,6 +1349,15 @@ impl HeaderSyncReactor {
             completion.finish();
             return;
         };
+        // Decide completeness from the prepared response, before any rejection below empties
+        // the vectors.
+        let roots_complete = prepared_roots_complete(
+            want_tree_aux_roots,
+            start_height,
+            headers.len(),
+            &tree_aux_roots,
+        );
+
         if validate_body_sizes_len(headers.len(), body_sizes.len()).is_err() {
             headers.clear();
             body_sizes.clear();
@@ -1339,9 +1365,6 @@ impl HeaderSyncReactor {
             result = HeaderRangeServeResult::InvalidPreparedResponse;
         }
 
-        let roots_complete = validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len())
-            .and_then(|()| validate_tree_aux_root_heights(start_height, &tree_aux_roots))
-            .is_ok();
         if !headers.is_empty()
             && ((want_tree_aux_roots && !roots_complete)
                 || (!want_tree_aux_roots && !tree_aux_roots.is_empty()))

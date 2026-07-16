@@ -187,26 +187,12 @@ fn fill_header_sync_fallback_roots(
             ironwood = ironwood_updates.next().map(|(_, tree)| tree);
         }
 
-        let needs_roots = row.commitment_roots.is_none();
-        let mut block_transactions = Vec::new();
-        while transactions
-            .peek()
-            .is_some_and(|(location, _)| location.height < row.height)
-        {
-            let _ = transactions.next();
-        }
-        while transactions
-            .peek()
-            .is_some_and(|(location, _)| location.height == row.height)
-        {
-            let (_, raw) = transactions
-                .next()
-                .expect("peeked transaction remains available");
-            if needs_roots {
-                block_transactions.push(Arc::<Transaction>::from_bytes(raw.raw_bytes()));
-            }
-        }
-        if !needs_roots {
+        // Decide whether this height needs a derived root before reading any of its body.
+        // Deriving is confined to a prefix of the range: the rows ascend, and only heights
+        // at or below the finalized tip and below the upgrade marker qualify. Rows that skip
+        // therefore leave the transaction iterator parked, so a request that needs one root
+        // reads one block body rather than the whole range's.
+        if row.commitment_roots.is_some() {
             continue;
         }
         if finalized_tip.is_none_or(|tip| row.height > tip) {
@@ -227,6 +213,23 @@ fn fill_header_sync_fallback_roots(
             .as_ref()
             .map(|tree| tree.root())
             .unwrap_or_else(|| ironwood::tree::NoteCommitmentTree::default().root());
+
+        let mut block_transactions = Vec::new();
+        while transactions
+            .peek()
+            .is_some_and(|(location, _)| location.height < row.height)
+        {
+            let _ = transactions.next();
+        }
+        while transactions
+            .peek()
+            .is_some_and(|(location, _)| location.height == row.height)
+        {
+            let (_, raw) = transactions
+                .next()
+                .expect("peeked transaction remains available");
+            block_transactions.push(Arc::<Transaction>::from_bytes(raw.raw_bytes()));
+        }
         // Every block has at least a coinbase transaction, so an empty list means the body
         // is unavailable (for example, pruned while the trees were retained). Leave the
         // roots unset so the caller reports incomplete roots instead of serving fabricated

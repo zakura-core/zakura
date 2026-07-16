@@ -339,6 +339,41 @@ async fn wait_for_outbound_getblocks(outbound: &mut FramedRecv) -> (block::Heigh
     }
 }
 
+async fn wait_for_peer_outstanding_state(
+    registry: &super::peer_registry::PeerRegistry,
+    peer: &ZakuraPeerId,
+    height: block::Height,
+    expected: bool,
+) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if registry.peer_has_outstanding_height(peer, height) == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer outstanding state reaches the expected value");
+}
+
+async fn assert_no_outbound_getblocks(outbound: &mut FramedRecv, context: &str) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                match next_outbound_message(outbound).await {
+                    BlockSyncMessage::Status(_) => {}
+                    BlockSyncMessage::GetBlocks { .. } => return,
+                    message => panic!("unexpected outbound message {context}: {message:?}"),
+                }
+            }
+        })
+        .await
+        .is_err(),
+        "unexpected outbound GetBlocks {context}",
+    );
+}
+
 /// Wait for the node's `Status` advertisement on this peer's real outbound — the
 /// connect status the reactor sends on `PeerConnected`, and later refreshes.
 /// Replaces the mirror-based `wait_for_connect_status`; the peer is implicit in
@@ -3152,6 +3187,214 @@ async fn block_liveness_credits_late_unmatched_body_and_keeps_peer() {
             .is_err(),
         "a peer that delivered an accepted (late) body must not be parked as silent",
     );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn block_liveness_credits_requested_body_after_local_commit_gc() {
+    // Regression: another path can commit a requested height before this peer's
+    // response arrives. GC must free the obsolete scheduling request without
+    // losing the exact height/hash correlation needed to prove peer liveness.
+    let config = ZakuraBlockSyncConfig {
+        request_timeout: Duration::from_secs(5),
+        ..ZakuraBlockSyncConfig::default()
+    };
+
+    let blocks = mainnet_blocks_1_to_3();
+    let genesis = Frontier::new(block::Height(0), block::Hash([0; 32]));
+    let initial = FrontierUpdate {
+        frontier: ChainFrontier {
+            finalized: genesis,
+            verified_body: genesis,
+            best_header: Frontier::new(block::Height(2), blocks[1].hash()),
+        },
+        change: FrontierChange::Snapshot,
+    };
+    let (exchange, startup) = exchange_block_sync_startup(initial, config.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let registry = handle
+        .routine_wiring
+        .as_ref()
+        .expect("reactor handle has routine wiring")
+        .registry
+        .clone();
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        0x54,
+        block::Height(2),
+        blocks[1].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            block_meta(&blocks[0]),
+            block_meta(&blocks[1]),
+        ]))
+        .await
+        .expect("needed metadata queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 1),
+    );
+    wait_for_peer_outstanding_state(&registry, &peer_id, block::Height(1), true).await;
+
+    // Simulate gossip or another sync path committing height 1 while the peer's
+    // requested body is already in flight.
+    exchange.publish_frontier(
+        FrontierUpdate {
+            frontier: ChainFrontier {
+                finalized: genesis,
+                verified_body: Frontier::new(block::Height(1), blocks[0].hash()),
+                best_header: Frontier::new(block::Height(2), blocks[1].hash()),
+            },
+            change: FrontierChange::VerifiedGrow,
+        },
+        "block_liveness_local_commit_gc",
+    );
+    wait_for_peer_outstanding_state(&registry, &peer_id, block::Height(1), false).await;
+    assert_no_outbound_getblocks(
+        &mut outbound_rx,
+        "before the correlated stale body proved progress",
+    )
+    .await;
+
+    // This body is stale locally but exactly matches what we asked this peer for.
+    // It must prove liveness without being submitted again, and unlock the next
+    // cold-start request.
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[0].clone())).await;
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(2), 1),
+    );
+
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { block, .. } => {
+                assert_eq!(
+                    block.coinbase_height(),
+                    Some(block::Height(2)),
+                    "the already-committed correlated body must not be resubmitted",
+                );
+                break;
+            }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action while waiting for height 2: {action:?}"),
+        }
+    }
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn block_liveness_rejects_invalid_stale_bodies_after_local_commit_gc() {
+    // A stale body must match the request and the header's transaction-effects
+    // Merkle root before it can prove peer progress.
+    let config = ZakuraBlockSyncConfig {
+        request_timeout: Duration::from_secs(5),
+        ..ZakuraBlockSyncConfig::default()
+    };
+
+    let blocks = mainnet_blocks_1_to_3();
+    let unrelated_block = forked_block(&blocks[0], 0x55);
+    let bad_body = block_with_bad_merkle_root(&blocks[0], &blocks[1]);
+    assert!(
+        u64::from(block_size(&bad_body))
+            <= super::reactor::tolerated_bytes(
+                u64::from(block_size(&blocks[0])),
+                config.size_deviation_tolerance,
+            ),
+        "the malformed body must reach the transaction-Merkle check",
+    );
+    let genesis = Frontier::new(block::Height(0), block::Hash([0; 32]));
+    let initial = FrontierUpdate {
+        frontier: ChainFrontier {
+            finalized: genesis,
+            verified_body: genesis,
+            best_header: Frontier::new(block::Height(2), blocks[1].hash()),
+        },
+        change: FrontierChange::Snapshot,
+    };
+    let (exchange, startup) = exchange_block_sync_startup(initial, config.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let registry = handle
+        .routine_wiring
+        .as_ref()
+        .expect("reactor handle has routine wiring")
+        .registry
+        .clone();
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        0x55,
+        block::Height(2),
+        blocks[1].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            block_meta(&blocks[0]),
+            block_meta(&blocks[1]),
+        ]))
+        .await
+        .expect("needed metadata queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 1),
+    );
+    wait_for_peer_outstanding_state(&registry, &peer_id, block::Height(1), true).await;
+
+    exchange.publish_frontier(
+        FrontierUpdate {
+            frontier: ChainFrontier {
+                finalized: genesis,
+                verified_body: Frontier::new(block::Height(1), blocks[0].hash()),
+                best_header: Frontier::new(block::Height(2), blocks[1].hash()),
+            },
+            change: FrontierChange::VerifiedGrow,
+        },
+        "block_liveness_invalid_stale_body",
+    );
+    wait_for_peer_outstanding_state(&registry, &peer_id, block::Height(1), false).await;
+
+    assert_eq!(unrelated_block.coinbase_height(), Some(block::Height(1)));
+    assert_ne!(unrelated_block.hash(), blocks[0].hash());
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(unrelated_block)).await;
+    assert_no_outbound_getblocks(
+        &mut outbound_rx,
+        "after an unrelated stale body failed exact request correlation",
+    )
+    .await;
+
+    assert_eq!(bad_body.coinbase_height(), Some(block::Height(1)));
+    assert_eq!(bad_body.hash(), blocks[0].hash());
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(bad_body)).await;
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(reason, BlockSyncMisbehavior::InvalidBlock);
+                break;
+            }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before stale body rejection: {action:?}"),
+        }
+    }
+    assert_no_outbound_getblocks(
+        &mut outbound_rx,
+        "after a correlated body failed its transaction-effects Merkle root",
+    )
+    .await;
 
     reactor_task.abort();
 }

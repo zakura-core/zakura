@@ -21,7 +21,7 @@
 //! task's own `FramedRecv`: a want-work fill loop, the matched-body tail, and the
 //! unmatched-body fallthroughs all run in this one task.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use tokio::sync::{futures::Notified, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -35,6 +35,7 @@ use super::{
         admit, floor_rescue_high, request_deadline, request_priority as classify_priority,
         AdmissionOutcome, AdmissionSnapshot, RequestPriority,
     },
+    config::DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
     reactor::{
@@ -50,7 +51,7 @@ use super::{
     },
     work_queue::{WorkItem, WorkQueue, WorkReturnOutcome},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
-    ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
+    ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MAX_BS_BLOCKS_PER_REQUEST, MSG_BS_BLOCK,
 };
 use crate::zakura::{
     trace::{block_sync_trace as bs_trace, BLOCK_SYNC_TABLE},
@@ -75,6 +76,15 @@ const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// emits controller state on a fixed interval so a trace can spot oscillation even while
 /// the peer is idle between deliveries.
 const BBR_TRACE_INTERVAL: Duration = Duration::from_secs(10);
+/// Maximum exact request correlations retained after local commit GC.
+///
+/// This covers one default no-progress window when every request has the
+/// protocol-maximum range, while bounding memory if another path keeps committing
+/// work that this peer never delivers.
+// Both factors are small `u32` protocol constants (64 and 128), so their product
+// fits in `usize` on every supported target.
+const MAX_STALE_REQUEST_CORRELATIONS: usize =
+    DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS as usize * MAX_BS_BLOCKS_PER_REQUEST as usize;
 
 /// Why a fill pass stopped issuing requests. Typed so every admission refusal is
 /// attributed exhaustively; the `as_str` labels feed the `sync.block.fill_stop`
@@ -171,6 +181,13 @@ enum Disposition {
     RetryMissing,
 }
 
+/// One unreceived block from a request removed by local commit GC.
+#[derive(Copy, Clone, Debug)]
+struct StaleRequestCorrelation {
+    expected: ExpectedBlock,
+    expires_at: Instant,
+}
+
 impl Disposition {
     fn trace_label(self) -> &'static str {
         match self {
@@ -224,6 +241,9 @@ pub(super) struct PeerRoutine {
     /// itself — the peer-local retry bias (see [`RETRY_AVOID_BACKOFF`]). Pruned on
     /// expiry each fill pass.
     retry_avoid: BTreeMap<block::Height, Instant>,
+    /// Exact, unreceived request metadata retained after local commit GC removes
+    /// the scheduling request. Entries are one-shot, expiring, and bounded.
+    stale_request_correlations: BTreeMap<block::Height, StaleRequestCorrelation>,
 
     // ---- shared primitives (clones) ----
     /// Generation this routine was spawned with; gates its registry writes (and
@@ -305,6 +325,7 @@ impl PeerRoutine {
             status_reply_meter,
             inbound_status_meter,
             retry_avoid: BTreeMap::new(),
+            stale_request_correlations: BTreeMap::new(),
             generation,
             budget,
             work,
@@ -594,6 +615,7 @@ impl PeerRoutine {
             self.trace_work_returned("view_reset", &outstanding, unreceived.len(), outcome);
         }
         self.retry_avoid.clear();
+        self.stale_request_correlations.clear();
         // Clear our (now-empty) registry outstanding and refresh slot diagnostics.
         self.publish_outstanding();
         // A destructive reset pulled this peer's outstanding on our initiative, so its
@@ -665,10 +687,10 @@ impl PeerRoutine {
         // requests; it is never a fetch throttle and never churns other peers (a
         // partially-received request whose suffix is still above the floor is left
         // in place).
-        self.gc_committed_outstanding();
+        let now = Instant::now();
+        self.gc_committed_outstanding(now);
         // Drop expired retry-avoid entries: those heights are contestable by this
         // routine again.
-        let now = Instant::now();
         self.retry_avoid.retain(|_, until| *until > now);
         // Count requests issued this pass and capture *why* the fill loop stops, so a
         // trace can attribute carrier idle ("bubble") time to a cause. The loop yields a
@@ -1192,7 +1214,9 @@ impl PeerRoutine {
     /// below the floor, GC'd from the WorkQueue). A partially-committed request
     /// (suffix still above the floor) is left so its remaining bodies keep their
     /// reservation and arrive on the same request.
-    fn gc_committed_outstanding(&mut self) {
+    fn gc_committed_outstanding(&mut self, now: Instant) {
+        self.stale_request_correlations
+            .retain(|_, correlation| correlation.expires_at > now);
         let floor = self.download_floor();
         let mut released = 0u64;
         let mut removed = false;
@@ -1200,6 +1224,7 @@ impl PeerRoutine {
         while index < self.window.outstanding.len() {
             if self.window.outstanding[index].request.end_height() <= floor {
                 let outstanding = self.window.outstanding.remove(index);
+                self.remember_stale_request_correlations(&outstanding, now);
                 // Release only the size-estimate still reserved for unreceived
                 // heights. A height a competing peer delivered late is `Held`: its
                 // body is in the commit pipeline and the Sequencer releases those
@@ -1219,6 +1244,32 @@ impl PeerRoutine {
         if removed {
             self.publish_outstanding();
             self.window.disarm_liveness_after_progress_if_idle();
+        }
+    }
+
+    /// Retain exact metadata for bodies that can arrive after local commit GC
+    /// removes their request. Oldest heights are evicted first at the hard cap;
+    /// body download normally advances monotonically, so they are also the least
+    /// useful correlations.
+    fn remember_stale_request_correlations(
+        &mut self,
+        outstanding: &OutstandingBlockRange,
+        now: Instant,
+    ) {
+        let expires_at = now + self.config.effective_liveness_timeout();
+        for expected in &outstanding.request.expected_blocks {
+            if !outstanding.has_received(expected.height) {
+                self.stale_request_correlations.insert(
+                    expected.height,
+                    StaleRequestCorrelation {
+                        expected: *expected,
+                        expires_at,
+                    },
+                );
+            }
+        }
+        while self.stale_request_correlations.len() > MAX_STALE_REQUEST_CORRELATIONS {
+            self.stale_request_correlations.pop_first();
         }
     }
 
@@ -1249,6 +1300,12 @@ impl PeerRoutine {
                     body_permit,
                     raw_block_payload.clone(),
                 )
+                .await
+            {
+                return;
+            }
+            if self
+                .accept_correlated_stale_body(height, hash, block, body_wire_bytes)
                 .await
             {
                 return;
@@ -1409,6 +1466,104 @@ impl PeerRoutine {
     /// passes it). Reads `download_floor` from the view.
     fn is_stale_response_height(&self, height: block::Height) -> bool {
         height <= self.download_floor() || self.work.in_flight_contains(height)
+    }
+
+    /// Credit a response to a request removed by local commit GC. The response
+    /// must match the exact height, header hash, size envelope, and
+    /// transaction-effects Merkle root. It is consumed once and never buffered
+    /// or sampled by BBR.
+    async fn accept_correlated_stale_body(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        block: Arc<block::Block>,
+        body_wire_bytes: Option<u64>,
+    ) -> bool {
+        if !self.is_stale_response_height(height) {
+            return false;
+        }
+        let Some(correlation) = self.stale_request_correlations.get(&height).copied() else {
+            return false;
+        };
+        let now = Instant::now();
+        if correlation.expires_at <= now {
+            self.stale_request_correlations.remove(&height);
+            return false;
+        }
+        if correlation.expected.hash != hash {
+            return false;
+        }
+
+        let serialized_bytes = match body_wire_bytes {
+            Some(bytes) => bytes,
+            None => match block.zcash_serialize_to_vec() {
+                Ok(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                Err(error) => {
+                    self.stale_request_correlations.remove(&height);
+                    tracing::debug!(
+                        peer = ?self.peer,
+                        ?height,
+                        ?error,
+                        "failed to serialize correlated stale block-sync body"
+                    );
+                    self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
+                        .await;
+                    return true;
+                }
+            },
+        };
+        if serialized_bytes
+            > tolerated_bytes(
+                correlation.expected.estimated_bytes,
+                self.config.size_deviation_tolerance,
+            )
+        {
+            self.stale_request_correlations.remove(&height);
+            self.report_misbehavior(BlockSyncMisbehavior::SizeMismatch)
+                .await;
+            return true;
+        }
+
+        // This stale body will not reach consensus, so perform the content checks
+        // that bind transaction effects to its already-verified header here.
+        let content_check = tokio::task::spawn_blocking(move || {
+            let transaction_hashes: Vec<_> =
+                block.transactions.iter().map(|tx| tx.hash()).collect();
+            let merkle_root: block::merkle::Root = transaction_hashes.iter().cloned().collect();
+            let unique_transactions = transaction_hashes.iter().collect::<HashSet<_>>().len();
+            merkle_root == block.header.merkle_root
+                && unique_transactions == transaction_hashes.len()
+        })
+        .await;
+        let content_matches_header = match content_check {
+            Ok(matches) => matches,
+            Err(error) => {
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?height,
+                    ?error,
+                    "correlated stale block content check did not complete"
+                );
+                return true;
+            }
+        };
+        if !content_matches_header {
+            self.stale_request_correlations.remove(&height);
+            self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
+                .await;
+            return true;
+        }
+
+        self.stale_request_correlations.remove(&height);
+        metrics::counter!("sync.block.response.correlated_stale_accepted").increment(1);
+        tracing::debug!(
+            peer = ?self.peer,
+            ?height,
+            "crediting a correlated stale block-sync body as peer progress"
+        );
+        self.window
+            .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
+        true
     }
 
     async fn ignore_stale_response(&mut self, height: block::Height, response_kind: &str) -> bool {

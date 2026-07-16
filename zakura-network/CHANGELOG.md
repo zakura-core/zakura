@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved exact block-sync request correlation after another path commits the
+  requested block, so a matching late response proves peer liveness instead of
+  being discarded before the peer is disconnected.
+
 ## [1.0.0] - 2026-07-15
 
 First "stable" release. However, be advised that the API may still greatly

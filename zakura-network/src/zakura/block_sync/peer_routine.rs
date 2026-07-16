@@ -1014,7 +1014,7 @@ impl PeerRoutine {
             sequencer_input_queued_bytes: self
                 .sequencer_input_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
-            submitted_applying_bytes: view.submitted_applying_bytes,
+            in_flight_submission_bytes: view.in_flight_submission_bytes,
             reserved_above_floor_bytes,
             reserved_above_floor_blocks,
             budget_available: self.budget.available(),

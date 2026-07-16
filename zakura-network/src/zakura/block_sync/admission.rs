@@ -49,9 +49,9 @@ pub(super) struct AdmissionSnapshot {
     pub(super) applying_buffered_bytes: u64,
     pub(super) applying_buffered_blocks: u64,
     pub(super) sequencer_input_queued_bytes: u64,
-    /// Wire bytes of `applying` bodies currently submitted to the verifier: the
-    /// decode window, the only applying bodies holding a decoded copy.
-    pub(super) submitted_applying_bytes: u64,
+    /// Wire bytes of decoded submissions the driver can still retain, including
+    /// bodies detached from `applying` while their completion is pending.
+    pub(super) in_flight_submission_bytes: u64,
     pub(super) reserved_above_floor_bytes: u64,
     pub(super) reserved_above_floor_blocks: u64,
     pub(super) budget_available: u64,
@@ -223,12 +223,14 @@ impl AdmissionSnapshot {
 /// Estimated resident memory of block bodies retained by, or already committed
 /// to enter, the pipeline.
 ///
-/// Serialized pools (reorder backlog, applying backlog past the decode window,
-/// and outstanding reservations) cost their wire bytes. Decoded pools cost the
-/// decoded multiple on top: the sequencer input channel (bodies arrive decoded
-/// from the peer routine, bounded by the channel depth) and the submitted
-/// decode window (decoded at `prepare_submit`, bounded by
-/// `submitted_apply_limit`). Both decoded pools are structurally bounded, so
+/// Serialized pools (reorder backlog, applying backlog, and outstanding
+/// reservations) cost their wire bytes while retained. Decoded pools add the
+/// decoded multiple: the sequencer input channel (bodies arrive decoded from
+/// the peer routine, bounded by the channel depth) and in-flight submissions
+/// (decoded at `prepare_submit`, charged through their exact completion even
+/// after detachment, and bounded by `submitted_apply_limit`). A detached
+/// submission no longer contributes applying wire bytes, but its decoded
+/// charge remains. Both decoded pools are structurally bounded, so
 /// the deep backlog — the pool that actually scales with look-ahead depth — is
 /// charged at its true serialized cost instead of a flat decoded multiple.
 fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
@@ -240,7 +242,7 @@ fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
     // decoded cost is the full decoded multiple on top of the ×1 wire charge.
     let decoded = snapshot
         .sequencer_input_queued_bytes
-        .saturating_add(snapshot.submitted_applying_bytes)
+        .saturating_add(snapshot.in_flight_submission_bytes)
         .saturating_mul(DESERIALIZED_MEM_FACTOR);
     serialized.saturating_add(decoded)
 }
@@ -463,7 +465,7 @@ mod tests {
             applying_buffered_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR - BS_PER_BLOCK_WORST_CASE_BYTES,
             applying_buffered_blocks: u64::from(range_blocks) - 1,
             sequencer_input_queued_bytes: 0,
-            submitted_applying_bytes: 0,
+            in_flight_submission_bytes: 0,
             reserved_above_floor_bytes: 0,
             reserved_above_floor_blocks: 0,
             budget_available: config.max_inflight_block_bytes,

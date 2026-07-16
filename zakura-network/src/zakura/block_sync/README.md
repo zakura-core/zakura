@@ -17,10 +17,11 @@ it:
 ```text
 WorkQueue (pending heights)
   → in-flight request (reserved bytes, outstanding)
-    → reorder buffer (out-of-order arrivals, wire-retained)
-      → applying pool (contiguous prefix, decoded Arc<Block>)
-        → sequencer input channel (decoded, awaiting submit)
-          → checkpoint/semantic verifier → commit (verified tip advances)
+    → sequencer input channel (wire payload plus transient peer-decoded block)
+      → reorder buffer (out-of-order arrivals, wire-retained)
+        → applying pool (contiguous; backlog wire-retained)
+          → bounded submission window (decoded Arc<Block>)
+            → checkpoint/semantic verifier → commit (verified tip advances)
 ```
 
 Two heights anchor every scheduling decision:
@@ -120,7 +121,7 @@ window. Accounting therefore follows each pool's actual representation:
 | `reorder_buffered_bytes` | serialized | wire bytes |
 | unsubmitted `applying_buffered_bytes` | serialized | wire bytes |
 | `sequencer_input_queued_bytes` | serialized payload plus decoded block | wire bytes plus `wire × DESERIALIZED_MEM_FACTOR` |
-| `submitted_applying_bytes` | serialized payload plus decoded block | wire bytes plus `wire × DESERIALIZED_MEM_FACTOR` |
+| `in_flight_submission_bytes` | submitted decoded block, including detached submissions awaiting completion | `wire × DESERIALIZED_MEM_FACTOR`, plus the applying wire charge while attached |
 | `reserved_above_floor_bytes` | not received yet | estimated wire bytes |
 
 Two gates, checked together in `lookahead_over_budget`:

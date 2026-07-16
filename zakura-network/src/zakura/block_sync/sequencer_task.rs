@@ -99,8 +99,10 @@ pub(super) struct SequencerView {
     pub(super) reorder_buffered_bytes: u64,
     pub(super) applying_buffered_bytes: u64,
     pub(super) unsubmitted_applying_count: u64,
-    pub(super) submitted_applying_count: u64,
-    pub(super) submitted_applying_bytes: u64,
+    /// Submitted decoded bodies awaiting matching completion, including entries
+    /// detached from `applying` but still retained by the driver.
+    pub(super) in_flight_submission_count: u64,
+    pub(super) in_flight_submission_bytes: u64,
     pub(super) committed_bytes_per_sec: u64,
     pub(super) committed_blocks_per_sec: u64,
 }
@@ -119,8 +121,8 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
         reorder_buffered_bytes: 0,
         applying_buffered_bytes: 0,
         unsubmitted_applying_count: 0,
-        submitted_applying_count: 0,
-        submitted_applying_bytes: 0,
+        in_flight_submission_count: 0,
+        in_flight_submission_bytes: 0,
         committed_bytes_per_sec: 0,
         committed_blocks_per_sec: 0,
     }
@@ -445,15 +447,15 @@ impl SequencerTask {
         local_frontier: Option<BlockSyncFrontiers>,
     ) -> bool {
         // A stale completion (no live applying entry, or token/hash mismatch)
-        // only decrements the submitted-apply record and returns; there is no
-        // query/schedule tail here, so it needs no reaction.
+        // releases only its exact token-aware in-flight-submission charge and
+        // returns; there is no query/schedule tail here, so it needs no reaction.
         let Some((applying_token, applying_hash)) = self.sequencer.applying_token_hash(height)
         else {
-            self.sequencer.decrement_submitted_apply(height, hash);
+            self.sequencer.finish_submission(token, height, hash);
             return false;
         };
         if applying_hash != hash || applying_token != token {
-            self.sequencer.decrement_submitted_apply(height, hash);
+            self.sequencer.finish_submission(token, height, hash);
             return false;
         }
 
@@ -474,7 +476,11 @@ impl SequencerTask {
         if matches!(result, BlockApplyResult::Duplicate) && self.sequencer.verified_tip() < height {
             // Stale duplicate for a height we have not verified to: the reactor
             // needs the serving/query tail only when the accepted local frontier
-            // actually advanced serving.
+            // actually advanced serving. The body stays attached until a later
+            // frontier update removes it, but the driver has released its decoded
+            // copy, so release the token-aware decode-window charge now.
+            self.sequencer
+                .finish_attached_submission(token, height, hash);
             return accepted_local_frontier.is_some();
         }
         let applying = self
@@ -487,7 +493,7 @@ impl SequencerTask {
         if matches!(result, BlockApplyResult::Committed) {
             self.committed_throughput.record(applying.bytes);
         }
-        self.sequencer.decrement_submitted_apply(height, hash);
+        self.sequencer.finish_submission(token, height, hash);
         match result {
             BlockApplyResult::Committed | BlockApplyResult::Duplicate => {}
             BlockApplyResult::Rejected | BlockApplyResult::TimedOut
@@ -737,8 +743,8 @@ impl SequencerTask {
             reorder_buffered_bytes,
             applying_buffered_bytes,
             unsubmitted_applying_count: self.sequencer.unsubmitted_applying_count() as u64,
-            submitted_applying_count: self.sequencer.submitted_applying_count() as u64,
-            submitted_applying_bytes: self.sequencer.submitted_applying_bytes(),
+            in_flight_submission_count: self.sequencer.in_flight_submission_count() as u64,
+            in_flight_submission_bytes: self.sequencer.in_flight_submission_bytes(),
             committed_bytes_per_sec: self.committed_throughput.bytes_per_sec(),
             committed_blocks_per_sec: self.committed_throughput.blocks_per_sec(),
         };
@@ -817,8 +823,8 @@ mod tests {
             reorder_buffered_bytes: 0,
             applying_buffered_bytes: 0,
             unsubmitted_applying_count: 0,
-            submitted_applying_count: 0,
-            submitted_applying_bytes: 0,
+            in_flight_submission_count: 0,
+            in_flight_submission_bytes: 0,
             committed_bytes_per_sec: 0,
             committed_blocks_per_sec: 0,
         }

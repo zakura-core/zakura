@@ -240,7 +240,9 @@ pub struct ZakuraBlockSyncConfig {
     /// bodies are bounded by `max_reorder_lookahead_bytes` instead.
     pub max_inflight_block_bytes: u64,
     /// Maximum estimated *resident* memory of look-ahead block bodies retained
-    /// by the download pipeline (wire bytes × `DESERIALIZED_MEM_FACTOR`).
+    /// by the download pipeline. Serialized backlog and reservations are charged
+    /// at wire size; decoded input/submission windows add
+    /// `DESERIALIZED_MEM_FACTOR` times their wire size.
     pub max_reorder_lookahead_bytes: u64,
     /// How long to avoid reassigning an expired floor height to the same peer.
     #[serde(with = "humantime_serde")]

@@ -1529,7 +1529,7 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
-        submitted_applying_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 40_000_000,
@@ -1595,7 +1595,7 @@ fn admission_counts_inflight_to_sequencer_bytes() {
         applying_buffered_bytes: 200,
         applying_buffered_blocks: 1,
         sequencer_input_queued_bytes: 600,
-        submitted_applying_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1630,7 +1630,7 @@ fn total_resident_plateaus_under_commit_stall() {
         applying_buffered_bytes: 700,
         applying_buffered_blocks: 1,
         sequencer_input_queued_bytes: 0,
-        submitted_applying_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1665,7 +1665,7 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
         applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
-        submitted_applying_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1717,7 +1717,7 @@ fn outstanding_reservations_are_charged_at_wire_size() {
         applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
-        submitted_applying_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 1_100,
         reserved_above_floor_blocks: 1,
         budget_available: 64_000_000,
@@ -1784,7 +1784,7 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
         applying_buffered_bytes: 1_200,
         applying_buffered_blocks: 990,
         sequencer_input_queued_bytes: 0,
-        submitted_applying_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1863,7 +1863,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
         applying_buffered_bytes: 1_000,
         applying_buffered_blocks: 10,
         sequencer_input_queued_bytes: 0,
-        submitted_applying_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1945,7 +1945,7 @@ fn commit_window_stays_fundable_at_exact_floor() {
         applying_buffered_bytes: 800_000_000,
         applying_buffered_blocks: u64::from(range_blocks) - 1,
         sequencer_input_queued_bytes: 0,
-        submitted_applying_bytes: 800_000_000,
+        in_flight_submission_bytes: 800_000_000,
         reserved_above_floor_bytes: 4_000_000,
         reserved_above_floor_blocks: 2,
         budget_available: 2_000_000,
@@ -3563,7 +3563,7 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
     for height in seq.submittable_heights() {
         seq.prepare_submit(height).expect("height is applying");
     }
-    assert_eq!(seq.submitted_applying_count(), limit);
+    assert_eq!(seq.in_flight_submission_count(), limit);
     assert_eq!(seq.decoded_applying_count(), limit);
 
     // Rolling a submission back also rolls its body out of the decode window.
@@ -3573,9 +3573,9 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
 
 #[test]
 fn sequencer_applying_counters_match_scan_across_transitions() {
-    // Assert the O(1) applying counters (buffered bytes, submitted count/bytes)
-    // never drift from a full scan across insert / submit / unsubmit / remove /
-    // commit-release / reset.
+    // Assert the O(1) applying and in-flight-submission counters never drift
+    // from their ground truth across insert / submit / unsubmit / detach /
+    // completion / commit-release / reset.
     let mut seq = test_sequencer(0, 8);
     let blocks = mainnet_blocks_1_to_3();
     let check = |seq: &Sequencer, label: &str| {
@@ -3585,18 +3585,18 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
             "applying_buffered_bytes drifted after {label}"
         );
         assert_eq!(
-            seq.submitted_applying_count(),
-            seq.submitted_applying_count_scanned(),
-            "submitted_applying_count drifted after {label}"
+            seq.in_flight_submission_count(),
+            seq.in_flight_submission_count_scanned(),
+            "in_flight_submission_count drifted after {label}"
         );
         assert_eq!(
-            seq.submitted_applying_bytes(),
-            seq.submitted_applying_bytes_scanned(),
-            "submitted_applying_bytes drifted after {label}"
+            seq.in_flight_submission_bytes(),
+            seq.in_flight_submission_bytes_scanned(),
+            "in_flight_submission_bytes drifted after {label}"
         );
         assert_eq!(
             seq.unsubmitted_applying_count(),
-            seq.applying_len() - seq.submitted_applying_count(),
+            seq.applying_len() - seq.attached_submission_count_scanned(),
             "unsubmitted derivation wrong after {label}"
         );
     };
@@ -3617,44 +3617,49 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
         vec![block::Height(1), block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.applying_buffered_bytes(), 600);
-    assert_eq!(seq.submitted_applying_count(), 0);
+    assert_eq!(seq.in_flight_submission_count(), 0);
     check(&seq, "drain");
 
     // Submit heights 1 and 2.
     let item1 = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 applying");
-    let _ = seq
+    let item2 = seq
         .prepare_submit(block::Height(2))
         .expect("height 2 applying");
-    assert_eq!(seq.submitted_applying_count(), 2);
-    assert_eq!(seq.submitted_applying_bytes(), 300);
+    assert_eq!(seq.in_flight_submission_count(), 2);
+    assert_eq!(seq.in_flight_submission_bytes(), 300);
     assert_eq!(seq.unsubmitted_applying_count(), 1);
     check(&seq, "submit 1,2");
 
     // Roll back the submit for height 1.
     seq.unsubmit(block::Height(1), item1.token);
-    assert_eq!(seq.submitted_applying_count(), 1);
-    assert_eq!(seq.submitted_applying_bytes(), 200);
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(seq.in_flight_submission_bytes(), 200);
     check(&seq, "unsubmit 1");
 
-    // Remove the still-submitted height 2 directly.
+    // Detaching the still-submitted height 2 does not release the driver-owned
+    // decoded body or its submission-window charge.
     seq.remove_applying(block::Height(2));
-    assert_eq!(seq.submitted_applying_count(), 0);
-    assert_eq!(seq.submitted_applying_bytes(), 0);
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(seq.in_flight_submission_bytes(), 200);
     assert_eq!(seq.applying_buffered_bytes(), 400);
-    check(&seq, "remove submitted 2");
+    check(&seq, "detach submitted 2");
+    assert!(seq.finish_submission(item2.token, item2.height, item2.hash));
+    assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(seq.in_flight_submission_bytes(), 0);
+    check(&seq, "finish detached 2");
 
     // Commit through height 1: releases the applied body (height 1) from `applying`.
     seq.advance_verified_tip(block::Height(1), true);
     assert_eq!(seq.applying_buffered_bytes(), 300);
     check(&seq, "advance_verified_tip");
 
-    // Reset drops all applying state and zeroes the counters.
+    // Reset drops all applying state; there are no in-flight submissions left.
     seq.reset_to(block::Height(0), false);
     assert_eq!(seq.applying_buffered_bytes(), 0);
-    assert_eq!(seq.submitted_applying_count(), 0);
-    assert_eq!(seq.submitted_applying_bytes(), 0);
+    assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(seq.in_flight_submission_bytes(), 0);
     check(&seq, "reset");
 }
 
@@ -3726,12 +3731,48 @@ fn sequencer_submits_within_window_and_rolls_back_on_unsubmit() {
     let item1 = seq.prepare_submit(block::Height(1)).expect("applying at 1");
     let item2 = seq.prepare_submit(block::Height(2)).expect("applying at 2");
     assert_eq!((item1.token, item2.token), (1, 2));
-    assert_eq!(seq.submitted_applying_count(), 2);
+    assert_eq!(seq.in_flight_submission_count(), 2);
     // The window is now full, so nothing else is submittable.
     assert!(seq.submittable_heights().is_empty());
     // Rolling back a failed dispatch frees the slot and re-offers the height.
     seq.unsubmit(block::Height(2), item2.token);
-    assert_eq!(seq.submitted_applying_count(), 1);
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
+}
+
+#[test]
+fn sequencer_completed_duplicate_releases_attached_decode_window_slot() {
+    let mut seq = test_sequencer(0, 1);
+    let blocks = mainnet_blocks_1_to_3();
+    for (index, block) in blocks.iter().take(2).enumerate() {
+        let height = block::Height(index as u32 + 1);
+        let body =
+            BufferedBlockBody::from_decoded_block(block.clone(), Some(raw_block_payload(block)));
+        seq.accept_buffered_body(
+            height,
+            block.hash(),
+            block.header.previous_block_hash,
+            body,
+            100,
+            peer(0),
+        );
+    }
+    seq.drain_ready_into_applying();
+
+    let item = seq
+        .prepare_submit(block::Height(1))
+        .expect("height 1 is applying");
+    seq.record_submitted_apply(item.height, item.hash);
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert!(seq.submittable_heights().is_empty());
+
+    // A duplicate completion can arrive before the frontier proving that block
+    // advances. Keep its applying entry attached, but drop the decoded copy and
+    // free the global submission slot because the driver released its Arc.
+    assert!(seq.finish_attached_submission(item.token, item.height, item.hash));
+    assert!(seq.applying_contains(block::Height(1)));
+    assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(seq.decoded_applying_count(), 0);
     assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
 }
 
@@ -3741,16 +3782,22 @@ fn sequencer_records_and_decrements_submitted_applies() {
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let hash = block.hash();
     assert!(!seq.has_submitted_apply(block::Height(1), hash));
-    seq.record_submitted_apply(block::Height(1), hash);
+    seq.accept_body(block::Height(1), hash, block, 100, peer(0));
+    seq.drain_ready_into_applying();
+    let item = seq
+        .prepare_submit(block::Height(1))
+        .expect("height 1 is applying");
+    seq.record_submitted_apply(item.height, item.hash);
     assert!(seq.has_submitted_apply(block::Height(1), hash));
     assert!(seq.submitted_contains(block::Height(1)));
-    seq.decrement_submitted_apply(block::Height(1), hash);
+    seq.remove_applying(item.height);
+    assert!(seq.finish_submission(item.token, item.height, item.hash));
     assert!(!seq.has_submitted_apply(block::Height(1), hash));
     assert!(!seq.submitted_contains(block::Height(1)));
 }
 
 #[test]
-fn sequencer_release_applied_through_clears_submitted_applies() {
+fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completion() {
     let mut seq = test_sequencer(0, 1);
     let blocks = mainnet_blocks_1_to_3();
     for (index, block) in blocks.iter().enumerate() {
@@ -3771,6 +3818,16 @@ fn sequencer_release_applied_through_clears_submitted_applies() {
 
     assert_eq!(seq.release_applied_through(block::Height(1)), 100);
     assert!(!seq.submitted_contains(block::Height(1)));
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert!(
+        seq.submittable_heights().is_empty(),
+        "detached driver submission still occupies the decode window"
+    );
+
+    assert!(!seq.finish_submission(item.token, item.height, block::Hash([99; 32])));
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert!(seq.finish_submission(item.token, item.height, item.hash));
+    assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
 }
 
@@ -3835,6 +3892,61 @@ fn sequencer_reset_clears_buffers_and_pins_floor_and_tip() {
 }
 
 #[test]
+fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions() {
+    let mut seq = test_sequencer(0, 2);
+    let blocks = mainnet_blocks_1_to_3();
+    for (index, block) in blocks.iter().take(2).enumerate() {
+        let height = block::Height(index as u32 + 1);
+        seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
+    }
+    seq.drain_ready_into_applying();
+
+    let old_items: Vec<_> = seq
+        .submittable_heights()
+        .into_iter()
+        .map(|height| {
+            let item = seq.prepare_submit(height).expect("height is applying");
+            seq.record_submitted_apply(item.height, item.hash);
+            item
+        })
+        .collect();
+    assert_eq!(old_items.len(), 2);
+    assert_eq!(seq.in_flight_submission_count(), 2);
+
+    // Keep `old_items` alive to model the driver's pending/in-flight Arc<Block>s.
+    seq.reset_to(block::Height(0), false);
+    assert_eq!(seq.applying_len(), 0);
+    assert_eq!(seq.in_flight_submission_count(), 2);
+    assert_eq!(seq.in_flight_submission_bytes(), 200);
+
+    for (index, block) in blocks.iter().take(2).enumerate() {
+        let replacement = forked_block(block, 100 + index as u8);
+        let height = block::Height(index as u32 + 1);
+        seq.accept_body(height, replacement.hash(), replacement, 100, peer(1));
+    }
+    seq.drain_ready_into_applying();
+    assert!(
+        seq.submittable_heights().is_empty(),
+        "replacement bodies must not exceed the live decode window"
+    );
+
+    let first = &old_items[0];
+    assert!(
+        !seq.finish_submission(first.token, first.height, block::Hash([99; 32])),
+        "a mismatched completion must not release a detached charge"
+    );
+    assert_eq!(seq.in_flight_submission_count(), 2);
+    assert!(seq.finish_submission(first.token, first.height, first.hash));
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(seq.submittable_heights().len(), 1);
+
+    let second = &old_items[1];
+    assert!(seq.finish_submission(second.token, second.height, second.hash));
+    assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(seq.submittable_heights().len(), 2);
+}
+
+#[test]
 fn sequencer_reject_drops_successors_and_rolls_floor_back() {
     let mut seq = test_sequencer(0, 8);
     let blocks = mainnet_blocks_1_to_3();
@@ -3858,12 +3970,8 @@ fn sequencer_reject_drops_successors_and_rolls_floor_back() {
 }
 
 #[test]
-fn sequencer_release_applying_blocks_from_keeps_submitted_counters_consistent() {
-    // `release_applying_blocks_from` removes each height through `remove_applying`,
-    // which must decrement the O(1) submitted counters for any *submitted* body it
-    // drops. Existing reject coverage only releases unsubmitted bodies, so this
-    // exercises the submitted-counter branch of that path.
-    let mut seq = test_sequencer(0, 8);
+fn sequencer_rejection_release_keeps_detached_submissions_charged() {
+    let mut seq = test_sequencer(0, 2);
     let blocks = mainnet_blocks_1_to_3();
     for (index, block) in blocks.iter().enumerate() {
         let height = block::Height(index as u32 + 1);
@@ -3877,43 +3985,48 @@ fn sequencer_release_applying_blocks_from_keeps_submitted_counters_consistent() 
     }
     seq.drain_ready_into_applying();
     // Submit heights 2 and 3 so the released prefix (>= 2) is all submitted work.
-    let _ = seq
+    let item2 = seq
         .prepare_submit(block::Height(2))
         .expect("height 2 applying");
-    let _ = seq
+    let item3 = seq
         .prepare_submit(block::Height(3))
         .expect("height 3 applying");
-    assert_eq!(seq.submitted_applying_count(), 2);
-    assert_eq!(seq.submitted_applying_bytes(), 200 + 300);
+    assert_eq!(seq.in_flight_submission_count(), 2);
+    assert_eq!(seq.in_flight_submission_bytes(), 200 + 300);
 
     let released = seq.release_applying_blocks_from(block::Height(2));
     assert_eq!(released, 500);
     assert_eq!(seq.applying_len(), 1);
-    // Only the unsubmitted height 1 (100 bytes) survives; the submitted counters
-    // shed exactly the released bodies' contribution.
+    // Only unsubmitted height 1 survives in `applying`, but both decoded
+    // submissions remain retained by the driver and occupy the whole window.
     assert_eq!(seq.applying_buffered_bytes(), 100);
-    assert_eq!(seq.submitted_applying_count(), 0);
-    assert_eq!(seq.submitted_applying_bytes(), 0);
-    // Every maintained counter still agrees with a full scan.
+    assert_eq!(seq.in_flight_submission_count(), 2);
+    assert_eq!(seq.in_flight_submission_bytes(), 500);
+    assert!(seq.submittable_heights().is_empty());
     assert_eq!(
         seq.applying_buffered_bytes(),
         seq.applying_buffered_bytes_scanned()
     );
     assert_eq!(
-        seq.submitted_applying_count(),
-        seq.submitted_applying_count_scanned()
+        seq.in_flight_submission_count(),
+        seq.in_flight_submission_count_scanned()
     );
     assert_eq!(
-        seq.submitted_applying_bytes(),
-        seq.submitted_applying_bytes_scanned()
+        seq.in_flight_submission_bytes(),
+        seq.in_flight_submission_bytes_scanned()
     );
+
+    assert!(seq.finish_submission(item2.token, item2.height, item2.hash));
+    assert_eq!(seq.submittable_heights(), vec![block::Height(1)]);
+    assert!(seq.finish_submission(item3.token, item3.height, item3.hash));
+    assert_eq!(seq.in_flight_submission_count(), 0);
 }
 
 #[test]
 fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
     // `unsubmit` only rolls back (and decrements the submitted counters) when the
-    // token still matches the live submission, so a stale rollback cannot clobber a
-    // newer one or double-decrement the O(1) counters.
+    // token still matches the in-flight submission, so a stale rollback cannot
+    // clobber a newer one or double-decrement the O(1) counters.
     let mut seq = test_sequencer(0, 4);
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     seq.accept_body(block::Height(1), block.hash(), block.clone(), 100, peer(0));
@@ -3921,39 +4034,39 @@ fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 applying");
-    assert_eq!(seq.submitted_applying_count(), 1);
-    assert_eq!(seq.submitted_applying_bytes(), 100);
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(seq.in_flight_submission_bytes(), 100);
 
     // A rollback carrying a non-matching token is ignored: the submission and the
     // counters are untouched.
     seq.unsubmit(block::Height(1), item.token + 1);
-    assert_eq!(seq.submitted_applying_count(), 1);
-    assert_eq!(seq.submitted_applying_bytes(), 100);
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(seq.in_flight_submission_bytes(), 100);
     assert_eq!(
-        seq.submitted_applying_count(),
-        seq.submitted_applying_count_scanned()
+        seq.in_flight_submission_count(),
+        seq.in_flight_submission_count_scanned()
     );
     assert_eq!(
-        seq.submitted_applying_bytes(),
-        seq.submitted_applying_bytes_scanned()
+        seq.in_flight_submission_bytes(),
+        seq.in_flight_submission_bytes_scanned()
     );
 
     // The matching rollback frees the slot exactly once.
     seq.unsubmit(block::Height(1), item.token);
-    assert_eq!(seq.submitted_applying_count(), 0);
-    assert_eq!(seq.submitted_applying_bytes(), 0);
+    assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(seq.in_flight_submission_bytes(), 0);
 
     // Replaying the now-stale token must not decrement a second time.
     seq.unsubmit(block::Height(1), item.token);
-    assert_eq!(seq.submitted_applying_count(), 0);
-    assert_eq!(seq.submitted_applying_bytes(), 0);
+    assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(seq.in_flight_submission_bytes(), 0);
     assert_eq!(
-        seq.submitted_applying_count(),
-        seq.submitted_applying_count_scanned()
+        seq.in_flight_submission_count(),
+        seq.in_flight_submission_count_scanned()
     );
     assert_eq!(
-        seq.submitted_applying_bytes(),
-        seq.submitted_applying_bytes_scanned()
+        seq.in_flight_submission_bytes(),
+        seq.in_flight_submission_bytes_scanned()
     );
 }
 
@@ -4153,7 +4266,7 @@ fn received_body_admission_ignores_request_budget() {
         applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
-        submitted_applying_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         // Outstanding requests have spent the entire in-flight budget.
@@ -4216,7 +4329,7 @@ proptest::proptest! {
             applying_buffered_bytes: applying_bytes,
             applying_buffered_blocks: applying_blocks,
             sequencer_input_queued_bytes: input_bytes,
-            submitted_applying_bytes: 0,
+            in_flight_submission_bytes: 0,
             reserved_above_floor_bytes: reserved_bytes,
             reserved_above_floor_blocks: reserved_blocks,
             budget_available: 64_000_000,

@@ -7,7 +7,7 @@
 //!  command(reserve expected) ─▶ expected_headers.insert ─▶ queued(GetHeaders)
 //!  queue failure ─────────────▶ command(cancel expected) ─▶ expected_headers.remove
 //!  recv ─▶ guard ─┬─ Headers ─▶ expected_headers.remove(id) ─▶ decode ─▶ forward(WireHeaders)
-//!                 └─ Control ─────────────────────────────────▶ decode ─▶ forward(WireMessage)
+//!                 └─ Control ─────────────────────────────────▶ decode ─▶ forward(SessionWireMessage)
 //!
 //! Phase 2 moves request/response correlation out of
 //! [`HeaderSyncPeerSession`] and into [`HsLocal`]. The shared scheduler still
@@ -15,8 +15,7 @@
 //! peer-owned pipe before queueing outbound `GetHeaders`, rolling it back if the
 //! transport queue rejects the frame. The pipe prioritizes and drains commands
 //! before inbound frames so a response cannot beat its local expectation. This
-//! retires the session mutex without changing the reactor's synthetic
-//! `WireMessage` test path.
+//! retires the session mutex while keeping production messages session-scoped.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -409,28 +408,27 @@ pub(super) fn deliver(
             }
         };
 
-        if let HeaderSyncMessage::Headers {
+        let HeaderSyncMessage::Headers {
             headers,
             body_sizes,
             tree_aux_roots,
         } = msg
-        {
-            return forward(
-                handle,
-                HeaderSyncEvent::WireHeaders {
-                    peer: peer_id,
-                    session_id,
-                    // The response was correlated by peeking this exact ID, so the
-                    // decoded ID is the expectation's by construction.
-                    request_id: expected.request_id,
-                    headers,
-                    body_sizes,
-                    tree_aux_roots,
-                },
-            );
-        }
-
-        return forward(handle, HeaderSyncEvent::WireMessage { peer: peer_id, msg });
+        else {
+            unreachable!("Headers frame type agreement guarantees a Headers message");
+        };
+        return forward(
+            handle,
+            HeaderSyncEvent::WireHeaders {
+                peer: peer_id,
+                session_id,
+                // The response was correlated by peeking this exact ID, so the
+                // decoded ID is the expectation's by construction.
+                request_id: expected.request_id,
+                headers,
+                body_sizes,
+                tree_aux_roots,
+            },
+        );
     }
 
     let (msg, request_id) = match decode_control_frame(frame) {

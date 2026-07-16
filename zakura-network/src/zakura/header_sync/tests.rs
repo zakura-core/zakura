@@ -1635,23 +1635,6 @@ fn request_and_serving_counts_are_clamped_by_byte_budget() {
         inbound_get_headers_count_limit(&config, &Network::Mainnet, LOCAL_MAX_MESSAGE_BYTES, true),
         count_with_roots
     );
-
-    let headers =
-        vec![mainnet_header(&BLOCK_MAINNET_1_BYTES); usize::try_from(count).unwrap() + 100];
-    let body_sizes = vec![0u32; headers.len()];
-    let tree_aux_roots = roots_from_height(block::Height(1), headers.len());
-    let (headers, _body_sizes, _tree_aux_roots) = truncate_headers_to_byte_budget(
-        headers,
-        body_sizes,
-        tree_aux_roots,
-        &Network::Mainnet,
-        LOCAL_MAX_MESSAGE_BYTES,
-    );
-    let message = headers_message(headers);
-    let encoded = encode_correlated(&message).unwrap();
-
-    assert!(encoded.len() <= MAX_HS_MESSAGE_BYTES);
-    assert!(encoded.len() + FRAME_HEADER_BYTES <= LOCAL_MAX_MESSAGE_BYTES as usize);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3835,7 +3818,6 @@ async fn full_block_committed_covers_outstanding_height() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: block::Hash([1; 32]),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -4212,11 +4194,7 @@ async fn local_full_block_commit_prevents_later_new_block_regossip() {
     }
     fixture
         .handle
-        .send(HeaderSyncEvent::FullBlockCommitted {
-            height,
-            hash,
-            header: block.header.clone(),
-        })
+        .send(HeaderSyncEvent::FullBlockCommitted { height, hash })
         .await
         .unwrap();
     fixture
@@ -5319,7 +5297,6 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_violation_recor
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5481,7 +5458,6 @@ async fn header_sync_metrics_record_status_range_new_block_dedup_and_violation()
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5701,7 +5677,6 @@ async fn partial_full_block_coverage_retires_old_request_and_requests_suffix() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5749,7 +5724,6 @@ async fn partial_coverage_recreates_an_interior_hole_before_a_later_batch() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5802,7 +5776,6 @@ async fn partial_coverage_trims_and_commits_an_already_buffered_suffix() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(3),
             hash: mainnet_block(&BLOCK_MAINNET_3_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_3_BYTES),
         })
         .await
         .unwrap();
@@ -5867,7 +5840,6 @@ async fn partially_covered_failed_commit_requeues_its_uncovered_suffix() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5928,7 +5900,6 @@ async fn buffered_successor_drains_after_full_block_covers_its_predecessor() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();

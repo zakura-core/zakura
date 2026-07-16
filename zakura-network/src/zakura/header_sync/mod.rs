@@ -48,8 +48,8 @@ mod work_queue;
 
 pub use config::{
     clamp_header_sync_request_count, header_sync_count_by_byte_budget,
-    header_sync_header_bytes_for_network, inbound_get_headers_count_limit,
-    truncate_headers_to_byte_budget, HeaderSyncStatus, ZakuraHeaderSyncConfig,
+    header_sync_header_bytes_for_network, inbound_get_headers_count_limit, HeaderSyncStatus,
+    ZakuraHeaderSyncConfig,
 };
 pub use error::{HeaderSyncStartError, HeaderSyncWireError};
 pub use events::{

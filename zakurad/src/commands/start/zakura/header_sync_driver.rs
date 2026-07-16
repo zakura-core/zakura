@@ -1653,7 +1653,7 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
             .oneshot(zakura_state::ReadRequest::Block(hash.into()))
             .await
         {
-            Ok(zakura_state::ReadResponse::Block(Some(block))) => {
+            Ok(zakura_state::ReadResponse::Block(Some(_))) => {
                 emit_commit_state(
                     &trace,
                     cs_trace::STATE_READ_SUCCESS,
@@ -1666,11 +1666,7 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                     },
                 );
                 let _ = header_sync
-                    .send(HeaderSyncEvent::FullBlockCommitted {
-                        height,
-                        hash,
-                        header: block.header.clone(),
-                    })
+                    .send(HeaderSyncEvent::FullBlockCommitted { height, hash })
                     .await;
                 emit_commit_state(
                     &trace,

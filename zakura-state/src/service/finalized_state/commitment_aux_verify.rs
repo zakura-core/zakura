@@ -84,6 +84,37 @@ impl CommitmentRootVerification {
     }
 }
 
+/// Identifies whether VCT verification rejected the current block body or a supplied root.
+#[derive(Debug)]
+pub(crate) enum CommitmentRootVerificationError {
+    /// The current block body does not match its parent-history commitment.
+    CurrentBlock {
+        height: Height,
+        error: ValidateContextError,
+    },
+    /// A supplied root failed a direct check or the successor commitment check.
+    SuppliedRoot {
+        height: Height,
+        error: ValidateContextError,
+    },
+}
+
+impl CommitmentRootVerificationError {
+    #[cfg(test)]
+    fn height(&self) -> Height {
+        match self {
+            Self::CurrentBlock { height, .. } | Self::SuppliedRoot { height, .. } => *height,
+        }
+    }
+
+    #[cfg(test)]
+    fn error(&self) -> &ValidateContextError {
+        match self {
+            Self::CurrentBlock { error, .. } | Self::SuppliedRoot { error, .. } => error,
+        }
+    }
+}
+
 /// Verifies a supplied Sapling root for a *pre-Heartwood* block directly against the
 /// block header.
 ///
@@ -196,7 +227,7 @@ pub(crate) fn verify_commitment_roots<I>(
     network: &Network,
     mut history_tree: HistoryTree,
     blocks_to_verify: I,
-) -> Result<HistoryTree, (Height, ValidateContextError)>
+) -> Result<HistoryTree, CommitmentRootVerificationError>
 where
     I: IntoIterator<Item = CommitmentRootVerification>,
 {
@@ -232,7 +263,7 @@ where
                     &history_tree,
                     precomputed_auth_data_root,
                 )
-                .map_err(|error| (height, error))?;
+                .map_err(|error| CommitmentRootVerificationError::CurrentBlock { height, error })?;
             } else {
                 let auth_data_root = precomputed_auth_data_root
                     .expect("header-only VCT witnesses have a stored precomputed auth-data root");
@@ -251,7 +282,7 @@ where
                         ValidateContextError::HistoryTreeError(error)
                     }
                 })
-                .map_err(|error| (height, error))?;
+                .map_err(|error| CommitmentRootVerificationError::SuppliedRoot { height, error })?;
             }
         }
 
@@ -261,11 +292,11 @@ where
 
         let block = block.expect("verification items with supplied roots have a block body");
         verify_supplied_sapling_root_below_heartwood(network, &block, &sapling_root)
-            .map_err(|error| (height, error))?;
+            .map_err(|error| CommitmentRootVerificationError::SuppliedRoot { height, error })?;
         verify_supplied_orchard_root_below_nu5(network, height, &orchard_root)
-            .map_err(|error| (height, error))?;
+            .map_err(|error| CommitmentRootVerificationError::SuppliedRoot { height, error })?;
         verify_supplied_ironwood_root_below_nu6_3(network, height, &ironwood_root)
-            .map_err(|error| (height, error))?;
+            .map_err(|error| CommitmentRootVerificationError::SuppliedRoot { height, error })?;
 
         // Fold this block's supplied roots into the running MMR (builds the leaf
         // from the block body tx-counts + the roots).
@@ -273,7 +304,7 @@ where
             .push(network, block, &sapling_root, &orchard_root, &ironwood_root)
             .map_err(Arc::new)
             .map_err(ValidateContextError::from)
-            .map_err(|error| (height, error))?;
+            .map_err(|error| CommitmentRootVerificationError::SuppliedRoot { height, error })?;
     }
 
     Ok(history_tree)
@@ -656,11 +687,10 @@ mod tests {
                 Some(next_block.auth_data_root()),
             ),
         ];
-        let (fail_height, _error) =
-            verify_commitment_roots(&Mainnet, empty_history_tree(), bad_items)
-                .expect_err("a wrong root must be rejected");
+        let failure = verify_commitment_roots(&Mainnet, empty_history_tree(), bad_items)
+            .expect_err("a wrong root must be rejected");
         assert_eq!(
-            fail_height.0,
+            failure.height().0,
             activation + 1,
             "a wrong root at H is detected at H+1 (the lag)"
         );
@@ -783,16 +813,16 @@ mod tests {
             .as_mut()
             .expect("test verification item has roots")
             .0 = wrong_root;
-        let (fail_height, _error) = verify_commitment_roots(&Mainnet, seed, bad_items)
+        let failure = verify_commitment_roots(&Mainnet, seed, bad_items)
             .expect_err("a wrong NU5 root must be rejected");
         assert_eq!(
-            fail_height.0,
+            failure.height().0,
             bad_height + 1,
             "a wrong root at H is detected at H+1 (the lag)"
         );
         eprintln!(
             "VCT NU5 negative: wrong root at {bad_height} rejected at {}",
-            fail_height.0
+            failure.height().0
         );
     }
 
@@ -996,7 +1026,13 @@ mod tests {
         for &(start, end) in ranges.iter().filter(|(start, _)| *start < heartwood) {
             let items = (start..=end).map(|height| verification_item_at(Height(height)));
             verify_commitment_roots(&Mainnet, empty_history_tree(), items).unwrap_or_else(
-                |(height, error)| panic!("pre-Heartwood roots failed at {height:?}: {error}"),
+                |failure| {
+                    panic!(
+                        "pre-Heartwood roots failed at {:?}: {}",
+                        failure.height(),
+                        failure.error()
+                    )
+                },
             );
             eprintln!("validated direct pre-Heartwood commitments for {start}..={end}");
         }
@@ -1041,14 +1077,14 @@ mod tests {
             let items =
                 (activation + 1..=confirm_end).map(|height| verification_item_at(Height(height)));
 
-            verify_commitment_roots(&Mainnet, history_tree, items).unwrap_or_else(
-                |(height, error)| {
-                    panic!(
-                        "{upgrade:?} MMR linkage failed at {height:?} while validating through \
-                         {confirm_end}: {error}"
-                    )
-                },
-            );
+            verify_commitment_roots(&Mainnet, history_tree, items).unwrap_or_else(|failure| {
+                panic!(
+                    "{upgrade:?} MMR linkage failed at {:?} while validating through \
+                     {confirm_end}: {}",
+                    failure.height(),
+                    failure.error()
+                )
+            });
             eprintln!(
                 "validated {upgrade:?} MMR linkage for {activation}..={end} \
                  (confirmed by {confirm_end})"

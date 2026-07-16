@@ -1882,7 +1882,7 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                 "the hostile body must have a different auth-data root",
             );
 
-            let mismatched = CheckpointVerifiedBlock::from(hostile_block);
+            let mismatched = CheckpointVerifiedBlock::from(hostile_block.clone());
 
             let error = fast
                 .commit_finalized_direct(
@@ -1912,11 +1912,38 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                 "the rejected body must leave finalized state untouched",
             );
 
-            // Rejecting an invalid body must not evict the authenticated VCT
-            // roots. A subsequently downloaded honest body with the same hash
-            // can therefore commit after the write loop's hard-error reset and
-            // let checkpoint sync continue.
+            // A write-loop reset clears the prevalidation cache. The same invalid
+            // body must still be a hard error: replacing the supplied roots cannot
+            // repair a body whose auth data does not match its header commitment.
             fast.clear_vct_prevalidated_next();
+            let mismatched_without_cache = CheckpointVerifiedBlock::from(hostile_block);
+            let error = fast
+                .commit_finalized_direct(
+                    mismatched_without_cache.into(),
+                    None,
+                    None,
+                    "vct mismatched auth-data root without prevalidation",
+                )
+                .expect_err("an invalid body must not become retryable when the cache is empty");
+            prop_assert!(
+                format!("{error:?}").contains("InvalidBlockCommitment"),
+                "the cache-empty mismatch must remain a block error, got: {error:?}",
+            );
+            prop_assert_eq!(
+                error.vct_retryable_height(),
+                None,
+                "the write loop must reset rather than park the invalid body",
+            );
+            prop_assert_eq!(
+                fast.db.finalized_tip_height(),
+                Some(Height((seed + 2) as u32)),
+                "the cache-empty rejected body must leave finalized state untouched",
+            );
+
+            // Rejecting either form of the invalid body must not evict the
+            // authenticated VCT roots. A subsequently downloaded honest body
+            // with the same hash can therefore commit and let checkpoint sync
+            // continue.
             commit(&mut fast, seed + 3);
             prop_assert_eq!(
                 fast.db.finalized_tip_height(),
@@ -1961,8 +1988,13 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
                 .commit_finalized_direct(forged.into(), None, None, "vct forged wrapper hash")
                 .expect_err("a forged wrapper hash must not skip the bad block's own commitment check");
             prop_assert!(
-                format!("{error:?}").contains("VctSuppliedRootUnavailable"),
+                format!("{error:?}").contains("InvalidBlockCommitment"),
                 "the forged wrapper hash path must reject the bad commitment, got: {error:?}",
+            );
+            prop_assert_eq!(
+                error.vct_retryable_height(),
+                None,
+                "a forged block commitment must not be retried as a supplied-root failure",
             );
             prop_assert_eq!(
                 fast.vct_prevalidated_count(),

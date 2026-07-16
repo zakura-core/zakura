@@ -854,9 +854,18 @@ impl FinalizedState {
                                     verification_items,
                                 )
                             })
-                            .map_err(|(_fail_height, error)| {
+                            .map_err(|failure| {
                                 self.vct.clear_prevalidated_next();
-                                self.vct_reject_supplied_root(height, error)
+                                match failure {
+                                    commitment_aux_verify::CommitmentRootVerificationError::CurrentBlock {
+                                        error,
+                                        ..
+                                    } => error.into(),
+                                    commitment_aux_verify::CommitmentRootVerificationError::SuppliedRoot {
+                                        error,
+                                        ..
+                                    } => self.vct_reject_supplied_root(height, error),
+                                }
                             })?;
 
                         if let Some(next_vct_block) = &next_vct_block {

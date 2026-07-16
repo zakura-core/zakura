@@ -148,6 +148,26 @@ fn is_block_frame(frame: &crate::zakura::Frame) -> bool {
     frame.payload.first().copied() == Some(MSG_BS_BLOCK)
 }
 
+/// Records decoded-memory metrics for an accepted block and returns its attributed size.
+/// The decoded-to-serialized ratio is omitted when the wire size is missing or zero.
+fn record_decoded_memory_size(block: &block::Block, body_wire_bytes: Option<u64>) -> u64 {
+    let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
+    // Metrics accepts f64 samples; these lossy conversions are observability-only.
+    metrics::histogram!(
+        "sync.block.body.decoded.attributed_memory_size_bytes",
+        "stage" => "peer"
+    )
+    .record(decoded_attributed_memory_size_bytes as f64);
+    if let Some(serialized_bytes) = body_wire_bytes.filter(|bytes| *bytes > 0) {
+        metrics::histogram!(
+            "sync.block.body.decoded.to_serialized_ratio",
+            "stage" => "peer"
+        )
+        .record(decoded_attributed_memory_size_bytes as f64 / serialized_bytes as f64);
+    }
+    decoded_attributed_memory_size_bytes
+}
+
 /// Outcome classification for finishing an outstanding request.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Disposition {
@@ -1195,20 +1215,6 @@ impl PeerRoutine {
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
         raw_block_payload: Option<Arc<[u8]>>,
     ) {
-        let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
-        // Metrics accepts f64 samples; these lossy conversions are observability-only.
-        metrics::histogram!(
-            "sync.block.body.decoded.attributed_memory_size_bytes",
-            "stage" => "peer"
-        )
-        .record(decoded_attributed_memory_size_bytes as f64);
-        if let Some(serialized_bytes) = body_wire_bytes.filter(|bytes| *bytes > 0) {
-            metrics::histogram!(
-                "sync.block.body.decoded.to_serialized_ratio",
-                "stage" => "peer"
-            )
-            .record(decoded_attributed_memory_size_bytes as f64 / serialized_bytes as f64);
-        }
         let hash = block.hash();
         let Some(height) = block.coinbase_height() else {
             self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
@@ -1226,7 +1232,6 @@ impl PeerRoutine {
                     body_wire_bytes,
                     body_permit,
                     raw_block_payload.clone(),
-                    decoded_attributed_memory_size_bytes,
                 )
                 .await
             {
@@ -1318,6 +1323,8 @@ impl PeerRoutine {
             self.accept_already_settled_height(index, height);
             return;
         };
+        let decoded_attributed_memory_size_bytes =
+            record_decoded_memory_size(&block, body_wire_bytes);
         self.trace_body_received(
             height,
             serialized_bytes,
@@ -1445,7 +1452,6 @@ impl PeerRoutine {
         body_wire_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
         raw_block_payload: Option<Arc<[u8]>>,
-        decoded_attributed_memory_size_bytes: u64,
     ) -> bool {
         if self.work.hash_for_height(height) != Some(hash) {
             return false;
@@ -1512,6 +1518,8 @@ impl PeerRoutine {
             estimate
         };
 
+        let decoded_attributed_memory_size_bytes =
+            record_decoded_memory_size(&block, body_wire_bytes);
         self.record_received(serialized_bytes);
         self.trace_body_received(
             height,

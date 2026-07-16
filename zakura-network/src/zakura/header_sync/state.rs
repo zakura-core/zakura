@@ -307,6 +307,17 @@ impl VctRootRepair {
             && now >= self.next_attempt_at
     }
 
+    pub(super) fn next_maintenance_deadline(&self) -> Instant {
+        let repair_deadline = self.started_at + VCT_ROOT_REPAIR_MAX_WALL_TIME;
+        // An in-flight attempt has its own request timeout, so ignore its stale
+        // retry timestamp while retaining the overall repair deadline.
+        if self.in_flight.is_none() {
+            repair_deadline.min(self.next_attempt_at)
+        } else {
+            repair_deadline
+        }
+    }
+
     pub(super) fn mark_attempt(&mut self, peer: ZakuraPeerId) {
         self.tried_peers.insert(peer.clone());
         self.in_flight = Some(peer);

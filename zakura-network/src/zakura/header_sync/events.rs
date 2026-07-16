@@ -56,6 +56,7 @@ impl HeaderSyncStartup {
         config: ZakuraHeaderSyncConfig,
         max_frame_bytes: u32,
     ) -> Self {
+        let status_refresh_interval = config.status_refresh_interval;
         Self {
             network,
             anchor,
@@ -65,7 +66,7 @@ impl HeaderSyncStartup {
             config,
             max_frame_bytes,
             request_timeout: DEFAULT_HS_REQUEST_TIMEOUT,
-            status_refresh_interval: DEFAULT_HS_STATUS_REFRESH_INTERVAL,
+            status_refresh_interval,
             trace: ZakuraTrace::noop(),
             shutdown: CancellationToken::new(),
             range_state_actions_enabled: false,

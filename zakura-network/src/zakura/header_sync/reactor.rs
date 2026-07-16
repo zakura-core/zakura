@@ -2154,8 +2154,7 @@ impl HeaderSyncReactor {
             deadline = deadline.min(status_deadline);
         }
         if let Some(repair) = self.state.repair.as_ref() {
-            deadline = deadline.min(repair.next_attempt_at);
-            deadline = deadline.min(repair.started_at + VCT_ROOT_REPAIR_MAX_WALL_TIME);
+            deadline = deadline.min(repair.next_maintenance_deadline());
         }
 
         deadline.max(now)

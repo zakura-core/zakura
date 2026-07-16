@@ -333,12 +333,9 @@ impl BenchCommitter {
             bs_insert_u64(
                 row,
                 "retained_pipeline_wire_bytes",
-                super::admission::RetainedPipelineBytes {
-                    reorder_buffered_bytes: view.reorder_buffered_bytes,
-                    applying_buffered_bytes: view.applying_buffered_bytes,
-                    sequencer_input_queued_bytes: self.body_input_bytes.load(Ordering::Relaxed),
-                }
-                .wire_bytes(),
+                view.reorder_buffered_bytes
+                    .saturating_add(view.applying_buffered_bytes)
+                    .saturating_add(self.body_input_bytes.load(Ordering::Relaxed)),
             );
         });
     }

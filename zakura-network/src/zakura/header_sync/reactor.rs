@@ -1,5 +1,5 @@
 use super::super::trace::{
-    ordered_send_error_label, queue_send_trace as qs_trace, QUEUE_SEND_TABLE,
+    header_sync_trace as hs_trace, ordered_send_error_label, queue_send_trace as qs_trace,
 };
 use super::{
     config::*, error::*, events::*, requester::*, state::*, validation::*, wire::*, work_queue::*,
@@ -15,8 +15,8 @@ mod trace;
 
 use trace::{
     commit_failure_reason_label, header_sync_wire_error_kind, insert_hash, insert_height,
-    insert_peer, insert_u64, record_wire_validation_metrics, GetHeadersTraceMeta,
-    TreeAuxTraceSummary,
+    insert_peer, insert_u64, record_wire_validation_metrics, set_header_connectivity_gauges,
+    GetHeadersTraceMeta, TreeAuxTraceSummary,
 };
 
 const STALE_REPAIR_GENERATION: &str = "stale_repair_generation";
@@ -2863,15 +2863,6 @@ impl HeaderSyncReactor {
             }
         }
     }
-}
-
-fn set_header_connectivity_gauges(connected_peers: usize, healthy_peers: usize) {
-    // Active Zakura reactor sessions are bounded by the configured connection
-    // limit, far below f64's exact integer range.
-    metrics::gauge!("zakura.p2p.reactor.active_connections", "reactor" => "header_sync")
-        .set(connected_peers as f64);
-    metrics::gauge!("zakura.p2p.connected_peers").set(connected_peers as f64);
-    metrics::gauge!("zakura.p2p.healthy_peers").set(healthy_peers as f64);
 }
 
 fn header_sync_candidate_target(best_header_tip: block::Height) -> block::Height {

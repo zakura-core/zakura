@@ -14,6 +14,7 @@ use super::{
 use crate::zakura::{
     framed_channel,
     testkit::{TraceCapture, TraceValue},
+    trace::{header_sync_trace as hs_trace, HEADER_SYNC_TABLE},
     FramedSend, HeaderSyncServiceSummary, Peer, Service, ServicePeerDirection, ServicePeerLimits,
     ServicePeerSnapshot, ZakuraConnId, ZakuraHeaderSyncCandidateState, ZAKURA_CAP_HEADER_SYNC,
 };
@@ -5239,7 +5240,8 @@ async fn tree_aux_height_mismatch_traces_structured_diagnostics() {
 
     capture.flush().await;
     let reader = capture.reader().unwrap();
-    reader.table(HEADER_SYNC_TABLE.table()).assert_row(
+    let header_sync = reader.table(HEADER_SYNC_TABLE.table());
+    header_sync.assert_row(
         hs_trace::HEADER_EVENT_RECEIVED,
         &[
             (
@@ -5253,6 +5255,13 @@ async fn tree_aux_height_mismatch_traces_structured_diagnostics() {
             (hs_trace::LAST_ROOT_HEIGHT, TraceValue::U64(300)),
         ],
     );
+    header_sync.assert_sequence(&[
+        hs_trace::HEADER_EVENT_RECEIVED,
+        hs_trace::HEADER_PEER_VIOLATION,
+        hs_trace::HEADER_PEER_VIOLATION,
+        hs_trace::HEADER_PEER_VIOLATION_RECORDED,
+        hs_trace::HEADER_ACTION_DISPATCHED,
+    ]);
 
     let _ = capture.finish().await.unwrap();
 }

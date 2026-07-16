@@ -1,4 +1,25 @@
-use super::*;
+use serde_json::{Number, Value};
+use zakura_chain::{block, parallel::commitment_aux::BlockCommitmentRoots};
+
+use super::super::{
+    config::HeaderSyncStatus,
+    error::HeaderSyncWireError,
+    events::{
+        HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncMisbehavior,
+        HeaderSyncRequestId,
+    },
+    state::RangeRequest,
+    validation::count_between,
+    wire::HeaderSyncMessage,
+};
+use super::HeaderSyncReactor;
+use crate::zakura::{
+    trace::{
+        header_sync_trace as hs_trace, ordered_send_error_label, peer_label as trace_peer_label,
+        queue_send_trace as qs_trace, HEADER_SYNC_TABLE, QUEUE_SEND_TABLE,
+    },
+    OrderedSendError, ServicePeerDirection, ZakuraPeerId,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct GetHeadersTraceMeta {
@@ -142,11 +163,7 @@ impl HeaderSyncReactor {
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(count));
             insert_u64(row, hs_trace::ADVERTISED_CAP, u64::from(advertised_cap));
             insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(expected_count));
-            insert_u64(
-                row,
-                hs_trace::IN_FLIGHT_COUNT,
-                u64::try_from(in_flight_count).unwrap_or(u64::MAX),
-            );
+            insert_u64(row, hs_trace::IN_FLIGHT_COUNT, in_flight_count as u64);
             insert_bool(row, hs_trace::WANT_TREE_AUX_ROOTS, want_tree_aux_roots);
             insert_u64(row, hs_trace::TREE_AUX_ROOTS_LEN, u64::from(roots.len));
             roots.insert_into(row);
@@ -247,7 +264,7 @@ impl HeaderSyncReactor {
             insert_u64(
                 row,
                 hs_trace::DESTINATION_PEER_COUNT,
-                u64::try_from(destination_count).unwrap_or(u64::MAX),
+                destination_count as u64,
             );
         });
     }
@@ -430,11 +447,7 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
         HeaderSyncEvent::WireHeaders { peer, headers, .. } => {
             insert_optional_str(row, hs_trace::KIND, Some("wire_headers"));
             insert_peer(row, hs_trace::PEER, peer);
-            insert_u64(
-                row,
-                hs_trace::RANGE_COUNT,
-                u64::try_from(headers.len()).unwrap_or(u64::MAX),
-            );
+            insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
         }
         HeaderSyncEvent::WireGetHeaders {
             peer,
@@ -489,11 +502,7 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
         } => {
             insert_optional_str(row, hs_trace::KIND, Some("vct_root_repair_requested"));
             insert_height(row, hs_trace::HEIGHT, *height);
-            insert_u64(
-                row,
-                hs_trace::RANGE_COUNT,
-                u64::try_from(expected_hashes.len()).unwrap_or(u64::MAX),
-            );
+            insert_u64(row, hs_trace::RANGE_COUNT, expected_hashes.len() as u64);
             insert_u64(row, "generation", *generation);
         }
         HeaderSyncEvent::VctRootRepairResolved { generation } => {
@@ -555,11 +564,7 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
             insert_optional_str(row, hs_trace::KIND, Some("header_range_response_ready"));
             insert_peer(row, hs_trace::PEER, peer);
             insert_height(row, hs_trace::RANGE_START, *start_height);
-            insert_u64(
-                row,
-                hs_trace::RANGE_COUNT,
-                u64::try_from(headers.len()).unwrap_or(u64::MAX),
-            );
+            insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
             insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(*requested_count));
         }
     }
@@ -624,11 +629,7 @@ fn trace_action_fields(row: &mut serde_json::Map<String, Value>, action: &Header
             insert_optional_str(row, hs_trace::KIND, Some("commit_header_range"));
             insert_peer(row, hs_trace::PEER, peer);
             insert_height(row, hs_trace::RANGE_START, *start_height);
-            insert_u64(
-                row,
-                hs_trace::RANGE_COUNT,
-                u64::try_from(headers.len()).unwrap_or(u64::MAX),
-            );
+            insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
         }
         HeaderSyncAction::QueryBestHeaderTip => {
             insert_optional_str(row, hs_trace::KIND, Some("query_best_header_tip"));
@@ -733,6 +734,15 @@ fn header_sync_message_label(msg: &HeaderSyncMessage) -> &'static str {
         HeaderSyncMessage::GetHeaders { .. } => "get_headers",
         HeaderSyncMessage::NewBlock(_) => "new_block",
     }
+}
+
+pub(super) fn set_header_connectivity_gauges(connected_peers: usize, healthy_peers: usize) {
+    // Active Zakura reactor sessions are bounded by the configured connection
+    // limit, far below f64's exact integer range.
+    metrics::gauge!("zakura.p2p.reactor.active_connections", "reactor" => "header_sync")
+        .set(connected_peers as f64);
+    metrics::gauge!("zakura.p2p.connected_peers").set(connected_peers as f64);
+    metrics::gauge!("zakura.p2p.healthy_peers").set(healthy_peers as f64);
 }
 
 pub(super) fn record_wire_validation_metrics(error: &HeaderSyncWireError) {
@@ -871,13 +881,27 @@ pub(super) fn commit_failure_reason_label(kind: HeaderSyncCommitFailureKind) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zakura::{framed_channel, HeaderSyncServiceSummary};
+    use std::{io, sync::Arc};
+
+    use chrono::Utc;
+    use tokio_util::sync::CancellationToken;
     use zakura_chain::{
         block::BlockTimeError,
-        orchard, sapling,
+        orchard,
+        parameters::Network,
+        sapling,
         serialization::{SerializationError, ZcashDeserializeInto},
+        work::equihash,
     };
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
+
+    use crate::zakura::{
+        framed_channel,
+        header_sync::{
+            events::HeaderSyncFrontiers, service::HeaderSyncPeerSession, state::RangePriority,
+        },
+        HeaderSyncServiceSummary,
+    };
 
     fn peer(byte: u8) -> ZakuraPeerId {
         ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds")

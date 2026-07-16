@@ -697,10 +697,10 @@ impl SequencerTask {
             return true;
         };
 
-        self.sequencer
-            .applying_previous_block_hash(next)
-            .map(|previous_block_hash| previous_block_hash == anchor_hash)
-            .unwrap_or(true)
+        direct_successor_links_to_anchor(
+            self.sequencer.applying_previous_block_hash(next),
+            anchor_hash,
+        )
     }
 
     async fn send_action(&self, action: BlockSyncAction) -> bool {
@@ -756,6 +756,13 @@ impl SequencerTask {
     }
 }
 
+fn direct_successor_links_to_anchor(
+    previous_block_hash: Option<block::Hash>,
+    anchor_hash: block::Hash,
+) -> bool {
+    previous_block_hash.is_some_and(|hash| hash == anchor_hash)
+}
+
 fn publish_sequencer_view(view_tx: &watch::Sender<SequencerView>, next: SequencerView) {
     view_tx.send_if_modified(|current| {
         let schedulable_changed = view_schedulable_ne(current, &next);
@@ -781,6 +788,21 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_direct_successor_cannot_prove_reset_anchor() {
+        let anchor_hash = block::Hash([1; 32]);
+
+        assert!(direct_successor_links_to_anchor(
+            Some(anchor_hash),
+            anchor_hash
+        ));
+        assert!(!direct_successor_links_to_anchor(
+            Some(block::Hash([2; 32])),
+            anchor_hash
+        ));
+        assert!(!direct_successor_links_to_anchor(None, anchor_hash));
+    }
 
     fn test_view() -> SequencerView {
         SequencerView {

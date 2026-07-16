@@ -847,31 +847,16 @@ async fn fuzz_mixed_block_sizes() {
     }
 }
 
-/// Commit stall: the mock commit pipeline drains slowly and in bursts while fast peers
-/// keep serving. This is the `BLOCKSYNC_BYTE_CWND_PLAN` step-3 system check — the apply
-/// backlog must be bounded **only** by the byte budget (download parks on the memory
-/// ceiling, not on a commit-coupled throttle), and the verified tip must resume the
-/// instant each stall clears so the run still reaches the target.
-///
-/// `run_checked` already asserts the target is reached (vtip resumes; no commit-induced
-/// wedge). On top of that we assert the peak reserved bytes stayed within the configured
-/// ceiling (the queue did not grow toward the full chain) yet the ceiling was actually
-/// exercised (the stall created real backpressure — the bound is not vacuous).
+/// A bursty commit stall builds resident pressure without wedging progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_commit_stall() {
     let blocks = 400;
     let body_bytes = 32 * 1024usize;
-    // A small resident download budget so the commit stall makes it bind: the chain is
-    // ~12.8 MB (400 × 32 KiB) against a 2 MiB ceiling, so the budget must recycle ~6× and
-    // download genuinely waits on commit. Kept below the request-count cap's byte
-    // equivalent (2 peers × 64 reqs × 32 KiB = 4 MiB) so the *byte budget*, not the
-    // request count, is the binding constraint. (The fuzzer reactor path does not call
-    // `validate()`, which would otherwise require a full checkpoint range; the synthetic
-    // bodies are tiny and the mock committer needs no checkpoint batch, so a sub-floor
-    // ceiling is the right knob to exercise byte-budget backpressure here.)
+    // A sub-range resident budget forces retention backpressure in the test harness.
     let byte_ceiling: u64 = 2 * 1024 * 1024;
+    let resident_budget = byte_ceiling * DESERIALIZED_MEM_FACTOR;
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: byte_ceiling,
+        max_reorder_lookahead_bytes: resident_budget,
         max_blocks_per_response: 1,
         ..fuzz_config()
     };
@@ -885,8 +870,7 @@ async fn fuzz_commit_stall() {
         ],
     );
     scenario.target_block_bytes = Some(body_bytes);
-    // Steady 1 ms/commit plus a 120 ms burst every 40 commits — a slow, sawtoothing drain
-    // that holds the byte budget full between bursts without ever permanently wedging.
+    // A sawtoothing drain holds retention at the gate without wedging.
     scenario.commit = CommitProfile {
         per_commit_delay: Duration::from_millis(1),
         burst: Some(CommitBurstStall {
@@ -897,33 +881,43 @@ async fn fuzz_commit_stall() {
     scenario.deadline = Duration::from_secs(60);
     let (_, report) = run_checked("fuzz_commit_stall", scenario, 64).await;
 
-    // The byte budget is the only bound on the apply backlog: peak reserved bytes stay
-    // within the ceiling plus a small floor-bypass / request-boundary margin — i.e. the
-    // queue did not grow toward the 12.8 MB chain despite the commit stall.
-    let margin = (body_bytes as u64).saturating_mul(16);
-    let bound = byte_ceiling.saturating_add(margin);
+    // Budget plus the commit-window exemption and request-boundary margin.
+    let window_slack = (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64)
+        .saturating_mul(body_bytes as u64)
+        .saturating_mul(DESERIALIZED_MEM_FACTOR);
+    let margin = (body_bytes as u64)
+        .saturating_mul(16)
+        .saturating_mul(DESERIALIZED_MEM_FACTOR);
+    let peak_retained_resident = report
+        .peak_retained_pipeline_wire_bytes
+        .saturating_mul(DESERIALIZED_MEM_FACTOR);
+    let bound = resident_budget
+        .saturating_add(window_slack)
+        .saturating_add(margin);
     assert!(
-        report.peak_budget_reserved <= bound,
-        "reserved bytes {} must stay within the {} B memory ceiling (+{} B margin); the \
-         apply backlog is bounded by the byte budget, not unbounded by the commit stall",
-        report.peak_budget_reserved,
-        byte_ceiling,
+        peak_retained_resident <= bound,
+        "peak retained resident cost {} must stay within the {} B budget \
+         (+{} B commit-window slack, +{} B margin); the apply backlog is bounded by \
+         the resident gate, not unbounded by the commit stall",
+        peak_retained_resident,
+        resident_budget,
+        window_slack,
         margin,
     );
-    // Non-vacuous: the stall actually filled the budget (otherwise the bound proves
-    // nothing about backpressure).
+    // Ensure the bound is exercised.
     assert!(
-        report.peak_budget_reserved >= byte_ceiling / 2,
-        "the commit stall should have created real byte-budget backpressure (reserved \
-         {} of the {} B ceiling)",
-        report.peak_budget_reserved,
-        byte_ceiling,
+        peak_retained_resident >= resident_budget / 2,
+        "the commit stall should have created real retained-memory pressure \
+         (retained {} of the {} B budget)",
+        peak_retained_resident,
+        resident_budget,
     );
     tracing::info!(
-        peak_budget_reserved = report.peak_budget_reserved,
+        peak_retained_pipeline_wire_bytes = report.peak_retained_pipeline_wire_bytes,
+        peak_retained_resident,
         final_budget_reserved = report.final_budget_reserved,
-        byte_ceiling,
-        "commit_stall byte-budget backpressure observation",
+        resident_budget,
+        "commit_stall retention backpressure observation",
     );
 }
 
@@ -1191,19 +1185,12 @@ async fn fuzz_reorder() {
     run_checked("fuzz_reorder", scenario, 32).await;
 }
 
-/// Many peers racing against a tight global byte budget: every per-peer routine reserves
-/// against the one shared `ByteBudget`, so this stresses the concurrent reservation path
-/// end-to-end. A steady slow commit keeps the shared budget full so it actually binds
-/// while eight routines reserve concurrently. `assert_core` asserts
-/// `peak_budget_reserved` never exceeds the configured ceiling (the global memory bound
-/// under multi-peer contention — the spec's "concurrent reservations MUST NOT
-/// over-commit"); here we additionally assert the ceiling was genuinely approached, so
-/// that bound is not vacuous.
+/// Many peers race against a tight shared request budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_multi_peer_tight_budget() {
     let blocks = 400;
     let body_bytes = 32 * 1024usize;
-    // ~12.8 MB chain against a 3 MiB ceiling ⇒ the shared budget recycles ~4× and binds.
+    // Opening demand exceeds the ceiling, forcing reservation contention.
     let byte_ceiling: u64 = 3 * 1024 * 1024;
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: byte_ceiling,
@@ -1215,8 +1202,7 @@ async fn fuzz_multi_peer_tight_budget() {
         .collect();
     let mut scenario = Scenario::new(blocks, 0x57ea_000f, config, peers);
     scenario.target_block_bytes = Some(body_bytes);
-    // A steady slow commit so the budget stays full and binds; instant commit would keep
-    // it nearly empty and make the bound vacuous.
+    // Slow commit creates repeated fill passes.
     scenario.commit = CommitProfile {
         per_commit_delay: Duration::from_millis(1),
         burst: None,
@@ -1224,9 +1210,7 @@ async fn fuzz_multi_peer_tight_budget() {
     scenario.deadline = Duration::from_secs(60);
     let (_, report) = run_checked("fuzz_multi_peer_tight_budget", scenario, 128).await;
 
-    // Non-vacuous: the tight ceiling was genuinely approached under 8-peer contention, so
-    // `assert_core`'s `peak_budget_reserved <= max_inflight_block_bytes` proves a real
-    // bound rather than an idle budget.
+    // Ensure the bound is exercised.
     assert!(
         report.peak_budget_reserved >= byte_ceiling / 2,
         "the tight budget should bind under 8-peer contention (reserved {} of {} B)",

@@ -997,10 +997,9 @@ fn config_validate_rejects_degenerate_values() {
     };
     assert!(config.validate().is_err());
 
-    // A positive budget below the checkpoint-range floor is no longer rejected by
-    // `validate`: it is clamped up to the floor (with a warning) at load instead,
-    // so older configs keep starting. See
-    // `config_clamps_below_floor_inflight_block_bytes`.
+    // A request budget below the checkpoint-range floor is fine: submitted bodies
+    // release their reservation at receipt, so the budget only has to exceed one
+    // floor request (checked below the floor-request bound in `validate`).
     config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR - 1,
         ..ZakuraBlockSyncConfig::default()
@@ -1040,58 +1039,45 @@ fn config_validate_rejects_degenerate_values() {
 }
 
 #[test]
-fn config_clamps_below_floor_inflight_block_bytes() {
-    // A positive budget below the checkpoint-range floor is clamped up to the
-    // floor so checkpoint sync cannot deadlock (instead of refusing to start).
-    let mut below = ZakuraBlockSyncConfig {
-        // 256 MiB, the historical `v4.5.0-zakura-blocksync.toml` value, which is
-        // below the ~802 MB checkpoint-range floor.
-        max_inflight_block_bytes: 256 * 1024 * 1024,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    assert!(below.max_inflight_block_bytes < BS_CHECKPOINT_RANGE_BYTE_FLOOR);
-    below.clamp_inflight_block_bytes_to_floor();
-    assert_eq!(
-        below.max_inflight_block_bytes,
-        BS_CHECKPOINT_RANGE_BYTE_FLOOR
-    );
-
-    // A budget at or above the floor is left untouched.
-    let mut at_floor = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR + 1,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    at_floor.clamp_inflight_block_bytes_to_floor();
-    assert_eq!(
-        at_floor.max_inflight_block_bytes,
-        BS_CHECKPOINT_RANGE_BYTE_FLOOR + 1
-    );
-
-    // Zero is left untouched so `validate` still rejects it as a misconfiguration.
-    let mut zero = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 0,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    zero.clamp_inflight_block_bytes_to_floor();
-    assert_eq!(zero.max_inflight_block_bytes, 0);
-    assert!(zero.validate().is_err());
-}
-
-#[test]
-fn config_deserialize_clamps_below_floor_inflight_block_bytes() {
-    // Regression: an older config with a too-small `max_inflight_block_bytes`
-    // (e.g. the stored `v4.5.0-zakura-blocksync.toml`) must still load -- clamped
-    // up to the checkpoint-range floor -- rather than being rejected at startup.
+fn config_deserialize_keeps_below_range_floor_inflight_block_bytes() {
+    // An older config with a small `max_inflight_block_bytes` (e.g. the stored
+    // `v4.5.0-zakura-blocksync.toml` 256 MiB value) loads unchanged: the request
+    // budget no longer bounds retention, so it needs no checkpoint-range clamp —
+    // only `validate`'s one-floor-request lower bound applies.
     let config: crate::Config = toml::from_str(
         r#"
         [zakura.block_sync]
         max_inflight_block_bytes = 268435456
         "#,
     )
-    .expect("a below-floor max_inflight_block_bytes config still loads");
+    .expect("a below-range-floor max_inflight_block_bytes config still loads");
+    const {
+        assert!(268435456u64 < BS_CHECKPOINT_RANGE_BYTE_FLOOR);
+    }
+    assert_eq!(config.zakura.block_sync.max_inflight_block_bytes, 268435456);
+}
+
+#[test]
+fn config_deserialize_clamps_sub_floor_request_inflight_block_bytes() {
+    // A stored config whose request budget cannot cover one floor request
+    // (e.g. an old 16 MiB value) loads clamped to just above the floor instead
+    // of failing `validate`'s one-floor-request lower bound, so older nodes
+    // keep starting.
+    let config: crate::Config = toml::from_str(
+        r#"
+        [zakura.block_sync]
+        max_inflight_block_bytes = 16777216
+        "#,
+    )
+    .expect("a sub-floor-request max_inflight_block_bytes config still loads");
+    let request_floor = config.zakura.block_sync.floor_request_byte_reservation();
+    assert!(
+        16_777_216 <= request_floor,
+        "test premise: the stored value is at or below one floor request"
+    );
     assert_eq!(
         config.zakura.block_sync.max_inflight_block_bytes,
-        BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+        request_floor + 1
     );
 }
 
@@ -1543,6 +1529,7 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 40_000_000,
@@ -1589,8 +1576,8 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         above.priority,
         super::admission::RequestPriority::AboveFloor
     );
-    // Remaining headroom is measured in resident memory: (500 - 100*4) / 4 = 25 wire bytes.
-    assert_eq!(above.max_request_bytes, 25);
+    // Remaining headroom is wire-denominated: 500 - 100 = 400 wire bytes.
+    assert_eq!(above.max_request_bytes, 400);
 }
 
 #[test]
@@ -1608,6 +1595,7 @@ fn admission_counts_inflight_to_sequencer_bytes() {
         applying_buffered_bytes: 200,
         applying_buffered_blocks: 1,
         sequencer_input_queued_bytes: 600,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1642,6 +1630,7 @@ fn total_resident_plateaus_under_commit_stall() {
         applying_buffered_bytes: 700,
         applying_buffered_blocks: 1,
         sequencer_input_queued_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1676,6 +1665,7 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
         applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1709,12 +1699,11 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
 }
 
 #[test]
-fn outstanding_reservations_are_charged_at_the_resident_multiple() {
-    // Regression for the reserved-0× hole: outstanding above-floor reservations land and
-    // decode like every other pool, so they must be pre-charged at the resident multiple.
-    // Charging them nothing makes in-flight volume invisible to the byte gate until it is
-    // already resident — in a commit stall the pipeline could fill the whole in-flight wire
-    // budget and then decode ×factor past the plateau.
+fn outstanding_reservations_are_charged_at_wire_size() {
+    // Regression for the reserved-0× hole: outstanding above-floor reservations land as
+    // retained wire bytes like every other serialized pool, so they must be pre-charged
+    // at their wire size. Charging them nothing makes in-flight volume invisible to the
+    // byte gate until it is already resident.
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
@@ -1728,11 +1717,12 @@ fn outstanding_reservations_are_charged_at_the_resident_multiple() {
         applying_buffered_bytes: 0,
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
-        reserved_above_floor_bytes: 700,
+        in_flight_submission_bytes: 0,
+        reserved_above_floor_bytes: 1_100,
         reserved_above_floor_blocks: 1,
         budget_available: 64_000_000,
     };
-    // Reservations alone fill the budget: 700 * 4 = 2_800 >= 1_000, so both the speculative
+    // Reservations alone fill the budget: 1_100 >= 1_000, so both the speculative
     // lane and an escalated floor block above the commit window are refused.
     assert_eq!(
         admit_grant(
@@ -1784,16 +1774,17 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
         // Large enough that the byte (memory) cap, not the block cap, is what bites here.
         ..ZakuraBlockSyncConfig::default()
     };
-    // Commit stalled far below the download floor; applying holds a full budget of bodies:
-    // 300 serialized * DESERIALIZED_MEM_FACTOR (4) = 1_200 resident >= 1_000 budget.
+    // Commit stalled far below the download floor; applying holds a full budget of
+    // serialized backlog bodies: 1_200 wire bytes >= 1_000 budget.
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(1_000),
         verified_block_tip: block::Height(10),
         reorder_buffered_bytes: 0,
         reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 300,
+        applying_buffered_bytes: 1_200,
         applying_buffered_blocks: 990,
         sequencer_input_queued_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1863,15 +1854,16 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
-    // Gate full: 300 wire * 4 = 1_200 resident >= 1_000 budget.
+    // Gate full: 1,000 serialized applying bytes fill the 1,000-byte budget.
     let full = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
         verified_block_tip: block::Height(10),
         reorder_buffered_bytes: 0,
         reorder_buffered_blocks: 0,
-        applying_buffered_bytes: 300,
+        applying_buffered_bytes: 1_000,
         applying_buffered_blocks: 10,
         sequencer_input_queued_bytes: 0,
+        in_flight_submission_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -1908,7 +1900,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
     assert_eq!(grant.take_high, block::Height(411));
 
     // An above-window start with headroom extends to the servable ceiling, sized by the
-    // remaining resident headroom in wire bytes: (1_000 - 0) / 4 = 250.
+    // remaining wire-denominated headroom: 1_000 - 0 = 1_000.
     let grant = admit_grant(
         &config,
         open,
@@ -1918,7 +1910,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
     )
     .expect("an above-window start is admitted below the cap");
     assert_eq!(grant.take_high, block::Height(10_000));
-    assert_eq!(grant.max_request_bytes, 250);
+    assert_eq!(grant.max_request_bytes, 1_000);
 }
 
 #[test]
@@ -1941,9 +1933,10 @@ fn commit_window_stays_fundable_at_exact_floor() {
     let range_blocks = u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
         .expect("checkpoint range block count fits in u32");
 
-    // verified_tip pinned at 0; applying holds all but the last worst-case range block, plus
+    // verified_tip pinned at 0; applying holds all but the last worst-case range block —
+    // all submitted during checkpoint sync, so charged at the decoded multiple — plus
     // next-range contamination in reorder and outstanding reservations. The byte gate is
-    // full: resident (8 MiB + 800 MB + 4 MB) * 4 >= 3_208_000_000.
+    // full: 8 MiB + 800 MB + 4 MB serialized + 800 MB * 4 decoded >= 3_208_000_000.
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(range_blocks - 1),
         verified_block_tip: block::Height(0),
@@ -1952,6 +1945,7 @@ fn commit_window_stays_fundable_at_exact_floor() {
         applying_buffered_bytes: 800_000_000,
         applying_buffered_blocks: u64::from(range_blocks) - 1,
         sequencer_input_queued_bytes: 0,
+        in_flight_submission_bytes: 800_000_000,
         reserved_above_floor_bytes: 4_000_000,
         reserved_above_floor_blocks: 2,
         budget_available: 2_000_000,
@@ -2039,20 +2033,21 @@ fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
     assert_eq!(queue.reserved_bytes(), 600);
     check("mark_reserved");
 
-    // settle: Reserved -> Held drops the reservation for height 1.
-    queue
-        .settle_active_reserved_height(block::Height(1), 80)
-        .expect("height 1 is reserved");
+    // receipt: Reserved -> Released drops the reservation for height 1.
+    assert_eq!(
+        queue.release_active_reserved_height(block::Height(1)),
+        Some(100),
+    );
     assert_eq!(queue.reserved_bytes(), 500);
-    check("settle");
+    check("release_active_reserved_height");
 
-    // mark_held_direct: Reserved -> Held drops height 2's reservation.
-    queue.mark_held_direct(block::Height(2), 90);
+    // claim_received: Reserved -> Released drops height 2's reservation.
+    assert_eq!(queue.claim_received(block::Height(2)), 100);
     assert_eq!(queue.reserved_bytes(), 400);
-    check("mark_held_direct");
+    check("claim_received");
 
     // release_heights: Reserved -> Released for height 3.
-    queue.release_heights([block::Height(3)]);
+    queue.release_reserved_heights([block::Height(3)]);
     assert_eq!(queue.reserved_bytes(), 300);
     check("release_heights");
 
@@ -2062,9 +2057,9 @@ fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
     assert_eq!(queue.reserved_bytes(), 200);
     check("release_reserved_and_return_items");
 
-    // advance_floor drops the committed `<= floor` prefix. Heights 1 (Held) and 2
-    // (Held) contribute no reservation; height 3 is already Released. Only heights
-    // 5 and 6 remain reserved above the new floor.
+    // advance_floor drops the committed `<= floor` prefix. Heights 1 and 2
+    // (received) and 3 (released) contribute no reservation. Only heights 5 and 6
+    // remain reserved above the new floor.
     let released = queue.advance_floor(block::Height(4));
     assert_eq!(released, 0, "heights <= 4 owned no live reservation");
     assert!(!queue.pending_contains(block::Height(1)));
@@ -2110,7 +2105,34 @@ fn work_queue_advance_floor_drops_only_committed_prefix() {
 }
 
 #[test]
-fn watchdog_after_held_settle_releases_once() {
+fn receipt_releases_wire_reservation_while_body_retained() {
+    // Receipt ends the wire reservation: the estimate returns to the budget while
+    // the caller still owns the body (the height stays claimed in `in_flight`).
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
+    let mut budget = ByteBudget::new(1_000);
+    let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
+    assert_eq!(taken.len(), 1);
+    assert!(budget.try_reserve(100));
+    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    assert_eq!(queue.reserved_bytes(), 100);
+
+    let reserved_estimate = queue
+        .release_active_reserved_height(block::Height(1))
+        .expect("active reserved height releases at receipt");
+    assert_eq!(reserved_estimate, 100);
+    budget.release(reserved_estimate);
+    assert_eq!(queue.reserved_bytes(), 0);
+    assert_eq!(budget.reserved(), 0);
+    assert!(
+        queue.in_flight_contains(block::Height(1)),
+        "the received height stays claimed; the body handoff owns it"
+    );
+}
+
+#[test]
+fn floor_watchdog_skips_received_heights() {
+    // After receipt released the reservation, the watchdog must neither requeue
+    // the height (the body handoff owns it) nor release a second time.
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
     let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
@@ -2118,33 +2140,33 @@ fn watchdog_after_held_settle_releases_once() {
     assert!(budget.try_reserve(100));
     assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
 
-    let delta = queue
-        .settle_active_reserved_height(block::Height(1), 80)
-        .expect("active reserved height settles");
-    assert_eq!(delta, -20);
-    budget.release(20);
-    assert_eq!(budget.reserved(), 80);
+    let reserved_estimate = queue
+        .release_active_reserved_height(block::Height(1))
+        .expect("active reserved height releases at receipt");
+    budget.release(reserved_estimate);
+    assert_eq!(budget.reserved(), 0);
 
     let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)]);
     let watchdog_released = outcome.released_bytes;
     budget.release(watchdog_released);
     assert_eq!(
         watchdog_released, 0,
-        "watchdog must not release a held body owned by the sequencer handoff"
+        "watchdog must not release a received height owned by the sequencer handoff"
     );
-    assert_eq!(outcome.held_count, 1);
+    assert!(
+        queue.in_flight_contains(block::Height(1)),
+        "the received height must not be requeued for a re-fetch"
+    );
+    assert_eq!(outcome.released_count, 1);
     assert_eq!(outcome.returned_count, 0);
     assert_eq!(outcome.missing_count, 0);
     assert!(queue.in_flight_contains(block::Height(1)));
-    assert_eq!(budget.reserved(), 80);
-
-    budget.release(80);
-    assert_eq!(queue.advance_floor(block::Height(1)), 0);
     assert_eq!(budget.reserved(), 0);
+    assert_eq!(queue.advance_floor(block::Height(1)), 0);
 }
 
 #[test]
-fn late_delivery_after_watchdog_cancellation_does_not_resurrect_released_claim() {
+fn late_body_does_not_resurrect_charge() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
     let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
@@ -2156,7 +2178,7 @@ fn late_delivery_after_watchdog_cancellation_does_not_resurrect_released_claim()
     let watchdog_released = outcome.released_bytes;
     budget.release(watchdog_released);
     assert_eq!(outcome.returned_count, 1);
-    assert_eq!(outcome.held_count, 0);
+    assert_eq!(outcome.released_count, 0);
     assert_eq!(outcome.missing_count, 0);
     assert_eq!(budget.reserved(), 0);
     assert!(queue.pending_contains(block::Height(1)));
@@ -2169,15 +2191,17 @@ fn late_delivery_after_watchdog_cancellation_does_not_resurrect_released_claim()
     assert_eq!(duplicate.max_height, Some(block::Height(2)));
 
     assert_eq!(
-        queue.settle_active_reserved_height(block::Height(1), 80),
+        queue.release_active_reserved_height(block::Height(1)),
         None,
-        "a late body cannot settle a claim the watchdog already released"
+        "a late body cannot release a claim the watchdog already released"
     );
     assert_eq!(budget.reserved(), 0);
 }
 
 #[test]
-fn mark_held_direct_does_not_orphan_a_charge() {
+fn claim_received_does_not_orphan_a_charge() {
+    // An unmatched queued body claims its height without a new reservation, but
+    // any stale request reservation it still owned is handed back exactly once.
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
     let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
@@ -2185,20 +2209,19 @@ fn mark_held_direct_does_not_orphan_a_charge() {
     assert!(budget.try_reserve(100));
     assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
 
-    assert!(budget.try_reserve(80));
-    let old_charge = queue.mark_held_direct(block::Height(1), 80);
+    let old_charge = queue.claim_received(block::Height(1));
     budget.release(old_charge);
     assert_eq!(old_charge, 100);
-    assert_eq!(budget.reserved(), 80);
+    assert_eq!(budget.reserved(), 0);
 
-    let released = queue.release_heights([block::Height(1)]);
+    let released = queue.release_reserved_heights([block::Height(1)]);
     budget.release(released);
-    assert_eq!(released, 80);
+    assert_eq!(released, 0, "a received height owns no further charge");
     assert_eq!(budget.reserved(), 0);
 }
 
 #[test]
-fn release_reserved_mixed_reserved_held_conserves_budget() {
+fn release_reserved_mixed_received_and_reserved_conserves_budget() {
     let queue = work_queue_with(
         0,
         [
@@ -2215,34 +2238,33 @@ fn release_reserved_mixed_reserved_held_conserves_budget() {
         200
     );
 
-    let delta = queue
-        .settle_active_reserved_height(block::Height(1), 80)
-        .expect("active height settles");
-    assert_eq!(delta, -20);
-    budget.release(20);
-    assert_eq!(budget.reserved(), 180);
+    // Height 1 is received: its whole estimate returns to the budget.
+    let reserved_estimate = queue
+        .release_active_reserved_height(block::Height(1))
+        .expect("active height releases at receipt");
+    assert_eq!(reserved_estimate, 100);
+    budget.release(reserved_estimate);
+    assert_eq!(budget.reserved(), 100);
 
+    // Floor GC releases only the still-reserved (unreceived) height 2.
     let released = queue.advance_floor(block::Height(2));
     budget.release(released);
     assert_eq!(
         released, 100,
-        "WorkQueue releases only the still-reserved height; held bytes are released by Sequencer"
+        "WorkQueue releases only the still-reserved height; received bodies hold no charge"
     );
-    assert_eq!(budget.reserved(), 80);
-
-    budget.release(80);
     assert_eq!(budget.reserved(), 0);
 }
 
 #[test]
-fn release_reserved_heights_skips_held_body_owned_by_sequencer() {
+fn release_reserved_heights_skips_received_body_owned_by_sequencer() {
     // The owner's routine GC / stale-trim cleanup (`gc_committed_outstanding`,
     // `stale_adjusted_disposition`, `finish_detached`) releases via
-    // `release_reserved_heights`. When a competing peer delivered a height late, it
-    // settled to `Held(actual)` in the shared queue; the owner must release only
-    // the still-reserved estimate and leave the held body for the Sequencer — never
-    // double-releasing its bytes. The non-Held-aware `release_heights` would return
-    // the held `actual` here and saturate the budget.
+    // `release_reserved_heights`. When a competing peer delivered a height late,
+    // its receipt ended that height's reservation in the shared queue; the owner
+    // must release only the still-reserved estimates and leave the received body
+    // to the winner (which releases the ended estimate after its forward) — never
+    // double-releasing.
     let queue = work_queue_with(
         0,
         [
@@ -2259,28 +2281,28 @@ fn release_reserved_heights_skips_held_body_owned_by_sequencer() {
         200
     );
 
-    // A competing peer's late body settles height 1 to Held(80); height 2 stays
-    // reserved (never delivered).
-    let delta = queue
-        .settle_active_reserved_height(block::Height(1), 80)
+    // A competing peer's late body ends height 1's reservation; height 2 stays
+    // reserved (never delivered). The winner releases the estimate after its
+    // forward.
+    let estimate = queue
+        .release_active_reserved_height(block::Height(1))
         .expect("height 1 is reserved");
-    assert_eq!(delta, -20);
-    budget.release(20);
-    assert_eq!(budget.reserved(), 180);
+    assert_eq!(estimate, 100);
+    budget.release(estimate);
+    assert_eq!(budget.reserved(), 100);
 
-    // GC both heights: only the still-reserved height 2 releases. The Held height 1
-    // is skipped (owned by the Sequencer) and stays in `in_flight`.
+    // GC both heights: only the still-reserved height 2 releases. The received
+    // height 1 is skipped (its reservation already ended) and stays in `in_flight`.
     let released = queue.release_reserved_heights([block::Height(1), block::Height(2)]);
     budget.release(released);
     assert_eq!(
         released, 100,
-        "release_reserved_heights frees only the still-reserved estimate, never held body bytes"
+        "release_reserved_heights frees only the still-reserved estimate, exactly once"
     );
     assert!(queue.in_flight_contains(block::Height(1)));
-    assert_eq!(budget.reserved(), 80);
+    assert_eq!(budget.reserved(), 0);
 
-    // The Sequencer releases the held body on commit; nothing drifts.
-    budget.release(80);
+    // Floor GC clears the bookkeeping; nothing drifts.
     assert_eq!(queue.advance_floor(block::Height(2)), 0);
     assert_eq!(budget.reserved(), 0);
 }
@@ -3343,24 +3365,20 @@ fn work_queue_keeps_pending_ordered_by_height() {
 }
 
 #[test]
-fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
+fn reorder_drains_only_contiguous_prefix_and_reports_dropped_bytes() {
+    // The reorder buffer never touches the byte budget: it maintains only the
+    // retained-size accounting (`buffered_bytes`) the resident gate reads, and
+    // its drop paths report the freed bytes for that accounting.
     let mut reorder = ReorderBuffer::new();
-    let mut budget = ByteBudget::new(10_000);
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
 
-    // The reorder buffer no longer touches the budget on insert: a received body
-    // already owns its (shrunk) reservation, so the caller reserves and the buffer
-    // only takes ownership. Model that by reserving the actual bytes here.
-    assert!(budget.try_reserve(300));
     assert_eq!(
         reorder.insert(block::Height(3), block.clone(), 300, peer(0)),
         ReorderInsertResult::Inserted
     );
     assert!(reorder.drain_contiguous_prefix(block::Height(0)).is_empty());
     assert_eq!(reorder.buffered_bytes(), 300);
-    assert_eq!(budget.reserved(), 300);
 
-    assert!(budget.try_reserve(100));
     assert_eq!(
         reorder.insert(block::Height(1), block.clone(), 100, peer(0)),
         ReorderInsertResult::Inserted
@@ -3369,17 +3387,14 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
     assert_eq!(
         released
             .iter()
-            .map(|(height, _, bytes, _)| (*height, *bytes))
+            .map(|drained| (drained.height, drained.bytes))
             .collect::<Vec<_>>(),
         vec![(block::Height(1), 100)]
     );
-    // Draining the contiguous prefix hands bytes to the apply stage; it does not
-    // release the budget, which the apply finish releases later.
+    // Draining the contiguous prefix hands bytes to the apply stage; height 3
+    // stays buffered behind the gap at 2.
     assert_eq!(reorder.buffered_bytes(), 300);
-    assert_eq!(budget.reserved(), 400);
-    budget.release(100);
 
-    assert!(budget.try_reserve(200));
     assert_eq!(
         reorder.insert(block::Height(2), block.clone(), 200, peer(0)),
         ReorderInsertResult::Inserted
@@ -3388,33 +3403,26 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
     assert_eq!(
         released
             .iter()
-            .map(|(height, _, bytes, _)| (*height, *bytes))
+            .map(|drained| (drained.height, drained.bytes))
             .collect::<Vec<_>>(),
         vec![(block::Height(2), 200), (block::Height(3), 300)]
     );
-    assert_eq!(budget.reserved(), 500);
-    budget.release(500);
+    assert_eq!(reorder.buffered_bytes(), 0);
 
-    assert!(budget.try_reserve(200));
     assert_eq!(
         reorder.insert(block::Height(2), block.clone(), 200, peer(0)),
         ReorderInsertResult::Inserted
     );
-    assert!(budget.try_reserve(300));
     assert_eq!(
         reorder.insert(block::Height(3), block, 300, peer(0)),
         ReorderInsertResult::Inserted
     );
     // `drop_from`/`drop_through`/`clear` return the bytes their dropped bodies
-    // held; the reactor releases that reservation (the reorder buffer, owned by
-    // the `Sequencer`, never touches the budget directly).
-    budget.release(reorder.drop_from(block::Height(3)));
+    // held, keeping `buffered_bytes` consistent for the resident view.
+    assert_eq!(reorder.drop_from(block::Height(3)), 300);
     assert_eq!(reorder.buffered_bytes(), 200);
-    assert_eq!(budget.reserved(), 200);
-    budget.release(reorder.drop_through(block::Height(2)));
+    assert_eq!(reorder.drop_through(block::Height(2)), 200);
     assert_eq!(reorder.buffered_bytes(), 0);
-    assert_eq!(budget.reserved(), 0);
-    assert!(budget.try_reserve(300));
     assert_eq!(
         reorder.insert(
             block::Height(3),
@@ -3424,182 +3432,8 @@ fn reorder_drains_only_contiguous_prefix_without_releasing_budget() {
         ),
         ReorderInsertResult::Inserted
     );
-    budget.release(reorder.clear());
+    assert_eq!(reorder.clear(), 300);
     assert_eq!(reorder.buffered_bytes(), 0);
-    assert_eq!(budget.reserved(), 0);
-}
-
-#[test]
-fn shed_top_for_floor_starvation_funds_lowest_pending_by_dropping_top() {
-    let worst = BS_PER_BLOCK_WORST_CASE_BYTES;
-    // Budget holds exactly two worst-case blocks, both consumed by buffered bodies
-    // (heights 5 and 6). Height 1 — the commit-unblocking floor gap — is pending
-    // and unfunded: this is the "download ran ahead, budget full, low height
-    // needs (re-)requesting" shape that wedged sync.
-    let mut budget = ByteBudget::new(2 * worst);
-    let work = work_queue_with(
-        0,
-        [
-            needed(1, BlockSizeEstimate::Unknown),
-            needed(5, BlockSizeEstimate::Unknown),
-            needed(6, BlockSizeEstimate::Unknown),
-        ],
-    );
-    let mut seq = test_sequencer(0, 100);
-    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
-
-    // Heights 5 and 6 are taken (pending -> in_flight) and buffered, each holding a
-    // worst-case block of budget; height 1 stays pending and unfunded.
-    work.take_in_range(block::Height(5), block::Height(6), 2);
-    for height in [5u32, 6] {
-        assert!(budget.try_reserve(worst));
-        seq.accept_body(
-            block::Height(height),
-            block::Hash([height as u8; 32]),
-            block.clone(),
-            worst,
-            peer(0),
-        );
-    }
-    assert_eq!(budget.available(), 0, "budget saturated by buffered bodies");
-    assert!(work.pending_contains(block::Height(1)));
-
-    // The floor-reservation rescue drops the top buffered body (6) — the
-    // one furthest from the floor — releasing its budget and returning its height
-    // to `pending` for later re-fetch, so the lower floor-gap request can now be
-    // funded. Without this the budget stays full and height 1 can never be
-    // requested (the wedge).
-    let shed = super::sequencer_task::shed_top_for_floor_starvation(&mut budget, &work, &mut seq);
-    assert!(shed, "the top buffered body is shed");
-    assert!(
-        budget.available() >= worst,
-        "freed budget can now fund the floor-gap request"
-    );
-    assert!(
-        !seq.reorder_contains(block::Height(6)),
-        "the top body is evicted"
-    );
-    assert!(
-        seq.reorder_contains(block::Height(5)),
-        "the lower buffered body is kept"
-    );
-    assert!(
-        work.pending_contains(block::Height(1)),
-        "the floor gap is still pending and now fundable"
-    );
-    assert!(
-        work.pending_contains(block::Height(6)),
-        "the evicted height is returned to pending for re-fetch"
-    );
-}
-
-#[test]
-fn shed_top_for_floor_starvation_funds_outstanding_floor_by_dropping_top() {
-    let worst = BS_PER_BLOCK_WORST_CASE_BYTES;
-    let mut budget = ByteBudget::new(2 * worst);
-    let work = work_queue_with(
-        0,
-        [
-            needed(1, BlockSizeEstimate::Unknown),
-            needed(5, BlockSizeEstimate::Unknown),
-            needed(6, BlockSizeEstimate::Unknown),
-        ],
-    );
-    let mut seq = test_sequencer(0, 100);
-    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
-
-    // Height 1 is outstanding on a slow peer, so it is not pending. The top
-    // reorder bodies saturate the budget and must still be shed to make the
-    // floor watchdog's re-request fundable.
-    work.take_in_range(block::Height(1), block::Height(1), 1);
-    for height in [5u32, 6] {
-        work.take_in_range(block::Height(height), block::Height(height), 1);
-        assert!(budget.try_reserve(worst));
-        seq.accept_body(
-            block::Height(height),
-            block::Hash([height as u8; 32]),
-            block.clone(),
-            worst,
-            peer(0),
-        );
-    }
-    assert_eq!(budget.available(), 0, "budget saturated by buffered bodies");
-    assert!(
-        !work.pending_contains(block::Height(1)),
-        "the floor gap is outstanding, not pending"
-    );
-
-    let shed = super::sequencer_task::shed_top_for_floor_starvation(&mut budget, &work, &mut seq);
-    assert!(
-        shed,
-        "the top buffered body is shed even while the floor gap is outstanding"
-    );
-    assert!(
-        budget.available() >= worst,
-        "freed budget can now fund the watchdog floor re-request"
-    );
-    assert!(
-        !seq.reorder_contains(block::Height(6)),
-        "the top body is evicted"
-    );
-    assert!(
-        seq.reorder_contains(block::Height(5)),
-        "the lower buffered body is kept"
-    );
-    assert!(
-        work.pending_contains(block::Height(6)),
-        "the evicted height is returned to pending for re-fetch"
-    );
-}
-
-#[test]
-fn shed_top_until_available_self_funds_floor_reservation() {
-    let worst = BS_PER_BLOCK_WORST_CASE_BYTES;
-    let mut budget = ByteBudget::new(3 * worst);
-    let work = work_queue_with(
-        0,
-        [
-            needed(1, BlockSizeEstimate::Unknown),
-            needed(8, BlockSizeEstimate::Unknown),
-            needed(9, BlockSizeEstimate::Unknown),
-            needed(10, BlockSizeEstimate::Unknown),
-        ],
-    );
-    let mut seq = test_sequencer(0, 100);
-    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
-
-    // The floor has already been taken for a request whose reservation lost a
-    // budget race. The speculative bodies saturate the budget, so the floor
-    // reservation path must pop enough high-tail bodies and retry.
-    work.take_in_range(block::Height(1), block::Height(1), 1);
-    for height in [8u32, 9, 10] {
-        work.take_in_range(block::Height(height), block::Height(height), 1);
-        assert!(budget.try_reserve(worst));
-        seq.accept_body(
-            block::Height(height),
-            block::Hash([height as u8; 32]),
-            block.clone(),
-            worst,
-            peer(0),
-        );
-    }
-    assert_eq!(budget.available(), 0);
-
-    let shed =
-        super::sequencer_task::shed_top_until_available(&mut budget, &work, &mut seq, 2 * worst);
-    assert!(shed, "the high tail is popped to fund the floor request");
-    assert!(
-        budget.available() >= 2 * worst,
-        "the pop frees the requested floor bytes"
-    );
-    assert!(
-        !seq.reorder_contains(block::Height(10)) && !seq.reorder_contains(block::Height(9)),
-        "the furthest buffered bodies are evicted first"
-    );
-    assert!(
-        seq.reorder_contains(block::Height(8)),
-        "nearer buffered body is kept once the request is fundable"
-    );
 }
 
 // ---- Sequencer commit pipeline ----
@@ -3650,7 +3484,14 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
     );
 
     assert_eq!(
-        seq.accept_buffered_body(block::Height(2), block2.hash(), block2_body, 200, peer(0)),
+        seq.accept_buffered_body(
+            block::Height(2),
+            block2.hash(),
+            block2.header.previous_block_hash,
+            block2_body,
+            200,
+            peer(0)
+        ),
         AcceptOutcome::Buffered {
             covered: block::Height(2)
         }
@@ -3669,17 +3510,72 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
         vec![block::Height(1), block::Height(2)]
     );
     assert_eq!(seq.applying_hash(block::Height(2)), Some(block2.hash()));
+    // The backlogged body kept only its raw payload, so submission decodes the
+    // raw bytes (block2), not the dropped decoded copy (the distinguishable fork).
+    let submitted = seq
+        .prepare_submit(block::Height(2))
+        .expect("height 2 is applying");
+    assert_eq!(submitted.block.hash(), block2.hash());
     assert_ne!(
-        seq.applying_hash(block::Height(2)),
-        Some(distinguishable_decoded_block2.hash())
+        submitted.block.hash(),
+        distinguishable_decoded_block2.hash()
     );
 }
 
 #[test]
+fn sequencer_bounds_decoded_bodies_to_submission_window() {
+    // A deep contiguous backlog must not hold decoded blocks beyond the
+    // submission window: everything past the free submit slots stays as raw
+    // bytes until `prepare_submit` decodes it.
+    let limit = 2;
+    let mut seq = test_sequencer(0, limit);
+    let blocks = mainnet_blocks_1_to_3();
+
+    for (index, block) in blocks.iter().enumerate() {
+        let height = block::Height(index as u32 + 1);
+        let body =
+            BufferedBlockBody::from_decoded_block(block.clone(), Some(raw_block_payload(block)));
+        assert_eq!(
+            seq.accept_buffered_body(
+                height,
+                block.hash(),
+                block.header.previous_block_hash,
+                body,
+                100,
+                peer(0)
+            ),
+            AcceptOutcome::Buffered { covered: height }
+        );
+    }
+
+    assert_eq!(
+        seq.drain_ready_into_applying(),
+        vec![block::Height(1), block::Height(2), block::Height(3)]
+    );
+    assert_eq!(seq.applying_len(), 3);
+    assert!(
+        seq.decoded_applying_count() <= limit,
+        "decoded applying bodies ({}) exceed the submission window ({limit})",
+        seq.decoded_applying_count(),
+    );
+
+    // Submission decodes exactly the window; the backlog tail stays raw.
+    for height in seq.submittable_heights() {
+        seq.prepare_submit(height).expect("height is applying");
+    }
+    assert_eq!(seq.in_flight_submission_count(), limit);
+    assert_eq!(seq.decoded_applying_count(), limit);
+
+    // Rolling a submission back also rolls its body out of the decode window.
+    seq.unsubmit(block::Height(1), 1);
+    assert_eq!(seq.decoded_applying_count(), limit - 1);
+}
+
+#[test]
 fn sequencer_applying_counters_match_scan_across_transitions() {
-    // Assert the O(1) applying counters (buffered bytes, submitted count/bytes)
-    // never drift from a full scan across insert / submit / unsubmit / remove /
-    // commit-release / reset.
+    // Assert the O(1) applying and in-flight-submission counters never drift
+    // from their ground truth across insert / submit / unsubmit / detach /
+    // completion / commit-release / reset.
     let mut seq = test_sequencer(0, 8);
     let blocks = mainnet_blocks_1_to_3();
     let check = |seq: &Sequencer, label: &str| {
@@ -3689,18 +3585,18 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
             "applying_buffered_bytes drifted after {label}"
         );
         assert_eq!(
-            seq.submitted_applying_count(),
-            seq.submitted_applying_count_scanned(),
-            "submitted_applying_count drifted after {label}"
+            seq.in_flight_submission_count(),
+            seq.in_flight_submission_count_scanned(),
+            "in_flight_submission_count drifted after {label}"
         );
         assert_eq!(
-            seq.submitted_applying_bytes(),
-            seq.submitted_applying_bytes_scanned(),
-            "submitted_applying_bytes drifted after {label}"
+            seq.in_flight_submission_bytes(),
+            seq.in_flight_submission_bytes_scanned(),
+            "in_flight_submission_bytes drifted after {label}"
         );
         assert_eq!(
             seq.unsubmitted_applying_count(),
-            seq.applying_len() - seq.submitted_applying_count(),
+            seq.applying_len() - seq.attached_submission_count_scanned(),
             "unsubmitted derivation wrong after {label}"
         );
     };
@@ -3721,44 +3617,49 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
         vec![block::Height(1), block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.applying_buffered_bytes(), 600);
-    assert_eq!(seq.submitted_applying_count(), 0);
+    assert_eq!(seq.in_flight_submission_count(), 0);
     check(&seq, "drain");
 
     // Submit heights 1 and 2.
     let item1 = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 applying");
-    let _ = seq
+    let item2 = seq
         .prepare_submit(block::Height(2))
         .expect("height 2 applying");
-    assert_eq!(seq.submitted_applying_count(), 2);
-    assert_eq!(seq.submitted_applying_bytes(), 300);
+    assert_eq!(seq.in_flight_submission_count(), 2);
+    assert_eq!(seq.in_flight_submission_bytes(), 300);
     assert_eq!(seq.unsubmitted_applying_count(), 1);
     check(&seq, "submit 1,2");
 
     // Roll back the submit for height 1.
     seq.unsubmit(block::Height(1), item1.token);
-    assert_eq!(seq.submitted_applying_count(), 1);
-    assert_eq!(seq.submitted_applying_bytes(), 200);
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(seq.in_flight_submission_bytes(), 200);
     check(&seq, "unsubmit 1");
 
-    // Remove the still-submitted height 2 directly.
+    // Detaching the still-submitted height 2 does not release the driver-owned
+    // decoded body or its submission-window charge.
     seq.remove_applying(block::Height(2));
-    assert_eq!(seq.submitted_applying_count(), 0);
-    assert_eq!(seq.submitted_applying_bytes(), 0);
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(seq.in_flight_submission_bytes(), 200);
     assert_eq!(seq.applying_buffered_bytes(), 400);
-    check(&seq, "remove submitted 2");
+    check(&seq, "detach submitted 2");
+    assert!(seq.finish_submission(item2.token, item2.height, item2.hash));
+    assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(seq.in_flight_submission_bytes(), 0);
+    check(&seq, "finish detached 2");
 
     // Commit through height 1: releases the applied body (height 1) from `applying`.
     seq.advance_verified_tip(block::Height(1), true);
     assert_eq!(seq.applying_buffered_bytes(), 300);
     check(&seq, "advance_verified_tip");
 
-    // Reset drops all applying state and zeroes the counters.
+    // Reset drops all applying state; there are no in-flight submissions left.
     seq.reset_to(block::Height(0), false);
     assert_eq!(seq.applying_buffered_bytes(), 0);
-    assert_eq!(seq.submitted_applying_count(), 0);
-    assert_eq!(seq.submitted_applying_bytes(), 0);
+    assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(seq.in_flight_submission_bytes(), 0);
     check(&seq, "reset");
 }
 
@@ -3830,12 +3731,48 @@ fn sequencer_submits_within_window_and_rolls_back_on_unsubmit() {
     let item1 = seq.prepare_submit(block::Height(1)).expect("applying at 1");
     let item2 = seq.prepare_submit(block::Height(2)).expect("applying at 2");
     assert_eq!((item1.token, item2.token), (1, 2));
-    assert_eq!(seq.submitted_applying_count(), 2);
+    assert_eq!(seq.in_flight_submission_count(), 2);
     // The window is now full, so nothing else is submittable.
     assert!(seq.submittable_heights().is_empty());
     // Rolling back a failed dispatch frees the slot and re-offers the height.
     seq.unsubmit(block::Height(2), item2.token);
-    assert_eq!(seq.submitted_applying_count(), 1);
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
+}
+
+#[test]
+fn sequencer_completed_duplicate_releases_attached_decode_window_slot() {
+    let mut seq = test_sequencer(0, 1);
+    let blocks = mainnet_blocks_1_to_3();
+    for (index, block) in blocks.iter().take(2).enumerate() {
+        let height = block::Height(index as u32 + 1);
+        let body =
+            BufferedBlockBody::from_decoded_block(block.clone(), Some(raw_block_payload(block)));
+        seq.accept_buffered_body(
+            height,
+            block.hash(),
+            block.header.previous_block_hash,
+            body,
+            100,
+            peer(0),
+        );
+    }
+    seq.drain_ready_into_applying();
+
+    let item = seq
+        .prepare_submit(block::Height(1))
+        .expect("height 1 is applying");
+    seq.record_submitted_apply(item.height, item.hash);
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert!(seq.submittable_heights().is_empty());
+
+    // A duplicate completion can arrive before the frontier proving that block
+    // advances. Keep its applying entry attached, but drop the decoded copy and
+    // free the global submission slot because the driver released its Arc.
+    assert!(seq.finish_attached_submission(item.token, item.height, item.hash));
+    assert!(seq.applying_contains(block::Height(1)));
+    assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(seq.decoded_applying_count(), 0);
     assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
 }
 
@@ -3845,16 +3782,22 @@ fn sequencer_records_and_decrements_submitted_applies() {
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let hash = block.hash();
     assert!(!seq.has_submitted_apply(block::Height(1), hash));
-    seq.record_submitted_apply(block::Height(1), hash);
+    seq.accept_body(block::Height(1), hash, block, 100, peer(0));
+    seq.drain_ready_into_applying();
+    let item = seq
+        .prepare_submit(block::Height(1))
+        .expect("height 1 is applying");
+    seq.record_submitted_apply(item.height, item.hash);
     assert!(seq.has_submitted_apply(block::Height(1), hash));
     assert!(seq.submitted_contains(block::Height(1)));
-    seq.decrement_submitted_apply(block::Height(1), hash);
+    seq.remove_applying(item.height);
+    assert!(seq.finish_submission(item.token, item.height, item.hash));
     assert!(!seq.has_submitted_apply(block::Height(1), hash));
     assert!(!seq.submitted_contains(block::Height(1)));
 }
 
 #[test]
-fn sequencer_release_applied_through_clears_submitted_applies() {
+fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completion() {
     let mut seq = test_sequencer(0, 1);
     let blocks = mainnet_blocks_1_to_3();
     for (index, block) in blocks.iter().enumerate() {
@@ -3875,6 +3818,16 @@ fn sequencer_release_applied_through_clears_submitted_applies() {
 
     assert_eq!(seq.release_applied_through(block::Height(1)), 100);
     assert!(!seq.submitted_contains(block::Height(1)));
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert!(
+        seq.submittable_heights().is_empty(),
+        "detached driver submission still occupies the decode window"
+    );
+
+    assert!(!seq.finish_submission(item.token, item.height, block::Hash([99; 32])));
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert!(seq.finish_submission(item.token, item.height, item.hash));
+    assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
 }
 
@@ -3939,6 +3892,61 @@ fn sequencer_reset_clears_buffers_and_pins_floor_and_tip() {
 }
 
 #[test]
+fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions() {
+    let mut seq = test_sequencer(0, 2);
+    let blocks = mainnet_blocks_1_to_3();
+    for (index, block) in blocks.iter().take(2).enumerate() {
+        let height = block::Height(index as u32 + 1);
+        seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
+    }
+    seq.drain_ready_into_applying();
+
+    let old_items: Vec<_> = seq
+        .submittable_heights()
+        .into_iter()
+        .map(|height| {
+            let item = seq.prepare_submit(height).expect("height is applying");
+            seq.record_submitted_apply(item.height, item.hash);
+            item
+        })
+        .collect();
+    assert_eq!(old_items.len(), 2);
+    assert_eq!(seq.in_flight_submission_count(), 2);
+
+    // Keep `old_items` alive to model the driver's pending/in-flight Arc<Block>s.
+    seq.reset_to(block::Height(0), false);
+    assert_eq!(seq.applying_len(), 0);
+    assert_eq!(seq.in_flight_submission_count(), 2);
+    assert_eq!(seq.in_flight_submission_bytes(), 200);
+
+    for (index, block) in blocks.iter().take(2).enumerate() {
+        let replacement = forked_block(block, 100 + index as u8);
+        let height = block::Height(index as u32 + 1);
+        seq.accept_body(height, replacement.hash(), replacement, 100, peer(1));
+    }
+    seq.drain_ready_into_applying();
+    assert!(
+        seq.submittable_heights().is_empty(),
+        "replacement bodies must not exceed the live decode window"
+    );
+
+    let first = &old_items[0];
+    assert!(
+        !seq.finish_submission(first.token, first.height, block::Hash([99; 32])),
+        "a mismatched completion must not release a detached charge"
+    );
+    assert_eq!(seq.in_flight_submission_count(), 2);
+    assert!(seq.finish_submission(first.token, first.height, first.hash));
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(seq.submittable_heights().len(), 1);
+
+    let second = &old_items[1];
+    assert!(seq.finish_submission(second.token, second.height, second.hash));
+    assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(seq.submittable_heights().len(), 2);
+}
+
+#[test]
 fn sequencer_reject_drops_successors_and_rolls_floor_back() {
     let mut seq = test_sequencer(0, 8);
     let blocks = mainnet_blocks_1_to_3();
@@ -3962,12 +3970,8 @@ fn sequencer_reject_drops_successors_and_rolls_floor_back() {
 }
 
 #[test]
-fn sequencer_release_applying_blocks_from_keeps_submitted_counters_consistent() {
-    // `release_applying_blocks_from` removes each height through `remove_applying`,
-    // which must decrement the O(1) submitted counters for any *submitted* body it
-    // drops. Existing reject coverage only releases unsubmitted bodies, so this
-    // exercises the submitted-counter branch of that path.
-    let mut seq = test_sequencer(0, 8);
+fn sequencer_rejection_release_keeps_detached_submissions_charged() {
+    let mut seq = test_sequencer(0, 2);
     let blocks = mainnet_blocks_1_to_3();
     for (index, block) in blocks.iter().enumerate() {
         let height = block::Height(index as u32 + 1);
@@ -3981,43 +3985,48 @@ fn sequencer_release_applying_blocks_from_keeps_submitted_counters_consistent() 
     }
     seq.drain_ready_into_applying();
     // Submit heights 2 and 3 so the released prefix (>= 2) is all submitted work.
-    let _ = seq
+    let item2 = seq
         .prepare_submit(block::Height(2))
         .expect("height 2 applying");
-    let _ = seq
+    let item3 = seq
         .prepare_submit(block::Height(3))
         .expect("height 3 applying");
-    assert_eq!(seq.submitted_applying_count(), 2);
-    assert_eq!(seq.submitted_applying_bytes(), 200 + 300);
+    assert_eq!(seq.in_flight_submission_count(), 2);
+    assert_eq!(seq.in_flight_submission_bytes(), 200 + 300);
 
     let released = seq.release_applying_blocks_from(block::Height(2));
     assert_eq!(released, 500);
     assert_eq!(seq.applying_len(), 1);
-    // Only the unsubmitted height 1 (100 bytes) survives; the submitted counters
-    // shed exactly the released bodies' contribution.
+    // Only unsubmitted height 1 survives in `applying`, but both decoded
+    // submissions remain retained by the driver and occupy the whole window.
     assert_eq!(seq.applying_buffered_bytes(), 100);
-    assert_eq!(seq.submitted_applying_count(), 0);
-    assert_eq!(seq.submitted_applying_bytes(), 0);
-    // Every maintained counter still agrees with a full scan.
+    assert_eq!(seq.in_flight_submission_count(), 2);
+    assert_eq!(seq.in_flight_submission_bytes(), 500);
+    assert!(seq.submittable_heights().is_empty());
     assert_eq!(
         seq.applying_buffered_bytes(),
         seq.applying_buffered_bytes_scanned()
     );
     assert_eq!(
-        seq.submitted_applying_count(),
-        seq.submitted_applying_count_scanned()
+        seq.in_flight_submission_count(),
+        seq.in_flight_submission_count_scanned()
     );
     assert_eq!(
-        seq.submitted_applying_bytes(),
-        seq.submitted_applying_bytes_scanned()
+        seq.in_flight_submission_bytes(),
+        seq.in_flight_submission_bytes_scanned()
     );
+
+    assert!(seq.finish_submission(item2.token, item2.height, item2.hash));
+    assert_eq!(seq.submittable_heights(), vec![block::Height(1)]);
+    assert!(seq.finish_submission(item3.token, item3.height, item3.hash));
+    assert_eq!(seq.in_flight_submission_count(), 0);
 }
 
 #[test]
 fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
     // `unsubmit` only rolls back (and decrements the submitted counters) when the
-    // token still matches the live submission, so a stale rollback cannot clobber a
-    // newer one or double-decrement the O(1) counters.
+    // token still matches the in-flight submission, so a stale rollback cannot
+    // clobber a newer one or double-decrement the O(1) counters.
     let mut seq = test_sequencer(0, 4);
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     seq.accept_body(block::Height(1), block.hash(), block.clone(), 100, peer(0));
@@ -4025,77 +4034,40 @@ fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 applying");
-    assert_eq!(seq.submitted_applying_count(), 1);
-    assert_eq!(seq.submitted_applying_bytes(), 100);
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(seq.in_flight_submission_bytes(), 100);
 
     // A rollback carrying a non-matching token is ignored: the submission and the
     // counters are untouched.
     seq.unsubmit(block::Height(1), item.token + 1);
-    assert_eq!(seq.submitted_applying_count(), 1);
-    assert_eq!(seq.submitted_applying_bytes(), 100);
+    assert_eq!(seq.in_flight_submission_count(), 1);
+    assert_eq!(seq.in_flight_submission_bytes(), 100);
     assert_eq!(
-        seq.submitted_applying_count(),
-        seq.submitted_applying_count_scanned()
+        seq.in_flight_submission_count(),
+        seq.in_flight_submission_count_scanned()
     );
     assert_eq!(
-        seq.submitted_applying_bytes(),
-        seq.submitted_applying_bytes_scanned()
+        seq.in_flight_submission_bytes(),
+        seq.in_flight_submission_bytes_scanned()
     );
 
     // The matching rollback frees the slot exactly once.
     seq.unsubmit(block::Height(1), item.token);
-    assert_eq!(seq.submitted_applying_count(), 0);
-    assert_eq!(seq.submitted_applying_bytes(), 0);
+    assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(seq.in_flight_submission_bytes(), 0);
 
     // Replaying the now-stale token must not decrement a second time.
     seq.unsubmit(block::Height(1), item.token);
-    assert_eq!(seq.submitted_applying_count(), 0);
-    assert_eq!(seq.submitted_applying_bytes(), 0);
+    assert_eq!(seq.in_flight_submission_count(), 0);
+    assert_eq!(seq.in_flight_submission_bytes(), 0);
     assert_eq!(
-        seq.submitted_applying_count(),
-        seq.submitted_applying_count_scanned()
+        seq.in_flight_submission_count(),
+        seq.in_flight_submission_count_scanned()
     );
     assert_eq!(
-        seq.submitted_applying_bytes(),
-        seq.submitted_applying_bytes_scanned()
+        seq.in_flight_submission_bytes(),
+        seq.in_flight_submission_bytes_scanned()
     );
-}
-
-#[test]
-fn sequencer_reorder_max_height_reports_highest_buffered() {
-    let mut seq = test_sequencer(0, 8);
-    let blocks = mainnet_blocks_1_to_3();
-    // Empty reorder buffer has no top.
-    assert_eq!(seq.reorder_max_height(), None);
-    // Buffer heights 1 and 3, leaving a gap at 2; the top is the highest buffered.
-    seq.accept_body(
-        block::Height(1),
-        blocks[0].hash(),
-        blocks[0].clone(),
-        100,
-        peer(0),
-    );
-    seq.accept_body(
-        block::Height(3),
-        blocks[2].hash(),
-        blocks[2].clone(),
-        300,
-        peer(0),
-    );
-    assert_eq!(seq.reorder_max_height(), Some(block::Height(3)));
-    // Draining the contiguous prefix removes height 1 but leaves the top (3).
-    seq.drain_ready_into_applying();
-    assert_eq!(seq.reorder_max_height(), Some(block::Height(3)));
-    // Filling the gap drains 2 and 3 out, emptying the reorder buffer.
-    seq.accept_body(
-        block::Height(2),
-        blocks[1].hash(),
-        blocks[1].clone(),
-        200,
-        peer(0),
-    );
-    seq.drain_ready_into_applying();
-    assert_eq!(seq.reorder_max_height(), None);
 }
 
 #[test]
@@ -4117,16 +4089,27 @@ fn sequencer_keeps_whole_body_for_contiguous_height() {
     );
     // Height 1 is the next contiguous height above the floor (0).
     assert_eq!(
-        seq.accept_buffered_body(block::Height(1), block1.hash(), body, 100, peer(0)),
+        seq.accept_buffered_body(
+            block::Height(1),
+            block1.hash(),
+            block1.header.previous_block_hash,
+            body,
+            100,
+            peer(0)
+        ),
         AcceptOutcome::Buffered {
             covered: block::Height(1)
         }
     );
     assert_eq!(seq.drain_ready_into_applying(), vec![block::Height(1)]);
-    // The kept decoded block drained in, not a re-decode of the raw payload.
+    // The drained body is inside the submission window, so the kept decoded
+    // block is submitted directly, not a re-decode of the raw payload.
+    let submitted = seq
+        .prepare_submit(block::Height(1))
+        .expect("height 1 is applying");
     assert_eq!(
-        seq.applying_hash(block::Height(1)),
-        Some(distinguishable_decoded_block1.hash())
+        submitted.block.hash(),
+        distinguishable_decoded_block1.hash()
     );
 }
 
@@ -4142,22 +4125,19 @@ fn reorder_fuzzes_arrival_order_as_parent_first() {
 
     for order in orders {
         let mut reorder = ReorderBuffer::new();
-        let mut budget = ByteBudget::new(10_000);
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let mut tip = block::Height(0);
         let mut released_all = Vec::new();
 
         for height in order {
-            assert!(budget.try_reserve(100));
             assert_eq!(
                 reorder.insert(block::Height(height), block.clone(), 100, peer(0)),
                 ReorderInsertResult::Inserted
             );
-            for (released, _, bytes, _) in reorder.drain_contiguous_prefix(tip) {
-                assert_eq!(released, block::Height(tip.0 + 1));
-                tip = released;
-                released_all.push(released);
-                budget.release(bytes);
+            for drained in reorder.drain_contiguous_prefix(tip) {
+                assert_eq!(drained.height, block::Height(tip.0 + 1));
+                tip = drained.height;
+                released_all.push(drained.height);
             }
         }
 
@@ -4170,13 +4150,13 @@ fn reorder_fuzzes_arrival_order_as_parent_first() {
                 block::Height(4)
             ]
         );
-        assert_eq!(budget.reserved(), 0);
+        assert_eq!(reorder.buffered_bytes(), 0);
     }
 }
 
-/// Build an outstanding three-block range whose worst-case reservation is already
-/// held against `budget`, mirroring what the scheduler does at send time.
-/// Per-height size-estimate reservation used by the budget-accounting tests.
+/// Build an outstanding three-block range whose summed size-estimate reservation
+/// is already held against `budget`, mirroring what the fill loop does at send
+/// time. Per-height size-estimate reservation used by the budget-accounting tests.
 const THREE_BLOCK_ESTIMATE: u64 = 1_000;
 
 fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRange {
@@ -4236,27 +4216,19 @@ fn outstanding_range_accumulates_delivered_bytes_for_bbr_sample() {
 }
 
 #[test]
-fn block_budget_ledger_settles_and_releases_current_charge() {
-    let mut under = BlockBudgetLedger::reserved(1_000);
-    assert_eq!(under.current_charge(), 1_000);
-    assert_eq!(under.settle(700), -300);
-    assert_eq!(under.current_charge(), 700);
-    assert_eq!(under.release(), 700);
-    assert_eq!(under.release(), 0);
-
-    let mut equal = BlockBudgetLedger::reserved(1_000);
-    assert_eq!(equal.settle(1_000), 0);
-    assert_eq!(equal.release(), 1_000);
-
-    let mut over = BlockBudgetLedger::reserved(1_000);
-    assert_eq!(over.settle(1_300), 300);
-    assert_eq!(over.current_charge(), 1_300);
-    assert_eq!(over.release(), 1_300);
+fn block_budget_ledger_releases_reserved_exactly_once() {
+    let mut ledger = BlockBudgetLedger::reserved(1_000);
+    assert!(ledger.is_reserved());
+    assert_eq!(ledger.reserved_charge(), 1_000);
+    assert_eq!(ledger.release_reserved(), 1_000);
+    assert!(!ledger.is_reserved());
+    assert_eq!(ledger.reserved_charge(), 0);
+    // Releasing twice yields nothing: the reservation lifecycle is one-shot.
+    assert_eq!(ledger.release_reserved(), 0);
 
     let mut released = BlockBudgetLedger::Released;
-    assert_eq!(released.settle(900), 0);
-    assert_eq!(released.current_charge(), 0);
-    assert_eq!(released.release(), 0);
+    assert!(!released.is_reserved());
+    assert_eq!(released.release_reserved(), 0);
 }
 
 #[test]
@@ -4264,12 +4236,64 @@ fn budget_audit_catches_injected_drift() {
     let mut budget = ByteBudget::new(1_000);
     assert!(budget.try_reserve(400));
     assert!(budget.audit(400, "test matching audit"));
+    // A budget excess is expected receipt-handoff skew (paired call sites drain
+    // the source ledger before releasing the budget), never drift.
+    assert!(budget.audit(300, "test transient handoff excess"));
+    // A budget shortfall cannot be produced by any healthy interleaving
+    // (a double release or lost charge): drift.
     assert!(
-        !budget.audit(300, "test injected drift"),
-        "audit reports mismatched derived accounting"
+        !budget.audit(500, "test injected drift"),
+        "audit reports a budget shortfall as drift"
     );
     budget.release(400);
     assert!(budget.audit(0, "test released audit"));
+}
+
+#[test]
+fn received_body_admission_ignores_request_budget() {
+    // A received body consumes no request budget, so a wire budget saturated by
+    // outstanding requests must not cause it to be dropped and re-downloaded:
+    // only the commit-window exemption and the resident gate apply.
+    let config = ZakuraBlockSyncConfig {
+        max_reorder_lookahead_bytes: 1_000,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let snapshot = super::admission::AdmissionSnapshot {
+        download_floor: block::Height(600),
+        verified_block_tip: block::Height(10),
+        reorder_buffered_bytes: 0,
+        reorder_buffered_blocks: 0,
+        applying_buffered_bytes: 0,
+        applying_buffered_blocks: 0,
+        sequencer_input_queued_bytes: 0,
+        in_flight_submission_bytes: 0,
+        reserved_above_floor_bytes: 0,
+        reserved_above_floor_blocks: 0,
+        // Outstanding requests have spent the entire in-flight budget.
+        budget_available: 0,
+    };
+    // In-window heights (<= verified_tip 10 + 401 = 411) stay exempt.
+    assert!(super::admission::admit_received_body(
+        &config,
+        &snapshot,
+        block::Height(411),
+        2_000_000,
+    ));
+    // Above the window the resident gate is the sole authority. The body is
+    // retained serialized, so one wire byte consumes one byte of headroom.
+    assert!(super::admission::admit_received_body(
+        &config,
+        &snapshot,
+        block::Height(602),
+        1_000,
+    ));
+    // A body larger than the remaining serialized headroom is refused.
+    assert!(!super::admission::admit_received_body(
+        &config,
+        &snapshot,
+        block::Height(602),
+        1_001,
+    ));
 }
 
 proptest::proptest! {
@@ -4305,19 +4329,19 @@ proptest::proptest! {
             applying_buffered_bytes: applying_bytes,
             applying_buffered_blocks: applying_blocks,
             sequencer_input_queued_bytes: input_bytes,
+            in_flight_submission_bytes: 0,
             reserved_above_floor_bytes: reserved_bytes,
             reserved_above_floor_blocks: reserved_blocks,
             budget_available: 64_000_000,
         };
-        // The resident estimate charges every pool — including the wire-retained reorder
-        // backlog and outstanding reservations — at its eventual decoded cost; mirrors
-        // admission::estimated_resident_pipeline_bytes.
+        // Serialized pools are charged at wire size. The sequencer input also
+        // carries a decoded copy, so it pays the decoded multiple in addition.
         let factor = super::admission::DESERIALIZED_MEM_FACTOR;
         let estimated_resident = reorder_bytes
             .saturating_add(applying_bytes)
             .saturating_add(input_bytes)
             .saturating_add(reserved_bytes)
-            .saturating_mul(factor);
+            .saturating_add(input_bytes.saturating_mul(factor));
         let held_blocks = reorder_blocks
             .saturating_add(applying_blocks)
             .saturating_add(reserved_blocks);
@@ -4331,25 +4355,24 @@ proptest::proptest! {
         );
         if estimated_resident >= effective
             || held_blocks >= super::admission::LOOKAHEAD_BLOCK_HARD_CAP
-            || (effective - estimated_resident) / factor == 0
+            || effective - estimated_resident == 0
         {
             prop_assert_eq!(above, super::admission::AdmissionOutcome::LookaheadAtCap);
         } else {
-            // A gated request funds min(budget, remaining_wire, response_cap); the next
-            // body is sized as decoded, so remaining_wire = (effective - resident) / factor.
-            let remaining_wire = (effective - estimated_resident) / factor;
+            // A gated request funds min(budget, remaining wire headroom,
+            // response cap); admitted backlog bodies remain serialized.
+            let remaining_wire = effective - estimated_resident;
             let expected = snapshot.budget_available.min(remaining_wire).min(1_000);
             match above {
                 super::admission::AdmissionOutcome::Admit(grant) => {
                     prop_assert_eq!(grant.max_request_bytes, expected);
                     // Gated grants pass the servable ceiling through unchanged.
                     prop_assert_eq!(grant.take_high, block::Height(100_000));
-                    // Single-admission no-breach invariant: whatever the gate admits
-                    // cannot push the resident estimate past the budget once it lands
-                    // and decodes.
+                    // The new reservation is charged at wire size, so one grant
+                    // cannot push the resident estimate past the budget.
                     prop_assert!(
                         estimated_resident
-                            .saturating_add(grant.max_request_bytes.saturating_mul(factor))
+                            .saturating_add(grant.max_request_bytes)
                             <= effective
                     );
                 }
@@ -4385,51 +4408,37 @@ proptest::proptest! {
     #[test]
     fn block_budget_ledger_mirrors_byte_budget(
         estimate in 1u64..1_000_000,
-        actual in 1u64..1_000_000,
         release_before_receipt in proptest::bool::ANY,
     ) {
+        // Whichever terminal path runs first (receipt, or a timeout/watchdog
+        // release) drains the mirrored budget to zero; any later path is a no-op.
         let mut ledger = BlockBudgetLedger::reserved(estimate);
         let mut budget = ByteBudget::new(u64::MAX);
         prop_assert!(budget.try_reserve(estimate));
 
         if release_before_receipt {
-            let released = ledger.release();
-            budget.release(released);
+            budget.release(ledger.release_reserved());
             prop_assert_eq!(budget.reserved(), 0);
-            let delta = ledger.settle(actual);
-            prop_assert_eq!(delta, 0);
-            prop_assert_eq!(budget.reserved(), 0);
-            prop_assert_eq!(ledger.current_charge(), 0);
-            let released = ledger.release();
-            budget.release(released);
-            prop_assert_eq!(budget.reserved(), 0);
-        } else {
-            let delta = ledger.settle(actual);
-            if delta >= 0 {
-                budget.charge(u64::try_from(delta).expect("positive test delta fits in u64"));
-            } else {
-                budget.release(u64::try_from(-delta).expect("negative test delta fits in u64"));
-            }
-            prop_assert_eq!(ledger.current_charge(), actual);
-            prop_assert_eq!(budget.reserved(), actual);
-
-            let released = ledger.release();
-            budget.release(released);
-            prop_assert_eq!(budget.reserved(), 0);
-            prop_assert_eq!(ledger.current_charge(), 0);
+            prop_assert!(!ledger.is_reserved());
         }
+        budget.release(ledger.release_reserved());
+        prop_assert_eq!(budget.reserved(), 0);
+        prop_assert_eq!(ledger.reserved_charge(), 0);
+        // A third release still yields nothing.
+        budget.release(ledger.release_reserved());
+        prop_assert_eq!(budget.reserved(), 0);
     }
 }
 
-/// The global reservation settles to the current held body bytes across the
-/// download -> buffer -> apply -> commit path, and releases exactly once across
-/// timeout/duplicate/short-response paths.
+/// The global reservation tracks only unreceived request estimates: each height
+/// releases its whole estimate exactly once (receipt or timeout), retained bodies
+/// charge nothing, and the counter never exceeds the max.
 #[test]
-fn budget_reservation_never_exceeds_max_and_only_shrinks_per_block() {
+fn budget_reservation_tracks_only_unreceived_estimates() {
     let estimate = THREE_BLOCK_ESTIMATE;
     let max = estimate * 3;
 
-    // Happy path: download -> shrink-on-receipt -> buffer -> apply -> commit.
+    // Happy path: download -> release-on-receipt -> buffer (uncharged) -> commit.
     {
         let mut budget = ByteBudget::new(max);
         let mut reorder = ReorderBuffer::new();
@@ -4438,82 +4447,75 @@ fn budget_reservation_never_exceeds_max_and_only_shrinks_per_block() {
         assert!(budget.reserved() <= budget.max_bytes_for_test());
 
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
-        // Receive each height: release `estimate - actual`, keep `actual` reserved,
-        // and hand `actual` to the reorder buffer without re-reserving.
-        let actuals = [700u64, 800, 900]; // each < its estimate, varies per block
+        // Receive each height: release its whole estimate and hand the body's
+        // actual size to the reorder buffer without any budget charge.
+        let actuals = [700u64, 800, 900];
         for (index, height) in [block::Height(1), block::Height(2), block::Height(3)]
             .into_iter()
             .enumerate()
         {
-            let before = budget.reserved();
-            let actual = actuals[index];
-            budget.settle(estimate, actual);
+            budget.release(estimate);
             outstanding.mark_received(height);
             assert_eq!(
-                reorder.insert(height, block.clone(), actual, peer(0)),
+                reorder.insert(height, block.clone(), actuals[index], peer(0)),
                 ReorderInsertResult::Inserted
             );
-            // Per-block reservation only shrank (estimate -> actual), never grew.
-            assert!(budget.reserved() <= before);
-            assert!(budget.reserved() <= budget.max_bytes_for_test());
+            // The budget mirrors the unreceived estimates exactly.
+            assert_eq!(budget.reserved(), outstanding.reserved_bytes());
         }
         assert!(outstanding.is_complete());
         assert_eq!(outstanding.reserved_bytes(), 0);
-        assert_eq!(budget.reserved(), 700 + 800 + 900);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "retained bodies charge nothing; the wire budget is fully free"
+        );
+        assert_eq!(reorder.buffered_bytes(), 700 + 800 + 900);
 
-        // Commit: draining to apply carries the actual bytes; the apply finish
-        // releases them.
-        let mut floor = block::Height(0);
-        let mut applied_bytes = 0;
-        for (_height, _block, bytes, _peer) in reorder.drain_contiguous_prefix(floor) {
-            applied_bytes += bytes;
-            floor = block::Height(floor.0 + 1);
-        }
+        // Commit: draining to apply carries the actual bytes for the retained
+        // view; no request-budget release is owed downstream.
+        let applied_bytes: u64 = reorder
+            .drain_contiguous_prefix(block::Height(0))
+            .into_iter()
+            .map(|drained| drained.bytes)
+            .sum();
         assert_eq!(applied_bytes, 700 + 800 + 900);
-        budget.release(applied_bytes);
         assert_eq!(budget.reserved(), 0);
     }
 
-    // Timeout / short-response path: heights that never buffer release exactly
-    // their size-estimate share, with no leak and no double-release.
+    // Timeout / short-response path: the received height released its estimate at
+    // receipt; the unreceived heights release theirs exactly once on timeout.
     {
         let mut budget = ByteBudget::new(max);
         let mut outstanding = outstanding_three_block_range(&mut budget);
         assert_eq!(budget.reserved(), estimate * 3);
-        // A short response delivers only height 1; release its estimate's slack.
-        let actual = 700u64;
-        budget.settle(estimate, actual);
+        // A short response delivers only height 1; its estimate is released.
+        budget.release(estimate);
         outstanding.mark_received(block::Height(1));
         // The remaining two unreceived heights still reserve their estimate each.
         assert_eq!(outstanding.reserved_bytes(), estimate * 2);
-        assert!(budget.reserved() <= budget.max_bytes_for_test());
-        // On timeout the outstanding range releases its still-reserved estimate.
+        assert_eq!(budget.reserved(), estimate * 2);
+        // On timeout the outstanding range releases its still-reserved estimates.
         budget.release(outstanding.reserved_bytes());
-        // Plus the actual bytes held for the one received-but-not-buffered height.
-        budget.release(actual);
         assert_eq!(budget.reserved(), 0);
     }
 
-    // Duplicate path: a duplicate body reserves nothing extra and releases its
-    // actual bytes, so the buffer's reservation is unchanged.
+    // Duplicate path: neither the first body nor a dropped duplicate touches the
+    // budget; only the retained-size accounting sees them.
     {
-        let mut budget = ByteBudget::new(max);
+        let budget = ByteBudget::new(max);
         let mut reorder = ReorderBuffer::new();
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
-        assert!(budget.try_reserve(1_000));
         assert_eq!(
             reorder.insert(block::Height(1), block.clone(), 1_000, peer(0)),
             ReorderInsertResult::Inserted
         );
-        // A second body for the same height is a duplicate; reserve-then-release
-        // leaves the reservation exactly where it was.
-        assert!(budget.try_reserve(1_000));
         assert_eq!(
             reorder.insert(block::Height(1), block, 1_000, peer(0)),
             ReorderInsertResult::Duplicate
         );
-        budget.release(1_000);
-        assert_eq!(budget.reserved(), 1_000);
+        assert_eq!(reorder.buffered_bytes(), 1_000);
+        assert_eq!(budget.reserved(), 0);
         assert!(budget.reserved() <= budget.max_bytes_for_test());
     }
 }
@@ -4557,10 +4559,10 @@ fn received_tracker_handles_a_full_range_at_the_bitset_boundary() {
 }
 
 /// A body whose actual serialized size exceeds its advertised size hint is still
-/// accepted and buffered, and the byte budget charges the overshoot so it cannot
-/// issue more work while under-counting held bodies.
+/// accepted and buffered, and receipt releases exactly the reserved hint — never
+/// more — so an oversized body cannot underflow or leak the request budget.
 #[test]
-fn underestimated_body_is_buffered_and_charges_budget_delta() {
+fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     let hint = 1_000u64;
     // Budget holds several hint-sized shares: enough to reserve this body's hint.
     let mut budget = ByteBudget::new(hint * 4);
@@ -4596,9 +4598,10 @@ fn underestimated_body_is_buffered_and_charges_budget_delta() {
     assert!(actual < BS_PER_BLOCK_WORST_CASE_BYTES);
     assert!(actual > hint);
 
-    // Receipt: settle toward the actual size. Because actual exceeds the reserved
-    // hint, the budget charges the delta even though the body is already admitted.
-    budget.settle(hint, actual);
+    // Receipt: release the reserved hint. The oversized body is retained at its
+    // actual size by the reorder buffer, invisible to the request budget (the
+    // resident look-ahead gate accounts for it instead).
+    budget.release(hint);
     outstanding.mark_received(block::Height(1));
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     assert_eq!(
@@ -4607,14 +4610,15 @@ fn underestimated_body_is_buffered_and_charges_budget_delta() {
         "an underestimated body must still buffer; a received body is never dropped"
     );
     assert_eq!(reorder.buffered_bytes(), actual);
-    assert_eq!(budget.reserved(), actual);
-    assert_eq!(budget.available(), 0);
-    assert!(
-        !budget.try_reserve(hint),
-        "charging the underestimated delta closes the budget gate"
-    );
-    budget.release(reorder.drop_through(block::Height(1)));
     assert_eq!(budget.reserved(), 0);
+    assert_eq!(outstanding.reserved_bytes(), 0);
+    assert!(
+        budget.try_reserve(hint),
+        "the freed reservation funds the next request immediately"
+    );
+    let dropped = reorder.drop_through(block::Height(1));
+    assert_eq!(dropped, actual);
+    assert_eq!(reorder.buffered_bytes(), 0);
 }
 
 #[test]
@@ -5170,7 +5174,7 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
 }
 
 #[tokio::test]
-async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
+async fn reactor_releases_request_budget_at_receipt_not_apply() {
     let blocks = mainnet_blocks_1_to_3();
     let block1_size = block_size(&blocks[0]);
     let mut config = immediate_body_download_config();
@@ -5270,21 +5274,14 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
     };
     assert_eq!(handle.local_status().servable_high, block::Height(0));
 
-    // The submitted-but-unapplied block must keep the body budget full, so no new
-    // GetBlocks may issue. a routine that consumed work pings the reactor to
-    // re-query, so a budget-orthogonal `QueryNeededBlocks` may appear in this
-    // window (the producer self-gates; it is idempotent and downloads nothing).
-    // Tolerate only that; any GetBlocks/SubmitBlock here would be the regression.
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
-    loop {
-        match tokio::time::timeout_at(deadline, actions.recv()).await {
-            Err(_) => break,
-            Ok(Some(BlockSyncAction::QueryNeededBlocks { .. })) => {}
-            Ok(other) => panic!(
-                "submitted-but-not-applied block should keep body budget full; got {other:?}"
-            ),
-        }
-    }
+    // Receipt — not apply-finish — released the request reservation, so with the
+    // one-block-hint budget and the one-slot window both freed by the delivery,
+    // the height-2 GetBlocks must go out while height 1 is still
+    // submitted-but-unapplied (retention is bounded by the resident gate, not
+    // the request budget).
+    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
+    assert_eq!(start_height, block::Height(2));
+    assert_eq!(count, 1);
 
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
@@ -5310,10 +5307,6 @@ async fn reactor_keeps_submitted_body_budget_until_apply_finishes() {
     })
     .await
     .expect("apply completion frontier advances advertised status");
-
-    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
-    assert_eq!(start_height, block::Height(2));
-    assert_eq!(count, 1);
 
     reactor_task.abort();
 }
@@ -5481,13 +5474,14 @@ async fn reactor_does_not_requeue_held_height_reported_still_needed() {
 }
 
 /// A real body whose serialized size dwarfs its advertised size hint is still
-/// accepted, buffered, and submitted. Worst case (not the hint) is reserved at
-/// send time, so shrink-on-receipt always has room and never drops the body.
+/// accepted, buffered, and submitted: a received body never touches the budget
+/// gate (its reservation is simply released at receipt), so it cannot be dropped
+/// for lack of budget.
 ///
 /// A/B: under the old release-then-reserve scheme the request reserved only the
 /// hint-sized estimate, so a body larger than the hint re-reserved more than was
 /// released and, against a tight budget, hit `BudgetFull` and dropped a valid
-/// body. With worst-case reservation this path is unreachable.
+/// body. That path is unreachable now.
 #[tokio::test]
 async fn reactor_buffers_body_larger_than_its_size_hint() {
     let blocks = mainnet_blocks_1_to_3();
@@ -5848,6 +5842,8 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
         .expect("needed metadata after duplicate queues");
 
     // A re-request would land on this peer's own real outbound, so watch the wire.
+    // Height 2 may legitimately be requested (receipt already freed height 1's
+    // request reservation); only a height-1 re-request would be the regression.
     let no_duplicate_request = tokio::time::timeout(Duration::from_millis(100), async {
         while let Some(frame) = outbound_rx.recv().await {
             if let BlockSyncMessage::GetBlocks {
@@ -5855,7 +5851,9 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
                 count,
             } = BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes")
             {
-                panic!("non-advancing duplicate result re-requested {start_height:?}/{count}");
+                if start_height == block::Height(1) {
+                    panic!("non-advancing duplicate result re-requested {start_height:?}/{count}");
+                }
             }
         }
     })
@@ -6100,70 +6098,75 @@ async fn reactor_ignores_unmatched_body_for_currently_needed_height() {
 #[tokio::test]
 async fn reactor_accepts_unmatched_body_for_queued_height() {
     let blocks = mainnet_blocks_1_to_3();
-    let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = u64::from(block_size(&blocks[0]));
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let block1_size = block_size(&blocks[0]);
+    let block2_size = block_size(&blocks[1]);
+    let config = immediate_body_download_config();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         },
-        (block::Height(1), blocks[0].hash()),
+        (block::Height(2), blocks[1].hash()),
         tip_rx,
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    // One request slot and a response byte cap of one block-1 hint, so the single
+    // GetBlocks below covers only height 1 and height 2 stays queued without an
+    // outstanding request — the gap the unmatched-queued acceptance path fills.
+    // (The old setup starved the request on the byte budget with an oversized
+    // hint; the floor overdraft now funds a floor request regardless, so the gap
+    // is created on slots/response bytes instead.)
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
         143,
-        block::Height(1),
-        blocks[0].hash(),
+        block::Height(2),
+        blocks[1].hash(),
         1,
-        1,
+        block1_size,
     )
     .await;
 
-    // Queue height 1 with a deliberately oversized advertised hint so its send-time
-    // reservation (the estimate) exceeds the one-actual-block budget: no GetBlocks
-    // can issue, leaving the height queued without an outstanding request. The body,
-    // arriving unsolicited, reserves only its small actual size and is still
-    // buffered. Under the old worst-case reservation this gap was implicit; with
-    // size-based reservation the oversized hint recreates it.
     handle
-        .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
-            height: block::Height(1),
-            hash: blocks[0].hash(),
-            size: BlockSizeEstimate::Advertised(
-                u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES).expect("worst case fits u32"),
-            ),
-        }]))
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            BlockSyncBlockMeta {
+                height: block::Height(1),
+                hash: blocks[0].hash(),
+                size: BlockSizeEstimate::Advertised(block1_size),
+            },
+            BlockSyncBlockMeta {
+                height: block::Height(2),
+                hash: blocks[1].hash(),
+                size: BlockSizeEstimate::Advertised(block2_size),
+            },
+        ]))
         .await
         .expect("needed metadata queues");
 
-    // No GetBlocks may issue (the body must stay queued without an outstanding
-    // request); a request would land on this peer's own real outbound.
-    let no_getblocks = tokio::time::timeout(Duration::from_millis(100), async {
-        loop {
-            if let Some(frame) = outbound_rx.recv().await {
-                if let BlockSyncMessage::GetBlocks { .. } =
-                    BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes")
-                {
-                    return;
-                }
-            } else {
-                return;
-            }
-        }
-    })
-    .await;
-    assert!(
-        no_getblocks.is_err(),
-        "test setup requires the body to remain queued without an outstanding request",
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 1),
+        "the byte-capped request must cover only height 1",
     );
 
+    // Height 2's body arrives without a matching outstanding request. It is a
+    // queued (pending) height in the peer's servable range, so the routine must
+    // claim and buffer it — no request reservation is consumed for it.
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(blocks[1].clone())
+                .encode_frame()
+                .expect("block encodes"),
+        )
+        .await
+        .expect("unmatched queued block queues");
+
+    // Deliver height 1 on its live request; both bodies must submit in order,
+    // proving the unmatched height-2 body was accepted and buffered.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[0].clone())
@@ -6171,18 +6174,19 @@ async fn reactor_accepts_unmatched_body_for_queued_height() {
                 .expect("block encodes"),
         )
         .await
-        .expect("unmatched queued block queues");
+        .expect("matched block queues");
 
-    let submitted = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
+    let mut submitted = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while submitted.len() < 2 {
             if let BlockSyncAction::SubmitBlock { block, .. } = next_action(&mut actions).await {
-                return block.hash();
+                submitted.push(block.hash());
             }
         }
     })
     .await
-    .expect("unmatched queued body is submitted");
-    assert_eq!(submitted, blocks[0].hash());
+    .expect("both bodies are submitted");
+    assert_eq!(submitted, vec![blocks[0].hash(), blocks[1].hash()]);
 
     reactor_task.abort();
 }
@@ -6627,8 +6631,8 @@ async fn reactor_keeps_issuing_far_above_floor_with_no_near_tip_pause() {
 async fn routine_refills_after_budget_release_no_missed_wake() {
     // missed-wake guard at the routine level: a routine blocked on an
     // exhausted byte budget must re-fill when budget is freed. The budget holds
-    // exactly one worst-case block, so the first GetBlocks exhausts it; delivering
-    // that body releases budget (shrink + commit) and the routine must issue the
+    // exactly one worst-case block, so the first GetBlocks exhausts it; receipt
+    // of that body releases the whole reservation and the routine must issue the
     // next GetBlocks without any external nudge.
     let mut config = immediate_body_download_config();
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
@@ -6684,10 +6688,9 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
     let (first_start, _count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
     assert_eq!(first_start, block::Height(1));
 
-    // Deliver height 1's body. Its worst-case reservation shrinks to the actual
-    // size, but the remaining reservation still leaves under one worst-case block
-    // free, so the routine cannot yet issue height 2 — the budget is freed only
-    // when height 1 *commits* and the Sequencer releases its reservation.
+    // Deliver height 1's body. Receipt releases its whole worst-case reservation
+    // (retention charges nothing), so the routine can issue height 2 as soon as
+    // its next fill pass runs.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[0].clone())
@@ -6697,10 +6700,10 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
         .await
         .expect("block frame queues");
 
-    // Drive height 1 to commit: drain its SubmitBlock and report it applied. The
-    // Sequencer task then releases the byte budget and the capacity notify must
-    // wake the budget-blocked routine to issue the next GetBlocks (the     // missed-wake guarantee — a release between the routine's fill-check and its
-    // await must not be lost).
+    // Drive height 1 through submit and apply so the pipeline finishes cleanly;
+    // the height-2 GetBlocks below must arrive regardless (the receipt-time
+    // release must wake the budget-blocked fill — a release between the
+    // routine's fill-check and its await must not be lost).
     let token = loop {
         match next_action(&mut actions).await {
             BlockSyncAction::SubmitBlock { token, block } => {
@@ -6726,7 +6729,7 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
     assert_eq!(
         second_start,
         block::Height(2),
-        "freeing the byte budget must wake the routine to issue the next request (no missed wake)"
+        "freeing the request budget must wake the routine to issue the next request (no missed wake)"
     );
 
     reactor_task.abort();

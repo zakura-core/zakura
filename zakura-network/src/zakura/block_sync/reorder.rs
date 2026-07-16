@@ -22,13 +22,6 @@ impl ReorderBuffer {
         self.blocks.len()
     }
 
-    /// Highest buffered height, if any. The shed-for-floor-starvation path drops
-    /// this (the body furthest from the committed floor) to free budget for a
-    /// lower, commit-unblocking request.
-    pub(super) fn max_height(&self) -> Option<block::Height> {
-        self.blocks.keys().next_back().copied()
-    }
-
     pub(super) fn contains(&self, height: block::Height) -> bool {
         self.blocks.contains_key(&height)
     }
@@ -41,12 +34,10 @@ impl ReorderBuffer {
         self.blocks.get(&height).map(|buffered| buffered.hash)
     }
 
-    /// Buffer a received body that already owns its `bytes` reservation.
+    /// Buffer a received body with its wire `bytes` size.
     ///
-    /// The caller reserved worst-case bytes for this height at send time and
-    /// shrank that reservation to `bytes` on receipt, so the reorder buffer takes
-    /// ownership of the existing reservation without touching the budget and can
-    /// never fail on budget. A `Duplicate` height is left to the caller to release.
+    /// Retained bodies carry no wire-budget charge (the resident look-ahead gate
+    /// bounds them via `buffered_bytes`), so an insert can never fail on budget.
     #[cfg(test)]
     pub(super) fn insert(
         &mut self,
@@ -58,6 +49,7 @@ impl ReorderBuffer {
         self.insert_body(
             height,
             block.hash(),
+            block.header.previous_block_hash,
             BufferedBlockBody::Decoded(block),
             bytes,
             source_peer,
@@ -70,6 +62,7 @@ impl ReorderBuffer {
         &mut self,
         height: block::Height,
         hash: block::Hash,
+        previous_block_hash: block::Hash,
         body: BufferedBlockBody,
         bytes: u64,
         source_peer: ZakuraPeerId,
@@ -82,6 +75,7 @@ impl ReorderBuffer {
             height,
             BufferedBlock {
                 hash,
+                previous_block_hash,
                 body,
                 bytes,
                 source_peer,
@@ -94,7 +88,7 @@ impl ReorderBuffer {
     pub(super) fn drain_contiguous_prefix(
         &mut self,
         verified_block_tip: block::Height,
-    ) -> Vec<(block::Height, Arc<block::Block>, u64, ZakuraPeerId)> {
+    ) -> Vec<DrainedBlock> {
         let mut released = Vec::new();
         let mut next = match next_height(verified_block_tip) {
             Some(next) => next,
@@ -103,12 +97,14 @@ impl ReorderBuffer {
 
         while let Some(buffered) = self.blocks.remove(&next) {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered.bytes);
-            released.push((
-                next,
-                buffered.body.into_block(),
-                buffered.bytes,
-                buffered.source_peer,
-            ));
+            released.push(DrainedBlock {
+                height: next,
+                hash: buffered.hash,
+                previous_block_hash: buffered.previous_block_hash,
+                body: buffered.body,
+                bytes: buffered.bytes,
+                source_peer: buffered.source_peer,
+            });
             let Some(after) = next_height(next) else {
                 break;
             };
@@ -118,10 +114,8 @@ impl ReorderBuffer {
         released
     }
 
-    /// Drop every buffered body and return the total bytes they held, so the
-    /// caller releases exactly that reservation. The reorder buffer is owned by
-    /// the `Sequencer`, which does not touch the byte budget; it returns the
-    /// freed bytes to the reactor instead.
+    /// Drop every buffered body and return the total bytes they held (the
+    /// retained-size accounting the resident view reads; not a budget charge).
     pub(crate) fn clear(&mut self) -> u64 {
         self.drop_from(block::Height::MIN)
     }
@@ -167,9 +161,23 @@ pub(super) enum ReorderInsertResult {
     Duplicate,
 }
 
+/// One block released from the contiguous reorder prefix, still in whatever
+/// buffered form it was held in (raw bytes for backlog entries), so draining
+/// into `applying` never forces a decode.
+#[derive(Clone, Debug)]
+pub(super) struct DrainedBlock {
+    pub(super) height: block::Height,
+    pub(super) hash: block::Hash,
+    pub(super) previous_block_hash: block::Hash,
+    pub(super) body: BufferedBlockBody,
+    pub(super) bytes: u64,
+    pub(super) source_peer: ZakuraPeerId,
+}
+
 #[derive(Clone, Debug)]
 struct BufferedBlock {
     hash: block::Hash,
+    previous_block_hash: block::Hash,
     body: BufferedBlockBody,
     bytes: u64,
     /// The peer that delivered this body, so an apply rejection can be attributed
@@ -214,17 +222,46 @@ impl BufferedBlockBody {
         }
     }
 
-    fn into_block(self) -> Arc<block::Block> {
+    /// In-place [`Self::retain_for_backlog`]: drop the decoded copy when raw
+    /// bytes are retained, so a body leaving the bounded decode window releases
+    /// its decoded heap footprint.
+    pub(super) fn retain_for_backlog_in_place(&mut self) {
+        if let BufferedBlockBody::DecodedWithRawFramePayload {
+            raw_frame_payload, ..
+        } = self
+        {
+            *self = BufferedBlockBody::RawFramePayload(raw_frame_payload.clone());
+        }
+    }
+
+    /// Whether this body currently holds a decoded block.
+    #[cfg(test)]
+    pub(super) fn is_decoded(&self) -> bool {
+        !matches!(self, BufferedBlockBody::RawFramePayload(_))
+    }
+
+    /// Return the decoded block, decoding from the retained raw bytes if needed
+    /// and caching the decoded copy in place (the entry enters the decode
+    /// window; `retain_for_backlog_in_place` is the matching downgrade).
+    pub(super) fn decoded_block(&mut self) -> Arc<block::Block> {
         match self {
-            BufferedBlockBody::Decoded(block) => block,
-            BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block,
+            BufferedBlockBody::Decoded(block) => block.clone(),
+            BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block.clone(),
             BufferedBlockBody::RawFramePayload(payload) => {
-                let mut reader = Cursor::new(&payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..]);
-                Arc::new(
-                    block::Block::zcash_deserialize(&mut reader)
-                        .expect("raw block bytes deserialize because the peer routine decoded them before buffering"),
-                )
+                let block = decode_raw_frame_payload(payload);
+                *self = BufferedBlockBody::DecodedWithRawFramePayload {
+                    block: block.clone(),
+                    raw_frame_payload: payload.clone(),
+                };
+                block
             }
         }
     }
+}
+
+fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> Arc<block::Block> {
+    let mut reader = Cursor::new(&payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..]);
+    Arc::new(block::Block::zcash_deserialize(&mut reader).expect(
+        "raw block bytes deserialize because the peer routine decoded them before buffering",
+    ))
 }

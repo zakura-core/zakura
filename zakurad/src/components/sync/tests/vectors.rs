@@ -68,6 +68,30 @@ const MAX_SERVICE_REQUEST_DELAY: Duration = Duration::from_millis(1000);
 /// unrelated failure. These tests pause time, so a long delay costs no wall-clock time.
 const STALLED_SERVICE_REQUEST_DELAY: Duration = Duration::from_secs(30 * 60);
 
+#[test]
+fn oversized_find_blocks_response_is_rejected() {
+    let hash = block::Hash([0; 32]);
+
+    // The guard is applied after ObtainTips/ExtendTips strip zcashd's extra
+    // trailing hash, so 500 remaining hashes are accepted and 501 are not.
+    assert!(sync::has_valid_tips_response_hash_count(&vec![
+        hash;
+        sync::MAX_TIPS_RESPONSE_HASH_COUNT
+    ]));
+    assert!(!sync::has_valid_tips_response_hash_count(&vec![
+        hash;
+        sync::MAX_TIPS_RESPONSE_HASH_COUNT
+            + 1
+    ]));
+
+    // A zcashd response with 500 chain hashes plus one appended hash must remain
+    // usable after the trailing hash is discarded.
+    let raw = vec![hash; sync::MAX_TIPS_RESPONSE_HASH_COUNT + 1];
+    let stripped = &raw[..raw.len() - 1];
+    assert_eq!(stripped.len(), sync::MAX_TIPS_RESPONSE_HASH_COUNT);
+    assert!(sync::has_valid_tips_response_hash_count(stripped));
+}
+
 /// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips.
 ///
 /// This test also makes sure that the syncer downloads blocks in order.

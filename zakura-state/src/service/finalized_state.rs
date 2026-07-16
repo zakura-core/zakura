@@ -747,8 +747,8 @@ impl FinalizedState {
                         // different parent tree, so verifying against it would fail and
                         // wrongly evict a good supplied root. Treat a non-linking witness
                         // as absent, so the await-successor deferral below handles it. The
-                        // write worker only buffers direct successors, so this should
-                        // never fire.
+                        // header-store lookup only returns direct successors, so this
+                        // should never fire in production.
                         let next_vct_block = next_vct_block.filter(|next_vct_block| {
                             let links = next_vct_block.header.previous_block_hash == block_hash;
                             if !links {
@@ -1190,7 +1190,7 @@ impl FinalizedState {
         self.vct.clear_prevalidated_next();
     }
 
-    /// `true` when committing `height` on the fast path needs a buffered successor before
+    /// `true` when committing `height` on the fast path needs a stored successor header before
     /// it can safely persist this block's supplied roots.
     ///
     /// Only untrusted peer-supplied roots at or above Heartwood require this. The

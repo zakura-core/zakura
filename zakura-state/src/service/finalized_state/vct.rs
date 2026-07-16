@@ -14,7 +14,7 @@ use thiserror::Error;
 #[cfg(test)]
 use zakura_chain::parallel::tree::NoteCommitmentTrees;
 use zakura_chain::{
-    block::{self, merkle::AuthDataRoot, Block, Header},
+    block::{self, merkle::AuthDataRoot, Header},
     ironwood, orchard,
     parameters::{Network, NetworkUpgrade},
     sapling, sprout,
@@ -40,22 +40,7 @@ pub struct NextVctBlock {
 }
 
 impl NextVctBlock {
-    /// Build a successor witness from a checkpoint-verified block.
-    pub(crate) fn from_block(block: Arc<Block>, auth_data_root: Option<AuthDataRoot>) -> Self {
-        let height = block
-            .coinbase_height()
-            .expect("checkpoint-verified successor blocks have a coinbase height");
-        let auth_data_root = Some(auth_data_root.unwrap_or_else(|| block.auth_data_root()));
-
-        Self {
-            header: block.header.clone(),
-            height,
-            hash: block.hash(),
-            auth_data_root,
-        }
-    }
-
-    /// Build a successor witness from a contextually validated stored header.
+    /// Build a successor witness from a header and its precomputed auth-data root.
     pub(crate) fn from_header(
         header: Arc<Header>,
         height: block::Height,
@@ -108,7 +93,7 @@ pub(crate) struct VctState {
     /// Where the verified per-block roots and final frontier come from. The
     /// committer reads roots/final frontier through this seam only.
     source: Box<dyn CommitmentRootSource>,
-    /// Whether roots from this VCT state must be confirmed against a buffered successor
+    /// Whether roots from this VCT state must be confirmed against a stored successor header
     /// before they are committed.
     requires_verified_successor: bool,
     /// Count of blocks that took the VCT fast-sync, for the run summary.
@@ -222,7 +207,7 @@ impl VctState {
         self.source.vct_root(height)
     }
 
-    /// `true` when committing `height` on the vct path needs a buffered successor before
+    /// `true` when committing `height` on the vct path needs a stored successor header before
     /// it can safely persist this block's supplied roots.
     ///
     /// Only untrusted peer-supplied roots at or above Heartwood require this. The
@@ -373,7 +358,7 @@ impl VctCommitState {
         self.prevalidated_next
     }
 
-    /// Caches the next block as already validated by this fast commit's look-ahead.
+    /// Caches the next header as already validated by this fast commit's look-ahead.
     pub(super) fn mark_prevalidated(
         &mut self,
         height: block::Height,
@@ -600,7 +585,7 @@ mod tests {
         );
         assert!(
             !trusted.vct_root_needs_successor(height, &network),
-            "trusted fixture roots can commit without a buffered successor"
+            "trusted fixture roots can commit without a stored successor header"
         );
 
         let untrusted = VctState::test_with_source(
@@ -612,7 +597,7 @@ mod tests {
         );
         assert!(
             untrusted.vct_root_needs_successor(height, &network),
-            "untrusted roots defer until a buffered successor verifies them"
+            "untrusted roots defer until a stored successor header verifies them"
         );
     }
 

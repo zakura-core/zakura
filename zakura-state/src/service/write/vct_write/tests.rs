@@ -92,9 +92,8 @@ fn fill_successor_only_buffers_one_linking_block_at_a_time() {
 }
 
 /// A buffered block that does not extend the block being committed is discarded:
-/// it can't witness the commit, and — because a parked retry is always taken
-/// before the look-ahead — it would otherwise never be popped, wedging the retry
-/// loop against a bogus witness that spuriously evicts good roots.
+/// because a parked retry is always taken before the look-ahead, leaving it there
+/// would wedge the retry loop ahead of the real successor body.
 #[test]
 fn fill_successor_discards_non_successors_and_keeps_the_linking_block() {
     let mut manager = VctWriteManager::default();
@@ -116,15 +115,20 @@ fn fill_successor_discards_non_successors_and_keeps_the_linking_block() {
         successor_hash,
         "the non-linking block is dropped and the true successor takes its place"
     );
-    let witness = manager
-        .next_vct_block()
-        .expect("successor is buffered")
-        .header;
-    assert_eq!(witness.previous_block_hash, current.0.hash);
+    assert_eq!(
+        manager
+            .lookahead
+            .front()
+            .expect("successor is buffered")
+            .0
+            .block
+            .header
+            .previous_block_hash,
+        current.0.hash,
+    );
 }
 
-/// With no linking block buffered anywhere, the look-ahead ends up empty, so the
-/// write loop's await-successor deferral engages instead of a bogus witness.
+/// With no linking body buffered anywhere, the look-ahead ends up empty.
 #[test]
 fn fill_successor_empties_the_lookahead_when_no_successor_exists() {
     let mut manager = VctWriteManager::default();
@@ -135,29 +139,19 @@ fn fill_successor_empties_the_lookahead_when_no_successor_exists() {
     manager.fill_successor(&mut rx, &current);
 
     assert!(manager.lookahead.is_empty());
-    assert!(manager.next_vct_block().is_none());
 }
 
 #[test]
-fn next_vct_block_reflects_the_lookahead_front() {
+fn buffered_successor_body_remains_queued_for_its_own_commit() {
     let mut manager = VctWriteManager::default();
-    assert!(manager.next_vct_block().is_none());
-
     let block = queued_block(1);
-    let expected_block = block.0.block.clone();
-    let expected_auth_data_root = block.0.auth_data_root;
+    let expected_hash = block.0.hash;
     manager.lookahead.push_back(block);
 
-    let next_vct_block = manager.next_vct_block().expect("look-ahead has a block");
-    assert_eq!(next_vct_block.header, expected_block.header);
-    assert_eq!(next_vct_block.hash, expected_block.hash());
-    assert_eq!(
-        next_vct_block.height,
-        expected_block
-            .coinbase_height()
-            .expect("fake block has a height")
-    );
-    assert_eq!(next_vct_block.auth_data_root, expected_auth_data_root);
+    let ready = manager
+        .take_ready()
+        .expect("the buffered successor body is ready for its own commit");
+    assert_eq!(ready.0.hash, expected_hash);
 }
 
 #[test]

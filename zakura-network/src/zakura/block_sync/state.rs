@@ -221,17 +221,18 @@ impl BlockSyncHandle {
         self.candidates.borrow().clone()
     }
 
-    /// Return a test-only probe that keeps the retained-memory counter alive after
-    /// every reactor, routine, and sequencer owner has been torn down.
-    #[cfg(any(test, feature = "zakura-testkit"))]
-    pub(crate) fn retained_memory_probe(&self) -> impl Fn() -> u64 + Clone + Send + 'static {
-        let retained_memory = self
-            .routine_wiring
-            .as_ref()
-            .expect("spawned block-sync handles have routine wiring")
-            .retained_memory
-            .clone();
-        move || retained_memory.used()
+    /// Return a test-only probe over every block-sync accounting ledger.
+    ///
+    /// It owns its handles, so it stays readable after every reactor, routine, and
+    /// sequencer owner has been torn down — the state in which a zero-slack teardown
+    /// assertion is meaningful.
+    #[cfg(test)]
+    pub(crate) fn accounting_probe(&self) -> super::accounting_probe::BlockSyncAccountingProbe {
+        super::accounting_probe::BlockSyncAccountingProbe::new(
+            self.routine_wiring
+                .as_ref()
+                .expect("spawned block-sync handles have routine wiring"),
+        )
     }
 }
 

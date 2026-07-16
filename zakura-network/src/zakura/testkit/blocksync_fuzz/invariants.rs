@@ -242,6 +242,43 @@ pub(crate) fn assert_retained_memory_drained(report: &InvariantReport) {
     );
 }
 
+/// Assert every accounting ledger drained to exactly zero after teardown.
+///
+/// Unlike the trace-derived bounds this reads the live ledgers and permits no slack:
+/// once every owner is gone there is no handoff left to be mid-flight, so any nonzero
+/// value is a charge some drop path failed to release.
+pub(crate) fn assert_accounting_drained(outcome: &FuzzOutcome) {
+    let accounting = outcome.final_accounting;
+    let leaked: Vec<(&'static str, u64)> = [
+        ("wire_budget_reserved", accounting.wire_budget_reserved),
+        ("work_reserved", accounting.work_reserved),
+        ("work_reserved_scanned", accounting.work_reserved_scanned),
+        ("retained_total", accounting.retained_total),
+        (
+            "in_flight_reservation_bytes",
+            accounting.in_flight_reservation_bytes,
+        ),
+        (
+            "in_flight_reservation_count",
+            accounting.in_flight_reservation_count,
+        ),
+        ("sequencer_input_bytes", accounting.sequencer_input_bytes),
+        (
+            "sequencer_input_decoded",
+            accounting.sequencer_input_decoded,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, value)| *value != 0)
+    .collect();
+
+    assert!(
+        leaked.is_empty(),
+        "block-sync accounting must drain to zero after teardown; leaked {leaked:?} \
+         (full snapshot: {accounting:?})",
+    );
+}
+
 fn max_unproven_requests_without_block_progress(reader: &TraceReader) -> u64 {
     reader
         .table("block_sync")
@@ -320,6 +357,7 @@ pub(crate) fn assert_core(
         "successful run never observed active decoded pipeline bytes",
     );
     assert_retained_memory_drained(report);
+    assert_accounting_drained(outcome);
 
     // Per-peer windows respect the advertised inflight caps: aggregate in-flight must
     // not exceed the sum of per-peer advertised `max_inflight_requests`.

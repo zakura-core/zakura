@@ -802,6 +802,21 @@ impl WorkQueue {
         self.lock().reserved_bytes
     }
 
+    /// Bytes and count still held by unreconciled in-flight memory reservations.
+    #[cfg(test)]
+    pub(super) fn in_flight_memory_reservations_for_test(&self) -> (u64, u64) {
+        let inner = self.lock();
+        inner.in_flight_memory_reservations.values().fold(
+            (0u64, 0u64),
+            |(bytes, count), reservation| {
+                (
+                    bytes.saturating_add(reservation.charged_bytes()),
+                    count.saturating_add(1),
+                )
+            },
+        )
+    }
+
     /// Ground-truth O(pending + in_flight) recomputation of [`reserved_bytes`],
     /// used by tests to assert the maintained counter never drifts.
     #[cfg(test)]

@@ -30,6 +30,8 @@ use super::{
     Frame, ServicePeerDirection, ServicePeerLimits, ZakuraPeerId, ZakuraTrace,
 };
 
+#[cfg(test)]
+mod accounting_probe;
 mod admission;
 mod bbr;
 #[cfg(feature = "internal-bench")]
@@ -52,6 +54,11 @@ mod state;
 mod tests;
 mod wire;
 mod work_queue;
+#[cfg(test)]
+mod work_queue_model;
+
+#[cfg(test)]
+pub(crate) use accounting_probe::BlockSyncAccounting;
 
 #[cfg(feature = "internal-bench")]
 pub use bench::{

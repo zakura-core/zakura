@@ -90,7 +90,7 @@ pub(crate) async fn run_scenario(
     startup.shutdown = shutdown.clone();
 
     let (handle, actions, reactor_task) = crate::zakura::spawn_block_sync_reactor(startup);
-    let retained_memory_used = handle.retained_memory_probe();
+    let accounting = handle.accounting_probe();
 
     let (committed_tx, mut committed_rx) = watch::channel(block::Height(0));
 
@@ -164,7 +164,7 @@ pub(crate) async fn run_scenario(
     // sequencer and peer routines can need a few scheduler turns to drop their final
     // queued/detached body owners. Keep only the counter probe alive while they settle.
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        while retained_memory_used() != 0 {
+        while accounting.retained_total() != 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
@@ -173,7 +173,8 @@ pub(crate) async fn run_scenario(
     Ok(FuzzOutcome {
         committed_tip,
         target,
-        final_retained_memory_bytes: retained_memory_used(),
+        final_retained_memory_bytes: accounting.retained_total(),
+        final_accounting: accounting.snapshot(),
     })
 }
 

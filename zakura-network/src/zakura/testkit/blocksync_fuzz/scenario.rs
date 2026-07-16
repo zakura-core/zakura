@@ -11,6 +11,8 @@ use std::time::Duration;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use zakura_chain::block;
 
+use crate::zakura::BlockSyncAccounting;
+
 use crate::zakura::{BlockSyncStatus, ZakuraBlockSyncConfig, ZakuraPeerId, MAX_BS_RESPONSE_BYTES};
 
 /// A latency draw, fixed or uniform over `[low, high]`.
@@ -346,6 +348,8 @@ pub(crate) struct FuzzOutcome {
     pub(crate) target: block::Height,
     /// Authoritative retained body memory after full harness teardown.
     pub(crate) final_retained_memory_bytes: u64,
+    /// Every block-sync accounting ledger, read after full harness teardown.
+    pub(crate) final_accounting: BlockSyncAccounting,
 }
 
 impl FuzzOutcome {

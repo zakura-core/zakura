@@ -403,10 +403,14 @@ impl BlockSyncReactor {
                 );
             }
             let retired_heights: Vec<_> = retired.iter().map(|(height, _)| *height).collect();
+            let owner = super::work_queue::ReservationOwner {
+                generation: claim.generation,
+                request_token: claim.meta.request_token,
+            };
             let released = self
                 .state
                 .work_queue
-                .release_reserved_and_return_items_detailed(retired_heights);
+                .release_reserved_and_return_items_detailed(retired_heights, owner);
             self.state.budget.release(released.released_bytes);
             self.emit_trace(bs_trace::BLOCK_FLOOR_WATCHDOG_CANCELLED, |row| {
                 bs_insert_peer(row, bs_trace::PEER, &claim.peer);
@@ -423,6 +427,7 @@ impl BlockSyncReactor {
                 bs_insert_u64(row, "already_pending_count", released.already_pending_count);
                 bs_insert_u64(row, "held_count", released.held_count);
                 bs_insert_u64(row, "released_count", released.released_count);
+                bs_insert_u64(row, "owner_mismatch_count", released.owner_mismatch_count);
                 bs_insert_u64(row, "missing_count", released.missing_count);
                 bs_insert_u64(
                     row,

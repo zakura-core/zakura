@@ -20,7 +20,7 @@ use super::{
     request::*,
     sequencer::*,
     state::*,
-    work_queue::{LateBodyClaim, WorkQueue},
+    work_queue::{LateBodyClaim, ReservationOwner, WorkQueue},
 };
 use crate::zakura::{
     framed_channel,
@@ -39,6 +39,13 @@ use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_M
 
 fn peer(byte: u8) -> ZakuraPeerId {
     ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds")
+}
+
+fn reservation_owner(generation: u64, request_token: BlockRequestToken) -> ReservationOwner {
+    ReservationOwner {
+        generation,
+        request_token,
+    }
 }
 
 fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
@@ -2227,10 +2234,11 @@ fn commit_window_stays_fundable_at_exact_floor() {
 fn work_queue_force_cancel_and_owner_timeout_release_once() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
+    let owner = reservation_owner(1, 1);
     let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
     assert_eq!(taken.len(), 1);
     assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    assert_eq!(queue.mark_reserved([block::Height(1)], owner), 100);
     assert_eq!(budget.reserved(), 100);
 
     let watchdog_released = queue.release_and_return_items([block::Height(1)]);
@@ -2254,6 +2262,7 @@ fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
         0,
         (1..=6).map(|h| needed(h, BlockSizeEstimate::Advertised(100))),
     );
+    let owner = reservation_owner(1, 1);
     let check = |label: &str| {
         assert_eq!(
             queue.reserved_bytes(),
@@ -2268,7 +2277,7 @@ fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
     // take + mark_reserved: Released -> Reserved.
     let taken = queue.take_in_range(block::Height(1), block::Height(6), 6);
     assert_eq!(taken.len(), 6);
-    assert_eq!(queue.mark_reserved((1..=6).map(block::Height)), 600);
+    assert_eq!(queue.mark_reserved((1..=6).map(block::Height), owner), 600);
     assert_eq!(queue.reserved_bytes(), 600);
     check("mark_reserved");
 
@@ -2290,7 +2299,7 @@ fn work_queue_reserved_bytes_counter_matches_scan_across_transitions() {
     check("release_heights");
 
     // release_reserved_and_return_items: only the still-reserved height 4 releases.
-    let released = queue.release_reserved_and_return_items([block::Height(4)]);
+    let released = queue.release_reserved_and_return_items([block::Height(4)], owner);
     assert_eq!(released, 100);
     assert_eq!(queue.reserved_bytes(), 200);
     check("release_reserved_and_return_items");
@@ -2323,7 +2332,10 @@ fn work_queue_advance_floor_drops_only_committed_prefix() {
     );
     // Reserve a contiguous run so we can see the reservation accounting on GC.
     let _ = queue.take_in_range(block::Height(1), block::Height(10), 10);
-    assert_eq!(queue.mark_reserved((1..=10).map(block::Height)), 1000);
+    assert_eq!(
+        queue.mark_reserved((1..=10).map(block::Height), reservation_owner(1, 1)),
+        1000
+    );
 
     // advance_floor to 4: drops heights 1..=4 (still reserved -> released), keeps 5..=10.
     let released = queue.advance_floor(block::Height(4));
@@ -2346,10 +2358,11 @@ fn work_queue_advance_floor_drops_only_committed_prefix() {
 fn watchdog_after_held_settle_releases_once() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
+    let owner = reservation_owner(1, 1);
     let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
     assert_eq!(taken.len(), 1);
     assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    assert_eq!(queue.mark_reserved([block::Height(1)], owner), 100);
 
     let delta = queue
         .settle_active_reserved_height(block::Height(1), 80)
@@ -2358,7 +2371,7 @@ fn watchdog_after_held_settle_releases_once() {
     budget.release(20);
     assert_eq!(budget.reserved(), 80);
 
-    let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)]);
+    let outcome = queue.release_reserved_and_return_items_detailed([block::Height(1)], owner);
     let watchdog_released = outcome.released_bytes;
     budget.release(watchdog_released);
     assert_eq!(
@@ -2380,17 +2393,17 @@ fn watchdog_after_held_settle_releases_once() {
 fn watchdog_between_registry_check_and_settlement_preserves_late_body() {
     let height = block::Height(1);
     let hash = block::Hash([1; 32]);
+    let registry = PeerRegistry::new();
+    let peer = peer(0x41);
+    let config = ZakuraBlockSyncConfig::default();
+    let generation = registry.admit(&peer, ServicePeerDirection::Outbound, &config);
+    let owner = reservation_owner(generation, 7);
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
     let taken = queue.take_in_range(height, height, 1);
     assert_eq!(taken.len(), 1);
     assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([height]), 100);
-
-    let registry = PeerRegistry::new();
-    let peer = peer(0x41);
-    let config = ZakuraBlockSyncConfig::default();
-    let generation = registry.admit(&peer, ServicePeerDirection::Outbound, &config);
+    assert_eq!(queue.mark_reserved([height], owner), 100);
     let now = Instant::now();
     registry.set_outstanding(
         &peer,
@@ -2417,7 +2430,7 @@ fn watchdog_between_registry_check_and_settlement_preserves_late_body() {
     let retired = registry.retire_outstanding_claim(&claim);
     assert_eq!(retired.len(), 1);
 
-    let outcome = queue.release_reserved_and_return_items_detailed([height]);
+    let outcome = queue.release_reserved_and_return_items_detailed([height], owner);
     let watchdog_released = outcome.released_bytes;
     budget.release(watchdog_released);
     assert_eq!(outcome.returned_count, 1);
@@ -2444,13 +2457,85 @@ fn watchdog_between_registry_check_and_settlement_preserves_late_body() {
 }
 
 #[test]
+fn stale_watchdog_cleanup_cannot_release_replacement_reservation() {
+    let height = block::Height(1);
+    let hash = block::Hash([1; 32]);
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
+    let mut budget = ByteBudget::new(1_000);
+    let registry = PeerRegistry::new();
+    let config = ZakuraBlockSyncConfig::default();
+    let old_peer = peer(0x41);
+    let old_generation = registry.admit(&old_peer, ServicePeerDirection::Outbound, &config);
+    let old_owner = reservation_owner(old_generation, 7);
+    let now = Instant::now();
+    registry.set_outstanding(
+        &old_peer,
+        old_generation,
+        std::collections::BTreeMap::from([(
+            height,
+            super::peer_registry::OutstandingMeta {
+                request_token: old_owner.request_token,
+                hash,
+                estimated_bytes: 100,
+                queued_at: now,
+                deadline: now,
+            },
+        )]),
+    );
+
+    assert_eq!(queue.take_in_range(height, height, 1).len(), 1);
+    assert!(budget.try_reserve(100));
+    assert_eq!(queue.mark_reserved([height], old_owner), 100);
+
+    // Local timeout returns the old reservation before its registry publication
+    // catches up, exposing the height to another peer.
+    let local = queue.release_reserved_and_return_items_detailed([height], old_owner);
+    budget.release(local.released_bytes);
+    assert_eq!(local.returned_count, 1);
+
+    let replacement_peer = peer(0x42);
+    let replacement_generation =
+        registry.admit(&replacement_peer, ServicePeerDirection::Outbound, &config);
+    let replacement_owner = reservation_owner(replacement_generation, 1);
+    assert_eq!(queue.take_in_range(height, height, 1).len(), 1);
+    assert!(budget.try_reserve(100));
+    assert_eq!(queue.mark_reserved([height], replacement_owner), 100);
+
+    // The watchdog can still retire the old registry claim, but its owner-tagged
+    // cleanup must not return or uncharge the replacement peer's request.
+    let stale_claim = registry
+        .outstanding_claims_at(height)
+        .into_iter()
+        .find(|claim| claim.peer == old_peer)
+        .expect("the old peer claim remains visible");
+    let retired = registry.retire_outstanding_claim(&stale_claim);
+    assert_eq!(retired.len(), 1);
+    let watchdog = queue.release_reserved_and_return_items_detailed(
+        retired.iter().map(|(height, _)| *height),
+        old_owner,
+    );
+    budget.release(watchdog.released_bytes);
+
+    assert_eq!(watchdog.released_bytes, 0);
+    assert_eq!(watchdog.returned_count, 0);
+    assert_eq!(watchdog.owner_mismatch_count, 1);
+    assert!(queue.in_flight_contains(height));
+    assert!(!queue.pending_contains(height));
+    assert_eq!(queue.reserved_bytes(), 100);
+    assert_eq!(budget.reserved(), 100);
+}
+
+#[test]
 fn mark_held_direct_does_not_orphan_a_charge() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
     let mut budget = ByteBudget::new(1_000);
     let taken = queue.take_in_range(block::Height(1), block::Height(1), 1);
     assert_eq!(taken.len(), 1);
     assert!(budget.try_reserve(100));
-    assert_eq!(queue.mark_reserved([block::Height(1)]), 100);
+    assert_eq!(
+        queue.mark_reserved([block::Height(1)], reservation_owner(1, 1)),
+        100
+    );
 
     assert!(budget.try_reserve(80));
     let old_charge = queue.mark_held_direct(block::Height(1), 80);
@@ -2478,7 +2563,10 @@ fn release_reserved_mixed_reserved_held_conserves_budget() {
     assert_eq!(taken.len(), 2);
     assert!(budget.try_reserve(200));
     assert_eq!(
-        queue.mark_reserved([block::Height(1), block::Height(2)]),
+        queue.mark_reserved(
+            [block::Height(1), block::Height(2)],
+            reservation_owner(1, 1),
+        ),
         200
     );
 
@@ -2518,11 +2606,12 @@ fn release_reserved_heights_skips_held_body_owned_by_sequencer() {
         ],
     );
     let mut budget = ByteBudget::new(1_000);
+    let owner = reservation_owner(1, 1);
     let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
     assert_eq!(taken.len(), 2);
     assert!(budget.try_reserve(200));
     assert_eq!(
-        queue.mark_reserved([block::Height(1), block::Height(2)]),
+        queue.mark_reserved([block::Height(1), block::Height(2)], owner),
         200
     );
 
@@ -2537,7 +2626,7 @@ fn release_reserved_heights_skips_held_body_owned_by_sequencer() {
 
     // GC both heights: only the still-reserved height 2 releases. The Held height 1
     // is skipped (owned by the Sequencer) and stays in `in_flight`.
-    let released = queue.release_reserved_heights([block::Height(1), block::Height(2)]);
+    let released = queue.release_reserved_heights([block::Height(1), block::Height(2)], owner);
     budget.release(released);
     assert_eq!(
         released, 100,

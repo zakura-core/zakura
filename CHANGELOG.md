@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
-- Block sync now preserves peer accountability when duplicate requests become
-  obsolete, without disconnecting healthy peers during local pipeline stalls.
+- Fixed block sync so obsolete in-flight requests no longer disconnect healthy
+  peers, spin the node, or re-fetch already-downloaded blocks
+  ([#209](https://github.com/zakura-core/zakura/pull/209)).
 
 ## [1.0.0] - 2026-07-15
 

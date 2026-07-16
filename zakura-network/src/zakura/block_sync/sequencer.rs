@@ -5,9 +5,10 @@
 //! never touches download-side state — the byte budget, the work scheduler,
 //! peers, emitted actions, or state queries. Two rules keep that boundary clean:
 //!
-//! - every method that frees reserved bytes *returns* the freed count, so the
-//!   reactor releases it against the budget (the budget stays in the reactor for
-//!   the budget is shared), and
+//! - every method that drops held bodies *returns* the freed byte count. Held
+//!   bodies carry no wire-budget charge (retention is bounded by the resident
+//!   look-ahead gate), so the count is accounting for callers and tests, not a
+//!   budget-release obligation, and
 //! - every download-side consequence (mark a height covered, clear covered,
 //!   re-query, attribute misbehavior) is expressed as a value the reactor acts
 //!   on, not performed here.
@@ -34,13 +35,13 @@ pub(super) struct ApplyingBlock {
 /// Outcome of offering a received body to the commit pipeline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum AcceptOutcome {
-    /// The body was buffered and now owns its byte reservation. The reactor must
-    /// mark `covered` covered in the download scheduler so the retry path stops
-    /// re-requesting it.
+    /// The body was buffered. The reactor must mark `covered` covered in the
+    /// download scheduler so the retry path stops re-requesting it.
     Buffered { covered: block::Height },
     /// The body was not buffered (already at/below the floor, held elsewhere in
-    /// the commit pipeline, or a duplicate). The reactor must release the
-    /// `release_bytes` the body still reserved.
+    /// the commit pipeline, or a duplicate). `release_bytes` is the dropped
+    /// body's size; held bodies carry no wire-budget charge, so it is
+    /// informational.
     Redundant { release_bytes: u64 },
 }
 
@@ -57,7 +58,9 @@ pub(super) struct SubmitItem {
 /// Sequencer half of a verified-tip advance (frontier growth/commit).
 #[derive(Copy, Clone, Debug)]
 pub(super) struct AdvanceOutcome {
-    /// Bytes freed from the reorder/applying buffers that the reactor releases.
+    /// Bytes freed from the reorder/applying buffers (informational; held bodies
+    /// carry no wire-budget charge).
+    #[cfg_attr(not(test), allow(dead_code))] // asserted by sequencer unit tests
     pub(super) release_bytes: u64,
     /// Whether the verified tip actually moved. The reactor drops download state
     /// (scheduler/outstanding) and re-drains only when it did.
@@ -156,11 +159,6 @@ impl Sequencer {
         self.reorder.buffered_bytes()
     }
 
-    /// Highest buffered reorder height, for shed-for-floor-starvation.
-    pub(super) fn reorder_max_height(&self) -> Option<block::Height> {
-        self.reorder.max_height()
-    }
-
     pub(super) fn unsubmitted_applying_count(&self) -> usize {
         // Derived: every applying body is either submitted or not.
         self.applying
@@ -243,8 +241,8 @@ impl Sequencer {
     // ---- body acceptance ----
 
     /// Offer a received body to the commit pipeline. Runs the redundancy checks
-    /// and (when not redundant) buffers it in the reorder buffer, which takes
-    /// ownership of the body's existing `bytes` reservation.
+    /// and (when not redundant) buffers it in the reorder buffer with its wire
+    /// `bytes` for the retained-size accounting.
     #[cfg(test)]
     pub(super) fn accept_body(
         &mut self,

@@ -69,9 +69,9 @@ pub(super) enum AdmissionOutcome {
     /// rounds to zero.
     LookaheadAtCap,
     /// The look-ahead gate has headroom but zero bytes are fundable right now
-    /// (the in-flight byte budget is spent). Never returned for floor-priority
+    /// (the in-flight request budget is spent). Never returned for floor-priority
     /// starts: their byte cap is floored at one so the floor block always
-    /// reaches the floor-reservation funding path.
+    /// reaches the bounded-overdraft reservation path.
     InflightBudgetEmpty,
 }
 
@@ -243,6 +243,39 @@ fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSna
         || held_blocks(snapshot) >= LOOKAHEAD_BLOCK_HARD_CAP
 }
 
+/// Remaining resident look-ahead headroom, expressed back in wire bytes so one
+/// admitted response cannot push resident memory past the budget. The next
+/// admitted body will usually become decoded soon, so it is sized as if it
+/// costs the decoded multiple.
+fn remaining_lookahead_wire_bytes(
+    config: &ZakuraBlockSyncConfig,
+    snapshot: &AdmissionSnapshot,
+) -> u64 {
+    config
+        .effective_max_reorder_lookahead_bytes()
+        .saturating_sub(estimated_resident_pipeline_bytes(snapshot))
+        / DESERIALIZED_MEM_FACTOR
+}
+
+/// Retention-only admission for a body that is already downloaded.
+///
+/// A received body consumes no request budget (its wire reservation is
+/// released at receipt), so unlike [`admit`] this never consults
+/// `budget_available`: only the commit-window exemption and the resident
+/// look-ahead gate — the two rules that bound retention — apply.
+pub(super) fn admit_received_body(
+    config: &ZakuraBlockSyncConfig,
+    snapshot: &AdmissionSnapshot,
+    height: block::Height,
+    serialized_bytes: u64,
+) -> bool {
+    if height <= commit_window_high(snapshot) {
+        return true;
+    }
+    !lookahead_over_budget(config, snapshot)
+        && serialized_bytes <= remaining_lookahead_wire_bytes(config, snapshot)
+}
+
 /// Plans one contiguous take starting at `start_height`: the single authority for
 /// the commit-window exemption, the resident-memory gate, and request sizing.
 ///
@@ -265,9 +298,10 @@ fn lookahead_over_budget(config: &ZakuraBlockSyncConfig, snapshot: &AdmissionSna
 /// ≈ 3.2 GB; a single in-window response can also exceed the byte gate by up to the
 /// response cap × the factor) regardless of how far headers/downloads run ahead.
 ///
-/// Floor-priority requests are never blocked just because the normal byte budget is exactly full.
-/// If the lowest missing block is needed to let commit move forward,
-/// it can still be requested even when speculative/look-ahead work has filled the byte budget.
+/// Floor-priority requests are never blocked just because the request budget is exactly
+/// full. If the lowest missing block is needed to let commit move forward, it can still
+/// be requested even when speculative work has spent the in-flight budget (the routine's
+/// bounded floor overdraft funds it).
 pub(super) fn admit(
     config: &ZakuraBlockSyncConfig,
     snapshot: AdmissionSnapshot,
@@ -289,13 +323,7 @@ pub(super) fn admit(
         if lookahead_over_budget(config, &snapshot) {
             return AdmissionOutcome::LookaheadAtCap;
         }
-        // Remaining memory headroom, expressed back in wire bytes for the response cap so a
-        // single response can't push resident memory past the budget. The next admitted body
-        // will usually become decoded soon, so it is sized as if it costs the decoded multiple.
-        let remaining_wire_bytes = config
-            .effective_max_reorder_lookahead_bytes()
-            .saturating_sub(estimated_resident_pipeline_bytes(&snapshot))
-            / DESERIALIZED_MEM_FACTOR;
+        let remaining_wire_bytes = remaining_lookahead_wire_bytes(config, &snapshot);
         if remaining_wire_bytes == 0 {
             return AdmissionOutcome::LookaheadAtCap;
         }
@@ -445,9 +473,10 @@ mod tests {
             ),
             "the final block of a checkpoint range must be admissible under a 1 GiB in-flight budget",
         );
-        // The first height above the window is memory-gated but must still have headroom
-        // under this budget: (802 MB - 2 MB) * 4 resident < 4 GiB effective. This keeps the
-        // assertion non-vacuous now that the whole range is window-exempt.
+        // The first height above the window is memory-gated but must still have headroom:
+        // the snapshot holds one block less than a full range, so its resident estimate is
+        // (802 MB - 2 MB) * 4 ~= 3.2 GB, below the default resident budget (~6.4 GB).
+        // This keeps the assertion non-vacuous now that the whole range is window-exempt.
         assert!(
             matches!(
                 admit(

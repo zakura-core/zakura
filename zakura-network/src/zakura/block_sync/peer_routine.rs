@@ -48,7 +48,7 @@ use super::{
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerControlInput, SequencerView},
     state::{DownloadWindow, LivenessOutcome, ThroughputMeter},
-    work_queue::{LateBodyClaim, WorkItem, WorkQueue, WorkReturnOutcome},
+    work_queue::{LateBodyClaim, ReservationOwner, WorkItem, WorkQueue, WorkReturnOutcome},
     BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
@@ -604,9 +604,10 @@ impl PeerRoutine {
                 continue;
             }
             let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
-            let outcome = self
-                .work
-                .release_reserved_and_return_items_detailed(unreceived.iter().copied());
+            let outcome = self.work.release_reserved_and_return_items_detailed(
+                unreceived.iter().copied(),
+                reservation_owner(self.generation, &outstanding),
+            );
             self.budget.release(outcome.released_bytes);
             self.trace_work_returned("view_reset", &outstanding, unreceived.len(), outcome);
         }
@@ -911,9 +912,14 @@ impl PeerRoutine {
                 self.return_taken_items(&items);
                 break FillStop::Budget;
             }
+            let request_token = self.window.next_request_token();
+            let reservation_owner = ReservationOwner {
+                generation: self.generation,
+                request_token,
+            };
             let marked = self
                 .work
-                .mark_reserved(items.iter().map(|(height, _)| *height));
+                .mark_reserved(items.iter().map(|(height, _)| *height), reservation_owner);
             if marked != reserved_bytes {
                 // Release only what is still reserved, mirroring the sibling unwinds
                 // below. A competing peer's late body may have settled one of these
@@ -921,9 +927,10 @@ impl PeerRoutine {
                 // height's estimate now belongs to the held body (the Sequencer
                 // releases it on commit), so releasing the fixed `reserved_bytes`
                 // here would double-release it and under-count the byte budget.
-                let released = self
-                    .work
-                    .release_reserved_and_return_items(items.iter().map(|(height, _)| *height));
+                let released = self.work.release_reserved_and_return_items(
+                    items.iter().map(|(height, _)| *height),
+                    reservation_owner,
+                );
                 self.budget.release(released);
                 break FillStop::Internal;
             }
@@ -931,9 +938,10 @@ impl PeerRoutine {
             let count = match u32::try_from(kept_count) {
                 Ok(count) => count,
                 Err(_) => {
-                    let released = self
-                        .work
-                        .release_reserved_and_return_items(items.iter().map(|(height, _)| *height));
+                    let released = self.work.release_reserved_and_return_items(
+                        items.iter().map(|(height, _)| *height),
+                        reservation_owner,
+                    );
                     self.budget.release(released);
                     break FillStop::Internal;
                 }
@@ -977,9 +985,10 @@ impl PeerRoutine {
                 // Held-aware: a competing peer's late body may have converted a taken
                 // height during the reserve await; that body is owned by the Sequencer,
                 // so skip it here rather than re-queue and double-release it.
-                let released = self
-                    .work
-                    .release_reserved_and_return_items(items.iter().map(|(height, _)| *height));
+                let released = self.work.release_reserved_and_return_items(
+                    items.iter().map(|(height, _)| *height),
+                    reservation_owner,
+                );
                 self.budget.release(released);
                 if matches!(error, OrderedSendError::Full) {
                     break FillStop::OutboundFull;
@@ -1006,7 +1015,6 @@ impl PeerRoutine {
             let request_start_height = request.start_height;
             let request_count = request.count;
             let request_estimated_bytes = request.estimated_bytes;
-            let request_token = self.window.next_request_token();
             self.window.outstanding.insert(OutstandingBlockRange {
                 token: request_token,
                 state: OutstandingRequestState::Active,
@@ -1234,9 +1242,10 @@ impl PeerRoutine {
             // `in_flight` until committed); re-queuing them would re-fetch a body
             // we already hold (the WorkQueue single-owner invariant forbids it).
             let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
-            let outcome = self
-                .work
-                .release_reserved_and_return_items_detailed(unreceived.iter().copied());
+            let outcome = self.work.release_reserved_and_return_items_detailed(
+                unreceived.iter().copied(),
+                reservation_owner(self.generation, &outstanding),
+            );
             self.budget.release(outcome.released_bytes);
             self.trace_work_returned("request_timeout", &outstanding, unreceived.len(), outcome);
             timed_out_heights.extend(unreceived);
@@ -1308,6 +1317,7 @@ impl PeerRoutine {
         let now = Instant::now();
         let correlation_deadline = self.retirement_deadline(now);
         let work = Arc::clone(&self.work);
+        let generation = self.generation;
         let retired = self.window.outstanding.retire_covered(
             floor,
             now,
@@ -1317,8 +1327,10 @@ impl PeerRoutine {
                 // heights. A height a competing peer delivered late is `Held`: its
                 // body is in the commit pipeline and the Sequencer releases those
                 // bytes on commit, so it must not be released a second time here.
-                released = released
-                    .saturating_add(work.release_reserved_heights(unreceived_heights(outstanding)));
+                released = released.saturating_add(work.release_reserved_heights(
+                    unreceived_heights(outstanding),
+                    reservation_owner(generation, outstanding),
+                ));
             },
         );
         if released > 0 {
@@ -1974,12 +1986,13 @@ impl PeerRoutine {
         if outstanding.request.start_height > tip {
             return current;
         }
+        let owner = reservation_owner(self.generation, outstanding);
         let released_heights: Vec<_> = outstanding_unreceived_through(outstanding, tip).collect();
         self.window.outstanding.mark_received_through(index, tip);
         // Held-aware: release only the still-reserved estimate for the committed
         // prefix; a height a competing peer delivered late is owned by the
         // Sequencer, so it is left in place instead of double-released.
-        let released_bytes = self.work.release_reserved_heights(released_heights);
+        let released_bytes = self.work.release_reserved_heights(released_heights, owner);
         self.budget.release(released_bytes);
         if self.window.outstanding.is_complete(index) {
             Disposition::Satisfied
@@ -2014,9 +2027,10 @@ impl PeerRoutine {
                 // returns to the queue (buffered heights stay in `in_flight`
                 // until the floor commits past them). Release any residual
                 // reserved estimate (normally none once complete).
-                let released = self
-                    .work
-                    .release_reserved_heights(unreceived_heights(&outstanding));
+                let released = self.work.release_reserved_heights(
+                    unreceived_heights(&outstanding),
+                    reservation_owner(self.generation, &outstanding),
+                );
                 self.budget.release(released);
             }
             // With fanout = 1 a received height is already buffered and must never
@@ -2024,9 +2038,10 @@ impl PeerRoutine {
             // unreceived heights to `pending`. `return_items` is idempotent.
             Disposition::RetryOriginal | Disposition::RetryMissing => {
                 let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
-                let outcome = self
-                    .work
-                    .release_reserved_and_return_items_detailed(unreceived.iter().copied());
+                let outcome = self.work.release_reserved_and_return_items_detailed(
+                    unreceived.iter().copied(),
+                    reservation_owner(self.generation, &outstanding),
+                );
                 self.budget.release(outcome.released_bytes);
                 self.trace_work_returned(
                     disposition.trace_label(),
@@ -2262,6 +2277,7 @@ impl PeerRoutine {
         if outcome.missing_count == 0
             && outcome.held_count == 0
             && outcome.released_count == 0
+            && outcome.owner_mismatch_count == 0
             && outcome.returned_count == unreceived_count
         {
             return;
@@ -2572,12 +2588,20 @@ fn insert_work_return_outcome(
     bs_insert_u64(row, "already_pending_count", outcome.already_pending_count);
     bs_insert_u64(row, "held_count", outcome.held_count);
     bs_insert_u64(row, "released_count", outcome.released_count);
+    bs_insert_u64(row, "owner_mismatch_count", outcome.owner_mismatch_count);
     bs_insert_u64(row, "missing_count", outcome.missing_count);
     if let Some(height) = outcome.min_height {
         bs_insert_height(row, "return_min_height", height);
     }
     if let Some(height) = outcome.max_height {
         bs_insert_height(row, "return_max_height", height);
+    }
+}
+
+fn reservation_owner(generation: u64, outstanding: &OutstandingBlockRange) -> ReservationOwner {
+    ReservationOwner {
+        generation,
+        request_token: outstanding.token,
     }
 }
 
@@ -2638,9 +2662,10 @@ impl Drop for PeerRoutine {
                 .filter(|expected| !outstanding.has_received(expected.height))
                 .map(|expected| expected.height)
                 .collect();
-            let outcome = self
-                .work
-                .release_reserved_and_return_items_detailed(unreceived.iter().copied());
+            let outcome = self.work.release_reserved_and_return_items_detailed(
+                unreceived.iter().copied(),
+                reservation_owner(self.generation, &outstanding),
+            );
             self.budget.release(outcome.released_bytes);
             self.trace_work_returned("peer_routine_drop", &outstanding, unreceived.len(), outcome);
         }

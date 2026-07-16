@@ -25,6 +25,9 @@ use super::{
     *,
 };
 
+#[cfg(test)]
+use super::work_queue::ReservationOwner;
+
 /// Favor the lowest needed height over the speculative high tail.
 ///
 /// While the byte budget cannot fund even one worst-case request yet the lowest
@@ -995,7 +998,16 @@ mod tests {
             1
         );
         assert_eq!(work.take_in_range(height, height, 1).len(), 1);
-        assert_eq!(work.mark_reserved([height]), 64);
+        assert_eq!(
+            work.mark_reserved(
+                [height],
+                ReservationOwner {
+                    generation: 1,
+                    request_token: 1,
+                },
+            ),
+            64
+        );
         assert!(budget.try_reserve(64));
         assert_eq!(work.settle_active_reserved_height(height, 64), Some(0));
         let budget_view = budget.clone();
@@ -1079,7 +1091,16 @@ mod tests {
             1
         );
         assert_eq!(work.take_in_range(successor, successor, 1).len(), 1);
-        assert_eq!(work.mark_reserved([successor]), 64);
+        assert_eq!(
+            work.mark_reserved(
+                [successor],
+                ReservationOwner {
+                    generation: 1,
+                    request_token: 1,
+                },
+            ),
+            64
+        );
         assert!(budget.try_reserve(64));
         assert_eq!(work.settle_active_reserved_height(successor, 64), Some(0));
         let work_view = Arc::clone(&work);

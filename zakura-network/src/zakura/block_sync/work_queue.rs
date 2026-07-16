@@ -27,12 +27,23 @@ use tokio::sync::Notify;
 use zakura_chain::block;
 
 use super::{
+    outstanding::BlockRequestToken,
     request::BlockSizeEstimate,
     state::{BlockBudgetLedger, ByteBudget},
 };
 
 /// Lower clamp on a body-size estimate.
 pub(super) const DEFAULT_BS_SIZE_FLOOR_BYTES: u64 = 1024;
+
+/// Identity of the request that owns a reserved work item.
+///
+/// Routine generations are allocated globally, so the pair is unique across
+/// peers and routine replacements without retaining a peer ID in every item.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct ReservationOwner {
+    pub(super) generation: u64,
+    pub(super) request_token: BlockRequestToken,
+}
 
 /// Per-height download metadata held in the [`WorkQueue`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -50,6 +61,10 @@ pub(super) struct WorkItem {
     /// stale local owner cannot release a charge that another path already
     /// returned.
     pub(super) budget: BlockBudgetLedger,
+    /// Request allowed to release a `Reserved` charge.
+    ///
+    /// Cleared whenever the item becomes pending, held, or otherwise released.
+    pub(super) reservation_owner: Option<ReservationOwner>,
 }
 
 /// Diagnostics for an attempted `in_flight -> pending` retry transition.
@@ -69,6 +84,8 @@ pub(super) struct WorkReturnOutcome {
     pub(super) held_count: u64,
     /// Items present in `in_flight` with an unexpected `Released` ledger.
     pub(super) released_count: u64,
+    /// Reserved items now owned by a replacement request.
+    pub(super) owner_mismatch_count: u64,
     /// Requested heights absent from both `pending` and `in_flight`.
     pub(super) missing_count: u64,
     /// Lowest height considered by the cleanup.
@@ -177,6 +194,7 @@ impl WorkQueue {
                         hash,
                         estimated_bytes,
                         budget: BlockBudgetLedger::Released,
+                        reservation_owner: None,
                     },
                 );
                 inserted += 1;
@@ -332,7 +350,11 @@ impl WorkQueue {
     ///
     /// Returns the sum marked. The caller must have already admitted the same
     /// byte total through [`ByteBudget`](crate::zakura::transport::ByteBudget).
-    pub(super) fn mark_reserved(&self, heights: impl IntoIterator<Item = block::Height>) -> u64 {
+    pub(super) fn mark_reserved(
+        &self,
+        heights: impl IntoIterator<Item = block::Height>,
+        owner: ReservationOwner,
+    ) -> u64 {
         let mut marked = 0u64;
         let mut inner = self.lock();
         for height in heights {
@@ -343,6 +365,7 @@ impl WorkQueue {
                 continue;
             }
             item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
+            item.reservation_owner = Some(owner);
             marked = marked.saturating_add(item.estimated_bytes);
         }
         // Released (0) -> Reserved(estimate): the reserved total grows by exactly
@@ -369,7 +392,9 @@ impl WorkQueue {
                 return None;
             }
             // Reserved(reserved) -> Held(actual): the reserved charge drops to 0.
-            (item.budget.reserved_charge(), item.budget.settle(actual))
+            let result = (item.budget.reserved_charge(), item.budget.settle(actual));
+            item.reservation_owner = None;
+            result
         };
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
         Some(delta)
@@ -396,6 +421,7 @@ impl WorkQueue {
             if item.budget.is_reserved() {
                 let reserved_before = item.budget.reserved_charge();
                 let delta = item.budget.settle(actual);
+                item.reservation_owner = None;
                 inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
                 return LateBodyClaim::SettledReserved(delta);
             }
@@ -423,6 +449,7 @@ impl WorkQueue {
         let reserved_before = item.budget.reserved_charge();
         let previous_charge = item.budget.release();
         item.budget = BlockBudgetLedger::Held(actual);
+        item.reservation_owner = None;
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
         inner.in_flight.insert(height, item);
         budget.release(previous_charge);
@@ -441,6 +468,7 @@ impl WorkQueue {
             let reserved_before = item.budget.reserved_charge();
             let previous_charge = item.budget.release();
             item.budget = BlockBudgetLedger::Held(actual);
+            item.reservation_owner = None;
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
             return previous_charge;
         }
@@ -448,6 +476,7 @@ impl WorkQueue {
             let reserved_before = item.budget.reserved_charge();
             let previous_charge = item.budget.release();
             item.budget = BlockBudgetLedger::Held(actual);
+            item.reservation_owner = None;
             inner.in_flight.insert(height, item);
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_before);
             return previous_charge;
@@ -471,9 +500,11 @@ impl WorkQueue {
             if let Some(item) = inner.in_flight.get_mut(&height) {
                 reserved_removed = reserved_removed.saturating_add(item.budget.reserved_charge());
                 released = released.saturating_add(item.budget.release());
+                item.reservation_owner = None;
             } else if let Some(item) = inner.pending.get_mut(&height) {
                 reserved_removed = reserved_removed.saturating_add(item.budget.reserved_charge());
                 released = released.saturating_add(item.budget.release());
+                item.reservation_owner = None;
             }
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(reserved_removed);
@@ -493,17 +524,20 @@ impl WorkQueue {
     pub(super) fn release_reserved_heights(
         &self,
         heights: impl IntoIterator<Item = block::Height>,
+        owner: ReservationOwner,
     ) -> u64 {
         let mut released = 0u64;
         let mut inner = self.lock();
         for height in heights {
             if let Some(item) = inner.in_flight.get_mut(&height) {
-                if item.budget.is_reserved() {
+                if item.budget.is_reserved() && item.reservation_owner == Some(owner) {
                     released = released.saturating_add(item.budget.release_reserved());
+                    item.reservation_owner = None;
                 }
             } else if let Some(item) = inner.pending.get_mut(&height) {
-                if item.budget.is_reserved() {
+                if item.budget.is_reserved() && item.reservation_owner == Some(owner) {
                     released = released.saturating_add(item.budget.release_reserved());
+                    item.reservation_owner = None;
                 }
             }
         }
@@ -526,6 +560,7 @@ impl WorkQueue {
                     reserved_removed =
                         reserved_removed.saturating_add(item.budget.reserved_charge());
                     released = released.saturating_add(item.budget.release());
+                    item.reservation_owner = None;
                     inner.pending.insert(height, item);
                     moved = true;
                 }
@@ -546,8 +581,9 @@ impl WorkQueue {
     pub(super) fn release_reserved_and_return_items(
         &self,
         heights: impl IntoIterator<Item = block::Height>,
+        owner: ReservationOwner,
     ) -> u64 {
-        self.release_reserved_and_return_items_detailed(heights)
+        self.release_reserved_and_return_items_detailed(heights, owner)
             .released_bytes
     }
 
@@ -556,6 +592,7 @@ impl WorkQueue {
     pub(super) fn release_reserved_and_return_items_detailed(
         &self,
         heights: impl IntoIterator<Item = block::Height>,
+        owner: ReservationOwner,
     ) -> WorkReturnOutcome {
         let mut moved = false;
         let mut outcome = WorkReturnOutcome::default();
@@ -592,6 +629,10 @@ impl WorkQueue {
                     }
                     BlockBudgetLedger::Reserved(_) => {}
                 }
+                if item.reservation_owner != Some(owner) {
+                    outcome.owner_mismatch_count = outcome.owner_mismatch_count.saturating_add(1);
+                    continue;
+                }
                 let mut item = inner
                     .in_flight
                     .remove(&height)
@@ -600,6 +641,7 @@ impl WorkQueue {
                 // the reserved charge leaving the queue.
                 outcome.released_bytes =
                     outcome.released_bytes.saturating_add(item.budget.release());
+                item.reservation_owner = None;
                 outcome.returned_count = outcome.returned_count.saturating_add(1);
                 inner.pending.insert(height, item);
                 moved = true;

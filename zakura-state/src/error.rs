@@ -151,7 +151,7 @@ impl CommitBlockError {
     }
 
     /// Returns the height for any retryable VCT root stall (absent/evicted root, or one
-    /// not yet verifiable for lack of a buffered successor). See
+    /// not yet verifiable for lack of a stored successor header). See
     /// [`ValidateContextError::vct_retryable_height`].
     pub fn vct_retryable_height(&self) -> Option<block::Height> {
         match self {
@@ -240,7 +240,7 @@ impl CommitCheckpointVerifiedError {
     }
 
     /// Returns the height for any retryable VCT root stall (absent/evicted root, or one
-    /// not yet verifiable for lack of a buffered successor). See
+    /// not yet verifiable for lack of a stored successor header). See
     /// [`ValidateContextError::vct_retryable_height`].
     pub fn vct_retryable_height(&self) -> Option<block::Height> {
         self.0.vct_retryable_height()
@@ -564,9 +564,9 @@ pub enum ValidateContextError {
 
     #[error(
         "verified-commitment-trees fast path cannot yet verify the supplied root for height \
-         {height:?}: no successor block is buffered to confirm it against the header chain, and \
+         {height:?}: no successor header is stored to confirm it against the header chain, and \
          committing it unverified would persist a root that is only checked one block later \
-         (irreversibly, once on disk). Commit is deferred until the successor arrives (retryable)"
+         (irreversibly, once on disk). Commit is deferred until the successor header arrives (retryable)"
     )]
     #[non_exhaustive]
     VctSuppliedRootAwaitingSuccessor { height: block::Height },
@@ -820,7 +820,7 @@ impl ValidateContextError {
     /// verification. It can only be filled by a later re-delivery of that header range (for
     /// example another fanout peer's response); roots are not individually re-requested. An
     /// await-successor stall ([`Self::vct_retryable_height`] but not this) already has its root
-    /// and only waits for the next block to be downloaded.
+    /// and only waits for the next header to be stored.
     pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
         match self {
             ValidateContextError::VctSuppliedRootUnavailable { height } => Some(*height),

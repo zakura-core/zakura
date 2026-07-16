@@ -27,6 +27,10 @@ use super::{
 
 #[cfg(test)]
 use super::work_queue::{LateBodyClaim, ReservationOwner};
+#[cfg(test)]
+use zakura_chain::serialization::ZcashDeserializeInto;
+#[cfg(test)]
+use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
 
 /// Favor the lowest needed height over the speculative high tail.
 ///
@@ -1058,6 +1062,139 @@ mod tests {
             task.sequencer.reorder_hash(height),
             Some(replacement_hash),
             "a replacement claimed under the new epoch must enter the reorder pipeline"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_rejection_discards_queued_successor_from_old_epoch() {
+        let predecessor: Arc<block::Block> = Arc::new(
+            BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .expect("block 1 vector parses"),
+        );
+        let successor: Arc<block::Block> = Arc::new(
+            BLOCK_MAINNET_2_BYTES
+                .zcash_deserialize_into()
+                .expect("block 2 vector parses"),
+        );
+        let predecessor_height = block::Height(1);
+        let successor_height = block::Height(2);
+        let peer = ZakuraPeerId::new(vec![3; 32]).expect("32-byte test peer id is valid");
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+
+        let mut budget = ByteBudget::new(1_024);
+        assert!(budget.try_reserve(64));
+        let budget_view = budget.clone();
+        let mut sequencer = Sequencer::new(block::Height(0), 2);
+        assert_eq!(
+            sequencer.accept_body(
+                predecessor_height,
+                predecessor.hash(),
+                predecessor,
+                64,
+                peer.clone(),
+            ),
+            AcceptOutcome::Buffered {
+                covered: predecessor_height
+            }
+        );
+        assert_eq!(
+            sequencer.drain_ready_into_applying(),
+            vec![predecessor_height]
+        );
+        let predecessor_submit = sequencer
+            .prepare_submit(predecessor_height)
+            .expect("contiguous predecessor is submittable");
+        sequencer.record_submitted_apply(predecessor_height, predecessor_submit.hash);
+
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        assert_eq!(
+            work.extend([(
+                successor_height,
+                successor.hash(),
+                BlockSizeEstimate::Advertised(64),
+            )]),
+            1
+        );
+        assert_eq!(
+            work.claim_late_body(
+                successor_height,
+                successor.hash(),
+                predecessor_submit.hash,
+                64,
+                &mut budget,
+                true,
+            ),
+            LateBodyClaim::ClaimedPending(0)
+        );
+
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(64));
+        let (body_tx, body_rx) = mpsc::channel(1);
+        body_tx
+            .send(SequencedBody {
+                height: successor_height,
+                hash: successor.hash(),
+                body: BufferedBlockBody::Decoded(successor),
+                bytes: 64,
+                peer: peer.clone(),
+                received_at: Instant::now(),
+                reset_epoch: 0,
+            })
+            .await
+            .expect("old-epoch successor queues before rejection");
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        control_tx
+            .send(SequencerControlInput::ApplyFinished {
+                token: predecessor_submit.token,
+                height: predecessor_height,
+                hash: predecessor_submit.hash,
+                result: BlockApplyResult::Rejected,
+                local_frontier: None,
+            })
+            .expect("predecessor rejection queues");
+        drop(body_tx);
+        drop(control_tx);
+
+        let (actions_tx, mut actions_rx) = mpsc::channel(4);
+        let (view_tx, view_rx) = watch::channel(initial_view(frontiers));
+        let task = SequencerTask::new(
+            sequencer,
+            budget,
+            work,
+            actions_tx,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            body_rx,
+            control_rx,
+            body_input_bytes,
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+
+        task.run().await;
+
+        assert_eq!(budget_view.reserved(), 0);
+        let final_view = *view_rx.borrow();
+        assert_eq!(final_view.reset_epoch, 1);
+        assert_eq!(final_view.reorder_len, 0);
+        assert_eq!(final_view.applying_len, 0);
+        assert_eq!(final_view.submitted_applying_count, 0);
+        assert!(matches!(
+            actions_rx.recv().await,
+            Some(BlockSyncAction::Misbehavior {
+                peer: source,
+                reason: BlockSyncMisbehavior::InvalidBlock,
+            }) if source == peer
+        ));
+        assert!(
+            actions_rx.recv().await.is_none(),
+            "the stale successor must not be submitted after predecessor rollback"
         );
     }
 

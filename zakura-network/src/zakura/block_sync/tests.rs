@@ -800,8 +800,9 @@ fn destructive_reset_and_claim_are_atomic_in_both_lock_orderings() {
         assert!(!queue.in_flight_contains(height));
     }
 
-    // Reset wins the mutex: it clears the pending old-epoch item and bumps the
-    // epoch before the competing claim can classify ownership.
+    // Reset wins the mutex: while it holds the lock, replacement work starts
+    // repopulating the same height. Once the reset clears the old item and bumps
+    // the epoch, the replacement is inserted and claimed under epoch 1.
     {
         let queue = Arc::new(WorkQueue::new(block::Height(0)));
         queue.set_estimate_floor_for_tests(1);
@@ -809,9 +810,11 @@ fn destructive_reset_and_claim_are_atomic_in_both_lock_orderings() {
             queue.extend([(height, hash, BlockSizeEstimate::Advertised(100))]),
             1
         );
+        let replacement_hash = block::Hash([2; 32]);
         let locked = Arc::new(std::sync::Barrier::new(2));
         let proceed = Arc::new(std::sync::Barrier::new(2));
-        let (reset, claim) = std::thread::scope(|scope| {
+        let replacement_ready = Arc::new(std::sync::Barrier::new(2));
+        let (reset, inserted, claim) = std::thread::scope(|scope| {
             let reset_queue = Arc::clone(&queue);
             let reset_locked = Arc::clone(&locked);
             let reset_proceed = Arc::clone(&proceed);
@@ -822,28 +825,40 @@ fn destructive_reset_and_claim_are_atomic_in_both_lock_orderings() {
                 })
             });
             locked.wait();
-            let claim_queue = Arc::clone(&queue);
-            let claim = scope.spawn(move || {
-                let mut budget = ByteBudget::new(1_000);
-                claim_queue.claim_late_body(
+            let replacement_queue = Arc::clone(&queue);
+            let replacement_is_ready = Arc::clone(&replacement_ready);
+            let replacement = scope.spawn(move || {
+                replacement_is_ready.wait();
+                let inserted = replacement_queue.extend([(
                     height,
-                    hash,
+                    replacement_hash,
+                    BlockSizeEstimate::Advertised(80),
+                )]);
+                let mut budget = ByteBudget::new(1_000);
+                let claim = replacement_queue.claim_late_body(
+                    height,
+                    replacement_hash,
                     block::Hash([0; 32]),
                     80,
                     &mut budget,
                     true,
-                )
+                );
+                (inserted, claim)
             });
+            replacement_ready.wait();
             proceed.wait();
-            (
-                reset.join().expect("reset thread does not panic"),
-                claim.join().expect("claim thread does not panic"),
-            )
+            let reset = reset.join().expect("reset thread does not panic");
+            let (inserted, claim) = replacement
+                .join()
+                .expect("replacement thread does not panic");
+            (reset, inserted, claim)
         });
 
         assert_eq!(reset.1, 1);
-        assert_eq!(claim, LateBodyClaim::Missing);
-        assert!(!queue.in_flight_contains(height));
+        assert_eq!(inserted, 1);
+        assert_eq!(claim, LateBodyClaim::ClaimedPending(1));
+        assert!(queue.in_flight_contains(height));
+        assert!(!queue.pending_contains(height));
     }
 }
 
@@ -9003,19 +9018,19 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
 #[tokio::test]
 async fn reactor_forward_reset_preserves_future_outstanding_body() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 3,
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: blocks[0].hash(),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
         },
-        (block::Height(1), blocks[0].hash()),
+        (block::Height(0), block::Hash([0; 32])),
         tip_rx,
         config.clone(),
     );
@@ -9028,7 +9043,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
         block::Height(3),
         blocks[2].hash(),
         1,
-        u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES * 2).unwrap_or(u32::MAX),
+        u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES * 3).unwrap_or(u32::MAX),
     )
     .await;
 
@@ -9038,7 +9053,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
-            from: block::Height(2),
+            from: block::Height(1),
             best_header_tip: block::Height(3),
             ..
         }
@@ -9046,6 +9061,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
 
     handle
         .send(BlockSyncEvent::NeededBlocks(vec![
+            block_meta(&blocks[0]),
             block_meta(&blocks[1]),
             block_meta(&blocks[2]),
         ]))
@@ -9053,14 +9069,39 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
         .expect("initial needed metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 2)
+        (block::Height(1), 3)
     );
+
+    for (expected_height, body) in [
+        (block::Height(1), blocks[0].clone()),
+        (block::Height(2), blocks[1].clone()),
+    ] {
+        inbound_tx
+            .send(
+                BlockSyncMessage::Block(body.clone())
+                    .encode_frame()
+                    .expect("block encodes"),
+            )
+            .await
+            .expect("ancestry body queues");
+        loop {
+            match next_action(&mut actions).await {
+                BlockSyncAction::SubmitBlock { block, .. } => {
+                    assert_eq!(block.coinbase_height(), Some(expected_height));
+                    assert_eq!(block.hash(), body.hash());
+                    break;
+                }
+                BlockSyncAction::QueryNeededBlocks { .. } => {}
+                action => panic!("unexpected action before ancestry submit: {action:?}"),
+            }
+        }
+    }
 
     handle
         .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
             finalized_height: block::Height(0),
-            verified_block_tip: block::Height(2),
-            verified_block_hash: blocks[1].hash(),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
         }))
         .await
         .expect("forward reset event queues");

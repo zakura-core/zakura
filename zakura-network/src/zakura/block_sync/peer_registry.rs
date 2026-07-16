@@ -157,11 +157,16 @@ impl PeerRegistry {
         self.lock_parked().insert(peer.clone(), until);
     }
 
-    /// Whether the peer is still in its no-progress reconnect cooldown.
-    pub(super) fn is_peer_parked(&self, peer: &ZakuraPeerId, now: Instant) -> bool {
+    /// Return this peer's active local park deadline.
+    pub(super) fn peer_parked_until(&self, peer: &ZakuraPeerId, now: Instant) -> Option<Instant> {
         let mut parked_peers = self.lock_parked();
         parked_peers.retain(|_, until| *until > now);
-        parked_peers.get(peer).is_some_and(|until| *until > now)
+        parked_peers.get(peer).copied()
+    }
+
+    /// Whether the peer is still in its no-progress reconnect cooldown.
+    pub(super) fn is_peer_parked(&self, peer: &ZakuraPeerId, now: Instant) -> bool {
+        self.peer_parked_until(peer, now).is_some()
     }
 
     /// Admit (or re-admit) a peer and allocate a fresh routine generation.

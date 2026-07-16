@@ -12,9 +12,9 @@ use tokio_util::sync::CancellationToken;
 use super::{events::*, pipe::*, wire::*, *};
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, Flow, Frame, FramedRecv, FramedSend,
-    OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServicePeerDirection, SessionGuard,
-    Sink, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId, ZakuraSupervisorHandle,
-    ZAKURA_CAP_HEADER_SYNC,
+    OrderedSendError, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
+    PeerStreamSession, Pipe, Service, ServicePeerDirection, SessionGuard, Sink, SinkReject, Stream,
+    StreamMode, ZakuraConnId, ZakuraPeerId, ZakuraSupervisorHandle, ZAKURA_CAP_HEADER_SYNC,
 };
 
 const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
@@ -497,6 +497,53 @@ impl Service for HeaderSyncService {
         header_sync_streams()
     }
 
+    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
+        OrderedStreamPolicy {
+            opening: OrderedStreamOpening::InitiatorOnly,
+            reopen: true,
+        }
+    }
+
+    fn ordered_session_demand(
+        &self,
+        _conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        _negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        let mut peers = self.header_sync.subscribe_peer_snapshot();
+        let snapshot = *peers.borrow_and_update();
+        let slots_free = match direction {
+            ServicePeerDirection::Inbound => snapshot.inbound_slots_free,
+            ServicePeerDirection::Outbound => snapshot.outbound_slots_free,
+        };
+        if slots_free == 0 {
+            return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+                if peers.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }));
+        }
+
+        let Some(node_id) = header_peer_node_id(peer) else {
+            return OrderedSessionDemand::Retire;
+        };
+        let mut candidates = self.header_sync.subscribe_candidate_state();
+        if candidates
+            .borrow_and_update()
+            .backed_off_node_ids
+            .contains(&node_id)
+        {
+            return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+                if candidates.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }));
+        }
+
+        OrderedSessionDemand::OpenNow
+    }
+
     fn wants_peer(
         &self,
         _peer: &ZakuraPeerId,
@@ -721,6 +768,21 @@ impl Service for HeaderSyncPassthroughService {
         header_sync_streams()
     }
 
+    fn ordered_stream_policy(&self, kind: u16) -> OrderedStreamPolicy {
+        self.inner.ordered_stream_policy(kind)
+    }
+
+    fn ordered_session_demand(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        self.inner
+            .ordered_session_demand(conn_id, peer, negotiated, direction)
+    }
+
     fn wants_peer(
         &self,
         peer: &ZakuraPeerId,
@@ -777,6 +839,11 @@ impl Service for HeaderSyncPassthroughService {
     ) -> Result<(), SinkReject> {
         self.inner.deliver_frame(peer_id, stream_kind, frame)
     }
+}
+
+fn header_peer_node_id(peer: &ZakuraPeerId) -> Option<iroh::NodeId> {
+    let bytes: [u8; 32] = peer.as_bytes().try_into().ok()?;
+    iroh::NodeId::from_bytes(&bytes).ok()
 }
 
 #[derive(Debug)]

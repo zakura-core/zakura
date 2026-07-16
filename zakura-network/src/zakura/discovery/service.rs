@@ -9,9 +9,10 @@
 //! original native-discovery wire so peers interoperate.
 
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
@@ -23,9 +24,10 @@ use tokio_util::sync::CancellationToken;
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
     CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncEvent, HeaderSyncHandle,
-    OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServiceAdmissionDecision,
-    ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId,
-    LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+    OrderedSendError, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
+    PeerStreamSession, Pipe, Service, ServiceAdmissionDecision, ServicePeerDirection, SinkReject,
+    Stream, StreamMode, ZakuraConnId, ZakuraPeerId, LOCAL_MAX_CONTROL_FRAME_BYTES,
+    ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
 };
 
 #[cfg(test)]
@@ -155,6 +157,7 @@ pub struct DiscoveryService {
     handle: ZakuraDiscoveryHandle,
     header_sync: Option<HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
+    retired_sessions: Arc<StdMutex<HashSet<(ZakuraPeerId, ZakuraConnId)>>>,
 }
 
 impl DiscoveryService {
@@ -164,6 +167,7 @@ impl DiscoveryService {
             handle,
             header_sync: None,
             block_sync: None,
+            retired_sessions: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -177,6 +181,7 @@ impl DiscoveryService {
             handle,
             header_sync: Some(header_sync),
             block_sync,
+            retired_sessions: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -193,6 +198,46 @@ impl Service for DiscoveryService {
 
     fn streams(&self) -> &[Stream] {
         discovery_streams()
+    }
+
+    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
+        OrderedStreamPolicy {
+            opening: OrderedStreamOpening::InitiatorOnly,
+            reopen: true,
+        }
+    }
+
+    fn ordered_session_demand(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        _negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        if self
+            .retired_sessions
+            .lock()
+            .expect("discovery retired-session mutex is never poisoned")
+            .contains(&(peer.clone(), conn_id))
+        {
+            return OrderedSessionDemand::Retire;
+        }
+
+        let mut peers = self.handle.subscribe_peer_snapshot();
+        let snapshot = *peers.borrow_and_update();
+        let slots_free = match direction {
+            ServicePeerDirection::Inbound => snapshot.inbound_slots_free,
+            ServicePeerDirection::Outbound => snapshot.outbound_slots_free,
+        };
+        if slots_free == 0 {
+            return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+                if peers.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }));
+        }
+
+        OrderedSessionDemand::OpenNow
     }
 
     fn wants_peer(
@@ -237,6 +282,7 @@ impl Service for DiscoveryService {
         let handle = self.handle.clone();
         let header_sync = self.header_sync.clone();
         let block_sync = self.block_sync.clone();
+        let retired_sessions = self.retired_sessions.clone();
         // SR-1: a panic in the admission task (before it hands off to the
         // exchange) must still disconnect this one peer and cancel its discovery
         // session instead of leaving admitted state behind a half-live
@@ -286,12 +332,17 @@ impl Service for DiscoveryService {
                     connection_cancel,
                     close_cause,
                     other_service_negotiated,
+                    retired_sessions,
                 });
             },
         );
     }
 
     fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
+        self.retired_sessions
+            .lock()
+            .expect("discovery retired-session mutex is never poisoned")
+            .remove(&(peer.clone(), conn_id));
         let handle = self.handle.clone();
         let peer = peer.clone();
         tokio::spawn(async move {
@@ -312,6 +363,7 @@ struct DiscoveryExchangeStart {
     connection_cancel: CancellationToken,
     close_cause: CloseCause,
     other_service_negotiated: bool,
+    retired_sessions: Arc<StdMutex<HashSet<(ZakuraPeerId, ZakuraConnId)>>>,
 }
 
 fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
@@ -327,6 +379,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         connection_cancel,
         close_cause,
         other_service_negotiated,
+        retired_sessions,
     } = start;
     let peer_id = discovery_session.peer_id().clone();
     let progress = Arc::new(DiscoveryExchangeProgress::default());
@@ -393,6 +446,10 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
             let exchanged = source.run().await;
             if exchanged {
                 handle.mark_short_lived_exchange(&peer_node_id).await;
+                retired_sessions
+                    .lock()
+                    .expect("discovery retired-session mutex is never poisoned")
+                    .insert((peer_id.clone(), conn_id));
             }
             service_cancel.cancel();
             handle.remove_peer(&peer_id, conn_id).await;
@@ -1642,7 +1699,7 @@ mod tests {
         let (service_send, mut peer_recv) = framed_channel(16);
         let streams = HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]);
         service.add_peer(Peer::new(
-            peer_id,
+            peer_id.clone(),
             None,
             ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC,
             streams,
@@ -1660,6 +1717,15 @@ mod tests {
                 .is_err(),
             "discovery releases only its own session while header sync owns the connection"
         );
+        assert!(matches!(
+            service.ordered_session_demand(
+                0,
+                &peer_id,
+                ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC,
+                ServicePeerDirection::Inbound,
+            ),
+            OrderedSessionDemand::Retire,
+        ));
 
         header_task.abort();
         Ok(())

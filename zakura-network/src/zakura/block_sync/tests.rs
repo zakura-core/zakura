@@ -24,9 +24,9 @@ use super::{
 use crate::zakura::{
     framed_channel,
     testkit::{await_until, TraceCapture, TraceValue},
-    ChainFrontier, FramedRecv, FramedSend, Frontier, FrontierChange, FrontierUpdate, Peer, Service,
-    ServicePeerSnapshot, ServiceRegistry, StreamMode, ZakuraBlockSyncCandidateState,
-    ZakuraSyncExchange,
+    ChainFrontier, FramedRecv, FramedSend, Frontier, FrontierChange, FrontierUpdate,
+    OrderedSessionDemand, Peer, Service, ServicePeerSnapshot, ServiceRegistry, StreamMode,
+    ZakuraBlockSyncCandidateState, ZakuraSyncExchange,
 };
 use zakura_chain::{
     fmt::HexDebug,
@@ -5346,6 +5346,56 @@ async fn wants_peer_rejects_when_configured_slot_cap_is_reached() {
     ));
 
     assert_eq!(service.peer_count(), 2);
+}
+
+#[tokio::test]
+async fn locally_parked_block_sync_session_waits_at_tip_then_reopens_for_new_work() {
+    let config = ZakuraBlockSyncConfig::default();
+    let (events, _event_rx) = mpsc::channel(config.peer_limits.inbound_queue_depth.max(1));
+    let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
+    let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
+    let (_status_tx, status) = watch::channel(config.initial_status());
+    let (candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
+    let handle = BlockSyncHandle {
+        events,
+        lifecycle,
+        peers,
+        status,
+        candidates,
+        routine_wiring: None,
+    };
+    let service = BlockSyncService::new_with_handle_for_test(config, handle);
+    let peer = peer(9);
+    let conn_id = 17;
+    service.mark_locally_parked_session_for_test(peer.clone(), conn_id);
+
+    let demand = service.ordered_session_demand(
+        conn_id,
+        &peer,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+    );
+    let OrderedSessionDemand::WaitForChange(changed) = demand else {
+        panic!("a locally parked session must stay absent while block sync is at tip");
+    };
+
+    candidates_tx.send_replace(ZakuraBlockSyncCandidateState {
+        missing_block_bodies: vec![block::Height(1)],
+        admitted_node_ids: Vec::new(),
+    });
+    tokio::time::timeout(Duration::from_secs(1), changed)
+        .await
+        .expect("new block work wakes the parked session demand");
+
+    assert!(matches!(
+        service.ordered_session_demand(
+            conn_id,
+            &peer,
+            ZAKURA_CAP_BLOCK_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow,
+    ));
 }
 
 #[tokio::test]

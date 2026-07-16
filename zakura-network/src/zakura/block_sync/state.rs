@@ -200,6 +200,11 @@ impl BlockSyncHandle {
         *self.peers.borrow()
     }
 
+    /// Subscribe to block-sync peer slot snapshots.
+    pub fn subscribe_peer_snapshot(&self) -> watch::Receiver<ServicePeerSnapshot> {
+        self.peers.clone()
+    }
+
     /// Park `peer` for `cooldown`, exactly as the no-progress liveness deadline
     /// does when it evicts an unproductive block-sync peer.
     #[cfg(test)]

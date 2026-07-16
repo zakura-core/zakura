@@ -41,10 +41,10 @@ use crate::{
 
 use super::{
     spawn_supervised_peer_task, trace::peer_label as trace_peer_label, BoxRunFuture, Frame,
-    FramedSend, OrderedSendError, Peer, RequestResponseService, Service as ZakuraService,
-    SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerHandle, ZakuraPeerId,
-    ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES, LEGACY_REQUEST_TABLE,
-    LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
+    FramedSend, OrderedSendError, OrderedStreamOpening, OrderedStreamPolicy, Peer,
+    RequestResponseService, Service as ZakuraService, SinkReject, Stream, StreamMode, ZakuraConnId,
+    ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
+    LEGACY_REQUEST_TABLE, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
 /// Zakura stream kind reserved for legacy gossip compatibility.
@@ -2339,6 +2339,13 @@ impl ZakuraService for LegacyGossipSink {
 
     fn streams(&self) -> &[Stream] {
         legacy_gossip_streams()
+    }
+
+    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
+        OrderedStreamPolicy {
+            opening: OrderedStreamOpening::InitiatorOnly,
+            reopen: true,
+        }
     }
 
     fn add_peer(&self, mut peer: Peer) {

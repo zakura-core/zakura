@@ -7,7 +7,9 @@ use std::{
 
 use thiserror::Error;
 
-use super::{Frame, Peer, Service, SinkReject, Stream, StreamMode};
+use super::{
+    Frame, OrderedSessionDemand, OrderedStreamPolicy, Peer, Service, SinkReject, Stream, StreamMode,
+};
 use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId};
 
 /// Errors returned while building a [`ServiceRegistry`].
@@ -228,6 +230,29 @@ impl ServiceRegistry {
         };
 
         service.wants_peer(peer_id, negotiated, direction)
+    }
+
+    /// Return the owning service's static ordered-stream policy.
+    pub fn ordered_stream_policy(&self, kind: u16) -> OrderedStreamPolicy {
+        self.service_for_kind(kind)
+            .map(|service| service.ordered_stream_policy(kind))
+            .unwrap_or_default()
+    }
+
+    /// Return the owning service's current demand for an absent ordered session.
+    pub fn ordered_session_demand(
+        &self,
+        kind: u16,
+        conn_id: ZakuraConnId,
+        negotiated: u64,
+        peer_id: &ZakuraPeerId,
+        direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        let Some(service) = self.service_for_kind(kind) else {
+            return OrderedSessionDemand::Retire;
+        };
+
+        service.ordered_session_demand(conn_id, peer_id, negotiated, direction)
     }
 
     /// Request/response streams negotiated with a peer, in registry service order.

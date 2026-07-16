@@ -381,8 +381,8 @@ jobs:
               "install-zakura.sh": {
                   "ZAKURA_RELEASE_TAG": release_tag,
                   "ZAKURA_ARCHIVE_SHA256": x86_sha256,
-                  "ZAKURA_DOCKER_IMAGE": f"valargroup/zakura:{image_version}",
-                  "ZAKURA_COMPAT_DOCKER_IMAGE": f"valargroup/zakura:zcashd-compat-{image_version}",
+                  "ZAKURA_DOCKER_IMAGE": f"zakuracore/zakura:{image_version}",
+                  "ZAKURA_COMPAT_DOCKER_IMAGE": f"zakuracore/zakura:zcashd-compat-{image_version}",
               },
           }
           for filename, replacements in installers.items():
@@ -707,16 +707,6 @@ jobs:
           - The release workflow built the archive and calculated this checksum.
           - The published installer was generated with the same checksum.
 
-          ### AI Disclosure
-
-          - [x] No AI tools were used in this automatically generated PR.
-
-          ### PR Checklist
-
-          - [x] The PR title follows conventional commits format.
-          - [x] The change is limited to generated release metadata.
-          - [x] The solution is validated by the release workflow.
-          - [x] Documentation and changelogs do not require changes.
           EOF
           )"
 
@@ -752,14 +742,14 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker_to_dockerhub
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 #v4.1.0
         with:
-          username: valargroup
-          password: ${{ secrets.DOCKERHUB_TOKEN_VALARGROUP }}
+          username: valaroman
+          password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
       - name: Build runtime image
         if: ${{ !startsWith(github.ref, 'refs/tags/v') && !inputs.publish_docker_to_dockerhub }}
         env:
           FEATURES: ${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
-          IMAGE_TAG: valargroup/zakura:release-ci-${{ matrix.name }}
+          IMAGE_TAG: zakuracore/zakura:release-ci-${{ matrix.name }}
         run: |
           set -euo pipefail
           short_sha="$(git rev-parse --short=12 HEAD)"
@@ -794,7 +784,7 @@ jobs:
             --build-arg "FEATURES=${FEATURES}" \
             --build-arg "SHORT_SHA=${short_sha}" \
             --build-arg "IMAGE_VERSION=${image_version}" \
-            --tag "valargroup/zakura:${image_version}-${DOCKER_TAG_SUFFIX}" \
+            --tag "zakuracore/zakura:${image_version}-${DOCKER_TAG_SUFFIX}" \
             --push \
             .
 
@@ -807,8 +797,8 @@ jobs:
       - name: Login to DockerHub
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 #v4.1.0
         with:
-          username: valargroup
-          password: ${{ secrets.DOCKERHUB_TOKEN_VALARGROUP }}
+          username: valaroman
+          password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd #v4.0.0
@@ -819,19 +809,19 @@ jobs:
         run: |
           set -euo pipefail
           image_version="${RELEASE_TAG#v}"
-          tags=(-t "valargroup/zakura:${image_version}")
+          tags=(-t "zakuracore/zakura:${image_version}")
           # Only full releases (no hyphen in the tag) move :latest;
           # pre-release tags like v1.0.0-rc0 never touch it.
           if [[ "$RELEASE_TAG" != *-* ]]; then
-            tags+=(-t "valargroup/zakura:latest")
+            tags+=(-t "zakuracore/zakura:latest")
           fi
 
           docker buildx imagetools create \
             "${tags[@]}" \
-            "valargroup/zakura:${image_version}-amd64" \
-            "valargroup/zakura:${image_version}-arm64"
+            "zakuracore/zakura:${image_version}-amd64" \
+            "zakuracore/zakura:${image_version}-arm64"
 
-          docker buildx imagetools inspect "valargroup/zakura:${image_version}" \
+          docker buildx imagetools inspect "zakuracore/zakura:${image_version}" \
             --format '{{json .Manifest}}' \
             | jq -e '
                 [ .manifests[].platform | "\(.os)/\(.architecture)" ] as $platforms
@@ -866,8 +856,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker_to_dockerhub
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 #v4.1.0
         with:
-          username: valargroup
-          password: ${{ secrets.DOCKERHUB_TOKEN_VALARGROUP }}
+          username: valaroman
+          password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
       - name: Prepare zcashd compat build context
         env:
@@ -882,7 +872,7 @@ jobs:
         if: ${{ !startsWith(github.ref, 'refs/tags/v') && !inputs.publish_docker_to_dockerhub }}
         env:
           FEATURES: ${{ vars.RUST_PROD_FEATURES || 'default-release-binaries' }}
-          IMAGE_TAG: valargroup/zakura:zcashd-compat-release-ci-${{ matrix.name }}
+          IMAGE_TAG: zakuracore/zakura:zcashd-compat-release-ci-${{ matrix.name }}
         run: |
           set -euo pipefail
           short_sha="$(git rev-parse --short=12 HEAD)"
@@ -919,7 +909,7 @@ jobs:
             --build-arg "FEATURES=${FEATURES}" \
             --build-arg "SHORT_SHA=${short_sha}" \
             --build-arg "IMAGE_VERSION=${image_version}" \
-            --tag "valargroup/zakura:zcashd-compat-${image_version}-${DOCKER_TAG_SUFFIX}" \
+            --tag "zakuracore/zakura:zcashd-compat-${image_version}-${DOCKER_TAG_SUFFIX}" \
             --push \
             .
 
@@ -932,8 +922,8 @@ jobs:
       - name: Login to DockerHub
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 #v4.1.0
         with:
-          username: valargroup
-          password: ${{ secrets.DOCKERHUB_TOKEN_VALARGROUP }}
+          username: valaroman
+          password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd #v4.0.0
@@ -944,18 +934,18 @@ jobs:
         run: |
           set -euo pipefail
           image_version="${RELEASE_TAG#v}"
-          tags=(-t "valargroup/zakura:zcashd-compat-${image_version}")
+          tags=(-t "zakuracore/zakura:zcashd-compat-${image_version}")
           # Only full releases (no hyphen in the tag) move :latest;
           # pre-release tags like v1.0.0-rc0 never touch it.
           if [[ "$RELEASE_TAG" != *-* ]]; then
-            tags+=(-t "valargroup/zakura:zcashd-compat-latest")
+            tags+=(-t "zakuracore/zakura:zcashd-compat-latest")
           fi
 
           docker buildx imagetools create \
             "${tags[@]}" \
-            "valargroup/zakura:zcashd-compat-${image_version}-amd64"
+            "zakuracore/zakura:zcashd-compat-${image_version}-amd64"
 
-          docker buildx imagetools inspect "valargroup/zakura:zcashd-compat-${image_version}" \
+          docker buildx imagetools inspect "zakuracore/zakura:zcashd-compat-${image_version}" \
             --format '{{json .Manifest}}' \
             | jq -e '
                 [ .manifests[].platform | "\(.os)/\(.architecture)" ] as $platforms

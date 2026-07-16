@@ -8,6 +8,7 @@
     - [Platform Tier Policy](user/target-tier-policies.md)
   - [Building and Installing Zakura](user/install.md)
   - [Running Zakura](user/run.md)
+  - [Experimental Zakura P2P v2](user/p2p.md)
   - [Zakura with Docker](user/docker.md)
   - [Tracing Zakura](user/tracing.md)
   - [Zakura Metrics](user/metrics.md)

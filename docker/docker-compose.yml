@@ -1,7 +1,7 @@
 services:
   zakura:
     container_name: zakura
-    image: valargroup/zakura
+    image: zakuracore/zakura
     platform: linux/amd64
     restart: unless-stopped
     deploy:

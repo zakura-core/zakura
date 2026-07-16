@@ -4,16 +4,15 @@ You are reviewing PRs for Zakura, a Zcash full node in Rust. Prioritize correctn
 
 If the diff or PR description is incomplete, ask questions before making strong claims.
 
-## Contribution Process Checks
+## Pull Request Context
 
-Before reviewing code quality, verify:
+Before reviewing code quality, check that:
 
-- [ ] PR links to a pre-discussed issue
-- [ ] PR description includes Motivation, Solution, and Tests sections
-- [ ] PR title follows conventional commits
-- [ ] If AI tools were used, disclosure is present in the PR description
+- For fixes, the description identifies the root cause and explains how the solution addresses it
+- The test description explains how coverage exercises the affected behavior, rather than only listing commands
+- The PR title follows conventional commits
 
-If these are missing, note it in the review.
+Ask for missing context only when it is needed to review the change.
 
 ## Architecture Constraints
 

@@ -3,9 +3,8 @@
 #
 # Packages every publishable workspace crate and checks each .crate archive
 # against the crates.io size limit. All crates are packaged in one cargo
-# invocation: the zakura-* crates depend on each other at the workspace
-# version, which does not exist on crates.io until the graph is actually
-# published, so per-crate packaging cannot resolve. Workspace-aware
+# invocation: some zakura-* crates depend on unpublished workspace package
+# versions, so per-crate packaging cannot always resolve. Workspace-aware
 # `cargo package` (Rust 1.90+) resolves those dependencies against an
 # in-memory overlay of the packages being packaged instead.
 #
@@ -59,30 +58,33 @@ PUBLISH_ORDER=(
   zakura
 )
 
-# All publishable crates share the workspace release version.
-version="$(
-  cargo metadata --format-version 1 --no-deps --manifest-path "${repo_root}/Cargo.toml" \
-    | jq -r '.packages[] | select(.name == "zakura") | .version'
+metadata="$(
+  cargo metadata --format-version 1 --no-deps --manifest-path "${repo_root}/Cargo.toml"
 )"
-if [ -z "$version" ]; then
-  echo "Could not find the 'zakura' package in the workspace." >&2
-  exit 1
-fi
 
 package_args=()
 for crate in "${PUBLISH_ORDER[@]}"; do
   package_args+=(-p "$crate")
 done
 
-echo "Packaging ${#PUBLISH_ORDER[@]} crates at version ${version}..."
+echo "Packaging ${#PUBLISH_ORDER[@]} crates..."
 # shellcheck disable=SC2086 # VERIFY_FLAG is intentionally empty or one flag
 cargo package --locked $VERIFY_FLAG "${package_args[@]}"
 
 # crates.io rejects archives over 10 MiB.
 max_bytes=$((10 * 1024 * 1024))
 
+echo
+echo "Package archive sizes:"
 failed=0
 for crate in "${PUBLISH_ORDER[@]}"; do
+  version="$(jq -r --arg crate "$crate" '.packages[] | select(.name == $crate) | .version' <<<"$metadata")"
+  if [ -z "$version" ] || [ "$version" = "null" ]; then
+    echo "ERROR: could not find ${crate} in workspace metadata" >&2
+    failed=1
+    continue
+  fi
+
   archive="${repo_root}/target/package/${crate}-${version}.crate"
   if [ ! -f "$archive" ]; then
     echo "ERROR: expected ${archive} to exist after packaging" >&2
@@ -102,4 +104,5 @@ if [ "$failed" -ne 0 ]; then
   exit 1
 fi
 
-echo "All ${#PUBLISH_ORDER[@]} crates package cleanly at version ${version}."
+echo
+echo "All ${#PUBLISH_ORDER[@]} crates package cleanly."

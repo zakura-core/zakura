@@ -10,7 +10,7 @@ Let's dive into the details of each step required to perform an upgrade:
 
 ### Before starting
 
-- Zakura developers often dismiss ECC dependency upgrade suggestions from dependabot. For instance, see [this closed PR](https://github.com/zakura-core/zakura/pull/7745) in favor of the [5.7.0 zcashd upgrade PR](https://github.com/zakura-core/zakura/pull/7784), which followed this guide.
+- Zebra developers often dismiss ECC dependency upgrade suggestions from dependabot. For instance, see [this closed PR](https://github.com/ZcashFoundation/zebra/pull/7745) in favor of the [5.7.0 zcashd upgrade PR](https://github.com/ZcashFoundation/zebra/pull/7784), which followed this guide.
 
 - Determine the version of `zcashd` to use. This version will determine which versions of other crates to use. Typically, this should be a [tag](https://github.com/zcash/zcash/tags), but in some cases, it might be a reference to a branch (e.g., nu5-consensus) for testing unreleased developments.
 
@@ -20,7 +20,7 @@ Let's dive into the details of each step required to perform an upgrade:
 
 ### Upgrade versions
 
-- Use the `cargo upgrade` command to upgrade all the ECC dependency versions in Zakura. For example, in [this PR](https://github.com/zakura-core/zakura/pull/7784), the following command was used:
+- Use the `cargo upgrade` command to upgrade all the ECC dependency versions in Zakura. For example, in [this Zebra PR](https://github.com/ZcashFoundation/zebra/pull/7784), the following command was used:
 
 ```sh
 cargo upgrade --incompatible -p bridgetree -p incrementalmerkletree -p orchard -p zcash_primitives -p zcash_proofs -p zcash_address -p zcash_encoding -p zcash_note_encryption -p zcash_script

@@ -520,7 +520,6 @@ impl Service for BlockSyncService {
                             wiring.sequencer_input,
                             wiring.sequencer_input_bytes,
                             wiring.sequencer_input_decoded_deep_bytes,
-                            wiring.sequencer_control,
                             wiring.actions,
                             wiring.routine_to_reactor,
                             wiring.view,

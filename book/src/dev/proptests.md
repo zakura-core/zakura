@@ -23,4 +23,4 @@ If we need to add another dependency as part of the `proptest-impl` feature:
 2. Add the crate as an optional `dependencies` entry
 3. Add the crate as a required `dev-dependencies` entry
 
-For an example of these changes, see [PR 2070](https://github.com/zakura-core/zakura/pull/2070/files).
+For an example of these changes, see [Zebra PR 2070](https://github.com/ZcashFoundation/zebra/pull/2070/files).

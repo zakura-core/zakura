@@ -36,13 +36,6 @@ impl ReorderBuffer {
         self.blocks.len()
     }
 
-    /// Highest buffered height, if any. The shed-for-floor-starvation path drops
-    /// this (the body furthest from the committed floor) to free budget for a
-    /// lower, commit-unblocking request.
-    pub(super) fn max_height(&self) -> Option<block::Height> {
-        self.blocks.keys().next_back().copied()
-    }
-
     pub(super) fn contains(&self, height: block::Height) -> bool {
         self.blocks.contains_key(&height)
     }
@@ -55,12 +48,10 @@ impl ReorderBuffer {
         self.blocks.get(&height).map(|buffered| buffered.hash)
     }
 
-    /// Buffer a received body that already owns its `bytes` reservation.
+    /// Buffer a received body with its wire `bytes` size.
     ///
-    /// The caller reserved worst-case bytes for this height at send time and
-    /// shrank that reservation to `bytes` on receipt, so the reorder buffer takes
-    /// ownership of the existing reservation without touching the budget and can
-    /// never fail on budget. A `Duplicate` height is left to the caller to release.
+    /// Retained bodies carry no wire-budget charge (the resident look-ahead gate
+    /// bounds them via `buffered_bytes`), so an insert can never fail on budget.
     #[cfg(test)]
     pub(super) fn insert(
         &mut self,
@@ -141,10 +132,8 @@ impl ReorderBuffer {
         released
     }
 
-    /// Drop every buffered body and return the total bytes they held, so the
-    /// caller releases exactly that reservation. The reorder buffer is owned by
-    /// the `Sequencer`, which does not touch the byte budget; it returns the
-    /// freed bytes to the reactor instead.
+    /// Drop every buffered body and return the total bytes they held (the
+    /// retained-size accounting the resident view reads; not a budget charge).
     pub(crate) fn clear(&mut self) -> u64 {
         self.drop_from(block::Height::MIN)
     }

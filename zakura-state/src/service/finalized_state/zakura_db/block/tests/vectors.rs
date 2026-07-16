@@ -669,6 +669,57 @@ fn header_range_roots_do_not_overwrite_committed_serving_index_rows() {
     );
 }
 
+/// Finalized root reads are indexed by block height, not by sparse tree rows.
+///
+/// Empty-shielded blocks leave the note-commitment trees unchanged, so only the
+/// genesis tree row is stored for this fixture. The range helper must still
+/// return one root payload for every committed height.
+#[test]
+fn finalized_commitment_roots_cover_unchanged_tree_heights() {
+    let _init_guard = zakura_test::init();
+    let genesis = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("genesis block deserializes");
+    let block1 = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("block 1 deserializes");
+    let mut state = ZakuraDb::new(
+        &Config::ephemeral(),
+        STATE_DATABASE_KIND,
+        &state_database_format_version_in_code(),
+        &Mainnet,
+        true,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        false,
+    )
+    .expect("opening the finalized state database should succeed");
+
+    write_full_block(&mut state, genesis);
+    write_full_block(&mut state, block1.clone());
+
+    assert_eq!(
+        state
+            .sapling_tree_by_height_range(Height(0)..=Height(1))
+            .count(),
+        1,
+        "the fixture must keep the Sapling tree column family sparse"
+    );
+
+    let roots = state.finalized_commitment_roots_by_height_range(Height(0)..=Height(1));
+    assert_eq!(
+        roots.iter().map(|roots| roots.height).collect::<Vec<_>>(),
+        vec![Height(0), Height(1)],
+        "every committed height must have a finalized root payload"
+    );
+    assert_eq!(
+        roots[1].auth_data_root,
+        block1.auth_data_root(),
+        "the unchanged-tree height still carries its own block auth-data root"
+    );
+}
+
 /// Pruning-readiness guard: a committed height whose body is removed (as online
 /// pruning deletes `tx_by_loc` rows) keeps its header readable from the retained
 /// consensus `block_header_by_height`, because the header readers are not gated
@@ -739,6 +790,45 @@ fn known_block_reports_finalized_block_after_body_pruned() {
     assert_eq!(
         read::finalized_state_contains_block_hash(&state, block1.hash()),
         Some(crate::KnownBlock::Finalized),
+    );
+}
+
+#[test]
+fn best_chain_hash_reads_survive_finalized_body_pruning() {
+    let _init_guard = zakura_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+
+    write_full_block_header_and_transactions(&state, block1.clone());
+
+    let tx_by_loc = state.db.cf_handle("tx_by_loc").unwrap();
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_delete_range(
+        &tx_by_loc,
+        TransactionLocation::min_for_height(Height(1)),
+        TransactionLocation::min_for_height(Height(2)),
+    );
+    state.db.write(batch).expect("body prune writes");
+
+    assert!(!state.contains_body_at_height(Height(1)));
+    assert_eq!(state.height(block1.hash()), Some(Height(1)));
+
+    let no_chain = Option::<Arc<crate::service::non_finalized_state::Chain>>::None;
+    assert_eq!(
+        read::depth(no_chain.clone(), &state, block1.hash()),
+        Some(0)
+    );
+    assert_eq!(
+        read::hash_by_height(no_chain.clone(), &state, Height(1)),
+        Some(block1.hash()),
+    );
+    assert!(read::find::chain_contains_hash(
+        no_chain.clone(),
+        &state,
+        block1.hash()
+    ));
+    assert_eq!(
+        read::find_chain_headers(no_chain, &state, vec![genesis.hash()], None, 1),
+        vec![block1.header.clone()],
     );
 }
 

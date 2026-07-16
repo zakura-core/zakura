@@ -1,6 +1,6 @@
 [package]
 name = "zakura-jsonl-trace"
-version = "1.0.0-rc3"
+version = "1.0.0"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

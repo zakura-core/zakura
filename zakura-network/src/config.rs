@@ -115,11 +115,11 @@ pub enum P2pStack {
     /// The legacy TCP Zcash P2P stack only.
     Legacy,
 
-    /// The native Zakura P2P v2 stack only.
+    /// The experimental native Zakura P2P v2 stack only.
     Zakura,
 
-    /// Both stacks: mutually capable peers are upgraded to Zakura P2P v2, and the legacy
-    /// stack stays available for peers that can't upgrade.
+    /// Both stacks: mutually capable peers are upgraded to the experimental Zakura P2P v2
+    /// stack, and the legacy stack stays available for peers that can't upgrade.
     Dual,
 }
 
@@ -280,8 +280,8 @@ pub struct Config {
     /// |---|---|
     /// | `"default"` | The configured network's binary default |
     /// | `"legacy"` | The legacy TCP Zcash P2P stack only |
-    /// | `"zakura"` | The native Zakura P2P v2 stack only |
-    /// | `"dual"` | Both stacks, with legacy fallback |
+    /// | `"zakura"` | The experimental native Zakura P2P v2 stack only |
+    /// | `"dual"` | Both stacks, enabling experimental v2 with legacy fallback |
     ///
     /// Leave this at `"default"` so Zakura can change the per-network default during upgrades.
     /// See [`P2pStack::resolve`] for the current defaults, and [`legacy_p2p`](Self::legacy_p2p)
@@ -1200,9 +1200,7 @@ impl<'de> Deserialize<'de> for Config {
             non_zero_config_field.filter(|config_value| config_value > &0).unwrap_or(default_config_value)
         });
 
-        // Clamp the in-flight byte budget up to the checkpoint-range floor (with a
-        // warning) rather than rejecting too-small configs, so older configs keep
-        // starting while checkpoint sync stays deadlock-free.
+        // Clamp too-small budgets rather than rejecting existing configurations.
         let mut zakura = zakura;
         zakura.apply_network_defaults(&network);
         let default_zakura_bootstrap_peers =
@@ -1233,10 +1231,9 @@ impl<'de> Deserialize<'de> for Config {
                  interface address for public Zakura peers"
             );
         }
-        zakura.block_sync.clamp_inflight_block_bytes_to_floor();
-        // Likewise clamp the resident look-ahead budget (and its block cap) up to one
-        // checkpoint range, so the resident-memory admission gate cannot deadlock checkpoint
-        // sync when verified_tip is pinned to the previous checkpoint.
+        zakura
+            .block_sync
+            .clamp_inflight_block_bytes_to_request_floor();
         zakura.block_sync.clamp_reorder_lookahead_to_floor();
         zakura.block_sync.validate().map_err(|error| {
             de::Error::custom(format!("invalid zakura.block_sync config: {error}"))

@@ -73,7 +73,7 @@ For mainnet deploys, confirm the `ref` explicitly with the user before dispatch.
 From a checkout with `gh` authenticated for `zakura-core/zakura`:
 
 ```bash
-cd /Users/roman/projects/zakura
+cd <zakura-repo-root>
 git fetch origin
 gh workflow view zakura-testnet-deploy.yml
 gh workflow view zakura-mainnet-deploy.yml

@@ -91,13 +91,15 @@ Both release workflows publish every release with `prerelease: true`, whatever
 the tag looks like — nothing promotes a release automatically. Promotion is a
 deliberate manual step, governed by this convention:
 
-- **Pre-releases are never promoted.** Hyphenated tags (`v1.0.0-rc4`) stay
-  pre-releases from publication until deletion. `v1.0.0-rc3` is the cautionary
-  tale: it was hand-promoted, external instructions adopted
-  `releases/latest/download/...` URLs, and deleting the release left those
-  links as dangling 404s. Pre-release artifacts are removed before the next
-  stable release as a matter of policy, so a promoted pre-release always
-  becomes a dangling "Latest" eventually.
+- **Pre-releases are never promoted.** The "Latest" badge only ever points at
+  a stable release, so anything automating against `releases/latest` is never
+  handed a release candidate. `v1.0.0-rc3` is the cautionary tale: it was
+  hand-promoted, external instructions adopted `releases/latest/download/...`
+  URLs, and deleting the release left those links as dangling 404s. (The
+  `v1.0.0-rc*` rehearsal line is removed before the first stable release as a
+  one-time, pre-1.0.0 exception; after `v1.0.0`, pre-releases stay published
+  permanently — the never-promote rule stands on its own and does not depend
+  on pre-release removal.)
 - **The first "Latest" release is `v1.0.0`.** Until it exists,
   `releases/latest` intentionally returns 404. Any published download
   instructions must use versioned URLs (`releases/download/<tag>/...`) until

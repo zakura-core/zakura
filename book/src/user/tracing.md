@@ -59,6 +59,6 @@ configuration.
 [filter]: https://docs.rs/zakura/latest/zakurad/components/tracing/struct.InnerConfig.html#structfield.filter
 [flamegraph]: https://docs.rs/zakura/latest/zakurad/components/tracing/struct.InnerConfig.html#structfield.flamegraph
 [flamegraphs]: http://www.brendangregg.com/flamegraphs.html
-[systemd_journald]: https://www.freedesktop.org/software/systemd/man/systemd-journald.service.html
+[systemd_journald]: https://man7.org/linux/man-pages/man8/systemd-journald.service.8.html
 [use_journald]: https://docs.rs/zakura/latest/zakurad/components/tracing/struct.InnerConfig.html#structfield.use_journald
 [sentry]: https://sentry.io/welcome/

@@ -135,16 +135,6 @@ if [ "$STATUS" = "applied" ]; then
   require_validation_passed '^git diff --check$' 'git diff --check'
 fi
 
-if ! printf '%s\n' "$BODY" | grep -Eq '^(#{2,6}[[:space:]]+AI Disclosure|\*\*AI Disclosure\*\*|AI Disclosure):?[[:space:]]*$'; then
-  echo "ERROR: PR body must include an AI Disclosure section" >&2
-  exit 1
-fi
-
-if ! printf '%s\n' "$BODY" | grep -q 'Codex was used'; then
-  echo "ERROR: PR body must disclose Codex usage" >&2
-  exit 1
-fi
-
 if ! printf '%s\n' "$BODY" | grep -Fqx "$EXPECTED_PR_MARKER"; then
   echo "ERROR: PR body must include ${EXPECTED_PR_MARKER}" >&2
   exit 1

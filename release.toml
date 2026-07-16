@@ -1,11 +1,9 @@
 # Only allow releases from the main branch
 allow-branch = [ 'main' ]
 
-# TODO:
-# configure all zebra-* crates with a shared version,
-# and all tower-* crates with a different one:
-# https://github.com/crate-ci/cargo-release/blob/master/docs/reference.md#config-fields
-#shared-version = "TODO named groups"
+# Workspace crate versions are deliberately independent: a crate is bumped and
+# published only when it has changes to publish. Do not configure
+# `shared-version` groups.
 
 # Verify releases with release features
 #

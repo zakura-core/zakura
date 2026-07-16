@@ -26,7 +26,7 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{events::*, scheduler::*, service::HeaderSyncPeerCommand, wire::*, *};
+use super::{events::*, service::HeaderSyncPeerCommand, wire::*, work_queue::*, *};
 use crate::zakura::{
     Edge, Flow, FramedRecv, Node, NodeKind, Pipe, PipeCx, PipeShape, SinkReject, ZakuraPeerId,
 };

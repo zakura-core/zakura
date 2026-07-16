@@ -13,7 +13,8 @@ use crate::{
             ConfiguredFundingStreams, ConfiguredLockboxDisbursement, RegtestParameters,
             MAX_NETWORK_NAME_LENGTH, RESERVED_NETWORK_NAMES,
         },
-        Network, NetworkUpgrade, MAINNET_ACTIVATION_HEIGHTS, TESTNET_ACTIVATION_HEIGHTS,
+        ConsensusBranchId, Network, NetworkKind, NetworkUpgrade, MAINNET_ACTIVATION_HEIGHTS,
+        TESTNET_ACTIVATION_HEIGHTS,
     },
 };
 
@@ -99,6 +100,119 @@ fn check_parameters_impl() {
     }
 }
 
+/// Pins the public-network NU6.3 boundary and branch ID to librustzcash's consensus parameters.
+#[test]
+fn nu6_3_public_consensus_boundary_matches_librustzcash() {
+    assert_eq!(
+        NetworkUpgrade::from(zp_consensus::NetworkUpgrade::Nu6_3),
+        NetworkUpgrade::Nu6_3,
+        "librustzcash's NU6.3 upgrade must map to Zakura's NU6.3 era",
+    );
+
+    let expected_branch_id = u32::from(zp_consensus::BranchId::Nu6_3);
+    let branch_id = NetworkUpgrade::Nu6_3
+        .branch_id()
+        .expect("NU6.3 has a published consensus branch ID");
+
+    assert_eq!(u32::from(branch_id), expected_branch_id);
+    assert_eq!(
+        NetworkUpgrade::try_from(expected_branch_id)
+            .expect("librustzcash's NU6.3 branch ID is known to Zakura"),
+        NetworkUpgrade::Nu6_3,
+    );
+    assert_eq!(
+        zp_consensus::BranchId::try_from(branch_id)
+            .expect("Zakura's NU6.3 branch ID is known to librustzcash"),
+        zp_consensus::BranchId::Nu6_3,
+    );
+
+    for (network, zp_network) in [
+        (Network::Mainnet, zp_consensus::Network::MainNetwork),
+        (
+            Network::new_default_testnet(),
+            zp_consensus::Network::TestNetwork,
+        ),
+    ] {
+        let expected_height: u32 = zp_network
+            .activation_height(zp_consensus::NetworkUpgrade::Nu6_3)
+            .expect("NU6.3 is scheduled on both public networks")
+            .into();
+        let activation_height = Height(expected_height);
+        let previous_height = (activation_height - 1).expect("NU6.3 is not genesis");
+
+        assert_eq!(
+            NetworkUpgrade::Nu6_3.activation_height(&network),
+            Some(activation_height),
+        );
+        assert_eq!(
+            NetworkUpgrade::current(&network, previous_height),
+            NetworkUpgrade::Nu6_2,
+        );
+        assert_eq!(
+            NetworkUpgrade::current(&network, activation_height),
+            NetworkUpgrade::Nu6_3,
+        );
+        assert_eq!(
+            ConsensusBranchId::current(&network, previous_height),
+            NetworkUpgrade::Nu6_2.branch_id(),
+        );
+        assert_eq!(
+            ConsensusBranchId::current(&network, activation_height),
+            Some(branch_id),
+        );
+    }
+}
+
+/// NU6.3 does not change the post-Blossom timing rules used by difficulty validation.
+#[test]
+fn nu6_3_keeps_post_blossom_timing_rules() {
+    assert_eq!(NetworkUpgrade::Nu6_3.target_spacing().num_seconds(), 75);
+    assert_eq!(
+        NetworkUpgrade::Nu6_3
+            .averaging_window_timespan()
+            .num_seconds(),
+        75 * 17,
+    );
+
+    for network in [Network::Mainnet, Network::new_default_testnet()] {
+        let activation_height = NetworkUpgrade::Nu6_3
+            .activation_height(&network)
+            .expect("NU6.3 is scheduled on both public networks");
+        let previous_height = (activation_height - 1).expect("NU6.3 is not genesis");
+
+        assert_eq!(
+            NetworkUpgrade::target_spacing_for_height(&network, previous_height),
+            NetworkUpgrade::target_spacing_for_height(&network, activation_height),
+            "NU6.3 must not introduce a target-spacing transition",
+        );
+        assert_eq!(
+            NetworkUpgrade::target_spacing_for_height(&network, activation_height).num_seconds(),
+            75,
+        );
+    }
+
+    assert_eq!(
+        NetworkUpgrade::minimum_difficulty_spacing_for_height(
+            &Network::new_default_testnet(),
+            NetworkUpgrade::Nu6_3
+                .activation_height(&Network::new_default_testnet())
+                .expect("NU6.3 is scheduled on default Testnet"),
+        )
+        .expect("the Testnet minimum-difficulty rule is active by NU6.3")
+        .num_seconds(),
+        6 * 75,
+    );
+}
+
+/// Pins the BIP-70 network names, which appear in payment URIs and RPC
+/// responses: Regtest deliberately shares Testnet's "test" name.
+#[test]
+fn bip70_network_names_are_stable_for_every_network_kind() {
+    assert_eq!(NetworkKind::Mainnet.bip70_network_name(), "main");
+    assert_eq!(NetworkKind::Testnet.bip70_network_name(), "test");
+    assert_eq!(NetworkKind::Regtest.bip70_network_name(), "test");
+}
+
 /// Checks that `NetworkUpgrade::activation_height()` returns the activation height of the next
 /// network upgrade if it doesn't find an activation height for a prior network upgrade, that the
 /// `Genesis` upgrade is always at `Height(0)`, and that the default Mainnet/Testnet/Regtest activation
@@ -171,6 +285,109 @@ fn activates_network_upgrades_correctly() {
             "network activation list should match expected activation heights"
         );
     }
+}
+
+/// Configured testnets must keep network upgrades in protocol order around
+/// NU6.3: a later upgrade may share NU6.3's activation height (and wins the
+/// height lookup), but an earlier upgrade configured above it must be
+/// rejected.
+#[test]
+fn configured_nu6_3_activation_preserves_upgrade_order() {
+    let activation_height = Height(23);
+
+    let nu6_3_network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_2: Some(activation_height.0),
+            nu6_3: Some(activation_height.0),
+            ..Default::default()
+        })
+        .expect("same-height upgrades are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("valid configured network");
+
+    assert_eq!(
+        NetworkUpgrade::current(&nu6_3_network, activation_height),
+        NetworkUpgrade::Nu6_3,
+        "NU6.3 must overwrite NU6.2 when both activate at the same height"
+    );
+    assert_eq!(
+        NetworkUpgrade::Nu6_2.activation_height(&nu6_3_network),
+        Some(activation_height),
+        "an overwritten NU6.2 activation must remain implicit at the NU6.3 height"
+    );
+
+    let nu7_network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_3: Some(activation_height.0),
+            nu7: Some(activation_height.0),
+            ..Default::default()
+        })
+        .expect("same-height upgrades are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("valid configured network");
+
+    assert_eq!(
+        NetworkUpgrade::current(&nu7_network, activation_height),
+        NetworkUpgrade::Nu7,
+        "NU7 must overwrite NU6.3 when both activate at the same height"
+    );
+    assert_eq!(
+        NetworkUpgrade::Nu6_3.activation_height(&nu7_network),
+        Some(activation_height),
+        "an overwritten NU6.3 activation must remain implicit at the NU7 height"
+    );
+
+    let out_of_order = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_2: Some(activation_height.0 + 1),
+            nu6_3: Some(activation_height.0),
+            ..Default::default()
+        })
+        .expect_err("NU6.3 must not activate before NU6.2");
+
+    assert_eq!(out_of_order, ParametersBuilderError::OutOfOrderUpgrades);
+}
+
+/// Regtest must not activate NU6.3 unless it is explicitly configured, and
+/// must preserve a configured NU6.3 height in its activation map.
+#[test]
+fn regtest_preserves_optional_nu6_3_activation() {
+    let default_regtest = Network::new_regtest(RegtestParameters::default());
+
+    assert_eq!(
+        NetworkUpgrade::Nu6_3.activation_height(&default_regtest),
+        None,
+        "NU6.3 must remain disabled when it is not configured"
+    );
+    assert!(
+        !default_regtest
+            .activation_list()
+            .values()
+            .any(|upgrade| *upgrade == NetworkUpgrade::Nu6_3),
+        "NU6.3 must not be inserted into the explicit activation map by Regtest defaults"
+    );
+
+    let nu6_3_height = Height(23);
+    let configured_regtest = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu6_3: Some(nu6_3_height.0),
+            ..Default::default()
+        }
+        .into(),
+    );
+
+    assert_eq!(
+        NetworkUpgrade::Nu6_3.activation_height(&configured_regtest),
+        Some(nu6_3_height),
+        "Regtest conversion must preserve the configured NU6.3 height"
+    );
+    assert_eq!(
+        configured_regtest.activation_list().get(&nu6_3_height),
+        Some(&NetworkUpgrade::Nu6_3),
+        "the configured NU6.3 height must remain explicit"
+    );
 }
 
 /// Checks that configured testnet names are validated and used correctly.

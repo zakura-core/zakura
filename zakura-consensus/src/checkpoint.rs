@@ -1039,6 +1039,12 @@ impl VerifyCheckpointError {
             // TODO: make this duplicate-incomplete
             VerifyCheckpointError::NewerRequest { .. } => true,
             VerifyCheckpointError::VerifyBlock(block_error) => block_error.is_duplicate_request(),
+            // The state boxes commit errors as `zs::CommitCheckpointVerifiedError`,
+            // a newtype around `zs::CommitBlockError`, so the wrapper must be
+            // unwrapped to classify duplicate blocks as benign.
+            VerifyCheckpointError::CommitCheckpointVerified(source) => source
+                .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                .is_some_and(|commit_err| commit_err.inner().is_duplicate_request()),
             _ => false,
         }
     }
@@ -1146,11 +1152,12 @@ where
             if req_block.block.auth_data_root.is_none()
                 && NetworkUpgrade::current(&network, req_block.block.height) >= NetworkUpgrade::Nu5
             {
-                let block = req_block.block.block.clone();
-                if let Ok(auth_data_root) =
-                    tokio::task::spawn_blocking(move || block.auth_data_root()).await
+                let block = req_block.block.clone();
+                if let Ok(block) =
+                    tokio::task::spawn_blocking(move || block.with_precomputed_auth_data_root())
+                        .await
                 {
-                    req_block.block.auth_data_root = Some(auth_data_root);
+                    req_block.block = block;
                 }
             }
 

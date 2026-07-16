@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- New `network.zakura.header_sync.max_concurrent_range_reads` option bounding the
+  header-range state reads served at once across all peers. Serving reads run on
+  the blocking pool and each holds a database snapshot, so this caps the
+  wire-triggered read load a node takes on. Defaults to 32, matching the previous
+  hardcoded limit; existing configuration files are unaffected.
+
 ### Fixed
 
 - Prevent initial sync from stalling at checkpoint boundaries by refilling the

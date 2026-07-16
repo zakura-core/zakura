@@ -219,6 +219,142 @@ impl Drop for HeaderResponseCompletionGuard {
     }
 }
 
+/// Releases a claimed serving slot if the admission task never reports the request itself.
+///
+/// The slot is claimed before the task spawns, and only a `HeaderRangeResponseFinished` event
+/// releases it. A task the runtime drops before its first poll sends nothing, so without this the
+/// peer's `served_headers_inflight` never decrements. Serving also requires request ids to
+/// increase, so a lost slot is never reclaimed for the life of the session: enough of them fill
+/// the peer's cap, and the reactor then reports an honest peer for spamming.
+pub(super) struct ServingAdmissionGuard {
+    lifecycle: mpsc::UnboundedSender<HeaderSyncEvent>,
+    peer: ZakuraPeerId,
+    session_id: u64,
+    request_id: HeaderSyncRequestId,
+    start_height: block::Height,
+    requested_count: u32,
+    want_tree_aux_roots: bool,
+    armed: bool,
+}
+
+impl ServingAdmissionGuard {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        lifecycle: mpsc::UnboundedSender<HeaderSyncEvent>,
+        peer: ZakuraPeerId,
+        session_id: u64,
+        request_id: HeaderSyncRequestId,
+        start_height: block::Height,
+        requested_count: u32,
+        want_tree_aux_roots: bool,
+    ) -> Self {
+        Self {
+            lifecycle,
+            peer,
+            session_id,
+            request_id,
+            start_height,
+            requested_count,
+            want_tree_aux_roots,
+            armed: true,
+        }
+    }
+
+    /// Releases the slot now, reporting `result` as the outcome.
+    fn finish(&mut self, result: HeaderRangeServeResult) {
+        self.send(result);
+        self.armed = false;
+    }
+
+    /// Hands the slot to whoever reports the response, so `Drop` does not release it early.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn send(&self, result: HeaderRangeServeResult) {
+        let _ = self
+            .lifecycle
+            .send(HeaderSyncEvent::HeaderRangeResponseFinished {
+                peer: self.peer.clone(),
+                session_id: self.session_id,
+                request_id: self.request_id,
+                start_height: self.start_height,
+                requested_count: self.requested_count,
+                returned_count: 0,
+                want_tree_aux_roots: self.want_tree_aux_roots,
+                roots_complete: false,
+                result,
+            });
+    }
+}
+
+impl Drop for ServingAdmissionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            metrics::counter!(
+                "sync.header.serve.action_wait",
+                "result" => HeaderRangeServeResult::TaskPanic.label()
+            )
+            .increment(1);
+            self.send(HeaderRangeServeResult::TaskPanic);
+        }
+    }
+}
+
+/// Waits for `action` to reach the state driver, releasing the serving slot on any path that
+/// leaves nobody else to report the request.
+///
+/// Takes `guard` already built, for the same reason as [`send_prepared_header_response`].
+pub(super) async fn await_header_range_admission(
+    mut guard: ServingAdmissionGuard,
+    actions: mpsc::Sender<HeaderSyncAction>,
+    cancel: CancellationToken,
+    action: HeaderSyncAction,
+    deadline: Instant,
+) {
+    const OUTBOUND_DEADLINE_MARGIN: Duration = Duration::from_secs(1);
+    let action_deadline = deadline
+        .checked_sub(OUTBOUND_DEADLINE_MARGIN)
+        .unwrap_or(deadline);
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(HeaderRangeServeResult::StreamClosed),
+        result = time::timeout_at(action_deadline, actions.send(action)) => match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(HeaderRangeServeResult::ReactorClosed),
+            Err(_) => Err(HeaderRangeServeResult::AdmissionTimeout),
+        },
+    };
+    let Err(result) = result else {
+        // The state read owns the request now, and its prepared response releases the slot.
+        guard.disarm();
+        return;
+    };
+    metrics::counter!("sync.header.serve.action_wait", "result" => result.label()).increment(1);
+    if result != HeaderRangeServeResult::AdmissionTimeout {
+        guard.finish(result);
+        return;
+    }
+    let ready = HeaderSyncEvent::HeaderRangeResponseReady {
+        peer: guard.peer.clone(),
+        session_id: guard.session_id,
+        request_id: guard.request_id,
+        start_height: guard.start_height,
+        requested_count: guard.requested_count,
+        want_tree_aux_roots: guard.want_tree_aux_roots,
+        headers: Vec::new(),
+        body_sizes: Vec::new(),
+        tree_aux_roots: Vec::new(),
+        deadline,
+        completion: HeaderRangeResponseToken::new(),
+        result,
+    };
+    if guard.lifecycle.send(ready).is_ok() {
+        // The empty prepared response reports completion and releases the slot.
+        guard.disarm();
+    }
+}
+
 /// Enqueues a prepared header-range response on `session`, reporting completion through `guard`.
 ///
 /// Takes `guard` already built so the caller constructs it before spawning this future. A task the
@@ -1593,56 +1729,21 @@ impl HeaderSyncReactor {
             deadline,
         };
         let actions = self.actions.clone();
-        let lifecycle = self.lifecycle_events.clone();
         let cancel = peer_state.session.cancel_token();
-        tokio::spawn(async move {
-            const OUTBOUND_DEADLINE_MARGIN: Duration = Duration::from_secs(1);
-            let action_deadline = deadline
-                .checked_sub(OUTBOUND_DEADLINE_MARGIN)
-                .unwrap_or(deadline);
-            let result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => Err(HeaderRangeServeResult::StreamClosed),
-                result = time::timeout_at(action_deadline, actions.send(action)) => match result {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) => Err(HeaderRangeServeResult::ReactorClosed),
-                    Err(_) => Err(HeaderRangeServeResult::AdmissionTimeout),
-                },
-            };
-            if let Err(result) = result {
-                metrics::counter!("sync.header.serve.action_wait", "result" => result.label())
-                    .increment(1);
-                if result == HeaderRangeServeResult::AdmissionTimeout {
-                    let completion = HeaderRangeResponseToken::new();
-                    let _ = lifecycle.send(HeaderSyncEvent::HeaderRangeResponseReady {
-                        peer,
-                        session_id,
-                        request_id,
-                        start_height,
-                        requested_count: count,
-                        want_tree_aux_roots,
-                        headers: Vec::new(),
-                        body_sizes: Vec::new(),
-                        tree_aux_roots: Vec::new(),
-                        deadline,
-                        completion,
-                        result,
-                    });
-                } else {
-                    let _ = lifecycle.send(HeaderSyncEvent::HeaderRangeResponseFinished {
-                        peer,
-                        session_id,
-                        request_id,
-                        start_height,
-                        requested_count: count,
-                        returned_count: 0,
-                        want_tree_aux_roots,
-                        roots_complete: false,
-                        result,
-                    });
-                }
-            }
-        });
+        // Build the guard here rather than inside the task: the slot is already claimed above, and
+        // a task the runtime drops before its first poll would never release it.
+        let guard = ServingAdmissionGuard::new(
+            self.lifecycle_events.clone(),
+            peer,
+            session_id,
+            request_id,
+            start_height,
+            count,
+            want_tree_aux_roots,
+        );
+        tokio::spawn(await_header_range_admission(
+            guard, actions, cancel, action, deadline,
+        ));
     }
 
     #[tracing::instrument(skip(self, block))]

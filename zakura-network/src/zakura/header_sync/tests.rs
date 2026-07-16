@@ -375,6 +375,57 @@ async fn a_response_send_dropped_before_its_first_poll_still_reports_completion(
     }
 }
 
+/// The serving slot is claimed before the admission task spawns, so a task the runtime drops
+/// before its first poll would leave `served_headers_inflight` incremented forever. Request ids
+/// must increase to be served, so that slot is never reclaimed: enough drops fill the peer's cap
+/// and the reactor then reports an honest peer for `GetHeadersSpam`.
+#[tokio::test(flavor = "current_thread")]
+async fn admission_dropped_before_its_first_poll_still_releases_the_serving_slot() {
+    let peer_id = peer(212);
+    let (lifecycle, mut lifecycle_recv) = mpsc::unbounded_channel();
+    let (actions, _actions_recv) = mpsc::channel(8);
+    let request_id = HeaderSyncRequestId::new(13).expect("non-zero id");
+    let guard = ServingAdmissionGuard::new(
+        lifecycle,
+        peer_id.clone(),
+        0,
+        request_id,
+        block::Height(1),
+        1,
+        true,
+    );
+
+    // The future owns the guard from the moment it is created, before any poll.
+    let admission = await_header_range_admission(
+        guard,
+        actions,
+        CancellationToken::new(),
+        HeaderSyncAction::QueryHeadersByHeightRange {
+            peer: peer_id,
+            session_id: 0,
+            request_id,
+            start: block::Height(1),
+            count: 1,
+            want_tree_aux_roots: true,
+            deadline: Instant::now() + HEADER_SYNC_SERVE_DEADLINE,
+        },
+        Instant::now() + HEADER_SYNC_SERVE_DEADLINE,
+    );
+    drop(admission);
+
+    match lifecycle_recv.try_recv().expect("the slot is released") {
+        HeaderSyncEvent::HeaderRangeResponseFinished {
+            request_id: finished_id,
+            result,
+            ..
+        } => {
+            assert_eq!(finished_id, request_id);
+            assert_eq!(result, HeaderRangeServeResult::TaskPanic);
+        }
+        event => panic!("unexpected event: {event:?}"),
+    }
+}
+
 fn test_header_height(header: &block::Header) -> block::Height {
     let hash = block::Hash::from(header);
     [

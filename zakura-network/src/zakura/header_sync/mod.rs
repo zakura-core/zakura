@@ -11,7 +11,6 @@ use std::{
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use chrono::{DateTime, Utc};
 use iroh::NodeId;
-use serde_json::{Number, Value};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, watch},
@@ -27,10 +26,7 @@ use zakura_chain::{
     work::{difficulty::CompactDifficulty, difficulty::ExpandedDifficulty, equihash},
 };
 
-use super::{
-    trace::{header_sync_trace as hs_trace, peer_label as trace_peer_label, HEADER_SYNC_TABLE},
-    Frame, ZakuraPeerId, ZakuraTrace, FRAME_HEADER_BYTES, LOCAL_MAX_MESSAGE_BYTES,
-};
+use super::{Frame, ZakuraPeerId, ZakuraTrace, FRAME_HEADER_BYTES, LOCAL_MAX_MESSAGE_BYTES};
 
 mod config;
 mod error;

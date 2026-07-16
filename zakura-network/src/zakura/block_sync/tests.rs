@@ -2496,7 +2496,8 @@ fn stale_watchdog_cleanup_cannot_release_replacement_reservation() {
     let replacement_peer = peer(0x42);
     let replacement_generation =
         registry.admit(&replacement_peer, ServicePeerDirection::Outbound, &config);
-    let replacement_owner = reservation_owner(replacement_generation, 1);
+    assert_ne!(replacement_generation, old_generation);
+    let replacement_owner = reservation_owner(replacement_generation, old_owner.request_token);
     assert_eq!(queue.take_in_range(height, height, 1).len(), 1);
     assert!(budget.try_reserve(100));
     assert_eq!(queue.mark_reserved([height], replacement_owner), 100);
@@ -2622,6 +2623,14 @@ fn release_reserved_heights_skips_held_body_owned_by_sequencer() {
         .expect("height 1 is reserved");
     assert_eq!(delta, -20);
     budget.release(20);
+    assert_eq!(budget.reserved(), 180);
+
+    let stale_owner = reservation_owner(2, owner.request_token);
+    assert_eq!(
+        queue.release_reserved_heights([block::Height(1), block::Height(2)], stale_owner),
+        0,
+        "a stale request generation must not release replacement reservations"
+    );
     assert_eq!(budget.reserved(), 180);
 
     // GC both heights: only the still-reserved height 2 releases. The Held height 1

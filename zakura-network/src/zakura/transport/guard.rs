@@ -124,10 +124,9 @@ impl ByteBudget {
 
     /// Add `bytes` to the shared counter without applying the admission gate.
     ///
-    /// Used when a body was already admitted based on an estimate and its actual
-    /// serialized size is larger than that estimate. The request cannot be
-    /// rejected at this point, so the budget must record the overshoot and let
-    /// later releases drain it.
+    /// Used for the single floor-priority request allowed to overdraft a full
+    /// budget so floor progress cannot deadlock. The request's normal receipt,
+    /// timeout, watchdog, or reset path releases the charge.
     pub(crate) fn charge(&mut self, bytes: u64) {
         if bytes == 0 {
             return;

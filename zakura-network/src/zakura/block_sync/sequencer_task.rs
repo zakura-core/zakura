@@ -742,10 +742,10 @@ impl SequencerTask {
         };
         // Only wake watchers (the reactor + every per-peer routine) when a field
         // they schedule against actually changed. The two committed_*_per_sec rates
-        // are observability-only; without this guard a no-op control input — e.g. a
-        // `FundFloorReservation` that shed nothing while the byte budget is pinned —
-        // still publishes an otherwise-identical view and re-wakes the requesting
-        // routine's `sequencer_view.changed()` arm into an immediate refill retry.
+        // are observability-only; without this guard a stale or duplicate
+        // `ApplyFinished` input can publish an otherwise-identical view and re-wake
+        // every routine's `sequencer_view.changed()` arm into an immediate refill
+        // retry.
         // That is a timer-free reactor<->sequencer<->routine busy-spin: it wastes a
         // core (and starves progress under CI load) on a real clock and fully wedges
         // a `start_paused` test clock, which auto-advances only once every task

@@ -927,10 +927,10 @@ impl PeerRoutine {
                     "failed to queue Zakura block-sync GetBlocks"
                 );
                 self.trace_queue_send_failed(&msg, &error);
-                // Nothing was received, so return every taken height to the queue.
-                // Held-aware: a competing peer's late body may have converted a taken
-                // height during the reserve await; that body is owned by the Sequencer,
-                // so skip it here rather than re-queue and double-release it.
+                // Return every still-reserved height to the queue. A competing
+                // peer's late body may have claimed a taken height and released its
+                // request reservation during the reserve await; leave that height
+                // in flight rather than re-queueing or releasing it twice.
                 let released = self
                     .work
                     .release_reserved_and_return_items(items.iter().map(|(height, _)| *height));
@@ -1177,10 +1177,9 @@ impl PeerRoutine {
         while index < self.window.outstanding.len() {
             if self.window.outstanding[index].request.end_height() <= floor {
                 let outstanding = self.window.outstanding.remove(index);
-                // Release only the size-estimate still reserved for unreceived
-                // heights. A height a competing peer delivered late is `Held`: its
-                // body is in the commit pipeline and the Sequencer releases those
-                // bytes on commit, so it must not be released a second time here.
+                // Release only estimates whose per-height ledger is still
+                // `Reserved`. A competing delivery changes that ledger to
+                // `Released` at receipt, so floor GC must not release it again.
                 released = released.saturating_add(
                     self.work
                         .release_reserved_heights(unreceived_heights(&outstanding)),
@@ -1745,14 +1744,12 @@ impl PeerRoutine {
         }
     }
 
-    /// A body arrived for a request this peer owns, but its height was already
-    /// settled by a competing peer (first-completion-wins), released by a
-    /// watchdog, or committed past the floor — so `settle_active_reserved_height`
-    /// returned `None`. The body is already in the commit pipeline: record the
-    /// height as received so the request can complete without re-queuing a body we
-    /// already hold, and without touching the budget (the settling path owns those
-    /// bytes). Count it as block progress since a real wanted body did arrive on
-    /// this peer's stream.
+    /// A body arrived for a request this peer owns, but its per-height ledger was
+    /// already `Released` by a competing receipt, watchdog, or floor GC, so
+    /// `release_active_reserved_height` returned `None`. Record the height as
+    /// received so the request can complete without re-queueing it or touching
+    /// the budget again. Count it as block progress since a real wanted body did
+    /// arrive on this peer's stream.
     fn accept_already_settled_height(&mut self, index: usize, height: block::Height) {
         self.window
             .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());

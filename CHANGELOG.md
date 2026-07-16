@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevent initial sync from stalling at checkpoint boundaries by refilling the
+  verifier submission window after stale apply completions.
+
 ### Changed
 
 - Block-sync now keeps its apply backlog in serialized wire form and decodes

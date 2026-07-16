@@ -403,8 +403,11 @@ impl SequencerTask {
                 result,
                 local_frontier,
             } => {
-                self.handle_apply_finished(token, height, hash, result, local_frontier)
-                    .await
+                let needs_reaction = self
+                    .handle_apply_finished(token, height, hash, result, local_frontier)
+                    .await;
+                self.submit_pending_blocks().await;
+                needs_reaction
             }
         }
     }

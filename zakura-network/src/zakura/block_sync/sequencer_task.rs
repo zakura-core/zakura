@@ -807,7 +807,12 @@ impl SequencerTask {
             return false;
         };
 
-        self.sequencer.has_buffered_at_or_above(next) || peer_has_successor_after
+        // A successor is active while buffered, requested from a peer, or in flight
+        // from the work queue. Include in-flight bodies so a forward advance does not
+        // mistake a completed request for a reorg and discard its body.
+        self.sequencer.has_buffered_at_or_above(next)
+            || peer_has_successor_after
+            || self.work.max_in_flight().is_some_and(|max| max >= next)
     }
 
     fn active_successor_links_to_anchor(
@@ -1042,6 +1047,77 @@ mod tests {
         assert!(
             !task.sequencer.reorder_contains(height),
             "body claimed before the reset must not enter the new-fork reorder buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_reset_with_held_successor_classifies_growth_and_admits_body() {
+        // A forward advance onto our own chain must not be treated as a reorg when
+        // its successor body is downloaded (held in the work queue) but still
+        // travelling the bounded body channel. Treating it destructively would bump
+        // the reset epoch and drop the valid successor.
+        let startup_frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: block::Hash([1; 32]),
+        };
+        // Advance the verified tip forward to height 2 on the same chain.
+        let reset_frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(2),
+            verified_block_hash: block::Hash([2; 32]),
+        };
+        // The successor at height 3 was delivered and settled to Held; its body is
+        // still in the body channel (fed below), so no peer request references it.
+        let successor = block::Height(3);
+        let successor_hash = block::Hash([3; 32]);
+        let mut budget = ByteBudget::new(1_024);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        assert_eq!(
+            work.extend([(successor, successor_hash, BlockSizeEstimate::Advertised(64))]),
+            1
+        );
+        assert_eq!(work.take_in_range(successor, successor, 1).len(), 1);
+        assert_eq!(work.mark_reserved([successor]), 64);
+        assert!(budget.try_reserve(64));
+        assert_eq!(work.settle_active_reserved_height(successor, 64), Some(0));
+        let work_view = Arc::clone(&work);
+        let (actions_tx, _actions_rx) = mpsc::channel(1);
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (view_tx, _view_rx) = watch::channel(initial_view(startup_frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            budget,
+            work,
+            actions_tx,
+            ThroughputMeter::new(Instant::now()),
+            startup_frontiers,
+            body_rx,
+            control_rx,
+            body_input_bytes,
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+
+        task.handle_frontier_reset(reset_frontiers, false, false, false)
+            .await;
+
+        // The classification is the fix: no epoch bump means a body still carrying
+        // the pre-reset epoch matches and is admitted rather than dropped. The
+        // end-to-end admission of the in-channel body is exercised with a real block
+        // by `reactor_forward_reset_preserves_buffered_successor_body`.
+        assert_eq!(
+            task.reset_epoch, 0,
+            "a forward advance with a held successor is growth, not a reorg, so the \
+             reset epoch must not bump"
+        );
+        assert!(
+            work_view.in_flight_contains(successor),
+            "growth must preserve the held successor claim rather than reset_above it"
         );
     }
 }

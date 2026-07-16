@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Security
+
+- Bound health endpoint connections and expire incomplete HTTP requests to
+  prevent externally reachable health listeners from accumulating sockets and
+  tasks.
+
 ### Fixed
 
 - Prevent initial sync from stalling at checkpoint boundaries by refilling the

@@ -21,6 +21,7 @@
 //! - Endpoints are unauthenticated by design. Bind to internal network interfaces,
 //!   and restrict exposure using network policy, firewall rules, and service configuration.
 //! - The server does not access or return private data. It only summarises coarse node state.
+//! - Active connections are bounded and each connection has a short request timeout.
 //!
 //! Configuration and examples
 //!
@@ -48,7 +49,7 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use tokio::{
-    sync::watch,
+    sync::{watch, Semaphore},
     task::JoinHandle,
     time::{self, MissedTickBehavior},
 };
@@ -71,6 +72,18 @@ const MAX_RECENT_REQUESTS: usize = 10_000;
 const MAX_RECENT_REQUESTS: usize = 10;
 
 const RECENT_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Maximum number of health connections that can be active at once.
+#[cfg(not(test))]
+const MAX_ACTIVE_HEALTH_CONNECTIONS: usize = 100;
+#[cfg(test)]
+const MAX_ACTIVE_HEALTH_CONNECTIONS: usize = 2;
+
+/// Maximum time allowed to receive and serve one health request.
+#[cfg(not(test))]
+const HEALTH_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const HEALTH_CONNECTION_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 struct HealthCtx<SyncStatus>
@@ -312,22 +325,31 @@ async fn run_health_server<SyncStatus>(
 {
     let mut num_recent_requests: usize = 0;
     let mut last_request_count_reset_time = Instant::now();
+    let active_connections = Arc::new(Semaphore::new(MAX_ACTIVE_HEALTH_CONNECTIONS));
 
-    // Dedicated accept loop to keep request handling small and predictable; we
-    // still spawn per-connection tasks but share the context clone.
+    // Dedicated accept loop to keep request handling small and predictable.
 
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                if num_recent_requests < MAX_RECENT_REQUESTS {
-                    num_recent_requests += 1;
-                } else if last_request_count_reset_time.elapsed() > RECENT_REQUEST_INTERVAL {
+                if last_request_count_reset_time.elapsed() > RECENT_REQUEST_INTERVAL {
                     num_recent_requests = 0;
                     last_request_count_reset_time = Instant::now();
-                } else {
-                    // Drop the request if there have been too many recent requests
+                }
+
+                if num_recent_requests >= MAX_RECENT_REQUESTS {
+                    // Drop the connection if there have been too many recent accepts.
                     continue;
                 }
+                num_recent_requests += 1;
+
+                let Ok(connection_permit) = active_connections.clone().try_acquire_owned() else {
+                    debug!(
+                        max_active_connections = MAX_ACTIVE_HEALTH_CONNECTIONS,
+                        "health server active connection limit reached"
+                    );
+                    continue;
+                };
 
                 let io = TokioIo::new(stream);
                 let svc_ctx = shared.clone();
@@ -335,8 +357,26 @@ async fn run_health_server<SyncStatus>(
                     hyper::service::service_fn(move |req| handle_request(req, svc_ctx.clone()));
 
                 tokio::spawn(async move {
-                    if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                        debug!(?err, "health server connection closed with error");
+                    let _connection_permit = connection_permit;
+                    let mut builder = http1::Builder::new();
+                    builder.keep_alive(false);
+
+                    match time::timeout(
+                        HEALTH_CONNECTION_TIMEOUT,
+                        builder.serve_connection(io, service),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            debug!(?err, "health server connection closed with error");
+                        }
+                        Err(_) => {
+                            debug!(
+                                ?HEALTH_CONNECTION_TIMEOUT,
+                                "health server connection timed out"
+                            );
+                        }
                     }
                 });
             }

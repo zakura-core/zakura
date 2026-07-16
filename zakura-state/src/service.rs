@@ -1650,52 +1650,38 @@ where
             break;
         };
 
-        let root = if finalized_tip.is_some_and(|finalized_tip| height <= finalized_tip) {
-            finalized_roots.get(&height).cloned()
-        } else if let Some(chain) = chain
-            .as_ref()
-            .map(|chain| chain.as_ref())
-            .filter(|chain| chain.contains_block_height(height))
-        {
-            match (
-                chain.sapling_tree(height.into()),
-                chain.orchard_tree(height.into()),
-                chain.ironwood_tree(height.into()),
-            ) {
-                (Some(sapling), Some(orchard), Some(ironwood)) => {
-                    let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = chain
+        let root =
+            if finalized_tip.is_some_and(|finalized_tip| height <= finalized_tip) {
+                finalized_roots.get(&height).cloned()
+            } else if let Some(chain) = chain
+                .as_ref()
+                .map(|chain| chain.as_ref())
+                .filter(|chain| chain.contains_block_height(height))
+            {
+                match (
+                    chain.sapling_tree(height.into()),
+                    chain.orchard_tree(height.into()),
+                    chain.ironwood_tree(height.into()),
+                ) {
+                    // A chain that reports this height also holds the block. Yield no roots rather
+                    // than serve fabricated counts and an all-zero auth-data root if it does not.
+                    (Some(sapling), Some(orchard), Some(ironwood)) => chain
                         .block(height.into())
-                        .map(|block| {
-                            (
-                                block.block.sapling_transactions_count(),
-                                block.block.orchard_transactions_count(),
-                                block.block.ironwood_transactions_count(),
-                                block.block.auth_data_root(),
-                            )
-                        })
-                        .unwrap_or((
-                            0,
-                            0,
-                            0,
-                            zakura_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
-                        ));
-
-                    Some(BlockCommitmentRoots {
-                        height,
-                        sapling_root: sapling.root(),
-                        orchard_root: orchard.root(),
-                        ironwood_root: ironwood.root(),
-                        sapling_tx,
-                        orchard_tx,
-                        ironwood_tx,
-                        auth_data_root,
-                    })
+                        .map(|block| BlockCommitmentRoots {
+                            height,
+                            sapling_root: sapling.root(),
+                            orchard_root: orchard.root(),
+                            ironwood_root: ironwood.root(),
+                            sapling_tx: block.block.sapling_transactions_count(),
+                            orchard_tx: block.block.orchard_transactions_count(),
+                            ironwood_tx: block.block.ironwood_transactions_count(),
+                            auth_data_root: block.block.auth_data_root(),
+                        }),
+                    _ => None,
                 }
-                _ => None,
-            }
-        } else {
-            provisional_roots.get(&height).cloned()
-        };
+            } else {
+                provisional_roots.get(&height).cloned()
+            };
 
         let Some(root) = root else {
             break;

@@ -227,27 +227,24 @@ fn fill_header_sync_fallback_roots(
             .as_ref()
             .map(|tree| tree.root())
             .unwrap_or_else(|| ironwood::tree::NoteCommitmentTree::default().root());
-        let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = if block_transactions.is_empty()
-        {
-            metrics::counter!("state.block_roots.zero_aux_fallback").increment(1);
-            (
-                0,
-                0,
-                0,
-                zakura_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
-            )
-        } else {
-            let block = Block {
-                header: row.header.clone(),
-                transactions: block_transactions,
-            };
-            (
-                block.sapling_transactions_count(),
-                block.orchard_transactions_count(),
-                block.ironwood_transactions_count(),
-                block.auth_data_root(),
-            )
+        // Every block has at least a coinbase transaction, so an empty list means the body
+        // is unavailable (for example, pruned while the trees were retained). Leave the
+        // roots unset so the caller reports incomplete roots instead of serving fabricated
+        // counts and an all-zero auth-data root.
+        if block_transactions.is_empty() {
+            metrics::counter!("state.block_roots.missing_body").increment(1);
+            continue;
+        }
+        let block = Block {
+            header: row.header.clone(),
+            transactions: block_transactions,
         };
+        let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = (
+            block.sapling_transactions_count(),
+            block.orchard_transactions_count(),
+            block.ironwood_transactions_count(),
+            block.auth_data_root(),
+        );
         row.commitment_roots = Some(BlockCommitmentRoots {
             height: row.height,
             sapling_root: sapling.root(),

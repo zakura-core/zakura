@@ -1158,6 +1158,40 @@ fn pruned_block_bodies_stop_tree_derived_root_serving() {
     );
 }
 
+/// The header-sync range reader derives the same tree-backed roots as
+/// [`serve_block_roots`], so it must also refuse to fabricate them. Leaving the roots
+/// unset makes the serving path report incomplete roots rather than send a peer zeroed
+/// transaction counts and an all-zero auth-data root.
+#[test]
+fn pruned_block_bodies_stop_header_sync_range_root_serving() {
+    let _init_guard = zakura_test::init();
+    let network = Mainnet;
+    let state = new_state_with_blocks(&Config::ephemeral(), &network);
+
+    let mut batch = DiskWriteBatch::new();
+    batch.prepare_prune_batch(&state.db, Height(1), Height(4));
+    // Model a database upgraded after these blocks were committed: historical
+    // heights below this marker are served from trees instead of the roots index.
+    batch.update_vct_upgrade_marker(&state.db, Height(TEST_BLOCKS + 1));
+    state.db.write_batch(batch).expect("prune batch writes");
+    // These heights predate the serving index, so they take the tree-backed
+    // fallback that derives the auxiliary metadata from the (now pruned) body.
+    state
+        .db
+        .delete_zakura_header_commitment_roots([Height(1), Height(2), Height(3)])
+        .expect("roots index rows are removed");
+
+    let rows = state.db.header_sync_range_snapshot(Height(1), 3, true);
+    assert!(
+        !rows.is_empty(),
+        "pruning retains the headers this range serves"
+    );
+    assert!(
+        rows.iter().all(|row| row.commitment_roots.is_none()),
+        "pruned bodies leave the roots unset instead of fabricating counts and an auth-data root"
+    );
+}
+
 #[test]
 #[should_panic(expected = "pruned")]
 fn reopening_pruned_database_in_archive_mode_panics() {

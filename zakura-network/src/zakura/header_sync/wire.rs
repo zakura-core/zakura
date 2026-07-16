@@ -33,6 +33,12 @@ pub const DEFAULT_HS_RANGE: u32 = 1000;
 pub const MAX_HS_RANGE: u32 = 4000;
 /// Default number of in-flight header requests advertised per peer.
 pub const DEFAULT_HS_MAX_INFLIGHT: u16 = 10;
+/// Default number of header-range state reads this node runs at once, across all peers.
+///
+/// Serving reads run on the blocking pool and each holds a database snapshot, so this bounds
+/// how much wire-triggered work a node does concurrently. It is not advertised: peers pace
+/// themselves with [`DEFAULT_HS_MAX_INFLIGHT`], and this is the local ceiling underneath.
+pub const DEFAULT_HS_MAX_CONCURRENT_RANGE_READS: usize = 32;
 
 pub(super) const HEADER_SYNC_MESSAGE_TYPE_BYTES: usize = 1;
 pub(super) const HEADER_SYNC_REQUEST_ID_BYTES: usize = 8;

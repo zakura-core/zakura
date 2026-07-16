@@ -10,6 +10,7 @@ use futures::FutureExt;
 use tokio::{
     pin, select,
     sync::{mpsc, Semaphore},
+    task::JoinSet,
 };
 use tower::{Service, ServiceExt};
 use tracing::{debug, warn};
@@ -33,6 +34,12 @@ use super::{
     block_verify_error_is_duplicate, emit_commit_state, insert_cs_frontiers, insert_cs_hash,
     insert_cs_height, insert_cs_peer, insert_cs_str, insert_cs_u64, verified_block_tip_from_state,
 };
+
+/// How long shutdown waits for in-flight header-range serving before aborting it.
+///
+/// The endpoint aborts each tracked task after one second, so a drain that used the whole
+/// budget would be cut off mid-way and abort the tasks anyway, just later.
+const SERVE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub(crate) async fn zakura_header_sync_driver_startup(
     read_state: zakura_state::ReadStateService,
@@ -750,6 +757,12 @@ pub(crate) async fn serve_header_sync_range<ReadState>(
     drop(permit);
 }
 
+/// Runs the header-sync action loop until `shutdown`.
+///
+/// `max_concurrent_header_range_reads` bounds the header-range state reads in flight at once
+/// across all peers; callers pass
+/// [`ZakuraHeaderSyncConfig::effective_max_concurrent_range_reads`], which floors it at 1.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<HeaderSyncAction>,
     handles: ZakuraHeaderSyncDriverHandles,
@@ -757,6 +770,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
     read_state: ReadState,
     block_verifier: BlockVerifier,
     trace: ZakuraTrace,
+    max_concurrent_header_range_reads: usize,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) where
     State: Service<
@@ -780,17 +794,24 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
-    const MAX_CONCURRENT_HEADER_RANGE_READS: usize = 32;
-    // Requests wait for a slot in their own task, so saturation backpressures
-    // only that peer's admitted requests and never the header-sync reactor.
-    let header_range_reads = Arc::new(Semaphore::new(MAX_CONCURRENT_HEADER_RANGE_READS));
+    // Requests wait for a slot in their own task, so saturation backpressures the
+    // admitted requests of every peer and never the header-sync reactor itself.
+    let header_range_reads = Arc::new(Semaphore::new(max_concurrent_header_range_reads));
+    // Own the serving tasks rather than detaching them: the endpoint drains this driver on
+    // shutdown and would otherwise report the header-sync lifecycle stopped while detached
+    // state reads were still running against the database.
+    let mut serve_tasks = JoinSet::new();
     pin!(shutdown);
     loop {
+        // Reap the tasks that finished since the last action, so the set tracks in-flight
+        // serving rather than growing for the life of the node.
+        while serve_tasks.try_join_next().is_some() {}
+
         let action = select! {
-            _ = &mut shutdown => return,
+            _ = &mut shutdown => break,
             action = actions.recv() => {
                 let Some(action) = action else {
-                    return;
+                    break;
                 };
                 action
             }
@@ -994,7 +1015,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     want_tree_aux_roots,
                     deadline,
                 );
-                tokio::spawn(async move {
+                serve_tasks.spawn(async move {
                     if AssertUnwindSafe(task).catch_unwind().await.is_err() {
                         metrics::counter!("sync.header.serve.task_panics").increment(1);
                         warn!(
@@ -1306,6 +1327,22 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 );
             }
         }
+    }
+
+    // Give in-flight serving a bounded chance to finish so shutdown does not cut a response
+    // the peer is already owed, then let the set abort the rest as it drops. The endpoint
+    // bounds each tracked task at one second, so stay well inside that budget.
+    let drained = tokio::time::timeout(SERVE_DRAIN_TIMEOUT, async {
+        while serve_tasks.join_next().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    if !drained {
+        metrics::counter!("sync.header.serve.shutdown_aborted").increment(1);
+        debug!(
+            remaining = serve_tasks.len(),
+            "aborting Zakura header range serving tasks still running at shutdown"
+        );
     }
 }
 

@@ -61,6 +61,17 @@ pub struct ZakuraHeaderSyncConfig {
     /// outbound requester ceiling. The effective requester limit is the minimum
     /// of this value, the peer's advertisement, and the hard protocol cap of 16.
     pub max_inflight_requests: u16,
+    /// Maximum header-range state reads this node runs at once, across all peers.
+    ///
+    /// Serving a range reads the database on the blocking pool while holding a snapshot, so
+    /// this bounds the wire-triggered read concurrency a node will take on. Requests over the
+    /// limit wait for a slot and are answered with an empty response if they wait too long;
+    /// peers retry those, so lowering this trades serving throughput for local load rather
+    /// than dropping peers. Unlike [`max_inflight_requests`](Self::max_inflight_requests) it
+    /// is a local ceiling and is not advertised.
+    ///
+    /// A value of `0` is treated as `1`.
+    pub max_concurrent_range_reads: usize,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
     #[serde(with = "humantime_serde")]
     pub status_refresh_interval: Duration,
@@ -88,6 +99,7 @@ impl Default for ZakuraHeaderSyncConfig {
         Self {
             max_headers_per_response: DEFAULT_HS_RANGE,
             max_inflight_requests: DEFAULT_HS_MAX_INFLIGHT,
+            max_concurrent_range_reads: DEFAULT_HS_MAX_CONCURRENT_RANGE_READS,
             status_refresh_interval: DEFAULT_HS_STATUS_REFRESH_INTERVAL,
             peer_limits: ServicePeerLimits::default(),
             accept_new_blocks: true,
@@ -107,6 +119,14 @@ impl ZakuraHeaderSyncConfig {
     pub fn advertised_max_inflight_requests(&self) -> u16 {
         self.max_inflight_requests
             .clamp(1, LOCAL_MAX_HS_INFLIGHT_PER_PEER)
+    }
+
+    /// Return the concurrent header-range read limit, floored so serving always makes progress.
+    ///
+    /// A configured `0` would otherwise leave every request waiting for a slot that never
+    /// exists, silently turning off header-range serving.
+    pub fn effective_max_concurrent_range_reads(&self) -> usize {
+        self.max_concurrent_range_reads.max(1)
     }
 
     /// Return the configured trusted anchor, or genesis when no override is configured.

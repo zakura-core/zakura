@@ -487,6 +487,11 @@ impl StartCmd {
                         read_only_state_service.clone(),
                         block_verifier_router.clone(),
                         trace.clone(),
+                        config
+                            .network
+                            .zakura
+                            .header_sync
+                            .effective_max_concurrent_range_reads(),
                         shutdown.clone().cancelled_owned(),
                     )
                     .in_current_span(),
@@ -2535,6 +2540,7 @@ mod zakura_header_sync_driver_tests {
             read_state,
             verifier,
             zakura_network::zakura::ZakuraTrace::noop(),
+            zakura_network::zakura::DEFAULT_HS_MAX_CONCURRENT_RANGE_READS,
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -2572,6 +2578,166 @@ mod zakura_header_sync_driver_tests {
         })
         .await
         .expect("HeaderAdvanced publishes to the exchange");
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        endpoint.shutdown().await;
+    }
+
+    /// Serving reads run on the blocking pool holding a database snapshot, so the operator's
+    /// configured ceiling has to reach the driver's semaphore. A hardcoded limit would let a
+    /// node take on wire-triggered read concurrency its config says it will not.
+    #[tokio::test]
+    async fn header_range_read_concurrency_honors_the_configured_limit() {
+        const LIMIT: usize = 2;
+        const REQUESTS: u64 = 6;
+
+        let network = zakura_chain::parameters::Network::Mainnet;
+        let genesis_hash = network.genesis_hash();
+        let mut config = zakura_network::Config {
+            network: network.clone(),
+            ..zakura_network::Config::for_test(P2pStack::Dual)
+        };
+        config.zakura.listen_addr = None;
+        let endpoint = zakura_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(
+            &config,
+            |_supervisor, _trace| Arc::new(NoopZakuraService) as Arc<dyn ZakuraService>,
+            Some(ZakuraHeaderSyncDriverStartup {
+                frontiers: HeaderSyncFrontiers {
+                    finalized_height: block::Height(0),
+                    verified_block_tip: block::Height(0),
+                    verified_block_hash: genesis_hash,
+                },
+                best_header_tip: Some((block::Height(0), genesis_hash)),
+                verified_block_tip_hash: genesis_hash,
+            }),
+        )
+        .await
+        .expect("Zakura endpoint starts")
+        .expect("v2_p2p starts an endpoint");
+
+        let (action_tx, action_rx) = mpsc::channel(16);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handles = ZakuraHeaderSyncDriverHandles {
+            endpoint: endpoint.clone(),
+            header_sync: endpoint
+                .header_sync()
+                .expect("driver startup starts header sync"),
+        };
+        let state = service_fn(|request: zakura_state::Request| async move {
+            panic!("unexpected state request while serving ranges: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_state::BoxError>(zakura_state::Response::Committed(block::Hash([0; 32])))
+        });
+        let verifier = service_fn(|request: zakura_consensus::Request| async move {
+            panic!("unexpected verifier request while serving ranges: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_consensus::BoxError>(block::Hash([0; 32]))
+        });
+
+        // Hold every read open so the reads that started are exactly the reads holding a slot.
+        let read_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let read_state = service_fn({
+            let read_gate = read_gate.clone();
+            let active = active.clone();
+            let started = started.clone();
+            let peak = peak.clone();
+            move |request: zakura_state::ReadRequest| {
+                let read_gate = read_gate.clone();
+                let active = active.clone();
+                let started = started.clone();
+                let peak = peak.clone();
+                async move {
+                    assert!(matches!(
+                        request,
+                        zakura_state::ReadRequest::HeaderSyncRange { .. }
+                    ));
+                    started.fetch_add(1, Ordering::SeqCst);
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    let _active = ActiveServingRead(active);
+                    read_gate
+                        .acquire()
+                        .await
+                        .expect("read test gate stays open")
+                        .forget();
+                    Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::HeaderSyncRange(
+                        Vec::new(),
+                    ))
+                }
+            }
+        });
+
+        let driver = tokio::spawn(drive_zakura_header_sync_actions(
+            action_rx,
+            handles,
+            state,
+            read_state,
+            verifier,
+            zakura_network::zakura::ZakuraTrace::noop(),
+            LIMIT,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let peer = test_zakura_peer(241);
+        for id in 1..=REQUESTS {
+            action_tx
+                .send(
+                    zakura_network::zakura::HeaderSyncAction::QueryHeadersByHeightRange {
+                        peer: peer.clone(),
+                        session_id: 0,
+                        request_id: zakura_network::zakura::HeaderSyncRequestId::new(id)
+                            .expect("test request ID is non-zero"),
+                        start: block::Height(id as u32),
+                        count: 1,
+                        want_tree_aux_roots: false,
+                        deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+                    },
+                )
+                .await
+                .expect("driver action channel stays open");
+        }
+
+        // The limit's worth of reads enter state; the rest wait for a slot.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while started.load(Ordering::SeqCst) < LIMIT {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the configured number of reads enter state");
+
+        // Give any unbounded read the chance to start, so this fails against a hardcoded cap
+        // rather than merely racing ahead of one.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            LIMIT,
+            "reads beyond the configured limit must wait for a slot"
+        );
+
+        // Releasing the gate lets the waiting requests through, proving they were queued
+        // rather than dropped.
+        read_gate.add_permits(REQUESTS as usize);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while started.load(Ordering::SeqCst) < REQUESTS as usize {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every queued request eventually reads");
+        assert!(
+            peak.load(Ordering::SeqCst) <= LIMIT,
+            "concurrent reads peaked at {}, above the configured limit of {LIMIT}",
+            peak.load(Ordering::SeqCst)
+        );
 
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
@@ -2655,6 +2821,7 @@ mod zakura_header_sync_driver_tests {
             read_state,
             verifier,
             zakura_network::zakura::ZakuraTrace::noop(),
+            zakura_network::zakura::DEFAULT_HS_MAX_CONCURRENT_RANGE_READS,
             async move {
                 let _ = shutdown_rx.await;
             },

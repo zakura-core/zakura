@@ -1710,6 +1710,23 @@ fn advertised_defaults_and_clamping_match_design() {
         LOCAL_MAX_HS_INFLIGHT_PER_PEER
     );
 
+    // The serving read limit keeps its default and is a local ceiling, so unlike
+    // `max_inflight_requests` it is never clamped to the per-peer advertisement cap.
+    assert_eq!(
+        config.effective_max_concurrent_range_reads(),
+        DEFAULT_HS_MAX_CONCURRENT_RANGE_READS
+    );
+    // A configured zero would leave every request waiting for a slot that never exists,
+    // silently turning off header-range serving.
+    assert_eq!(
+        ZakuraHeaderSyncConfig {
+            max_concurrent_range_reads: 0,
+            ..ZakuraHeaderSyncConfig::default()
+        }
+        .effective_max_concurrent_range_reads(),
+        1
+    );
+
     let status = HeaderSyncStatus {
         max_headers_per_response: MAX_HS_RANGE + 10,
         ..HeaderSyncStatus::default()

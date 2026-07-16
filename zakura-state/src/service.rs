@@ -51,7 +51,7 @@ use crate::{
     service::{
         block_iter::any_ancestor_blocks,
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
-        finalized_state::{FinalizedState, ZakuraDb},
+        finalized_state::{FinalizedState, HeaderRangeColumns, ZakuraDb},
         non_finalized_state::{Chain, NonFinalizedState},
         pending_utxos::PendingUtxos,
         queued_blocks::QueuedBlocks,
@@ -1517,7 +1517,14 @@ where
 {
     let count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
     let mut disk_rows = db
-        .header_sync_range_snapshot(start, count, include_roots)
+        .header_sync_range_snapshot(
+            start,
+            count,
+            HeaderRangeColumns {
+                body_sizes: true,
+                commitment_roots: include_roots,
+            },
+        )
         .into_iter()
         .peekable();
     let mut rows = Vec::with_capacity(
@@ -1535,10 +1542,18 @@ where
                     height,
                     hash: block.hash,
                     header: block.block.header.clone(),
-                    body_size: Some(
-                        u32::try_from(block.block.zcash_serialized_size())
-                            .expect("serialized consensus blocks are bounded below u32::MAX"),
-                    ),
+                    // Prefer the size the chain recorded when it pushed this block: it is the
+                    // same `zcash_serialized_size`, so re-deriving it costs a full serialization
+                    // pass per block per request for an advisory hint. Serialize only if the
+                    // record is somehow absent, because `None` reaches the driver as a zero-byte
+                    // body and would silently under-account serving memory.
+                    body_size: Some(chain.block_info(height.into()).map_or_else(
+                        || {
+                            u32::try_from(block.block.zcash_serialized_size())
+                                .expect("serialized consensus blocks are bounded below u32::MAX")
+                        },
+                        |info| info.size(),
+                    )),
                     // Derive this height's roots from the chain that already holds it, so a
                     // range reaching the non-finalized tip does not send the fallback below
                     // back over the whole range for the few heights it covers.

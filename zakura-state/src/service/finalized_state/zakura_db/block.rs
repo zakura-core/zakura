@@ -81,6 +81,18 @@ where
         .map(|(_, value)| value)
 }
 
+/// Which optional columns a header range reads.
+///
+/// Each one costs iterators and per-height decoding, so requests that do not use a column say
+/// so rather than paying for it and dropping the result.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HeaderRangeColumns {
+    /// Read the advisory serialized body size of each block.
+    pub(crate) body_sizes: bool,
+    /// Read each block's tree-aux commitment roots, deriving any the index is missing.
+    pub(crate) commitment_roots: bool,
+}
+
 fn fill_header_sync_fallback_roots(
     db: &DiskDb,
     snapshot: &DiskDbSnapshot<'_>,
@@ -743,7 +755,7 @@ impl ZakuraDb {
         &self,
         start: block::Height,
         count: u32,
-        include_roots: bool,
+        columns: HeaderRangeColumns,
     ) -> Vec<crate::HeaderSyncRangeEntry> {
         let capped_count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
 
@@ -785,19 +797,23 @@ impl ZakuraDb {
                 start..=end,
             )
             .peekable();
-        let mut block_infos = snapshot
-            .zs_forward_range_iter::<_, block::Height, zakura_chain::block_info::BlockInfo, _>(
-                &block_info,
-                start..=end,
-            )
-            .peekable();
-        let mut advertised_sizes = snapshot
-            .zs_forward_range_iter::<_, block::Height, AdvertisedBodySize, _>(
-                &body_size_by_height,
-                start..=end,
-            )
-            .peekable();
-        let mut roots = include_roots.then(|| {
+        let mut block_infos = columns.body_sizes.then(|| {
+            snapshot
+                .zs_forward_range_iter::<_, block::Height, zakura_chain::block_info::BlockInfo, _>(
+                    &block_info,
+                    start..=end,
+                )
+                .peekable()
+        });
+        let mut advertised_sizes = columns.body_sizes.then(|| {
+            snapshot
+                .zs_forward_range_iter::<_, block::Height, AdvertisedBodySize, _>(
+                    &body_size_by_height,
+                    start..=end,
+                )
+                .peekable()
+        });
+        let mut roots = columns.commitment_roots.then(|| {
             snapshot
                 .zs_forward_range_iter::<_, block::Height, CommitmentRootsByHeight, _>(
                     &roots_by_height,
@@ -808,9 +824,11 @@ impl ZakuraDb {
         metrics::counter!("state.header_sync_range.iterators", "column" => "header_hash")
             .increment(2);
         metrics::counter!("state.header_sync_range.iterators", "column" => "header").increment(2);
-        metrics::counter!("state.header_sync_range.iterators", "column" => "body_size")
-            .increment(2);
-        if include_roots {
+        if columns.body_sizes {
+            metrics::counter!("state.header_sync_range.iterators", "column" => "body_size")
+                .increment(2);
+        }
+        if columns.commitment_roots {
             metrics::counter!("state.header_sync_range.iterators", "column" => "roots")
                 .increment(1);
         }
@@ -829,10 +847,15 @@ impl ZakuraDb {
                 break;
             };
 
-            let body_size = take_value_at_height(&mut block_infos, height)
+            let body_size = block_infos
+                .as_mut()
+                .and_then(|infos| take_value_at_height(infos, height))
                 .map(|info| info.size())
                 .or_else(|| {
-                    take_value_at_height(&mut advertised_sizes, height).map(AdvertisedBodySize::get)
+                    advertised_sizes
+                        .as_mut()
+                        .and_then(|sizes| take_value_at_height(sizes, height))
+                        .map(AdvertisedBodySize::get)
                 });
             let commitment_roots = roots
                 .as_mut()
@@ -861,7 +884,7 @@ impl ZakuraDb {
             height = next_height;
         }
 
-        if include_roots {
+        if columns.commitment_roots {
             fill_header_sync_fallback_roots(&self.db, &snapshot, &mut headers);
         }
 
@@ -874,7 +897,9 @@ impl ZakuraDb {
         start: block::Height,
         count: u32,
     ) -> Vec<(block::Height, block::Hash, Arc<block::Header>)> {
-        self.header_sync_range_snapshot(start, count, false)
+        // Headers only: this request drops every other column, so reading them would open
+        // iterators and decode a `BlockInfo` per height for nothing.
+        self.header_sync_range_snapshot(start, count, HeaderRangeColumns::default())
             .into_iter()
             .map(|row| (row.height, row.hash, row.header))
             .collect()

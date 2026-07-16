@@ -32,7 +32,9 @@ use crate::{
     RollbackFinalizedStateOptions, SemanticallyVerifiedBlock,
 };
 
-use super::super::{prune_height_range_inner, should_log_prune_progress, RetentionPlan};
+use super::super::{
+    prune_height_range_inner, should_log_prune_progress, HeaderRangeColumns, RetentionPlan,
+};
 
 /// The number of leading blocks committed by the database-backed prune tests.
 const TEST_BLOCKS: u32 = 9;
@@ -1181,7 +1183,14 @@ fn pruned_block_bodies_stop_header_sync_range_root_serving() {
         .delete_zakura_header_commitment_roots([Height(1), Height(2), Height(3)])
         .expect("roots index rows are removed");
 
-    let rows = state.db.header_sync_range_snapshot(Height(1), 3, true);
+    let rows = state.db.header_sync_range_snapshot(
+        Height(1),
+        3,
+        HeaderRangeColumns {
+            body_sizes: true,
+            commitment_roots: true,
+        },
+    );
     assert!(
         !rows.is_empty(),
         "pruning retains the headers this range serves"
@@ -1189,6 +1198,62 @@ fn pruned_block_bodies_stop_header_sync_range_root_serving() {
     assert!(
         rows.iter().all(|row| row.commitment_roots.is_none()),
         "pruned bodies leave the roots unset instead of fabricating counts and an auth-data root"
+    );
+}
+
+/// Every optional column costs two iterators and a decode per height. A headers-only request --
+/// what `headers_by_height_range` issues on every block-locator response -- must not read the
+/// columns it drops.
+#[test]
+fn header_sync_range_reads_only_the_columns_the_request_asks_for() {
+    let _init_guard = zakura_test::init();
+    let network = Mainnet;
+    let state = new_state_with_blocks(&Config::ephemeral(), &network);
+
+    let all = state.db.header_sync_range_snapshot(
+        Height(1),
+        3,
+        HeaderRangeColumns {
+            body_sizes: true,
+            commitment_roots: true,
+        },
+    );
+    assert_eq!(all.len(), 3);
+    assert!(
+        all.iter().all(|row| row.body_size.is_some()),
+        "the sizes are on disk, so asking for them returns them"
+    );
+    assert!(
+        all.iter().all(|row| row.commitment_roots.is_some()),
+        "the roots are on disk, so asking for them returns them"
+    );
+
+    let identity: fn(&crate::HeaderSyncRangeEntry) -> _ =
+        |row| (row.height, row.hash, row.header.clone());
+    let headers_only =
+        state
+            .db
+            .header_sync_range_snapshot(Height(1), 3, HeaderRangeColumns::default());
+    assert_eq!(
+        headers_only.iter().map(identity).collect::<Vec<_>>(),
+        all.iter().map(identity).collect::<Vec<_>>(),
+        "skipping the optional columns must not change which headers are served",
+    );
+    assert!(
+        headers_only.iter().all(|row| row.body_size.is_none()),
+        "a request that drops body sizes must not read them",
+    );
+    assert!(
+        headers_only
+            .iter()
+            .all(|row| row.commitment_roots.is_none()),
+        "a request that drops roots must not read them",
+    );
+
+    assert_eq!(
+        state.db.headers_by_height_range(Height(1), 3),
+        all.iter().map(identity).collect::<Vec<_>>(),
+        "the headers-only request still serves the same headers",
     );
 }
 
@@ -1210,7 +1275,14 @@ fn header_sync_range_derives_roots_after_skipping_indexed_heights() {
 
     let expected: Vec<_> = state
         .db
-        .header_sync_range_snapshot(Height(1), 3, true)
+        .header_sync_range_snapshot(
+            Height(1),
+            3,
+            HeaderRangeColumns {
+                body_sizes: true,
+                commitment_roots: true,
+            },
+        )
         .into_iter()
         .map(|row| row.commitment_roots)
         .collect();
@@ -1228,7 +1300,14 @@ fn header_sync_range_derives_roots_after_skipping_indexed_heights() {
 
     let derived: Vec<_> = state
         .db
-        .header_sync_range_snapshot(Height(1), 3, true)
+        .header_sync_range_snapshot(
+            Height(1),
+            3,
+            HeaderRangeColumns {
+                body_sizes: true,
+                commitment_roots: true,
+            },
+        )
         .into_iter()
         .map(|row| row.commitment_roots)
         .collect();

@@ -29,9 +29,10 @@ use crate::{
     init_test,
     service::{
         arbitrary::populated_state,
+        block_roots_by_height_range, chain_commitment_roots,
         chain_tip::TipAction,
         finalized_state::{serve_block_roots, DiskWriteBatch, WriteDisk, VCT_UPGRADE_METADATA},
-        headers_by_height_range,
+        header_sync_range, headers_by_height_range,
         non_finalized_state::Chain,
         read, StateService,
     },
@@ -920,6 +921,102 @@ async fn header_range_reads_include_non_finalized_best_chain_blocks() -> Result<
     assert_eq!(
         headers_by_height_range(None::<Arc<Chain>>, &state_service.read_service.db, start, 2),
         Vec::new(),
+    );
+
+    Ok(())
+}
+
+/// Header-range rows for non-finalized heights are built from the chain that already holds
+/// them, rather than from the range fallback. Two things have to hold for that shortcut.
+///
+/// The roots it derives must equal what the fallback derives. `chain_commitment_roots` is
+/// asserted directly because the fallback backfills any row it leaves unset, which hides a
+/// broken shortcut behind the cost the shortcut exists to avoid.
+///
+/// The body size must match a full serialization. It is read from the size the chain recorded
+/// at push time instead of re-serializing every block of every range, and the two must agree.
+#[tokio::test(flavor = "multi_thread")]
+async fn header_sync_range_serves_non_finalized_heights_from_the_chain() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let (state_service, _read_state, _, _) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
+    let block1 = Arc::new(
+        network
+            .test_block(653599, 583999)
+            .expect("fake test block can be built for a post-Canopy height"),
+    );
+    let block2 = block1.make_fake_child();
+    let start = block1.coinbase_height().unwrap();
+    let mut chain = Chain::new(
+        &network,
+        (start - 1).unwrap(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        ValueBalance::fake_populated_pool(),
+    );
+    chain = chain.push(block1.clone().prepare().test_with_zero_spent_utxos())?;
+    chain = chain.push(block2.clone().prepare().test_with_zero_spent_utxos())?;
+    let chain = Arc::new(chain);
+
+    let rows = header_sync_range(
+        Some(chain.clone()),
+        &state_service.read_service.db,
+        start,
+        2,
+        true,
+    );
+    assert_eq!(rows.len(), 2, "both chain heights are served");
+
+    for (row, block) in rows.iter().zip([&block1, &block2]) {
+        assert_eq!(
+            row.body_size,
+            Some(u32::try_from(block.zcash_serialized_size()).expect("test block fits in u32")),
+            "the recorded body size must match a full serialization",
+        );
+        assert!(
+            row.commitment_roots.is_some(),
+            "a height the chain holds must come back with roots, or the node stops serving \
+             ranges that reach its tip",
+        );
+    }
+
+    // The shortcut must agree with the general path it bypasses. Assert the shortcut itself,
+    // not just the rows: the fallback backfills unset rows, so a shortcut that silently
+    // stopped deriving would still produce correct rows -- at the cost it exists to avoid.
+    let ladder = block_roots_by_height_range(
+        Some(chain.clone()),
+        &state_service.read_service.db,
+        start,
+        2,
+    );
+    assert_eq!(ladder.len(), 2, "the fallback covers both chain heights");
+    for (height, expected) in ladder.iter().map(|roots| (roots.height, roots)) {
+        assert_eq!(
+            chain_commitment_roots(chain.as_ref(), height).as_ref(),
+            Some(expected),
+            "the chain shortcut must derive what the fallback derives at {height:?}",
+        );
+    }
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.commitment_roots.clone().expect("roots are present"))
+            .collect::<Vec<_>>(),
+        ladder,
+        "chain-derived roots must match the fallback derivation",
+    );
+
+    // A request that wants no roots must not pay for them.
+    let headers_only =
+        header_sync_range(Some(chain), &state_service.read_service.db, start, 2, false);
+    assert!(
+        headers_only
+            .iter()
+            .all(|row| row.commitment_roots.is_none()),
+        "roots nobody asked for must not be derived",
     );
 
     Ok(())

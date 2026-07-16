@@ -104,6 +104,7 @@ pub use disk_format::{
     MAX_ON_DISK_HEIGHT,
 };
 pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, NextVctBlock};
+pub(crate) use zakura_db::block::HeaderRangeColumns;
 pub use zakura_db::ZakuraDb;
 
 #[cfg(any(test, feature = "proptest-impl"))]

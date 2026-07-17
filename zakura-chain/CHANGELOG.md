@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-18
+
 ### Added
 
-- `Block::attributed_memory_size_bytes()` for deterministic decoded-block memory attribution.
+- `Block::attributed_memory_size_bytes()` for deterministic decoded-block
+  memory attribution
+  ([#159](https://github.com/zakura-core/zakura/pull/159)).
 
 ## [1.0.0] - 2026-07-15
 

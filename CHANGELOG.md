@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-## [1.0.1] - 2026-07-18
+## [1.0.1] - 2026-07-17
 
 ### Added
 
@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Zakura v1.0.1 remains supported through the expected Ironwood activation
+  (height 3,428,143, ~2026-07-28) and halts one week after it: the
+  end-of-support window widens from 7 to 18 days after the estimated release
+  height ([#234](https://github.com/zakura-core/zakura/pull/234)).
 - Block-sync now keeps its apply backlog in serialized wire form and decodes
   bodies only for the verifier submission window, so decoded memory is bounded
   regardless of backlog depth. Admission accounting charges serialized pools at

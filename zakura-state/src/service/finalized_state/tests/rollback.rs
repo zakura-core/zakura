@@ -135,8 +135,8 @@ fn assert_equivalent(
         "value pool"
     );
     assert_eq!(
-        rolled.sprout_tree_for_tip().root(),
-        fresh.sprout_tree_for_tip().root(),
+        rolled.sprout_tree_for_tip().unwrap().root(),
+        fresh.sprout_tree_for_tip().unwrap().root(),
         "sprout root"
     );
     assert_eq!(
@@ -777,6 +777,7 @@ fn rollback_resets_sprout_tree_changed_in_range() {
         sync_to(&config, &network, blocks);
         open_unchecked_db(&config, &network)
             .sprout_tree_for_tip()
+            .unwrap()
             .root()
     };
     let root_at_1 = sprout_root_at(&to_height_1);
@@ -803,6 +804,7 @@ fn rollback_resets_sprout_tree_changed_in_range() {
     assert_eq!(
         open_unchecked_db(&config, &network)
             .sprout_tree_for_tip()
+            .unwrap()
             .root(),
         root_at_1,
         "sprout tip reset to the target height, not left at the rolled-back tip",
@@ -874,6 +876,7 @@ fn modern_rollback_does_not_rebuild_note_trees_from_genesis() -> Result<()> {
 
             let old_sprout_root = open_unchecked_db(&synced_config, &network)
                 .sprout_tree_for_tip()
+                .unwrap()
                 .root();
 
             {
@@ -905,7 +908,7 @@ fn modern_rollback_does_not_rebuild_note_trees_from_genesis() -> Result<()> {
                 "value pool"
             );
             prop_assert_eq!(
-                rolled.sprout_tree_for_tip().root(),
+                rolled.sprout_tree_for_tip().unwrap().root(),
                 old_sprout_root,
                 "modern rollback keeps the current Sprout tip tree"
             );
@@ -966,7 +969,7 @@ fn modern_rollback_resets_sprout_tree_changed_in_range() -> Result<()> {
                 .block
                 .clone();
             let previous_history_tree = target_db.history_tree();
-            let root_at_target = target_db.sprout_tree_for_tip().root();
+            let root_at_target = target_db.sprout_tree_for_tip().unwrap().root();
             drop(target_db);
 
             let removed_height = (target_height + 1).expect("test target height is not max");
@@ -990,6 +993,7 @@ fn modern_rollback_resets_sprout_tree_changed_in_range() -> Result<()> {
             sync_to(&sprout_config, &network, &synced);
             let root_at_tip = open_unchecked_db(&sprout_config, &network)
                 .sprout_tree_for_tip()
+                .unwrap()
                 .root();
             prop_assert_ne!(
                 root_at_target,
@@ -1011,6 +1015,7 @@ fn modern_rollback_resets_sprout_tree_changed_in_range() -> Result<()> {
             prop_assert_eq!(
                 open_unchecked_db(&sprout_config, &network)
                     .sprout_tree_for_tip()
+                    .unwrap()
                     .root(),
                 root_at_target,
                 "modern rollback reset Sprout to the target height"

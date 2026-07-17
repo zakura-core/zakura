@@ -45,6 +45,14 @@ impl From<BoxError> for CloneError {
 /// A boxed [`std::error::Error`].
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// The finalized database has blocks but no persisted Sprout tip frontier.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("missing Sprout note commitment tree at finalized tip {tip:?}")]
+pub struct MissingSproutTipTree {
+    /// The finalized tip whose Sprout frontier is missing.
+    pub tip: block::Height,
+}
+
 /// An error describing why opening the finalized state database failed.
 ///
 /// These errors are recoverable open-time failures that the caller can report,
@@ -539,6 +547,10 @@ pub enum ReconsiderError {
     /// validation.
     #[error("replaying a previously invalidated block failed contextual validation: {0}")]
     ReplayFailed(#[source] ValidateContextError),
+
+    /// The finalized parent chain is missing its Sprout tip frontier.
+    #[error(transparent)]
+    MissingSproutTipTree(#[from] MissingSproutTipTree),
 }
 
 /// An error describing why a block failed contextual validation.
@@ -546,6 +558,9 @@ pub enum ReconsiderError {
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum ValidateContextError {
+    #[error(transparent)]
+    MissingSproutTipTree(#[from] MissingSproutTipTree),
+
     #[error("block hash {block_hash} was previously invalidated")]
     #[non_exhaustive]
     BlockPreviouslyInvalidated { block_hash: block::Hash },
@@ -580,6 +595,17 @@ pub enum ValidateContextError {
         height: block::Height,
         expected: block::merkle::AuthDataRoot,
         actual: block::merkle::AuthDataRoot,
+    },
+
+    #[error(
+        "locally reconstructed Sprout root at the VCT handoff height {height:?} is \
+         {actual:?}, but the embedded handoff frontier requires {expected:?}"
+    )]
+    #[non_exhaustive]
+    VctSproutHandoffRootMismatch {
+        height: block::Height,
+        expected: sprout::tree::Root,
+        actual: sprout::tree::Root,
     },
 
     #[error("block height {candidate_height:?} is lower than the current finalized height {finalized_tip_height:?}")]

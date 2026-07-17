@@ -45,6 +45,13 @@ pub(super) struct FinalFrontiers {
 /// Errors producing [`FinalFrontiers`] from a finalized database.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum FinalFrontiersGenerationError {
+    /// The finalized tip has no persisted Sprout tree.
+    #[error("missing Sprout final frontier tree at height {height:?}")]
+    MissingSproutTree {
+        /// The finalized tip height.
+        height: block::Height,
+    },
+
     /// The database has no Sapling tree at the requested height.
     #[error("missing Sapling final frontier tree at height {height:?}")]
     MissingSaplingTree {
@@ -553,12 +560,15 @@ pub(super) fn produce_final_frontiers(
     let ironwood = db
         .ironwood_tree_by_height(&height)
         .ok_or(FinalFrontiersGenerationError::MissingIronwoodTree { height })?;
+    let sprout = db
+        .sprout_tree_for_tip()
+        .map_err(|error| FinalFrontiersGenerationError::MissingSproutTree { height: error.tip })?;
 
     Ok(FinalFrontiers {
         height,
         sapling,
         orchard,
-        sprout: db.sprout_tree_for_tip(),
+        sprout,
         ironwood,
     })
 }

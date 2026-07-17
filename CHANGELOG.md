@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve Sprout note-commitment history during fresh verified-commitment-tree
+  fast sync, so later JoinSplit spends can use historical anchors.
+
 ### Changed
 
 - Header sync now schedules only forward ranges from the durable verified block

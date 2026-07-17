@@ -16,3 +16,8 @@ tag = false
 
 # Owners for new crates
 owners = [ 'valardragon', 'p0mvn', 'evan-forbes', 'czarcas7ic', 'ebfull' ]
+
+# Only rewrite dependent version requirements when the existing requirement
+# no longer matches: unchanged crates must stay untouched (and unpublished)
+# when a dependency takes a compatible bump.
+dependent-version = "fix"

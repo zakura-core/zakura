@@ -1413,6 +1413,10 @@ pub(crate) fn header_range_commit_failure_kind(
         // store's own linkage check failing means the local anchor/response pairing
         // went wrong, not that the peer misbehaved.
         | zakura_state::CommitHeaderRangeError::UnlinkedRange { .. }
+        // The reactor chose this anchor from its local best-header frontier.
+        // If state no longer knows it, the local frontier is stale; the peer
+        // did not choose or corrupt the anchor.
+        | zakura_state::CommitHeaderRangeError::UnknownAnchor { .. }
         // Store incoherence is by definition a local storage fault: the range was
         // rejected because our own header rows failed a linkage/bijection check
         // while reading validation context, not because the peer's range was shown
@@ -1427,7 +1431,6 @@ pub(crate) fn header_range_commit_failure_kind(
         | zakura_state::CommitHeaderRangeError::BodySizeCountMismatch { .. }
         | zakura_state::CommitHeaderRangeError::TreeAuxRootCountMismatch { .. }
         | zakura_state::CommitHeaderRangeError::TreeAuxRootHeightMismatch { .. }
-        | zakura_state::CommitHeaderRangeError::UnknownAnchor { .. }
         | zakura_state::CommitHeaderRangeError::HeightOverflow
         | zakura_state::CommitHeaderRangeError::ImmutableConflict { .. }
         | zakura_state::CommitHeaderRangeError::ReorgTooDeep { .. }
@@ -1610,17 +1613,12 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
             },
         );
         if let Some(mut update) = endpoint.current_sync_frontier() {
-            let previous_verified_body = update.frontier.verified_body.height;
             if let Some((finalized_height, finalized_hash)) = finalized_tip {
                 update.frontier.finalized = Frontier::new(finalized_height, finalized_hash);
             }
             update.frontier.verified_body =
                 Frontier::new(verified_block_tip.0, verified_block_tip.1);
-            update.change = chain_tip_mirror_frontier_change(
-                &action,
-                previous_verified_body,
-                verified_block_tip.0,
-            );
+            update.change = chain_tip_mirror_frontier_change(&action);
             endpoint.publish_sync_frontier_from(update, "chain_tip_mirror");
             emit_commit_state(
                 &trace,
@@ -1740,16 +1738,9 @@ pub(crate) fn block_sync_chain_tip_event(
     }
 }
 
-pub(crate) fn chain_tip_mirror_frontier_change(
-    action: &zakura_state::TipAction,
-    previous_verified_body: block::Height,
-    verified_block_tip: block::Height,
-) -> FrontierChange {
+pub(crate) fn chain_tip_mirror_frontier_change(action: &zakura_state::TipAction) -> FrontierChange {
     match action {
         zakura_state::TipAction::Grow { .. } => FrontierChange::VerifiedGrow,
-        zakura_state::TipAction::Reset { .. } if verified_block_tip > previous_verified_body => {
-            FrontierChange::VerifiedGrow
-        }
         zakura_state::TipAction::Reset { .. } => FrontierChange::VerifiedReset,
     }
 }

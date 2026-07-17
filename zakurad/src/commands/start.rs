@@ -1767,6 +1767,18 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[test]
+    fn unknown_anchor_is_local_header_sync_commit_failure() {
+        let error = zakura_state::CommitHeaderRangeError::UnknownAnchor {
+            anchor: block::Hash([0; 32]),
+        };
+
+        assert_eq!(
+            header_range_commit_failure_kind(&error),
+            HeaderSyncCommitFailureKind::Local
+        );
+    }
+
+    #[test]
     fn header_range_commit_error_labels_preserve_exact_variant() {
         let unknown_anchor = zakura_state::CommitHeaderRangeError::UnknownAnchor {
             anchor: block::Hash([0; 32]),
@@ -2088,7 +2100,7 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[test]
-    fn chain_tip_mirror_classifies_forward_reset_as_verified_grow() {
+    fn chain_tip_mirror_preserves_forward_reset() {
         let tip_block = zakura_state::ChainTipBlock {
             hash: block::Hash([8; 32]),
             height: block::Height(8),
@@ -2098,33 +2110,21 @@ mod zakura_header_sync_driver_tests {
             previous_block_hash: block::Hash([7; 32]),
         };
         assert_eq!(
-            chain_tip_mirror_frontier_change(
-                &zakura_state::TipAction::Grow { block: tip_block },
-                block::Height(7),
-                block::Height(8),
-            ),
+            chain_tip_mirror_frontier_change(&zakura_state::TipAction::Grow { block: tip_block }),
             zakura_network::zakura::FrontierChange::VerifiedGrow
         );
         assert_eq!(
-            chain_tip_mirror_frontier_change(
-                &zakura_state::TipAction::Reset {
-                    height: block::Height(8),
-                    hash: block::Hash([8; 32]),
-                },
-                block::Height(7),
-                block::Height(8),
-            ),
-            zakura_network::zakura::FrontierChange::VerifiedGrow
+            chain_tip_mirror_frontier_change(&zakura_state::TipAction::Reset {
+                height: block::Height(8),
+                hash: block::Hash([8; 32]),
+            }),
+            zakura_network::zakura::FrontierChange::VerifiedReset
         );
         assert_eq!(
-            chain_tip_mirror_frontier_change(
-                &zakura_state::TipAction::Reset {
-                    height: block::Height(7),
-                    hash: block::Hash([77; 32]),
-                },
-                block::Height(8),
-                block::Height(7),
-            ),
+            chain_tip_mirror_frontier_change(&zakura_state::TipAction::Reset {
+                height: block::Height(7),
+                hash: block::Hash([77; 32]),
+            }),
             zakura_network::zakura::FrontierChange::VerifiedReset
         );
     }

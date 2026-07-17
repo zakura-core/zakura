@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Prevent initial sync from stalling at checkpoint boundaries by refilling the
   verifier submission window after stale apply completions.
+- Prevent header sync from stalling after a verified-chain fork by atomically
+  persisting the promoted header branch before reanchoring network requests.
 
 ### Changed
 

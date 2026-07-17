@@ -14,8 +14,9 @@ use super::{
 use crate::zakura::{
     framed_channel,
     testkit::{TraceCapture, TraceValue},
-    FramedSend, HeaderSyncServiceSummary, Peer, Service, ServicePeerDirection, ServicePeerLimits,
-    ServicePeerSnapshot, ZakuraConnId, ZakuraHeaderSyncCandidateState, ZAKURA_CAP_HEADER_SYNC,
+    ChainFrontier, FramedSend, Frontier, FrontierChange, FrontierUpdate, HeaderSyncServiceSummary,
+    Peer, Service, ServicePeerDirection, ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId,
+    ZakuraHeaderSyncCandidateState, ZAKURA_CAP_HEADER_SYNC,
 };
 use chrono::Duration;
 use metrics::{
@@ -3807,6 +3808,105 @@ async fn full_block_committed_covers_outstanding_height() {
     assert!(!cancel.is_cancelled());
     assert_eq!(fixture.handle.peer_snapshot().inbound_peers, 1);
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn same_height_verified_reset_reanchors_header_tip() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let old_tip = (block::Height(1), block::Hash([1; 32]));
+    let new_tip = (block::Height(1), block::Hash([2; 32]));
+    let initial = FrontierUpdate {
+        frontier: ChainFrontier {
+            finalized: Frontier::new(anchor.0, anchor.1),
+            verified_body: Frontier::new(old_tip.0, old_tip.1),
+            best_header: Frontier::new(old_tip.0, old_tip.1),
+        },
+        change: FrontierChange::Snapshot,
+    };
+    let (frontier_tx, frontier_rx) = tokio::sync::watch::channel(initial);
+    let mut startup = startup_for(network, anchor, Some(old_tip));
+    startup.frontiers = HeaderSyncFrontiers {
+        finalized_height: anchor.0,
+        verified_block_tip: old_tip.0,
+        verified_block_hash: old_tip.1,
+    };
+    startup.frontier_updates = Some(frontier_rx);
+    let mut fixture = spawn_test_reactor(startup);
+
+    frontier_tx
+        .send(FrontierUpdate {
+            frontier: ChainFrontier {
+                finalized: Frontier::new(anchor.0, anchor.1),
+                verified_body: Frontier::new(new_tip.0, new_tip.1),
+                best_header: Frontier::new(new_tip.0, new_tip.1),
+            },
+            change: FrontierChange::VerifiedReset,
+        })
+        .expect("reactor retains the frontier receiver");
+
+    assert!(matches!(
+        next_non_query_action(&mut fixture.actions).await,
+        HeaderSyncAction::HeaderReanchored { old, new }
+            if old == old_tip && new == new_tip
+    ));
+    assert_eq!(fixture.handle.best_header_tip(), new_tip);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn forward_verified_reset_clears_old_work_and_requests_from_new_tip() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let old_tip = (block::Height(1), block::Hash([1; 32]));
+    let new_tip = (block::Height(2), block::Hash([2; 32]));
+    let initial = FrontierUpdate {
+        frontier: ChainFrontier {
+            finalized: Frontier::new(anchor.0, anchor.1),
+            verified_body: Frontier::new(old_tip.0, old_tip.1),
+            best_header: Frontier::new(old_tip.0, old_tip.1),
+        },
+        change: FrontierChange::Snapshot,
+    };
+    let (frontier_tx, frontier_rx) = tokio::sync::watch::channel(initial);
+    let mut startup = startup_for(network, anchor, Some(old_tip));
+    startup.frontiers = HeaderSyncFrontiers {
+        finalized_height: anchor.0,
+        verified_block_tip: old_tip.0,
+        verified_block_hash: old_tip.1,
+    };
+    startup.frontier_updates = Some(frontier_rx);
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(211);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(&fixture, peer_id, anchor.0, block::Height(3), 2, 1).await;
+    let (_, _, old_start, _) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(old_start, block::Height(2));
+
+    frontier_tx
+        .send(FrontierUpdate {
+            frontier: ChainFrontier {
+                finalized: Frontier::new(anchor.0, anchor.1),
+                verified_body: Frontier::new(new_tip.0, new_tip.1),
+                best_header: Frontier::new(new_tip.0, new_tip.1),
+            },
+            change: FrontierChange::VerifiedReset,
+        })
+        .expect("reactor retains the frontier receiver");
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::HeaderReanchored { old, new } => {
+                assert_eq!(old, old_tip);
+                assert_eq!(new, new_tip);
+                break;
+            }
+            HeaderSyncAction::SendMessage { .. } => {}
+            action => panic!("unexpected action while reanchoring: {action:?}"),
+        }
+    }
+    let (_, _, new_start, new_count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!((new_start, new_count), (block::Height(3), 1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

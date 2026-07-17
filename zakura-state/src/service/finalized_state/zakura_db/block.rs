@@ -1332,6 +1332,20 @@ impl ZakuraDb {
                 error: error.to_string(),
             })
     }
+
+    /// Atomically reconcile the Zakura header store with the non-finalized best chain.
+    pub(crate) fn reconcile_zakura_headers_from_committed_blocks(
+        &self,
+        blocks: &[(block::Height, Arc<block::Block>)],
+    ) -> Result<(), CommitHeaderRangeError> {
+        let mut batch = DiskWriteBatch::new();
+        batch.prepare_zakura_headers_from_committed_blocks(self, blocks)?;
+        self.db
+            .write(batch)
+            .map_err(|error| CommitHeaderRangeError::StorageWriteError {
+                error: error.to_string(),
+            })
+    }
 }
 
 /// Read a spent transparent UTXO and its output location before deleting it from the database.
@@ -1852,6 +1866,113 @@ impl DiskWriteBatch {
         Ok(())
     }
 
+    /// Prepare a database batch that replaces a stale Zakura header suffix with
+    /// the corresponding headers from the non-finalized best chain.
+    #[allow(clippy::unwrap_in_result)]
+    pub(crate) fn prepare_zakura_headers_from_committed_blocks(
+        &mut self,
+        zakura_db: &ZakuraDb,
+        blocks: &[(block::Height, Arc<block::Block>)],
+    ) -> Result<(), CommitHeaderRangeError> {
+        let Some((new_tip_height, _)) = blocks.last() else {
+            return Ok(());
+        };
+
+        let (first_height, first_block) = blocks
+            .first()
+            .expect("a best chain with a tip contains a first block");
+        let expected_parent = first_height
+            .previous()
+            .ok()
+            .and_then(|parent_height| zakura_db.header_hash(parent_height))
+            .ok_or(CommitHeaderRangeError::UnknownAnchor {
+                anchor: first_block.header.previous_block_hash,
+            })?;
+        if first_block.header.previous_block_hash != expected_parent {
+            return Err(CommitHeaderRangeError::UnlinkedRange {
+                height: *first_height,
+                expected_parent,
+                actual_parent: first_block.header.previous_block_hash,
+            });
+        }
+
+        for pair in blocks.windows(2) {
+            let [(parent_height, parent), (child_height, child)] = pair else {
+                unreachable!("a two-item window always contains two best-chain blocks");
+            };
+            if parent_height.next().ok() != Some(*child_height)
+                || child.header.previous_block_hash != parent.hash()
+            {
+                return Err(CommitHeaderRangeError::UnlinkedRange {
+                    height: *child_height,
+                    expected_parent: parent.hash(),
+                    actual_parent: child.header.previous_block_hash,
+                });
+            }
+        }
+
+        let first_divergence = blocks
+            .iter()
+            .position(|(height, block)| zakura_db.header_hash(*height) != Some(block.hash()));
+
+        let zakura_header_by_height = zakura_db.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
+        let zakura_hash_by_height = zakura_db
+            .db
+            .cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT)
+            .unwrap();
+        let zakura_height_by_hash = zakura_db
+            .db
+            .cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH)
+            .unwrap();
+        let zakura_body_size_by_height = zakura_db
+            .db
+            .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+            .unwrap();
+        let zakura_roots_by_height = zakura_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+        let tx_by_loc = zakura_db.db.cf_handle("tx_by_loc").unwrap();
+
+        let delete_from = first_divergence
+            .map(|index| blocks[index].0)
+            .or_else(|| new_tip_height.next().ok());
+        let old_tip = zakura_db.zakura_header_tip().map(|(height, _)| height);
+        if let (Some(delete_from), Some(old_tip)) = (delete_from, old_tip) {
+            if delete_from <= old_tip {
+                for old_height in delete_from.0..=old_tip.0 {
+                    let old_height = block::Height(old_height);
+                    if zakura_db
+                        .db
+                        .zs_contains(&tx_by_loc, &TransactionLocation::min_for_height(old_height))
+                    {
+                        return Err(CommitHeaderRangeError::ConflictingFullBlockHeader {
+                            height: old_height,
+                        });
+                    }
+                    if let Some(old_hash) = zakura_db
+                        .db
+                        .zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &old_height)
+                    {
+                        self.zs_delete(&zakura_height_by_hash, old_hash);
+                    }
+                    self.zs_delete(&zakura_hash_by_height, old_height);
+                    self.zs_delete(&zakura_header_by_height, old_height);
+                    self.zs_delete(&zakura_body_size_by_height, old_height);
+                    self.zs_delete(&zakura_roots_by_height, old_height);
+                }
+            }
+        }
+
+        if let Some(first_divergence) = first_divergence {
+            for (height, block) in &blocks[first_divergence..] {
+                let hash = block.hash();
+                self.zs_insert(&zakura_header_by_height, *height, &block.header);
+                self.zs_insert(&zakura_hash_by_height, *height, hash);
+                self.zs_insert(&zakura_height_by_hash, hash, *height);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Prepare a database batch that seeds the Zakura header store from a
     /// committed full block.
     ///
@@ -1860,10 +1981,8 @@ impl DiskWriteBatch {
     /// block-derived header and drop stale provisional descendants.
     ///
     /// A block whose parent hash does not match the stored header row below
-    /// `height` is skipped without error: writing it would leave a gap or
-    /// broken link in the header store, so the store instead waits for
-    /// header-range sync to deliver the connecting rows (see the linkage
-    /// refusal below).
+    /// `height` is rejected: reporting success would allow the caller to
+    /// publish an anchor that was never made durable.
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_zakura_header_from_committed_block(
         &mut self,
@@ -1882,28 +2001,29 @@ impl DiskWriteBatch {
         let existing_zakura_header: Option<Arc<block::Header>> =
             db.zs_get(&zakura_header_by_height, &height);
 
-        if existing_zakura_header.as_ref() == Some(&block.header)
-            && db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &height) == Some(hash)
-        {
-            return Ok(());
-        }
-
-        // Seeds can jump to a non-finalized best tip whose parent is not the
-        // stored row below it. Refuse those seeds so the header store stays
-        // linked; header-range sync will later deliver the missing rows.
+        // Reject a seed that jumps across missing promoted ancestors so the
+        // caller can reconcile the whole branch before publishing its tip.
         let hash_by_height = db.cf_handle("hash_by_height").unwrap();
         let parent_hash: Option<block::Hash> = height.previous().ok().and_then(|parent_height| {
             db.zs_get(&hash_by_height, &parent_height)
                 .or_else(|| db.zs_get(&zakura_hash_by_height, &parent_height))
         });
-        if parent_hash != Some(block.header.previous_block_hash) {
-            tracing::debug!(
-                ?height,
-                ?hash,
-                parent = ?block.header.previous_block_hash,
-                stored_parent = ?parent_hash,
-                "skipping Zakura header seed that does not link to the stored row below it"
-            );
+        let Some(parent_hash) = parent_hash else {
+            return Err(CommitHeaderRangeError::UnknownAnchor {
+                anchor: block.header.previous_block_hash,
+            });
+        };
+        if parent_hash != block.header.previous_block_hash {
+            return Err(CommitHeaderRangeError::UnlinkedRange {
+                height,
+                expected_parent: parent_hash,
+                actual_parent: block.header.previous_block_hash,
+            });
+        }
+
+        if existing_zakura_header.as_ref() == Some(&block.header)
+            && db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &height) == Some(hash)
+        {
             return Ok(());
         }
 

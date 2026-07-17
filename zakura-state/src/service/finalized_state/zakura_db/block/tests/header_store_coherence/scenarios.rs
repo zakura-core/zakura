@@ -539,14 +539,14 @@ fn s10_seed_interplay() {
     );
 }
 
-/// s11: a refused (unlinked) seed converges through header-range sync. The
+/// s11: a rejected (unlinked) seed converges through header-range sync. The
 /// zakura store follows branch A (seeded at the fork height); the
 /// non-finalized best chain switches to branch B and its new best tip (B's
-/// *second* row) is seeded. The store refuses the unlinked seed as a no-op —
+/// *second* row) is seeded. The store rejects the unlinked seed —
 /// the header store briefly lags the nf chain — and the later linked range
 /// delivery of B converges it onto the new branch.
 #[test]
-fn s11_refused_seed_converges_via_range_delivery() {
+fn s11_rejected_seed_converges_via_range_delivery() {
     let _init_guard = zakura_test::init();
     let mut harness = Harness::new();
 
@@ -567,18 +567,21 @@ fn s11_refused_seed_converges_via_range_delivery() {
     );
 
     // The nf best tip jumps to B[1]; its parent row is not stored, so the
-    // seed is refused without touching the store (checked by the harness).
+    // seed is rejected without touching the store (checked by the harness).
     let outcome = harness
         .run(&Op::Seed {
             source: Source::Branch(BRANCH_B),
             index: 1,
         })
-        .expect("the refused seed leaves the store coherent");
-    assert_accepted(&outcome);
+        .expect("the rejected seed leaves the store coherent");
+    assert!(matches!(
+        outcome.header_range_error(),
+        CommitHeaderRangeError::UnlinkedRange { .. }
+    ));
     assert_eq!(
         harness.state().best_header_tip(),
         Some((a_first.height, a_first.hash)),
-        "the refused seed must not move the header tip",
+        "the rejected seed must not move the header tip",
     );
 
     // Header sync catches up with the nf chain: B arrives as a linked range
@@ -680,7 +683,7 @@ fn seed_above_gap_ops() -> Vec<Op> {
     }]
 }
 
-/// A seed above a gap is refused as a no-op instead of stranding a row.
+/// A seed above a gap is rejected instead of stranding a row.
 #[test]
 fn seed_above_gap_upholds_invariants() {
     let _init_guard = zakura_test::init();
@@ -693,7 +696,7 @@ fn seed_above_gap_upholds_invariants() {
     assert_eq!(
         harness.state().best_header_tip(),
         Some((Height(0), genesis_hash)),
-        "the refused seed must not move the header tip",
+        "the rejected seed must not move the header tip",
     );
 }
 
@@ -702,8 +705,7 @@ fn seed_above_gap_upholds_invariants() {
 /// best tip (B's *second* row) is seeded. Before the parent-linkage refusal,
 /// the seed's non-conflict arm inserted the row directly over A's truncated
 /// parent — broken linkage on disk, the poisoned-DAA-window generator from
-/// the production incident table. (`s11` proves the refused seed converges
-/// later through range delivery.)
+/// the production incident table.
 fn seed_fork_switch_ops() -> Vec<Op> {
     vec![
         commit_trunk(),
@@ -718,7 +720,7 @@ fn seed_fork_switch_ops() -> Vec<Op> {
     ]
 }
 
-/// A fork-switch seed keeps the store linked (the unlinked seed is refused).
+/// A fork-switch seed keeps the store linked (the unlinked seed is rejected).
 #[test]
 fn seed_fork_switch_upholds_invariants() {
     let _init_guard = zakura_test::init();

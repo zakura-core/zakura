@@ -307,10 +307,8 @@ impl Harness {
                     }
                     _ => {
                         // A seed whose parent is not the stored row below it is
-                        // refused by the store as a silent no-op (the header
-                        // store briefly lags the non-finalized chain until a
-                        // linkage-checked header range converges it), so the
-                        // call must succeed without mutating anything.
+                        // rejected without mutating the store. Reporting success
+                        // would let the caller publish a missing durable anchor.
                         let parent_linked = self.oracle.seed_is_parent_linked(&fab);
                         let dump_before = (!parent_linked).then(|| dump_store(self.state()));
                         let block = fabricate_body(&fab);
@@ -321,19 +319,25 @@ impl Harness {
                             Ok(()) => {
                                 if parent_linked {
                                     self.oracle.apply_seed(&fab);
-                                } else if dump_store(self.state())
-                                    != dump_before.expect("dumped before an unlinked seed")
-                                {
+                                } else {
                                     mismatches.push(format!(
-                                        "refused unlinked seed mutated the store: {op:?}"
+                                        "unlinked seed unexpectedly succeeded: {op:?}"
                                     ));
                                 }
                                 OpOutcome::Accepted
                             }
                             Err(error) => {
-                                mismatches.push(format!(
-                                    "oracle predicted accept, seed rejected with {error:?}: {op:?}"
-                                ));
+                                if parent_linked {
+                                    mismatches.push(format!(
+                                        "oracle predicted accept, seed rejected with {error:?}: {op:?}"
+                                    ));
+                                } else if dump_store(self.state())
+                                    != dump_before.expect("dumped before an unlinked seed")
+                                {
+                                    mismatches.push(format!(
+                                        "rejected unlinked seed mutated the store: {op:?}"
+                                    ));
+                                }
                                 OpOutcome::Rejected(RejectError::HeaderRange(error))
                             }
                         }

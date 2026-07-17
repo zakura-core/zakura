@@ -625,6 +625,7 @@ impl WriteBlockWorkerTask {
             let child_height = queued_child.height;
             let child_block = queued_child.block.clone();
             let parent_error = parent_error_map.get(&parent_hash);
+            let previous_best_tip = non_finalized_state.best_tip();
 
             // If the parent block was marked as rejected, also reject all its children.
             //
@@ -680,11 +681,27 @@ impl WriteBlockWorkerTask {
                 child_height,
                 child_hash,
             ) {
-                seed_zakura_header_from_committed_block(
-                    &finalized_state.db,
-                    child_height,
-                    &child_block,
-                );
+                let direct_best_chain_growth =
+                    previous_best_tip.is_none_or(|(previous_height, previous_hash)| {
+                        previous_height.next().ok() == Some(child_height)
+                            && previous_hash == parent_hash
+                    });
+                if direct_best_chain_growth {
+                    seed_zakura_header_from_committed_block(
+                        &finalized_state.db,
+                        child_height,
+                        &child_block,
+                    )
+                    .expect(
+                        "the published best-chain tip must have a durable linked header anchor",
+                    );
+                } else {
+                    reconcile_zakura_headers_from_best_chain(
+                        &finalized_state.db,
+                        non_finalized_state,
+                    )
+                    .expect("a promoted best chain must be durable before its tip is published");
+                }
             }
 
             // Committing blocks to the finalized state keeps the same chain,
@@ -752,20 +769,38 @@ fn seed_zakura_header_from_committed_block(
     finalized_state: &ZakuraDb,
     height: block::Height,
     block: &Arc<block::Block>,
-) {
+) -> Result<(), CommitHeaderRangeError> {
     match finalized_state.seed_zakura_header_from_committed_block(height, block) {
         Ok(()) => {
             tracing::trace!(?height, hash = ?block.hash(), "seeded Zakura header from committed block");
+            Ok(())
         }
         Err(error) => {
-            tracing::warn!(
+            tracing::error!(
                 ?height,
                 hash = ?block.hash(),
                 ?error,
                 "failed to seed Zakura header from committed block"
             );
+            Err(error)
         }
     }
+}
+
+fn reconcile_zakura_headers_from_best_chain(
+    finalized_state: &ZakuraDb,
+    non_finalized_state: &NonFinalizedState,
+) -> Result<(), CommitHeaderRangeError> {
+    let best_chain = non_finalized_state
+        .best_chain()
+        .expect("a successful best-chain commit leaves a non-empty best chain");
+    let blocks: Vec<_> = best_chain
+        .blocks
+        .iter()
+        .map(|(height, block)| (*height, block.block.clone()))
+        .collect();
+
+    finalized_state.reconcile_zakura_headers_from_committed_blocks(&blocks)
 }
 
 fn should_seed_zakura_header_from_non_finalized_commit(
@@ -788,10 +823,10 @@ mod tests {
     use crate::{
         arbitrary::Prepare,
         service::{
-            finalized_state::{DiskWriteBatch, FinalizedState, WriteDisk},
+            finalized_state::{DiskWriteBatch, FinalizedState, ReadDisk, WriteDisk},
             non_finalized_state::NonFinalizedState,
             write::{
-                seed_zakura_header_from_committed_block,
+                reconcile_zakura_headers_from_best_chain, seed_zakura_header_from_committed_block,
                 should_seed_zakura_header_from_non_finalized_commit,
             },
         },
@@ -856,7 +891,8 @@ mod tests {
             best_height,
             best_block.hash(),
         ));
-        seed_zakura_header_from_committed_block(&finalized_state.db, best_height, &best_block);
+        seed_zakura_header_from_committed_block(&finalized_state.db, best_height, &best_block)
+            .expect("best block header seeds");
 
         non_finalized_state
             .commit_new_chain(side_block.clone().prepare(), &finalized_state)
@@ -875,6 +911,145 @@ mod tests {
         assert_eq!(
             finalized_state.db.headers_by_height_range(best_height, 1),
             vec![(best_height, best_block.hash(), best_block.header.clone())],
+        );
+    }
+
+    #[test]
+    fn promoted_side_chain_reconciles_zakura_headers() {
+        let _init_guard = zakura_test::init();
+
+        let network = Network::Mainnet;
+        let mut config = Config::ephemeral();
+        config.enable_zakura_header_seed_from_committed_blocks = true;
+        let finalized_state = FinalizedState::new(
+            &config,
+            &network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        )
+        .expect("opening an ephemeral database should succeed");
+        finalized_state.set_finalized_value_pool(ValueBalance::fake_populated_pool());
+
+        let parent = zakura_test::vectors::BLOCK_MAINNET_434873_BYTES
+            .zcash_deserialize_into::<Arc<zakura_chain::block::Block>>()
+            .expect("block deserializes");
+        let best_block = parent.make_fake_child().set_work(10);
+        let side_block = parent.make_fake_child().set_work(1);
+        let fork_height = best_block
+            .coinbase_height()
+            .expect("fake child block has a coinbase height");
+
+        let parent_height = parent
+            .coinbase_height()
+            .expect("test vector block has a coinbase height");
+        let zakura_hash_by_height = finalized_state
+            .db
+            .db()
+            .cf_handle("zakura_header_hash_by_height")
+            .unwrap();
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(&zakura_hash_by_height, parent_height, parent.hash());
+        finalized_state
+            .db
+            .db()
+            .write(batch)
+            .expect("parent hash row writes");
+
+        let mut non_finalized_state = NonFinalizedState::new(&network);
+        non_finalized_state
+            .commit_new_chain(best_block.clone().prepare(), &finalized_state)
+            .expect("best block commits to a new chain");
+        seed_zakura_header_from_committed_block(&finalized_state.db, fork_height, &best_block)
+            .expect("best block header seeds");
+
+        non_finalized_state
+            .commit_new_chain(side_block.clone().prepare(), &finalized_state)
+            .expect("side block commits to a losing fork");
+        let mut promoted_blocks = vec![side_block.clone()];
+        let mut promoted_tip = side_block;
+        for _ in 0..10 {
+            promoted_tip = promoted_tip.make_fake_child();
+            non_finalized_state
+                .commit_block(promoted_tip.clone().prepare(), &finalized_state)
+                .expect("side-chain child commits");
+            promoted_blocks.push(promoted_tip.clone());
+        }
+
+        let promoted_tip_height = promoted_tip
+            .coinbase_height()
+            .expect("fake child block has a coinbase height");
+        assert_eq!(
+            non_finalized_state.best_tip(),
+            Some((promoted_tip_height, promoted_tip.hash())),
+        );
+        assert!(should_seed_zakura_header_from_non_finalized_commit(
+            true,
+            &non_finalized_state,
+            promoted_tip_height,
+            promoted_tip.hash(),
+        ));
+
+        // Before reconciliation, production seeded only this newly promoted
+        // tip. The call reported success even though its unseeded parent was
+        // absent, leaving the whole B suffix unusable as a range anchor.
+        reconcile_zakura_headers_from_best_chain(&finalized_state.db, &non_finalized_state)
+            .expect("the promoted best chain reconciles atomically");
+
+        for block in &promoted_blocks {
+            let height = block
+                .coinbase_height()
+                .expect("fake child block has a coinbase height");
+            assert_eq!(finalized_state.db.header_hash(height), Some(block.hash()));
+        }
+        let expected_headers: Vec<_> = promoted_blocks
+            .iter()
+            .map(|block| {
+                (
+                    block
+                        .coinbase_height()
+                        .expect("fake child block has a coinbase height"),
+                    block.hash(),
+                    block.header.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            finalized_state.db.headers_by_height_range(
+                fork_height,
+                u32::try_from(expected_headers.len())
+                    .expect("the bounded non-finalized chain length fits in u32"),
+            ),
+            expected_headers,
+        );
+        assert_eq!(
+            finalized_state.db.best_header_tip(),
+            Some((promoted_tip_height, promoted_tip.hash())),
+        );
+
+        let zakura_height_by_hash = finalized_state
+            .db
+            .db()
+            .cf_handle("zakura_header_height_by_hash")
+            .unwrap();
+        assert_eq!(
+            finalized_state
+                .db
+                .db()
+                .zs_get::<_, _, zakura_chain::block::Height>(
+                    &zakura_height_by_hash,
+                    &promoted_tip.hash(),
+                ),
+            Some(promoted_tip_height),
+        );
+        assert_eq!(
+            finalized_state
+                .db
+                .db()
+                .zs_get::<_, _, zakura_chain::block::Height>(
+                    &zakura_height_by_hash,
+                    &best_block.hash(),
+                ),
+            None,
         );
     }
 }

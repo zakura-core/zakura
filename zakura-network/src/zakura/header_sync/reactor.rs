@@ -537,9 +537,7 @@ impl HeaderSyncReactor {
 
     async fn handle_frontier_update(&mut self, update: FrontierUpdate) {
         match update.change {
-            FrontierChange::Snapshot
-            | FrontierChange::VerifiedGrow
-            | FrontierChange::VerifiedReset => {
+            FrontierChange::Snapshot | FrontierChange::VerifiedGrow => {
                 let frontier = update.frontier;
                 self.handle_state_frontiers_changed(HeaderSyncFrontiers {
                     finalized_height: frontier.finalized.height,
@@ -547,6 +545,15 @@ impl HeaderSyncReactor {
                     verified_block_hash: frontier.verified_body.hash,
                 })
                 .await;
+            }
+            FrontierChange::VerifiedReset => {
+                let frontier = update.frontier;
+                self.state.finalized_height = frontier.finalized.height;
+                self.state.verified_block_tip = frontier.verified_body.height;
+                self.state.verified_block_hash = frontier.verified_body.hash;
+                metrics::counter!("sync.header.verified_reset.reanchored").increment(1);
+                self.reanchor_to_verified_block_tip_inner().await;
+                self.schedule().await;
             }
             FrontierChange::HeaderAdvanced | FrontierChange::HeaderReanchored => {}
         }
@@ -2059,10 +2066,13 @@ impl HeaderSyncReactor {
     }
 
     async fn reanchor_to_verified_block_tip(&mut self) {
+        metrics::counter!("sync.header.stale_anchor.reanchored").increment(1);
+        self.reanchor_to_verified_block_tip_inner().await;
+    }
+
+    async fn reanchor_to_verified_block_tip_inner(&mut self) {
         let height = self.state.verified_block_tip;
         let hash = self.state.verified_block_hash;
-        metrics::counter!("sync.header.stale_anchor.reanchored").increment(1);
-
         self.state.stale_anchor.reset();
         self.state.schedule.clear_forward();
         self.state

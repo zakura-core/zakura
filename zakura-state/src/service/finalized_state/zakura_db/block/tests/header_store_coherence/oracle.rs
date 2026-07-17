@@ -248,10 +248,9 @@ impl Oracle {
     }
 
     /// Whether a seeded block's parent is the expected canonical row below it.
-    /// The store refuses seeds that are not parent-linked as silent no-ops
-    /// (writing them would strand a row the chain walk cannot reach); the
-    /// harness uses this to decide whether a successful seed call must have
-    /// mutated the store or left it untouched.
+    /// The store rejects seeds that are not parent-linked (writing them would
+    /// strand a row the chain walk cannot reach); the harness uses this to
+    /// decide whether the seed must succeed or fail without mutation.
     pub fn seed_is_parent_linked(&self, fab: &FabHeader) -> bool {
         let parent_height = Height(fab.height.0 - 1);
         if parent_height == Height(0) {

@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Update the embedded zcashd-compat binary and default split-container image to
+  valargroup/zcashd v1.0.1.
 - Header sync now schedules only forward ranges from the durable verified block
   tip. Startup rejects configured anchors above that base, and no longer
   backfills headers below a checkpoint anchor.

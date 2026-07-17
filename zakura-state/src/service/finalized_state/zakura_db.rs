@@ -29,6 +29,7 @@ use crate::{
     write_database_format_version_to_disk, BoxError, Config, StateInitError,
 };
 
+use super::disk_format::upgrade::repair_vct_sprout_history;
 use super::disk_format::upgrade::restorable_db_versions;
 
 pub mod block;
@@ -163,6 +164,7 @@ impl ZakuraDb {
                 .expect("unable to read database format version file")
             })
         };
+        let disk_version_before_open = disk_version.clone();
 
         // Log any format changes before opening the database, in case opening fails.
         let format_change = DbFormatChange::open_database(format_version_in_code, disk_version);
@@ -175,6 +177,8 @@ impl ZakuraDb {
             let db_path = config.db_path(&db_kind, format_version_in_code.major, network);
             return Err(StateInitError::ReadOnlyDatabaseNotFound { path: db_path });
         }
+
+        let upgrades_explicitly_disabled = debug_skip_format_upgrades;
 
         // Format upgrades try to write to the database, so we always skip them
         // if `read_only` is `true`.
@@ -203,6 +207,34 @@ impl ZakuraDb {
             format_change_handle: None,
             db: disk_db,
         };
+
+        // The original Mainnet VCT fast path did not persist historical Sprout frontiers.
+        // Never expose an affected database unless this writable startup can synchronously
+        // complete the authenticated repair.
+        if repair_vct_sprout_history::is_repair_eligible(&db, disk_version_before_open.as_ref()) {
+            if read_only
+                || upgrades_explicitly_disabled
+                || !repair_vct_sprout_history::artifact_available(&db)
+            {
+                let reason = if read_only {
+                    "read-only databases cannot be repaired"
+                } else if upgrades_explicitly_disabled {
+                    "database format upgrades are disabled"
+                } else {
+                    "the canonical Mainnet Sprout repair artifact is not embedded in this build"
+                };
+                return Err(StateInitError::VctSproutHistoryRepairRequired {
+                    mode: if read_only { "read-only" } else { "writable" },
+                    reason,
+                });
+            }
+
+            repair_vct_sprout_history::validate_startup_repair(&db).map_err(|error| {
+                StateInitError::VctSproutHistoryRepairInvalid {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
 
         let zero_location_utxos =
             db.address_utxo_locations(AddressLocation::from_usize(Height(0), 0, 0));

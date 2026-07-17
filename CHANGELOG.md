@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   state database; only configured periodic format checks continue in the
   background.
 - Preserve Sprout note-commitment history during fresh verified-commitment-tree
-  fast sync, so later JoinSplit spends can use historical anchors.
+  fast sync, so later JoinSplit spends can use historical anchors. Affected
+  Mainnet databases that previously ran v2 p2p + fast mode require repair at
+  startup from a reviewed trusted artifact, snapshot redownload, or genesis
+  resync.
 
 ### Changed
 

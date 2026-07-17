@@ -21,8 +21,6 @@ const MAGIC: &[u8; 8] = b"ZKVCTSP1";
 const MAINNET_NETWORK: u8 = 1;
 const MAX_RECORDS: usize = 1_000_000;
 const MAX_COMMITMENTS_PER_RECORD: usize = 65_535;
-// Consumed by the follow-up repair migration once reviewed bytes are embedded.
-#[allow(dead_code)]
 const MAINNET_ARTIFACT: Option<&[u8]> = None;
 
 /// One historical block that changed the Sprout commitment tree.
@@ -37,8 +35,6 @@ pub(crate) struct Record {
 /// Errors parsing or replaying a canonical Sprout-history artifact.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum Error {
-    // Consumed by the follow-up repair migration's artifact loader.
-    #[allow(dead_code)]
     #[error("Sprout history artifact is unavailable: canonical Mainnet bytes have not been verified and embedded")]
     CanonicalArtifactUnavailable,
     #[error("invalid Sprout history artifact magic")]
@@ -430,8 +426,6 @@ pub fn generate_mainnet_from_archive(config: &Config) -> Result<Vec<u8>, Generat
 /// Loads the canonical artifact once independently reviewed bytes are embedded.
 ///
 /// This must never be replaced with downloaded or guessed bytes.
-// Consumed by the follow-up repair migration.
-#[allow(dead_code)]
 pub(crate) fn embedded_mainnet() -> Result<Artifact, Error> {
     MAINNET_ARTIFACT
         .map(Artifact::decode)

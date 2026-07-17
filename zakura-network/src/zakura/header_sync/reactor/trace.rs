@@ -1525,7 +1525,6 @@ mod tests {
         assert_eq!(row[hs_trace::LAST_ROOT_HEIGHT], Value::from(9));
 
         assert_eq!(RangePriority::Forward.label(), "forward");
-        assert_eq!(RangePriority::Backward.label(), "backward");
         assert_eq!(RangePriority::Repair.label(), "repair");
     }
 }

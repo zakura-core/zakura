@@ -391,7 +391,7 @@ pub mod header_sync_trace {
     pub const WANT_TREE_AUX_ROOTS: &str = "want_tree_aux_roots";
     /// Whether the range is expected to terminate at a checkpoint.
     pub const FINALIZED: &str = "finalized";
-    /// Header scheduler priority label (`forward` or `backward`).
+    /// Header scheduler priority label (`forward` or `repair`).
     pub const RANGE_PRIORITY: &str = "range_priority";
     /// Highest verified full-block/body height observed by the header scheduler.
     pub const VERIFIED_BLOCK_TIP: &str = "verified_block_tip";

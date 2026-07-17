@@ -43,8 +43,8 @@ pub use config::{
 pub use constants::{state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT};
 pub use error::{
     BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError, CommitHeaderRangeError,
-    CommitSemanticallyVerifiedError, DuplicateNullifierError, StateInitError, StoreIncoherentError,
-    ValidateContextError,
+    CommitSemanticallyVerifiedError, DuplicateNullifierError, MissingSproutTipTree, StateInitError,
+    StoreIncoherentError, ValidateContextError,
 };
 pub use request::{
     CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight, MappedRequest,
@@ -82,8 +82,8 @@ pub use service::finalized_state::{
     RollbackFinalizedStateError, RollbackFinalizedStateOptions, RollbackFinalizedStateSummary,
 };
 pub use service::finalized_state::{
-    produce_final_frontiers_bytes, validate_final_frontiers_bytes, FinalFrontiersGenerationError,
-    FinalFrontiersValidationError,
+    generate_mainnet_from_archive, produce_final_frontiers_bytes, validate_final_frontiers_bytes,
+    FinalFrontiersGenerationError, FinalFrontiersValidationError, GeneratorError,
 };
 pub use service::{
     finalized_state::{DiskWriteBatch, FromDisk, IntoDisk, WriteDisk, ZakuraDb},

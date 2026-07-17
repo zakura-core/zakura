@@ -5,20 +5,27 @@ use std::{collections::HashMap, env, error::Error, fs, sync::Arc};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-use zakura_chain::serialization::ZcashDeserializeInto;
 use zakura_chain::{
+    amount::Amount,
     block::{Block, Height},
     parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{
         testnet::{ConfiguredActivationHeights, ParametersBuilder},
         NetworkUpgrade,
     },
+    primitives::Groth16Proof,
+    serialization::ZcashDeserializeInto,
+    sprout::JoinSplit,
+    transaction::{JoinSplitData, LockTime, Transaction, UnminedTx},
     LedgerState,
 };
 use zakura_test::prelude::*;
 
 use crate::{
-    config::Config, service::arbitrary::PreparedChain, tests::FakeChainHelper, HashOrHeight,
+    config::Config,
+    service::{arbitrary::PreparedChain, check::anchors::tx_anchors_refer_to_final_treestates},
+    tests::FakeChainHelper,
+    HashOrHeight,
 };
 
 use super::super::{
@@ -165,6 +172,86 @@ fn enable_vct_test_fixture_source_with_handoff(
         )),
         false,
     );
+}
+
+/// Builds a structurally valid V4 transaction with two Groth16 JoinSplits from the first
+/// historical Sprout JoinSplit fixture. Its later JoinSplit references the first one's
+/// interstitial output tree.
+///
+/// The contextual anchor check does not verify proofs, so the original BCTV14 proof is replaced
+/// with a correctly sized placeholder Groth16 proof. Proof verification belongs to semantic
+/// verification and is deliberately outside this state-anchor regression.
+fn v4_transaction_with_interstitial_anchor(old_anchor_tree: &SproutTree) -> Arc<Transaction> {
+    let source = zakura_test::vectors::BLOCK_MAINNET_396_BYTES
+        .zcash_deserialize_into::<Block>()
+        .expect("the first mainnet Sprout block deserializes");
+    let source_joinsplit = source
+        .transactions
+        .iter()
+        .find_map(|transaction| match &**transaction {
+            Transaction::V2 {
+                joinsplit_data: Some(data),
+                ..
+            } => data.joinsplits().next(),
+            _ => None,
+        })
+        .expect("the first mainnet Sprout block has a JoinSplit");
+
+    let to_groth16 = |anchor| JoinSplit {
+        vpub_old: Amount::zero(),
+        vpub_new: Amount::zero(),
+        anchor,
+        nullifiers: source_joinsplit.nullifiers,
+        commitments: source_joinsplit.commitments,
+        ephemeral_key: source_joinsplit.ephemeral_key,
+        random_seed: source_joinsplit.random_seed.clone(),
+        vmacs: source_joinsplit.vmacs.clone(),
+        zkproof: Groth16Proof::from([0; 192]),
+        enc_ciphertexts: source_joinsplit.enc_ciphertexts,
+    };
+
+    let first = to_groth16(old_anchor_tree.root());
+    let mut interstitial_tree = (**old_anchor_tree).clone();
+    for commitment in first.commitments {
+        interstitial_tree
+            .append(commitment)
+            .expect("two historical JoinSplit commitments fit in the Sprout tree");
+    }
+    let second = to_groth16(interstitial_tree.root());
+
+    Arc::new(Transaction::V4 {
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        lock_time: LockTime::min_lock_time_timestamp(),
+        expiry_height: Height(0),
+        joinsplit_data: Some(JoinSplitData {
+            first,
+            rest: vec![second],
+            pub_key: source
+                .transactions
+                .iter()
+                .find_map(|transaction| match &**transaction {
+                    Transaction::V2 {
+                        joinsplit_data: Some(data),
+                        ..
+                    } => Some(data.pub_key),
+                    _ => None,
+                })
+                .expect("the source JoinSplit has a public key"),
+            sig: source
+                .transactions
+                .iter()
+                .find_map(|transaction| match &**transaction {
+                    Transaction::V2 {
+                        joinsplit_data: Some(data),
+                        ..
+                    } => Some(data.sig),
+                    _ => None,
+                })
+                .expect("the source JoinSplit has a signature"),
+        }),
+        sapling_shielded_data: None,
+    })
 }
 
 #[test]
@@ -1334,6 +1421,9 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
             let mut fixture = std::collections::HashMap::new();
             let mut handoff_trees = None;
+            let mut previous_sprout_root =
+                zakura_chain::sprout::tree::NoteCommitmentTree::default().root();
+            let mut historical_sprout_frontiers = Vec::new();
             for i in 0..=last {
                 let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
                 let (_h, trees) = legacy
@@ -1349,10 +1439,18 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
                         ),
                     );
                 }
+                if i > seed && i < last && trees.sprout.root() != previous_sprout_root {
+                    historical_sprout_frontiers.push((trees.sprout.root(), trees.sprout.clone()));
+                }
+                previous_sprout_root = trees.sprout.root();
                 if i == last {
                     handoff_trees = Some(trees);
                 }
             }
+            prop_assert!(
+                !historical_sprout_frontiers.is_empty(),
+                "the VCT fixture must include a pre-handoff Sprout commitment"
+            );
             let golden_anchors = legacy.db.vct_anchor_digest();
             let golden_history = legacy.db.history_tree().hash();
             let golden_tip = legacy.db.note_commitment_trees_for_tip();
@@ -1395,6 +1493,82 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             prop_assert_eq!(fast_tip.sapling.root(), golden_tip.sapling.root(), "tip sapling frontier must match legacy");
             prop_assert_eq!(fast_tip.orchard.root(), golden_tip.orchard.root(), "tip orchard frontier must match legacy");
             prop_assert_eq!(fast_tip.sprout.root(), golden_tip.sprout.root(), "tip sprout frontier must match legacy");
+            for (root, expected_frontier) in &historical_sprout_frontiers {
+                let actual_frontier = fast
+                    .db
+                    .sprout_tree_by_anchor(root)
+                    .expect("each changed fast-sync Sprout root is persisted");
+                prop_assert_eq!(
+                    actual_frontier.root(),
+                    expected_frontier.root(),
+                    "historical Sprout root resolves to its complete frontier after fast sync"
+                );
+            }
+
+            // State contextual validation must still resolve an old pre-handoff Sprout
+            // anchor after a fresh VCT sync, then derive the interstitial tree for a
+            // later JoinSplit in the same post-handoff V4 transaction.
+            //
+            // The fixture keeps historical JoinSplit fields and V4/Groth16 structure,
+            // but uses a placeholder proof because this routine intentionally performs
+            // contextual anchor validation only (proof verification runs earlier).
+            let (_old_anchor, old_anchor_tree) = historical_sprout_frontiers
+                .first()
+                .expect("the VCT fixture has a changed pre-handoff Sprout frontier");
+            let post_handoff_v4 = v4_transaction_with_interstitial_anchor(old_anchor_tree);
+            prop_assert_eq!(
+                post_handoff_v4.sprout_groth16_joinsplits().count(),
+                2,
+                "the regression transaction has multiple Groth16 JoinSplits"
+            );
+            tx_anchors_refer_to_final_treestates(
+                &fast.db,
+                None,
+                &UnminedTx::from(post_handoff_v4),
+            )
+            .expect(
+                "fresh VCT sync preserves the old final Sprout tree needed to validate \
+                 the later JoinSplit's interstitial anchor",
+            );
+
+            // A corrupted embedded Sprout handoff frontier is a local artifact failure,
+            // not a retryable peer-root stall. It must reject the handoff atomically and
+            // leave the previous finalized tip and locally reconstructed Sprout tree intact.
+            let mut corrupt_sprout = zakura_chain::sprout::tree::NoteCommitmentTree::default();
+            corrupt_sprout
+                .append(zakura_chain::sprout::NoteCommitment::from([99; 32]))
+                .expect("one corrupt fixture commitment fits");
+            prop_assert_ne!(corrupt_sprout.root(), handoff_trees.sprout.root());
+            let mut corrupt_handoff = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
+            enable_vct_test_fixture_source_with_handoff(
+                &mut corrupt_handoff,
+                fixture.clone(),
+                handoff,
+                handoff_trees.sapling.clone(),
+                handoff_trees.orchard.clone(),
+                Arc::new(corrupt_sprout),
+                handoff_trees.ironwood.clone(),
+            );
+            for i in 0..last {
+                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let next = Some(vct_successor_header(blocks[i + 1].block.clone()));
+                corrupt_handoff
+                    .commit_finalized_direct(cv.into(), None, next, "vct corrupt Sprout handoff prefix")
+                    .expect("the prefix before the corrupt handoff commits");
+            }
+            let prior_sprout_root = corrupt_handoff.db.sprout_tree_for_tip().root();
+            let error = corrupt_handoff
+                .commit_finalized_direct(
+                    CheckpointVerifiedBlock::from(blocks[last].block.clone()).into(),
+                    None,
+                    None,
+                    "vct corrupt Sprout handoff",
+                )
+                .expect_err("a corrupt embedded Sprout handoff must fail");
+            prop_assert_eq!(error.vct_retryable_height(), None, "embedded Sprout corruption is non-retryable");
+            prop_assert!(error.to_string().contains("checkpoint-verified block"));
+            prop_assert_eq!(corrupt_handoff.finalized_tip_height(), Some(Height(last as u32 - 1)), "failed handoff leaves the previous tip");
+            prop_assert_eq!(corrupt_handoff.db.sprout_tree_for_tip().root(), prior_sprout_root, "failed handoff leaves Sprout state unchanged");
 
             // Historical per-height tree reads below the handoff are unavailable
             // (guarded, no panic), while the handoff height itself is present.

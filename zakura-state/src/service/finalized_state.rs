@@ -897,6 +897,14 @@ impl FinalizedState {
                             self.vct.clear_prevalidated_next();
                         }
 
+                        // Sprout roots are not supplied by VCT or committed to the modern
+                        // history-tree payload. Reconstruct Sprout locally, but only after all
+                        // retryable supplied-root and successor checks have succeeded so a
+                        // deferred retry cannot append the same commitments twice.
+                        note_commitment_trees
+                            .update_sprout_tree(&block)
+                            .map_err(ValidateContextError::from)?;
+
                         history_tree = Arc::new(candidate);
                         if let Some(v) = self.vct.source() {
                             v.record_fast_block();
@@ -931,10 +939,23 @@ impl FinalizedState {
                                 &ironwood_root,
                             )?;
 
+                            let expected_sprout_root = sprout_frontier.root();
+                            let actual_sprout_root = note_commitment_trees.sprout.root();
+                            if actual_sprout_root != expected_sprout_root {
+                                self.vct.clear_prevalidated_next();
+                                return Err(ValidateContextError::VctSproutHandoffRootMismatch {
+                                    height,
+                                    expected: expected_sprout_root,
+                                    actual: actual_sprout_root,
+                                }
+                                .into());
+                            }
+
                             // Subtree tips are left `None`: the resuming chain recomputes
                             // them from the frontier position.
                             note_commitment_trees = NoteCommitmentTrees {
-                                sprout: sprout_frontier,
+                                // Sprout was reconstructed locally throughout fast sync.
+                                sprout: note_commitment_trees.sprout,
                                 sapling: sapling_frontier,
                                 sapling_subtree: None,
                                 orchard: orchard_frontier,

@@ -246,7 +246,9 @@ fn snapshot_block_and_transaction_data(state: &FinalizedState) {
         let mut stored_sapling_trees = Vec::new();
         let mut stored_orchard_trees = Vec::new();
 
-        let sprout_tree_at_tip = state.sprout_tree_for_tip();
+        let sprout_tree_at_tip = state
+            .sprout_tree_for_tip()
+            .expect("snapshot state has a Sprout tip tree");
         let sapling_tree_at_tip = state.sapling_tree_for_tip();
         let orchard_tree_at_tip = state.orchard_tree_for_tip();
 

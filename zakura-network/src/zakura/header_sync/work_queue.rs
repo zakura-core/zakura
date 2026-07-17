@@ -49,7 +49,6 @@ pub(super) struct CoveredRange {
 #[derive(Clone, Debug)]
 pub(super) struct HeaderWorkQueue {
     pub(super) forward: VecDeque<RangeRequest>,
-    pub(super) backward: VecDeque<RangeRequest>,
     pub(super) active: HashMap<RangeRequest, HeaderWorkState>,
     pending_starts: HashSet<(RangePriority, block::Height)>,
     active_starts: HashSet<(RangePriority, block::Height)>,
@@ -64,7 +63,6 @@ impl HeaderWorkQueue {
     pub(super) fn new() -> Self {
         Self {
             forward: VecDeque::new(),
-            backward: VecDeque::new(),
             active: HashMap::new(),
             pending_starts: HashSet::new(),
             active_starts: HashSet::new(),
@@ -79,10 +77,6 @@ impl HeaderWorkQueue {
         self.ensure(range, RangePriority::Forward);
     }
 
-    pub(super) fn ensure_backward(&mut self, range: RangeRequest) {
-        self.ensure(range, RangePriority::Backward);
-    }
-
     pub(super) fn ensure(&mut self, range: RangeRequest, priority: RangePriority) {
         if self.is_covered(range)
             || self.active_starts.contains(&(priority, range.start_height))
@@ -94,7 +88,6 @@ impl HeaderWorkQueue {
         }
         let queue = match priority {
             RangePriority::Forward => &mut self.forward,
-            RangePriority::Backward => &mut self.backward,
             RangePriority::Repair => return,
         };
         queue.push_back(range);
@@ -114,16 +107,7 @@ impl HeaderWorkQueue {
             !ranges.is_empty()
         });
         let range =
-            Self::pop_assignable(&mut self.forward, &self.retry_avoidance, peer_id, peer, now)
-                .or_else(|| {
-                    Self::pop_assignable(
-                        &mut self.backward,
-                        &self.retry_avoidance,
-                        peer_id,
-                        peer,
-                        now,
-                    )
-                });
+            Self::pop_assignable(&mut self.forward, &self.retry_avoidance, peer_id, peer, now);
         if let Some(range) = range {
             self.pending_starts
                 .remove(&(range.priority, range.start_height));
@@ -210,7 +194,6 @@ impl HeaderWorkQueue {
         }
         let queue = match range.priority {
             RangePriority::Forward => &mut self.forward,
-            RangePriority::Backward => &mut self.backward,
             RangePriority::Repair => return,
         };
         if self
@@ -289,7 +272,6 @@ impl HeaderWorkQueue {
     ) {
         let queue = match priority {
             RangePriority::Forward => &mut self.forward,
-            RangePriority::Backward => &mut self.backward,
             RangePriority::Repair => return,
         };
         if let Some(range) = queue
@@ -367,24 +349,22 @@ impl HeaderWorkQueue {
                 .any(|covered| covered.start <= range.start_height && covered.end >= end)
         };
         self.forward.retain(|range| !is_covered(range));
-        self.backward.retain(|range| !is_covered(range));
         self.active.retain(|range, state| {
             matches!(state, HeaderWorkState::Committing { .. }) || !is_covered(range)
         });
         self.rebuild_start_indexes();
-        if self.forward.is_empty() && self.backward.is_empty() && self.active.is_empty() {
+        if self.forward.is_empty() && self.active.is_empty() {
             self.oldest_missing_since = None;
         }
     }
 
     pub(super) fn pending_len(&self) -> usize {
-        self.forward.len().saturating_add(self.backward.len())
+        self.forward.len()
     }
 
     pub(super) fn resident_heights(&self) -> u64 {
         self.forward
             .iter()
-            .chain(&self.backward)
             .chain(self.active.keys())
             .map(|range| u64::from(range.count))
             .sum()
@@ -393,7 +373,6 @@ impl HeaderWorkQueue {
     pub(super) fn highest_end(&self, priority: RangePriority) -> Option<block::Height> {
         self.forward
             .iter()
-            .chain(&self.backward)
             .chain(self.active.keys())
             .filter(|range| range.priority == priority)
             .map(|range| range.end_height())
@@ -414,7 +393,7 @@ impl HeaderWorkQueue {
     }
 
     pub(super) fn has_pending(&self) -> bool {
-        !self.forward.is_empty() || !self.backward.is_empty()
+        !self.forward.is_empty()
     }
 
     pub(super) fn peer_retry_avoided(
@@ -425,7 +404,7 @@ impl HeaderWorkQueue {
         let Some(avoided) = self.retry_avoidance.get(peer) else {
             return false;
         };
-        self.forward.iter().chain(&self.backward).any(|range| {
+        self.forward.iter().any(|range| {
             range.end_height() <= advertised_tip
                 && avoided
                     .get(&(range.start_height, range.priority))
@@ -452,7 +431,6 @@ impl HeaderWorkQueue {
     pub(super) fn oldest_missing_height(&self) -> Option<block::Height> {
         self.forward
             .iter()
-            .chain(&self.backward)
             .chain(self.active.keys())
             .map(|range| range.start_height)
             .min()
@@ -463,7 +441,6 @@ impl HeaderWorkQueue {
         self.pending_starts.extend(
             self.forward
                 .iter()
-                .chain(&self.backward)
                 .map(|range| (range.priority, range.start_height)),
         );
         self.active_starts.clear();
@@ -607,14 +584,14 @@ mod tests {
         let poisoned = block::Hash([7; 32]);
         let suffix = RangeRequest {
             anchor_hash: Some(poisoned),
-            ..range(3, 2, RangePriority::Backward)
+            ..range(3, 2, RangePriority::Forward)
         };
-        queue.ensure_backward(suffix);
+        queue.ensure_forward(suffix);
 
-        queue.clear_pending_anchor(RangePriority::Backward, suffix.start_height, poisoned);
+        queue.clear_pending_anchor(RangePriority::Forward, suffix.start_height, poisoned);
 
         assert_eq!(
-            queue.backward.front().and_then(|range| range.anchor_hash),
+            queue.forward.front().and_then(|range| range.anchor_hash),
             None
         );
     }
@@ -670,34 +647,6 @@ mod tests {
     }
 
     #[test]
-    fn clearing_forward_work_preserves_backward_ownership_and_rebuilds_indexes() {
-        let mut queue = HeaderWorkQueue::new();
-        let forward_pending = range(1, 1, RangePriority::Forward);
-        let forward_active = range(2, 1, RangePriority::Forward);
-        let backward_pending = range(3, 1, RangePriority::Backward);
-        let backward_active = range(4, 1, RangePriority::Backward);
-        let owner = peer(4);
-        queue.ensure_forward(forward_pending);
-        queue.ensure_backward(backward_pending);
-        queue.mark_assigned(owner.clone(), forward_active);
-        queue.mark_assigned(owner.clone(), backward_active);
-        let old_epoch = queue.epoch;
-
-        queue.clear_forward();
-
-        assert_eq!(queue.epoch, old_epoch.wrapping_add(1));
-        assert_eq!(queue.forward, VecDeque::new());
-        assert!(queue.state(forward_active).is_none());
-        assert_eq!(queue.backward, VecDeque::from([backward_pending]));
-        assert!(matches!(
-            queue.state(backward_active),
-            Some(HeaderWorkState::InFlight { peer }) if peer == &owner
-        ));
-        queue.ensure_forward(forward_pending);
-        assert_eq!(queue.forward, VecDeque::from([forward_pending]));
-    }
-
-    #[test]
     fn retry_avoidance_is_local_to_the_failed_peer() {
         let mut queue = HeaderWorkQueue::new();
         let range = range(1, 1, RangePriority::Forward);
@@ -714,21 +663,6 @@ mod tests {
         assert!(queue.peer_retry_avoided(&failed_peer, failed_state.advertised_tip));
         assert_eq!(queue.next_for_peer(&failed_peer, &failed_state), None);
         assert_eq!(queue.next_for_peer(&other_peer, &other_state), Some(range));
-    }
-
-    #[test]
-    fn assignment_prefers_forward_work_but_skips_ranges_above_the_peer_tip() {
-        let mut queue = HeaderWorkQueue::new();
-        let forward = range(10, 2, RangePriority::Forward);
-        let backward = range(1, 2, RangePriority::Backward);
-        let (peer, mut state) = peer_state(4, 2);
-
-        queue.ensure_forward(forward);
-        queue.ensure_backward(backward);
-        assert_eq!(queue.next_for_peer(&peer, &state), Some(backward));
-
-        state.advertised_tip = block::Height(11);
-        assert_eq!(queue.next_for_peer(&peer, &state), Some(forward));
     }
 
     #[test]

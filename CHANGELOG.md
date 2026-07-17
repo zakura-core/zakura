@@ -18,10 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   tip. Startup rejects configured anchors above that base, and no longer
   backfills headers below a checkpoint anchor.
 
-
-
 ## [1.0.1] - 2026-07-17
-  
+
 ### Added
 
 - Deterministic attributed-memory accounting for decoded blocks in the

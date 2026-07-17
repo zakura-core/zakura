@@ -822,3 +822,66 @@ cargo test -p zakura-state final_frontier
 cargo test -p zakura-utils --features zakura-checkpoints
 cargo test -p zakura --features zakura-checkpoints checkpoints
 ```
+
+## 17. VCT Sprout-history repair artifact
+
+### 17.1 Purpose and trust boundary
+
+The original VCT fast path advanced Sprout locally but omitted the historical
+`Sprout root → frontier` anchor entries. A later JoinSplit can spend one of those roots, so an
+affected database must be repaired before it is used for validation. The repair artifact is a
+canonical, Mainnet-only history of **only the blocks that change Sprout**; it is unrelated to
+peer-delivered VCT roots and is never accepted from peers.
+
+The SHA-256 digest in the artifact detects accidental or malicious byte changes, but does not
+establish provenance. Provenance comes from release review and embedding the approved bytes in
+the binary. The loader must never substitute downloaded, locally generated, or guessed bytes.
+Each record is bound to its canonical block hash, and the header is bound to the canonical
+handoff block hash. The terminal root is independently pinned to the separately embedded VCT
+handoff frontier, so both artifacts must agree before replay.
+
+### 17.2 Binary format (version 1)
+
+All integers are little-endian. The fixed 115-byte header is:
+
+| Bytes | Field |
+| --- | --- |
+| 0–7 | ASCII magic `ZKVCTSP1` |
+| 8–9 | `u16` format version (`1`) |
+| 10 | network tag (`1`, Mainnet) |
+| 11–14 | `u32` handoff height |
+| 15–46 | canonical handoff block hash |
+| 47–50 | `u32` record count |
+| 51–82 | 32-byte terminal Sprout root |
+| 83–114 | SHA-256 digest of the remaining payload |
+
+The payload contains exactly `record_count` records. Each record is `height_delta: u32`,
+the canonical 32-byte block hash, `commitment_count: u16`, `commitment_count` 32-byte Sprout
+commitments, and one 32-byte resulting Sprout root. The digest covers these canonical hashes.
+Heights are delta-coded from an initial height of zero. The current implementation permits at
+most 1M records and 65,535 commitments per record. Because no bytes using the earlier
+unshipped layout were published, this corrected layout remains version 1 and has no compatibility
+decoder.
+
+### 17.3 Validation and generation
+
+The decoder rejects a wrong magic, version, or network; truncation; digest mismatches; excess
+counts; zero or overflowing/non-increasing height deltas; heights above the handoff; empty
+records; record-root mismatches while replaying commitments from an empty Sprout tree; a
+terminal-root mismatch; and trailing bytes. The generated artifact is authenticated against the
+current build's own identity: its handoff must equal the embedded final frontier's height and its
+terminal Sprout root must equal the embedded final frontier's Sprout root.
+
+The offline generator opens a complete current-format Mainnet archive read-only, scans canonical
+block bodies from genesis through the embedded handoff, emits only Sprout-changing blocks with
+their canonical hashes, and then decodes, replays, canonical-index-validates, and handoff-validates
+its own output:
+
+```console
+cargo run -p zakura-state --bin generate-vct-sprout-artifact -- \
+  /path/to/zakura-cache /path/to/vct-sprout-history.bin
+```
+
+Reviewers must reproduce and compare the emitted bytes, SHA-256 digest, terminal root, and
+handoff identity before changing `MAINNET_ARTIFACT`. Running the tool never installs or enables
+its output.

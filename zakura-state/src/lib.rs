@@ -74,16 +74,16 @@ pub use service::{
 pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
 
 pub use service::finalized_state::{
+    generate_mainnet_from_archive, produce_final_frontiers_bytes, validate_final_frontiers_bytes,
+    FinalFrontiersGenerationError, FinalFrontiersValidationError, GeneratorError,
+};
+pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,
     PruneFinalizedStateOptions, PruneFinalizedStateSummary,
 };
 pub use service::finalized_state::{
     preview_rollback_finalized_state, rollback_finalized_state, RollbackBackupSummary,
     RollbackFinalizedStateError, RollbackFinalizedStateOptions, RollbackFinalizedStateSummary,
-};
-pub use service::finalized_state::{
-    produce_final_frontiers_bytes, validate_final_frontiers_bytes, FinalFrontiersGenerationError,
-    FinalFrontiersValidationError,
 };
 pub use service::{
     finalized_state::{DiskWriteBatch, FromDisk, IntoDisk, WriteDisk, ZakuraDb},

@@ -103,7 +103,10 @@ pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
 };
-pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, NextVctBlock};
+pub use vct::{
+    generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
+    GeneratorError, NextVctBlock,
+};
 pub use zakura_db::ZakuraDb;
 
 #[cfg(any(test, feature = "proptest-impl"))]

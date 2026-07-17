@@ -8482,6 +8482,8 @@ dependencies = [
 name = "zakura-jsonl-trace"
 version = "1.1.0-rc1"
 dependencies = [
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

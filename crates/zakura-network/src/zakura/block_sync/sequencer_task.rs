@@ -15,13 +15,12 @@
 //! byte budget, and work queue directly and emit `SubmitBlock`/`Misbehavior`
 //! actions on the same channel the reactor uses.
 
-use super::super::trace::queue_send_trace as qs_trace;
 use super::{
     events::*,
-    reactor::{bs_insert_height, bs_insert_str, bs_insert_u64},
     reorder::BufferedBlockBody,
     sequencer::*,
     state::*,
+    trace::{height as trace_height, saturating_usize, BlockTraceEvent},
     work_queue::WorkQueue,
     *,
 };
@@ -727,64 +726,43 @@ impl SequencerTask {
     }
 
     fn trace_body_submitted(&self, height: block::Height, token: BlockApplyToken) {
-        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
-            row.insert(
-                bs_trace::EVENT.to_string(),
-                serde_json::Value::String(bs_trace::BLOCK_BODY_SUBMITTED.to_string()),
-            );
-            bs_insert_height(row, bs_trace::HEIGHT, height);
-            bs_insert_u64(row, bs_trace::APPLY_TOKEN, token);
+        self.trace.emit_event(|| {
+            BlockTraceEvent::build(bs_trace::BLOCK_BODY_SUBMITTED, |row| {
+                row.height = Some(trace_height(height));
+                row.apply_token = Some(token);
+            })
         });
     }
 
     fn trace_submission_retry_scheduled(&self, height: block::Height) {
-        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
-            bs_insert_str(
-                row,
-                bs_trace::EVENT,
-                bs_trace::BLOCK_BODY_SUBMISSION_RETRY_SCHEDULED,
-            );
-            bs_insert_height(row, bs_trace::HEIGHT, height);
-            bs_insert_u64(
-                row,
-                qs_trace::QUEUE_CAPACITY,
-                u64::try_from(self.actions.capacity()).unwrap_or(u64::MAX),
-            );
-            bs_insert_u64(
-                row,
-                qs_trace::QUEUE_MAX_CAPACITY,
-                u64::try_from(self.actions.max_capacity()).unwrap_or(u64::MAX),
-            );
-            bs_insert_u64(
-                row,
-                "in_flight_submission_count",
-                u64::try_from(self.sequencer.in_flight_submission_count()).unwrap_or(u64::MAX),
-            );
-            bs_insert_u64(
-                row,
-                "unsubmitted_applying_count",
-                u64::try_from(self.sequencer.unsubmitted_applying_count()).unwrap_or(u64::MAX),
-            );
-            bs_insert_u64(row, "retry_attempt", self.submission_retry_attempt);
+        self.trace.emit_event(|| {
+            BlockTraceEvent::build(bs_trace::BLOCK_BODY_SUBMISSION_RETRY_SCHEDULED, |row| {
+                row.height = Some(trace_height(height));
+                row.queue_capacity = Some(saturating_usize(self.actions.capacity()));
+                row.queue_max_capacity = Some(saturating_usize(self.actions.max_capacity()));
+                row.in_flight_submission_count = Some(saturating_usize(
+                    self.sequencer.in_flight_submission_count(),
+                ));
+                row.unsubmitted_applying_count = Some(saturating_usize(
+                    self.sequencer.unsubmitted_applying_count(),
+                ));
+                row.retry_attempt = Some(self.submission_retry_attempt);
+            })
         });
     }
 
-    fn trace_body_accepted(&self, height: block::Height, queued_elapsed: Duration, outcome: &str) {
-        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
-            row.insert(
-                bs_trace::EVENT.to_string(),
-                serde_json::Value::String(bs_trace::BLOCK_BODY_ACCEPTED.to_string()),
-            );
-            bs_insert_height(row, bs_trace::HEIGHT, height);
-            bs_insert_u64(
-                row,
-                "sequencer_queue_elapsed_us",
-                u64::try_from(queued_elapsed.as_micros()).unwrap_or(u64::MAX),
-            );
-            row.insert(
-                bs_trace::RESULT.to_string(),
-                serde_json::Value::String(outcome.to_string()),
-            );
+    fn trace_body_accepted(
+        &self,
+        height: block::Height,
+        queued_elapsed: Duration,
+        outcome: &'static str,
+    ) {
+        self.trace.emit_event(|| {
+            BlockTraceEvent::build(bs_trace::BLOCK_BODY_ACCEPTED, |row| {
+                row.height = Some(trace_height(height));
+                row.sequencer_queue_elapsed_us = Some(super::trace::elapsed_us(queued_elapsed));
+                row.result = Some(outcome);
+            })
         });
     }
 
@@ -798,48 +776,22 @@ impl SequencerTask {
         peer_outstanding_conflicts_at_tip: bool,
         reset_tip_matches_local_work: bool,
     ) {
-        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
-            bs_insert_str(
-                row,
-                bs_trace::EVENT,
-                bs_trace::BLOCK_FRONTIER_RESET_CLASSIFIED,
-            );
-            bs_insert_str(row, bs_trace::RESULT, classification);
-            bs_insert_height(
-                row,
-                bs_trace::VERIFIED_BLOCK_TIP,
-                frontiers.verified_block_tip,
-            );
-            bs_insert_height(row, "previous_verified_tip", self.sequencer.verified_tip());
-            bs_insert_height(row, "previous_download_floor", self.sequencer.floor());
-            bs_insert_u64(
-                row,
-                "preserve_active_successors",
-                u64::from(preserve_active_successors),
-            );
-            bs_insert_u64(
-                row,
-                "peer_has_successor_after",
-                u64::from(peer_has_successor_after),
-            );
-            bs_insert_u64(
-                row,
-                "peer_outstanding_conflicts_at_tip",
-                u64::from(peer_outstanding_conflicts_at_tip),
-            );
-            bs_insert_u64(
-                row,
-                "reset_tip_matches_local_work",
-                u64::from(reset_tip_matches_local_work),
-            );
-            bs_insert_u64(
-                row,
-                "has_local_successor_after",
-                u64::from(
+        self.trace.emit_event(|| {
+            BlockTraceEvent::build(bs_trace::BLOCK_FRONTIER_RESET_CLASSIFIED, |row| {
+                row.result = Some(classification);
+                row.verified_block_tip = Some(trace_height(frontiers.verified_block_tip));
+                row.previous_verified_tip = Some(trace_height(self.sequencer.verified_tip()));
+                row.previous_download_floor = Some(trace_height(self.sequencer.floor()));
+                row.preserve_active_successors = Some(u64::from(preserve_active_successors));
+                row.peer_has_successor_after = Some(u64::from(peer_has_successor_after));
+                row.peer_outstanding_conflicts_at_tip =
+                    Some(u64::from(peer_outstanding_conflicts_at_tip));
+                row.reset_tip_matches_local_work = Some(u64::from(reset_tip_matches_local_work));
+                row.has_local_successor_after = Some(u64::from(
                     next_height(frontiers.verified_block_tip)
                         .is_some_and(|next| self.sequencer.has_buffered_at_or_above(next)),
-                ),
-            );
+                ));
+            })
         });
     }
 

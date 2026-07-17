@@ -26,7 +26,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::Value;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -35,20 +34,18 @@ use zakura_chain::block::{self, Block};
 use zakura_jsonl_trace::{JsonlTraceGuard, JsonlTracer};
 
 use crate::zakura::{
-    trace::{block_sync_trace as bs_trace, BLOCK_SYNC_TABLE},
-    transport::ByteBudget,
-    ZakuraPeerId, ZakuraTrace,
+    trace::block_sync_trace as bs_trace, transport::ByteBudget, ZakuraPeerId, ZakuraTrace,
 };
 
 use super::{
     events::{BlockApplyResult, BlockApplyToken, BlockSyncAction},
-    reactor::{bs_insert_height, bs_insert_u64},
     reorder::BufferedBlockBody,
     sequencer::Sequencer,
     sequencer_task::{
         initial_view, SequencedBody, SequencerControlInput, SequencerTask, SequencerView,
     },
     state::{BlockSyncFrontiers, ThroughputMeter},
+    trace::{height as trace_height, BlockTraceEvent},
     work_queue::WorkQueue,
 };
 
@@ -289,57 +286,38 @@ impl BenchCommitter {
     /// `submitted_applies`, and the in-flight byte counters). Cheap and non-blocking;
     /// a no-op when tracing is disabled. Call it on a cadence from the bench driver.
     pub fn emit_state_snapshot(&self) {
-        let view = *self.view.borrow();
-        let sequencer_input_decoded_attributed_memory_bytes = self
-            .body_input_decoded_attributed_memory_bytes
-            .load(Ordering::Relaxed);
-        self.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
-            row.insert(
-                bs_trace::EVENT.to_string(),
-                Value::String(bs_trace::BLOCK_SYNC_STATE.to_string()),
-            );
-            bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, view.verified_tip);
-            bs_insert_u64(row, bs_trace::APPLYING, view.applying_len);
-            bs_insert_u64(row, bs_trace::REORDER, view.reorder_len);
-            bs_insert_u64(
-                row,
-                bs_trace::SUBMITTED_APPLIES,
-                view.in_flight_submission_count,
-            );
-            bs_insert_u64(row, "applying_buffered_bytes", view.applying_buffered_bytes);
-            bs_insert_u64(row, "reorder_buffered_bytes", view.reorder_buffered_bytes);
-            bs_insert_u64(
-                row,
-                bs_trace::SEQUENCER_INPUT_DECODED_ATTRIBUTED_MEMORY_BYTES,
-                sequencer_input_decoded_attributed_memory_bytes,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::REORDER_DECODED_ATTRIBUTED_MEMORY_BYTES,
-                view.reorder_decoded_attributed_memory_bytes,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::APPLYING_DECODED_ATTRIBUTED_MEMORY_BYTES,
-                view.applying_decoded_attributed_memory_bytes,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::ACTIVE_PIPELINE_DECODED_ATTRIBUTED_MEMORY_BYTES,
-                sequencer_input_decoded_attributed_memory_bytes
-                    .saturating_add(view.reorder_decoded_attributed_memory_bytes)
-                    .saturating_add(view.applying_decoded_attributed_memory_bytes),
-            );
-            bs_insert_u64(
-                row,
-                "retained_pipeline_wire_bytes",
-                super::admission::RetainedPipelineBytes {
-                    reorder_buffered_bytes: view.reorder_buffered_bytes,
-                    applying_buffered_bytes: view.applying_buffered_bytes,
-                    sequencer_input_queued_bytes: self.body_input_bytes.load(Ordering::Relaxed),
-                }
-                .wire_bytes(),
-            );
+        self.trace.emit_event(|| {
+            BlockTraceEvent::build(bs_trace::BLOCK_SYNC_STATE, |row| {
+                let view = *self.view.borrow();
+                let sequencer_input_decoded_attributed_memory_bytes = self
+                    .body_input_decoded_attributed_memory_bytes
+                    .load(Ordering::Relaxed);
+                row.verified_block_tip = Some(trace_height(view.verified_tip));
+                row.applying = Some(view.applying_len);
+                row.reorder = Some(view.reorder_len);
+                row.submitted_applies = Some(view.in_flight_submission_count);
+                row.applying_buffered_bytes = Some(view.applying_buffered_bytes);
+                row.reorder_buffered_bytes = Some(view.reorder_buffered_bytes);
+                row.sequencer_input_decoded_attributed_memory_bytes =
+                    Some(sequencer_input_decoded_attributed_memory_bytes);
+                row.reorder_decoded_attributed_memory_bytes =
+                    Some(view.reorder_decoded_attributed_memory_bytes);
+                row.applying_decoded_attributed_memory_bytes =
+                    Some(view.applying_decoded_attributed_memory_bytes);
+                row.active_pipeline_decoded_attributed_memory_bytes = Some(
+                    sequencer_input_decoded_attributed_memory_bytes
+                        .saturating_add(view.reorder_decoded_attributed_memory_bytes)
+                        .saturating_add(view.applying_decoded_attributed_memory_bytes),
+                );
+                row.retained_pipeline_wire_bytes = Some(
+                    super::admission::RetainedPipelineBytes {
+                        reorder_buffered_bytes: view.reorder_buffered_bytes,
+                        applying_buffered_bytes: view.applying_buffered_bytes,
+                        sequencer_input_queued_bytes: self.body_input_bytes.load(Ordering::Relaxed),
+                    }
+                    .wire_bytes(),
+                );
+            })
         });
     }
 

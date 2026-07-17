@@ -26,8 +26,8 @@ use zakura_chain::{
 };
 
 use super::{
-    trace::{block_sync_trace as bs_trace, peer_label as trace_peer_label, BLOCK_SYNC_TABLE},
-    Frame, ServicePeerDirection, ServicePeerLimits, ZakuraPeerId, ZakuraTrace,
+    trace::block_sync_trace as bs_trace, Frame, ServicePeerDirection, ServicePeerLimits,
+    ZakuraPeerId, ZakuraTrace,
 };
 
 mod admission;
@@ -49,6 +49,7 @@ mod service;
 mod state;
 #[cfg(test)]
 mod tests;
+mod trace;
 mod wire;
 mod work_queue;
 

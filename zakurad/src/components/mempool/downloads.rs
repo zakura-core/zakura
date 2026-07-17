@@ -72,6 +72,20 @@ fn peer_source_from_queue_source(source: &QueueSource) -> Option<zn::PeerSource>
     }
 }
 
+/// Returns the peer address to attribute a peer-pushed transaction's verification
+/// failure to, for the mempool misbehavior channel.
+///
+/// Only legacy-socket peers carry a routable [`PeerSocketAddr`], which is the key
+/// the misbehavior channel bans on. Zakura peers yield `None`, matching the
+/// advertised-download path, which also delivers Zakura-served transactions with
+/// no advertiser address (see `legacy_gossip.rs`).
+fn misbehavior_addr_from_queue_source(source: &QueueSource) -> Option<PeerSocketAddr> {
+    match source {
+        QueueSource::LegacySocket(addr) => Some(PeerSocketAddr::from(*addr)),
+        QueueSource::Zakura(_) => None,
+    }
+}
+
 /// Controls how long we wait for a transaction download request to complete.
 ///
 /// This is currently equal to [`BLOCK_DOWNLOAD_TIMEOUT`] for
@@ -387,6 +401,7 @@ where
         let verifier = self.verifier.clone();
         let mut state = self.state.clone();
         let download_source = source.as_ref().and_then(peer_source_from_queue_source);
+        let pushed_advertiser_addr = source.as_ref().and_then(misbehavior_addr_from_queue_source);
 
         let gossiped_tx_req = gossiped_tx.clone();
 
@@ -454,7 +469,7 @@ where
                         "mempool.pushed.transactions.total",
                         "version" => format!("{}",tx.transaction.version()),
                     ).increment(1);
-                    (tx, None)
+                    (tx, pushed_advertiser_addr)
                 }
             };
 
@@ -686,6 +701,24 @@ mod tests {
         UnminedTxId::from_legacy_id(transaction::Hash(bytes))
     }
 
+    fn empty_v5_transaction(byte: u8) -> transaction::UnminedTx {
+        use zakura_chain::{
+            block,
+            parameters::NetworkUpgrade,
+            transaction::{LockTime, Transaction},
+        };
+
+        transaction::UnminedTx::from(Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::min_lock_time_timestamp(),
+            expiry_height: block::Height(u32::from(byte)),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        })
+    }
+
     fn pending_downloads() -> Downloads<PendingNetwork, PendingVerifier, PendingState> {
         Downloads::new(
             BoxCloneService::new(service_fn(|_request| {
@@ -830,5 +863,65 @@ mod tests {
                 if error.0 == txid
                     && matches!(error.1, TransactionDownloadVerifyError::DownloadFailed(_))
         ));
+    }
+
+    /// A directly pushed transaction from a legacy-socket peer must keep that
+    /// peer's address on the `Invalid` verification error, so the mempool can
+    /// score the peer's misbehavior. Regression test for the push-path
+    /// attribution gap.
+    #[tokio::test]
+    async fn pushed_transaction_attributes_invalid_error_to_peer() {
+        use zakura_consensus::error::TransactionError;
+
+        let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+        let transaction = empty_v5_transaction(1);
+
+        let mut downloads = Downloads::new(
+            // The network service must never be called for a pushed transaction.
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("pushed transactions must not be downloaded");
+            })),
+            // Reject with a consensus error that carries a nonzero misbehavior score.
+            BoxCloneService::new(service_fn(|_request| async move {
+                Err(Box::new(TransactionError::WrongVersion) as BoxError)
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
+                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+        );
+
+        downloads
+            .download_if_needed_and_verify(
+                Gossip::Tx(transaction),
+                Some(QueueSource::LegacySocket(
+                    peer_addr.remove_socket_addr_privacy(),
+                )),
+                None,
+            )
+            .expect("download is queued");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("pushed transaction should complete")
+            .expect("download stream should yield an item")
+            .expect("pushed transaction should not time out");
+
+        let error = result
+            .expect_err("invalid pushed transaction should fail verification")
+            .1;
+        assert!(
+            matches!(
+                error,
+                TransactionDownloadVerifyError::Invalid {
+                    advertiser_addr: Some(addr),
+                    ..
+                } if addr == peer_addr
+            ),
+            "expected the pushed transaction failure to carry the peer address, got {error:?}"
+        );
     }
 }

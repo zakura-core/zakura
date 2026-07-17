@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   coincided with a ready service. The latest hash is now queued for an unready
   sidecar and delivered once it is ready again, bounding the stall to one
   readiness cycle.
+- The inbound-overload protection no longer disconnects operator-configured
+  block-gossip / zcashd-compat sidecar peers. When such a peer's own getdata /
+  getheaders overloaded or timed out the inbound service, the random
+  connection-drop (probability 0.05→0.5) could sever the very peer this node
+  feeds, and the one-connection-per-IP reconnect refusal could stretch that into
+  a multi-second blackout. Configured sidecars are now exempt from the drop —
+  their requests are still shed for backpressure, but the connection is not
+  closed. Every other peer's denial-of-service protection is unchanged.
 
 ## [1.0.1] - 2026-07-17
 

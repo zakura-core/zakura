@@ -60,6 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admission accounting charges serialized pools at wire size
   ([#190](https://github.com/zakura-core/zakura/pull/190)).
 
+### Added
+
+- Added typed Zakura trace events while preserving the existing JSONL schemas and raw trace API.
+
 ## [1.0.0] - 2026-07-15
 
 First "stable" release. However, be advised that the API may still greatly

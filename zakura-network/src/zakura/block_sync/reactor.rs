@@ -1,8 +1,6 @@
-use super::super::trace::{
-    ordered_send_error_label, queue_send_trace as qs_trace, QUEUE_SEND_TABLE,
-};
 use super::{
-    config::*, events::*, peer_registry::*, sequencer::*, sequencer_task::*, state::*, wire::*, *,
+    config::*, events::*, peer_registry::*, sequencer::*, sequencer_task::*, state::*, trace::*,
+    wire::*, *,
 };
 use crate::zakura::{
     FrontierChange, FrontierUpdate, OrderedSendError, ServiceAdmissionDecision,
@@ -411,25 +409,21 @@ impl BlockSyncReactor {
                 .work_queue
                 .release_reserved_and_return_items_detailed([claim.height]);
             self.state.budget.release(released.released_bytes);
-            self.emit_trace(bs_trace::BLOCK_FLOOR_WATCHDOG_CANCELLED, |row| {
-                bs_insert_peer(row, bs_trace::PEER, &claim.peer);
-                bs_insert_height(row, bs_trace::HEIGHT, claim.height);
-                bs_insert_u64(row, bs_trace::ESTIMATED_BYTES, claim.meta.estimated_bytes);
-                bs_insert_u64(row, "released_bytes", released.released_bytes);
-                bs_insert_u64(row, "returned_count", released.returned_count);
-                bs_insert_u64(row, "already_pending_count", released.already_pending_count);
-                bs_insert_u64(row, "released_count", released.released_count);
-                bs_insert_u64(row, "missing_count", released.missing_count);
-                bs_insert_u64(
-                    row,
-                    "pending_after",
-                    u64::from(self.state.work_queue.pending_contains(claim.height)),
-                );
-                bs_insert_u64(
-                    row,
-                    "in_flight_after",
-                    u64::from(self.state.work_queue.in_flight_contains(claim.height)),
-                );
+            self.emit_block(bs_trace::BLOCK_FLOOR_WATCHDOG_CANCELLED, |row| {
+                row.peer = Some(peer(&claim.peer));
+                row.height = Some(super::trace::height(claim.height));
+                row.estimated_bytes = Some(claim.meta.estimated_bytes);
+                row.released_bytes = Some(released.released_bytes);
+                row.returned_count = Some(released.returned_count);
+                row.already_pending_count = Some(released.already_pending_count);
+                row.released_count = Some(released.released_count);
+                row.missing_count = Some(released.missing_count);
+                row.pending_after = Some(u64::from(
+                    self.state.work_queue.pending_contains(claim.height),
+                ));
+                row.in_flight_after = Some(u64::from(
+                    self.state.work_queue.in_flight_contains(claim.height),
+                ));
             });
             metrics::counter!("sync.block.floor_watchdog.cancelled").increment(1);
             tracing::debug!(
@@ -1591,18 +1585,10 @@ impl BlockSyncReactor {
         }
     }
 
-    fn emit_trace(
-        &self,
-        event: &'static str,
-        build: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
-    ) {
-        self.startup.trace.emit_with(BLOCK_SYNC_TABLE, |row| {
-            row.insert(
-                bs_trace::EVENT.to_string(),
-                serde_json::Value::String(event.to_string()),
-            );
-            build(row);
-        });
+    fn emit_block(&self, event: &'static str, build: impl FnOnce(&mut BlockTraceFields)) {
+        self.startup
+            .trace
+            .emit_event(|| BlockTraceEvent::build(event, build));
     }
 
     /// Emit the periodic reactor snapshot used to diagnose body-sync stalls.
@@ -1625,76 +1611,46 @@ impl BlockSyncReactor {
     }
 
     fn trace_sync_state(&self, include_diagnostics: bool) {
-        if !self.startup.trace.is_enabled() {
-            return;
-        }
-        let floor_gap = include_diagnostics
-            .then(|| self.floor_gap_diagnostics(Instant::now()))
-            .flatten();
-        // The per-peer download window now lives in the routines, mirrored into the
-        // registry slot diagnostics; the periodic row sums them. Skip these registry
-        // walks on per-commit view changes, where the row is only needed to keep commit
-        // pipeline counters fresh.
-        let slots = include_diagnostics.then(|| self.registry.slot_summary());
-        let counts = include_diagnostics.then(|| self.registry.direction_status_counts());
-        let peers_with_status = include_diagnostics.then(|| self.registry.peers_with_status());
-        // The commit-pipeline counters now live on the Sequencer task; read them
-        // from the latest published view snapshot.
-        let view = self.last_view;
-        let submitted_applies = view.in_flight_submission_count;
-        let (received_bytes_per_sec, received_blocks_per_sec) = self
-            .state
-            .received_throughput
-            .lock()
-            .map(|meter| (meter.bytes_per_sec(), meter.blocks_per_sec()))
-            .unwrap_or((0, 0));
-        self.emit_trace(bs_trace::BLOCK_SYNC_STATE, |row| {
-            bs_insert_height(row, bs_trace::REQUEST_FLOOR, self.request_floor);
-            bs_insert_height(row, bs_trace::BODY_DOWNLOAD_FLOOR, view.download_floor);
-            bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, view.verified_tip);
-            bs_insert_height(row, bs_trace::BEST_HEADER_TIP, self.state.best_header_tip);
-            bs_insert_u64(row, bs_trace::BODY_LAG, u64::from(self.body_lag()));
-            bs_insert_u64(row, bs_trace::APPLYING, view.applying_len);
-            bs_insert_u64(row, bs_trace::SUBMITTED_APPLIES, submitted_applies);
-            bs_insert_u64(row, bs_trace::REORDER, view.reorder_len);
+        self.emit_block(bs_trace::BLOCK_SYNC_STATE, |row| {
+            let floor_gap = include_diagnostics
+                .then(|| self.floor_gap_diagnostics(Instant::now()))
+                .flatten();
+            // Skip these registry walks on per-commit view changes, where the row is
+            // only needed to keep commit pipeline counters fresh.
+            let slots = include_diagnostics.then(|| self.registry.slot_summary());
+            let counts = include_diagnostics.then(|| self.registry.direction_status_counts());
+            let peers_with_status = include_diagnostics.then(|| self.registry.peers_with_status());
+            let view = self.last_view;
+            let submitted_applies = view.in_flight_submission_count;
+            let (received_bytes_per_sec, received_blocks_per_sec) = self
+                .state
+                .received_throughput
+                .lock()
+                .map(|meter| (meter.bytes_per_sec(), meter.blocks_per_sec()))
+                .unwrap_or((0, 0));
+            row.request_floor = Some(height(self.request_floor));
+            row.body_download_floor = Some(height(view.download_floor));
+            row.verified_block_tip = Some(height(view.verified_tip));
+            row.best_header_tip = Some(height(self.state.best_header_tip));
+            row.body_lag = Some(u64::from(self.body_lag()));
+            row.applying = Some(view.applying_len);
+            row.submitted_applies = Some(submitted_applies);
+            row.reorder = Some(view.reorder_len);
             if let Some(slots) = slots {
-                bs_insert_u64(
-                    row,
-                    bs_trace::OUTSTANDING,
-                    slots.outstanding_requests as u64,
-                );
+                row.outstanding = Some(saturating_usize(slots.outstanding_requests));
             }
             if let Some(floor_gap) = floor_gap {
-                bs_insert_height(row, bs_trace::FLOOR_GAP_HEIGHT, floor_gap.height);
-                bs_insert_str(row, bs_trace::FLOOR_GAP_STATE, floor_gap.state);
-                bs_insert_u64(
-                    row,
-                    bs_trace::FLOOR_GAP_SERVABLE_PEERS,
-                    floor_gap.servable_peers as u64,
-                );
-                bs_insert_u64(
-                    row,
-                    bs_trace::FLOOR_GAP_AVAILABLE_PEERS,
-                    floor_gap.available_peers as u64,
-                );
-                bs_insert_u64(
-                    row,
-                    bs_trace::FLOOR_GAP_OUTSTANDING_PEERS,
-                    floor_gap.outstanding_peers as u64,
-                );
-                if let Some(age) = floor_gap.oldest_outstanding_ms {
-                    bs_insert_u64(row, bs_trace::FLOOR_GAP_OLDEST_OUTSTANDING_MS, age);
-                }
-                if let Some(deadline) = floor_gap.next_deadline_ms {
-                    bs_insert_u64(row, bs_trace::FLOOR_GAP_NEXT_DEADLINE_MS, deadline);
-                }
+                row.floor_gap_height = Some(height(floor_gap.height));
+                row.floor_gap_state = Some(floor_gap.state);
+                row.floor_gap_servable_peers = Some(saturating_usize(floor_gap.servable_peers));
+                row.floor_gap_available_peers = Some(saturating_usize(floor_gap.available_peers));
+                row.floor_gap_outstanding_peers =
+                    Some(saturating_usize(floor_gap.outstanding_peers));
+                row.floor_gap_oldest_outstanding_ms = floor_gap.oldest_outstanding_ms;
+                row.floor_gap_next_deadline_ms = floor_gap.next_deadline_ms;
             }
-            bs_insert_u64(
-                row,
-                bs_trace::BUDGET_AVAILABLE,
-                self.state.budget.available(),
-            );
-            bs_insert_u64(row, bs_trace::BUDGET_RESERVED, self.state.budget.reserved());
+            row.budget_available = Some(self.state.budget.available());
+            row.budget_reserved = Some(self.state.budget.reserved());
             let sequencer_input_queued_bytes = self
                 .sequencer_input_bytes
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -1705,63 +1661,27 @@ impl BlockSyncReactor {
             let sequencer_input_capacity = self.sequencer_input.capacity();
             let sequencer_input_queued_blocks =
                 sequencer_input_max_capacity.saturating_sub(sequencer_input_capacity);
-            bs_insert_u64(
-                row,
-                "sequencer_input_queued_bytes",
-                sequencer_input_queued_bytes,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::SEQUENCER_INPUT_DECODED_ATTRIBUTED_MEMORY_BYTES,
-                sequencer_input_decoded_attributed_memory_bytes,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::REORDER_DECODED_ATTRIBUTED_MEMORY_BYTES,
-                view.reorder_decoded_attributed_memory_bytes,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::APPLYING_DECODED_ATTRIBUTED_MEMORY_BYTES,
-                view.applying_decoded_attributed_memory_bytes,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::ACTIVE_PIPELINE_DECODED_ATTRIBUTED_MEMORY_BYTES,
+            row.sequencer_input_queued_bytes = Some(sequencer_input_queued_bytes);
+            row.sequencer_input_decoded_attributed_memory_bytes =
+                Some(sequencer_input_decoded_attributed_memory_bytes);
+            row.reorder_decoded_attributed_memory_bytes =
+                Some(view.reorder_decoded_attributed_memory_bytes);
+            row.applying_decoded_attributed_memory_bytes =
+                Some(view.applying_decoded_attributed_memory_bytes);
+            row.active_pipeline_decoded_attributed_memory_bytes = Some(
                 sequencer_input_decoded_attributed_memory_bytes
                     .saturating_add(view.reorder_decoded_attributed_memory_bytes)
                     .saturating_add(view.applying_decoded_attributed_memory_bytes),
             );
-            bs_insert_u64(
-                row,
-                "sequencer_input_queued_blocks",
-                sequencer_input_queued_blocks as u64,
-            );
-            bs_insert_u64(
-                row,
-                "sequencer_input_capacity",
-                sequencer_input_capacity as u64,
-            );
-            bs_insert_u64(
-                row,
-                "sequencer_input_max_capacity",
-                sequencer_input_max_capacity as u64,
-            );
-            bs_insert_u64(row, "reorder_buffered_bytes", view.reorder_buffered_bytes);
-            bs_insert_u64(row, "applying_buffered_bytes", view.applying_buffered_bytes);
-            bs_insert_u64(
-                row,
-                "unsubmitted_applying_count",
-                view.unsubmitted_applying_count,
-            );
-            bs_insert_u64(
-                row,
-                "in_flight_submission_bytes",
-                view.in_flight_submission_bytes,
-            );
-            bs_insert_u64(
-                row,
-                "retained_pipeline_wire_bytes",
+            row.sequencer_input_queued_blocks =
+                Some(saturating_usize(sequencer_input_queued_blocks));
+            row.sequencer_input_capacity = Some(saturating_usize(sequencer_input_capacity));
+            row.sequencer_input_max_capacity = Some(saturating_usize(sequencer_input_max_capacity));
+            row.reorder_buffered_bytes = Some(view.reorder_buffered_bytes);
+            row.applying_buffered_bytes = Some(view.applying_buffered_bytes);
+            row.unsubmitted_applying_count = Some(view.unsubmitted_applying_count);
+            row.in_flight_submission_bytes = Some(view.in_flight_submission_bytes);
+            row.retained_pipeline_wire_bytes = Some(
                 super::admission::RetainedPipelineBytes {
                     reorder_buffered_bytes: view.reorder_buffered_bytes,
                     applying_buffered_bytes: view.applying_buffered_bytes,
@@ -1769,9 +1689,9 @@ impl BlockSyncReactor {
                 }
                 .wire_bytes(),
             );
-            bs_insert_u64(row, bs_trace::PEERS, self.state.peers.len() as u64);
+            row.peers = Some(saturating_usize(self.state.peers.len()));
             if let Some(peers_with_status) = peers_with_status {
-                bs_insert_u64(row, bs_trace::PEERS_WITH_STATUS, peers_with_status as u64);
+                row.peers_with_status = Some(saturating_usize(peers_with_status));
             }
             // Peers that could be issued work but have no free slots are
             // saturated; the remainder want slots. If those exist and the budget
@@ -1784,107 +1704,44 @@ impl BlockSyncReactor {
                     peers_wanting_slots > 0
                         && self.state.budget.available() < BS_PER_BLOCK_WORST_CASE_BYTES,
                 );
-                bs_insert_u64(
-                    row,
-                    bs_trace::PEERS_WANTING_SLOTS,
-                    peers_wanting_slots as u64,
-                );
-                bs_insert_u64(
-                    row,
-                    bs_trace::DOWNLOAD_BLOCKED_ON_BUDGET,
-                    download_blocked_on_budget,
-                );
+                row.peers_wanting_slots = Some(saturating_usize(peers_wanting_slots));
+                row.download_blocked_on_budget = Some(download_blocked_on_budget);
             }
-            bs_insert_u64(
-                row,
-                bs_trace::RECEIVED_BYTES_PER_SEC,
-                received_bytes_per_sec,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::RECEIVED_BLOCKS_PER_SEC,
-                received_blocks_per_sec,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::COMMITTED_BYTES_PER_SEC,
-                view.committed_bytes_per_sec,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::COMMITTED_BLOCKS_PER_SEC,
-                view.committed_blocks_per_sec,
-            );
+            row.received_bytes_per_sec = Some(received_bytes_per_sec);
+            row.received_blocks_per_sec = Some(received_blocks_per_sec);
+            row.committed_bytes_per_sec = Some(view.committed_bytes_per_sec);
+            row.committed_blocks_per_sec = Some(view.committed_blocks_per_sec);
             if let Some(counts) = counts {
-                bs_insert_u64(row, "inbound_peers", counts.inbound as u64);
-                bs_insert_u64(row, "outbound_peers", counts.outbound as u64);
-                bs_insert_u64(
-                    row,
-                    "inbound_peers_with_status",
-                    counts.inbound_with_status as u64,
-                );
-                bs_insert_u64(
-                    row,
-                    "outbound_peers_with_status",
-                    counts.outbound_with_status as u64,
-                );
+                row.inbound_peers = Some(saturating_usize(counts.inbound));
+                row.outbound_peers = Some(saturating_usize(counts.outbound));
+                row.inbound_peers_with_status = Some(saturating_usize(counts.inbound_with_status));
+                row.outbound_peers_with_status =
+                    Some(saturating_usize(counts.outbound_with_status));
             }
             if let Some(slots) = slots {
-                bs_insert_u64(row, "request_slot_capacity", slots.capacity as u64);
-                bs_insert_u64(
-                    row,
-                    "request_slot_effective_window",
-                    slots.effective_window as u64,
-                );
-                bs_insert_u64(row, "request_slot_available", slots.available as u64);
-                bs_insert_u64(
-                    row,
-                    "request_slot_saturated_peers",
-                    slots.saturated_peers as u64,
-                );
+                row.request_slot_capacity = Some(saturating_usize(slots.capacity));
+                row.request_slot_effective_window = Some(saturating_usize(slots.effective_window));
+                row.request_slot_available = Some(saturating_usize(slots.available));
+                row.request_slot_saturated_peers = Some(saturating_usize(slots.saturated_peers));
             }
             if include_diagnostics {
                 // Scheduling visibility: distinguishes "gap not in `needed`"
                 // (state/filter) from "gap in `needed` but never queued" (`ensure`
                 // rejected it) from "queued but never requested" (starvation).
                 if let Some(min) = self.state.needed_heights.first() {
-                    bs_insert_height(row, bs_trace::NEEDED_MIN, *min);
+                    row.needed_min = Some(height(*min));
                 }
-                bs_insert_u64(
-                    row,
-                    bs_trace::NEEDED_COUNT,
-                    self.state.needed_heights.len() as u64,
-                );
-                bs_insert_u64(
-                    row,
-                    bs_trace::QUEUE_LEN,
-                    self.state.work_queue.pending_run_count() as u64,
-                );
-                bs_insert_u64(
-                    row,
-                    bs_trace::QUEUE_BLOCKS,
-                    self.state.work_queue.pending_len() as u64,
-                );
+                row.needed_count = Some(saturating_usize(self.state.needed_heights.len()));
+                row.queue_len = Some(saturating_usize(self.state.work_queue.pending_run_count()));
+                row.queue_blocks = Some(saturating_usize(self.state.work_queue.pending_len()));
                 if let Some(start) = self.state.work_queue.min_pending() {
-                    bs_insert_height(row, bs_trace::QUEUE_MIN_START, start);
+                    row.queue_min_start = Some(height(start));
                 }
-                bs_insert_u64(
-                    row,
-                    bs_trace::ASSIGNED_LEN,
-                    self.state.work_queue.in_flight_len() as u64,
-                );
-                bs_insert_u64(
-                    row,
-                    bs_trace::LOCAL_BODY_WORK,
-                    self.local_body_work_blocks() as u64,
-                );
-                bs_insert_u64(
-                    row,
-                    bs_trace::REFILL_LOW_WATER,
-                    self.refill_low_water_blocks() as u64,
-                );
+                row.assigned_len = Some(saturating_usize(self.state.work_queue.in_flight_len()));
+                row.local_body_work = Some(saturating_usize(self.local_body_work_blocks()));
+                row.refill_low_water = Some(saturating_usize(self.refill_low_water_blocks()));
                 if let Some(end) = self.state.work_queue.max_in_flight() {
-                    bs_insert_height(row, bs_trace::COVERED_MAX_END, end);
+                    row.covered_max_end = Some(height(end));
                 }
             }
         });
@@ -1896,18 +1753,17 @@ impl BlockSyncReactor {
         reason: &'static str,
         status: BlockSyncStatus,
     ) {
-        self.emit_trace(bs_trace::BLOCK_STATUS_SENT, |row| {
-            bs_insert_peer(row, bs_trace::PEER, peer);
-            bs_insert_str(row, bs_trace::REASON, reason);
-            bs_insert_height(row, bs_trace::RANGE_START, status.servable_low);
-            bs_insert_height(row, bs_trace::HEIGHT, status.servable_high);
+        self.emit_block(bs_trace::BLOCK_STATUS_SENT, |row| {
+            row.peer = Some(super::trace::peer(peer));
+            row.reason = Some(reason);
+            status_fields(row, status);
         });
     }
 
     fn trace_status_send_failed(&self, peer: &ZakuraPeerId, reason: &'static str) {
-        self.emit_trace(bs_trace::BLOCK_STATUS_SEND_FAILED, |row| {
-            bs_insert_peer(row, bs_trace::PEER, peer);
-            bs_insert_str(row, bs_trace::REASON, reason);
+        self.emit_block(bs_trace::BLOCK_STATUS_SEND_FAILED, |row| {
+            row.peer = Some(super::trace::peer(peer));
+            row.reason = Some(reason);
         });
     }
 
@@ -1920,26 +1776,8 @@ impl BlockSyncReactor {
         queue_max_capacity: usize,
         reason: Option<&'static str>,
     ) {
-        self.startup.trace.emit_with(QUEUE_SEND_TABLE, |row| {
-            bs_insert_str(row, qs_trace::EVENT, qs_trace::QUEUE_SEND_FAILED);
-            bs_insert_str(row, qs_trace::SERVICE, "block_sync");
-            bs_insert_str(row, qs_trace::MESSAGE, block_sync_message_label(msg));
-            bs_insert_peer(row, qs_trace::PEER, peer);
-            bs_insert_str(row, qs_trace::ERROR, ordered_send_error_label(error));
-            if let Some(reason) = reason {
-                bs_insert_str(row, qs_trace::REASON, reason);
-            }
-            bs_insert_u64(
-                row,
-                qs_trace::QUEUE_CAPACITY,
-                u64::try_from(queue_capacity).unwrap_or(u64::MAX),
-            );
-            bs_insert_u64(
-                row,
-                qs_trace::QUEUE_MAX_CAPACITY,
-                u64::try_from(queue_max_capacity).unwrap_or(u64::MAX),
-            );
-            trace_block_sync_message_fields(row, msg);
+        self.startup.trace.emit_event(|| {
+            QueueSendFailedEvent::new(peer, msg, error, reason, queue_capacity, queue_max_capacity)
         });
     }
 
@@ -1949,14 +1787,10 @@ impl BlockSyncReactor {
         direction: ServicePeerDirection,
         active_connections: usize,
     ) {
-        self.emit_trace(bs_trace::BLOCK_PEER_CONNECTED, |row| {
-            bs_insert_peer(row, bs_trace::PEER, peer);
-            bs_insert_str(row, "direction", direction.trace_label());
-            bs_insert_u64(
-                row,
-                bs_trace::ACTIVE_CONNECTIONS,
-                u64::try_from(active_connections).unwrap_or(u64::MAX),
-            );
+        self.emit_block(bs_trace::BLOCK_PEER_CONNECTED, |row| {
+            row.peer = Some(super::trace::peer(peer));
+            row.direction = Some(direction.trace_label());
+            row.active_connections = Some(saturating_usize(active_connections));
         });
     }
 
@@ -1966,17 +1800,10 @@ impl BlockSyncReactor {
         received_status: bool,
         active_connections: usize,
     ) {
-        self.emit_trace(bs_trace::BLOCK_PEER_DISCONNECTED, |row| {
-            bs_insert_peer(row, bs_trace::PEER, peer);
-            row.insert(
-                "received_status".to_string(),
-                serde_json::Value::Bool(received_status),
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::ACTIVE_CONNECTIONS,
-                u64::try_from(active_connections).unwrap_or(u64::MAX),
-            );
+        self.emit_block(bs_trace::BLOCK_PEER_DISCONNECTED, |row| {
+            row.peer = Some(super::trace::peer(peer));
+            row.received_status = Some(BoolOrU64::Bool(received_status));
+            row.active_connections = Some(saturating_usize(active_connections));
         });
     }
 
@@ -1987,12 +1814,12 @@ impl BlockSyncReactor {
         result: &'static str,
         elapsed: Duration,
     ) {
-        self.emit_trace(bs_trace::BLOCK_MESSAGE_SENT, |row| {
-            bs_insert_peer(row, bs_trace::PEER, peer);
-            bs_insert_str(row, bs_trace::KIND, block_sync_message_label(msg));
-            bs_insert_str(row, bs_trace::RESULT, result);
-            bs_insert_duration_ms(row, bs_trace::ELAPSED_MS, elapsed);
-            trace_block_sync_message_fields(row, msg);
+        self.emit_block(bs_trace::BLOCK_MESSAGE_SENT, |row| {
+            row.peer = Some(super::trace::peer(peer));
+            row.kind = Some(block_sync_message_label(msg));
+            row.result = Some(result);
+            row.elapsed_ms = Some(elapsed_ms(elapsed));
+            project_message(row, msg);
         });
     }
 
@@ -2003,11 +1830,11 @@ impl BlockSyncReactor {
         result: BlockApplyResult,
         budget_reserved_after: u64,
     ) {
-        self.emit_trace(bs_trace::BLOCK_APPLY_FINISHED, |row| {
-            bs_insert_height(row, bs_trace::HEIGHT, height);
-            bs_insert_u64(row, bs_trace::APPLY_TOKEN, token);
-            bs_insert_str(row, bs_trace::RESULT, block_apply_result_label(result));
-            bs_insert_u64(row, bs_trace::BUDGET_RESERVED_AFTER, budget_reserved_after);
+        self.emit_block(bs_trace::BLOCK_APPLY_FINISHED, |row| {
+            row.height = Some(super::trace::height(height));
+            row.apply_token = Some(token);
+            row.result = Some(block_apply_result_label(result));
+            row.budget_reserved_after = Some(budget_reserved_after);
         });
     }
 
@@ -2022,48 +1849,28 @@ impl BlockSyncReactor {
         capacity: usize,
         max_capacity: usize,
     ) {
-        self.emit_trace(bs_trace::BLOCK_SEQUENCER_CONTROL_SENT, |row| {
-            bs_insert_str(row, bs_trace::KIND, kind);
-            bs_insert_str(row, bs_trace::RESULT, result);
-            bs_insert_duration_ms(row, bs_trace::ELAPSED_MS, elapsed);
-            if let Some(height) = height {
-                bs_insert_height(row, bs_trace::HEIGHT, height);
-            }
-            if let Some(token) = token {
-                bs_insert_u64(row, bs_trace::APPLY_TOKEN, token);
-            }
-            bs_insert_u64(
-                row,
-                "sequencer_input_capacity",
-                u64::try_from(capacity).unwrap_or(u64::MAX),
-            );
-            bs_insert_u64(
-                row,
-                "sequencer_input_max_capacity",
-                u64::try_from(max_capacity).unwrap_or(u64::MAX),
-            );
+        self.emit_block(bs_trace::BLOCK_SEQUENCER_CONTROL_SENT, |row| {
+            row.kind = Some(kind);
+            row.result = Some(result);
+            row.elapsed_ms = Some(elapsed_ms(elapsed));
+            row.height = height.map(super::trace::height);
+            row.apply_token = token;
+            row.sequencer_input_capacity = Some(saturating_usize(capacity));
+            row.sequencer_input_max_capacity = Some(saturating_usize(max_capacity));
         });
     }
 
     fn trace_range_response_sent(&self, peer: &ZakuraPeerId, response: RangeResponseTrace) {
-        self.emit_trace(bs_trace::BLOCK_RANGE_RESPONSE_SENT, |row| {
-            bs_insert_peer(row, bs_trace::PEER, peer);
-            bs_insert_height(row, bs_trace::RANGE_START, response.start_height);
-            bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(response.sent_count));
-            bs_insert_u64(
-                row,
-                bs_trace::EXPECTED_COUNT,
-                u64::from(response.requested_count),
-            );
-            bs_insert_u64(row, bs_trace::SERIALIZED_BYTES, response.sent_bytes);
-            bs_insert_str(row, bs_trace::REASON, response.reason);
-            if let Some(prepare_elapsed) = response.prepare_elapsed {
-                bs_insert_duration_ms(row, bs_trace::PREPARE_ELAPSED_MS, prepare_elapsed);
-            }
-            bs_insert_duration_ms(row, bs_trace::SEND_ELAPSED_MS, response.send_elapsed);
-            if let Some(total_elapsed) = response.total_elapsed {
-                bs_insert_duration_ms(row, bs_trace::ELAPSED_MS, total_elapsed);
-            }
+        self.emit_block(bs_trace::BLOCK_RANGE_RESPONSE_SENT, |row| {
+            row.peer = Some(super::trace::peer(peer));
+            row.range_start = Some(height(response.start_height));
+            row.range_count = Some(u64::from(response.sent_count));
+            row.expected_count = Some(u64::from(response.requested_count));
+            row.serialized_bytes = Some(response.sent_bytes);
+            row.reason = Some(response.reason);
+            row.prepare_elapsed_ms = response.prepare_elapsed.map(elapsed_ms);
+            row.send_elapsed_ms = Some(elapsed_ms(response.send_elapsed));
+            row.elapsed_ms = response.total_elapsed.map(elapsed_ms);
         });
     }
 
@@ -2072,27 +1879,23 @@ impl BlockSyncReactor {
         if !self.startup.trace.is_enabled() {
             return;
         }
-        self.emit_trace(bs_trace::BLOCK_WORK_EXTENDED, |row| {
-            bs_insert_u64(row, bs_trace::RANGE_COUNT, inserted as u64);
-            bs_insert_u64(
-                row,
-                bs_trace::QUEUE_BLOCKS,
-                self.state.work_queue.pending_len() as u64,
-            );
+        self.emit_block(bs_trace::BLOCK_WORK_EXTENDED, |row| {
+            row.range_count = Some(saturating_usize(inserted));
+            row.queue_blocks = Some(saturating_usize(self.state.work_queue.pending_len()));
         });
     }
 
     /// Trace a WorkQueue take (a contiguous chunk claimed by a peer for issuance).
     fn trace_frontiers_changed(&self, verified_block_tip: block::Height) {
-        self.emit_trace(bs_trace::BLOCK_FRONTIERS_CHANGED, |row| {
-            bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, verified_block_tip);
-            bs_insert_height(row, bs_trace::BEST_HEADER_TIP, self.state.best_header_tip);
+        self.emit_block(bs_trace::BLOCK_FRONTIERS_CHANGED, |row| {
+            row.verified_block_tip = Some(height(verified_block_tip));
+            row.best_header_tip = Some(height(self.state.best_header_tip));
         });
     }
 
     fn trace_chain_tip_reset(&self, verified_block_tip: block::Height) {
-        self.emit_trace(bs_trace::BLOCK_CHAIN_TIP_RESET, |row| {
-            bs_insert_height(row, bs_trace::VERIFIED_BLOCK_TIP, verified_block_tip);
+        self.emit_block(bs_trace::BLOCK_CHAIN_TIP_RESET, |row| {
+            row.verified_block_tip = Some(height(verified_block_tip));
         });
     }
 
@@ -2254,260 +2057,21 @@ impl BlockSyncReactor {
     }
 
     fn trace_event_received(&self, event: &BlockSyncEvent) {
-        self.emit_trace(bs_trace::BLOCK_EVENT_RECEIVED, |row| match event {
-            BlockSyncEvent::PeerConnected(session) => {
-                bs_insert_str(row, bs_trace::KIND, "peer_connected");
-                bs_insert_peer(row, bs_trace::PEER, session.peer_id());
-            }
-            BlockSyncEvent::PeerDisconnected(peer) => {
-                bs_insert_str(row, bs_trace::KIND, "peer_disconnected");
-                bs_insert_peer(row, bs_trace::PEER, peer);
-            }
-            BlockSyncEvent::HeaderTipChanged { height, hash } => {
-                bs_insert_str(row, bs_trace::KIND, "header_tip_changed");
-                bs_insert_height(row, bs_trace::HEIGHT, *height);
-                bs_insert_hash(row, bs_trace::HASH, *hash);
-            }
-            BlockSyncEvent::StateFrontiersChanged(frontiers) => {
-                bs_insert_str(row, bs_trace::KIND, "state_frontiers_changed");
-                bs_insert_frontiers(row, frontiers);
-            }
-            BlockSyncEvent::ChainTipGrow(frontiers) => {
-                bs_insert_str(row, bs_trace::KIND, "chain_tip_grow");
-                bs_insert_frontiers(row, frontiers);
-            }
-            BlockSyncEvent::ChainTipReset(frontiers) => {
-                bs_insert_str(row, bs_trace::KIND, "chain_tip_reset");
-                bs_insert_frontiers(row, frontiers);
-            }
-            BlockSyncEvent::NeededBlocks(blocks) => {
-                bs_insert_str(row, bs_trace::KIND, "needed_blocks");
-                bs_insert_u64(row, bs_trace::RANGE_COUNT, blocks.len() as u64);
-                if let Some(first) = blocks.first() {
-                    bs_insert_height(row, bs_trace::RANGE_START, first.height);
-                }
-            }
-            BlockSyncEvent::BlockApplyFinished {
-                token,
-                height,
-                hash,
-                result,
-                local_frontier,
-            } => {
-                bs_insert_str(row, bs_trace::KIND, "block_apply_finished");
-                bs_insert_u64(row, bs_trace::APPLY_TOKEN, *token);
-                bs_insert_height(row, bs_trace::HEIGHT, *height);
-                bs_insert_hash(row, bs_trace::HASH, *hash);
-                bs_insert_str(row, bs_trace::RESULT, block_apply_result_label(*result));
-                if let Some(frontiers) = local_frontier {
-                    bs_insert_frontiers(row, frontiers);
-                }
-            }
-            BlockSyncEvent::BlockRangeResponseFinished {
-                peer,
-                start_height,
-                requested_count,
-                returned_count,
-            } => {
-                bs_insert_str(row, bs_trace::KIND, "block_range_response_finished");
-                bs_insert_peer(row, bs_trace::PEER, peer);
-                bs_insert_height(row, bs_trace::RANGE_START, *start_height);
-                bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*returned_count));
-                bs_insert_u64(row, bs_trace::EXPECTED_COUNT, u64::from(*requested_count));
-            }
-            BlockSyncEvent::BlockRangeResponseReady {
-                peer,
-                start_height,
-                requested_count,
-                blocks,
-            } => {
-                bs_insert_str(row, bs_trace::KIND, "block_range_response_ready");
-                bs_insert_peer(row, bs_trace::PEER, peer);
-                bs_insert_height(row, bs_trace::RANGE_START, *start_height);
-                bs_insert_u64(row, bs_trace::RANGE_COUNT, blocks.len() as u64);
-                bs_insert_u64(row, bs_trace::EXPECTED_COUNT, u64::from(*requested_count));
-            }
-        });
+        self.startup
+            .trace
+            .emit_event(|| BlockEventReceived::new(event));
     }
 
     fn trace_action_dispatched(&self, action: &BlockSyncAction) {
-        self.emit_trace(bs_trace::BLOCK_ACTION_DISPATCHED, |row| match action {
-            BlockSyncAction::QueryNeededBlocks {
-                from,
-                limit,
-                best_header_tip,
-            } => {
-                bs_insert_str(row, bs_trace::KIND, "query_needed_blocks");
-                bs_insert_height(row, bs_trace::RANGE_START, *from);
-                bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*limit));
-                bs_insert_height(row, bs_trace::BEST_HEADER_TIP, *best_header_tip);
-            }
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                bs_insert_str(row, bs_trace::KIND, "query_blocks_by_height_range");
-                bs_insert_peer(row, bs_trace::PEER, peer);
-                bs_insert_height(row, bs_trace::RANGE_START, *start);
-                bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*count));
-            }
-            BlockSyncAction::SubmitBlock { token, block } => {
-                bs_insert_str(row, bs_trace::KIND, "submit_block");
-                bs_insert_u64(row, bs_trace::APPLY_TOKEN, *token);
-                bs_insert_hash(row, bs_trace::HASH, block.hash());
-                if let Some(height) = block.coinbase_height() {
-                    bs_insert_height(row, bs_trace::HEIGHT, height);
-                }
-            }
-            BlockSyncAction::Misbehavior { peer, reason } => {
-                bs_insert_str(row, bs_trace::KIND, "misbehavior");
-                bs_insert_peer(row, bs_trace::PEER, peer);
-                bs_insert_str(row, bs_trace::REASON, block_misbehavior_label(*reason));
-            }
-        });
+        self.startup
+            .trace
+            .emit_event(|| BlockActionDispatched::new(action));
     }
 }
 
 pub(super) fn node_id_from_block_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
     let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
     NodeId::from_bytes(&bytes).ok()
-}
-
-fn block_apply_result_label(result: BlockApplyResult) -> &'static str {
-    match result {
-        BlockApplyResult::Committed => "committed",
-        BlockApplyResult::Duplicate => "duplicate",
-        BlockApplyResult::Rejected => "rejected",
-        BlockApplyResult::TimedOut => "timed_out",
-    }
-}
-
-pub(super) fn bs_insert_peer(
-    row: &mut serde_json::Map<String, serde_json::Value>,
-    key: &'static str,
-    peer: &ZakuraPeerId,
-) {
-    row.insert(
-        key.to_string(),
-        serde_json::Value::String(trace_peer_label(peer)),
-    );
-}
-
-pub(super) fn bs_insert_height(
-    row: &mut serde_json::Map<String, serde_json::Value>,
-    key: &'static str,
-    height: block::Height,
-) {
-    bs_insert_u64(row, key, u64::from(height.0));
-}
-
-fn bs_insert_hash(
-    row: &mut serde_json::Map<String, serde_json::Value>,
-    key: &'static str,
-    hash: block::Hash,
-) {
-    row.insert(
-        key.to_string(),
-        serde_json::Value::String(format!("{hash}")),
-    );
-}
-
-pub(super) fn bs_insert_u64(
-    row: &mut serde_json::Map<String, serde_json::Value>,
-    key: &'static str,
-    value: u64,
-) {
-    row.insert(key.to_string(), serde_json::Value::from(value));
-}
-
-fn bs_insert_duration_ms(
-    row: &mut serde_json::Map<String, serde_json::Value>,
-    key: &'static str,
-    duration: Duration,
-) {
-    bs_insert_u64(
-        row,
-        key,
-        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-    );
-}
-
-fn bs_insert_frontiers(
-    row: &mut serde_json::Map<String, serde_json::Value>,
-    frontiers: &BlockSyncFrontiers,
-) {
-    bs_insert_height(
-        row,
-        bs_trace::VERIFIED_BLOCK_TIP,
-        frontiers.verified_block_tip,
-    );
-    bs_insert_hash(row, bs_trace::HASH, frontiers.verified_block_hash);
-}
-
-fn trace_block_sync_message_fields(
-    row: &mut serde_json::Map<String, serde_json::Value>,
-    msg: &BlockSyncMessage,
-) {
-    match msg {
-        BlockSyncMessage::Status(status) => {
-            bs_insert_height(row, bs_trace::RANGE_START, status.servable_low);
-            bs_insert_height(row, bs_trace::HEIGHT, status.servable_high);
-        }
-        BlockSyncMessage::Block(block) => {
-            bs_insert_hash(row, bs_trace::HASH, block.hash());
-            if let Some(height) = block.coinbase_height() {
-                bs_insert_height(row, bs_trace::HEIGHT, height);
-            }
-        }
-        BlockSyncMessage::BlocksDone {
-            start_height,
-            returned,
-        } => {
-            bs_insert_height(row, bs_trace::RANGE_START, *start_height);
-            bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*returned));
-        }
-        BlockSyncMessage::RangeUnavailable {
-            start_height,
-            count,
-        }
-        | BlockSyncMessage::GetBlocks {
-            start_height,
-            count,
-        } => {
-            bs_insert_height(row, bs_trace::RANGE_START, *start_height);
-            bs_insert_u64(row, bs_trace::RANGE_COUNT, u64::from(*count));
-        }
-    }
-}
-
-pub(super) fn block_sync_message_label(msg: &BlockSyncMessage) -> &'static str {
-    match msg {
-        BlockSyncMessage::Status(_) => "status",
-        BlockSyncMessage::Block(_) => "block",
-        BlockSyncMessage::BlocksDone { .. } => "blocks_done",
-        BlockSyncMessage::RangeUnavailable { .. } => "range_unavailable",
-        BlockSyncMessage::GetBlocks { .. } => "get_blocks",
-    }
-}
-
-fn block_misbehavior_label(reason: BlockSyncMisbehavior) -> &'static str {
-    match reason {
-        BlockSyncMisbehavior::MalformedMessage => "malformed_message",
-        BlockSyncMisbehavior::UnsolicitedBlock => "unsolicited_block",
-        BlockSyncMisbehavior::GetBlocksTooLong => "get_blocks_too_long",
-        BlockSyncMisbehavior::GetBlocksSpam => "get_blocks_spam",
-        BlockSyncMisbehavior::InvalidBlock => "invalid_block",
-        BlockSyncMisbehavior::SizeMismatch => "size_mismatch",
-        BlockSyncMisbehavior::InvalidStatus => "invalid_status",
-        BlockSyncMisbehavior::UnsolicitedDone => "unsolicited_done",
-        BlockSyncMisbehavior::RangeUnavailable => "range_unavailable",
-        BlockSyncMisbehavior::StatusSpam => "status_spam",
-    }
-}
-
-pub(super) fn bs_insert_str(
-    row: &mut serde_json::Map<String, serde_json::Value>,
-    key: &'static str,
-    value: &str,
-) {
-    row.insert(key.to_string(), serde_json::Value::from(value.to_string()));
 }
 
 fn elapsed_ms_u64(duration: Duration) -> u64 {

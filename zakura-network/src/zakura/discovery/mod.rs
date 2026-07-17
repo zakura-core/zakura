@@ -7,6 +7,7 @@ mod protocol;
 mod redial;
 mod runtime;
 mod service;
+mod trace;
 
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use candidate_dialer::run_native_discovery_dialer;

@@ -8,97 +8,54 @@
 //! one event name per rejection metric, so readers should pivot by `event` plus
 //! `reason` for those rows.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
 
 use blake2b_simd::Params as Blake2bParams;
 use serde_json::{Map, Number, Value};
-use zakura_jsonl_trace::{JsonlTracer, JsonlWriteEvent};
+use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceEvent, JsonlTracer};
 
 use super::{ZakuraPeerId, ZakuraRejectReason};
 
 /// A Zakura JSONL trace table.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct ZakuraTraceTable {
-    table: &'static str,
-    file_name: &'static str,
-}
-
-impl ZakuraTraceTable {
-    /// Logical table name.
-    pub fn table(self) -> &'static str {
-        self.table
-    }
-
-    /// JSONL file name.
-    pub fn file_name(self) -> &'static str {
-        self.file_name
-    }
-}
+pub type ZakuraTraceTable = zakura_jsonl_trace::JsonlTraceTable;
 
 /// Legacy upgrade and control-handshake transitions.
-pub const HANDSHAKE_TABLE: ZakuraTraceTable = ZakuraTraceTable {
-    table: "handshake",
-    file_name: "handshake.jsonl",
-};
+pub const HANDSHAKE_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("handshake", "handshake.jsonl");
 
 /// Connection admission and close transitions.
-pub const CONN_TABLE: ZakuraTraceTable = ZakuraTraceTable {
-    table: "conn",
-    file_name: "conn.jsonl",
-};
+pub const CONN_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("conn", "conn.jsonl");
 
 /// Per-connection stream admission transitions.
-pub const STREAM_TABLE: ZakuraTraceTable = ZakuraTraceTable {
-    table: "stream",
-    file_name: "stream.jsonl",
-};
+pub const STREAM_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("stream", "stream.jsonl");
 
 /// Discovery dialer decisions and backoff classification.
-pub const DISCOVERY_TABLE: ZakuraTraceTable = ZakuraTraceTable {
-    table: "discovery",
-    file_name: "discovery.jsonl",
-};
+pub const DISCOVERY_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("discovery", "discovery.jsonl");
 
 /// Frame and message rate-limit decisions.
-pub const RATELIMIT_TABLE: ZakuraTraceTable = ZakuraTraceTable {
-    table: "ratelimit",
-    file_name: "ratelimit.jsonl",
-};
+pub const RATELIMIT_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("ratelimit", "ratelimit.jsonl");
 
 /// Header-sync policy, accounting, and frontier events.
-pub const HEADER_SYNC_TABLE: ZakuraTraceTable = ZakuraTraceTable {
-    table: "header_sync",
-    file_name: "header_sync.jsonl",
-};
+pub const HEADER_SYNC_TABLE: ZakuraTraceTable =
+    ZakuraTraceTable::new("header_sync", "header_sync.jsonl");
 
 /// Legacy compatibility request/response events.
-pub const LEGACY_REQUEST_TABLE: ZakuraTraceTable = ZakuraTraceTable {
-    table: "legacy_request",
-    file_name: "legacy_request.jsonl",
-};
+pub const LEGACY_REQUEST_TABLE: ZakuraTraceTable =
+    ZakuraTraceTable::new("legacy_request", "legacy_request.jsonl");
 
 /// Block-sync (stream-6) scheduling, download, submit, and commit events.
-pub const BLOCK_SYNC_TABLE: ZakuraTraceTable = ZakuraTraceTable {
-    table: "block_sync",
-    file_name: "block_sync.jsonl",
-};
+pub const BLOCK_SYNC_TABLE: ZakuraTraceTable =
+    ZakuraTraceTable::new("block_sync", "block_sync.jsonl");
 
 /// Zakurad adapter boundary events for commits, state reads, and frontier mirrors.
-pub const COMMIT_STATE_TABLE: ZakuraTraceTable = ZakuraTraceTable {
-    table: "commit_state",
-    file_name: "commit_state.jsonl",
-};
+pub const COMMIT_STATE_TABLE: ZakuraTraceTable =
+    ZakuraTraceTable::new("commit_state", "commit_state.jsonl");
 
 /// Failed non-blocking outbound queue sends for Zakura wire messages.
-pub const QUEUE_SEND_TABLE: ZakuraTraceTable = ZakuraTraceTable {
-    table: "queue_send",
-    file_name: "queue_send.jsonl",
-};
+pub const QUEUE_SEND_TABLE: ZakuraTraceTable =
+    ZakuraTraceTable::new("queue_send", "queue_send.jsonl");
 
 /// Shared queue-send trace event names and field keys.
+#[allow(dead_code)] // Preserved as schema constants for compatible trace consumers.
 pub mod queue_send_trace {
     /// Trace row event field.
     pub const EVENT: &str = "event";
@@ -144,6 +101,7 @@ pub mod queue_send_trace {
 /// stall: it reports where the body floor, verified tip, and header tip are, how
 /// much is buffered/applying, and whether the byte budget or peer status is
 /// blocking new downloads.
+#[allow(dead_code)] // Preserved as schema constants for compatible trace consumers.
 pub mod block_sync_trace {
     /// Trace row event field.
     pub const EVENT: &str = "event";
@@ -345,6 +303,7 @@ pub mod block_sync_trace {
 }
 
 /// Shared discovery trace event names and field keys.
+#[allow(dead_code)] // Preserved as schema constants for compatible trace consumers.
 pub mod discovery_trace {
     /// Trace row event field.
     pub const EVENT: &str = "event";
@@ -358,6 +317,7 @@ pub mod discovery_trace {
 }
 
 /// Shared header-sync trace event names and field keys.
+#[allow(dead_code)] // Preserved as schema constants for compatible trace consumers.
 pub mod header_sync_trace {
     /// Trace row event field.
     pub const EVENT: &str = "event";
@@ -605,9 +565,7 @@ pub mod commit_state_trace {
 /// Cloneable Zakura trace emitter.
 #[derive(Clone, Debug)]
 pub struct ZakuraTrace {
-    tracer: JsonlTracer,
-    node: Arc<str>,
-    started: Instant,
+    emitter: JsonlEventEmitter,
 }
 
 impl ZakuraTrace {
@@ -619,25 +577,31 @@ impl ZakuraTrace {
     /// Create a trace emitter with an explicit node label.
     pub fn new(tracer: JsonlTracer, node: impl Into<Arc<str>>) -> Self {
         Self {
-            tracer,
-            node: node.into(),
-            started: Instant::now(),
+            emitter: JsonlEventEmitter::new(tracer, node),
         }
     }
 
     /// Return the underlying JSONL tracer.
     pub fn tracer(&self) -> &JsonlTracer {
-        &self.tracer
+        self.emitter.tracer()
     }
 
     /// Return true when this emitter will attempt to write rows.
     pub fn is_enabled(&self) -> bool {
-        self.tracer.is_enabled()
+        self.emitter.is_enabled()
     }
 
     /// Emit one event row without awaiting or back-pressuring the caller.
     pub fn emit(&self, table: ZakuraTraceTable, event: ZakuraTraceEvent<'_>) {
         self.emit_with(table, |row| event.insert_into(row));
+    }
+
+    /// Lazily build and emit a typed event after reserving channel capacity.
+    pub fn emit_event<E>(&self, build: impl FnOnce() -> E)
+    where
+        E: JsonlTraceEvent,
+    {
+        self.emitter.emit_event(build);
     }
 
     /// Emit one event row, building the row only when a queue slot is reserved.
@@ -646,22 +610,7 @@ impl ZakuraTrace {
     /// serialization never run when the queue is full or the writer has closed,
     /// keeping attacker-rate emit sites cheap once the writer falls behind.
     pub fn emit_with(&self, table: ZakuraTraceTable, build: impl FnOnce(&mut Map<String, Value>)) {
-        let Ok(permit) = self.tracer.try_reserve() else {
-            return;
-        };
-
-        let mut row = Map::new();
-        row.insert("ts".to_string(), elapsed_micros(self.started.elapsed()));
-        row.insert("node".to_string(), Value::String(self.node.to_string()));
-        build(&mut row);
-
-        if let Ok(line) = serde_json::to_vec(&Value::Object(row)) {
-            permit.send(JsonlWriteEvent {
-                table: table.table(),
-                file_name: table.file_name(),
-                line,
-            });
-        }
+        self.emitter.emit_with(table, build);
     }
 }
 
@@ -849,11 +798,6 @@ pub(crate) fn ordered_send_error_label(
         crate::zakura::transport::OrderedSendError::Closed => "closed",
         crate::zakura::transport::OrderedSendError::Encode(_) => "encode",
     }
-}
-
-fn elapsed_micros(elapsed: Duration) -> Value {
-    let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-    Value::Number(Number::from(micros))
 }
 
 fn insert_optional_str(row: &mut Map<String, Value>, key: &'static str, value: Option<&str>) {

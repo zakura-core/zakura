@@ -14,7 +14,6 @@ use std::{
     time::Duration,
 };
 
-use serde_json::{Map, Number, Value};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore},
@@ -40,12 +39,15 @@ use crate::{
 };
 
 use super::{
-    spawn_supervised_peer_task, trace::peer_label as trace_peer_label, BoxRunFuture, Frame,
-    FramedSend, OrderedSendError, Peer, RequestResponseService, Service as ZakuraService,
-    SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerHandle, ZakuraPeerId,
-    ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES, LEGACY_REQUEST_TABLE,
+    spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
+    RequestResponseService, Service as ZakuraService, SinkReject, Stream, StreamMode, ZakuraConnId,
+    ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
+
+mod trace;
+
+use trace::{LegacyRequestError, LegacyRequestResponse, LegacyRequestStart};
 
 /// Zakura stream kind reserved for legacy gossip compatibility.
 pub const ZAKURA_STREAM_GOSSIP: u16 = 2;
@@ -2050,12 +2052,8 @@ fn trace_legacy_request_start(
     request_kind: LegacyRequestKind,
     message_type: u16,
 ) {
-    trace.emit_with(LEGACY_REQUEST_TABLE, |row| {
-        insert_trace_str(row, "event", event);
-        insert_trace_peer(row, peer);
-        insert_trace_u64(row, "request_id", request_id);
-        insert_trace_str(row, "request", request_kind.command());
-        insert_trace_u64(row, "message_type", u64::from(message_type));
+    trace.emit_event(|| {
+        LegacyRequestStart::new(event, peer, request_id, request_kind, message_type)
     });
 }
 
@@ -2067,16 +2065,7 @@ fn trace_legacy_request_response(
     request: &'static str,
     response: &Response,
 ) {
-    let (response_kind, item_count, missing_count) = response_summary(response);
-    trace.emit_with(LEGACY_REQUEST_TABLE, |row| {
-        insert_trace_str(row, "event", event);
-        insert_trace_peer(row, peer);
-        insert_trace_u64(row, "request_id", request_id);
-        insert_trace_str(row, "request", request);
-        insert_trace_str(row, "response", response_kind);
-        insert_trace_u64(row, "item_count", item_count);
-        insert_trace_u64(row, "missing_count", missing_count);
-    });
+    trace.emit_event(|| LegacyRequestResponse::new(event, peer, request_id, request, response));
 }
 
 fn trace_legacy_request_error(
@@ -2087,54 +2076,7 @@ fn trace_legacy_request_error(
     request: &'static str,
     error: String,
 ) {
-    trace.emit_with(LEGACY_REQUEST_TABLE, |row| {
-        insert_trace_str(row, "event", event);
-        insert_trace_peer(row, peer);
-        insert_trace_u64(row, "request_id", request_id);
-        insert_trace_str(row, "request", request);
-        row.insert("error".to_string(), Value::String(error));
-    });
-}
-
-fn response_summary(response: &Response) -> (&'static str, u64, u64) {
-    match response {
-        Response::Blocks(blocks) => (
-            "Blocks",
-            bounded_u64(blocks.len()),
-            bounded_u64(blocks.iter().filter(|block| block.is_missing()).count()),
-        ),
-        Response::Transactions(transactions) => (
-            "Transactions",
-            bounded_u64(transactions.len()),
-            bounded_u64(
-                transactions
-                    .iter()
-                    .filter(|transaction| transaction.is_missing())
-                    .count(),
-            ),
-        ),
-        Response::BlockHashes(hashes) => ("BlockHashes", bounded_u64(hashes.len()), 0),
-        Response::BlockHeaders(headers) => ("BlockHeaders", bounded_u64(headers.len()), 0),
-        Response::TransactionIds(ids) => ("TransactionIds", bounded_u64(ids.len()), 0),
-        Response::Pong(_) => ("Pong", 1, 0),
-        Response::Nil => ("Nil", 0, 0),
-        response => (response.command(), 0, 0),
-    }
-}
-
-fn insert_trace_peer(row: &mut Map<String, Value>, peer: Option<&ZakuraPeerId>) {
-    row.insert(
-        "peer".to_string(),
-        peer.map_or(Value::Null, |peer| Value::String(trace_peer_label(peer))),
-    );
-}
-
-fn insert_trace_str(row: &mut Map<String, Value>, key: &'static str, value: &'static str) {
-    row.insert(key.to_string(), Value::String(value.to_string()));
-}
-
-fn insert_trace_u64(row: &mut Map<String, Value>, key: &'static str, value: u64) {
-    row.insert(key.to_string(), Value::Number(Number::from(value)));
+    trace.emit_event(|| LegacyRequestError::new(event, peer, request_id, request, error));
 }
 
 fn bounded_u64(value: usize) -> u64 {

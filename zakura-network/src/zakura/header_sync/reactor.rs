@@ -1,6 +1,4 @@
-use super::super::trace::{
-    header_sync_trace as hs_trace, ordered_send_error_label, queue_send_trace as qs_trace,
-};
+use super::super::trace::ordered_send_error_label;
 use super::{config::*, error::*, events::*, requester::*, state::*, validation::*, wire::*, *};
 use crate::zakura::{
     FrontierChange, FrontierUpdate, HeaderSyncServiceSummary, OrderedSendError,
@@ -11,9 +9,8 @@ use crate::zakura::{
 mod trace;
 
 use trace::{
-    commit_failure_reason_label, header_sync_wire_error_kind, insert_hash, insert_height,
-    insert_peer, insert_u64, record_wire_validation_metrics, set_header_connectivity_gauges,
-    GetHeadersTraceMeta, TreeAuxTraceSummary,
+    commit_failure_reason_label, header_sync_wire_error_kind, record_wire_validation_metrics,
+    set_header_connectivity_gauges, QueueSendContext, TreeAuxTraceSummary,
 };
 
 const STALE_REPAIR_GENERATION: &str = "stale_repair_generation";
@@ -193,7 +190,7 @@ impl HeaderSyncReactor {
                 }
                 _ = time::sleep_until(maintenance_deadline) => {
                     metrics::counter!("sync.header.reactor.maintenance_wakeups").increment(1);
-                    self.emit_trace(hs_trace::HEADER_MAINTENANCE_WAKEUP, |_| {});
+                    self.trace_maintenance_wakeup();
                     metrics::counter!("sync.header.reactor.event_started", "kind" => "tick").increment(1);
                     self.handle_timeouts().await;
                     self.refresh_statuses();
@@ -254,17 +251,7 @@ impl HeaderSyncReactor {
                         if range.priority == RangePriority::Repair {
                             metrics::counter!("sync.header.vct_repair.request.sent").increment(1);
                         }
-                        self.trace_get_headers_sent(
-                            &requester_id.peer,
-                            range,
-                            range.count(),
-                            peer_cap,
-                            GetHeadersTraceMeta {
-                                request_id,
-                                session_id: requester_id.session_id,
-                                stream_version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
-                            },
-                        );
+                        self.trace_get_headers_sent(range, peer_cap, &wire_request);
                         #[cfg(test)]
                         let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
                             peer: requester_id.peer,
@@ -845,11 +832,11 @@ impl HeaderSyncReactor {
                     &error,
                     destination_peer.session.outbound_capacity(),
                     destination_peer.session.outbound_max_capacity(),
-                    |row| {
-                        insert_peer(row, qs_trace::SOURCE_PEER, &peer);
-                        insert_peer(row, qs_trace::DESTINATION_PEER, &destination);
-                        insert_height(row, qs_trace::HEIGHT, height);
-                        insert_hash(row, qs_trace::HASH, hash);
+                    QueueSendContext::NewBlock {
+                        source: &peer,
+                        destination: &destination,
+                        height,
+                        hash,
                     },
                 );
                 continue;
@@ -1045,13 +1032,7 @@ impl HeaderSyncReactor {
         let start_height = range.start_height();
         let tip_height = range.end_height();
         metrics::counter!("sync.header.range.committed").increment(1);
-        self.trace_range_event(
-            hs_trace::HEADER_RANGE_COMMITTED,
-            start_height,
-            count_between(start_height, tip_height),
-            None,
-            None,
-        );
+        self.trace_range_committed(start_height, count_between(start_height, tip_height));
         self.state.schedule.complete(range);
         if let RangePurpose::VctRepair { generation, .. } = pending.purpose {
             let repair_peer = operation.wire_request.peer.clone();
@@ -1097,12 +1078,11 @@ impl HeaderSyncReactor {
         let start_height = range.start_height();
         let count = range.count();
         metrics::counter!("sync.header.range.rejected").increment(1);
-        self.trace_range_event(
-            hs_trace::HEADER_RANGE_REJECTED,
+        self.trace_range_commit_failed(
+            &peer,
             start_height,
             count,
-            Some(&peer),
-            Some(commit_failure_reason_label(kind)),
+            commit_failure_reason_label(kind),
         );
         if kind == HeaderSyncCommitFailureKind::InvalidPeerRange {
             self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
@@ -1233,10 +1213,10 @@ impl HeaderSyncReactor {
                     &error,
                     queue_capacity,
                     queue_max_capacity,
-                    |row| {
-                        insert_height(row, qs_trace::RANGE_START, start_height);
-                        insert_u64(row, qs_trace::RANGE_COUNT, u64::from(requested_count));
-                        insert_u64(row, qs_trace::RETURNED, u64::from(returned_count));
+                    QueueSendContext::Headers {
+                        start_height,
+                        requested_count,
+                        returned_count,
                     },
                 );
             }
@@ -1520,12 +1500,10 @@ impl HeaderSyncReactor {
             let deadline = Instant::now() + self.empty_headers_retry_delay();
             self.trace_headers_received(
                 &peer,
-                outstanding.range_request.start_height(),
-                0,
-                outstanding.range_request.count(),
+                outstanding.range_request,
+                &headers,
                 peer_max_headers_per_response,
                 in_flight_count,
-                outstanding.range_request.want_tree_aux_roots,
                 &tree_aux_roots,
             );
             if let Some(peer_state) = self.state.peers.get_mut(&peer) {
@@ -1542,12 +1520,10 @@ impl HeaderSyncReactor {
             u32::try_from(headers.len()).expect("decoded Headers length is capped by u32");
         self.trace_headers_received(
             &peer,
-            outstanding.range_request.start_height(),
-            header_count,
-            outstanding.range_request.count(),
+            outstanding.range_request,
+            &headers,
             peer_max_headers_per_response,
             in_flight_count,
-            outstanding.range_request.want_tree_aux_roots,
             &tree_aux_roots,
         );
         if header_count > outstanding.range_request.count() {
@@ -2530,7 +2506,7 @@ impl HeaderSyncReactor {
                     &error,
                     session.outbound_capacity(),
                     session.outbound_max_capacity(),
-                    |_| {},
+                    QueueSendContext::Status,
                 );
                 false
             }

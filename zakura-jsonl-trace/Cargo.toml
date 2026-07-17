@@ -12,6 +12,8 @@ rust-version.workspace = true
 description = "Shared non-blocking JSONL tracing support for the Zakura node. Internal crate, published to support cargo install zakura"
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "time", "rt", "macros"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

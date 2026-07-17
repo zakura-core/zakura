@@ -12,12 +12,25 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Database format upgrades now finish before startup exposes the finalized
   state database; only configured periodic format checks continue in the
   background.
+- Preserve Sprout note-commitment history during fresh verified-commitment-tree
+  fast sync, so later JoinSplit spends can use historical anchors.
 
 ### Changed
 
 - Header sync now schedules only forward ranges from the durable verified block
   tip. Startup rejects configured anchors above that base, and no longer
   backfills headers below a checkpoint anchor.
+
+### Fixed
+
+- Deliver committed-tip block gossip to configured zcashd-compat sidecar peers
+  even when they are momentarily unready. The "always include sidecars" carve-out
+  in block broadcasts only covered ready peers, so a sidecar that was unready when
+  a block was gossiped was skipped; because it follows a single upstream and
+  learns the tip only from block `inv`s, it then stalled until a later gossip
+  coincided with a ready service. The latest hash is now queued for an unready
+  sidecar and delivered once it is ready again, bounding the stall to one
+  readiness cycle.
 
 ## [1.0.1] - 2026-07-17
 

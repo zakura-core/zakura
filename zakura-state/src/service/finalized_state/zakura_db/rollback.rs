@@ -216,6 +216,13 @@ pub enum RollbackFinalizedStateError {
         height: block::Height,
     },
 
+    /// The finalized tip's Sprout note commitment tree is missing.
+    #[error("missing Sprout note commitment tree at finalized tip {height:?}")]
+    MissingSproutTree {
+        /// Missing tree height.
+        height: block::Height,
+    },
+
     /// Address balance arithmetic failed while reversing transparent indexes.
     #[error("transparent address balance update failed")]
     AddressBalance(#[from] amount::Error),
@@ -536,7 +543,9 @@ fn load_modern_treestate_at_height(
     network: &Network,
     target_height: Height,
 ) -> Result<RebuiltTreestate, RollbackFinalizedStateError> {
-    let sprout_tree = db.sprout_tree_for_tip();
+    let sprout_tree = db
+        .sprout_tree_for_tip()
+        .map_err(|error| RollbackFinalizedStateError::MissingSproutTree { height: error.tip })?;
     let history_tree = rebuild_history_tree_from_upgrade_activation(db, network, target_height)?;
 
     Ok(RebuiltTreestate {

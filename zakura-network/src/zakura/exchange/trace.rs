@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use super::{ChainFrontier, FrontierChange, FrontierUpdate};
+use super::{ChainFrontier, FrontierChange, FrontierUpdate, ZakuraSyncExchange};
 use crate::zakura::{commit_state_trace as cs_trace, COMMIT_STATE_TABLE};
 
 #[derive(Debug, Serialize)]
@@ -68,6 +68,21 @@ impl SyncFrontierTransition {
 }
 
 zakura_jsonl_trace::impl_jsonl_trace_event!(SyncFrontierTransition, COMMIT_STATE_TABLE);
+
+impl ZakuraSyncExchange {
+    pub(super) fn trace_transition(
+        &self,
+        sequence: u64,
+        source: &'static str,
+        old: FrontierUpdate,
+        new: FrontierUpdate,
+        result: &'static str,
+    ) {
+        self.inner
+            .trace
+            .emit_event(|| SyncFrontierTransition::new(sequence, source, old, new, result));
+    }
+}
 
 fn frontier_change_label(change: FrontierChange) -> &'static str {
     match change {

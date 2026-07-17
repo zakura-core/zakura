@@ -17,17 +17,15 @@ use tracing::{debug, warn};
 
 use zakura_chain::{block, chain_tip::ChainTip};
 use zakura_network::zakura::{
-    commit_state_trace as cs_trace, BlockApplyResult, BlockApplyToken, BlockSizeEstimate,
-    BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncHandle, BlockSyncMisbehavior,
-    Frontier, FrontierChange, ZakuraEndpoint, ZakuraTrace,
+    BlockApplyResult, BlockApplyToken, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta,
+    BlockSyncEvent, BlockSyncHandle, Frontier, FrontierChange, ZakuraEndpoint, ZakuraTrace,
 };
 
 use crate::components::sync;
 
 use super::{
-    block_apply_result_label, block_verify_error_is_duplicate, emit_commit_state, insert_cs_bool,
-    insert_cs_frontiers, insert_cs_hash, insert_cs_height, insert_cs_peer, insert_cs_str,
-    insert_cs_u64, query_block_sync_frontiers, BlocksyncThroughputProbe,
+    block_verify_error_is_duplicate, query_block_sync_frontiers,
+    trace::block_driver::BlockDriverTraceExt, BlocksyncThroughputProbe,
     ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
 };
 
@@ -281,7 +279,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
         let action =
             coalesce_stale_needed_block_queries(action, &mut actions, &mut deferred_actions);
 
-        trace_block_driver_action(&trace, &action);
+        trace.trace_block_action_received(&action);
         match action {
             BlockSyncAction::Misbehavior { peer, reason } => {
                 // Record-only: peer scoring no longer drives disconnects.
@@ -292,52 +290,16 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 limit,
                 best_header_tip,
             } => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_START,
-                    "block_sync_driver",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "query_needed_blocks");
-                        insert_cs_height(row, cs_trace::RANGE_START, from);
-                        insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(limit));
-                        insert_cs_height(row, cs_trace::BEST_HEADER_TIP, best_header_tip);
-                    },
-                );
+                trace.trace_needed_blocks_query_started(from, limit, best_header_tip);
                 let started = Instant::now();
                 match query_block_sync_needed_blocks(read_state.clone(), from, limit).await {
                     Ok(blocks) => {
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::STATE_READ_SUCCESS,
-                            "block_sync_driver",
-                            |row| {
-                                insert_cs_str(row, cs_trace::ACTION, "query_needed_blocks");
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, blocks.len() as u64);
-                                insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                            },
-                        );
+                        trace.trace_needed_blocks_query_succeeded(blocks.len(), started);
                         let _ = block_sync.send_control(BlockSyncEvent::NeededBlocks(blocks));
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::REACTOR_EVENT_SENT,
-                            "block_sync_driver",
-                            |row| {
-                                insert_cs_str(row, cs_trace::ACTION, "needed_blocks");
-                            },
-                        );
+                        trace.trace_block_reactor_event("needed_blocks");
                     }
                     Err(error) => {
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::STATE_READ_ERROR,
-                            "block_sync_driver",
-                            |row| {
-                                insert_cs_str(row, cs_trace::ACTION, "query_needed_blocks");
-                                insert_cs_str(row, cs_trace::RESULT, "error");
-                                insert_cs_str(row, cs_trace::REASON, &format!("{error}"));
-                                insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                            },
-                        );
+                        trace.trace_needed_blocks_query_failed(&format!("{error}"), started);
                         warn!(
                             ?from,
                             ?limit,
@@ -349,17 +311,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 }
             }
             BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_START,
-                    "block_sync_driver",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "query_blocks_by_height_range");
-                        insert_cs_peer(row, cs_trace::PEER, &peer);
-                        insert_cs_height(row, cs_trace::RANGE_START, start);
-                        insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-                    },
-                );
+                trace.trace_block_range_query_started(&peer, start, count);
                 let started = Instant::now();
                 match tokio::time::timeout(
                     ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
@@ -370,32 +322,17 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 .await
                 {
                     Ok(Ok(zakura_state::ReadResponse::Blocks(blocks))) => {
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::STATE_READ_SUCCESS,
-                            "block_sync_driver",
-                            |row| {
-                                insert_cs_str(
-                                    row,
-                                    cs_trace::ACTION,
-                                    "query_blocks_by_height_range",
-                                );
-                                insert_cs_peer(row, cs_trace::PEER, &peer);
-                                insert_cs_height(row, cs_trace::RANGE_START, start);
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, blocks.len() as u64);
-                                insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                            },
+                        trace.trace_block_range_query_succeeded(
+                            &peer,
+                            start,
+                            blocks.len(),
+                            started,
                         );
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::REACTOR_EVENT_SENT,
-                            "block_sync_driver",
-                            |row| {
-                                insert_cs_str(row, cs_trace::ACTION, "block_range_response_ready");
-                                insert_cs_peer(row, cs_trace::PEER, &peer);
-                                insert_cs_height(row, cs_trace::RANGE_START, start);
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-                            },
+                        trace.trace_block_range_event(
+                            "block_range_response_ready",
+                            &peer,
+                            start,
+                            count,
                         );
                         let _ = block_sync.send_control(BlockSyncEvent::BlockRangeResponseReady {
                             peer,
@@ -447,22 +384,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                             });
                     }
                     Err(_elapsed) => {
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::STATE_READ_TIMEOUT,
-                            "block_sync_driver",
-                            |row| {
-                                insert_cs_str(
-                                    row,
-                                    cs_trace::ACTION,
-                                    "query_blocks_by_height_range",
-                                );
-                                insert_cs_peer(row, cs_trace::PEER, &peer);
-                                insert_cs_height(row, cs_trace::RANGE_START, start);
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-                                insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                            },
-                        );
+                        trace.trace_block_range_query_timed_out(&peer, start, count, started);
                         warn!(?peer, "timed out reading Zakura block-sync serving range");
                         trace_block_range_finished(&trace, &peer, start, count, 0);
                         let _ =
@@ -482,29 +404,16 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     abandon_block_apply(&block_sync, token, block.as_ref(), &trace);
                     continue;
                 }
-                emit_commit_state(
-                    &trace,
-                    cs_trace::BLOCK_SUBMIT_QUEUED,
-                    "block_sync_driver",
-                    |row| {
-                        insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-                        insert_cs_str(row, cs_trace::APPLY_CLASS, block_apply_class_label(class));
-                        insert_cs_hash(row, cs_trace::HASH, block.hash());
-                        if let Some(height) = height {
-                            insert_cs_height(row, cs_trace::HEIGHT, height);
-                        }
-                        let queue_len = if throughput_probe.is_some() {
-                            pending_probe_applies.len()
-                        } else {
-                            pending_applies.len()
-                        };
-                        insert_cs_u64(row, cs_trace::QUEUE_LEN, queue_len as u64);
-                        insert_cs_u64(
-                            row,
-                            cs_trace::IN_FLIGHT_COUNT,
-                            (checkpoint_in_flight.saturating_add(full_in_flight)) as u64,
-                        );
+                trace.trace_block_submit_queued(
+                    token,
+                    class,
+                    block.as_ref(),
+                    if throughput_probe.is_some() {
+                        pending_probe_applies.len()
+                    } else {
+                        pending_applies.len()
                     },
+                    checkpoint_in_flight.saturating_add(full_in_flight),
                 );
                 if let Some(probe) = throughput_probe.clone() {
                     let pending = PendingBlockApply {
@@ -586,19 +495,7 @@ fn abandon_block_apply(
     };
 
     let _ = block_sync.send_control(event);
-    emit_commit_state(
-        trace,
-        cs_trace::REACTOR_EVENT_SENT,
-        "block_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, "block_apply_finished");
-            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, expected_hash);
-            insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
-            insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, false);
-        },
-    );
+    trace.trace_block_apply_finished(token, height, expected_hash, result, false);
 }
 
 pub(crate) fn abandoned_block_apply_finished_event(
@@ -902,19 +799,7 @@ fn release_pending_applies(
         };
 
         let _ = block_sync.send_control(event);
-        emit_commit_state(
-            trace,
-            cs_trace::REACTOR_EVENT_SENT,
-            "block_sync_driver",
-            |row| {
-                insert_cs_str(row, cs_trace::ACTION, "block_apply_finished");
-                insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-                insert_cs_height(row, cs_trace::HEIGHT, height);
-                insert_cs_hash(row, cs_trace::HASH, expected_hash);
-                insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
-                insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, false);
-            },
-        );
+        trace.trace_block_apply_finished(token, height, expected_hash, result, false);
     }
 }
 
@@ -1090,12 +975,7 @@ where
         };
     };
 
-    emit_commit_state(&trace, cs_trace::COMMIT_START, "block_sync_driver", |row| {
-        insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-        insert_cs_str(row, cs_trace::APPLY_CLASS, block_apply_class_label(class));
-        insert_cs_height(row, cs_trace::HEIGHT, height);
-        insert_cs_hash(row, cs_trace::HASH, expected_hash);
-    });
+    trace.trace_block_commit_started(token, class, height, expected_hash);
     let started = Instant::now();
     // Throughput-probe mode (debug only): skip consensus verify+commit and
     // advance an in-memory synthetic frontier instead, discarding the body. In
@@ -1116,29 +996,8 @@ where
             None,
         ),
     };
-    emit_commit_state(
-        &trace,
-        cs_trace::COMMIT_FINISH,
-        "block_sync_driver",
-        |row| {
-            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-            insert_cs_str(row, cs_trace::APPLY_CLASS, block_apply_class_label(class));
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, expected_hash);
-            insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
-            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-        },
-    );
-    emit_commit_state(
-        &trace,
-        cs_trace::FRONTIER_QUERY_START,
-        "block_sync_driver",
-        |row| {
-            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, expected_hash);
-        },
-    );
+    trace.trace_block_commit_finished(token, class, height, expected_hash, result, started);
+    trace.trace_block_frontier_query_started(token, height, expected_hash);
     let local_frontier = match throughput_probe.as_ref() {
         Some(_) => probe_frontier,
         None => query_block_sync_frontiers(read_state.clone(), latest_chain_tip.clone()).await,
@@ -1154,19 +1013,11 @@ where
             publish_body_frontier(endpoint.as_ref(), frontiers, change);
         }
     }
-    emit_commit_state(
-        &trace,
-        cs_trace::FRONTIER_QUERY_FINISH,
-        "block_sync_driver",
-        |row| {
-            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, expected_hash);
-            insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, local_frontier.is_some());
-            if let Some(frontiers) = &local_frontier {
-                insert_cs_frontiers(row, frontiers);
-            }
-        },
+    trace.trace_block_frontier_query_finished(
+        token,
+        height,
+        expected_hash,
+        local_frontier.as_ref(),
     );
 
     let _ = block_sync.send_control(BlockSyncEvent::BlockApplyFinished {
@@ -1176,18 +1027,12 @@ where
         result,
         local_frontier,
     });
-    emit_commit_state(
-        &trace,
-        cs_trace::REACTOR_EVENT_SENT,
-        "block_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, "block_apply_finished");
-            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, expected_hash);
-            insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
-            insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, local_frontier.is_some());
-        },
+    trace.trace_block_apply_finished(
+        token,
+        height,
+        expected_hash,
+        result,
+        local_frontier.is_some(),
     );
 
     BlockApplyCompletion {
@@ -1259,21 +1104,12 @@ where
             tokio::select! {
                 outcome = &mut commit => block_commit_result(Some(height), expected_hash, outcome),
                 _ = tokio::time::sleep(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT) => {
-                    emit_commit_state(
-                        trace,
-                        cs_trace::COMMIT_STALLED,
-                        "block_sync_driver",
-                        |row| {
-                            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
-                            insert_cs_str(row, cs_trace::APPLY_CLASS, block_apply_class_label(class));
-                            insert_cs_height(row, cs_trace::HEIGHT, height);
-                            insert_cs_hash(row, cs_trace::HASH, expected_hash);
-                            insert_cs_u64(
-                                row,
-                                cs_trace::ELAPSED_MS,
-                                ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT.as_millis().try_into().unwrap_or(u64::MAX),
-                            );
-                        },
+                    trace.trace_block_commit_stalled(
+                        token,
+                        class,
+                        height,
+                        expected_hash,
+                        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
                     );
                     block_commit_result(Some(height), expected_hash, commit.await)
                 }
@@ -1369,15 +1205,7 @@ async fn refresh_block_sync_frontiers_for_checkpoint_window<ReadState>(
         return;
     };
 
-    emit_commit_state(
-        &trace,
-        cs_trace::CHECKPOINT_REFRESH_ATTEMPT,
-        "block_sync_driver",
-        |row| {
-            insert_cs_u64(row, "attempts_remaining", refresh.attempts_remaining as u64);
-            insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, highest_sent);
-        },
-    );
+    trace.trace_checkpoint_refresh_attempt(refresh.attempts_remaining, highest_sent);
     let Some(frontiers) =
         query_block_sync_frontiers(read_state.clone(), latest_chain_tip.clone()).await
     else {
@@ -1395,14 +1223,7 @@ async fn refresh_block_sync_frontiers_for_checkpoint_window<ReadState>(
     if let Some(block_sync) = &block_sync {
         let _ = block_sync.send_control(BlockSyncEvent::ChainTipGrow(frontiers));
     }
-    emit_commit_state(
-        &trace,
-        cs_trace::CHECKPOINT_REFRESH_SENT,
-        "block_sync_driver",
-        |row| {
-            insert_cs_frontiers(row, &frontiers);
-        },
-    );
+    trace.trace_checkpoint_refresh_sent(&frontiers);
     refresh.finish_attempt(highest_sent);
 }
 
@@ -1534,45 +1355,6 @@ pub(crate) fn block_sync_needed_blocks_from_state(
         .collect()
 }
 
-fn trace_block_driver_action(trace: &ZakuraTrace, action: &BlockSyncAction) {
-    emit_commit_state(
-        trace,
-        cs_trace::ACTION_RECEIVED,
-        "block_sync_driver",
-        |row| match action {
-            BlockSyncAction::Misbehavior { peer, reason } => {
-                insert_cs_str(row, cs_trace::ACTION, "misbehavior");
-                insert_cs_peer(row, cs_trace::PEER, peer);
-                insert_cs_str(row, cs_trace::REASON, block_sync_misbehavior_label(*reason));
-            }
-            BlockSyncAction::QueryNeededBlocks {
-                from,
-                limit,
-                best_header_tip,
-            } => {
-                insert_cs_str(row, cs_trace::ACTION, "query_needed_blocks");
-                insert_cs_height(row, cs_trace::RANGE_START, *from);
-                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(*limit));
-                insert_cs_height(row, cs_trace::BEST_HEADER_TIP, *best_header_tip);
-            }
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                insert_cs_str(row, cs_trace::ACTION, "query_blocks_by_height_range");
-                insert_cs_peer(row, cs_trace::PEER, peer);
-                insert_cs_height(row, cs_trace::RANGE_START, *start);
-                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(*count));
-            }
-            BlockSyncAction::SubmitBlock { token, block } => {
-                insert_cs_str(row, cs_trace::ACTION, "submit_block");
-                insert_cs_u64(row, cs_trace::APPLY_TOKEN, *token);
-                insert_cs_hash(row, cs_trace::HASH, block.hash());
-                if let Some(height) = block.coinbase_height() {
-                    insert_cs_height(row, cs_trace::HEIGHT, height);
-                }
-            }
-        },
-    );
-}
-
 fn trace_block_range_error(
     trace: &ZakuraTrace,
     peer: &zakura_network::zakura::ZakuraPeerId,
@@ -1581,20 +1363,7 @@ fn trace_block_range_error(
     reason: &str,
     started: Instant,
 ) {
-    emit_commit_state(
-        trace,
-        cs_trace::STATE_READ_ERROR,
-        "block_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, "query_blocks_by_height_range");
-            insert_cs_peer(row, cs_trace::PEER, peer);
-            insert_cs_height(row, cs_trace::RANGE_START, start);
-            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-            insert_cs_str(row, cs_trace::RESULT, "error");
-            insert_cs_str(row, cs_trace::REASON, reason);
-            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-        },
-    );
+    trace.trace_block_range_query_failed(peer, start, count, reason, started);
 }
 
 fn trace_block_range_finished(
@@ -1604,44 +1373,7 @@ fn trace_block_range_finished(
     requested_count: u32,
     returned_count: u32,
 ) {
-    emit_commit_state(
-        trace,
-        cs_trace::REACTOR_EVENT_SENT,
-        "block_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, "block_range_response_finished");
-            insert_cs_peer(row, cs_trace::PEER, peer);
-            insert_cs_height(row, cs_trace::RANGE_START, start);
-            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(returned_count));
-            insert_cs_u64(row, "requested_count", u64::from(requested_count));
-        },
-    );
-}
-
-fn block_apply_class_label(class: BlockApplyClass) -> &'static str {
-    match class {
-        BlockApplyClass::Checkpoint => "checkpoint",
-        BlockApplyClass::Full => "full",
-    }
-}
-
-fn block_sync_misbehavior_label(reason: BlockSyncMisbehavior) -> &'static str {
-    match reason {
-        BlockSyncMisbehavior::MalformedMessage => "malformed_message",
-        BlockSyncMisbehavior::UnsolicitedBlock => "unsolicited_block",
-        BlockSyncMisbehavior::GetBlocksTooLong => "get_blocks_too_long",
-        BlockSyncMisbehavior::GetBlocksSpam => "get_blocks_spam",
-        BlockSyncMisbehavior::InvalidBlock => "invalid_block",
-        BlockSyncMisbehavior::SizeMismatch => "size_mismatch",
-        BlockSyncMisbehavior::InvalidStatus => "invalid_status",
-        BlockSyncMisbehavior::UnsolicitedDone => "unsolicited_done",
-        BlockSyncMisbehavior::RangeUnavailable => "range_unavailable",
-        BlockSyncMisbehavior::StatusSpam => "status_spam",
-    }
-}
-
-fn elapsed_ms(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    trace.trace_block_range_finished(peer, start, requested_count, returned_count);
 }
 
 #[cfg(test)]

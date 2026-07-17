@@ -60,8 +60,7 @@ impl LegacySyncTrace {
     }
 
     pub(super) fn round_start(&self, state_tip: Option<Height>) {
-        self.emitter.emit_event(|| RoundStart {
-            event: "round_start",
+        self.emitter.emit_event(|| LegacyEvent::RoundStart {
             state_tip: state_tip.map(|height| height.0),
         });
     }
@@ -72,8 +71,7 @@ impl LegacySyncTrace {
         state_tip: Option<Height>,
         error: Option<&dyn Display>,
     ) {
-        self.emitter.emit_event(|| RoundFinish {
-            event: "round_finish",
+        self.emitter.emit_event(|| LegacyEvent::RoundFinish {
             reason,
             state_tip: state_tip.map(|height| height.0),
             error: error.map(ToString::to_string),
@@ -81,16 +79,14 @@ impl LegacySyncTrace {
     }
 
     pub(super) fn tips_obtained(&self, reserve: usize, prospective_tips: usize) {
-        self.emitter.emit_event(|| TipsObtained {
-            event: "tips_obtained",
+        self.emitter.emit_event(|| LegacyEvent::TipsObtained {
             reserve: bounded_count(reserve),
             prospective_tips: bounded_count(prospective_tips),
         });
     }
 
     pub(super) fn tips_extended(&self, discovered: usize, prospective_tips: usize) {
-        self.emitter.emit_event(|| TipsExtended {
-            event: "tips_extended",
+        self.emitter.emit_event(|| LegacyEvent::TipsExtended {
             discovered: bounded_count(discovered),
             prospective_tips: bounded_count(prospective_tips),
         });
@@ -103,7 +99,7 @@ impl LegacySyncTrace {
         state: Option<LegacyTaskState>,
     ) {
         self.emitter
-            .emit_event(|| BlockFinish::new(hash, outcome, state));
+            .emit_event(|| block_finish(hash, outcome, state));
     }
 
     pub(super) fn block_phase(
@@ -114,8 +110,7 @@ impl LegacySyncTrace {
         state: LegacyTaskState,
         phase_elapsed: Duration,
     ) {
-        self.emitter.emit_event(|| BlockPhase {
-            event: "block_phase",
+        self.emitter.emit_event(|| LegacyEvent::BlockPhase {
             hash: hash.to_string(),
             phase,
             previous_phase,
@@ -137,14 +132,19 @@ impl LegacySyncTrace {
                 .collect();
             tasks.sort_by_key(|task| task.height().map(u64::from).unwrap_or(u64::MAX));
 
-            DiagnosticSnapshot {
-                event: snapshot.event,
+            let fields = DiagnosticFields {
                 state_tip: snapshot.state_tip.map(|height| height.0),
                 in_flight: bounded_count(snapshot.in_flight),
                 reserve: bounded_count(snapshot.reserve),
                 prospective_tips: bounded_count(snapshot.prospective_tips),
                 registry_retries: bounded_count(snapshot.registry_retries),
                 tasks,
+            };
+            match snapshot.event {
+                "pipeline_reset" => LegacyEvent::PipelineReset(fields),
+                "round_error_snapshot" => LegacyEvent::RoundErrorSnapshot(fields),
+                "round_stalled" => LegacyEvent::RoundStalled(fields),
+                event => unreachable!("unsupported legacy diagnostic event: {event}"),
             }
         });
     }
@@ -156,8 +156,7 @@ impl LegacySyncTrace {
         download_elapsed: Duration,
         peer: Option<PeerSocketAddr>,
     ) {
-        self.emitter.emit_event(|| BlockDownloaded {
-            event: "block_downloaded",
+        self.emitter.emit_event(|| LegacyEvent::BlockDownloaded {
             hash: hash.to_string(),
             height: height.0,
             download_elapsed_ms: elapsed_millis(download_elapsed),
@@ -184,101 +183,101 @@ fn bounded_count(count: usize) -> u64 {
 }
 
 #[derive(Debug, Serialize)]
-struct RoundStart {
-    event: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state_tip: Option<u32>,
+#[serde(tag = "event", rename_all = "snake_case")]
+enum LegacyEvent {
+    RoundStart {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state_tip: Option<u32>,
+    },
+    RoundFinish {
+        reason: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state_tip: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    TipsObtained {
+        reserve: u64,
+        prospective_tips: u64,
+    },
+    TipsExtended {
+        discovered: u64,
+        prospective_tips: u64,
+    },
+    BlockFinish {
+        hash: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        result: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase_elapsed_ms: Option<u64>,
+    },
+    BlockPhase {
+        hash: String,
+        phase: &'static str,
+        previous_phase: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        phase_elapsed_ms: u64,
+        elapsed_ms: u64,
+    },
+    PipelineReset(DiagnosticFields),
+    RoundErrorSnapshot(DiagnosticFields),
+    RoundStalled(DiagnosticFields),
+    BlockDownloaded {
+        hash: String,
+        height: u32,
+        download_elapsed_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
+    },
 }
-zakura_jsonl_trace::impl_jsonl_trace_event!(RoundStart, TABLE);
+zakura_jsonl_trace::impl_jsonl_trace_event!(LegacyEvent, TABLE);
 
 #[derive(Debug, Serialize)]
-struct RoundFinish {
-    event: &'static str,
-    reason: &'static str,
+struct DiagnosticFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     state_tip: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-zakura_jsonl_trace::impl_jsonl_trace_event!(RoundFinish, TABLE);
-
-#[derive(Debug, Serialize)]
-struct TipsObtained {
-    event: &'static str,
+    in_flight: u64,
     reserve: u64,
     prospective_tips: u64,
-}
-zakura_jsonl_trace::impl_jsonl_trace_event!(TipsObtained, TABLE);
-
-#[derive(Debug, Serialize)]
-struct TipsExtended {
-    event: &'static str,
-    discovered: u64,
-    prospective_tips: u64,
-}
-zakura_jsonl_trace::impl_jsonl_trace_event!(TipsExtended, TABLE);
-
-#[derive(Debug, Serialize)]
-struct BlockFinish {
-    event: &'static str,
-    hash: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    height: Option<u32>,
-    result: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    phase: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    elapsed_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    phase_elapsed_ms: Option<u64>,
+    registry_retries: u64,
+    tasks: Vec<LegacyTaskTrace>,
 }
 
-impl BlockFinish {
-    fn new(
-        hash: block::Hash,
-        outcome: LegacyBlockOutcome<'_>,
-        state: Option<LegacyTaskState>,
-    ) -> Self {
-        let (mut height, result, error) = match outcome {
-            LegacyBlockOutcome::Verified(height) => (Some(height.0), "verified", None),
-            LegacyBlockOutcome::Error(error) => (None, "error", Some(error.to_string())),
-        };
-        let (phase, elapsed_ms, phase_elapsed_ms) = state.map_or((None, None, None), |state| {
-            height = state.height.map(|height| height.0).or(height);
-            (
-                Some(state.phase),
-                Some(elapsed_millis(state.started.elapsed())),
-                Some(elapsed_millis(state.phase_started.elapsed())),
-            )
-        });
-        Self {
-            event: "block_finish",
-            hash: hash.to_string(),
-            height,
-            result,
-            error,
-            phase,
-            elapsed_ms,
-            phase_elapsed_ms,
-        }
+fn block_finish(
+    hash: block::Hash,
+    outcome: LegacyBlockOutcome<'_>,
+    state: Option<LegacyTaskState>,
+) -> LegacyEvent {
+    let (mut height, result, error) = match outcome {
+        LegacyBlockOutcome::Verified(height) => (Some(height.0), "verified", None),
+        LegacyBlockOutcome::Error(error) => (None, "error", Some(error.to_string())),
+    };
+    let (phase, elapsed_ms, phase_elapsed_ms) = state.map_or((None, None, None), |state| {
+        height = state.height.map(|height| height.0).or(height);
+        (
+            Some(state.phase),
+            Some(elapsed_millis(state.started.elapsed())),
+            Some(elapsed_millis(state.phase_started.elapsed())),
+        )
+    });
+    LegacyEvent::BlockFinish {
+        hash: hash.to_string(),
+        height,
+        result,
+        error,
+        phase,
+        elapsed_ms,
+        phase_elapsed_ms,
     }
 }
-zakura_jsonl_trace::impl_jsonl_trace_event!(BlockFinish, TABLE);
-
-#[derive(Debug, Serialize)]
-struct BlockPhase {
-    event: &'static str,
-    hash: String,
-    phase: &'static str,
-    previous_phase: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    height: Option<u32>,
-    phase_elapsed_ms: u64,
-    elapsed_ms: u64,
-}
-zakura_jsonl_trace::impl_jsonl_trace_event!(BlockPhase, TABLE);
 
 #[derive(Debug, Serialize)]
 pub(super) struct LegacyTaskTrace {
@@ -306,30 +305,6 @@ impl LegacyTaskTrace {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct DiagnosticSnapshot {
-    event: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state_tip: Option<u32>,
-    in_flight: u64,
-    reserve: u64,
-    prospective_tips: u64,
-    registry_retries: u64,
-    tasks: Vec<LegacyTaskTrace>,
-}
-zakura_jsonl_trace::impl_jsonl_trace_event!(DiagnosticSnapshot, TABLE);
-
-#[derive(Debug, Serialize)]
-struct BlockDownloaded {
-    event: &'static str,
-    hash: String,
-    height: u32,
-    download_elapsed_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    peer: Option<String>,
-}
-zakura_jsonl_trace::impl_jsonl_trace_event!(BlockDownloaded, TABLE);
-
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
@@ -339,11 +314,8 @@ mod tests {
     #[test]
     fn absent_round_tip_is_omitted() {
         assert_eq!(
-            serde_json::to_value(RoundStart {
-                event: "round_start",
-                state_tip: None
-            })
-            .expect("event serializes"),
+            serde_json::to_value(LegacyEvent::RoundStart { state_tip: None })
+                .expect("event serializes"),
             json!({"event": "round_start"})
         );
     }

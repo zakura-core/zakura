@@ -47,7 +47,7 @@ use super::{
 
 mod trace;
 
-use trace::{LegacyRequestError, LegacyRequestResponse, LegacyRequestStart};
+use trace::LegacyRequestTraceExt;
 
 /// Zakura stream kind reserved for legacy gossip compatibility.
 pub const ZAKURA_STREAM_GOSSIP: u16 = 2;
@@ -1914,8 +1914,7 @@ impl ZakuraRequestClient {
             _ => None,
         };
         let frame = frame.encode_frame()?;
-        trace_legacy_request_start(
-            &self.trace,
+        self.trace.trace_legacy_request_start(
             "outbound.request",
             Some(handle.peer_id()),
             request_id,
@@ -1937,8 +1936,7 @@ impl ZakuraRequestClient {
         {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
-                trace_legacy_request_error(
-                    &self.trace,
+                self.trace.trace_legacy_request_error(
                     "outbound.error",
                     Some(handle.peer_id()),
                     request_id,
@@ -1953,8 +1951,7 @@ impl ZakuraRequestClient {
                     handle.peer_id()
                 )
                 .into();
-                trace_legacy_request_error(
-                    &self.trace,
+                self.trace.trace_legacy_request_error(
                     "outbound.error",
                     Some(handle.peer_id()),
                     request_id,
@@ -1972,8 +1969,7 @@ impl ZakuraRequestClient {
         ) {
             Ok(response) => response,
             Err(error) => {
-                trace_legacy_request_error(
-                    &self.trace,
+                self.trace.trace_legacy_request_error(
                     "outbound.decode_error",
                     Some(handle.peer_id()),
                     request_id,
@@ -1987,8 +1983,7 @@ impl ZakuraRequestClient {
             // The responder can only acknowledge a Ping; the requester stamps the RTT.
             response = Response::Pong(started_at.elapsed());
         }
-        trace_legacy_request_response(
-            &self.trace,
+        self.trace.trace_legacy_request_response(
             "outbound.response",
             Some(handle.peer_id()),
             request_id,
@@ -2042,41 +2037,6 @@ fn all_inventory_missing(response: &Response) -> bool {
         Response::TransactionIds(ids) => ids.is_empty(),
         _ => false,
     }
-}
-
-fn trace_legacy_request_start(
-    trace: &ZakuraTrace,
-    event: &'static str,
-    peer: Option<&ZakuraPeerId>,
-    request_id: u64,
-    request_kind: LegacyRequestKind,
-    message_type: u16,
-) {
-    trace.emit_event(|| {
-        LegacyRequestStart::new(event, peer, request_id, request_kind, message_type)
-    });
-}
-
-fn trace_legacy_request_response(
-    trace: &ZakuraTrace,
-    event: &'static str,
-    peer: Option<&ZakuraPeerId>,
-    request_id: u64,
-    request: &'static str,
-    response: &Response,
-) {
-    trace.emit_event(|| LegacyRequestResponse::new(event, peer, request_id, request, response));
-}
-
-fn trace_legacy_request_error(
-    trace: &ZakuraTrace,
-    event: &'static str,
-    peer: Option<&ZakuraPeerId>,
-    request_id: u64,
-    request: &'static str,
-    error: String,
-) {
-    trace.emit_event(|| LegacyRequestError::new(event, peer, request_id, request, error));
 }
 
 fn bounded_u64(value: usize) -> u64 {
@@ -2255,8 +2215,7 @@ impl LegacyGossipSink {
                 .map_err(|_| SinkReject::local("legacy request service timed out"))?
                 .map_err(|_| SinkReject::local("legacy request response dropped"))?
                 .map_err(SinkReject::local)?;
-            trace_legacy_request_response(
-                &self.trace,
+            self.trace.trace_legacy_request_response(
                 "inbound.response",
                 Some(&peer_id),
                 request_id,
@@ -2542,8 +2501,7 @@ async fn handle_legacy_request<Inbound>(
         let _ = response_tx.send(Ok(Response::Pong(Duration::ZERO)));
         return;
     };
-    trace_legacy_request_start(
-        &trace,
+    trace.trace_legacy_request_start(
         "inbound.request",
         Some(&peer_id),
         request_id,
@@ -2584,8 +2542,7 @@ async fn handle_legacy_request<Inbound>(
     };
 
     if let Err(error) = &result {
-        trace_legacy_request_error(
-            &trace,
+        trace.trace_legacy_request_error(
             "inbound.error",
             Some(&peer_id),
             request_id,

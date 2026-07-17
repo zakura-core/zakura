@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use zakura_network::zakura::BlockApplyResult;
-
 /// Hands the Zakura block-sync bulk-apply pipeline over to legacy `ChainSync`
 /// fallback.
 ///
@@ -117,11 +115,6 @@ pub(crate) mod header_sync_driver;
 pub(crate) mod throughput_probe;
 pub(crate) mod trace;
 
-pub(crate) use trace::{
-    emit_commit_state, insert_cs_bool, insert_cs_frontiers, insert_cs_hash, insert_cs_height,
-    insert_cs_peer, insert_cs_str, insert_cs_u64,
-};
-
 pub(crate) use block_sync_driver::drive_block_sync_actions;
 #[cfg(test)]
 pub(crate) use block_sync_driver::{
@@ -146,15 +139,6 @@ pub(crate) use header_sync_driver::{
 pub(crate) use throughput_probe::{BlocksyncThroughputProbe, BlocksyncThroughputSummary};
 
 pub(crate) const ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT: Duration = Duration::from_secs(30);
-
-pub(crate) fn block_apply_result_label(result: BlockApplyResult) -> &'static str {
-    match result {
-        BlockApplyResult::Committed => "committed",
-        BlockApplyResult::Duplicate => "duplicate",
-        BlockApplyResult::Rejected => "rejected",
-        BlockApplyResult::TimedOut => "timed_out",
-    }
-}
 
 pub(crate) fn block_verify_error_is_duplicate<Error>(error: &Error) -> bool
 where

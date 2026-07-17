@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Preserve Sprout note-commitment history during fresh verified-commitment-tree
+  fast sync, so later JoinSplit spends can use historical anchors.
 - Prevent initial sync from stalling at checkpoint boundaries by refilling the
   verifier submission window after stale apply completions.
 

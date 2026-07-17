@@ -23,7 +23,9 @@ pub fn run(
     upgrade_db: &ZakuraDb,
     cancel_receiver: &Receiver<CancelFormatChange>,
 ) -> Result<(), CancelFormatChange> {
-    let sprout_tip_tree = upgrade_db.sprout_tree_for_tip();
+    let sprout_tip_tree = upgrade_db
+        .sprout_tree_for_tip()
+        .expect("Sprout tip tree exists because this upgrade requires a non-empty valid database");
     let history_tip_tree = upgrade_db.history_tree();
 
     // Writing the trees back to the database automatically updates their format.

@@ -43,8 +43,8 @@ pub use config::{
 pub use constants::{state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT};
 pub use error::{
     BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError, CommitHeaderRangeError,
-    CommitSemanticallyVerifiedError, DuplicateNullifierError, StateInitError, StoreIncoherentError,
-    ValidateContextError,
+    CommitSemanticallyVerifiedError, DuplicateNullifierError, MissingSproutTipTree, StateInitError,
+    StoreIncoherentError, ValidateContextError,
 };
 pub use request::{
     CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight, MappedRequest,

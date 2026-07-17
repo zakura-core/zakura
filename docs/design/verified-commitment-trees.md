@@ -2,14 +2,17 @@
 
 ## Overview (start here)
 
-**What it is.** Below the last checkpoint, Zebra normally rebuilds the Sapling and Orchard
+**What it is.** Below the last checkpoint, Zebra normally rebuilds the Sapling, Orchard, and
+Ironwood
 note-commitment trees for every block just to learn each block's treestate root — the single
 biggest CPU cost of checkpoint sync. Verified commitment trees (VCT) instead **fetch the
 per-block roots from peers**, **verify each one against the headers the node already trusts**,
 fold them straight into the anchor set and history tree, and **skip the rebuild**. At the
 last checkpoint height an **embedded final frontier** (verified against that block's proven root) is
 written so normal per-block verification resumes above the checkpoint. Result: same consensus
-state as the legacy committer, far less work — and no new cryptography.
+state as the legacy committer, far less work — and no new cryptography. Sprout is different:
+VCT roots do not carry it, so the fast path still appends every JoinSplit commitment locally
+and persists each changed historical Sprout frontier.
 
 **The one invariant that makes it safe:** _no root influences consensus state until it has been
 authenticated against a header commitment._ Everything else (the transport, the cache, the peer
@@ -62,7 +65,7 @@ the direct below-Heartwood/below-NU5/below-Nu6_3 checks); fold it in; freeze the
 | **last checkpoint height** | The network's max checkpoint height; the boundary where the fast path ends and the embedded final frontier is written. |
 | **Fast root** | A peer-supplied `(sapling_root, orchard_root, ironwood_root)` for one height, folded in after verification instead of being recomputed. |
 | **Final frontier** | The real Sapling/Orchard/Sprout/Ironwood note-commitment trees at the last checkpoint height, embedded in the binary (§5.2) and written as the tip treestate at last checkpoint height. |
-| **Frozen frontier** | During VCT fast sync below the last checkpoint, Zebra folds verified roots into the root indexes but does not advance the full on-disk note-commitment trees for every block. If a required root is missing, the committer must stop and retry later, because recomputing from the stale frontier would write invalid state (§8). |
+| **Frozen frontier** | During VCT fast sync below the last checkpoint, Zebra folds verified modern-pool roots into the root indexes but does not advance the full Sapling/Orchard/Ironwood frontiers for every block. Sprout continues to advance locally. If a required modern-pool root is missing, the committer must stop and retry later, because recomputing from a stale modern frontier would write invalid state (§8). |
 | **Verify-before-commit** | Authenticating each root against the node's header commitments (ZIP-221 MMR one-block-lag + direct sub-Heartwood/sub-NU5/sub-Nu6_3 checks) before it affects state (§6). |
 | **Fail closed** | Stop and retry without writing state when a required root is missing or invalid (§8). |
 | **Provisional roots** | Peer-supplied roots carried in the header-sync `Headers` message and persisted to `commitment_roots_by_height` ahead of body commit. Advisory until verify-before-commit authenticates them (§4.2, §6). |
@@ -73,8 +76,8 @@ For where each piece lives in the tree, see the file map (§15).
 
 ## 1. Goal
 
-Let a node sync the chain up to the last checkpoint **without recomputing the Sapling and
-Orchard note-commitment frontiers per block** — the dominant CPU cost of checkpoint sync
+Let a node sync the chain up to the last checkpoint **without recomputing the Sapling,
+Orchard, and Ironwood note-commitment frontiers per block** — the dominant CPU cost of checkpoint sync
 (the per-block `update_trees_parallel` recompute, ~70% of per-block commit time).
 
 Instead of rebuilding the trees, the committer consumes:
@@ -250,7 +253,11 @@ tied to the network's max checkpoint height (validated on load:
 Mainnet checkpoint list advances, this file is regenerated alongside the checkpoint artifacts
 by the maintenance tool described in §16.
 
-- **Sprout** is frozen far below any modern checkpoint, so the tip Sprout tree is its frontier.
+- **Sprout is reconstructed locally throughout fast sync.** JoinSplits remain valid in
+  historical blocks after Sprout's introduction, and their anchors can be referenced by later
+  transactions. VCT therefore appends each block's Sprout commitments after all retryable
+  peer-root checks pass, writes every changed `root → frontier` entry, and verifies the
+  locally reconstructed root against the embedded frontier at handoff.
 - **Ironwood** is carried the same way as Sapling/Orchard, and is authenticated at the
   handoff (§7) against the supplied Ironwood root before it is written as the tip treestate.
   The on-disk byte format is backward compatible: the Ironwood tree is a 4th length-prefixed
@@ -436,7 +443,9 @@ logic. For a checkpoint-verified block at `height`:
      pre-validated, or, at the checkpoint last checkpoint height only, verify the embedded final
      frontiers — including Ironwood — against this height's roots; a failure means _this_
      height's root is bad → reject and evict (§8);
-   - fold the roots (Sapling, Orchard, and Ironwood) into their anchor sets, skip the frontier
+   - after all retryable root/successor checks pass, append this block's Sprout commitments
+     locally, so retrying a deferred block cannot double-append them;
+   - fold the roots (Sapling, Orchard, and Ironwood) into their anchor sets, skip the modern frontier
      recompute, and **freeze** the note-commitment frontier (`vct_frontier_frozen = true`) for
      non-last checkpoint height fast blocks.
 3. **Checkpoint last checkpoint height** (when `height` is the last checkpoint height): verify the embedded
@@ -444,7 +453,8 @@ logic. For a checkpoint-verified block at `height`:
    verified root` for each pool; collision resistance makes each root a binding commitment to
    its frontier), write them as the real tip treestate via the normal write path, and
    **unfreeze** — heights at/above the last checkpoint height resume legacy recompute from a
-   correct frontier.
+   correct frontier. The embedded Sprout root must equal the locally reconstructed root, but
+   the local Sprout frontier is retained rather than replaced.
 4. **If not supplied:** §8.
 
 The write worker enforces the successor side of this contract before calling the committer: if

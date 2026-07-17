@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   tip. Startup rejects configured anchors above that base, and no longer
   backfills headers below a checkpoint anchor.
 
+### Fixed
+
+- Deliver committed-tip block gossip to configured zcashd-compat sidecar peers
+  even when they are momentarily unready. The "always include sidecars" carve-out
+  in block broadcasts only covered ready peers, so a sidecar that was unready when
+  a block was gossiped was skipped; because it follows a single upstream and
+  learns the tip only from block `inv`s, it then stalled until a later gossip
+  coincided with a ready service. The latest hash is now queued for an unready
+  sidecar and delivered once it is ready again, bounding the stall to one
+  readiness cycle.
+
 ## [1.0.1] - 2026-07-17
 
 ### Added

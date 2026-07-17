@@ -6,6 +6,13 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+#[cfg(test)]
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
+};
+
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use semver::Version;
 use tracing::Span;
@@ -208,6 +215,59 @@ pub struct DbFormatChangeThreadHandle {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct CancelFormatChange;
 
+#[cfg(test)]
+type StartupUpgradeHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static STARTUP_UPGRADE_HOOKS: LazyLock<Mutex<HashMap<PathBuf, StartupUpgradeHook>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+struct StartupUpgradeHookGuard {
+    db_path: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for StartupUpgradeHookGuard {
+    fn drop(&mut self) {
+        STARTUP_UPGRADE_HOOKS
+            .lock()
+            .expect("startup upgrade test hook mutex is not poisoned")
+            .remove(&self.db_path);
+    }
+}
+
+#[cfg(test)]
+fn register_startup_upgrade_hook(
+    db_path: impl Into<PathBuf>,
+    hook: StartupUpgradeHook,
+) -> StartupUpgradeHookGuard {
+    let db_path = db_path.into();
+    let replaced = STARTUP_UPGRADE_HOOKS
+        .lock()
+        .expect("startup upgrade test hook mutex is not poisoned")
+        .insert(db_path.clone(), hook);
+    assert!(
+        replaced.is_none(),
+        "database already has an upgrade test hook"
+    );
+
+    StartupUpgradeHookGuard { db_path }
+}
+
+#[cfg(test)]
+fn run_startup_upgrade_hook(db_path: &Path) {
+    let hook = STARTUP_UPGRADE_HOOKS
+        .lock()
+        .expect("startup upgrade test hook mutex is not poisoned")
+        .get(db_path)
+        .cloned();
+
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 impl DbFormatChange {
     /// Returns the format change for `running_version` code loading a `disk_version` database.
     ///
@@ -325,13 +385,13 @@ impl DbFormatChange {
         .cloned()
     }
 
-    /// Launch a `std::thread` that applies this format change to the database,
-    /// then continues running to perform periodic format checks.
+    /// Launch a `std::thread` that performs periodic current-format checks.
+    ///
+    /// The startup format change must already have completed synchronously.
     ///
     /// `initial_tip_height` is the database height when it was opened, and `db` is the
     /// database instance to upgrade or check.
-    pub fn spawn_format_change(
-        self,
+    pub fn spawn_periodic_format_checks(
         db: ZakuraDb,
         initial_tip_height: Option<Height>,
     ) -> DbFormatChangeThreadHandle {
@@ -344,7 +404,7 @@ impl DbFormatChange {
         let span = Span::current();
         let update_task = thread::spawn(move || {
             span.in_scope(move || {
-                self.format_change_run_loop(db, initial_tip_height, cancel_receiver)
+                Self::periodic_format_check_loop(db, initial_tip_height, cancel_receiver)
             })
         });
 
@@ -358,19 +418,12 @@ impl DbFormatChange {
         handle
     }
 
-    /// Run the initial format change or check to the database. Under the default runtime config,
-    /// this method returns after the format change or check.
-    ///
-    /// But if runtime validity checks are enabled, this method periodically checks the format of
-    /// newly added blocks matches the current format. It will run until it is cancelled or panics.
-    fn format_change_run_loop(
-        self,
+    /// Periodically check that newly added blocks match the current format.
+    fn periodic_format_check_loop(
         db: ZakuraDb,
         initial_tip_height: Option<Height>,
         cancel_receiver: Receiver<CancelFormatChange>,
     ) -> Result<(), CancelFormatChange> {
-        self.run_format_change_or_check(&db, initial_tip_height, &cancel_receiver)?;
-
         let Some(debug_validity_check_interval) = db.config().debug_validity_check_interval else {
             return Ok(());
         };
@@ -564,6 +617,9 @@ impl DbFormatChange {
         else {
             unreachable!("already checked for Upgrade")
         };
+
+        #[cfg(test)]
+        run_startup_upgrade_hook(db.path());
 
         // # New Upgrades Sometimes Go Here
         //
@@ -874,6 +930,99 @@ impl Drop for DbFormatChangeThreadHandle {
             self.check_for_panics();
         }
     }
+}
+
+#[test]
+fn database_startup_waits_for_format_upgrade() {
+    use std::time::Duration;
+
+    use crate::{
+        constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+        service::finalized_state::STATE_COLUMN_FAMILIES_IN_CODE,
+        Config,
+    };
+    use zakura_chain::parameters::Network;
+
+    let tempdir = tempfile::tempdir().expect("temporary cache directory is created");
+    let config = Config {
+        cache_dir: tempdir.path().to_owned(),
+        ephemeral: false,
+        debug_skip_non_finalized_state_backup_task: true,
+        ..Config::default()
+    };
+    let network = Network::Mainnet;
+    let running_version = state_database_format_version_in_code();
+
+    let db = ZakuraDb::new(
+        &config,
+        STATE_DATABASE_KIND,
+        &running_version,
+        &network,
+        false,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        false,
+    )
+    .expect("initial database creation succeeds");
+    db.update_format_version_on_disk(&Version::new(27, 3, 0))
+        .expect("test database version is set to an older format");
+    let db_path = db.path().to_owned();
+    drop(db);
+
+    let (entered_tx, entered_rx) = bounded(1);
+    let (release_tx, release_rx) = bounded(1);
+    let _hook_guard = register_startup_upgrade_hook(
+        db_path,
+        Arc::new(move || {
+            entered_tx
+                .send(())
+                .expect("startup test receiver remains open");
+            release_rx
+                .recv()
+                .expect("startup test releases the format upgrade");
+        }),
+    );
+
+    let (returned_tx, returned_rx) = bounded(1);
+    let open_thread = thread::spawn(move || {
+        let db = ZakuraDb::new(
+            &config,
+            STATE_DATABASE_KIND,
+            &running_version,
+            &network,
+            false,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .expect("upgraded database startup succeeds");
+        returned_tx
+            .send(
+                db.format_version_on_disk()
+                    .expect("upgraded database version is readable"),
+            )
+            .expect("startup result receiver remains open");
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("startup reaches the blocking format upgrade hook");
+    assert_eq!(
+        returned_rx.recv_timeout(Duration::from_millis(100)),
+        Err(RecvTimeoutError::Timeout),
+        "ZakuraDb::new must not return while its format upgrade is incomplete"
+    );
+
+    release_tx.send(()).expect("blocked upgrade is released");
+    assert_eq!(
+        returned_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("startup returns after the format upgrade"),
+        Some(state_database_format_version_in_code()),
+    );
+    open_thread.join().expect("startup thread does not panic");
 }
 
 #[test]

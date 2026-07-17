@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Database format upgrades now finish before startup exposes the finalized
+  state database; only configured periodic format checks continue in the
+  background.
+
 ### Changed
 
 - Header sync now schedules only forward ranges from the durable verified block

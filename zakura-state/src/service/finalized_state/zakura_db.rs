@@ -225,30 +225,27 @@ impl ZakuraDb {
                 .expect("startup header-store repair write failed: RocksDB is unavailable");
         }
 
-        db.spawn_format_change(format_change);
+        db.run_startup_format_change(format_change);
 
         Ok(db)
     }
 
-    /// Launch any required format changes or format checks, and store their thread handle.
-    pub fn spawn_format_change(&mut self, format_change: DbFormatChange) {
+    /// Complete the startup format change before exposing the database, then launch only
+    /// configured periodic current-format checks in the background.
+    pub fn run_startup_format_change(&mut self, format_change: DbFormatChange) {
         if self.debug_skip_format_upgrades {
             return;
         }
 
-        // We have to get this height before we spawn the upgrade task, because threads can take
-        // a while to start, and new blocks can be committed as soon as we return from this method.
+        // No state service can commit while this synchronous startup operation is running.
         let initial_tip_height = self.finalized_tip_height();
+        let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
+        format_change
+            .run_format_change_or_check(self, initial_tip_height, &never_cancel_receiver)
+            .expect("startup format change cannot be cancelled");
 
-        // `upgrade_db` is a special clone of this database, which can't be used to shut down
-        // the upgrade task. (Because the task hasn't been launched yet,
-        // its `db.format_change_handle` is always None.)
-        let upgrade_db = self.clone();
-
-        // TODO:
-        // - should debug_stop_at_height wait for the upgrade task to finish?
         let format_change_handle =
-            format_change.spawn_format_change(upgrade_db, initial_tip_height);
+            DbFormatChange::spawn_periodic_format_checks(self.clone(), initial_tip_height);
 
         self.format_change_handle = Some(format_change_handle);
     }

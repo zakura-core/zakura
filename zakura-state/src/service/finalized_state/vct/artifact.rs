@@ -21,8 +21,6 @@ const MAGIC: &[u8; 8] = b"ZKVCTSP1";
 const MAINNET_NETWORK: u8 = 1;
 const MAX_RECORDS: usize = 1_000_000;
 const MAX_COMMITMENTS_PER_RECORD: usize = 65_535;
-// Consumed by the follow-up repair migration once reviewed bytes are embedded.
-#[allow(dead_code)]
 const MAINNET_ARTIFACT: Option<&[u8]> = None;
 
 /// One historical block that changed the Sprout commitment tree.
@@ -37,8 +35,6 @@ pub(crate) struct Record {
 /// Errors parsing or replaying a canonical Sprout-history artifact.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum Error {
-    // Consumed by the follow-up repair migration's artifact loader.
-    #[allow(dead_code)]
     #[error("Sprout history artifact is unavailable: canonical Mainnet bytes have not been verified and embedded")]
     CanonicalArtifactUnavailable,
     #[error("invalid Sprout history artifact magic")]
@@ -253,19 +249,19 @@ impl Artifact {
         })
     }
 
-    pub(crate) fn validate_last_checkpoint(
+    pub(crate) fn validate_for_handoff(
         &self,
-        last_checkpoint: block::Height,
-        last_checkpoint_hash: block::Hash,
+        handoff: block::Height,
+        handoff_hash: block::Hash,
         sprout_root: sprout::tree::Root,
     ) -> Result<(), Error> {
-        if self.last_checkpoint != last_checkpoint {
+        if self.last_checkpoint != handoff {
             return Err(Error::HandoffMismatch {
                 actual: self.last_checkpoint,
-                expected: last_checkpoint,
+                expected: handoff,
             });
         }
-        if self.last_checkpoint_hash != last_checkpoint_hash {
+        if self.last_checkpoint_hash != handoff_hash {
             return Err(Error::HandoffHashMismatch);
         }
         if self.terminal_root != sprout_root {
@@ -371,11 +367,11 @@ pub fn generate_mainnet_from_archive(config: &Config) -> Result<Vec<u8>, Generat
     let frontiers = embedded_final_frontiers(&network)
         .expect("Mainnet always has an embedded VCT handoff frontier");
     let last_checkpoint = frontiers.height;
-    let last_checkpoint_hash =
-        db.hash(last_checkpoint)
-            .ok_or(GeneratorError::MissingCanonicalHash {
-                height: last_checkpoint,
-            })?;
+    let handoff_hash = db
+        .hash(last_checkpoint)
+        .ok_or(GeneratorError::MissingCanonicalHash {
+            height: last_checkpoint,
+        })?;
 
     let mut tree = sprout::tree::NoteCommitmentTree::default();
     let mut records = Vec::new();
@@ -410,16 +406,12 @@ pub fn generate_mainnet_from_archive(config: &Config) -> Result<Vec<u8>, Generat
         });
     }
 
-    let bytes = Artifact::encode(last_checkpoint, last_checkpoint_hash, records)
+    let bytes = Artifact::encode(last_checkpoint, handoff_hash, records)
         .map_err(|error| GeneratorError::Artifact(error.to_string()))?;
     let decoded =
         Artifact::decode(&bytes).map_err(|error| GeneratorError::Artifact(error.to_string()))?;
     decoded
-        .validate_last_checkpoint(
-            last_checkpoint,
-            last_checkpoint_hash,
-            frontiers.sprout.root(),
-        )
+        .validate_for_handoff(last_checkpoint, handoff_hash, frontiers.sprout.root())
         .map_err(|error| GeneratorError::Artifact(error.to_string()))?;
     decoded
         .validate_canonical(|height| db.hash(height), |hash| db.height(hash))
@@ -430,8 +422,6 @@ pub fn generate_mainnet_from_archive(config: &Config) -> Result<Vec<u8>, Generat
 /// Loads the canonical artifact once independently reviewed bytes are embedded.
 ///
 /// This must never be replaced with downloaded or guessed bytes.
-// Consumed by the follow-up repair migration.
-#[allow(dead_code)]
 pub(crate) fn embedded_mainnet() -> Result<Artifact, Error> {
     MAINNET_ARTIFACT
         .map(Artifact::decode)
@@ -462,7 +452,7 @@ mod tests {
 
         let artifact = Artifact::decode(&bytes).expect("fixture decodes");
         artifact
-            .validate_last_checkpoint(block::Height(20), block::Hash([20; 32]), tree.root())
+            .validate_for_handoff(block::Height(20), block::Hash([20; 32]), tree.root())
             .expect("matching handoff validates");
         assert_eq!(artifact.records_through(block::Height(9)).count(), 0);
         assert_eq!(artifact.records_through(block::Height(10)).count(), 1);
@@ -514,7 +504,7 @@ mod tests {
         .expect("valid fixture decodes");
 
         artifact
-            .validate_last_checkpoint(handoff, handoff_hash, tree.root())
+            .validate_for_handoff(handoff, handoff_hash, tree.root())
             .expect("matching handoff identity validates");
         artifact
             .validate_canonical(
@@ -524,7 +514,7 @@ mod tests {
             .expect("matching canonical indexes validate");
 
         assert_eq!(
-            artifact.validate_last_checkpoint(handoff, block::Hash([21; 32]), tree.root()),
+            artifact.validate_for_handoff(handoff, block::Hash([21; 32]), tree.root()),
             Err(Error::HandoffHashMismatch)
         );
         assert_eq!(

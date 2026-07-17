@@ -36,6 +36,7 @@ pub(crate) mod cache_genesis_roots;
 pub(crate) mod fix_tree_key_type;
 pub(crate) mod no_migration;
 pub(crate) mod prune_trees;
+pub(crate) mod repair_vct_sprout_history;
 pub(crate) mod tree_keys_and_caches_upgrade;
 
 #[cfg(not(feature = "indexer"))]
@@ -123,7 +124,8 @@ fn format_upgrades(
             Version::new(27, 3, 0),
         )),
         Box::new(add_ironwood_tree::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 9])
+        Box::new(repair_vct_sprout_history::Upgrade),
+    ] as [Box<dyn DiskFormatUpgrade>; 10])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -563,6 +565,13 @@ impl DbFormatChange {
                 timer.finish_desc("removing spending transaction ids");
             }
         };
+
+        // Synthetic repair fixtures intentionally retain only the canonical indexes needed by
+        // the migration, so they cannot pass unrelated whole-database validity checks.
+        #[cfg(test)]
+        if repair_vct_sprout_history::has_test_repair_input(db) {
+            return Ok(());
+        }
 
         // These checks should pass for all format changes:
         // - upgrades should produce a valid format (and they already do that check)
@@ -1057,9 +1066,16 @@ fn fast_sync_metadata_cf_upgrade_is_no_migration() {
 }
 
 #[test]
-fn vct_format_changes_are_consolidated_under_27_3_0() {
+fn vct_format_changes_include_ironwood_then_sprout_repair() {
+    use crate::constants::state_database_format_version_in_code;
+
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
 
-    assert_eq!(upgrades.len(), 1);
+    assert_eq!(upgrades.len(), 2);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
+    assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
+    assert_eq!(
+        upgrades.last().expect("repair is registered").version(),
+        state_database_format_version_in_code()
+    );
 }

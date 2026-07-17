@@ -103,15 +103,15 @@ impl DiskFormatUpgrade for Upgrade {
             return Ok(());
         }
 
-        let Some(handoff) = db.vct_synced_below() else {
+        let Some(last_vct_height) = db.vct_synced_below() else {
             unreachable!("repair eligibility requires the VCT handoff marker");
         };
 
-        let input = validated_repair_input(db, handoff)
+        let input = validated_repair_input(db, last_vct_height)
             .expect("writable startup preflight validated the VCT Sprout repair");
         repair_records(
             db,
-            handoff,
+            last_vct_height,
             input.artifact_last_checkpoint,
             input.artifact_last_checkpoint_hash,
             input.artifact_sprout_root,

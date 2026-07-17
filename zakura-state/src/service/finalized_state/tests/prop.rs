@@ -14,7 +14,7 @@ use zakura_chain::{
         NetworkUpgrade,
     },
     primitives::Groth16Proof,
-    serialization::ZcashDeserializeInto,
+    serialization::{BytesInDisplayOrder, ZcashDeserializeInto},
     sprout::JoinSplit,
     transaction::{JoinSplitData, LockTime, Transaction, UnminedTx},
     LedgerState,
@@ -914,19 +914,43 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
         |((chain, _count, network, _history_tree) in PreparedChain::default().with_ledger_strategy(ledger_strategy.clone()).with_valid_commitments().no_shrink())| {
 
             let blocks: Vec<_> = chain.iter().collect();
-            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
             let heartwood = NetworkUpgrade::Heartwood.activation_height(&network).unwrap().0;
-            // The deferral target: a post-NU5 (real MMR root) height, so it sits above
-            // Heartwood where the root needs a successor to be confirmed.
-            let tip_target = (nu5 + 1) as usize;
+            let nu5 = NetworkUpgrade::Nu5.activation_height(&network).unwrap().0;
+            // Use a post-Heartwood, pre-NU5 target so its root needs a successor, while a
+            // deterministic V4 JoinSplit transaction can exercise the Sprout retry path.
+            let tip_target = (heartwood + 1) as usize;
             prop_assert!(blocks.len() > tip_target + 1, "generated chain unexpectedly short");
+            prop_assert!((tip_target as u32) < nu5, "the retry target must permit V4 transactions");
             let seed = (heartwood - 1) as usize;
+
+            // The checkpoint commit path intentionally assumes semantic verification already
+            // succeeded, so this fixture can append a structurally valid JoinSplit transaction
+            // without rebuilding the block's transaction Merkle root.
+            let mut target_block = blocks[tip_target].block.clone();
+            let empty_sprout_tree = SproutTree::default();
+            Arc::make_mut(&mut target_block)
+                .transactions
+                .push(v4_transaction_with_interstitial_anchor(&empty_sprout_tree));
+            let target_sprout_commitment_count: u64 = target_block
+                .sprout_note_commitments()
+                .count()
+                .try_into()
+                .expect("the fixture commitment count fits in u64");
+            prop_assert!(
+                target_sprout_commitment_count > 0,
+                "the deferred block must exercise the Sprout update path"
+            );
 
             // Legacy golden pass to source the correct per-block roots for the fast range.
             let mut legacy = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
             let mut peer_roots = Vec::new();
             for i in 0..=tip_target {
-                let cv = CheckpointVerifiedBlock::from(blocks[i].block.clone());
+                let block = if i == tip_target {
+                    target_block.clone()
+                } else {
+                    blocks[i].block.clone()
+                };
+                let cv = CheckpointVerifiedBlock::from(block.clone());
                 let (_h, trees) = legacy
                     .commit_finalized_direct(cv.into(), None, None, "vct defer legacy")
                     .unwrap();
@@ -939,10 +963,23 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
                         sapling_tx: 0,
                         orchard_tx: 0,
                         ironwood_tx: 0,
-                        auth_data_root: blocks[i].block.auth_data_root(),
+                        auth_data_root: block.auth_data_root(),
                     });
                 }
             }
+            let legacy_sprout_tree = legacy.db.sprout_tree_for_tip().unwrap();
+
+            // The modified target changes its history-tree leaf. Before NU5 the successor
+            // header commits directly to that resulting history root, so update the witness
+            // fixture while preserving its link to the target's unchanged header hash.
+            let mut target_successor = blocks[tip_target + 1].block.clone();
+            let target_history_root = legacy
+                .db
+                .history_tree()
+                .hash()
+                .expect("the post-Heartwood history tree has a root");
+            Arc::make_mut(&mut Arc::make_mut(&mut target_successor).header).commitment_bytes =
+                target_history_root.bytes_in_serialized_order().into();
 
             // An untrusted peer source pre-filled with the *correct* roots: the deferral is
             // about the missing successor, not a bad root. The roots are persisted into the
@@ -963,6 +1000,9 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
                     .expect("pre-tip fast commits succeed");
             }
             prop_assert_eq!(fast.db.finalized_tip_height(), Some(Height((tip_target - 1) as u32)));
+            let sprout_tree_before_retries = fast.db.sprout_tree_for_tip().unwrap();
+            let sprout_root_before_retries = sprout_tree_before_retries.root();
+            let sprout_count_before_retries = sprout_tree_before_retries.count();
 
             // The tip target with no successor header must defer, not commit: its own
             // (correct) root is not yet confirmed, and the peer source is untrusted.
@@ -971,7 +1011,7 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
                 "an untrusted peer tip root needs successor verification"
             );
             let pre_deferral_prevalidated = fast.vct_prevalidated_count();
-            let cv = CheckpointVerifiedBlock::from(blocks[tip_target].block.clone());
+            let cv = CheckpointVerifiedBlock::from(target_block.clone());
             let error = fast
                 .commit_finalized_direct(cv.into(), None, None, "vct defer tip no successor")
                 .expect_err("an untrusted tip root with no successor must defer, not commit");
@@ -988,6 +1028,16 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
                 Some(Height((tip_target - 1) as u32)),
                 "the deferred block left the database untouched"
             );
+            prop_assert_eq!(
+                fast.db.sprout_tree_for_tip().unwrap().root(),
+                sprout_root_before_retries,
+                "the deferred JoinSplit block leaves the persisted Sprout root unchanged"
+            );
+            prop_assert_eq!(
+                fast.db.sprout_tree_for_tip().unwrap().count(),
+                sprout_count_before_retries,
+                "the deferred JoinSplit block leaves the persisted Sprout count unchanged"
+            );
             let after_deferral_prevalidated = fast.vct_prevalidated_count();
             prop_assert_eq!(
                 after_deferral_prevalidated,
@@ -1000,8 +1050,8 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             // and deferred exactly like a missing successor. It must *not* be treated as a
             // verification failure: that would evict the correct root and, because the write
             // loop's parked retry is taken before the look-ahead, wedge the retry loop.
-            let cv = CheckpointVerifiedBlock::from(blocks[tip_target].block.clone());
-            let forged_witness = next_vct_block(blocks[tip_target].block.clone());
+            let cv = CheckpointVerifiedBlock::from(target_block.clone());
+            let forged_witness = next_vct_block(target_block.clone());
             let error = fast
                 .commit_finalized_direct(cv.into(), None, forged_witness, "vct defer tip forged witness")
                 .expect_err("a non-linking witness must defer, not commit or evict");
@@ -1018,6 +1068,16 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
                 Some(Height((tip_target - 1) as u32)),
                 "the forged-witness attempt left the database untouched"
             );
+            prop_assert_eq!(
+                fast.db.sprout_tree_for_tip().unwrap().root(),
+                sprout_root_before_retries,
+                "the forged-witness retry leaves the persisted Sprout root unchanged"
+            );
+            prop_assert_eq!(
+                fast.db.sprout_tree_for_tip().unwrap().count(),
+                sprout_count_before_retries,
+                "the forged-witness retry leaves the persisted Sprout count unchanged"
+            );
             let after_forged_prevalidated = fast.vct_prevalidated_count();
             prop_assert_eq!(
                 after_forged_prevalidated,
@@ -1028,8 +1088,8 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
             // Once a successor is buffered, the very same height commits and the tip advances:
             // the deferral was a wait, not a permanent stall — and the root survived the
             // forged-witness attempt (it was never evicted).
-            let cv = CheckpointVerifiedBlock::from(blocks[tip_target].block.clone());
-            let next = next_vct_block(blocks[tip_target + 1].block.clone());
+            let cv = CheckpointVerifiedBlock::from(target_block);
+            let next = next_vct_block(target_successor);
             fast.commit_finalized_direct(cv.into(), None, next, "vct defer tip with successor")
                 .expect("the deferred height commits once its successor is buffered");
             prop_assert_eq!(
@@ -1041,6 +1101,17 @@ fn vct_peer_source_defers_unverifiable_tip_root_until_successor() -> Result<()> 
                 fast.db.finalized_tip_height(),
                 Some(Height(tip_target as u32)),
                 "the tip advances once the successor confirms the root"
+            );
+            let fast_sprout_tree = fast.db.sprout_tree_for_tip().unwrap();
+            prop_assert_eq!(
+                fast_sprout_tree.count(),
+                sprout_count_before_retries + target_sprout_commitment_count,
+                "the successful retry appends each target Sprout commitment exactly once"
+            );
+            prop_assert_eq!(
+                fast_sprout_tree.root(),
+                legacy_sprout_tree.root(),
+                "the retried fast commit produces the same Sprout root as legacy commit"
             );
     });
 

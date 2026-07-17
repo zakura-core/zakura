@@ -119,6 +119,30 @@ impl DiskFormatUpgrade for Upgrade {
             cancel_receiver,
         )
     }
+
+    fn validate(
+        &self,
+        db: &ZakuraDb,
+        cancel_receiver: &Receiver<CancelFormatChange>,
+    ) -> Result<Result<(), String>, CancelFormatChange> {
+        check_cancelled(cancel_receiver)?;
+        let disk_version = db
+            .format_version_on_disk()
+            .expect("database format version must remain readable during repair validation");
+        if !is_repair_eligible(db, disk_version.as_ref()) {
+            return Ok(Ok(()));
+        }
+
+        let marker = db
+            .vct_synced_below()
+            .expect("a VCT-synced database has a persisted handoff marker");
+        let input = match validated_repair_input(db, marker) {
+            Ok(input) => input,
+            Err(error) => return Ok(Err(error.to_string())),
+        };
+
+        validate_repaired_records(db, marker, &input, cancel_receiver)
+    }
 }
 
 fn repair_input(
@@ -250,9 +274,54 @@ fn repair_records(
         before_write();
     }
     check_cancelled(cancel_receiver)?;
-    db.write_batch(batch)
+    db.write_batch_sync(batch)
         .expect("atomic Sprout anchor repair batch should be writable");
     Ok(())
+}
+
+fn validate_repaired_records(
+    db: &ZakuraDb,
+    marker: Height,
+    input: &RepairInput,
+    cancel_receiver: &Receiver<CancelFormatChange>,
+) -> Result<Result<(), String>, CancelFormatChange> {
+    let tip = db
+        .finalized_tip_height()
+        .expect("repair input validation requires a finalized database tip");
+    let replay_until = tip.min(marker);
+    let mut tree = sprout::tree::NoteCommitmentTree::default();
+
+    if db.sprout_tree_by_anchor(&tree.root()).as_deref() != Some(&tree) {
+        return Ok(Err(
+            "the repaired database is missing the empty Sprout anchor".to_string(),
+        ));
+    }
+
+    for record in input.artifact.records_through(replay_until) {
+        check_cancelled(cancel_receiver)?;
+        for commitment in &record.commitments {
+            tree.append(*commitment)
+                .expect("validated Sprout history record must fit in the Sprout tree");
+        }
+
+        if db.sprout_tree_by_anchor(&tree.root()).as_deref() != Some(&tree) {
+            return Ok(Err(format!(
+                "the repaired database is missing the Sprout anchor at {:?}",
+                record.height
+            )));
+        }
+    }
+
+    if tip < marker {
+        let tip_tree = db.sprout_tree_for_tip().map_err(|error| error.to_string());
+        if tip_tree.as_deref() != Ok(&tree) {
+            return Ok(Err(format!(
+                "the repaired Sprout tip does not match the artifact at {tip:?}"
+            )));
+        }
+    }
+
+    Ok(Ok(()))
 }
 
 #[cfg(test)]
@@ -670,6 +739,18 @@ mod tests {
         );
         let (artifact, repaired_root) =
             fixture_artifact(handoff, handoff_hash, record_height, record_hash, 7);
+        mark_vct(&db, handoff);
+        let _injection = inject_test_repair_input(
+            db.path().to_path_buf(),
+            TestRepairInput {
+                handoff,
+                handoff_hash,
+                handoff_sprout_root: repaired_root,
+                artifact: artifact.clone(),
+                marker_hash: None,
+                before_write: None,
+            },
+        );
 
         let mut existing_tip = NoteCommitmentTree::default();
         existing_tip
@@ -712,6 +793,16 @@ mod tests {
             Some(old_version),
             "the durable repair batch must complete before the upgrade framework updates the version"
         );
+
+        assert_eq!(Upgrade.validate(&db, &cancel_rx), Ok(Ok(())));
+        let mut delete_batch = DiskWriteBatch::new();
+        delete_batch.delete_sprout_anchor(&db, &repaired_root);
+        db.write_batch(delete_batch)
+            .expect("corrupting the repaired fixture succeeds");
+        assert!(matches!(
+            Upgrade.validate(&db, &cancel_rx),
+            Ok(Err(reason)) if reason.contains("Sprout anchor at")
+        ));
     }
 
     #[test]

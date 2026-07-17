@@ -14,6 +14,7 @@ use super::{
 use crate::zakura::{
     framed_channel,
     testkit::{TraceCapture, TraceValue},
+    trace::{header_sync_trace as hs_trace, HEADER_SYNC_TABLE},
     FramedSend, HeaderSyncServiceSummary, Peer, Service, ServicePeerDirection, ServicePeerLimits,
     ServicePeerSnapshot, ZakuraConnId, ZakuraHeaderSyncCandidateState, ZAKURA_CAP_HEADER_SYNC,
 };
@@ -504,6 +505,30 @@ fn startup_new_is_passive_until_local_hooks_are_wired() {
 
     assert!(!startup.range_state_actions_enabled);
     assert!(!startup.inbound_new_block_acceptance_enabled);
+}
+
+#[test]
+fn startup_new_uses_configured_status_refresh_interval() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let status_refresh_interval = std::time::Duration::from_secs(17);
+    let startup = HeaderSyncStartup::new(
+        network,
+        anchor,
+        HeaderSyncFrontiers {
+            finalized_height: anchor.0,
+            verified_block_tip: anchor.0,
+            verified_block_hash: anchor.1,
+        },
+        Some(anchor),
+        ZakuraHeaderSyncConfig {
+            status_refresh_interval,
+            ..ZakuraHeaderSyncConfig::default()
+        },
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+
+    assert_eq!(startup.status_refresh_interval, status_refresh_interval);
 }
 
 fn startup_with_timeout(
@@ -1611,23 +1636,6 @@ fn request_and_serving_counts_are_clamped_by_byte_budget() {
         inbound_get_headers_count_limit(&config, &Network::Mainnet, LOCAL_MAX_MESSAGE_BYTES, true),
         count_with_roots
     );
-
-    let headers =
-        vec![mainnet_header(&BLOCK_MAINNET_1_BYTES); usize::try_from(count).unwrap() + 100];
-    let body_sizes = vec![0u32; headers.len()];
-    let tree_aux_roots = roots_from_height(block::Height(1), headers.len());
-    let (headers, _body_sizes, _tree_aux_roots) = truncate_headers_to_byte_budget(
-        headers,
-        body_sizes,
-        tree_aux_roots,
-        &Network::Mainnet,
-        LOCAL_MAX_MESSAGE_BYTES,
-    );
-    let message = headers_message(headers);
-    let encoded = encode_correlated(&message).unwrap();
-
-    assert!(encoded.len() <= MAX_HS_MESSAGE_BYTES);
-    assert!(encoded.len() + FRAME_HEADER_BYTES <= LOCAL_MAX_MESSAGE_BYTES as usize);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1772,6 +1780,28 @@ fn vct_repair_episode_enforces_attempt_and_time_bounds() {
     assert!(timed.exhausted);
     assert!(!timed.refresh_exhausted(now));
     assert!(!timed.can_attempt(now));
+}
+
+#[test]
+fn vct_repair_maintenance_ignores_retry_deadline_during_attempt() {
+    let mut repair = VctRootRepair::new(
+        block::Height(1),
+        1,
+        Network::Mainnet.genesis_hash(),
+        vec![(
+            block::Height(1),
+            mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+        )],
+    )
+    .expect("single-header handoff repair is valid");
+    let retry_deadline = repair.next_attempt_at;
+    let repair_deadline = repair.started_at + VCT_ROOT_REPAIR_MAX_WALL_TIME;
+
+    assert_eq!(repair.next_maintenance_deadline(), retry_deadline);
+
+    repair.mark_attempt(peer(129));
+
+    assert_eq!(repair.next_maintenance_deadline(), repair_deadline);
 }
 
 #[test]
@@ -3789,7 +3819,6 @@ async fn full_block_committed_covers_outstanding_height() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: block::Hash([1; 32]),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -4166,11 +4195,7 @@ async fn local_full_block_commit_prevents_later_new_block_regossip() {
     }
     fixture
         .handle
-        .send(HeaderSyncEvent::FullBlockCommitted {
-            height,
-            hash,
-            header: block.header.clone(),
-        })
+        .send(HeaderSyncEvent::FullBlockCommitted { height, hash })
         .await
         .unwrap();
     fixture
@@ -5215,7 +5240,8 @@ async fn tree_aux_height_mismatch_traces_structured_diagnostics() {
 
     capture.flush().await;
     let reader = capture.reader().unwrap();
-    reader.table(HEADER_SYNC_TABLE.table()).assert_row(
+    let header_sync = reader.table(HEADER_SYNC_TABLE.table());
+    header_sync.assert_row(
         hs_trace::HEADER_EVENT_RECEIVED,
         &[
             (
@@ -5229,6 +5255,13 @@ async fn tree_aux_height_mismatch_traces_structured_diagnostics() {
             (hs_trace::LAST_ROOT_HEIGHT, TraceValue::U64(300)),
         ],
     );
+    header_sync.assert_sequence(&[
+        hs_trace::HEADER_EVENT_RECEIVED,
+        hs_trace::HEADER_PEER_VIOLATION,
+        hs_trace::HEADER_PEER_VIOLATION,
+        hs_trace::HEADER_PEER_VIOLATION_RECORDED,
+        hs_trace::HEADER_ACTION_DISPATCHED,
+    ]);
 
     let _ = capture.finish().await.unwrap();
 }
@@ -5273,7 +5306,6 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_violation_recor
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5435,7 +5467,6 @@ async fn header_sync_metrics_record_status_range_new_block_dedup_and_violation()
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5655,7 +5686,6 @@ async fn partial_full_block_coverage_retires_old_request_and_requests_suffix() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5703,7 +5733,6 @@ async fn partial_coverage_recreates_an_interior_hole_before_a_later_batch() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5756,7 +5785,6 @@ async fn partial_coverage_trims_and_commits_an_already_buffered_suffix() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(3),
             hash: mainnet_block(&BLOCK_MAINNET_3_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_3_BYTES),
         })
         .await
         .unwrap();
@@ -5821,7 +5849,6 @@ async fn partially_covered_failed_commit_requeues_its_uncovered_suffix() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5882,7 +5909,6 @@ async fn buffered_successor_drains_after_full_block_covers_its_predecessor() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();

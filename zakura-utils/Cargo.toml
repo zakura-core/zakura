@@ -1,6 +1,6 @@
 [package]
 name = "zakura-utils"
-version = "1.0.0"
+version = "1.0.1"
 authors.workspace = true
 description = "Developer tools for Zakura maintenance and testing. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -64,7 +64,7 @@ zakura-node-services = { path = "../zakura-node-services", version = "1.0.0" }
 zakura-chain = { path = "../zakura-chain", version = "1.0.0" }
 
 # These crates are needed for the block-template-to-proposal binary
-zakura-rpc = { path = "../zakura-rpc", version = "1.0.0" }
+zakura-rpc = { path = "../zakura-rpc", version = "2.0.0" }
 
 # These crates are needed for the zakura-checkpoints binary
 itertools = { workspace = true, optional = true }

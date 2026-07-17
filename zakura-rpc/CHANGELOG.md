@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-17
+
+### Breaking Changes
+
+- `zakura-state`, `zakura-network`, and `zakura-consensus` moved to 2.0.0.
+  Their service types appear in this crate's public server signatures, so
+  their major versions are part of this crate's API; no APIs defined in this
+  crate changed.
+
+### Changed
+
+- Removed the obsolete `ZALLET`-gated external wallet path from the build
+  script; setting that environment variable no longer clones or compiles an
+  external repository during a `zakura-rpc` build
+  ([#206](https://github.com/zakura-core/zakura/pull/206)).
+
 ## [1.0.0] - 2026-07-15
 
 First "stable" release. However, be advised that the API may still greatly

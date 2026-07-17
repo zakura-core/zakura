@@ -350,6 +350,180 @@ fn broadcast_all_queued_removes_banned_peers() {
     });
 }
 
+/// A mined block advertised via `AdvertiseBlockToAll` while a peer is unready
+/// must reach that peer once it is ready again, not be silently dropped.
+///
+/// Regression test for the mined-block twin of the committed-tip sidecar-gossip
+/// stall: `broadcast_all` queued a re-send for peers that were unready at
+/// broadcast time, but its drain loop received each queued `send_multiple`
+/// future and dropped it unpolled. Because [`crate::peer::Client::call`]
+/// enqueues the peer request synchronously yet holds the response receiver
+/// inside that future, dropping it makes the connection treat the request as
+/// canceled and skip the block `inv`.
+///
+/// A plain "the peer received the request" assertion does *not* catch this: the
+/// mock enqueues the `ClientRequest` synchronously, so it arrives even on the
+/// buggy code. The distinguishing signal is whether the delivery future was
+/// kept alive — i.e. the received request's response channel is not canceled.
+#[test]
+fn mined_block_gossip_to_unready_peer_is_delivered_not_canceled() {
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version, peer_version],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    tokio::time::pause();
+
+    let (discovered_peers, handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    assert_eq!(handles.len(), 2);
+
+    // `mock_peer_discovery` assigns ascending ports from 1, so the two peers
+    // share IP `127.0.0.1` and differ only by port. The harnesses are returned
+    // in the same order as those ports.
+    let mut handles = handles.into_iter();
+    let handle_1 = handles.next().expect("first peer harness");
+    let handle_2 = handles.next().expect("second peer harness");
+    let addr_1: PeerSocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1).into();
+    let addr_2: PeerSocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2).into();
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            // Both peers share an IP, so lift the per-IP cap above the default of 1.
+            .max_conns_per_ip(max(2, DEFAULT_MAX_CONNS_PER_IP))
+            .build();
+
+        {
+            let ready = peer_set.ready().await.expect("peer set is always ready");
+            assert_eq!(ready.ready_services.len(), 2);
+        }
+
+        // Force both peers unready, as if a request to each were in flight. With
+        // no ready peers, `broadcast_all`'s initial send is empty and its drain
+        // loop runs immediately; both peers are then served only by the queued
+        // re-send delivered from `broadcast_all_queued`.
+        for addr in [addr_1, addr_2] {
+            let svc = peer_set.take_ready_service(&addr).expect("peer is ready");
+            peer_set.push_unready(addr, svc);
+        }
+
+        // Advertise a mined block to all peers while both are unready, and drive
+        // the returned future to completion (spawned, as the mined-block gossip
+        // caller in `zakurad::components::sync::gossip` does).
+        let hash = block::Hash([7; 32]);
+        let broadcast_handle =
+            tokio::spawn(peer_set.broadcast_all(Request::AdvertiseBlockToAll(hash)));
+
+        // Drive the peer set so both peers re-ready and `broadcast_all_queued`
+        // delivers the queued gossip; yield so the spawned drain loop processes
+        // it. Once every queued peer has been delivered, the drain loop drains
+        // and the broadcast future completes — that completion is the point at
+        // which the delivery future has definitively been spawned (fixed) or
+        // dropped (buggy), so we can check the response channel deterministically.
+        let mut broadcast_finished = false;
+        for _ in 0..16 {
+            {
+                let _ = peer_set.ready().await.expect("peer set is always ready");
+            }
+            tokio::task::yield_now().await;
+            if broadcast_handle.is_finished() {
+                broadcast_finished = true;
+                break;
+            }
+        }
+        assert!(
+            broadcast_finished,
+            "the mined-block broadcast future should complete once queued deliveries drain",
+        );
+        broadcast_handle
+            .await
+            .expect("broadcast task should not panic")
+            .expect("broadcast_all should succeed");
+
+        // Both originally-unready peers must have received the mined-block inv,
+        // and — crucially — the delivery future must have been kept alive rather
+        // than dropped. On the buggy code the future is dropped, cancelling the
+        // response channel, which the connection task treats as a canceled
+        // request and skips the block inv.
+        for mut handle in [handle_1, handle_2] {
+            let client_request = handle
+                .try_to_receive_outbound_client_request()
+                .request()
+                .expect("each once-unready peer should receive the queued mined-block gossip");
+            assert!(
+                matches!(client_request.request, Request::AdvertiseBlockToAll(h) if h == hash),
+                "expected the mined-block advertisement, got {:?}",
+                client_request.request,
+            );
+            assert!(
+                !client_request.tx.is_canceled(),
+                "the queued send future must be spawned, not dropped: a dropped future \
+                 cancels the response channel and the connection skips the block inv",
+            );
+        }
+    });
+}
+
+/// A mined block advertised while peers are ready reaches those peers
+/// immediately, guarding the common path against a regression from the fix.
+#[test]
+fn mined_block_gossip_reaches_ready_peers() {
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version, peer_version],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    tokio::time::pause();
+
+    let (discovered_peers, handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    assert_eq!(handles.len(), 2);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .max_conns_per_ip(max(2, DEFAULT_MAX_CONNS_PER_IP))
+            .build();
+
+        {
+            let ready = peer_set.ready().await.expect("peer set is always ready");
+            assert_eq!(ready.ready_services.len(), 2);
+        }
+
+        // With every peer ready, `broadcast_all` sends to them synchronously and
+        // has nothing to queue. Keep the future alive so its response receivers
+        // are not dropped before we inspect the delivered requests.
+        let hash = block::Hash([5; 32]);
+        let _broadcast_fut = peer_set.broadcast_all(Request::AdvertiseBlockToAll(hash));
+
+        let mut received = 0;
+        for mut handle in handles {
+            if let Some(client_request) = handle.try_to_receive_outbound_client_request().request()
+            {
+                assert!(
+                    matches!(client_request.request, Request::AdvertiseBlockToAll(h) if h == hash),
+                    "expected the mined-block advertisement, got {:?}",
+                    client_request.request,
+                );
+                received += 1;
+            }
+        }
+        assert_eq!(
+            received, 2,
+            "both ready peers should receive the mined block"
+        );
+    });
+}
+
 #[test]
 fn remove_unready_peer_clears_cancel_handle_and_updates_counts() {
     let peer_versions = PeerVersions {

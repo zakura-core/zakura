@@ -1220,7 +1220,18 @@ where
 
         async move {
             let _ = send_multiple_fut.await?;
-            while queued_broadcast_fut_receiver.recv().await.is_some() {}
+            // Each queued item is a `send_multiple` future whose response receivers
+            // keep the enqueued peer requests from being treated as canceled (see the
+            // `tx.is_canceled()` skip in `Connection::handle_client_request`).
+            // `send_multiple` calls `Client::call`, which enqueues each request to the
+            // connection task synchronously but holds the response receiver inside the
+            // returned future. Dropping that future unpolled — as `.is_some() {}` did —
+            // drops the receiver before the connection task drains the request, so it
+            // sees a canceled request and racily skips the block `inv`. Spawn each
+            // future so it is polled to completion and keeps its receivers alive.
+            while let Some(send_fut) = queued_broadcast_fut_receiver.recv().await {
+                tokio::spawn(send_fut);
+            }
             Ok(Response::Nil)
         }
         .boxed()

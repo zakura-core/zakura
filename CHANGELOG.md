@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   tip. Startup rejects configured anchors above that base, and no longer
   backfills headers below a checkpoint anchor.
 
+### Fixed
+
+- Deliver mined/submitted block gossip to peers that were momentarily unready
+  when the block was advertised. A block broadcast via `AdvertiseBlockToAll`
+  queued a re-send for unready peers, but the queued send future was dropped
+  before the connection wrote the `inv`, so the connection treated the request
+  as canceled and silently skipped it. Because a zcashd-compat sidecar follows a
+  single upstream and learns the tip only from block `inv`s, it could then stall.
+  The queued send now runs to completion. Only local mining paths (regtest, e2e,
+  and local-mining deployments) exercise `AdvertiseBlockToAll`; standard
+  following nodes advertise network blocks via `AdvertiseBlock` and are
+  unaffected.
+
 ## [1.0.1] - 2026-07-17
 
 ### Added

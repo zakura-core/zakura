@@ -249,19 +249,19 @@ impl Artifact {
         })
     }
 
-    pub(crate) fn validate_for_handoff(
+    pub(crate) fn validate_last_checkpoint(
         &self,
-        handoff: block::Height,
-        handoff_hash: block::Hash,
+        last_checkpoint: block::Height,
+        last_checkpoint_hash: block::Hash,
         sprout_root: sprout::tree::Root,
     ) -> Result<(), Error> {
-        if self.last_checkpoint != handoff {
+        if self.last_checkpoint != last_checkpoint {
             return Err(Error::HandoffMismatch {
                 actual: self.last_checkpoint,
-                expected: handoff,
+                expected: last_checkpoint,
             });
         }
-        if self.last_checkpoint_hash != handoff_hash {
+        if self.last_checkpoint_hash != last_checkpoint_hash {
             return Err(Error::HandoffHashMismatch);
         }
         if self.terminal_root != sprout_root {
@@ -367,7 +367,7 @@ pub fn generate_mainnet_from_archive(config: &Config) -> Result<Vec<u8>, Generat
     let frontiers = embedded_final_frontiers(&network)
         .expect("Mainnet always has an embedded VCT handoff frontier");
     let last_checkpoint = frontiers.height;
-    let handoff_hash = db
+    let last_checkpoint_hash = db
         .hash(last_checkpoint)
         .ok_or(GeneratorError::MissingCanonicalHash {
             height: last_checkpoint,
@@ -406,12 +406,12 @@ pub fn generate_mainnet_from_archive(config: &Config) -> Result<Vec<u8>, Generat
         });
     }
 
-    let bytes = Artifact::encode(last_checkpoint, handoff_hash, records)
+    let bytes = Artifact::encode(last_checkpoint, last_checkpoint_hash, records)
         .map_err(|error| GeneratorError::Artifact(error.to_string()))?;
     let decoded =
         Artifact::decode(&bytes).map_err(|error| GeneratorError::Artifact(error.to_string()))?;
     decoded
-        .validate_for_handoff(last_checkpoint, handoff_hash, frontiers.sprout.root())
+        .validate_last_checkpoint(last_checkpoint, last_checkpoint_hash, frontiers.sprout.root())
         .map_err(|error| GeneratorError::Artifact(error.to_string()))?;
     decoded
         .validate_canonical(|height| db.hash(height), |hash| db.height(hash))
@@ -452,7 +452,7 @@ mod tests {
 
         let artifact = Artifact::decode(&bytes).expect("fixture decodes");
         artifact
-            .validate_for_handoff(block::Height(20), block::Hash([20; 32]), tree.root())
+            .validate_last_checkpoint(block::Height(20), block::Hash([20; 32]), tree.root())
             .expect("matching handoff validates");
         assert_eq!(artifact.records_through(block::Height(9)).count(), 0);
         assert_eq!(artifact.records_through(block::Height(10)).count(), 1);
@@ -504,7 +504,7 @@ mod tests {
         .expect("valid fixture decodes");
 
         artifact
-            .validate_for_handoff(handoff, handoff_hash, tree.root())
+            .validate_last_checkpoint(handoff, handoff_hash, tree.root())
             .expect("matching handoff identity validates");
         artifact
             .validate_canonical(
@@ -514,7 +514,7 @@ mod tests {
             .expect("matching canonical indexes validate");
 
         assert_eq!(
-            artifact.validate_for_handoff(handoff, block::Hash([21; 32]), tree.root()),
+            artifact.validate_last_checkpoint(handoff, block::Hash([21; 32]), tree.root()),
             Err(Error::HandoffHashMismatch)
         );
         assert_eq!(

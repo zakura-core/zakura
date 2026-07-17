@@ -158,7 +158,7 @@ fn validated_repair_input(
 ) -> Result<RepairInput, RepairValidationError> {
     let (artifact_handoff, artifact_handoff_hash, artifact_sprout_root, artifact) =
         repair_input(db)?;
-    artifact.validate_for_handoff(
+    artifact.validate_last_checkpoint(
         artifact_handoff,
         artifact_handoff_hash,
         artifact_sprout_root,
@@ -196,7 +196,7 @@ fn repair_records(
 ) -> Result<(), CancelFormatChange> {
     check_cancelled(cancel_receiver)?;
     artifact
-        .validate_for_handoff(
+        .validate_last_checkpoint(
             artifact_handoff,
             artifact_handoff_hash,
             artifact_sprout_root,

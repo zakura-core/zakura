@@ -5,6 +5,9 @@
 //! the default source is the peer `tree_aux` source. `checkpoint_sync = false` or
 //! `consensus.vct_fast_sync = false` selects legacy recompute.
 
+pub(super) mod artifact;
+pub use artifact::{generate_mainnet_from_archive, GeneratorError};
+
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,

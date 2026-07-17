@@ -45,6 +45,13 @@ pub(super) struct FinalFrontiers {
 /// Errors producing [`FinalFrontiers`] from a finalized database.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum FinalFrontiersGenerationError {
+    /// The database has no finalized tip identity to bind the generated frontier.
+    #[error("cannot produce final frontiers at height {height:?}: finalized database is empty")]
+    MissingFinalizedTip {
+        /// The requested final frontier height.
+        height: block::Height,
+    },
+
     /// The finalized tip has no persisted Sprout tree.
     #[error("missing Sprout final frontier tree at height {height:?}")]
     MissingSproutTree {
@@ -71,6 +78,28 @@ pub enum FinalFrontiersGenerationError {
     MissingIronwoodTree {
         /// The requested final frontier height.
         height: block::Height,
+    },
+
+    /// The requested height is not the finalized tip, so its Sprout frontier is unavailable.
+    #[error(
+        "cannot produce final frontiers at height {height:?}: Sprout is only stored at finalized tip {tip:?}"
+    )]
+    RequestedHeightIsNotTip {
+        /// The requested final frontier height.
+        height: block::Height,
+        /// The finalized database tip height.
+        tip: block::Height,
+    },
+
+    /// The finalized tip changed while the four frontiers were being read.
+    #[error(
+        "finalized tip changed while producing final frontiers: before {before:?}, after {after:?}; retry generation"
+    )]
+    FinalizedTipChanged {
+        /// The full tip identity captured before reading any frontier.
+        before: Option<(block::Height, block::Hash)>,
+        /// The full tip identity captured after reading all frontiers.
+        after: Option<(block::Height, block::Hash)>,
     },
 }
 
@@ -543,14 +572,30 @@ pub(crate) fn serve_block_roots(
     roots
 }
 
-/// Produce the final frontiers at `height` from `db`'s per-height trees.
+/// Produce the final frontiers at the finalized database tip `height`.
 ///
-/// Sprout is frozen far below any modern checkpoint, so the tip Sprout tree is the frontier at
-/// `height`.
+/// Sprout stores only its current tip frontier, so producing a frontier at any other height would
+/// combine the requested Sapling/Orchard/Ironwood trees with a later Sprout tree.
 pub(super) fn produce_final_frontiers(
     db: &ZakuraDb,
     height: block::Height,
 ) -> Result<FinalFrontiers, FinalFrontiersGenerationError> {
+    produce_final_frontiers_with_post_read(db, height, || {})
+}
+
+fn produce_final_frontiers_with_post_read(
+    db: &ZakuraDb,
+    height: block::Height,
+    post_read: impl FnOnce(),
+) -> Result<FinalFrontiers, FinalFrontiersGenerationError> {
+    let before = db
+        .tip()
+        .ok_or(FinalFrontiersGenerationError::MissingFinalizedTip { height })?;
+    if before.0 != height {
+        let tip = before.0;
+        return Err(FinalFrontiersGenerationError::RequestedHeightIsNotTip { height, tip });
+    }
+
     let sapling = db
         .sapling_tree_by_height(&height)
         .ok_or(FinalFrontiersGenerationError::MissingSaplingTree { height })?;
@@ -563,6 +608,15 @@ pub(super) fn produce_final_frontiers(
     let sprout = db
         .sprout_tree_for_tip()
         .map_err(|error| FinalFrontiersGenerationError::MissingSproutTree { height: error.tip })?;
+
+    post_read();
+    let after = db.tip();
+    if after != Some(before) {
+        return Err(FinalFrontiersGenerationError::FinalizedTipChanged {
+            before: Some(before),
+            after,
+        });
+    }
 
     Ok(FinalFrontiers {
         height,
@@ -677,6 +731,13 @@ mod tests {
         let mut batch = DiskWriteBatch::new();
         batch.update_sprout_tree(db, tree);
         db.write_batch(batch).expect("seeding Sprout tree succeeds");
+    }
+
+    fn sprout_tree_with_note(value: u8) -> sprout::tree::NoteCommitmentTree {
+        let mut tree = sprout::tree::NoteCommitmentTree::default();
+        tree.append(sprout::commitment::NoteCommitment::from([value; 32]))
+            .expect("single-note Sprout tree is not full");
+        tree
     }
 
     fn seed_finalized_tip(db: &ZakuraDb, height: block::Height) {
@@ -911,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn produce_final_frontiers_reads_requested_trees_and_tip_sprout() {
+    fn produce_final_frontiers_reads_tip_trees_and_sprout() {
         let _init_guard = zakura_test::init();
         let db = ephemeral_mainnet_db();
         let height = block::Height(2);
@@ -935,14 +996,63 @@ mod tests {
     }
 
     #[test]
+    fn produce_final_frontiers_rejects_height_below_tip_after_sprout_change() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+        let height = block::Height(2);
+        let tip = block::Height(3);
+        let later_sprout = sprout_tree_with_note(1);
+
+        seed_trees(&db, [2, 3]);
+        seed_sprout_tree(&db, &later_sprout);
+        seed_finalized_tip(&db, tip);
+
+        assert_ne!(
+            later_sprout.root(),
+            sprout::tree::NoteCommitmentTree::default().root(),
+            "the later block must change the Sprout frontier"
+        );
+        assert_eq!(
+            produce_final_frontiers(&db, height).expect_err(
+                "a historical request must not mix height 2 trees with the tip Sprout tree"
+            ),
+            FinalFrontiersGenerationError::RequestedHeightIsNotTip { height, tip },
+            "a historical request must not combine height 2 trees with the changed tip Sprout tree"
+        );
+    }
+
+    #[test]
+    fn produce_final_frontiers_retries_when_tip_identity_changes_during_read() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+        let height = block::Height(2);
+        let advanced_height = block::Height(3);
+
+        seed_trees(&db, [2, 3]);
+        seed_sprout_tree(&db, &sprout::tree::NoteCommitmentTree::default());
+        seed_finalized_tip(&db, height);
+
+        assert_eq!(
+            produce_final_frontiers_with_post_read(&db, height, || {
+                seed_finalized_tip(&db, advanced_height);
+            })
+            .expect_err("tip advancement during frontier reads must request a retry"),
+            FinalFrontiersGenerationError::FinalizedTipChanged {
+                before: Some((height, block::Hash([2; 32]))),
+                after: Some((advanced_height, block::Hash([3; 32]))),
+            }
+        );
+    }
+
+    #[test]
     fn produce_final_frontiers_reports_missing_trees() {
         let _init_guard = zakura_test::init();
         let db = ephemeral_mainnet_db();
         let height = block::Height(2);
 
         assert_eq!(
-            produce_final_frontiers(&db, height).expect_err("Sapling absence is reported first"),
-            FinalFrontiersGenerationError::MissingSaplingTree { height },
+            produce_final_frontiers(&db, height).expect_err("empty database is reported first"),
+            FinalFrontiersGenerationError::MissingFinalizedTip { height },
         );
     }
 

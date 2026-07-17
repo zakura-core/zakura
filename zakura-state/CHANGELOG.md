@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added authenticated VCT Sprout-history artifact generation and validation
+  APIs, plus an offline generator binary.
+
 ## [2.0.0] - 2026-07-17
 
 ### Breaking Changes

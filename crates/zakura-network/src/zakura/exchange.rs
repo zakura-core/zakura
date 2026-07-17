@@ -16,8 +16,6 @@ use super::{
 
 mod trace;
 
-use trace::SyncFrontierTransition;
-
 /// A height/hash pair at one chain frontier.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Frontier {
@@ -138,19 +136,6 @@ impl ZakuraSyncExchange {
         if let Some((sequence, old, new, result)) = transition {
             self.trace_transition(sequence, source, old, new, result);
         }
-    }
-
-    fn trace_transition(
-        &self,
-        sequence: u64,
-        source: &'static str,
-        old: FrontierUpdate,
-        new: FrontierUpdate,
-        result: &'static str,
-    ) {
-        self.inner
-            .trace
-            .emit_event(|| SyncFrontierTransition::new(sequence, source, old, new, result));
     }
 }
 

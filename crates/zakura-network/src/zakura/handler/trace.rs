@@ -3,7 +3,7 @@ use zakura_jsonl_trace::{JsonlTraceEvent, JsonlTraceTable};
 
 use crate::zakura::{
     trace::{peer_label, CONN_TABLE, HANDSHAKE_TABLE, RATELIMIT_TABLE, STREAM_TABLE},
-    ZakuraPeerId,
+    ZakuraPeerId, ZakuraTrace,
 };
 
 const HANDSHAKE: u8 = 0;
@@ -15,6 +15,153 @@ pub(super) type HandshakeTraceEvent<'a> = HandlerTraceEvent<'a, HANDSHAKE>;
 pub(super) type ConnectionTraceEvent<'a> = HandlerTraceEvent<'a, CONNECTION>;
 pub(super) type StreamTraceEvent<'a> = HandlerTraceEvent<'a, STREAM>;
 pub(super) type RateLimitTraceEvent<'a> = HandlerTraceEvent<'a, RATE_LIMIT>;
+
+#[derive(Clone, Debug)]
+pub(super) struct ZakuraConnTrace {
+    trace: ZakuraTrace,
+    pub(super) id: u64,
+    peer_id: Option<ZakuraPeerId>,
+}
+
+impl ZakuraConnTrace {
+    pub(super) fn new(trace: &ZakuraTrace, id: u64, peer_id: &ZakuraPeerId) -> Self {
+        Self {
+            trace: trace.clone(),
+            id,
+            peer_id: trace.is_enabled().then(|| peer_id.clone()),
+        }
+    }
+
+    #[cfg(any(test, feature = "zakura-testkit"))]
+    pub(super) fn without_peer(id: u64) -> Self {
+        Self {
+            trace: ZakuraTrace::noop(),
+            id,
+            peer_id: None,
+        }
+    }
+
+    pub(super) fn without_peer_on(trace: &ZakuraTrace, id: u64) -> Self {
+        Self {
+            trace: trace.clone(),
+            id,
+            peer_id: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "zakura-testkit"))]
+    pub(super) fn placeholder() -> Self {
+        Self::without_peer(0)
+    }
+
+    fn peer(&self) -> Option<&ZakuraPeerId> {
+        self.peer_id.as_ref()
+    }
+
+    pub(super) fn connection_event(&self, event: &'static str) -> ConnectionTraceEvent<'_> {
+        ConnectionTraceEvent::new(event, self.id, self.peer())
+    }
+
+    pub(super) fn handshake_event(&self, event: &'static str) -> HandshakeTraceEvent<'_> {
+        HandshakeTraceEvent::new(event, self.id, self.peer())
+    }
+
+    pub(super) fn stream_event(&self, event: &'static str, stream: u64) -> StreamTraceEvent<'_> {
+        StreamTraceEvent::new(event, self.id, self.peer()).stream(stream)
+    }
+
+    pub(super) fn rate_limit_event(
+        &self,
+        event: &'static str,
+        stream: u64,
+    ) -> RateLimitTraceEvent<'_> {
+        RateLimitTraceEvent::new(event, self.id, self.peer()).stream(stream)
+    }
+
+    pub(super) fn trace_connection(
+        &self,
+        event: &'static str,
+        role: Option<&'static str>,
+        direction: Option<&'static str>,
+        reason: Option<&'static str>,
+    ) {
+        self.trace.emit_event(|| {
+            let mut row = self.connection_event(event);
+            if let Some(role) = role {
+                row = row.role(role);
+            }
+            if let Some(direction) = direction {
+                row = row.direction(direction);
+            }
+            if let Some(reason) = reason {
+                row = row.reason(reason);
+            }
+            row
+        });
+    }
+
+    pub(super) fn trace_handshake(
+        &self,
+        event: &'static str,
+        role: &'static str,
+        selected_protocol: Option<u16>,
+        network: &'static str,
+    ) {
+        self.trace.emit_event(|| {
+            let mut row = self
+                .handshake_event(event)
+                .role(role)
+                .phase("control")
+                .network(network);
+            if let Some(selected_protocol) = selected_protocol {
+                row = row.selected_protocol(selected_protocol);
+            }
+            row
+        });
+    }
+
+    pub(super) fn trace_stream(
+        &self,
+        event: &'static str,
+        stream: u64,
+        stream_kind: Option<&'static str>,
+    ) {
+        self.trace.emit_event(|| {
+            let mut row = self.stream_event(event, stream);
+            if let Some(stream_kind) = stream_kind {
+                row = row.stream_kind(stream_kind);
+            }
+            row
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn trace_rate_limit(
+        &self,
+        event: &'static str,
+        stream: u64,
+        stream_kind: &'static str,
+        payload_len: Option<u64>,
+        frame_len: Option<u64>,
+        max_frame_bytes: Option<u64>,
+    ) {
+        self.trace.emit_event(|| {
+            let mut row = self
+                .rate_limit_event(event, stream)
+                .stream_kind(stream_kind);
+            if let Some(payload_len) = payload_len {
+                row = row.payload_len(payload_len);
+            }
+            if let Some(frame_len) = frame_len {
+                row = row.frame_len(frame_len);
+            }
+            if let Some(max_frame_bytes) = max_frame_bytes {
+                row = row.max_frame_bytes(max_frame_bytes);
+            }
+            row
+        });
+    }
+}
 
 /// A transport event whose table is fixed by its const-generic local alias.
 ///

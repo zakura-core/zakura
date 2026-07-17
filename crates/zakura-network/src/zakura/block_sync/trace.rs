@@ -757,6 +757,28 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn block_sync_core_uses_only_semantic_trace_calls() {
+        for (name, source) in [
+            ("reactor", include_str!("reactor.rs")),
+            ("peer_routine", include_str!("peer_routine.rs")),
+            ("sequencer_task", include_str!("sequencer_task.rs")),
+        ] {
+            for forbidden in [
+                ".emit_event(",
+                "emit_block(",
+                "BlockTraceFields",
+                "BlockTraceEvent",
+                "bs_trace::",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{name} must not contain trace construction `{forbidden}`"
+                );
+            }
+        }
+    }
+
     fn value(event: BlockTraceEvent) -> serde_json::Value {
         serde_json::to_value(event).expect("typed block trace event serializes")
     }

@@ -15,21 +15,19 @@ use zakura_chain::{
     parallel::commitment_aux::BlockCommitmentRoots,
 };
 use zakura_network::zakura::{
-    commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange,
-    HeaderRootAuthState, HeaderRootAuthUpdate, HeaderRootAuthenticationFailureKind,
-    HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers,
-    HeaderSyncOperationIdentity, HeaderWitnessState, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup,
-    ZakuraTrace, DEFAULT_HS_RANGE,
+    Frontier, FrontierChange, HeaderRootAuthState, HeaderRootAuthUpdate,
+    HeaderRootAuthenticationFailureKind, HeaderSyncAction, HeaderSyncCommitFailureKind,
+    HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncOperationIdentity, HeaderWitnessState,
+    ZakuraEndpoint, ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
 };
 use zakura_state::MappedRequest;
 
 #[cfg(test)]
-use zakura_network::zakura::{BlockSyncEvent, BlockSyncHandle};
+use zakura_network::zakura::{BlockSyncEvent, BlockSyncFrontiers, BlockSyncHandle};
 
-use super::{
-    block_verify_error_is_duplicate, emit_commit_state, insert_cs_frontiers, insert_cs_hash,
-    insert_cs_height, insert_cs_peer, insert_cs_str, insert_cs_u64, verified_block_tip_from_state,
-};
+use super::trace::chain_tip_mirror::ChainTipMirrorTraceExt;
+use super::trace::header_driver::HeaderDriverTraceExt;
+use super::{block_verify_error_is_duplicate, verified_block_tip_from_state};
 
 const ROOT_AUTH_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const DURABLE_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -836,7 +834,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
             }
         };
 
-        trace_header_driver_action(&trace, &action);
+        trace.trace_header_action_received(&action);
         match action {
             HeaderSyncAction::Misbehavior { peer, reason } => {
                 // Record-only: peer scoring no longer drives disconnects.
@@ -848,17 +846,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 hash,
                 block,
             } => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::COMMIT_START,
-                    "header_sync_driver",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "new_block");
-                        insert_cs_peer(row, cs_trace::PEER, &peer);
-                        insert_cs_height(row, cs_trace::HEIGHT, height);
-                        insert_cs_hash(row, cs_trace::HASH, hash);
-                    },
-                );
+                trace.trace_new_block_commit_started(&peer, height, hash);
                 let started = Instant::now();
                 match block_verifier
                     .clone()
@@ -880,8 +868,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         } else {
                             "accepted_non_best_chain"
                         };
-                        trace_header_commit_finish(
-                            &trace,
+                        trace.trace_header_commit_finished(
                             "new_block",
                             &peer,
                             height,
@@ -889,8 +876,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             result_label,
                             started,
                         );
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             if on_best_chain {
                                 "new_block_accepted"
                             } else {
@@ -950,8 +936,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         }
                     }
                     Ok(committed_hash) => {
-                        trace_header_commit_finish(
-                            &trace,
+                        trace.trace_header_commit_finished(
                             "new_block",
                             &peer,
                             height,
@@ -965,8 +950,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             ?committed_hash,
                             "Zakura NewBlock verifier returned an unexpected hash"
                         );
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             "new_block_rejected",
                             Some(&peer),
                             height,
@@ -980,8 +964,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     }
                     Err(error) => {
                         if block_verify_error_is_duplicate(&error) {
-                            trace_header_commit_finish(
-                                &trace,
+                            trace.trace_header_commit_finished(
                                 "new_block",
                                 &peer,
                                 height,
@@ -996,8 +979,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 ?error,
                                 "Zakura NewBlock was already known by the block verifier"
                             );
-                            trace_header_reactor_event(
-                                &trace,
+                            trace.trace_header_reactor_event(
                                 "new_block_duplicate",
                                 Some(&peer),
                                 height,
@@ -1011,8 +993,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             continue;
                         }
 
-                        trace_header_commit_finish(
-                            &trace,
+                        trace.trace_header_commit_finished(
                             "new_block",
                             &peer,
                             height,
@@ -1026,8 +1007,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             ?error,
                             "Zakura NewBlock rejected by block verifier"
                         );
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             "new_block_rejected",
                             Some(&peer),
                             height,
@@ -1049,8 +1029,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 count,
                 want_tree_aux_roots,
             } => {
-                trace_state_read_start(
-                    &trace,
+                trace.trace_header_state_read_started(
                     "query_headers_by_height_range",
                     Some(&peer),
                     start,
@@ -1063,24 +1042,13 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     .await
                 {
                     Ok(zakura_state::ReadResponse::Headers(headers)) => {
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::STATE_READ_SUCCESS,
-                            "header_sync_driver",
-                            |row| {
-                                insert_cs_str(
-                                    row,
-                                    cs_trace::ACTION,
-                                    "query_headers_by_height_range",
-                                );
-                                insert_cs_peer(row, cs_trace::PEER, &peer);
-                                insert_cs_height(row, cs_trace::RANGE_START, start);
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, headers.len() as u64);
-                                insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                            },
+                        trace.trace_header_range_query_succeeded(
+                            &peer,
+                            start,
+                            headers.len(),
+                            started,
                         );
-                        trace_state_read_start(
-                            &trace,
+                        trace.trace_header_state_read_started(
                             "block_size_hints",
                             Some(&peer),
                             start,
@@ -1096,8 +1064,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         {
                             Ok(zakura_state::ReadResponse::BlockSizeHints(hints)) => hints,
                             Ok(response) => {
-                                trace_state_read_error(
-                                    &trace,
+                                trace.trace_header_state_read_failed(
                                     "block_size_hints",
                                     Some(&peer),
                                     start,
@@ -1109,8 +1076,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 Vec::new()
                             }
                             Err(error) => {
-                                trace_state_read_error(
-                                    &trace,
+                                trace.trace_header_state_read_failed(
                                     "block_size_hints",
                                     Some(&peer),
                                     start,
@@ -1127,8 +1093,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             }
                         };
                         let block_roots = if want_tree_aux_roots {
-                            trace_state_read_start(
-                                &trace,
+                            trace.trace_header_state_read_started(
                                 "block_roots",
                                 Some(&peer),
                                 start,
@@ -1144,8 +1109,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             {
                                 Ok(zakura_state::ReadResponse::BlockRoots(roots)) => roots,
                                 Ok(response) => {
-                                    trace_state_read_error(
-                                        &trace,
+                                    trace.trace_header_state_read_failed(
                                         "block_roots",
                                         Some(&peer),
                                         start,
@@ -1157,8 +1121,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                     Vec::new()
                                 }
                                 Err(error) => {
-                                    trace_state_read_error(
-                                        &trace,
+                                    trace.trace_header_state_read_failed(
                                         "block_roots",
                                         Some(&peer),
                                         start,
@@ -1216,8 +1179,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .into_iter()
                             .map(|(_height, _hash, header)| header)
                             .collect();
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             "header_range_response_ready",
                             Some(&peer),
                             start,
@@ -1240,8 +1202,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .await;
                     }
                     Ok(response) => {
-                        trace_state_read_error(
-                            &trace,
+                        trace.trace_header_state_read_failed(
                             "query_headers_by_height_range",
                             Some(&peer),
                             start,
@@ -1250,7 +1211,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             started,
                         );
                         warn!(?peer, ?response, "unexpected HeadersByHeightRange response");
-                        trace_header_range_finished(&trace, &peer, start, count, 0);
+                        trace.trace_header_range_finished(&peer, start, count, 0);
                         let _ = handles
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
@@ -1264,8 +1225,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .await;
                     }
                     Err(error) => {
-                        trace_state_read_error(
-                            &trace,
+                        trace.trace_header_state_read_failed(
                             "query_headers_by_height_range",
                             Some(&peer),
                             start,
@@ -1278,7 +1238,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             ?error,
                             "failed to read Zakura Headers response from state"
                         );
-                        trace_header_range_finished(&trace, &peer, start, count, 0);
+                        trace.trace_header_range_finished(&peer, start, count, 0);
                         let _ = handles
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
@@ -1308,22 +1268,12 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     .map_or(0, |roots| u32::try_from(roots.len()).unwrap_or(u32::MAX));
                 let (_range, headers, body_sizes, tree_aux_roots) = payload.into_parts();
                 let tree_aux_roots = tree_aux_roots.unwrap_or_default();
-                emit_commit_state(
-                    &trace,
-                    cs_trace::COMMIT_START,
-                    "header_sync_driver",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "commit_header_range");
-                        insert_cs_peer(row, cs_trace::PEER, &peer);
-                        insert_cs_height(row, cs_trace::RANGE_START, start_height);
-                        insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-                        insert_cs_u64(
-                            row,
-                            cs_trace::TREE_AUX_ROOTS_LEN,
-                            u64::from(tree_aux_roots_len),
-                        );
-                        insert_cs_hash(row, cs_trace::HASH, anchor);
-                    },
+                trace.trace_header_range_commit_started(
+                    &peer,
+                    start_height,
+                    count,
+                    tree_aux_roots_len,
+                    anchor,
                 );
                 let started = Instant::now();
                 match state
@@ -1337,23 +1287,13 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     .await
                 {
                     Ok(zakura_state::Response::Committed(tip_hash)) => {
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::COMMIT_FINISH,
-                            "header_sync_driver",
-                            |row| {
-                                insert_cs_str(row, cs_trace::ACTION, "commit_header_range");
-                                insert_cs_peer(row, cs_trace::PEER, &peer);
-                                insert_cs_height(row, cs_trace::RANGE_START, start_height);
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-                                insert_cs_u64(
-                                    row,
-                                    cs_trace::TREE_AUX_ROOTS_LEN,
-                                    u64::from(tree_aux_roots_len),
-                                );
-                                insert_cs_str(row, cs_trace::RESULT, "committed");
-                                insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                            },
+                        trace.trace_header_range_commit_finished(
+                            &peer,
+                            start_height,
+                            count,
+                            Some(tree_aux_roots_len),
+                            "committed",
+                            started,
                         );
                         let tip_height =
                             block::Height(start_height.0.saturating_add(count.saturating_sub(1)));
@@ -1361,8 +1301,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .header_sync
                             .send(header_range_committed(operation, tip_hash))
                             .await;
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             "header_range_committed",
                             None,
                             tip_height,
@@ -1371,22 +1310,16 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         );
                     }
                     Ok(response) => {
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::COMMIT_FINISH,
-                            "header_sync_driver",
-                            |row| {
-                                insert_cs_str(row, cs_trace::ACTION, "commit_header_range");
-                                insert_cs_peer(row, cs_trace::PEER, &peer);
-                                insert_cs_height(row, cs_trace::RANGE_START, start_height);
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-                                insert_cs_str(row, cs_trace::RESULT, "unexpected_response");
-                                insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                            },
+                        trace.trace_header_range_commit_finished(
+                            &peer,
+                            start_height,
+                            count,
+                            None,
+                            "unexpected_response",
+                            started,
                         );
                         warn!(?peer, ?response, "unexpected CommitHeaderRange response");
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             "header_range_commit_failed",
                             Some(&peer),
                             start_height,
@@ -1403,33 +1336,14 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     }
                     Err(error) => {
                         let kind = header_range_commit_failure_kind(error.as_ref());
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::COMMIT_FINISH,
-                            "header_sync_driver",
-                            |row| {
-                                insert_cs_str(row, cs_trace::ACTION, "commit_header_range");
-                                insert_cs_peer(row, cs_trace::PEER, &peer);
-                                insert_cs_height(row, cs_trace::RANGE_START, start_height);
-                                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-                                insert_cs_str(
-                                    row,
-                                    cs_trace::RESULT,
-                                    commit_failure_result_label(kind),
-                                );
-                                insert_cs_hash(row, cs_trace::HASH, anchor);
-                                insert_cs_str(
-                                    row,
-                                    cs_trace::ERROR_VARIANT,
-                                    header_range_commit_error_label(error.as_ref()),
-                                );
-                                insert_cs_str(
-                                    row,
-                                    cs_trace::ERROR_DEBUG,
-                                    &header_range_commit_error_debug(error.as_ref()),
-                                );
-                                insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                            },
+                        trace.trace_header_range_commit_failed(
+                            &peer,
+                            start_height,
+                            count,
+                            anchor,
+                            kind,
+                            error.as_ref(),
+                            started,
                         );
                         debug!(
                             ?peer,
@@ -1439,8 +1353,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             ?error,
                             "Zakura header range commit failed"
                         );
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             "header_range_commit_failed",
                             Some(&peer),
                             start_height,
@@ -1549,26 +1462,10 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 });
             }
             HeaderSyncAction::QueryBestHeaderTip { reanchor_from } => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_START,
-                    "header_sync_driver",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
-                    },
-                );
+                trace.trace_best_header_tip_query_started();
                 match best_durable_header_tip(read_state.clone()).await {
                     Ok(Some((tip_height, tip_hash))) => {
-                        emit_commit_state(
-                            &trace,
-                            cs_trace::STATE_READ_SUCCESS,
-                            "header_sync_driver",
-                            |row| {
-                                insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
-                                insert_cs_height(row, cs_trace::BEST_HEADER_TIP, tip_height);
-                                insert_cs_hash(row, cs_trace::HASH, tip_hash);
-                            },
-                        );
+                        trace.trace_best_header_tip_query_succeeded(tip_height, tip_hash);
                         let _ = handles
                             .header_sync
                             .send(HeaderSyncEvent::BestHeaderTipLoaded {
@@ -1580,8 +1477,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        trace_state_read_error(
-                            &trace,
+                        trace.trace_header_state_read_failed(
                             "query_best_header_tip",
                             None,
                             block::Height(0),
@@ -1639,15 +1535,7 @@ pub(crate) fn publish_header_frontier(
     update.frontier.best_header = Frontier::new(height, hash);
     update.change = change;
     endpoint.publish_sync_frontier_from(update, "header_sync_driver");
-    emit_commit_state(
-        trace,
-        cs_trace::BLOCK_SYNC_NOTIFY_SENT,
-        "header_sync_driver",
-        |row| {
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, hash);
-        },
-    );
+    trace.trace_block_sync_notified(height, hash);
 }
 
 #[cfg(test)]
@@ -1661,15 +1549,7 @@ pub(crate) async fn notify_block_sync_header_tip(
         let _ = block_sync
             .send(BlockSyncEvent::HeaderTipChanged { height, hash })
             .await;
-        emit_commit_state(
-            trace,
-            cs_trace::BLOCK_SYNC_NOTIFY_SENT,
-            "header_sync_driver",
-            |row| {
-                insert_cs_height(row, cs_trace::HEIGHT, height);
-                insert_cs_hash(row, cs_trace::HASH, hash);
-            },
-        );
+        trace.trace_block_sync_notified(height, hash);
     }
 }
 
@@ -1768,24 +1648,14 @@ async fn log_missing_block_bodies<ReadState>(
         + 'static,
     ReadState::Future: Send + 'static,
 {
-    trace_state_read_start(trace, "missing_block_bodies", None, from, limit);
+    trace.trace_header_state_read_started("missing_block_bodies", None, from, limit);
     let started = Instant::now();
     match read_state
         .oneshot(zakura_state::ReadRequest::MissingBlockBodies { from, limit })
         .await
     {
         Ok(zakura_state::ReadResponse::MissingBlockBodies(heights)) => {
-            emit_commit_state(
-                trace,
-                cs_trace::STATE_READ_SUCCESS,
-                "header_sync_driver",
-                |row| {
-                    insert_cs_str(row, cs_trace::ACTION, "missing_block_bodies");
-                    insert_cs_height(row, cs_trace::RANGE_START, from);
-                    insert_cs_u64(row, cs_trace::RANGE_COUNT, heights.len() as u64);
-                    insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-                },
-            );
+            trace.trace_missing_block_bodies_query_succeeded(from, heights.len(), started);
             let first = heights.first().copied();
             let last = heights.last().copied();
             let count = heights.len();
@@ -1799,8 +1669,7 @@ async fn log_missing_block_bodies<ReadState>(
             );
         }
         Ok(response) => {
-            trace_state_read_error(
-                trace,
+            trace.trace_header_state_read_failed(
                 "missing_block_bodies",
                 None,
                 from,
@@ -1811,8 +1680,7 @@ async fn log_missing_block_bodies<ReadState>(
             warn!(?response, "unexpected MissingBlockBodies response")
         }
         Err(error) => {
-            trace_state_read_error(
-                trace,
+            trace.trace_header_state_read_failed(
                 "missing_block_bodies",
                 None,
                 from,
@@ -1990,7 +1858,7 @@ fn validate_context_error_label(error: &zakura_state::ValidateContextError) -> &
     }
 }
 
-fn header_range_commit_error_debug(
+pub(super) fn header_range_commit_error_debug(
     error: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> String {
     error
@@ -2030,16 +1898,7 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
         };
         let height = action.best_tip_height();
         let hash = action.best_tip_hash();
-        emit_commit_state(
-            &trace,
-            cs_trace::CHAIN_TIP_ACTION,
-            "chain_tip_mirror",
-            |row| {
-                insert_cs_str(row, cs_trace::ACTION, tip_action_label(&action));
-                insert_cs_height(row, cs_trace::HEIGHT, height);
-                insert_cs_hash(row, cs_trace::HASH, hash);
-            },
-        );
+        trace.trace_chain_tip_action(&action, height, hash);
 
         let finalized_tip = match read_state
             .clone()
@@ -2057,15 +1916,7 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
             }
         };
         let finalized_height = finalized_tip.map_or(block::Height(0), |(height, _)| height);
-        emit_commit_state(
-            &trace,
-            cs_trace::STATE_READ_SUCCESS,
-            "chain_tip_mirror",
-            |row| {
-                insert_cs_str(row, cs_trace::ACTION, "finalized_tip");
-                insert_cs_height(row, cs_trace::FINALIZED_HEIGHT, finalized_height);
-            },
-        );
+        trace.trace_finalized_tip_read(finalized_height);
         let action_tip = Some((height, hash));
         let verified_block_tip =
             verified_block_tip_from_state(finalized_tip, action_tip, (height, hash));
@@ -2075,17 +1926,7 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
             verified_block_tip,
         );
 
-        emit_commit_state(
-            &trace,
-            cs_trace::FRONTIER_DERIVED,
-            "chain_tip_mirror",
-            |row| {
-                insert_cs_str(row, cs_trace::ACTION, "sync_exchange_frontier_derived");
-                insert_cs_height(row, cs_trace::FINALIZED_HEIGHT, finalized_height);
-                insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, verified_block_tip.0);
-                insert_cs_hash(row, cs_trace::VERIFIED_BLOCK_HASH, verified_block_tip.1);
-            },
-        );
+        trace.trace_mirror_frontier_derived(finalized_height, verified_block_tip);
         if let Some(mut update) = endpoint.current_sync_frontier() {
             let previous_verified_body = update.frontier.verified_body.height;
             if let Some((finalized_height, finalized_hash)) = finalized_tip {
@@ -2099,49 +1940,17 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                 verified_block_tip.0,
             );
             endpoint.publish_sync_frontier_from(update, "chain_tip_mirror");
-            emit_commit_state(
-                &trace,
-                cs_trace::FRONTIER_DERIVED,
-                "chain_tip_mirror",
-                |row| {
-                    let frontiers = BlockSyncFrontiers {
-                        finalized_height,
-                        verified_block_tip: verified_block_tip.0,
-                        verified_block_hash: verified_block_tip.1,
-                    };
-                    insert_cs_str(row, cs_trace::ACTION, "sync_exchange_frontier_sent");
-                    insert_cs_frontiers(row, &frontiers);
-                },
-            );
+            trace.trace_mirror_frontier_sent(finalized_height, verified_block_tip);
         }
 
-        emit_commit_state(
-            &trace,
-            cs_trace::STATE_READ_START,
-            "chain_tip_mirror",
-            |row| {
-                insert_cs_str(row, cs_trace::ACTION, "committed_tip_block");
-                insert_cs_height(row, cs_trace::HEIGHT, height);
-                insert_cs_hash(row, cs_trace::HASH, hash);
-            },
-        );
+        trace.trace_committed_tip_lookup_started(height, hash);
         match read_state
             .clone()
             .oneshot(zakura_state::ReadRequest::Block(hash.into()))
             .await
         {
             Ok(zakura_state::ReadResponse::Block(Some(_))) => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_SUCCESS,
-                    "chain_tip_mirror",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "committed_tip_block");
-                        insert_cs_height(row, cs_trace::HEIGHT, height);
-                        insert_cs_hash(row, cs_trace::HASH, hash);
-                        insert_cs_str(row, cs_trace::RESULT, "found");
-                    },
-                );
+                trace.trace_committed_tip_lookup_finished(height, hash, "found");
                 if header_sync
                     .send(HeaderSyncEvent::FullBlockCommitted { height, hash })
                     .await
@@ -2149,16 +1958,7 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                 {
                     return;
                 }
-                emit_commit_state(
-                    &trace,
-                    cs_trace::REACTOR_EVENT_SENT,
-                    "chain_tip_mirror",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "full_block_committed");
-                        insert_cs_height(row, cs_trace::HEIGHT, height);
-                        insert_cs_hash(row, cs_trace::HASH, hash);
-                    },
-                );
+                trace.trace_full_block_committed(height, hash);
                 match best_durable_header_tip(read_state.clone()).await {
                     Ok(Some((tip_height, tip_hash))) => {
                         if header_sync
@@ -2191,17 +1991,7 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                 }
             }
             Ok(zakura_state::ReadResponse::Block(None)) => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_SUCCESS,
-                    "chain_tip_mirror",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "committed_tip_block");
-                        insert_cs_height(row, cs_trace::HEIGHT, height);
-                        insert_cs_hash(row, cs_trace::HASH, hash);
-                        insert_cs_str(row, cs_trace::RESULT, "missing");
-                    },
-                );
+                trace.trace_committed_tip_lookup_finished(height, hash, "missing");
                 debug!(
                     ?height,
                     ?hash,
@@ -2209,27 +1999,11 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                 );
             }
             Ok(response) => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_ERROR,
-                    "chain_tip_mirror",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "committed_tip_block");
-                        insert_cs_str(row, cs_trace::REASON, "unexpected_response");
-                    },
-                );
+                trace.trace_committed_tip_lookup_failed("unexpected_response");
                 warn!(?response, "unexpected block lookup response")
             }
             Err(error) => {
-                emit_commit_state(
-                    &trace,
-                    cs_trace::STATE_READ_ERROR,
-                    "chain_tip_mirror",
-                    |row| {
-                        insert_cs_str(row, cs_trace::ACTION, "committed_tip_block");
-                        insert_cs_str(row, cs_trace::REASON, &format!("{error}"));
-                    },
-                );
+                trace.trace_committed_tip_lookup_failed(&format!("{error}"));
                 warn!(?error, "failed to mirror Zakura full-block commit")
             }
         }
@@ -2289,240 +2063,4 @@ pub(crate) fn chain_tip_mirror_frontier_change(
         }
         zakura_state::TipAction::Reset { .. } => FrontierChange::VerifiedReset,
     }
-}
-
-fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
-    emit_commit_state(
-        trace,
-        cs_trace::ACTION_RECEIVED,
-        "header_sync_driver",
-        |row| match action {
-            HeaderSyncAction::CommitHeaderRange {
-                operation, payload, ..
-            } => {
-                insert_cs_str(row, cs_trace::ACTION, "commit_header_range");
-                insert_cs_peer(row, cs_trace::PEER, &operation.wire_request.peer);
-                insert_cs_height(row, cs_trace::RANGE_START, payload.range().start());
-                insert_cs_u64(
-                    row,
-                    cs_trace::RANGE_COUNT,
-                    u64::from(payload.range().count()),
-                );
-            }
-            HeaderSyncAction::AuthenticateHeaderRoots {
-                operation, payload, ..
-            } => {
-                insert_cs_str(row, cs_trace::ACTION, "authenticate_header_roots");
-                insert_cs_peer(row, cs_trace::PEER, &operation.wire_request.peer);
-                insert_cs_height(row, cs_trace::RANGE_START, payload.range().start());
-                insert_cs_u64(
-                    row,
-                    cs_trace::RANGE_COUNT,
-                    u64::from(payload.range().count()),
-                );
-            }
-            HeaderSyncAction::QueryBestHeaderTip { .. } => {
-                insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
-            }
-            HeaderSyncAction::QueryHeadersByHeightRange {
-                peer, start, count, ..
-            } => {
-                insert_cs_str(row, cs_trace::ACTION, "query_headers_by_height_range");
-                insert_cs_peer(row, cs_trace::PEER, peer);
-                insert_cs_height(row, cs_trace::RANGE_START, *start);
-                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(*count));
-            }
-            HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
-                insert_cs_str(row, cs_trace::ACTION, "query_missing_block_bodies");
-                insert_cs_height(row, cs_trace::RANGE_START, *from);
-                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(*limit));
-            }
-            HeaderSyncAction::Misbehavior { peer, reason } => {
-                insert_cs_str(row, cs_trace::ACTION, "misbehavior");
-                insert_cs_peer(row, cs_trace::PEER, peer);
-                insert_cs_str(row, cs_trace::REASON, header_misbehavior_label(*reason));
-            }
-            HeaderSyncAction::BodyGaps { from, to } => {
-                insert_cs_str(row, cs_trace::ACTION, "body_gaps");
-                insert_cs_height(row, cs_trace::RANGE_START, *from);
-                insert_cs_u64(
-                    row,
-                    cs_trace::RANGE_COUNT,
-                    u64::from(to.0.saturating_sub(from.0).saturating_add(1)),
-                );
-            }
-            HeaderSyncAction::HeaderAdvanced { height, hash } => {
-                insert_cs_str(row, cs_trace::ACTION, "header_advanced");
-                insert_cs_height(row, cs_trace::HEIGHT, *height);
-                insert_cs_hash(row, cs_trace::HASH, *hash);
-            }
-            HeaderSyncAction::HeaderReanchored { old, new } => {
-                insert_cs_str(row, cs_trace::ACTION, "header_reanchored");
-                insert_cs_height(row, cs_trace::BEST_HEADER_TIP, old.0);
-                insert_cs_height(row, cs_trace::HEIGHT, new.0);
-                insert_cs_hash(row, cs_trace::HASH, new.1);
-            }
-            HeaderSyncAction::NewBlockReceived {
-                peer, height, hash, ..
-            } => {
-                insert_cs_str(row, cs_trace::ACTION, "new_block_received");
-                insert_cs_peer(row, cs_trace::PEER, peer);
-                insert_cs_height(row, cs_trace::HEIGHT, *height);
-                insert_cs_hash(row, cs_trace::HASH, *hash);
-            }
-        },
-    );
-}
-
-fn trace_header_commit_finish(
-    trace: &ZakuraTrace,
-    action: &'static str,
-    peer: &zakura_network::zakura::ZakuraPeerId,
-    height: block::Height,
-    hash: block::Hash,
-    result: &'static str,
-    started: Instant,
-) {
-    emit_commit_state(
-        trace,
-        cs_trace::COMMIT_FINISH,
-        "header_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, action);
-            insert_cs_peer(row, cs_trace::PEER, peer);
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, hash);
-            insert_cs_str(row, cs_trace::RESULT, result);
-            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-        },
-    );
-}
-
-fn trace_header_reactor_event(
-    trace: &ZakuraTrace,
-    action: &'static str,
-    peer: Option<&zakura_network::zakura::ZakuraPeerId>,
-    height: block::Height,
-    hash: block::Hash,
-    count: u32,
-) {
-    emit_commit_state(
-        trace,
-        cs_trace::REACTOR_EVENT_SENT,
-        "header_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, action);
-            if let Some(peer) = peer {
-                insert_cs_peer(row, cs_trace::PEER, peer);
-            }
-            insert_cs_height(row, cs_trace::HEIGHT, height);
-            insert_cs_hash(row, cs_trace::HASH, hash);
-            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-        },
-    );
-}
-
-fn trace_header_range_finished(
-    trace: &ZakuraTrace,
-    peer: &zakura_network::zakura::ZakuraPeerId,
-    start: block::Height,
-    requested_count: u32,
-    returned_count: u32,
-) {
-    emit_commit_state(
-        trace,
-        cs_trace::REACTOR_EVENT_SENT,
-        "header_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, "header_range_response_finished");
-            insert_cs_peer(row, cs_trace::PEER, peer);
-            insert_cs_height(row, cs_trace::RANGE_START, start);
-            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(returned_count));
-            insert_cs_u64(row, "requested_count", u64::from(requested_count));
-        },
-    );
-}
-
-fn trace_state_read_start(
-    trace: &ZakuraTrace,
-    action: &'static str,
-    peer: Option<&zakura_network::zakura::ZakuraPeerId>,
-    start: block::Height,
-    count: u32,
-) {
-    emit_commit_state(
-        trace,
-        cs_trace::STATE_READ_START,
-        "header_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, action);
-            if let Some(peer) = peer {
-                insert_cs_peer(row, cs_trace::PEER, peer);
-            }
-            insert_cs_height(row, cs_trace::RANGE_START, start);
-            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-        },
-    );
-}
-
-fn trace_state_read_error(
-    trace: &ZakuraTrace,
-    action: &'static str,
-    peer: Option<&zakura_network::zakura::ZakuraPeerId>,
-    start: block::Height,
-    count: u32,
-    reason: &str,
-    started: Instant,
-) {
-    emit_commit_state(
-        trace,
-        cs_trace::STATE_READ_ERROR,
-        "header_sync_driver",
-        |row| {
-            insert_cs_str(row, cs_trace::ACTION, action);
-            if let Some(peer) = peer {
-                insert_cs_peer(row, cs_trace::PEER, peer);
-            }
-            insert_cs_height(row, cs_trace::RANGE_START, start);
-            insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(count));
-            insert_cs_str(row, cs_trace::REASON, reason);
-            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
-        },
-    );
-}
-
-fn commit_failure_result_label(kind: HeaderSyncCommitFailureKind) -> &'static str {
-    match kind {
-        HeaderSyncCommitFailureKind::InvalidPeerRange => "invalid_peer_range",
-        HeaderSyncCommitFailureKind::UnknownAnchor => "unknown_anchor",
-        HeaderSyncCommitFailureKind::Local => "local_error",
-    }
-}
-
-fn header_misbehavior_label(reason: zakura_network::zakura::HeaderSyncMisbehavior) -> &'static str {
-    match reason {
-        zakura_network::zakura::HeaderSyncMisbehavior::InvalidStatus => "invalid_status",
-        zakura_network::zakura::HeaderSyncMisbehavior::UnsolicitedHeaders => "unsolicited_headers",
-        zakura_network::zakura::HeaderSyncMisbehavior::EmptyHeaders => "empty_headers",
-        zakura_network::zakura::HeaderSyncMisbehavior::ResponseTooLong => "response_too_long",
-        zakura_network::zakura::HeaderSyncMisbehavior::InvalidRange => "invalid_range",
-        zakura_network::zakura::HeaderSyncMisbehavior::MalformedMessage => "malformed_message",
-        zakura_network::zakura::HeaderSyncMisbehavior::StatusSpam => "status_spam",
-        zakura_network::zakura::HeaderSyncMisbehavior::NewBlockSpam => "new_block_spam",
-        zakura_network::zakura::HeaderSyncMisbehavior::GetHeadersSpam => "get_headers_spam",
-        zakura_network::zakura::HeaderSyncMisbehavior::GetHeadersTooLong => "get_headers_too_long",
-        zakura_network::zakura::HeaderSyncMisbehavior::UnknownPeer => "unknown_peer",
-        zakura_network::zakura::HeaderSyncMisbehavior::InvalidNewBlock => "invalid_new_block",
-    }
-}
-
-fn tip_action_label(action: &zakura_state::TipAction) -> &'static str {
-    match action {
-        zakura_state::TipAction::Grow { .. } => "grow",
-        zakura_state::TipAction::Reset { .. } => "reset",
-    }
-}
-
-fn elapsed_ms(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

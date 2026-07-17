@@ -48,8 +48,8 @@ pub(crate) enum RepairValidationError {
 }
 
 struct RepairInput {
-    artifact_handoff: Height,
-    artifact_handoff_hash: block::Hash,
+    artifact_last_checkpoint: Height,
+    artifact_last_checkpoint_hash: block::Hash,
     artifact_sprout_root: sprout::tree::Root,
     artifact: Artifact,
 }
@@ -112,8 +112,8 @@ impl DiskFormatUpgrade for Upgrade {
         repair_records(
             db,
             handoff,
-            input.artifact_handoff,
-            input.artifact_handoff_hash,
+            input.artifact_last_checkpoint,
+            input.artifact_last_checkpoint_hash,
             input.artifact_sprout_root,
             &input.artifact,
             cancel_receiver,
@@ -136,7 +136,7 @@ fn repair_input(
 
     let frontiers = embedded_mainnet_final_frontiers()
         .map_err(|error| RepairValidationError::InvalidFrontier(error.to_string()))?;
-    let artifact_handoff_hash = db
+    let artifact_last_checkpoint_hash = db
         .network()
         .checkpoint_list()
         .hash(frontiers.height)
@@ -146,7 +146,7 @@ fn repair_input(
     let artifact = embedded_mainnet()?;
     Ok((
         frontiers.height,
-        artifact_handoff_hash,
+        artifact_last_checkpoint_hash,
         frontiers.sprout.root(),
         artifact,
     ))
@@ -156,11 +156,11 @@ fn validated_repair_input(
     db: &ZakuraDb,
     marker: Height,
 ) -> Result<RepairInput, RepairValidationError> {
-    let (artifact_handoff, artifact_handoff_hash, artifact_sprout_root, artifact) =
+    let (artifact_last_checkpoint, artifact_last_checkpoint_hash, artifact_sprout_root, artifact) =
         repair_input(db)?;
     artifact.validate_last_checkpoint(
-        artifact_handoff,
-        artifact_handoff_hash,
+        artifact_last_checkpoint,
+        artifact_last_checkpoint_hash,
         artifact_sprout_root,
     )?;
 
@@ -168,7 +168,7 @@ fn validated_repair_input(
         .finalized_tip_height()
         .ok_or(RepairValidationError::MissingFinalizedTip)?;
     if tip >= marker {
-        let marker_hash = expected_marker_hash(db, marker, artifact_handoff, artifact_handoff_hash)
+        let marker_hash = expected_marker_hash(db, marker, artifact_last_checkpoint, artifact_last_checkpoint_hash)
             .ok_or(RepairValidationError::MissingMarkerCheckpoint { height: marker })?;
         if db.hash(marker) != Some(marker_hash) {
             return Err(RepairValidationError::MarkerHashMismatch { height: marker });
@@ -177,8 +177,8 @@ fn validated_repair_input(
     artifact.validate_canonical_through(tip, |height| db.hash(height), |hash| db.height(hash))?;
 
     Ok(RepairInput {
-        artifact_handoff,
-        artifact_handoff_hash,
+        artifact_last_checkpoint,
+        artifact_last_checkpoint_hash,
         artifact_sprout_root,
         artifact,
     })

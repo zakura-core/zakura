@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Database format upgrades now finish before startup exposes the finalized
+  state database; only configured periodic format checks continue in the
+  background.
 - Preserve Sprout note-commitment history during fresh verified-commitment-tree
   fast sync, so later JoinSplit spends can use historical anchors.
 

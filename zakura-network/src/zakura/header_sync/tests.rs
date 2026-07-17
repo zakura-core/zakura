@@ -5,8 +5,8 @@ use super::{
     events::*,
     reactor::*,
     state::{
-        OutstandingPhase, OutstandingRange, RangePriority, RangePurpose, RangeRequest,
-        VctRootRepair, VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME,
+        HeaderSyncCore, OutstandingPhase, OutstandingRange, RangePriority, RangePurpose,
+        RangeRequest, VctRootRepair, VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME,
     },
     validation::*,
     wire::*,
@@ -539,6 +539,46 @@ fn startup_with_timeout(
     let mut startup = startup_for(network, anchor, None);
     startup.request_timeout = request_timeout;
     startup
+}
+
+#[test]
+fn startup_rejects_anchor_above_verified_block_tip() {
+    let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
+    let mut startup = startup_for(
+        network,
+        (block::Height(3), checkpoint_hash),
+        Some((block::Height(3), checkpoint_hash)),
+    );
+    startup.frontiers.verified_block_tip = block::Height(0);
+
+    assert!(matches!(
+        HeaderSyncCore::new(&startup),
+        Err(HeaderSyncStartError::AnchorAboveVerifiedBlockTip {
+            anchor_height: block::Height(3),
+            verified_block_tip: block::Height(0),
+        })
+    ));
+}
+
+#[test]
+fn startup_uses_verified_block_tip_when_stored_header_tip_is_stale() {
+    let network = regtest_network();
+    let verified_tip = block::Height(5);
+    let verified_hash = block::Hash([5; 32]);
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(3), block::Hash([3; 32]))),
+    );
+    startup.frontiers.verified_block_tip = verified_tip;
+    startup.frontiers.verified_block_hash = verified_hash;
+
+    let state = HeaderSyncCore::new(&startup).expect("forward-only startup is coherent");
+
+    assert_eq!(
+        (state.best_header_tip, state.best_header_hash),
+        (verified_tip, verified_hash)
+    );
 }
 
 #[tokio::test]
@@ -2524,95 +2564,6 @@ async fn scheduler_fills_v7_outstanding_request_slots() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_uses_inflight_slots_and_matches_reverse_response_ids() {
-    let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
-    let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), checkpoint_hash),
-        Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peer_id = peer(83);
-    let (send, mut recv) = crate::zakura::framed_channel(32);
-    let session = HeaderSyncPeerSession::from_parts_with_direction(
-        peer_id.clone(),
-        ServicePeerDirection::Inbound,
-        send,
-        CancellationToken::new(),
-    );
-    fixture
-        .handle
-        .send(HeaderSyncEvent::PeerConnected(session))
-        .await
-        .unwrap();
-    advertise_tip(
-        &fixture,
-        peer_id.clone(),
-        block::Height(0),
-        block::Height(8),
-        DEFAULT_HS_RANGE,
-        2,
-    )
-    .await;
-
-    let mut starts = HashSet::new();
-    while starts.len() < 2 {
-        if let HeaderSyncAction::SendMessage {
-            peer,
-            msg: HeaderSyncMessage::GetHeaders { start_height, .. },
-            ..
-        } = next_non_query_action(&mut fixture.actions).await
-        {
-            assert_eq!(peer, peer_id);
-            starts.insert(start_height);
-        }
-    }
-    assert_eq!(starts, HashSet::from([block::Height(1), block::Height(4)]));
-
-    let mut request_ids = HashMap::new();
-    while request_ids.len() < 2 {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
-            .await
-            .expect("v7 outbound frame arrives")
-            .expect("v7 stream stays open");
-        let (message, request_id) =
-            HeaderSyncMessage::decode_frame(frame, HeaderSyncDecodeContext::control())
-                .expect("v7 outbound frame decodes");
-        if let HeaderSyncMessage::GetHeaders { start_height, .. } = message {
-            request_ids.insert(
-                start_height,
-                request_id.expect("v7 GetHeaders carries request id"),
-            );
-        }
-    }
-    let backward_id = request_ids[&block::Height(1)];
-
-    fixture
-        .handle
-        .send(HeaderSyncEvent::WireHeaders {
-            peer: peer_id.clone(),
-            session_id: 0,
-            request_id: backward_id,
-            headers: vec![mainnet_header(&BLOCK_MAINNET_1_BYTES); 4],
-            body_sizes: vec![0; 4],
-            tree_aux_roots: roots_from_height(block::Height(1), 4),
-        })
-        .await
-        .unwrap();
-
-    loop {
-        match next_non_query_action(&mut fixture.actions).await {
-            HeaderSyncAction::Misbehavior { peer, reason } => {
-                assert_eq!(peer, peer_id);
-                assert_eq!(reason, HeaderSyncMisbehavior::ResponseTooLong);
-                break;
-            }
-            HeaderSyncAction::SendMessage { .. } => {}
-            action => panic!("unexpected action for reverse v7 response: {action:?}"),
-        }
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn work_queue_assigns_each_forward_range_to_one_peer() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
@@ -2770,7 +2721,7 @@ async fn work_queue_splits_large_ranges_without_duplicate_ownership() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_creates_checkpoint_forward_before_backward_ranges() {
+async fn scheduler_starts_forward_work_above_checkpoint_anchor() {
     let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
     let mut fixture = spawn_test_reactor(startup_for(
         network,
@@ -2809,7 +2760,7 @@ async fn scheduler_creates_checkpoint_forward_before_backward_ranges() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_creates_backward_checkpoint_terminating_ranges() {
+async fn scheduler_does_not_backfill_below_checkpoint_anchor() {
     let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
     let mut fixture = spawn_test_reactor(startup_for(
         network,
@@ -2829,22 +2780,22 @@ async fn scheduler_creates_backward_checkpoint_terminating_ranges() {
     )
     .await;
 
-    loop {
-        if let HeaderSyncAction::SendMessage {
-            msg:
-                HeaderSyncMessage::GetHeaders {
-                    start_height,
-                    count,
-                    want_tree_aux_roots: true,
-                },
-            ..
-        } = next_non_query_action(&mut fixture.actions).await
-        {
-            assert_eq!(start_height, block::Height(1));
-            assert_eq!(count, 3);
-            break;
+    let unexpected_request = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+        loop {
+            if let HeaderSyncAction::SendMessage {
+                msg: HeaderSyncMessage::GetHeaders { start_height, .. },
+                ..
+            } = next_non_query_action(&mut fixture.actions).await
+            {
+                break start_height;
+            }
         }
-    }
+    })
+    .await;
+    assert!(
+        unexpected_request.is_err(),
+        "forward-only header sync must not request ranges below its startup base"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -6629,105 +6580,6 @@ async fn truncated_finalized_backfill_commits_valid_prefix_and_requeues_suffix()
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn backward_checkpoint_backfill_accepts_linking_run_as_finalized() {
-    let headers = [
-        mainnet_header(&BLOCK_MAINNET_1_BYTES),
-        mainnet_header(&BLOCK_MAINNET_2_BYTES),
-        mainnet_header(&BLOCK_MAINNET_3_BYTES),
-    ];
-    let checkpoint_hash = block::Hash::from(headers[2].as_ref());
-    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
-    let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), checkpoint_hash),
-        Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peer_id = peer(45);
-
-    connect_peer(&fixture, peer_id.clone()).await;
-    advertise_tip(
-        &fixture,
-        peer_id.clone(),
-        block::Height(0),
-        block::Height(3),
-        DEFAULT_HS_RANGE,
-        1,
-    )
-    .await;
-    let request_id = next_get_headers_request_id(&mut fixture.actions).await;
-
-    send_headers(
-        &fixture,
-        &peer_id,
-        request_id,
-        headers_message(headers.to_vec()),
-    )
-    .await;
-
-    match next_non_query_action(&mut fixture.actions).await {
-        HeaderSyncAction::CommitHeaderRange {
-            peer,
-            start_height,
-            headers,
-            finalized,
-            ..
-        } => {
-            assert_eq!(peer, peer_id);
-            assert_eq!(start_height, block::Height(1));
-            assert_eq!(headers.len(), 3);
-            assert!(finalized);
-        }
-        action => panic!("unexpected action: {action:?}"),
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn checkpoint_backfill_rejects_non_contiguous_run_before_commit() {
-    let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
-    let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), checkpoint_hash),
-        Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peer_id = peer(10);
-
-    connect_peer(&fixture, peer_id.clone()).await;
-    advertise_tip(
-        &fixture,
-        peer_id.clone(),
-        block::Height(0),
-        block::Height(3),
-        DEFAULT_HS_RANGE,
-        1,
-    )
-    .await;
-    let request_id = next_get_headers_request_id(&mut fixture.actions).await;
-
-    send_headers(
-        &fixture,
-        &peer_id,
-        request_id,
-        headers_message_from(
-            block::Height(1),
-            vec![
-                mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
-                mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
-                mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
-            ],
-        ),
-    )
-    .await;
-
-    match next_non_query_action(&mut fixture.actions).await {
-        HeaderSyncAction::Misbehavior { peer, reason } => {
-            assert_eq!(peer, peer_id);
-            assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
-        }
-        action => panic!("unexpected action: {action:?}"),
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn header_response_that_does_not_link_to_anchor_is_misbehavior_before_commit() {
     let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
@@ -6755,52 +6607,6 @@ async fn header_response_that_does_not_link_to_anchor_is_misbehavior_before_comm
             block::Height(1),
             vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)],
         ),
-    )
-    .await;
-
-    match next_non_query_action(&mut fixture.actions).await {
-        HeaderSyncAction::Misbehavior { peer, reason } => {
-            assert_eq!(peer, peer_id);
-            assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
-        }
-        action => panic!("unexpected action: {action:?}"),
-    }
-    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn checkpoint_backfill_rejects_checkpoint_hash_mismatch_before_commit() {
-    let headers = [
-        mainnet_header(&BLOCK_MAINNET_1_BYTES),
-        mainnet_header(&BLOCK_MAINNET_2_BYTES),
-        mainnet_header(&BLOCK_MAINNET_3_BYTES),
-    ];
-    let divergent_checkpoint_hash = block::Hash::from(headers[0].as_ref());
-    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), divergent_checkpoint_hash);
-    let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), divergent_checkpoint_hash),
-        Some((block::Height(3), divergent_checkpoint_hash)),
-    ));
-    let peer_id = peer(46);
-
-    connect_peer(&fixture, peer_id.clone()).await;
-    advertise_tip(
-        &fixture,
-        peer_id.clone(),
-        block::Height(0),
-        block::Height(3),
-        DEFAULT_HS_RANGE,
-        1,
-    )
-    .await;
-    let request_id = next_get_headers_request_id(&mut fixture.actions).await;
-
-    send_headers(
-        &fixture,
-        &peer_id,
-        request_id,
-        headers_message(headers.to_vec()),
     )
     .await;
 

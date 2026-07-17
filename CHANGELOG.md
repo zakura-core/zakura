@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Header sync now schedules only forward ranges from the durable verified block
+  tip. Startup rejects configured anchors above that base, and no longer
+  backfills headers below a checkpoint anchor.
 - Block-sync now keeps its apply backlog in serialized wire form and decodes
   bodies only for the verifier submission window, so decoded memory is bounded
   regardless of backlog depth. Admission accounting charges serialized pools at

@@ -1057,9 +1057,6 @@ impl HeaderSyncReactor {
                 })
             })
             .cloned();
-        let completed_backward = self.state.pending_commits.values().any(|range| {
-            range.priority == RangePriority::Backward && range.is_within(start_height, tip_height)
-        });
         let completed_ranges: Vec<_> = self
             .state
             .pending_commits
@@ -1101,10 +1098,6 @@ impl HeaderSyncReactor {
             self.publish_best_tip(tip_height, tip_hash, BestTipPublication::Advanced)
                 .await;
         }
-        if completed_backward {
-            self.state.backward_frontier = Some((tip_height, tip_hash));
-        }
-        self.drain_buffered_with_permit(None).await;
         self.drain_buffered_with_permit(None).await;
         self.notify_body_gaps().await;
         self.schedule().await;
@@ -1923,19 +1916,6 @@ impl HeaderSyncReactor {
             }
         }
 
-        if !self
-            .state
-            .pending_commits
-            .values()
-            .any(|range| range.priority == RangePriority::Backward)
-        {
-            let (height, hash) = self.state.backward_frontier?;
-            let start = next_height(height)?;
-            let key = (RangePriority::Backward, start);
-            if self.state.buffered.contains_key(&key) {
-                return Some((key, hash));
-            }
-        }
         None
     }
 
@@ -2176,7 +2156,6 @@ impl HeaderSyncReactor {
         }
 
         self.state.refresh_forward_range(&self.startup);
-        self.state.refresh_backward_range(&self.startup);
 
         if self.schedule_vct_repair() {
             return;

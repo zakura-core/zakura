@@ -106,6 +106,24 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   submitted to one blocking task
   ([#150](https://github.com/zakura-core/zakura/pull/150)).
 
+### Security
+
+- Validate transparent spends without cloning the block's spent UTXO set for
+  every transaction, removing quadratic work that let a specially crafted
+  block stall block validation for nearly a minute on fast hardware
+  ([GHSA-4g24-549m-hp75](https://github.com/zakura-core/zakura/security/advisories/GHSA-4g24-549m-hp75)).
+- Attribute transactions pushed directly by a peer to that peer when they fail
+  verification, so peers sending consensus-invalid transactions — including
+  transactions with invalid proofs that poison batched proof verification and
+  force repeated, expensive fallback verification — are now misbehavior-scored
+  and banned instead of degrading block validation unidentified
+  ([GHSA-g7c4-2w6c-cr3r](https://github.com/zakura-core/zakura/security/advisories/GHSA-g7c4-2w6c-cr3r)).
+- Reserve the serialized block header, transaction count, and maximum
+  pool-modified coinbase size when selecting mempool transactions for
+  `getblocktemplate`, so an adversary can no longer provoke templates that
+  violate the consensus block size limit and stall mining on a targeted node
+  ([GHSA-95m2-vx53-v2jw](https://github.com/zakura-core/zakura/security/advisories/GHSA-95m2-vx53-v2jw)).
+
 ## [1.0.0] - 2026-07-15
 
 Initial release of Zakura.

@@ -14,13 +14,16 @@ use rand::{
 };
 
 use zakura_chain::{
-    amount::Amount,
+    amount::{self, Amount},
     block::{Height, MAX_BLOCK_BYTES},
     parameters::Network,
+    serialization::{CompactSizeMessage, TrustedPreallocate, ZcashDeserializeInto, ZcashSerialize},
     transaction::{self, zip317::BLOCK_UNPAID_ACTION_LIMIT, VerifiedUnminedTx},
+    work::equihash::Solution,
 };
 use zakura_consensus::MAX_BLOCK_SIGOPS;
 use zakura_node_services::mempool::TransactionDependencies;
+use zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN;
 
 use crate::methods::types::transaction::TransactionTemplate;
 
@@ -40,12 +43,61 @@ type SelectedMempoolTx = (InBlockTxDependenciesDepth, VerifiedUnminedTx);
 #[cfg(not(test))]
 type SelectedMempoolTx = VerifiedUnminedTx;
 
+/// The serialized size of the block header nonce.
+const BLOCK_HEADER_NONCE_BYTES: usize = 32;
+
+/// Returns the block header and transaction-count bytes reserved by a template.
+fn block_template_overhead_bytes(net: &Network) -> usize {
+    let solution_bytes = Solution::for_proposal_for_network(net).zcash_serialized_size();
+    let header_bytes = Solution::INPUT_LENGTH + BLOCK_HEADER_NONCE_BYTES + solution_bytes;
+
+    // Reserve the largest CompactSize prefix possible for a valid block's
+    // transaction count, so the budget does not need to change during selection.
+    let max_transaction_count =
+        usize::try_from(<transaction::Transaction as TrustedPreallocate>::max_allocation())
+            .expect("the maximum block transaction count fits in memory");
+    let transaction_count_bytes = CompactSizeMessage::try_from(max_transaction_count)
+        .expect("the maximum block transaction count fits in a network message")
+        .zcash_serialized_size();
+
+    header_bytes + transaction_count_bytes
+}
+
+/// Returns the maximum serialized coinbase size after a pool appends its tag.
+fn max_coinbase_bytes(fake_coinbase: &TransactionTemplate<amount::NegativeOrZero>) -> usize {
+    let coinbase: transaction::Transaction = fake_coinbase
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("a generated coinbase template is structurally valid");
+    let coinbase_script_len = coinbase
+        .inputs()
+        .first()
+        .and_then(|input| input.coinbase_script())
+        .expect("a generated coinbase has one canonical coinbase input")
+        .len();
+
+    // Coinbase scripts are at most 100 bytes, so appending tag bytes does not
+    // change the one-byte CompactSize prefix.
+    let remaining_coinbase_script_bytes = MAX_COINBASE_SCRIPT_LEN
+        .checked_sub(coinbase_script_len)
+        .expect("a generated coinbase script is within the consensus limit");
+
+    fake_coinbase
+        .data
+        .as_ref()
+        .len()
+        .checked_add(remaining_coinbase_script_bytes)
+        .expect("the maximum serialized coinbase size fits in memory")
+}
+
 /// Selects mempool transactions for block production according to [ZIP-317],
 /// using a fake coinbase transaction and the mempool.
 ///
-/// The fake coinbase transaction's serialized size and sigops must be at least as large
-/// as the real coinbase transaction. (The real coinbase transaction depends on the total
-/// fees from the transactions returned by this function.)
+/// The reserved maximum coinbase transaction size and the fake coinbase sigops
+/// must be at least as large as the real coinbase transaction. (The real
+/// coinbase transaction depends on the total fees from the transactions
+/// returned by this function.)
 ///
 /// Returns selected transactions from `mempool_txs`.
 ///
@@ -79,12 +131,17 @@ pub fn select_mempool_transactions(
     let mut selected_txs = Vec::new();
 
     // Set up limit tracking
-    let mut remaining_block_bytes: usize = MAX_BLOCK_BYTES.try_into().expect("fits in memory");
+    let max_block_bytes: usize = MAX_BLOCK_BYTES.try_into().expect("fits in memory");
+    let reserved_block_bytes = block_template_overhead_bytes(net)
+        .checked_add(max_coinbase_bytes(&fake_coinbase_tx))
+        .expect("block template byte reservation fits in memory");
+    let mut remaining_block_bytes = max_block_bytes
+        .checked_sub(reserved_block_bytes)
+        .expect("the fake coinbase and block overhead fit in a block");
     let mut remaining_block_sigops = MAX_BLOCK_SIGOPS;
     let mut remaining_block_unpaid_actions: u32 = BLOCK_UNPAID_ACTION_LIMIT;
 
-    // Adjust the limits based on the coinbase transaction
-    remaining_block_bytes -= fake_coinbase_tx.data.as_ref().len();
+    // Adjust the sigop limit based on the coinbase transaction.
     remaining_block_sigops -= fake_coinbase_tx.sigops;
 
     // > Repeat while there is any candidate transaction

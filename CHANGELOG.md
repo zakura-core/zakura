@@ -26,9 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   Mainnet databases that previously ran v2 p2p + fast mode require repair at
   startup from a reviewed trusted artifact, snapshot redownload, or genesis
   resync.
-  - Fixed early-chain header validation to use the consensus proof-of-work limit
+- Fixed early-chain header validation to use the consensus proof-of-work limit
   at height 17.
-
 
 ### Changed
 

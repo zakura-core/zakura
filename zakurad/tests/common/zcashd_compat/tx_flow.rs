@@ -1,6 +1,6 @@
 //! Transaction flow test bodies for the zcashd-compat integration test suite.
 
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use color_eyre::eyre::{eyre, Result};
 use serde::Deserialize;
@@ -15,6 +15,7 @@ use zakura_rpc::{
     client::{BlockTemplateResponse, BlockTemplateTimeSource},
     proposal_block_from_template,
 };
+use zakura_test::net::random_known_port;
 
 use super::{
     config::{read_test_network_kind, MINER_PRIV_WIF},
@@ -24,6 +25,8 @@ use super::{
 use crate::common::regtest::MiningRpcMethods;
 
 const OVERSIZED_TRANSACTION_LIMIT: u64 = 1;
+const OVERSIZED_REJECTION_METRIC: &str = "mempool_rejected_transactions_total";
+const PEER_MISBEHAVIOR_FLUSH_WAIT: Duration = Duration::from_secs(40);
 
 #[derive(Deserialize)]
 struct FundRawTransactionResponse {
@@ -111,8 +114,125 @@ async fn signed_transparent_transaction(setup: &ZcashdCompatSetup) -> Result<(St
     Ok((signed.hex, txid))
 }
 
+async fn single_zcashd_peer(setup: &ZcashdCompatSetup) -> Result<serde_json::Value> {
+    let mut peers: Vec<serde_json::Value> = setup
+        .zcashd_client
+        .json_result_from_call("getpeerinfo", "[]")
+        .await
+        .map_err(|error| eyre!("zcashd getpeerinfo: {error}"))?;
+
+    if peers.len() != 1 {
+        return Err(eyre!(
+            "the sidecar must have exactly one Zakura peer, got: {peers:?}"
+        ));
+    }
+
+    Ok(peers.pop().expect("peer count was checked"))
+}
+
+fn peer_connection_identity(peer: &serde_json::Value) -> Result<(u64, u64, String)> {
+    if peer.get("inbound").and_then(serde_json::Value::as_bool) != Some(false) {
+        return Err(eyre!(
+            "the sidecar connection to Zakura must be outbound: {peer}"
+        ));
+    }
+
+    let id = peer
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| eyre!("zcashd peer is missing its connection id: {peer}"))?;
+    let connected_at = peer
+        .get("conntime")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| eyre!("zcashd peer is missing its connection time: {peer}"))?;
+    let addr = peer
+        .get("addr")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| eyre!("zcashd peer is missing its address: {peer}"))?
+        .to_string();
+
+    Ok((id, connected_at, addr))
+}
+
+async fn single_zakura_peer_addr(setup: &ZcashdCompatSetup) -> Result<String> {
+    let mut peers: Vec<serde_json::Value> = setup
+        .zakura_client
+        .json_result_from_call("getpeerinfo", "[]")
+        .await
+        .map_err(|error| eyre!("Zakura getpeerinfo: {error}"))?;
+
+    if peers.len() != 1 {
+        return Err(eyre!(
+            "Zakura must have exactly one sidecar peer, got: {peers:?}"
+        ));
+    }
+
+    let peer = peers.pop().expect("peer count was checked");
+    if peer.get("inbound").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(eyre!("the sidecar must be inbound to Zakura: {peer}"));
+    }
+
+    peer.get("addr")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| eyre!("Zakura peer is missing its address: {peer}"))
+}
+
+async fn oversized_rejection_count(
+    client: &reqwest::Client,
+    metrics_addr: SocketAddr,
+) -> Result<f64> {
+    let body = client
+        .get(format!("http://{metrics_addr}"))
+        .send()
+        .await
+        .map_err(|error| eyre!("fetching Zakura metrics: {error}"))?
+        .error_for_status()
+        .map_err(|error| eyre!("Zakura metrics response: {error}"))?
+        .text()
+        .await
+        .map_err(|error| eyre!("reading Zakura metrics: {error}"))?;
+
+    Ok(body
+        .lines()
+        .find_map(|line| {
+            if line.starts_with(OVERSIZED_REJECTION_METRIC)
+                && line.contains("reason=\"transaction_too_large\"")
+            {
+                line.split_whitespace().last()?.parse::<f64>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0.0))
+}
+
+async fn wait_for_oversized_rejection(
+    client: &reqwest::Client,
+    metrics_addr: SocketAddr,
+    previous_count: f64,
+) -> Result<()> {
+    let mut last_seen = previous_count;
+
+    for attempt in 1..=60u32 {
+        last_seen = oversized_rejection_count(client, metrics_addr).await?;
+        if last_seen >= previous_count + 1.0 {
+            return Ok(());
+        }
+
+        if attempt < 60 {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    Err(eyre!(
+        "Zakura did not record an oversized peer transaction within 60 s (before: {previous_count}, last seen: {last_seen})"
+    ))
+}
+
 /// Submits a valid transparent transaction larger than Zakura's configured
-/// mempool limit, then proves the same transaction is accepted inside a block.
+/// mempool limit over P2P, keeps the peer connected, then proves the same
+/// transaction is accepted inside a block.
 pub async fn oversized_transparent_tx_rejected() -> Result<()> {
     if zakura_skip_zcashd_compat_tests() {
         return Ok(());
@@ -122,8 +242,10 @@ pub async fn oversized_transparent_tx_rejected() -> Result<()> {
         return Ok(());
     }
 
+    let metrics_addr = SocketAddr::from(([127, 0, 0, 1], random_known_port()));
     let setup = spawn_zakurad_with_zcashd_compat_config(|config| {
         config.mempool.max_transaction_bytes = OVERSIZED_TRANSACTION_LIMIT;
+        config.metrics.endpoint_addr = Some(metrics_addr);
     })
     .await?;
 
@@ -131,21 +253,89 @@ pub async fn oversized_transparent_tx_rejected() -> Result<()> {
     wait_for_zcashd_height(&setup.zcashd_client, 110).await?;
     import_miner_key(&setup).await?;
 
-    let (raw, txid) = signed_transparent_transaction(&setup).await?;
-    let raw_bytes = hex::decode(&raw)
+    let (p2p_raw, p2p_txid) = signed_transparent_transaction(&setup).await?;
+    let p2p_raw_bytes = hex::decode(&p2p_raw)
         .map_err(|error| eyre!("zcashd returned invalid transaction hex: {error}"))?;
-    let transaction_bytes = raw_bytes.len();
-    let transaction_bytes_u64 = u64::try_from(transaction_bytes)
+    let p2p_transaction_bytes = p2p_raw_bytes.len();
+    let p2p_transaction_bytes_u64 = u64::try_from(p2p_transaction_bytes)
         .expect("transaction length fits in u64 on supported platforms");
     assert!(
-        transaction_bytes_u64 > OVERSIZED_TRANSACTION_LIMIT,
+        p2p_transaction_bytes_u64 > OVERSIZED_TRANSACTION_LIMIT,
         "test transaction must exceed the configured limit"
+    );
+
+    let peer_identity = peer_connection_identity(&single_zcashd_peer(&setup).await?)?;
+    let zakura_peer_addr = single_zakura_peer_addr(&setup).await?;
+    let metrics_client = reqwest::Client::new();
+    let rejection_count = oversized_rejection_count(&metrics_client, metrics_addr).await?;
+    let relayed_txid: String = setup
+        .zcashd_client
+        .json_result_from_call(
+            "sendrawtransaction",
+            serde_json::json!([&p2p_raw]).to_string(),
+        )
+        .await
+        .map_err(|error| eyre!("zcashd sendrawtransaction: {error}"))?;
+    assert_eq!(relayed_txid, p2p_txid, "zcashd returned an unexpected txid");
+
+    let zcashd_mempool: Vec<String> = setup
+        .zcashd_client
+        .json_result_from_call("getrawmempool", "[]")
+        .await
+        .map_err(|error| eyre!("zcashd getrawmempool: {error}"))?;
+    assert!(
+        zcashd_mempool.iter().any(|entry| entry == &p2p_txid),
+        "zcashd must accept the transaction before relaying it"
+    );
+
+    wait_for_oversized_rejection(&metrics_client, metrics_addr, rejection_count).await?;
+    assert_eq!(
+        peer_connection_identity(&single_zcashd_peer(&setup).await?)?,
+        peer_identity,
+        "Zakura must not disconnect the peer that relayed the oversized transaction"
+    );
+
+    let mempool: Vec<String> = setup
+        .zakura_client
+        .json_result_from_call("getrawmempool", "[]")
+        .await
+        .map_err(|error| eyre!("Zakura getrawmempool: {error}"))?;
+    assert!(
+        !mempool.iter().any(|entry| entry == &p2p_txid),
+        "oversized peer transaction must not enter Zakura's mempool"
+    );
+
+    // Mempool misbehavior updates are applied to the address book in 30-second batches.
+    sleep(PEER_MISBEHAVIOR_FLUSH_WAIT).await;
+    assert_eq!(
+        peer_connection_identity(&single_zcashd_peer(&setup).await?)?,
+        peer_identity,
+        "Zakura must not ban or reconnect the peer after the misbehavior flush"
+    );
+    assert_eq!(
+        single_zakura_peer_addr(&setup).await?,
+        zakura_peer_addr,
+        "Zakura must retain the same sidecar connection after the policy rejection"
+    );
+
+    let (rpc_raw, _rpc_txid) = signed_transparent_transaction(&setup).await?;
+    let rpc_transaction_bytes = hex::decode(&rpc_raw)
+        .map_err(|error| eyre!("zcashd returned invalid transaction hex: {error}"))?
+        .len();
+    assert!(
+        u64::try_from(rpc_transaction_bytes)
+            .expect("transaction length fits in u64 on supported platforms")
+            > OVERSIZED_TRANSACTION_LIMIT,
+        "RPC test transaction must exceed the configured limit"
     );
 
     for attempt in 1..=2 {
         let response_text = setup
             .zakura_client
-            .text_from_call("sendrawtransaction", serde_json::json!([&raw]).to_string())
+            .text_from_call(
+                "sendrawtransaction",
+                serde_json::json!([&rpc_raw]).to_string(),
+            )
             .await?;
         let response: serde_json::Value = serde_json::from_str(&response_text)?;
         let error = response
@@ -165,7 +355,7 @@ pub async fn oversized_transparent_tx_rejected() -> Result<()> {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| eyre!("sendrawtransaction error is missing `message`: {error}"))?;
         assert!(
-            message.contains(&format!("transaction is {transaction_bytes} bytes")),
+            message.contains(&format!("transaction is {rpc_transaction_bytes} bytes")),
             "error must include the actual serialized size: {message}"
         );
         assert!(
@@ -173,16 +363,6 @@ pub async fn oversized_transparent_tx_rejected() -> Result<()> {
             "error must include the configured limit: {message}"
         );
     }
-
-    let mempool: Vec<String> = setup
-        .zakura_client
-        .json_result_from_call("getrawmempool", "[]")
-        .await
-        .map_err(|e| eyre!("getrawmempool: {e}"))?;
-    assert!(
-        !mempool.iter().any(|entry| entry == &txid),
-        "oversized transaction must not enter Zakura's mempool"
-    );
 
     let block_template: BlockTemplateResponse = setup
         .zakura_client
@@ -194,7 +374,7 @@ pub async fn oversized_transparent_tx_rejected() -> Result<()> {
         BlockTemplateTimeSource::CurTime,
         &setup.network,
     )?;
-    let transaction: Arc<Transaction> = raw_bytes.zcash_deserialize_into()?;
+    let transaction: Arc<Transaction> = p2p_raw_bytes.zcash_deserialize_into()?;
     block.transactions.push(transaction);
 
     let merkle_root = block.transactions.iter().map(|tx| tx.hash()).collect();
@@ -211,6 +391,11 @@ pub async fn oversized_transparent_tx_rejected() -> Result<()> {
 
     setup.zakura_client.submit_block(block).await?;
     wait_for_zcashd_height(&setup.zcashd_client, 111).await?;
+    assert_eq!(
+        peer_connection_identity(&single_zcashd_peer(&setup).await?)?,
+        peer_identity,
+        "the same peer connection must remain live after the policy rejection"
+    );
     let block_count: u64 = setup
         .zakura_client
         .json_result_from_call("getblockcount", "[]")
@@ -222,7 +407,7 @@ pub async fn oversized_transparent_tx_rejected() -> Result<()> {
         .zakura_client
         .json_result_from_call(
             "getrawtransaction",
-            serde_json::json!([txid, 1]).to_string(),
+            serde_json::json!([p2p_txid, 1]).to_string(),
         )
         .await
         .map_err(|error| eyre!("getrawtransaction: {error}"))?;

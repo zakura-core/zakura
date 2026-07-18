@@ -233,6 +233,18 @@ where
     // handshakes. These use the same handshake service internally to detect
     // self-connection attempts. Both are decorated with a tower TimeoutLayer to
     // enforce timeouts as specified in the Config.
+
+    // Inbound peers exempt from the inbound-overload connection drop: the
+    // operator-configured block-gossip / zcashd-compat sidecars. Canonicalized
+    // (IPv4-mapped IPv6 -> IPv4) so an inbound `::ffff:` address still matches,
+    // exactly like the reserved-slot accounting in `accept_inbound_connections`.
+    let protected_peer_ips: Arc<HashSet<IpAddr>> = Arc::new(
+        block_gossip_peer_ips
+            .iter()
+            .map(|&ip| canonical_socket_addr(SocketAddr::new(ip, 0)).ip())
+            .collect(),
+    );
+
     let (listen_handshaker, outbound_connector) = {
         use tower::timeout::TimeoutLayer;
         let hs_timeout = TimeoutLayer::new(constants::HANDSHAKE_TIMEOUT);
@@ -248,6 +260,7 @@ where
             .with_advertised_services(advertised_services)
             .with_user_agent(user_agent)
             .with_latest_chain_tip(latest_chain_tip.clone())
+            .with_protected_peer_ips(protected_peer_ips)
             .want_transactions(true);
 
         if let Some(zakura_handshake_connector) = zakura_handshake_connector {

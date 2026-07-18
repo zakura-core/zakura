@@ -50,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Deliver committed-tip block gossip to configured zcashd-compat sidecar peers
   even when they are momentarily unready, bounding missed gossip to one
   readiness cycle ([#231](https://github.com/zakura-core/zakura/pull/231)).
+- Keep operator-configured block-gossip and zcashd-compat sidecar connections
+  open when their inbound requests overload or time out, while continuing to
+  shed those requests for backpressure
+  ([#242](https://github.com/zakura-core/zakura/pull/242)).
 
 ## [1.0.1] - 2026-07-17
 

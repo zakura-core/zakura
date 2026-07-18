@@ -1614,6 +1614,24 @@ where
     /// probability of being disconnected increases.
     async fn handle_inbound_overload(&mut self, req: Request, now: Instant, error: PeerError) {
         let prev = self.last_overload_time.replace(now);
+
+        // # Security / liveness
+        //
+        // Operator-configured sidecar / block-gossip peers are trusted and
+        // depended on: they follow this node and learn the chain tip only from
+        // it. Shedding (ignoring) their request is correct backpressure, but
+        // *severing* the connection just makes the sidecar fall behind, and the
+        // `max_connections_per_ip = 1` reconnect refusal can stretch that into a
+        // multi-second blackout. So we never drop them for an overload/timeout.
+        //
+        // This exemption is scoped strictly to configured IPs; every other
+        // peer's denial-of-service protection below is unchanged.
+        if self.connection_info.is_protected_peer {
+            self.update_state_metrics(format!("In::Req::{}/Rsp::{error}::Ignored", req.command()));
+            metrics::counter!("pool.ignored.protected").increment(1);
+            return;
+        }
+
         let drop_connection_probability = overload_drop_connection_probability(now, prev);
 
         if thread_rng().gen::<f32>() < drop_connection_probability {

@@ -882,6 +882,29 @@ cargo run -p zakura-state --bin generate-vct-sprout-artifact -- \
   /path/to/zakura-cache /path/to/vct-sprout-history.bin
 ```
 
+The generator scans height-keyed RocksDB column families in contiguous shards instead of
+performing point reads at every height. Transactions are decoded in parallel, but candidate
+records are merged by height and Sprout commitments are replayed by one ordered reducer. It also
+checks transaction locations and stored transaction hashes, and recomputes each block's
+transaction Merkle root against its canonical header.
+
+For maximum throughput, copy a stopped archive database to local NVMe and give the generator
+enough shards and workers to saturate the device and available CPU:
+
+```console
+cargo run --release -p zakura-state --bin generate-vct-sprout-artifact -- \
+  /local-nvme/zakura-cache /output/vct-sprout-history.bin \
+  --shards 16 --workers 32 --readahead-mib 32 \
+  --checkpoint-dir /local-nvme/vct-sprout-progress
+```
+
+Completed height shards are written atomically to the checkpoint directory. After interruption,
+repeat the same command with `--resume`. The manifest binds progress to the source path, database
+format, handoff identity, and exact shard boundaries; incompatible or corrupt progress is
+rejected. Checkpoints are local recovery data, not trusted runtime artifacts. Final output is
+always rebuilt by an ordered merge and passed through the production artifact decoder and
+canonical/handoff validation. The output path retains no-clobber semantics.
+
 Reviewers must reproduce and compare the emitted bytes, SHA-256 digest, terminal root, and
 handoff identity before changing `MAINNET_ARTIFACT`. Running the tool never installs or enables
 its output.

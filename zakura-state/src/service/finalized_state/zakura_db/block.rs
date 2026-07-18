@@ -292,6 +292,38 @@ impl ZakuraDb {
         self.db.zs_get(&hash_by_height, &height)
     }
 
+    /// Returns canonical block hashes in ascending height order.
+    pub(crate) fn hashes_by_height_range(
+        &self,
+        range: impl RangeBounds<block::Height>,
+        readahead_size: usize,
+    ) -> impl Iterator<Item = (block::Height, block::Hash)> + '_ {
+        let hash_by_height = self.db.cf_handle("hash_by_height").unwrap();
+        self.db
+            .zs_forward_range_iter_for_bulk_scan(hash_by_height, range, readahead_size)
+    }
+
+    /// Returns raw canonical block headers in ascending height order.
+    pub(crate) fn raw_block_headers_by_height_range(
+        &self,
+        range: impl RangeBounds<block::Height>,
+        readahead_size: usize,
+    ) -> impl Iterator<Item = (block::Height, RawBytes)> + '_ {
+        let block_header_by_height = self.db.cf_handle("block_header_by_height").unwrap();
+        self.db
+            .zs_forward_range_iter_for_bulk_scan(block_header_by_height, range, readahead_size)
+    }
+
+    /// Returns the canonical reverse block index in block-hash order.
+    pub(crate) fn heights_by_hash(
+        &self,
+        readahead_size: usize,
+    ) -> impl Iterator<Item = (block::Hash, block::Height)> + '_ {
+        let height_by_hash = self.db.cf_handle("height_by_hash").unwrap();
+        self.db
+            .zs_forward_range_iter_for_bulk_scan(height_by_hash, .., readahead_size)
+    }
+
     /// Returns the height of the given block if it exists.
     #[allow(clippy::unwrap_in_result)]
     pub fn height(&self, hash: block::Hash) -> Option<block::Height> {
@@ -827,6 +859,34 @@ impl ZakuraDb {
     {
         let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
         self.db.zs_forward_range_iter(tx_by_loc, range)
+    }
+
+    /// Returns raw transactions in chain order using the offline bulk-read profile.
+    pub(crate) fn raw_transactions_by_location_range_for_bulk_scan<R>(
+        &self,
+        range: R,
+        readahead_size: usize,
+    ) -> impl Iterator<Item = (TransactionLocation, RawBytes)> + '_
+    where
+        R: RangeBounds<TransactionLocation>,
+    {
+        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+        self.db
+            .zs_forward_range_iter_for_bulk_scan(tx_by_loc, range, readahead_size)
+    }
+
+    /// Returns stored transaction hashes in chain order.
+    pub(crate) fn transaction_hashes_by_location_range<R>(
+        &self,
+        range: R,
+        readahead_size: usize,
+    ) -> impl Iterator<Item = (TransactionLocation, transaction::Hash)> + '_
+    where
+        R: RangeBounds<TransactionLocation>,
+    {
+        let hash_by_tx_loc = self.db.cf_handle("hash_by_tx_loc").unwrap();
+        self.db
+            .zs_forward_range_iter_for_bulk_scan(hash_by_tx_loc, range, readahead_size)
     }
 
     /// Returns `true` if raw transaction bytes exist in the half-open height range

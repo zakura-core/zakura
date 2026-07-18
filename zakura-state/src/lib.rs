@@ -74,8 +74,9 @@ pub use service::{
 pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
 
 pub use service::finalized_state::{
-    generate_mainnet_from_archive, produce_final_frontiers_bytes, validate_final_frontiers_bytes,
-    FinalFrontiersGenerationError, FinalFrontiersValidationError, GeneratorError,
+    generate_mainnet_from_archive, generate_mainnet_from_archive_with_options,
+    produce_final_frontiers_bytes, validate_final_frontiers_bytes, FinalFrontiersGenerationError,
+    FinalFrontiersValidationError, GeneratorError, GeneratorOptions, GeneratorProgress,
 };
 pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,

@@ -108,8 +108,9 @@ pub use disk_format::{
     MAX_ON_DISK_HEIGHT,
 };
 pub use vct::{
-    generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
-    GeneratorError, NextVctBlock,
+    generate_mainnet_from_archive, generate_mainnet_from_archive_with_options,
+    validate_final_frontiers_bytes, FinalFrontiersValidationError, GeneratorError,
+    GeneratorOptions, GeneratorProgress, NextVctBlock,
 };
 pub use zakura_db::ZakuraDb;
 

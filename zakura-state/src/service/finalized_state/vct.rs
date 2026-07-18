@@ -6,7 +6,10 @@
 //! `consensus.vct_fast_sync = false` selects legacy recompute.
 
 pub(super) mod artifact;
-pub use artifact::{generate_mainnet_from_archive, GeneratorError};
+pub use artifact::{
+    generate_mainnet_from_archive, generate_mainnet_from_archive_with_options, GeneratorError,
+    GeneratorOptions, GeneratorProgress,
+};
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},

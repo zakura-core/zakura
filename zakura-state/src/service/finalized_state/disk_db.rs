@@ -782,7 +782,26 @@ impl DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
-        self.zs_range_iter_with_direction(cf, range, false)
+        self.zs_range_iter_with_direction(cf, range, false, None)
+    }
+
+    /// Returns a forward iterator configured for a large offline sequential scan.
+    ///
+    /// This profile avoids polluting the shared block cache and gives RocksDB enough
+    /// readahead to keep high-throughput local storage busy.
+    pub(crate) fn zs_forward_range_iter_for_bulk_scan<C, K, V, R>(
+        &self,
+        cf: &C,
+        range: R,
+        readahead_size: usize,
+    ) -> impl Iterator<Item = (K, V)> + '_
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk,
+        V: FromDisk,
+        R: RangeBounds<K>,
+    {
+        self.zs_range_iter_with_direction(cf, range, false, Some(readahead_size))
     }
 
     /// Returns a reverse iterator over the items in `cf` in `range`.
@@ -799,7 +818,7 @@ impl DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
-        self.zs_range_iter_with_direction(cf, range, true)
+        self.zs_range_iter_with_direction(cf, range, true, None)
     }
 
     /// Returns an iterator over the items in `cf` in `range`.
@@ -813,6 +832,7 @@ impl DiskDb {
         cf: &C,
         range: R,
         reverse: bool,
+        bulk_readahead_size: Option<usize>,
     ) -> impl Iterator<Item = (K, V)> + '_
     where
         C: rocksdb::AsColumnFamilyRef,
@@ -837,7 +857,12 @@ impl DiskDb {
         let range = (start_bound, end_bound);
 
         let mode = Self::zs_iter_mode(&range, reverse);
-        let opts = Self::zs_iter_opts(&range);
+        let mut opts = Self::zs_iter_opts(&range);
+        if let Some(readahead_size) = bulk_readahead_size {
+            opts.fill_cache(false);
+            opts.set_readahead_size(readahead_size);
+            opts.set_async_io(true);
+        }
 
         // Reading multiple items from iterators has caused database hangs,
         // in previous RocksDB versions

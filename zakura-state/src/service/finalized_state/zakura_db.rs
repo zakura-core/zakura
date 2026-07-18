@@ -107,18 +107,18 @@ pub struct ZakuraDb {
 
 #[derive(Clone, Copy)]
 enum DbOpenMode {
-    ReadWrite,
+    Writable,
     ReadOnly,
-    ReadOnlyVctSproutValidation,
+    VctSproutValidation,
 }
 
 impl DbOpenMode {
     fn is_read_only(self) -> bool {
-        !matches!(self, Self::ReadWrite)
+        !matches!(self, Self::Writable)
     }
 
     fn enforces_vct_repair_guard(self) -> bool {
-        !matches!(self, Self::ReadOnlyVctSproutValidation)
+        !matches!(self, Self::VctSproutValidation)
     }
 }
 
@@ -146,7 +146,7 @@ impl ZakuraDb {
         let open_mode = if read_only {
             DbOpenMode::ReadOnly
         } else {
-            DbOpenMode::ReadWrite
+            DbOpenMode::Writable
         };
 
         Self::new_with_vct_repair_guard(
@@ -180,7 +180,7 @@ impl ZakuraDb {
             network,
             false,
             column_families_in_code,
-            DbOpenMode::ReadOnlyVctSproutValidation,
+            DbOpenMode::VctSproutValidation,
         )
     }
 

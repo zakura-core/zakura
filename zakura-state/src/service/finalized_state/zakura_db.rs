@@ -126,6 +126,53 @@ impl ZakuraDb {
         column_families_in_code: impl IntoIterator<Item = String>,
         read_only: bool,
     ) -> Result<ZakuraDb, StateInitError> {
+        Self::new_with_vct_repair_guard(
+            config,
+            db_kind,
+            format_version_in_code,
+            network,
+            debug_skip_format_upgrades,
+            column_families_in_code,
+            read_only,
+            true,
+        )
+    }
+
+    /// Opens a read-only database for the explicit VCT Sprout-history audit.
+    ///
+    /// Unlike normal read-only callers, the audit must inspect databases that predate the repair
+    /// format. The returned database remains read-only; only the startup rejection of an
+    /// unrepaired VCT database is skipped.
+    /// This method is temporary and can be removed after the VCT Sprout-history repair is complete.
+    pub(crate) fn new_for_vct_sprout_history_validation(
+        config: &Config,
+        db_kind: impl AsRef<str>,
+        format_version_in_code: &Version,
+        network: &Network,
+        column_families_in_code: impl IntoIterator<Item = String>,
+    ) -> Result<ZakuraDb, StateInitError> {
+        Self::new_with_vct_repair_guard(
+            config,
+            db_kind,
+            format_version_in_code,
+            network,
+            false,
+            column_families_in_code,
+            true,
+            false,
+        )
+    }
+
+    fn new_with_vct_repair_guard(
+        config: &Config,
+        db_kind: impl AsRef<str>,
+        format_version_in_code: &Version,
+        network: &Network,
+        debug_skip_format_upgrades: bool,
+        column_families_in_code: impl IntoIterator<Item = String>,
+        read_only: bool,
+        enforce_vct_repair_guard: bool,
+    ) -> Result<ZakuraDb, StateInitError> {
         // A read-only secondary follows another process's primary database and must never delete
         // it, whereas an ephemeral database deletes its files on drop, so the two modes are
         // mutually exclusive. Reject the combination up front, before the read-only branch below
@@ -211,7 +258,9 @@ impl ZakuraDb {
         // The original Mainnet VCT fast path did not persist historical Sprout frontiers.
         // Never expose an affected database unless this writable startup can synchronously
         // complete the authenticated repair.
-        if repair_vct_sprout_history::is_repair_eligible(&db, disk_version_before_open.as_ref()) {
+        if enforce_vct_repair_guard
+            && repair_vct_sprout_history::is_repair_eligible(&db, disk_version_before_open.as_ref())
+        {
             if read_only
                 || upgrades_explicitly_disabled
                 || !repair_vct_sprout_history::artifact_available(&db)

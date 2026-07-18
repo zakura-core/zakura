@@ -32,6 +32,8 @@ pub struct Upgrade;
 pub struct VctSproutHistoryValidationSummary {
     /// The finalized database tip checked by the audit.
     pub finalized_tip: Height,
+    /// The Sprout commitment root at the finalized database tip.
+    pub sprout_root_at_finalized_tip: sprout::tree::Root,
     /// The persisted VCT handoff marker.
     pub vct_marker: Height,
     /// The handoff authenticated by the embedded artifact.
@@ -144,16 +146,6 @@ pub(crate) fn validate_completed_repair(
             reason: error.to_string(),
         }
     })?;
-    if disk_version
-        .as_ref()
-        .is_none_or(|version| version < &REPAIR_VERSION)
-    {
-        return Err(VctSproutHistoryValidationError::RepairNotCompleted {
-            actual: disk_version
-                .map_or_else(|| "unknown".to_string(), |version| version.to_string()),
-            required: REPAIR_VERSION,
-        });
-    }
 
     let input = validated_repair_input(db, marker).map_err(|error| {
         VctSproutHistoryValidationError::Invalid {
@@ -164,6 +156,12 @@ pub(crate) fn validate_completed_repair(
         db.finalized_tip_height()
             .ok_or_else(|| VctSproutHistoryValidationError::Invalid {
                 reason: RepairValidationError::MissingFinalizedTip.to_string(),
+            })?;
+    let sprout_root_at_finalized_tip =
+        db.sprout_tree_for_tip()
+            .map(|tree| tree.root())
+            .map_err(|error| VctSproutHistoryValidationError::Invalid {
+                reason: error.to_string(),
             })?;
     let checked_anchor_count = input
         .artifact
@@ -177,8 +175,20 @@ pub(crate) fn validate_completed_repair(
         })?
         .map_err(|reason| VctSproutHistoryValidationError::Invalid { reason })?;
 
+    if disk_version
+        .as_ref()
+        .is_none_or(|version| version < &REPAIR_VERSION)
+    {
+        return Err(VctSproutHistoryValidationError::RepairNotCompleted {
+            actual: disk_version
+                .map_or_else(|| "unknown".to_string(), |version| version.to_string()),
+            required: REPAIR_VERSION,
+        });
+    }
+
     Ok(VctSproutHistoryValidationSummary {
         finalized_tip,
+        sprout_root_at_finalized_tip,
         vct_marker: marker,
         artifact_handoff: input.artifact_last_checkpoint,
         checked_anchor_count,
@@ -401,7 +411,7 @@ fn validate_repaired_records(
 
     if db.sprout_tree_by_anchor(&tree.root()).as_deref() != Some(&tree) {
         return Ok(Err(
-            "the repaired database is missing the empty Sprout anchor".to_string(),
+            "the database is missing the empty Sprout anchor".to_string(),
         ));
     }
 
@@ -418,7 +428,7 @@ fn validate_repaired_records(
 
         if db.sprout_tree_by_anchor(&tree.root()).as_deref() != Some(&tree) {
             return Ok(Err(format!(
-                "the repaired database is missing the Sprout anchor at {:?}",
+                "the database is missing the Sprout anchor at {:?}",
                 record.height
             )));
         }
@@ -428,7 +438,7 @@ fn validate_repaired_records(
         let tip_tree = db.sprout_tree_for_tip().map_err(|error| error.to_string());
         if tip_tree.as_deref() != Ok(&tree) {
             return Ok(Err(format!(
-                "the repaired Sprout tip does not match the artifact at {tip:?}"
+                "the Sprout tip does not match the artifact at {tip:?}"
             )));
         }
     }
@@ -979,6 +989,7 @@ mod tests {
             summary,
             VctSproutHistoryValidationSummary {
                 finalized_tip: handoff,
+                sprout_root_at_finalized_tip: tip_tree.root(),
                 vct_marker: handoff,
                 artifact_handoff: handoff,
                 checked_anchor_count: 3,
@@ -993,6 +1004,50 @@ mod tests {
             validate_completed_repair(&db),
             Err(VctSproutHistoryValidationError::Invalid { reason })
                 if reason.contains("Sprout anchor at")
+        ));
+    }
+
+    #[test]
+    fn audit_opens_pre_repair_database_and_reports_missing_history() {
+        let (_cache, config) = persistent_config();
+        let network = Network::Mainnet;
+        let handoff = Height(1);
+        let hash = block::Hash([1; 32]);
+        let (artifact, roots) =
+            fixture_artifact_with_records(handoff, hash, &[(handoff, hash, 17)]);
+        let mut tip_tree = NoteCommitmentTree::default();
+        tip_tree
+            .append(sprout::commitment::NoteCommitment::from([17; 32]))
+            .expect("fixture tree has capacity");
+        let path =
+            seed_repair_db_with_tip(&config, &network, handoff, &[(handoff, hash)], &tip_tree);
+        let _injection = inject_test_repair_input(
+            path,
+            TestRepairInput {
+                handoff,
+                handoff_hash: hash,
+                handoff_sprout_root: roots[0],
+                artifact,
+                marker_hash: None,
+                before_write: None,
+            },
+        );
+
+        let db = ZakuraDb::new_for_vct_sprout_history_validation(
+            &config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &network,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+        )
+        .expect("the explicit audit can open an old database read-only");
+
+        assert!(matches!(
+            validate_completed_repair(&db),
+            Err(VctSproutHistoryValidationError::Invalid { reason })
+                if reason.contains("empty Sprout anchor")
         ));
     }
 

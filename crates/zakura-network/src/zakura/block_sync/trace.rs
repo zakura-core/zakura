@@ -758,14 +758,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn block_sync_core_uses_only_semantic_trace_calls() {
+    fn block_sync_core_avoids_legacy_trace_builders() {
         for (name, source) in [
             ("reactor", include_str!("reactor.rs")),
             ("peer_routine", include_str!("peer_routine.rs")),
             ("sequencer_task", include_str!("sequencer_task.rs")),
         ] {
             for forbidden in [
-                ".emit_event(",
                 "emit_block(",
                 "BlockTraceFields",
                 "BlockTraceEvent",

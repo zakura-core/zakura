@@ -160,7 +160,7 @@ impl LegacySyncTrace {
             hash: hash.to_string(),
             height: height.0,
             download_elapsed_ms: elapsed_millis(download_elapsed),
-            peer: peer.map(|peer| peer_addr_label(peer, self.expose_peer_addresses)),
+            peer: peer.map(|peer| self.peer_label(peer)),
         });
     }
 }

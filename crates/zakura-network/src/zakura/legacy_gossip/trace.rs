@@ -5,69 +5,7 @@ use serde::Serialize;
 use crate::protocol::internal::Response;
 
 use super::{bounded_u64, LegacyRequestKind};
-use crate::zakura::{trace::peer_label, ZakuraPeerId, ZakuraTrace, LEGACY_REQUEST_TABLE};
-
-pub(super) trait LegacyRequestTraceExt {
-    fn trace_legacy_request_start(
-        &self,
-        event: &'static str,
-        peer: Option<&ZakuraPeerId>,
-        request_id: u64,
-        request: LegacyRequestKind,
-        message_type: u16,
-    );
-    fn trace_legacy_request_response(
-        &self,
-        event: &'static str,
-        peer: Option<&ZakuraPeerId>,
-        request_id: u64,
-        request: &'static str,
-        response: &Response,
-    );
-    fn trace_legacy_request_error(
-        &self,
-        event: &'static str,
-        peer: Option<&ZakuraPeerId>,
-        request_id: u64,
-        request: &'static str,
-        error: String,
-    );
-}
-
-impl LegacyRequestTraceExt for ZakuraTrace {
-    fn trace_legacy_request_start(
-        &self,
-        event: &'static str,
-        peer: Option<&ZakuraPeerId>,
-        request_id: u64,
-        request: LegacyRequestKind,
-        message_type: u16,
-    ) {
-        self.emit_event(|| LegacyRequestStart::new(event, peer, request_id, request, message_type));
-    }
-
-    fn trace_legacy_request_response(
-        &self,
-        event: &'static str,
-        peer: Option<&ZakuraPeerId>,
-        request_id: u64,
-        request: &'static str,
-        response: &Response,
-    ) {
-        self.emit_event(|| LegacyRequestResponse::new(event, peer, request_id, request, response));
-    }
-
-    fn trace_legacy_request_error(
-        &self,
-        event: &'static str,
-        peer: Option<&ZakuraPeerId>,
-        request_id: u64,
-        request: &'static str,
-        error: String,
-    ) {
-        self.emit_event(|| LegacyRequestError::new(event, peer, request_id, request, error));
-    }
-}
+use crate::zakura::{trace::peer_label, ZakuraPeerId, LEGACY_REQUEST_TABLE};
 
 #[derive(Debug, Serialize)]
 pub(super) struct LegacyRequestStart {

@@ -109,7 +109,7 @@ pub enum StateInitError {
     /// A Mainnet VCT database written before the Sprout-history repair format is unsafe to use.
     #[error(
         "cannot open {mode} state: this verified-commitment-tree database may be missing historical Sprout anchors. \
-         {reason}. Hint: reopen the database writable with a build containing the reviewed repair artifact, or discard it and resync"
+         {reason}. Hint: reopen the database writable with a build containing the repair artifact, sync from snapshot (https://zakura.com/snapshots/), or resync from genesis"
     )]
     VctSproutHistoryRepairRequired {
         /// Whether this was a writable primary or read-only secondary open.
@@ -121,8 +121,7 @@ pub enum StateInitError {
     /// The embedded repair inputs or the local marker-scoped canonical state did not validate.
     #[error(
         "cannot open state: verified-commitment-tree Sprout-history repair validation failed: {reason}. \
-         Hint: use a build with mutually consistent checkpoint, frontier, and repair artifacts; \
-         if the local canonical marker binding is invalid, discard the database and resync"
+         Hint: reopen the database writable with a build containing the repair artifact, sync from snapshot (https://zakura.com/snapshots/), or resync from genesis"
     )]
     VctSproutHistoryRepairInvalid {
         /// The failed build-level or database-level validation.

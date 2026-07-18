@@ -888,13 +888,11 @@ its output.
 
 ### 17.4 Embedding, availability, and replay
 
-`vct/artifact.rs` currently has no embedded Mainnet bytes (`MAINNET_ARTIFACT` is `None`).
-When reviewed bytes are available, they are compiled into that module and loaded only through
-`embedded_mainnet()`. Until then, opening a pre-28.0.1 Mainnet VCT-synced database is rejected.
-The guard also rejects affected read-only databases and writable opens with upgrades disabled,
-even after artifact bytes become available: operators must reopen writable to repair or
-discard/resync. Non-Mainnet databases never load or replay this Mainnet artifact. Normally synced
-databases and databases already marked at the repair format are unaffected.
+The reviewed Mainnet bytes are compiled into `vct/artifact.rs` and loaded only through
+`embedded_mainnet()`. The guard rejects affected read-only databases and writable opens with
+upgrades disabled: operators must reopen writable to repair or discard/resync. Non-Mainnet
+databases never load or replay this Mainnet artifact. Normally synced databases and databases
+already marked at the repair format are unaffected.
 
 The initial startup format change now runs synchronously before `ZakuraDb` or `FinalizedState`
 is exposed; only periodic current-format checks remain in the background. Therefore no block

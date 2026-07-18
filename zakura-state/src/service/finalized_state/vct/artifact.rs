@@ -21,7 +21,7 @@ const MAGIC: &[u8; 8] = b"ZKVCTSP1";
 const MAINNET_NETWORK: u8 = 1;
 const MAX_RECORDS: usize = 1_000_000;
 const MAX_COMMITMENTS_PER_RECORD: usize = 65_535;
-const MAINNET_ARTIFACT: Option<&[u8]> = None;
+const MAINNET_ARTIFACT: Option<&[u8]> = Some(include_bytes!("mainnet-sprout-history.bin"));
 
 /// One historical block that changed the Sprout commitment tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -436,6 +436,22 @@ pub(crate) fn embedded_mainnet() -> Result<Artifact, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_mainnet_artifact_matches_handoff() {
+        let network = zakura_chain::parameters::Network::Mainnet;
+        let frontiers =
+            embedded_final_frontiers(&network).expect("Mainnet has embedded final frontiers");
+        let handoff_hash = network
+            .checkpoint_list()
+            .hash(frontiers.height)
+            .expect("the embedded frontier height has a Mainnet checkpoint");
+        let artifact = embedded_mainnet().expect("the reviewed Mainnet artifact decodes");
+
+        artifact
+            .validate_last_checkpoint(frontiers.height, handoff_hash, frontiers.sprout.root())
+            .expect("the reviewed Mainnet artifact matches the embedded handoff");
+    }
 
     #[test]
     fn artifact_round_trip_replays_each_record() {

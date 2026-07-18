@@ -105,6 +105,23 @@ pub struct ZakuraDb {
     db: DiskDb,
 }
 
+#[derive(Clone, Copy)]
+enum DbOpenMode {
+    ReadWrite,
+    ReadOnly,
+    ReadOnlyVctSproutValidation,
+}
+
+impl DbOpenMode {
+    fn is_read_only(self) -> bool {
+        !matches!(self, Self::ReadWrite)
+    }
+
+    fn enforces_vct_repair_guard(self) -> bool {
+        !matches!(self, Self::ReadOnlyVctSproutValidation)
+    }
+}
+
 impl ZakuraDb {
     /// Opens or creates the database at a path based on the kind, major version and network,
     /// with the supplied column families, preserving any existing column families,
@@ -126,6 +143,12 @@ impl ZakuraDb {
         column_families_in_code: impl IntoIterator<Item = String>,
         read_only: bool,
     ) -> Result<ZakuraDb, StateInitError> {
+        let open_mode = if read_only {
+            DbOpenMode::ReadOnly
+        } else {
+            DbOpenMode::ReadWrite
+        };
+
         Self::new_with_vct_repair_guard(
             config,
             db_kind,
@@ -133,8 +156,7 @@ impl ZakuraDb {
             network,
             debug_skip_format_upgrades,
             column_families_in_code,
-            read_only,
-            true,
+            open_mode,
         )
     }
 
@@ -158,11 +180,11 @@ impl ZakuraDb {
             network,
             false,
             column_families_in_code,
-            true,
-            false,
+            DbOpenMode::ReadOnlyVctSproutValidation,
         )
     }
 
+    #[allow(clippy::unwrap_in_result)]
     fn new_with_vct_repair_guard(
         config: &Config,
         db_kind: impl AsRef<str>,
@@ -170,9 +192,10 @@ impl ZakuraDb {
         network: &Network,
         debug_skip_format_upgrades: bool,
         column_families_in_code: impl IntoIterator<Item = String>,
-        read_only: bool,
-        enforce_vct_repair_guard: bool,
+        open_mode: DbOpenMode,
     ) -> Result<ZakuraDb, StateInitError> {
+        let read_only = open_mode.is_read_only();
+
         // A read-only secondary follows another process's primary database and must never delete
         // it, whereas an ephemeral database deletes its files on drop, so the two modes are
         // mutually exclusive. Reject the combination up front, before the read-only branch below
@@ -258,7 +281,7 @@ impl ZakuraDb {
         // The original Mainnet VCT fast path did not persist historical Sprout frontiers.
         // Never expose an affected database unless this writable startup can synchronously
         // complete the authenticated repair.
-        if enforce_vct_repair_guard
+        if open_mode.enforces_vct_repair_guard()
             && repair_vct_sprout_history::is_repair_eligible(&db, disk_version_before_open.as_ref())
         {
             if read_only

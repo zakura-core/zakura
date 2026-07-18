@@ -64,7 +64,7 @@ pub use service::{
     finalized_state::FinalizedState,
     init, init_read_only,
     non_finalized_state::NonFinalizedState,
-    spawn_init_read_only,
+    spawn_init_read_only, validate_vct_sprout_history,
     watch_receiver::WatchReceiver,
     OutputLocation, ReadState, State, TransactionIndex, TransactionLocation,
 };
@@ -84,6 +84,9 @@ pub use service::finalized_state::{
 pub use service::finalized_state::{
     preview_rollback_finalized_state, rollback_finalized_state, RollbackBackupSummary,
     RollbackFinalizedStateError, RollbackFinalizedStateOptions, RollbackFinalizedStateSummary,
+};
+pub use service::finalized_state::{
+    VctSproutHistoryValidationError, VctSproutHistoryValidationSummary,
 };
 pub use service::{
     finalized_state::{DiskWriteBatch, FromDisk, IntoDisk, WriteDisk, ZakuraDb},

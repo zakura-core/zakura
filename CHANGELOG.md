@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Add `zakurad validate-vct-sprout-history` to audit repaired historical
+  Sprout anchors in archive or pruned Mainnet state databases.
+
 ### Fixed
 
 - Database format upgrades now finish before startup exposes the finalized

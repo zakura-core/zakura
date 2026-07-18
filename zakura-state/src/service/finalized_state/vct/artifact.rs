@@ -3,6 +3,8 @@
 //! This format intentionally contains only blocks that change Sprout. It is
 //! independent from peer-delivered VCT roots and is never accepted from peers.
 
+use std::io::{Cursor, ErrorKind, Read};
+
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zakura_chain::{block, sprout};
@@ -21,7 +23,10 @@ const MAGIC: &[u8; 8] = b"ZKVCTSP1";
 const MAINNET_NETWORK: u8 = 1;
 const MAX_RECORDS: usize = 1_000_000;
 const MAX_COMMITMENTS_PER_RECORD: usize = 65_535;
-const MAINNET_ARTIFACT: Option<&[u8]> = None;
+const HEADER_LEN: usize = 8 + 2 + 1 + 4 + 32 + 4 + 32 + 32;
+const MAINNET_ARTIFACT_LEN: usize = 71_710_871;
+const MAINNET_ARTIFACT_SHA256: [u8; 32] =
+    hex_literal::hex!("abf89ec7b9eacbe7a259be891a17059496f2c7c7c2144d3babb34f85f8098832");
 
 /// One historical block that changed the Sprout commitment tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,8 +40,6 @@ pub(crate) struct Record {
 /// Errors parsing or replaying a canonical Sprout-history artifact.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum Error {
-    #[error("Sprout history artifact is unavailable: canonical Mainnet bytes have not been verified and embedded")]
-    CanonicalArtifactUnavailable,
     #[error("invalid Sprout history artifact magic")]
     InvalidMagic,
     #[error("unsupported Sprout history artifact version {actual}")]
@@ -45,6 +48,12 @@ pub(crate) enum Error {
     WrongNetwork,
     #[error("Sprout history artifact is truncated")]
     Truncated,
+    #[error("could not read the Sprout history artifact")]
+    ReadFailure,
+    #[error("Sprout history artifact length does not match the reviewed artifact")]
+    ArtifactLengthMismatch,
+    #[error("Sprout history artifact digest does not match the reviewed artifact")]
+    ArtifactDigestMismatch,
     #[error("Sprout history artifact has too many records")]
     TooManyRecords,
     #[error("Sprout history artifact record has too many commitments")]
@@ -78,6 +87,65 @@ pub(crate) enum Error {
         "canonical reverse block index does not match Sprout history artifact record {height:?}"
     )]
     CanonicalReverseIndexMismatch { height: block::Height },
+}
+
+fn read_exact(reader: &mut impl Read, bytes: &mut [u8]) -> Result<(), Error> {
+    reader.read_exact(bytes).map_err(|error| {
+        if error.kind() == ErrorKind::UnexpectedEof {
+            Error::Truncated
+        } else {
+            Error::ReadFailure
+        }
+    })
+}
+
+#[allow(clippy::type_complexity)]
+#[allow(clippy::unwrap_in_result)]
+fn decode_header(
+    bytes: &[u8; HEADER_LEN],
+) -> Result<
+    (
+        block::Height,
+        block::Hash,
+        usize,
+        sprout::tree::Root,
+        [u8; 32],
+    ),
+    Error,
+> {
+    if &bytes[..8] != MAGIC {
+        return Err(Error::InvalidMagic);
+    }
+    let version = u16::from_le_bytes(bytes[8..10].try_into().expect("fixed slice length"));
+    if version != VERSION {
+        return Err(Error::UnsupportedVersion { actual: version });
+    }
+    if bytes[10] != MAINNET_NETWORK {
+        return Err(Error::WrongNetwork);
+    }
+    let checkpoint = block::Height(u32::from_le_bytes(
+        bytes[11..15].try_into().expect("fixed slice length"),
+    ));
+    let handoff_hash = block::Hash(bytes[15..47].try_into().expect("fixed slice length"));
+    let record_count = usize::try_from(u32::from_le_bytes(
+        bytes[47..51].try_into().expect("fixed slice length"),
+    ))
+    .expect("u32 fits in usize on supported platforms");
+    if record_count > MAX_RECORDS {
+        return Err(Error::TooManyRecords);
+    }
+    let terminal_root = <[u8; 32]>::try_from(&bytes[51..83])
+        .expect("fixed slice length")
+        .into();
+    let expected_digest = bytes[83..115].try_into().expect("fixed slice length");
+
+    Ok((
+        checkpoint,
+        handoff_hash,
+        record_count,
+        terminal_root,
+        expected_digest,
+    ))
 }
 
 /// A decoded, independently replay-validated artifact.
@@ -149,50 +217,67 @@ impl Artifact {
 
     #[allow(clippy::unwrap_in_result)]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        const HEADER_LEN: usize = 8 + 2 + 1 + 4 + 32 + 4 + 32 + 32;
-        if bytes.len() < HEADER_LEN {
+        Self::decode_from_readers(bytes.len(), || Cursor::new(bytes), None)
+    }
+
+    #[allow(clippy::unwrap_in_result)]
+    fn decode_from_readers<R: Read>(
+        source_len: usize,
+        mut reader: impl FnMut() -> R,
+        expected_identity: Option<(usize, [u8; 32])>,
+    ) -> Result<Self, Error> {
+        if let Some((expected_len, _)) = expected_identity {
+            if source_len != expected_len {
+                return Err(Error::ArtifactLengthMismatch);
+            }
+        }
+        if source_len < HEADER_LEN {
             return Err(Error::Truncated);
         }
-        if &bytes[..8] != MAGIC {
-            return Err(Error::InvalidMagic);
-        }
-        let version = u16::from_le_bytes(bytes[8..10].try_into().expect("fixed slice length"));
-        if version != VERSION {
-            return Err(Error::UnsupportedVersion { actual: version });
-        }
-        if bytes[10] != MAINNET_NETWORK {
-            return Err(Error::WrongNetwork);
-        }
-        let checkpoint = block::Height(u32::from_le_bytes(
-            bytes[11..15].try_into().expect("fixed slice length"),
-        ));
-        let handoff_hash = block::Hash(bytes[15..47].try_into().expect("fixed slice length"));
-        let record_count = usize::try_from(u32::from_le_bytes(
-            bytes[47..51].try_into().expect("fixed slice length"),
-        ))
-        .expect("u32 fits in usize on supported platforms");
-        if record_count > MAX_RECORDS {
-            return Err(Error::TooManyRecords);
-        }
-        let terminal_root = <[u8; 32]>::try_from(&bytes[51..83])
-            .expect("fixed slice length")
-            .into();
-        let expected_digest: [u8; 32] = bytes[83..115].try_into().expect("fixed slice length");
-        let payload = &bytes[HEADER_LEN..];
-        if Sha256::digest(payload).as_slice() != expected_digest {
-            return Err(Error::DigestMismatch);
+
+        let mut first_pass = reader();
+        let mut header = [0; HEADER_LEN];
+        read_exact(&mut first_pass, &mut header)?;
+        let (checkpoint, handoff_hash, record_count, terminal_root, expected_payload_digest) =
+            decode_header(&header)?;
+
+        let mut artifact_digest = Sha256::new();
+        artifact_digest.update(header);
+        let mut payload_digest = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        let mut remaining = source_len - HEADER_LEN;
+        while remaining > 0 {
+            let read_len = remaining.min(buffer.len());
+            read_exact(&mut first_pass, &mut buffer[..read_len])?;
+            artifact_digest.update(&buffer[..read_len]);
+            payload_digest.update(&buffer[..read_len]);
+            remaining -= read_len;
         }
 
-        let mut cursor = 0usize;
+        if <[u8; 32]>::from(payload_digest.finalize()) != expected_payload_digest {
+            return Err(Error::DigestMismatch);
+        }
+        if let Some((_, expected_digest)) = expected_identity {
+            if <[u8; 32]>::from(artifact_digest.finalize()) != expected_digest {
+                return Err(Error::ArtifactDigestMismatch);
+            }
+        }
+
+        let mut second_pass = reader();
+        read_exact(&mut second_pass, &mut header)?;
+        let mut cursor = HEADER_LEN;
         let mut previous = 0u32;
         let mut tree = sprout::tree::NoteCommitmentTree::default();
         let mut records = Vec::with_capacity(record_count);
         for _ in 0..record_count {
-            let header = payload.get(cursor..cursor + 38).ok_or(Error::Truncated)?;
-            let delta = u32::from_le_bytes(header[..4].try_into().expect("fixed slice length"));
-            let block_hash = block::Hash(header[4..36].try_into().expect("fixed slice length"));
+            let mut record_header = [0; 38];
+            read_exact(&mut second_pass, &mut record_header)?;
+            let delta =
+                u32::from_le_bytes(record_header[..4].try_into().expect("fixed slice length"));
+            let block_hash =
+                block::Hash(record_header[4..36].try_into().expect("fixed slice length"));
             let count = usize::from(u16::from_le_bytes(
-                header[36..].try_into().expect("fixed slice length"),
+                record_header[36..].try_into().expect("fixed slice length"),
             ));
             cursor += 38;
             let height = previous
@@ -206,23 +291,19 @@ impl Artifact {
                 return Err(Error::TooManyCommitments);
             }
             let length = count.checked_mul(32).ok_or(Error::Truncated)?;
-            let commitment_bytes = payload
-                .get(cursor..cursor + length)
-                .ok_or(Error::Truncated)?;
             let mut commitments = Vec::with_capacity(count);
-            for bytes in commitment_bytes.chunks_exact(32) {
-                let commitment = sprout::commitment::NoteCommitment::from(
-                    <[u8; 32]>::try_from(bytes).expect("chunks have fixed length"),
-                );
+            for _ in 0..count {
+                let mut bytes = [0; 32];
+                read_exact(&mut second_pass, &mut bytes)?;
+                let commitment = sprout::commitment::NoteCommitment::from(bytes);
                 tree.append(commitment)
                     .map_err(|_| Error::RecordRootMismatch { height })?;
                 commitments.push(commitment);
             }
             cursor += length;
-            let root: sprout::tree::Root =
-                <[u8; 32]>::try_from(payload.get(cursor..cursor + 32).ok_or(Error::Truncated)?)
-                    .expect("fixed slice length")
-                    .into();
+            let mut root_bytes = [0; 32];
+            read_exact(&mut second_pass, &mut root_bytes)?;
+            let root: sprout::tree::Root = root_bytes.into();
             cursor += 32;
             if tree.root() != root {
                 return Err(Error::RecordRootMismatch { height });
@@ -235,7 +316,7 @@ impl Artifact {
             });
             previous = height.0;
         }
-        if cursor != payload.len() {
+        if cursor != source_len {
             return Err(Error::TrailingBytes);
         }
         if tree.root() != terminal_root {
@@ -427,10 +508,11 @@ pub fn generate_mainnet_from_archive(config: &Config) -> Result<Vec<u8>, Generat
 ///
 /// This must never be replaced with downloaded or guessed bytes.
 pub(crate) fn embedded_mainnet() -> Result<Artifact, Error> {
-    MAINNET_ARTIFACT
-        .map(Artifact::decode)
-        .transpose()?
-        .ok_or(Error::CanonicalArtifactUnavailable)
+    Artifact::decode_from_readers(
+        zakura_vct_sprout_history::TOTAL_LEN,
+        zakura_vct_sprout_history::Reader::new,
+        Some((MAINNET_ARTIFACT_LEN, MAINNET_ARTIFACT_SHA256)),
+    )
 }
 
 #[cfg(test)]
@@ -438,8 +520,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mainnet_artifact_is_unavailable_without_reviewed_bytes() {
-        assert_eq!(embedded_mainnet(), Err(Error::CanonicalArtifactUnavailable));
+    fn embedded_mainnet_artifact_matches_handoff() {
+        let network = zakura_chain::parameters::Network::Mainnet;
+        let frontiers =
+            embedded_final_frontiers(&network).expect("Mainnet has embedded final frontiers");
+        let handoff_hash = network
+            .checkpoint_list()
+            .hash(frontiers.height)
+            .expect("the embedded frontier height has a Mainnet checkpoint");
+        let artifact = embedded_mainnet().expect("the reviewed Mainnet artifact decodes");
+
+        artifact
+            .validate_last_checkpoint(frontiers.height, handoff_hash, frontiers.sprout.root())
+            .expect("the reviewed Mainnet artifact matches the embedded handoff");
     }
 
     #[test]
@@ -465,6 +558,48 @@ mod tests {
             .expect("matching handoff validates");
         assert_eq!(artifact.records_through(block::Height(9)).count(), 0);
         assert_eq!(artifact.records_through(block::Height(10)).count(), 1);
+    }
+
+    #[test]
+    fn artifact_identity_is_checked_independently() {
+        let mut tree = sprout::tree::NoteCommitmentTree::default();
+        let commitment = sprout::commitment::NoteCommitment::from([7; 32]);
+        tree.append(commitment).expect("test tree has capacity");
+        let bytes = Artifact::encode(
+            block::Height(1),
+            block::Hash([1; 32]),
+            [Record {
+                height: block::Height(1),
+                block_hash: block::Hash([1; 32]),
+                commitments: vec![commitment],
+                resulting_root: tree.root(),
+            }],
+        )
+        .expect("valid fixture encodes");
+        let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
+
+        Artifact::decode_from_readers(
+            bytes.len(),
+            || Cursor::new(bytes.as_slice()),
+            Some((bytes.len(), digest)),
+        )
+        .expect("matching artifact identity decodes");
+        assert_eq!(
+            Artifact::decode_from_readers(
+                bytes.len(),
+                || Cursor::new(bytes.as_slice()),
+                Some((bytes.len(), [0; 32])),
+            ),
+            Err(Error::ArtifactDigestMismatch)
+        );
+        assert_eq!(
+            Artifact::decode_from_readers(
+                bytes.len(),
+                || Cursor::new(bytes.as_slice()),
+                Some((bytes.len() + 1, digest)),
+            ),
+            Err(Error::ArtifactLengthMismatch)
+        );
     }
 
     #[test]

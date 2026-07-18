@@ -117,10 +117,7 @@ pub(crate) fn artifact_available(_db: &ZakuraDb) -> bool {
         return true;
     }
 
-    !matches!(
-        embedded_mainnet(),
-        Err(crate::service::finalized_state::vct::artifact::Error::CanonicalArtifactUnavailable)
-    )
+    embedded_mainnet().is_ok()
 }
 
 pub(crate) fn validate_startup_repair(db: &ZakuraDb) -> Result<(), RepairValidationError> {

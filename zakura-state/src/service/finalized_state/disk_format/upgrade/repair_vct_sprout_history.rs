@@ -126,9 +126,10 @@ impl DiskFormatUpgrade for Upgrade {
         cancel_receiver: &Receiver<CancelFormatChange>,
     ) -> Result<Result<(), String>, CancelFormatChange> {
         check_cancelled(cancel_receiver)?;
-        let disk_version = db
-            .format_version_on_disk()
-            .expect("database format version must remain readable during repair validation");
+        let disk_version = match db.format_version_on_disk() {
+            Ok(version) => version,
+            Err(error) => return Ok(Err(error.to_string())),
+        };
         if !is_repair_eligible(db, disk_version.as_ref()) {
             return Ok(Ok(()));
         }
@@ -300,8 +301,12 @@ fn validate_repaired_records(
     for record in input.artifact.records_through(replay_until) {
         check_cancelled(cancel_receiver)?;
         for commitment in &record.commitments {
-            tree.append(*commitment)
-                .expect("validated Sprout history record must fit in the Sprout tree");
+            if tree.append(*commitment).is_err() {
+                return Ok(Err(format!(
+                    "the Sprout history tree is full at {:?}",
+                    record.height
+                )));
+            }
         }
 
         if db.sprout_tree_by_anchor(&tree.root()).as_deref() != Some(&tree) {

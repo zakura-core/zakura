@@ -39,8 +39,8 @@ use zakura_chain::{
 use zakura_consensus::{error::TransactionError, transaction};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
-    CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolTxSubscriber, Request,
-    Response,
+    CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolTxSubscriber, QueueSource,
+    Request, Response,
 };
 use zakura_state as zs;
 use zakura_state::{ChainTipChange, TipAction};
@@ -77,6 +77,36 @@ use downloads::{
     Downloads as TxDownloads, TransactionDownloadVerifyError, TRANSACTION_DOWNLOAD_TIMEOUT,
     TRANSACTION_VERIFY_TIMEOUT,
 };
+
+fn legacy_peer_log_label(addr: PeerSocketAddr, expose_peer_addresses: bool) -> String {
+    if expose_peer_addresses {
+        format!("legacy:{}", addr.remove_socket_addr_privacy())
+    } else {
+        "legacy:redacted".to_string()
+    }
+}
+
+fn queue_source_log_label(source: &QueueSource, expose_peer_addresses: bool) -> String {
+    match source {
+        QueueSource::LegacySocket(addr) => {
+            legacy_peer_log_label(PeerSocketAddr::from(*addr), expose_peer_addresses)
+        }
+        QueueSource::Zakura(peer_id) => format!("zakura:{peer_id:?}"),
+    }
+}
+
+fn transaction_error_peer_log_label(
+    error: &TransactionDownloadVerifyError,
+    expose_peer_addresses: bool,
+) -> Option<String> {
+    match error {
+        TransactionDownloadVerifyError::Invalid {
+            advertiser_addr: Some(addr),
+            ..
+        } => Some(legacy_peer_log_label(*addr, expose_peer_addresses)),
+        _ => None,
+    }
+}
 
 type Outbound = Buffer<BoxService<zn::Request, zn::Response, zn::BoxError>, zn::Request>;
 type State = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
@@ -211,6 +241,9 @@ pub struct Mempool {
     /// The configurable options for the mempool, persisted between states.
     config: Config,
 
+    /// Whether legacy peer address labels in logs are unredacted.
+    expose_peer_addresses: bool,
+
     /// The state of the mempool.
     active_state: ActiveState,
 
@@ -273,6 +306,7 @@ impl Mempool {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &Config,
+        expose_peer_addresses: bool,
         outbound: Outbound,
         state: State,
         tx_verifier: TxVerifier,
@@ -287,6 +321,7 @@ impl Mempool {
 
         let mut service = Mempool {
             config: config.clone(),
+            expose_peer_addresses,
             active_state: ActiveState::Disabled,
             sync_status,
             debug_enable_at_height: config.debug_enable_at_height.map(Height),
@@ -364,6 +399,7 @@ impl Mempool {
             Timeout::new(self.outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
             Timeout::new(self.tx_verifier.clone(), TRANSACTION_VERIFY_TIMEOUT),
             self.state.clone(),
+            self.expose_peer_addresses,
         ));
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),
@@ -687,7 +723,15 @@ impl Service<Request> for Mempool {
                             }
                         };
 
-                        tracing::debug!(?tx_id, ?error, "mempool transaction failed to verify");
+                        let peer_label =
+                            transaction_error_peer_log_label(&error, self.expose_peer_addresses);
+                        let peer = peer_label.as_deref().unwrap_or("none");
+                        tracing::debug!(
+                            ?tx_id,
+                            ?error,
+                            peer = %peer,
+                            "mempool transaction failed to verify"
+                        );
 
                         metrics::counter!("mempool.failed.verify.tasks.total", "reason" => error.to_string()).increment(1);
 
@@ -931,7 +975,11 @@ impl Service<Request> for Mempool {
                     transactions,
                     source,
                 } => {
-                    trace!(req_count = ?transactions.len(), ?source, "got mempool QueueFromPeer request");
+                    trace!(
+                        req_count = ?transactions.len(),
+                        source = %queue_source_log_label(&source, self.expose_peer_addresses),
+                        "got mempool QueueFromPeer request"
+                    );
 
                     for gossiped_tx in transactions {
                         if storage.should_download_or_verify(gossiped_tx.id()).is_err() {

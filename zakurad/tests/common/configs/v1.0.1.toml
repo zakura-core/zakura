@@ -64,6 +64,7 @@ internal_miner = false
 [network]
 cache_dir = true
 crawl_new_peer_interval = "1m 1s"
+expose_peer_addresses = false
 identity_dir = "identity_dir"
 initial_mainnet_peers = [
     "dnsseed.str4d.xyz:8233",

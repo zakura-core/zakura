@@ -25,6 +25,27 @@ front end that you can visualize:
    endpoint_addr = "127.0.0.1:9999"
    ```
 
+   Legacy peer IP addresses are redacted in metric labels and peer
+   activity logs by default. Operators that need per-peer visibility can
+   explicitly expose them in the `network` section:
+
+   ```toml
+   [network]
+   expose_peer_addresses = true
+
+   [metrics]
+   endpoint_addr = "127.0.0.1:9999"
+   ```
+
+   This exposes legacy peer addresses, including connected and candidate or
+   address book entries, in peer activity logs and the `remote_ip` and `addr`
+   metric labels. Literal addresses in the node
+   configuration can still appear in startup logs and `seed` labels regardless
+   of this setting. Unredacted addresses reveal peer topology, logs can be
+   retained or exported, and per-peer metrics can create high-cardinality
+   series. Keep the endpoint on loopback and restrict access to logs,
+   Prometheus, and downstream monitoring systems.
+
 4. Run Zakura, and specify the path to the `zakurad.toml` file, for example:
 
    ```bash

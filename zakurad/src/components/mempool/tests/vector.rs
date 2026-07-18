@@ -2082,6 +2082,7 @@ async fn setup_with_mempool_config(
     let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let (mempool, mempool_transaction_subscriber) = Mempool::new(
         &mempool_config,
+        false,
         Buffer::new(BoxService::new(peer_set.clone()), 1),
         state_service.clone(),
         Buffer::new(BoxService::new(tx_verifier.clone()), 1),
@@ -2158,6 +2159,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
         Timeout::new(peer_set, TRANSACTION_DOWNLOAD_TIMEOUT),
         Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
         state,
+        false,
     ));
 
     let mut iter = Network::Mainnet.unmined_transactions_in_blocks(1..=10);

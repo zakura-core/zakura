@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Add an opt-in `Config::expose_peer_addresses` field for unredacted legacy
+  peer address labels in peer activity logs and metrics. Downstream exhaustive
+  `Config` struct literals must initialize the new field.
+
 ## [2.0.0] - 2026-07-17
 
 ### Breaking Changes

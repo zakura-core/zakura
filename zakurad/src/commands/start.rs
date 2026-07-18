@@ -429,6 +429,7 @@ impl StartCmd {
             .timeout(MAX_INBOUND_RESPONSE_TIME)
             .service(Inbound::new(
                 config.sync.full_verify_concurrency_limit,
+                config.network.expose_peer_addresses,
                 setup_rx,
             ));
 
@@ -560,6 +561,7 @@ impl StartCmd {
         info!("initializing mempool");
         let (mempool, mempool_transaction_subscriber) = Mempool::new(
             &config.mempool,
+            config.network.expose_peer_addresses,
             peer_set.clone(),
             state.clone(),
             tx_verifier,

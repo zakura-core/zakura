@@ -336,6 +336,18 @@ pub struct Config {
     /// after the handshake, but before adding them to the peer set. The total numbers of inbound and
     /// outbound connections are also limited to a multiple of `peerset_initial_target_size`.
     pub max_connections_per_ip: usize,
+
+    /// Exposes legacy peer IP addresses in peer activity logs and Prometheus metric labels.
+    /// This includes connected peers and candidate or address book entries.
+    ///
+    /// Literal addresses supplied in the node configuration can appear in startup logs and
+    /// `seed` labels regardless of this setting.
+    ///
+    /// # Security
+    ///
+    /// Enabling this setting reveals peer topology in logs and can create high-cardinality metric
+    /// series. Restrict access to logs, the metrics endpoint, and downstream monitoring systems.
+    pub expose_peer_addresses: bool,
 }
 
 impl Config {
@@ -399,8 +411,11 @@ impl Config {
     /// If a configured address is an invalid [`SocketAddr`] or DNS name.
     pub async fn initial_peers(&self) -> HashSet<PeerSocketAddr> {
         // TODO: do DNS and disk in parallel if startup speed becomes important
-        let dns_peers =
-            Config::resolve_peers(&self.initial_peer_hostnames().iter().cloned().collect()).await;
+        let dns_peers = Config::resolve_peers(
+            &self.initial_peer_hostnames().iter().cloned().collect(),
+            self.expose_peer_addresses,
+        )
+        .await;
 
         if self.network.is_regtest() {
             // Only return local peer addresses and skip loading the peer cache on Regtest.
@@ -421,7 +436,10 @@ impl Config {
     ///
     /// If DNS resolution fails or times out for all peers, continues retrying
     /// until at least one peer is found.
-    async fn resolve_peers(peers: &HashSet<String>) -> HashSet<PeerSocketAddr> {
+    async fn resolve_peers(
+        peers: &HashSet<String>,
+        expose_peer_addresses: bool,
+    ) -> HashSet<PeerSocketAddr> {
         use futures::stream::StreamExt;
 
         if peers.is_empty() {
@@ -441,7 +459,9 @@ impl Config {
             // address peers. Individual retries avoid this issue.
             let peer_addresses = peers
                 .iter()
-                .map(|s| Config::resolve_host(s, MAX_SINGLE_SEED_PEER_DNS_RETRIES))
+                .map(|s| {
+                    Config::resolve_host(s, MAX_SINGLE_SEED_PEER_DNS_RETRIES, expose_peer_addresses)
+                })
                 .collect::<futures::stream::FuturesUnordered<_>>()
                 .concat()
                 .await;
@@ -468,9 +488,13 @@ impl Config {
     /// # Panics
     ///
     /// If a configured address is an invalid [`SocketAddr`] or DNS name.
-    async fn resolve_host(host: &str, max_retries: usize) -> HashSet<PeerSocketAddr> {
+    async fn resolve_host(
+        host: &str,
+        max_retries: usize,
+        expose_peer_addresses: bool,
+    ) -> HashSet<PeerSocketAddr> {
         for retries in 0..=max_retries {
-            if let Ok(addresses) = Config::resolve_host_once(host).await {
+            if let Ok(addresses) = Config::resolve_host_once(host, expose_peer_addresses).await {
                 return addresses;
             }
 
@@ -501,7 +525,10 @@ impl Config {
     /// # Panics
     ///
     /// If a configured address is an invalid [`SocketAddr`] or DNS name.
-    async fn resolve_host_once(host: &str) -> Result<HashSet<PeerSocketAddr>, BoxError> {
+    async fn resolve_host_once(
+        host: &str,
+        expose_peer_addresses: bool,
+    ) -> Result<HashSet<PeerSocketAddr>, BoxError> {
         let fut = tokio::net::lookup_host(host);
         let fut = tokio::time::timeout(DNS_LOOKUP_TIMEOUT, fut);
 
@@ -524,7 +551,7 @@ impl Config {
                     metrics::counter!(
                         "zcash.net.peers.initial",
                         "seed" => host.to_string(),
-                        "remote_ip" => ip.to_string()
+                        "remote_ip" => ip.addr_label(expose_peer_addresses)
                     )
                     .increment(1);
                 }
@@ -611,7 +638,7 @@ impl Config {
             metrics::counter!(
                 "zcash.net.peers.initial",
                 "cache" => peer_cache_file.display().to_string(),
-                "remote_ip" => ip.to_string()
+                "remote_ip" => ip.addr_label(self.expose_peer_addresses)
             )
             .increment(1);
         }
@@ -639,11 +666,16 @@ impl Config {
             return Ok(());
         }
 
-        // Turn IP addresses into strings
-        let mut peer_list: Vec<String> = peer_list
+        let selected_peers: Vec<PeerSocketAddr> = peer_list
             .iter()
             .take(MAX_PEER_DISK_CACHE_SIZE)
-            .map(|redacted_peer| redacted_peer.remove_socket_addr_privacy().to_string())
+            .copied()
+            .collect();
+
+        // Turn IP addresses into unredacted strings so they remain reconnectable.
+        let mut peer_list: Vec<String> = selected_peers
+            .iter()
+            .map(|peer| peer.remove_socket_addr_privacy().to_string())
             .collect();
         // # Privacy
         //
@@ -670,11 +702,11 @@ impl Config {
                     "updated cached peer IP addresses"
                 );
 
-                for ip in &peer_list {
+                for ip in &selected_peers {
                     metrics::counter!(
                         "zcash.net.peers.cache",
                         "cache" => peer_cache_file.display().to_string(),
-                        "remote_ip" => ip.to_string()
+                        "remote_ip" => ip.addr_label(self.expose_peer_addresses)
                     )
                     .increment(1);
                 }
@@ -869,6 +901,7 @@ impl Default for Config {
             // so that idle peers don't use too many connection slots.
             peerset_initial_target_size: DEFAULT_PEERSET_INITIAL_TARGET_SIZE,
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
+            expose_peer_addresses: false,
         }
     }
 }
@@ -986,6 +1019,7 @@ struct DConfig {
     #[serde(alias = "new_peer_interval", with = "humantime_serde")]
     crawl_new_peer_interval: Duration,
     max_connections_per_ip: Option<usize>,
+    expose_peer_addresses: bool,
 }
 
 impl Default for DConfig {
@@ -1008,6 +1042,7 @@ impl Default for DConfig {
             peerset_initial_target_size: config.peerset_initial_target_size,
             crawl_new_peer_interval: config.crawl_new_peer_interval,
             max_connections_per_ip: Some(config.max_connections_per_ip),
+            expose_peer_addresses: config.expose_peer_addresses,
         }
     }
 }
@@ -1067,6 +1102,7 @@ impl From<Config> for DConfig {
             peerset_initial_target_size,
             crawl_new_peer_interval,
             max_connections_per_ip,
+            expose_peer_addresses,
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -1107,6 +1143,7 @@ impl From<Config> for DConfig {
             peerset_initial_target_size,
             crawl_new_peer_interval,
             max_connections_per_ip: Some(max_connections_per_ip),
+            expose_peer_addresses,
         }
     }
 }
@@ -1133,6 +1170,7 @@ impl<'de> Deserialize<'de> for Config {
             peerset_initial_target_size,
             crawl_new_peer_interval,
             max_connections_per_ip,
+            expose_peer_addresses,
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
@@ -1253,6 +1291,7 @@ impl<'de> Deserialize<'de> for Config {
             peerset_initial_target_size,
             crawl_new_peer_interval,
             max_connections_per_ip,
+            expose_peer_addresses,
         })
     }
 }

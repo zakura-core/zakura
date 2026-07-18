@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Add `zakurad validate-vct-sprout-history` to audit repaired historical
   Sprout anchors in archive or pruned Mainnet state databases.
+- Add an opt-in `network.expose_peer_addresses` setting for unredacted legacy
+  peer address labels in peer activity logs and metrics.
 
 ### Fixed
 

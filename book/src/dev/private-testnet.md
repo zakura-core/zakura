@@ -111,6 +111,7 @@ checkpoint_sync = true
 eviction_memory_time = "1h"
 tx_cost_limit = 80000000
 max_datacarrier_bytes = 83
+max_transaction_bytes = 250000
 
 [metrics]
 endpoint_addr = "127.0.0.1:9999"

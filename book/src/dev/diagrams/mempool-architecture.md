@@ -14,6 +14,7 @@ graph TD
     Mempool{{Mempool Service}}
     Storage{{Storage}}
     Downloads{{Transaction Downloads}}
+    SizePolicy{Within configured size limit?}
     Crawler{{Crawler}}
     QueueChecker{{Queue Checker}}
 
@@ -27,8 +28,10 @@ graph TD
     Downloads -->|4a- Download request| Net
     Net -->|4b- Transaction data| Downloads
 
-    Downloads -->|5a- Verify request| TxVerifier
-    TxVerifier -->|5b- Verification result| Downloads
+    Downloads -->|5a- Check serialized size| SizePolicy
+    SizePolicy -->|5b- Within limit| TxVerifier
+    SizePolicy -->|Over limit: policy result| Downloads
+    TxVerifier -->|5c- Verification result| Downloads
 
     Downloads -->|6a- Check UTXO| State
     State -->|6b- UTXO data| Downloads
@@ -54,7 +57,7 @@ graph TD
     classDef component fill:#333,stroke:#888,stroke-width:1px,color:white;
 
     class Net,State,TxVerifier,RPC external;
-    class Mempool,Storage,Downloads,Crawler,QueueChecker component;
+    class Mempool,Storage,Downloads,SizePolicy,Crawler,QueueChecker component;
 ```
 
 ## Component Descriptions
@@ -79,12 +82,14 @@ graph TD
 
 3. The download service retrieves transaction data from peers.
 
-4. Transactions are verified against consensus rules using the transaction verifier.
+4. The download service rejects transactions larger than `max_transaction_bytes` before semantic and contextual verification. This local mempool policy does not penalize peers or affect transaction validity in blocks.
 
-5. Verified transactions are stored in memory and gossiped to peers via the Gossip task.
+5. Transactions within the configured size limit are verified against consensus rules using the transaction verifier.
 
-6. The queue checker triggers the mempool to process newly verified transactions from the Downloads stream.
+6. Verified transactions are stored in memory and gossiped to peers via the Gossip task.
 
-7. Transactions remain in the mempool until they are mined or evicted due to size limits.
+7. The queue checker triggers the mempool to process newly verified transactions from the Downloads stream.
 
-8. When the chain tip changes, the mempool updates its verification context and potentially evicts invalid transactions.
+8. Transactions remain in the mempool until they are mined or evicted due to total mempool size limits.
+
+9. When the chain tip changes, the mempool updates its verification context and potentially evicts invalid transactions.

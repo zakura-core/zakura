@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Add a configurable 250,000-byte default maximum for individual mempool
+  transactions. Larger transactions are rejected before semantic and contextual
+  verification without penalizing peers, and the policy does not affect block
+  validation.
 - Add `zakurad validate-vct-sprout-history` to audit repaired historical
   Sprout anchors in archive or pruned Mainnet state databases.
 - Add an opt-in `network.expose_peer_addresses` setting for unredacted legacy

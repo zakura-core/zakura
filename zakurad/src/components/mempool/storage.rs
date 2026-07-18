@@ -136,6 +136,10 @@ pub enum RejectionError {
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum NonStandardTransactionError {
+    #[error(
+        "transaction is {actual_bytes} bytes, exceeding the configured mempool maximum of {max_bytes} bytes"
+    )]
+    TransactionTooLarge { actual_bytes: usize, max_bytes: u64 },
     #[error("transaction is dust")]
     IsDust,
     #[error("transaction scriptSig is too large")]
@@ -871,6 +875,11 @@ impl Storage {
             // If it was cancelled then a block was mined, or there was a network
             // upgrade, etc. No reason to reject it.
             TransactionDownloadVerifyError::Cancelled => {}
+
+            TransactionDownloadVerifyError::PolicyRejected(error) => self.reject(
+                tx_id,
+                ExactTipRejectionError::FailedStandard(error).into(),
+            ),
 
             // Consensus verification failed. Reject transaction to avoid
             // having to download and verify it again just for it to fail again.

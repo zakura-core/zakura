@@ -89,6 +89,40 @@ fn verified_ironwood_v6_tx(
 }
 
 #[test]
+fn oversized_policy_rejection_is_cached_by_exact_id() {
+    let mut storage = Storage::new(&config::Config::default());
+    let transaction = Network::Mainnet
+        .unmined_transactions_in_blocks(..)
+        .find(|transaction| transaction.transaction.id.auth_digest().is_some())
+        .expect("mainnet test vectors contain a witnessed transaction");
+    let tx_id = transaction.transaction.id;
+    let rejection = NonStandardTransactionError::TransactionTooLarge {
+        actual_bytes: 250_001,
+        max_bytes: 250_000,
+    };
+
+    storage.reject_if_needed(
+        tx_id,
+        TransactionDownloadVerifyError::PolicyRejected(rejection.clone()),
+    );
+
+    assert_eq!(
+        storage.rejection_error(&tx_id),
+        Some(MempoolError::StorageExactTip(
+            ExactTipRejectionError::FailedStandard(rejection)
+        ))
+    );
+
+    let mut different_authorizing_data = tx_id;
+    let different_auth_digest = different_authorizing_data
+        .auth_digest_mut()
+        .expect("test selected a witnessed transaction");
+    different_auth_digest.0[0] ^= 1;
+    assert_eq!(different_authorizing_data.mined_id(), tx_id.mined_id());
+    assert!(!storage.contains_rejected(&different_authorizing_data));
+}
+
+#[test]
 fn mempool_storage_crud_exact_mainnet() {
     let _init_guard = zakura_test::init();
 

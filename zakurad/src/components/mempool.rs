@@ -116,6 +116,21 @@ type TxVerifier = Buffer<
 >;
 type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, State>;
 
+fn transaction_misbehavior(
+    error: &TransactionDownloadVerifyError,
+) -> Option<(PeerSocketAddr, u32)> {
+    let TransactionDownloadVerifyError::Invalid {
+        error,
+        advertiser_addr: Some(advertiser_addr),
+    } = error
+    else {
+        return None;
+    };
+
+    let score = error.mempool_misbehavior_score();
+    (score != 0).then_some((*advertiser_addr, score))
+}
+
 /// The state of the mempool.
 ///
 /// Indicates whether it is enabled or disabled and, if enabled, contains
@@ -400,6 +415,7 @@ impl Mempool {
             Timeout::new(self.tx_verifier.clone(), TRANSACTION_VERIFY_TIMEOUT),
             self.state.clone(),
             self.expose_peer_addresses,
+            self.config.max_transaction_bytes,
         ));
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),
@@ -710,18 +726,9 @@ impl Service<Request> for Mempool {
                     }
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
-                        if let TransactionDownloadVerifyError::Invalid {
-                            error,
-                            advertiser_addr: Some(advertiser_addr),
-                        } = &error
-                        {
-                            if error.mempool_misbehavior_score() != 0 {
-                                let _ = self.misbehavior_sender.try_send((
-                                    *advertiser_addr,
-                                    error.mempool_misbehavior_score(),
-                                ));
-                            }
-                        };
+                        if let Some((advertiser_addr, score)) = transaction_misbehavior(&error) {
+                            let _ = self.misbehavior_sender.try_send((advertiser_addr, score));
+                        }
 
                         let peer_label =
                             transaction_error_peer_log_label(&error, self.expose_peer_addresses);
@@ -730,10 +737,25 @@ impl Service<Request> for Mempool {
                             ?tx_id,
                             ?error,
                             peer = %peer,
-                            "mempool transaction failed to verify"
+                            "mempool transaction was not accepted"
                         );
 
-                        metrics::counter!("mempool.failed.verify.tasks.total", "reason" => error.to_string()).increment(1);
+                        match &error {
+                            TransactionDownloadVerifyError::PolicyRejected(
+                                storage::NonStandardTransactionError::TransactionTooLarge {
+                                    ..
+                                },
+                            ) => metrics::counter!(
+                                "mempool.rejected.transactions.total",
+                                "reason" => "transaction_too_large"
+                            )
+                            .increment(1),
+                            _ => metrics::counter!(
+                                "mempool.failed.verify.tasks.total",
+                                "reason" => error.to_string()
+                            )
+                            .increment(1),
+                        }
 
                         invalidated_ids.insert(tx_id);
                         storage.reject_if_needed(tx_id, error);
@@ -949,7 +971,24 @@ impl Service<Request> for Mempool {
                                     MempoolError,
                                 > {
                                     let (rsp_tx, rsp_rx) = oneshot::channel();
-                                    storage.should_download_or_verify(gossiped_tx.id())?;
+                                    match storage.should_download_or_verify(gossiped_tx.id()) {
+                                        Ok(()) => {}
+                                        Err(
+                                            error @ MempoolError::StorageExactTip(
+                                                ExactTipRejectionError::FailedStandard(
+                                                    storage::NonStandardTransactionError::TransactionTooLarge {
+                                                        ..
+                                                    },
+                                                ),
+                                            ),
+                                        ) => {
+                                            // A cached policy rejection is a completed admission
+                                            // result, not a failure to queue the request.
+                                            let _ = rsp_tx.send(Err(error.into()));
+                                            return Ok(rsp_rx);
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
                                     tx_downloads.download_if_needed_and_verify(
                                         gossiped_tx,
                                         None,

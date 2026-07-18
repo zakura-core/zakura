@@ -54,6 +54,7 @@ ready_max_tip_age = "5m"
 [mempool]
 eviction_memory_time = "1h"
 max_datacarrier_bytes = 83
+max_transaction_bytes = 250000
 tx_cost_limit = 80000000
 
 [metrics]
@@ -148,4 +149,3 @@ shutdown_grace_period = "5m"
 startup_delay = "1s"
 zcashd_extra_args = []
 zcashd_source = "path"
-

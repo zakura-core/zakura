@@ -32,7 +32,7 @@ impl Runnable for ValidateVctSproutHistoryCmd {
     /// `validate-vct-sprout-history` sub-command entrypoint.
     fn run(&self) {
         if let Err(error) = self.run_with_config(APPLICATION.config().state.clone()) {
-            tracing::error!("Failed to validate VCT Sprout history: {error}");
+            tracing::error!("Failed to validate VCT Sprout history: {error:#}");
             std::process::exit(1);
         }
     }
@@ -57,6 +57,14 @@ impl ValidateVctSproutHistoryCmd {
 fn print_summary(summary: &VctSproutHistoryValidationSummary) {
     println!("VCT Sprout history is valid:");
     println!("  finalized tip: {}", summary.finalized_tip.0);
+    println!(
+        "  sprout root at finalized tip height: {}",
+        hex::encode(
+            summary
+                .sprout_root_at_finalized_tip
+                .bytes_in_display_order()
+        )
+    );
     println!("  VCT marker: {}", summary.vct_marker.0);
     println!("  artifact handoff: {}", summary.artifact_handoff.0);
     println!("  checked Sprout anchors: {}", summary.checked_anchor_count);

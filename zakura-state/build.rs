@@ -38,6 +38,7 @@ fn embed_artifact(source: &Path, out_dir: &Path, generated: &Path) {
 fn require_artifact(source: &Path) -> ! {
     // From the repository root:
     // curl -fL https://raw.githubusercontent.com/zakura-core/zakura/main/zakura-state/src/service/finalized_state/vct/mainnet-sprout-history.bin -o zakura-state/src/service/finalized_state/vct/mainnet-sprout-history.bin
+    // echo "abf89ec7b9eacbe7a259be891a17059496f2c7c7c2144d3babb34f85f8098832  zakura-state/src/service/finalized_state/vct/mainnet-sprout-history.bin" | shasum -a 256 --check
     // cargo install --locked --path zakurad
     panic!(
         "the Sprout-history artifact is missing at {}. It was not included in the crates.io build due to size limit. Download it from https://github.com/zakura-core/zakura/blob/main/zakura-state/src/service/finalized_state/vct/mainnet-sprout-history.bin. Alternatively, sync from genesis or restore a snapshot from https://zakura.com/snapshots/",

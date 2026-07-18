@@ -758,8 +758,10 @@ synced Zebra state at that same height.
 
 This belongs in the checkpoint-maintenance flow rather than in node runtime configuration. The
 `zakura-checkpoints` utility runs against a synced node and produces the `HEIGHT HASH`
-checkpoint artifact consumed by `.github/workflows/checkpoint-update.yml`. It also has an
-explicit Mainnet frontier-artifact output:
+checkpoint artifact used to update the embedded checkpoint lists. (The automated
+`checkpoint-update.yml` pipeline that consumed this artifact was removed together with the
+GCP-based integration tests that produced its inputs; checkpoint maintenance currently runs
+manually.) It also has an explicit Mainnet frontier-artifact output:
 
 ```text
 zakura-checkpoints \
@@ -795,12 +797,14 @@ Zebra state read-only and calls `zakura-state` helpers that:
   path used for the embedded frontier (`produce_final_frontiers_bytes` followed by
   `validate_final_frontiers_bytes`).
 
-The GCP checkpoint-generation workflow copies `/tmp/mainnet-frontier.bin` out of the Mainnet
-checkpoint-generation container and uploads it as a separate artifact named
-`generate-checkpoints-mainnet-frontier`. `checkpoint-update.yml` replaces the embedded frontier
-only when it appends new Mainnet checkpoints, and fails closed if Mainnet checkpoints advance
-but the frontier artifact is missing, empty, or has an embedded height that does not match the
-updated checkpoint max height.
+The removed GCP checkpoint-generation workflow copied `/tmp/mainnet-frontier.bin` out of the
+Mainnet checkpoint-generation container and uploaded it as a separate artifact named
+`generate-checkpoints-mainnet-frontier`, and `checkpoint-update.yml` replaced the embedded
+frontier only when it appended new Mainnet checkpoints, failing closed if Mainnet checkpoints
+advanced but the frontier artifact was missing, empty, or had an embedded height that did not
+match the updated checkpoint max height. The manual flow must keep that contract: whenever a
+checkpoint update advances the Mainnet checkpoint max height, regenerate the frontier with
+`--mainnet-frontier-output` in the same run and land both in the same PR.
 
 Local testing proves byte compatibility with the node loader:
 

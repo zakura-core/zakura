@@ -424,7 +424,9 @@ impl BlockSyncReactor {
     }
 
     async fn handle_event(&mut self, event: BlockSyncEvent) {
-        self.trace_event_received(&event);
+        self.startup
+            .trace
+            .emit_event(|| BlockEventReceived::new(&event));
         match event {
             BlockSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
             BlockSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),
@@ -1699,7 +1701,9 @@ impl BlockSyncReactor {
             "action" => action_label
         )
         .record(queue_depth as f64);
-        self.trace_action_dispatched(&action);
+        self.startup
+            .trace
+            .emit_event(|| BlockActionDispatched::new(&action));
         match self.actions.try_send(action) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {

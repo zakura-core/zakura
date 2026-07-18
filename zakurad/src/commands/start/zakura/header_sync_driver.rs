@@ -517,8 +517,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         } else {
                             "accepted_non_best_chain"
                         };
-                        trace_header_commit_finish(
-                            &trace,
+                        trace.trace_header_commit_finished(
                             "new_block",
                             &peer,
                             height,
@@ -526,8 +525,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             result_label,
                             started,
                         );
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             if on_best_chain {
                                 "new_block_accepted"
                             } else {
@@ -558,8 +556,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         let _ = handles.header_sync.send(event).await;
                     }
                     Ok(committed_hash) => {
-                        trace_header_commit_finish(
-                            &trace,
+                        trace.trace_header_commit_finished(
                             "new_block",
                             &peer,
                             height,
@@ -573,8 +570,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             ?committed_hash,
                             "Zakura NewBlock verifier returned an unexpected hash"
                         );
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             "new_block_rejected",
                             Some(&peer),
                             height,
@@ -588,8 +584,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     }
                     Err(error) => {
                         if block_verify_error_is_duplicate(&error) {
-                            trace_header_commit_finish(
-                                &trace,
+                            trace.trace_header_commit_finished(
                                 "new_block",
                                 &peer,
                                 height,
@@ -604,8 +599,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 ?error,
                                 "Zakura NewBlock was already known by the block verifier"
                             );
-                            trace_header_reactor_event(
-                                &trace,
+                            trace.trace_header_reactor_event(
                                 "new_block_duplicate",
                                 Some(&peer),
                                 height,
@@ -619,8 +613,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             continue;
                         }
 
-                        trace_header_commit_finish(
-                            &trace,
+                        trace.trace_header_commit_finished(
                             "new_block",
                             &peer,
                             height,
@@ -634,8 +627,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             ?error,
                             "Zakura NewBlock rejected by block verifier"
                         );
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             "new_block_rejected",
                             Some(&peer),
                             height,
@@ -657,8 +649,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 count,
                 want_tree_aux_roots,
             } => {
-                trace_state_read_start(
-                    &trace,
+                trace.trace_header_state_read_started(
                     "query_headers_by_height_range",
                     Some(&peer),
                     start,
@@ -677,8 +668,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             headers.len(),
                             started,
                         );
-                        trace_state_read_start(
-                            &trace,
+                        trace.trace_header_state_read_started(
                             "block_size_hints",
                             Some(&peer),
                             start,
@@ -694,8 +684,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         {
                             Ok(zakura_state::ReadResponse::BlockSizeHints(hints)) => hints,
                             Ok(response) => {
-                                trace_state_read_error(
-                                    &trace,
+                                trace.trace_header_state_read_failed(
                                     "block_size_hints",
                                     Some(&peer),
                                     start,
@@ -707,8 +696,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 Vec::new()
                             }
                             Err(error) => {
-                                trace_state_read_error(
-                                    &trace,
+                                trace.trace_header_state_read_failed(
                                     "block_size_hints",
                                     Some(&peer),
                                     start,
@@ -725,8 +713,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             }
                         };
                         let block_roots = if want_tree_aux_roots {
-                            trace_state_read_start(
-                                &trace,
+                            trace.trace_header_state_read_started(
                                 "block_roots",
                                 Some(&peer),
                                 start,
@@ -742,8 +729,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             {
                                 Ok(zakura_state::ReadResponse::BlockRoots(roots)) => roots,
                                 Ok(response) => {
-                                    trace_state_read_error(
-                                        &trace,
+                                    trace.trace_header_state_read_failed(
                                         "block_roots",
                                         Some(&peer),
                                         start,
@@ -755,8 +741,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                     Vec::new()
                                 }
                                 Err(error) => {
-                                    trace_state_read_error(
-                                        &trace,
+                                    trace.trace_header_state_read_failed(
                                         "block_roots",
                                         Some(&peer),
                                         start,
@@ -814,8 +799,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .into_iter()
                             .map(|(_height, _hash, header)| header)
                             .collect();
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             "header_range_response_ready",
                             Some(&peer),
                             start,
@@ -838,8 +822,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .await;
                     }
                     Ok(response) => {
-                        trace_state_read_error(
-                            &trace,
+                        trace.trace_header_state_read_failed(
                             "query_headers_by_height_range",
                             Some(&peer),
                             start,
@@ -848,7 +831,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             started,
                         );
                         warn!(?peer, ?response, "unexpected HeadersByHeightRange response");
-                        trace_header_range_finished(&trace, &peer, start, count, 0);
+                        trace.trace_header_range_finished(&peer, start, count, 0);
                         let _ = handles
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
@@ -862,8 +845,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .await;
                     }
                     Err(error) => {
-                        trace_state_read_error(
-                            &trace,
+                        trace.trace_header_state_read_failed(
                             "query_headers_by_height_range",
                             Some(&peer),
                             start,
@@ -876,7 +858,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             ?error,
                             "failed to read Zakura Headers response from state"
                         );
-                        trace_header_range_finished(&trace, &peer, start, count, 0);
+                        trace.trace_header_range_finished(&peer, start, count, 0);
                         let _ = handles
                             .header_sync
                             .send(HeaderSyncEvent::HeaderRangeResponseFinished {
@@ -939,8 +921,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             .header_sync
                             .send(header_range_committed(operation, tip_hash))
                             .await;
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             "header_range_committed",
                             None,
                             tip_height,
@@ -965,8 +946,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             started,
                         );
                         warn!(?peer, ?response, "unexpected CommitHeaderRange response");
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             "header_range_commit_failed",
                             Some(&peer),
                             start_height,
@@ -1000,8 +980,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             ?error,
                             "Zakura header range commit failed"
                         );
-                        trace_header_reactor_event(
-                            &trace,
+                        trace.trace_header_reactor_event(
                             "header_range_commit_failed",
                             Some(&peer),
                             start_height,
@@ -1032,8 +1011,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         {
                             Ok(tip) => tip,
                             Err(error) => {
-                                trace_state_read_error(
-                                    &trace,
+                                trace.trace_header_state_read_failed(
                                     "query_best_header_tip_roots",
                                     None,
                                     best_header_tip.0,
@@ -1066,8 +1044,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     }
                     Ok(zakura_state::ReadResponse::BestHeaderTip(None)) => {}
                     Ok(response) => {
-                        trace_state_read_error(
-                            &trace,
+                        trace.trace_header_state_read_failed(
                             "query_best_header_tip",
                             None,
                             block::Height(0),
@@ -1078,8 +1055,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         warn!(?response, "unexpected BestHeaderTip response")
                     }
                     Err(error) => {
-                        trace_state_read_error(
-                            &trace,
+                        trace.trace_header_state_read_failed(
                             "query_best_header_tip",
                             None,
                             block::Height(0),
@@ -1250,7 +1226,7 @@ async fn log_missing_block_bodies<ReadState>(
         + 'static,
     ReadState::Future: Send + 'static,
 {
-    trace_state_read_start(trace, "missing_block_bodies", None, from, limit);
+    trace.trace_header_state_read_started("missing_block_bodies", None, from, limit);
     let started = Instant::now();
     match read_state
         .oneshot(zakura_state::ReadRequest::MissingBlockBodies { from, limit })
@@ -1271,8 +1247,7 @@ async fn log_missing_block_bodies<ReadState>(
             );
         }
         Ok(response) => {
-            trace_state_read_error(
-                trace,
+            trace.trace_header_state_read_failed(
                 "missing_block_bodies",
                 None,
                 from,
@@ -1283,8 +1258,7 @@ async fn log_missing_block_bodies<ReadState>(
             warn!(?response, "unexpected MissingBlockBodies response")
         }
         Err(error) => {
-            trace_state_read_error(
-                trace,
+            trace.trace_header_state_read_failed(
                 "missing_block_bodies",
                 None,
                 from,
@@ -1598,59 +1572,4 @@ pub(crate) fn chain_tip_mirror_frontier_change(
         }
         zakura_state::TipAction::Reset { .. } => FrontierChange::VerifiedReset,
     }
-}
-
-fn trace_header_commit_finish(
-    trace: &ZakuraTrace,
-    action: &'static str,
-    peer: &zakura_network::zakura::ZakuraPeerId,
-    height: block::Height,
-    hash: block::Hash,
-    result: &'static str,
-    started: Instant,
-) {
-    trace.trace_header_commit_finished(action, peer, height, hash, result, started);
-}
-
-fn trace_header_reactor_event(
-    trace: &ZakuraTrace,
-    action: &'static str,
-    peer: Option<&zakura_network::zakura::ZakuraPeerId>,
-    height: block::Height,
-    hash: block::Hash,
-    count: u32,
-) {
-    trace.trace_header_reactor_event(action, peer, height, hash, count);
-}
-
-fn trace_header_range_finished(
-    trace: &ZakuraTrace,
-    peer: &zakura_network::zakura::ZakuraPeerId,
-    start: block::Height,
-    requested_count: u32,
-    returned_count: u32,
-) {
-    trace.trace_header_range_finished(peer, start, requested_count, returned_count);
-}
-
-fn trace_state_read_start(
-    trace: &ZakuraTrace,
-    action: &'static str,
-    peer: Option<&zakura_network::zakura::ZakuraPeerId>,
-    start: block::Height,
-    count: u32,
-) {
-    trace.trace_header_state_read_started(action, peer, start, count);
-}
-
-fn trace_state_read_error(
-    trace: &ZakuraTrace,
-    action: &'static str,
-    peer: Option<&zakura_network::zakura::ZakuraPeerId>,
-    start: block::Height,
-    count: u32,
-    reason: &str,
-    started: Instant,
-) {
-    trace.trace_header_state_read_failed(action, peer, start, count, reason, started);
 }

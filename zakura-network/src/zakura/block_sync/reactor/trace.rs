@@ -345,16 +345,4 @@ impl BlockSyncReactor {
             row.verified_block_tip = Some(height(verified_block_tip));
         });
     }
-
-    pub(super) fn trace_event_received(&self, event: &BlockSyncEvent) {
-        self.startup
-            .trace
-            .emit_event(|| BlockEventReceived::new(event));
-    }
-
-    pub(super) fn trace_action_dispatched(&self, action: &BlockSyncAction) {
-        self.startup
-            .trace
-            .emit_event(|| BlockActionDispatched::new(action));
-    }
 }

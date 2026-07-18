@@ -47,7 +47,7 @@ use super::{
 
 mod trace;
 
-use trace::LegacyRequestTraceExt;
+use trace::{LegacyRequestError, LegacyRequestResponse, LegacyRequestStart};
 
 /// Zakura stream kind reserved for legacy gossip compatibility.
 pub const ZAKURA_STREAM_GOSSIP: u16 = 2;
@@ -1914,13 +1914,15 @@ impl ZakuraRequestClient {
             _ => None,
         };
         let frame = frame.encode_frame()?;
-        self.trace.trace_legacy_request_start(
-            "outbound.request",
-            Some(handle.peer_id()),
-            request_id,
-            request_kind,
-            frame.message_type,
-        );
+        self.trace.emit_event(|| {
+            LegacyRequestStart::new(
+                "outbound.request",
+                Some(handle.peer_id()),
+                request_id,
+                request_kind,
+                frame.message_type,
+            )
+        });
         let started_at = Instant::now();
         let response = match timeout(
             self.request_timeout,
@@ -1936,13 +1938,15 @@ impl ZakuraRequestClient {
         {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
-                self.trace.trace_legacy_request_error(
-                    "outbound.error",
-                    Some(handle.peer_id()),
-                    request_id,
-                    request_kind.command(),
-                    error.to_string(),
-                );
+                self.trace.emit_event(|| {
+                    LegacyRequestError::new(
+                        "outbound.error",
+                        Some(handle.peer_id()),
+                        request_id,
+                        request_kind.command(),
+                        error.to_string(),
+                    )
+                });
                 return Err(error);
             }
             Err(_) => {
@@ -1951,13 +1955,15 @@ impl ZakuraRequestClient {
                     handle.peer_id()
                 )
                 .into();
-                self.trace.trace_legacy_request_error(
-                    "outbound.error",
-                    Some(handle.peer_id()),
-                    request_id,
-                    request_kind.command(),
-                    error.to_string(),
-                );
+                self.trace.emit_event(|| {
+                    LegacyRequestError::new(
+                        "outbound.error",
+                        Some(handle.peer_id()),
+                        request_id,
+                        request_kind.command(),
+                        error.to_string(),
+                    )
+                });
                 return Err(error);
             }
         };
@@ -1969,13 +1975,15 @@ impl ZakuraRequestClient {
         ) {
             Ok(response) => response,
             Err(error) => {
-                self.trace.trace_legacy_request_error(
-                    "outbound.decode_error",
-                    Some(handle.peer_id()),
-                    request_id,
-                    request_kind.command(),
-                    error.to_string(),
-                );
+                self.trace.emit_event(|| {
+                    LegacyRequestError::new(
+                        "outbound.decode_error",
+                        Some(handle.peer_id()),
+                        request_id,
+                        request_kind.command(),
+                        error.to_string(),
+                    )
+                });
                 return Err(error.into());
             }
         };
@@ -1983,13 +1991,15 @@ impl ZakuraRequestClient {
             // The responder can only acknowledge a Ping; the requester stamps the RTT.
             response = Response::Pong(started_at.elapsed());
         }
-        self.trace.trace_legacy_request_response(
-            "outbound.response",
-            Some(handle.peer_id()),
-            request_id,
-            request_kind.command(),
-            &response,
-        );
+        self.trace.emit_event(|| {
+            LegacyRequestResponse::new(
+                "outbound.response",
+                Some(handle.peer_id()),
+                request_id,
+                request_kind.command(),
+                &response,
+            )
+        });
         Ok(response)
     }
 }
@@ -2215,13 +2225,15 @@ impl LegacyGossipSink {
                 .map_err(|_| SinkReject::local("legacy request service timed out"))?
                 .map_err(|_| SinkReject::local("legacy request response dropped"))?
                 .map_err(SinkReject::local)?;
-            self.trace.trace_legacy_request_response(
-                "inbound.response",
-                Some(&peer_id),
-                request_id,
-                response.command(),
-                &response,
-            );
+            self.trace.emit_event(|| {
+                LegacyRequestResponse::new(
+                    "inbound.response",
+                    Some(&peer_id),
+                    request_id,
+                    response.command(),
+                    &response,
+                )
+            });
             LegacyResponseCodec::encode_response(
                 request_id,
                 response,
@@ -2501,13 +2513,15 @@ async fn handle_legacy_request<Inbound>(
         let _ = response_tx.send(Ok(Response::Pong(Duration::ZERO)));
         return;
     };
-    trace.trace_legacy_request_start(
-        "inbound.request",
-        Some(&peer_id),
-        request_id,
-        request_kind,
-        request_kind.message_type(),
-    );
+    trace.emit_event(|| {
+        LegacyRequestStart::new(
+            "inbound.request",
+            Some(&peer_id),
+            request_id,
+            request_kind,
+            request_kind.message_type(),
+        )
+    });
 
     let service_work = async move {
         let ready = timeout(LEGACY_REQUEST_TIMEOUT, inbound.ready()).await;
@@ -2542,13 +2556,15 @@ async fn handle_legacy_request<Inbound>(
     };
 
     if let Err(error) = &result {
-        trace.trace_legacy_request_error(
-            "inbound.error",
-            Some(&peer_id),
-            request_id,
-            request_kind.command(),
-            error.to_string(),
-        );
+        trace.emit_event(|| {
+            LegacyRequestError::new(
+                "inbound.error",
+                Some(&peer_id),
+                request_id,
+                request_kind.command(),
+                error.to_string(),
+            )
+        });
     }
 
     if response_tx.send(result).is_err() {

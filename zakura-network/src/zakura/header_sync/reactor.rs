@@ -9,8 +9,9 @@ use crate::zakura::{
 mod trace;
 
 use trace::{
-    commit_failure_reason_label, header_sync_wire_error_kind, record_wire_validation_metrics,
-    set_header_connectivity_gauges, QueueSendContext, TreeAuxTraceSummary,
+    action_dispatched, commit_failure_reason_label, event_received, header_sync_wire_error_kind,
+    record_wire_validation_metrics, set_header_connectivity_gauges, QueueSendContext,
+    TreeAuxTraceSummary,
 };
 
 const STALE_REPAIR_GENERATION: &str = "stale_repair_generation";
@@ -206,7 +207,7 @@ impl HeaderSyncReactor {
     }
 
     async fn handle_event(&mut self, event: HeaderSyncEvent) {
-        self.trace_event_received(&event);
+        self.startup.trace.emit_event(|| event_received(&event));
         // Started/finished pairs expose which event kind an await inside
         // `handle_event` is stuck on: after a freeze, exactly one kind shows
         // started == finished + 1.
@@ -2678,7 +2679,7 @@ impl HeaderSyncReactor {
     /// stalled driver wedge the reactor. Returns `true` only if the action was
     /// accepted.
     fn dispatch_action(&self, action: HeaderSyncAction) -> bool {
-        self.trace_action_dispatched(&action);
+        self.startup.trace.emit_event(|| action_dispatched(&action));
         match self.actions.try_send(action) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -2698,7 +2699,7 @@ impl HeaderSyncReactor {
         // Best-effort record of the violation for the driver. Never block the
         // reactor waiting for channel capacity.
         let action = HeaderSyncAction::Misbehavior { peer, reason };
-        self.trace_action_dispatched(&action);
+        self.startup.trace.emit_event(|| action_dispatched(&action));
         if self.actions.try_send(action).is_err() {
             metrics::counter!("sync.header.peer.violation.action_dropped").increment(1);
         }

@@ -342,8 +342,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         });
                     }
                     Ok(Ok(response)) => {
-                        trace_block_range_error(
-                            &trace,
+                        trace.trace_block_range_query_failed(
                             &peer,
                             start,
                             count,
@@ -351,7 +350,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                             started,
                         );
                         warn!(?peer, ?response, "unexpected BlocksByHeightRange response");
-                        trace_block_range_finished(&trace, &peer, start, count, 0);
+                        trace.trace_block_range_finished(&peer, start, count, 0);
                         let _ =
                             block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
                                 peer,
@@ -361,8 +360,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                             });
                     }
                     Ok(Err(error)) => {
-                        trace_block_range_error(
-                            &trace,
+                        trace.trace_block_range_query_failed(
                             &peer,
                             start,
                             count,
@@ -374,7 +372,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                             ?error,
                             "failed to read Zakura Blocks response from state"
                         );
-                        trace_block_range_finished(&trace, &peer, start, count, 0);
+                        trace.trace_block_range_finished(&peer, start, count, 0);
                         let _ =
                             block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
                                 peer,
@@ -386,7 +384,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     Err(_elapsed) => {
                         trace.trace_block_range_query_timed_out(&peer, start, count, started);
                         warn!(?peer, "timed out reading Zakura block-sync serving range");
-                        trace_block_range_finished(&trace, &peer, start, count, 0);
+                        trace.trace_block_range_finished(&peer, start, count, 0);
                         let _ =
                             block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
                                 peer,
@@ -1353,27 +1351,6 @@ pub(crate) fn block_sync_needed_blocks_from_state(
             BlockSyncBlockMeta { height, hash, size }
         })
         .collect()
-}
-
-fn trace_block_range_error(
-    trace: &ZakuraTrace,
-    peer: &zakura_network::zakura::ZakuraPeerId,
-    start: block::Height,
-    count: u32,
-    reason: &str,
-    started: Instant,
-) {
-    trace.trace_block_range_query_failed(peer, start, count, reason, started);
-}
-
-fn trace_block_range_finished(
-    trace: &ZakuraTrace,
-    peer: &zakura_network::zakura::ZakuraPeerId,
-    start: block::Height,
-    requested_count: u32,
-    returned_count: u32,
-) {
-    trace.trace_block_range_finished(peer, start, requested_count, returned_count);
 }
 
 #[cfg(test)]

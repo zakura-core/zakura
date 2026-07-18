@@ -2,7 +2,7 @@ use serde::Serialize;
 #[cfg(test)]
 use serde_json::Value;
 use zakura_chain::{block, parallel::commitment_aux::BlockCommitmentRoots};
-use zakura_jsonl_trace::impl_jsonl_trace_event;
+use zakura_jsonl_trace::{impl_jsonl_trace_event, JsonlTraceEvent};
 
 use super::super::{
     config::HeaderSyncStatus,
@@ -177,6 +177,18 @@ enum HeaderTraceEvent {
 }
 
 impl_jsonl_trace_event!(HeaderTraceEvent, HEADER_SYNC_TABLE);
+
+pub(super) fn event_received(event: &HeaderSyncEvent) -> impl JsonlTraceEvent {
+    HeaderTraceEvent::EventReceived {
+        projection: HeaderEventProjection::from(event),
+    }
+}
+
+pub(super) fn action_dispatched(action: &HeaderSyncAction) -> impl JsonlTraceEvent {
+    HeaderTraceEvent::ActionDispatched {
+        action: HeaderActionProjection::from(action),
+    }
+}
 
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -477,22 +489,6 @@ impl From<QueueSendContext<'_>> for QueueSendProjection {
 }
 
 impl HeaderSyncReactor {
-    pub(super) fn trace_event_received(&self, event: &HeaderSyncEvent) {
-        self.startup
-            .trace
-            .emit_event(|| HeaderTraceEvent::EventReceived {
-                projection: HeaderEventProjection::from(event),
-            });
-    }
-
-    pub(super) fn trace_action_dispatched(&self, action: &HeaderSyncAction) {
-        self.startup
-            .trace
-            .emit_event(|| HeaderTraceEvent::ActionDispatched {
-                action: HeaderActionProjection::from(action),
-            });
-    }
-
     pub(super) fn trace_status_sent(&self, peer: &ZakuraPeerId, status: HeaderSyncStatus) {
         self.startup
             .trace

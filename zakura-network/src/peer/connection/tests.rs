@@ -82,6 +82,38 @@ fn new_test_connection<A>() -> (
     mpsc::Receiver<Message>,
     ErrorSlot,
 ) {
+    new_test_connection_with_protection(false)
+}
+
+/// Creates a new [`Connection`] marked as an operator-configured protected peer
+/// (exempt from the inbound-overload connection drop).
+fn new_protected_test_connection<A>() -> (
+    Connection<
+        MockService<Request, Response, A>,
+        SinkMapErr<mpsc::Sender<Message>, fn(mpsc::SendError) -> SerializationError>,
+    >,
+    mpsc::Sender<ClientRequest>,
+    MockService<Request, Response, A>,
+    mpsc::Receiver<Message>,
+    ErrorSlot,
+) {
+    new_test_connection_with_protection(true)
+}
+
+/// Creates a new [`Connection`] instance for testing, setting whether it is an
+/// operator-configured protected peer.
+fn new_test_connection_with_protection<A>(
+    is_protected_peer: bool,
+) -> (
+    Connection<
+        MockService<Request, Response, A>,
+        SinkMapErr<mpsc::Sender<Message>, fn(mpsc::SendError) -> SerializationError>,
+    >,
+    mpsc::Sender<ClientRequest>,
+    MockService<Request, Response, A>,
+    mpsc::Receiver<Message>,
+    ErrorSlot,
+) {
     let mock_inbound_service = MockService::build().finish();
     let (client_tx, client_rx) = mpsc::channel(0);
     let shared_error_slot = ErrorSlot::default();
@@ -120,6 +152,7 @@ fn new_test_connection<A>() -> (
         local: remote.clone(),
         remote,
         negotiated_version: fake_version,
+        is_protected_peer,
     };
 
     let connection = Connection::new(
@@ -172,6 +205,7 @@ fn new_never_closing_test_connection<A>(
         local: remote.clone(),
         remote,
         negotiated_version: fake_version,
+        is_protected_peer: false,
     };
 
     let connection = Connection::new(

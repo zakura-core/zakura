@@ -1756,11 +1756,9 @@ async fn rpc_endpoint_client_content_type() -> Result<()> {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn non_blocking_logger() -> Result<()> {
-    use futures::FutureExt;
-    use std::{sync::mpsc, time::Duration};
+    use std::time::Duration;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (done_tx, done_rx) = mpsc::channel();
 
     let test_task_handle: tokio::task::JoinHandle<Result<()>> = rt.spawn(async move {
         let mut config = os_assigned_rpc_port_config(false, &Mainnet)?;
@@ -1797,20 +1795,19 @@ fn non_blocking_logger() -> Result<()> {
             .assert_was_killed()
             .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
 
-        done_tx.send(())?;
-
         Ok(())
     });
 
-    // Wait until the spawned task finishes up to 45 seconds before shutting down tokio runtime
-    if done_rx.recv_timeout(Duration::from_secs(90)).is_ok() {
-        rt.shutdown_timeout(Duration::from_secs(3));
-    }
+    let test_result = rt.block_on(tokio::time::timeout(
+        Duration::from_secs(90),
+        test_task_handle,
+    ));
+    rt.shutdown_timeout(Duration::from_secs(3));
 
-    match test_task_handle.now_or_never() {
-        Some(Ok(result)) => result,
-        Some(Err(error)) => Err(eyre!("join error: {:?}", error)),
-        None => Err(eyre!("unexpected test task hang")),
+    match test_result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(eyre!("join error: {:?}", error)),
+        Err(_) => Err(eyre!("unexpected test task hang")),
     }
 }
 

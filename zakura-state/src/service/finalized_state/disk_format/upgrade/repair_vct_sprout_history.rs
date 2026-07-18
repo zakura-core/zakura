@@ -411,7 +411,7 @@ fn validate_repaired_records(
 
     if db.sprout_tree_by_anchor(&tree.root()).as_deref() != Some(&tree) {
         return Ok(Err(
-            "the database is missing the empty Sprout anchor".to_string(),
+            "the database is missing the empty Sprout anchor".to_string()
         ));
     }
 

@@ -2,9 +2,10 @@
 
 use std::{
     cmp::min,
+    collections::HashSet,
     fmt,
     future::Future,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     panic,
     pin::Pin,
     sync::Arc,
@@ -44,7 +45,7 @@ use crate::{
     },
     peer_set::{ConnectionTracker, InventoryChange},
     protocol::{
-        external::{types::*, AddrInVersion, Codec, InventoryHash, Message},
+        external::{canonical_socket_addr, types::*, AddrInVersion, Codec, InventoryHash, Message},
         internal::{Request, Response},
     },
     types::MetaAddr,
@@ -85,6 +86,11 @@ where
     minimum_peer_version: MinimumPeerVersion<C>,
     nonces: Arc<futures::lock::Mutex<IndexSet<Nonce>>>,
     zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
+
+    /// Inbound peer IPs that are exempt from the inbound-overload connection
+    /// drop (operator-configured block-gossip / zcashd-compat sidecars),
+    /// canonicalized for IPv4-mapped matching. Empty when unconfigured.
+    protected_peer_ips: Arc<HashSet<IpAddr>>,
 
     parent_span: Span,
 }
@@ -130,6 +136,7 @@ where
             minimum_peer_version: self.minimum_peer_version.clone(),
             nonces: self.nonces.clone(),
             zakura_handshake_connector: self.zakura_handshake_connector.clone(),
+            protected_peer_ips: self.protected_peer_ips.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -156,6 +163,21 @@ pub struct ConnectionInfo {
     /// Derived from `remote.version` and the
     /// [current `zakura_network` protocol version](constants::CURRENT_NETWORK_PROTOCOL_VERSION).
     pub negotiated_version: Version,
+
+    /// Whether this is an inbound connection from an operator-configured
+    /// protected peer (a block-gossip / zcashd-compat sidecar).
+    ///
+    /// Protected peers follow this node and learn the chain tip only from it,
+    /// so they are exempt from the inbound-overload connection drop (their
+    /// requests are still shed for backpressure, but the connection is not
+    /// severed). See [`Connection::handle_inbound_overload`].
+    pub is_protected_peer: bool,
+}
+
+/// Canonicalizes `ip` so an IPv4-mapped IPv6 address (`::ffff:A.B.C.D`) compares
+/// equal to its plain IPv4 form, matching how inbound peer accounting keys peers.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    canonical_socket_addr(SocketAddr::new(ip, 0)).ip()
 }
 
 /// The peer address that we are handshaking with.
@@ -393,6 +415,24 @@ impl ConnectedAddr {
     pub fn is_inbound(&self) -> bool {
         matches!(self, InboundDirect { .. } | InboundProxy { .. })
     }
+
+    /// Returns `true` if this is an inbound connection whose peer IP is in the
+    /// operator-configured `protected_peer_ips` set (block-gossip / zcashd-compat
+    /// sidecars).
+    ///
+    /// The peer's transient inbound IP is canonicalized (IPv4-mapped IPv6 →
+    /// IPv4) before lookup, so a dual-stack `::ffff:` sidecar still matches an
+    /// IPv4 configuration entry. Outbound connections are never protected: the
+    /// set describes inbound sidecars that dial this node.
+    pub fn is_protected_peer(&self, protected_peer_ips: &HashSet<IpAddr>) -> bool {
+        if protected_peer_ips.is_empty() || !self.is_inbound() {
+            return false;
+        }
+
+        self.get_transient_addr()
+            .map(|addr| protected_peer_ips.contains(&canonical_ip(addr.ip())))
+            .unwrap_or(false)
+    }
 }
 
 impl fmt::Debug for ConnectedAddr {
@@ -424,6 +464,7 @@ where
     address_book_updater: Option<tokio::sync::mpsc::Sender<MetaAddrChange>>,
     inv_collector: Option<broadcast::Sender<InventoryChange>>,
     zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
+    protected_peer_ips: Option<Arc<HashSet<IpAddr>>>,
     latest_chain_tip: C,
 }
 
@@ -507,6 +548,7 @@ where
             relay: self.relay,
             inv_collector: self.inv_collector,
             zakura_handshake_connector: self.zakura_handshake_connector,
+            protected_peer_ips: self.protected_peer_ips,
         }
     }
 
@@ -516,6 +558,17 @@ where
         zakura_handshake_connector: ZakuraHandshakeConnector,
     ) -> Self {
         self.zakura_handshake_connector = Some(zakura_handshake_connector);
+        self
+    }
+
+    /// Provide the set of inbound peer IPs that are exempt from the
+    /// inbound-overload connection drop. Optional.
+    ///
+    /// These are operator-configured block-gossip / zcashd-compat sidecar IPs
+    /// (canonicalized for IPv4-mapped matching). If this is unset, no peer is
+    /// exempted and every connection behaves exactly as before.
+    pub fn with_protected_peer_ips(mut self, protected_peer_ips: Arc<HashSet<IpAddr>>) -> Self {
+        self.protected_peer_ips = Some(protected_peer_ips);
         self
     }
 
@@ -566,6 +619,7 @@ where
             minimum_peer_version,
             nonces,
             zakura_handshake_connector: self.zakura_handshake_connector,
+            protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
             parent_span: Span::current(),
         })
     }
@@ -590,6 +644,7 @@ where
             address_book_updater: None,
             inv_collector: None,
             zakura_handshake_connector: None,
+            protected_peer_ips: None,
             latest_chain_tip: NoChainTip,
         }
     }
@@ -656,6 +711,7 @@ pub async fn negotiate_version<PeerTransport>(
     our_services: PeerServices,
     relay: bool,
     mut minimum_peer_version: MinimumPeerVersion<impl ChainTip>,
+    is_protected_peer: bool,
 ) -> Result<Arc<ConnectionInfo>, HandshakeError>
 where
     PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -871,6 +927,7 @@ where
         remote,
         local: our_version,
         negotiated_version,
+        is_protected_peer,
     });
 
     debug!(
@@ -1369,6 +1426,11 @@ where
         let minimum_peer_version = self.minimum_peer_version.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
 
+        // Whether this peer is exempt from the inbound-overload connection drop.
+        // Computed here (not in the future) so only the resulting `bool` is moved
+        // into the handshake task.
+        let is_protected_peer = connected_addr.is_protected_peer(&self.protected_peer_ips);
+
         // # Security
         //
         // `zakura_network::init()` implements a connection timeout on this future.
@@ -1400,6 +1462,7 @@ where
                 our_services,
                 relay,
                 minimum_peer_version,
+                is_protected_peer,
             )
             .await
             {

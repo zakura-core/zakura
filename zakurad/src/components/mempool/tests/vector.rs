@@ -19,6 +19,7 @@ use zakura_chain::{
     transparent::{self, OutPoint},
 };
 use zakura_consensus::transaction as tx;
+use zakura_node_services::mempool::QueueSource;
 use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -35,6 +36,255 @@ type StateService = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, 
 
 /// A [`MockService`] representing the Zebra transaction verifier service.
 type MockTxVerifier = MockService<tx::Request, tx::Response, PanicAssertion, TransactionError>;
+
+#[test]
+fn policy_rejection_has_no_misbehavior_score() {
+    let policy_error = TransactionDownloadVerifyError::PolicyRejected(
+        storage::NonStandardTransactionError::TransactionTooLarge {
+            actual_bytes: 250_001,
+            max_bytes: 250_000,
+        },
+    );
+    assert_eq!(transaction_misbehavior(&policy_error), None);
+
+    let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+    let consensus_error = zakura_consensus::error::TransactionError::WrongVersion;
+    let expected_score = consensus_error.mempool_misbehavior_score();
+    assert_ne!(expected_score, 0, "control error must have a score");
+    let invalid_error = TransactionDownloadVerifyError::Invalid {
+        error: consensus_error,
+        advertiser_addr: Some(advertiser_addr),
+    };
+    assert_eq!(
+        transaction_misbehavior(&invalid_error),
+        Some((advertiser_addr, expected_score))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let mut transactions = network
+        .unmined_transactions_in_blocks(2..)
+        .map(|transaction| transaction.transaction.clone())
+        .collect::<Vec<_>>();
+    transactions.sort_by_key(|transaction| transaction.size);
+
+    let at_limit_transaction = transactions
+        .first()
+        .expect("mainnet test vectors contain an unmined transaction")
+        .clone();
+    let oversized_transaction = transactions
+        .last()
+        .expect("mainnet test vectors contain an unmined transaction")
+        .clone();
+    assert!(
+        at_limit_transaction.size < oversized_transaction.size,
+        "test transactions must have different serialized sizes"
+    );
+
+    let max_transaction_bytes = u64::try_from(at_limit_transaction.size)
+        .expect("serialized transaction sizes fit in u64 on supported platforms");
+    let mempool_config = mempool::Config {
+        max_transaction_bytes,
+        ..Default::default()
+    };
+    let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+    let queue_source = QueueSource::LegacySocket(peer_addr.remove_socket_addr_privacy());
+    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
+
+    let (
+        mut mempool,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup_with_mempool_config_and_misbehavior_sender(
+        &network,
+        mempool_config,
+        true,
+        misbehavior_tx,
+    )
+    .await;
+    mempool.enable(&mut recent_syncs).await;
+
+    let oversized_id = oversized_transaction.id;
+    let response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueueFromPeer {
+            transactions: vec![oversized_id.into()],
+            source: queue_source.clone(),
+        })
+        .await
+        .expect("mempool service queues the peer transaction");
+    assert!(matches!(response, Response::Queued(results) if results.is_empty()));
+
+    peer_set
+        .expect_request_that(|request| {
+            matches!(request, zn::Request::TransactionsById(ids) if ids.contains(&oversized_id))
+        })
+        .await
+        .respond(zn::Response::Transactions(vec![
+            zn::InventoryResponse::Available((oversized_transaction.clone(), Some(peer_addr))),
+        ]));
+
+    timeout(Duration::from_secs(3), async {
+        while !mempool.storage().contains_rejected(&oversized_id) {
+            mempool.dummy_call().await;
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("oversized transaction should reach the rejection cache");
+
+    assert!(matches!(
+        mempool.storage().rejection_error(&oversized_id),
+        Some(MempoolError::StorageExactTip(
+            ExactTipRejectionError::FailedStandard(
+                storage::NonStandardTransactionError::TransactionTooLarge {
+                    actual_bytes,
+                    max_bytes,
+                }
+            )
+        )) if actual_bytes == oversized_transaction.size && max_bytes == max_transaction_bytes
+    ));
+    assert_eq!(mempool.storage().transaction_count(), 0);
+    tx_verifier.expect_no_requests().await;
+    assert!(matches!(
+        misbehavior_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    let at_limit_id = at_limit_transaction.id;
+    let response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueueFromPeer {
+            transactions: vec![at_limit_id.into()],
+            source: queue_source,
+        })
+        .await
+        .expect("mempool service queues the peer transaction");
+    assert!(matches!(response, Response::Queued(results) if results.is_empty()));
+
+    peer_set
+        .expect_request_that(|request| {
+            matches!(request, zn::Request::TransactionsById(ids) if ids.contains(&at_limit_id))
+        })
+        .await
+        .respond(zn::Response::Transactions(vec![
+            zn::InventoryResponse::Available((at_limit_transaction, Some(peer_addr))),
+        ]));
+    tx_verifier
+        .expect_request_that(|request| {
+            matches!(
+                request,
+                tx::Request::Mempool { transaction, .. } if transaction.id == at_limit_id
+            )
+        })
+        .await
+        .respond(Err(TransactionError::WrongVersion));
+
+    timeout(Duration::from_secs(3), async {
+        while !mempool.storage().contains_rejected(&at_limit_id) {
+            mempool.dummy_call().await;
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("invalid transaction should reach the rejection cache");
+
+    let expected_score = TransactionError::WrongVersion.mempool_misbehavior_score();
+    assert_eq!(misbehavior_rx.try_recv(), Ok((peer_addr, expected_score)));
+    assert!(matches!(
+        misbehavior_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_size_policy_rejection_is_a_transaction_result() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let transaction = network
+        .unmined_transactions_in_blocks(1..=1)
+        .next()
+        .expect("mainnet test vectors contain an unmined transaction")
+        .transaction
+        .clone();
+    let transaction_id = transaction.id;
+    let mempool_config = mempool::Config {
+        max_transaction_bytes: 1,
+        ..Default::default()
+    };
+
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup_with_mempool_config(&network, mempool_config, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    let response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::Queue(vec![transaction.clone().into()]))
+        .await
+        .expect("mempool service returns a queue response");
+    let Response::Queued(mut queue_results) = response else {
+        panic!("unexpected response to transaction queue request");
+    };
+    let first_result = queue_results
+        .pop()
+        .expect("one transaction has one queue result")
+        .expect("the policy check was queued")
+        .await
+        .expect("the policy result channel remains open")
+        .expect_err("the oversized transaction is rejected");
+    assert!(first_result
+        .to_string()
+        .contains("exceeding the configured mempool maximum"));
+
+    for _ in 0..2 {
+        mempool.dummy_call().await;
+        time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(mempool.storage().contains_rejected(&transaction_id));
+
+    let response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::Queue(vec![transaction.into()]))
+        .await
+        .expect("mempool service returns a queue response");
+    let Response::Queued(mut queue_results) = response else {
+        panic!("unexpected response to transaction queue request");
+    };
+    let cached_result = queue_results
+        .pop()
+        .expect("one transaction has one queue result")
+        .expect("a cached policy rejection is returned as a transaction result")
+        .await
+        .expect("the cached policy result channel remains open")
+        .expect_err("the cached oversized transaction is rejected");
+    assert!(cached_result
+        .to_string()
+        .contains("exceeding the configured mempool maximum"));
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn mempool_service_basic() -> Result<(), Report> {
@@ -2068,6 +2318,30 @@ async fn setup_with_mempool_config(
     RecentSyncLengths,
     tokio::sync::broadcast::Receiver<MempoolChange>,
 ) {
+    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    setup_with_mempool_config_and_misbehavior_sender(
+        network,
+        mempool_config,
+        should_commit_genesis_block,
+        misbehavior_tx,
+    )
+    .await
+}
+
+async fn setup_with_mempool_config_and_misbehavior_sender(
+    network: &Network,
+    mempool_config: mempool::Config,
+    should_commit_genesis_block: bool,
+    misbehavior_tx: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
+) -> (
+    Mempool,
+    MockPeerSet,
+    StateService,
+    ChainTipChange,
+    MockTxVerifier,
+    RecentSyncLengths,
+    tokio::sync::broadcast::Receiver<MempoolChange>,
+) {
     let peer_set = MockService::build().for_unit_tests();
 
     // UTXO verification doesn't matter here.
@@ -2079,7 +2353,6 @@ async fn setup_with_mempool_config(
     let tx_verifier = MockService::build().for_unit_tests();
 
     let (sync_status, recent_syncs) = SyncStatus::new();
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let (mempool, mempool_transaction_subscriber) = Mempool::new(
         &mempool_config,
         Buffer::new(BoxService::new(peer_set.clone()), 1),
@@ -2158,6 +2431,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
         Timeout::new(peer_set, TRANSACTION_DOWNLOAD_TIMEOUT),
         Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
         state,
+        u64::MAX,
     ));
 
     let mut iter = Network::Mainnet.unmined_transactions_in_blocks(1..=10);

@@ -56,6 +56,8 @@ The mempool has the following configurable parameters:
 
 4. **Max Data Carrier Bytes** (`max_datacarrier_bytes`): Optional maximum size of an `OP_RETURN` output script in bytes. If omitted, defaults to 83 (80-byte payload plus opcode overhead).
 
+5. **Maximum Transaction Bytes** (`max_transaction_bytes`): The maximum serialized size of an individual transaction accepted into the mempool, defaulting to 250,000 bytes. Transactions exactly at the limit are accepted; larger transactions are rejected before semantic and contextual verification. This is local mempool policy, not a consensus rule, so it does not affect transaction validity in blocks. Setting the limit to at least 2,000,000 bytes effectively disables this additional restriction because transactions are already bounded by the consensus block size limit.
+
 ## State Management
 
 The mempool maintains an `ActiveState` which can be either:
@@ -83,17 +85,22 @@ The mempool responds to chain tip changes:
    - Queues transaction for download if needed
    - Downloads transaction data from peers
 
-3. **Transaction Verification**:
+3. **Transaction Size Policy**:
+   - Compares the transaction's serialized size with `max_transaction_bytes`
+   - Rejects transactions larger than the configured limit before semantic and contextual verification
+   - Does not treat the transaction or its peer as consensus-invalid
+
+4. **Transaction Verification**:
    - Checks transaction against consensus rules
    - Verifies transaction against the current chain state
    - Manages dependencies between transactions
 
-4. **Transaction Storage**:
+5. **Transaction Storage**:
    - Stores verified transactions in memory
    - Tracks transaction dependencies
    - Enforces size limits and eviction policies
 
-5. **Transaction Gossip**:
+6. **Transaction Gossip**:
    - Broadcasts newly verified transactions to peers
 
 ## Transaction Rejection
@@ -117,6 +124,8 @@ Transactions can be rejected for multiple reasons, categorized into:
    - Applies until a rollback or network upgrade
 
 Rejection reasons are stored alongside rejected transaction IDs to prevent repeated verification of invalid transactions.
+
+Transactions larger than `max_transaction_bytes` are local policy rejections. They are not consensus failures, do not contribute to peer misbehavior scores, and remain eligible for validation when included in a block.
 
 ## Memory Management
 

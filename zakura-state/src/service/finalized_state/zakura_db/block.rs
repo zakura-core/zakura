@@ -1299,6 +1299,11 @@ impl ZakuraDb {
         self.db.write(batch)
     }
 
+    /// Writes the given batch and synchronizes its write-ahead log before returning.
+    pub(crate) fn write_batch_sync(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
+        self.db.write_sync(batch)
+    }
+
     /// Flushes pending writes to SST files.
     pub fn flush(&self) -> Result<(), rocksdb::Error> {
         self.db.flush()

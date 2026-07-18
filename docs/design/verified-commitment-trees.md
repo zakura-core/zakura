@@ -885,3 +885,34 @@ cargo run -p zakura-state --bin generate-vct-sprout-artifact -- \
 Reviewers must reproduce and compare the emitted bytes, SHA-256 digest, terminal root, and
 handoff identity before changing `MAINNET_ARTIFACT`. Running the tool never installs or enables
 its output.
+
+### 17.4 Embedding, availability, and replay
+
+`vct/artifact.rs` currently has no embedded Mainnet bytes (`MAINNET_ARTIFACT` is `None`).
+When reviewed bytes are available, they are compiled into that module and loaded only through
+`embedded_mainnet()`. Until then, opening a pre-28.0.1 Mainnet VCT-synced database is rejected.
+The guard also rejects affected read-only databases and writable opens with upgrades disabled,
+even after artifact bytes become available: operators must reopen writable to repair or
+discard/resync. Non-Mainnet databases never load or replay this Mainnet artifact. Normally synced
+databases and databases already marked at the repair format are unaffected.
+
+The initial startup format change now runs synchronously before `ZakuraDb` or `FinalizedState`
+is exposed; only periodic current-format checks remain in the background. Therefore no block
+commit can race the migration or observe partially repaired anchors. The 28.0.1 format upgrade
+validates artifact records against both retained canonical indexes only through the local
+finalized tip. If the tip has reached the database marker, it also requires the local block hash
+at that marker to equal the checkpoint list's canonical hash; a prefix database below the marker
+does not yet need that local entry. It then replays records through
+`min(finalized_tip, database_marker)` into one
+`DiskWriteBatch`, first inserting the empty Sprout anchor and then every recorded resulting
+anchor. If the tip is below the database marker, it also replaces the stale Sprout **tip** with
+the replayed prefix frontier. If the tip is at or above the marker, it deliberately leaves the
+tip unchanged: post-marker commits may have advanced truthful state, while the replay only
+reconstructs the originally broken fast region. Artifact handoff and database marker equality is
+never required.
+
+Cancellation is checked before work, between records, and before the write. The anchor inserts
+and any prefix-tip update commit atomically. The database format version is marked complete
+only after the upgrade succeeds, so a crash or cancellation leaves the old version and safely
+replays the same deterministic batch on the next startup. This makes the migration
+crash-safe and idempotent at the format-upgrade boundary; it does not alter post-marker state.

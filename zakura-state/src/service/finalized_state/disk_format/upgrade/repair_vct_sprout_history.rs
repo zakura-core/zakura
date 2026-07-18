@@ -27,6 +27,55 @@ pub(crate) const REPAIR_VERSION: Version = Version::new(28, 0, 1);
 /// Replays the reviewed Mainnet artifact into pre-28.0.1 VCT databases.
 pub struct Upgrade;
 
+/// A successful read-only audit of VCT Sprout history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VctSproutHistoryValidationSummary {
+    /// The finalized database tip checked by the audit.
+    pub finalized_tip: Height,
+    /// The persisted VCT handoff marker.
+    pub vct_marker: Height,
+    /// The handoff authenticated by the embedded artifact.
+    pub artifact_handoff: Height,
+    /// The empty anchor plus artifact-record anchors checked by the audit.
+    pub checked_anchor_count: usize,
+}
+
+/// Errors returned by the read-only VCT Sprout-history audit.
+#[derive(Debug, Error)]
+pub enum VctSproutHistoryValidationError {
+    /// The state database could not be opened read-only.
+    #[error("could not open the state database read-only")]
+    OpenDatabase(#[source] crate::StateInitError),
+    /// The audit only has canonical inputs for Mainnet.
+    #[error("VCT Sprout-history validation is only supported on Mainnet")]
+    UnsupportedNetwork,
+    /// The database was not created by VCT fast sync.
+    #[error("the database does not have a persisted VCT marker")]
+    NotVctSynced,
+    /// The database has not durably completed the repair format.
+    #[error(
+        "database format {actual} predates required VCT Sprout-history repair format {required}"
+    )]
+    RepairNotCompleted {
+        /// The version stored on disk, or `None` if no version was stored.
+        actual: String,
+        /// The first format version containing the repair.
+        required: Version,
+    },
+    /// The database format version could not be read.
+    #[error("could not read the database format version: {reason}")]
+    FormatVersion {
+        /// The underlying version-file error.
+        reason: String,
+    },
+    /// The artifact, canonical indexes, or repaired records failed validation.
+    #[error("VCT Sprout-history validation failed: {reason}")]
+    Invalid {
+        /// The failed artifact, index, anchor, or frontier check.
+        reason: String,
+    },
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum RepairValidationError {
     #[error("the embedded VCT final frontier is invalid: {0}")]
@@ -77,6 +126,63 @@ pub(crate) fn validate_startup_repair(db: &ZakuraDb) -> Result<(), RepairValidat
         .vct_synced_below()
         .ok_or(RepairValidationError::MissingVctMarker)?;
     validated_repair_input(db, marker).map(|_| ())
+}
+
+/// Audits a completed VCT Sprout-history repair without modifying the database.
+pub(crate) fn validate_completed_repair(
+    db: &ZakuraDb,
+) -> Result<VctSproutHistoryValidationSummary, VctSproutHistoryValidationError> {
+    if db.network() != Network::Mainnet {
+        return Err(VctSproutHistoryValidationError::UnsupportedNetwork);
+    }
+
+    let marker = db
+        .vct_synced_below()
+        .ok_or(VctSproutHistoryValidationError::NotVctSynced)?;
+    let disk_version = db.format_version_on_disk().map_err(|error| {
+        VctSproutHistoryValidationError::FormatVersion {
+            reason: error.to_string(),
+        }
+    })?;
+    if disk_version
+        .as_ref()
+        .is_none_or(|version| version < &REPAIR_VERSION)
+    {
+        return Err(VctSproutHistoryValidationError::RepairNotCompleted {
+            actual: disk_version
+                .map_or_else(|| "unknown".to_string(), |version| version.to_string()),
+            required: REPAIR_VERSION,
+        });
+    }
+
+    let input = validated_repair_input(db, marker).map_err(|error| {
+        VctSproutHistoryValidationError::Invalid {
+            reason: error.to_string(),
+        }
+    })?;
+    let finalized_tip =
+        db.finalized_tip_height()
+            .ok_or_else(|| VctSproutHistoryValidationError::Invalid {
+                reason: RepairValidationError::MissingFinalizedTip.to_string(),
+            })?;
+    let checked_anchor_count = input
+        .artifact
+        .records_through(finalized_tip.min(marker))
+        .count()
+        .saturating_add(1);
+    let (_cancel_sender, cancel_receiver) = crossbeam_channel::bounded(1);
+    validate_repaired_records(db, marker, &input, true, &cancel_receiver)
+        .map_err(|_| VctSproutHistoryValidationError::Invalid {
+            reason: "validation was unexpectedly cancelled".to_string(),
+        })?
+        .map_err(|reason| VctSproutHistoryValidationError::Invalid { reason })?;
+
+    Ok(VctSproutHistoryValidationSummary {
+        finalized_tip,
+        vct_marker: marker,
+        artifact_handoff: input.artifact_last_checkpoint,
+        checked_anchor_count,
+    })
 }
 
 impl DiskFormatUpgrade for Upgrade {
@@ -142,7 +248,7 @@ impl DiskFormatUpgrade for Upgrade {
             Err(error) => return Ok(Err(error.to_string())),
         };
 
-        validate_repaired_records(db, marker, &input, cancel_receiver)
+        validate_repaired_records(db, marker, &input, false, cancel_receiver)
     }
 }
 
@@ -284,6 +390,7 @@ fn validate_repaired_records(
     db: &ZakuraDb,
     marker: Height,
     input: &RepairInput,
+    check_tip_at_marker: bool,
     cancel_receiver: &Receiver<CancelFormatChange>,
 ) -> Result<Result<(), String>, CancelFormatChange> {
     let tip = db
@@ -317,7 +424,7 @@ fn validate_repaired_records(
         }
     }
 
-    if tip < marker {
+    if tip < marker || (check_tip_at_marker && tip == marker) {
         let tip_tree = db.sprout_tree_for_tip().map_err(|error| error.to_string());
         if tip_tree.as_deref() != Ok(&tree) {
             return Ok(Err(format!(
@@ -818,16 +925,23 @@ mod tests {
         let handoff = Height(2);
         let first_hash = block::Hash([1; 32]);
         let handoff_hash = block::Hash([2; 32]);
-        let path = seed_repair_db(
-            &config,
-            &network,
-            handoff,
-            &[(first_height, first_hash), (handoff, handoff_hash)],
-        );
         let (artifact, roots) = fixture_artifact_with_records(
             handoff,
             handoff_hash,
             &[(first_height, first_hash, 11), (handoff, handoff_hash, 12)],
+        );
+        let mut tip_tree = NoteCommitmentTree::default();
+        for value in [11, 12] {
+            tip_tree
+                .append(sprout::commitment::NoteCommitment::from([value; 32]))
+                .expect("fixture tree has capacity");
+        }
+        let path = seed_repair_db_with_tip(
+            &config,
+            &network,
+            handoff,
+            &[(first_height, first_hash), (handoff, handoff_hash)],
+            &tip_tree,
         );
         let _injection = inject_test_repair_input(
             path,
@@ -858,6 +972,76 @@ mod tests {
             db.block(first_height.into()).is_none(),
             "repair uses retained canonical indexes and does not require pruned bodies"
         );
+
+        let summary =
+            validate_completed_repair(&db).expect("the completed pruned repair validates");
+        assert_eq!(
+            summary,
+            VctSproutHistoryValidationSummary {
+                finalized_tip: handoff,
+                vct_marker: handoff,
+                artifact_handoff: handoff,
+                checked_anchor_count: 3,
+            }
+        );
+
+        let mut corrupt_batch = DiskWriteBatch::new();
+        corrupt_batch.delete_sprout_anchor(&db, &roots[0]);
+        db.write_batch(corrupt_batch)
+            .expect("fixture anchor corruption succeeds");
+        assert!(matches!(
+            validate_completed_repair(&db),
+            Err(VctSproutHistoryValidationError::Invalid { reason })
+                if reason.contains("Sprout anchor at")
+        ));
+    }
+
+    #[test]
+    fn completed_repair_audit_detects_canonical_reverse_index_corruption() {
+        let (_cache, config) = persistent_config();
+        let network = Network::Mainnet;
+        let record_height = Height(1);
+        let handoff = Height(2);
+        let record_hash = block::Hash([1; 32]);
+        let handoff_hash = block::Hash([2; 32]);
+        let (artifact, roots) =
+            fixture_artifact(handoff, handoff_hash, record_height, record_hash, 13);
+        let mut tip_tree = NoteCommitmentTree::default();
+        tip_tree
+            .append(sprout::commitment::NoteCommitment::from([13; 32]))
+            .expect("fixture tree has capacity");
+        let path = seed_repair_db_with_tip(
+            &config,
+            &network,
+            handoff,
+            &[(record_height, record_hash), (handoff, handoff_hash)],
+            &tip_tree,
+        );
+        let _injection = inject_test_repair_input(
+            path,
+            TestRepairInput {
+                handoff,
+                handoff_hash,
+                handoff_sprout_root: roots,
+                artifact,
+                marker_hash: None,
+                before_write: None,
+            },
+        );
+        let db = open_normally(&config, &network);
+        validate_completed_repair(&db).expect("the completed repair initially validates");
+
+        let height_by_hash = db.db().cf_handle("height_by_hash").unwrap();
+        let mut corrupt_batch = DiskWriteBatch::new();
+        corrupt_batch.zs_delete(&height_by_hash, record_hash);
+        db.write_batch(corrupt_batch)
+            .expect("fixture reverse-index corruption succeeds");
+
+        assert!(matches!(
+            validate_completed_repair(&db),
+            Err(VctSproutHistoryValidationError::Invalid { reason })
+                if reason.contains("reverse block index")
+        ));
     }
 
     #[test]

@@ -98,6 +98,10 @@ pub(crate) use commitment_aux::serve_block_roots;
 pub use commitment_aux::{produce_final_frontiers_bytes, FinalFrontiersGenerationError};
 #[allow(unused_imports)]
 pub use disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk};
+pub(crate) use disk_format::upgrade::repair_vct_sprout_history::validate_completed_repair;
+pub use disk_format::upgrade::repair_vct_sprout_history::{
+    VctSproutHistoryValidationError, VctSproutHistoryValidationSummary,
+};
 #[allow(unused_imports)]
 pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,

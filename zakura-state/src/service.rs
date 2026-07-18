@@ -2283,6 +2283,20 @@ pub fn init_read_only(
     ))
 }
 
+/// Opens an existing database read-only and audits its completed VCT Sprout-history repair.
+pub fn validate_vct_sprout_history(
+    config: Config,
+    network: &Network,
+) -> Result<
+    finalized_state::VctSproutHistoryValidationSummary,
+    finalized_state::VctSproutHistoryValidationError,
+> {
+    let (_, db, _) = init_read_only(config, network)
+        .map_err(finalized_state::VctSproutHistoryValidationError::OpenDatabase)?;
+
+    finalized_state::validate_completed_repair(&db)
+}
+
 /// Calls [`init_read_only`] with the provided [`Config`] and [`Network`] from a blocking task.
 ///
 /// Returns a [`tokio::task::JoinHandle`] whose output is a [`Result`]: awaiting it yields a

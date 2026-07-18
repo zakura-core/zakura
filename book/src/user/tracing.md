@@ -19,18 +19,21 @@ See the [`filter`][filter] documentation for more details.
 
 ## Peer Address Visibility
 
-Legacy peer IP addresses are redacted from peer activity logs by
-default. Operators who need per-peer diagnostics can expose them in both logs
-and metrics:
+Legacy peer IP addresses are redacted from peer activity logs and configured
+legacy sync trace files by default. Operators who need per-peer diagnostics can
+expose them in logs, trace files, and metrics:
 
 ```toml
 [network]
 expose_peer_addresses = true
 ```
 
-Unredacted addresses reveal peer topology, and logs can be retained or exported
-to other systems. Only enable this setting when log storage, exporters, and
-monitoring systems are access-controlled.
+When `trace_dir` is configured in `[network.zakura]`, the `peer` field in
+`legacy_sync.jsonl` follows this setting and can contain raw socket addresses.
+Unredacted addresses reveal peer topology, and logs and trace files can be
+retained or exported to other systems. Only enable this setting when log
+storage, trace directories, exporters, and monitoring systems are
+access-controlled.
 
 ## `journald` Logging
 

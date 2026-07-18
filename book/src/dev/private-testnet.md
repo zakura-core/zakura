@@ -83,9 +83,9 @@ testnet test.
 
 ### Unredact peer IPs
 
-Zakura redacts legacy peer addresses in peer activity logs and in the
-`remote_ip` and `addr` metric labels by default. For a controlled private
-testnet, you can expose them together:
+Zakura redacts legacy peer addresses in peer activity logs, configured legacy
+sync trace files, and the `remote_ip` and `addr` metric labels by default. For a
+controlled private testnet, you can expose them together:
 
 ```toml
 [network]
@@ -95,8 +95,8 @@ expose_peer_addresses = true
 endpoint_addr = "127.0.0.1:9999"
 ```
 
-Restrict access to the logs and metrics endpoint because the addresses reveal
-the testnet's peer topology.
+Restrict access to the logs, any configured trace directory, and the metrics
+endpoint because the addresses reveal the testnet's peer topology.
 
 ### Sample config file
 

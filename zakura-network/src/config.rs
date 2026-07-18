@@ -337,16 +337,20 @@ pub struct Config {
     /// outbound connections are also limited to a multiple of `peerset_initial_target_size`.
     pub max_connections_per_ip: usize,
 
-    /// Exposes legacy peer IP addresses in peer activity logs and Prometheus metric labels.
-    /// This includes connected peers and candidate or address book entries.
+    /// Exposes legacy peer IP addresses in peer activity logs, structured trace files, and
+    /// Prometheus metric labels. This includes connected peers and candidate or address book
+    /// entries.
     ///
     /// Literal addresses supplied in the node configuration can appear in startup logs and
     /// `seed` labels regardless of this setting.
+    /// If `trace_dir` is configured in `[network.zakura]`, legacy sync diagnostics can write
+    /// unredacted addresses to `legacy_sync.jsonl`.
     ///
     /// # Security
     ///
-    /// Enabling this setting reveals peer topology in logs and can create high-cardinality metric
-    /// series. Restrict access to logs, the metrics endpoint, and downstream monitoring systems.
+    /// Enabling this setting reveals peer topology in logs and trace files, and can create
+    /// high-cardinality metric series. Restrict access to logs, trace directories, the metrics
+    /// endpoint, and downstream monitoring systems.
     pub expose_peer_addresses: bool,
 }
 

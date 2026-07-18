@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-07-18
+
+### Changed
+
+- `zakura-rpc` moved to 3.0.0 (internal dependency of the bundled tools; no
+  API defined in this crate changed).
+
 ## [1.0.1] - 2026-07-17
 
 ### Changed

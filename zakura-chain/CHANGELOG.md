@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-18
+
+### Added
+
+- Added `NoteCommitmentTrees::update_sprout_tree` for selectively updating the
+  Sprout tree from a block
+  ([#239](https://github.com/zakura-core/zakura/pull/239)).
+
+### Changed
+
+- Made `atomic_write` synchronize the file and, on Unix, its containing
+  directory before reporting success
+  ([#244](https://github.com/zakura-core/zakura/pull/244)).
+
 ## [1.1.0] - 2026-07-17
 
 ### Added

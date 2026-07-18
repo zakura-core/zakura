@@ -7,10 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-07-18
+
+### Breaking Changes
+
+- Removed `ZakuraDb::spawn_format_change`; database format upgrades now
+  complete synchronously during startup
+  ([#240](https://github.com/zakura-core/zakura/pull/240)).
+- Added variants to the exhaustive `FinalFrontiersGenerationError` and
+  `RollbackFinalizedStateError` enums for missing Sprout state and stable-tip
+  validation failures
+  ([#239](https://github.com/zakura-core/zakura/pull/239),
+  [#241](https://github.com/zakura-core/zakura/pull/241)).
+
 ### Added
 
 - Added authenticated VCT Sprout-history artifact generation and validation
-  APIs, plus an offline generator binary.
+  APIs, plus an offline generator binary
+  ([#241](https://github.com/zakura-core/zakura/pull/241)).
+- Added an offline validation API for auditing repaired Sprout anchors in
+  archive or pruned Mainnet state databases
+  ([#247](https://github.com/zakura-core/zakura/pull/247)).
+- Embedded the reviewed Mainnet Sprout-history artifact used by startup repair
+  and offline validation
+  ([#250](https://github.com/zakura-core/zakura/pull/250)).
+
+### Fixed
+
+- Persist Sprout history during verified-commitment-tree fast sync and validate
+  the reconstructed checkpoint frontier
+  ([#239](https://github.com/zakura-core/zakura/pull/239)).
+- Complete database upgrades before exposing the finalized state service
+  ([#240](https://github.com/zakura-core/zakura/pull/240)).
+- Automatically repair eligible legacy VCT Sprout history during writable
+  startup using the reviewed embedded Mainnet artifact. Startup fails safely
+  when repair cannot run or its inputs do not validate
+  ([#244](https://github.com/zakura-core/zakura/pull/244),
+  [#250](https://github.com/zakura-core/zakura/pull/250)).
 
 ## [2.0.0] - 2026-07-17
 

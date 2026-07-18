@@ -7,50 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-07-18
+
 ### Added
 
+- Add authenticated artifact tooling for deterministic repair of Sprout history
+  in databases produced by verified-commitment-tree fast sync
+  ([#241](https://github.com/zakura-core/zakura/pull/241)).
 - Add `zakurad validate-vct-sprout-history` to audit repaired historical
-  Sprout anchors in archive or pruned Mainnet state databases.
+  Sprout anchors in archive or pruned Mainnet state databases
+  ([#247](https://github.com/zakura-core/zakura/pull/247)).
+
+### Changed
+
+- Update the embedded zcashd-compat binary and default split-container image to
+  valargroup/zcashd v1.0.1
+  ([#245](https://github.com/zakura-core/zakura/pull/245)).
+- Schedule header sync only forward from the durable verified block tip, reject
+  configured anchors above that base, and stop backfilling headers below a
+  checkpoint anchor
+  ([#227](https://github.com/zakura-core/zakura/pull/227)).
 
 ### Fixed
 
 - Database format upgrades now finish before startup exposes the finalized
   state database; only configured periodic format checks continue in the
-  background.
+  background ([#240](https://github.com/zakura-core/zakura/pull/240)).
 - Preserve Sprout note-commitment history during fresh verified-commitment-tree
-  fast sync, so later JoinSplit spends can use historical anchors. Affected
-  Mainnet databases that previously ran v2 p2p + fast mode require repair at
-  startup from a reviewed trusted artifact, snapshot redownload, or genesis
-  resync.
-
-### Changed
-
-- Update the embedded zcashd-compat binary and default split-container image to
-  valargroup/zcashd v1.0.1.
-- Header sync now schedules only forward ranges from the durable verified block
-  tip. Startup rejects configured anchors above that base, and no longer
-  backfills headers below a checkpoint anchor.
-
-### Fixed
-
+  fast sync, so later JoinSplit spends can use historical anchors
+  ([#239](https://github.com/zakura-core/zakura/pull/239)).
+- Automatically repair affected Mainnet databases that previously ran v2 p2p
+  plus fast mode during writable startup, using the reviewed embedded artifact.
+  Startup fails safely if the artifact or database does not validate, the
+  database is read-only, or format upgrades are disabled; operators can instead
+  restore a trusted snapshot or resync from genesis
+  ([#244](https://github.com/zakura-core/zakura/pull/244),
+  [#250](https://github.com/zakura-core/zakura/pull/250)).
 - Deliver mined/submitted block gossip to peers that were momentarily unready
-  when the block was advertised. A block broadcast via `AdvertiseBlockToAll`
-  queued a re-send for unready peers, but the queued send future was dropped
-  before the connection wrote the `inv`, so the connection treated the request
-  as canceled and silently skipped it. Because a zcashd-compat sidecar follows a
-  single upstream and learns the tip only from block `inv`s, it could then stall.
-  The queued send now runs to completion. Only local mining paths (regtest, e2e,
-  and local-mining deployments) exercise `AdvertiseBlockToAll`; standard
-  following nodes advertise network blocks via `AdvertiseBlock` and are
-  unaffected.
+  when the block was advertised, preventing zcashd-compat sidecars from
+  stalling on local-mining paths
+  ([#236](https://github.com/zakura-core/zakura/pull/236)).
 - Deliver committed-tip block gossip to configured zcashd-compat sidecar peers
-  even when they are momentarily unready. The "always include sidecars" carve-out
-  in block broadcasts only covered ready peers, so a sidecar that was unready when
-  a block was gossiped was skipped; because it follows a single upstream and
-  learns the tip only from block `inv`s, it then stalled until a later gossip
-  coincided with a ready service. The latest hash is now queued for an unready
-  sidecar and delivered once it is ready again, bounding the stall to one
-  readiness cycle.
+  even when they are momentarily unready, bounding missed gossip to one
+  readiness cycle ([#231](https://github.com/zakura-core/zakura/pull/231)).
 
 ## [1.0.1] - 2026-07-17
 

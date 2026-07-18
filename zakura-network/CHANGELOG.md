@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-07-18
+
+### Changed
+
+- Header sync now schedules only forward ranges from the durable verified block
+  tip and rejects configured anchors above that base
+  ([#227](https://github.com/zakura-core/zakura/pull/227)).
+
+### Fixed
+
+- Block gossip queued while a peer is unready now runs to completion, and the
+  latest committed-tip gossip is retained for configured sidecar peers
+  ([#231](https://github.com/zakura-core/zakura/pull/231),
+  [#236](https://github.com/zakura-core/zakura/pull/236)).
+
 ## [2.0.0] - 2026-07-17
 
 ### Breaking Changes

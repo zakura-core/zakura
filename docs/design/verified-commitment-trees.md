@@ -888,11 +888,18 @@ its output.
 
 ### 17.4 Embedding, availability, and replay
 
-The reviewed Mainnet bytes are compiled into `vct/artifact.rs` and loaded only through
-`embedded_mainnet()`. The guard rejects affected read-only databases and writable opens with
-upgrades disabled: operators must reopen writable to repair or discard/resync. Non-Mainnet
-databases never load or replay this Mainnet artifact. Normally synced databases and databases
-already marked at the repair format are unaffected.
+Source-checkout and official release builds compile the reviewed Mainnet bytes into the binary
+and load them only through `embedded_mainnet()`. Official Docker builds require the source
+artifact at build time and fail rather than produce an artifactless release binary. The
+`zakura-state` crates.io package excludes the large artifact to remain within registry package
+limits; builds from that package report the artifact as unavailable and fail closed if an affected
+database requires repair. They never download or substitute bytes.
+
+The startup guard also rejects affected read-only databases and writable opens with upgrades
+disabled. Operators must use an official release binary and reopen writable to repair, or
+discard/restore/resync the database. Non-Mainnet databases never load or replay this Mainnet
+artifact. Normally synced databases and databases already marked at the repair format are
+unaffected.
 
 The initial startup format change now runs synchronously before `ZakuraDb` or `FinalizedState`
 is exposed; only periodic current-format checks remain in the background. Therefore no block

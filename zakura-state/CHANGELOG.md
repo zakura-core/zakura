@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed `ZakuraDb::spawn_format_change`; database format upgrades now
   complete synchronously during startup
   ([#240](https://github.com/zakura-core/zakura/pull/240)).
+- Changed `ZakuraDb::note_commitment_trees_for_tip`,
+  `ZakuraDb::sprout_tree_for_tip`, and
+  `DiskWriteBatch::prepare_trees_batch` to return errors when required Sprout
+  state is unavailable
+  ([#239](https://github.com/zakura-core/zakura/pull/239)).
 - Added variants to the exhaustive `FinalFrontiersGenerationError` and
   `RollbackFinalizedStateError` enums for missing Sprout state and stable-tip
   validation failures
@@ -28,8 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added an offline validation API for auditing repaired Sprout anchors in
   archive or pruned Mainnet state databases
   ([#247](https://github.com/zakura-core/zakura/pull/247)).
-- Embedded the reviewed Mainnet Sprout-history artifact used by startup repair
-  and offline validation
+- Embedded the reviewed Mainnet Sprout-history artifact in source and official
+  release builds for startup repair and offline validation. The crates.io
+  package omits the large artifact and fails safely when an affected database
+  requires it
   ([#250](https://github.com/zakura-core/zakura/pull/250)).
 
 ### Fixed
@@ -40,8 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Complete database upgrades before exposing the finalized state service
   ([#240](https://github.com/zakura-core/zakura/pull/240)).
 - Automatically repair eligible legacy VCT Sprout history during writable
-  startup using the reviewed embedded Mainnet artifact. Startup fails safely
-  when repair cannot run or its inputs do not validate
+  startup when the build contains the reviewed Mainnet artifact. Startup fails
+  safely when repair cannot run or its inputs do not validate
   ([#244](https://github.com/zakura-core/zakura/pull/244),
   [#250](https://github.com/zakura-core/zakura/pull/250)).
 

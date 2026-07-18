@@ -14,6 +14,7 @@ homepage.workspace = true
 keywords.workspace = true
 # Must be one of <https://crates.io/category_slugs>
 categories = ["asynchronous", "caching", "cryptography::cryptocurrencies"]
+exclude = ["src/service/finalized_state/vct/mainnet-sprout-history.bin"]
 
 [features]
 

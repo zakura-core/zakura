@@ -139,6 +139,7 @@ FROM deps AS release
 ARG SHORT_SHA
 ARG FEATURES
 ENV FEATURES=${FEATURES}
+ENV ZAKURA_REQUIRE_VCT_SPROUT_HISTORY=1
 
 # Set the working directory for the build.
 ARG HOME

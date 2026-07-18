@@ -36,11 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Preserve Sprout note-commitment history during fresh verified-commitment-tree
   fast sync, so later JoinSplit spends can use historical anchors
   ([#239](https://github.com/zakura-core/zakura/pull/239)).
-- Automatically repair affected Mainnet databases that previously ran v2 p2p
-  plus fast mode during writable startup, using the reviewed embedded artifact.
-  Startup fails safely if the artifact or database does not validate, the
-  database is read-only, or format upgrades are disabled; operators can instead
-  restore a trusted snapshot or resync from genesis
+- Official release binaries automatically repair affected Mainnet databases
+  that previously ran v2 p2p plus fast mode during writable startup, using the
+  reviewed embedded artifact. Builds installed from crates.io omit the large
+  artifact and fail safely on affected databases; those operators must use an
+  official release binary, restore a trusted snapshot, or resync from genesis.
+  Startup also fails safely if validation fails, the database is read-only, or
+  format upgrades are disabled
   ([#244](https://github.com/zakura-core/zakura/pull/244),
   [#250](https://github.com/zakura-core/zakura/pull/250)).
 - Deliver mined/submitted block gossip to peers that were momentarily unready

@@ -113,7 +113,7 @@ zakura-chain = { path = "../zakura-chain", version = "1.0.0", features = [
     "json-conversion",
 ] }
 zakura-consensus = { path = "../zakura-consensus", version = "3.0.0" }
-zakura-network = { path = "../zakura-network", version = "2.0.0" }
+zakura-network = { path = "../zakura-network", version = "3.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "1.0.0", features = [
     "rpc-client",
 ] }
@@ -146,7 +146,7 @@ zakura-chain = { path = "../zakura-chain", version = "1.0.0", features = [
 zakura-consensus = { path = "../zakura-consensus", version = "3.0.0", features = [
     "proptest-impl",
 ] }
-zakura-network = { path = "../zakura-network", version = "2.0.0", features = [
+zakura-network = { path = "../zakura-network", version = "3.0.0", features = [
     "proptest-impl",
 ] }
 zakura-state = { path = "../zakura-state", version = "3.0.0", features = [

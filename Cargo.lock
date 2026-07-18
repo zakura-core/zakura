@@ -8988,7 +8988,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "2.0.1"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",

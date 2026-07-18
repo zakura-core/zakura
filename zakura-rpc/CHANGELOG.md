@@ -11,9 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
-- `zakura-state` and `zakura-consensus` moved to 3.0.0. Their service types
-  appear in this crate's public server signatures, so their major versions are
-  part of this crate's API; no APIs defined in this crate changed.
+- `zakura-state`, `zakura-network`, and `zakura-consensus` moved to 3.0.0.
+  Their service types appear in this crate's public server signatures, so
+  their major versions are part of this crate's API; no APIs defined in this
+  crate changed.
 
 ## [2.0.0] - 2026-07-17
 

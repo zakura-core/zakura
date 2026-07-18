@@ -1,0 +1,52 @@
+# Rejects changes that grow the git history by more than 2 MiB of packed
+# objects. Added after a 68 MB embedded artifact had to be removed from
+# history with a force push: large artifacts belong in release assets or
+# external storage with a pinned hash, never in git history.
+name: History growth
+
+on:
+  pull_request:
+    branches: [main, "feat/**", "release/**"]
+
+  # Run when a PR is queued so the merge queue validates the merged result
+  # against the latest `main`.
+  merge_group:
+
+# Ensures that only one workflow task will run at a time. Previous builds, if
+# already in process, will get cancelled. Only the latest commit will be allowed
+# to run, cancelling any workflows in between
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Limit history growth to 2 MiB
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Select revision range
+        id: range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          if [ "${EVENT_NAME}" = "merge_group" ]; then
+            echo "base=${MG_BASE_SHA}" >> "${GITHUB_OUTPUT}"
+            echo "head=${MG_HEAD_SHA}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "base=${PR_BASE_SHA}" >> "${GITHUB_OUTPUT}"
+            echo "head=${PR_HEAD_SHA}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Check history growth
+        run: ./scripts/check-history-growth.sh "${{ steps.range.outputs.base }}" "${{ steps.range.outputs.head }}"

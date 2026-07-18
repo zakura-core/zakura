@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added authenticated VCT Sprout-history artifact generation and validation
   APIs, plus an offline generator binary and exact-versioned crates.io
-  packaging that keeps the embedded repair bytes outside `zakura-state`.
+  packaging that keeps the embedded repair bytes outside `zakura-state` and
+  reuses one validated decode throughout startup repair.
 
 ## [2.0.0] - 2026-07-17
 

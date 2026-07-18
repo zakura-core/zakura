@@ -27,7 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Source the embedded Mainnet VCT Sprout-history repair artifact from
   exact-versioned crates.io packages instead of storing its large source
-  bytes in the Zakura repository.
+  bytes in the Zakura repository, and reuse one validated decode throughout
+  startup repair.
 - Update the embedded zcashd-compat binary and default split-container image to
   valargroup/zcashd v1.0.1.
 - Header sync now schedules only forward ranges from the durable verified block

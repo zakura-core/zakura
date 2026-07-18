@@ -904,6 +904,8 @@ SHA-256 before applying the format and semantic checks above. The guard rejects 
 read-only databases and writable opens with upgrades disabled: operators must reopen writable
 to repair or discard/resync. Non-Mainnet databases never load or replay this Mainnet artifact.
 Normally synced databases and databases already marked at the repair format are unaffected.
+An eligible writable startup decodes and validates the artifact once, then reuses that prepared
+input for the repair and its immediate post-write validation.
 
 The initial startup format change now runs synchronously before `ZakuraDb` or `FinalizedState`
 is exposed; only periodic current-format checks remain in the background. Therefore no block

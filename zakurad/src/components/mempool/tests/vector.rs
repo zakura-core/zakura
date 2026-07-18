@@ -36,6 +36,107 @@ type StateService = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, 
 /// A [`MockService`] representing the Zebra transaction verifier service.
 type MockTxVerifier = MockService<tx::Request, tx::Response, PanicAssertion, TransactionError>;
 
+#[test]
+fn policy_rejection_has_no_misbehavior_score() {
+    let policy_error = TransactionDownloadVerifyError::PolicyRejected(
+        storage::NonStandardTransactionError::TransactionTooLarge {
+            actual_bytes: 250_001,
+            max_bytes: 250_000,
+        },
+    );
+    assert_eq!(transaction_misbehavior(&policy_error), None);
+
+    let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+    let consensus_error = zakura_consensus::error::TransactionError::WrongVersion;
+    let expected_score = consensus_error.mempool_misbehavior_score();
+    assert_ne!(expected_score, 0, "control error must have a score");
+    let invalid_error = TransactionDownloadVerifyError::Invalid {
+        error: consensus_error,
+        advertiser_addr: Some(advertiser_addr),
+    };
+    assert_eq!(
+        transaction_misbehavior(&invalid_error),
+        Some((advertiser_addr, expected_score))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_size_policy_rejection_is_a_transaction_result() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let transaction = network
+        .unmined_transactions_in_blocks(1..=1)
+        .next()
+        .expect("mainnet test vectors contain an unmined transaction")
+        .transaction
+        .clone();
+    let transaction_id = transaction.id;
+    let mempool_config = mempool::Config {
+        max_transaction_bytes: 1,
+        ..Default::default()
+    };
+
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup_with_mempool_config(&network, mempool_config, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    let response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::Queue(vec![transaction.clone().into()]))
+        .await
+        .expect("mempool service returns a queue response");
+    let Response::Queued(mut queue_results) = response else {
+        panic!("unexpected response to transaction queue request");
+    };
+    let first_result = queue_results
+        .pop()
+        .expect("one transaction has one queue result")
+        .expect("the policy check was queued")
+        .await
+        .expect("the policy result channel remains open")
+        .expect_err("the oversized transaction is rejected");
+    assert!(first_result
+        .to_string()
+        .contains("exceeding the configured mempool maximum"));
+
+    for _ in 0..2 {
+        mempool.dummy_call().await;
+        time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(mempool.storage().contains_rejected(&transaction_id));
+
+    let response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::Queue(vec![transaction.into()]))
+        .await
+        .expect("mempool service returns a queue response");
+    let Response::Queued(mut queue_results) = response else {
+        panic!("unexpected response to transaction queue request");
+    };
+    let cached_result = queue_results
+        .pop()
+        .expect("one transaction has one queue result")
+        .expect("a cached policy rejection is returned as a transaction result")
+        .await
+        .expect("the cached policy result channel remains open")
+        .expect_err("the cached oversized transaction is rejected");
+    assert!(cached_result
+        .to_string()
+        .contains("exceeding the configured mempool maximum"));
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn mempool_service_basic() -> Result<(), Report> {
     // Test multiple times to catch intermittent bugs since eviction is randomized
@@ -2158,6 +2259,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
         Timeout::new(peer_set, TRANSACTION_DOWNLOAD_TIMEOUT),
         Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
         state,
+        u64::MAX,
     ));
 
     let mut iter = Network::Mainnet.unmined_transactions_in_blocks(1..=10);

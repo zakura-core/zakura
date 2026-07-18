@@ -4575,6 +4575,15 @@ async fn zcashd_compat_transparent_tx_in_mempool() -> Result<()> {
     common::zcashd_compat::tx_flow::transparent_tx_in_mempool().await
 }
 
+/// Rejects a transaction above Zakura's mempool size limit, then accepts it in a block.
+///
+/// See [`common::zcashd_compat::tx_flow::oversized_transparent_tx_rejected`] for details.
+#[tokio::test]
+#[ignore]
+async fn zcashd_compat_oversized_transparent_tx_rejected() -> Result<()> {
+    common::zcashd_compat::tx_flow::oversized_transparent_tx_rejected().await
+}
+
 /// Sends a transparent transaction via zcashd, mines a block, and confirms it via zakurad.
 ///
 /// See [`common::zcashd_compat::tx_flow::transparent_tx_confirms`] for details.

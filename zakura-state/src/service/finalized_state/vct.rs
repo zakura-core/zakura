@@ -5,6 +5,9 @@
 //! the default source is the peer `tree_aux` source. `checkpoint_sync = false` or
 //! `consensus.vct_fast_sync = false` selects legacy recompute.
 
+pub(super) mod artifact;
+pub use artifact::{generate_mainnet_from_archive, GeneratorError};
+
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -440,12 +443,11 @@ pub struct VctWriteData {
 /// `VCT_REGTEST_FRONTIER` env var. This is scoped to **Regtest only** and validated
 /// against the configured Regtest checkpoint height, so Mainnet always uses the
 /// embedded constant and never reads the env. Other testnets have no frontier.
-fn embedded_final_frontiers(network: &Network) -> Option<FinalFrontiers> {
+pub(super) fn embedded_final_frontiers(network: &Network) -> Option<FinalFrontiers> {
     match network {
-        Network::Mainnet => Some(parse_embedded_final_frontiers(
-            MAINNET_FINAL_FRONTIERS,
-            network.checkpoint_list().max_height(),
-        )),
+        Network::Mainnet => {
+            Some(embedded_mainnet_final_frontiers().unwrap_or_else(|error| panic!("{error}")))
+        }
         Network::Testnet(params) if params.is_regtest() => {
             let path = std::env::var_os("VCT_REGTEST_FRONTIER")?;
             Some(load_frontier_file(
@@ -455,6 +457,15 @@ fn embedded_final_frontiers(network: &Network) -> Option<FinalFrontiers> {
         }
         Network::Testnet(_) => None,
     }
+}
+
+/// Parse the Mainnet frontier without panicking, for fallible startup validation.
+pub(super) fn embedded_mainnet_final_frontiers(
+) -> Result<FinalFrontiers, FinalFrontiersValidationError> {
+    parse_final_frontiers_bytes(
+        MAINNET_FINAL_FRONTIERS,
+        Network::Mainnet.checkpoint_list().max_height(),
+    )
 }
 
 /// Load and validate a final-frontier fixture file (the Regtest path; see

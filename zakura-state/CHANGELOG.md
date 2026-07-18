@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added authenticated VCT Sprout-history artifact generation and validation
+  APIs, plus an offline generator binary.
+
 ## [2.0.0] - 2026-07-17
 
 ### Breaking Changes
@@ -20,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CheckpointVerifiedBlock::with_precomputed_auth_data_root`, a consuming API
   for supplying a precomputed authorizing-data root
   ([#208](https://github.com/zakura-core/zakura/pull/208)).
+
+### Security
+
+- `service::check::utxo::remaining_transaction_value` now converts the block's
+  spent UTXO set once per block instead of cloning it for every transaction,
+  removing quadratic work from transparent value-pool validation that a
+  specially crafted block could exploit to stall block verification
+  ([GHSA-4g24-549m-hp75](https://github.com/zakura-core/zakura/security/advisories/GHSA-4g24-549m-hp75)).
 
 ## [1.0.0] - 2026-07-15
 

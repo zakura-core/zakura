@@ -7,8 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-- Fixed early-chain header validation to use the consensus proof-of-work limit
+### Added
+
+- Add a configurable 250,000-byte default maximum for individual mempool
+  transactions. Larger transactions are rejected before semantic and contextual
+  verification without penalizing peers, and the policy does not affect block
+  validation.
+- Add `zakurad validate-vct-sprout-history` to audit repaired historical
+  Sprout anchors in archive or pruned Mainnet state databases.
+
+### Fixed
+
+- Database format upgrades now finish before startup exposes the finalized
+  state database; only configured periodic format checks continue in the
+  background.
+- Preserve Sprout note-commitment history during fresh verified-commitment-tree
+  fast sync, so later JoinSplit spends can use historical anchors. Affected
+  Mainnet databases that previously ran v2 p2p + fast mode require repair at
+  startup from a reviewed trusted artifact, snapshot redownload, or genesis
+  resync.
+  - Fixed early-chain header validation to use the consensus proof-of-work limit
   at height 17.
+
+
+### Changed
+
+- Update the embedded zcashd-compat binary and default split-container image to
+  valargroup/zcashd v1.0.1.
+- Header sync now schedules only forward ranges from the durable verified block
+  tip. Startup rejects configured anchors above that base, and no longer
+  backfills headers below a checkpoint anchor.
+
+### Fixed
+
+- Deliver mined/submitted block gossip to peers that were momentarily unready
+  when the block was advertised. A block broadcast via `AdvertiseBlockToAll`
+  queued a re-send for unready peers, but the queued send future was dropped
+  before the connection wrote the `inv`, so the connection treated the request
+  as canceled and silently skipped it. Because a zcashd-compat sidecar follows a
+  single upstream and learns the tip only from block `inv`s, it could then stall.
+  The queued send now runs to completion. Only local mining paths (regtest, e2e,
+  and local-mining deployments) exercise `AdvertiseBlockToAll`; standard
+  following nodes advertise network blocks via `AdvertiseBlock` and are
+  unaffected.
+- Deliver committed-tip block gossip to configured zcashd-compat sidecar peers
+  even when they are momentarily unready. The "always include sidecars" carve-out
+  in block broadcasts only covered ready peers, so a sidecar that was unready when
+  a block was gossiped was skipped; because it follows a single upstream and
+  learns the tip only from block `inv`s, it then stalled until a later gossip
+  coincided with a ready service. The latest hash is now queued for an unready
+  sidecar and delivered once it is ready again, bounding the stall to one
+  readiness cycle.
+- The inbound-overload protection no longer disconnects operator-configured
+  block-gossip / zcashd-compat sidecar peers. When such a peer's own getdata /
+  getheaders overloaded or timed out the inbound service, the random
+  connection-drop (probability 0.05→0.5) could sever the very peer this node
+  feeds, and the one-connection-per-IP reconnect refusal could stretch that into
+  a multi-second blackout. Configured sidecars are now exempt from the drop —
+  their requests are still shed for backpressure, but the connection is not
+  closed. Every other peer's denial-of-service protection is unchanged.
 
 ## [1.0.1] - 2026-07-17
 
@@ -83,6 +140,24 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   bundle count, so batch limits bound the actual Groth16 verification work
   submitted to one blocking task
   ([#150](https://github.com/zakura-core/zakura/pull/150)).
+
+### Security
+
+- Validate transparent spends without cloning the block's spent UTXO set for
+  every transaction, removing quadratic work that let a specially crafted
+  block stall block validation for nearly a minute on fast hardware
+  ([GHSA-4g24-549m-hp75](https://github.com/zakura-core/zakura/security/advisories/GHSA-4g24-549m-hp75)).
+- Attribute transactions pushed directly by a peer to that peer when they fail
+  verification, so peers sending consensus-invalid transactions — including
+  transactions with invalid proofs that poison batched proof verification and
+  force repeated, expensive fallback verification — are now misbehavior-scored
+  and banned instead of degrading block validation unidentified
+  ([GHSA-g7c4-2w6c-cr3r](https://github.com/zakura-core/zakura/security/advisories/GHSA-g7c4-2w6c-cr3r)).
+- Reserve the serialized block header, transaction count, and maximum
+  pool-modified coinbase size when selecting mempool transactions for
+  `getblocktemplate`, so an adversary can no longer provoke templates that
+  violate the consensus block size limit and stall mining on a targeted node
+  ([GHSA-95m2-vx53-v2jw](https://github.com/zakura-core/zakura/security/advisories/GHSA-95m2-vx53-v2jw)).
 
 ## [1.0.0] - 2026-07-15
 

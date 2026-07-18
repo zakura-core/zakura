@@ -37,7 +37,6 @@
   - [Zakura versioning and releases](dev/release-process.md)
   - [Continuous Integration](dev/continuous-integration.md)
   - [Continuous Delivery](dev/continuous-delivery.md)
-    - [GCP Deployment Operations](dev/gcp-deployment-operations.md)
   - [Generating Zakura Checkpoints](dev/zakura-checkpoints.md)
   - [Doing Mass Renames](dev/mass-renames.md)
   - [Updating the ECC dependencies](dev/ecc-updates.md)

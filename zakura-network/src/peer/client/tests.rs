@@ -338,6 +338,7 @@ where
             local: remote.clone(),
             remote,
             negotiated_version,
+            is_protected_peer: false,
         });
 
         let client = Client {

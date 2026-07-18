@@ -29,6 +29,7 @@ use crate::{
     write_database_format_version_to_disk, BoxError, Config, StateInitError,
 };
 
+use super::disk_format::upgrade::repair_vct_sprout_history;
 use super::disk_format::upgrade::restorable_db_versions;
 
 pub mod block;
@@ -104,6 +105,23 @@ pub struct ZakuraDb {
     db: DiskDb,
 }
 
+#[derive(Clone, Copy)]
+enum DbOpenMode {
+    Writable,
+    ReadOnly,
+    VctSproutValidation,
+}
+
+impl DbOpenMode {
+    fn is_read_only(self) -> bool {
+        !matches!(self, Self::Writable)
+    }
+
+    fn enforces_vct_repair_guard(self) -> bool {
+        !matches!(self, Self::VctSproutValidation)
+    }
+}
+
 impl ZakuraDb {
     /// Opens or creates the database at a path based on the kind, major version and network,
     /// with the supplied column families, preserving any existing column families,
@@ -125,6 +143,59 @@ impl ZakuraDb {
         column_families_in_code: impl IntoIterator<Item = String>,
         read_only: bool,
     ) -> Result<ZakuraDb, StateInitError> {
+        let open_mode = if read_only {
+            DbOpenMode::ReadOnly
+        } else {
+            DbOpenMode::Writable
+        };
+
+        Self::new_with_vct_repair_guard(
+            config,
+            db_kind,
+            format_version_in_code,
+            network,
+            debug_skip_format_upgrades,
+            column_families_in_code,
+            open_mode,
+        )
+    }
+
+    /// Opens a read-only database for the explicit VCT Sprout-history audit.
+    ///
+    /// Unlike normal read-only callers, the audit must inspect databases that predate the repair
+    /// format. The returned database remains read-only; only the startup rejection of an
+    /// unrepaired VCT database is skipped.
+    /// This method is temporary and can be removed after the VCT Sprout-history repair is complete.
+    pub(crate) fn new_for_vct_sprout_history_validation(
+        config: &Config,
+        db_kind: impl AsRef<str>,
+        format_version_in_code: &Version,
+        network: &Network,
+        column_families_in_code: impl IntoIterator<Item = String>,
+    ) -> Result<ZakuraDb, StateInitError> {
+        Self::new_with_vct_repair_guard(
+            config,
+            db_kind,
+            format_version_in_code,
+            network,
+            false,
+            column_families_in_code,
+            DbOpenMode::VctSproutValidation,
+        )
+    }
+
+    #[allow(clippy::unwrap_in_result)]
+    fn new_with_vct_repair_guard(
+        config: &Config,
+        db_kind: impl AsRef<str>,
+        format_version_in_code: &Version,
+        network: &Network,
+        debug_skip_format_upgrades: bool,
+        column_families_in_code: impl IntoIterator<Item = String>,
+        open_mode: DbOpenMode,
+    ) -> Result<ZakuraDb, StateInitError> {
+        let read_only = open_mode.is_read_only();
+
         // A read-only secondary follows another process's primary database and must never delete
         // it, whereas an ephemeral database deletes its files on drop, so the two modes are
         // mutually exclusive. Reject the combination up front, before the read-only branch below
@@ -163,6 +234,7 @@ impl ZakuraDb {
                 .expect("unable to read database format version file")
             })
         };
+        let disk_version_before_open = disk_version.clone();
 
         // Log any format changes before opening the database, in case opening fails.
         let format_change = DbFormatChange::open_database(format_version_in_code, disk_version);
@@ -175,6 +247,8 @@ impl ZakuraDb {
             let db_path = config.db_path(&db_kind, format_version_in_code.major, network);
             return Err(StateInitError::ReadOnlyDatabaseNotFound { path: db_path });
         }
+
+        let upgrades_explicitly_disabled = debug_skip_format_upgrades;
 
         // Format upgrades try to write to the database, so we always skip them
         // if `read_only` is `true`.
@@ -204,6 +278,36 @@ impl ZakuraDb {
             db: disk_db,
         };
 
+        // The original Mainnet VCT fast path did not persist historical Sprout frontiers.
+        // Never expose an affected database unless this writable startup can synchronously
+        // complete the authenticated repair.
+        if open_mode.enforces_vct_repair_guard()
+            && repair_vct_sprout_history::is_repair_eligible(&db, disk_version_before_open.as_ref())
+        {
+            if read_only
+                || upgrades_explicitly_disabled
+                || !repair_vct_sprout_history::artifact_available(&db)
+            {
+                let reason = if read_only {
+                    "read-only databases cannot be repaired"
+                } else if upgrades_explicitly_disabled {
+                    "database format upgrades are disabled"
+                } else {
+                    "the canonical Mainnet Sprout repair artifact is not embedded in this build"
+                };
+                return Err(StateInitError::VctSproutHistoryRepairRequired {
+                    mode: if read_only { "read-only" } else { "writable" },
+                    reason,
+                });
+            }
+
+            repair_vct_sprout_history::validate_startup_repair(&db).map_err(|error| {
+                StateInitError::VctSproutHistoryRepairInvalid {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
+
         let zero_location_utxos =
             db.address_utxo_locations(AddressLocation::from_usize(Height(0), 0, 0));
         if !zero_location_utxos.is_empty() {
@@ -225,30 +329,27 @@ impl ZakuraDb {
                 .expect("startup header-store repair write failed: RocksDB is unavailable");
         }
 
-        db.spawn_format_change(format_change);
+        db.run_startup_format_change(format_change);
 
         Ok(db)
     }
 
-    /// Launch any required format changes or format checks, and store their thread handle.
-    pub fn spawn_format_change(&mut self, format_change: DbFormatChange) {
+    /// Complete the startup format change before exposing the database, then launch only
+    /// configured periodic current-format checks in the background.
+    pub fn run_startup_format_change(&mut self, format_change: DbFormatChange) {
         if self.debug_skip_format_upgrades {
             return;
         }
 
-        // We have to get this height before we spawn the upgrade task, because threads can take
-        // a while to start, and new blocks can be committed as soon as we return from this method.
+        // No state service can commit while this synchronous startup operation is running.
         let initial_tip_height = self.finalized_tip_height();
+        let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
+        format_change
+            .run_format_change_or_check(self, initial_tip_height, &never_cancel_receiver)
+            .expect("startup format change cannot be cancelled");
 
-        // `upgrade_db` is a special clone of this database, which can't be used to shut down
-        // the upgrade task. (Because the task hasn't been launched yet,
-        // its `db.format_change_handle` is always None.)
-        let upgrade_db = self.clone();
-
-        // TODO:
-        // - should debug_stop_at_height wait for the upgrade task to finish?
         let format_change_handle =
-            format_change.spawn_format_change(upgrade_db, initial_tip_height);
+            DbFormatChange::spawn_periodic_format_checks(self.clone(), initial_tip_height);
 
         self.format_change_handle = Some(format_change_handle);
     }

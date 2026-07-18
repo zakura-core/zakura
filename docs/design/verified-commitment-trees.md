@@ -2,14 +2,17 @@
 
 ## Overview (start here)
 
-**What it is.** Below the last checkpoint, Zebra normally rebuilds the Sapling and Orchard
+**What it is.** Below the last checkpoint, Zebra normally rebuilds the Sapling, Orchard, and
+Ironwood
 note-commitment trees for every block just to learn each block's treestate root — the single
 biggest CPU cost of checkpoint sync. Verified commitment trees (VCT) instead **fetch the
 per-block roots from peers**, **verify each one against the headers the node already trusts**,
 fold them straight into the anchor set and history tree, and **skip the rebuild**. At the
 last checkpoint height an **embedded final frontier** (verified against that block's proven root) is
 written so normal per-block verification resumes above the checkpoint. Result: same consensus
-state as the legacy committer, far less work — and no new cryptography.
+state as the legacy committer, far less work — and no new cryptography. Sprout is different:
+VCT roots do not carry it, so the fast path still appends every JoinSplit commitment locally
+and persists each changed historical Sprout frontier.
 
 **The one invariant that makes it safe:** _no root influences consensus state until it has been
 authenticated against a header commitment._ Everything else (the transport, the cache, the peer
@@ -62,7 +65,7 @@ the direct below-Heartwood/below-NU5/below-Nu6_3 checks); fold it in; freeze the
 | **last checkpoint height** | The network's max checkpoint height; the boundary where the fast path ends and the embedded final frontier is written. |
 | **Fast root** | A peer-supplied `(sapling_root, orchard_root, ironwood_root)` for one height, folded in after verification instead of being recomputed. |
 | **Final frontier** | The real Sapling/Orchard/Sprout/Ironwood note-commitment trees at the last checkpoint height, embedded in the binary (§5.2) and written as the tip treestate at last checkpoint height. |
-| **Frozen frontier** | During VCT fast sync below the last checkpoint, Zebra folds verified roots into the root indexes but does not advance the full on-disk note-commitment trees for every block. If a required root is missing, the committer must stop and retry later, because recomputing from the stale frontier would write invalid state (§8). |
+| **Frozen frontier** | During VCT fast sync below the last checkpoint, Zebra folds verified modern-pool roots into the root indexes but does not advance the full Sapling/Orchard/Ironwood frontiers for every block. Sprout continues to advance locally. If a required modern-pool root is missing, the committer must stop and retry later, because recomputing from a stale modern frontier would write invalid state (§8). |
 | **Verify-before-commit** | Authenticating each root against the node's header commitments (ZIP-221 MMR one-block-lag + direct sub-Heartwood/sub-NU5/sub-Nu6_3 checks) before it affects state (§6). |
 | **Fail closed** | Stop and retry without writing state when a required root is missing or invalid (§8). |
 | **Provisional roots** | Peer-supplied roots carried in the header-sync `Headers` message and persisted to `commitment_roots_by_height` ahead of body commit. Advisory until verify-before-commit authenticates them (§4.2, §6). |
@@ -73,8 +76,8 @@ For where each piece lives in the tree, see the file map (§15).
 
 ## 1. Goal
 
-Let a node sync the chain up to the last checkpoint **without recomputing the Sapling and
-Orchard note-commitment frontiers per block** — the dominant CPU cost of checkpoint sync
+Let a node sync the chain up to the last checkpoint **without recomputing the Sapling,
+Orchard, and Ironwood note-commitment frontiers per block** — the dominant CPU cost of checkpoint sync
 (the per-block `update_trees_parallel` recompute, ~70% of per-block commit time).
 
 Instead of rebuilding the trees, the committer consumes:
@@ -250,7 +253,11 @@ tied to the network's max checkpoint height (validated on load:
 Mainnet checkpoint list advances, this file is regenerated alongside the checkpoint artifacts
 by the maintenance tool described in §16.
 
-- **Sprout** is frozen far below any modern checkpoint, so the tip Sprout tree is its frontier.
+- **Sprout is reconstructed locally throughout fast sync.** JoinSplits remain valid in
+  historical blocks after Sprout's introduction, and their anchors can be referenced by later
+  transactions. VCT therefore appends each block's Sprout commitments after all retryable
+  peer-root checks pass, writes every changed `root → frontier` entry, and verifies the
+  locally reconstructed root against the embedded frontier at handoff.
 - **Ironwood** is carried the same way as Sapling/Orchard, and is authenticated at the
   handoff (§7) against the supplied Ironwood root before it is written as the tip treestate.
   The on-disk byte format is backward compatible: the Ironwood tree is a 4th length-prefixed
@@ -436,7 +443,9 @@ logic. For a checkpoint-verified block at `height`:
      pre-validated, or, at the checkpoint last checkpoint height only, verify the embedded final
      frontiers — including Ironwood — against this height's roots; a failure means _this_
      height's root is bad → reject and evict (§8);
-   - fold the roots (Sapling, Orchard, and Ironwood) into their anchor sets, skip the frontier
+   - after all retryable root/successor checks pass, append this block's Sprout commitments
+     locally, so retrying a deferred block cannot double-append them;
+   - fold the roots (Sapling, Orchard, and Ironwood) into their anchor sets, skip the modern frontier
      recompute, and **freeze** the note-commitment frontier (`vct_frontier_frozen = true`) for
      non-last checkpoint height fast blocks.
 3. **Checkpoint last checkpoint height** (when `height` is the last checkpoint height): verify the embedded
@@ -444,7 +453,8 @@ logic. For a checkpoint-verified block at `height`:
    verified root` for each pool; collision resistance makes each root a binding commitment to
    its frontier), write them as the real tip treestate via the normal write path, and
    **unfreeze** — heights at/above the last checkpoint height resume legacy recompute from a
-   correct frontier.
+   correct frontier. The embedded Sprout root must equal the locally reconstructed root, but
+   the local Sprout frontier is retained rather than replaced.
 4. **If not supplied:** §8.
 
 The write worker enforces the successor side of this contract before calling the committer: if
@@ -748,8 +758,10 @@ synced Zebra state at that same height.
 
 This belongs in the checkpoint-maintenance flow rather than in node runtime configuration. The
 `zakura-checkpoints` utility runs against a synced node and produces the `HEIGHT HASH`
-checkpoint artifact consumed by `.github/workflows/checkpoint-update.yml`. It also has an
-explicit Mainnet frontier-artifact output:
+checkpoint artifact used to update the embedded checkpoint lists. (The automated
+`checkpoint-update.yml` pipeline that consumed this artifact was removed together with the
+GCP-based integration tests that produced its inputs; checkpoint maintenance currently runs
+manually.) It also has an explicit Mainnet frontier-artifact output:
 
 ```text
 zakura-checkpoints \
@@ -785,12 +797,14 @@ Zebra state read-only and calls `zakura-state` helpers that:
   path used for the embedded frontier (`produce_final_frontiers_bytes` followed by
   `validate_final_frontiers_bytes`).
 
-The GCP checkpoint-generation workflow copies `/tmp/mainnet-frontier.bin` out of the Mainnet
-checkpoint-generation container and uploads it as a separate artifact named
-`generate-checkpoints-mainnet-frontier`. `checkpoint-update.yml` replaces the embedded frontier
-only when it appends new Mainnet checkpoints, and fails closed if Mainnet checkpoints advance
-but the frontier artifact is missing, empty, or has an embedded height that does not match the
-updated checkpoint max height.
+The removed GCP checkpoint-generation workflow copied `/tmp/mainnet-frontier.bin` out of the
+Mainnet checkpoint-generation container and uploaded it as a separate artifact named
+`generate-checkpoints-mainnet-frontier`, and `checkpoint-update.yml` replaced the embedded
+frontier only when it appended new Mainnet checkpoints, failing closed if Mainnet checkpoints
+advanced but the frontier artifact was missing, empty, or had an embedded height that did not
+match the updated checkpoint max height. The manual flow must keep that contract: whenever a
+checkpoint update advances the Mainnet checkpoint max height, regenerate the frontier with
+`--mainnet-frontier-output` in the same run and land both in the same PR.
 
 Local testing proves byte compatibility with the node loader:
 
@@ -812,3 +826,95 @@ cargo test -p zakura-state final_frontier
 cargo test -p zakura-utils --features zakura-checkpoints
 cargo test -p zakura --features zakura-checkpoints checkpoints
 ```
+
+## 17. VCT Sprout-history repair artifact
+
+### 17.1 Purpose and trust boundary
+
+The original VCT fast path advanced Sprout locally but omitted the historical
+`Sprout root → frontier` anchor entries. A later JoinSplit can spend one of those roots, so an
+affected database must be repaired before it is used for validation. The repair artifact is a
+canonical, Mainnet-only history of **only the blocks that change Sprout**; it is unrelated to
+peer-delivered VCT roots and is never accepted from peers.
+
+The SHA-256 digest in the artifact detects accidental or malicious byte changes, but does not
+establish provenance. Provenance comes from release review and embedding the approved bytes in
+the binary. The loader must never substitute downloaded, locally generated, or guessed bytes.
+Each record is bound to its canonical block hash, and the header is bound to the canonical
+handoff block hash. The terminal root is independently pinned to the separately embedded VCT
+handoff frontier, so both artifacts must agree before replay.
+
+### 17.2 Binary format (version 1)
+
+All integers are little-endian. The fixed 115-byte header is:
+
+| Bytes | Field |
+| --- | --- |
+| 0–7 | ASCII magic `ZKVCTSP1` |
+| 8–9 | `u16` format version (`1`) |
+| 10 | network tag (`1`, Mainnet) |
+| 11–14 | `u32` handoff height |
+| 15–46 | canonical handoff block hash |
+| 47–50 | `u32` record count |
+| 51–82 | 32-byte terminal Sprout root |
+| 83–114 | SHA-256 digest of the remaining payload |
+
+The payload contains exactly `record_count` records. Each record is `height_delta: u32`,
+the canonical 32-byte block hash, `commitment_count: u16`, `commitment_count` 32-byte Sprout
+commitments, and one 32-byte resulting Sprout root. The digest covers these canonical hashes.
+Heights are delta-coded from an initial height of zero. The current implementation permits at
+most 1M records and 65,535 commitments per record. Because no bytes using the earlier
+unshipped layout were published, this corrected layout remains version 1 and has no compatibility
+decoder.
+
+### 17.3 Validation and generation
+
+The decoder rejects a wrong magic, version, or network; truncation; digest mismatches; excess
+counts; zero or overflowing/non-increasing height deltas; heights above the handoff; empty
+records; record-root mismatches while replaying commitments from an empty Sprout tree; a
+terminal-root mismatch; and trailing bytes. The generated artifact is authenticated against the
+current build's own identity: its handoff must equal the embedded final frontier's height and its
+terminal Sprout root must equal the embedded final frontier's Sprout root.
+
+The offline generator opens a complete current-format Mainnet archive read-only, scans canonical
+block bodies from genesis through the embedded handoff, emits only Sprout-changing blocks with
+their canonical hashes, and then decodes, replays, canonical-index-validates, and handoff-validates
+its own output:
+
+```console
+cargo run -p zakura-state --bin generate-vct-sprout-artifact -- \
+  /path/to/zakura-cache /path/to/vct-sprout-history.bin
+```
+
+Reviewers must reproduce and compare the emitted bytes, SHA-256 digest, terminal root, and
+handoff identity before changing `MAINNET_ARTIFACT`. Running the tool never installs or enables
+its output.
+
+### 17.4 Embedding, availability, and replay
+
+The reviewed Mainnet bytes are compiled into `vct/artifact.rs` and loaded only through
+`embedded_mainnet()`. The guard rejects affected read-only databases and writable opens with
+upgrades disabled: operators must reopen writable to repair or discard/resync. Non-Mainnet
+databases never load or replay this Mainnet artifact. Normally synced databases and databases
+already marked at the repair format are unaffected.
+
+The initial startup format change now runs synchronously before `ZakuraDb` or `FinalizedState`
+is exposed; only periodic current-format checks remain in the background. Therefore no block
+commit can race the migration or observe partially repaired anchors. The 28.0.1 format upgrade
+validates artifact records against both retained canonical indexes only through the local
+finalized tip. If the tip has reached the database marker, it also requires the local block hash
+at that marker to equal the checkpoint list's canonical hash; a prefix database below the marker
+does not yet need that local entry. It then replays records through
+`min(finalized_tip, database_marker)` into one
+`DiskWriteBatch`, first inserting the empty Sprout anchor and then every recorded resulting
+anchor. If the tip is below the database marker, it also replaces the stale Sprout **tip** with
+the replayed prefix frontier. If the tip is at or above the marker, it deliberately leaves the
+tip unchanged: post-marker commits may have advanced truthful state, while the replay only
+reconstructs the originally broken fast region. Artifact handoff and database marker equality is
+never required.
+
+Cancellation is checked before work, between records, and before the write. The anchor inserts
+and any prefix-tip update commit atomically. The database format version is marked complete
+only after the upgrade succeeds, so a crash or cancellation leaves the old version and safely
+replays the same deterministic batch on the next startup. This makes the migration
+crash-safe and idempotent at the format-upgrade boundary; it does not alter post-marker state.

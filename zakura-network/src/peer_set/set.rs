@@ -98,7 +98,7 @@ use std::{
     convert,
     fmt::Debug,
     marker::PhantomData,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -137,7 +137,7 @@ use crate::{
         InventoryChange, InventoryRegistry,
     },
     protocol::{
-        external::InventoryHash,
+        external::{canonical_socket_addr, InventoryHash},
         internal::{Request, Response},
     },
     BoxError, Config, PeerError, PeerSocketAddr, SharedPeerError,
@@ -246,6 +246,21 @@ where
 
     /// Inbound peer IPs that must always receive block inventory broadcasts.
     block_gossip_peer_ips: HashSet<IpAddr>,
+
+    /// The most recent block gossip queued for configured sidecar peers (see
+    /// [`Self::block_gossip_peer_ips`]) that were unready when it fired, paired
+    /// with the unready sidecar peers still awaiting it.
+    ///
+    /// A sidecar follows a single upstream and learns the chain tip only from
+    /// block `inv`s, so a gossip dropped because the peer was momentarily
+    /// unready starves it until a later gossip happens to coincide with a ready
+    /// service — an unbounded stall. Re-delivering the latest hash once the peer
+    /// is ready again (mirroring [`Self::queued_broadcast_all`], on a subsequent
+    /// `poll_ready`) bounds that stall to a single readiness cycle. Only the
+    /// newest hash is kept: a sidecar that missed
+    /// earlier hashes learns them from its `getheaders` locator once it receives
+    /// any newer tip `inv`.
+    queued_sidecar_block_gossip: Option<(Request, HashSet<D::Key>)>,
 
     // Peer Tracking: Busy Peers
     //
@@ -372,6 +387,7 @@ where
             inventory_registry: InventoryRegistry::new(inv_stream),
             queued_broadcast_all: None,
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
+            queued_sidecar_block_gossip: None,
 
             // Busy peers
             unready_services: FuturesUnordered::new(),
@@ -1186,6 +1202,11 @@ where
     /// Broadcasts a block inventory request to sampled peers and configured sidecars.
     fn route_block_broadcast(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
         let selected_peers = self.select_block_broadcast_peers(self.number_of_peers_to_broadcast());
+        // `select_block_broadcast_peers` can only include sidecar peers that are
+        // ready right now. A sidecar that is unready would silently miss this
+        // gossip, and a single-upstream sidecar has no other way to learn the
+        // tip, so queue the gossip for any unready sidecar to receive once ready.
+        self.queue_block_gossip_for_unready_sidecars(&req, &selected_peers);
         self.send_multiple(req, selected_peers)
     }
 
@@ -1199,7 +1220,18 @@ where
 
         async move {
             let _ = send_multiple_fut.await?;
-            while queued_broadcast_fut_receiver.recv().await.is_some() {}
+            // Each queued item is a `send_multiple` future whose response receivers
+            // keep the enqueued peer requests from being treated as canceled (see the
+            // `tx.is_canceled()` skip in `Connection::handle_client_request`).
+            // `send_multiple` calls `Client::call`, which enqueues each request to the
+            // connection task synchronously but holds the response receiver inside the
+            // returned future. Dropping that future unpolled — as `.is_some() {}` did —
+            // drops the receiver before the connection task drains the request, so it
+            // sees a canceled request and racily skips the block `inv`. Spawn each
+            // future so it is polled to completion and keeps its receivers alive.
+            while let Some(send_fut) = queued_broadcast_fut_receiver.recv().await {
+                tokio::spawn(send_fut);
+            }
             Ok(Response::Nil)
         }
         .boxed()
@@ -1256,6 +1288,84 @@ where
 
         if !remaining_peers.is_empty() {
             self.queued_broadcast_all = Some((req, sender, remaining_peers));
+        }
+    }
+
+    /// Queues block gossip `req` for configured sidecar peers that are currently
+    /// unready, so [`PeerSet::deliver_queued_sidecar_block_gossip`] can send it
+    /// once they become ready.
+    ///
+    /// `already_selected` are the peers being served synchronously by the
+    /// caller; a sidecar in that list is already covered and is not queued. Only
+    /// the newest request is retained (see [`Self::queued_sidecar_block_gossip`]).
+    fn queue_block_gossip_for_unready_sidecars(
+        &mut self,
+        req: &Request,
+        already_selected: &[D::Key],
+    ) {
+        if self.block_gossip_peer_ips.is_empty() {
+            return;
+        }
+
+        // Collect keys first so the sidecar-IP check can borrow `self`.
+        let unready_keys: Vec<D::Key> = self.cancel_handles.keys().copied().collect();
+        let unready_sidecars: HashSet<D::Key> = unready_keys
+            .into_iter()
+            .filter(|key| self.is_block_gossip_sidecar_ip(key))
+            .filter(|key| !already_selected.contains(key))
+            .collect();
+
+        // A ready sidecar was just served directly, so a newer gossip supersedes
+        // any stale queue: replace it, or clear it when nothing is left unready.
+        self.queued_sidecar_block_gossip =
+            (!unready_sidecars.is_empty()).then(|| (req.clone(), unready_sidecars));
+    }
+
+    /// Returns true if `key`'s canonical IP is one of the configured sidecar
+    /// block-gossip IPs ([`Self::block_gossip_peer_ips`]).
+    ///
+    /// This identifies a sidecar peer by key alone, for when the peer is unready
+    /// and its service is not available for the stricter
+    /// [`Self::is_zcashd_compat_peer`] check. Canonicalizing both sides matches
+    /// [`LoadTrackedClient::is_inbound_direct_from_ip`], so IPv4-mapped and native
+    /// loopback forms compare equal.
+    fn is_block_gossip_sidecar_ip(&self, key: &D::Key) -> bool {
+        let key_ip = canonical_socket_addr(SocketAddr::new(key.ip(), 0)).ip();
+        self.block_gossip_peer_ips
+            .iter()
+            .any(|ip| canonical_socket_addr(SocketAddr::new(*ip, 0)).ip() == key_ip)
+    }
+
+    /// Sends the queued block gossip to configured sidecar peers that have
+    /// become ready since it was queued, mirroring
+    /// [`PeerSet::broadcast_all_queued`] but scoped to sidecar peers.
+    ///
+    /// Called from `poll_ready`, so delivery happens on the next peer-set poll
+    /// after the sidecar becomes ready — near-immediate on an active node, but
+    /// gated on peer-set traffic rather than truly instantaneous.
+    fn deliver_queued_sidecar_block_gossip(&mut self) {
+        let Some((req, mut remaining)) = self.queued_sidecar_block_gossip.take() else {
+            return;
+        };
+
+        let ready_now: Vec<D::Key> = self
+            .ready_services
+            .keys()
+            .filter(|key| remaining.remove(*key))
+            .copied()
+            .collect();
+
+        if !ready_now.is_empty() {
+            // `send_multiple` enqueues the inventory to each peer synchronously
+            // and marks it unready; the returned future only drains the ignored
+            // broadcast responses, so it is spawned to run to completion.
+            let send_fut = self.send_multiple(req.clone(), ready_now);
+            tokio::spawn(send_fut);
+        }
+
+        // Keep waiting on any sidecar that is still unready.
+        if !remaining.is_empty() {
+            self.queued_sidecar_block_gossip = Some((req, remaining));
         }
     }
 
@@ -1456,6 +1566,7 @@ where
         }
 
         self.broadcast_all_queued();
+        self.deliver_queued_sidecar_block_gossip();
 
         if self.ready_services.is_empty() {
             self.poll_peers(cx)

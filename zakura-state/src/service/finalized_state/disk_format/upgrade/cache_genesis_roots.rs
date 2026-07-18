@@ -25,7 +25,9 @@ pub fn run(
     cancel_receiver: &Receiver<CancelFormatChange>,
 ) -> Result<(), CancelFormatChange> {
     let sprout_genesis_tree = sprout::tree::NoteCommitmentTree::default();
-    let sprout_tip_tree = upgrade_db.sprout_tree_for_tip();
+    let sprout_tip_tree = upgrade_db
+        .sprout_tree_for_tip()
+        .expect("Sprout tip tree exists because this upgrade requires a non-empty valid database");
 
     let sapling_genesis_tree = upgrade_db
         .sapling_tree_by_height(&Height(0))
@@ -90,7 +92,9 @@ pub fn quick_check(db: &ZakuraDb) -> Result<(), String> {
     let Some(sprout_genesis_tree) = db.sprout_tree_by_anchor(&sprout_genesis_tree.root()) else {
         return Ok(());
     };
-    let sprout_tip_tree = db.sprout_tree_for_tip();
+    let sprout_tip_tree = db
+        .sprout_tree_for_tip()
+        .map_err(|error| error.to_string())?;
 
     let Some(sapling_genesis_tree) = db.sapling_tree_by_height(&Height(0)) else {
         return Ok(());

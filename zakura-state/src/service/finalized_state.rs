@@ -98,12 +98,19 @@ pub(crate) use commitment_aux::serve_block_roots;
 pub use commitment_aux::{produce_final_frontiers_bytes, FinalFrontiersGenerationError};
 #[allow(unused_imports)]
 pub use disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk};
+pub(crate) use disk_format::upgrade::repair_vct_sprout_history::validate_completed_repair;
+pub use disk_format::upgrade::repair_vct_sprout_history::{
+    VctSproutHistoryValidationError, VctSproutHistoryValidationSummary,
+};
 #[allow(unused_imports)]
 pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
 };
-pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, NextVctBlock};
+pub use vct::{
+    generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
+    GeneratorError, NextVctBlock,
+};
 pub use zakura_db::ZakuraDb;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -698,8 +705,13 @@ impl FinalizedState {
                     let block = checkpoint_verified.block.clone();
                     let precomputed_auth_data_root = checkpoint_verified.auth_data_root;
                     let mut history_tree = self.db.history_tree();
-                    let prev_note_commitment_trees = prev_note_commitment_trees
-                        .unwrap_or_else(|| self.db.note_commitment_trees_for_tip());
+                    let prev_note_commitment_trees = match prev_note_commitment_trees {
+                        Some(trees) => trees,
+                        None => self
+                            .db
+                            .note_commitment_trees_for_tip()
+                            .map_err(ValidateContextError::from)?,
+                    };
 
                     let mut note_commitment_trees = prev_note_commitment_trees.clone();
                     let network = self.network();
@@ -897,6 +909,14 @@ impl FinalizedState {
                             self.vct.clear_prevalidated_next();
                         }
 
+                        // Sprout roots are not supplied by VCT or committed to the modern
+                        // history-tree payload. Reconstruct Sprout locally, but only after all
+                        // retryable supplied-root and successor checks have succeeded so a
+                        // deferred retry cannot append the same commitments twice.
+                        note_commitment_trees
+                            .update_sprout_tree(&block)
+                            .map_err(ValidateContextError::from)?;
+
                         history_tree = Arc::new(candidate);
                         if let Some(v) = self.vct.source() {
                             v.record_fast_block();
@@ -931,10 +951,23 @@ impl FinalizedState {
                                 &ironwood_root,
                             )?;
 
+                            let expected_sprout_root = sprout_frontier.root();
+                            let actual_sprout_root = note_commitment_trees.sprout.root();
+                            if actual_sprout_root != expected_sprout_root {
+                                self.vct.clear_prevalidated_next();
+                                return Err(ValidateContextError::VctSproutHandoffRootMismatch {
+                                    height,
+                                    expected: expected_sprout_root,
+                                    actual: actual_sprout_root,
+                                }
+                                .into());
+                            }
+
                             // Subtree tips are left `None`: the resuming chain recomputes
                             // them from the frontier position.
                             note_commitment_trees = NoteCommitmentTrees {
-                                sprout: sprout_frontier,
+                                // Sprout was reconstructed locally throughout fast sync.
+                                sprout: note_commitment_trees.sprout,
                                 sapling: sapling_frontier,
                                 sapling_subtree: None,
                                 orchard: orchard_frontier,

@@ -1,11 +1,16 @@
 ---
-status: accepted
+status: deprecated
 date: 2026-04-14
 builds-on: [Continuous Delivery](../../../book/src/dev/continuous-delivery.md)
 story: Stateful disk collisions during release rollouts, silent main-branch CD failures, and the regional-stateful-MIG quirks that made rolling updates impossible on Google Cloud Platform.
 ---
 
 # GCP Deployment Topology: zonal MIG per (environment, branch, network, zone)
+
+> **Deprecated (2026-07):** the GCP deployment pipeline this ADR describes was decommissioned
+> when Zakura moved fleet deployments to SSH-based workflows targeting DigitalOcean hosts
+> (see [Continuous Delivery](../../../book/src/dev/continuous-delivery.md)). Retained as a
+> historical record of the zonal-MIG design.
 
 ## Context and Problem Statement
 
@@ -109,6 +114,6 @@ Every MIG, instance, and disk carries `app`, `environment`, `network`, `zone`, `
 
 ## More Information
 
-- [GCP Deployment Operations runbook](../../../book/src/dev/gcp-deployment-operations.md): PR-deploy cleanup, disk-corruption recovery, DB-format-version-break release procedure, regional-to-zonal migration procedure.
+- GCP Deployment Operations runbook (removed with the GCP infrastructure): covered PR-deploy cleanup, disk-corruption recovery, the DB-format-version-break release procedure, and the regional-to-zonal migration procedure.
 - [Continuous Delivery overview](../../../book/src/dev/continuous-delivery.md): the high-level model.
 - GCP documentation on [instance groups](https://cloud.google.com/compute/docs/instance-groups), [stateful MIGs](https://cloud.google.com/compute/docs/instance-groups/stateful-migs), and [persistent disk attachment limits](https://cloud.google.com/compute/docs/disks#pd_modes).

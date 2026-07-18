@@ -58,14 +58,21 @@ pub fn atomic_write(
     // so atomic filesystem operations are possible.
     let mut tmp_file = tempfile::Builder::new()
         .prefix(&tmp_file_prefix)
-        .tempfile_in(file_dir)?;
+        .tempfile_in(&file_dir)?;
 
     tmp_file.write_all(data)?;
+    tmp_file.as_file().sync_all()?;
 
     // Atomically write the temp file to `file_path`.
     let persist_result = tmp_file
         .persist(&file_path)
         // Drops the temp file and returns the file path.
         .map(|_| file_path);
+
+    #[cfg(unix)]
+    if persist_result.is_ok() {
+        fs::File::open(file_dir)?.sync_all()?;
+    }
+
     Ok(persist_result)
 }

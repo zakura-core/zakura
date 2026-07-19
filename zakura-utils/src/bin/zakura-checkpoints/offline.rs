@@ -165,7 +165,19 @@ pub fn run_offline(args: &Args) -> Result<()> {
         base_height.0
     );
 
-    // Lock stdout once: the full list is ~8k lines and per-line locking is slow.
+    let &(last_height, last_hash) = selected
+        .last()
+        .expect("selection was checked to be non-empty");
+
+    // Produce the frontier before any checkpoint output: a frontier failure
+    // (Sprout change in the window, unretained body, filesystem error) must
+    // not leave a caller's redirected stdout holding an advanced checkpoint
+    // list without its coupled frontier artifact.
+    if let Some(frontier_path) = &args.mainnet_frontier_output {
+        write_frontier(&db, last_height, frontier_path)?;
+    }
+
+    // Lock stdout once: the full list is ~14k lines and per-line locking is slow.
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     if args.full_list {
@@ -178,18 +190,11 @@ pub fn run_offline(args: &Args) -> Result<()> {
     }
     stdout.flush()?;
 
-    let &(last_height, last_hash) = selected
-        .last()
-        .expect("selection was checked to be non-empty");
     eprintln!(
         "emitted {} checkpoints; last checkpoint {} ({last_hash})",
         selected.len(),
         last_height.0
     );
-
-    if let Some(frontier_path) = &args.mainnet_frontier_output {
-        write_frontier(&db, last_height, frontier_path)?;
-    }
 
     Ok(())
 }

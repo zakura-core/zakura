@@ -1,16 +1,19 @@
 //! Signature hashes for Zcash transactions
 
+mod legacy;
+
 use std::sync::Arc;
 
 use zcash_protocol::value::ZatBalance;
 use zcash_transparent::sighash::SighashType;
 
-use super::Transaction;
+use super::{zip244::Zip244SighashCache, Transaction};
 
 use crate::parameters::NetworkUpgrade;
 use crate::{transparent, Error};
 
 use crate::primitives::zcash_primitives::{sighash, sighash_v4_raw, PrecomputedTxData};
+use legacy::LegacySighash;
 
 bitflags::bitflags! {
     /// The different SigHash types, as defined in <https://zips.z.cash/zip-0143>
@@ -78,6 +81,8 @@ impl From<SigHash> for [u8; 32] {
 #[derive(Debug)]
 pub struct SigHasher {
     precomputed_tx_data: PrecomputedTxData,
+    legacy: Option<LegacySighash>,
+    zip244: Option<Zip244SighashCache>,
 }
 
 impl SigHasher {
@@ -95,8 +100,12 @@ impl SigHasher {
         nu: NetworkUpgrade,
         all_previous_outputs: Arc<Vec<transparent::Output>>,
     ) -> Result<Self, Error> {
+        let precomputed_tx_data = PrecomputedTxData::new(trans, nu, all_previous_outputs.clone())?;
+
         Ok(SigHasher {
-            precomputed_tx_data: PrecomputedTxData::new(trans, nu, all_previous_outputs)?,
+            precomputed_tx_data,
+            legacy: LegacySighash::new(trans, nu, &all_previous_outputs),
+            zip244: Zip244SighashCache::new(trans, &all_previous_outputs),
         })
     }
 
@@ -117,6 +126,29 @@ impl SigHasher {
         hash_type: HashType,
         input_index_script_code: Option<(usize, Vec<u8>)>,
     ) -> SigHash {
+        let canonical_hash_type: SighashType =
+            hash_type.try_into().expect("hash type should be canonical");
+
+        if let Some(zip244) = &self.zip244 {
+            return zip244.sighash(
+                hash_type,
+                input_index_script_code.as_ref().map(|(index, _)| *index),
+            );
+        }
+
+        if let Some(legacy) = &self.legacy {
+            return legacy
+                .signature_hash(
+                    canonical_hash_type.encode(),
+                    input_index_script_code
+                        .as_ref()
+                        .map(|(index, script_code)| (*index, script_code.as_slice())),
+                )
+                .expect(
+                    "sighash precondition violated: callers must pass an in-bounds input_index",
+                );
+        }
+
         sighash(
             &self.precomputed_tx_data,
             hash_type,
@@ -135,6 +167,19 @@ impl SigHasher {
         raw_hash_type: u8,
         input_index_script_code: Option<(usize, Vec<u8>)>,
     ) -> SigHash {
+        if let Some(legacy) = &self.legacy {
+            return legacy
+                .signature_hash(
+                    raw_hash_type,
+                    input_index_script_code
+                        .as_ref()
+                        .map(|(index, script_code)| (*index, script_code.as_slice())),
+                )
+                .expect(
+                    "sighash precondition violated: callers must pass an in-bounds input_index",
+                );
+        }
+
         sighash_v4_raw(
             &self.precomputed_tx_data,
             raw_hash_type,

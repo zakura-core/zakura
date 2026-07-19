@@ -1199,17 +1199,99 @@ fn zip244_sighash() -> Result<()> {
         let expected = hex::encode(test.sighash_shielded);
         assert_eq!(expected, result, "test #{i}: sighash does not match");
 
-        if let Some(sighash_all) = test.sighash_all {
-            let result = hex::encode(
-                sighasher.sighash(
-                    HashType::ALL,
-                    test.transparent_input
-                        .map(|idx| (idx as _, test.script_pubkeys[idx as usize].clone())),
-                ),
+        for (hash_type, expected) in [
+            (HashType::ALL, test.sighash_all),
+            (HashType::NONE, test.sighash_none),
+            (HashType::SINGLE, test.sighash_single),
+            (HashType::ALL_ANYONECANPAY, test.sighash_all_anyone),
+            (HashType::NONE_ANYONECANPAY, test.sighash_none_anyone),
+            (HashType::SINGLE_ANYONECANPAY, test.sighash_single_anyone),
+        ] {
+            let Some(expected) = expected else {
+                continue;
+            };
+            let input_index = usize::try_from(
+                test.transparent_input
+                    .expect("transparent sighash vector has an input index"),
+            )
+            .expect("u32 input index fits in usize");
+            let result = hex::encode(sighasher.sighash(
+                hash_type,
+                Some((input_index, test.script_pubkeys[input_index].clone())),
+            ));
+            assert_eq!(
+                hex::encode(expected),
+                result,
+                "test #{i}: {hash_type:?} sighash does not match"
             );
-            let expected = hex::encode(sighash_all);
-            assert_eq!(expected, result, "test #{i}: sighash does not match");
         }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn v6_zip244_sighash_matches_librustzcash() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    let test = ironwood_v6_tx_hash::TEST_VECTORS
+        .iter()
+        .find(|test| test.scenario == "transparent_sighashes")
+        .expect("V6 vectors include transparent sighashes");
+    let mut tx_bytes = test.tx.to_vec();
+    tx_bytes[4..8].copy_from_slice(&crate::parameters::TX_V6_VERSION_GROUP_ID.to_le_bytes());
+    tx_bytes[8..12].copy_from_slice(
+        &u32::from(
+            NetworkUpgrade::Nu6_3
+                .branch_id()
+                .expect("NU6.3 has a consensus branch ID"),
+        )
+        .to_le_bytes(),
+    );
+
+    let transaction = tx_bytes.zcash_deserialize_into::<Transaction>()?;
+    let previous_outputs: Arc<Vec<transparent::Output>> = Arc::new(
+        test.amounts
+            .iter()
+            .zip(test.script_pubkeys.iter())
+            .map(|(amount, script_pubkey)| transparent::Output {
+                value: (*amount).try_into().expect("vector amount is valid"),
+                lock_script: Script::new(script_pubkey),
+            })
+            .collect(),
+    );
+    let native = SigHasher::new(
+        &transaction,
+        NetworkUpgrade::Nu6_3,
+        previous_outputs.clone(),
+    )?;
+    let librustzcash =
+        PrecomputedTxData::new(&transaction, NetworkUpgrade::Nu6_3, previous_outputs)?;
+
+    assert_eq!(
+        native.sighash(HashType::ALL, None),
+        crate::primitives::zcash_primitives::sighash(&librustzcash, HashType::ALL, None),
+    );
+
+    let input_index = usize::try_from(
+        test.transparent_input
+            .expect("transparent vector has an input index"),
+    )
+    .expect("u32 fits in usize");
+    for hash_type in [
+        HashType::ALL,
+        HashType::NONE,
+        HashType::SINGLE,
+        HashType::ALL_ANYONECANPAY,
+        HashType::NONE_ANYONECANPAY,
+        HashType::SINGLE_ANYONECANPAY,
+    ] {
+        let input = Some((input_index, Vec::new()));
+        assert_eq!(
+            native.sighash(hash_type, input.clone()),
+            crate::primitives::zcash_primitives::sighash(&librustzcash, hash_type, input),
+            "V6 {hash_type:?} sighash must match librustzcash",
+        );
     }
 
     Ok(())

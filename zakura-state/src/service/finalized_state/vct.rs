@@ -734,12 +734,16 @@ mod tests {
                 "bundle provenance must bind its bundle meta digest"
             ),
         }
-        assert_eq!(
-            frontiers.ironwood.root(),
-            ironwood::tree::NoteCommitmentTree::default().root(),
-            "frontiers generated before Ironwood activates parse with the Ironwood frontier \
-             at the empty tree"
-        );
+        let ironwood_active = NetworkUpgrade::Nu6_3
+            .activation_height(&Network::Mainnet)
+            .is_some_and(|activation| frontiers.height >= activation);
+        if !ironwood_active {
+            assert_eq!(
+                frontiers.ironwood.root(),
+                ironwood::tree::NoteCommitmentTree::default().root(),
+                "frontiers below the Ironwood activation height carry the empty Ironwood tree"
+            );
+        }
     }
 
     #[test]

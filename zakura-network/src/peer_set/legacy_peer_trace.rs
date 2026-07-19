@@ -23,8 +23,6 @@ use crate::{protocol::internal::Response, NotFoundClass, PeerSocketAddr, SharedP
 
 const TABLE: &str = "legacy_peer_request";
 const FILE_NAME: &str = "legacy_peer_request.jsonl";
-const HASH_SAMPLE_EDGE_SIZE: usize = 8;
-const MAX_HASH_SAMPLE_SIZE: usize = HASH_SAMPLE_EDGE_SIZE * 2;
 
 #[derive(Clone, Debug)]
 pub(super) struct LegacyPeerTrace {
@@ -82,30 +80,7 @@ impl LegacyPeerTrace {
                 Ok(Response::BlockHashes(hashes)) => {
                     insert_str(row, "result", "block_hashes");
                     insert_count(row, "hash_count", hashes.len());
-                    let hashes_truncated = hashes.len() > MAX_HASH_SAMPLE_SIZE;
-                    row.insert(
-                        "hashes_truncated".to_string(),
-                        Value::Bool(hashes_truncated),
-                    );
-
-                    let sampled_hashes: Box<dyn Iterator<Item = &block::Hash>> =
-                        if hashes_truncated {
-                            Box::new(
-                                hashes.iter().take(HASH_SAMPLE_EDGE_SIZE).chain(
-                                    hashes.iter().skip(hashes.len() - HASH_SAMPLE_EDGE_SIZE),
-                                ),
-                            )
-                        } else {
-                            Box::new(hashes.iter())
-                        };
-                    row.insert(
-                        "hashes".to_string(),
-                        Value::Array(
-                            sampled_hashes
-                                .map(|hash| Value::String(hash.to_string()))
-                                .collect(),
-                        ),
-                    );
+                    insert_inferred_height_range(row, peer.local_tip_height, hashes.len());
                 }
                 Ok(response) => {
                     insert_str(row, "result", "unexpected_response");
@@ -233,6 +208,35 @@ fn insert_count(row: &mut Map<String, Value>, key: &'static str, count: usize) {
     );
 }
 
+/// Insert the response range assuming the peer matched the first locator hash.
+///
+/// The legacy protocol does not identify which locator hash matched, so these heights are not an
+/// exact or authenticated claim about the peer's response.
+fn insert_inferred_height_range(
+    row: &mut Map<String, Value>,
+    local_tip_height: Option<Height>,
+    hash_count: usize,
+) {
+    if hash_count == 0 {
+        return;
+    }
+
+    let Some(local_tip_height) = local_tip_height else {
+        return;
+    };
+    let hash_count = u32::try_from(hash_count).unwrap_or(u32::MAX);
+    insert_height(
+        row,
+        "inferred_start_height",
+        Some(Height(local_tip_height.0.saturating_add(1))),
+    );
+    insert_height(
+        row,
+        "inferred_end_height",
+        Some(Height(local_tip_height.0.saturating_add(hash_count))),
+    );
+}
+
 fn elapsed_millis(duration: Duration) -> Value {
     Value::from(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }
@@ -304,14 +308,16 @@ mod tests {
         assert_eq!(events[0]["peer_id"], 7);
         assert_eq!(events[0]["peer_start_height"], 100);
         assert_eq!(events[0]["hash_count"], 2);
-        assert_eq!(events[0]["hashes_truncated"], false);
+        assert_eq!(events[0]["inferred_start_height"], 91);
+        assert_eq!(events[0]["inferred_end_height"], 92);
+        assert!(events[0].get("hashes").is_none());
         assert_eq!(events[1]["event"], "block_request_finish");
         assert_eq!(events[1]["route"], "advertised");
         assert_eq!(events[1]["result"], "notfound_response");
     }
 
     #[tokio::test]
-    async fn bounds_maximum_find_blocks_hash_sample() {
+    async fn omits_hashes_from_maximum_find_blocks_response() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
         let trace = LegacyPeerTrace {
@@ -334,13 +340,6 @@ mod tests {
                 block::Hash(bytes)
             })
             .collect();
-        let expected_sample = [
-            hashes[0].to_string(),
-            hashes[HASH_SAMPLE_EDGE_SIZE - 1].to_string(),
-            hashes[hash_count - HASH_SAMPLE_EDGE_SIZE].to_string(),
-            hashes[hash_count - 1].to_string(),
-        ];
-
         trace.find_blocks_finish(
             1,
             peer,
@@ -356,20 +355,14 @@ mod tests {
         let event = std::fs::read_to_string(dir.path().join(FILE_NAME))
             .expect("legacy peer trace file is written");
         let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
-        let sampled_hashes = event["hashes"].as_array().expect("hashes is an array");
 
         assert_eq!(event["hash_count"], hash_count);
-        assert_eq!(event["hashes_truncated"], true);
-        assert_eq!(sampled_hashes.len(), MAX_HASH_SAMPLE_SIZE);
-        assert_eq!(sampled_hashes[0], expected_sample[0]);
-        assert_eq!(
-            sampled_hashes[HASH_SAMPLE_EDGE_SIZE - 1],
-            expected_sample[1]
-        );
-        assert_eq!(sampled_hashes[HASH_SAMPLE_EDGE_SIZE], expected_sample[2]);
-        assert_eq!(sampled_hashes[MAX_HASH_SAMPLE_SIZE - 1], expected_sample[3]);
+        assert_eq!(event["inferred_start_height"], 91);
+        assert_eq!(event["inferred_end_height"], 50_090);
+        assert!(event.get("hashes").is_none());
+        assert!(event.get("hashes_truncated").is_none());
         assert!(
-            event.to_string().len() < 2_000,
+            event.to_string().len() < 1_000,
             "maximum response trace row must remain bounded"
         );
     }

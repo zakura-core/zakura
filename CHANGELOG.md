@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+- Reject transactions that do not meet ZIP-317 mempool fee policy before
+  running script and proof checks. Block validation is unchanged.
+
 ## [1.0.2-rc0] - 2026-07-19
 
 ### Added

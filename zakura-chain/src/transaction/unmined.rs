@@ -493,3 +493,36 @@ impl VerifiedUnminedTx {
         cost
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        block::Height,
+        parameters::NetworkUpgrade,
+        transaction::{LockTime, Transaction},
+    };
+
+    #[test]
+    fn verified_unmined_tx_rejects_insufficient_zip317_fee() {
+        let transaction = UnminedTx::from(Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(1),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        });
+
+        let result = VerifiedUnminedTx::new(
+            transaction,
+            Amount::try_from(1).expect("valid amount"),
+            0,
+            0,
+            Arc::new(Vec::new()),
+        );
+
+        assert_eq!(result, Err(zip317::Error::UnpaidActions));
+    }
+}

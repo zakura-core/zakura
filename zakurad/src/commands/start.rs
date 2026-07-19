@@ -95,6 +95,7 @@ use zakura_chain::block::{self, genesis::regtest_genesis_block};
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_network::types::PeerServices;
 use zakura_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
+use zakura_state::StorageMode;
 
 use zakura::{
     drive_block_sync_actions, drive_vct_root_repairs, drive_zakura_header_sync_actions,
@@ -248,6 +249,15 @@ impl StartCmd {
             SocketAddr::from(([127, 0, 0, 1], local_listener.port()))
         } else {
             local_listener
+        }
+    }
+
+    /// Returns the services advertised to legacy P2P peers.
+    fn advertised_services(config: &ZakuradConfig) -> PeerServices {
+        if config.zcashd_compat.enabled || config.state.storage_mode == StorageMode::Archive {
+            PeerServices::NODE_NETWORK
+        } else {
+            PeerServices::empty()
         }
     }
 
@@ -432,13 +442,7 @@ impl StartCmd {
                 setup_rx,
             ));
 
-        // Pruned nodes can still make outbound requests, but they cannot serve
-        // arbitrary historical blocks, so they must not advertise full-node service.
-        let advertised_services = if config.state.pruning_config().is_some() {
-            PeerServices::empty()
-        } else {
-            PeerServices::NODE_NETWORK
-        };
+        let advertised_services = Self::advertised_services(&config);
 
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
             zakura_network::init_with_zakura_header_sync(
@@ -1169,7 +1173,27 @@ mod tests {
     use super::StartCmd;
     use crate::components::zcashd_compat;
     use crate::config::ZakuradConfig;
+    use zakura_network::types::PeerServices;
     use zakura_network::P2pStack;
+    use zakura_state::{PruningConfig, StorageMode};
+
+    #[test]
+    fn zcashd_compat_advertises_node_network_when_pruned() {
+        let mut config = ZakuradConfig::default();
+        config.state.storage_mode = StorageMode::Pruned(PruningConfig::default());
+
+        assert_eq!(
+            StartCmd::advertised_services(&config),
+            PeerServices::empty()
+        );
+
+        config.zcashd_compat.enabled = true;
+
+        assert_eq!(
+            StartCmd::advertised_services(&config),
+            PeerServices::NODE_NETWORK
+        );
+    }
 
     #[test]
     fn zcashd_compat_flag_enables_mode() {

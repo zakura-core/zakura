@@ -4869,6 +4869,78 @@ async fn mempool_zip317_ok() {
     );
 }
 
+#[tokio::test]
+async fn mempool_transaction_with_sufficient_fee_is_rejected_by_script() {
+    let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
+    let verifier = Verifier::new_for_tests(&Network::Mainnet, state.clone());
+
+    let height = NetworkUpgrade::Nu5
+        .activation_height(&Network::Mainnet)
+        .expect("Nu5 activation height is specified");
+    let fund_height = (height - 1).expect("fake source fund block height is too small");
+
+    // The fee passes ZIP-317, but the standard P2SH input's redeem script fails.
+    let (input, output, known_utxos) = mock_transparent_transfer(
+        fund_height,
+        false,
+        0,
+        Amount::try_from(10_001).expect("valid amount"),
+    );
+
+    let tx = Transaction::V5 {
+        inputs: vec![input],
+        outputs: vec![output],
+        lock_time: LockTime::unlocked(),
+        network_upgrade: NetworkUpgrade::Nu5,
+        expiry_height: height,
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+
+    let input_outpoint = match tx.inputs()[0] {
+        transparent::Input::PrevOut { outpoint, .. } => outpoint,
+        transparent::Input::Coinbase { .. } => panic!("requires a non-coinbase transaction"),
+    };
+
+    tokio::spawn(async move {
+        state
+            .expect_request(zakura_state::Request::UnspentBestChainUtxo(input_outpoint))
+            .await
+            .expect("verifier should call mock state service with correct request")
+            .respond(zakura_state::Response::UnspentBestChainUtxo(
+                known_utxos
+                    .get(&input_outpoint)
+                    .map(|utxo| utxo.utxo.clone()),
+            ));
+
+        state
+            .expect_request_that(|req| {
+                matches!(
+                    req,
+                    zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+                )
+            })
+            .await
+            .expect("verifier should call mock state service with correct request")
+            .respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
+    });
+
+    let verifier_response = verifier
+        .oneshot(Request::Mempool {
+            transaction: tx.into(),
+            height,
+        })
+        .await;
+
+    assert_eq!(
+        verifier_response,
+        Err(TransactionError::InternalDowncastError(
+            "downcast to known transaction error type failed, original error: ScriptInvalid"
+                .to_string()
+        ))
+    );
+}
+
 /// Test for CVE-2026-34377 https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-3vmh-33xr-9cqh
 ///
 /// Ensure a block with a transaction with garbage Orchard proofs is rejected, even if the mempool has a valid version of the same transaction.

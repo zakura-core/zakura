@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `legacy_peer_request.jsonl` tracing for attributed legacy `FindBlocks`
   responses and block downloads when `[network.zakura] trace_dir` is set.
 
+### Fixed
+
+- Pruned nodes no longer advertise retained block hashes in legacy `getblocks`
+  responses when their corresponding block bodies are unavailable.
+
 ## [3.0.0-rc0] - 2026-07-19
 
 ### Breaking Changes

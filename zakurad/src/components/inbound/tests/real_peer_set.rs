@@ -283,12 +283,11 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
     Ok(())
 }
 
-/// Check that a block advertised from the retained chain index returns `notfound`
-/// when its pruned body is requested.
+/// Check that a retained chain-index hash is not advertised when its block body is pruned.
 ///
 /// Uses a real Zebra network stack, with an isolated Zebra inbound TCP connection.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_pruned_advertised_block_notfound() -> Result<(), crate::BoxError> {
+async fn inbound_pruned_block_is_not_advertised() -> Result<(), crate::BoxError> {
     // `setup` configures checkpoint retention against `Height::MAX`, so block 1 is committed
     // to the retained chain indexes without storing its transaction bytes. Genesis is retained.
     let state_config = StateConfig {
@@ -335,8 +334,21 @@ async fn inbound_pruned_advertised_block_notfound() -> Result<(), crate::BoxErro
         .await?;
     assert_eq!(
         advertised_hashes,
-        zakura_state::Response::BlockHashes(vec![block1.hash()]),
-        "the retained chain index advertises the pruned block"
+        zakura_state::Response::BlockHashes(Vec::new()),
+        "the retained chain index must not advertise the pruned block body"
+    );
+
+    let inbound_find_response = inbound_service
+        .clone()
+        .oneshot(Request::FindBlocks {
+            known_blocks: vec![genesis.hash()],
+            stop: None,
+        })
+        .await?;
+    assert_eq!(
+        inbound_find_response,
+        Response::Nil,
+        "legacy getblocks must not produce an inv for the pruned block body"
     );
 
     let block_response = state_service
@@ -372,7 +384,7 @@ async fn inbound_pruned_advertised_block_notfound() -> Result<(), crate::BoxErro
         assert_eq!(missing_error.inner_debug(), expected.inner_debug());
     } else {
         unreachable!(
-            "the wire response should be `notfound` for an advertised block with a pruned body, \
+            "an explicit getdata request for a pruned body should still return `notfound`, \
              actual result: {wire_response:?}"
         )
     }

@@ -1095,6 +1095,7 @@ pub enum Request {
     ///   * adding 500 hashes to the list.
     ///
     /// Returns an empty list if the state is empty.
+    /// Stops before the first block whose body is unavailable or has been pruned.
     ///
     /// Returns
     ///
@@ -1385,6 +1386,7 @@ pub enum ReadRequest {
     ///   * adding [`MAX_FIND_BLOCK_HASHES_RESULTS`] hashes to the list.
     ///
     /// Returns an empty list if the state is empty.
+    /// Stops before the first block whose body is unavailable or has been pruned.
     ///
     /// Returns
     ///

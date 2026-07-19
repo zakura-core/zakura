@@ -181,6 +181,17 @@ zcash_script = "0.4.5"
 config = { version = "0.15.14", features = ["toml"] }
 which = "8.0.0"
 
+[patch.crates-io]
+equihash = { git = "https://github.com/zakura-core/librustzcash.git", rev = "f0676a6ab49723cb02ae4035d4c04a5cd137556a" }
+zcash_address = { git = "https://github.com/zakura-core/librustzcash.git", rev = "f0676a6ab49723cb02ae4035d4c04a5cd137556a" }
+zcash_encoding = { git = "https://github.com/zakura-core/librustzcash.git", rev = "f0676a6ab49723cb02ae4035d4c04a5cd137556a" }
+zcash_history = { git = "https://github.com/zakura-core/librustzcash.git", rev = "f0676a6ab49723cb02ae4035d4c04a5cd137556a" }
+zcash_keys = { git = "https://github.com/zakura-core/librustzcash.git", rev = "f0676a6ab49723cb02ae4035d4c04a5cd137556a" }
+zcash_primitives = { git = "https://github.com/zakura-core/librustzcash.git", rev = "f0676a6ab49723cb02ae4035d4c04a5cd137556a" }
+zcash_proofs = { git = "https://github.com/zakura-core/librustzcash.git", rev = "f0676a6ab49723cb02ae4035d4c04a5cd137556a" }
+zcash_protocol = { git = "https://github.com/zakura-core/librustzcash.git", rev = "f0676a6ab49723cb02ae4035d4c04a5cd137556a" }
+zcash_transparent = { git = "https://github.com/zakura-core/librustzcash.git", rev = "f0676a6ab49723cb02ae4035d4c04a5cd137556a" }
+
 [workspace.metadata.release]
 
 # We always do releases from the main branch

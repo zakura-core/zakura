@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Reuse transaction-wide transparent signature hash components across input
+  checks.
+
 ## [1.2.0-rc0] - 2026-07-19
 
 ### Added

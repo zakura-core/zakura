@@ -1191,31 +1191,21 @@ fn zip244_sighash() -> Result<()> {
                 })
                 .collect(),
         );
+        let sighasher = transaction
+            .sighasher(NetworkUpgrade::Nu5, all_previous_outputs)
+            .expect("network upgrade is valid for tx");
 
-        let result = hex::encode(
-            transaction
-                .sighash(
-                    NetworkUpgrade::Nu5,
-                    HashType::ALL,
-                    all_previous_outputs.clone(),
-                    None,
-                )
-                .expect("network upgrade is valid for tx"),
-        );
+        let result = hex::encode(sighasher.sighash(HashType::ALL, None));
         let expected = hex::encode(test.sighash_shielded);
         assert_eq!(expected, result, "test #{i}: sighash does not match");
 
         if let Some(sighash_all) = test.sighash_all {
             let result = hex::encode(
-                transaction
-                    .sighash(
-                        NetworkUpgrade::Nu5,
-                        HashType::ALL,
-                        all_previous_outputs,
-                        test.transparent_input
-                            .map(|idx| (idx as _, test.script_pubkeys[idx as usize].clone())),
-                    )
-                    .expect("network upgrade is valid for tx"),
+                sighasher.sighash(
+                    HashType::ALL,
+                    test.transparent_input
+                        .map(|idx| (idx as _, test.script_pubkeys[idx as usize].clone())),
+                ),
             );
             let expected = hex::encode(sighash_all);
             assert_eq!(expected, result, "test #{i}: sighash does not match");

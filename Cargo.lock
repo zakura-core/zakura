@@ -1955,8 +1955,7 @@ dependencies = [
 [[package]]
 name = "equihash"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "306286e8dcc39ab3dfceb74c792ce8baffdab90591321d3ffaae64829734c37f"
+source = "git+https://github.com/zakura-core/librustzcash.git?rev=f0676a6ab49723cb02ae4035d4c04a5cd137556a#f0676a6ab49723cb02ae4035d4c04a5cd137556a"
 dependencies = [
  "blake2b_simd",
  "cc",
@@ -2004,8 +2003,7 @@ dependencies = [
 [[package]]
 name = "f4jumble"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d42773cb15447644d170be20231a3268600e0c4cea8987d013b93ac973d3cf7"
+source = "git+https://github.com/zakura-core/librustzcash.git?rev=f0676a6ab49723cb02ae4035d4c04a5cd137556a#f0676a6ab49723cb02ae4035d4c04a5cd137556a"
 dependencies = [
  "blake2b_simd",
 ]
@@ -9366,8 +9364,7 @@ dependencies = [
 [[package]]
 name = "zcash_address"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a854b28c07dba372f4410ea8ad62b4bf7d5c2bf8be32fc4b31bc0db6521a975"
+source = "git+https://github.com/zakura-core/librustzcash.git?rev=f0676a6ab49723cb02ae4035d4c04a5cd137556a#f0676a6ab49723cb02ae4035d4c04a5cd137556a"
 dependencies = [
  "bech32",
  "bs58",
@@ -9380,8 +9377,7 @@ dependencies = [
 [[package]]
 name = "zcash_encoding"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1440921903cdb86133fb9e2fe800be488015db2939a30bedb413078a1acb0306"
+source = "git+https://github.com/zakura-core/librustzcash.git?rev=f0676a6ab49723cb02ae4035d4c04a5cd137556a#f0676a6ab49723cb02ae4035d4c04a5cd137556a"
 dependencies = [
  "corez",
  "hex",
@@ -9391,8 +9387,7 @@ dependencies = [
 [[package]]
 name = "zcash_history"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69d2ed9a9fa7b466a7adedab1ad5a21f8330e4943756912fc776cf7f3beae32b"
+source = "git+https://github.com/zakura-core/librustzcash.git?rev=f0676a6ab49723cb02ae4035d4c04a5cd137556a#f0676a6ab49723cb02ae4035d4c04a5cd137556a"
 dependencies = [
  "blake2b_simd",
  "byteorder",
@@ -9402,8 +9397,7 @@ dependencies = [
 [[package]]
 name = "zcash_keys"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36391ebfce7df2510c6564f79e608ed93f1c0692c6464e2397b248e06dae3912"
+source = "git+https://github.com/zakura-core/librustzcash.git?rev=f0676a6ab49723cb02ae4035d4c04a5cd137556a#f0676a6ab49723cb02ae4035d4c04a5cd137556a"
 dependencies = [
  "bech32",
  "blake2b_simd",
@@ -9443,8 +9437,7 @@ dependencies = [
 [[package]]
 name = "zcash_primitives"
 version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdbeccc05bfe63b6dee9e989c6ff5027421741562a4853c36504dd621f6a81b1"
+source = "git+https://github.com/zakura-core/librustzcash.git?rev=f0676a6ab49723cb02ae4035d4c04a5cd137556a#f0676a6ab49723cb02ae4035d4c04a5cd137556a"
 dependencies = [
  "blake2b_simd",
  "block-buffer 0.11.0-rc.3",
@@ -9474,8 +9467,7 @@ dependencies = [
 [[package]]
 name = "zcash_proofs"
 version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b91fb0b420fb66a765f1fa92ab7a6b631aa54c08415415ef6185256826e74fbd"
+source = "git+https://github.com/zakura-core/librustzcash.git?rev=f0676a6ab49723cb02ae4035d4c04a5cd137556a#f0676a6ab49723cb02ae4035d4c04a5cd137556a"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -9497,8 +9489,7 @@ dependencies = [
 [[package]]
 name = "zcash_protocol"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2973d210e74ebd81adc50828fbbb284ab6aaa099308097c42c47dc63cf3420fc"
+source = "git+https://github.com/zakura-core/librustzcash.git?rev=f0676a6ab49723cb02ae4035d4c04a5cd137556a#f0676a6ab49723cb02ae4035d4c04a5cd137556a"
 dependencies = [
  "corez",
  "document-features",
@@ -9536,8 +9527,7 @@ dependencies = [
 [[package]]
 name = "zcash_transparent"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72e0f8c142bed366ed5886dcfa8772ec90b5420cc127e6cdb76b6744c53a287b"
+source = "git+https://github.com/zakura-core/librustzcash.git?rev=f0676a6ab49723cb02ae4035d4c04a5cd137556a#f0676a6ab49723cb02ae4035d4c04a5cd137556a"
 dependencies = [
  "bip32",
  "bs58",

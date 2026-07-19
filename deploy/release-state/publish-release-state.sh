@@ -50,6 +50,19 @@ HEIGHT=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f1)
 BLOCK_HASH=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f2)
 GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+# Never move the pointer backwards: an export from a stale quiesced state
+# would regress latest.json, and retention could then purge the very bundle
+# it points at.
+if [ -n "$(rclone lsf "$REMOTE_PREFIX/latest.json" 2>/dev/null)" ]; then
+    rclone copyto "$REMOTE_PREFIX/latest.json" "$STAGE/existing-latest.json"
+    POINTER_HEIGHT=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["height"])' \
+        "$STAGE/existing-latest.json")
+    if [ "$POINTER_HEIGHT" -gt "$HEIGHT" ]; then
+        echo "refusing to publish height $HEIGHT below the current pointer height $POINTER_HEIGHT; stale quiesced state?" >&2
+        exit 1
+    fi
+fi
+
 HEIGHT="$HEIGHT" BLOCK_HASH="$BLOCK_HASH" GENERATED_AT="$GENERATED_AT" \
     python3 - "$STAGE" <<'PY'
 import hashlib, json, os, sys

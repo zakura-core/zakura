@@ -28,6 +28,10 @@ use zcash_script::{
 
 use crate::error::TransactionError;
 
+/// Number of blocks after NU6.3 activation during which a NU6.2 branch ID
+/// does not count as peer misbehavior.
+const NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS: i64 = 40;
+
 /// Checks if the transaction's lock time allows this transaction to be included in a block.
 ///
 /// Arguments:
@@ -909,6 +913,19 @@ pub fn consensus_branch_id(
     };
 
     if tx_nu != current_nu {
+        if tx_nu == NetworkUpgrade::Nu6_2 && current_nu == NetworkUpgrade::Nu6_3 {
+            let is_in_grace_period = NetworkUpgrade::Nu6_3
+                .activation_height(network)
+                .and_then(|activation_height| {
+                    activation_height + NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS
+                })
+                .is_some_and(|grace_period_end| height < grace_period_end);
+
+            if is_in_grace_period {
+                return Err(TransactionError::WrongConsensusBranchIdNu6_3GracePeriod);
+            }
+        }
+
         return Err(TransactionError::WrongConsensusBranchId);
     }
 

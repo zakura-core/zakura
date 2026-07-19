@@ -31,6 +31,15 @@ use crate::{error::TransactionError, BoxError};
 /// - verify Sapling shielded data in the tx verifier.
 static SAPLING: Lazy<LocalTxProver> = Lazy::new(LocalTxProver::bundled);
 
+/// Returns the process-wide Sapling prover for constructing Sapling proofs, initializing it on
+/// first use.
+///
+/// The bundled Sapling spend and output proving parameters are parsed once, then the same prover is
+/// reused for proof construction and verification for the lifetime of the process.
+pub fn sapling_prover() -> &'static LocalTxProver {
+    Lazy::force(&SAPLING)
+}
+
 #[derive(Clone)]
 pub struct Item {
     /// The bundle containing the Sapling shielded data to verify.
@@ -230,3 +239,13 @@ pub static VERIFIER: Lazy<
         tower::service_fn(verify_single),
     )
 });
+
+#[cfg(test)]
+mod tests {
+    use super::sapling_prover;
+
+    #[test]
+    fn sapling_prover_is_reused() {
+        assert!(std::ptr::eq(sapling_prover(), sapling_prover()));
+    }
+}

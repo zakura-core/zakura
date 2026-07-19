@@ -2086,9 +2086,8 @@ async fn v4_transaction_with_transparent_transfer_is_rejected_by_the_script() {
 
     assert_eq!(
         result,
-        Err(TransactionError::InternalDowncastError(
-            "downcast to known transaction error type failed, original error: ScriptInvalid"
-                .to_string()
+        Err(TransactionError::Script(
+            zakura_script::Error::ScriptInvalid
         ))
     );
 }
@@ -2757,9 +2756,8 @@ async fn v5_transaction_with_transparent_transfer_is_rejected_by_the_script() {
 
     assert_eq!(
         result,
-        Err(TransactionError::InternalDowncastError(
-            "downcast to known transaction error type failed, original error: ScriptInvalid"
-                .to_string()
+        Err(TransactionError::Script(
+            zakura_script::Error::ScriptInvalid
         ))
     );
 }
@@ -4934,9 +4932,8 @@ async fn mempool_transaction_with_sufficient_fee_is_rejected_by_script() {
 
     assert_eq!(
         verifier_response,
-        Err(TransactionError::InternalDowncastError(
-            "downcast to known transaction error type failed, original error: ScriptInvalid"
-                .to_string()
+        Err(TransactionError::Script(
+            zakura_script::Error::ScriptInvalid
         ))
     );
 }

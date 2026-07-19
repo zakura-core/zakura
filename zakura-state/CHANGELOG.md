@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `FindBlockHashes` now returns only the contiguous prefix of block hashes whose
+  full bodies are serveable, while other chain-identity reads continue using
+  retained indexes after pruning.
+
 ## [3.0.0-rc0] - 2026-07-19
 
 ### Breaking Changes

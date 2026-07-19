@@ -463,10 +463,30 @@ where
 
     let height_range = find_chain_height_range(chain, db, intersection, stop, max_len);
 
-    // All the hashes should be in the chain.
-    // If they are not, we don't want to return them.
+    // `getblocks` responses are block availability advertisements. Stop before the first body we
+    // cannot serve, rather than announcing a retained chain-index hash whose transactions were
+    // pruned. We must not skip unavailable heights because the response represents a contiguous
+    // chain extension from the peer's locator.
     let hashes: Vec<block::Hash> = height_range.into_iter().map_while(|height| {
-        let hash = hash_by_height(chain, db, Height(height));
+        let height = Height(height);
+        let body_available = chain
+            .map(|chain| chain.as_ref().contains_block_height(height))
+            .unwrap_or(false)
+            || db.contains_body_at_height(height);
+
+        if !body_available {
+            tracing::debug!(
+                ?height,
+                ?intersection,
+                ?stop,
+                ?max_len,
+                "stopping peer FindBlocks response before unavailable block body",
+            );
+            return None;
+        }
+
+        // All the hashes should be in the chain. If they are not, return the contiguous prefix.
+        let hash = hash_by_height(chain, db, height);
 
         // A recently committed block dropped the intersection we previously found.
         if hash.is_none() {
@@ -565,6 +585,9 @@ where
 /// hash.
 ///
 /// Includes finalized and non-finalized blocks.
+/// Only returns the contiguous prefix whose full block bodies are currently serveable. Retained
+/// chain-index hashes for pruned bodies are still valid for internal chain identity, but are not
+/// advertised to peers through `getblocks`.
 ///
 /// Stops the list of hashes after:
 ///   * adding the tip,

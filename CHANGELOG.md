@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   script verification errors.
 - Shut down a managed zcashd-compat process before Zakura exits on SIGINT or
   SIGTERM.
+- Point snapshot links and benchmark defaults at the Zakura snapshot service.
 
 ## [1.0.2-rc0] - 2026-07-19
 

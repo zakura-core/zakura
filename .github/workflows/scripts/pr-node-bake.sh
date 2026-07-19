@@ -92,10 +92,9 @@ fetch_state() {
   local tarball="${dest%/}.tar.zst"
   echo "Fetching ${url} -> ${dest}"
   df -h "$(dirname "$dest")"
-  # --http1.1: the CDN intermittently kills long HTTP/2 streams (INTERNAL_ERROR).
-  # --retry-all-errors + -C -: resume interrupted multi-GB transfers instead of
+  # --retry-all-errors + -C - resumes interrupted multi-GB transfers instead of
   # failing the whole bake (plain --retry does not cover mid-stream resets).
-  curl -fL --http1.1 --retry 8 --retry-delay 15 --retry-all-errors -C - \
+  curl -fL --retry 8 --retry-delay 15 --retry-all-errors -C - \
     -o "$tarball" "$url"
   if [ -n "$sha" ]; then
     echo "${sha}  ${tarball}" | sha256sum -c -

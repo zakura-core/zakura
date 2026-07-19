@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0-rc0] - 2026-07-19
+
+### Added
+
+- Added `NoteCommitmentTrees::update_sprout_tree` for updating the Sprout
+  note-commitment tree from a block.
+
 ## [1.1.0] - 2026-07-17
 
 ### Added

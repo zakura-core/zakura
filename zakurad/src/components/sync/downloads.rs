@@ -191,6 +191,22 @@ pub(super) enum NotFoundKind {
 }
 
 impl BlockDownloadVerifyError {
+    /// Returns the connected legacy peer that supplied the invalid block, if known.
+    pub(super) fn advertiser_addr(&self) -> Option<PeerSocketAddr> {
+        match self {
+            Self::AboveLookaheadHeightLimit {
+                advertiser_addr, ..
+            }
+            | Self::InvalidHeight {
+                advertiser_addr, ..
+            }
+            | Self::Invalid {
+                advertiser_addr, ..
+            } => *advertiser_addr,
+            _ => None,
+        }
+    }
+
     /// Returns the missing block hash for network `notfound` download failures.
     pub(super) fn not_found_download_hash(&self) -> Option<block::Hash> {
         self.not_found_download().map(|(hash, _kind)| hash)
@@ -707,6 +723,7 @@ where
 
                     return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr });
                 };
+                let advertiser_label = advertiser_addr.map(|addr| trace.peer_label(addr));
                 trace.emit("block_downloaded", |row| {
                     row.insert("hash".to_string(), Value::String(hash.to_string()));
                     row.insert("height".to_string(), Value::from(block_height.0));
@@ -714,10 +731,10 @@ where
                         "download_elapsed_ms".to_string(),
                         elapsed_millis(download_start.elapsed()),
                     );
-                    if let Some(advertiser_addr) = advertiser_addr {
+                    if let Some(advertiser_label) = advertiser_label {
                         row.insert(
                             "peer".to_string(),
-                            Value::String(format!("{advertiser_addr:?}")),
+                            Value::String(advertiser_label),
                         );
                     }
                 });

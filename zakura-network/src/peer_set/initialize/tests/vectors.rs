@@ -381,6 +381,21 @@ async fn written_peer_cache_can_be_read_manually() {
         .await
         .expect("unexpected error reading peer cache");
 
+    let peer_cache_file = config
+        .cache_dir
+        .peer_cache_file_path(&config.network)
+        .expect("test cache directory is enabled");
+    let disk_entry = tokio::fs::read_to_string(peer_cache_file)
+        .await
+        .expect("written peer cache is readable");
+    assert_eq!(
+        disk_entry.trim(),
+        expected_cached_peer
+            .remove_socket_addr_privacy()
+            .to_string(),
+        "peer cache entries must stay unredacted so they remain reconnectable"
+    );
+
     assert!(
         cached_peers.contains(&expected_cached_peer),
         "expected peer missing from manual cache load: {:?}",

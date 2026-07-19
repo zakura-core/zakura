@@ -107,6 +107,9 @@ pub struct AddressBook {
     /// The span for operations on this address book.
     span: Span,
 
+    /// Whether operational log fields expose legacy peer addresses.
+    expose_peer_addresses: bool,
+
     /// A channel used to send the latest address book metrics.
     address_metrics_tx: watch::Sender<AddressMetrics>,
 
@@ -174,6 +177,7 @@ impl AddressBook {
             network: network.clone(),
             addr_limit: constants::MAX_ADDRS_IN_ADDRESS_BOOK,
             span,
+            expose_peer_addresses: false,
             address_metrics_tx,
             last_address_log: None,
             most_recent_by_ip: should_limit_outbound_conns_per_ip.then(HashMap::new),
@@ -190,6 +194,13 @@ impl AddressBook {
     #[must_use]
     pub fn with_local_listener_services(mut self, services: PeerServices) -> Self {
         self.local_listener_services = services;
+        self
+    }
+
+    /// Sets whether operational logs expose legacy peer addresses.
+    #[must_use]
+    pub(crate) fn with_expose_peer_addresses(mut self, expose_peer_addresses: bool) -> Self {
+        self.expose_peer_addresses = expose_peer_addresses;
         self
     }
 
@@ -434,8 +445,11 @@ impl AddressBook {
     /// peers.
     #[allow(clippy::unwrap_in_result)]
     pub fn update(&mut self, change: MetaAddrChange) -> Option<MetaAddr> {
+        let addr_label = change.addr().addr_label(self.expose_peer_addresses);
+
         if self.bans_by_ip.contains_key(&change.addr().ip()) {
             tracing::warn!(
+                peer = %addr_label,
                 ?change,
                 "attempted to add a banned peer addr to address book"
             );
@@ -452,6 +466,7 @@ impl AddressBook {
         let updated = change.apply_to_meta_addr(previous, instant_now, chrono_now);
 
         trace!(
+            peer = %addr_label,
             ?change,
             ?updated,
             ?previous,
@@ -493,6 +508,7 @@ impl AddressBook {
                 }
 
                 warn!(
+                    peer = %addr_label,
                     ?updated,
                     total_peers = self.by_addr.len(),
                     recent_peers = self.recently_live_peers(chrono_now).len(),
@@ -531,6 +547,7 @@ impl AddressBook {
             }
 
             debug!(
+                peer = %addr_label,
                 ?change,
                 ?updated,
                 ?previous,
@@ -896,6 +913,7 @@ impl Clone for AddressBook {
             network: self.network.clone(),
             addr_limit: self.addr_limit,
             span: self.span.clone(),
+            expose_peer_addresses: self.expose_peer_addresses,
             address_metrics_tx,
             last_address_log: None,
             most_recent_by_ip: self.most_recent_by_ip.clone(),

@@ -844,7 +844,7 @@ async fn setup(
 
     // Inbound
     let (setup_tx, setup_rx) = oneshot::channel();
-    let inbound_service = Inbound::new(MAX_INBOUND_CONCURRENCY, setup_rx);
+    let inbound_service = Inbound::new(MAX_INBOUND_CONCURRENCY, false, setup_rx);
     // TODO: add a timeout just above the service, if needed
     let inbound_service = ServiceBuilder::new()
         .load_shed()
@@ -914,6 +914,7 @@ async fn setup(
     let mempool_config = MempoolConfig::default();
     let (mut mempool_service, transaction_subscriber) = Mempool::new(
         &mempool_config,
+        false,
         peer_set.clone(),
         state_service.clone(),
         buffered_tx_verifier.clone(),
@@ -1072,7 +1073,7 @@ mod submitblock_test {
 
         // Inbound
         let (_setup_tx, setup_rx) = oneshot::channel();
-        let inbound_service = Inbound::new(MAX_INBOUND_CONCURRENCY, setup_rx);
+        let inbound_service = Inbound::new(MAX_INBOUND_CONCURRENCY, false, setup_rx);
         let inbound_service = ServiceBuilder::new()
             .load_shed()
             .buffer(10)

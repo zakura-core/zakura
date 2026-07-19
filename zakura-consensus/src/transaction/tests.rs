@@ -4130,16 +4130,14 @@ fn mock_transparent_transfer(
     transparent::Output,
     HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
 ) {
-    // A standard, signature-free P2SH input that the script interpreter accepts. The redeem
-    // script is OP_TRUE, so the spend is valid without a signature, while the spent output is a
-    // standard P2SH `scriptPubKey`. This lets the input pass the mempool `AreInputsStandard`
-    // gate (`check::mempool_standard_input_scripts`) that now runs before script verification,
-    // as well as the interpreter itself.
+    // Standard, signature-free P2SH inputs that either pass or fail in the script interpreter.
+    // Both variants pass the mempool `AreInputsStandard` gate.
+    const OP_FALSE: u8 = 0x00;
     const OP_TRUE: u8 = 0x51;
-    // `scriptSig`: a single push of the OP_TRUE redeem script (push-only, one stack item).
     let accepting_unlock_script = transparent::Script::new(&[0x01, OP_TRUE]);
-    // `scriptPubKey`: OP_HASH160 <HASH160(OP_TRUE)> OP_EQUAL. The 20-byte hash is precomputed
-    // (RIPEMD160(SHA256([OP_TRUE]))) so the P2SH hash check passes during verification.
+    let rejecting_unlock_script = transparent::Script::new(&[0x01, OP_FALSE]);
+
+    // `scriptPubKey`: OP_HASH160 <HASH160(redeem script)> OP_EQUAL.
     let mut p2sh_lock_bytes = vec![0xa9, 0x14];
     p2sh_lock_bytes.extend_from_slice(&[
         0xda, 0x17, 0x45, 0xe9, 0xb5, 0x49, 0xbd, 0x0b, 0xfa, 0x1a, 0x56, 0x99, 0x71, 0xc7, 0x7e,
@@ -4147,9 +4145,14 @@ fn mock_transparent_transfer(
     ]);
     p2sh_lock_bytes.push(0x87);
     let accepting_lock_script = transparent::Script::new(&p2sh_lock_bytes);
-    // A script with a single opcode that rejects the transaction (OP_FALSE). Only used for block
-    // requests (the standardness gate is mempool-only), so it need not be a standard type.
-    let rejecting_script = transparent::Script::new(&[0]);
+
+    let mut p2sh_lock_bytes = vec![0xa9, 0x14];
+    p2sh_lock_bytes.extend_from_slice(&[
+        0x9f, 0x7f, 0xd0, 0x96, 0xd3, 0x7e, 0xd2, 0xc0, 0xe3, 0xf7, 0xf0, 0xcf, 0xc9, 0x24, 0xbe,
+        0xef, 0x4f, 0xfc, 0xeb, 0x68,
+    ]);
+    p2sh_lock_bytes.push(0x87);
+    let rejecting_lock_script = transparent::Script::new(&p2sh_lock_bytes);
 
     // Mock an unspent transaction output
     let previous_outpoint = transparent::OutPoint {
@@ -4160,9 +4163,7 @@ fn mock_transparent_transfer(
     let (lock_script, unlock_script) = if script_should_succeed {
         (accepting_lock_script, accepting_unlock_script)
     } else {
-        // The spent output's OP_FALSE `scriptPubKey` makes verification fail regardless of the
-        // `scriptSig`, so the `scriptSig` value is irrelevant here.
-        (rejecting_script.clone(), accepting_unlock_script)
+        (rejecting_lock_script, rejecting_unlock_script)
     };
 
     let previous_output = transparent::Output {
@@ -4183,7 +4184,7 @@ fn mock_transparent_transfer(
     // Using the rejecting script pretends the amount is burned because it can't be spent again
     let output = transparent::Output {
         value: Amount::try_from(1).expect("1 is an invalid amount"),
-        lock_script: rejecting_script,
+        lock_script: transparent::Script::new(&[OP_FALSE]),
     };
 
     // Cache the source of the fund so that it can be used during verification
@@ -4746,10 +4747,11 @@ async fn mempool_zip317_error() {
         .expect("Nu5 activation height is specified");
     let fund_height = (height - 1).expect("fake source fund block height is too small");
 
-    // Will produce a small enough miner fee to fail the check.
+    // This transaction has both an insufficient fee and a standard P2SH input whose redeem
+    // script fails. ZIP-317 must reject it before the script interpreter is invoked.
     let (input, output, known_utxos) = mock_transparent_transfer(
         fund_height,
-        true,
+        false,
         0,
         Amount::try_from(10).expect("valid amount"),
     );
@@ -4780,17 +4782,6 @@ async fn mempool_zip317_error() {
                     .get(&input_outpoint)
                     .map(|utxo| utxo.utxo.clone()),
             ));
-
-        state
-            .expect_request_that(|req| {
-                matches!(
-                    req,
-                    zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
-                )
-            })
-            .await
-            .expect("verifier should call mock state service with correct request")
-            .respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
     });
 
     let verifier_response = verifier

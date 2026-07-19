@@ -521,6 +521,18 @@ where
                 check::mempool_standard_input_scripts(tx.as_ref(), &spent_outputs)?;
             }
 
+            let mut miner_fee = None;
+            if let Some(unmined_tx) = req.mempool_transaction() {
+                // Apply ZIP-317 policy before expensive cryptographic verification.
+                // VerifiedUnminedTx::new() repeats this check to preserve its constructor
+                // invariant.
+                let fee = Self::miner_fee(tx.as_ref(), &spent_utxos)?;
+                let unpaid_actions = transaction::zip317::unpaid_actions(&unmined_tx, fee);
+
+                transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size)?;
+                miner_fee = Some(fee);
+            }
+
             let nu = req.upgrade(&network);
             let cached_ffi_transaction =
                 Arc::new(CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
@@ -584,20 +596,10 @@ where
 
             tracing::trace!(?tx_id, "finished async checks");
 
-            // Get the `value_balance` to calculate the transaction fee.
-            let value_balance = tx.value_balance(&spent_utxos);
-
-            // Calculate the fee only for non-coinbase transactions.
-            let mut miner_fee = None;
-            if !tx.is_coinbase() {
-                // TODO: deduplicate this code with remaining_transaction_value()?
-                miner_fee = match value_balance {
-                    Ok(vb) => match vb.remaining_transaction_value() {
-                        Ok(fee) => Some(fee),
-                        Err(_) => return Err(TransactionError::IncorrectFee),
-                    },
-                    Err(_) => return Err(TransactionError::IncorrectFee),
-                };
+            // Mempool fees were calculated before the expensive async checks.
+            // Calculate the fee here only for non-coinbase block transactions.
+            if miner_fee.is_none() && !tx.is_coinbase() {
+                miner_fee = Some(Self::miner_fee(tx.as_ref(), &spent_utxos)?);
             }
 
             let sigops = tx.sigops().map_err(zakura_script::Error::from)?;
@@ -687,6 +689,19 @@ where
             Ok(median_time_past)
         } else {
             unreachable!("Request::BestChainNextMedianTimePast always responds with BestChainNextMedianTimePast")
+        }
+    }
+
+    /// Calculate the miner fee from the transaction's value balance.
+    fn miner_fee(
+        tx: &Transaction,
+        spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
+    ) -> Result<Amount<NonNegative>, TransactionError> {
+        match tx.value_balance(spent_utxos) {
+            Ok(value_balance) => value_balance
+                .remaining_transaction_value()
+                .map_err(|_| TransactionError::IncorrectFee),
+            Err(_) => Err(TransactionError::IncorrectFee),
         }
     }
 

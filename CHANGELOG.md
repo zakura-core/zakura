@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   SIGTERM.
 - Enable all legacy wallet features by default for supervised zcashd-compat
   processes, while allowing `-allowdeprecated=none` to disable them all.
+- Preserve failed shielded proof/signature verification errors so they receive
+  the existing mempool peer-misbehaviour score.
 
 ## [1.0.2-rc0] - 2026-07-19
 

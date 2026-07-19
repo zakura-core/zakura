@@ -78,6 +78,27 @@ const MEMPOOL_OUTPUT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::
 /// response from the transaction verifier.
 const POLL_MEMPOOL_DELAY: std::time::Duration = Duration::from_millis(50);
 
+/// Number of blocks after NU6.3 activation during which a NU6.2 branch ID
+/// does not count as peer misbehavior.
+const NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS: i64 = 40;
+
+/// Returns whether a mempool transaction with a NU6.2 branch ID is within the
+/// NU6.3 peer-misbehavior grace period.
+fn is_nu6_3_branch_id_misbehavior_grace_period(
+    tx: &Transaction,
+    height: block::Height,
+    network: &Network,
+) -> bool {
+    tx.network_upgrade() == Some(NetworkUpgrade::Nu6_2)
+        && NetworkUpgrade::current(network, height) == NetworkUpgrade::Nu6_3
+        && NetworkUpgrade::Nu6_3
+            .activation_height(network)
+            .and_then(|activation_height| {
+                activation_height + NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS
+            })
+            .is_some_and(|grace_period_end| height < grace_period_end)
+}
+
 /// Asynchronous transaction verification.
 ///
 /// # Correctness
@@ -406,7 +427,16 @@ where
             check::has_enough_orchard_flags(&tx)?;
             check::has_enough_ironwood_flags(&tx)?;
             check::orchard_cross_address_disabled(&tx)?;
-            check::consensus_branch_id(&tx, req.height(), &network)?;
+            match check::consensus_branch_id(&tx, req.height(), &network) {
+                Err(TransactionError::WrongConsensusBranchId)
+                    if req.is_mempool()
+                        && is_nu6_3_branch_id_misbehavior_grace_period(&tx, req.height(), &network) =>
+                {
+                    return Err(TransactionError::WrongConsensusBranchIdNu6_3GracePeriod);
+                }
+                Err(error) => return Err(error),
+                Ok(()) => {}
+            }
             check::sapling_point_encodings_are_valid(&tx)?;
 
             // Soft fork: temporarily require transactions to not contain Orchard actions.

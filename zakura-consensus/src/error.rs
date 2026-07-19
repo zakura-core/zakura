@@ -259,6 +259,11 @@ pub enum TransactionError {
     #[error("transaction uses an incorrect consensus branch id")]
     WrongConsensusBranchId,
 
+    #[error(
+        "mempool transaction uses the NU6.2 consensus branch id during the NU6.3 grace period"
+    )]
+    WrongConsensusBranchIdNu6_3GracePeriod,
+
     #[error("wrong tx format: tx version is ≥ 5, but `nConsensusBranchId` is missing")]
     MissingConsensusBranchId,
 
@@ -408,6 +413,10 @@ impl TransactionError {
             | MissingConsensusBranchId
             | LockedUntilAfterBlockHeight(_)
             | LockedUntilAfterBlockTime(_) => 100,
+
+            // NU6.2 mempool transactions are invalid under NU6.3 rules, but
+            // honest peers can relay them briefly while their chain tips converge.
+            WrongConsensusBranchIdNu6_3GracePeriod => 0,
 
             // Standardness (policy) rejections must not be punished: non-standard
             // transactions are consensus-valid, and zcashd relays a reject message

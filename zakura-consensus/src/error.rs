@@ -27,6 +27,10 @@ use proptest_derive::Arbitrary;
 /// Workaround for format string identifier rules.
 const MAX_EXPIRY_HEIGHT: block::Height = block::Height::MAX_EXPIRY_HEIGHT;
 
+/// The misbehaviour score assigned to a peer that sends a transaction which
+/// fails ZIP-317 mempool fee policy.
+const ZIP317_MEMPOOL_MISBEHAVIOR_SCORE: u32 = 10;
+
 /// Errors for semantic transaction validation.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
@@ -404,10 +408,36 @@ impl TransactionError {
             | LockedUntilAfterBlockHeight(_)
             | LockedUntilAfterBlockTime(_) => 100,
 
-            // Standardness (policy) rejections must not be punished: non-standard
-            // transactions are consensus-valid, and zcashd relays a reject message
-            // without a DoS score for them.
+            // ZIP-317 fee policy rejections get a low score, because locally
+            // generated and relayed transactions must meet this policy.
+            Zip317(_) => ZIP317_MEMPOOL_MISBEHAVIOR_SCORE,
+
+            // Other standardness (policy) rejections must not be punished:
+            // non-standard transactions are consensus-valid, and zcashd relays a
+            // reject message without a DoS score for them.
             _other => 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zakura_chain::transaction::zip317;
+
+    #[test]
+    fn zip317_mempool_errors_have_low_misbehavior_score() {
+        for zip317_error in [
+            zip317::Error::UnpaidActions,
+            zip317::Error::FeeBelowMinimumRate,
+            zip317::Error::InvalidMinFee,
+        ] {
+            let error = TransactionError::Zip317(zip317_error);
+
+            assert_eq!(
+                error.mempool_misbehavior_score(),
+                ZIP317_MEMPOOL_MISBEHAVIOR_SCORE
+            );
         }
     }
 }

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0-rc0] - 2026-07-19
+
+### Breaking Changes
+
+- Added `ConnectionInfo::is_protected_peer`, requiring downstream struct
+  literals to specify whether a configured peer is protected from overload
+  disconnects.
+- Added `HeaderSyncStartError::AnchorAboveVerifiedBlockTip` for invalid
+  checkpoint anchors.
+
+### Added
+
+- Added `ConnectedAddr::is_protected_peer` for identifying configured
+  block-gossip and zcashd-compat peers.
+
 ## [2.0.0] - 2026-07-17
 
 ### Breaking Changes

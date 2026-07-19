@@ -7,7 +7,7 @@ name = "zakura"
 # [package.metadata.release] below does it automatically, but only under the
 # full `cargo release` flow (`cargo release version` skips the replace step) -
 # keep the two in sync when bumping by hand.
-version = "1.0.1"
+version = "1.0.2-rc0"
 authors.workspace = true
 description = "Zakura, an independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true
@@ -158,21 +158,21 @@ tokio-console = ["console-subscriber"]
 comparison-interpreter = ["zakura-script/comparison-interpreter"]
 
 [dependencies]
-zakura-chain = { path = "../zakura-chain", version = "1.0.0" }
-zakura-consensus = { path = "../zakura-consensus", version = "2.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "1.2.0-rc0" }
+zakura-consensus = { path = "../zakura-consensus", version = "3.0.0-rc0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.0.0" }
-zakura-network = { path = "../zakura-network", version = "2.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "1.0.0", features = ["rpc-client"] }
-zakura-rpc = { path = "../zakura-rpc", version = "2.0.0" }
-zakura-state = { path = "../zakura-state", version = "2.0.0" }
+zakura-network = { path = "../zakura-network", version = "3.0.0-rc0" }
+zakura-node-services = { path = "../zakura-node-services", version = "1.0.1-rc0", features = ["rpc-client"] }
+zakura-rpc = { path = "../zakura-rpc", version = "3.0.0-rc0" }
+zakura-state = { path = "../zakura-state", version = "3.0.0-rc0" }
 # zakura-script is not used directly, but we list it here to enable the
 # "comparison-interpreter" feature. (Feature unification will take care of
 # enabling it in the other imports of zcash-script.)
-zakura-script = { path = "../zakura-script", version = "1.0.0" }
+zakura-script = { path = "../zakura-script", version = "1.0.1-rc0" }
 zcash_script = { workspace = true }
 
 # Required for crates.io publishing, but it's only used in tests
-zakura-utils = { path = "../zakura-utils", version = "1.0.0", optional = true }
+zakura-utils = { path = "../zakura-utils", version = "1.0.2-rc0", optional = true }
 
 abscissa_core = { workspace = true }
 clap = { workspace = true, features = ["cargo"] }
@@ -312,10 +312,10 @@ proptest-derive = { workspace = true }
 # enable span traces and track caller in tests
 color-eyre = { workspace = true }
 
-zakura-chain = { path = "../zakura-chain", version = "1.0.0", features = ["proptest-impl"] }
-zakura-consensus = { path = "../zakura-consensus", version = "2.0.0", features = ["proptest-impl"] }
-zakura-network = { path = "../zakura-network", version = "2.0.0", features = ["proptest-impl", "zakura-testkit"] }
-zakura-state = { path = "../zakura-state", version = "2.0.0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "1.2.0-rc0", features = ["proptest-impl"] }
+zakura-consensus = { path = "../zakura-consensus", version = "3.0.0-rc0", features = ["proptest-impl"] }
+zakura-network = { path = "../zakura-network", version = "3.0.0-rc0", features = ["proptest-impl", "zakura-testkit"] }
+zakura-state = { path = "../zakura-state", version = "3.0.0-rc0", features = ["proptest-impl"] }
 
 zakura-test = { path = "../zakura-test", version = "1.0.0" }
 
@@ -328,7 +328,7 @@ zakura-test = { path = "../zakura-test", version = "1.0.0" }
 # When `-Z bindeps` is stabilised, enable this binary dependency instead:
 # https://github.com/rust-lang/cargo/issues/9096
 # zakura-utils { path = "../zakura-utils", artifact = "bin:zakura-checkpoints" }
-zakura-utils = { path = "../zakura-utils", version = "1.0.0" }
+zakura-utils = { path = "../zakura-utils", version = "1.0.2-rc0" }
 
 [package.metadata.cargo-udeps.ignore]
 # These dependencies are false positives - they are actually used

@@ -3913,23 +3913,23 @@ fn public_nu6_3_consensus_branch_id_boundary() {
         );
         assert_eq!(
             check::consensus_branch_id(&tx, activation_height, &network),
-            Err(TransactionError::WrongConsensusBranchIdNu6_3GracePeriod),
+            Err(TransactionError::WrongConsensusBranchId),
         );
         assert_eq!(
-            check::consensus_branch_id(
+            super::is_nu6_3_branch_id_misbehavior_grace_period(
                 &tx,
                 (activation_height + 39).expect("NU6.3 grace period should fit in a height"),
                 &network,
             ),
-            Err(TransactionError::WrongConsensusBranchIdNu6_3GracePeriod),
+            true,
         );
         assert_eq!(
-            check::consensus_branch_id(
+            super::is_nu6_3_branch_id_misbehavior_grace_period(
                 &tx,
                 (activation_height + 40).expect("NU6.3 grace period should fit in a height"),
                 &network,
             ),
-            Err(TransactionError::WrongConsensusBranchId),
+            false,
         );
         assert_eq!(
             TransactionError::WrongConsensusBranchIdNu6_3GracePeriod.mempool_misbehavior_score(),
@@ -4033,7 +4033,13 @@ async fn v5_consensus_branch_ids() {
             let (block_rsp, mempool_rsp) = futures::join!(block_req, mempool_req);
 
             assert_eq!(block_rsp, Err(TransactionError::WrongConsensusBranchId));
-            assert_eq!(mempool_rsp, Err(TransactionError::WrongConsensusBranchId));
+            let mempool_expected_error =
+                if network_upgrade == NetworkUpgrade::Nu6_2 && next_nu == NetworkUpgrade::Nu6_3 {
+                    TransactionError::WrongConsensusBranchIdNu6_3GracePeriod
+                } else {
+                    TransactionError::WrongConsensusBranchId
+                };
+            assert_eq!(mempool_rsp, Err(mempool_expected_error));
 
             // Check the currently supported network upgrade.
             let height = network_upgrade.activation_height(&network).expect("height");

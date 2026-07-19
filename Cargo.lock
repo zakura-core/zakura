@@ -8855,7 +8855,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "1.1.0"
+version = "1.2.0-rc0"
 dependencies = [
  "bech32",
  "bitflags 2.13.0",
@@ -8925,7 +8925,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "2.0.0"
+version = "3.0.0-rc0"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -8988,7 +8988,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "2.0.0"
+version = "3.0.0-rc0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -9036,7 +9036,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "1.0.0"
+version = "1.0.1-rc0"
 dependencies = [
  "color-eyre",
  "jsonrpsee-types",
@@ -9050,7 +9050,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "2.0.0"
+version = "3.0.0-rc0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9120,7 +9120,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "1.0.0"
+version = "1.0.1-rc0"
 dependencies = [
  "hex",
  "lazy_static",
@@ -9138,7 +9138,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "2.0.0"
+version = "3.0.0-rc0"
 dependencies = [
  "bincode",
  "chrono",
@@ -9252,7 +9252,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "1.0.1"
+version = "1.0.2-rc0"
 dependencies = [
  "color-eyre",
  "hex",

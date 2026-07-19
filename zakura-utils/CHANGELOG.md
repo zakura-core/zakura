@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2-rc0] - 2026-07-19
+
+### Changed
+
+- Updated the bundled tools to the release-candidate Zakura crate graph; no
+  APIs defined in this crate changed.
+
 ## [1.0.1] - 2026-07-17
 
 ### Changed

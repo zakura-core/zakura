@@ -40,6 +40,25 @@ sha256_of() {
     python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
 }
 
+# List one remote object, printing nothing when it is absent. Only a clean
+# empty listing (or rclone's "directory not found", exit 3, for a prefix that
+# does not exist yet) means absent: any other rclone failure aborts, so a
+# transient list error can never masquerade as absence and bypass the
+# pointer-regression or bundle-immutability guards below.
+list_remote_object() {
+    local target=$1 listing status
+    status=0
+    listing=$(rclone lsf "$target" 2>"$STAGE/lsf-stderr") || status=$?
+    if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+        echo "rclone lsf failed for $target (exit $status):" >&2
+        cat "$STAGE/lsf-stderr" >&2
+        exit 1
+    fi
+    if [ "$status" -eq 0 ]; then
+        printf '%s' "$listing"
+    fi
+}
+
 "$BIN" \
     --state-cache-dir "$STATE_DIR" \
     --full-list \
@@ -53,7 +72,8 @@ GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # Never move the pointer backwards: an export from a stale quiesced state
 # would regress latest.json, and retention could then purge the very bundle
 # it points at.
-if [ -n "$(rclone lsf "$REMOTE_PREFIX/latest.json" 2>/dev/null)" ]; then
+POINTER_LISTING=$(list_remote_object "$REMOTE_PREFIX/latest.json")
+if [ -n "$POINTER_LISTING" ]; then
     rclone copyto "$REMOTE_PREFIX/latest.json" "$STAGE/existing-latest.json"
     POINTER_HEIGHT=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["height"])' \
         "$STAGE/existing-latest.json")
@@ -93,9 +113,8 @@ PY
 # is reused as-is and only the pointer is refreshed; different contents at the
 # same height mean timestamp-free determinism broke and a human should look.
 BUNDLE_REMOTE="$REMOTE_PREFIX/v1/$HEIGHT"
-# Existence must be judged from the listing output: on bucket remotes rclone
-# lsf exits 0 with empty output for a nonexistent path.
-if [ -n "$(rclone lsf "$BUNDLE_REMOTE/meta.json" 2>/dev/null)" ]; then
+BUNDLE_LISTING=$(list_remote_object "$BUNDLE_REMOTE/meta.json")
+if [ -n "$BUNDLE_LISTING" ]; then
     rclone copyto "$BUNDLE_REMOTE/meta.json" "$STAGE/existing-meta.json"
     python3 - "$STAGE" <<'PY'
 import json, os, sys

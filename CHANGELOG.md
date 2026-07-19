@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Add an opt-in `network.expose_peer_addresses` setting for unredacted legacy
   peer address labels in peer activity logs and metrics
   ([#258](https://github.com/zakura-core/zakura/pull/258)).
+- Shut down a managed zcashd-compat process before Zakura exits on SIGINT or
+  SIGTERM.
 
 ## [1.0.2-rc0] - 2026-07-19
 

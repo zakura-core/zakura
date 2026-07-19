@@ -23,6 +23,8 @@ use crate::{protocol::internal::Response, NotFoundClass, PeerSocketAddr, SharedP
 
 const TABLE: &str = "legacy_peer_request";
 const FILE_NAME: &str = "legacy_peer_request.jsonl";
+const HASH_SAMPLE_EDGE_SIZE: usize = 8;
+const MAX_HASH_SAMPLE_SIZE: usize = HASH_SAMPLE_EDGE_SIZE * 2;
 
 #[derive(Clone, Debug)]
 pub(super) struct LegacyPeerTrace {
@@ -80,11 +82,26 @@ impl LegacyPeerTrace {
                 Ok(Response::BlockHashes(hashes)) => {
                     insert_str(row, "result", "block_hashes");
                     insert_count(row, "hash_count", hashes.len());
+                    let hashes_truncated = hashes.len() > MAX_HASH_SAMPLE_SIZE;
+                    row.insert(
+                        "hashes_truncated".to_string(),
+                        Value::Bool(hashes_truncated),
+                    );
+
+                    let sampled_hashes: Box<dyn Iterator<Item = &block::Hash>> =
+                        if hashes_truncated {
+                            Box::new(
+                                hashes.iter().take(HASH_SAMPLE_EDGE_SIZE).chain(
+                                    hashes.iter().skip(hashes.len() - HASH_SAMPLE_EDGE_SIZE),
+                                ),
+                            )
+                        } else {
+                            Box::new(hashes.iter())
+                        };
                     row.insert(
                         "hashes".to_string(),
                         Value::Array(
-                            hashes
-                                .iter()
+                            sampled_hashes
                                 .map(|hash| Value::String(hash.to_string()))
                                 .collect(),
                         ),
@@ -231,6 +248,8 @@ mod tests {
     use super::*;
     use crate::{protocol::external::InventoryHash, PeerError};
 
+    const MAX_RECEIVED_BLOCK_HASHES: usize = 50_000;
+
     fn hash(byte: u8) -> block::Hash {
         block::Hash([byte; 32])
     }
@@ -285,8 +304,73 @@ mod tests {
         assert_eq!(events[0]["peer_id"], 7);
         assert_eq!(events[0]["peer_start_height"], 100);
         assert_eq!(events[0]["hash_count"], 2);
+        assert_eq!(events[0]["hashes_truncated"], false);
         assert_eq!(events[1]["event"], "block_request_finish");
         assert_eq!(events[1]["route"], "advertised");
         assert_eq!(events[1]["result"], "notfound_response");
+    }
+
+    #[tokio::test]
+    async fn bounds_maximum_find_blocks_hash_sample() {
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
+        let trace = LegacyPeerTrace {
+            tracer: guard.tracer(),
+            node: "test-node".into(),
+            started: Instant::now(),
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        };
+        let peer = PeerTraceContext {
+            peer_id: 7,
+            peer: "127.0.0.1:8233".parse().expect("valid peer address"),
+            peer_start_height: Height(100),
+            local_tip_height: Some(Height(90)),
+        };
+        let hash_count = MAX_RECEIVED_BLOCK_HASHES;
+        let hashes: Vec<_> = (0..hash_count)
+            .map(|index| {
+                let mut bytes = [0; 32];
+                bytes[..8].copy_from_slice(&index.to_le_bytes());
+                block::Hash(bytes)
+            })
+            .collect();
+        let expected_sample = [
+            hashes[0].to_string(),
+            hashes[HASH_SAMPLE_EDGE_SIZE - 1].to_string(),
+            hashes[hash_count - HASH_SAMPLE_EDGE_SIZE].to_string(),
+            hashes[hash_count - 1].to_string(),
+        ];
+
+        trace.find_blocks_finish(
+            1,
+            peer,
+            None,
+            None,
+            Duration::from_millis(12),
+            &Ok(Response::BlockHashes(hashes)),
+        );
+
+        drop(trace);
+        guard.shutdown().await;
+
+        let event = std::fs::read_to_string(dir.path().join(FILE_NAME))
+            .expect("legacy peer trace file is written");
+        let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
+        let sampled_hashes = event["hashes"].as_array().expect("hashes is an array");
+
+        assert_eq!(event["hash_count"], hash_count);
+        assert_eq!(event["hashes_truncated"], true);
+        assert_eq!(sampled_hashes.len(), MAX_HASH_SAMPLE_SIZE);
+        assert_eq!(sampled_hashes[0], expected_sample[0]);
+        assert_eq!(
+            sampled_hashes[HASH_SAMPLE_EDGE_SIZE - 1],
+            expected_sample[1]
+        );
+        assert_eq!(sampled_hashes[HASH_SAMPLE_EDGE_SIZE], expected_sample[2]);
+        assert_eq!(sampled_hashes[MAX_HASH_SAMPLE_SIZE - 1], expected_sample[3]);
+        assert!(
+            event.to_string().len() < 2_000,
+            "maximum response trace row must remain bounded"
+        );
     }
 }

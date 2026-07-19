@@ -1060,9 +1060,12 @@ async fn caches_getaddr_response() {
             Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 10);
         let (setup_tx, setup_rx) = oneshot::channel();
 
-        let inbound_service = ServiceBuilder::new()
-            .load_shed()
-            .service(Inbound::new(MAX_INBOUND_CONCURRENCY, setup_rx));
+        let inbound_service = ServiceBuilder::new().load_shed().service(Inbound::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            None,
+            setup_rx,
+        ));
         let inbound_service = BoxService::new(inbound_service);
         let inbound_service = ServiceBuilder::new().buffer(1).service(inbound_service);
         let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
@@ -1231,6 +1234,7 @@ async fn setup(
     let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let (mut mempool_service, transaction_subscriber) = Mempool::new(
         &MempoolConfig::default(),
+        false,
         buffered_peer_set.clone(),
         state_service.clone(),
         buffered_tx_verifier.clone(),
@@ -1290,9 +1294,12 @@ async fn setup(
 
     let (setup_tx, setup_rx) = oneshot::channel();
 
-    let inbound_service = ServiceBuilder::new()
-        .load_shed()
-        .service(Inbound::new(MAX_INBOUND_CONCURRENCY, setup_rx));
+    let inbound_service = ServiceBuilder::new().load_shed().service(Inbound::new(
+        MAX_INBOUND_CONCURRENCY,
+        false,
+        None,
+        setup_rx,
+    ));
     let inbound_service = BoxService::new(inbound_service);
     let inbound_service = ServiceBuilder::new().buffer(1).service(inbound_service);
 

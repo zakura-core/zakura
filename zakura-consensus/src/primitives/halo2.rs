@@ -18,7 +18,7 @@ use rand::thread_rng;
 use zakura_chain::{parameters::NetworkUpgrade, transaction::SigHash};
 use zcash_protocol::value::ZatBalance;
 
-use crate::BoxError;
+use crate::{error::TransactionError, BoxError};
 use thiserror::Error;
 use tokio::sync::watch;
 use tower::Service;
@@ -416,7 +416,7 @@ impl Verifier {
         if spawn_fifo(move || item.verify_single(vk)).await? {
             Ok(())
         } else {
-            Err("could not validate orchard proof".into())
+            Err(TransactionError::Halo2VerificationFailed.into())
         }
     }
 }
@@ -462,7 +462,7 @@ impl Service<BatchControl<Item>> for Verifier {
                             } else {
                                 tracing::trace!(?is_valid, "invalid halo2 proof");
                                 metrics::counter!("proofs.halo2.invalid").increment(1);
-                                Err("could not validate halo2 proofs".into())
+                                Err(TransactionError::Halo2VerificationFailed.into())
                             }
                         }
                         Err(_recv_error) => panic!("verifier was dropped without flushing"),

@@ -7,13 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+- Ban peers that send mempool transactions with invalid Orchard or Ironwood
+  proof sizes.
+- Stop pruned nodes from returning retained chain-index hashes through legacy
+  `getblocks` when the corresponding block bodies are no longer serveable.
+- Add structured legacy peer request traces that attribute `FindBlocks` hash
+  announcements and block download outcomes to privacy-preserving peer IDs,
+  including exact-inventory versus speculative routing and the peer's
+  self-reported handshake height.
 - Reject transactions that do not meet ZIP-317 mempool fee policy before
   running script and proof checks. Block validation is unchanged.
 - Streamline mempool script error handling so invalid scripts are reported as
   script verification errors.
+- Add an opt-in `network.expose_peer_addresses` setting for unredacted legacy
+  peer address labels in peer activity logs and metrics
+  ([#258](https://github.com/zakura-core/zakura/pull/258)).
 - Shut down a managed zcashd-compat process before Zakura exits on SIGINT or
   SIGTERM.
 - Point snapshot links and benchmark defaults at the Zakura snapshot service.
+- Enable all legacy wallet features by default for supervised zcashd-compat
+  processes, while allowing `-allowdeprecated=none` to disable them all.
+- Preserve failed shielded proof/signature verification errors so they receive
+  the existing mempool peer-misbehaviour score.
 
 ## [1.0.2-rc0] - 2026-07-19
 

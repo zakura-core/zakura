@@ -102,6 +102,7 @@ fn config_load_defaults() {
     );
     assert_eq!(config.rpc.listen_addr, None); // RPC disabled by default
     assert_eq!(config.metrics.endpoint_addr, None); // Metrics disabled by default
+    assert!(!config.network.expose_peer_addresses); // Peer addresses redacted by default
 }
 
 #[test]
@@ -131,6 +132,7 @@ fn config_load_from_file() {
     let test_config = r#"
 [network]
 network = "Testnet"
+expose_peer_addresses = true
 
 [rpc]
 listen_addr = "127.0.0.1:8232"
@@ -152,6 +154,7 @@ endpoint_addr = "127.0.0.1:9999"
         config.metrics.endpoint_addr.unwrap().to_string(),
         "127.0.0.1:9999"
     );
+    assert!(config.network.expose_peer_addresses);
 }
 
 /// The NU6.3 activation height must be configurable from a zakurad config
@@ -366,6 +369,17 @@ fn config_zakura_metrics_endpoint_addr_env() {
         config.metrics.endpoint_addr.unwrap().to_string(),
         "0.0.0.0:9999"
     );
+}
+
+#[test]
+fn config_zakura_network_expose_peer_addresses_env() {
+    let env = EnvGuard::new();
+
+    env.set_var("ZAKURA_NETWORK__EXPOSE_PEER_ADDRESSES", "true");
+
+    let config =
+        ZakuradConfig::load(None).expect("load config with ZAKURA_NETWORK__EXPOSE_PEER_ADDRESSES");
+    assert!(config.network.expose_peer_addresses);
 }
 
 #[test]

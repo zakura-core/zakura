@@ -21,6 +21,13 @@ listen_addr = "[::]:8233"
 
 cache_dir = "/home/zebra/.cache/zakura"
 
+# Legacy peer addresses are redacted in peer activity logs, configured legacy
+# sync trace files, and metrics by default.
+# Only enable this when logs, trace directories, and downstream monitoring
+# systems are access-controlled.
+
+# expose_peer_addresses = true
+
 [rpc]
 # The RPC server is disabled by default. To enable it, uncomment one of the
 # lines below and alternatively set your own port.

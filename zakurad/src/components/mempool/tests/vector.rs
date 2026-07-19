@@ -61,6 +61,26 @@ fn policy_rejection_has_no_misbehavior_score() {
     );
 }
 
+#[test]
+fn invalid_shielded_proof_sizes_ban_mempool_peers() {
+    let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+
+    for consensus_error in [
+        TransactionError::OrchardProofSize,
+        TransactionError::IronwoodProofSize,
+    ] {
+        let invalid_error = TransactionDownloadVerifyError::Invalid {
+            error: consensus_error,
+            advertiser_addr: Some(advertiser_addr),
+        };
+
+        assert_eq!(
+            transaction_misbehavior(&invalid_error),
+            Some((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE)),
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<(), Report> {
     let network = Network::Mainnet;
@@ -2355,6 +2375,7 @@ async fn setup_with_mempool_config_and_misbehavior_sender(
     let (sync_status, recent_syncs) = SyncStatus::new();
     let (mempool, mempool_transaction_subscriber) = Mempool::new(
         &mempool_config,
+        false,
         Buffer::new(BoxService::new(peer_set.clone()), 1),
         state_service.clone(),
         Buffer::new(BoxService::new(tx_verifier.clone()), 1),
@@ -2431,6 +2452,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
         Timeout::new(peer_set, TRANSACTION_DOWNLOAD_TIMEOUT),
         Timeout::new(tx_verifier, TRANSACTION_VERIFY_TIMEOUT),
         state,
+        false,
         u64::MAX,
     ));
 

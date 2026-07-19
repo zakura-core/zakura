@@ -1,5 +1,4 @@
-//! Wrappers for peer addresses which hide sensitive user and node operator details in logs and
-//! metrics.
+//! Wrappers for peer addresses which hide sensitive user and node operator details by default.
 
 use std::{
     fmt,
@@ -11,7 +10,7 @@ use std::{
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
-/// A thin wrapper for [`SocketAddr`] which hides peer IP addresses in logs and metrics.
+/// A thin wrapper for [`SocketAddr`] which hides peer IP addresses by default.
 #[derive(
     Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -76,6 +75,18 @@ impl PeerSocketAddr {
     /// be printed and logged.
     pub fn remove_socket_addr_privacy(&self) -> SocketAddr {
         **self
+    }
+
+    /// Returns a peer-address label using the configured privacy policy.
+    ///
+    /// Use this helper for logs and metrics that follow the node's peer-address setting.
+    /// Formatting [`PeerSocketAddr`] directly remains redacted for callers without a config.
+    pub(crate) fn addr_label(&self, expose_peer_addresses: bool) -> String {
+        if expose_peer_addresses {
+            self.remove_socket_addr_privacy().to_string()
+        } else {
+            self.to_string()
+        }
     }
 
     /// Returns true if the inner [`SocketAddr`]'s IP is the localhost IP.

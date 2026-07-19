@@ -1,19 +1,8 @@
 ---
-description: Classify PR risk before deciding which local checks to run
-alwaysApply: true
+description: Use when the user mentions PR, pull request, open PR, draft PR, create PR, publish PR, or prepare PR
+alwaysApply: false
 ---
 
-# PR Verification Policy
+# Zakura Pull Requests
 
-Avoid running tests and linters after every micro change. Build times are slow in this repository, and agents should not be blocked locally when CI can catch failures.
-
-Before opening or preparing a PR, classify the change:
-
-- High risk: run all relevant CI-equivalent tests and lints before PRing.
-  - Use this for changes over 300 LOC, or changes touching consensus, P2P, cryptography, serialization, database migrations, or other validation-critical logic.
-- Low risk: PR without local checks unless the user asks otherwise.
-  - Use this for small PRs, configuration changes, CI boilerplate, docs-only changes, or other low-risk edits.
-
-When touching Markdown files, always run the Markdown linter for the changed files even if the PR is otherwise low risk.
-
-If checks are skipped, say so clearly in the final response or PR summary, including the risk classification and reason.
+Read and follow `.agents/skills/create-zakura-pr/SKILL.md`.

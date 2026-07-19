@@ -438,12 +438,20 @@ impl StartCmd {
         //
         // See `zakura_network::Connection::drive_peer_request()` for details.
         let (setup_tx, setup_rx) = oneshot::channel();
+        let zcashd_compat_pruning_retention = config
+            .zcashd_compat
+            .enabled
+            .then(|| config.state.pruning_config())
+            .flatten()
+            .map(|pruning| pruning.tx_retention);
         let inbound = ServiceBuilder::new()
             .load_shed()
             .buffer(inbound::downloads::MAX_INBOUND_CONCURRENCY)
             .timeout(MAX_INBOUND_RESPONSE_TIME)
             .service(Inbound::new(
                 config.sync.full_verify_concurrency_limit,
+                config.network.expose_peer_addresses,
+                zcashd_compat_pruning_retention,
                 setup_rx,
             ));
 
@@ -569,6 +577,7 @@ impl StartCmd {
         info!("initializing mempool");
         let (mempool, mempool_transaction_subscriber) = Mempool::new(
             &config.mempool,
+            config.network.expose_peer_addresses,
             peer_set.clone(),
             state.clone(),
             tx_verifier,

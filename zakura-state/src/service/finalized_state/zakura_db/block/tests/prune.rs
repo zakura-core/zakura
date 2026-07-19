@@ -645,11 +645,10 @@ fn chain_identity_uses_retained_hashes_when_checkpoint_bodies_are_skipped() {
         .hash(Height::MIN)
         .expect("test state has a finalized genesis block");
     let hashes = find_chain_hashes(no_chain, &state.db, vec![genesis_hash], None, 500);
-    assert_eq!(
-        hashes.len(),
-        usize::try_from(TEST_BLOCKS).expect("test block count fits in usize")
+    assert!(
+        hashes.is_empty(),
+        "getblocks must not advertise retained chain-index hashes without serveable bodies"
     );
-    assert_eq!(hashes.last(), Some(&tip_hash));
 }
 
 #[test]

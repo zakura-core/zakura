@@ -3913,6 +3913,31 @@ fn public_nu6_3_consensus_branch_id_boundary() {
             check::consensus_branch_id(&tx, activation_height, &network),
             Err(TransactionError::WrongConsensusBranchId),
         );
+        assert!(super::is_nu6_3_branch_id_misbehavior_grace_period(
+            &tx,
+            (activation_height + 39).expect("NU6.3 grace period should fit in a height"),
+            &network,
+        ));
+        assert!(!super::is_nu6_3_branch_id_misbehavior_grace_period(
+            &tx,
+            (activation_height + 40).expect("NU6.3 grace period should fit in a height"),
+            &network,
+        ));
+        assert_eq!(
+            TransactionError::WrongConsensusBranchIdNu6_3GracePeriod.mempool_misbehavior_score(),
+            0,
+        );
+
+        tx.update_network_upgrade(NetworkUpgrade::Nu6_1)
+            .expect("V5 transactions support the NU6.1 branch ID");
+        assert_eq!(
+            check::consensus_branch_id(&tx, activation_height, &network),
+            Err(TransactionError::WrongConsensusBranchId),
+        );
+        assert_eq!(
+            TransactionError::WrongConsensusBranchId.mempool_misbehavior_score(),
+            100,
+        );
 
         tx.update_network_upgrade(NetworkUpgrade::Nu6_3)
             .expect("V5 transactions support the NU6.3 branch ID");
@@ -4000,7 +4025,45 @@ async fn v5_consensus_branch_ids() {
             let (block_rsp, mempool_rsp) = futures::join!(block_req, mempool_req);
 
             assert_eq!(block_rsp, Err(TransactionError::WrongConsensusBranchId));
-            assert_eq!(mempool_rsp, Err(TransactionError::WrongConsensusBranchId));
+            let mempool_expected_error =
+                if network_upgrade == NetworkUpgrade::Nu6_2 && next_nu == NetworkUpgrade::Nu6_3 {
+                    TransactionError::WrongConsensusBranchIdNu6_3GracePeriod
+                } else {
+                    TransactionError::WrongConsensusBranchId
+                };
+            assert_eq!(mempool_rsp, Err(mempool_expected_error));
+
+            if network_upgrade == NetworkUpgrade::Nu6_2 && next_nu == NetworkUpgrade::Nu6_3 {
+                let grace_period_last_height =
+                    (height + 39).expect("NU6.3 grace period should fit in a height");
+                let grace_period_response = verifier
+                    .clone()
+                    .oneshot(Request::Mempool {
+                        transaction: tx.clone().into(),
+                        height: grace_period_last_height,
+                    })
+                    .map_err(|err| *err.downcast().expect("`TransactionError` type"))
+                    .await;
+                assert_eq!(
+                    grace_period_response,
+                    Err(TransactionError::WrongConsensusBranchIdNu6_3GracePeriod),
+                );
+
+                let grace_period_end_height =
+                    (height + 40).expect("NU6.3 grace period should fit in a height");
+                let grace_period_end_response = verifier
+                    .clone()
+                    .oneshot(Request::Mempool {
+                        transaction: tx.clone().into(),
+                        height: grace_period_end_height,
+                    })
+                    .map_err(|err| *err.downcast().expect("`TransactionError` type"))
+                    .await;
+                assert_eq!(
+                    grace_period_end_response,
+                    Err(TransactionError::WrongConsensusBranchId),
+                );
+            }
 
             // Check the currently supported network upgrade.
             let height = network_upgrade.activation_height(&network).expect("height");

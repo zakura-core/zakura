@@ -438,6 +438,12 @@ impl StartCmd {
         //
         // See `zakura_network::Connection::drive_peer_request()` for details.
         let (setup_tx, setup_rx) = oneshot::channel();
+        let zcashd_compat_pruning_retention = config
+            .zcashd_compat
+            .enabled
+            .then(|| config.state.pruning_config())
+            .flatten()
+            .map(|pruning| pruning.tx_retention);
         let inbound = ServiceBuilder::new()
             .load_shed()
             .buffer(inbound::downloads::MAX_INBOUND_CONCURRENCY)
@@ -445,6 +451,7 @@ impl StartCmd {
             .service(Inbound::new(
                 config.sync.full_verify_concurrency_limit,
                 config.network.expose_peer_addresses,
+                zcashd_compat_pruning_retention,
                 setup_rx,
             ));
 

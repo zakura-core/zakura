@@ -108,6 +108,7 @@ toml = { workspace = true }
 
 hex = { workspace = true, features = ["serde"] }
 insta = { workspace = true, features = ["ron", "redactions"] }
+serde_json = { workspace = true }
 
 proptest = { workspace = true }
 proptest-derive = { workspace = true }

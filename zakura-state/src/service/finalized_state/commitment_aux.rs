@@ -101,6 +101,36 @@ pub enum FinalFrontiersGenerationError {
         /// The full tip identity captured after reading all frontiers.
         after: Option<(block::Height, block::Hash)>,
     },
+
+    /// A block above the requested height appended Sprout note commitments, so the stored tip
+    /// Sprout frontier is not the Sprout frontier at the requested height.
+    #[error(
+        "cannot produce final frontiers at height {height:?}: Sprout note commitments were \
+         appended at {last_change:?}, below finalized tip {tip:?}; retry once the requested \
+         height passes that block"
+    )]
+    SproutChangedAboveRequestedHeight {
+        /// The highest block above `height` that appended Sprout note commitments.
+        last_change: block::Height,
+        /// The requested final frontier height.
+        height: block::Height,
+        /// The finalized database tip height.
+        tip: block::Height,
+    },
+
+    /// A block body needed to prove the Sprout frontier is settled was not retained.
+    #[error(
+        "cannot produce final frontiers at height {height:?}: block {missing:?} below finalized \
+         tip {tip:?} is not retained, so the settled-Sprout scan cannot run"
+    )]
+    MissingBlockInSproutWindow {
+        /// The unretained block height.
+        missing: block::Height,
+        /// The requested final frontier height.
+        height: block::Height,
+        /// The finalized database tip height.
+        tip: block::Height,
+    },
 }
 
 /// Errors parsing [`FinalFrontiers`] from the embedded/frontier-file byte format.
@@ -596,6 +626,64 @@ fn produce_final_frontiers_with_post_read(
         return Err(FinalFrontiersGenerationError::RequestedHeightIsNotTip { height, tip });
     }
 
+    read_final_frontiers_at(db, height, before, post_read)
+}
+
+/// Produce the final frontiers at `height`, which may be below the finalized tip.
+///
+/// Sprout stores only its current tip frontier, so this proves the tip frontier is also the
+/// frontier at `height` before pairing them: it scans every retained block body in
+/// `(height, tip]` and fails closed if any block appended Sprout note commitments
+/// ([`FinalFrontiersGenerationError::SproutChangedAboveRequestedHeight`]) or is not retained
+/// ([`FinalFrontiersGenerationError::MissingBlockInSproutWindow`]). See
+/// [`produce_final_frontiers`] for the tip-only variant that needs no scan.
+pub(super) fn produce_settled_final_frontiers(
+    db: &ZakuraDb,
+    height: block::Height,
+) -> Result<FinalFrontiers, FinalFrontiersGenerationError> {
+    let before = db
+        .tip()
+        .ok_or(FinalFrontiersGenerationError::MissingFinalizedTip { height })?;
+    let tip = before.0;
+
+    // Scan the whole window rather than stopping at the first change, so the error
+    // names the height the next export's grid has to pass.
+    let mut last_change = None;
+    for raw_height in height.0.saturating_add(1)..=tip.0 {
+        let scan_height = block::Height(raw_height);
+        let block = db.block(scan_height.into()).ok_or(
+            FinalFrontiersGenerationError::MissingBlockInSproutWindow {
+                missing: scan_height,
+                height,
+                tip,
+            },
+        )?;
+        if block.sprout_note_commitments().next().is_some() {
+            last_change = Some(scan_height);
+        }
+    }
+    if let Some(last_change) = last_change {
+        return Err(
+            FinalFrontiersGenerationError::SproutChangedAboveRequestedHeight {
+                last_change,
+                height,
+                tip,
+            },
+        );
+    }
+
+    read_final_frontiers_at(db, height, before, || {})
+}
+
+/// Read the four frontiers for `height` and re-check that the tip identity `before` did not
+/// change during the reads. The caller has already established that pairing `height`'s trees
+/// with the tip Sprout frontier is sound.
+fn read_final_frontiers_at(
+    db: &ZakuraDb,
+    height: block::Height,
+    before: (block::Height, block::Hash),
+    post_read: impl FnOnce(),
+) -> Result<FinalFrontiers, FinalFrontiersGenerationError> {
     let sapling = db
         .sapling_tree_by_height(&height)
         .ok_or(FinalFrontiersGenerationError::MissingSaplingTree { height })?;
@@ -636,6 +724,18 @@ pub fn produce_final_frontiers_bytes(
     height: block::Height,
 ) -> Result<Vec<u8>, FinalFrontiersGenerationError> {
     Ok(produce_final_frontiers(db, height)?.to_bytes())
+}
+
+/// Produce serialized final-frontier bytes for the checkpoint handoff at `height`, which may
+/// be below the finalized tip.
+///
+/// Same byte format as [`produce_final_frontiers_bytes`]; the settled-Sprout scan contract is
+/// documented on [`produce_settled_final_frontiers`].
+pub fn produce_settled_final_frontiers_bytes(
+    db: &ZakuraDb,
+    height: block::Height,
+) -> Result<Vec<u8>, FinalFrontiersGenerationError> {
+    Ok(produce_settled_final_frontiers(db, height)?.to_bytes())
 }
 
 #[cfg(test)]
@@ -1083,6 +1183,70 @@ mod tests {
             bytes,
             frontiers.to_bytes(),
             "public byte producer serializes the generated final frontiers"
+        );
+    }
+
+    #[test]
+    fn produce_settled_final_frontiers_at_tip_matches_tip_variant() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+        let height = block::Height(2);
+        seed_trees(&db, [2]);
+        seed_sprout_tree(&db, &sprout::tree::NoteCommitmentTree::default());
+        seed_finalized_tip(&db, height);
+
+        let tip_variant =
+            produce_final_frontiers(&db, height).expect("seeded frontiers should be produced");
+        let settled = produce_settled_final_frontiers(&db, height)
+            .expect("an empty settled-Sprout window needs no block bodies");
+
+        assert_eq!(settled.height, tip_variant.height);
+        assert_eq!(settled.sapling.root(), tip_variant.sapling.root());
+        assert_eq!(settled.orchard.root(), tip_variant.orchard.root());
+        assert_eq!(settled.sprout.root(), tip_variant.sprout.root());
+        assert_eq!(settled.ironwood.root(), tip_variant.ironwood.root());
+    }
+
+    #[test]
+    fn produce_settled_final_frontiers_requires_retained_window_bodies() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+        let height = block::Height(2);
+        let tip = block::Height(3);
+        seed_trees(&db, [2, 3]);
+        seed_sprout_tree(&db, &sprout::tree::NoteCommitmentTree::default());
+        seed_finalized_tip(&db, tip);
+
+        assert_eq!(
+            produce_settled_final_frontiers(&db, height)
+                .expect_err("an unretained window body must fail the settled-Sprout scan closed"),
+            FinalFrontiersGenerationError::MissingBlockInSproutWindow {
+                missing: tip,
+                height,
+                tip,
+            },
+        );
+    }
+
+    /// Pin the settled-Sprout scan's change detector against real Mainnet blocks:
+    /// block 396 contains the first Mainnet JoinSplit, whose dummy output notes
+    /// still append Sprout commitments; block 395 precedes it.
+    #[test]
+    fn sprout_change_detector_matches_known_mainnet_blocks() {
+        let clean: zakura_chain::block::Block = zakura_test::vectors::BLOCK_MAINNET_395_BYTES
+            .zcash_deserialize_into()
+            .expect("test vector block 395 deserializes");
+        let changed: zakura_chain::block::Block = zakura_test::vectors::BLOCK_MAINNET_396_BYTES
+            .zcash_deserialize_into()
+            .expect("test vector block 396 deserializes");
+
+        assert!(
+            clean.sprout_note_commitments().next().is_none(),
+            "block 395 appends no Sprout note commitments"
+        );
+        assert!(
+            changed.sprout_note_commitments().next().is_some(),
+            "block 396 appends the first Mainnet Sprout note commitments"
         );
     }
 

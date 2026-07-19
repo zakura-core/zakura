@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Add an offline Mainnet checkpoint and VCT frontier export mode to
+  `zakura-checkpoints`, and a committed provenance record
+  (`vct/mainnet-frontier.json`) that CI verifies against the embedded
+  checkpoint list and frontier on every PR. Groundwork for automated
+  release-state updates.
 - Add a configurable 250,000-byte default maximum for individual mempool
   transactions. Larger transactions are rejected before semantic and contextual
   verification without penalizing peers, and the policy does not affect block

@@ -370,6 +370,21 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         "the pruned block body is unavailable"
     );
 
+    let unknown_hash = block::Hash([0x11; 32]);
+    let unknown_response = inbound_service
+        .clone()
+        .oneshot(Request::BlocksByHash(iter::once(unknown_hash).collect()))
+        .await?;
+    assert_eq!(
+        unknown_response,
+        Response::Blocks(vec![Missing(unknown_hash)]),
+        "an unknown hash maps to missing inventory"
+    );
+    assert!(
+        !logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        "an unknown hash must not log a pruning error"
+    );
+
     let inbound_response = inbound_service
         .clone()
         .oneshot(Request::BlocksByHash(iter::once(block1.hash()).collect()))

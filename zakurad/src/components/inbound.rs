@@ -110,6 +110,10 @@ impl PrunedBlockNotFoundLogger {
         }
     }
 
+    fn is_enabled(&self) -> bool {
+        self.tx_retention.is_some()
+    }
+
     /// Reserves the current log interval and returns the configured retention.
     fn reserve_log(&self) -> Option<u32> {
         self.reserve_log_at(Instant::now())
@@ -542,21 +546,23 @@ impl Service<zn::Request> for Inbound {
                             // because it is already limited to the size of the getdata request
                             // sent by the peer. (Their content and encodings are the same.)
                             zs::Response::Block(None) => {
-                                if let Some(tx_retention) =
-                                    pruned_block_not_found_logger.reserve_log()
-                                {
-                                    // A retained canonical header with no block body identifies
-                                    // history removed by pruning. Unknown hashes remain ordinary
-                                    // `notfound` responses without an operator error.
+                                // A retained canonical header with no block body identifies
+                                // history removed by pruning. Unknown hashes remain ordinary
+                                // `notfound` responses without reserving a log interval.
+                                if pruned_block_not_found_logger.is_enabled() {
                                     if let Some(height) =
                                         retained_block_height(state.clone(), hash).await
                                     {
-                                        error!(
-                                            ?hash,
-                                            ?height,
-                                            tx_retention,
-                                            "{ZCASHD_COMPAT_PRUNED_BLOCK_ERROR}"
-                                        );
+                                        if let Some(tx_retention) =
+                                            pruned_block_not_found_logger.reserve_log()
+                                        {
+                                            error!(
+                                                ?hash,
+                                                ?height,
+                                                tx_retention,
+                                                "{ZCASHD_COMPAT_PRUNED_BLOCK_ERROR}"
+                                            );
+                                        }
                                     }
                                 }
 

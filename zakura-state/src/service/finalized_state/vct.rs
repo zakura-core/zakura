@@ -527,19 +527,29 @@ fn final_frontiers_bytes(height: block::Height, trees: &NoteCommitmentTrees) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
 
-    const EXPECTED_MAINNET_FINAL_SAPLING_ROOT: [u8; 32] = [
-        5, 88, 219, 64, 134, 21, 57, 124, 234, 59, 83, 8, 7, 143, 19, 29, 247, 58, 105, 80, 119,
-        139, 242, 243, 206, 137, 211, 94, 151, 126, 154, 13,
-    ];
-    const EXPECTED_MAINNET_FINAL_ORCHARD_ROOT: [u8; 32] = [
-        177, 173, 139, 203, 63, 186, 47, 172, 148, 107, 150, 204, 211, 212, 33, 155, 172, 108, 132,
-        148, 70, 210, 120, 97, 219, 160, 58, 242, 198, 124, 44, 3,
-    ];
-    const EXPECTED_MAINNET_FINAL_SPROUT_ROOT: [u8; 32] = [
-        77, 239, 224, 205, 90, 67, 51, 216, 15, 139, 120, 78, 55, 17, 177, 22, 246, 34, 206, 184,
-        49, 7, 97, 172, 28, 178, 69, 208, 13, 101, 55, 169,
-    ];
+    const MAINNET_FRONTIER_PROVENANCE: &[u8] = include_bytes!("vct/mainnet-frontier.json");
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MainnetFrontierProvenance {
+        schema_version: u32,
+        network: String,
+        source: String,
+        generated_at: String,
+        finalized_height: u32,
+        finalized_hash: String,
+        checkpoints_sha256: String,
+        frontier_sha256: String,
+        frontier_size: u64,
+        #[serde(default)]
+        block_metadata_sha256: Option<String>,
+        #[serde(default)]
+        bundle_manifest_sha256: Option<String>,
+    }
 
     #[test]
     fn source_mode_precedence() {
@@ -654,33 +664,74 @@ mod tests {
     fn embedded_mainnet_final_frontiers_parse() {
         let frontiers = embedded_final_frontiers(&Network::Mainnet)
             .expect("mainnet has embedded final frontiers");
+        let provenance: MainnetFrontierProvenance =
+            serde_json::from_slice(MAINNET_FRONTIER_PROVENANCE)
+                .expect("embedded Mainnet frontier provenance must be strict JSON");
+        let finalized_hash: block::Hash = provenance
+            .finalized_hash
+            .parse()
+            .expect("provenance must contain a canonical finalized block hash");
 
         assert_eq!(
             frontiers.height,
             Network::Mainnet.checkpoint_list().max_height(),
             "embedded frontier is tied to the last mainnet checkpoint"
         );
+        assert_eq!(provenance.schema_version, 1);
+        assert_eq!(provenance.network, "Mainnet");
+        assert!(
+            matches!(
+                provenance.source.as_str(),
+                "legacy-bootstrap" | "release-state-bundle"
+            ),
+            "provenance must identify a supported source"
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&provenance.generated_at).is_ok(),
+            "provenance must contain an RFC 3339 generation time"
+        );
+        assert_eq!(provenance.finalized_height, frontiers.height.0);
         assert_eq!(
-            <[u8; 32]>::from(frontiers.sapling.root()),
-            EXPECTED_MAINNET_FINAL_SAPLING_ROOT,
-            "embedded mainnet final Sapling frontier root is pinned"
+            Network::Mainnet.checkpoint_list().hash(frontiers.height),
+            Some(finalized_hash),
+            "provenance must identify the terminal Mainnet checkpoint"
         );
         assert_eq!(
-            <[u8; 32]>::from(frontiers.orchard.root()),
-            EXPECTED_MAINNET_FINAL_ORCHARD_ROOT,
-            "embedded mainnet final Orchard frontier root is pinned"
+            provenance.checkpoints_sha256,
+            hex::encode(Sha256::digest(
+                Network::Mainnet.checkpoint_list().iter_cloned().fold(
+                    Vec::new(),
+                    |mut bytes, (height, hash)| {
+                        writeln!(&mut bytes, "{} {}", height.0, hash)
+                            .expect("writing to a Vec is infallible");
+                        bytes
+                    }
+                )
+            )),
+            "provenance must authenticate the complete Mainnet checkpoint file"
         );
         assert_eq!(
-            <[u8; 32]>::from(frontiers.sprout.root()),
-            EXPECTED_MAINNET_FINAL_SPROUT_ROOT,
-            "embedded mainnet final Sprout frontier root is pinned"
+            provenance.frontier_size,
+            u64::try_from(MAINNET_FINAL_FRONTIERS.len()).expect("frontier length fits in u64")
         );
         assert_eq!(
-            frontiers.ironwood.root(),
-            ironwood::tree::NoteCommitmentTree::default().root(),
-            "the embedded mainnet-frontier.bin predates Ironwood, so it parses (backward \
-             compatibly) with the Ironwood frontier defaulted to the empty tree"
+            provenance.frontier_sha256,
+            hex::encode(Sha256::digest(MAINNET_FINAL_FRONTIERS)),
+            "provenance must authenticate the embedded Mainnet frontier bytes"
         );
+        if provenance.source == "legacy-bootstrap" {
+            assert!(provenance.block_metadata_sha256.is_none());
+            assert!(provenance.bundle_manifest_sha256.is_none());
+        } else {
+            assert_eq!(
+                provenance.block_metadata_sha256.as_deref().map(str::len),
+                Some(64)
+            );
+            assert_eq!(
+                provenance.bundle_manifest_sha256.as_deref().map(str::len),
+                Some(64)
+            );
+        }
     }
 
     #[test]

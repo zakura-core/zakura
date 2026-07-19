@@ -2,6 +2,7 @@
 
 Tools for maintaining and testing Zebra:
 
+- [zakura-release-state](#zakura-release-state)
 - [zakura-checkpoints](#zakura-checkpoints)
 - [zakurad-hash-lookup](#zakurad-hash-lookup)
 - [zakurad-log-filter](#zakurad-log-filter)
@@ -10,15 +11,60 @@ Tools for maintaining and testing Zebra:
 
 Binaries are easier to use if they are located in your system execution path.
 
+## zakura-release-state
+
+`zakura-release-state` produces the coupled Mainnet checkpoint and verified commitment tree
+frontier input for a release. It reads retained block hashes and `BlockInfo` sizes from a
+finalized state database, so it works with pruned state and does not need historical block
+bodies. The output directory is created atomically and contains exactly:
+
+- `manifest.json`, which binds the fixed checkpoint base, finalized height and hash, timestamp,
+  artifact names, sizes, and SHA-256 digests;
+- `block-metadata.bin`, a compact contiguous sequence of block hashes and sizes; and
+- `mainnet-frontier.bin`, the four final note commitment tree frontiers at that finalized height.
+
+Build and export a bundle from a stopped, synced Mainnet node:
+
+```sh
+cargo run --locked -p zakura-utils --features zakura-release-state \
+  --bin zakura-release-state -- export \
+  --cache-dir /path/to/zakura-cache \
+  --output-dir /path/to/new-bundle \
+  --generated-at 2026-07-18T12:34:56Z
+```
+
+The fixed base is Mainnet checkpoint 3,358,006. A publisher can therefore keep producing bundles
+after an earlier bundle has been imported without rebuilding its binary. Import authenticates
+the source's fixed prefix and every existing later checkpoint against the bundle, preserves that
+source prefix byte-for-byte, and appends a deterministic suffix whose terminal checkpoint is the
+bundle's finalized height. Every checkpoint gap remains between 17 and 400 blocks.
+
+Verify a downloaded bundle, import it into a source checkout, and verify the tracked result:
+
+```sh
+cargo run --locked -p zakura-utils --features zakura-release-state \
+  --bin zakura-release-state -- verify --bundle-dir /path/to/bundle
+cargo run --locked -p zakura-utils --features zakura-release-state \
+  --bin zakura-release-state -- import --bundle-dir /path/to/bundle --source-dir .
+cargo run --locked -p zakura-utils --features zakura-release-state \
+  --bin zakura-release-state -- verify-source --source-dir . --require-bundle-provenance
+```
+
+Import updates `main-checkpoints.txt`, `mainnet-frontier.bin`, and the tracked
+`mainnet-frontier.json` provenance record only after the entire bundle and source prefix validate.
+An identical reimport is a no-op. Lower heights, same-height conflicts, digest mismatches, and
+unknown manifest fields fail closed. Ordinary source validation accepts the initial
+`legacy-bootstrap` provenance, but release preparation uses `--require-bundle-provenance` so a
+future release cannot use that bootstrap state.
+
 ## zakura-checkpoints
 
 This command generates a list of zebra checkpoints, and writes them to standard output. Each checkpoint consists of a block height and hash.
 
-Checkpoint generation is currently a manual process: the upstream CI pipeline that generated
-checkpoints automatically was removed with the GCP integration-test infrastructure. When a
-checkpoint update advances the Mainnet checkpoint max height, regenerate the embedded Mainnet
-frontier in the same run using `--mainnet-frontier-output`
-(see `docs/design/verified-commitment-trees.md`, "Frontier regeneration tool").
+The former GCP checkpoint-generation and `checkpoint-update.yml` pipelines remain retired. For
+Mainnet releases, use the coupled `zakura-release-state` flow above instead. A manually generated
+Mainnet checkpoint list does not provide the matching frontier or bundle provenance required by
+the release gate. This command remains useful for diagnostics and Testnet updates.
 
 #### Manual Checkpoint Generation
 

@@ -8,11 +8,18 @@ assignees: ""
 
 # Prepare for the Release
 
-# Checkpoints
+# Mainnet Release State
 
-For performance and security, we want to update the Zakura checkpoints in every release.
+For performance and security, every release should contain a current Mainnet
+checkpoint and its matching VCT frontier.
 
-- [ ] You can copy the latest checkpoints from CI by following [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/zakura-utils/README.md#zakura-checkpoints).
+- [ ] Run the `Prepare Mainnet release state` workflow from `main`. It resolves
+      the latest pointer once and opens or updates a draft PR from the resulting
+      immutable bundle.
+- [ ] Review and merge that draft PR before preparing the release commit.
+- [ ] Confirm `make pre-release` accepts the committed checkpoint, frontier,
+      and provenance. The release workflow deliberately does not fetch R2 state.
+      Bootstrap provenance is rejected, so this requires a generated bundle PR.
 
 # Missed Dependency Updates
 
@@ -138,6 +145,8 @@ sed "s#$HOME/.zakura#identity_dir#g" \
       about to create, using the previous release tag as the base:
       `make pre-release RELEASE_TAG=v<version> BASE_TAG=v<previous-release-tag>`
       For example: `make pre-release RELEASE_TAG=v1.0.0 BASE_TAG=v1.0.0-rc5`
+      This also verifies that the committed Mainnet checkpoint, VCT frontier,
+      and provenance identify the same finalized block.
 
 ## Update Crate Versions and Crate Change Logs
 
@@ -212,8 +221,9 @@ The end of support height is calculated from the current blockchain height:
 - [ ] Wait for all the release PRs to be merged
 - [ ] Run the [Create release workflow](https://github.com/zakura-core/zakura/actions/workflows/create-release.yml)
       from `main`, entering the exact version tag, for example `v1.0.0-rc2`.
-      The workflow verifies that the tag matches the `zakura` package version,
-      then builds and verifies the assets without creating a tag.
+      The workflow verifies the committed Mainnet release state and checks that
+      the tag matches the `zakura` package version, then builds and verifies the
+      assets without creating a tag.
 - [ ] Wait for the build and no-push Docker checks to pass, then approve the
       `release` environment deployment. The workflow publishes a complete
       pre-release and creates the protected tag as its final step.

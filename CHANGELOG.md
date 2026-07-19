@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   validation.
 - Add `zakurad validate-vct-sprout-history` to audit repaired historical
   Sprout anchors in archive or pruned Mainnet state databases.
+- Add deterministic Mainnet release-state bundles that update checkpoints and
+  the matching VCT frontier together, plus provenance and an offline release
+  gate that rejects legacy or inconsistent inputs.
 
 ### Fixed
 

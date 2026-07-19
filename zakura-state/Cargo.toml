@@ -101,6 +101,7 @@ derive-new.workspace = true
 
 [dev-dependencies]
 color-eyre = { workspace = true }
+serde_json = { workspace = true }
 
 once_cell = { workspace = true }
 spandoc = { workspace = true }

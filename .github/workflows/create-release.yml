@@ -49,6 +49,8 @@ jobs:
             exit 1
           fi
 
+          # This validates only release state committed to TARGET_SHA. Resolving
+          # the moving R2 pointer belongs to prepare-mainnet-release-state.yml.
           make pre-release \
             RELEASE_TAG="$RELEASE_TAG" \
             PRE_RELEASE_WARN_CRATE_VERSION_BUMPS=0

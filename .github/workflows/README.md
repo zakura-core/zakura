@@ -28,6 +28,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 | `zakura-e2e.yml` | The heaviest PR-path job, isolated in its own workflow: regtest docker-compose end-to-end gate, multi-node testkit test, block-sync fuzz on every push to `main`, and long four-node modes nightly. PR runs are gated by a `changes` job or the `run-zakura-e2e` label. | PR/push (self-gated), merge queue, nightly, manual |
 | `status-checks.patch.yml` | Empty jobs with the same names as required checks, so branch protection passes when path filters skip `lint.yml` / `tests-unit.yml` / `test-crates.yml`. Its `paths-ignore` list **must stay the exact inverse** of those workflows' `paths`. | PR on non-Rust paths only |
 | `docs-check.yml` | markdownlint, codespell, and lychee link checking over all Markdown. | PR/push on Markdown paths |
+| `verify-mainnet-release-state.yml` | Always emits the required release-state check. It runs the full checkpoint, frontier, and provenance validation only when those files or this workflow change; generated state updates must come from the release GitHub App. | Every PR |
 | `coverage.yml` | llvm-cov + nextest coverage uploaded to Codecov. A 120-minute instrumented build, kept off the PR path. | Push to `main`/`release/**`, nightly, manual |
 | `benchmarks.yml` | Criterion benchmarks. Runs on PRs carrying the `C-benchmark` label; results publish to the dashboard data on `gh-pages/dev/bench`. | Labeled PRs, manual |
 | `book.yml` | Builds the mdBook and internal rustdoc as a merge gate, and snapshots the benchmark dashboard into the docs output. | Push to `main` on docs/Rust paths |
@@ -39,6 +40,8 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 - **`create-release.yml`** — the only supported path for creating `v*` release tags. Calls `release-binaries.yml` (as a reusable workflow) to build and verify every asset, then a protected environment lets the release GitHub App publish the draft and create the immutable tag. See the release runbook before using it.
 - **`release-binaries.yml`** — builds and publishes `zakurad` release assets and Docker images when a `v*` tag is pushed. Also callable from `create-release.yml` for pre-tag staging, and manually dispatchable to repair assets on an existing tag. Gated on the tag matching the `zakura` package version.
 - **`release-drafter.yml`** — manual: compiles PR titles since the last release into a draft release note.
+- **`publish-release-state-image.yml`** — manual from `main`: builds the digest-pinned amd64 image used by the isolated Mainnet release-state publisher.
+- **`prepare-mainnet-release-state.yml`** — manual from `main`: resolves one immutable publisher bundle, imports its matching checkpoint and frontier, and opens a draft PR through the release GitHub App.
 
 ## Fleet operations (DigitalOcean)
 
@@ -65,4 +68,4 @@ These workflows use the helper scripts in `.github/workflows/scripts/` (`pr-node
 - **Patch workflows.** When a required check is skipped by path filters, GitHub leaves it "Expected" forever. The `.patch.yml` pattern provides an empty job with the same name on the inverse path set. If you change `paths` in a gating workflow, update `status-checks.patch.yml` to match.
 - **Label-gated heavy jobs.** `C-benchmark` runs benchmarks on a PR; `run-zakura-e2e` forces the e2e suite on a PR that wouldn't otherwise trigger it.
 - **Fork PRs.** Repository secrets and variables are not available to workflows on PRs from forks, so fleet and PR-node workflows are dispatch-only from this repository.
-- **Checkpoints are updated manually.** The upstream automated checkpoint pipeline depended on the removed GCP integration tests. Until a replacement exists, follow [Generating Zakura Checkpoints](../../book/src/dev/zakura-checkpoints.md); checkpoint PRs remain consensus-critical and need careful review.
+- **Mainnet release state is updated as one reviewed unit.** Use `prepare-mainnet-release-state.yml` to update the Mainnet checkpoint and matching VCT frontier together. `zakura-checkpoints` remains available for diagnostics and Testnet maintenance.

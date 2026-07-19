@@ -23,6 +23,11 @@ path = "src/bin/zakura-checkpoints/main.rs"
 required-features = ["zakura-checkpoints"]
 
 [[bin]]
+name = "zakura-release-state"
+path = "src/bin/zakura-release-state/main.rs"
+required-features = ["zakura-release-state"]
+
+[[bin]]
 name = "search-issue-refs"
 path = "src/bin/search-issue-refs/main.rs"
 required-features = ["search-issue-refs"]
@@ -44,6 +49,14 @@ zakura-checkpoints = [
     "zakura-node-services/rpc-client"
 ]
 
+zakura-release-state = [
+    "chrono",
+    "serde",
+    "sha2",
+    "tempfile",
+    "zakura-state",
+]
+
 search-issue-refs = [
     "regex",
     "reqwest",
@@ -55,13 +68,18 @@ color-eyre = { workspace = true }
 
 structopt = { workspace = true }
 hex = { workspace = true }
+chrono = { workspace = true, features = ["clock", "serde"], optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 tracing-error = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 
 zakura-node-services = { path = "../zakura-node-services", version = "1.0.0" }
 zakura-chain = { path = "../zakura-chain", version = "1.0.0" }
+zakura-state = { path = "../zakura-state", version = "2.0.0", optional = true }
 
 # These crates are needed for the block-template-to-proposal binary
 zakura-rpc = { path = "../zakura-rpc", version = "2.0.0" }
@@ -79,6 +97,9 @@ tokio = { workspace = true, features = ["full"], optional = true }
 
 zcash_primitives = { workspace = true, optional = true }
 zcash_protocol.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true

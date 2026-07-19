@@ -1,0 +1,91 @@
+name: Verify Mainnet release state
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-mainnet-release-state-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify checkpoint and frontier
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect release-state changes
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "$BASE_SHA" HEAD -- \
+            zakura-chain/src/parameters/checkpoint/main-checkpoints.txt \
+            zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin \
+            zakura-state/src/service/finalized_state/vct/mainnet-frontier.json \
+            .github/workflows/verify-mainnet-release-state.yml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        if: steps.changes.outputs.changed == 'true'
+        with:
+          toolchain: stable
+
+      - name: Verify source consistency
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          cargo run --locked \
+            -p zakura-utils \
+            --features zakura-release-state \
+            --bin zakura-release-state \
+            -- verify-source \
+            --source-dir .
+          .github/scripts/validate-checkpoints.sh \
+            zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+
+      - name: Require imported bundle provenance after bootstrap
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          provenance=zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+          if git cat-file -e "${BASE_SHA}:${provenance}"; then
+            if ! git diff --quiet "$BASE_SHA" HEAD -- \
+              zakura-chain/src/parameters/checkpoint/main-checkpoints.txt \
+              zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin \
+              zakura-state/src/service/finalized_state/vct/mainnet-frontier.json; then
+              [[ "$PR_AUTHOR" == 'zakura-release-bot[bot]' ]] || {
+                echo "Release-state updates must be opened by the Zakura release GitHub App." >&2
+                exit 1
+              }
+              [[ "$HEAD_REPOSITORY" == "$REPOSITORY" && \
+                "$HEAD_REF" == adam/update-mainnet-release-state ]] || {
+                echo "Release-state updates must use the generated repository branch." >&2
+                exit 1
+              }
+              make pre-release-state
+            fi
+          else
+            echo "Base commit predates release-state provenance; allowing the one-time bootstrap."
+          fi
+
+      - name: Confirm release state is unchanged
+        if: steps.changes.outputs.changed != 'true'
+        run: echo "Mainnet release-state files are unchanged."

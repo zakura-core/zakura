@@ -9253,13 +9253,18 @@ dependencies = [
 name = "zakura-utils"
 version = "1.0.1"
 dependencies = [
+ "chrono",
  "color-eyre",
  "hex",
  "itertools 0.14.0",
+ "proptest",
  "regex",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "structopt",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing-error",
@@ -9267,6 +9272,7 @@ dependencies = [
  "zakura-chain",
  "zakura-node-services",
  "zakura-rpc",
+ "zakura-state",
  "zcash_primitives",
  "zcash_protocol",
 ]

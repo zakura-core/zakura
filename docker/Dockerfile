@@ -172,6 +172,38 @@ RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
     cp ${CARGO_TARGET_DIR}/release/zakura-rollback-state /usr/local/bin && \
     cp ${CARGO_TARGET_DIR}/release/zakura-prune-state /usr/local/bin
 
+# Build the release-state exporter separately so the ordinary runtime image
+# does not ship a publisher-only maintenance binary.
+FROM deps AS release-state-publisher-build
+
+ARG HOME
+WORKDIR ${HOME}
+
+ARG CARGO_HOME
+ARG CARGO_TARGET_DIR
+
+RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
+    --mount=type=bind,source=tower-fallback,target=tower-fallback \
+    --mount=type=bind,source=deploy/zakura-watchdog,target=deploy/zakura-watchdog \
+    --mount=type=bind,source=xtask,target=xtask \
+    --mount=type=bind,source=zakura-chain,target=zakura-chain \
+    --mount=type=bind,source=zakura-consensus,target=zakura-consensus \
+    --mount=type=bind,source=zakura-jsonl-trace,target=zakura-jsonl-trace \
+    --mount=type=bind,source=zakura-network,target=zakura-network \
+    --mount=type=bind,source=zakura-node-services,target=zakura-node-services \
+    --mount=type=bind,source=zakura-rpc,target=zakura-rpc \
+    --mount=type=bind,source=zakura-script,target=zakura-script \
+    --mount=type=bind,source=zakura-state,target=zakura-state \
+    --mount=type=bind,source=zakura-test,target=zakura-test \
+    --mount=type=bind,source=zakura-utils,target=zakura-utils \
+    --mount=type=bind,source=zakurad,target=zakurad \
+    --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
+    --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
+    --mount=type=cache,target=${CARGO_TARGET_DIR} \
+    --mount=type=cache,target=${CARGO_HOME} \
+    cargo build --locked --release --package zakura-utils --features zakura-release-state --bin zakura-release-state && \
+    cp ${CARGO_TARGET_DIR}/release/zakura-release-state /usr/local/bin
+
 # This stage starts from scratch using Debian and copies the built Zebra binaries
 # from the `release` stage along with other binaries and files.
 FROM debian:trixie-slim AS runtime
@@ -230,6 +262,12 @@ COPY --link --chown=${UID}:${GID} ./docker/entrypoint.sh /usr/local/bin/entrypoi
 
 ENTRYPOINT [ "entrypoint.sh" ]
 CMD ["zakurad"]
+
+# Dedicated publisher image. It contains the normal node plus the release-state
+# exporter, but ordinary release images remain unchanged.
+FROM runtime AS runtime-release-state-publisher
+
+COPY --link --from=release-state-publisher-build /usr/local/bin/zakura-release-state /usr/local/bin/
 
 # zcashd-compat runtime image, expects an externally prepared build context named
 # `zcashd_compat` with a Linux executable at /bin/zcashd.

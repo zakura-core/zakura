@@ -100,12 +100,33 @@ if len(frontier) != provenance["frontier_size"]:
     fail(f"{FRONTIER} size {len(frontier)} does not match the provenance record")
 if hashlib.sha256(frontier).hexdigest() != provenance["frontier_sha256"]:
     fail(f"{FRONTIER} digest does not match the provenance record")
+if len(frontier) < 4:
+    fail(f"{FRONTIER} is truncated before its height field")
 (frontier_height,) = struct.unpack("<I", frontier[:4])
 if frontier_height != height:
     fail(
         f"embedded frontier height {frontier_height} does not match "
         f"provenance finalized_height {height}"
     )
+
+# Structural framing check: the height must be followed by 3 or 4 length-prefixed
+# tree blobs (Sapling, Orchard, Sprout, and optionally Ironwood) covering the file
+# exactly. Tree-content validity stays with the cargo-side
+# embedded_mainnet_final_frontiers_parse test; this catches truncated or padded
+# bytes without a cargo build.
+offset = 4
+blobs = 0
+while offset < len(frontier):
+    if offset + 4 > len(frontier):
+        fail(f"{FRONTIER} tree blob length prefix is truncated at byte {offset}")
+    (blob_len,) = struct.unpack_from("<I", frontier, offset)
+    offset += 4
+    if offset + blob_len > len(frontier):
+        fail(f"{FRONTIER} tree blob at byte {offset - 4} extends past the end of the file")
+    offset += blob_len
+    blobs += 1
+if blobs not in (3, 4):
+    fail(f"{FRONTIER} must frame 3 or 4 tree blobs, found {blobs}")
 
 source = provenance["source"]
 meta_sha256 = provenance.get("meta_sha256")

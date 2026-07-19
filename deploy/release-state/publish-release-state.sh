@@ -80,7 +80,9 @@ PY
 # is reused as-is and only the pointer is refreshed; different contents at the
 # same height mean timestamp-free determinism broke and a human should look.
 BUNDLE_REMOTE="$REMOTE_PREFIX/v1/$HEIGHT"
-if rclone lsf "$BUNDLE_REMOTE/meta.json" >/dev/null 2>&1; then
+# Existence must be judged from the listing output: on bucket remotes rclone
+# lsf exits 0 with empty output for a nonexistent path.
+if [ -n "$(rclone lsf "$BUNDLE_REMOTE/meta.json" 2>/dev/null)" ]; then
     rclone copyto "$BUNDLE_REMOTE/meta.json" "$STAGE/existing-meta.json"
     python3 - "$STAGE" <<'PY'
 import json, os, sys

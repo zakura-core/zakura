@@ -39,6 +39,11 @@ REQUIRED_KEYS = {
 }
 OPTIONAL_KEYS = {"meta_sha256"}
 STALE_WARNING = timedelta(days=14)
+# NetworkUpgrade::Nu6_3 (Ironwood) activation on Mainnet; kept in sync with
+# zakura-chain/src/parameters/constants.rs. Frontiers at or above activation
+# must carry the fourth (Ironwood) tree blob, because the node parser defaults
+# a missing fourth blob to the empty tree.
+IRONWOOD_ACTIVATION_HEIGHT = 3_428_143
 
 
 def fail(message: str) -> None:
@@ -125,8 +130,12 @@ while offset < len(frontier):
         fail(f"{FRONTIER} tree blob at byte {offset - 4} extends past the end of the file")
     offset += blob_len
     blobs += 1
-if blobs not in (3, 4):
-    fail(f"{FRONTIER} must frame 3 or 4 tree blobs, found {blobs}")
+allowed_blobs = (4,) if height >= IRONWOOD_ACTIVATION_HEIGHT else (3, 4)
+if blobs not in allowed_blobs:
+    fail(
+        f"{FRONTIER} must frame {' or '.join(map(str, allowed_blobs))} tree blobs "
+        f"for height {height}, found {blobs}"
+    )
 
 source = provenance["source"]
 meta_sha256 = provenance.get("meta_sha256")

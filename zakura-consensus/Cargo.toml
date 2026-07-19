@@ -60,6 +60,8 @@ sapling-crypto = { workspace = true, features = ["multicore"]}
 orchard.workspace = true
 
 zcash_proofs = { workspace = true, features = ["multicore", "bundled-prover"] }
+# Provides the bundled Sapling proving parameter bytes so they can be cached to disk on first use.
+wagyu-zcash-parameters = { workspace = true }
 zcash_transparent = { workspace = true }
 libzcash_script = { workspace = true }
 zcash_script = { workspace = true }

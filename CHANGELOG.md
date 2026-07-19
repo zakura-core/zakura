@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+- Cache the Sapling proving parameters to disk (in the default Zcash parameters
+  folder) the first time they are needed, for example when `getblocktemplate`
+  builds a coinbase transaction. The shared prover is now built once and reused,
+  instead of re-parsing the bundled parameters on every template refresh.
 - Reject transactions that do not meet ZIP-317 mempool fee policy before
   running script and proof checks. Block validation is unchanged.
 - Streamline mempool script error handling so invalid scripts are reported as

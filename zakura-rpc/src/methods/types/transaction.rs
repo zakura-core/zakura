@@ -32,7 +32,6 @@ use zcash_primitives::transaction::{
     builder::{BuildConfig, Builder},
     fees::fixed::FeeRule,
 };
-use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::Zatoshis};
 
 use super::zec::Zec;
@@ -248,14 +247,16 @@ impl TransactionTemplate<NegativeOrZero> {
             builder.add_transparent_output(&fs_addr, fs_amount)?;
         }
 
-        let sapling_prover = LocalTxProver::bundled();
+        // Use the process-wide Sapling prover, which caches its proving parameters to disk on
+        // first use, instead of re-parsing the bundled parameters on every coinbase build.
+        let sapling_prover = zakura_consensus::sapling_prover();
         let build_result = builder.build(
             &Default::default(),
             Default::default(),
             Default::default(),
             OsRng,
-            &sapling_prover,
-            &sapling_prover,
+            sapling_prover,
+            sapling_prover,
             &FeeRule::non_standard(Zatoshis::ZERO),
         )?;
 

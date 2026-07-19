@@ -8962,6 +8962,7 @@ dependencies = [
  "tracing-error",
  "tracing-futures",
  "tracing-subscriber",
+ "wagyu-zcash-parameters",
  "zakura-chain",
  "zakura-node-services",
  "zakura-script",

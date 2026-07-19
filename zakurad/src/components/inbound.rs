@@ -133,6 +133,25 @@ impl PrunedBlockNotFoundLogger {
     }
 }
 
+/// Returns the height when `hash` is a known canonical block with a retained header.
+///
+/// Diagnostic lookup errors are intentionally ignored so they never change the
+/// peer's ordinary `notfound` response.
+async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<block::Height> {
+    let response = state
+        .ready()
+        .await
+        .ok()?
+        .call(zs::Request::BlockHeader(hash.into()))
+        .await
+        .ok()?;
+
+    match response {
+        zs::Response::BlockHeader { height, .. } => Some(height),
+        _ => None,
+    }
+}
+
 fn mempool_queue_source(source: zn::PeerSource) -> mempool::QueueSource {
     match source {
         zn::PeerSource::LegacySocket(addr) => mempool::QueueSource::LegacySocket(*addr),
@@ -529,10 +548,8 @@ impl Service<zn::Request> for Inbound {
                                     // A retained canonical header with no block body identifies
                                     // history removed by pruning. Unknown hashes remain ordinary
                                     // `notfound` responses without an operator error.
-                                    if let Ok(zs::Response::BlockHeader { height, .. }) = state
-                                        .clone()
-                                        .oneshot(zs::Request::BlockHeader(hash.into()))
-                                        .await
+                                    if let Some(height) =
+                                        retained_block_height(state.clone(), hash).await
                                     {
                                         error!(
                                             ?hash,

@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   Sprout anchors in archive or pruned Mainnet state databases
   ([#247](https://github.com/zakura-core/zakura/pull/247),
   [#251](https://github.com/zakura-core/zakura/pull/251)).
+
 ### Changed
 
 - Source the embedded Mainnet VCT Sprout-history repair artifact from

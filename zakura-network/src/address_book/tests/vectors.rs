@@ -36,6 +36,23 @@ fn address_book_empty() {
     assert_eq!(address_book.len(), 0);
 }
 
+/// Peer addresses stay redacted unless the address book is explicitly configured to expose them.
+#[test]
+fn peer_address_exposure_requires_explicit_opt_in() {
+    let address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::current(),
+    );
+
+    assert!(!address_book.expose_peer_addresses);
+    let address_book = address_book.with_expose_peer_addresses(true);
+
+    assert!(address_book.expose_peer_addresses);
+    assert!(address_book.clone().expose_peer_addresses);
+}
+
 /// Helper: build a `MetaAddrChange::NewGossiped` for a given address and
 /// last-seen time. Used to seed the address book before triggering a ban so
 /// the test exercises the by-IP cleanup loop on real entries.

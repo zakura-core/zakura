@@ -142,6 +142,18 @@ where
     }
 }
 
+impl<S, C> Handshake<S, C>
+where
+    S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + 'static,
+    S::Future: Send,
+    C: ChainTip + Clone + Send + 'static,
+{
+    /// Returns a connection address label using this handshake's configured privacy policy.
+    pub(crate) fn addr_label(&self, connected_addr: &ConnectedAddr) -> String {
+        connected_addr.addr_label(self.config.expose_peer_addresses)
+    }
+}
+
 /// The metadata for a peer connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionInfo {
@@ -339,10 +351,18 @@ impl ConnectedAddr {
         }
     }
 
-    /// Returns the metrics label for this connection's address.
+    /// Returns the redacted label for this connection's address.
     pub fn get_transient_addr_label(&self) -> String {
         self.get_transient_addr()
             .map_or_else(|| "isolated".to_string(), |addr| addr.to_string())
+    }
+
+    /// Returns this connection's address using the configured privacy policy.
+    pub(crate) fn addr_label(&self, expose_peer_addresses: bool) -> String {
+        self.get_transient_addr().map_or_else(
+            || "isolated".to_string(),
+            |addr| addr.addr_label(expose_peer_addresses),
+        )
     }
 
     /// Returns a short label for the kind of connection.
@@ -796,7 +816,11 @@ where
             // Include the configured external address in our version message, if any, otherwise, include our listen address.
             let advertise_addr = match config.external_addr {
                 Some(external_addr) => {
-                    info!(?their_addr, ?config.listen_addr, "using external address for Version messages");
+                    info!(
+                        peer = %their_addr.addr_label(config.expose_peer_addresses),
+                        ?config.listen_addr,
+                        "using external address for Version messages"
+                    );
                     external_addr
                 }
                 None => config.listen_addr,
@@ -853,6 +877,8 @@ where
     };
 
     let remote_address_services = remote.address_from.untrusted_services();
+    let addr_label = their_addr.addr_label(config.expose_peer_addresses);
+
     if remote_address_services != remote.services {
         info!(
             ?remote.services,
@@ -879,7 +905,11 @@ where
     // maliciously remove nonces, and force us to make self-connections.
     let nonce_reuse = nonces.lock().await.contains(&remote.nonce);
     if nonce_reuse {
-        info!(?connected_addr, "rejecting self-connection attempt");
+        info!(
+            peer = %addr_label,
+            connection_kind = connected_addr.get_short_kind_label(),
+            "rejecting self-connection attempt"
+        );
         Err(HandshakeError::RemoteNonceReuse)?;
     }
 
@@ -888,10 +918,9 @@ where
     // Reject connections to peers on old versions, because they might not know about all
     // network upgrades and could lead to chain forks or slower block propagation.
     let min_version = minimum_peer_version.current();
-
     if remote.version < min_version {
         debug!(
-            remote_ip = ?their_addr,
+            remote_ip = %addr_label,
             ?remote.version,
             ?min_version,
             ?remote.user_agent,
@@ -901,7 +930,7 @@ where
         // the value is the number of rejected handshakes, by peer IP and protocol version
         metrics::counter!(
             "zcash.net.peers.obsolete",
-            "remote_ip" => their_addr.to_string(),
+            "remote_ip" => addr_label.clone(),
             "remote_version" => remote.version.to_string(),
             "min_version" => min_version.to_string(),
             "user_agent" => remote.user_agent.clone(),
@@ -911,7 +940,7 @@ where
         // the value is the remote version of the most recent rejected handshake from each peer
         metrics::gauge!(
             "zcash.net.peers.version.obsolete",
-            "remote_ip" => their_addr.to_string(),
+            "remote_ip" => addr_label.clone(),
         )
         .set(remote.version.0 as f64);
 
@@ -931,7 +960,7 @@ where
     });
 
     debug!(
-        remote_ip = ?their_addr,
+        remote_ip = %addr_label,
         ?connection_info.remote.version,
         ?negotiated_version,
         ?min_version,
@@ -942,7 +971,7 @@ where
     // the value is the number of connected handshakes, by peer IP and protocol version
     metrics::counter!(
         "zcash.net.peers.connected",
-        "remote_ip" => their_addr.to_string(),
+        "remote_ip" => addr_label.clone(),
         "remote_version" => connection_info.remote.version.to_string(),
         "negotiated_version" => negotiated_version.to_string(),
         "min_version" => min_version.to_string(),
@@ -953,7 +982,7 @@ where
     // the value is the remote version of the most recent connected handshake from each peer
     metrics::gauge!(
         "zcash.net.peers.version.connected",
-        "remote_ip" => their_addr.to_string(),
+        "remote_ip" => addr_label,
     )
     .set(connection_info.remote.version.0 as f64);
 
@@ -999,8 +1028,7 @@ async fn upgrade_to_zakura_handshake<PeerTransport>(
     peer_conn: &mut Framed<PeerTransport, Codec>,
     connection_info: &ConnectionInfo,
     connected_addr: ConnectedAddr,
-    network: &Network,
-    dev_network: Option<&str>,
+    node_config: &Config,
     zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
     address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
 ) -> Result<ZakuraUpgradeOutcome, HandshakeError>
@@ -1027,7 +1055,11 @@ where
         return Ok(neutral_upgrade_fallback());
     };
 
-    let config = ZakuraHandshakeConfig::for_network_with_dev_cohort(network, dev_network);
+    let addr_label = connected_addr.addr_label(node_config.expose_peer_addresses);
+    let upgrade_config = ZakuraHandshakeConfig::for_network_with_dev_cohort(
+        &node_config.network,
+        node_config.zakura.dev_network.as_deref(),
+    );
     let nonces = ZakuraLegacyNonces {
         local_zebra_nonce: connection_info.local.nonce,
         remote_zebra_nonce: connection_info.remote.nonce,
@@ -1039,7 +1071,7 @@ where
         run_responder_upgrade(
             peer_conn,
             &connector,
-            &config,
+            &upgrade_config,
             nonces,
             local_node_id,
             local_direct_addresses,
@@ -1049,7 +1081,7 @@ where
         run_initiator_upgrade(
             peer_conn,
             &connector,
-            &config,
+            &upgrade_config,
             nonces,
             local_node_id,
             local_direct_addresses,
@@ -1062,7 +1094,8 @@ where
             // The success metric `zakura.p2p.handshake.upgraded` is incremented by
             // the supervisor when the dialed/accepted QUIC connection registers.
             info!(
-                ?connected_addr,
+                peer = %addr_label,
+                connection_kind = connected_addr.get_short_kind_label(),
                 ?peer_id,
                 remote_services = ?connection_info.remote.services,
                 "upgraded mutually P2P-v2-capable peer to Zakura",
@@ -1070,7 +1103,8 @@ where
         }
         ZakuraUpgradeOutcome::Duplicate { peer_id } => {
             info!(
-                ?connected_addr,
+                peer = %addr_label,
+                connection_kind = connected_addr.get_short_kind_label(),
                 ?peer_id,
                 "closing duplicate Zakura peer neutrally"
             );
@@ -1078,14 +1112,15 @@ where
         }
         ZakuraUpgradeOutcome::Rejected { reason } => {
             debug!(
-                ?connected_addr,
+                peer = %addr_label,
+                connection_kind = connected_addr.get_short_kind_label(),
                 ?reason,
                 "Zakura upgrade not completed; continuing on the legacy connection",
             );
             metrics::counter!(
                 "zakura.p2p.upgrade.prelude.rejected",
                 "reason" => format!("{reason:?}"),
-                "network" => config.network_label(),
+                "network" => upgrade_config.network_label(),
             )
             .increment(1);
         }
@@ -1407,12 +1442,22 @@ where
             connection_tracker,
         } = req;
 
-        let negotiator_span = debug_span!("negotiator", peer = ?connected_addr);
+        let addr_label = connected_addr.addr_label(self.config.expose_peer_addresses);
+        let negotiator_span = debug_span!(
+            "negotiator",
+            peer = %addr_label,
+            connection_kind = connected_addr.get_short_kind_label(),
+        );
         // set the peer connection span's parent to the global span, as it
         // should exist independently of its creation source (inbound
         // connection, crawler, initial peer, ...)
-        let connection_span =
-            span!(parent: &self.parent_span, Level::INFO, "", peer = ?connected_addr);
+        let connection_span = span!(
+            parent: &self.parent_span,
+            Level::INFO,
+            "",
+            peer = %addr_label,
+            connection_kind = connected_addr.get_short_kind_label(),
+        );
 
         // Clone these upfront, so they can be moved into the future.
         let nonces = self.nonces.clone();
@@ -1437,7 +1482,8 @@ where
         // Any code outside this future does not have a timeout.
         let fut = async move {
             debug!(
-                addr = ?connected_addr,
+                addr = %addr_label,
+                connection_kind = connected_addr.get_short_kind_label(),
                 "negotiating protocol version with remote peer"
             );
 
@@ -1448,7 +1494,7 @@ where
                 data_stream,
                 Codec::builder()
                     .for_network(&config.network)
-                    .with_metrics_addr_label(connected_addr.get_transient_addr_label())
+                    .with_metrics_addr_label(addr_label.clone())
                     .finish(),
             );
             let mut connection_tracker = connection_tracker;
@@ -1515,8 +1561,7 @@ where
                     &mut peer_conn,
                     &connection_info,
                     connected_addr,
-                    &config.network,
-                    config.zakura.dev_network.as_deref(),
+                    &config,
                     zakura_handshake_connector,
                     &address_book_updater,
                 )
@@ -1534,7 +1579,8 @@ where
                         reason: ZakuraRejectReason::TemporaryUnavailable,
                     }) => {
                         debug!(
-                            ?connected_addr,
+                            peer = %addr_label,
+                            connection_kind = connected_addr.get_short_kind_label(),
                             "Zakura upgrade is temporarily unavailable; continuing legacy handshake"
                         );
                     }
@@ -1585,13 +1631,14 @@ where
             // Instrument the peer's rx and tx streams.
 
             let inner_conn_span = connection_span.clone();
+            let outbound_addr_label = addr_label.clone();
             let peer_tx = peer_tx.with(move |msg: Message| {
                 let span = debug_span!(parent: inner_conn_span.clone(), "outbound_metric");
                 // Add a metric for outbound messages.
                 metrics::counter!(
                     "zcash.net.out.messages",
                     "command" => msg.command(),
-                    "addr" => connected_addr.get_transient_addr_label(),
+                    "addr" => outbound_addr_label.clone(),
                 )
                 .increment(1);
                 // We need to use future::ready rather than an async block here,
@@ -1614,11 +1661,13 @@ where
             let inbound_inv_collector = inv_collector.clone();
             let ts_inner_conn_span = connection_span.clone();
             let inv_inner_conn_span = connection_span.clone();
+            let inbound_addr_label = addr_label.clone();
             let peer_rx = peer_rx
                 .then(move |msg| {
                     // Add a metric for inbound messages and errors.
                     // Fire a timestamp or failure event.
                     let inbound_ts_collector = inbound_ts_collector.clone();
+                    let addr_label = inbound_addr_label.clone();
                     let span =
                         debug_span!(parent: ts_inner_conn_span.clone(), "inbound_ts_collector");
 
@@ -1628,7 +1677,7 @@ where
                                 metrics::counter!(
                                     "zcash.net.in.messages",
                                     "command" => msg.command(),
-                                    "addr" => connected_addr.get_transient_addr_label(),
+                                    "addr" => addr_label.clone(),
                                 )
                                 .increment(1);
 
@@ -1641,7 +1690,7 @@ where
                                 metrics::counter!(
                                     "zakura.net.in.errors",
                                     "error" => err.to_string(),
-                                    "addr" => connected_addr.get_transient_addr_label(),
+                                    "addr" => addr_label.clone(),
                                 )
                                 .increment(1);
 
@@ -1704,6 +1753,7 @@ where
                 peer_tx,
                 connection_tracker,
                 connection_info.clone(),
+                addr_label,
                 alternate_addrs.collect(),
             );
 

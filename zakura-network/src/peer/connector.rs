@@ -89,7 +89,12 @@ where
 
         let hs = self.handshaker.clone();
         let connected_addr = ConnectedAddr::new_outbound_direct(addr);
-        let connector_span = info_span!("connector", peer = ?connected_addr);
+        let addr_label = hs.addr_label(&connected_addr);
+        let connector_span = info_span!(
+            "connector",
+            peer = %addr_label,
+            connection_kind = connected_addr.get_short_kind_label(),
+        );
 
         // # Security
         //

@@ -222,6 +222,9 @@ pub struct Inbound {
     ///
     /// Some services are unavailable until Zebra has completed setup.
     setup: Setup,
+
+    /// Whether legacy peer address labels in logs are unredacted.
+    expose_peer_addresses: bool,
 }
 
 impl Inbound {
@@ -230,6 +233,7 @@ impl Inbound {
     /// Dependent services are sent via the `setup` channel after initialization.
     pub fn new(
         full_verify_concurrency_limit: usize,
+        expose_peer_addresses: bool,
         setup: oneshot::Receiver<InboundSetupData>,
     ) -> Inbound {
         Inbound {
@@ -237,6 +241,7 @@ impl Inbound {
                 full_verify_concurrency_limit,
                 setup,
             },
+            expose_peer_addresses,
         }
     }
 
@@ -284,6 +289,7 @@ impl Service<zn::Request> for Inbound {
 
                     let block_downloads = Box::pin(BlockDownloads::new(
                         full_verify_concurrency_limit,
+                        self.expose_peer_addresses,
                         Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
                         Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
                         state.clone(),

@@ -154,6 +154,7 @@ fn new_test_connection_with_protection<A>(
         negotiated_version: fake_version,
         is_protected_peer,
     };
+    let addr_label = connection_info.connected_addr.get_transient_addr_label();
 
     let connection = Connection::new(
         mock_inbound_service.clone(),
@@ -162,6 +163,7 @@ fn new_test_connection_with_protection<A>(
         peer_tx,
         ActiveConnectionCounter::new_counter().track_connection(),
         Arc::new(connection_info),
+        addr_label,
         Vec::new(),
     );
 
@@ -207,6 +209,7 @@ fn new_never_closing_test_connection<A>(
         negotiated_version: fake_version,
         is_protected_peer: false,
     };
+    let addr_label = connection_info.connected_addr.get_transient_addr_label();
 
     let connection = Connection::new(
         mock_inbound_service,
@@ -215,6 +218,7 @@ fn new_never_closing_test_connection<A>(
         NeverClosingSink,
         connection_tracker,
         Arc::new(connection_info),
+        addr_label,
         Vec::new(),
     );
 

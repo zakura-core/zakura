@@ -275,6 +275,7 @@ fn setup(
             tx_cost_limit: 160_000_000,
             ..Default::default()
         },
+        false,
         Buffer::new(BoxService::new(peer_set.clone()), 1),
         Buffer::new(BoxService::new(state_service.clone()), 1),
         Buffer::new(BoxService::new(tx_verifier.clone()), 1),

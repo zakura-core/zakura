@@ -21,16 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   (`vct/mainnet-frontier.json`) that CI verifies against the embedded
   checkpoint list and frontier on every PR. Groundwork for automated
   release-state updates.
-
-## [1.0.2-rc0] - 2026-07-19
-
-### Added
-
 - Automate Mainnet checkpoint and VCT frontier refreshes: the
   `update-release-state.yml` workflow imports digest-verified publisher bundles
   from R2 into reviewable draft PRs, and `make pre-release` now verifies the
   committed checkpoint/frontier/provenance coupling (rejecting pre-pipeline
   bootstrap state unless explicitly overridden).
+
+## [1.0.2-rc0] - 2026-07-19
+
+### Added
+
 - Add a configurable 250,000-byte default maximum for individual mempool
   transactions. Larger transactions are rejected before semantic and contextual
   verification without penalizing peers, and the policy does not affect block

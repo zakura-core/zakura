@@ -14,6 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Config` struct literals must initialize the new field
   ([#258](https://github.com/zakura-core/zakura/pull/258)).
 
+### Added
+
+- Added `legacy_peer_request.jsonl` tracing for attributed legacy `FindBlocks`
+  responses and block downloads when `[network.zakura] trace_dir` is set.
+
+### Fixed
+
+- Pruned nodes no longer advertise retained block hashes in legacy `getblocks`
+  responses when their corresponding block bodies are unavailable.
+
 ## [3.0.0-rc0] - 2026-07-19
 
 ### Breaking Changes

@@ -55,6 +55,9 @@ pub struct VerifiedSet {
     /// The total cost of the verified transactions in the set.
     total_cost: u64,
 
+    /// The metric totals for verified transactions in the set.
+    metrics: MempoolMetrics,
+
     /// The set of spent out points by the verified transactions.
     spent_outpoints: HashSet<transparent::OutPoint>,
 
@@ -140,7 +143,8 @@ impl VerifiedSet {
         self.created_outputs.clear();
         self.transactions_serialized_size = 0;
         self.total_cost = 0;
-        self.update_metrics();
+        self.metrics = MempoolMetrics::default();
+        self.report_metrics();
     }
 
     /// Insert a `transaction` into the set.
@@ -191,9 +195,10 @@ impl VerifiedSet {
         self.total_cost += transaction.cost();
         transaction.time = Some(chrono::Utc::now());
         transaction.height = height;
+        self.metrics.add_transaction(&transaction);
         self.transactions.insert(tx_id, transaction);
 
-        self.update_metrics();
+        self.report_metrics();
 
         Ok(())
     }
@@ -305,13 +310,14 @@ impl VerifiedSet {
 
                 self.transactions_serialized_size -= removed_tx.transaction.size;
                 self.total_cost -= removed_tx.cost();
+                self.metrics.remove_transaction(&removed_tx);
                 self.remove_outputs(&removed_tx.transaction);
 
                 Some(removed_tx)
             })
             .collect();
 
-        self.update_metrics();
+        self.report_metrics();
         removed_transactions
     }
 
@@ -376,110 +382,168 @@ impl VerifiedSet {
         }
     }
 
-    fn update_metrics(&mut self) {
-        // Track the sum of unpaid actions within each transaction (as they are subject to the
-        // unpaid action limit). Transactions that have weight >= 1 have no unpaid actions by
-        // definition.
-        let mut unpaid_actions_with_weight_lt20pct = 0;
-        let mut unpaid_actions_with_weight_lt40pct = 0;
-        let mut unpaid_actions_with_weight_lt60pct = 0;
-        let mut unpaid_actions_with_weight_lt80pct = 0;
-        let mut unpaid_actions_with_weight_lt1 = 0;
-
-        // Track the total number of paid actions across all transactions in the mempool. This
-        // added to the bucketed unpaid actions above is equal to the total number of conventional
-        // actions in the mempool.
-        let mut paid_actions = 0;
-
-        // Track the sum of transaction sizes (the metric by which they are mainly limited) across
-        // several buckets.
-        let mut size_with_weight_lt1 = 0;
-        let mut size_with_weight_eq1 = 0;
-        let mut size_with_weight_gt1 = 0;
-        let mut size_with_weight_gt2 = 0;
-        let mut size_with_weight_gt3 = 0;
-
-        for entry in self.transactions().values() {
-            paid_actions += entry.conventional_actions - entry.unpaid_actions;
-
-            if entry.fee_weight_ratio > 3.0 {
-                size_with_weight_gt3 += entry.transaction.size;
-            } else if entry.fee_weight_ratio > 2.0 {
-                size_with_weight_gt2 += entry.transaction.size;
-            } else if entry.fee_weight_ratio > 1.0 {
-                size_with_weight_gt1 += entry.transaction.size;
-            } else if entry.fee_weight_ratio == 1.0 {
-                size_with_weight_eq1 += entry.transaction.size;
-            } else {
-                size_with_weight_lt1 += entry.transaction.size;
-                if entry.fee_weight_ratio < 0.2 {
-                    unpaid_actions_with_weight_lt20pct += entry.unpaid_actions;
-                } else if entry.fee_weight_ratio < 0.4 {
-                    unpaid_actions_with_weight_lt40pct += entry.unpaid_actions;
-                } else if entry.fee_weight_ratio < 0.6 {
-                    unpaid_actions_with_weight_lt60pct += entry.unpaid_actions;
-                } else if entry.fee_weight_ratio < 0.8 {
-                    unpaid_actions_with_weight_lt80pct += entry.unpaid_actions;
-                } else {
-                    unpaid_actions_with_weight_lt1 += entry.unpaid_actions;
-                }
-            }
-        }
-
+    /// Report the current mempool metrics.
+    fn report_metrics(&self) {
         metrics::gauge!(
             "zcash.mempool.actions.unpaid",
             "bk" => "< 0.2",
         )
-        .set(unpaid_actions_with_weight_lt20pct as f64);
+        .set(self.metrics.unpaid_actions_with_weight_lt20pct as f64);
         metrics::gauge!(
             "zcash.mempool.actions.unpaid",
             "bk" => "< 0.4",
         )
-        .set(unpaid_actions_with_weight_lt40pct as f64);
+        .set(self.metrics.unpaid_actions_with_weight_lt40pct as f64);
         metrics::gauge!(
             "zcash.mempool.actions.unpaid",
             "bk" => "< 0.6",
         )
-        .set(unpaid_actions_with_weight_lt60pct as f64);
+        .set(self.metrics.unpaid_actions_with_weight_lt60pct as f64);
         metrics::gauge!(
             "zcash.mempool.actions.unpaid",
             "bk" => "< 0.8",
         )
-        .set(unpaid_actions_with_weight_lt80pct as f64);
+        .set(self.metrics.unpaid_actions_with_weight_lt80pct as f64);
         metrics::gauge!(
             "zcash.mempool.actions.unpaid",
             "bk" => "< 1",
         )
-        .set(unpaid_actions_with_weight_lt1 as f64);
-        metrics::gauge!("zcash.mempool.actions.paid").set(paid_actions as f64);
+        .set(self.metrics.unpaid_actions_with_weight_lt1 as f64);
+        metrics::gauge!("zcash.mempool.actions.paid").set(self.metrics.paid_actions as f64);
         metrics::gauge!("zcash.mempool.size.transactions",).set(self.transaction_count() as f64);
         metrics::gauge!(
             "zcash.mempool.size.weighted",
             "bk" => "< 1",
         )
-        .set(size_with_weight_lt1 as f64);
+        .set(self.metrics.size_with_weight_lt1 as f64);
         metrics::gauge!(
             "zcash.mempool.size.weighted",
             "bk" => "1",
         )
-        .set(size_with_weight_eq1 as f64);
+        .set(self.metrics.size_with_weight_eq1 as f64);
         metrics::gauge!(
             "zcash.mempool.size.weighted",
             "bk" => "> 1",
         )
-        .set(size_with_weight_gt1 as f64);
+        .set(self.metrics.size_with_weight_gt1 as f64);
         metrics::gauge!(
             "zcash.mempool.size.weighted",
             "bk" => "> 2",
         )
-        .set(size_with_weight_gt2 as f64);
+        .set(self.metrics.size_with_weight_gt2 as f64);
         metrics::gauge!(
             "zcash.mempool.size.weighted",
             "bk" => "> 3",
         )
-        .set(size_with_weight_gt3 as f64);
+        .set(self.metrics.size_with_weight_gt3 as f64);
         metrics::gauge!("zcash.mempool.size.bytes",).set(self.transactions_serialized_size as f64);
         metrics::gauge!("zcash.mempool.cost.bytes").set(self.total_cost as f64);
+    }
+}
+
+/// The aggregate values for mempool metrics.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MempoolMetrics {
+    unpaid_actions_with_weight_lt20pct: u32,
+    unpaid_actions_with_weight_lt40pct: u32,
+    unpaid_actions_with_weight_lt60pct: u32,
+    unpaid_actions_with_weight_lt80pct: u32,
+    unpaid_actions_with_weight_lt1: u32,
+    paid_actions: u32,
+    size_with_weight_lt1: usize,
+    size_with_weight_eq1: usize,
+    size_with_weight_gt1: usize,
+    size_with_weight_gt2: usize,
+    size_with_weight_gt3: usize,
+}
+
+impl MempoolMetrics {
+    /// Add a verified transaction's contribution to the metric totals.
+    fn add_transaction(&mut self, transaction: &VerifiedUnminedTx) {
+        self.add(Self::for_transaction(transaction));
+    }
+
+    /// Remove a verified transaction's contribution from the metric totals.
+    fn remove_transaction(&mut self, transaction: &VerifiedUnminedTx) {
+        self.remove(Self::for_transaction(transaction));
+    }
+
+    /// Return the metric contribution for a verified transaction.
+    fn for_transaction(transaction: &VerifiedUnminedTx) -> Self {
+        Self::for_values(
+            transaction.fee_weight_ratio,
+            transaction.conventional_actions,
+            transaction.unpaid_actions,
+            transaction.transaction.size,
+        )
+    }
+
+    /// Return the metric contribution for transaction metric values.
+    fn for_values(
+        fee_weight_ratio: f32,
+        conventional_actions: u32,
+        unpaid_actions: u32,
+        size: usize,
+    ) -> Self {
+        let mut metrics = Self {
+            paid_actions: conventional_actions - unpaid_actions,
+            ..Default::default()
+        };
+
+        if fee_weight_ratio > 3.0 {
+            metrics.size_with_weight_gt3 = size;
+        } else if fee_weight_ratio > 2.0 {
+            metrics.size_with_weight_gt2 = size;
+        } else if fee_weight_ratio > 1.0 {
+            metrics.size_with_weight_gt1 = size;
+        } else if fee_weight_ratio == 1.0 {
+            metrics.size_with_weight_eq1 = size;
+        } else {
+            metrics.size_with_weight_lt1 = size;
+            if fee_weight_ratio < 0.2 {
+                metrics.unpaid_actions_with_weight_lt20pct = unpaid_actions;
+            } else if fee_weight_ratio < 0.4 {
+                metrics.unpaid_actions_with_weight_lt40pct = unpaid_actions;
+            } else if fee_weight_ratio < 0.6 {
+                metrics.unpaid_actions_with_weight_lt60pct = unpaid_actions;
+            } else if fee_weight_ratio < 0.8 {
+                metrics.unpaid_actions_with_weight_lt80pct = unpaid_actions;
+            } else {
+                metrics.unpaid_actions_with_weight_lt1 = unpaid_actions;
+            }
+        }
+
+        metrics
+    }
+
+    /// Add another set of metric totals to this set.
+    fn add(&mut self, other: Self) {
+        self.unpaid_actions_with_weight_lt20pct += other.unpaid_actions_with_weight_lt20pct;
+        self.unpaid_actions_with_weight_lt40pct += other.unpaid_actions_with_weight_lt40pct;
+        self.unpaid_actions_with_weight_lt60pct += other.unpaid_actions_with_weight_lt60pct;
+        self.unpaid_actions_with_weight_lt80pct += other.unpaid_actions_with_weight_lt80pct;
+        self.unpaid_actions_with_weight_lt1 += other.unpaid_actions_with_weight_lt1;
+        self.paid_actions += other.paid_actions;
+        self.size_with_weight_lt1 += other.size_with_weight_lt1;
+        self.size_with_weight_eq1 += other.size_with_weight_eq1;
+        self.size_with_weight_gt1 += other.size_with_weight_gt1;
+        self.size_with_weight_gt2 += other.size_with_weight_gt2;
+        self.size_with_weight_gt3 += other.size_with_weight_gt3;
+    }
+
+    /// Remove another set of metric totals from this set.
+    fn remove(&mut self, other: Self) {
+        self.unpaid_actions_with_weight_lt20pct -= other.unpaid_actions_with_weight_lt20pct;
+        self.unpaid_actions_with_weight_lt40pct -= other.unpaid_actions_with_weight_lt40pct;
+        self.unpaid_actions_with_weight_lt60pct -= other.unpaid_actions_with_weight_lt60pct;
+        self.unpaid_actions_with_weight_lt80pct -= other.unpaid_actions_with_weight_lt80pct;
+        self.unpaid_actions_with_weight_lt1 -= other.unpaid_actions_with_weight_lt1;
+        self.paid_actions -= other.paid_actions;
+        self.size_with_weight_lt1 -= other.size_with_weight_lt1;
+        self.size_with_weight_eq1 -= other.size_with_weight_eq1;
+        self.size_with_weight_gt1 -= other.size_with_weight_gt1;
+        self.size_with_weight_gt2 -= other.size_with_weight_gt2;
+        self.size_with_weight_gt3 -= other.size_with_weight_gt3;
     }
 }
 
@@ -498,5 +562,61 @@ mod tests {
         verified.clear();
 
         assert!(verified.ironwood_nullifiers.is_empty());
+    }
+
+    #[test]
+    fn metrics_are_updated_incrementally() {
+        let transaction_metrics = [
+            (0.1, 5, 4, 10),
+            (0.2, 6, 3, 20),
+            (0.4, 7, 2, 30),
+            (0.6, 8, 1, 40),
+            (0.8, 9, 0, 50),
+            (1.0, 10, 0, 60),
+            (1.5, 11, 0, 70),
+            (2.5, 12, 0, 80),
+            (3.5, 13, 0, 90),
+        ];
+        let mut metrics = MempoolMetrics::default();
+
+        for &(fee_weight_ratio, conventional_actions, unpaid_actions, size) in &transaction_metrics
+        {
+            metrics.add(MempoolMetrics::for_values(
+                fee_weight_ratio,
+                conventional_actions,
+                unpaid_actions,
+                size,
+            ));
+        }
+
+        assert_eq!(
+            metrics,
+            MempoolMetrics {
+                unpaid_actions_with_weight_lt20pct: 4,
+                unpaid_actions_with_weight_lt40pct: 3,
+                unpaid_actions_with_weight_lt60pct: 2,
+                unpaid_actions_with_weight_lt80pct: 1,
+                unpaid_actions_with_weight_lt1: 0,
+                paid_actions: 71,
+                size_with_weight_lt1: 150,
+                size_with_weight_eq1: 60,
+                size_with_weight_gt1: 70,
+                size_with_weight_gt2: 80,
+                size_with_weight_gt3: 90,
+            }
+        );
+
+        for &(fee_weight_ratio, conventional_actions, unpaid_actions, size) in
+            transaction_metrics.iter().rev()
+        {
+            metrics.remove(MempoolMetrics::for_values(
+                fee_weight_ratio,
+                conventional_actions,
+                unpaid_actions,
+                size,
+            ));
+        }
+
+        assert_eq!(metrics, MempoolMetrics::default());
     }
 }

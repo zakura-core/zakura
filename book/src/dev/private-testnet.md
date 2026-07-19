@@ -81,24 +81,22 @@ you can use `getpeerinfo` RPC as above or check the peers file
 `[network]` section. You might want to sort this out before the next private
 testnet test.
 
-### Unredact IPs
+### Unredact peer IPs
 
-Zakura redacts IPs when logging for privacy reasons. However, for a test like
-this it can be annoying. You can disable that by editing `peer_addr.rs`
-with something like
+Zakura redacts legacy peer addresses in peer activity logs, configured legacy
+sync trace files, and the `remote_ip` and `addr` metric labels by default. For a
+controlled private testnet, you can expose them together:
 
-```diff
---- a/zakura-network/src/meta_addr/peer_addr.rs
-+++ b/zakura-network/src/meta_addr/peer_addr.rs
-@@ -30,7 +30,7 @@ impl fmt::Display for PeerSocketAddr {
-         let ip_version = if self.is_ipv4() { "v4" } else { "v6" };
+```toml
+[network]
+expose_peer_addresses = true
 
-         // The port is usually not sensitive, and it's useful for debugging.
--        f.pad(&format!("{}redacted:{}", ip_version, self.port()))
-+        f.pad(&format!("{}:{}", self.ip(), self.port()))
-     }
- }
+[metrics]
+endpoint_addr = "127.0.0.1:9999"
 ```
+
+Restrict access to the logs, any configured trace directory, and the metrics
+endpoint because the addresses reveal the testnet's peer topology.
 
 ### Sample config file
 
@@ -116,6 +114,7 @@ max_datacarrier_bytes = 83
 max_transaction_bytes = 250000
 
 [metrics]
+endpoint_addr = "127.0.0.1:9999"
 
 [mining]
 miner_address = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v"
@@ -128,6 +127,9 @@ internal_miner = true
 # either disable this or delete the peers file before starting.
 cache_dir = true
 crawl_new_peer_interval = "1m 1s"
+
+# Expose peer addresses in logs and metrics for this controlled testnet.
+expose_peer_addresses = true
 
 initial_mainnet_peers = []
 

@@ -59,7 +59,7 @@ use crate::components::{
     sync::{BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT},
 };
 
-use super::{storage::NonStandardTransactionError, MempoolError};
+use super::{queue_source_log_label, storage::NonStandardTransactionError, MempoolError};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -189,6 +189,9 @@ where
 
     /// A service that manages cached blockchain state.
     state: ZS,
+
+    /// Whether legacy peer address labels in logs are unredacted.
+    expose_peer_addresses: bool,
 
     /// The maximum serialized size of a transaction accepted into the mempool.
     max_transaction_bytes: u64,
@@ -326,15 +329,24 @@ where
     /// `network` is used to download transactions.
     /// `verifier` is used to verify transactions.
     /// `state` is used to check if transactions are already in the state.
+    /// `expose_peer_addresses` controls whether legacy peer labels are unredacted.
+    /// `max_transaction_bytes` limits the serialized size of accepted transactions.
     ///
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
     /// this constructor.
-    pub fn new(network: ZN, verifier: ZV, state: ZS, max_transaction_bytes: u64) -> Self {
+    pub fn new(
+        network: ZN,
+        verifier: ZV,
+        state: ZS,
+        expose_peer_addresses: bool,
+        max_transaction_bytes: u64,
+    ) -> Self {
         Self {
             network,
             verifier,
             state,
+            expose_peer_addresses,
             max_transaction_bytes,
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
@@ -349,7 +361,10 @@ where
     /// When `source` is `Some`, the per-peer cap
     /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`] is enforced; crawler-driven and
     /// locally-pushed transactions pass `None` and are not capped per peer.
-    #[instrument(skip(self, gossiped_tx), fields(txid = %gossiped_tx.id()))]
+    #[instrument(
+        skip(self, gossiped_tx, source, rsp_tx),
+        fields(txid = %gossiped_tx.id(), source = tracing::field::Empty)
+    )]
     #[allow(clippy::unwrap_in_result)]
     pub fn download_if_needed_and_verify(
         &mut self,
@@ -358,6 +373,11 @@ where
         mut rsp_tx: Option<oneshot::Sender<Result<(), BoxError>>>,
     ) -> Result<(), MempoolError> {
         let txid = gossiped_tx.id();
+        let source_label = source
+            .as_ref()
+            .map(|source| queue_source_log_label(source, self.expose_peer_addresses))
+            .unwrap_or_else(|| "none".to_string());
+        tracing::Span::current().record("source", source_label.as_str());
 
         if self.cancel_handles.contains_key(&txid) {
             debug!(
@@ -768,6 +788,7 @@ mod tests {
             BoxCloneService::new(service_fn(|_request| {
                 future::pending::<Result<zs::Response, BoxError>>()
             })),
+            false,
             u64::MAX,
         )
     }
@@ -836,6 +857,7 @@ mod tests {
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
+            false,
             u64::MAX,
         );
 
@@ -885,6 +907,7 @@ mod tests {
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
+            false,
             u64::MAX,
         );
 
@@ -943,6 +966,7 @@ mod tests {
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
+            false,
             max_transaction_bytes,
         );
 
@@ -995,6 +1019,7 @@ mod tests {
                     panic!("oversized pushed transactions must not query state");
                 }
             })),
+            false,
             max_bytes,
         );
 
@@ -1077,6 +1102,7 @@ mod tests {
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
+            false,
             max_bytes,
         );
 
@@ -1132,6 +1158,7 @@ mod tests {
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
+            false,
             u64::MAX,
         );
 

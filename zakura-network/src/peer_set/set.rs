@@ -132,6 +132,7 @@ use crate::{
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{LoadTrackedClient, MinimumPeerVersion},
     peer_set::{
+        legacy_peer_trace::{LegacyPeerTrace, PeerTraceContext},
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
@@ -247,6 +248,9 @@ where
     /// Inbound peer IPs that must always receive block inventory broadcasts.
     block_gossip_peer_ips: HashSet<IpAddr>,
 
+    /// Structured attribution for legacy peer discovery and block requests.
+    legacy_peer_trace: LegacyPeerTrace,
+
     /// The most recent block gossip queued for configured sidecar peers (see
     /// [`Self::block_gossip_peer_ips`]) that were unready when it fired, paired
     /// with the unready sidecar peers still awaiting it.
@@ -311,6 +315,9 @@ where
     /// The configured maximum number of peers that can be in the
     /// peer set per IP, defaults to [`crate::constants::DEFAULT_MAX_CONNS_PER_IP`]
     max_conns_per_ip: usize,
+
+    /// Whether peer address labels in logs are unredacted.
+    expose_peer_addresses: bool,
 
     /// The network of this peer set.
     network: Network,
@@ -384,9 +391,10 @@ where
             // Ready peers
             ready_services: HashMap::new(),
             // Request Routing
-            inventory_registry: InventoryRegistry::new(inv_stream),
+            inventory_registry: InventoryRegistry::new(inv_stream, config.expose_peer_addresses),
             queued_broadcast_all: None,
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
+            legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
             queued_sidecar_block_gossip: None,
 
             // Busy peers
@@ -406,6 +414,7 @@ where
             address_metrics,
 
             max_conns_per_ip: max_conns_per_ip.unwrap_or(config.max_connections_per_ip),
+            expose_peer_addresses: config.expose_peer_addresses,
 
             network: config.network.clone(),
         }
@@ -581,10 +590,16 @@ where
 
                 // Unready -> Ready
                 Some(Ok((key, svc))) => {
-                    trace!(?key, "service became ready");
+                    trace!(
+                        peer = %key.addr_label(self.expose_peer_addresses),
+                        "service became ready"
+                    );
 
                     if self.bans_receiver.borrow().contains_key(&key.ip()) {
-                        warn!(?key, "service is banned, dropping service");
+                        warn!(
+                            peer = %key.addr_label(self.expose_peer_addresses),
+                            "service is banned, dropping service"
+                        );
                         std::mem::drop(svc);
                         let cancel = self.cancel_handles.remove(&key);
                         debug_assert!(
@@ -606,7 +621,7 @@ where
                     // In that case, there is a cancel handle for the peer address,
                     // but it belongs to the service for the newer connection.
                     trace!(
-                        ?key,
+                        peer = %key.addr_label(self.expose_peer_addresses),
                         duplicate_connection = self.cancel_handles.contains_key(&key),
                         "service was canceled, dropping service"
                     );
@@ -614,7 +629,7 @@ where
                 Some(Err((key, UnreadyError::CancelHandleDropped(_)))) => {
                     // Similarly, services with dropped cancel handes can have duplicates.
                     trace!(
-                        ?key,
+                        peer = %key.addr_label(self.expose_peer_addresses),
                         duplicate_connection = self.cancel_handles.contains_key(&key),
                         "cancel handle was dropped, dropping service"
                     );
@@ -665,7 +680,10 @@ where
                 // Still ready, add it back to the list.
                 Ok(()) => {
                     if self.bans_receiver.borrow().contains_key(&key.ip()) {
-                        debug!(?key, "service ip is banned, dropping service");
+                        debug!(
+                            peer = %key.addr_label(self.expose_peer_addresses),
+                            "service ip is banned, dropping service"
+                        );
                         std::mem::drop(svc);
                         continue;
                     }
@@ -740,14 +758,20 @@ where
             // Process each change.
             match change {
                 Change::Remove(key) => {
-                    trace!(?key, "got Change::Remove from Discover");
+                    trace!(
+                        peer = %key.addr_label(self.expose_peer_addresses),
+                        "got Change::Remove from Discover"
+                    );
                     self.remove(&key);
                 }
                 Change::Insert(key, svc) => {
                     // We add peers as unready, so that we:
                     // - always do the same checks on every ready peer, and
                     // - check for any errors that happened right after the handshake
-                    trace!(?key, "got Change::Insert from Discover");
+                    trace!(
+                        peer = %key.addr_label(self.expose_peer_addresses),
+                        "got Change::Insert from Discover"
+                    );
 
                     // # Security
                     //
@@ -808,7 +832,7 @@ where
                 StallOutcome::Stall => {
                     if self.find_response_stalls.record_stall(addr) {
                         info!(
-                            ?addr,
+                            peer = %addr.addr_label(self.expose_peer_addresses),
                             "dropping stalled peer: exceeded FindBlocks/FindHeaders stall threshold",
                         );
                         self.remove(&addr);
@@ -922,11 +946,11 @@ where
                 let selected = if a_load <= b_load { a } else { b };
 
                 trace!(
-                    a.key = ?a,
+                    a.key = %a.addr_label(self.expose_peer_addresses),
                     a.load = ?a_load,
-                    b.key = ?b,
+                    b.key = %b.addr_label(self.expose_peer_addresses),
                     b.load = ?b_load,
-                    selected = ?selected,
+                    selected = %selected.addr_label(self.expose_peer_addresses),
                     ?len,
                     "selected service by p2c"
                 );
@@ -986,14 +1010,42 @@ where
         svc.map(|svc| svc.load())
     }
 
+    /// Build privacy-preserving metadata for correlating requests to one legacy peer connection.
+    fn legacy_peer_trace_context(
+        &self,
+        peer: PeerSocketAddr,
+        svc: &D::Service,
+    ) -> PeerTraceContext {
+        PeerTraceContext {
+            peer_id: svc.trace_id(),
+            peer,
+            peer_start_height: svc.remote_start_height(),
+            local_tip_height: self.minimum_peer_version.chain_tip().best_tip_height(),
+        }
+    }
+
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
         if let Some(p2c_key) = self.select_ready_p2c_peer() {
-            tracing::trace!(?p2c_key, "routing based on p2c");
+            tracing::trace!(
+                peer = %p2c_key.addr_label(self.expose_peer_addresses),
+                "routing based on p2c"
+            );
 
             let mut svc = self
                 .take_ready_service(&p2c_key)
                 .expect("selected peer must be ready");
+
+            let find_blocks_trace = match &req {
+                Request::FindBlocks { known_blocks, stop } => Some((
+                    self.legacy_peer_trace.next_request_id(),
+                    self.legacy_peer_trace_context(p2c_key, &svc),
+                    known_blocks.first().copied(),
+                    *stop,
+                    Instant::now(),
+                )),
+                _ => None,
+            };
 
             let is_find_request = matches!(
                 &req,
@@ -1009,12 +1061,26 @@ where
             let fut = svc.call(req);
             self.push_unready(p2c_key, svc);
 
-            if track_stalls {
+            if track_stalls || find_blocks_trace.is_some() {
                 let stall_tx = self.stall_event_tx.clone();
+                let trace = self.legacy_peer_trace.clone();
                 return async move {
                     let result = fut.await;
-                    if let Some(outcome) = classify_find_response(&result) {
-                        let _ = stall_tx.send((p2c_key, outcome));
+                    if track_stalls {
+                        if let Some(outcome) = classify_find_response(&result) {
+                            let _ = stall_tx.send((p2c_key, outcome));
+                        }
+                    }
+                    if let Some((request_id, peer, locator_tip, stop, started)) = find_blocks_trace
+                    {
+                        trace.find_blocks_finish(
+                            request_id,
+                            peer,
+                            locator_tip,
+                            stop,
+                            started.elapsed(),
+                            &result,
+                        );
                     }
                     result.map_err(Into::into)
                 }
@@ -1070,10 +1136,39 @@ where
 
         if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
-            tracing::trace!(?hash, ?peer, "routing to a peer which advertised inventory");
+            tracing::trace!(
+                ?hash,
+                peer = %peer.addr_label(self.expose_peer_addresses),
+                "routing to a peer which advertised inventory"
+            );
             metrics::counter!("pool.route_inv.advertiser.count").increment(1);
+            let trace_context = match hash {
+                InventoryHash::Block(hash) => Some((
+                    self.legacy_peer_trace.next_request_id(),
+                    self.legacy_peer_trace_context(peer, &svc),
+                    hash,
+                    Instant::now(),
+                )),
+                _ => None,
+            };
             let fut = svc.call(req);
             self.push_unready(peer, svc);
+            if let Some((request_id, peer, hash, started)) = trace_context {
+                let trace = self.legacy_peer_trace.clone();
+                return async move {
+                    let result = fut.await;
+                    trace.block_request_finish(
+                        request_id,
+                        peer,
+                        hash,
+                        "advertised",
+                        started.elapsed(),
+                        &result,
+                    );
+                    result.map_err(Into::into)
+                }
+                .boxed();
+            }
             return fut.map_err(Into::into).boxed();
         }
 
@@ -1094,10 +1189,39 @@ where
 
         if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
-            tracing::trace!(?hash, ?peer, "routing to a peer that might have inventory");
+            tracing::trace!(
+                ?hash,
+                peer = %peer.addr_label(self.expose_peer_addresses),
+                "routing to a peer that might have inventory"
+            );
             metrics::counter!("pool.route_inv.maybe.count").increment(1);
+            let trace_context = match hash {
+                InventoryHash::Block(hash) => Some((
+                    self.legacy_peer_trace.next_request_id(),
+                    self.legacy_peer_trace_context(peer, &svc),
+                    hash,
+                    Instant::now(),
+                )),
+                _ => None,
+            };
             let fut = svc.call(req);
             self.push_unready(peer, svc);
+            if let Some((request_id, peer, hash, started)) = trace_context {
+                let trace = self.legacy_peer_trace.clone();
+                return async move {
+                    let result = fut.await;
+                    trace.block_request_finish(
+                        request_id,
+                        peer,
+                        hash,
+                        "maybe",
+                        started.elapsed(),
+                        &result,
+                    );
+                    result.map_err(Into::into)
+                }
+                .boxed();
+            }
             return fut.map_err(Into::into).boxed();
         }
 

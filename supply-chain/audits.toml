@@ -732,6 +732,61 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
 
+[[audits.zakura-vct-sprout-history]]
+who = "roman <roman@osmosis.team>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+
+[[audits.zakura-vct-sprout-history-part-00]]
+who = "roman <roman@osmosis.team>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+
+[[audits.zakura-vct-sprout-history-part-01]]
+who = "roman <roman@osmosis.team>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+
+[[audits.zakura-vct-sprout-history-part-02]]
+who = "roman <roman@osmosis.team>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+
+[[audits.zakura-vct-sprout-history-part-03]]
+who = "roman <roman@osmosis.team>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+
+[[audits.zakura-vct-sprout-history-part-04]]
+who = "roman <roman@osmosis.team>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+
+[[audits.zakura-vct-sprout-history-part-05]]
+who = "roman <roman@osmosis.team>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+
+[[audits.zakura-vct-sprout-history-part-06]]
+who = "roman <roman@osmosis.team>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+
+[[audits.zakura-vct-sprout-history-part-07]]
+who = "roman <roman@osmosis.team>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+
+[[audits.zakura-vct-sprout-history-part-08]]
+who = "roman <roman@osmosis.team>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+
+[[audits.zakura-vct-sprout-history-part-09]]
+who = "roman <roman@osmosis.team>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+
 [[audits.zakurad]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"

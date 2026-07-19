@@ -3,6 +3,8 @@
 //! The migration is deliberately one RocksDB write batch: a crash leaves the
 //! old format version in place, so startup replays the validated artifact again.
 
+use std::sync::Arc;
+
 use crossbeam_channel::{Receiver, TryRecvError};
 use semver::Version;
 use thiserror::Error;
@@ -25,7 +27,15 @@ use super::{CancelFormatChange, DiskFormatUpgrade};
 pub(crate) const REPAIR_VERSION: Version = Version::new(28, 0, 1);
 
 /// Replays the reviewed Mainnet artifact into pre-28.0.1 VCT databases.
-pub struct Upgrade;
+pub struct Upgrade {
+    prepared_input: Option<Arc<RepairInput>>,
+}
+
+impl Upgrade {
+    pub(super) fn new(prepared_input: Option<Arc<RepairInput>>) -> Self {
+        Self { prepared_input }
+    }
+}
 
 /// A successful read-only audit of VCT Sprout history.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,7 +108,7 @@ pub(crate) enum RepairValidationError {
     MarkerHashMismatch { height: Height },
 }
 
-struct RepairInput {
+pub(crate) struct RepairInput {
     artifact_last_checkpoint: Height,
     artifact_last_checkpoint_hash: block::Hash,
     artifact_sprout_root: sprout::tree::Root,
@@ -111,23 +121,13 @@ pub(crate) fn is_repair_eligible(db: &ZakuraDb, disk_version: Option<&Version>) 
         && disk_version.is_some_and(|version| version < &REPAIR_VERSION)
 }
 
-pub(crate) fn artifact_available(_db: &ZakuraDb) -> bool {
-    #[cfg(test)]
-    if test_repair_input(_db).is_some() {
-        return true;
-    }
-
-    !matches!(
-        embedded_mainnet(),
-        Err(crate::service::finalized_state::vct::artifact::Error::CanonicalArtifactUnavailable)
-    )
-}
-
-pub(crate) fn validate_startup_repair(db: &ZakuraDb) -> Result<(), RepairValidationError> {
+pub(crate) fn prepare_startup_repair(
+    db: &ZakuraDb,
+) -> Result<Arc<RepairInput>, RepairValidationError> {
     let marker = db
         .vct_synced_below()
         .ok_or(RepairValidationError::MissingVctMarker)?;
-    validated_repair_input(db, marker).map(|_| ())
+    validated_repair_input(db, marker).map(Arc::new)
 }
 
 /// Audits a completed VCT Sprout-history repair without modifying the database.
@@ -223,8 +223,10 @@ impl DiskFormatUpgrade for Upgrade {
             unreachable!("repair eligibility requires the VCT handoff marker");
         };
 
-        let input = validated_repair_input(db, last_vct_height)
-            .expect("writable startup preflight validated the VCT Sprout repair");
+        let input = self
+            .prepared_input
+            .as_deref()
+            .expect("writable startup preflight provides the validated VCT Sprout repair input");
         repair_records(
             db,
             last_vct_height,
@@ -253,12 +255,12 @@ impl DiskFormatUpgrade for Upgrade {
         let marker = db
             .vct_synced_below()
             .expect("a VCT-synced database has a persisted handoff marker");
-        let input = match validated_repair_input(db, marker) {
-            Ok(input) => input,
-            Err(error) => return Ok(Err(error.to_string())),
-        };
+        let input = self
+            .prepared_input
+            .as_deref()
+            .expect("repair validation reuses the startup-prepared VCT Sprout repair input");
 
-        validate_repaired_records(db, marker, &input, false, cancel_receiver)
+        validate_repaired_records(db, marker, input, false, cancel_receiver)
     }
 }
 
@@ -266,7 +268,8 @@ fn repair_input(
     db: &ZakuraDb,
 ) -> Result<(Height, block::Hash, sprout::tree::Root, Artifact), RepairValidationError> {
     #[cfg(test)]
-    if let Some(input) = test_repair_input(db) {
+    if let Some(input) = load_test_repair_input(db) {
+        let input = input?;
         return Ok((
             input.handoff,
             input.handoff_hash,
@@ -509,10 +512,23 @@ struct TestRepairInput {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+enum TestRepairSource {
+    Input(Box<TestRepairInput>),
+    Error(crate::service::finalized_state::vct::artifact::Error),
+}
+
+#[cfg(test)]
+struct TestRepairEntry {
+    source: TestRepairSource,
+    load_count: usize,
+}
+
+#[cfg(test)]
 fn test_repair_inputs(
-) -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, TestRepairInput>> {
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, TestRepairEntry>> {
     static INPUTS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, TestRepairInput>>,
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, TestRepairEntry>>,
     > = std::sync::OnceLock::new();
     INPUTS.get_or_init(Default::default)
 }
@@ -523,7 +539,34 @@ fn test_repair_input(db: &ZakuraDb) -> Option<TestRepairInput> {
         .lock()
         .expect("test repair input mutex is not poisoned")
         .get(db.path())
-        .cloned()
+        .and_then(|entry| match &entry.source {
+            TestRepairSource::Input(input) => Some(input.as_ref().clone()),
+            TestRepairSource::Error(_) => None,
+        })
+}
+
+#[cfg(test)]
+fn load_test_repair_input(
+    db: &ZakuraDb,
+) -> Option<Result<TestRepairInput, crate::service::finalized_state::vct::artifact::Error>> {
+    let mut inputs = test_repair_inputs()
+        .lock()
+        .expect("test repair input mutex is not poisoned");
+    let entry = inputs.get_mut(db.path())?;
+    entry.load_count += 1;
+    Some(match &entry.source {
+        TestRepairSource::Input(input) => Ok(input.as_ref().clone()),
+        TestRepairSource::Error(error) => Err(error.clone()),
+    })
+}
+
+#[cfg(test)]
+fn test_repair_input_load_count(path: &std::path::Path) -> usize {
+    test_repair_inputs()
+        .lock()
+        .expect("test repair input mutex is not poisoned")
+        .get(path)
+        .map_or(0, |entry| entry.load_count)
 }
 
 #[cfg(test)]
@@ -555,7 +598,35 @@ fn inject_test_repair_input(
         test_repair_inputs()
             .lock()
             .expect("test repair input mutex is not poisoned")
-            .insert(path.clone(), input)
+            .insert(
+                path.clone(),
+                TestRepairEntry {
+                    source: TestRepairSource::Input(Box::new(input)),
+                    load_count: 0,
+                },
+            )
+            .is_none(),
+        "only one repair input can be injected per database"
+    );
+    TestRepairInputGuard { path }
+}
+
+#[cfg(test)]
+fn inject_test_repair_error(
+    path: std::path::PathBuf,
+    error: crate::service::finalized_state::vct::artifact::Error,
+) -> TestRepairInputGuard {
+    assert!(
+        test_repair_inputs()
+            .lock()
+            .expect("test repair input mutex is not poisoned")
+            .insert(
+                path.clone(),
+                TestRepairEntry {
+                    source: TestRepairSource::Error(error),
+                    load_count: 0,
+                },
+            )
             .is_none(),
         "only one repair input can be injected per database"
     );
@@ -916,13 +987,16 @@ mod tests {
             "the durable repair batch must complete before the upgrade framework updates the version"
         );
 
-        assert_eq!(Upgrade.validate(&db, &cancel_rx), Ok(Ok(())));
+        let upgrade = Upgrade::new(Some(
+            prepare_startup_repair(&db).expect("fixture repair input validates"),
+        ));
+        assert_eq!(upgrade.validate(&db, &cancel_rx), Ok(Ok(())));
         let mut delete_batch = DiskWriteBatch::new();
         delete_batch.delete_sprout_anchor(&db, &repaired_root);
         db.write_batch(delete_batch)
             .expect("corrupting the repaired fixture succeeds");
         assert!(matches!(
-            Upgrade.validate(&db, &cancel_rx),
+            upgrade.validate(&db, &cancel_rx),
             Ok(Err(reason)) if reason.contains("Sprout anchor at")
         ));
     }
@@ -954,7 +1028,7 @@ mod tests {
             &tip_tree,
         );
         let _injection = inject_test_repair_input(
-            path,
+            path.clone(),
             TestRepairInput {
                 handoff,
                 handoff_hash,
@@ -978,9 +1052,22 @@ mod tests {
         );
         assert_eq!(db.hash(first_height), Some(first_hash));
         assert_eq!(db.height(first_hash), Some(first_height));
+        assert_eq!(
+            test_repair_input_load_count(&path),
+            1,
+            "startup preparation must load the repair artifact exactly once"
+        );
         assert!(
             db.block(first_height.into()).is_none(),
             "repair uses retained canonical indexes and does not require pruned bodies"
+        );
+
+        drop(db);
+        let db = open_normally(&config, &network);
+        assert_eq!(
+            test_repair_input_load_count(&path),
+            1,
+            "reopening the completed repair format must not load the artifact"
         );
 
         let summary =
@@ -1005,6 +1092,55 @@ mod tests {
             Err(VctSproutHistoryValidationError::Invalid { reason })
                 if reason.contains("Sprout anchor at")
         ));
+    }
+
+    #[test]
+    fn startup_preserves_artifact_validation_error_without_writes() {
+        let (_cache, config) = persistent_config();
+        let network = Network::Mainnet;
+        let handoff = Height(1);
+        let hash = block::Hash([1; 32]);
+        let path = seed_repair_db(&config, &network, handoff, &[(handoff, hash)]);
+        let _injection = inject_test_repair_error(path.clone(), ArtifactError::DigestMismatch);
+
+        let open = ZakuraDb::new(
+            &config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &network,
+            false,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        );
+        assert!(matches!(
+            open,
+            Err(crate::StateInitError::VctSproutHistoryRepairInvalid { reason })
+                if reason.contains("artifact payload digest does not match")
+        ));
+        assert_eq!(
+            test_repair_input_load_count(&path),
+            1,
+            "startup reports the first artifact preparation failure directly"
+        );
+
+        let db = ZakuraDb::new_for_vct_sprout_history_validation(
+            &config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &network,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+        )
+        .expect("read-only audit open bypasses the normal repair guard");
+        assert_eq!(
+            db.format_version_on_disk()
+                .expect("fixture version remains readable"),
+            Some(Version::new(28, 0, 0)),
+            "failed artifact preparation must not advance the format version"
+        );
     }
 
     #[test]
@@ -1265,10 +1401,13 @@ mod tests {
         let _injection = inject_test_repair_input(path, input.clone());
 
         let (_cancel_tx, cancel_rx) = bounded(1);
-        Upgrade
+        let upgrade = Upgrade::new(Some(
+            prepare_startup_repair(&db).expect("fixture repair input validates"),
+        ));
+        upgrade
             .run(tip, &db, &cancel_rx)
             .expect("simulated pre-version repair succeeds");
-        Upgrade
+        upgrade
             .run(tip, &db, &cancel_rx)
             .expect("same old-version repair is idempotent");
         assert_eq!(

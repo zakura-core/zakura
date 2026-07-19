@@ -126,6 +126,26 @@ pub fn run_offline(args: &Args) -> Result<()> {
         base_height.0, tip_height.0
     );
 
+    // Anchor the export: the database must agree with the embedded checkpoint
+    // list at the base, or the printed embedded prefix would stitch onto a
+    // different chain (a corrupted or foreign state snapshot). A test-only
+    // --last-checkpoint base off the checkpoint grid has no embedded hash to
+    // compare.
+    if let Some(embedded_hash) = network.checkpoint_list().hash(base_height) {
+        let db_hash = db.hash(base_height).ok_or_else(|| {
+            eyre!(
+                "state database has no block at the base checkpoint {}",
+                base_height.0
+            )
+        })?;
+        ensure!(
+            db_hash == embedded_hash,
+            "state database hash at base checkpoint {} is {db_hash}, but the embedded checkpoint \
+             list has {embedded_hash}; refusing to export from a mismatched chain",
+            base_height.0
+        );
+    }
+
     // Read every retained candidate row, cross-checking both hash indexes so a
     // corrupt or partially deleted database fails loudly instead of exporting
     // a wrong chain.

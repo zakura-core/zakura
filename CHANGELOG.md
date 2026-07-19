@@ -73,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   their requests are still shed for backpressure, but the connection is not
   closed. Every other peer's denial-of-service protection is unchanged
   ([#242](https://github.com/zakura-core/zakura/pull/242)).
+- Fixed early-chain header validation to use the consensus proof-of-work limit
+  at height 17.
 
 ## [1.0.1] - 2026-07-17
 

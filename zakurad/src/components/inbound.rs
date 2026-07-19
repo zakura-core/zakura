@@ -9,9 +9,9 @@ use std::{
     collections::HashSet,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures::{
@@ -75,6 +75,15 @@ pub const GETDATA_SENT_BYTES_LIMIT: usize = 1_000_000;
 /// many peers instead of just a few peers.)
 pub const GETDATA_MAX_BLOCK_COUNT: usize = 16;
 
+/// Minimum interval between zcashd-compat errors for requested pruned block bodies.
+const ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Actionable error emitted when a zcashd sidecar requests a pruned block body.
+pub(crate) const ZCASHD_COMPAT_PRUNED_BLOCK_ERROR: &str =
+    "zcashd_compat: cannot serve block because its body has been pruned; a zcashd sidecar \
+     requiring this block cannot continue syncing. Restore zcashd from a newer snapshot, or use \
+     archive storage on Zakura side https://zakura.com/snapshots/ .";
+
 type BlockDownloadPeerSet =
     Buffer<BoxService<zn::Request, zn::Response, zn::BoxError>, zn::Request>;
 type State = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
@@ -85,6 +94,44 @@ type SemanticBlockVerifier = Buffer<
 >;
 type GossipedBlockDownloads =
     BlockDownloads<Timeout<BlockDownloadPeerSet>, Timeout<SemanticBlockVerifier>, State>;
+
+/// Rate-limits diagnostics for missing block bodies in pruned zcashd-compat mode.
+#[derive(Debug)]
+struct PrunedBlockNotFoundLogger {
+    tx_retention: Option<u32>,
+    last_log: Mutex<Option<Instant>>,
+}
+
+impl PrunedBlockNotFoundLogger {
+    fn new(tx_retention: Option<u32>) -> Self {
+        Self {
+            tx_retention,
+            last_log: Mutex::new(None),
+        }
+    }
+
+    /// Reserves the current log interval and returns the configured retention.
+    fn reserve_log(&self) -> Option<u32> {
+        self.reserve_log_at(Instant::now())
+    }
+
+    fn reserve_log_at(&self, now: Instant) -> Option<u32> {
+        let tx_retention = self.tx_retention?;
+        let mut last_log = self
+            .last_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if last_log.is_some_and(|last| {
+            now.saturating_duration_since(last) < ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL
+        }) {
+            return None;
+        }
+
+        *last_log = Some(now);
+        Some(tx_retention)
+    }
+}
 
 fn mempool_queue_source(source: zn::PeerSource) -> mempool::QueueSource {
     match source {
@@ -225,6 +272,9 @@ pub struct Inbound {
 
     /// Whether legacy peer address labels in logs are unredacted.
     expose_peer_addresses: bool,
+
+    /// Diagnostics for zcashd-compat requests that need pruned block bodies.
+    pruned_block_not_found_logger: Arc<PrunedBlockNotFoundLogger>,
 }
 
 impl Inbound {
@@ -234,6 +284,7 @@ impl Inbound {
     pub fn new(
         full_verify_concurrency_limit: usize,
         expose_peer_addresses: bool,
+        zcashd_compat_pruning_retention: Option<u32>,
         setup: oneshot::Receiver<InboundSetupData>,
     ) -> Inbound {
         Inbound {
@@ -242,6 +293,9 @@ impl Inbound {
                 setup,
             },
             expose_peer_addresses,
+            pruned_block_not_found_logger: Arc::new(PrunedBlockNotFoundLogger::new(
+                zcashd_compat_pruning_retention,
+            )),
         }
     }
 
@@ -395,6 +449,7 @@ impl Service<zn::Request> for Inbound {
     /// and will cause callers to disconnect from the remote peer.
     #[instrument(name = "inbound", skip(self, req))]
     fn call(&mut self, req: zn::Request) -> Self::Future {
+        let pruned_block_not_found_logger = self.pruned_block_not_found_logger.clone();
         let (cached_peer_addr_response, block_downloads, mempool, state) = match &mut self.setup {
             Setup::Initialized {
                 cached_peer_addr_response,
@@ -467,7 +522,29 @@ impl Service<zn::Request> for Inbound {
                             // We don't need to limit the size of the missing block IDs list,
                             // because it is already limited to the size of the getdata request
                             // sent by the peer. (Their content and encodings are the same.)
-                            zs::Response::Block(None) => blocks.push(Missing(hash)),
+                            zs::Response::Block(None) => {
+                                if let Some(tx_retention) =
+                                    pruned_block_not_found_logger.reserve_log()
+                                {
+                                    // A retained canonical header with no block body identifies
+                                    // history removed by pruning. Unknown hashes remain ordinary
+                                    // `notfound` responses without an operator error.
+                                    if let Ok(zs::Response::BlockHeader { height, .. }) = state
+                                        .clone()
+                                        .oneshot(zs::Request::BlockHeader(hash.into()))
+                                        .await
+                                    {
+                                        error!(
+                                            ?hash,
+                                            ?height,
+                                            tx_retention,
+                                            "{ZCASHD_COMPAT_PRUNED_BLOCK_ERROR}"
+                                        );
+                                    }
+                                }
+
+                                blocks.push(Missing(hash))
+                            },
                             _ => unreachable!("wrong response from state"),
                         }
 

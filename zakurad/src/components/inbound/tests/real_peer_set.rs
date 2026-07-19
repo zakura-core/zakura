@@ -62,7 +62,7 @@ async fn inbound_peers_empty_address_book() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         listen_addr,
-    ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral()).await;
+    ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral(), None).await;
 
     // yield and sleep until the address book lock is released.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -155,6 +155,7 @@ async fn dual_stack_node_coexists_with_legacy_tcp_peer() -> Result<(), crate::Bo
         Some(Response::Peers(Vec::new())),
         P2pStack::Dual,
         StateConfig::ephemeral(),
+        None,
     )
     .await;
 
@@ -220,7 +221,7 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral()).await;
+    ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral(), None).await;
 
     let test_block = block::Hash([0x11; 32]);
 
@@ -287,7 +288,9 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
 ///
 /// Uses a real Zebra network stack, with an isolated Zebra inbound TCP connection.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_pruned_block_is_not_advertised() -> Result<(), crate::BoxError> {
+#[tracing_test::traced_test]
+async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
+) -> Result<(), crate::BoxError> {
     // `setup` configures checkpoint retention against `Height::MAX`, so block 1 is committed
     // to the retained chain indexes without storing its transaction bytes. Genesis is retained.
     let state_config = StateConfig {
@@ -309,7 +312,13 @@ async fn inbound_pruned_block_is_not_advertised() -> Result<(), crate::BoxError>
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(None, P2pStack::Legacy, state_config).await;
+    ) = setup(
+        None,
+        P2pStack::Legacy,
+        state_config,
+        Some(PruningConfig::default().tx_retention),
+    )
+    .await;
 
     let genesis: std::sync::Arc<block::Block> =
         zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into()?;
@@ -370,6 +379,7 @@ async fn inbound_pruned_block_is_not_advertised() -> Result<(), crate::BoxError>
         Response::Blocks(vec![Missing(block1.hash())]),
         "inbound maps the unavailable block body to missing inventory"
     );
+    assert!(logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR));
 
     let wire_response = connected_peer_service
         .clone()
@@ -421,7 +431,7 @@ async fn inbound_tx_empty_state_notfound() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral()).await;
+    ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral(), None).await;
 
     let test_tx = UnminedTxId::from_legacy_id(TxHash([0x22; 32]));
     let test_wtx: UnminedTxId = WtxId {
@@ -557,6 +567,7 @@ async fn outbound_tx_unrelated_response_notfound() -> Result<(), crate::BoxError
         Some(unrelated_response),
         P2pStack::Legacy,
         StateConfig::ephemeral(),
+        None,
     )
     .await;
 
@@ -711,6 +722,7 @@ async fn outbound_tx_partial_response_notfound() -> Result<(), crate::BoxError> 
         Some(repeated_response),
         P2pStack::Legacy,
         StateConfig::ephemeral(),
+        None,
     )
     .await;
 
@@ -806,6 +818,7 @@ async fn setup(
     isolated_peer_response: Option<Response>,
     p2p_stack: P2pStack,
     state_config: StateConfig,
+    zcashd_compat_pruning_retention: Option<u32>,
 ) -> (
     // real services
     // connected peer which responds with isolated_peer_response
@@ -844,7 +857,12 @@ async fn setup(
 
     // Inbound
     let (setup_tx, setup_rx) = oneshot::channel();
-    let inbound_service = Inbound::new(MAX_INBOUND_CONCURRENCY, false, setup_rx);
+    let inbound_service = Inbound::new(
+        MAX_INBOUND_CONCURRENCY,
+        false,
+        zcashd_compat_pruning_retention,
+        setup_rx,
+    );
     // TODO: add a timeout just above the service, if needed
     let inbound_service = ServiceBuilder::new()
         .load_shed()
@@ -1073,7 +1091,7 @@ mod submitblock_test {
 
         // Inbound
         let (_setup_tx, setup_rx) = oneshot::channel();
-        let inbound_service = Inbound::new(MAX_INBOUND_CONCURRENCY, false, setup_rx);
+        let inbound_service = Inbound::new(MAX_INBOUND_CONCURRENCY, false, None, setup_rx);
         let inbound_service = ServiceBuilder::new()
             .load_shed()
             .buffer(10)

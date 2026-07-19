@@ -132,6 +132,7 @@ use crate::{
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{LoadTrackedClient, MinimumPeerVersion},
     peer_set::{
+        legacy_peer_trace::{LegacyPeerTrace, PeerTraceContext},
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
         InventoryChange, InventoryRegistry,
@@ -246,6 +247,9 @@ where
 
     /// Inbound peer IPs that must always receive block inventory broadcasts.
     block_gossip_peer_ips: HashSet<IpAddr>,
+
+    /// Structured attribution for legacy peer discovery and block requests.
+    legacy_peer_trace: LegacyPeerTrace,
 
     /// The most recent block gossip queued for configured sidecar peers (see
     /// [`Self::block_gossip_peer_ips`]) that were unready when it fired, paired
@@ -390,6 +394,7 @@ where
             inventory_registry: InventoryRegistry::new(inv_stream, config.expose_peer_addresses),
             queued_broadcast_all: None,
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
+            legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
             queued_sidecar_block_gossip: None,
 
             // Busy peers
@@ -1005,6 +1010,20 @@ where
         svc.map(|svc| svc.load())
     }
 
+    /// Build privacy-preserving metadata for correlating requests to one legacy peer connection.
+    fn legacy_peer_trace_context(
+        &self,
+        peer: PeerSocketAddr,
+        svc: &D::Service,
+    ) -> PeerTraceContext {
+        PeerTraceContext {
+            peer_id: svc.trace_id(),
+            peer,
+            peer_start_height: svc.remote_start_height(),
+            local_tip_height: self.minimum_peer_version.chain_tip().best_tip_height(),
+        }
+    }
+
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
         if let Some(p2c_key) = self.select_ready_p2c_peer() {
@@ -1016,6 +1035,17 @@ where
             let mut svc = self
                 .take_ready_service(&p2c_key)
                 .expect("selected peer must be ready");
+
+            let find_blocks_trace = match &req {
+                Request::FindBlocks { known_blocks, stop } => Some((
+                    self.legacy_peer_trace.next_request_id(),
+                    self.legacy_peer_trace_context(p2c_key, &svc),
+                    known_blocks.first().copied(),
+                    *stop,
+                    Instant::now(),
+                )),
+                _ => None,
+            };
 
             let is_find_request = matches!(
                 &req,
@@ -1031,12 +1061,26 @@ where
             let fut = svc.call(req);
             self.push_unready(p2c_key, svc);
 
-            if track_stalls {
+            if track_stalls || find_blocks_trace.is_some() {
                 let stall_tx = self.stall_event_tx.clone();
+                let trace = self.legacy_peer_trace.clone();
                 return async move {
                     let result = fut.await;
-                    if let Some(outcome) = classify_find_response(&result) {
-                        let _ = stall_tx.send((p2c_key, outcome));
+                    if track_stalls {
+                        if let Some(outcome) = classify_find_response(&result) {
+                            let _ = stall_tx.send((p2c_key, outcome));
+                        }
+                    }
+                    if let Some((request_id, peer, locator_tip, stop, started)) = find_blocks_trace
+                    {
+                        trace.find_blocks_finish(
+                            request_id,
+                            peer,
+                            locator_tip,
+                            stop,
+                            started.elapsed(),
+                            &result,
+                        );
                     }
                     result.map_err(Into::into)
                 }
@@ -1098,8 +1142,33 @@ where
                 "routing to a peer which advertised inventory"
             );
             metrics::counter!("pool.route_inv.advertiser.count").increment(1);
+            let trace_context = match hash {
+                InventoryHash::Block(hash) => Some((
+                    self.legacy_peer_trace.next_request_id(),
+                    self.legacy_peer_trace_context(peer, &svc),
+                    hash,
+                    Instant::now(),
+                )),
+                _ => None,
+            };
             let fut = svc.call(req);
             self.push_unready(peer, svc);
+            if let Some((request_id, peer, hash, started)) = trace_context {
+                let trace = self.legacy_peer_trace.clone();
+                return async move {
+                    let result = fut.await;
+                    trace.block_request_finish(
+                        request_id,
+                        peer,
+                        hash,
+                        "advertised",
+                        started.elapsed(),
+                        &result,
+                    );
+                    result.map_err(Into::into)
+                }
+                .boxed();
+            }
             return fut.map_err(Into::into).boxed();
         }
 
@@ -1126,8 +1195,33 @@ where
                 "routing to a peer that might have inventory"
             );
             metrics::counter!("pool.route_inv.maybe.count").increment(1);
+            let trace_context = match hash {
+                InventoryHash::Block(hash) => Some((
+                    self.legacy_peer_trace.next_request_id(),
+                    self.legacy_peer_trace_context(peer, &svc),
+                    hash,
+                    Instant::now(),
+                )),
+                _ => None,
+            };
             let fut = svc.call(req);
             self.push_unready(peer, svc);
+            if let Some((request_id, peer, hash, started)) = trace_context {
+                let trace = self.legacy_peer_trace.clone();
+                return async move {
+                    let result = fut.await;
+                    trace.block_request_finish(
+                        request_id,
+                        peer,
+                        hash,
+                        "maybe",
+                        started.elapsed(),
+                        &result,
+                    );
+                    result.map_err(Into::into)
+                }
+                .boxed();
+            }
             return fut.map_err(Into::into).boxed();
         }
 

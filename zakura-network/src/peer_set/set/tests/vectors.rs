@@ -5,7 +5,6 @@ use std::{
     collections::HashSet,
     iter,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
     time::Duration,
 };
 
@@ -25,10 +24,8 @@ use crate::{
     },
     peer_set::{inventory_registry::InventoryStatus, stall_tracker::FIND_RESPONSE_STALL_THRESHOLD},
     protocol::external::{types::Version, InventoryHash},
-    BoxError, PeerSocketAddr, Request, Response, SharedPeerError,
+    BannedIps, BoxError, PeerSocketAddr, Request, Response, SharedPeerError,
 };
-use indexmap::IndexMap;
-use tokio::sync::watch;
 
 use super::{PeerSetBuilder, PeerVersions};
 
@@ -326,12 +323,7 @@ fn broadcast_all_queued_removes_banned_peers() {
             .build();
 
         let banned_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        let mut bans_map: IndexMap<std::net::IpAddr, std::time::Instant> = IndexMap::new();
-        bans_map.insert(banned_ip, std::time::Instant::now());
-
-        let (bans_tx, bans_rx) = watch::channel(Arc::new(bans_map));
-        let _ = bans_tx;
-        peer_set.bans_receiver = bans_rx;
+        peer_set.bans = BannedIps::with_banned_ip(banned_ip);
 
         let banned_addr: PeerSocketAddr = SocketAddr::new(banned_ip, 1).into();
         let mut remaining_peers = HashSet::new();
@@ -549,10 +541,7 @@ fn remove_unready_peer_clears_cancel_handle_and_updates_counts() {
         // Prepare a banned IP map (not strictly required for remove(), but keeps
         // the test's setup similar to real-world conditions).
         let banned_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        let mut bans_map: IndexMap<std::net::IpAddr, std::time::Instant> = IndexMap::new();
-        bans_map.insert(banned_ip, std::time::Instant::now());
-        let (_bans_tx, bans_rx) = watch::channel(Arc::new(bans_map));
-        peer_set.bans_receiver = bans_rx;
+        peer_set.bans = BannedIps::with_banned_ip(banned_ip);
 
         // Create a cancel handle as if a request was in-flight to `banned_addr`.
         let banned_addr: PeerSocketAddr = SocketAddr::new(banned_ip, 1).into();

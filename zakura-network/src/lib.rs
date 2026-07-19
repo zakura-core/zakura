@@ -182,7 +182,7 @@ pub use crate::{
 };
 
 pub use crate::{
-    address_book::AddressBook,
+    address_book::{AddressBook, BannedIps},
     address_book_peers::AddressBookPeers,
     config::{CacheDir, Config, P2pStack},
     isolated::{connect_isolated, connect_isolated_tcp_direct},

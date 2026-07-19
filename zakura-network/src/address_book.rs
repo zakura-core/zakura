@@ -3,14 +3,13 @@
 
 use std::{
     cmp::Reverse,
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
 
 use chrono::Utc;
-use indexmap::IndexMap;
 use ordered_map::OrderedMap;
 use tokio::sync::watch;
 use tracing::Span;
@@ -27,6 +26,63 @@ use crate::{
 
 #[cfg(test)]
 mod tests;
+
+/// Read-only access to currently banned peer IP addresses.
+#[derive(Clone, Debug, Default)]
+pub struct BannedIps {
+    inner: Arc<RwLock<BanList>>,
+}
+
+/// A bounded FIFO list of banned peer IP addresses.
+#[derive(Debug, Default)]
+struct BanList {
+    /// Banned IP addresses for fast membership checks.
+    ips: HashSet<IpAddr>,
+
+    /// Banned IP addresses in insertion order for FIFO eviction.
+    insertion_order: VecDeque<IpAddr>,
+}
+
+impl BanList {
+    /// Inserts `ip`, evicting the oldest IP when the list exceeds its bound.
+    fn insert(&mut self, ip: IpAddr) {
+        if !self.ips.insert(ip) {
+            return;
+        }
+
+        self.insertion_order.push_back(ip);
+
+        if self.ips.len() > constants::MAX_BANNED_IPS {
+            let oldest = self
+                .insertion_order
+                .pop_front()
+                .expect("ban order has an entry for every banned IP");
+
+            self.ips.remove(&oldest);
+        }
+    }
+}
+
+impl BannedIps {
+    /// Returns whether `ip` is currently banned.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        self.inner
+            .read()
+            .expect("ban list lock should not be poisoned")
+            .ips
+            .contains(&ip)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_banned_ip(ip: IpAddr) -> Self {
+        let bans = Self::default();
+        bans.inner
+            .write()
+            .expect("ban list lock should not be poisoned")
+            .insert(ip);
+        bans
+    }
+}
 
 /// A database of peer listener addresses, their advertised services, and
 /// information on when they were last seen.
@@ -82,7 +138,7 @@ pub struct AddressBook {
     most_recent_by_ip: Option<HashMap<IpAddr, MetaAddr>>,
 
     /// A list of banned addresses, with the time they were banned.
-    bans_by_ip: Arc<IndexMap<IpAddr, Instant>>,
+    bans_by_ip: BannedIps,
 
     /// The local listener address.
     local_listener: SocketAddr,
@@ -447,7 +503,7 @@ impl AddressBook {
     pub fn update(&mut self, change: MetaAddrChange) -> Option<MetaAddr> {
         let addr_label = change.addr().addr_label(self.expose_peer_addresses);
 
-        if self.bans_by_ip.contains_key(&change.addr().ip()) {
+        if self.bans_by_ip.contains(change.addr().ip()) {
             tracing::warn!(
                 peer = %addr_label,
                 ?change,
@@ -479,13 +535,13 @@ impl AddressBook {
             if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
                 // Ban and skip outbound connections with excessively misbehaving peers.
                 let banned_ip = updated.addr.ip();
-                let bans_by_ip = Arc::make_mut(&mut self.bans_by_ip);
+                let mut bans_by_ip = self
+                    .bans_by_ip
+                    .inner
+                    .write()
+                    .expect("ban list lock should not be poisoned");
 
-                bans_by_ip.insert(banned_ip, Instant::now());
-                if bans_by_ip.len() > constants::MAX_BANNED_IPS {
-                    // Remove the oldest banned IP from the address book.
-                    bans_by_ip.shift_remove_index(0);
-                }
+                bans_by_ip.insert(banned_ip);
 
                 // `most_recent_by_ip` is only populated when
                 // `max_connections_per_ip == 1`. The ban path runs for any
@@ -726,7 +782,7 @@ impl AddressBook {
     }
 
     /// Returns banned IP addresses.
-    pub fn bans(&self) -> Arc<IndexMap<IpAddr, Instant>> {
+    pub fn bans(&self) -> BannedIps {
         self.bans_by_ip.clone()
     }
 

@@ -1,0 +1,215 @@
+# Refresh the embedded Mainnet checkpoint list and VCT frontier from one
+# immutable, digest-verified R2 bundle produced by the release-state publisher
+# (deploy/release-state/), and open a draft PR for human review. Checkpoints
+# are consensus-critical: nothing merges or ships from this workflow directly,
+# and release creation never consults the moving R2 pointer.
+# See docs/design/verified-commitment-trees.md, section 16.
+name: Update Mainnet release state
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_age_hours:
+        description: "Maximum bundle age in hours"
+        required: false
+        default: "48"
+  schedule:
+    # Weekly refresh; the publisher exports daily alongside the snapshot job.
+    - cron: "0 6 * * 1"
+
+permissions: {}
+
+concurrency:
+  group: update-release-state
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Import Mainnet release state
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: release-automation
+    permissions:
+      contents: read
+    steps:
+      - name: Create release GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 #v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+        with:
+          persist-credentials: false
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Self-test the bundle fetcher
+        run: python3 .github/scripts/fetch-release-state.py --self-test
+
+      - name: Fetch one immutable bundle
+        env:
+          LATEST_URL: ${{ vars.MAINNET_RELEASE_STATE_LATEST_URL }}
+          MAX_AGE_HOURS: ${{ inputs.max_age_hours || '48' }}
+        run: |
+          if [ -z "$LATEST_URL" ]; then
+            echo "Set the MAINNET_RELEASE_STATE_LATEST_URL repository variable." >&2
+            exit 1
+          fi
+          python3 .github/scripts/fetch-release-state.py \
+            --latest-url "$LATEST_URL" \
+            --output-dir "$RUNNER_TEMP/release-state-bundle" \
+            --metadata-out "$RUNNER_TEMP/release-state-resolution.json" \
+            --max-age-hours "$MAX_AGE_HOURS"
+
+      - name: Import checkpoints, frontier, and provenance
+        id: import
+        env:
+          BUNDLE: ${{ runner.temp }}/release-state-bundle
+          RESOLUTION: ${{ runner.temp }}/release-state-resolution.json
+          CHECKPOINTS: zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+          FRONTIER: zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
+          PROVENANCE: zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+          EOS_FILE: zakurad/src/components/sync/end_of_support.rs
+        run: |
+          set -euo pipefail
+
+          BUNDLE_HEIGHT=$(jq -er '.height' "$RESOLUTION")
+          COMMITTED_HEIGHT=$(tail -1 "$CHECKPOINTS" | cut -d' ' -f1)
+          echo "bundle height ${BUNDLE_HEIGHT}, committed height ${COMMITTED_HEIGHT}"
+
+          if [ "$BUNDLE_HEIGHT" -le "$COMMITTED_HEIGHT" ]; then
+            echo "The committed checkpoint list is already at or above the bundle; nothing to do."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The committed list must be a byte-identical prefix of the bundle's
+          # full list (the selection-grid contract): any rewrite of committed
+          # history fails closed here and in review.
+          COMMITTED_SIZE=$(stat -c%s "$CHECKPOINTS")
+          if ! head -c "$COMMITTED_SIZE" "$BUNDLE/main-checkpoints.txt" | cmp -s - "$CHECKPOINTS"; then
+            echo "Bundle checkpoint list does not extend the committed list byte-for-byte." >&2
+            echo "Publisher and repository are on different selection grids; investigate before retrying." >&2
+            exit 1
+          fi
+
+          cp "$BUNDLE/main-checkpoints.txt" "$CHECKPOINTS"
+          cp "$BUNDLE/mainnet-frontier.bin" "$FRONTIER"
+
+          python3 - "$RESOLUTION" "$BUNDLE" "$CHECKPOINTS" "$FRONTIER" "$PROVENANCE" <<'PY'
+          import hashlib, json, sys
+          resolution_path, bundle, checkpoints, frontier, provenance_path = sys.argv[1:6]
+          resolution = json.load(open(resolution_path, encoding="utf-8"))
+          frontier_bytes = open(frontier, "rb").read()
+          provenance = {
+              "schema_version": 1,
+              "network": "Mainnet",
+              "source": "release-state-bundle",
+              "generated_at": resolution["generated_at"],
+              "finalized_height": resolution["height"],
+              "finalized_hash": resolution["block_hash"],
+              "checkpoints_sha256": hashlib.sha256(open(checkpoints, "rb").read()).hexdigest(),
+              "frontier_sha256": hashlib.sha256(frontier_bytes).hexdigest(),
+              "frontier_size": len(frontier_bytes),
+              "meta_sha256": resolution["meta_sha256"],
+          }
+          with open(provenance_path, "w", encoding="utf-8") as out:
+              json.dump(provenance, out, indent=2)
+              out.write("\n")
+          PY
+
+          # Floor the end-of-support estimate at the bundle height plus ~3 days
+          # of blocks. The release checklist's manual estimate stays
+          # authoritative; this only keeps a skipped checklist step from
+          # shipping a long-stale estimate inside an 18-day support window.
+          EOS_HEIGHT=$((BUNDLE_HEIGHT + 3456))
+          FORMATTED=$(echo "$EOS_HEIGHT" | awk '{n=$0; r=""; for(i=length(n);i>0;i--) { r=substr(n,i,1) r; if((length(n)-i)%3==2 && i>1) r="_" r }; print r}')
+          CURRENT_EOS=$(grep -oE 'ESTIMATED_RELEASE_HEIGHT: u32 = [0-9_]+' "$EOS_FILE" | grep -oE '[0-9_]+$' | tr -d '_')
+          if [ "$CURRENT_EOS" -lt "$EOS_HEIGHT" ]; then
+            sed -i "s/ESTIMATED_RELEASE_HEIGHT: u32 = [0-9_]*/ESTIMATED_RELEASE_HEIGHT: u32 = ${FORMATTED}/" "$EOS_FILE"
+            echo "floored ESTIMATED_RELEASE_HEIGHT at ${FORMATTED}"
+          else
+            echo "ESTIMATED_RELEASE_HEIGHT ${CURRENT_EOS} already at or above the floor"
+          fi
+
+          {
+            echo "has_changes=true"
+            echo "height=${BUNDLE_HEIGHT}"
+            jq -r '"block_hash=\(.block_hash)", "generated_at=\(.generated_at)", "meta_url=\(.meta_url)", "meta_sha256=\(.meta_sha256)"' "$RESOLUTION"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate the imported release state
+        if: steps.import.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          .github/scripts/validate-checkpoints.sh \
+            zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+          ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=0 scripts/check-release-state.sh
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        if: steps.import.outputs.has_changes == 'true'
+        with:
+          toolchain: stable
+
+      - name: Re-prove the checkpoint/frontier pairing in cargo
+        if: steps.import.outputs.has_changes == 'true'
+        run: cargo test -p zakura-state --lib -- frontier sprout_change
+
+      - name: Restrict the generated diff to release-state files
+        if: steps.import.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          {
+            git diff --name-only HEAD
+            git ls-files --others --exclude-standard
+          } | sort -u > "$RUNNER_TEMP/actual-files"
+          sort > "$RUNNER_TEMP/allowed-files" <<'EOF'
+          zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+          zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
+          zakura-state/src/service/finalized_state/vct/mainnet-frontier.json
+          zakurad/src/components/sync/end_of_support.rs
+          EOF
+          UNEXPECTED=$(comm -23 "$RUNNER_TEMP/actual-files" "$RUNNER_TEMP/allowed-files")
+          if [ -n "$UNEXPECTED" ]; then
+            echo "Import changed files outside the release-state allowlist:" >&2
+            echo "$UNEXPECTED" >&2
+            exit 1
+          fi
+
+          # The checkpoint diff must be append-only.
+          REMOVED=$(git diff --numstat HEAD -- \
+            zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -f2)
+          if [ "${REMOVED:-0}" != "0" ]; then
+            echo "Checkpoint update removed ${REMOVED} committed lines; refusing." >&2
+            exit 1
+          fi
+          git diff --stat HEAD
+
+      - name: Open or update the draft pull request
+        if: steps.import.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 #v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch: adam/update-release-state
+          base: main
+          title: "chore(chain): update Mainnet checkpoints and VCT frontier"
+          body: |
+            Updates the embedded Mainnet checkpoint list, matching VCT frontier, and provenance record from one immutable release-state bundle, and floors the end-of-support estimate.
+
+            - Finalized height: `${{ steps.import.outputs.height }}`
+            - Finalized hash: `${{ steps.import.outputs.block_hash }}`
+            - Generated at: `${{ steps.import.outputs.generated_at }}`
+            - Bundle meta: `${{ steps.import.outputs.meta_url }}`
+            - Meta SHA-256: `${{ steps.import.outputs.meta_sha256 }}`
+
+            The checkpoint diff is append-only over the committed list, and CI re-derives the provenance digests from the embedded data on every PR. Review before merging: checkpoints are consensus-critical, so spot-check a few new heights and the terminal hash against an independent node or explorer.
+          labels: A-release
+          commit-message: "chore(chain): update Mainnet checkpoints and VCT frontier"
+          sign-commits: true
+          draft: always-true
+          delete-branch: true

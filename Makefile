@@ -41,5 +41,5 @@ help:
 	@echo "  compat-test-testnet              Run read-only zcashd-compat tests against live testnet"
 	@echo ""
 	@echo "  Release:"
-	@echo "  pre-release RELEASE_TAG=vX.Y.Z BASE_TAG=vX.Y.Z   Run release version, local crate bump, and packaging checks"
+	@echo "  pre-release RELEASE_TAG=vX.Y.Z BASE_TAG=vX.Y.Z   Run release version, Mainnet release-state, and packaging checks"
 	@echo "  sign-release TAG=vX.Y.Z          Sign a release's SHA256SUMS.txt with the maintainer minisign key (see VERIFY.md)"

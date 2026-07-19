@@ -423,6 +423,8 @@ impl TransactionError {
             | NotEnoughFlags
             | NotEnoughIronwoodFlags
             | OrchardHasEnableCrossAddress
+            | OrchardProofSize
+            | IronwoodProofSize
             | WrongConsensusBranchId
             | MissingConsensusBranchId
             | LockedUntilAfterBlockHeight(_)

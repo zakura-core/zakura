@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+- Reject transactions that do not meet ZIP-317 mempool fee policy before
+  running script and proof checks. Block validation is unchanged.
+- Streamline mempool script error handling so invalid scripts are reported as
+  script verification errors.
+- Add an opt-in `network.expose_peer_addresses` setting for unredacted legacy
+  peer address labels in peer activity logs and metrics
+  ([#258](https://github.com/zakura-core/zakura/pull/258)).
+- Shut down a managed zcashd-compat process before Zakura exits on SIGINT or
+  SIGTERM.
+- Add an offline Mainnet checkpoint and VCT frontier export mode to
+  `zakura-checkpoints`, and a committed provenance record
+  (`vct/mainnet-frontier.json`) that CI verifies against the embedded
+  checkpoint list and frontier on every PR. Groundwork for automated
+  release-state updates.
+
+## [1.0.2-rc0] - 2026-07-19
+
 ### Added
 
 - Automate Mainnet checkpoint and VCT frontier refreshes: the
@@ -17,31 +34,38 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Add a configurable 250,000-byte default maximum for individual mempool
   transactions. Larger transactions are rejected before semantic and contextual
   verification without penalizing peers, and the policy does not affect block
-  validation.
+  validation ([#255](https://github.com/zakura-core/zakura/pull/255)).
 - Add `zakurad validate-vct-sprout-history` to audit repaired historical
-  Sprout anchors in archive or pruned Mainnet state databases.
+  Sprout anchors in archive or pruned Mainnet state databases
+  ([#247](https://github.com/zakura-core/zakura/pull/247),
+  [#251](https://github.com/zakura-core/zakura/pull/251)).
+
+### Changed
+
+- Source the embedded Mainnet VCT Sprout-history repair artifact from
+  exact-versioned crates.io packages instead of storing its large source
+  bytes in the Zakura repository, and reuse one validated decode throughout
+  startup repair ([#259](https://github.com/zakura-core/zakura/pull/259)).
+- Update the embedded zcashd-compat binary and default split-container image to
+  valargroup/zcashd v1.0.1
+  ([#245](https://github.com/zakura-core/zakura/pull/245)).
+- Header sync now schedules only forward ranges from the durable verified block
+  tip. Startup rejects configured anchors above that base, and no longer
+  backfills headers below a checkpoint anchor
+  ([#227](https://github.com/zakura-core/zakura/pull/227)).
 
 ### Fixed
 
 - Database format upgrades now finish before startup exposes the finalized
   state database; only configured periodic format checks continue in the
-  background.
+  background ([#240](https://github.com/zakura-core/zakura/pull/240)).
 - Preserve Sprout note-commitment history during fresh verified-commitment-tree
   fast sync, so later JoinSplit spends can use historical anchors. Affected
   Mainnet databases that previously ran v2 p2p + fast mode require repair at
   startup from a reviewed trusted artifact, snapshot redownload, or genesis
-  resync.
-
-### Changed
-
-- Update the embedded zcashd-compat binary and default split-container image to
-  valargroup/zcashd v1.0.1.
-- Header sync now schedules only forward ranges from the durable verified block
-  tip. Startup rejects configured anchors above that base, and no longer
-  backfills headers below a checkpoint anchor.
-
-### Fixed
-
+  resync ([#239](https://github.com/zakura-core/zakura/pull/239),
+  [#244](https://github.com/zakura-core/zakura/pull/244),
+  [#259](https://github.com/zakura-core/zakura/pull/259)).
 - Deliver mined/submitted block gossip to peers that were momentarily unready
   when the block was advertised. A block broadcast via `AdvertiseBlockToAll`
   queued a re-send for unready peers, but the queued send future was dropped
@@ -51,7 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   The queued send now runs to completion. Only local mining paths (regtest, e2e,
   and local-mining deployments) exercise `AdvertiseBlockToAll`; standard
   following nodes advertise network blocks via `AdvertiseBlock` and are
-  unaffected.
+  unaffected ([#236](https://github.com/zakura-core/zakura/pull/236)).
 - Deliver committed-tip block gossip to configured zcashd-compat sidecar peers
   even when they are momentarily unready. The "always include sidecars" carve-out
   in block broadcasts only covered ready peers, so a sidecar that was unready when
@@ -59,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   learns the tip only from block `inv`s, it then stalled until a later gossip
   coincided with a ready service. The latest hash is now queued for an unready
   sidecar and delivered once it is ready again, bounding the stall to one
-  readiness cycle.
+  readiness cycle ([#231](https://github.com/zakura-core/zakura/pull/231)).
 - The inbound-overload protection no longer disconnects operator-configured
   block-gossip / zcashd-compat sidecar peers. When such a peer's own getdata /
   getheaders overloaded or timed out the inbound service, the random
@@ -67,7 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   feeds, and the one-connection-per-IP reconnect refusal could stretch that into
   a multi-second blackout. Configured sidecars are now exempt from the drop —
   their requests are still shed for backpressure, but the connection is not
-  closed. Every other peer's denial-of-service protection is unchanged.
+  closed. Every other peer's denial-of-service protection is unchanged
+  ([#242](https://github.com/zakura-core/zakura/pull/242)).
+- Fixed early-chain header validation to use the consensus proof-of-work limit
+  at height 17.
 
 ## [1.0.1] - 2026-07-17
 

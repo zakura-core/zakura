@@ -43,6 +43,21 @@ fn peer_addr(port: u16) -> PeerSocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port)).into()
 }
 
+#[test]
+fn connected_addr_labels_require_explicit_opt_in() {
+    let peer = ConnectedAddr::new_outbound_direct(
+        "192.0.2.1:8233".parse().expect("valid test peer address"),
+    );
+
+    assert_eq!(peer.addr_label(false), "v4redacted:8233");
+    assert_eq!(peer.addr_label(true), "192.0.2.1:8233");
+    assert_eq!(ConnectedAddr::Isolated.addr_label(true), "isolated");
+
+    let debug = format!("{peer:?}");
+    assert!(debug.contains("v4redacted:8233"));
+    assert!(!debug.contains("192.0.2.1"));
+}
+
 fn test_config(p2p_stack: P2pStack) -> Config {
     Config::for_test(p2p_stack)
 }

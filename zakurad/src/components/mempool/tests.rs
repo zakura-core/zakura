@@ -4,7 +4,9 @@ use proptest::prelude::*;
 use tower::ServiceExt;
 
 use super::{
-    error::MempoolError, storage::Storage, ActiveState, InboundTxDownloads, Mempool, Request,
+    downloads::TransactionDownloadVerifyError, error::MempoolError, queue_source_log_label,
+    storage::Storage, transaction_error_peer_log_label, ActiveState, InboundTxDownloads, Mempool,
+    Request,
 };
 use crate::{
     components::sync::{RecentSyncLengths, SyncStatus},
@@ -16,9 +18,42 @@ use zakura_chain::{
     transaction::{Transaction, UnminedTx, VerifiedUnminedTx},
     transparent::{self, Address},
 };
+use zakura_node_services::mempool::QueueSource;
 
 mod prop;
 mod vector;
+
+#[test]
+fn legacy_queue_source_log_labels_require_explicit_opt_in() {
+    let source = QueueSource::LegacySocket("192.0.2.1:8233".parse().expect("valid test socket"));
+
+    assert_eq!(queue_source_log_label(&source, false), "legacy:redacted");
+    assert_eq!(
+        queue_source_log_label(&source, true),
+        "legacy:192.0.2.1:8233"
+    );
+
+    let source = QueueSource::Zakura(vec![7, 8, 9]);
+    assert_eq!(queue_source_log_label(&source, false), "zakura:[7, 8, 9]");
+    assert_eq!(queue_source_log_label(&source, true), "zakura:[7, 8, 9]");
+}
+
+#[test]
+fn transaction_error_peer_log_labels_require_explicit_opt_in() {
+    let error = TransactionDownloadVerifyError::Invalid {
+        error: zakura_consensus::error::TransactionError::WrongVersion,
+        advertiser_addr: Some("192.0.2.1:8233".parse().expect("valid test socket")),
+    };
+
+    assert_eq!(
+        transaction_error_peer_log_label(&error, false).as_deref(),
+        Some("legacy:redacted")
+    );
+    assert_eq!(
+        transaction_error_peer_log_label(&error, true).as_deref(),
+        Some("legacy:192.0.2.1:8233")
+    );
+}
 
 impl Mempool {
     /// Get the storage field of the mempool for testing purposes.

@@ -9,8 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `produce_settled_final_frontiers_bytes`: produce VCT final-frontier bytes at
+  a height below the finalized tip after proving Sprout is settled across the
+  window, with two new `FinalFrontiersGenerationError` variants
+  (`SproutChangedAboveRequestedHeight`, `MissingBlockInSproutWindow`).
+
+## [3.0.0-rc0] - 2026-07-19
+
+### Breaking Changes
+
+- Changed Sprout tip-tree lookups to return `Result` when the tree is missing,
+  and made tree-batch preparation report validation errors.
+- Removed `ZakuraDb::spawn_format_change`; database format upgrades now finish
+  during initialization.
+- Added variants to public finalized-state error enums for missing Sprout data,
+  tip changes, and invalid VCT repair state.
+
+### Added
+
 - Added authenticated VCT Sprout-history artifact generation and validation
-  APIs, plus an offline generator binary.
+  APIs, plus an offline generator binary and exact-versioned crates.io
+  packaging that keeps the embedded repair bytes outside `zakura-state` and
+  reuses one validated decode throughout startup repair.
 
 ## [2.0.0] - 2026-07-17
 

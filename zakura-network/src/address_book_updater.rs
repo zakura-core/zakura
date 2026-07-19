@@ -58,7 +58,7 @@ impl AddressBookUpdater {
     ) {
         // Create an mpsc channel for peerset address book updates,
         // based on the maximum number of inbound and outbound peers.
-        let (worker_tx, mut worker_rx) = mpsc::channel(max(
+        let (worker_tx, mut worker_rx) = mpsc::channel::<MetaAddrChange>(max(
             config.peerset_total_connection_limit(),
             MIN_CHANNEL_SIZE,
         ));
@@ -69,7 +69,8 @@ impl AddressBookUpdater {
             config.max_connections_per_ip,
             span!(Level::TRACE, "address book"),
         )
-        .with_local_listener_services(advertised_services);
+        .with_local_listener_services(advertised_services)
+        .with_expose_peer_addresses(config.expose_peer_addresses);
         let address_metrics = address_book.address_metrics_watcher();
         let address_book = Arc::new(std::sync::Mutex::new(address_book));
 
@@ -84,6 +85,7 @@ impl AddressBookUpdater {
         };
 
         let worker_address_book = address_book.clone();
+        let expose_peer_addresses = config.expose_peer_addresses;
         let (bans_sender, bans_receiver) = tokio::sync::watch::channel(
             worker_address_book
                 .lock()
@@ -95,7 +97,11 @@ impl AddressBookUpdater {
             info!("starting the address book updater");
 
             while let Some(event) = worker_rx.blocking_recv() {
-                trace!(?event, "got address book change");
+                trace!(
+                    peer = %event.addr().addr_label(expose_peer_addresses),
+                    ?event,
+                    "got address book change"
+                );
 
                 // # Correctness
                 //

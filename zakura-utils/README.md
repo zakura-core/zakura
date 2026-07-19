@@ -14,11 +14,30 @@ Binaries are easier to use if they are located in your system execution path.
 
 This command generates a list of zebra checkpoints, and writes them to standard output. Each checkpoint consists of a block height and hash.
 
-Checkpoint generation is currently a manual process: the upstream CI pipeline that generated
-checkpoints automatically was removed with the GCP integration-test infrastructure. When a
-checkpoint update advances the Mainnet checkpoint max height, regenerate the embedded Mainnet
-frontier in the same run using `--mainnet-frontier-output`
-(see `docs/design/verified-commitment-trees.md`, "Frontier regeneration tool").
+#### Offline Mainnet export (release-state pipeline)
+
+Mainnet checkpoint updates flow through the release-state pipeline: the publisher host runs
+offline mode against a quiesced copy of a synced Mainnet state database, which also produces
+the matching VCT frontier artifact for the last emitted checkpoint. Build with the offline
+feature and run:
+
+```sh
+cargo install --locked --features zakura-checkpoints-offline --git https://github.com/zakura-core/zakura zakura-utils
+
+zakura-checkpoints \
+  --state-cache-dir /path/to/quiesced-zakura-cache \
+  --full-list \
+  --mainnet-frontier-output /out/mainnet-frontier.bin > /out/main-checkpoints.txt
+```
+
+Offline mode reads canonical hashes and `BlockInfo` sizes straight from the finalized
+database, so it works on pruned state and needs no running node. `--full-list` prints the
+embedded checkpoint list before the new entries, making stdout a complete replacement
+`main-checkpoints.txt`. Do not hand-append RPC-mode output to the Mainnet list: pipeline
+updates must stay on the deterministic selection grid (see
+`docs/design/verified-commitment-trees.md`, "Mainnet release-state pipeline").
+
+The RPC modes below remain for Testnet updates and diagnostics.
 
 #### Manual Checkpoint Generation
 

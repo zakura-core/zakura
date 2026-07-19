@@ -88,6 +88,7 @@ use tokio::{
     pin, select,
     sync::{oneshot, watch},
 };
+use tokio_util::sync::CancellationToken;
 use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
 
@@ -95,6 +96,7 @@ use zakura_chain::block::{self, genesis::regtest_genesis_block};
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_network::types::PeerServices;
 use zakura_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
+use zakura_state::StorageMode;
 
 use zakura::{
     drive_block_sync_actions, drive_vct_root_repairs, drive_zakura_header_sync_actions,
@@ -251,6 +253,15 @@ impl StartCmd {
         }
     }
 
+    /// Returns the services advertised to legacy P2P peers.
+    fn advertised_services(config: &ZakuradConfig) -> PeerServices {
+        if config.zcashd_compat.enabled || config.state.storage_mode == StorageMode::Archive {
+            PeerServices::NODE_NETWORK
+        } else {
+            PeerServices::empty()
+        }
+    }
+
     fn zcashd_compat_default_block_gossip_peer_ips() -> Vec<IpAddr> {
         vec![
             IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -274,7 +285,11 @@ impl StartCmd {
         )
     }
 
-    async fn start(&self) -> Result<(), Report> {
+    async fn start(
+        &self,
+        shutdown: CancellationToken,
+        cleanup_ready: CancellationToken,
+    ) -> Result<(), Report> {
         check_tcp_slow_start_after_idle();
 
         let config = APPLICATION.config();
@@ -429,16 +444,11 @@ impl StartCmd {
             .timeout(MAX_INBOUND_RESPONSE_TIME)
             .service(Inbound::new(
                 config.sync.full_verify_concurrency_limit,
+                config.network.expose_peer_addresses,
                 setup_rx,
             ));
 
-        // Pruned nodes can still make outbound requests, but they cannot serve
-        // arbitrary historical blocks, so they must not advertise full-node service.
-        let advertised_services = if config.state.pruning_config().is_some() {
-            PeerServices::empty()
-        } else {
-            PeerServices::NODE_NETWORK
-        };
+        let advertised_services = Self::advertised_services(&config);
 
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
             zakura_network::init_with_zakura_header_sync(
@@ -560,6 +570,7 @@ impl StartCmd {
         info!("initializing mempool");
         let (mempool, mempool_transaction_subscriber) = Mempool::new(
             &config.mempool,
+            config.network.expose_peer_addresses,
             peer_set.clone(),
             state.clone(),
             tx_verifier,
@@ -625,38 +636,34 @@ impl StartCmd {
 
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
-        let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
-        let mut zcashd_compat_task_handle = if let Some(resolved_zcashd_path) = resolved_zcashd_path
-        {
-            let local_listener = address_book
-                .lock()
-                .expect("unexpected panic in address book mutex guard")
-                .local_listener_socket_addr();
-            let supervisor_config = zcashd_compat::SupervisorConfig::new(
-                &config.zcashd_compat,
-                resolved_zcashd_path,
-                &config.state.cache_dir,
-                config.network.network.kind(),
-                Self::zcashd_compat_p2p_connect_addr(&config, local_listener),
-            );
+        let zcashd_compat_supervisor_config =
+            if let Some(resolved_zcashd_path) = resolved_zcashd_path {
+                let local_listener = address_book
+                    .lock()
+                    .expect("unexpected panic in address book mutex guard")
+                    .local_listener_socket_addr();
+                let supervisor_config = zcashd_compat::SupervisorConfig::new(
+                    &config.zcashd_compat,
+                    resolved_zcashd_path,
+                    &config.state.cache_dir,
+                    config.network.network.kind(),
+                    Self::zcashd_compat_p2p_connect_addr(&config, local_listener),
+                );
 
-            info!(
-                connect = %supervisor_config.zakura_p2p_addr,
-                "zcashd-compat source enabled"
-            );
+                info!(
+                    connect = %supervisor_config.zakura_p2p_addr,
+                    "zcashd-compat source enabled"
+                );
 
-            tokio::spawn(
-                zcashd_compat::run_supervisor(supervisor_config, zcashd_compat_shutdown_rx)
-                    .in_current_span(),
-            )
-        } else {
-            if config.zcashd_compat.enabled {
-                zcashd_compat::set_supervision_config_disabled_metrics();
-                info!("zcashd-compat source enabled: zcashd supervision disabled");
-            }
+                Some(supervisor_config)
+            } else {
+                if config.zcashd_compat.enabled {
+                    zcashd_compat::set_supervision_config_disabled_metrics();
+                    info!("zcashd-compat source enabled: zcashd supervision disabled");
+                }
 
-            tokio::spawn(std::future::pending().in_current_span())
-        };
+                None
+            };
 
         // TODO: Add a shutdown signal and start the server with `serve_with_incoming_shutdown()` if
         //       any related unit tests sometimes crash with memory errors
@@ -821,6 +828,20 @@ impl StartCmd {
 
         info!("spawned initial Zakura tasks");
 
+        let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
+        let mut zcashd_compat_task_handle =
+            if let Some(supervisor_config) = zcashd_compat_supervisor_config {
+                tokio::spawn(
+                    zcashd_compat::run_supervisor(supervisor_config, zcashd_compat_shutdown_rx)
+                        .in_current_span(),
+                )
+            } else {
+                tokio::spawn(std::future::pending().in_current_span())
+            };
+        // The supervisor may own a child after this point, so shutdown must
+        // await cleanup. Do not add a yield between the spawn and this marker.
+        cleanup_ready.cancel();
+
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
 
         // ongoing tasks
@@ -856,6 +877,8 @@ impl StartCmd {
                 let mut exit_when_task_finishes = true;
 
                 let result = select! {
+                _ = shutdown.cancelled() => Ok(()),
+
                 rpc_join_result = &mut rpc_task_handle => {
                     let rpc_server_result = rpc_join_result
                         .expect("unexpected panic in the rpc task");
@@ -969,7 +992,7 @@ impl StartCmd {
             }
         };
 
-        info!("exiting Zebra because an ongoing task exited: asking other tasks to stop");
+        info!("exiting Zebra: asking other tasks to stop");
 
         // ongoing tasks
         rpc_task_handle.abort();
@@ -1089,7 +1112,9 @@ impl Runnable for StartCmd {
             .take();
 
         rt.expect("runtime should not already be taken")
-            .run(self.start());
+            .run_with_graceful_shutdown(|shutdown, cleanup_ready| {
+                self.start(shutdown, cleanup_ready)
+            });
 
         info!("stopping zakurad");
     }
@@ -1169,7 +1194,27 @@ mod tests {
     use super::StartCmd;
     use crate::components::zcashd_compat;
     use crate::config::ZakuradConfig;
+    use zakura_network::types::PeerServices;
     use zakura_network::P2pStack;
+    use zakura_state::{PruningConfig, StorageMode};
+
+    #[test]
+    fn zcashd_compat_advertises_node_network_when_pruned() {
+        let mut config = ZakuradConfig::default();
+        config.state.storage_mode = StorageMode::Pruned(PruningConfig::default());
+
+        assert_eq!(
+            StartCmd::advertised_services(&config),
+            PeerServices::empty()
+        );
+
+        config.zcashd_compat.enabled = true;
+
+        assert_eq!(
+            StartCmd::advertised_services(&config),
+            PeerServices::NODE_NETWORK
+        );
+    }
 
     #[test]
     fn zcashd_compat_flag_enables_mode() {

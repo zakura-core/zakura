@@ -18,7 +18,7 @@ pub const MAX_PENDING_CHANGES: usize = 32;
 fn new_inv_registry() -> (InventoryRegistry, broadcast::Sender<InventoryChange>) {
     let (inv_stream_tx, inv_stream_rx) = broadcast::channel(MAX_PENDING_CHANGES);
 
-    let inv_registry = InventoryRegistry::new(inv_stream_rx);
+    let inv_registry = InventoryRegistry::new(inv_stream_rx, false);
 
     (inv_registry, inv_stream_tx)
 }

@@ -312,6 +312,9 @@ where
     /// peer set per IP, defaults to [`crate::constants::DEFAULT_MAX_CONNS_PER_IP`]
     max_conns_per_ip: usize,
 
+    /// Whether peer address labels in logs are unredacted.
+    expose_peer_addresses: bool,
+
     /// The network of this peer set.
     network: Network,
 }
@@ -384,7 +387,7 @@ where
             // Ready peers
             ready_services: HashMap::new(),
             // Request Routing
-            inventory_registry: InventoryRegistry::new(inv_stream),
+            inventory_registry: InventoryRegistry::new(inv_stream, config.expose_peer_addresses),
             queued_broadcast_all: None,
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             queued_sidecar_block_gossip: None,
@@ -406,6 +409,7 @@ where
             address_metrics,
 
             max_conns_per_ip: max_conns_per_ip.unwrap_or(config.max_connections_per_ip),
+            expose_peer_addresses: config.expose_peer_addresses,
 
             network: config.network.clone(),
         }
@@ -581,10 +585,16 @@ where
 
                 // Unready -> Ready
                 Some(Ok((key, svc))) => {
-                    trace!(?key, "service became ready");
+                    trace!(
+                        peer = %key.addr_label(self.expose_peer_addresses),
+                        "service became ready"
+                    );
 
                     if self.bans_receiver.borrow().contains_key(&key.ip()) {
-                        warn!(?key, "service is banned, dropping service");
+                        warn!(
+                            peer = %key.addr_label(self.expose_peer_addresses),
+                            "service is banned, dropping service"
+                        );
                         std::mem::drop(svc);
                         let cancel = self.cancel_handles.remove(&key);
                         debug_assert!(
@@ -606,7 +616,7 @@ where
                     // In that case, there is a cancel handle for the peer address,
                     // but it belongs to the service for the newer connection.
                     trace!(
-                        ?key,
+                        peer = %key.addr_label(self.expose_peer_addresses),
                         duplicate_connection = self.cancel_handles.contains_key(&key),
                         "service was canceled, dropping service"
                     );
@@ -614,7 +624,7 @@ where
                 Some(Err((key, UnreadyError::CancelHandleDropped(_)))) => {
                     // Similarly, services with dropped cancel handes can have duplicates.
                     trace!(
-                        ?key,
+                        peer = %key.addr_label(self.expose_peer_addresses),
                         duplicate_connection = self.cancel_handles.contains_key(&key),
                         "cancel handle was dropped, dropping service"
                     );
@@ -665,7 +675,10 @@ where
                 // Still ready, add it back to the list.
                 Ok(()) => {
                     if self.bans_receiver.borrow().contains_key(&key.ip()) {
-                        debug!(?key, "service ip is banned, dropping service");
+                        debug!(
+                            peer = %key.addr_label(self.expose_peer_addresses),
+                            "service ip is banned, dropping service"
+                        );
                         std::mem::drop(svc);
                         continue;
                     }
@@ -740,14 +753,20 @@ where
             // Process each change.
             match change {
                 Change::Remove(key) => {
-                    trace!(?key, "got Change::Remove from Discover");
+                    trace!(
+                        peer = %key.addr_label(self.expose_peer_addresses),
+                        "got Change::Remove from Discover"
+                    );
                     self.remove(&key);
                 }
                 Change::Insert(key, svc) => {
                     // We add peers as unready, so that we:
                     // - always do the same checks on every ready peer, and
                     // - check for any errors that happened right after the handshake
-                    trace!(?key, "got Change::Insert from Discover");
+                    trace!(
+                        peer = %key.addr_label(self.expose_peer_addresses),
+                        "got Change::Insert from Discover"
+                    );
 
                     // # Security
                     //
@@ -808,7 +827,7 @@ where
                 StallOutcome::Stall => {
                     if self.find_response_stalls.record_stall(addr) {
                         info!(
-                            ?addr,
+                            peer = %addr.addr_label(self.expose_peer_addresses),
                             "dropping stalled peer: exceeded FindBlocks/FindHeaders stall threshold",
                         );
                         self.remove(&addr);
@@ -922,11 +941,11 @@ where
                 let selected = if a_load <= b_load { a } else { b };
 
                 trace!(
-                    a.key = ?a,
+                    a.key = %a.addr_label(self.expose_peer_addresses),
                     a.load = ?a_load,
-                    b.key = ?b,
+                    b.key = %b.addr_label(self.expose_peer_addresses),
                     b.load = ?b_load,
-                    selected = ?selected,
+                    selected = %selected.addr_label(self.expose_peer_addresses),
                     ?len,
                     "selected service by p2c"
                 );
@@ -989,7 +1008,10 @@ where
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
         if let Some(p2c_key) = self.select_ready_p2c_peer() {
-            tracing::trace!(?p2c_key, "routing based on p2c");
+            tracing::trace!(
+                peer = %p2c_key.addr_label(self.expose_peer_addresses),
+                "routing based on p2c"
+            );
 
             let mut svc = self
                 .take_ready_service(&p2c_key)
@@ -1070,7 +1092,11 @@ where
 
         if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
-            tracing::trace!(?hash, ?peer, "routing to a peer which advertised inventory");
+            tracing::trace!(
+                ?hash,
+                peer = %peer.addr_label(self.expose_peer_addresses),
+                "routing to a peer which advertised inventory"
+            );
             metrics::counter!("pool.route_inv.advertiser.count").increment(1);
             let fut = svc.call(req);
             self.push_unready(peer, svc);
@@ -1094,7 +1120,11 @@ where
 
         if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
-            tracing::trace!(?hash, ?peer, "routing to a peer that might have inventory");
+            tracing::trace!(
+                ?hash,
+                peer = %peer.addr_label(self.expose_peer_addresses),
+                "routing to a peer that might have inventory"
+            );
             metrics::counter!("pool.route_inv.maybe.count").increment(1);
             let fut = svc.call(req);
             self.push_unready(peer, svc);

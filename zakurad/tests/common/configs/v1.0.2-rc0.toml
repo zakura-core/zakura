@@ -1,0 +1,151 @@
+# Default configuration for zakurad.
+#
+# This file can be used as a skeleton for custom configs.
+#
+# Unspecified fields use default values. Optional fields are Some(field) if the
+# field is present and None if it is absent.
+#
+# This file is generated as an example using zakurad's current defaults.
+# You should set only the config options you want to keep, and delete the rest.
+# Only a subset of fields are present in the skeleton, since optional values
+# whose default is None are omitted.
+#
+# The config format (including a complete list of sections and fields) is
+# documented here:
+# https://docs.rs/zakura/latest/zakurad/config/struct.ZakuradConfig.html
+#
+# CONFIGURATION SOURCES (in order of precedence, highest to lowest):
+#
+# 1. Environment variables with ZAKURA_ prefix (highest precedence)
+#    - Format: ZAKURA_SECTION__KEY (double underscore for nested keys)
+#    - Examples:
+#      - ZAKURA_NETWORK__NETWORK=Testnet
+#      - ZAKURA_RPC__LISTEN_ADDR=127.0.0.1:8232
+#      - ZAKURA_STATE__CACHE_DIR=/path/to/cache
+#      - ZAKURA_TRACING__FILTER=debug
+#      - ZAKURA_METRICS__ENDPOINT_ADDR=0.0.0.0:9999
+#
+# 2. Environment variables with deprecated ZEBRA_ prefix
+#
+# 3. Configuration file (TOML format)
+#    - At the path specified via -c flag, e.g. `zakurad -c myconfig.toml start`, or
+#    - At the default path in the user's preference directory (platform-dependent, see below)
+#
+# 4. Hard-coded defaults (lowest precedence)
+#
+# The user's preference directory and the default path to the `zakurad` config are platform dependent,
+# based on `dirs::preference_dir`, see https://docs.rs/dirs/latest/dirs/fn.preference_dir.html :
+#
+# | Platform | Value                                 | Example                                        |
+# | -------- | ------------------------------------- | ---------------------------------------------- |
+# | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/zakura.toml`              |
+# | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/zakura.toml` |
+# | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\zakura.toml`     |
+
+[consensus]
+checkpoint_sync = true
+
+[health]
+enforce_on_test_networks = false
+min_connected_peers = 1
+ready_max_blocks_behind = 2
+ready_max_tip_age = "5m"
+
+[mempool]
+eviction_memory_time = "1h"
+max_datacarrier_bytes = 83
+max_transaction_bytes = 250000
+tx_cost_limit = 80000000
+
+[metrics]
+
+[mining]
+internal_miner = false
+
+[network]
+cache_dir = true
+crawl_new_peer_interval = "1m 1s"
+identity_dir = "identity_dir"
+initial_mainnet_peers = [
+    "dnsseed.str4d.xyz:8233",
+    "dnsseed.z.cash:8233",
+    "mainnet.seeder.shieldedinfra.net:8233",
+    "mainnet.seeder.zfnd.org:8233",
+]
+initial_testnet_peers = [
+    "dnsseed.testnet.z.cash:18233",
+    "testnet.seeder.zfnd.org:18233",
+]
+listen_addr = "[::]:8233"
+max_connections_per_ip = 1
+network = "Mainnet"
+# The peer-to-peer stack to run:
+# - "legacy": the legacy TCP Zcash P2P stack only.
+# - "zakura": the experimental native Zakura P2P v2 stack only.
+# - "dual": both stacks, enabling experimental v2 with legacy fallback.
+# - "default": Zakura's default for this network, which can change between
+#   releases. Currently "legacy" on Mainnet, and "dual" everywhere else.
+p2p_stack = "default"
+peerset_initial_target_size = 100
+
+[network.zakura]
+bootstrap_peers = [
+    "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
+    "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@104.131.184.123:8234",
+    "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234",
+    "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22@143.244.184.176:8234",
+    "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57@159.203.38.10:8234",
+    "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5@64.227.44.93:8234",
+    "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1@161.35.156.226:8234",
+    "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234",
+    "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
+]
+listen_addr = "0.0.0.0:8234"
+max_connections = 256
+max_connections_per_ip = 16
+max_pending_handshakes = 32
+message_rate_per_second = 2048
+stream_open_rate_per_second = 32
+
+[rpc]
+cookie_dir = "cache_dir"
+cookie_file_name = ".cookie"
+debug_force_finished_sync = false
+enable_cookie_auth = true
+max_response_body_size = 52428800
+parallel_cpu_threads = 0
+
+[state]
+cache_dir = "cache_dir"
+debug_skip_non_finalized_state_backup_task = false
+delete_old_database = true
+ephemeral = false
+repair_zakura_header_store_on_startup = false
+should_backup_non_finalized_state = true
+storage_mode = "archive"
+
+[sync]
+checkpoint_verify_concurrency_limit = 1000
+download_concurrency_limit = 100
+full_verify_concurrency_limit = 20
+parallel_cpu_threads = 0
+zakura_block_apply_concurrency_limit = 32
+
+[tracing]
+buffer_limit = 128000
+force_use_color = false
+use_color = true
+use_journald = false
+
+[zcashd_compat]
+block_gossip_peer_ips = []
+enabled = false
+manage_zcashd = false
+restart_backoff = "2s"
+restart_backoff_max = "5m"
+restart_reset_after = "1h"
+shutdown_grace_period = "5m"
+startup_delay = "1s"
+zcashd_extra_args = []
+zcashd_source = "path"
+

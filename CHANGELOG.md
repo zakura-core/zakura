@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.0.2-rc0] - 2026-07-19
+
 ### Added
 
 - Add a configurable 250,000-byte default maximum for individual mempool
@@ -15,17 +17,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   validation.
 - Add `zakurad validate-vct-sprout-history` to audit repaired historical
   Sprout anchors in archive or pruned Mainnet state databases.
-
-### Fixed
-
-- Database format upgrades now finish before startup exposes the finalized
-  state database; only configured periodic format checks continue in the
-  background.
-- Preserve Sprout note-commitment history during fresh verified-commitment-tree
-  fast sync, so later JoinSplit spends can use historical anchors. Affected
-  Mainnet databases that previously ran v2 p2p + fast mode require repair at
-  startup from a reviewed trusted artifact, snapshot redownload, or genesis
-  resync.
 
 ### Changed
 
@@ -41,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Database format upgrades now finish before startup exposes the finalized
+  state database; only configured periodic format checks continue in the
+  background.
+- Preserve Sprout note-commitment history during fresh verified-commitment-tree
+  fast sync, so later JoinSplit spends can use historical anchors. Affected
+  Mainnet databases that previously ran v2 p2p + fast mode require repair at
+  startup from a reviewed trusted artifact, snapshot redownload, or genesis
+  resync.
 - Deliver mined/submitted block gossip to peers that were momentarily unready
   when the block was advertised. A block broadcast via `AdvertiseBlockToAll`
   queued a re-send for unready peers, but the queued send future was dropped

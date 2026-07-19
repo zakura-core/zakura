@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+- Add structured legacy peer request traces that attribute `FindBlocks` hash
+  announcements and block download outcomes to privacy-preserving peer IDs,
+  including exact-inventory versus speculative routing and the peer's
+  self-reported handshake height.
 - Reject transactions that do not meet ZIP-317 mempool fee policy before
   running script and proof checks. Block validation is unchanged.
 - Streamline mempool script error handling so invalid scripts are reported as

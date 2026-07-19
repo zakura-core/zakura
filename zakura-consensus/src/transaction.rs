@@ -521,13 +521,14 @@ where
                 check::mempool_standard_input_scripts(tx.as_ref(), &spent_outputs)?;
             }
 
+            let mempool_transaction = req.mempool_transaction();
             let mut miner_fee = None;
-            if let Some(unmined_tx) = req.mempool_transaction() {
+            if let Some(unmined_tx) = mempool_transaction.as_ref() {
                 // Apply ZIP-317 policy before expensive cryptographic verification.
                 // VerifiedUnminedTx::new() repeats this check to preserve its constructor
                 // invariant.
                 let fee = Self::miner_fee(tx.as_ref(), &spent_utxos)?;
-                let unpaid_actions = transaction::zip317::unpaid_actions(&unmined_tx, fee);
+                let unpaid_actions = transaction::zip317::unpaid_actions(unmined_tx, fee);
 
                 transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size)?;
                 miner_fee = Some(fee);
@@ -572,7 +573,7 @@ where
                 )?,
             };
 
-            if let Some(unmined_tx) = req.mempool_transaction() {
+            if let Some(unmined_tx) = mempool_transaction {
                 let check_anchors_and_revealed_nullifiers_query = state
                     .clone()
                     .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(

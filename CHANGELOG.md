@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+- Ban peers that send mempool transactions with invalid Orchard or Ironwood
+  proof sizes.
 - Stop pruned nodes from returning retained chain-index hashes through legacy
   `getblocks` when the corresponding block bodies are no longer serveable.
 - Add structured legacy peer request traces that attribute `FindBlocks` hash

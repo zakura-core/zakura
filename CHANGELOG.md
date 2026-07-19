@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   ([#258](https://github.com/zakura-core/zakura/pull/258)).
 - Shut down a managed zcashd-compat process before Zakura exits on SIGINT or
   SIGTERM.
+- Point snapshot links and benchmark defaults at the Zakura snapshot service.
 - Enable all legacy wallet features by default for supervised zcashd-compat
   processes, while allowing `-allowdeprecated=none` to disable them all.
 - Preserve failed shielded proof/signature verification errors so they receive

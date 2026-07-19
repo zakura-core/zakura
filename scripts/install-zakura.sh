@@ -2461,7 +2461,7 @@ default_data_detection_message() {
       printf 'Please download the Zakura snapshot from the location below if you want a faster sync\n'
     fi
   fi
-  printf '\nhttps://zakura.valargroup.dev/\n\n'
+  printf '\nhttps://zakura.com/snapshots/\n\n'
 }
 
 default_prepare_docker_image() {

@@ -21,9 +21,9 @@
 // Disabled due to warnings in criterion macros
 #![allow(missing_docs)]
 
-use std::io::Cursor;
+use std::{io::Cursor, sync::Arc};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use zakura_chain::{
     block::Block,
@@ -38,6 +38,20 @@ fn first_tx_of_version(block: &Block, version: u32) -> Option<Vec<u8>> {
         .iter()
         .find(|tx| tx.version() == version)
         .map(|tx| tx.zcash_serialize_to_vec().expect("valid transaction"))
+}
+
+/// Extracts the first Orchard-only v5 transaction from a block.
+fn first_v5_orchard_only_tx(block: &Block) -> Option<Arc<Transaction>> {
+    block
+        .transactions
+        .iter()
+        .find(|tx| {
+            tx.version() == 5
+                && !tx.has_transparent_inputs_or_outputs()
+                && !tx.has_sapling_shielded_data()
+                && tx.has_orchard_shielded_data()
+        })
+        .cloned()
 }
 
 fn bench_transaction_deserialize(c: &mut Criterion) {
@@ -114,9 +128,43 @@ fn bench_transaction_deserialize(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_zip244_digests(c: &mut Criterion) {
+    let nu5_blocks = [
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687108_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687113_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687118_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687121_BYTES.as_slice(),
+    ];
+    let tx = nu5_blocks
+        .into_iter()
+        .find_map(|block_bytes| {
+            let block = Block::zcash_deserialize(Cursor::new(block_bytes)).expect("valid block");
+            first_v5_orchard_only_tx(&block)
+        })
+        .expect("vectors contain an Orchard-only v5 tx");
+
+    let mut group = c.benchmark_group("ZIP-244 Digests");
+    group.sample_size(1000);
+
+    group.bench_function("auth_digest/orchard_only", |b| {
+        b.iter(|| {
+            black_box(&tx)
+                .auth_digest()
+                .expect("v5 tx has an auth digest")
+        })
+    });
+
+    group.bench_function("txid_and_auth_digest/orchard_only", |b| {
+        b.iter(|| black_box(&tx).txid_and_auth_digest())
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().noise_threshold(0.1).sample_size(50);
-    targets = bench_transaction_deserialize
+    targets = bench_transaction_deserialize, bench_zip244_digests
 }
 criterion_main!(benches);

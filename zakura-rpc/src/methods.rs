@@ -2562,16 +2562,23 @@ where
                     // Respond instantly with an empty block upon a chain tip change so that
                     // the miner doesn't waste their effort trying to extend a shorter
                     // chain.
-                    return Ok(BlockTemplateResponse::new_internal(
-                        &self.network,
-                        precomputed_coinbase,
-                        miner_params,
-                        &chain_info,
-                        server_long_poll_id,
-                        vec![],
-                        submit_old,
-                    )
-                    .into())
+                    let network = self.network.clone();
+                    let miner_params = miner_params.clone();
+                    let response = tokio::task::spawn_blocking(move || {
+                        BlockTemplateResponse::new_internal(
+                            &network,
+                            precomputed_coinbase,
+                            &miner_params,
+                            &chain_info,
+                            server_long_poll_id,
+                            vec![],
+                            submit_old,
+                        )
+                    })
+                    .await
+                    .expect("block template construction task must complete");
+
+                    return Ok(response.into())
                 }
 
                 // The max time does not elapse during normal operation on mainnet,
@@ -2626,16 +2633,23 @@ where
 
         // - After this point, the template only depends on the previously fetched data.
 
-        Ok(BlockTemplateResponse::new_internal(
-            &self.network,
-            None,
-            miner_params,
-            &chain_info,
-            server_long_poll_id,
-            mempool_txs,
-            submit_old,
-        )
-        .into())
+        let network = self.network.clone();
+        let miner_params = miner_params.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            BlockTemplateResponse::new_internal(
+                &network,
+                None,
+                &miner_params,
+                &chain_info,
+                server_long_poll_id,
+                mempool_txs,
+                submit_old,
+            )
+        })
+        .await
+        .expect("block template construction task must complete");
+
+        Ok(response.into())
     }
 
     async fn submit_block(

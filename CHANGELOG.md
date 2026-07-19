@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Ban peers that send mempool transactions with invalid Orchard or Ironwood
   proof sizes.
+- Parse the bundled Sapling proving parameters once per process and reuse the
+  shared prover, instead of re-parsing the parameters on every
+  `getblocktemplate` refresh.
 - Stop pruned nodes from returning retained chain-index hashes through legacy
   `getblocks` when the corresponding block bodies are no longer serveable.
 - Add structured legacy peer request traces that attribute `FindBlocks` hash

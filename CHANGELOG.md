@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   running script and proof checks. Block validation is unchanged.
 - Streamline mempool script error handling so invalid scripts are reported as
   script verification errors.
+- Shut down a managed zcashd-compat process before Zakura exits on SIGINT or
+  SIGTERM.
 
 ## [1.0.2-rc0] - 2026-07-19
 

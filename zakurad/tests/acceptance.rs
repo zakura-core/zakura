@@ -4598,6 +4598,7 @@ async fn zcashd_compat_transparent_tx_confirms() -> Result<()> {
 /// See [`common::zcashd_compat::resilience::zakurad_clean_shutdown`] for details.
 #[tokio::test]
 #[ignore]
+#[cfg(target_os = "linux")]
 async fn zcashd_compat_zakurad_clean_shutdown() -> Result<()> {
     common::zcashd_compat::resilience::zakurad_clean_shutdown().await
 }

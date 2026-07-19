@@ -25,6 +25,12 @@ STATE_DIR=${1:?usage: publish-release-state.sh <quiesced-zakura-cache-dir>}
 : "${RELEASE_STATE_PUBLIC_BASE:?set RELEASE_STATE_PUBLIC_BASE to the public HTTPS base URL}"
 BIN=${ZAKURA_CHECKPOINTS_BIN:-zakura-checkpoints}
 KEEP=${RELEASE_STATE_KEEP:-4}
+# A zero or malformed KEEP would make `head -n -"$KEEP"` select every bundle,
+# purging the one latest.json points at.
+if ! [[ "$KEEP" =~ ^[1-9][0-9]*$ ]]; then
+    echo "RELEASE_STATE_KEEP must be a positive integer, got: ${KEEP@Q}" >&2
+    exit 1
+fi
 REMOTE_PREFIX="${RELEASE_STATE_R2_REMOTE%/}/release-state"
 
 STAGE=$(mktemp -d)

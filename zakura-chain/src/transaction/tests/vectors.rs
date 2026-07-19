@@ -1090,6 +1090,44 @@ fn test_vec243_3() -> Result<()> {
     Ok(())
 }
 
+/// Non-canonical pre-V5 hash types use masked bits for selection but commit to
+/// the complete raw byte in the signature hash.
+#[test]
+fn v4_raw_noncanonical_sighash_matches_librustzcash() -> Result<()> {
+    const NON_CANONICAL_SIGHASH_ALL: u8 = 0x41;
+
+    let _init_guard = zakura_test::init();
+    let transaction = ZIP243_3.zcash_deserialize_into::<Transaction>()?;
+    let value = hex::decode("80f0fa0200000000")?.zcash_deserialize_into::<Amount<_>>()?;
+    let lock_script = Script::new(&hex::decode(
+        "76a914507173527b4c3318a2aecd793bf1cfed705950cf88ac",
+    )?);
+    let previous_outputs = Arc::new(vec![transparent::Output {
+        value,
+        lock_script: lock_script.clone(),
+    }]);
+
+    let native = SigHasher::new(
+        &transaction,
+        NetworkUpgrade::Sapling,
+        previous_outputs.clone(),
+    )?;
+    let librustzcash =
+        PrecomputedTxData::new(&transaction, NetworkUpgrade::Sapling, previous_outputs)?;
+    let input = Some((0, lock_script.as_raw_bytes().to_vec()));
+
+    assert_eq!(
+        native.sighash_v4_raw(NON_CANONICAL_SIGHASH_ALL, input.clone()),
+        crate::primitives::zcash_primitives::sighash_v4_raw(
+            &librustzcash,
+            NON_CANONICAL_SIGHASH_ALL,
+            input,
+        ),
+    );
+
+    Ok(())
+}
+
 #[test]
 fn zip143_sighash() -> Result<()> {
     let _init_guard = zakura_test::init();

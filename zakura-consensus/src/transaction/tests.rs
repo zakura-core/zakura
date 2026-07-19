@@ -3915,22 +3915,16 @@ fn public_nu6_3_consensus_branch_id_boundary() {
             check::consensus_branch_id(&tx, activation_height, &network),
             Err(TransactionError::WrongConsensusBranchId),
         );
-        assert_eq!(
-            super::is_nu6_3_branch_id_misbehavior_grace_period(
-                &tx,
-                (activation_height + 39).expect("NU6.3 grace period should fit in a height"),
-                &network,
-            ),
-            true,
-        );
-        assert_eq!(
-            super::is_nu6_3_branch_id_misbehavior_grace_period(
-                &tx,
-                (activation_height + 40).expect("NU6.3 grace period should fit in a height"),
-                &network,
-            ),
-            false,
-        );
+        assert!(super::is_nu6_3_branch_id_misbehavior_grace_period(
+            &tx,
+            (activation_height + 39).expect("NU6.3 grace period should fit in a height"),
+            &network,
+        ));
+        assert!(!super::is_nu6_3_branch_id_misbehavior_grace_period(
+            &tx,
+            (activation_height + 40).expect("NU6.3 grace period should fit in a height"),
+            &network,
+        ));
         assert_eq!(
             TransactionError::WrongConsensusBranchIdNu6_3GracePeriod.mempool_misbehavior_score(),
             0,

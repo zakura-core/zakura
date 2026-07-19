@@ -191,7 +191,10 @@ pub use crate::{
         Client, ConnectedAddr, ConnectionInfo, HandshakeError, NotFoundClass, PeerError,
         SharedPeerError,
     },
-    peer_set::{init, init_with_zakura_header_sync},
+    peer_set::{
+        init, init_with_zakura_header_sync,
+        init_with_zakura_header_sync_and_compatibility_pruning_height,
+    },
     policies::RetryLimit,
     protocol::{
         external::{Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE},

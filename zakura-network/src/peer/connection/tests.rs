@@ -6,7 +6,10 @@ use std::{
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     panic,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 
@@ -29,6 +32,18 @@ use crate::{
 
 mod prop;
 mod vectors;
+
+#[test]
+fn compatibility_pruning_watermark_only_advances() {
+    let watermark = Arc::new(AtomicU32::new(10));
+    let configured = Some(watermark.clone());
+
+    super::update_compatibility_pruning_height(&configured, Height(9));
+    assert_eq!(watermark.load(Ordering::Relaxed), 10);
+
+    super::update_compatibility_pruning_height(&configured, Height(11));
+    assert_eq!(watermark.load(Ordering::Relaxed), 11);
+}
 
 /// Test that dropping a peer sender does not require a Tokio timer context.
 #[test]
@@ -165,6 +180,7 @@ fn new_test_connection_with_protection<A>(
         Arc::new(connection_info),
         addr_label,
         Vec::new(),
+        None,
     );
 
     (
@@ -220,6 +236,7 @@ fn new_never_closing_test_connection<A>(
         Arc::new(connection_info),
         addr_label,
         Vec::new(),
+        None,
     );
 
     (connection, client_tx, shared_error_slot)

@@ -7,7 +7,14 @@
 //! And it's unclear if these assumptions match the `zcashd` implementation.
 //! It should be refactored into a cleaner set of request/response pairs (#1515).
 
-use std::{borrow::Cow, collections::HashSet, fmt, pin::Pin, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    fmt,
+    pin::Pin,
+    sync::{atomic::AtomicU32, Arc},
+    time::Instant,
+};
 
 use futures::{future::Either, prelude::*};
 use rand::{seq::SliceRandom, thread_rng, Rng};
@@ -614,6 +621,9 @@ where
     /// service to a request from this connection,
     /// or None if this connection hasn't yet received an overload error.
     last_overload_time: Option<Instant>,
+
+    /// Highest block height served to this compatibility peer.
+    compatibility_pruning_height: Option<Arc<AtomicU32>>,
 }
 
 impl<S, Tx> fmt::Debug for Connection<S, Tx>
@@ -650,6 +660,7 @@ where
         connection_info: Arc<ConnectionInfo>,
         addr_label: String,
         initial_cached_addrs: Vec<MetaAddr>,
+        compatibility_pruning_height: Option<Arc<AtomicU32>>,
     ) -> Self {
         Connection {
             connection_info,
@@ -664,6 +675,7 @@ where
             addr_label,
             last_metrics_state: None,
             last_overload_time: None,
+            compatibility_pruning_height,
         }
     }
 }
@@ -1525,9 +1537,16 @@ where
                 for block in blocks.into_iter() {
                     match block {
                         Available((block, _)) => {
+                            let height = block.coinbase_height();
                             if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
                                 self.fail_with(e).await;
                                 return;
+                            }
+                            if let Some(height) = height {
+                                update_compatibility_pruning_height(
+                                    &self.compatibility_pruning_height,
+                                    height,
+                                );
                             }
                         }
                         Missing(hash) => missing_hashes.push(hash.into()),
@@ -1844,6 +1863,10 @@ where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     fn drop(&mut self) {
+        if let Some(watermark) = &self.compatibility_pruning_height {
+            watermark.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+
         self.shutdown(PeerError::ConnectionDropped);
 
         self.erase_state_metrics();
@@ -1863,4 +1886,11 @@ fn transaction_ids(items: &'_ [InventoryHash]) -> impl Iterator<Item = UnminedTx
 /// Non-block inventory hashes are skipped.
 fn block_hashes(items: &'_ [InventoryHash]) -> impl Iterator<Item = block::Hash> + '_ {
     items.iter().filter_map(InventoryHash::block_hash)
+}
+
+/// Advance the compatibility pruning watermark after serving a block.
+fn update_compatibility_pruning_height(watermark: &Option<Arc<AtomicU32>>, height: block::Height) {
+    if let Some(watermark) = watermark {
+        watermark.fetch_max(height.0, std::sync::atomic::Ordering::Relaxed);
+    }
 }

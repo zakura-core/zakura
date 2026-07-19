@@ -62,7 +62,7 @@ pub use service::{
     chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip, TipAction},
     check,
     finalized_state::FinalizedState,
-    init, init_read_only,
+    init, init_read_only, init_with_compatibility_pruning_height,
     non_finalized_state::NonFinalizedState,
     spawn_init_read_only, validate_vct_sprout_history,
     watch_receiver::WatchReceiver,

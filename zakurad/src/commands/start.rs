@@ -78,7 +78,7 @@ pub(crate) mod zakura;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
-    sync::Arc,
+    sync::{atomic::AtomicU32, Arc},
 };
 
 use abscissa_core::{config, Command, FrameworkError};
@@ -322,6 +322,10 @@ impl StartCmd {
         } else {
             Vec::new()
         };
+        let compatibility_pruning_height = config
+            .zcashd_compat
+            .enabled
+            .then(|| Arc::new(AtomicU32::new(0)));
 
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
@@ -373,14 +377,26 @@ impl StartCmd {
         state_config.vct_fast_sync = config.consensus.vct_fast_sync_enabled();
 
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zakura_state::init(
-                state_config,
-                &config.network.network,
-                max_checkpoint_height,
-                config.sync.checkpoint_verify_concurrency_limit
-                    * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
-            )
-            .await;
+            if let Some(compatibility_pruning_height) = compatibility_pruning_height.clone() {
+                zakura_state::init_with_compatibility_pruning_height(
+                    state_config,
+                    &config.network.network,
+                    max_checkpoint_height,
+                    config.sync.checkpoint_verify_concurrency_limit
+                        * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
+                    compatibility_pruning_height,
+                )
+                .await
+            } else {
+                zakura_state::init(
+                    state_config,
+                    &config.network.network,
+                    max_checkpoint_height,
+                    config.sync.checkpoint_verify_concurrency_limit
+                        * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
+                )
+                .await
+            };
 
         info!("logging database metrics on startup");
         read_only_state_service.log_db_metrics();
@@ -451,7 +467,7 @@ impl StartCmd {
         let advertised_services = Self::advertised_services(&config);
 
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
-            zakura_network::init_with_zakura_header_sync(
+            zakura_network::init_with_zakura_header_sync_and_compatibility_pruning_height(
                 config.network.clone(),
                 inbound,
                 latest_chain_tip.clone(),
@@ -459,6 +475,7 @@ impl StartCmd {
                 advertised_services,
                 zcashd_compat_block_gossip_peer_ips,
                 zakura_header_sync_driver_startup,
+                compatibility_pruning_height,
             )
             .await;
 

@@ -330,6 +330,24 @@ impl StateService {
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
     ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
+        Self::new_with_compatibility_pruning_height(
+            config,
+            network,
+            max_checkpoint_height,
+            checkpoint_verify_concurrency_limit,
+            None,
+        )
+        .await
+    }
+
+    /// Creates a state service with an optional compatibility-peer pruning limit.
+    pub async fn new_with_compatibility_pruning_height(
+        config: Config,
+        network: &Network,
+        max_checkpoint_height: block::Height,
+        checkpoint_verify_concurrency_limit: usize,
+        compatibility_pruning_height: Option<Arc<std::sync::atomic::AtomicU32>>,
+    ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
         let (finalized_state, finalized_tip, timer) = {
             let config = config.clone();
             let network = network.clone();
@@ -346,7 +364,8 @@ impl StateService {
                      state cache directory is writable and not locked by another Zakura instance, \
                      and that there is free disk space",
                 )
-                .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
+                .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config)
+                .with_compatibility_pruning_height(compatibility_pruning_height);
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();
@@ -2231,6 +2250,37 @@ pub async fn init(
             network,
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
+        )
+        .await;
+
+    (
+        BoxService::new(state_service),
+        read_only_state_service,
+        latest_chain_tip,
+        chain_tip_change,
+    )
+}
+
+/// Initialize state with a dynamic compatibility-peer pruning limit.
+pub async fn init_with_compatibility_pruning_height(
+    config: Config,
+    network: &Network,
+    max_checkpoint_height: block::Height,
+    checkpoint_verify_concurrency_limit: usize,
+    compatibility_pruning_height: Arc<std::sync::atomic::AtomicU32>,
+) -> (
+    BoxService<Request, Response, BoxError>,
+    ReadStateService,
+    LatestChainTip,
+    ChainTipChange,
+) {
+    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
+        StateService::new_with_compatibility_pruning_height(
+            config,
+            network,
+            max_checkpoint_height,
+            checkpoint_verify_concurrency_limit,
+            Some(compatibility_pruning_height),
         )
         .await;
 

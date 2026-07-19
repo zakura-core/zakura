@@ -17,7 +17,7 @@
 use std::{
     io::{stderr, stdout, Write},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, LazyLock,
     },
 };
@@ -240,6 +240,10 @@ pub struct FinalizedState {
     /// clones rather than an owned `bool`.
     checkpoint_raw_tx_archive_backlog: Arc<AtomicBool>,
 
+    /// The highest block height observed in requests served to the configured
+    /// compatibility peer. Genesis is the conservative initial watermark.
+    compatibility_pruning_height: Option<Arc<AtomicU32>>,
+
     // Owned State
     //
     // Everything contained in this state must be shared by all clones, or read-only.
@@ -428,6 +432,7 @@ impl FinalizedState {
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
             checkpoint_raw_tx_retention_start: None,
             checkpoint_raw_tx_archive_backlog: Arc::new(AtomicBool::new(false)),
+            compatibility_pruning_height: None,
             db,
             elastic_db,
             elastic_blocks: vec![],
@@ -439,6 +444,7 @@ impl FinalizedState {
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
             checkpoint_raw_tx_retention_start: None,
             checkpoint_raw_tx_archive_backlog: Arc::new(AtomicBool::new(false)),
+            compatibility_pruning_height: None,
             db,
             vct: VctCommitState::new(vct, is_vct_sync_below_last_checkpoint),
         };
@@ -537,6 +543,20 @@ impl FinalizedState {
         self
     }
 
+    /// Limit pruning to heights observed by the configured compatibility peer.
+    pub(crate) fn with_compatibility_pruning_height(
+        mut self,
+        compatibility_pruning_height: Option<Arc<AtomicU32>>,
+    ) -> Self {
+        self.compatibility_pruning_height = compatibility_pruning_height;
+        self
+    }
+
+    /// Returns the exclusive pruning limit allowed by the compatibility peer.
+    fn compatibility_prune_until(&self) -> block::Height {
+        compatibility_prune_until(self.compatibility_pruning_height.as_deref())
+    }
+
     /// Returns `true` when raw transaction bytes should be stored for a
     /// checkpoint-verified block at `height`.
     fn store_checkpoint_raw_transactions(&self, height: block::Height) -> bool {
@@ -564,11 +584,33 @@ impl FinalizedState {
         };
 
         let lowest_retained = self.db.lowest_retained_height();
+        let compatibility_prune_until = self.compatibility_prune_until();
 
         // Checkpoint blocks before the retention start: skip raw transactions,
         // draining any pre-existing archive backlog in bounded chunks first.
         if is_checkpoint && !self.store_checkpoint_raw_transactions(height) {
             let skipped_until = (height + 1).expect("checkpoint block height plus one is valid");
+
+            // A compatibility peer can only request this block after it is
+            // committed, so its watermark normally trails `height`. Store the
+            // current block while still pruning older served blocks.
+            if self.compatibility_pruning_height.is_some() {
+                if let Some((from, until)) = self
+                    .db
+                    .checkpoint_raw_transaction_prune_range(skipped_until)
+                    .and_then(|range| cap_prune_range(range, compatibility_prune_until))
+                {
+                    return RetentionPlan::DrainBacklog {
+                        from,
+                        until,
+                        final_chunk: until == skipped_until,
+                    };
+                }
+
+                if skipped_until > compatibility_prune_until {
+                    return RetentionPlan::Store;
+                }
+            }
 
             if self
                 .checkpoint_raw_tx_archive_backlog
@@ -577,6 +619,7 @@ impl FinalizedState {
                 if let Some((from, until)) = self
                     .db
                     .checkpoint_raw_transaction_prune_range(skipped_until)
+                    .and_then(|range| cap_prune_range(range, compatibility_prune_until))
                 {
                     // The marker can only advance past this block once the
                     // backlog below it is fully drained, so the last chunk (which
@@ -593,6 +636,10 @@ impl FinalizedState {
                 }
             }
 
+            if skipped_until > compatibility_prune_until {
+                return RetentionPlan::Store;
+            }
+
             // No archive backlog left to drain: skip this block's raw
             // transactions and advance the pruning marker so readers know raw
             // data below it may be unavailable.
@@ -605,7 +652,9 @@ impl FinalizedState {
         // Archive-equivalent path for this block (contextual blocks, or
         // checkpoint blocks within the retention window): keep raw transactions
         // and run ordinary online pruning.
-        match ZakuraDb::prune_height_range(height, pruning.tx_retention, lowest_retained) {
+        match ZakuraDb::prune_height_range(height, pruning.tx_retention, lowest_retained)
+            .and_then(|range| cap_prune_range(range, compatibility_prune_until))
+        {
             Some((from, until)) => RetentionPlan::Prune { from, until },
             None => RetentionPlan::Store,
         }
@@ -1538,4 +1587,24 @@ fn compute_checkpoint_raw_tx_retention_start(
     let max_skipped_height = max_checkpoint_height.0.checked_sub(tx_retention)?;
 
     max_skipped_height.checked_add(1).map(block::Height)
+}
+
+/// Returns the exclusive pruning limit for a compatibility watermark.
+fn compatibility_prune_until(watermark: Option<&AtomicU32>) -> block::Height {
+    let Some(watermark) = watermark else {
+        return block::Height(u32::MAX);
+    };
+
+    block::Height(watermark.load(Ordering::Relaxed))
+        .next()
+        .unwrap_or(block::Height(u32::MAX))
+}
+
+/// Caps a half-open pruning range at `prune_until`.
+fn cap_prune_range(
+    (from, until): (block::Height, block::Height),
+    prune_until: block::Height,
+) -> Option<(block::Height, block::Height)> {
+    let until = until.min(prune_until);
+    (from < until).then_some((from, until))
 }

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+- Prevent pruned zcashd-compat nodes from deleting block data ahead of the
+  configured sidecar's observed block-serving watermark.
 - Reject transactions that do not meet ZIP-317 mempool fee policy before
   running script and proof checks. Block validation is unchanged.
 - Streamline mempool script error handling so invalid scripts are reported as

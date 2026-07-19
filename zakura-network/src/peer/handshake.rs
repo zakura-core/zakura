@@ -8,7 +8,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     panic,
     pin::Pin,
-    sync::Arc,
+    sync::{atomic::AtomicU32, Arc},
     task::{Context, Poll},
     time::Duration,
 };
@@ -92,6 +92,9 @@ where
     /// canonicalized for IPv4-mapped matching. Empty when unconfigured.
     protected_peer_ips: Arc<HashSet<IpAddr>>,
 
+    /// Highest block height observed by the configured compatibility peer.
+    compatibility_pruning_height: Option<Arc<AtomicU32>>,
+
     parent_span: Span,
 }
 
@@ -137,6 +140,7 @@ where
             nonces: self.nonces.clone(),
             zakura_handshake_connector: self.zakura_handshake_connector.clone(),
             protected_peer_ips: self.protected_peer_ips.clone(),
+            compatibility_pruning_height: self.compatibility_pruning_height.clone(),
             parent_span: self.parent_span.clone(),
         }
     }
@@ -485,6 +489,7 @@ where
     inv_collector: Option<broadcast::Sender<InventoryChange>>,
     zakura_handshake_connector: Option<ZakuraHandshakeConnector>,
     protected_peer_ips: Option<Arc<HashSet<IpAddr>>>,
+    compatibility_pruning_height: Option<Arc<AtomicU32>>,
     latest_chain_tip: C,
 }
 
@@ -569,6 +574,7 @@ where
             inv_collector: self.inv_collector,
             zakura_handshake_connector: self.zakura_handshake_connector,
             protected_peer_ips: self.protected_peer_ips,
+            compatibility_pruning_height: self.compatibility_pruning_height,
         }
     }
 
@@ -589,6 +595,15 @@ where
     /// exempted and every connection behaves exactly as before.
     pub fn with_protected_peer_ips(mut self, protected_peer_ips: Arc<HashSet<IpAddr>>) -> Self {
         self.protected_peer_ips = Some(protected_peer_ips);
+        self
+    }
+
+    /// Provide a compatibility-peer pruning watermark. Optional.
+    pub fn with_compatibility_pruning_height(
+        mut self,
+        compatibility_pruning_height: Option<Arc<AtomicU32>>,
+    ) -> Self {
+        self.compatibility_pruning_height = compatibility_pruning_height;
         self
     }
 
@@ -640,6 +655,7 @@ where
             nonces,
             zakura_handshake_connector: self.zakura_handshake_connector,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
+            compatibility_pruning_height: self.compatibility_pruning_height,
             parent_span: Span::current(),
         })
     }
@@ -665,6 +681,7 @@ where
             inv_collector: None,
             zakura_handshake_connector: None,
             protected_peer_ips: None,
+            compatibility_pruning_height: None,
             latest_chain_tip: NoChainTip,
         }
     }
@@ -1470,6 +1487,7 @@ where
         let relay = self.relay;
         let minimum_peer_version = self.minimum_peer_version.clone();
         let zakura_handshake_connector = self.zakura_handshake_connector.clone();
+        let compatibility_pruning_height = self.compatibility_pruning_height.clone();
 
         // Whether this peer is exempt from the inbound-overload connection drop.
         // Computed here (not in the future) so only the resulting `bool` is moved
@@ -1553,6 +1571,16 @@ where
                     return Err(err);
                 }
             };
+
+            let compatibility_pruning_height = is_protected_peer
+                .then_some(compatibility_pruning_height)
+                .flatten();
+            if let Some(height) = &compatibility_pruning_height {
+                height.store(
+                    connection_info.remote.start_height.0,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
 
             let remote_services = connection_info.remote.services;
 
@@ -1755,6 +1783,7 @@ where
                 connection_info.clone(),
                 addr_label,
                 alternate_addrs.collect(),
+                compatibility_pruning_height,
             );
 
             let connection_task = tokio::spawn(

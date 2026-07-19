@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add an optional dynamic compatibility-peer height limit for checkpoint and
+  online raw-transaction pruning.
+
 ## [3.0.0-rc0] - 2026-07-19
 
 ### Breaking Changes

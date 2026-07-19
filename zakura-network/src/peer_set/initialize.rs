@@ -145,6 +145,41 @@ where
     S::Future: Send + 'static,
     C: ChainTip + Clone + Send + Sync + 'static,
 {
+    init_with_zakura_header_sync_and_compatibility_pruning_height(
+        config,
+        inbound_service,
+        latest_chain_tip,
+        user_agent,
+        advertised_services,
+        block_gossip_peer_ips,
+        header_sync_driver_startup,
+        None,
+    )
+    .await
+}
+
+/// Initialize a peer set with a compatibility-peer block-serving watermark.
+#[allow(clippy::too_many_arguments)]
+pub async fn init_with_zakura_header_sync_and_compatibility_pruning_height<S, C>(
+    config: Config,
+    inbound_service: S,
+    latest_chain_tip: C,
+    user_agent: String,
+    advertised_services: PeerServices,
+    block_gossip_peer_ips: Vec<IpAddr>,
+    header_sync_driver_startup: Option<crate::zakura::ZakuraHeaderSyncDriverStartup>,
+    compatibility_pruning_height: Option<Arc<std::sync::atomic::AtomicU32>>,
+) -> (
+    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    Arc<std::sync::Mutex<AddressBook>>,
+    mpsc::Sender<(PeerSocketAddr, u32)>,
+    Option<crate::zakura::ZakuraEndpoint>,
+)
+where
+    S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + Sync + 'static,
+    S::Future: Send + 'static,
+    C: ChainTip + Clone + Send + Sync + 'static,
+{
     let (tcp_listener, listen_addr) = if config.legacy_p2p() {
         let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
         (Some(tcp_listener), listen_addr)
@@ -261,6 +296,7 @@ where
             .with_user_agent(user_agent)
             .with_latest_chain_tip(latest_chain_tip.clone())
             .with_protected_peer_ips(protected_peer_ips)
+            .with_compatibility_pruning_height(compatibility_pruning_height)
             .want_transactions(true);
 
         if let Some(zakura_handshake_connector) = zakura_handshake_connector {

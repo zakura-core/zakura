@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Track the highest block served to a configured compatibility peer, seeded by
+  its handshake height and reset when its connection closes.
+
 ### Breaking Changes
 
 - Add an opt-in `Config::expose_peer_addresses` field for unredacted legacy

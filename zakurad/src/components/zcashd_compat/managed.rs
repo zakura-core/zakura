@@ -47,17 +47,20 @@ pub fn zcashd_target_triple() -> Option<&'static str> {
         .map(|_| target)
 }
 
-/// Resolves the effective source for `zcashd`.
+/// Resolves the `zcashd` source selected by configuration.
 pub fn effective_zcashd_source(config: &Config) -> Result<ZcashdBinarySource, Report> {
-    if let Some(path) = config.zcashd_path.clone() {
-        return Ok(ZcashdBinarySource::Path(path));
-    }
-
     match config.zcashd_source {
         ConfigZcashdBinarySource::Embedded => Ok(ZcashdBinarySource::Embedded),
-        ConfigZcashdBinarySource::Path => Err(eyre!(
-            "zcashd_compat.zcashd_source=path requires zcashd_compat.zcashd_path to be set"
-        )),
+        ConfigZcashdBinarySource::Path => config
+            .zcashd_path
+            .clone()
+            .map(ZcashdBinarySource::Path)
+            .ok_or_else(|| {
+                eyre!(
+                    "zcashd_compat.zcashd_source=path requires \
+                     zcashd_compat.zcashd_path to be set"
+                )
+            }),
     }
 }
 
@@ -541,9 +544,23 @@ mod tests {
     };
 
     #[test]
-    fn explicit_zcashd_path_overrides_embedded_source() {
+    fn embedded_source_ignores_explicit_zcashd_path() {
         let config = Config {
             zcashd_source: ConfigZcashdBinarySource::Embedded,
+            zcashd_path: Some("/usr/local/bin/zcashd".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            effective_zcashd_source(&config).expect("source should resolve"),
+            ZcashdBinarySource::Embedded
+        );
+    }
+
+    #[test]
+    fn path_source_uses_explicit_path() {
+        let config = Config {
+            zcashd_source: ConfigZcashdBinarySource::Path,
             zcashd_path: Some("/usr/local/bin/zcashd".into()),
             ..Default::default()
         };

@@ -1316,7 +1316,7 @@ async fn should_restart_sync_returns_false() {
         MockService<zs::Request, zs::Response, PanicAssertion>,
         MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
         MockChainTip,
-    >::should_restart_sync(&err);
+    >::should_restart_sync(&err, false);
     assert!(
         !restart,
         "duplicate commit block errors should NOT trigger sync restart"
@@ -1440,7 +1440,7 @@ fn duplicate_finalized_checkpoint_block_does_not_restart_sync() -> Result<(), cr
         advertiser_addr: None,
     };
 
-    let restart = TestChainSync::should_restart_sync(&err);
+    let restart = TestChainSync::should_restart_sync(&err, false);
 
     assert!(
         !restart,
@@ -1465,7 +1465,7 @@ async fn above_lookahead_does_not_restart_sync() {
         MockService<zs::Request, zs::Response, PanicAssertion>,
         MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
         MockChainTip,
-    >::should_restart_sync(&err);
+    >::should_restart_sync(&err, false);
 
     assert!(
         !restart,
@@ -1484,15 +1484,9 @@ async fn above_lookahead_has_peer_attribution() {
         advertiser_addr: Some(addr),
     };
 
-    let has_addr = match &err {
-        BlockDownloadVerifyError::AboveLookaheadHeightLimit {
-            advertiser_addr, ..
-        } => advertiser_addr.is_some(),
-        _ => false,
-    };
-
-    assert!(
-        has_addr,
+    assert_eq!(
+        err.advertiser_addr(),
+        Some(addr),
         "AboveLookaheadHeightLimit should carry advertiser_addr for peer scoring \
          (GHSA-gvjc-3w7c-92jx fix)"
     );
@@ -1518,14 +1512,14 @@ async fn both_height_limits_do_not_restart_sync() {
         MockService<zs::Request, zs::Response, PanicAssertion>,
         MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
         MockChainTip,
-    >::should_restart_sync(&below);
+    >::should_restart_sync(&below, false);
 
     let restart_above = ChainSync::<
         MockService<zn::Request, zn::Response, PanicAssertion>,
         MockService<zs::Request, zs::Response, PanicAssertion>,
         MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
         MockChainTip,
-    >::should_restart_sync(&above);
+    >::should_restart_sync(&above, false);
 
     assert!(
         !restart_below,
@@ -1552,21 +1546,16 @@ async fn invalid_height_does_not_restart_sync() {
         MockService<zs::Request, zs::Response, PanicAssertion>,
         MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
         MockChainTip,
-    >::should_restart_sync(&err);
+    >::should_restart_sync(&err, false);
 
     assert!(
         !restart,
         "InvalidHeight should NOT trigger sync restart (GHSA-rj6c-83wx-jxf2 fix)"
     );
 
-    let has_addr = match &err {
-        BlockDownloadVerifyError::InvalidHeight {
-            advertiser_addr, ..
-        } => advertiser_addr.is_some(),
-        _ => false,
-    };
-    assert!(
-        has_addr,
+    assert_eq!(
+        err.advertiser_addr(),
+        Some(addr),
         "InvalidHeight should carry advertiser_addr for peer scoring"
     );
 }
@@ -1657,7 +1646,7 @@ async fn not_found_download_restarts_sync() {
         hash: block_hash,
     };
 
-    let restart = TestChainSync::should_restart_sync(&err);
+    let restart = TestChainSync::should_restart_sync(&err, false);
     assert!(
         restart,
         "notfound block downloads should restart sync after queue retries"
@@ -2255,7 +2244,7 @@ async fn empty_block_response_is_retryable_download_failure() {
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
         Height(0),
-        LegacySyncTrace::new(None),
+        LegacySyncTrace::new(None, false),
     );
 
     let block0: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES

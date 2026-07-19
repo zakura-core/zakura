@@ -281,19 +281,14 @@ impl ZakuraDb {
         // The original Mainnet VCT fast path did not persist historical Sprout frontiers.
         // Never expose an affected database unless this writable startup can synchronously
         // complete the authenticated repair.
-        if open_mode.enforces_vct_repair_guard()
+        let prepared_vct_repair = if open_mode.enforces_vct_repair_guard()
             && repair_vct_sprout_history::is_repair_eligible(&db, disk_version_before_open.as_ref())
         {
-            if read_only
-                || upgrades_explicitly_disabled
-                || !repair_vct_sprout_history::artifact_available(&db)
-            {
+            if read_only || upgrades_explicitly_disabled {
                 let reason = if read_only {
                     "read-only databases cannot be repaired"
-                } else if upgrades_explicitly_disabled {
-                    "database format upgrades are disabled"
                 } else {
-                    "the canonical Mainnet Sprout repair artifact is not embedded in this build"
+                    "database format upgrades are disabled"
                 };
                 return Err(StateInitError::VctSproutHistoryRepairRequired {
                     mode: if read_only { "read-only" } else { "writable" },
@@ -301,12 +296,16 @@ impl ZakuraDb {
                 });
             }
 
-            repair_vct_sprout_history::validate_startup_repair(&db).map_err(|error| {
-                StateInitError::VctSproutHistoryRepairInvalid {
-                    reason: error.to_string(),
-                }
-            })?;
-        }
+            Some(
+                repair_vct_sprout_history::prepare_startup_repair(&db).map_err(|error| {
+                    StateInitError::VctSproutHistoryRepairInvalid {
+                        reason: error.to_string(),
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
 
         let zero_location_utxos =
             db.address_utxo_locations(AddressLocation::from_usize(Height(0), 0, 0));
@@ -329,14 +328,18 @@ impl ZakuraDb {
                 .expect("startup header-store repair write failed: RocksDB is unavailable");
         }
 
-        db.run_startup_format_change(format_change);
+        db.run_startup_format_change(format_change, prepared_vct_repair);
 
         Ok(db)
     }
 
     /// Complete the startup format change before exposing the database, then launch only
     /// configured periodic current-format checks in the background.
-    pub fn run_startup_format_change(&mut self, format_change: DbFormatChange) {
+    pub(crate) fn run_startup_format_change(
+        &mut self,
+        format_change: DbFormatChange,
+        prepared_vct_repair: Option<Arc<repair_vct_sprout_history::RepairInput>>,
+    ) {
         if self.debug_skip_format_upgrades {
             return;
         }
@@ -345,7 +348,12 @@ impl ZakuraDb {
         let initial_tip_height = self.finalized_tip_height();
         let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
         format_change
-            .run_format_change_or_check(self, initial_tip_height, &never_cancel_receiver)
+            .run_format_change_or_check(
+                self,
+                initial_tip_height,
+                &never_cancel_receiver,
+                prepared_vct_repair,
+            )
             .expect("startup format change cannot be cancelled");
 
         let format_change_handle =
@@ -509,6 +517,7 @@ impl ZakuraDb {
                             // The initial tip height is not used by the new blocks format check.
                             None,
                             &never_cancel_receiver,
+                            None,
                         )
                         .expect("cancel handle is never used");
                 }

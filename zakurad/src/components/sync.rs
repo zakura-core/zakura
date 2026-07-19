@@ -52,7 +52,7 @@ mod status;
 mod tests;
 
 use downloads::{AlwaysHedge, Downloads, NotFoundKind};
-use legacy_trace::LegacySyncTrace;
+use legacy_trace::{peer_addr_label, LegacySyncTrace};
 
 pub use downloads::VERIFICATION_PIPELINE_SCALING_MULTIPLIER;
 pub use gossip::{gossip_best_tip_block_hashes, BlockGossipError};
@@ -72,6 +72,13 @@ const FANOUT: usize = 3;
 /// We also hedge requests, so we may retry up to twice this many times. Hedged
 /// retries may be concurrent, inner retries are sequential.
 const BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 3;
+
+fn block_error_peer_label(error: &BlockDownloadVerifyError, expose_peer_addresses: bool) -> String {
+    error
+        .advertiser_addr()
+        .map(|addr| peer_addr_label(addr, expose_peer_addresses))
+        .unwrap_or_else(|| "unattributed".to_string())
+}
 
 /// Controls how many times the syncer requeues a required block hash after a peer responds
 /// `notfound` (`NotFoundKind::Response`), before giving up on the round and obtaining fresh tips.
@@ -737,6 +744,9 @@ where
     /// Whether the node is running on regtest. Used to apply a shorter sync restart delay.
     is_regtest: bool,
 
+    /// Whether connected legacy peer address labels in logs are unredacted.
+    expose_peer_addresses: bool,
+
     // Services
     //
     /// A network service which is used to perform ObtainTips and ExtendTips
@@ -909,7 +919,11 @@ where
 
         let (past_lookahead_limit_sender, past_lookahead_limit_receiver) = watch::channel(false);
         let past_lookahead_limit_receiver = zs::WatchReceiver::new(past_lookahead_limit_receiver);
-        let trace = LegacySyncTrace::new(config.network.zakura.trace_dir.clone());
+        let expose_peer_addresses = config.network.expose_peer_addresses;
+        let trace = LegacySyncTrace::new(
+            config.network.zakura.trace_dir.clone(),
+            expose_peer_addresses,
+        );
 
         let downloads = Box::pin(Downloads::new(
             block_network,
@@ -930,6 +944,7 @@ where
             checkpoint_verify_concurrency_limit,
             full_verify_concurrency_limit,
             is_regtest: config.network.network.is_regtest(),
+            expose_peer_addresses,
             tip_network,
             downloads,
             state,
@@ -1345,7 +1360,7 @@ where
                 )
                 .await
                 .map_err(Report::from)?;
-                reserve = Self::handle_hash_response(response)?;
+                reserve = Self::handle_hash_response(response, self.expose_peer_addresses)?;
                 last_progress = Instant::now();
                 continue;
             }
@@ -1695,7 +1710,7 @@ where
         metrics::histogram!("sync.stage.duration_seconds", "stage" => "obtain_tips")
             .record(stage_start.elapsed().as_secs_f64());
 
-        Self::handle_hash_response(response).map_err(Into::into)
+        Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into)
     }
 
     /// Asks peers to extend the given prospective `tips`, returning the newly discovered block
@@ -1884,23 +1899,28 @@ where
                 Ok(Err(fatal_error)) => Err(fatal_error)?,
                 // Handle timeouts and block errors
                 Err(error) | Ok(Ok(Err(error))) => {
+                    let peer = block_error_peer_label(&error, self.expose_peer_addresses);
+
                     if self.is_duplicate_finalized_genesis_error(&error) {
                         info!(
                             ?error,
+                            %peer,
                             "genesis block is already finalized, continuing sync"
                         );
                         return Ok(());
                     }
 
                     // TODO: exit syncer on permanent service errors (NetworkError, VerifierError)
-                    if Self::should_restart_sync(&error) {
+                    if Self::should_restart_sync(&error, self.expose_peer_addresses) {
                         warn!(
                             ?error,
+                            %peer,
                             "could not download or verify genesis block, retrying"
                         );
                     } else {
                         info!(
                             ?error,
+                            %peer,
                             "temporary error downloading or verifying genesis block, retrying"
                         );
                     }
@@ -1940,7 +1960,7 @@ where
         &mut self,
     ) -> Result<Result<(Height, block::Hash), BlockDownloadVerifyError>, Report> {
         let response = self.downloads.download_and_verify(self.genesis_hash).await;
-        Self::handle_response(response).map_err(|e| eyre!(e))?;
+        Self::handle_response(response, self.expose_peer_addresses).map_err(|e| eyre!(e))?;
 
         let response = self.downloads.next().await.expect("downloads is nonempty");
 
@@ -2057,7 +2077,7 @@ where
             Err(_) => {}
         };
 
-        Self::handle_response(response)
+        Self::handle_response(response, self.expose_peer_addresses)
     }
 
     /// Handles a downloaded block response, requeueing required missing block hashes.
@@ -2192,10 +2212,13 @@ where
     #[allow(unknown_lints)]
     fn handle_hash_response(
         response: Result<IndexSet<block::Hash>, BlockDownloadVerifyError>,
+        expose_peer_addresses: bool,
     ) -> Result<IndexSet<block::Hash>, BlockDownloadVerifyError> {
         match response {
             Ok(extra_hashes) => Ok(extra_hashes),
-            Err(_) => Self::handle_response(response).map(|()| IndexSet::new()),
+            Err(_) => {
+                Self::handle_response(response, expose_peer_addresses).map(|()| IndexSet::new())
+            }
         }
     }
 
@@ -2208,12 +2231,13 @@ where
     #[allow(unknown_lints)]
     fn handle_response<T>(
         response: Result<T, BlockDownloadVerifyError>,
+        expose_peer_addresses: bool,
     ) -> Result<(), BlockDownloadVerifyError> {
         match response {
             Ok(_t) => Ok(()),
             Err(error) => {
                 // TODO: exit syncer on permanent service errors (NetworkError, VerifierError)
-                if Self::should_restart_sync(&error) {
+                if Self::should_restart_sync(&error, expose_peer_addresses) {
                     Err(error)
                 } else {
                     Ok(())
@@ -2268,11 +2292,13 @@ where
 
     /// Return if the sync should be restarted based on the given error
     /// from the block downloader and verifier stream.
-    fn should_restart_sync(e: &BlockDownloadVerifyError) -> bool {
+    fn should_restart_sync(e: &BlockDownloadVerifyError, expose_peer_addresses: bool) -> bool {
+        let peer = block_error_peer_label(e, expose_peer_addresses);
+
         match e {
             // Structural matches: downcasts
             BlockDownloadVerifyError::Invalid { error, .. } if error.is_duplicate_request() => {
-                debug!(error = ?e, "block was already verified or committed, possibly from a previous sync run, continuing");
+                debug!(error = ?e, %peer, "block was already verified or committed, possibly from a previous sync run, continuing");
                 false
             }
             BlockDownloadVerifyError::Invalid { error, .. }
@@ -2280,6 +2306,7 @@ where
             {
                 debug!(
                     error = ?e,
+                    %peer,
                     "block was already finalized, possibly from a previous sync run, continuing"
                 );
                 false
@@ -2288,12 +2315,13 @@ where
             // Structural matches: direct
             BlockDownloadVerifyError::CancelledDuringDownload { .. }
             | BlockDownloadVerifyError::CancelledDuringVerification { .. } => {
-                debug!(error = ?e, "block verification was cancelled, continuing");
+                debug!(error = ?e, %peer, "block verification was cancelled, continuing");
                 false
             }
             BlockDownloadVerifyError::BehindTipHeightLimit { .. } => {
                 debug!(
                     error = ?e,
+                    %peer,
                     "block height is behind the current state tip, \
                      assuming the syncer will eventually catch up to the state, continuing"
                 );
@@ -2302,6 +2330,7 @@ where
             BlockDownloadVerifyError::AboveLookaheadHeightLimit { .. } => {
                 debug!(
                     error = ?e,
+                    %peer,
                     "block height is above the lookahead limit, \
                      dropping the block and continuing sync"
                 );
@@ -2310,6 +2339,7 @@ where
             BlockDownloadVerifyError::InvalidHeight { .. } => {
                 debug!(
                     error = ?e,
+                    %peer,
                     "block has no valid height, \
                      dropping the block and continuing sync"
                 );
@@ -2318,6 +2348,7 @@ where
             BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. } => {
                 debug!(
                     error = ?e,
+                    %peer,
                     "queued duplicate block hash for download, \
                      assuming the syncer will eventually resolve duplicates, continuing"
                 );
@@ -2329,6 +2360,7 @@ where
             {
                 warn!(
                     error = ?e,
+                    %peer,
                     "required sync block was not found after retries, restarting sync"
                 );
                 true
@@ -2346,14 +2378,14 @@ where
                 // https://github.com/ZcashFoundation/zebra/issues/2909
                 let err_str = format!("{e:?}");
                 if err_str.contains("NotFound") {
-                    error!(?e,
+                    error!(?e, %peer,
                         "a BlockDownloadVerifyError that should have been filtered out was detected, \
                         which possibly indicates a programming error in the downcast inside \
                         zakurad::components::sync::downloads::Downloads::download_and_verify"
                     )
                 }
 
-                warn!(?e, "error downloading and verifying block");
+                warn!(?e, %peer, "error downloading and verifying block");
                 true
             }
         }

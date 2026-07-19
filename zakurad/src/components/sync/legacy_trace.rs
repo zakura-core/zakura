@@ -8,6 +8,7 @@ use std::{
 use serde_json::{Map, Value};
 use zakura_chain::block::{self, Height};
 use zakura_jsonl_trace::{JsonlTracer, JsonlWriteEvent};
+use zakura_network::PeerSocketAddr;
 
 const TABLE: &str = "legacy_sync";
 const FILE_NAME: &str = "legacy_sync.jsonl";
@@ -31,10 +32,11 @@ pub(super) struct LegacySyncTrace {
     tracer: JsonlTracer,
     node: Arc<str>,
     started: Instant,
+    expose_peer_addresses: bool,
 }
 
 impl LegacySyncTrace {
-    pub(super) fn new(trace_dir: Option<PathBuf>) -> Self {
+    pub(super) fn new(trace_dir: Option<PathBuf>, expose_peer_addresses: bool) -> Self {
         let tracer = trace_dir
             .map(JsonlTracer::spawn)
             .unwrap_or_else(JsonlTracer::noop);
@@ -43,7 +45,13 @@ impl LegacySyncTrace {
             tracer,
             node: zakura_jsonl_trace::node_id().into(),
             started: Instant::now(),
+            expose_peer_addresses,
         }
+    }
+
+    /// Returns a legacy peer address using this trace's configured privacy policy.
+    pub(super) fn peer_label(&self, addr: PeerSocketAddr) -> String {
+        peer_addr_label(addr, self.expose_peer_addresses)
     }
 
     pub(super) fn emit(&self, event: &'static str, build: impl FnOnce(&mut Map<String, Value>)) {
@@ -136,6 +144,15 @@ impl LegacySyncTrace {
     }
 }
 
+/// Returns a legacy peer address using the configured privacy policy.
+pub(super) fn peer_addr_label(addr: PeerSocketAddr, expose_peer_addresses: bool) -> String {
+    if expose_peer_addresses {
+        addr.remove_socket_addr_privacy().to_string()
+    } else {
+        addr.to_string()
+    }
+}
+
 pub(super) fn elapsed_millis(duration: Duration) -> Value {
     Value::from(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }
@@ -169,6 +186,7 @@ mod tests {
             tracer: guard.tracer(),
             node: "test-node".into(),
             started: Instant::now(),
+            expose_peer_addresses: false,
         };
 
         trace.round_start(Some(Height(42)));
@@ -181,5 +199,19 @@ mod tests {
         assert_eq!(event["event"], "round_start");
         assert_eq!(event["node"], "test-node");
         assert_eq!(event["state_tip"], 42);
+    }
+
+    #[test]
+    fn peer_labels_require_explicit_opt_in() {
+        let addr: PeerSocketAddr = "192.0.2.1:8233".parse().expect("valid test address");
+
+        assert_eq!(
+            LegacySyncTrace::new(None, false).peer_label(addr),
+            "v4redacted:8233"
+        );
+        assert_eq!(
+            LegacySyncTrace::new(None, true).peer_label(addr),
+            "192.0.2.1:8233"
+        );
     }
 }

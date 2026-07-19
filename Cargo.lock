@@ -8765,7 +8765,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
 name = "zakura"
-version = "1.0.1"
+version = "1.0.2-rc0"
 dependencies = [
  "abscissa_core",
  "anyhow",
@@ -8855,7 +8855,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "1.1.0"
+version = "1.2.0-rc0"
 dependencies = [
  "bech32",
  "bitflags 2.13.0",
@@ -8925,7 +8925,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "2.0.0"
+version = "3.0.0-rc0"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -8988,7 +8988,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "2.0.0"
+version = "3.0.0-rc0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",
@@ -9036,7 +9036,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "1.0.0"
+version = "1.0.1-rc0"
 dependencies = [
  "color-eyre",
  "jsonrpsee-types",
@@ -9050,7 +9050,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "2.0.0"
+version = "3.0.0-rc0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9120,7 +9120,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "1.0.0"
+version = "1.0.1-rc0"
 dependencies = [
  "hex",
  "lazy_static",
@@ -9138,7 +9138,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "2.0.0"
+version = "3.0.0-rc0"
 dependencies = [
  "bincode",
  "chrono",
@@ -9186,6 +9186,7 @@ dependencies = [
  "zakura-chain",
  "zakura-node-services",
  "zakura-test",
+ "zakura-vct-sprout-history",
 ]
 
 [[package]]
@@ -9251,7 +9252,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "1.0.1"
+version = "1.0.2-rc0"
 dependencies = [
  "color-eyre",
  "hex",
@@ -9271,6 +9272,84 @@ dependencies = [
  "zcash_primitives",
  "zcash_protocol",
 ]
+
+[[package]]
+name = "zakura-vct-sprout-history"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b225824a2cf126446e4608df7ae885dcaa341330e49d671b09f22a40ffa8afd"
+dependencies = [
+ "zakura-vct-sprout-history-part-00",
+ "zakura-vct-sprout-history-part-01",
+ "zakura-vct-sprout-history-part-02",
+ "zakura-vct-sprout-history-part-03",
+ "zakura-vct-sprout-history-part-04",
+ "zakura-vct-sprout-history-part-05",
+ "zakura-vct-sprout-history-part-06",
+ "zakura-vct-sprout-history-part-07",
+ "zakura-vct-sprout-history-part-08",
+ "zakura-vct-sprout-history-part-09",
+]
+
+[[package]]
+name = "zakura-vct-sprout-history-part-00"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b9e97b6df1e94b2e85924605374e7d2cdbcfcb4336d598a5bac9b43ab30587e"
+
+[[package]]
+name = "zakura-vct-sprout-history-part-01"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c486fbeb398f1b5ef3d60ab3052a6ae1abfa50669c46161f3adfda48ed29f556"
+
+[[package]]
+name = "zakura-vct-sprout-history-part-02"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f4b0e664c2cba085d068019ced5e40fa14bc270525a2a9f6b8c8498a29e5d97"
+
+[[package]]
+name = "zakura-vct-sprout-history-part-03"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ac11d3743f3ec0e562f65b3a9419dcf683beeceff8532ff50d44db8c9919600"
+
+[[package]]
+name = "zakura-vct-sprout-history-part-04"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ec02604581e10e94bf198b932cb3435a22673ce0a7700a8243fcc3a5fcb9b3d"
+
+[[package]]
+name = "zakura-vct-sprout-history-part-05"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "146f91379519288a7e3e170260ae4a1ca3ac77e6e22a17014f0fe215ddba8d73"
+
+[[package]]
+name = "zakura-vct-sprout-history-part-06"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f92a0c7ed43b5c02fe6f1f56481381b7573a078296bbca0eeb9a275a86386a8"
+
+[[package]]
+name = "zakura-vct-sprout-history-part-07"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c310a436add618c801ec61e52771984b8ab32a81e42fd58910f729a860313962"
+
+[[package]]
+name = "zakura-vct-sprout-history-part-08"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0642d6e8efcdec7fc45098cb58ab5a94950ddd0b4ee62c815d7e2fcd53cdb301"
+
+[[package]]
+name = "zakura-vct-sprout-history-part-09"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d4c5ef9d7727d9a522a4d0f2f5776ba0c731f08678d56f2ea6fec9a472026c"
 
 [[package]]
 name = "zakura-watchdog"

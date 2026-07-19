@@ -98,6 +98,7 @@ pub trait DiskFormatUpgrade {
 
 fn format_upgrades(
     min_version: Option<Version>,
+    prepared_vct_repair: Option<Arc<repair_vct_sprout_history::RepairInput>>,
 ) -> impl DoubleEndedIterator<Item = Box<dyn DiskFormatUpgrade>> {
     let min_version = move || min_version.clone().unwrap_or(Version::new(0, 0, 0));
 
@@ -124,7 +125,7 @@ fn format_upgrades(
             Version::new(27, 3, 0),
         )),
         Box::new(add_ironwood_tree::Upgrade),
-        Box::new(repair_vct_sprout_history::Upgrade),
+        Box::new(repair_vct_sprout_history::Upgrade::new(prepared_vct_repair)),
     ] as [Box<dyn DiskFormatUpgrade>; 10])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
@@ -133,7 +134,7 @@ fn format_upgrades(
 /// Returns a list of all the major db format versions that can restored from the
 /// previous major database format.
 pub fn restorable_db_versions() -> Vec<u64> {
-    format_upgrades(None)
+    format_upgrades(None, None)
         .filter_map(|upgrade| {
             upgrade
                 .is_reusable_major_upgrade()
@@ -444,6 +445,7 @@ impl DbFormatChange {
                 &db,
                 initial_tip_height,
                 &cancel_receiver,
+                None,
             )?;
         }
     }
@@ -455,6 +457,7 @@ impl DbFormatChange {
         db: &ZakuraDb,
         initial_tip_height: Option<Height>,
         cancel_receiver: &Receiver<CancelFormatChange>,
+        prepared_vct_repair: Option<Arc<repair_vct_sprout_history::RepairInput>>,
     ) -> Result<(), CancelFormatChange> {
         // Mark the database as having finished applying any format upgrades if there are no
         // format upgrades that need to be applied.
@@ -465,7 +468,12 @@ impl DbFormatChange {
         match self {
             // Perform any required upgrades, then mark the state as upgraded.
             Upgrade { .. } => {
-                self.apply_format_upgrade(db, initial_tip_height, cancel_receiver)?;
+                self.apply_format_upgrade(
+                    db,
+                    initial_tip_height,
+                    cancel_receiver,
+                    prepared_vct_repair,
+                )?;
                 db.mark_finished_format_upgrades();
             }
 
@@ -618,6 +626,7 @@ impl DbFormatChange {
         db: &ZakuraDb,
         initial_tip_height: Option<Height>,
         cancel_receiver: &Receiver<CancelFormatChange>,
+        prepared_vct_repair: Option<Arc<repair_vct_sprout_history::RepairInput>>,
     ) -> Result<(), CancelFormatChange> {
         let Upgrade {
             newer_running_version,
@@ -653,7 +662,10 @@ impl DbFormatChange {
         };
 
         // Apply or validate format upgrades
-        for upgrade in format_upgrades(Some(older_disk_version.clone())) {
+        for upgrade in format_upgrades(
+            Some(older_disk_version.clone()),
+            prepared_vct_repair.clone(),
+        ) {
             if upgrade.needs_migration() {
                 let timer = CodeTimer::start();
 
@@ -723,7 +735,7 @@ impl DbFormatChange {
         // Do the quick checks first, so we don't have to do this in every detailed check.
         results.push(Self::format_validity_checks_quick(db));
 
-        for upgrade in format_upgrades(None) {
+        for upgrade in format_upgrades(None, None) {
             results.push(upgrade.validate(db, cancel_receiver)?);
         }
 
@@ -1037,7 +1049,7 @@ fn database_startup_waits_for_format_upgrade() {
 #[test]
 fn format_upgrades_are_in_version_order() {
     let mut last_version = Version::new(0, 0, 0);
-    for upgrade in format_upgrades(None) {
+    for upgrade in format_upgrades(None, None) {
         assert!(upgrade.version() > last_version);
         last_version = upgrade.version();
     }
@@ -1045,7 +1057,7 @@ fn format_upgrades_are_in_version_order() {
 
 #[test]
 fn zakura_header_body_size_cf_upgrade_is_no_migration() {
-    let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 1, 0))).collect();
+    let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 1, 0)), None).collect();
     let upgrade = upgrades
         .iter()
         .find(|upgrade| upgrade.version() == Version::new(27, 2, 0))
@@ -1056,7 +1068,7 @@ fn zakura_header_body_size_cf_upgrade_is_no_migration() {
 
 #[test]
 fn fast_sync_metadata_cf_upgrade_is_no_migration() {
-    let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 2, 0))).collect();
+    let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 2, 0)), None).collect();
     let upgrade = upgrades
         .iter()
         .find(|upgrade| upgrade.version() == Version::new(27, 3, 0))
@@ -1069,7 +1081,7 @@ fn fast_sync_metadata_cf_upgrade_is_no_migration() {
 fn vct_format_changes_include_ironwood_then_sprout_repair() {
     use crate::constants::state_database_format_version_in_code;
 
-    let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
+    let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0)), None).collect();
 
     assert_eq!(upgrades.len(), 2);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));

@@ -63,6 +63,16 @@ impl AdvertiserSource {
     }
 }
 
+fn peer_source_log_label(source: &zn::PeerSource, expose_peer_addresses: bool) -> String {
+    match source {
+        zn::PeerSource::LegacySocket(addr) if expose_peer_addresses => {
+            format!("legacy:{}", addr.remove_socket_addr_privacy())
+        }
+        zn::PeerSource::LegacySocket(_) => "legacy:redacted".to_string(),
+        zn::PeerSource::Zakura(peer_id) => format!("zakura:{peer_id:?}"),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DownloadTask {
     hash: block::Hash,
@@ -146,6 +156,9 @@ where
     //
     /// The configured full verification concurrency limit, after applying the minimum limit.
     full_verify_concurrency_limit: usize,
+
+    /// Whether legacy peer address labels in logs are unredacted.
+    expose_peer_addresses: bool,
 
     // Services
     //
@@ -261,6 +274,7 @@ where
     /// this constructor.
     pub fn new(
         full_verify_concurrency_limit: usize,
+        expose_peer_addresses: bool,
         network: ZN,
         verifier: ZV,
         state: ZS,
@@ -272,6 +286,7 @@ where
 
         Self {
             full_verify_concurrency_limit,
+            expose_peer_addresses,
             network,
             verifier,
             state,
@@ -289,12 +304,21 @@ where
     /// source. Admission is still controlled by the global queue bound and
     /// per-hash dedupe, so valid consecutive blocks from one source are not
     /// dropped solely because an earlier block is still being verified.
-    #[instrument(skip(self, hash), fields(hash = %hash))]
+    #[instrument(
+        skip(self, hash, download_source),
+        fields(hash = %hash, source = tracing::field::Empty)
+    )]
     pub fn download_and_verify(
         &mut self,
         hash: block::Hash,
         download_source: Option<zn::PeerSource>,
     ) -> DownloadAction {
+        let source_label = download_source
+            .as_ref()
+            .map(|source| peer_source_log_label(source, self.expose_peer_addresses))
+            .unwrap_or_else(|| "none".to_string());
+        tracing::Span::current().record("source", source_label.as_str());
+
         if self.cancel_handles.contains_key(&hash) {
             debug!(
                 ?hash,
@@ -330,7 +354,6 @@ where
             if source_count >= source_limit {
                 debug!(
                     ?hash,
-                    ?source,
                     source_count,
                     source_limit,
                     queue_len = self.queue_len(),
@@ -597,11 +620,25 @@ mod tests {
         block::Hash([byte; 32])
     }
 
+    #[test]
+    fn peer_source_log_labels_require_explicit_opt_in() {
+        let source = zn::PeerSource::LegacySocket(
+            "192.0.2.1:8233".parse().expect("valid test peer address"),
+        );
+
+        assert_eq!(peer_source_log_label(&source, false), "legacy:redacted");
+        assert_eq!(
+            peer_source_log_label(&source, true),
+            "legacy:192.0.2.1:8233"
+        );
+    }
+
     fn pending_downloads() -> Downloads<PendingNetwork, PendingVerifier, PendingState> {
         let (_tip_sender, latest_chain_tip, _tip_change) =
             zs::ChainTipSender::new(None, &Network::Mainnet);
         Downloads::new(
             MAX_INBOUND_CONCURRENCY,
+            false,
             BoxCloneService::new(service_fn(|_request| {
                 future::pending::<Result<zn::Response, BoxError>>()
             })),
@@ -721,6 +758,7 @@ mod tests {
             zs::ChainTipSender::new(None, &Network::Mainnet);
         let mut downloads = Downloads::new(
             MIN_CONCURRENCY_LIMIT,
+            false,
             BoxCloneService::new(service_fn(|_request| {
                 future::pending::<Result<zn::Response, BoxError>>()
             })),
@@ -822,6 +860,7 @@ mod tests {
             zs::ChainTipSender::new(None, &Network::Mainnet);
         let mut downloads = Downloads::new(
             MAX_INBOUND_CONCURRENCY,
+            false,
             network,
             verifier,
             BoxCloneService::new(service_fn(|request| async move {
@@ -921,6 +960,7 @@ mod tests {
             zs::ChainTipSender::new(None, &Network::Mainnet);
         let mut downloads = Downloads::new(
             MAX_INBOUND_CONCURRENCY,
+            false,
             BoxCloneService::new(service_fn(move |request| {
                 let network_tx = network_tx.clone();
                 async move {
@@ -1002,6 +1042,7 @@ mod tests {
             zs::ChainTipSender::new(None, &Network::Mainnet);
         let mut downloads = Downloads::new(
             MAX_INBOUND_CONCURRENCY,
+            false,
             network,
             verifier,
             BoxCloneService::new(service_fn(|request| async move {

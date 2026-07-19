@@ -76,6 +76,7 @@
 pub(crate) mod zakura;
 
 use std::{
+    future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::Arc,
@@ -88,6 +89,7 @@ use tokio::{
     pin, select,
     sync::{oneshot, watch},
 };
+use tokio_util::sync::CancellationToken;
 use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
 
@@ -173,6 +175,89 @@ fn check_tcp_slow_start_after_idle() {
 
 fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
     config.v2_p2p()
+}
+
+/// Awaits `future` unless Zakurad receives a shutdown signal first.
+async fn await_or_shutdown<F>(shutdown: &CancellationToken, future: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => None,
+        result = future => Some(result),
+    }
+}
+
+/// Owns a managed zcashd supervisor until startup fails or the node exits.
+struct ManagedZcashdSupervisor {
+    task_handle: tokio::task::JoinHandle<Result<(), Report>>,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_timeout: Option<std::time::Duration>,
+}
+
+impl ManagedZcashdSupervisor {
+    /// Requests managed zcashd shutdown and waits for its supervisor to exit.
+    async fn shutdown(&mut self) {
+        if self.task_handle.is_finished() {
+            debug!("zcashd-compat supervisor task already exited before shutdown");
+        } else if let Some(shutdown_timeout) = self.shutdown_timeout {
+            info!(
+                ?shutdown_timeout,
+                "requesting zcashd-compat supervisor shutdown"
+            );
+            if self.shutdown_tx.send(true).is_err() {
+                warn!("zcashd-compat supervisor shutdown request was not delivered");
+            }
+
+            match tokio::time::timeout(shutdown_timeout, &mut self.task_handle).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => warn!(
+                    ?error,
+                    "zcashd-compat supervisor exited with an error during shutdown"
+                ),
+                Ok(Err(join_error)) => warn!(
+                    ?join_error,
+                    "zcashd-compat supervisor panicked during shutdown"
+                ),
+                Err(_timeout) => {
+                    warn!(
+                        ?shutdown_timeout,
+                        "zcashd-compat supervisor did not finish before shutdown timeout; \
+                         abandoning child process handle"
+                    );
+                    // The supervisor spawns zcashd without kill_on_drop, so this
+                    // abort abandons an already-signalled child rather than
+                    // SIGKILLing it mid-flush.
+                    self.task_handle.abort();
+                }
+            }
+        } else {
+            debug!("aborting zcashd-compat supervisor task without managed child shutdown");
+            self.task_handle.abort();
+        }
+    }
+
+    /// Runs post-sidecar startup and keeps supervision active on success.
+    ///
+    /// A successful `Some` result transfers continued supervision to the caller.
+    /// A shutdown request, error, or catchable panic shuts down the sidecar
+    /// before returning its result or panic payload.
+    async fn run_post_startup<F, T>(
+        &mut self,
+        future: F,
+    ) -> std::thread::Result<Result<Option<T>, Report>>
+    where
+        F: Future<Output = Result<Option<T>, Report>>,
+    {
+        let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
+
+        if !matches!(&result, Ok(Ok(Some(_)))) {
+            self.shutdown().await;
+        }
+
+        result
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -284,7 +369,16 @@ impl StartCmd {
         )
     }
 
-    async fn start(&self) -> Result<(), Report> {
+    async fn start(&self, shutdown: CancellationToken) -> Result<(), Report> {
+        macro_rules! await_startup_or_shutdown {
+            ($future:expr) => {
+                match await_or_shutdown(&shutdown, $future).await {
+                    Some(result) => result,
+                    None => return Ok(()),
+                }
+            };
+        }
+
         check_tcp_slow_start_after_idle();
 
         let config = APPLICATION.config();
@@ -331,13 +425,12 @@ impl StartCmd {
             let zcashd_compat_config = config.zcashd_compat.clone();
             let state_cache_dir = config.state.cache_dir.clone();
             Some(
-                tokio::task::spawn_blocking(move || {
+                await_startup_or_shutdown!(tokio::task::spawn_blocking(move || {
                     zcashd_compat::resolve_zcashd_binary_path(
                         &zcashd_compat_config,
                         &state_cache_dir,
                     )
-                })
-                .await
+                }))
                 .map_err(|err| eyre!("failed to join managed zcashd binary resolver: {err}"))??,
             )
         } else {
@@ -368,14 +461,13 @@ impl StartCmd {
         state_config.vct_fast_sync = config.consensus.vct_fast_sync_enabled();
 
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zakura_state::init(
+            await_startup_or_shutdown!(zakura_state::init(
                 state_config,
                 &config.network.network,
                 max_checkpoint_height,
                 config.sync.checkpoint_verify_concurrency_limit
                     * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
-            )
-            .await;
+            ));
 
         info!("logging database metrics on startup");
         read_only_state_service.log_db_metrics();
@@ -383,11 +475,10 @@ impl StartCmd {
         let (blocksync_throughput_probe, mut blocksync_throughput_completion_rx) =
             if let Some(target_height) = config.sync.debug_blocksync_throughput_target_height {
                 let target_height = block::Height(target_height);
-                let initial_frontiers = query_block_sync_frontiers(
+                let initial_frontiers = await_startup_or_shutdown!(query_block_sync_frontiers(
                     read_only_state_service.clone(),
                     latest_chain_tip.clone(),
-                )
-                .await
+                ))
                 .unwrap_or(zakura_network::zakura::BlockSyncFrontiers {
                     finalized_height: block::Height(0),
                     verified_block_tip: block::Height(0),
@@ -410,13 +501,12 @@ impl StartCmd {
             .service(state_service);
 
         let zakura_header_sync_driver_startup = if config.network.v2_p2p() {
-            Some(
+            Some(await_startup_or_shutdown!(
                 zakura_header_sync_driver_startup(
                     read_only_state_service.clone(),
                     &config.network.network,
                 )
-                .await?,
-            )
+            )?)
         } else {
             None
         };
@@ -445,7 +535,7 @@ impl StartCmd {
         let advertised_services = Self::advertised_services(&config);
 
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
-            zakura_network::init_with_zakura_header_sync(
+            await_startup_or_shutdown!(zakura_network::init_with_zakura_header_sync(
                 config.network.clone(),
                 inbound,
                 latest_chain_tip.clone(),
@@ -453,21 +543,19 @@ impl StartCmd {
                 advertised_services,
                 zcashd_compat_block_gossip_peer_ips,
                 zakura_header_sync_driver_startup,
-            )
-            .await;
+            ));
 
         // Start health server if configured (after sync_status is available)
 
         info!("initializing verifiers");
         let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();
         let (block_verifier_router, tx_verifier, consensus_task_handles, max_checkpoint_height) =
-            zakura_consensus::router::init(
+            await_startup_or_shutdown!(zakura_consensus::router::init(
                 config.consensus.clone(),
                 &config.network.network,
                 state.clone(),
                 tx_verifier_setup_rx,
-            )
-            .await;
+            ));
 
         // Hands off the Zakura bulk-apply pipeline so legacy fallback can drain
         // in-flight applies before driving commits through the same pipeline.
@@ -478,7 +566,7 @@ impl StartCmd {
             if let (Some(header_sync), Some(shutdown), Some(actions)) = (
                 endpoint.header_sync(),
                 endpoint.header_sync_shutdown(),
-                endpoint.take_header_sync_actions().await,
+                await_startup_or_shutdown!(endpoint.take_header_sync_actions()),
             ) {
                 let driver_task = tokio::spawn(
                     drive_zakura_header_sync_actions(
@@ -495,7 +583,7 @@ impl StartCmd {
                     )
                     .in_current_span(),
                 );
-                endpoint.push_header_sync_task(driver_task).await;
+                await_startup_or_shutdown!(endpoint.push_header_sync_task(driver_task));
 
                 let vct_repair_task = tokio::spawn(
                     drive_vct_root_repairs(
@@ -505,11 +593,11 @@ impl StartCmd {
                     )
                     .in_current_span(),
                 );
-                endpoint.push_header_sync_task(vct_repair_task).await;
+                await_startup_or_shutdown!(endpoint.push_header_sync_task(vct_repair_task));
 
                 if let (Some(block_sync), Some(block_actions)) = (
                     endpoint.block_sync(),
-                    endpoint.take_block_sync_actions().await,
+                    await_startup_or_shutdown!(endpoint.take_block_sync_actions()),
                 ) {
                     let block_driver_task = tokio::spawn(
                         drive_block_sync_actions(
@@ -531,7 +619,7 @@ impl StartCmd {
                         )
                         .in_current_span(),
                     );
-                    endpoint.push_block_sync_task(block_driver_task).await;
+                    await_startup_or_shutdown!(endpoint.push_block_sync_task(block_driver_task));
                 }
 
                 let full_block_task = tokio::spawn(
@@ -546,7 +634,7 @@ impl StartCmd {
                     )
                     .in_current_span(),
                 );
-                endpoint.push_header_sync_task(full_block_task).await;
+                await_startup_or_shutdown!(endpoint.push_header_sync_task(full_block_task));
             }
         }
 
@@ -596,7 +684,7 @@ impl StartCmd {
             .send(setup_data)
             .map_err(|_| eyre!("could not send setup data to inbound service"))?;
         // And give it time to clear its queue
-        tokio::task::yield_now().await;
+        await_startup_or_shutdown!(tokio::task::yield_now());
 
         // Create a channel to send mined blocks to the gossip task
         let submit_block_channel = SubmitBlockChannel::new();
@@ -620,8 +708,7 @@ impl StartCmd {
         );
 
         let rpc_task_handle = if config.rpc.listen_addr.is_some() {
-            RpcServer::start(rpc_impl.clone(), config.rpc.clone())
-                .await
+            await_startup_or_shutdown!(RpcServer::start(rpc_impl.clone(), config.rpc.clone()))
                 .expect("server should start")
         } else {
             tokio::spawn(std::future::pending().in_current_span())
@@ -630,8 +717,7 @@ impl StartCmd {
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
         let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
-        let mut zcashd_compat_task_handle = if let Some(resolved_zcashd_path) = resolved_zcashd_path
-        {
+        let zcashd_compat_task_handle = if let Some(resolved_zcashd_path) = resolved_zcashd_path {
             let local_listener = address_book
                 .lock()
                 .expect("unexpected panic in address book mutex guard")
@@ -662,168 +748,224 @@ impl StartCmd {
             tokio::spawn(std::future::pending().in_current_span())
         };
 
-        // TODO: Add a shutdown signal and start the server with `serve_with_incoming_shutdown()` if
-        //       any related unit tests sometimes crash with memory errors
-        let indexer_rpc_task_handle = {
-            if let Some(indexer_listen_addr) = config.rpc.indexer_listen_addr {
-                info!("spawning indexer RPC server");
-                let (indexer_rpc_task_handle, _listen_addr) = zakura_rpc::indexer::server::init(
-                    indexer_listen_addr,
-                    read_only_state_service.clone(),
-                    latest_chain_tip.clone(),
-                    mempool_transaction_subscriber.clone(),
-                )
-                .await
-                .map_err(|err| eyre!(err))?;
-
-                indexer_rpc_task_handle
-            } else {
-                warn!("configure an indexer_listen_addr to start the indexer RPC server");
-                tokio::spawn(std::future::pending().in_current_span())
-            }
+        let mut zcashd_compat_supervisor = ManagedZcashdSupervisor {
+            task_handle: zcashd_compat_task_handle,
+            shutdown_tx: zcashd_compat_shutdown_tx,
+            shutdown_timeout: zcashd_compat_shutdown_timeout,
         };
 
-        // Start concurrent tasks which don't add load to other tasks
-        info!("spawning block gossip task");
-        let block_gossip_task_handle = tokio::spawn(
-            sync::gossip_best_tip_block_hashes(
-                sync_status.clone(),
-                chain_tip_change.clone(),
-                peer_set.clone(),
-                Some(submit_block_channel.receiver()),
-            )
-            .in_current_span(),
-        );
+        let post_start_result = zcashd_compat_supervisor
+            .run_post_startup(async {
+                macro_rules! await_post_startup_or_shutdown {
+                    ($future:expr) => {
+                        match await_or_shutdown(&shutdown, $future).await {
+                            Some(result) => result,
+                            None => return Ok(None),
+                        }
+                    };
+                }
 
-        info!("spawning mempool queue checker task");
-        let mempool_queue_checker_task_handle = mempool::QueueChecker::spawn(mempool.clone());
+                // TODO: Add a shutdown signal and start the server with `serve_with_incoming_shutdown()` if
+                //       any related unit tests sometimes crash with memory errors
+                let indexer_rpc_task_handle = {
+                    if let Some(indexer_listen_addr) = config.rpc.indexer_listen_addr {
+                        info!("spawning indexer RPC server");
+                        let (indexer_rpc_task_handle, _listen_addr) =
+                            await_post_startup_or_shutdown!(zakura_rpc::indexer::server::init(
+                                indexer_listen_addr,
+                                read_only_state_service.clone(),
+                                latest_chain_tip.clone(),
+                                mempool_transaction_subscriber.clone(),
+                            ))
+                            .map_err(|err| eyre!(err))?;
 
-        info!("spawning mempool transaction gossip task");
-        let tx_gossip_task_handle = tokio::spawn(
-            mempool::gossip_mempool_transaction_id(
-                mempool_transaction_subscriber.subscribe(),
-                peer_set.clone(),
-            )
-            .in_current_span(),
-        );
+                        indexer_rpc_task_handle
+                    } else {
+                        warn!("configure an indexer_listen_addr to start the indexer RPC server");
+                        tokio::spawn(std::future::pending().in_current_span())
+                    }
+                };
 
-        info!("spawning delete old databases task");
-        let mut old_databases_task_handle = zakura_state::check_and_delete_old_state_databases(
-            &config.state,
-            &config.network.network,
-        );
-
-        info!("spawning progress logging task");
-        let (chain_tip_metrics_sender, chain_tip_metrics_receiver) =
-            health::ChainTipMetrics::channel();
-        let progress_task_handle = tokio::spawn(
-            show_block_chain_progress(
-                config.network.network.clone(),
-                latest_chain_tip.clone(),
-                sync_status.clone(),
-                chain_tip_metrics_sender,
-            )
-            .in_current_span(),
-        );
-
-        // Start health server if configured
-        info!("initializing health endpoints");
-        let (health_task_handle, _) = health::init(
-            config.health.clone(),
-            config.network.network.clone(),
-            chain_tip_metrics_receiver,
-            sync_status.clone(),
-            address_book.clone(),
-        )
-        .await;
-
-        // Spawn never ending end of support task.
-        info!("spawning end of support checking task");
-        let end_of_support_task_handle = tokio::spawn(
-            sync::end_of_support::start(config.network.network.clone(), latest_chain_tip.clone())
-                .in_current_span(),
-        );
-
-        // Give the inbound service more time to clear its queue,
-        // then start concurrent tasks that can add load to the inbound service
-        // (by opening more peer connections, so those peers send us requests)
-        tokio::task::yield_now().await;
-
-        // The crawler only activates immediately in tests that use mempool debug mode
-        info!("spawning mempool crawler task");
-        let mempool_crawler_task_handle = mempool::Crawler::spawn(
-            &config.mempool,
-            peer_set,
-            mempool.clone(),
-            sync_status.clone(),
-            chain_tip_change.clone(),
-        );
-
-        info!("spawning syncer task");
-        // In regtest, commit the genesis block directly (bypassing the syncer's genesis
-        // download, which requires a connected peer). Then run the syncer normally so
-        // that multi-hop block propagation works: gossiped blocks that arrive out of
-        // order (e.g. only the latest tip hash was gossiped) will be recovered by the
-        // syncer using block locators within REGTEST_SYNC_RESTART_DELAY (2 seconds).
-        //
-        // `debug_skip_regtest_genesis_self_seed` opts a node out of this shortcut so it
-        // downloads genesis from a peer instead, exercising the production
-        // genesis-bootstrap path (e.g. a Zakura-only node fetching genesis over Zakura).
-        if is_regtest
-            && !config.sync.debug_skip_regtest_genesis_self_seed
-            && !syncer
-                .state_contains(config.network.network.genesis_hash())
-                .await?
-        {
-            let genesis_hash = block_verifier_router
-                .clone()
-                .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block()))
-                .await
-                .expect("should validate Regtest genesis block");
-
-            assert_eq!(
-                genesis_hash,
-                config.network.network.genesis_hash(),
-                "validated block hash should match network genesis hash"
-            )
-        }
-        let syncer_task_handle = if use_zakura_block_sync(&config.network) {
-            info!("Zakura block sync is replacing the legacy ChainSync body downloader");
-            // Only dual-stack nodes (Zakura + legacy peers) fall back to legacy ChainSync on a
-            // Zakura stall; a Zakura-only node has no legacy peers to drive body sync. The
-            // fallback resumes legacy ChainSync as the body-sync driver while the Zakura
-            // reactors stay alive as a serving/advertising bridge for zakura-only peers.
-            let legacy_fallback = config.network.v2_p2p() && config.network.legacy_p2p();
-            tokio::spawn(
-                syncer
-                    .bootstrap_genesis_then_pause(
-                        read_only_state_service.clone(),
-                        legacy_fallback,
-                        zakura_block_sync_handoff.clone(),
+                // Start concurrent tasks which don't add load to other tasks
+                info!("spawning block gossip task");
+                let block_gossip_task_handle = tokio::spawn(
+                    sync::gossip_best_tip_block_hashes(
+                        sync_status.clone(),
+                        chain_tip_change.clone(),
+                        peer_set.clone(),
+                        Some(submit_block_channel.receiver()),
                     )
                     .in_current_span(),
-            )
-        } else {
-            tokio::spawn(syncer.sync().in_current_span())
+                );
+
+                info!("spawning mempool queue checker task");
+                let mempool_queue_checker_task_handle =
+                    mempool::QueueChecker::spawn(mempool.clone());
+
+                info!("spawning mempool transaction gossip task");
+                let tx_gossip_task_handle = tokio::spawn(
+                    mempool::gossip_mempool_transaction_id(
+                        mempool_transaction_subscriber.subscribe(),
+                        peer_set.clone(),
+                    )
+                    .in_current_span(),
+                );
+
+                info!("spawning delete old databases task");
+                let old_databases_task_handle = zakura_state::check_and_delete_old_state_databases(
+                    &config.state,
+                    &config.network.network,
+                );
+
+                info!("spawning progress logging task");
+                let (chain_tip_metrics_sender, chain_tip_metrics_receiver) =
+                    health::ChainTipMetrics::channel();
+                let progress_task_handle = tokio::spawn(
+                    show_block_chain_progress(
+                        config.network.network.clone(),
+                        latest_chain_tip.clone(),
+                        sync_status.clone(),
+                        chain_tip_metrics_sender,
+                    )
+                    .in_current_span(),
+                );
+
+                // Start health server if configured
+                info!("initializing health endpoints");
+                let (health_task_handle, _) = await_post_startup_or_shutdown!(health::init(
+                    config.health.clone(),
+                    config.network.network.clone(),
+                    chain_tip_metrics_receiver,
+                    sync_status.clone(),
+                    address_book.clone(),
+                ));
+
+                // Spawn never ending end of support task.
+                info!("spawning end of support checking task");
+                let end_of_support_task_handle = tokio::spawn(
+                    sync::end_of_support::start(
+                        config.network.network.clone(),
+                        latest_chain_tip.clone(),
+                    )
+                    .in_current_span(),
+                );
+
+                // Give the inbound service more time to clear its queue,
+                // then start concurrent tasks that can add load to the inbound service
+                // (by opening more peer connections, so those peers send us requests)
+                await_post_startup_or_shutdown!(tokio::task::yield_now());
+
+                // The crawler only activates immediately in tests that use mempool debug mode
+                info!("spawning mempool crawler task");
+                let mempool_crawler_task_handle = mempool::Crawler::spawn(
+                    &config.mempool,
+                    peer_set,
+                    mempool.clone(),
+                    sync_status.clone(),
+                    chain_tip_change.clone(),
+                );
+
+                info!("spawning syncer task");
+                // In regtest, commit the genesis block directly (bypassing the syncer's genesis
+                // download, which requires a connected peer). Then run the syncer normally so
+                // that multi-hop block propagation works: gossiped blocks that arrive out of
+                // order (e.g. only the latest tip hash was gossiped) will be recovered by the
+                // syncer using block locators within REGTEST_SYNC_RESTART_DELAY (2 seconds).
+                //
+                // `debug_skip_regtest_genesis_self_seed` opts a node out of this shortcut so it
+                // downloads genesis from a peer instead, exercising the production
+                // genesis-bootstrap path (e.g. a Zakura-only node fetching genesis over Zakura).
+                if is_regtest
+                    && !config.sync.debug_skip_regtest_genesis_self_seed
+                    && !await_post_startup_or_shutdown!(
+                        syncer.state_contains(config.network.network.genesis_hash())
+                    )?
+                {
+                    let genesis_hash = await_post_startup_or_shutdown!(block_verifier_router
+                        .clone()
+                        .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block())))
+                    .expect("should validate Regtest genesis block");
+
+                    assert_eq!(
+                        genesis_hash,
+                        config.network.network.genesis_hash(),
+                        "validated block hash should match network genesis hash"
+                    )
+                }
+                let syncer_task_handle = if use_zakura_block_sync(&config.network) {
+                    info!("Zakura block sync is replacing the legacy ChainSync body downloader");
+                    // Only dual-stack nodes (Zakura + legacy peers) fall back to legacy ChainSync on a
+                    // Zakura stall; a Zakura-only node has no legacy peers to drive body sync. The
+                    // fallback resumes legacy ChainSync as the body-sync driver while the Zakura
+                    // reactors stay alive as a serving/advertising bridge for zakura-only peers.
+                    let legacy_fallback = config.network.v2_p2p() && config.network.legacy_p2p();
+                    tokio::spawn(
+                        syncer
+                            .bootstrap_genesis_then_pause(
+                                read_only_state_service.clone(),
+                                legacy_fallback,
+                                zakura_block_sync_handoff.clone(),
+                            )
+                            .in_current_span(),
+                    )
+                } else {
+                    tokio::spawn(syncer.sync().in_current_span())
+                };
+
+                // And finally, spawn the internal Zcash miner, if it is enabled.
+                //
+                // TODO: add a config to enable the miner rather than a feature.
+                #[cfg(feature = "internal-miner")]
+                let miner_task_handle = if config.mining.is_internal_miner_enabled() {
+                    info!("spawning Zcash miner");
+                    components::miner::spawn_init(&config.metrics, rpc_impl)
+                } else {
+                    tokio::spawn(std::future::pending().in_current_span())
+                };
+
+                #[cfg(not(feature = "internal-miner"))]
+                // Spawn a dummy miner task which doesn't do anything and never finishes.
+                let miner_task_handle: tokio::task::JoinHandle<Result<(), Report>> =
+                    tokio::spawn(std::future::pending().in_current_span());
+
+                info!("spawned initial Zakura tasks");
+
+                Ok(Some((
+                    indexer_rpc_task_handle,
+                    block_gossip_task_handle,
+                    mempool_queue_checker_task_handle,
+                    tx_gossip_task_handle,
+                    old_databases_task_handle,
+                    progress_task_handle,
+                    health_task_handle,
+                    end_of_support_task_handle,
+                    mempool_crawler_task_handle,
+                    syncer_task_handle,
+                    miner_task_handle,
+                )))
+            })
+            .await;
+
+        let Some((
+            indexer_rpc_task_handle,
+            block_gossip_task_handle,
+            mempool_queue_checker_task_handle,
+            tx_gossip_task_handle,
+            mut old_databases_task_handle,
+            progress_task_handle,
+            health_task_handle,
+            end_of_support_task_handle,
+            mempool_crawler_task_handle,
+            syncer_task_handle,
+            miner_task_handle,
+        )) = (match post_start_result {
+            Ok(Ok(startup_tasks)) => startup_tasks,
+            Ok(Err(error)) => return Err(error),
+            Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+        })
+        else {
+            return Ok(());
         };
-
-        // And finally, spawn the internal Zcash miner, if it is enabled.
-        //
-        // TODO: add a config to enable the miner rather than a feature.
-        #[cfg(feature = "internal-miner")]
-        let miner_task_handle = if config.mining.is_internal_miner_enabled() {
-            info!("spawning Zcash miner");
-            components::miner::spawn_init(&config.metrics, rpc_impl)
-        } else {
-            tokio::spawn(std::future::pending().in_current_span())
-        };
-
-        #[cfg(not(feature = "internal-miner"))]
-        // Spawn a dummy miner task which doesn't do anything and never finishes.
-        let miner_task_handle: tokio::task::JoinHandle<Result<(), Report>> =
-            tokio::spawn(std::future::pending().in_current_span());
-
-        info!("spawned initial Zakura tasks");
 
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
 
@@ -851,15 +993,21 @@ impl StartCmd {
         pin!(old_databases_task_handle_fused);
 
         // Wait for tasks to finish
-        let mut zcashd_compat_task_finished = false;
         let exit_status = {
-            let zcashd_compat_task_handle_fused = (&mut zcashd_compat_task_handle).fuse();
+            let zcashd_compat_task_handle_fused =
+                (&mut zcashd_compat_supervisor.task_handle).fuse();
             pin!(zcashd_compat_task_handle_fused);
 
             loop {
                 let mut exit_when_task_finishes = true;
 
                 let result = select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    info!("received shutdown signal: asking other tasks to stop");
+                    Ok(())
+                }
+
                 rpc_join_result = &mut rpc_task_handle => {
                     let rpc_server_result = rpc_join_result
                         .expect("unexpected panic in the rpc task");
@@ -954,7 +1102,6 @@ impl StartCmd {
                     .map(|_| info!("miner task exited")),
 
                     zcashd_compat_result = &mut zcashd_compat_task_handle_fused => {
-                        zcashd_compat_task_finished = true;
                         exit_when_task_finishes =
                             Self::zcashd_compat_supervisor_should_exit(zcashd_compat_result);
                         Ok(())
@@ -973,7 +1120,7 @@ impl StartCmd {
             }
         };
 
-        info!("exiting Zebra because an ongoing task exited: asking other tasks to stop");
+        info!("exiting Zebra: asking other tasks to stop");
 
         // ongoing tasks
         rpc_task_handle.abort();
@@ -987,37 +1134,7 @@ impl StartCmd {
         progress_task_handle.abort();
         end_of_support_task_handle.abort();
         miner_task_handle.abort();
-        if zcashd_compat_task_finished {
-            debug!("zcashd-compat supervisor task already exited before shutdown");
-        } else if let Some(zcashd_compat_shutdown_timeout) = zcashd_compat_shutdown_timeout {
-            info!(
-                ?zcashd_compat_shutdown_timeout,
-                "requesting zcashd-compat supervisor shutdown"
-            );
-            if zcashd_compat_shutdown_tx.send(true).is_err() {
-                warn!("zcashd-compat supervisor shutdown request was not delivered");
-            }
-            if tokio::time::timeout(
-                zcashd_compat_shutdown_timeout,
-                &mut zcashd_compat_task_handle,
-            )
-            .await
-            .is_err()
-            {
-                warn!(
-                    ?zcashd_compat_shutdown_timeout,
-                    "zcashd-compat supervisor did not finish before shutdown timeout; \
-                     abandoning child process handle"
-                );
-                // The supervisor spawns zcashd without kill_on_drop, so this
-                // abort abandons an already-signalled child rather than
-                // SIGKILLing it mid-flush.
-                zcashd_compat_task_handle.abort();
-            }
-        } else {
-            debug!("aborting zcashd-compat supervisor task without managed child shutdown");
-            zcashd_compat_task_handle.abort();
-        }
+        zcashd_compat_supervisor.shutdown().await;
 
         // startup tasks
         state_checkpoint_verify_handle.abort();
@@ -1093,7 +1210,7 @@ impl Runnable for StartCmd {
             .take();
 
         rt.expect("runtime should not already be taken")
-            .run(self.start());
+            .run_with_graceful_shutdown(|shutdown| self.start(shutdown));
 
         info!("stopping zakurad");
     }
@@ -1167,15 +1284,127 @@ impl config::Override<ZakuradConfig> for StartCmd {
 
 #[cfg(test)]
 mod tests {
+    use std::{future, time::Duration};
+
     use abscissa_core::config::Override;
     use color_eyre::eyre::eyre;
+    use tokio_util::sync::CancellationToken;
 
-    use super::StartCmd;
+    use super::{await_or_shutdown, ManagedZcashdSupervisor, StartCmd};
     use crate::components::zcashd_compat;
     use crate::config::ZakuradConfig;
     use zakura_network::types::PeerServices;
     use zakura_network::P2pStack;
     use zakura_state::{PruningConfig, StorageMode};
+
+    #[tokio::test]
+    async fn startup_shutdown_interrupts_pending_initialization() {
+        let shutdown = CancellationToken::new();
+        let startup_shutdown = shutdown.clone();
+        let (initialization_started_tx, initialization_started_rx) =
+            tokio::sync::oneshot::channel();
+        let startup_task = tokio::spawn(async move {
+            await_or_shutdown(&startup_shutdown, async move {
+                initialization_started_tx
+                    .send(())
+                    .expect("the test waits for pending initialization to start");
+                future::pending::<()>().await
+            })
+            .await
+        });
+
+        initialization_started_rx
+            .await
+            .expect("pending initialization should start");
+        shutdown.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), startup_task)
+            .await
+            .expect("shutdown should interrupt pending initialization promptly")
+            .expect("startup task should not panic");
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn post_startup_completion_keeps_zcashd_supervisor_running() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor_task = tokio::spawn(async move {
+            shutdown_rx
+                .changed()
+                .await
+                .expect("the startup shutdown request sender remains alive");
+            assert!(*shutdown_rx.borrow_and_update());
+            Ok::<_, color_eyre::Report>(())
+        });
+        let mut supervisor = ManagedZcashdSupervisor {
+            task_handle: supervisor_task,
+            shutdown_tx,
+            shutdown_timeout: Some(Duration::from_secs(1)),
+        };
+
+        let result = supervisor.run_post_startup(async { Ok(Some(())) }).await;
+
+        assert!(matches!(
+            result.expect("post-startup work should not panic"),
+            Ok(Some(()))
+        ));
+        assert!(!supervisor.task_handle.is_finished());
+
+        supervisor.shutdown().await;
+        assert!(supervisor.task_handle.is_finished());
+    }
+
+    #[tokio::test]
+    async fn post_startup_error_requests_zcashd_supervisor_shutdown() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor_task = tokio::spawn(async move {
+            shutdown_rx
+                .changed()
+                .await
+                .expect("the post-startup shutdown request sender remains alive");
+            assert!(*shutdown_rx.borrow_and_update());
+            Ok::<_, color_eyre::Report>(())
+        });
+        let mut supervisor = ManagedZcashdSupervisor {
+            task_handle: supervisor_task,
+            shutdown_tx,
+            shutdown_timeout: Some(Duration::from_secs(1)),
+        };
+
+        let result = supervisor
+            .run_post_startup(async {
+                Err::<Option<()>, _>(eyre!("simulated post-startup failure"))
+            })
+            .await;
+
+        assert!(result.expect("post-startup work should not panic").is_err());
+        assert!(supervisor.task_handle.is_finished());
+    }
+
+    #[tokio::test]
+    async fn post_startup_panic_requests_zcashd_supervisor_shutdown() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor_task = tokio::spawn(async move {
+            shutdown_rx
+                .changed()
+                .await
+                .expect("the post-startup shutdown request sender remains alive");
+            assert!(*shutdown_rx.borrow_and_update());
+            Ok::<_, color_eyre::Report>(())
+        });
+        let mut supervisor = ManagedZcashdSupervisor {
+            task_handle: supervisor_task,
+            shutdown_tx,
+            shutdown_timeout: Some(Duration::from_secs(1)),
+        };
+
+        let result: std::thread::Result<Result<Option<()>, color_eyre::Report>> = supervisor
+            .run_post_startup(async { panic!("simulated post-startup panic") })
+            .await;
+
+        assert!(result.is_err());
+        assert!(supervisor.task_handle.is_finished());
+    }
 
     #[test]
     fn zcashd_compat_advertises_node_network_when_pruned() {

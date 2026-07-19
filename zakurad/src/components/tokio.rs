@@ -14,6 +14,7 @@ use std::{future::Future, time::Duration};
 use abscissa_core::{Component, FrameworkError, Shutdown};
 use color_eyre::Report;
 use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
 
 use crate::prelude::*;
 
@@ -56,6 +57,17 @@ async fn shutdown() {
 /// depend on tokio
 pub(crate) trait RuntimeRun {
     fn run(self, fut: impl Future<Output = Result<(), Report>>);
+
+    /// Runs a root future that performs its own orderly signal shutdown.
+    ///
+    /// The callback receives a cancellation token which is cancelled after
+    /// Zakurad receives SIGINT or SIGTERM. It must then resolve its future
+    /// after completing any cleanup that needs the Tokio runtime to remain
+    /// alive.
+    fn run_with_graceful_shutdown<F, Fut>(self, run: F)
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = Result<(), Report>>;
 }
 
 impl RuntimeRun for Runtime {
@@ -72,22 +84,66 @@ impl RuntimeRun for Runtime {
             }
         });
 
-        // Don't wait for long blocking tasks before shutting down
-        info!(
-            ?TOKIO_SHUTDOWN_TIMEOUT,
-            "waiting for async tokio tasks to shut down"
-        );
-        self.shutdown_timeout(TOKIO_SHUTDOWN_TIMEOUT);
+        finish_runtime(self, result);
+    }
 
-        match result {
-            Ok(()) => {
-                info!("shutting down Zebra");
-            }
-            Err(error) => {
-                warn!(?error, "shutting down Zebra due to an error");
-                APPLICATION.shutdown(Shutdown::Forced);
-            }
+    fn run_with_graceful_shutdown<F, Fut>(self, run: F)
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = Result<(), Report>>,
+    {
+        let graceful_shutdown = CancellationToken::new();
+        let fut = run(graceful_shutdown.clone());
+        let result = self.block_on(run_until_shutdown(fut, shutdown(), graceful_shutdown));
+
+        finish_runtime(self, result);
+    }
+}
+
+/// Shuts down the Tokio runtime after its root future has finished.
+fn finish_runtime(runtime: Runtime, result: Result<(), Report>) {
+    // Don't wait for long blocking tasks before shutting down
+    info!(
+        ?TOKIO_SHUTDOWN_TIMEOUT,
+        "waiting for async tokio tasks to shut down"
+    );
+    runtime.shutdown_timeout(TOKIO_SHUTDOWN_TIMEOUT);
+
+    match result {
+        Ok(()) => {
+            info!("shutting down Zebra");
         }
+        Err(error) => {
+            warn!(?error, "shutting down Zebra due to an error");
+            APPLICATION.shutdown(Shutdown::Forced);
+        }
+    }
+}
+
+/// Waits for a root future or an external shutdown signal.
+///
+/// After receiving a signal, this cancels [`CancellationToken`] and waits for
+/// the root future to complete its cleanup instead of dropping it.
+async fn run_until_shutdown<F, S>(
+    fut: F,
+    shutdown: S,
+    graceful_shutdown: CancellationToken,
+) -> Result<(), Report>
+where
+    F: Future<Output = Result<(), Report>>,
+    S: Future<Output = ()>,
+{
+    tokio::pin!(fut);
+
+    // Always poll the shutdown future first. Otherwise, a busy Zakura
+    // instance could starve shutdown processing and delay cleanup.
+    tokio::select! {
+        biased;
+        _ = shutdown => {
+            graceful_shutdown.cancel();
+            fut.await
+        }
+        result = &mut fut => result,
     }
 }
 
@@ -125,6 +181,41 @@ mod imp {
             "received {}, starting shutdown",
             name,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future;
+
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    use super::run_until_shutdown;
+
+    #[tokio::test]
+    async fn graceful_shutdown_waits_for_root_future_cleanup() {
+        let graceful_shutdown = CancellationToken::new();
+        let root_shutdown = graceful_shutdown.clone();
+        let (cleanup_started_tx, cleanup_started_rx) = oneshot::channel();
+
+        let result = run_until_shutdown(
+            async move {
+                root_shutdown.cancelled().await;
+                cleanup_started_tx
+                    .send(())
+                    .expect("the test keeps the cleanup receiver until the root future exits");
+                Ok(())
+            },
+            future::ready(()),
+            graceful_shutdown,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        cleanup_started_rx
+            .await
+            .expect("the root future should complete cleanup before the runtime exits");
     }
 }
 

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Reject transactions that do not meet ZIP-317 mempool fee policy before
   running script and proof checks. Block validation is unchanged.
+- Stop a managed zcashd-compat sidecar cleanly after Zakura receives SIGINT or
+  SIGTERM, instead of leaving it running and holding its data-directory lock
+  ([#272](https://github.com/zakura-core/zakura/pull/272)).
 
 ## [1.0.2-rc0] - 2026-07-19
 

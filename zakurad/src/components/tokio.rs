@@ -14,6 +14,7 @@ use std::{future::Future, time::Duration};
 use abscissa_core::{Component, FrameworkError, Shutdown};
 use color_eyre::Report;
 use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
 
 use crate::prelude::*;
 
@@ -56,6 +57,12 @@ async fn shutdown() {
 /// depend on tokio
 pub(crate) trait RuntimeRun {
     fn run(self, fut: impl Future<Output = Result<(), Report>>);
+
+    fn run_with_graceful_shutdown<F>(
+        self,
+        run: impl FnOnce(CancellationToken, CancellationToken) -> F,
+    ) where
+        F: Future<Output = Result<(), Report>>;
 }
 
 impl RuntimeRun for Runtime {
@@ -72,22 +79,114 @@ impl RuntimeRun for Runtime {
             }
         });
 
-        // Don't wait for long blocking tasks before shutting down
-        info!(
-            ?TOKIO_SHUTDOWN_TIMEOUT,
-            "waiting for async tokio tasks to shut down"
-        );
-        self.shutdown_timeout(TOKIO_SHUTDOWN_TIMEOUT);
+        finish_runtime(self, result);
+    }
 
-        match result {
-            Ok(()) => {
-                info!("shutting down Zebra");
-            }
-            Err(error) => {
-                warn!(?error, "shutting down Zebra due to an error");
-                APPLICATION.shutdown(Shutdown::Forced);
+    fn run_with_graceful_shutdown<F>(
+        self,
+        run: impl FnOnce(CancellationToken, CancellationToken) -> F,
+    ) where
+        F: Future<Output = Result<(), Report>>,
+    {
+        let shutdown_token = CancellationToken::new();
+        let cleanup_ready = CancellationToken::new();
+        let fut = run(shutdown_token.clone(), cleanup_ready.clone());
+        let result = self.block_on(run_until_shutdown(
+            fut,
+            shutdown(),
+            shutdown_token,
+            cleanup_ready,
+        ));
+
+        finish_runtime(self, result);
+    }
+}
+
+async fn run_until_shutdown(
+    fut: impl Future<Output = Result<(), Report>>,
+    shutdown_signal: impl Future<Output = ()>,
+    shutdown_token: CancellationToken,
+    cleanup_ready: CancellationToken,
+) -> Result<(), Report> {
+    tokio::pin!(fut);
+    tokio::pin!(shutdown_signal);
+
+    tokio::select! {
+        biased;
+        _ = &mut shutdown_signal => {
+            shutdown_token.cancel();
+            if cleanup_ready.is_cancelled() {
+                fut.await
+            } else {
+                Ok(())
             }
         }
+        result = &mut fut => result,
+    }
+}
+
+fn finish_runtime(runtime: Runtime, result: Result<(), Report>) {
+    // Don't wait for long blocking tasks before shutting down
+    info!(
+        ?TOKIO_SHUTDOWN_TIMEOUT,
+        "waiting for async tokio tasks to shut down"
+    );
+    runtime.shutdown_timeout(TOKIO_SHUTDOWN_TIMEOUT);
+
+    match result {
+        Ok(()) => {
+            info!("shutting down Zebra");
+        }
+        Err(error) => {
+            warn!(?error, "shutting down Zebra due to an error");
+            APPLICATION.shutdown(Shutdown::Forced);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future;
+
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn graceful_shutdown_waits_for_root_future_cleanup() {
+        let shutdown = CancellationToken::new();
+        let future_shutdown = shutdown.clone();
+        let cleanup_ready = CancellationToken::new();
+        cleanup_ready.cancel();
+        let (cleanup_tx, cleanup_rx) = oneshot::channel();
+
+        let fut = async move {
+            future_shutdown.cancelled().await;
+            cleanup_tx.send(()).expect("cleanup receiver is open");
+            Ok(())
+        };
+
+        run_until_shutdown(fut, future::ready(()), shutdown, cleanup_ready)
+            .await
+            .expect("shutdown should succeed");
+        cleanup_rx.await.expect("root future ran cleanup");
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_startup_does_not_wait_for_root_future() {
+        let shutdown = CancellationToken::new();
+        let cleanup_ready = CancellationToken::new();
+
+        run_until_shutdown(
+            future::pending(),
+            future::ready(()),
+            shutdown.clone(),
+            cleanup_ready,
+        )
+        .await
+        .expect("shutdown should succeed");
+
+        assert!(shutdown.is_cancelled());
     }
 }
 

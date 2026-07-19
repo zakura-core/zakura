@@ -3,6 +3,9 @@
 use std::io;
 
 use blake2b_simd::{Hash as Blake2bHash, Params, State};
+use zcash_transparent::sighash::{
+    SIGHASH_ALL, SIGHASH_ANYONECANPAY, SIGHASH_MASK, SIGHASH_NONE, SIGHASH_SINGLE,
+};
 
 use super::SigHash;
 use crate::{
@@ -26,11 +29,6 @@ const OVERWINTERED_FLAG: u32 = 1 << 31;
 const V3_VERSION: u32 = 3;
 const V4_VERSION: u32 = 4;
 
-const SIGHASH_MASK: u8 = 0x1f;
-const SIGHASH_ALL: u8 = 0x01;
-const SIGHASH_NONE: u8 = 0x02;
-const SIGHASH_SINGLE: u8 = 0x03;
-const SIGHASH_ANYONECANPAY: u8 = 0x80;
 const ZERO_DIGEST: [u8; 32] = [0; 32];
 
 fn hasher(personalization: &[u8; 16]) -> State {

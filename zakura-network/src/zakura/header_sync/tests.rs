@@ -5,8 +5,8 @@ use super::{
     events::*,
     reactor::*,
     state::{
-        OutstandingPhase, OutstandingRange, RangePriority, RangePurpose, RangeRequest,
-        VctRootRepair, VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME,
+        HeaderSyncCore, OutstandingPhase, OutstandingRange, RangePriority, RangePurpose,
+        RangeRequest, VctRootRepair, VCT_ROOT_REPAIR_BACKOFFS, VCT_ROOT_REPAIR_MAX_WALL_TIME,
     },
     validation::*,
     wire::*,
@@ -14,6 +14,7 @@ use super::{
 use crate::zakura::{
     framed_channel,
     testkit::{TraceCapture, TraceValue},
+    trace::{header_sync_trace as hs_trace, HEADER_SYNC_TABLE},
     FramedSend, HeaderSyncServiceSummary, Peer, Service, ServicePeerDirection, ServicePeerLimits,
     ServicePeerSnapshot, ZakuraConnId, ZakuraHeaderSyncCandidateState, ZAKURA_CAP_HEADER_SYNC,
 };
@@ -506,6 +507,30 @@ fn startup_new_is_passive_until_local_hooks_are_wired() {
     assert!(!startup.inbound_new_block_acceptance_enabled);
 }
 
+#[test]
+fn startup_new_uses_configured_status_refresh_interval() {
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let status_refresh_interval = std::time::Duration::from_secs(17);
+    let startup = HeaderSyncStartup::new(
+        network,
+        anchor,
+        HeaderSyncFrontiers {
+            finalized_height: anchor.0,
+            verified_block_tip: anchor.0,
+            verified_block_hash: anchor.1,
+        },
+        Some(anchor),
+        ZakuraHeaderSyncConfig {
+            status_refresh_interval,
+            ..ZakuraHeaderSyncConfig::default()
+        },
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+
+    assert_eq!(startup.status_refresh_interval, status_refresh_interval);
+}
+
 fn startup_with_timeout(
     network: Network,
     anchor: (block::Height, block::Hash),
@@ -514,6 +539,46 @@ fn startup_with_timeout(
     let mut startup = startup_for(network, anchor, None);
     startup.request_timeout = request_timeout;
     startup
+}
+
+#[test]
+fn startup_rejects_anchor_above_verified_block_tip() {
+    let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
+    let mut startup = startup_for(
+        network,
+        (block::Height(3), checkpoint_hash),
+        Some((block::Height(3), checkpoint_hash)),
+    );
+    startup.frontiers.verified_block_tip = block::Height(0);
+
+    assert!(matches!(
+        HeaderSyncCore::new(&startup),
+        Err(HeaderSyncStartError::AnchorAboveVerifiedBlockTip {
+            anchor_height: block::Height(3),
+            verified_block_tip: block::Height(0),
+        })
+    ));
+}
+
+#[test]
+fn startup_uses_verified_block_tip_when_stored_header_tip_is_stale() {
+    let network = regtest_network();
+    let verified_tip = block::Height(5);
+    let verified_hash = block::Hash([5; 32]);
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(3), block::Hash([3; 32]))),
+    );
+    startup.frontiers.verified_block_tip = verified_tip;
+    startup.frontiers.verified_block_hash = verified_hash;
+
+    let state = HeaderSyncCore::new(&startup).expect("forward-only startup is coherent");
+
+    assert_eq!(
+        (state.best_header_tip, state.best_header_hash),
+        (verified_tip, verified_hash)
+    );
 }
 
 #[tokio::test]
@@ -1611,23 +1676,6 @@ fn request_and_serving_counts_are_clamped_by_byte_budget() {
         inbound_get_headers_count_limit(&config, &Network::Mainnet, LOCAL_MAX_MESSAGE_BYTES, true),
         count_with_roots
     );
-
-    let headers =
-        vec![mainnet_header(&BLOCK_MAINNET_1_BYTES); usize::try_from(count).unwrap() + 100];
-    let body_sizes = vec![0u32; headers.len()];
-    let tree_aux_roots = roots_from_height(block::Height(1), headers.len());
-    let (headers, _body_sizes, _tree_aux_roots) = truncate_headers_to_byte_budget(
-        headers,
-        body_sizes,
-        tree_aux_roots,
-        &Network::Mainnet,
-        LOCAL_MAX_MESSAGE_BYTES,
-    );
-    let message = headers_message(headers);
-    let encoded = encode_correlated(&message).unwrap();
-
-    assert!(encoded.len() <= MAX_HS_MESSAGE_BYTES);
-    assert!(encoded.len() + FRAME_HEADER_BYTES <= LOCAL_MAX_MESSAGE_BYTES as usize);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1772,6 +1820,28 @@ fn vct_repair_episode_enforces_attempt_and_time_bounds() {
     assert!(timed.exhausted);
     assert!(!timed.refresh_exhausted(now));
     assert!(!timed.can_attempt(now));
+}
+
+#[test]
+fn vct_repair_maintenance_ignores_retry_deadline_during_attempt() {
+    let mut repair = VctRootRepair::new(
+        block::Height(1),
+        1,
+        Network::Mainnet.genesis_hash(),
+        vec![(
+            block::Height(1),
+            mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
+        )],
+    )
+    .expect("single-header handoff repair is valid");
+    let retry_deadline = repair.next_attempt_at;
+    let repair_deadline = repair.started_at + VCT_ROOT_REPAIR_MAX_WALL_TIME;
+
+    assert_eq!(repair.next_maintenance_deadline(), retry_deadline);
+
+    repair.mark_attempt(peer(129));
+
+    assert_eq!(repair.next_maintenance_deadline(), repair_deadline);
 }
 
 #[test]
@@ -2494,95 +2564,6 @@ async fn scheduler_fills_v7_outstanding_request_slots() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_uses_inflight_slots_and_matches_reverse_response_ids() {
-    let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
-    let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), checkpoint_hash),
-        Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peer_id = peer(83);
-    let (send, mut recv) = crate::zakura::framed_channel(32);
-    let session = HeaderSyncPeerSession::from_parts_with_direction(
-        peer_id.clone(),
-        ServicePeerDirection::Inbound,
-        send,
-        CancellationToken::new(),
-    );
-    fixture
-        .handle
-        .send(HeaderSyncEvent::PeerConnected(session))
-        .await
-        .unwrap();
-    advertise_tip(
-        &fixture,
-        peer_id.clone(),
-        block::Height(0),
-        block::Height(8),
-        DEFAULT_HS_RANGE,
-        2,
-    )
-    .await;
-
-    let mut starts = HashSet::new();
-    while starts.len() < 2 {
-        if let HeaderSyncAction::SendMessage {
-            peer,
-            msg: HeaderSyncMessage::GetHeaders { start_height, .. },
-            ..
-        } = next_non_query_action(&mut fixture.actions).await
-        {
-            assert_eq!(peer, peer_id);
-            starts.insert(start_height);
-        }
-    }
-    assert_eq!(starts, HashSet::from([block::Height(1), block::Height(4)]));
-
-    let mut request_ids = HashMap::new();
-    while request_ids.len() < 2 {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
-            .await
-            .expect("v7 outbound frame arrives")
-            .expect("v7 stream stays open");
-        let (message, request_id) =
-            HeaderSyncMessage::decode_frame(frame, HeaderSyncDecodeContext::control())
-                .expect("v7 outbound frame decodes");
-        if let HeaderSyncMessage::GetHeaders { start_height, .. } = message {
-            request_ids.insert(
-                start_height,
-                request_id.expect("v7 GetHeaders carries request id"),
-            );
-        }
-    }
-    let backward_id = request_ids[&block::Height(1)];
-
-    fixture
-        .handle
-        .send(HeaderSyncEvent::WireHeaders {
-            peer: peer_id.clone(),
-            session_id: 0,
-            request_id: backward_id,
-            headers: vec![mainnet_header(&BLOCK_MAINNET_1_BYTES); 4],
-            body_sizes: vec![0; 4],
-            tree_aux_roots: roots_from_height(block::Height(1), 4),
-        })
-        .await
-        .unwrap();
-
-    loop {
-        match next_non_query_action(&mut fixture.actions).await {
-            HeaderSyncAction::Misbehavior { peer, reason } => {
-                assert_eq!(peer, peer_id);
-                assert_eq!(reason, HeaderSyncMisbehavior::ResponseTooLong);
-                break;
-            }
-            HeaderSyncAction::SendMessage { .. } => {}
-            action => panic!("unexpected action for reverse v7 response: {action:?}"),
-        }
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn work_queue_assigns_each_forward_range_to_one_peer() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
@@ -2740,7 +2721,7 @@ async fn work_queue_splits_large_ranges_without_duplicate_ownership() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_creates_checkpoint_forward_before_backward_ranges() {
+async fn scheduler_starts_forward_work_above_checkpoint_anchor() {
     let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
     let mut fixture = spawn_test_reactor(startup_for(
         network,
@@ -2779,7 +2760,7 @@ async fn scheduler_creates_checkpoint_forward_before_backward_ranges() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_creates_backward_checkpoint_terminating_ranges() {
+async fn scheduler_does_not_backfill_below_checkpoint_anchor() {
     let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
     let mut fixture = spawn_test_reactor(startup_for(
         network,
@@ -2799,22 +2780,22 @@ async fn scheduler_creates_backward_checkpoint_terminating_ranges() {
     )
     .await;
 
-    loop {
-        if let HeaderSyncAction::SendMessage {
-            msg:
-                HeaderSyncMessage::GetHeaders {
-                    start_height,
-                    count,
-                    want_tree_aux_roots: true,
-                },
-            ..
-        } = next_non_query_action(&mut fixture.actions).await
-        {
-            assert_eq!(start_height, block::Height(1));
-            assert_eq!(count, 3);
-            break;
+    let unexpected_request = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+        loop {
+            if let HeaderSyncAction::SendMessage {
+                msg: HeaderSyncMessage::GetHeaders { start_height, .. },
+                ..
+            } = next_non_query_action(&mut fixture.actions).await
+            {
+                break start_height;
+            }
         }
-    }
+    })
+    .await;
+    assert!(
+        unexpected_request.is_err(),
+        "forward-only header sync must not request ranges below its startup base"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3789,7 +3770,6 @@ async fn full_block_committed_covers_outstanding_height() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: block::Hash([1; 32]),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -4166,11 +4146,7 @@ async fn local_full_block_commit_prevents_later_new_block_regossip() {
     }
     fixture
         .handle
-        .send(HeaderSyncEvent::FullBlockCommitted {
-            height,
-            hash,
-            header: block.header.clone(),
-        })
+        .send(HeaderSyncEvent::FullBlockCommitted { height, hash })
         .await
         .unwrap();
     fixture
@@ -5215,7 +5191,8 @@ async fn tree_aux_height_mismatch_traces_structured_diagnostics() {
 
     capture.flush().await;
     let reader = capture.reader().unwrap();
-    reader.table(HEADER_SYNC_TABLE.table()).assert_row(
+    let header_sync = reader.table(HEADER_SYNC_TABLE.table());
+    header_sync.assert_row(
         hs_trace::HEADER_EVENT_RECEIVED,
         &[
             (
@@ -5229,6 +5206,13 @@ async fn tree_aux_height_mismatch_traces_structured_diagnostics() {
             (hs_trace::LAST_ROOT_HEIGHT, TraceValue::U64(300)),
         ],
     );
+    header_sync.assert_sequence(&[
+        hs_trace::HEADER_EVENT_RECEIVED,
+        hs_trace::HEADER_PEER_VIOLATION,
+        hs_trace::HEADER_PEER_VIOLATION,
+        hs_trace::HEADER_PEER_VIOLATION_RECORDED,
+        hs_trace::HEADER_ACTION_DISPATCHED,
+    ]);
 
     let _ = capture.finish().await.unwrap();
 }
@@ -5273,7 +5257,6 @@ async fn header_sync_jsonl_trace_captures_status_range_dedup_and_violation_recor
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5435,7 +5418,6 @@ async fn header_sync_metrics_record_status_range_new_block_dedup_and_violation()
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5655,7 +5637,6 @@ async fn partial_full_block_coverage_retires_old_request_and_requests_suffix() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5703,7 +5684,6 @@ async fn partial_coverage_recreates_an_interior_hole_before_a_later_batch() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5756,7 +5736,6 @@ async fn partial_coverage_trims_and_commits_an_already_buffered_suffix() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(3),
             hash: mainnet_block(&BLOCK_MAINNET_3_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_3_BYTES),
         })
         .await
         .unwrap();
@@ -5821,7 +5800,6 @@ async fn partially_covered_failed_commit_requeues_its_uncovered_suffix() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -5882,7 +5860,6 @@ async fn buffered_successor_drains_after_full_block_covers_its_predecessor() {
         .send(HeaderSyncEvent::FullBlockCommitted {
             height: block::Height(1),
             hash: mainnet_block(&BLOCK_MAINNET_1_BYTES).hash(),
-            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
         })
         .await
         .unwrap();
@@ -6603,105 +6580,6 @@ async fn truncated_finalized_backfill_commits_valid_prefix_and_requeues_suffix()
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn backward_checkpoint_backfill_accepts_linking_run_as_finalized() {
-    let headers = [
-        mainnet_header(&BLOCK_MAINNET_1_BYTES),
-        mainnet_header(&BLOCK_MAINNET_2_BYTES),
-        mainnet_header(&BLOCK_MAINNET_3_BYTES),
-    ];
-    let checkpoint_hash = block::Hash::from(headers[2].as_ref());
-    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
-    let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), checkpoint_hash),
-        Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peer_id = peer(45);
-
-    connect_peer(&fixture, peer_id.clone()).await;
-    advertise_tip(
-        &fixture,
-        peer_id.clone(),
-        block::Height(0),
-        block::Height(3),
-        DEFAULT_HS_RANGE,
-        1,
-    )
-    .await;
-    let request_id = next_get_headers_request_id(&mut fixture.actions).await;
-
-    send_headers(
-        &fixture,
-        &peer_id,
-        request_id,
-        headers_message(headers.to_vec()),
-    )
-    .await;
-
-    match next_non_query_action(&mut fixture.actions).await {
-        HeaderSyncAction::CommitHeaderRange {
-            peer,
-            start_height,
-            headers,
-            finalized,
-            ..
-        } => {
-            assert_eq!(peer, peer_id);
-            assert_eq!(start_height, block::Height(1));
-            assert_eq!(headers.len(), 3);
-            assert!(finalized);
-        }
-        action => panic!("unexpected action: {action:?}"),
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn checkpoint_backfill_rejects_non_contiguous_run_before_commit() {
-    let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
-    let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), checkpoint_hash),
-        Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peer_id = peer(10);
-
-    connect_peer(&fixture, peer_id.clone()).await;
-    advertise_tip(
-        &fixture,
-        peer_id.clone(),
-        block::Height(0),
-        block::Height(3),
-        DEFAULT_HS_RANGE,
-        1,
-    )
-    .await;
-    let request_id = next_get_headers_request_id(&mut fixture.actions).await;
-
-    send_headers(
-        &fixture,
-        &peer_id,
-        request_id,
-        headers_message_from(
-            block::Height(1),
-            vec![
-                mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
-                mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
-                mainnet_header(&BLOCK_MAINNET_GENESIS_BYTES),
-            ],
-        ),
-    )
-    .await;
-
-    match next_non_query_action(&mut fixture.actions).await {
-        HeaderSyncAction::Misbehavior { peer, reason } => {
-            assert_eq!(peer, peer_id);
-            assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
-        }
-        action => panic!("unexpected action: {action:?}"),
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn header_response_that_does_not_link_to_anchor_is_misbehavior_before_commit() {
     let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
@@ -6729,52 +6607,6 @@ async fn header_response_that_does_not_link_to_anchor_is_misbehavior_before_comm
             block::Height(1),
             vec![mainnet_header(&BLOCK_MAINNET_2_BYTES)],
         ),
-    )
-    .await;
-
-    match next_non_query_action(&mut fixture.actions).await {
-        HeaderSyncAction::Misbehavior { peer, reason } => {
-            assert_eq!(peer, peer_id);
-            assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
-        }
-        action => panic!("unexpected action: {action:?}"),
-    }
-    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn checkpoint_backfill_rejects_checkpoint_hash_mismatch_before_commit() {
-    let headers = [
-        mainnet_header(&BLOCK_MAINNET_1_BYTES),
-        mainnet_header(&BLOCK_MAINNET_2_BYTES),
-        mainnet_header(&BLOCK_MAINNET_3_BYTES),
-    ];
-    let divergent_checkpoint_hash = block::Hash::from(headers[0].as_ref());
-    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), divergent_checkpoint_hash);
-    let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), divergent_checkpoint_hash),
-        Some((block::Height(3), divergent_checkpoint_hash)),
-    ));
-    let peer_id = peer(46);
-
-    connect_peer(&fixture, peer_id.clone()).await;
-    advertise_tip(
-        &fixture,
-        peer_id.clone(),
-        block::Height(0),
-        block::Height(3),
-        DEFAULT_HS_RANGE,
-        1,
-    )
-    .await;
-    let request_id = next_get_headers_request_id(&mut fixture.actions).await;
-
-    send_headers(
-        &fixture,
-        &peer_id,
-        request_id,
-        headers_message(headers.to_vec()),
     )
     .await;
 

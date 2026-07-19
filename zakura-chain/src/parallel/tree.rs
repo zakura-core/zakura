@@ -75,34 +75,22 @@ impl NoteCommitmentTrees {
 
         // Prepare arguments for parallel threads
         let NoteCommitmentTrees {
-            sprout,
             sapling,
             orchard,
             ironwood,
             ..
         } = self.clone();
 
-        let sprout_note_commitments: Vec<_> = block.sprout_note_commitments().cloned().collect();
         let sapling_note_commitments: Vec<_> = block.sapling_note_commitments().cloned().collect();
         let orchard_note_commitments: Vec<_> = block.orchard_note_commitments().cloned().collect();
         let ironwood_note_commitments: Vec<_> =
             block.ironwood_note_commitments().cloned().collect();
 
-        let mut sprout_result = None;
         let mut sapling_result = None;
         let mut orchard_result = None;
         let mut ironwood_result = None;
 
         rayon::in_place_scope_fifo(|scope| {
-            if !sprout_note_commitments.is_empty() {
-                scope.spawn_fifo(|_scope| {
-                    sprout_result = Some(Self::update_sprout_note_commitment_tree(
-                        sprout,
-                        sprout_note_commitments,
-                    ));
-                });
-            }
-
             if !sapling_note_commitments.is_empty() {
                 scope.spawn_fifo(|_scope| {
                     sapling_result = Some(Self::update_sapling_note_commitment_tree(
@@ -131,9 +119,7 @@ impl NoteCommitmentTrees {
             }
         });
 
-        if let Some(sprout_result) = sprout_result {
-            self.sprout = sprout_result?;
-        }
+        self.update_sprout_tree(&block)?;
 
         if let Some(sapling_result) = sapling_result {
             let (sapling, subtree_root) = sapling_result?;
@@ -159,7 +145,23 @@ impl NoteCommitmentTrees {
         Ok(())
     }
 
-    /// Update the sprout note commitment tree.
+    /// Updates the Sprout note commitment tree using the transactions in `block`.
+    ///
+    /// Returns immediately without cloning or recalculating the root when the block has
+    /// no Sprout note commitments.
+    pub fn update_sprout_tree(&mut self, block: &Block) -> Result<(), NoteCommitmentTreeError> {
+        let sprout_note_commitments: Vec<_> = block.sprout_note_commitments().cloned().collect();
+        if sprout_note_commitments.is_empty() {
+            return Ok(());
+        }
+
+        self.sprout =
+            Self::update_sprout_note_commitment_tree(self.sprout.clone(), sprout_note_commitments)?;
+
+        Ok(())
+    }
+
+    /// Update the Sprout note commitment tree.
     /// This method modifies the tree inside the `Arc`, if the `Arc` only has one reference.
     fn update_sprout_note_commitment_tree(
         mut sprout: Arc<sprout::tree::NoteCommitmentTree>,
@@ -289,6 +291,37 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn selective_sprout_update_skips_empty_blocks_and_matches_legacy_update() {
+        let no_joinsplit: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .expect("Mainnet block 1 deserializes");
+        let first_joinsplit: Block = zakura_test::vectors::BLOCK_MAINNET_396_BYTES
+            .zcash_deserialize_into()
+            .expect("Mainnet block 396 deserializes");
+
+        let mut selective = NoteCommitmentTrees::default();
+        let empty = selective.sprout.clone();
+        selective
+            .update_sprout_tree(&no_joinsplit)
+            .expect("an empty Sprout update succeeds");
+        assert!(
+            Arc::ptr_eq(&selective.sprout, &empty),
+            "a block without JoinSplits performs no Sprout clone or update"
+        );
+
+        selective
+            .update_sprout_tree(&first_joinsplit)
+            .expect("the first JoinSplit commitments fit");
+        assert_eq!(selective.sprout.count(), 2);
+
+        let mut legacy = NoteCommitmentTrees::default();
+        legacy
+            .update_trees_parallel(&Arc::new(first_joinsplit))
+            .expect("the legacy all-tree update succeeds");
+        assert_eq!(selective.sprout, legacy.sprout);
+    }
 
     /// `update_trees_parallel` must feed each pool's note commitments to its
     /// own tree, in transaction order, and must not touch unrelated trees.

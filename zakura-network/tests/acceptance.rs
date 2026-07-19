@@ -42,5 +42,6 @@ fn connection_info_types_are_public() {
         local: remote.clone(),
         remote,
         negotiated_version,
+        is_protected_peer: false,
     });
 }

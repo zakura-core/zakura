@@ -1176,6 +1176,13 @@ impl DiskDb {
         self.db.write(batch.batch)
     }
 
+    /// Writes `batch` and synchronizes its write-ahead log before returning.
+    pub(crate) fn write_sync(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
+        let mut options = rocksdb::WriteOptions::default();
+        options.set_sync(true);
+        self.db.write_opt(batch.batch, &options)
+    }
+
     /// Flushes pending writes to SST files.
     pub(crate) fn flush(&self) -> Result<(), rocksdb::Error> {
         self.db.flush()

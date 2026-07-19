@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0-rc0] - 2026-07-19
+
+### Breaking Changes
+
+- `zakura-state` moved to 3.0.0-rc0. State service types appear in this crate's
+  public `init` signatures, so the state major version is part of this crate's
+  API; no APIs defined in this crate changed.
+
+## [2.0.0] - 2026-07-17
+
+### Breaking Changes
+
+- `zakura-state` moved to 2.0.0. State service types appear in this crate's
+  public `init` signatures, so the state major version is part of this crate's
+  API; no APIs defined in this crate changed.
+
 ## [1.0.0] - 2026-07-15
 
 First "stable" release. However, be advised that the API may still greatly

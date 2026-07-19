@@ -18,6 +18,12 @@ pub struct Config {
     /// This corresponds to `mempooltxcostlimit` from [ZIP-401](https://zips.z.cash/zip-0401#specification).
     pub tx_cost_limit: u64,
 
+    /// Maximum serialized size of an individual transaction accepted into the mempool.
+    ///
+    /// Transactions exactly at this limit are accepted. Larger transactions are rejected before
+    /// semantic and contextual verification. This local policy does not affect block validation.
+    pub max_transaction_bytes: u64,
+
     /// The mempool transaction eviction age limit.
     ///
     /// This limits the maximum amount of time evicted transaction IDs stay in
@@ -62,6 +68,7 @@ impl Default for Config {
             //
             // [ZIP-401]: https://zips.z.cash/zip-0401#specification
             tx_cost_limit: 80_000_000,
+            max_transaction_bytes: DEFAULT_MAX_TRANSACTION_BYTES,
             eviction_memory_time: Duration::from_secs(60 * 60),
 
             debug_enable_at_height: None,
@@ -70,6 +77,9 @@ impl Default for Config {
         }
     }
 }
+
+/// Default maximum serialized size of an individual mempool transaction, in bytes.
+pub const DEFAULT_MAX_TRANSACTION_BYTES: u64 = 250_000;
 
 /// Default maximum size of data carrier scripts (OP_RETURN), in bytes.
 ///

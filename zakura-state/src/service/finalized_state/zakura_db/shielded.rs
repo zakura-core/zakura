@@ -37,7 +37,7 @@ use crate::{
         zakura_db::ZakuraDb,
         COMMITMENT_ROOTS_BY_HEIGHT,
     },
-    TransactionLocation,
+    MissingSproutTipTree, TransactionLocation, ValidateContextError,
 };
 
 // Doc-only items
@@ -224,11 +224,16 @@ impl ZakuraDb {
 
     // # Sprout trees
 
-    /// Returns the Sprout note commitment tree of the finalized tip
+    /// Returns the Sprout note commitment tree of the finalized tip,
     /// or the empty tree if the state is empty.
-    pub fn sprout_tree_for_tip(&self) -> Arc<sprout::tree::NoteCommitmentTree> {
+    ///
+    /// Returns an error rather than inventing an empty frontier when a non-empty
+    /// database is missing its persisted Sprout tip.
+    pub fn sprout_tree_for_tip(
+        &self,
+    ) -> Result<Arc<sprout::tree::NoteCommitmentTree>, MissingSproutTipTree> {
         if self.is_empty() {
-            return Arc::<sprout::tree::NoteCommitmentTree>::default();
+            return Ok(Arc::<sprout::tree::NoteCommitmentTree>::default());
         }
 
         let sprout_tree_cf = self.db.cf_handle("sprout_note_commitment_tree").unwrap();
@@ -260,16 +265,10 @@ impl ZakuraDb {
                 .map(|(_key, tree_value): (Height, _)| tree_value);
         }
 
-        sprout_tree.unwrap_or_else(|| {
-            // While a fast sync is in progress (tip below the handoff height), the
-            // sprout tip tree is only written at the handoff; the committer does not
-            // read it before then.
-            assert!(
-                self.finalized_tip_height()
-                    .is_some_and(|tip| self.vct_tree_absent(tip)),
-                "Sprout note commitment tree must exist if there is a finalized tip"
-            );
-            Arc::<sprout::tree::NoteCommitmentTree>::default()
+        sprout_tree.ok_or_else(|| MissingSproutTipTree {
+            tip: self
+                .finalized_tip_height()
+                .expect("the database is non-empty because it passed the empty-state check"),
         })
     }
 
@@ -704,16 +703,18 @@ impl ZakuraDb {
     /// or the empty trees if the state is empty.
     /// Additionally, returns the sapling and orchard subtrees for the finalized tip if
     /// the current subtree is finalizing in the tip, None otherwise.
-    pub fn note_commitment_trees_for_tip(&self) -> NoteCommitmentTrees {
-        NoteCommitmentTrees {
-            sprout: self.sprout_tree_for_tip(),
+    pub fn note_commitment_trees_for_tip(
+        &self,
+    ) -> Result<NoteCommitmentTrees, MissingSproutTipTree> {
+        Ok(NoteCommitmentTrees {
+            sprout: self.sprout_tree_for_tip()?,
             sapling: self.sapling_tree_for_tip(),
             sapling_subtree: self.sapling_subtree_for_tip(),
             orchard: self.orchard_tree_for_tip(),
             orchard_subtree: self.orchard_subtree_for_tip(),
             ironwood: self.ironwood_tree_for_tip(),
             ironwood_subtree: self.ironwood_subtree_for_tip(),
-        }
+        })
     }
 }
 
@@ -795,7 +796,7 @@ impl DiskWriteBatch {
         finalized: &FinalizedBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         fast_write: VctWriteData,
-    ) {
+    ) -> Result<(), ValidateContextError> {
         let FinalizedBlock {
             height,
             treestate:
@@ -840,12 +841,22 @@ impl DiskWriteBatch {
             self.update_vct_sync_marker(zakura_db, handoff);
         }
 
+        let prev_sprout_tree = match prev_note_commitment_trees.as_ref() {
+            Some(prev_trees) => prev_trees.sprout.clone(),
+            None => zakura_db.sprout_tree_for_tip()?,
+        };
+
+        // Sprout is reconstructed even on the VCT fast path because its roots are not
+        // supplied by peers. Persist genesis and every changed root/frontier pair in the
+        // same atomic block batch, while leaving no-JoinSplit blocks write-free.
+        if height.is_min() || prev_sprout_tree != note_commitment_trees.sprout {
+            self.update_sprout_tree(zakura_db, &note_commitment_trees.sprout);
+        }
+
         // POC (verified-commitment-trees) vct path: the committer skipped the
-        // per-block frontier recompute, so `note_commitment_trees` is the frozen
-        // parent frontier. Write only the supplied roots into the anchor set and
+        // modern per-block frontier recompute. Write only the supplied roots into the anchor set and
         // the (already-extended) history tree; skip the per-height Sapling/Orchard
-        // tree CFs and subtrees entirely. The Sprout tree is unchanged below any
-        // modern checkpoint, so it is correctly left untouched here.
+        // tree CFs and subtrees entirely.
         // See docs/design/verified-commitment-trees.md.
         if let Some((sapling_root, orchard_root, ironwood_root)) = fast_write.anchor_roots {
             self.insert_sapling_anchor(zakura_db, &sapling_root);
@@ -866,13 +877,9 @@ impl DiskWriteBatch {
                 &auth_data_root,
             );
             self.update_history_tree(zakura_db, history_tree);
-            return;
+            return Ok(());
         }
 
-        let prev_sprout_tree = prev_note_commitment_trees.as_ref().map_or_else(
-            || zakura_db.sprout_tree_for_tip(),
-            |prev_trees| prev_trees.sprout.clone(),
-        );
         let prev_sapling_tree = prev_note_commitment_trees.as_ref().map_or_else(
             || zakura_db.sapling_tree_for_tip(),
             |prev_trees| prev_trees.sapling.clone(),
@@ -885,11 +892,6 @@ impl DiskWriteBatch {
             || zakura_db.ironwood_tree_for_tip(),
             |prev_trees| prev_trees.ironwood.clone(),
         );
-        // Update the Sprout tree and store its anchor only if it has changed
-        if height.is_min() || prev_sprout_tree != note_commitment_trees.sprout {
-            self.update_sprout_tree(zakura_db, &note_commitment_trees.sprout)
-        }
-
         // Store the Sapling tree, anchor, and any new subtrees only if they have changed
         if height.is_min() || prev_sapling_tree != note_commitment_trees.sapling {
             self.create_sapling_tree(zakura_db, height, &note_commitment_trees.sapling);
@@ -934,6 +936,8 @@ impl DiskWriteBatch {
         );
 
         self.update_history_tree(zakura_db, history_tree);
+
+        Ok(())
     }
 
     // Sprout tree methods
@@ -944,15 +948,33 @@ impl DiskWriteBatch {
         zakura_db: &ZakuraDb,
         tree: &sprout::tree::NoteCommitmentTree,
     ) {
+        self.insert_sprout_anchor(zakura_db, tree);
+        self.update_sprout_tip(zakura_db, tree);
+    }
+
+    /// Inserts one historical Sprout frontier keyed by its anchor.
+    pub fn insert_sprout_anchor(
+        &mut self,
+        zakura_db: &ZakuraDb,
+        tree: &sprout::tree::NoteCommitmentTree,
+    ) {
         let sprout_anchors = zakura_db.db.cf_handle("sprout_anchors").unwrap();
-        let sprout_tree_cf = zakura_db
-            .db
-            .cf_handle("sprout_note_commitment_tree")
-            .unwrap();
 
         // Sprout lookups need all previous trees by their anchors.
         // The root must be calculated first, so it is cached in the database.
         self.zs_insert(&sprout_anchors, tree.root(), tree);
+    }
+
+    /// Replaces the current Sprout tip frontier without changing historical anchors.
+    pub fn update_sprout_tip(
+        &mut self,
+        zakura_db: &ZakuraDb,
+        tree: &sprout::tree::NoteCommitmentTree,
+    ) {
+        let sprout_tree_cf = zakura_db
+            .db
+            .cf_handle("sprout_note_commitment_tree")
+            .unwrap();
         self.zs_insert(&sprout_tree_cf, (), tree);
     }
 
@@ -1294,5 +1316,45 @@ impl DiskWriteBatch {
 
         // TODO: convert zs_delete_range() to take std::ops::RangeBounds
         self.zs_delete_range(&ironwood_subtree_cf, from, to);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::{block, parameters::Network};
+
+    use crate::{
+        constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+        service::finalized_state::{DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE},
+        Config,
+    };
+
+    use super::*;
+
+    #[test]
+    fn missing_sprout_tip_fails_closed() {
+        let db = ZakuraDb::new(
+            &Config::ephemeral(),
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &Network::Mainnet,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .expect("ephemeral database opens");
+        let tip = Height(1);
+        let hash_by_height = db.db().cf_handle("hash_by_height").unwrap();
+        let height_by_hash = db.db().cf_handle("height_by_hash").unwrap();
+        let hash = block::Hash([1; 32]);
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(&hash_by_height, tip, hash);
+        batch.zs_insert(&height_by_hash, hash, tip);
+        db.write_batch(batch)
+            .expect("canonical block index writes succeed");
+
+        assert_eq!(db.sprout_tree_for_tip(), Err(MissingSproutTipTree { tip }));
     }
 }

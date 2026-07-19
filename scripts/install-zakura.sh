@@ -21,14 +21,14 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZAKURA_RELEASE_TAG="v1.0.0"
+ZAKURA_RELEASE_TAG="v1.0.1"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
 # Replaced with the archive checksum by release-binaries.yml before publishing.
-ZAKURA_ARCHIVE_SHA256="19faee68cb442b943a432cd84705e615f753eb4dcbd190416302e256ad3df9df"
+ZAKURA_ARCHIVE_SHA256="6b00a3eacc620f11b05e03ceb572b3dd9ee31eb1465d7a02016cf5ade26530ed"
 ZAKURA_MEMBER="./bin/zakurad"
-ZAKURA_DOCKER_IMAGE="zakuracore/zakura:1.0.0"
-ZAKURA_COMPAT_DOCKER_IMAGE="zakuracore/zakura:zcashd-compat-1.0.0"
+ZAKURA_DOCKER_IMAGE="zakuracore/zakura:1.0.1"
+ZAKURA_COMPAT_DOCKER_IMAGE="zakuracore/zakura:zcashd-compat-1.0.1"
 ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="zakuracore/zakura:zcashd-compat-latest"
 ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
 # Persistent Zakura iroh identity (NodeId secret). Kept outside the state cache so
@@ -41,10 +41,10 @@ ZAKURA_DOCKER_IDENTITY_DIR="/home/zebra/.zakura"
 
 MANIFEST_PATH="$REPO_ROOT/zakurad/zcashd-compat-manifest.json"
 TARGET_TRIPLE="x86_64-pc-linux-gnu"
-ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v1.0.0/zcashd-zebra-compat-v1.0.0-linux-x86_64.tar.gz"
-ZCASHD_RUNTIME_ARCHIVE_SHA256="b861ea94215647a69a944ded7c9d6c7c3dfd836e54e3e194103242935e6879f2"
+ZCASHD_RUNTIME_ARCHIVE_URL="https://github.com/valargroup/zcashd/releases/download/v1.0.1/zcashd-zebra-compat-v1.0.1-linux-x86_64.tar.gz"
+ZCASHD_RUNTIME_ARCHIVE_SHA256="92bdb38ce3c602ebefda0ba9afb47130f9eb034012c811d0f5d159d10db247e9"
 ZCASHD_RUNTIME_ARCHIVE_MEMBER_BINARY_PATH="./bin/zcashd"
-ZCASHD_DEFAULT_DOCKER_IMAGE="zakuracore/zcashd:v1.0.0"
+ZCASHD_DEFAULT_DOCKER_IMAGE="zakuracore/zcashd:v1.0.1"
 
 INSTALL_PROFILE=""
 MODE=""

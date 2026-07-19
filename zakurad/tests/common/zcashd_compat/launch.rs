@@ -127,6 +127,13 @@ pub fn send_signal(pid: u32, signal: &str) -> Result<()> {
 /// Spawns a fresh regtest zakurad that supervises a zcashd-compat zcashd process,
 /// waits for both to be ready, and returns the test setup.
 pub async fn spawn_zakurad_with_zcashd_compat() -> Result<ZcashdCompatSetup> {
+    spawn_zakurad_with_zcashd_compat_config(|_| {}).await
+}
+
+/// Spawns a managed regtest setup after applying `configure` to zakurad's config.
+pub async fn spawn_zakurad_with_zcashd_compat_config(
+    configure: impl FnOnce(&mut zakurad::config::ZakuradConfig),
+) -> Result<ZcashdCompatSetup> {
     let _init_guard = zakura_test::init();
 
     let dir = testdir()?;
@@ -134,6 +141,7 @@ pub async fn spawn_zakurad_with_zcashd_compat() -> Result<ZcashdCompatSetup> {
 
     let compat_cfg: ZcashdCompatConfig = build_zcashd_compat_config(work_dir)?;
     let mut zakurad_config = compat_cfg.zakurad_config;
+    configure(&mut zakurad_config);
 
     let zakura_rpc_addr = compat_cfg.zakura_rpc_addr;
     let zcashd_own_rpc_addr = compat_cfg.zcashd_own_rpc_addr;

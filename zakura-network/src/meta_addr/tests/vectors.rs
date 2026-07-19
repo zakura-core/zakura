@@ -1,7 +1,7 @@
 //! Fixed test cases for MetaAddr and MetaAddrChange.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::{Duration, Instant},
 };
 
@@ -26,6 +26,25 @@ use super::{super::MetaAddr, check};
 /// This is a short duration to consider as error due to a test's execution time when comparing
 /// [`DateTime32`]s.
 const TEST_TIME_ERROR_MARGIN: Duration32 = Duration32::from_seconds(1);
+
+#[test]
+fn peer_addr_labels_require_explicit_opt_in() {
+    let ipv4 = PeerSocketAddr::from(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 8233));
+    let ipv6 = PeerSocketAddr::from(SocketAddr::new(
+        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
+        8233,
+    ));
+
+    assert_eq!(ipv4.addr_label(false), "v4redacted:8233");
+    assert_eq!(ipv6.addr_label(false), "v6redacted:8233");
+    assert_eq!(ipv4.addr_label(true), "192.0.2.1:8233");
+    assert_eq!(ipv6.addr_label(true), "[2001:db8::1]:8233");
+
+    assert_eq!(ipv4.to_string(), "v4redacted:8233");
+    assert_eq!(format!("{ipv4:?}"), "v4redacted:8233");
+    assert_eq!(ipv6.to_string(), "v6redacted:8233");
+    assert_eq!(format!("{ipv6:?}"), "v6redacted:8233");
+}
 
 /// Make sure that the sanitize function handles minimum and maximum times.
 #[test]

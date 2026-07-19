@@ -59,7 +59,7 @@ use crate::components::{
     sync::{BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT},
 };
 
-use super::MempoolError;
+use super::{queue_source_log_label, storage::NonStandardTransactionError, MempoolError};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -69,6 +69,20 @@ fn peer_source_from_queue_source(source: &QueueSource) -> Option<zn::PeerSource>
         QueueSource::Zakura(peer_id) => zn::zakura::ZakuraPeerId::new(peer_id.clone())
             .ok()
             .map(zn::PeerSource::Zakura),
+    }
+}
+
+/// Returns the peer address to attribute a peer-pushed transaction's verification
+/// failure to, for the mempool misbehavior channel.
+///
+/// Only legacy-socket peers carry a routable [`PeerSocketAddr`], which is the key
+/// the misbehavior channel bans on. Zakura peers yield `None`, matching the
+/// advertised-download path, which also delivers Zakura-served transactions with
+/// no advertiser address (see `legacy_gossip.rs`).
+fn misbehavior_addr_from_queue_source(source: &QueueSource) -> Option<PeerSocketAddr> {
+    match source {
+        QueueSource::LegacySocket(addr) => Some(PeerSocketAddr::from(*addr)),
+        QueueSource::Zakura(_) => None,
     }
 }
 
@@ -143,6 +157,9 @@ pub enum TransactionDownloadVerifyError {
     #[error("transaction download / verification was cancelled")]
     Cancelled,
 
+    #[error("transaction did not pass mempool policy: {0}")]
+    PolicyRejected(#[source] NonStandardTransactionError),
+
     #[error("transaction did not pass consensus validation: {error}")]
     Invalid {
         error: zakura_consensus::error::TransactionError,
@@ -172,6 +189,12 @@ where
 
     /// A service that manages cached blockchain state.
     state: ZS,
+
+    /// Whether legacy peer address labels in logs are unredacted.
+    expose_peer_addresses: bool,
+
+    /// The maximum serialized size of a transaction accepted into the mempool.
+    max_transaction_bytes: u64,
 
     // Internal downloads state
     /// A list of pending transaction download and verify tasks.
@@ -306,15 +329,25 @@ where
     /// `network` is used to download transactions.
     /// `verifier` is used to verify transactions.
     /// `state` is used to check if transactions are already in the state.
+    /// `expose_peer_addresses` controls whether legacy peer labels are unredacted.
+    /// `max_transaction_bytes` limits the serialized size of accepted transactions.
     ///
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
     /// this constructor.
-    pub fn new(network: ZN, verifier: ZV, state: ZS) -> Self {
+    pub fn new(
+        network: ZN,
+        verifier: ZV,
+        state: ZS,
+        expose_peer_addresses: bool,
+        max_transaction_bytes: u64,
+    ) -> Self {
         Self {
             network,
             verifier,
             state,
+            expose_peer_addresses,
+            max_transaction_bytes,
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             pending_per_peer: HashMap::new(),
@@ -328,7 +361,10 @@ where
     /// When `source` is `Some`, the per-peer cap
     /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`] is enforced; crawler-driven and
     /// locally-pushed transactions pass `None` and are not capped per peer.
-    #[instrument(skip(self, gossiped_tx), fields(txid = %gossiped_tx.id()))]
+    #[instrument(
+        skip(self, gossiped_tx, source, rsp_tx),
+        fields(txid = %gossiped_tx.id(), source = tracing::field::Empty)
+    )]
     #[allow(clippy::unwrap_in_result)]
     pub fn download_if_needed_and_verify(
         &mut self,
@@ -337,6 +373,11 @@ where
         mut rsp_tx: Option<oneshot::Sender<Result<(), BoxError>>>,
     ) -> Result<(), MempoolError> {
         let txid = gossiped_tx.id();
+        let source_label = source
+            .as_ref()
+            .map(|source| queue_source_log_label(source, self.expose_peer_addresses))
+            .unwrap_or_else(|| "none".to_string());
+        tracing::Span::current().record("source", source_label.as_str());
 
         if self.cancel_handles.contains_key(&txid) {
             debug!(
@@ -387,10 +428,16 @@ where
         let verifier = self.verifier.clone();
         let mut state = self.state.clone();
         let download_source = source.as_ref().and_then(peer_source_from_queue_source);
+        let pushed_advertiser_addr = source.as_ref().and_then(misbehavior_addr_from_queue_source);
+        let max_transaction_bytes = self.max_transaction_bytes;
 
         let gossiped_tx_req = gossiped_tx.clone();
 
         let fut = async move {
+            if let Gossip::Tx(tx) = &gossiped_tx {
+                Self::check_transaction_size(tx, max_transaction_bytes)?;
+            }
+
             // Don't download/verify if the transaction is already in the best chain.
             Self::transaction_in_best_chain(&mut state, txid).await?;
 
@@ -447,6 +494,7 @@ where
                         "mempool.downloaded.transactions.total",
                         "version" => format!("{}",tx.transaction.version()),
                     ).increment(1);
+                    Self::check_transaction_size(&tx, max_transaction_bytes)?;
                     (tx, advertiser_addr)
                 }
                 Gossip::Tx(tx) => {
@@ -454,7 +502,7 @@ where
                         "mempool.pushed.transactions.total",
                         "version" => format!("{}",tx.transaction.version()),
                     ).increment(1);
-                    (tx, None)
+                    (tx, pushed_advertiser_addr)
                 }
             };
 
@@ -629,6 +677,25 @@ where
             .map(|(_tx_id, (_handle, tx, _source))| tx)
     }
 
+    /// Reject transactions that exceed the configured serialized size limit.
+    fn check_transaction_size(
+        transaction: &transaction::UnminedTx,
+        max_transaction_bytes: u64,
+    ) -> Result<(), TransactionDownloadVerifyError> {
+        if usize::try_from(max_transaction_bytes)
+            .is_ok_and(|max_transaction_bytes| transaction.size > max_transaction_bytes)
+        {
+            return Err(TransactionDownloadVerifyError::PolicyRejected(
+                NonStandardTransactionError::TransactionTooLarge {
+                    actual_bytes: transaction.size,
+                    max_bytes: max_transaction_bytes,
+                },
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Check if transaction is already in the best chain.
     async fn transaction_in_best_chain(
         state: &mut ZS,
@@ -673,7 +740,13 @@ where
 mod tests {
     use super::*;
     use futures::StreamExt as _;
-    use std::future;
+    use std::{
+        future,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
     use tower::{service_fn, util::BoxCloneService};
 
     type PendingNetwork = BoxCloneService<zn::Request, zn::Response, BoxError>;
@@ -684,6 +757,24 @@ mod tests {
         let mut bytes = [0; 32];
         bytes[..8].copy_from_slice(&index.to_le_bytes());
         UnminedTxId::from_legacy_id(transaction::Hash(bytes))
+    }
+
+    fn empty_v5_transaction(byte: u8) -> transaction::UnminedTx {
+        use zakura_chain::{
+            block,
+            parameters::NetworkUpgrade,
+            transaction::{LockTime, Transaction},
+        };
+
+        transaction::UnminedTx::from(Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::min_lock_time_timestamp(),
+            expiry_height: block::Height(u32::from(byte)),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        })
     }
 
     fn pending_downloads() -> Downloads<PendingNetwork, PendingVerifier, PendingState> {
@@ -697,6 +788,8 @@ mod tests {
             BoxCloneService::new(service_fn(|_request| {
                 future::pending::<Result<zs::Response, BoxError>>()
             })),
+            false,
+            u64::MAX,
         )
     }
 
@@ -764,6 +857,8 @@ mod tests {
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
+            false,
+            u64::MAX,
         );
 
         downloads
@@ -812,6 +907,8 @@ mod tests {
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
+            false,
+            u64::MAX,
         );
 
         downloads
@@ -830,5 +927,269 @@ mod tests {
                 if error.0 == txid
                     && matches!(error.1, TransactionDownloadVerifyError::DownloadFailed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn pushed_transaction_at_size_limit_is_verified() {
+        let transaction = empty_v5_transaction(1);
+        let max_transaction_bytes = u64::try_from(transaction.size)
+            .expect("serialized transaction sizes fit in u64 on supported platforms");
+        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let verifier_calls_for_service = verifier_calls.clone();
+
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("pushed transactions must not be downloaded");
+            })),
+            BoxCloneService::new(service_fn(move |request| {
+                let verifier_calls = verifier_calls_for_service.clone();
+                async move {
+                    verifier_calls.fetch_add(1, Ordering::SeqCst);
+                    let tx::Request::Mempool { transaction, .. } = request else {
+                        panic!("unexpected transaction verifier request: {request:?}");
+                    };
+                    let miner_fee = transaction.conventional_fee;
+                    let transaction =
+                        VerifiedUnminedTx::new(transaction, miner_fee, 0, 0, Arc::new(Vec::new()))
+                            .expect("test transaction pays its conventional fee");
+
+                    Ok::<_, BoxError>(tx::Response::Mempool {
+                        transaction,
+                        spent_mempool_outpoints: Vec::new(),
+                    })
+                }
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
+                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            max_transaction_bytes,
+        );
+
+        downloads
+            .download_if_needed_and_verify(Gossip::Tx(transaction), None, None)
+            .expect("transaction at the configured limit is queued");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("pushed transaction should complete")
+            .expect("download stream should yield an item")
+            .expect("pushed transaction should not time out");
+
+        assert!(result.is_ok(), "transaction at the limit should verify");
+        assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pushed_transaction_over_size_limit_skips_state_and_verifier() {
+        let transaction = empty_v5_transaction(1);
+        let actual_bytes = transaction.size;
+        let max_bytes = u64::try_from(
+            actual_bytes
+                .checked_sub(1)
+                .expect("test transaction is not empty"),
+        )
+        .expect("serialized transaction sizes fit in u64 on supported platforms");
+        let state_calls = Arc::new(AtomicUsize::new(0));
+        let state_calls_for_service = state_calls.clone();
+        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let verifier_calls_for_service = verifier_calls.clone();
+        let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("pushed transactions must not be downloaded");
+            })),
+            BoxCloneService::new(service_fn(move |_request| {
+                let verifier_calls = verifier_calls_for_service.clone();
+                async move {
+                    verifier_calls.fetch_add(1, Ordering::SeqCst);
+                    panic!("oversized pushed transactions must not be verified");
+                }
+            })),
+            BoxCloneService::new(service_fn(move |_request| {
+                let state_calls = state_calls_for_service.clone();
+                async move {
+                    state_calls.fetch_add(1, Ordering::SeqCst);
+                    panic!("oversized pushed transactions must not query state");
+                }
+            })),
+            false,
+            max_bytes,
+        );
+
+        downloads
+            .download_if_needed_and_verify(
+                Gossip::Tx(transaction),
+                Some(QueueSource::LegacySocket(
+                    peer_addr.remove_socket_addr_privacy(),
+                )),
+                Some(rsp_tx),
+            )
+            .expect("oversized transaction policy check is queued");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("pushed transaction should complete")
+            .expect("download stream should yield an item")
+            .expect("pushed transaction should not time out");
+        let error = result
+            .expect_err("oversized pushed transaction should be rejected")
+            .1;
+
+        assert!(matches!(
+            error,
+            TransactionDownloadVerifyError::PolicyRejected(
+                NonStandardTransactionError::TransactionTooLarge {
+                    actual_bytes: error_actual_bytes,
+                    max_bytes: error_max_bytes,
+                }
+            ) if error_actual_bytes == actual_bytes && error_max_bytes == max_bytes
+        ));
+        assert_eq!(state_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
+
+        let responder_error = rsp_rx
+            .await
+            .expect("responder should receive the policy result")
+            .expect_err("responder should receive a policy rejection")
+            .to_string();
+        assert!(responder_error.contains(&format!(
+            "transaction is {actual_bytes} bytes, exceeding the configured mempool maximum of {max_bytes} bytes"
+        )));
+    }
+
+    #[tokio::test]
+    async fn downloaded_transaction_over_size_limit_skips_verifier() {
+        let transaction = empty_v5_transaction(1);
+        let txid = transaction.id;
+        let actual_bytes = transaction.size;
+        let max_bytes = u64::try_from(
+            actual_bytes
+                .checked_sub(1)
+                .expect("test transaction is not empty"),
+        )
+        .expect("serialized transaction sizes fit in u64 on supported platforms");
+        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let verifier_calls_for_service = verifier_calls.clone();
+
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(move |request| {
+                let transaction = transaction.clone();
+                async move {
+                    assert!(matches!(request, zn::Request::TransactionsById(_)));
+                    Ok::<_, BoxError>(zn::Response::Transactions(vec![
+                        zn::InventoryResponse::Available((transaction, None)),
+                    ]))
+                }
+            })),
+            BoxCloneService::new(service_fn(move |_request| {
+                let verifier_calls = verifier_calls_for_service.clone();
+                async move {
+                    verifier_calls.fetch_add(1, Ordering::SeqCst);
+                    panic!("oversized downloaded transactions must not be verified");
+                }
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
+                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            max_bytes,
+        );
+
+        downloads
+            .download_if_needed_and_verify(Gossip::Id(txid), None, None)
+            .expect("oversized advertised transaction is queued");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("downloaded transaction should complete")
+            .expect("download stream should yield an item")
+            .expect("downloaded transaction should not time out");
+        let error = result
+            .expect_err("oversized downloaded transaction should be rejected")
+            .1;
+
+        assert!(matches!(
+            error,
+            TransactionDownloadVerifyError::PolicyRejected(
+                NonStandardTransactionError::TransactionTooLarge {
+                    actual_bytes: error_actual_bytes,
+                    max_bytes: error_max_bytes,
+                }
+            ) if error_actual_bytes == actual_bytes && error_max_bytes == max_bytes
+        ));
+        assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A directly pushed transaction from a legacy-socket peer must keep that
+    /// peer's address on the `Invalid` verification error, so the mempool can
+    /// score the peer's misbehavior. Regression test for the push-path
+    /// attribution gap.
+    #[tokio::test]
+    async fn pushed_transaction_attributes_invalid_error_to_peer() {
+        use zakura_consensus::error::TransactionError;
+
+        let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+        let transaction = empty_v5_transaction(1);
+
+        let mut downloads = Downloads::new(
+            // The network service must never be called for a pushed transaction.
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("pushed transactions must not be downloaded");
+            })),
+            // Reject with a consensus error that carries a nonzero misbehavior score.
+            BoxCloneService::new(service_fn(|_request| async move {
+                Err(Box::new(TransactionError::WrongVersion) as BoxError)
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
+                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            u64::MAX,
+        );
+
+        downloads
+            .download_if_needed_and_verify(
+                Gossip::Tx(transaction),
+                Some(QueueSource::LegacySocket(
+                    peer_addr.remove_socket_addr_privacy(),
+                )),
+                None,
+            )
+            .expect("download is queued");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("pushed transaction should complete")
+            .expect("download stream should yield an item")
+            .expect("pushed transaction should not time out");
+
+        let error = result
+            .expect_err("invalid pushed transaction should fail verification")
+            .1;
+        assert!(
+            matches!(
+                error,
+                TransactionDownloadVerifyError::Invalid {
+                    advertiser_addr: Some(addr),
+                    ..
+                } if addr == peer_addr
+            ),
+            "expected the pushed transaction failure to carry the peer address, got {error:?}"
+        );
     }
 }

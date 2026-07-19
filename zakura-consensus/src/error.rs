@@ -132,6 +132,12 @@ pub enum TransactionError {
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
     Script(#[from] zakura_script::Error),
 
+    #[error("Sapling proof or signature verification failed")]
+    SaplingVerificationFailed,
+
+    #[error("Orchard or Ironwood Halo2 proof verification failed")]
+    Halo2VerificationFailed,
+
     #[error("spend description cv and rk MUST NOT be of small order")]
     SmallOrder,
 
@@ -158,8 +164,7 @@ pub enum TransactionError {
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
     RedPallas(zakura_chain::primitives::reddsa::Error),
 
-    // temporary error type until #1186 is fixed
-    #[error("Downcast from BoxError to redjubjub::Error failed: {0}")]
+    #[error("could not convert an asynchronous verification error: {0}")]
     InternalDowncastError(String),
 
     #[error("either vpub_old or vpub_new must be zero")]
@@ -259,6 +264,11 @@ pub enum TransactionError {
     #[error("transaction uses an incorrect consensus branch id")]
     WrongConsensusBranchId,
 
+    #[error(
+        "mempool transaction uses the NU6.2 consensus branch id during the NU6.3 grace period"
+    )]
+    WrongConsensusBranchIdNu6_3GracePeriod,
+
     #[error("wrong tx format: tx version is ≥ 5, but `nConsensusBranchId` is missing")]
     MissingConsensusBranchId,
 
@@ -332,12 +342,24 @@ impl From<amount::Error> for TransactionError {
     }
 }
 
-// TODO: use a dedicated variant and From impl for each concrete type, and update callers (#5732)
 impl From<BoxError> for TransactionError {
     fn from(mut err: BoxError) -> Self {
-        // TODO: handle redpallas::Error, ScriptInvalid, InvalidSignature
+        match err.downcast::<zakura_script::Error>() {
+            Ok(e) => return TransactionError::Script(*e),
+            Err(e) => err = e,
+        }
+
+        match err.downcast::<zakura_chain::primitives::ed25519::Error>() {
+            Ok(e) => return TransactionError::Ed25519(*e),
+            Err(e) => err = e,
+        }
         match err.downcast::<zakura_chain::primitives::redjubjub::Error>() {
             Ok(e) => return TransactionError::RedJubjub(*e),
+            Err(e) => err = e,
+        }
+
+        match err.downcast::<zakura_chain::primitives::reddsa::Error>() {
+            Ok(e) => return TransactionError::RedPallas(*e),
             Err(e) => err = e,
         }
 
@@ -387,6 +409,8 @@ impl TransactionError {
             | NoOutputs
             | BadBalance
             | Script(_)
+            | SaplingVerificationFailed
+            | Halo2VerificationFailed
             | SmallOrder
             | Groth16(_)
             | MalformedGroth16(_)
@@ -399,15 +423,74 @@ impl TransactionError {
             | NotEnoughFlags
             | NotEnoughIronwoodFlags
             | OrchardHasEnableCrossAddress
+            | OrchardProofSize
+            | IronwoodProofSize
             | WrongConsensusBranchId
             | MissingConsensusBranchId
             | LockedUntilAfterBlockHeight(_)
             | LockedUntilAfterBlockTime(_) => 100,
 
+            // NU6.2 mempool transactions are invalid under NU6.3 rules, but
+            // honest peers can relay them briefly while their chain tips converge.
+            WrongConsensusBranchIdNu6_3GracePeriod => 0,
+
             // Standardness (policy) rejections must not be punished: non-standard
             // transactions are consensus-valid, and zcashd relays a reject message
             // without a DoS score for them.
             _other => 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boxed_signature_errors_are_preserved() {
+        let script_error: BoxError = Box::new(zakura_script::Error::ScriptInvalid);
+        assert_eq!(
+            TransactionError::from(script_error),
+            TransactionError::Script(zakura_script::Error::ScriptInvalid)
+        );
+
+        let ed25519_error: BoxError =
+            Box::new(zakura_chain::primitives::ed25519::Error::InvalidSignature);
+        assert_eq!(
+            TransactionError::from(ed25519_error),
+            TransactionError::Ed25519(zakura_chain::primitives::ed25519::Error::InvalidSignature)
+        );
+
+        let redjubjub_error: BoxError =
+            Box::new(zakura_chain::primitives::redjubjub::Error::InvalidSignature);
+        assert_eq!(
+            TransactionError::from(redjubjub_error),
+            TransactionError::RedJubjub(
+                zakura_chain::primitives::redjubjub::Error::InvalidSignature
+            )
+        );
+
+        let redpallas_error: BoxError =
+            Box::new(zakura_chain::primitives::reddsa::Error::InvalidSignature);
+        assert_eq!(
+            TransactionError::from(redpallas_error),
+            TransactionError::RedPallas(zakura_chain::primitives::reddsa::Error::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn verification_errors_have_high_misbehavior_score() {
+        for error in [
+            TransactionError::Script(zakura_script::Error::ScriptInvalid),
+            TransactionError::SaplingVerificationFailed,
+            TransactionError::Halo2VerificationFailed,
+            TransactionError::Ed25519(zakura_chain::primitives::ed25519::Error::InvalidSignature),
+            TransactionError::RedJubjub(
+                zakura_chain::primitives::redjubjub::Error::InvalidSignature,
+            ),
+            TransactionError::RedPallas(zakura_chain::primitives::reddsa::Error::InvalidSignature),
+        ] {
+            assert_eq!(error.mempool_misbehavior_score(), 100);
         }
     }
 }

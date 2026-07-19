@@ -3,7 +3,10 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 
@@ -18,6 +21,8 @@ use crate::{
     protocol::external::{canonical_socket_addr, types::Version},
 };
 
+static NEXT_PEER_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// A client service wrapper that keeps track of its load.
 ///
 /// It also keeps track of the peer's reported protocol version.
@@ -28,6 +33,9 @@ pub struct LoadTrackedClient {
 
     /// The metadata for the connected peer `service`.
     connection_info: Arc<ConnectionInfo>,
+
+    /// A process-local identifier for correlating privacy-preserving peer traces.
+    trace_id: u64,
 }
 
 /// Create a new [`LoadTrackedClient`] wrapping the provided `client` service.
@@ -45,6 +53,11 @@ impl From<Client> for LoadTrackedClient {
         LoadTrackedClient {
             service,
             connection_info,
+            trace_id: NEXT_PEER_TRACE_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+                    Some(id.saturating_add(1))
+                })
+                .expect("trace ID update succeeds because its closure always returns Some"),
         }
     }
 }
@@ -53,6 +66,16 @@ impl LoadTrackedClient {
     /// Retrieve the peer's reported protocol version.
     pub fn remote_version(&self) -> Version {
         self.connection_info.remote.version
+    }
+
+    /// Retrieve the peer's self-reported chain height from its handshake.
+    pub(crate) fn remote_start_height(&self) -> zakura_chain::block::Height {
+        self.connection_info.remote.start_height
+    }
+
+    /// Retrieve a process-local identifier used to correlate peer trace events.
+    pub(crate) fn trace_id(&self) -> u64 {
+        self.trace_id
     }
 
     /// Returns true if this peer connected directly to us from `ip`.

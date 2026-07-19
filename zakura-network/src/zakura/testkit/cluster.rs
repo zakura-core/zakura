@@ -442,17 +442,6 @@ mod tests {
             store
         }
 
-        fn with_checkpoint_anchor(height: u32) -> Self {
-            let mut store = Self::genesis_only();
-            let block = mainnet_block(block_bytes(height));
-            store
-                .headers
-                .insert(block::Height(height), (block.hash(), block.header.clone()));
-            store.finalized_height = block::Height(height);
-            store.verified_block_tip = block::Height(0);
-            store
-        }
-
         fn best_header_tip(&self) -> (block::Height, block::Hash) {
             self.headers
                 .last_key_value()
@@ -783,7 +772,6 @@ mod tests {
                 .send(HeaderSyncEvent::FullBlockCommitted {
                     height,
                     hash: block.hash(),
-                    header: block.header.clone(),
                 })
                 .await
                 .unwrap();
@@ -796,27 +784,6 @@ mod tests {
                 .lock()
                 .expect("test store mutex is not poisoned")
                 .missing_bodies(block::Height(1), 100)
-        }
-
-        async fn finalized_height(&self, node: usize) -> block::Height {
-            self.nodes[node]
-                .view
-                .store
-                .lock()
-                .expect("test store mutex is not poisoned")
-                .finalized_height
-        }
-
-        fn has_headers(&self, node: usize, range: impl Iterator<Item = u32>) -> bool {
-            let store = self.nodes[node]
-                .view
-                .store
-                .lock()
-                .expect("test store mutex is not poisoned");
-
-            range
-                .map(block::Height)
-                .all(|height| store.headers.contains_key(&height))
         }
 
         async fn reject_next_commit(&self, node: usize, kind: HeaderSyncCommitFailureKind) {
@@ -1347,44 +1314,6 @@ mod tests {
             .expect("e2e checkpoints use valid header hashes")
             .to_network()
             .expect("e2e network has enough checkpoint coverage")
-    }
-
-    fn e2e_network_with_checkpoint_hash(height: u32, hash: block::Hash) -> Network {
-        let checkpoints = vec![
-            (block::Height(0), mainnet_genesis_hash()),
-            (block::Height(height), hash),
-        ];
-
-        TestnetParameters::build()
-            .with_genesis_hash(mainnet_genesis_hash())
-            .expect("mainnet genesis vector hash parses")
-            .with_activation_heights(ConfiguredActivationHeights {
-                before_overwinter: None,
-                overwinter: Some(1),
-                sapling: Some(1),
-                blossom: Some(1),
-                heartwood: Some(1),
-                canopy: Some(1),
-                nu5: None,
-                nu6: None,
-                nu6_1: None,
-                nu6_2: None,
-                nu6_3: None,
-                nu7: None,
-                #[cfg(zcash_unstable = "zfuture")]
-                zfuture: None,
-            })
-            .expect("height-1 activation set is valid")
-            .with_funding_streams(Vec::new())
-            .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(checkpoints))
-            .expect("e2e checkpoints use valid header hashes")
-            .to_network()
-            .expect("e2e network has enough checkpoint coverage")
-    }
-
-    fn checkpoint_network(checkpoint_height: u32) -> (Network, block::Hash) {
-        let checkpoint_hash = mainnet_block(block_bytes(checkpoint_height)).hash();
-        (e2e_network([checkpoint_height]), checkpoint_hash)
     }
 
     fn header_sync_test_builder(
@@ -2807,12 +2736,10 @@ mod tests {
             max_inflight_requests: 2,
             ..ZakuraHeaderSyncConfig::default()
         };
-        // The scheduler keeps at most one forward range outstanding, so the two
-        // concurrent v7 requests come from distinct queues: anchoring at the
-        // height-2 checkpoint leaves a backward backfill bracket (1..=2) plus a
-        // forward range (3..=4), each within the peer's advertised cap of 2.
-        let network = e2e_network([2]);
-        let anchor = (block::Height(2), mainnet_block(block_bytes(2)).hash());
+        // The peer's range cap splits forward work into two concurrent requests,
+        // allowing request IDs to correlate responses delivered in reverse order.
+        let network = e2e_network([]);
+        let anchor = (block::Height(0), mainnet_genesis_hash());
         let victim = ZakuraTestNode::builder(70)
             .tracer(capture.tracer_for_node(70))
             .header_sync_driver(
@@ -2930,14 +2857,11 @@ mod tests {
                 .await?;
         }
 
-        let mut commits = vec![
-            next_controlled_header_commit(&mut actions).await?,
-            next_controlled_header_commit(&mut actions).await?,
-        ];
-        commits.sort_by_key(|commit| commit.start_height);
-        for commit in &commits {
+        for expected_start in [block::Height(1), block::Height(3)] {
+            let commit = next_controlled_header_commit(&mut actions).await?;
             assert_eq!(commit.peer, hostile_id);
             assert_ne!(commit.session_id, 0);
+            assert_eq!(commit.start_height, expected_start);
             let expected_anchor = if commit.start_height == block::Height(1) {
                 mainnet_genesis_hash()
             } else {
@@ -2953,8 +2877,6 @@ mod tests {
                 ),
                 commit.start_height
             );
-        }
-        for commit in commits {
             let tip_height = block::Height(
                 commit.start_height.0
                     + u32::try_from(commit.headers.len()).expect("test header count fits u32")
@@ -3403,76 +3325,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn header_sync_e2e_checkpoint_forward_then_backward_finalizes_backfill(
-    ) -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let mut capture = TraceCapture::for_test_with_keep_override(
-            "header_sync_e2e_checkpoint_forward_then_backward_finalizes_backfill",
-            false,
-        )?;
-        let (network, checkpoint_hash) = checkpoint_network(3);
-        let mut cluster = HeaderSyncE2eCluster::new();
-        let source = cluster.spawn_node(
-            1,
-            network.clone(),
-            (block::Height(0), mainnet_genesis_hash()),
-            E2eHeaderStore::with_headers(4),
-            ZakuraTrace::new(capture.tracer_for_node(1), "01"),
-        )?;
-        let checkpointed = cluster.spawn_node(
-            2,
-            network,
-            (block::Height(3), checkpoint_hash),
-            E2eHeaderStore::with_checkpoint_anchor(3),
-            ZakuraTrace::new(capture.tracer_for_node(2), "02"),
-        )?;
-        assert_eq!(source, 0);
-        cluster.start_drivers();
-        cluster.connect_all().await;
-
-        // Same CI race as the genesis-convergence test: a status emitted before the
-        // receiver has processed its `PeerConnected` is rejected as unknown-peer
-        // misbehavior, and the source's frontier never changes here, so nothing
-        // re-sends it. Wait for both peers to register, then deliver the source's
-        // status deterministically; a duplicate of the natural status is harmless.
-        let source_handle = cluster.nodes[source].view.handle.clone();
-        let checkpointed_handle = cluster.nodes[checkpointed].view.handle.clone();
-        await_until("header-sync e2e peers registered", TEST_NET_TIMEOUT, || {
-            let source_peers = source_handle.peer_snapshot();
-            let checkpointed_peers = checkpointed_handle.peer_snapshot();
-            source_peers.inbound_peers + source_peers.outbound_peers >= 1
-                && checkpointed_peers.inbound_peers + checkpointed_peers.outbound_peers >= 1
-        })
-        .await?;
-        let source_peer = cluster.nodes[source].view.peer_id.clone();
-        cluster
-            .inject(checkpointed, source_peer, status_for_tip(4, 1000, 10))
-            .await;
-
-        cluster.wait_for_tip(checkpointed, block::Height(4)).await?;
-        await_until(
-            "checkpoint backfill headers committed",
-            Duration::from_secs(5),
-            || cluster.has_headers(checkpointed, 1..=3),
-        )
-        .await?;
-
-        capture.flush().await;
-        let reader = capture.reader()?;
-        let target_trace = reader.node("02").table("header_sync");
-        target_trace.assert_header_range_request(4, 1);
-        target_trace.assert_header_range_request(1, 3);
-        assert_eq!(
-            cluster.finalized_height(checkpointed).await,
-            block::Height(3)
-        );
-
-        cluster.shutdown().await;
-        assert!(capture.finish().await?.is_none());
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn header_sync_e2e_tip_flood_and_no_double_gossip_cover_both_orderings(
     ) -> Result<(), BoxError> {
         let _guard = zakura_test::init();
@@ -3796,46 +3648,6 @@ mod tests {
             .wait_for_misbehavior_reason(bad_daa_victim, HeaderSyncMisbehavior::InvalidRange)
             .await?;
 
-        let bad_checkpoint_backfill = e2e_peer(101);
-        let checkpoint_hash = mainnet_block(&BLOCK_MAINNET_1_BYTES).hash();
-        let checkpoint_network = e2e_network_with_checkpoint_hash(3, checkpoint_hash);
-        let checkpointed = cluster.spawn_node(
-            6,
-            checkpoint_network,
-            (block::Height(3), checkpoint_hash),
-            E2eHeaderStore::with_checkpoint_anchor(3),
-            ZakuraTrace::new(capture.tracer_for_node(6), "06"),
-        )?;
-        cluster.start_drivers();
-        cluster
-            .connect_peer(checkpointed, bad_checkpoint_backfill.clone())
-            .await;
-        cluster
-            .inject(
-                checkpointed,
-                bad_checkpoint_backfill.clone(),
-                status_for_tip(3, 4, 1),
-            )
-            .await;
-        let request_id = cluster
-            .wait_for_get_headers(checkpointed, &bad_checkpoint_backfill, block::Height(1), 3)
-            .await?;
-        cluster
-            .inject_headers(
-                checkpointed,
-                bad_checkpoint_backfill,
-                request_id,
-                headers_message(vec![
-                    mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
-                    mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
-                    mainnet_block(&BLOCK_MAINNET_3_BYTES).header.clone(),
-                ]),
-            )
-            .await;
-        cluster
-            .wait_for_misbehavior_reason(checkpointed, HeaderSyncMisbehavior::InvalidRange)
-            .await?;
-
         let over_cap = e2e_peer(91);
         cluster.connect_peer(victim, over_cap.clone()).await;
         cluster
@@ -3920,7 +3732,7 @@ mod tests {
         trace.assert_header_violation("status_spam");
         trace.assert_header_violation("new_block_spam");
         trace.assert_header_violation("malformed_message");
-        for node in ["03", "04", "05", "06"] {
+        for node in ["03", "04", "05"] {
             reader
                 .node(node)
                 .table("header_sync")

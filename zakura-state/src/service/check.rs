@@ -33,6 +33,10 @@ pub(crate) mod difficulty;
 pub(crate) mod nullifier;
 pub(crate) mod utxo;
 
+#[cfg(feature = "internal-bench")]
+#[doc(hidden)]
+pub use utxo::remaining_transaction_value;
+
 pub use utxo::transparent_coinbase_spend;
 
 #[cfg(test)]

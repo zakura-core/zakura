@@ -1299,6 +1299,11 @@ impl ZakuraDb {
         self.db.write(batch)
     }
 
+    /// Writes the given batch and synchronizes its write-ahead log before returning.
+    pub(crate) fn write_batch_sync(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
+        self.db.write_sync(batch)
+    }
+
     /// Flushes pending writes to SST files.
     pub fn flush(&self) -> Result<(), rocksdb::Error> {
         self.db.flush()
@@ -1648,7 +1653,7 @@ impl DiskWriteBatch {
         //
         // In Zebra we include the nullifiers and note commitments in the genesis block because it simplifies our code.
         self.prepare_shielded_transaction_batch(zakura_db, finalized);
-        self.prepare_trees_batch(zakura_db, finalized, prev_note_commitment_trees, vct_data);
+        self.prepare_trees_batch(zakura_db, finalized, prev_note_commitment_trees, vct_data)?;
 
         // # Consensus
         //

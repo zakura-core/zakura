@@ -3,7 +3,8 @@
 #![allow(clippy::unwrap_in_result)]
 
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    collections::HashSet,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -40,6 +41,21 @@ where
 
 fn peer_addr(port: u16) -> PeerSocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port)).into()
+}
+
+#[test]
+fn connected_addr_labels_require_explicit_opt_in() {
+    let peer = ConnectedAddr::new_outbound_direct(
+        "192.0.2.1:8233".parse().expect("valid test peer address"),
+    );
+
+    assert_eq!(peer.addr_label(false), "v4redacted:8233");
+    assert_eq!(peer.addr_label(true), "192.0.2.1:8233");
+    assert_eq!(ConnectedAddr::Isolated.addr_label(true), "isolated");
+
+    let debug = format!("{peer:?}");
+    assert!(debug.contains("v4redacted:8233"));
+    assert!(!debug.contains("192.0.2.1"));
 }
 
 fn test_config(p2p_stack: P2pStack) -> Config {
@@ -94,6 +110,7 @@ async fn negotiate_test_pair(
             local_services,
             true,
             local_min_version,
+            false,
         )
         .await
     });
@@ -108,6 +125,7 @@ async fn negotiate_test_pair(
             remote_services,
             true,
             remote_min_version,
+            false,
         )
         .await
     });
@@ -707,6 +725,7 @@ fn p2p_v2_upgrade_uses_main_version_services_only() {
         local: inconsistent_remote.clone(),
         remote: inconsistent_remote,
         negotiated_version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        is_protected_peer: false,
     };
 
     assert!(!should_attempt_zakura_upgrade(&config, &connection_info));
@@ -733,6 +752,7 @@ fn p2p_v2_upgrade_requires_local_enable_and_remote_service_bit() {
         local: version(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2),
         remote: version(remote_services),
         negotiated_version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        is_protected_peer: false,
     };
 
     assert!(!should_attempt_zakura_upgrade(
@@ -747,6 +767,42 @@ fn p2p_v2_upgrade_requires_local_enable_and_remote_service_bit() {
         &test_config(P2pStack::Dual),
         &connection_info(PeerServices::NODE_NETWORK | PeerServices::NODE_P2P_V2),
     ));
+}
+
+/// A configured inbound peer is recognized as protected, including when it
+/// arrives as an IPv4-mapped IPv6 address; outbound, unconfigured, empty-set,
+/// and isolated cases are not protected.
+#[test]
+fn connected_addr_is_protected_peer_matches_configured_inbound_ips() {
+    let _init_guard = zakura_test::init();
+
+    let configured = Ipv4Addr::new(203, 0, 113, 7);
+    let protected: HashSet<IpAddr> = [IpAddr::V4(configured)].into_iter().collect();
+
+    let inbound = |ip: IpAddr| ConnectedAddr::new_inbound_direct(SocketAddr::new(ip, 8233).into());
+
+    // A configured inbound peer (plain IPv4) is protected.
+    assert!(inbound(IpAddr::V4(configured)).is_protected_peer(&protected));
+
+    // The same peer arriving as an IPv4-mapped IPv6 address is still protected:
+    // its IP is canonicalized before the lookup.
+    let mapped = IpAddr::V6(configured.to_ipv6_mapped());
+    assert!(inbound(mapped).is_protected_peer(&protected));
+
+    // An inbound peer that is not in the configured set is not protected.
+    assert!(!inbound(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))).is_protected_peer(&protected));
+
+    // Outbound connections are never protected, even to a configured IP.
+    assert!(!ConnectedAddr::new_outbound_direct(
+        SocketAddr::new(IpAddr::V4(configured), 8233).into()
+    )
+    .is_protected_peer(&protected));
+
+    // An empty configured set protects no one.
+    assert!(!inbound(IpAddr::V4(configured)).is_protected_peer(&HashSet::new()));
+
+    // Isolated connections have no peer address and are never protected.
+    assert!(!ConnectedAddr::Isolated.is_protected_peer(&protected));
 }
 
 #[tokio::test]

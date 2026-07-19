@@ -335,7 +335,12 @@ impl From<amount::Error> for TransactionError {
 // TODO: use a dedicated variant and From impl for each concrete type, and update callers (#5732)
 impl From<BoxError> for TransactionError {
     fn from(mut err: BoxError) -> Self {
-        // TODO: handle redpallas::Error, ScriptInvalid, InvalidSignature
+        // TODO: handle redpallas::Error and InvalidSignature
+        match err.downcast::<zakura_script::Error>() {
+            Ok(e) => return TransactionError::Script(*e),
+            Err(e) => err = e,
+        }
+
         match err.downcast::<zakura_chain::primitives::redjubjub::Error>() {
             Ok(e) => return TransactionError::RedJubjub(*e),
             Err(e) => err = e,

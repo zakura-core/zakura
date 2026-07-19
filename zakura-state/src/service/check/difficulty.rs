@@ -214,17 +214,13 @@ impl AdjustedDifficulty {
         let averaging_window_height = u32::try_from(POW_AVERAGING_WINDOW)
             .expect("averaging window is much smaller than u32::MAX");
 
-        if self.relevant_difficulty_thresholds.len() < POW_AVERAGING_WINDOW
-            && self.candidate_height.0 <= averaging_window_height
-        {
+        if self.candidate_height.0 <= averaging_window_height {
             // # Consensus
             //
             // `ThresholdBits(height)` is `PoWLimit` for `height <= PoWAveragingWindow`.
             // Zebra's full-block contextual validation on Mainnet and Testnet
-            // starts after the mandatory checkpoint, so this short-context path
-            // is only reachable through header sync and non-checkpointed test
-            // networks, where it implements the Zcash specification's early-chain
-            // `PoWLimit` rule.
+            // starts after the mandatory checkpoint, so this early-chain path is
+            // only reachable through header sync and non-checkpointed test networks.
             return self.network.target_difficulty_limit().to_compact();
         }
 
@@ -246,10 +242,9 @@ impl AdjustedDifficulty {
     ///
     /// Implements `MeanTarget` from the Zcash specification.
     fn mean_target_difficulty(&self) -> ExpandedDifficulty {
-        // In Zebra, contextual validation starts after Canopy activation, so we
-        // can assume that the relevant chain contains at least 17 blocks.
-        // Therefore, the `PoWLimit` case of `MeanTarget()` from the Zcash
-        // specification is unreachable.
+        // `threshold_bits` returns `PoWLimit` before calling this function for
+        // early-chain heights. At later heights, a valid relevant chain contains
+        // at least 17 blocks.
 
         let averaging_window_thresholds =
             if self.relevant_difficulty_thresholds.len() >= POW_AVERAGING_WINDOW {

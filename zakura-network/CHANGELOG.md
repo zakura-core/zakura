@@ -11,7 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add an opt-in `Config::expose_peer_addresses` field for unredacted legacy
   peer address labels in peer activity logs and metrics. Downstream exhaustive
-  `Config` struct literals must initialize the new field.
+  `Config` struct literals must initialize the new field
+  ([#258](https://github.com/zakura-core/zakura/pull/258)).
+
+## [3.0.0-rc0] - 2026-07-19
+
+### Breaking Changes
+
+- Added `ConnectionInfo::is_protected_peer`, requiring downstream struct
+  literals to specify whether a configured peer is protected from overload
+  disconnects.
+- Added `HeaderSyncStartError::AnchorAboveVerifiedBlockTip` for invalid
+  checkpoint anchors.
+
+### Added
+
+- Added `ConnectedAddr::is_protected_peer` for identifying configured
+  block-gossip and zcashd-compat peers.
 
 ## [2.0.0] - 2026-07-17
 

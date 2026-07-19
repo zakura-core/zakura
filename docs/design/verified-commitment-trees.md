@@ -887,16 +887,25 @@ cargo run -p zakura-state --bin generate-vct-sprout-artifact -- \
 ```
 
 Reviewers must reproduce and compare the emitted bytes, SHA-256 digest, terminal root, and
-handoff identity before changing `MAINNET_ARTIFACT`. Running the tool never installs or enables
-its output.
+the last checkpoint identity before updating the artifact package. Running the tool never installs or enables
+its output. The reviewed contiguous output is split in the
+[`zakura-vct-sprout-history`](https://github.com/zakura-core/zakura-vct-sprout-history)
+repository, whose release tooling reconstructs the full stream and verifies its identity before
+publishing exact-versioned crates.io packages. Those packages must be published before Zakura
+updates its pinned facade version and independent digest.
 
 ### 17.4 Embedding, availability, and replay
 
-The reviewed Mainnet bytes are compiled into `vct/artifact.rs` and loaded only through
-`embedded_mainnet()`. The guard rejects affected read-only databases and writable opens with
-upgrades disabled: operators must reopen writable to repair or discard/resync. Non-Mainnet
-databases never load or replay this Mainnet artifact. Normally synced databases and databases
-already marked at the repair format are unaffected.
+The Mainnet bytes are compiled into the final binary from the exact-versioned
+`zakura-vct-sprout-history` facade crate and loaded only through `embedded_mainnet()`. Its part
+crates keep every crates.io archive below the registry limit without reconstructing a second
+contiguous buffer at runtime. `zakura-state` independently verifies the complete byte length and
+SHA-256 before applying the format and semantic checks above. The guard rejects affected
+read-only databases and writable opens with upgrades disabled: operators must reopen writable
+to repair or discard/resync. Non-Mainnet databases never load or replay this Mainnet artifact.
+Normally synced databases and databases already marked at the repair format are unaffected.
+An eligible writable startup decodes and validates the artifact once, then reuses that prepared
+input for the repair and its immediate post-write validation.
 
 The initial startup format change now runs synchronously before `ZakuraDb` or `FinalizedState`
 is exposed; only periodic current-format checks remain in the background. Therefore no block

@@ -1,6 +1,6 @@
 [package]
 name = "zakura-rpc"
-version = "2.0.0"
+version = "3.0.0-rc0"
 authors.workspace = true
 description = "The Zakura node's JSON Remote Procedure Call (JSON-RPC) interface. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -109,16 +109,16 @@ zcash_transparent = { workspace = true }
 # Test-only feature proptest-impl
 proptest = { workspace = true, optional = true }
 
-zakura-chain = { path = "../zakura-chain", version = "1.0.0", features = [
+zakura-chain = { path = "../zakura-chain", version = "1.2.0-rc0", features = [
     "json-conversion",
 ] }
-zakura-consensus = { path = "../zakura-consensus", version = "2.0.0" }
-zakura-network = { path = "../zakura-network", version = "2.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "1.0.0", features = [
+zakura-consensus = { path = "../zakura-consensus", version = "3.0.0-rc0" }
+zakura-network = { path = "../zakura-network", version = "3.0.0-rc0" }
+zakura-node-services = { path = "../zakura-node-services", version = "1.0.1-rc0", features = [
     "rpc-client",
 ] }
-zakura-script = { path = "../zakura-script", version = "1.0.0" }
-zakura-state = { path = "../zakura-state", version = "2.0.0" }
+zakura-script = { path = "../zakura-script", version = "1.0.1-rc0" }
+zakura-state = { path = "../zakura-state", version = "3.0.0-rc0" }
 rustls = "0.23.40"
 tokio-rustls = "0.26.4"
 rustls-pemfile = "2.2.0"
@@ -140,16 +140,16 @@ proptest = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-chain = { path = "../zakura-chain", version = "1.0.0", features = [
+zakura-chain = { path = "../zakura-chain", version = "1.2.0-rc0", features = [
     "proptest-impl",
 ] }
-zakura-consensus = { path = "../zakura-consensus", version = "2.0.0", features = [
+zakura-consensus = { path = "../zakura-consensus", version = "3.0.0-rc0", features = [
     "proptest-impl",
 ] }
-zakura-network = { path = "../zakura-network", version = "2.0.0", features = [
+zakura-network = { path = "../zakura-network", version = "3.0.0-rc0", features = [
     "proptest-impl",
 ] }
-zakura-state = { path = "../zakura-state", version = "2.0.0", features = [
+zakura-state = { path = "../zakura-state", version = "3.0.0-rc0", features = [
     "proptest-impl",
 ] }
 

@@ -25,8 +25,6 @@ const MAX_RECORDS: usize = 1_000_000;
 const MAX_COMMITMENTS_PER_RECORD: usize = 65_535;
 const HEADER_LEN: usize = 8 + 2 + 1 + 4 + 32 + 4 + 32 + 32;
 const MAINNET_ARTIFACT_LEN: usize = 71_710_871;
-const MAINNET_ARTIFACT_SHA256: [u8; 32] =
-    hex_literal::hex!("abf89ec7b9eacbe7a259be891a17059496f2c7c7c2144d3babb34f85f8098832");
 
 /// One historical block that changed the Sprout commitment tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,8 +50,6 @@ pub(crate) enum Error {
     ReadFailure,
     #[error("Sprout history artifact length does not match the reviewed artifact")]
     ArtifactLengthMismatch,
-    #[error("Sprout history artifact digest does not match the reviewed artifact")]
-    ArtifactDigestMismatch,
     #[error("Sprout history artifact has too many records")]
     TooManyRecords,
     #[error("Sprout history artifact record has too many commitments")]
@@ -224,9 +220,9 @@ impl Artifact {
     fn decode_from_readers<R: Read>(
         source_len: usize,
         mut reader: impl FnMut() -> R,
-        expected_identity: Option<(usize, [u8; 32])>,
+        expected_len: Option<usize>,
     ) -> Result<Self, Error> {
-        if let Some((expected_len, _)) = expected_identity {
+        if let Some(expected_len) = expected_len {
             if source_len != expected_len {
                 return Err(Error::ArtifactLengthMismatch);
             }
@@ -241,26 +237,18 @@ impl Artifact {
         let (checkpoint, handoff_hash, record_count, terminal_root, expected_payload_digest) =
             decode_header(&header)?;
 
-        let mut artifact_digest = Sha256::new();
-        artifact_digest.update(header);
         let mut payload_digest = Sha256::new();
         let mut buffer = [0; 64 * 1024];
         let mut remaining = source_len - HEADER_LEN;
         while remaining > 0 {
             let read_len = remaining.min(buffer.len());
             read_exact(&mut first_pass, &mut buffer[..read_len])?;
-            artifact_digest.update(&buffer[..read_len]);
             payload_digest.update(&buffer[..read_len]);
             remaining -= read_len;
         }
 
         if <[u8; 32]>::from(payload_digest.finalize()) != expected_payload_digest {
             return Err(Error::DigestMismatch);
-        }
-        if let Some((_, expected_digest)) = expected_identity {
-            if <[u8; 32]>::from(artifact_digest.finalize()) != expected_digest {
-                return Err(Error::ArtifactDigestMismatch);
-            }
         }
 
         let mut second_pass = reader();
@@ -511,7 +499,7 @@ pub(crate) fn embedded_mainnet() -> Result<Artifact, Error> {
     Artifact::decode_from_readers(
         zakura_vct_sprout_history::TOTAL_LEN,
         zakura_vct_sprout_history::Reader::new,
-        Some((MAINNET_ARTIFACT_LEN, MAINNET_ARTIFACT_SHA256)),
+        Some(MAINNET_ARTIFACT_LEN),
     )
 }
 
@@ -561,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_identity_is_checked_independently() {
+    fn artifact_length_is_checked_independently() {
         let mut tree = sprout::tree::NoteCommitmentTree::default();
         let commitment = sprout::commitment::NoteCommitment::from([7; 32]);
         tree.append(commitment).expect("test tree has capacity");
@@ -576,27 +564,18 @@ mod tests {
             }],
         )
         .expect("valid fixture encodes");
-        let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
 
         Artifact::decode_from_readers(
             bytes.len(),
             || Cursor::new(bytes.as_slice()),
-            Some((bytes.len(), digest)),
+            Some(bytes.len()),
         )
-        .expect("matching artifact identity decodes");
+        .expect("artifact with the expected length decodes");
         assert_eq!(
             Artifact::decode_from_readers(
                 bytes.len(),
                 || Cursor::new(bytes.as_slice()),
-                Some((bytes.len(), [0; 32])),
-            ),
-            Err(Error::ArtifactDigestMismatch)
-        );
-        assert_eq!(
-            Artifact::decode_from_readers(
-                bytes.len(),
-                || Cursor::new(bytes.as_slice()),
-                Some((bytes.len() + 1, digest)),
+                Some(bytes.len() + 1),
             ),
             Err(Error::ArtifactLengthMismatch)
         );

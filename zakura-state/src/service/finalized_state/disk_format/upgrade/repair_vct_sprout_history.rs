@@ -1101,8 +1101,7 @@ mod tests {
         let handoff = Height(1);
         let hash = block::Hash([1; 32]);
         let path = seed_repair_db(&config, &network, handoff, &[(handoff, hash)]);
-        let _injection =
-            inject_test_repair_error(path.clone(), ArtifactError::ArtifactDigestMismatch);
+        let _injection = inject_test_repair_error(path.clone(), ArtifactError::DigestMismatch);
 
         let open = ZakuraDb::new(
             &config,
@@ -1118,7 +1117,7 @@ mod tests {
         assert!(matches!(
             open,
             Err(crate::StateInitError::VctSproutHistoryRepairInvalid { reason })
-                if reason.contains("artifact digest does not match")
+                if reason.contains("artifact payload digest does not match")
         ));
         assert_eq!(
             test_repair_input_load_count(&path),

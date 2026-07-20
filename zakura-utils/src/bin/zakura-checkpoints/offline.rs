@@ -146,9 +146,10 @@ pub fn run_offline(args: &Args) -> Result<()> {
         );
     }
 
-    // Read every retained candidate row, cross-checking both hash indexes so a
-    // corrupt or partially deleted database fails loudly instead of exporting
-    // a wrong chain.
+    // Read every retained candidate row, cross-checking both hash indexes and
+    // recomputing each hash from its retained header (headers survive pruning),
+    // so a corrupt database fails loudly instead of exporting hashes the header
+    // chain never had.
     let rows = ((base_height.0 + 1)..=tip_height.0).map(|raw_height| {
         let height = Height(raw_height);
         let hash = db
@@ -157,6 +158,13 @@ pub fn run_offline(args: &Args) -> Result<()> {
         ensure!(
             db.height(hash) == Some(height),
             "finalized hash indexes disagree at height {raw_height}"
+        );
+        let header = db
+            .block_header(height.into())
+            .ok_or_else(|| eyre!("missing retained block header at height {raw_height}"))?;
+        ensure!(
+            block::Hash::from(header.as_ref()) == hash,
+            "hash index disagrees with the retained block header at height {raw_height}"
         );
         let info = db
             .block_info(height.into())

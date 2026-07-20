@@ -339,10 +339,15 @@ impl Transaction {
     /// `all_previous_outputs` represents the UTXOs being spent by each input
     /// in the transaction.
     ///
-    /// The `input_index_script_code` tuple indicates the index of the
-    /// transparent Input for which we are producing a sighash and the
-    /// respective script code being validated, or None if it's a shielded
-    /// input.
+    /// The `input_index_script_code` tuple contains the transparent input index
+    /// and the script code being validated, or `None` for a shielded signature.
+    /// Pre-V5 sighashes commit to the supplied script code. V5 and later
+    /// transactions ignore it because ZIP-244 commits to the spent output's
+    /// `scriptPubKey` instead.
+    ///
+    /// This method only calculates a digest. For V5 and later transactions,
+    /// callers must separately reject `SIGHASH_SINGLE` when the transparent
+    /// input does not have a corresponding output.
     ///
     /// # Panics
     ///
@@ -350,6 +355,8 @@ impl Transaction {
     /// - if called on a v1 or v2 transaction
     /// - if the input index points to a transparent::Input::CoinBase
     /// - if the input index is out of bounds for self.inputs()
+    /// - if `hash_type` is not `ALL`, `NONE`, `SINGLE`, or one of their
+    ///   `ANYONECANPAY` variants
     /// - if the tx contains `nConsensusBranchId` field and `nu` doesn't match it
     /// - if the tx is not convertible to its `librustzcash` equivalent
     /// - if `nu` doesn't contain a consensus branch id convertible to its `librustzcash`

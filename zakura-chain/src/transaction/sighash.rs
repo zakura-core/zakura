@@ -113,14 +113,22 @@ impl SigHasher {
     ///
     /// # Details
     ///
-    /// The `input_index_script_code` tuple indicates the index of the
-    /// transparent Input for which we are producing a sighash and the
-    /// respective script code being validated, or None if it's a shielded
-    /// input.
+    /// The `input_index_script_code` tuple contains the transparent input index
+    /// and the script code being validated, or `None` for a shielded signature.
+    /// Pre-V5 sighashes commit to the supplied script code. V5 and later
+    /// transactions ignore it because ZIP-244 commits to the spent output's
+    /// `scriptPubKey` instead.
+    ///
+    /// This method only calculates a digest. For V5 and later transactions,
+    /// callers must separately reject `SIGHASH_SINGLE` when the transparent
+    /// input does not have a corresponding output. Callers that need raw
+    /// pre-V5 hash type bytes must use [`SigHasher::sighash_v4_raw`].
     ///
     /// # Panics
     ///
-    /// - if the input index is out of bounds for self.inputs()
+    /// - If the input index is out of bounds for the transaction inputs.
+    /// - If `hash_type` is not `ALL`, `NONE`, `SINGLE`, or one of their
+    ///   `ANYONECANPAY` variants.
     pub fn sighash(
         &self,
         hash_type: HashType,

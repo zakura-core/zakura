@@ -147,6 +147,15 @@ fn hasher(personal: &[u8; 16]) -> State {
     Params::new().hash_length(32).personal(personal).to_state()
 }
 
+/// Finalizes a ZIP-244 node digest as its fixed-width byte representation.
+fn finalize_node_hash(state: State) -> [u8; 32] {
+    state
+        .finalize()
+        .as_bytes()
+        .try_into()
+        .expect("ZIP-244 node hashers have 32-byte outputs")
+}
+
 /// `io::Write` adapter that feeds bytes into a BLAKE2b [`State`], so Zebra's
 /// existing [`ZcashSerialize`] implementations can write a field's canonical
 /// bytes straight into a hash with no intermediate allocation.
@@ -437,16 +446,16 @@ fn hash_outputs(outputs: &[transparent::Output]) -> Blake2bHash {
 fn hash_transparent_txid(
     inputs: &[transparent::Input],
     outputs: &[transparent::Output],
-) -> Blake2bHash {
-    let mut h = hasher(ZCASH_TRANSPARENT_HASH_PERSONALIZATION);
-    // The transparent bundle is absent (and the digest is the bare
-    // personalization hash) only when there are no inputs and no outputs.
-    if !inputs.is_empty() || !outputs.is_empty() {
-        h.update(hash_prevouts(inputs).as_bytes());
-        h.update(hash_sequence(inputs).as_bytes());
-        h.update(hash_outputs(outputs).as_bytes());
+) -> [u8; 32] {
+    if inputs.is_empty() && outputs.is_empty() {
+        return *EMPTY_TRANSPARENT_TXID_HASH;
     }
-    h.finalize()
+
+    let mut h = hasher(ZCASH_TRANSPARENT_HASH_PERSONALIZATION);
+    h.update(hash_prevouts(inputs).as_bytes());
+    h.update(hash_sequence(inputs).as_bytes());
+    h.update(hash_outputs(outputs).as_bytes());
+    finalize_node_hash(h)
 }
 
 /// ZIP-244 §T.3a sapling spends digest.
@@ -518,9 +527,9 @@ fn hash_sapling_outputs(sapling: &sapling::ShieldedData<sapling::SharedAnchor>) 
 fn hash_sapling_txid(
     sapling: Option<&sapling::ShieldedData<sapling::SharedAnchor>>,
     version: Zip244Version,
-) -> Blake2bHash {
+) -> [u8; 32] {
     let Some(sapling) = sapling else {
-        return hasher(ZCASH_SAPLING_HASH_PERSONALIZATION).finalize();
+        return *EMPTY_SAPLING_TXID_HASH;
     };
 
     let mut h = hasher(ZCASH_SAPLING_HASH_PERSONALIZATION);
@@ -537,7 +546,7 @@ fn hash_sapling_txid(
         h.update(EMPTY_SAPLING_OUTPUTS_HASH);
     }
     h.update(&sapling.value_balance.zatoshis().to_le_bytes());
-    h.finalize()
+    finalize_node_hash(h)
 }
 
 /// ZIP-244 §T.4 Orchard-style bundle digest.
@@ -546,36 +555,38 @@ fn hash_sapling_txid(
 fn hash_bundle_txid(
     bundle: Option<&orchard::ShieldedData>,
     format: BundleCommitmentFormat,
-) -> Blake2bHash {
+) -> [u8; 32] {
+    let Some(bundle) = bundle else {
+        return *format.empty_txid_hash();
+    };
+
     let personalizations = format.personalizations();
     let mut h = hasher(personalizations.bundle);
-    if let Some(bundle) = bundle {
-        let mut ch = hasher(personalizations.actions_compact);
-        let mut mh = hasher(personalizations.actions_memos);
-        let mut nh = hasher(personalizations.actions_noncompact);
-        for action in bundle.actions() {
-            ch.update(&<[u8; 32]>::from(action.nullifier));
-            ch.update(&<[u8; 32]>::from(action.cm_x));
-            update_serialized(&mut ch, &action.ephemeral_key);
-            ch.update(&action.enc_ciphertext.0[..52]);
+    let mut ch = hasher(personalizations.actions_compact);
+    let mut mh = hasher(personalizations.actions_memos);
+    let mut nh = hasher(personalizations.actions_noncompact);
+    for action in bundle.actions() {
+        ch.update(&<[u8; 32]>::from(action.nullifier));
+        ch.update(&<[u8; 32]>::from(action.cm_x));
+        update_serialized(&mut ch, &action.ephemeral_key);
+        ch.update(&action.enc_ciphertext.0[..52]);
 
-            mh.update(&action.enc_ciphertext.0[52..564]);
+        mh.update(&action.enc_ciphertext.0[52..564]);
 
-            update_serialized(&mut nh, &action.cv);
-            nh.update(&<[u8; 32]>::from(action.rk));
-            nh.update(&action.enc_ciphertext.0[564..]);
-            nh.update(&action.out_ciphertext.0[..]);
-        }
-        h.update(ch.finalize().as_bytes());
-        h.update(mh.finalize().as_bytes());
-        h.update(nh.finalize().as_bytes());
-        h.update(&[bundle.flags.bits()]);
-        h.update(&bundle.value_balance.zatoshis().to_le_bytes());
-        if format.includes_anchor_in_txid_digest() {
-            h.update(&<[u8; 32]>::from(bundle.shared_anchor));
-        }
+        update_serialized(&mut nh, &action.cv);
+        nh.update(&<[u8; 32]>::from(action.rk));
+        nh.update(&action.enc_ciphertext.0[564..]);
+        nh.update(&action.out_ciphertext.0[..]);
     }
-    h.finalize()
+    h.update(ch.finalize().as_bytes());
+    h.update(mh.finalize().as_bytes());
+    h.update(nh.finalize().as_bytes());
+    h.update(&[bundle.flags.bits()]);
+    h.update(&bundle.value_balance.zatoshis().to_le_bytes());
+    if format.includes_anchor_in_txid_digest() {
+        h.update(&<[u8; 32]>::from(bundle.shared_anchor));
+    }
+    finalize_node_hash(h)
 }
 
 /// Combine the level-1 digests into the txid (ZIP-244 txid digest).
@@ -584,6 +595,13 @@ fn hash_bundle_txid(
 /// <https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L426>
 fn txid_inner(parts: &Zip244Parts) -> Hash {
     let header = hash_header(parts);
+    let transparent = hash_transparent_txid(parts.inputs, parts.outputs);
+    let sapling = hash_sapling_txid(parts.sapling, parts.version);
+    let orchard = hash_bundle_txid(parts.orchard, parts.version.orchard_format());
+    let ironwood = parts
+        .version
+        .has_ironwood()
+        .then(|| hash_bundle_txid(parts.ironwood, BundleCommitmentFormat::IronwoodV6));
 
     let mut personal = [0u8; 16];
     personal[..12].copy_from_slice(ZCASH_TX_PERSONALIZATION_PREFIX);
@@ -591,31 +609,11 @@ fn txid_inner(parts: &Zip244Parts) -> Hash {
 
     let mut h = hasher(&personal);
     h.update(header.as_bytes());
-    if parts.inputs.is_empty() && parts.outputs.is_empty() {
-        h.update(EMPTY_TRANSPARENT_TXID_HASH);
-    } else {
-        h.update(hash_transparent_txid(parts.inputs, parts.outputs).as_bytes());
-    }
-    if parts.sapling.is_some() {
-        h.update(hash_sapling_txid(parts.sapling, parts.version).as_bytes());
-    } else {
-        h.update(EMPTY_SAPLING_TXID_HASH);
-    }
-
-    let orchard_format = parts.version.orchard_format();
-    if parts.orchard.is_some() {
-        h.update(hash_bundle_txid(parts.orchard, orchard_format).as_bytes());
-    } else {
-        h.update(orchard_format.empty_txid_hash());
-    }
-    if parts.version.has_ironwood() {
-        if parts.ironwood.is_some() {
-            h.update(
-                hash_bundle_txid(parts.ironwood, BundleCommitmentFormat::IronwoodV6).as_bytes(),
-            );
-        } else {
-            h.update(BundleCommitmentFormat::IronwoodV6.empty_txid_hash());
-        }
+    h.update(&transparent);
+    h.update(&sapling);
+    h.update(&orchard);
+    if let Some(ironwood) = ironwood {
+        h.update(&ironwood);
     }
 
     Hash(
@@ -635,25 +633,26 @@ fn txid_inner(parts: &Zip244Parts) -> Hash {
 fn hash_transparent_auth(
     inputs: &[transparent::Input],
     outputs: &[transparent::Output],
-) -> Blake2bHash {
+) -> [u8; 32] {
+    if inputs.is_empty() && outputs.is_empty() {
+        return *EMPTY_TRANSPARENT_AUTH_HASH;
+    }
+
     let mut h = hasher(ZCASH_TRANSPARENT_SCRIPTS_HASH_PERSONALIZATION);
-    // Present only when the transparent bundle is present (any input or output).
-    if !inputs.is_empty() || !outputs.is_empty() {
-        for input in inputs {
-            match input {
-                transparent::Input::PrevOut { unlock_script, .. } => {
-                    update_serialized(&mut h, unlock_script)
-                }
-                transparent::Input::Coinbase { .. } => {
-                    let script = input
-                        .coinbase_script()
-                        .expect("v5 coinbase input has a valid script sig");
-                    update_serialized(&mut h, &script);
-                }
+    for input in inputs {
+        match input {
+            transparent::Input::PrevOut { unlock_script, .. } => {
+                update_serialized(&mut h, unlock_script)
+            }
+            transparent::Input::Coinbase { .. } => {
+                let script = input
+                    .coinbase_script()
+                    .expect("v5 coinbase input has a valid script sig");
+                update_serialized(&mut h, &script);
             }
         }
     }
-    h.finalize()
+    finalize_node_hash(h)
 }
 
 /// ZIP-244 sapling auth digest.
@@ -663,29 +662,31 @@ fn hash_transparent_auth(
 fn hash_sapling_auth(
     sapling: Option<&sapling::ShieldedData<sapling::SharedAnchor>>,
     version: Zip244Version,
-) -> Blake2bHash {
+) -> [u8; 32] {
+    let Some(sapling) = sapling else {
+        return *version.empty_sapling_auth_hash();
+    };
+
     let mut h = hasher(version.sapling_auth_personalization());
-    if let Some(sapling) = sapling {
-        for spend in sapling.spends() {
-            h.update(&spend.zkproof.0[..]);
-        }
-        for spend in sapling.spends() {
-            h.update(&<[u8; 64]>::from(spend.spend_auth_sig)[..]);
-        }
-        for output in sapling.outputs() {
-            h.update(&output.zkproof.0[..]);
-        }
-        h.update(&<[u8; 64]>::from(sapling.binding_sig)[..]);
-        if version.sapling_auth_includes_anchor() && sapling.spends().next().is_some() {
-            let anchor = <[u8; 32]>::from(
-                sapling
-                    .shared_anchor()
-                    .expect("sapling spends share an anchor when present"),
-            );
-            h.update(&anchor);
-        }
+    for spend in sapling.spends() {
+        h.update(&spend.zkproof.0[..]);
     }
-    h.finalize()
+    for spend in sapling.spends() {
+        h.update(&<[u8; 64]>::from(spend.spend_auth_sig)[..]);
+    }
+    for output in sapling.outputs() {
+        h.update(&output.zkproof.0[..]);
+    }
+    h.update(&<[u8; 64]>::from(sapling.binding_sig)[..]);
+    if version.sapling_auth_includes_anchor() && sapling.spends().next().is_some() {
+        let anchor = <[u8; 32]>::from(
+            sapling
+                .shared_anchor()
+                .expect("sapling spends share an anchor when present"),
+        );
+        h.update(&anchor);
+    }
+    finalize_node_hash(h)
 }
 
 /// ZIP-244 Orchard-style auth digest.
@@ -694,19 +695,21 @@ fn hash_sapling_auth(
 fn hash_bundle_auth(
     bundle: Option<&orchard::ShieldedData>,
     format: BundleCommitmentFormat,
-) -> Blake2bHash {
+) -> [u8; 32] {
+    let Some(bundle) = bundle else {
+        return *format.empty_auth_hash();
+    };
+
     let mut h = hasher(format.personalizations().auth);
-    if let Some(bundle) = bundle {
-        h.update(&bundle.proof.0[..]);
-        for action in bundle.actions.iter() {
-            update_serialized(&mut h, &action.spend_auth_sig);
-        }
-        update_serialized(&mut h, &bundle.binding_sig);
-        if format.includes_anchor_in_authorizing_digest() {
-            h.update(&<[u8; 32]>::from(bundle.shared_anchor));
-        }
+    h.update(&bundle.proof.0[..]);
+    for action in bundle.actions.iter() {
+        update_serialized(&mut h, &action.spend_auth_sig);
     }
-    h.finalize()
+    update_serialized(&mut h, &bundle.binding_sig);
+    if format.includes_anchor_in_authorizing_digest() {
+        h.update(&<[u8; 32]>::from(bundle.shared_anchor));
+    }
+    finalize_node_hash(h)
 }
 
 /// Combine the authorizing-data digests into the ZIP-244 auth commitment.
@@ -714,36 +717,24 @@ fn hash_bundle_auth(
 /// Reference implementation:
 /// <https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L426-L448>
 fn auth_digest_inner(parts: &Zip244Parts) -> AuthDigest {
+    let transparent = hash_transparent_auth(parts.inputs, parts.outputs);
+    let sapling = hash_sapling_auth(parts.sapling, parts.version);
+    let orchard = hash_bundle_auth(parts.orchard, parts.version.orchard_format());
+    let ironwood = parts
+        .version
+        .has_ironwood()
+        .then(|| hash_bundle_auth(parts.ironwood, BundleCommitmentFormat::IronwoodV6));
+
     let mut personal = [0u8; 16];
     personal[..12].copy_from_slice(ZCASH_AUTH_PERSONALIZATION_PREFIX);
     personal[12..].copy_from_slice(&consensus_branch_id(parts).to_le_bytes());
 
     let mut h = hasher(&personal);
-    if parts.inputs.is_empty() && parts.outputs.is_empty() {
-        h.update(EMPTY_TRANSPARENT_AUTH_HASH);
-    } else {
-        h.update(hash_transparent_auth(parts.inputs, parts.outputs).as_bytes());
-    }
-    if parts.sapling.is_some() {
-        h.update(hash_sapling_auth(parts.sapling, parts.version).as_bytes());
-    } else {
-        h.update(parts.version.empty_sapling_auth_hash());
-    }
-
-    let orchard_format = parts.version.orchard_format();
-    if parts.orchard.is_some() {
-        h.update(hash_bundle_auth(parts.orchard, orchard_format).as_bytes());
-    } else {
-        h.update(orchard_format.empty_auth_hash());
-    }
-    if parts.version.has_ironwood() {
-        if parts.ironwood.is_some() {
-            h.update(
-                hash_bundle_auth(parts.ironwood, BundleCommitmentFormat::IronwoodV6).as_bytes(),
-            );
-        } else {
-            h.update(BundleCommitmentFormat::IronwoodV6.empty_auth_hash());
-        }
+    h.update(&transparent);
+    h.update(&sapling);
+    h.update(&orchard);
+    if let Some(ironwood) = ironwood {
+        h.update(&ironwood);
     }
 
     AuthDigest(

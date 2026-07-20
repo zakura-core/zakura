@@ -620,7 +620,7 @@ fn commit_and_authentication_operations_from_one_request_are_distinct() {
         op_kind: HeaderSyncOperationKind::AuthenticateRoots,
     };
     let range = RangeRequest {
-        geometry: CheckedHeaderRange::from_count(block::Height(1), 1)
+        range: CheckedHeaderRange::from_count(block::Height(1), 1)
             .expect("test range is non-empty"),
         anchor_hash: Some(network.genesis_hash()),
         finalized: false,
@@ -3689,7 +3689,7 @@ fn response_before_publication_completion_is_not_reinstalled() {
     );
     let request_id = HeaderSyncRequestId::new(1).expect("non-zero request ID");
     let range = RangeRequest {
-        geometry: CheckedHeaderRange::from_count(block::Height(1), 1)
+        range: CheckedHeaderRange::from_count(block::Height(1), 1)
             .expect("test range is non-empty"),
         anchor_hash: None,
         finalized: false,
@@ -6509,7 +6509,7 @@ fn work_queue_transitions_have_one_explicit_owner() {
 
     let owner = peer(144);
     let range = RangeRequest {
-        geometry: CheckedHeaderRange::from_count(block::Height(1), 2)
+        range: CheckedHeaderRange::from_count(block::Height(1), 2)
             .expect("test range is non-empty"),
         anchor_hash: Some(block::Hash([1; 32])),
         finalized: false,

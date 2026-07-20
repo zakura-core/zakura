@@ -501,7 +501,7 @@ mod tests {
 
     fn range(start: u32, count: u32, priority: RangePriority) -> RangeRequest {
         RangeRequest {
-            geometry: CheckedHeaderRange::from_count(block::Height(start), count)
+            range: CheckedHeaderRange::from_count(block::Height(start), count)
                 .expect("test range is non-empty and bounded"),
             anchor_hash: None,
             finalized: false,
@@ -548,7 +548,7 @@ mod tests {
             .expect("peer can claim the pending range");
         queue.mark_assigned(peer.clone(), claimed);
         queue.ensure_forward(RangeRequest {
-            geometry: CheckedHeaderRange::from_count(block::Height(1), 3)
+            range: CheckedHeaderRange::from_count(block::Height(1), 3)
                 .expect("test range is non-empty"),
             ..range
         });
@@ -579,7 +579,7 @@ mod tests {
             queue.forward.iter().copied().collect::<Vec<_>>(),
             vec![
                 RangeRequest {
-                    geometry: CheckedHeaderRange::from_count(block::Height(2), 1)
+                    range: CheckedHeaderRange::from_count(block::Height(2), 1)
                         .expect("test suffix is non-empty"),
                     anchor_hash: Some(anchor),
                     ..first

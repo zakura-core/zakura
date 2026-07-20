@@ -1717,13 +1717,13 @@ impl HeaderSyncReactor {
 
         if header_count < outstanding.range.count() {
             let original = outstanding.range;
-            outstanding.range.geometry = payload.range();
+            outstanding.range.range = payload.range();
             self.state
                 .schedule
                 .narrow_queued_range(original, outstanding.range);
             if let Some(suffix_start) = height_after_count(original.start_height(), header_count) {
                 let suffix = RangeRequest {
-                    geometry: CheckedHeaderRange::from_count(
+                    range: CheckedHeaderRange::from_count(
                         suffix_start,
                         original.count().saturating_sub(header_count),
                     )
@@ -2232,13 +2232,13 @@ impl HeaderSyncReactor {
             self.startup.max_frame_bytes,
             range.want_tree_aux_roots,
         );
-        range.geometry = CheckedHeaderRange::from_count(range.start_height(), count)
+        range.range = CheckedHeaderRange::from_count(range.start_height(), count)
             .expect("clamped request count is non-zero and within the original range");
         if count < original_range.count() {
             if let Some(suffix_start) = height_after_count(range.start_height(), count) {
                 self.state.schedule.ensure(
                     RangeRequest {
-                        geometry: CheckedHeaderRange::from_count(
+                        range: CheckedHeaderRange::from_count(
                             suffix_start,
                             original_range.count().saturating_sub(count),
                         )

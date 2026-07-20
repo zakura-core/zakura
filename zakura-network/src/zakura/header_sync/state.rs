@@ -155,7 +155,7 @@ impl HeaderSyncCore {
                 batch_len = count_between(batch_start, checkpoint);
             }
             self.schedule.ensure_forward(RangeRequest {
-                geometry: CheckedHeaderRange::from_count(batch_start, batch_len)
+                range: CheckedHeaderRange::from_count(batch_start, batch_len)
                     .expect("bounded non-empty batch has checked geometry"),
                 anchor_hash,
                 finalized,
@@ -218,7 +218,7 @@ impl VctRootRepair {
             height,
             generation,
             range: RangeRequest {
-                geometry: CheckedHeaderRange::from_count(height, count)?,
+                range: CheckedHeaderRange::from_count(height, count)?,
                 anchor_hash: Some(anchor_hash),
                 finalized: false,
                 want_tree_aux_roots: true,
@@ -563,7 +563,7 @@ pub(super) struct PendingOperation {
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct RangeRequest {
-    pub(super) geometry: CheckedHeaderRange,
+    pub(super) range: CheckedHeaderRange,
     pub(super) anchor_hash: Option<block::Hash>,
     pub(super) finalized: bool,
     pub(super) want_tree_aux_roots: bool,
@@ -572,15 +572,15 @@ pub(super) struct RangeRequest {
 
 impl RangeRequest {
     pub(super) fn start_height(self) -> block::Height {
-        self.geometry.start()
+        self.range.start()
     }
 
     pub(super) fn count(self) -> u32 {
-        self.geometry.count()
+        self.range.count()
     }
 
     pub(super) fn end_height(self) -> block::Height {
-        self.geometry.end()
+        self.range.end()
     }
 
     pub(super) fn suffix_after(
@@ -595,7 +595,7 @@ impl RangeRequest {
         let start_height = next_height(covered_through)?;
         let geometry = CheckedHeaderRange::from_bounds(start_height, end_height)?;
         Some(Self {
-            geometry,
+            range: geometry,
             anchor_hash: Some(anchor_hash),
             ..self
         })

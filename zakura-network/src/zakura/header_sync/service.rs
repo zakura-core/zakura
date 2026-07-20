@@ -819,7 +819,7 @@ mod request_id_tests {
             Some(commands_tx),
         );
         let range = RangeRequest {
-            geometry: CheckedHeaderRange::from_count(block::Height(1), 1)
+            range: CheckedHeaderRange::from_count(block::Height(1), 1)
                 .expect("test range is non-empty"),
             anchor_hash: None,
             finalized: false,

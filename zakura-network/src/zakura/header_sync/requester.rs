@@ -137,7 +137,7 @@ mod tests {
 
     fn range(start: u32, count: u32) -> RangeRequest {
         RangeRequest {
-            geometry: CheckedHeaderRange::from_count(block::Height(start), count)
+            range: CheckedHeaderRange::from_count(block::Height(start), count)
                 .expect("test range is non-empty and bounded"),
             anchor_hash: None,
             finalized: false,

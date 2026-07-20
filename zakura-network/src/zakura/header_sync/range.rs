@@ -45,11 +45,6 @@ impl CheckedHeaderRange {
             .expect("checked range bounds are ascending")
     }
 
-    /// Return the part of this range through `included_end`.
-    pub fn prefix_through(self, included_end: block::Height) -> Option<Self> {
-        Self::from_bounds(self.start, self.end.min(included_end))
-    }
-
     /// Return the part of this range strictly after `covered_through`.
     pub fn suffix_after(self, covered_through: block::Height) -> Option<Self> {
         if covered_through < self.start {
@@ -137,19 +132,6 @@ impl HeaderRangePayload {
         Some(self)
     }
 
-    /// Keep only the part of this payload through `included_end`.
-    pub fn prefix_through(mut self, included_end: block::Height) -> Option<Self> {
-        let prefix = self.range.prefix_through(included_end)?;
-        let retained_count = usize::try_from(prefix.count()).expect("payload length fits in usize");
-        self.headers.truncate(retained_count);
-        self.body_sizes.truncate(retained_count);
-        if let Some(roots) = self.tree_aux_roots.as_mut() {
-            roots.truncate(retained_count);
-        }
-        self.range = prefix;
-        Some(self)
-    }
-
     /// Consume this payload into state request parts.
     pub fn into_parts(
         self,
@@ -199,10 +181,6 @@ mod tests {
         assert_eq!(suffix.end(), block::Height(u32::MAX));
         assert_eq!(suffix.count(), 1);
         assert_eq!(suffix.suffix_after(block::Height(u32::MAX)), None);
-        assert_eq!(
-            range.prefix_through(block::Height(u32::MAX - 1)),
-            CheckedHeaderRange::from_count(block::Height(u32::MAX - 1), 1)
-        );
     }
 
     #[test]

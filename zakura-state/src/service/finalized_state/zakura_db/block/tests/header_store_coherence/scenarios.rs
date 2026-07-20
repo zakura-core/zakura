@@ -342,6 +342,7 @@ fn s06_reorg_to_lower_height() {
         .run_all(&[commit_trunk(), commit_branch(BRANCH_B)])
         .expect("setup is clean");
     outcomes.iter().for_each(assert_accepted);
+    let old_tip = branch_tip(BRANCH_B).0;
     assert_eq!(
         harness.state().best_header_tip(),
         Some(branch_tip(BRANCH_B)),
@@ -356,6 +357,13 @@ fn s06_reorg_to_lower_height() {
         Some(branch_tip(BRANCH_A)),
         "the tip height decreased to A's tip",
     );
+    let new_tip = branch_tip(BRANCH_A).0;
+    for height in (new_tip.0 + 1..=old_tip.0).map(Height) {
+        assert!(
+            harness.state().commitment_roots(height).is_none(),
+            "the reorg removes stale commitment roots at {height:?}",
+        );
+    }
 }
 
 /// s07: double reorg at the same fork point (B → A → B_ext), then the losing

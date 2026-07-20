@@ -1064,6 +1064,7 @@ async fn caches_getaddr_response() {
             MAX_INBOUND_CONCURRENCY,
             false,
             None,
+            Vec::new(),
             setup_rx,
         ));
         let inbound_service = BoxService::new(inbound_service);
@@ -1298,6 +1299,7 @@ async fn setup(
         MAX_INBOUND_CONCURRENCY,
         false,
         None,
+        Vec::new(),
         setup_rx,
     ));
     let inbound_service = BoxService::new(inbound_service);

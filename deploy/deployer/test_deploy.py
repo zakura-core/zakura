@@ -121,6 +121,8 @@ class MountRenderingTests(unittest.TestCase):
             "deploy_kind": "systemd",
             "manage_config": True,
             "service_name": "zakurad",
+            "service_kill_mode": "",
+            "service_timeout_stop_sec": "",
             "bin_path": "/usr/local/bin/zakurad",
             "config_path": "/etc/zakura/zakura.toml",
             "log_file": "/var/log/zakura/zakura.log",
@@ -138,6 +140,7 @@ class MountRenderingTests(unittest.TestCase):
             "checkpoint_sync": True,
             "vct_fast_sync": True,
             "zakura": None,
+            "zcashd_compat": None,
             "working_dir": "",
             "start_command": "",
             "process_pattern": "",
@@ -160,6 +163,40 @@ class MountRenderingTests(unittest.TestCase):
 
         self.assertNotIn("RequiresMountsFor=/mnt/data", service)
         self.assertNotIn("AssertPathIsMountPoint=/mnt/data", service)
+
+    def test_render_service_stop_policy(self):
+        service = deploy.render_service(self.node(
+            service_kill_mode="mixed",
+            service_timeout_stop_sec="6m",
+        ))
+
+        self.assertIn("KillMode=mixed", service)
+        self.assertIn("TimeoutStopSec=6m", service)
+
+    def test_render_zcashd_compat_config(self):
+        config = deploy.render_node_config(self.node(
+            rpc_listen_addr="127.0.0.1:18232",
+            zcashd_compat={
+                "enabled": True,
+                "manage_zcashd": True,
+                "zcashd_source": "embedded",
+                "zcashd_datadir": "/mnt/zcashd",
+                "zcashd_extra_args": [
+                    "-rpcbind=127.0.0.1",
+                    "-rpcallowip=127.0.0.1",
+                ],
+                "shutdown_grace_period": "5m",
+            },
+        ))
+
+        self.assertIn('listen_addr = "127.0.0.1:18232"', config)
+        self.assertIn("[zcashd_compat]", config)
+        self.assertIn("enabled = true", config)
+        self.assertIn("manage_zcashd = true", config)
+        self.assertIn('zcashd_source = "embedded"', config)
+        self.assertIn('zcashd_datadir = "/mnt/zcashd"', config)
+        self.assertIn('    "-rpcbind=127.0.0.1",', config)
+        self.assertIn('shutdown_grace_period = "5m"', config)
 
 
 if __name__ == "__main__":

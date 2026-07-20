@@ -49,6 +49,8 @@ DEFAULTS = {
     # For fleets provisioned outside the deployer with hand-tuned configs.
     "manage_config": True,
     "service_name": "zakurad",
+    "service_kill_mode": "",
+    "service_timeout_stop_sec": "",
     "bin_path": "/usr/local/bin/zakurad",
     "config_path": "/etc/zakura/zakura.toml",
     "log_file": "/var/log/zakura/zakura.log",
@@ -72,6 +74,8 @@ DEFAULTS = {
     # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
     # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
     "zakura": None,
+    # Optional fleet-wide [zcashd_compat] table.
+    "zcashd_compat": None,
     # Process deploys are for manually supervised nodes, like the testnet
     # zcashd-compat Zakura sidecar, where systemd would fight the local runbook.
     "working_dir": "",
@@ -95,6 +99,8 @@ class Node:
     deploy_kind: str
     manage_config: bool
     service_name: str
+    service_kill_mode: str
+    service_timeout_stop_sec: str
     bin_path: str
     config_path: str
     log_file: str
@@ -112,6 +118,7 @@ class Node:
     checkpoint_sync: bool
     vct_fast_sync: bool
     zakura: object  # dict | None: fleet-wide [network.zakura] settings
+    zcashd_compat: object  # dict | None: fleet-wide [zcashd_compat] settings
     working_dir: str
     start_command: str
     process_pattern: str
@@ -219,6 +226,8 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             deploy_kind=merged["deploy_kind"],
             manage_config=merged["manage_config"],
             service_name=merged["service_name"],
+            service_kill_mode=merged["service_kill_mode"],
+            service_timeout_stop_sec=merged["service_timeout_stop_sec"],
             bin_path=merged["bin_path"],
             config_path=merged["config_path"],
             log_file=merged["log_file"],
@@ -238,6 +247,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             checkpoint_sync=merged["checkpoint_sync"],
             vct_fast_sync=merged["vct_fast_sync"],
             zakura=merged.get("zakura"),
+            zcashd_compat=merged.get("zcashd_compat"),
             working_dir=merged["working_dir"],
             start_command=merged["start_command"],
             process_pattern=merged["process_pattern"],
@@ -421,17 +431,12 @@ def render_template(name: str, subst: dict[str, str]) -> str:
     return text
 
 
-def render_zakura_block(zakura: object) -> str:
-    """Render a fleet-wide [network.zakura] section from a dict, or "" if unset.
-
-    Recognises `dev_network` (str), `listen_addr` (str), and `bootstrap_peers`
-    (list of `node_id@addr` strings). Unknown keys are passed through verbatim so
-    the deployer does not need to learn every Zakura field.
-    """
-    if not zakura:
+def render_toml_table(section: str, values: object) -> str:
+    """Render a simple TOML table from a dict, or "" when it is unset."""
+    if not values:
         return ""
-    lines = ["[network.zakura]"]
-    for key, value in zakura.items():
+    lines = [f"[{section}]"]
+    for key, value in values.items():
         if isinstance(value, bool):
             lines.append(f"{key} = {'true' if value else 'false'}")
         elif isinstance(value, (int, float)):
@@ -442,10 +447,19 @@ def render_zakura_block(zakura: object) -> str:
                 lines.append(f"{key} = [\n{items}]")
             else:
                 lines.append(f"{key} = []")
-        else:
+        elif value is not None:
             lines.append(f'{key} = "{value}"')
-    # Leading/trailing blank lines so the section reads cleanly between [network] and [state].
     return "\n" + "\n".join(lines) + "\n"
+
+
+def render_zakura_block(zakura: object) -> str:
+    """Render fleet-wide settings under [network.zakura]."""
+    return render_toml_table("network.zakura", zakura)
+
+
+def render_zcashd_compat_block(zcashd_compat: object) -> str:
+    """Render fleet-wide settings under [zcashd_compat]."""
+    return render_toml_table("zcashd_compat", zcashd_compat)
 
 
 def render_node_config(node: Node) -> str:
@@ -482,6 +496,7 @@ def render_node_config(node: Node) -> str:
         "RPC_BLOCK": rpc_block,
         "CHECKPOINT_SYNC": "true" if node.checkpoint_sync else "false",
         "VCT_FAST_SYNC": "true" if node.vct_fast_sync else "false",
+        "ZCASHD_COMPAT_BLOCK": render_zcashd_compat_block(node.zcashd_compat),
     })
 
 
@@ -496,12 +511,18 @@ def render_service(node: Node) -> str:
             f"RequiresMountsFor={DATA_MOUNT}\n"
             f"AssertPathIsMountPoint={DATA_MOUNT}\n"
         )
+    stop_lines = ""
+    if node.service_kill_mode:
+        stop_lines += f"KillMode={node.service_kill_mode}\n"
+    if node.service_timeout_stop_sec:
+        stop_lines += f"TimeoutStopSec={node.service_timeout_stop_sec}\n"
     return render_template("zakurad.service", {
         "SERVICE_NAME": node.service_name,
         "BIN_PATH": node.bin_path,
         "CONFIG_PATH": node.config_path,
         "LOG_FILE": node.log_file,
         "MOUNT_LINES": mount_lines,
+        "STOP_LINES": stop_lines,
     })
 
 

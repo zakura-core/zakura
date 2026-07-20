@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test Zakura PR Node"
+  short_description: "Run Golden DigitalOcean node tests"
+  default_prompt: "Use $test-zakura-pr-node to run this Zakura or zcashd compatibility test with the maintained Golden DigitalOcean assets."

@@ -9,6 +9,21 @@
 - Run formatting and the checks relevant to the code you changed.
 - For fixes, explain the root cause, how the solution addresses it, and how the tests exercise the affected behavior.
 
+## DigitalOcean Real-Node Tests
+
+- For normal DigitalOcean tests of Zakura or the managed zcashd compatibility
+  wrapper, use `.github/workflows/zakura-pr-node.yml` and its Golden assets.
+  Do not provision an ad hoc test Droplet or manually download or unpack chain
+  state on a test Droplet.
+- Only `.github/workflows/zakura-pr-node-bake.yml` may create or refresh the
+  Golden image and state fixtures. If an asset is missing, stale, or
+  incompatible with the requested database format, stop and report it or run
+  the bake workflow. Do not bypass the Golden path with an untracked fixture.
+- Select `test_profile=zakura` for ordinary Zakura tests and
+  `test_profile=zcashd-compat` when the managed zcashd wrapper is under test.
+  Follow `.agents/skills/test-zakura-pr-node/SKILL.md` and
+  `docs/pr-node-do-setup.md` for dispatch, validation, and cleanup.
+
 ## Project Structure & Module Organization
 
 Zakura is a Rust workspace. Main crates include:

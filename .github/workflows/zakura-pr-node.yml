@@ -20,6 +20,11 @@ on:
       ref:
         description: "Branch, tag, or SHA to test (exactly one of pr_number / ref)"
         required: false
+      test_profile:
+        description: "Node profile to exercise"
+        type: choice
+        options: [zakura, zcashd-compat]
+        default: zakura
       snapshot_mode:
         description: "Chain state to start from"
         type: choice
@@ -55,7 +60,7 @@ jobs:
   node:
     runs-on: ubuntu-latest
     # duration_minutes (<=60 typically) + incremental build + provisioning overhead.
-    timeout-minutes: 110
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -69,10 +74,15 @@ jobs:
           REF: ${{ inputs.ref }}
           MODE: ${{ inputs.snapshot_mode }}
           NETWORK: ${{ inputs.network }}
+          TEST_PROFILE: ${{ inputs.test_profile || 'zakura' }}
         run: |
           set -euo pipefail
           if [ "${MODE}" = "sandblast" ] && [ "${NETWORK}" != "mainnet" ]; then
             echo "snapshot_mode=sandblast is mainnet-only (the spam region is a mainnet range)" >&2
+            exit 1
+          fi
+          if [ "${TEST_PROFILE}" = "zcashd-compat" ] && { [ "${MODE}" != "tip" ] || [ "${NETWORK}" != "mainnet" ]; }; then
+            echo "test_profile=zcashd-compat requires snapshot_mode=tip and network=mainnet" >&2
             exit 1
           fi
           if { [ -n "${PR_NUMBER}" ] && [ -n "${REF}" ]; } || { [ -z "${PR_NUMBER}" ] && [ -z "${REF}" ]; }; then
@@ -121,54 +131,123 @@ jobs:
           install -m 600 /dev/null /tmp/do_ssh
           printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh
 
-      - name: Pick baked image and state snapshot
+      - name: Pick Golden image and state snapshots
         id: baked
         env:
           MODE: ${{ inputs.snapshot_mode }}
           NETWORK: ${{ inputs.network }}
+          TEST_PROFILE: ${{ inputs.test_profile || 'zakura' }}
         run: |
           set -euo pipefail
-          IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
-            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | tail -1 | awk '{print $2}')
+          IMAGE_ROW=$(doctl compute image list-user --format ID,Name,Created --no-header | \
+            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1, $3}' | sort | tail -1)
+          read -r IMAGE_NAME IMAGE IMAGE_CREATED <<< "${IMAGE_ROW}"
           if [ -z "${IMAGE}" ]; then
             echo "no zakura-pr-node-* image found; run the 'PR node image bake' workflow first" >&2
             exit 1
           fi
-          echo "image_id=${IMAGE}" >> "$GITHUB_OUTPUT"
+          {
+            echo "image_id=${IMAGE}"
+            echo "image_name=${IMAGE_NAME}"
+            echo "image_created=${IMAGE_CREATED}"
+            echo "zakura_snap_id="
+            echo "zakura_snap_name="
+            echo "zakura_snap_created="
+            echo "zcashd_snap_id="
+            echo "zcashd_snap_name="
+            echo "zcashd_snap_created="
+          } >> "$GITHUB_OUTPUT"
           if [ "${MODE}" = "genesis" ]; then
-            echo "vol_snap_id=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          SNAP=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
-            awk -v pre="zakura-pr-state-${NETWORK}-" 'index($2, pre) == 1 {print $2, $1}' | \
-            sort | tail -1 | awk '{print $2}')
-          if [ -z "${SNAP}" ]; then
+          SNAPSHOTS=$(doctl compute snapshot list --resource volume --format ID,Name,CreatedAt --no-header)
+          if [ "${TEST_PROFILE}" = "zcashd-compat" ]; then
+            PAIR_ROW=$(awk '
+              index($2, "zakura-pr-state-mainnet-") == 1 {
+                stamp = substr($2, length("zakura-pr-state-mainnet-") + 1)
+                z_name[stamp] = $2; z_id[stamp] = $1; z_created[stamp] = $3
+              }
+              index($2, "zakura-pr-state-zcashd-mainnet-") == 1 {
+                stamp = substr($2, length("zakura-pr-state-zcashd-mainnet-") + 1)
+                d_name[stamp] = $2; d_id[stamp] = $1; d_created[stamp] = $3
+              }
+              END {
+                for (stamp in z_id) {
+                  if (stamp in d_id) {
+                    print stamp, z_name[stamp], z_id[stamp], z_created[stamp], d_name[stamp], d_id[stamp], d_created[stamp]
+                  }
+                }
+              }
+            ' <<< "${SNAPSHOTS}" | sort | tail -1)
+            read -r PAIR_STAMP ZAKURA_SNAP_NAME ZAKURA_SNAP ZAKURA_SNAP_CREATED \
+              ZCASHD_SNAP_NAME ZCASHD_SNAP ZCASHD_SNAP_CREATED <<< "${PAIR_ROW}"
+            if [ -z "${PAIR_STAMP}" ]; then
+              echo "no complete mainnet Zakura/zcashd Golden snapshot pair found; run the bake workflow first" >&2
+              exit 1
+            fi
+          else
+            ZAKURA_ROW=$(awk -v pre="zakura-pr-state-${NETWORK}-" \
+              'index($2, pre) == 1 {print $2, $1, $3}' <<< "${SNAPSHOTS}" | sort | tail -1)
+            read -r ZAKURA_SNAP_NAME ZAKURA_SNAP ZAKURA_SNAP_CREATED <<< "${ZAKURA_ROW}"
+          fi
+          if [ -z "${ZAKURA_SNAP}" ]; then
             echo "no zakura-pr-state-${NETWORK}-* volume snapshot found; run the bake workflow first" >&2
             exit 1
           fi
-          echo "vol_snap_id=${SNAP}" >> "$GITHUB_OUTPUT"
+          {
+            echo "zakura_snap_id=${ZAKURA_SNAP}"
+            echo "zakura_snap_name=${ZAKURA_SNAP_NAME}"
+            echo "zakura_snap_created=${ZAKURA_SNAP_CREATED}"
+          } >> "$GITHUB_OUTPUT"
+          if [ "${TEST_PROFILE}" = "zcashd-compat" ]; then
+            {
+              echo "zcashd_snap_id=${ZCASHD_SNAP}"
+              echo "zcashd_snap_name=${ZCASHD_SNAP_NAME}"
+              echo "zcashd_snap_created=${ZCASHD_SNAP_CREATED}"
+            } >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Create droplet (+ state volume)
+      - name: Create droplet and Golden state volumes
         id: droplet
         env:
           MODE: ${{ inputs.snapshot_mode }}
+          TEST_PROFILE: ${{ inputs.test_profile || 'zakura' }}
           DROPLET_SIZE: ${{ inputs.droplet_size || 'c-8' }}
           SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
           IMAGE_ID: ${{ steps.baked.outputs.image_id }}
-          VOL_SNAP_ID: ${{ steps.baked.outputs.vol_snap_id }}
+          ZAKURA_SNAP_ID: ${{ steps.baked.outputs.zakura_snap_id }}
+          ZCASHD_SNAP_ID: ${{ steps.baked.outputs.zcashd_snap_id }}
           SLUG: ${{ steps.target.outputs.slug }}
         run: |
           set -euo pipefail
           VOLUME_ARGS=()
-          VOLUME_NAME=""
-          VOLUME_ID=""
+          ZAKURA_VOLUME_NAME=""
+          ZAKURA_VOLUME_ID=""
+          ZCASHD_VOLUME_NAME=""
+          ZCASHD_VOLUME_ID=""
           if [ "${MODE}" != "genesis" ]; then
-            VOLUME_NAME="zakura-pr-vol-${GITHUB_RUN_ID}"
-            SIZE=$(doctl compute snapshot get "${VOL_SNAP_ID}" --format MinDiskSize --no-header)
-            VOLUME_ID=$(doctl compute volume create "${VOLUME_NAME}" \
-              --region nyc3 --snapshot "${VOL_SNAP_ID}" --size "${SIZE}GiB" \
+            ZAKURA_VOLUME_NAME="zakura-pr-vol-${GITHUB_RUN_ID}"
+            SIZE=$(doctl compute snapshot get "${ZAKURA_SNAP_ID}" --format MinDiskSize --no-header)
+            ZAKURA_VOLUME_ID=$(doctl compute volume create "${ZAKURA_VOLUME_NAME}" \
+              --region nyc3 --snapshot "${ZAKURA_SNAP_ID}" --size "${SIZE}GiB" \
               --format ID --no-header)
-            VOLUME_ARGS=(--volumes "${VOLUME_ID}")
+            VOLUME_ARGS+=(--volumes "${ZAKURA_VOLUME_ID}")
+            {
+              echo "zakura_volume_name=${ZAKURA_VOLUME_NAME}"
+              echo "zakura_volume_id=${ZAKURA_VOLUME_ID}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${TEST_PROFILE}" = "zcashd-compat" ]; then
+            ZCASHD_VOLUME_NAME="zakura-pr-zcashd-vol-${GITHUB_RUN_ID}"
+            SIZE=$(doctl compute snapshot get "${ZCASHD_SNAP_ID}" --format MinDiskSize --no-header)
+            ZCASHD_VOLUME_ID=$(doctl compute volume create "${ZCASHD_VOLUME_NAME}" \
+              --region nyc3 --snapshot "${ZCASHD_SNAP_ID}" --size "${SIZE}GiB" \
+              --format ID --no-header)
+            VOLUME_ARGS+=(--volumes "${ZCASHD_VOLUME_ID}")
+            {
+              echo "zcashd_volume_name=${ZCASHD_VOLUME_NAME}"
+              echo "zcashd_volume_id=${ZCASHD_VOLUME_ID}"
+            } >> "$GITHUB_OUTPUT"
           fi
           NAME="zakura-pr-${SLUG}-${GITHUB_RUN_ID}"
           doctl compute droplet create "$NAME" \
@@ -182,8 +261,6 @@ jobs:
           {
             echo "id=$(awk '{print $1}' /tmp/droplet.txt)"
             echo "ip=$(awk '{print $2}' /tmp/droplet.txt)"
-            echo "volume_name=${VOLUME_NAME}"
-            echo "volume_id=${VOLUME_ID}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Wait for SSH
@@ -206,10 +283,21 @@ jobs:
           GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MODE: ${{ inputs.snapshot_mode }}
           NETWORK: ${{ inputs.network }}
+          TEST_PROFILE: ${{ inputs.test_profile || 'zakura' }}
           SHA: ${{ steps.target.outputs.sha }}
           REFSPEC: ${{ steps.target.outputs.refspec }}
           DURATION_MINUTES: ${{ inputs.duration_minutes || '60' }}
-          VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
+          IMAGE_ID: ${{ steps.baked.outputs.image_id }}
+          IMAGE_NAME: ${{ steps.baked.outputs.image_name }}
+          IMAGE_CREATED: ${{ steps.baked.outputs.image_created }}
+          ZAKURA_SNAPSHOT_ID: ${{ steps.baked.outputs.zakura_snap_id }}
+          ZAKURA_SNAPSHOT_NAME: ${{ steps.baked.outputs.zakura_snap_name }}
+          ZAKURA_SNAPSHOT_CREATED: ${{ steps.baked.outputs.zakura_snap_created }}
+          ZCASHD_SNAPSHOT_ID: ${{ steps.baked.outputs.zcashd_snap_id }}
+          ZCASHD_SNAPSHOT_NAME: ${{ steps.baked.outputs.zcashd_snap_name }}
+          ZCASHD_SNAPSHOT_CREATED: ${{ steps.baked.outputs.zcashd_snap_created }}
+          ZAKURA_VOLUME_NAME: ${{ steps.droplet.outputs.zakura_volume_name }}
+          ZCASHD_VOLUME_NAME: ${{ steps.droplet.outputs.zcashd_volume_name }}
         run: |
           set -euo pipefail
           umask 077
@@ -218,16 +306,33 @@ jobs:
             printf 'GH_CLONE_TOKEN=%q\n'    "${GH_CLONE_TOKEN}"
             printf 'MODE=%q\n'              "${MODE}"
             printf 'NETWORK=%q\n'           "${NETWORK}"
+            printf 'TEST_PROFILE=%q\n'      "${TEST_PROFILE}"
             printf 'SHA=%q\n'               "${SHA}"
             printf 'REFSPEC=%q\n'           "${REFSPEC}"
             printf 'DURATION_MINUTES=%q\n'  "${DURATION_MINUTES}"
-            printf 'VOLUME_NAME=%q\n'       "${VOLUME_NAME}"
+            printf 'IMAGE_ID=%q\n'          "${IMAGE_ID}"
+            printf 'IMAGE_NAME=%q\n'        "${IMAGE_NAME}"
+            printf 'IMAGE_CREATED=%q\n'     "${IMAGE_CREATED}"
+            printf 'ZAKURA_SNAPSHOT_ID=%q\n'      "${ZAKURA_SNAPSHOT_ID}"
+            printf 'ZAKURA_SNAPSHOT_NAME=%q\n'    "${ZAKURA_SNAPSHOT_NAME}"
+            printf 'ZAKURA_SNAPSHOT_CREATED=%q\n' "${ZAKURA_SNAPSHOT_CREATED}"
+            printf 'ZCASHD_SNAPSHOT_ID=%q\n'      "${ZCASHD_SNAPSHOT_ID}"
+            printf 'ZCASHD_SNAPSHOT_NAME=%q\n'    "${ZCASHD_SNAPSHOT_NAME}"
+            printf 'ZCASHD_SNAPSHOT_CREATED=%q\n' "${ZCASHD_SNAPSHOT_CREATED}"
+            printf 'ZAKURA_VOLUME_NAME=%q\n'      "${ZAKURA_VOLUME_NAME}"
+            printf 'ZCASHD_VOLUME_NAME=%q\n'      "${ZCASHD_VOLUME_NAME}"
           } > /tmp/run.env
           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
             /tmp/run.env \
             .github/workflows/scripts/pr-node-run.sh \
             .github/workflows/scripts/pr-node-monitor.py \
             "root@${IP}:/root/"
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            deploy/deployer/deploy.py "root@${IP}:/root/pr-node-deploy.py"
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            deploy/deployer/templates/zakura.toml "root@${IP}:/root/pr-node-zakura.toml"
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            deploy/deployer/templates/zakurad.service "root@${IP}:/root/pr-node-zakurad.service"
           rm -f /tmp/run.env
           # Keepalives: the monitored hour is long and low-output.
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -272,6 +377,7 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PR: ${{ steps.target.outputs.pr }}
+          TEST_PROFILE: ${{ inputs.test_profile || 'zakura' }}
           MODE: ${{ inputs.snapshot_mode }}
           NETWORK: ${{ inputs.network }}
           IP: ${{ steps.droplet.outputs.ip }}
@@ -279,7 +385,9 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const marker = `<!-- zakura-pr-node:${process.env.MODE}:${process.env.NETWORK} -->`;
+            const marker = process.env.TEST_PROFILE === 'zakura'
+              ? `<!-- zakura-pr-node:${process.env.MODE}:${process.env.NETWORK} -->`
+              : `<!-- zakura-pr-node:${process.env.TEST_PROFILE}:${process.env.MODE}:${process.env.NETWORK} -->`;
             let summary;
             try {
               summary = fs.readFileSync('/tmp/out/summary.md', 'utf8');
@@ -320,7 +428,7 @@ jobs:
         if: always() && steps.droplet.outputs.ip != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
         with:
-          name: zakura-pr-node-${{ github.run_id }}
+          name: zakura-pr-node-${{ inputs.test_profile || 'zakura' }}-${{ github.run_id }}
           path: /tmp/out/
           retention-days: 14
           if-no-files-found: ignore
@@ -329,7 +437,8 @@ jobs:
         if: always()
         env:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
-          VOLUME_ID: ${{ steps.droplet.outputs.volume_id }}
+          ZAKURA_VOLUME_ID: ${{ steps.droplet.outputs.zakura_volume_id }}
+          ZCASHD_VOLUME_ID: ${{ steps.droplet.outputs.zcashd_volume_id }}
           TEARDOWN: ${{ inputs.teardown_after_run }}
           SSH_FAILED: ${{ steps.sshwait.outcome == 'failure' }}
         run: |
@@ -345,11 +454,13 @@ jobs:
               sleep 5
             done
           fi
-          if [ -n "${VOLUME_ID}" ]; then
-            # The volume detaches asynchronously after the droplet delete.
-            for _ in $(seq 1 12); do
-              doctl compute volume delete "${VOLUME_ID}" -f && break
-              sleep 10
-            done
-          fi
+          for VOLUME_ID in "${ZAKURA_VOLUME_ID}" "${ZCASHD_VOLUME_ID}"; do
+            if [ -n "${VOLUME_ID}" ]; then
+              # Volumes detach asynchronously after the droplet delete.
+              for _ in $(seq 1 12); do
+                doctl compute volume delete "${VOLUME_ID}" -f && break
+                sleep 10
+              done
+            fi
+          done
           true

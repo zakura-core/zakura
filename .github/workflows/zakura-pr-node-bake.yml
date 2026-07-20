@@ -4,9 +4,11 @@ name: PR node image bake
 #   - one base droplet image: build deps + rustup + repo clone + warm cargo
 #     release cache + a loopback SSH identity for deploy.py,
 #   - one volume snapshot per network with extracted chain state
-#     (mainnet: tip/ + sandblast/, testnet: tip/).
-# Runs weekly so the tip states and the cargo cache never drift far from main;
-# PR-node runs sync the remaining gap during their hour.
+#     (mainnet: tip/ + sandblast/, testnet: tip/),
+#   - one separate zcashd mainnet fixture snapshot when a prior fixture or an
+#     explicitly confirmed first-seed Droplet is available.
+# Runs twice weekly so the 10,000-block pruned retention window can tolerate one
+# missed refresh; PR-node runs sync the remaining gap during their hour.
 
 on:
   workflow_dispatch:
@@ -19,8 +21,34 @@ on:
         description: "DO region (must host the run droplets too)"
         required: false
         default: nyc3
+      zcashd_seed_droplet_id:
+        description: "First seed only: active same-region Droplet with a cleanly stopped zcashd datadir"
+        required: false
+      zcashd_seed_confirm:
+        description: "First seed only: type COPY_CLEAN_ZCASHD_STATE"
+        required: false
+      zcashd_seed_datadir:
+        description: "First seed only: source zcashd datadir"
+        required: false
+        default: /root/.zcashd
+      zcashd_seed_height:
+        description: "First seed only: cleanly flushed zcashd tip height"
+        required: false
+      zcashd_seed_hash:
+        description: "First seed only: cleanly flushed zcashd tip hash"
+        required: false
+      zcashd_seed_archive_url:
+        description: "First seed provenance: original archive URL"
+        required: false
+      zcashd_seed_archive_sha256:
+        description: "First seed provenance: expected archive SHA256"
+        required: false
+      zcashd_seed_checksum_verified:
+        description: "First seed provenance: full archive checksum was verified"
+        type: boolean
+        default: false
   schedule:
-    - cron: "0 4 * * 1" # weekly Monday 04:00 UTC
+    - cron: "0 4 * * 1,4" # Monday and Thursday 04:00 UTC
 
 permissions:
   contents: read
@@ -32,8 +60,8 @@ concurrency:
 jobs:
   bake:
     runs-on: ubuntu-latest
-    # Cold cargo build + three snapshot downloads + a ~50GB image snapshot.
-    timeout-minutes: 210
+    # Cold cargo build + state downloads + zcashd catch-up + image snapshot.
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -62,33 +90,134 @@ jobs:
           REGION: ${{ inputs.region || 'nyc3' }}
           DROPLET_SIZE: ${{ inputs.droplet_size || 'c-8' }}
           SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+          EVENT_NAME: ${{ github.event_name }}
+          ZCASHD_SEED_DROPLET_ID: ${{ inputs.zcashd_seed_droplet_id }}
+          ZCASHD_SEED_CONFIRM: ${{ inputs.zcashd_seed_confirm }}
         run: |
           set -euo pipefail
           MAINNET_VOL="zakura-pr-bake-mainnet-${GITHUB_RUN_ID}"
           TESTNET_VOL="zakura-pr-bake-testnet-${GITHUB_RUN_ID}"
+          MAINNET_VOL_ID=""
+          TESTNET_VOL_ID=""
+          ZCASHD_VOL=""
+          ZCASHD_VOL_ID=""
+          ZCASHD_SOURCE="none"
+          ZCASHD_SNAPSHOT=""
+          ZCASHD_SEED_IP=""
+          DROPLET_ID=""
+
+          # Validate the high-risk source operation before allocating anything.
+          if [ -n "${ZCASHD_SEED_DROPLET_ID}" ]; then
+            [ "${EVENT_NAME}" = workflow_dispatch ] || {
+              echo "zcashd seeding is only allowed on a manual workflow_dispatch run" >&2
+              exit 1
+            }
+            [ "${ZCASHD_SEED_CONFIRM}" = COPY_CLEAN_ZCASHD_STATE ] || {
+              echo "zcashd_seed_confirm must be COPY_CLEAN_ZCASHD_STATE" >&2
+              exit 1
+            }
+            SEED_JSON=$(doctl compute droplet get "${ZCASHD_SEED_DROPLET_ID}" --output json)
+            [ "$(echo "$SEED_JSON" | jq -r '.[0].status')" = active ] || {
+              echo "zcashd seed Droplet must be active" >&2
+              exit 1
+            }
+            [ "$(echo "$SEED_JSON" | jq -r '.[0].region.slug')" = "${REGION}" ] || {
+              echo "zcashd seed Droplet must be in ${REGION}" >&2
+              exit 1
+            }
+            ZCASHD_SEED_IP=$(echo "$SEED_JSON" | jq -er '.[0].networks.v4[] | select(.type == "public") | .ip_address' | head -n 1)
+          fi
+
+          cleanup_create_failure() {
+            rc=$?
+            trap - EXIT
+            [ "$rc" -ne 0 ] || return
+            set +e
+            if [ -n "$ZCASHD_VOL_ID" ] && [ -n "${ZCASHD_SEED_DROPLET_ID}" ]; then
+              doctl compute volume-action detach "$ZCASHD_VOL_ID" "${ZCASHD_SEED_DROPLET_ID}" --wait || true
+            fi
+            [ -z "$DROPLET_ID" ] || doctl compute droplet delete "$DROPLET_ID" -f || true
+            for volume_id in "$MAINNET_VOL_ID" "$TESTNET_VOL_ID" "$ZCASHD_VOL_ID"; do
+              [ -z "$volume_id" ] && continue
+              for _ in $(seq 1 12); do
+                doctl compute volume delete "$volume_id" -f && break
+                sleep 10
+              done
+            done
+            exit "$rc"
+          }
+          trap cleanup_create_failure EXIT
+
           MAINNET_VOL_ID=$(doctl compute volume create "$MAINNET_VOL" \
             --region "${REGION}" --size 300GiB --format ID --no-header)
+          echo "mainnet_vol=$MAINNET_VOL" >> "$GITHUB_OUTPUT"
+          echo "mainnet_vol_id=$MAINNET_VOL_ID" >> "$GITHUB_OUTPUT"
           TESTNET_VOL_ID=$(doctl compute volume create "$TESTNET_VOL" \
             --region "${REGION}" --size 100GiB --format ID --no-header)
+          echo "testnet_vol=$TESTNET_VOL" >> "$GITHUB_OUTPUT"
+          echo "testnet_vol_id=$TESTNET_VOL_ID" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${ZCASHD_SEED_DROPLET_ID}" ]; then
+            ZCASHD_VOL="zakura-pr-bake-zcashd-mainnet-${GITHUB_RUN_ID}"
+            ZCASHD_VOL_ID=$(doctl compute volume create "$ZCASHD_VOL" \
+              --region "${REGION}" --size 350GiB --format ID --no-header)
+            echo "zcashd_vol=$ZCASHD_VOL" >> "$GITHUB_OUTPUT"
+            echo "zcashd_vol_id=$ZCASHD_VOL_ID" >> "$GITHUB_OUTPUT"
+            doctl compute volume-action attach "$ZCASHD_VOL_ID" "${ZCASHD_SEED_DROPLET_ID}" --wait
+            ZCASHD_SOURCE=seed
+          else
+            ZCASHD_SNAPSHOT=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
+              awk '$2 ~ /^zakura-pr-state-zcashd-mainnet-/ {print $2, $1}' | sort | tail -n 1 | awk '{print $2}')
+            if [ -n "$ZCASHD_SNAPSHOT" ]; then
+              doctl compute snapshot get "$ZCASHD_SNAPSHOT" --output json | \
+                jq -e --arg region "$REGION" '.[0].regions | index($region) != null' >/dev/null || {
+                  echo "latest zcashd fixture snapshot is not available in ${REGION}" >&2
+                  exit 1
+                }
+              MIN_SIZE=$(doctl compute snapshot get "$ZCASHD_SNAPSHOT" --format MinDiskSize --no-header)
+              ZCASHD_SIZE=350
+              (( MIN_SIZE <= ZCASHD_SIZE )) || ZCASHD_SIZE=$MIN_SIZE
+              ZCASHD_VOL="zakura-pr-bake-zcashd-mainnet-${GITHUB_RUN_ID}"
+              ZCASHD_VOL_ID=$(doctl compute volume create "$ZCASHD_VOL" \
+                --region "${REGION}" --snapshot "$ZCASHD_SNAPSHOT" --size "${ZCASHD_SIZE}GiB" \
+                --format ID --no-header)
+              echo "zcashd_vol=$ZCASHD_VOL" >> "$GITHUB_OUTPUT"
+              echo "zcashd_vol_id=$ZCASHD_VOL_ID" >> "$GITHUB_OUTPUT"
+              ZCASHD_SOURCE=snapshot
+            else
+              echo "No zcashd fixture exists yet. Continuing the existing Zakura-only bake."
+              echo "Run this workflow manually with the guarded zcashd_seed_* inputs to create it."
+            fi
+          fi
           {
             echo "mainnet_vol=$MAINNET_VOL"
             echo "testnet_vol=$TESTNET_VOL"
             echo "mainnet_vol_id=$MAINNET_VOL_ID"
             echo "testnet_vol_id=$TESTNET_VOL_ID"
+            echo "zcashd_vol=$ZCASHD_VOL"
+            echo "zcashd_vol_id=$ZCASHD_VOL_ID"
+            echo "zcashd_source=$ZCASHD_SOURCE"
+            echo "zcashd_snapshot_id=$ZCASHD_SNAPSHOT"
+            echo "zcashd_seed_ip=$ZCASHD_SEED_IP"
           } >> "$GITHUB_OUTPUT"
 
           NAME="zakura-pr-bake-${GITHUB_RUN_ID}"
+          VOLUME_ARGS=(--volumes "${MAINNET_VOL_ID}" --volumes "${TESTNET_VOL_ID}")
+          if [ "$ZCASHD_SOURCE" = snapshot ]; then
+            VOLUME_ARGS+=(--volumes "${ZCASHD_VOL_ID}")
+          fi
           doctl compute droplet create "$NAME" \
             --region "${REGION}" \
             --size "${DROPLET_SIZE}" \
             --image ubuntu-24-04-x64 \
             --ssh-keys "${SSH_FINGERPRINT}" \
-            --volumes "${MAINNET_VOL_ID}" \
-            --volumes "${TESTNET_VOL_ID}" \
+            "${VOLUME_ARGS[@]}" \
             --tag-name zakura-image-bake \
             --wait --format ID,PublicIPv4 --no-header > /tmp/droplet.txt
-          echo "id=$(awk '{print $1}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
+          DROPLET_ID=$(awk '{print $1}' /tmp/droplet.txt)
+          echo "id=$DROPLET_ID" >> "$GITHUB_OUTPUT"
           echo "ip=$(awk '{print $2}' /tmp/droplet.txt)" >> "$GITHUB_OUTPUT"
+          trap - EXIT
 
       - name: Wait for SSH
         env:
@@ -103,6 +232,53 @@ jobs:
           done
           echo "SSH did not come up in time"; exit 1
 
+      - name: Seed zcashd fixture from existing Droplet
+        if: steps.droplet.outputs.zcashd_source == 'seed'
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+          DROPLET_ID: ${{ steps.droplet.outputs.id }}
+          ZCASHD_VOLUME_NAME: ${{ steps.droplet.outputs.zcashd_vol }}
+          ZCASHD_VOLUME_ID: ${{ steps.droplet.outputs.zcashd_vol_id }}
+          ZCASHD_SEED_IP: ${{ steps.droplet.outputs.zcashd_seed_ip }}
+          ZCASHD_SEED_DROPLET_ID: ${{ inputs.zcashd_seed_droplet_id }}
+          ZCASHD_SEED_DATADIR: ${{ inputs.zcashd_seed_datadir || '/root/.zcashd' }}
+          ZCASHD_SEED_HEIGHT: ${{ inputs.zcashd_seed_height }}
+          ZCASHD_SEED_HASH: ${{ inputs.zcashd_seed_hash }}
+          ZCASHD_SEED_ARCHIVE_URL: ${{ inputs.zcashd_seed_archive_url }}
+          ZCASHD_SEED_ARCHIVE_SHA256: ${{ inputs.zcashd_seed_archive_sha256 }}
+          ZCASHD_SEED_CHECKSUM_VERIFIED: ${{ inputs.zcashd_seed_checksum_verified || false }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+              -i /tmp/do_ssh "root@${ZCASHD_SEED_IP}" true 2>/dev/null; then
+              break
+            fi
+            sleep 10
+          done
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+            -i /tmp/do_ssh "root@${ZCASHD_SEED_IP}" true
+          umask 077
+          {
+            printf 'ZCASHD_VOLUME_NAME=%q\n'              "$ZCASHD_VOLUME_NAME"
+            printf 'ZCASHD_SEED_DATADIR=%q\n'             "$ZCASHD_SEED_DATADIR"
+            printf 'ZCASHD_SEED_HEIGHT=%q\n'              "$ZCASHD_SEED_HEIGHT"
+            printf 'ZCASHD_SEED_HASH=%q\n'                "$ZCASHD_SEED_HASH"
+            printf 'ZCASHD_SEED_DROPLET_ID=%q\n'          "$ZCASHD_SEED_DROPLET_ID"
+            printf 'ZCASHD_SEED_ARCHIVE_URL=%q\n'         "$ZCASHD_SEED_ARCHIVE_URL"
+            printf 'ZCASHD_SEED_ARCHIVE_SHA256=%q\n'      "$ZCASHD_SEED_ARCHIVE_SHA256"
+            printf 'ZCASHD_SEED_CHECKSUM_VERIFIED=%q\n'   "$ZCASHD_SEED_CHECKSUM_VERIFIED"
+          } > /tmp/zcashd-seed.env
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            /tmp/zcashd-seed.env .github/workflows/scripts/pr-node-zcashd-seed.sh \
+            "root@${ZCASHD_SEED_IP}:/root/"
+          rm -f /tmp/zcashd-seed.env
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${ZCASHD_SEED_IP}" \
+            'set -euo pipefail; trap '\''rm -f /root/zcashd-seed.env /root/pr-node-zcashd-seed.sh'\'' EXIT; set -a; . /root/zcashd-seed.env; set +a; bash /root/pr-node-zcashd-seed.sh'
+          doctl compute volume-action detach "$ZCASHD_VOLUME_ID" "$ZCASHD_SEED_DROPLET_ID" --wait
+          doctl compute volume-action attach "$ZCASHD_VOLUME_ID" "$DROPLET_ID" --wait
+
       - name: Run bake script
         env:
           IP: ${{ steps.droplet.outputs.ip }}
@@ -113,7 +289,12 @@ jobs:
           # Pre-spam-region archive snapshot; same artifact checkpoint-sync-bench pins.
           SANDBLAST_URL: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_URL || 'https://zakura.valargroup.dev/mainnet/historical/zakura-mainnet-20260717T095333Z-1707210.tar.zst' }}
           SANDBLAST_SHA256: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_SHA256 || '2bcb3786252300b4163b38a49b2d3a8015ba581d7d3efc854e6ed662a18258ac' }}
+          SANDBLAST_HEIGHT: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_HEIGHT || '1707210' }}
+          SANDBLAST_DB_FORMAT: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_DB_FORMAT || '28.0.1' }}
           TESTNET_SNAPSHOTS_BASE: ${{ vars.ZAKURA_TESTNET_SNAPSHOTS_URL || 'http://167.99.103.111:8091' }}
+          ZCASHD_VOLUME_NAME: ${{ steps.droplet.outputs.zcashd_vol }}
+          ZCASHD_SOURCE_SNAPSHOT_ID: ${{ steps.droplet.outputs.zcashd_snapshot_id }}
+          ZCASHD_TX_RETENTION: ${{ vars.ZAKURA_PR_NODE_ZCASHD_TX_RETENTION || '10000' }}
         run: |
           set -euo pipefail
           umask 077
@@ -125,10 +306,16 @@ jobs:
             printf 'TIP_MAINNET_LATEST_JSON=%q\n' "${TIP_MAINNET_LATEST_JSON}"
             printf 'SANDBLAST_URL=%q\n'           "${SANDBLAST_URL}"
             printf 'SANDBLAST_SHA256=%q\n'        "${SANDBLAST_SHA256}"
+            printf 'SANDBLAST_HEIGHT=%q\n'        "${SANDBLAST_HEIGHT}"
+            printf 'SANDBLAST_DB_FORMAT=%q\n'     "${SANDBLAST_DB_FORMAT}"
             printf 'TESTNET_SNAPSHOTS_BASE=%q\n'  "${TESTNET_SNAPSHOTS_BASE}"
+            printf 'ZCASHD_VOLUME_NAME=%q\n'      "${ZCASHD_VOLUME_NAME}"
+            printf 'ZCASHD_SOURCE_SNAPSHOT_ID=%q\n' "${ZCASHD_SOURCE_SNAPSHOT_ID}"
+            printf 'ZCASHD_TX_RETENTION=%q\n'     "${ZCASHD_TX_RETENTION}"
           } > /tmp/bake.env
           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
-            /tmp/bake.env .github/workflows/scripts/pr-node-bake.sh "root@${IP}:/root/"
+            /tmp/bake.env .github/workflows/scripts/pr-node-bake.sh \
+            .github/workflows/scripts/pr-node-zcashd-refresh.sh "root@${IP}:/root/"
           rm -f /tmp/bake.env
           # Keepalives: the cold build and snapshot downloads are long and low-output.
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -139,11 +326,15 @@ jobs:
         env:
           MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
           TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
+          ZCASHD_VOL_ID: ${{ steps.droplet.outputs.zcashd_vol_id }}
         run: |
           set -euo pipefail
           STAMP=$(date -u +%Y%m%d-%H%M)
           doctl compute volume snapshot "${MAINNET_VOL_ID}" --snapshot-name "zakura-pr-state-mainnet-${STAMP}"
           doctl compute volume snapshot "${TESTNET_VOL_ID}" --snapshot-name "zakura-pr-state-testnet-${STAMP}"
+          if [ -n "${ZCASHD_VOL_ID}" ]; then
+            doctl compute volume snapshot "${ZCASHD_VOL_ID}" --snapshot-name "zakura-pr-state-zcashd-mainnet-${STAMP}"
+          fi
 
       - name: Snapshot droplet image
         env:
@@ -174,8 +365,13 @@ jobs:
           DROPLET_ID: ${{ steps.droplet.outputs.id }}
           MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
           TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
+          ZCASHD_VOL_ID: ${{ steps.droplet.outputs.zcashd_vol_id }}
+          ZCASHD_SEED_DROPLET_ID: ${{ inputs.zcashd_seed_droplet_id }}
         run: |
           set +e
+          if [ -n "${ZCASHD_VOL_ID}" ] && [ -n "${ZCASHD_SEED_DROPLET_ID}" ]; then
+            doctl compute volume-action detach "${ZCASHD_VOL_ID}" "${ZCASHD_SEED_DROPLET_ID}" --wait || true
+          fi
           if [ -n "${DROPLET_ID}" ]; then
             for _ in 1 2 3; do
               doctl compute droplet delete "${DROPLET_ID}" -f && break
@@ -183,7 +379,7 @@ jobs:
             done
           fi
           # Volumes detach asynchronously after the droplet delete.
-          for VOL_ID in "${MAINNET_VOL_ID}" "${TESTNET_VOL_ID}"; do
+          for VOL_ID in "${MAINNET_VOL_ID}" "${TESTNET_VOL_ID}" "${ZCASHD_VOL_ID}"; do
             [ -z "${VOL_ID}" ] && continue
             for _ in $(seq 1 12); do
               doctl compute volume delete "${VOL_ID}" -f && break
@@ -195,7 +391,7 @@ jobs:
           doctl compute image list-user --format ID,Name --no-header | \
             awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | head -n -2 | \
             while read -r _name id; do doctl compute image delete "$id" -f; done
-          for NET in mainnet testnet; do
+          for NET in mainnet testnet zcashd-mainnet; do
             doctl compute snapshot list --resource volume --format ID,Name --no-header | \
               awk -v pre="zakura-pr-state-${NET}-" 'index($2, pre) == 1 {print $2, $1}' | \
               sort | head -n -2 | \

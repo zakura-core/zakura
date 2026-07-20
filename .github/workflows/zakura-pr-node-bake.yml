@@ -190,15 +190,17 @@ jobs:
               sleep 10
             done
           done
-          # Keep the newest 2 images and 2 volume snapshots per network so runs
-          # never depend on the latest bake having succeeded.
+          # Keep the newest 2 images so runs never depend on the latest bake
+          # having succeeded, and 3 volume snapshots per network so the oldest
+          # (used by the pr-node pre-checkpoint mode to sync through the last
+          # checkpoint handoff) stays ~2 weeks behind the newest.
           doctl compute image list-user --format ID,Name --no-header | \
             awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | head -n -2 | \
             while read -r _name id; do doctl compute image delete "$id" -f; done
           for NET in mainnet testnet; do
             doctl compute snapshot list --resource volume --format ID,Name --no-header | \
               awk -v pre="zakura-pr-state-${NET}-" 'index($2, pre) == 1 {print $2, $1}' | \
-              sort | head -n -2 | \
+              sort | head -n -3 | \
               while read -r _name id; do doctl compute snapshot delete "$id" -f; done
           done
           true

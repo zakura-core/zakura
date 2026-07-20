@@ -1630,9 +1630,10 @@ impl HeaderSyncReactor {
             self.schedule().await;
             return;
         }
-        if let Err(error) =
-            validate_tree_aux_root_heights(outstanding.range_request.start_height(), &tree_aux_roots)
-        {
+        if let Err(error) = validate_tree_aux_root_heights(
+            outstanding.range_request.start_height(),
+            &tree_aux_roots,
+        ) {
             tracing::debug!(
                 ?peer,
                 ?error,
@@ -1746,7 +1747,10 @@ impl HeaderSyncReactor {
                 .mark_buffered(peer.clone(), outstanding.range_request);
         }
         self.state.buffered.insert(
-            (outstanding.range_request.priority, outstanding.range_request.start_height()),
+            (
+                outstanding.range_request.priority,
+                outstanding.range_request.start_height(),
+            ),
             BufferedHeaderRange {
                 wire_request: outstanding.wire_request,
                 range: outstanding.range_request,
@@ -2088,7 +2092,9 @@ impl HeaderSyncReactor {
             match outstanding.purpose {
                 RangePurpose::Sync => {
                     if outstanding.phase == OutstandingPhase::EmptyRetry {
-                        self.state.schedule.clear_assignment(outstanding.range_request);
+                        self.state
+                            .schedule
+                            .clear_assignment(outstanding.range_request);
                     }
                     self.state
                         .schedule
@@ -2784,7 +2790,9 @@ impl HeaderSyncReactor {
                     let _ = peer
                         .session
                         .retire_expected_headers(outstanding.wire_request.request_id);
-                    self.state.schedule.clear_assignment(outstanding.range_request);
+                    self.state
+                        .schedule
+                        .clear_assignment(outstanding.range_request);
                     if let Some(suffix) = outstanding.range_request.suffix_after(height, hash) {
                         self.state.schedule.ensure_forward(suffix);
                     }

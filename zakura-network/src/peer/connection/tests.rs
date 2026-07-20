@@ -147,8 +147,13 @@ fn new_test_connection_with_protection<A>(
         relay: true,
     };
 
+    let connected_addr = if is_protected_peer {
+        ConnectedAddr::new_inbound_direct(fake_addr.into())
+    } else {
+        ConnectedAddr::Isolated
+    };
     let connection_info = ConnectionInfo {
-        connected_addr: ConnectedAddr::Isolated,
+        connected_addr,
         local: remote.clone(),
         remote,
         negotiated_version: fake_version,

@@ -4,9 +4,13 @@ include make/zcashd-compat.mk
 include make/perf.mk
 include make/zakura-dev.mk
 include make/release.mk
+include make/install.mk
 
 help:
 	@echo "Available targets:"
+	@echo ""
+	@echo "  Install:"
+	@echo "  BRANCH=<branch> make install-branch   Install zakurad from a Git branch (default: main)"
 	@echo ""
 	@echo "  Dev Zakura (local node):"
 	@echo "  zakura-build-dev                 Build release zakurad"

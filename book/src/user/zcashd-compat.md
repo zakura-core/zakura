@@ -177,7 +177,10 @@ On start, Zakura:
 
    The network-selection flags follow Zakura's own configured network, and
    `-printtoconsole` is always included so zcashd's output lands in Zakura's
-   logs.
+   logs. Zakura also passes each legacy wallet `-allowdeprecated` feature once,
+   preserving the full compatibility RPC surface by default. An
+   operator-supplied `-allowdeprecated=none` overrides that behavior; Zakura
+   then passes only `-allowdeprecated=none`.
 
 4. supervises it: restarts on unexpected exit with capped exponential
    backoff, and shuts it down gracefully (SIGTERM, then a configurable grace

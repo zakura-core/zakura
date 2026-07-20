@@ -61,6 +61,26 @@ fn policy_rejection_has_no_misbehavior_score() {
     );
 }
 
+#[test]
+fn invalid_shielded_proof_sizes_ban_mempool_peers() {
+    let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+
+    for consensus_error in [
+        TransactionError::OrchardProofSize,
+        TransactionError::IronwoodProofSize,
+    ] {
+        let invalid_error = TransactionDownloadVerifyError::Invalid {
+            error: consensus_error,
+            advertiser_addr: Some(advertiser_addr),
+        };
+
+        assert_eq!(
+            transaction_misbehavior(&invalid_error),
+            Some((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE)),
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<(), Report> {
     let network = Network::Mainnet;

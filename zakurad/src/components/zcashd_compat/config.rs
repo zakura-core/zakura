@@ -55,10 +55,13 @@ pub struct Config {
     /// - a JSON array string (useful for environment variable overrides):
     ///   `ZAKURA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-debug=1"]'`
     ///
-    /// Zebra passes these arguments through unchanged. For first-start bootstrap,
-    /// Zebra only infers path overrides from the first valid `-conf=/path` or
-    /// `-datadir=/path` form, and logs warnings for paired, empty, or duplicate
-    /// path options.
+    /// Zakura passes these arguments through unchanged, except that supervised
+    /// compatibility mode normalizes and deduplicates `-allowdeprecated`
+    /// arguments while enabling all legacy wallet features by default. An
+    /// explicit `-allowdeprecated=none` overrides those defaults. For first-start
+    /// bootstrap, Zakura only infers path overrides from the first valid
+    /// `-conf=/path` or `-datadir=/path` form, and logs warnings for paired,
+    /// empty, or duplicate path options.
     ///
     /// Supervised zcashd runs always include `-printtoconsole` automatically.
     #[serde(default, deserialize_with = "deserialize_zcashd_extra_args")]

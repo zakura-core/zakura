@@ -7,21 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-- Stop pruned nodes from returning retained chain-index hashes through legacy
-  `getblocks` when the corresponding block bodies are no longer serveable.
-- Add structured legacy peer request traces that attribute `FindBlocks` hash
-  announcements and block download outcomes to privacy-preserving peer IDs,
-  including exact-inventory versus speculative routing and the peer's
-  self-reported handshake height.
-- Reject transactions that do not meet ZIP-317 mempool fee policy before
-  running script and proof checks. Block validation is unchanged.
-- Streamline mempool script error handling so invalid scripts are reported as
-  script verification errors.
-- Add an opt-in `network.expose_peer_addresses` setting for unredacted legacy
-  peer address labels in peer activity logs and metrics
-  ([#258](https://github.com/zakura-core/zakura/pull/258)).
-- Shut down a managed zcashd-compat process before Zakura exits on SIGINT or
-  SIGTERM.
 - Add an offline Mainnet checkpoint and VCT frontier export mode to
   `zakura-checkpoints`, and a committed provenance record
   (`vct/mainnet-frontier.json`) that CI verifies against the embedded
@@ -33,10 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   committed checkpoint/frontier/provenance coupling (rejecting pre-pipeline
   bootstrap state unless explicitly overridden).
 
-## [1.0.2-rc0] - 2026-07-19
+## [1.0.2] - 2026-07-20
 
 ### Added
 
+- Add an opt-in `network.expose_peer_addresses` setting for unredacted legacy
+  peer address labels in peer activity logs and metrics
+  ([#258](https://github.com/zakura-core/zakura/pull/258)).
+- Add structured legacy peer request traces that attribute `FindBlocks` hash
+  announcements and block download outcomes to privacy-preserving peer IDs,
+  including exact-inventory versus speculative routing and the peer's
+  self-reported handshake height
+  ([#275](https://github.com/zakura-core/zakura/pull/275)).
+- Diagnose requests for pruned block bodies with the block height, hash, and
+  configured retention, rate limited to once per minute
+  ([#279](https://github.com/zakura-core/zakura/pull/279)).
 - Add a configurable 250,000-byte default maximum for individual mempool
   transactions. Larger transactions are rejected before semantic and contextual
   verification without penalizing peers, and the policy does not affect block
@@ -48,6 +44,21 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Reuse transaction-wide transparent signature hash components across input
+  checks instead of hashing them again for every signature
+  ([#281](https://github.com/zakura-core/zakura/pull/281)).
+- Reject transactions that do not meet ZIP-317 mempool fee policy before
+  running script and proof checks. Block validation is unchanged
+  ([#263](https://github.com/zakura-core/zakura/pull/263)).
+- Parse the bundled Sapling proving parameters once per process and reuse the
+  shared prover, instead of re-parsing the parameters on every
+  `getblocktemplate` refresh
+  ([#291](https://github.com/zakura-core/zakura/pull/291)).
+- Maintain mempool metric totals incrementally instead of rescanning the full
+  mempool after every insertion or removal
+  ([#268](https://github.com/zakura-core/zakura/pull/268)).
+- Point snapshot links and benchmark defaults at the Zakura snapshot service
+  ([#276](https://github.com/zakura-core/zakura/pull/276)).
 - Source the embedded Mainnet VCT Sprout-history repair artifact from
   exact-versioned crates.io packages instead of storing its large source
   bytes in the Zakura repository, and reuse one validated decode throughout
@@ -62,6 +73,32 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Use the consensus proof-of-work limit for early-chain header validation at
+  height 17 ([#220](https://github.com/zakura-core/zakura/pull/220)).
+- Advertise `NODE_NETWORK` to a supervised zcashd-compat sidecar even when
+  Zakura uses pruned storage
+  ([#270](https://github.com/zakura-core/zakura/pull/270)).
+- Report invalid mempool scripts as script verification errors
+  ([#265](https://github.com/zakura-core/zakura/pull/265)).
+- Honor an explicit embedded zcashd-compat source selection even when a stale
+  local binary path remains configured
+  ([#271](https://github.com/zakura-core/zakura/pull/271)).
+- Shut down a managed zcashd-compat process before Zakura exits on SIGINT or
+  SIGTERM ([#274](https://github.com/zakura-core/zakura/pull/274)).
+- Stop pruned nodes from returning retained chain-index hashes through legacy
+  `getblocks` when the corresponding block bodies are no longer serveable
+  ([#275](https://github.com/zakura-core/zakura/pull/275)).
+- Enable all legacy wallet features by default for supervised zcashd-compat
+  processes, while allowing `-allowdeprecated=none` to disable them all
+  ([#278](https://github.com/zakura-core/zakura/pull/278)).
+- Avoid penalizing peers that relay NU6.2 branch-ID transactions during the
+  first 40 heights after NU6.3 activation, while keeping consensus validation
+  strict ([#273](https://github.com/zakura-core/zakura/pull/273)).
+- Preserve failed shielded proof and signature verification errors so invalid
+  transactions receive the existing mempool peer misbehavior score
+  ([#283](https://github.com/zakura-core/zakura/pull/283)).
+- Ban peers that send mempool transactions with invalid Orchard or Ironwood
+  proof sizes ([#285](https://github.com/zakura-core/zakura/pull/285)).
 - Database format upgrades now finish before startup exposes the finalized
   state database; only configured periodic format checks continue in the
   background ([#240](https://github.com/zakura-core/zakura/pull/240)).
@@ -99,8 +136,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   their requests are still shed for backpressure, but the connection is not
   closed. Every other peer's denial-of-service protection is unchanged
   ([#242](https://github.com/zakura-core/zakura/pull/242)).
-- Fixed early-chain header validation to use the consensus proof-of-work limit
-  at height 17.
+
+### Security
+
+- Prevent a peer from stalling chain synchronization by delivering a rejected
+  block body that shares its header hash with a later valid block
+  ([GHSA-8gxx-hc65-vv82](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-8gxx-hc65-vv82)).
 
 ## [1.0.1] - 2026-07-17
 

@@ -36,7 +36,7 @@ use crate::{
     parameters::{NetworkUpgrade, TX_V5_VERSION_GROUP_ID, TX_V6_VERSION_GROUP_ID},
     sapling,
     serialization::ZcashSerialize,
-    transaction::{AuthDigest, Hash, Transaction},
+    transaction::{sighash::CanonicalHashType, AuthDigest, Hash, SigHash, Transaction},
     transparent,
 };
 
@@ -61,6 +61,11 @@ const ZCASH_IRONWOOD_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdIronwd_H_v6";
 const ZCASH_PREVOUTS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdPrevoutHash";
 const ZCASH_SEQUENCE_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdSequencHash";
 const ZCASH_OUTPUTS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdOutputsHash";
+
+// signature transparent level-2 node personalizations
+const ZCASH_TRANSPARENT_INPUT_HASH_PERSONALIZATION: &[u8; 16] = b"Zcash___TxInHash";
+const ZCASH_TRANSPARENT_AMOUNTS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxTrAmountsHash";
+const ZCASH_TRANSPARENT_SCRIPTPUBKEYS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxTrScriptsHash";
 
 // txid sapling level-2 node personalizations
 const ZCASH_SAPLING_SPENDS_HASH_PERSONALIZATION: &[u8; 16] = b"ZTxIdSSpendsHash";
@@ -354,6 +359,59 @@ fn hash_outputs(outputs: &[transparent::Output]) -> Blake2bHash {
     h.finalize()
 }
 
+/// ZIP-244 §S.2b amounts digest.
+fn hash_amounts(previous_outputs: &[transparent::Output]) -> Blake2bHash {
+    let mut h = hasher(ZCASH_TRANSPARENT_AMOUNTS_HASH_PERSONALIZATION);
+    for output in previous_outputs {
+        h.update(&output.value.zatoshis().to_le_bytes());
+    }
+    h.finalize()
+}
+
+/// ZIP-244 §S.2c scriptPubKeys digest.
+fn hash_scriptpubkeys(previous_outputs: &[transparent::Output]) -> Blake2bHash {
+    let mut h = hasher(ZCASH_TRANSPARENT_SCRIPTPUBKEYS_HASH_PERSONALIZATION);
+    for output in previous_outputs {
+        update_serialized(&mut h, &output.lock_script);
+    }
+    h.finalize()
+}
+
+/// ZIP-244 §S.2g digest for one transparent input.
+fn hash_txin(
+    input: &transparent::Input,
+    previous_output: &transparent::Output,
+) -> Option<Blake2bHash> {
+    let transparent::Input::PrevOut {
+        outpoint, sequence, ..
+    } = input
+    else {
+        return None;
+    };
+
+    let mut h = hasher(ZCASH_TRANSPARENT_INPUT_HASH_PERSONALIZATION);
+    update_serialized(&mut h, outpoint);
+    h.update(&previous_output.value.zatoshis().to_le_bytes());
+    update_serialized(&mut h, &previous_output.lock_script);
+    h.update(&sequence.to_le_bytes());
+    Some(h.finalize())
+}
+
+fn hash_transparent_txid_from_digests(
+    bundle_present: bool,
+    prevouts: &Blake2bHash,
+    sequence: &Blake2bHash,
+    outputs: &Blake2bHash,
+) -> Blake2bHash {
+    let mut h = hasher(ZCASH_TRANSPARENT_HASH_PERSONALIZATION);
+    if bundle_present {
+        h.update(prevouts.as_bytes());
+        h.update(sequence.as_bytes());
+        h.update(outputs.as_bytes());
+    }
+    h.finalize()
+}
+
 /// ZIP-244 §T.2 transparent digest.
 ///
 /// Reference implementation:
@@ -362,15 +420,12 @@ fn hash_transparent_txid(
     inputs: &[transparent::Input],
     outputs: &[transparent::Output],
 ) -> Blake2bHash {
-    let mut h = hasher(ZCASH_TRANSPARENT_HASH_PERSONALIZATION);
-    // The transparent bundle is absent (and the digest is the bare
-    // personalization hash) only when there are no inputs and no outputs.
-    if !inputs.is_empty() || !outputs.is_empty() {
-        h.update(hash_prevouts(inputs).as_bytes());
-        h.update(hash_sequence(inputs).as_bytes());
-        h.update(hash_outputs(outputs).as_bytes());
-    }
-    h.finalize()
+    hash_transparent_txid_from_digests(
+        !inputs.is_empty() || !outputs.is_empty(),
+        &hash_prevouts(inputs),
+        &hash_sequence(inputs),
+        &hash_outputs(outputs),
+    )
 }
 
 /// ZIP-244 §T.3a sapling spends digest.
@@ -498,19 +553,17 @@ fn hash_bundle_txid(
 ///
 /// Reference implementation:
 /// <https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L426>
-fn txid_inner(parts: &Zip244Parts) -> Hash {
-    let header = hash_header(parts);
-    let transparent = hash_transparent_txid(parts.inputs, parts.outputs);
-    let sapling = hash_sapling_txid(parts.sapling, parts.version);
-    let orchard = hash_bundle_txid(parts.orchard, parts.version.orchard_format());
-    let ironwood = parts
-        .version
-        .has_ironwood()
-        .then(|| hash_bundle_txid(parts.ironwood, BundleCommitmentFormat::IronwoodV6));
-
+fn combine_txid_digests(
+    consensus_branch_id: u32,
+    header: &Blake2bHash,
+    transparent: &Blake2bHash,
+    sapling: &Blake2bHash,
+    orchard: &Blake2bHash,
+    ironwood: Option<&Blake2bHash>,
+) -> Blake2bHash {
     let mut personal = [0u8; 16];
     personal[..12].copy_from_slice(ZCASH_TX_PERSONALIZATION_PREFIX);
-    personal[12..].copy_from_slice(&consensus_branch_id(parts).to_le_bytes());
+    personal[12..].copy_from_slice(&consensus_branch_id.to_le_bytes());
 
     let mut h = hasher(&personal);
     h.update(header.as_bytes());
@@ -521,11 +574,31 @@ fn txid_inner(parts: &Zip244Parts) -> Hash {
         h.update(ironwood.as_bytes());
     }
 
+    h.finalize()
+}
+
+fn txid_inner(parts: &Zip244Parts) -> Hash {
+    let header = hash_header(parts);
+    let transparent = hash_transparent_txid(parts.inputs, parts.outputs);
+    let sapling = hash_sapling_txid(parts.sapling, parts.version);
+    let orchard = hash_bundle_txid(parts.orchard, parts.version.orchard_format());
+    let ironwood = parts
+        .version
+        .has_ironwood()
+        .then(|| hash_bundle_txid(parts.ironwood, BundleCommitmentFormat::IronwoodV6));
+
     Hash(
-        h.finalize()
-            .as_bytes()
-            .try_into()
-            .expect("BLAKE2b-256 digest is 32 bytes"),
+        combine_txid_digests(
+            consensus_branch_id(parts),
+            &header,
+            &transparent,
+            &sapling,
+            &orchard,
+            ironwood.as_ref(),
+        )
+        .as_bytes()
+        .try_into()
+        .expect("BLAKE2b-256 digest is 32 bytes"),
     )
 }
 
@@ -643,6 +716,175 @@ fn auth_digest_inner(parts: &Zip244Parts) -> AuthDigest {
             .try_into()
             .expect("BLAKE2b-256 digest is 32 bytes"),
     )
+}
+
+// --- signature digest (ZIP-244 §S) -----------------------------------------
+
+/// Owned v5/v6 ZIP-244 data reused by signature hash calculations.
+#[derive(Clone, Debug)]
+pub(super) struct Zip244SighashCache {
+    consensus_branch_id: u32,
+    header: Blake2bHash,
+    transparent_txid: Blake2bHash,
+    prevouts: Blake2bHash,
+    amounts: Blake2bHash,
+    scriptpubkeys: Blake2bHash,
+    sequence: Blake2bHash,
+    outputs: Blake2bHash,
+    single_outputs: Vec<Blake2bHash>,
+    txins: Vec<Option<Blake2bHash>>,
+    transparent_bundle_present: bool,
+    transparent_is_coinbase_or_has_no_inputs: bool,
+    sapling: Blake2bHash,
+    orchard: Blake2bHash,
+    ironwood: Option<Blake2bHash>,
+}
+
+impl Zip244SighashCache {
+    /// Precomputes v5/v6 transaction and transparent input digests.
+    ///
+    /// `previous_outputs` must contain the spent output corresponding to each
+    /// transparent input. Coinbase transactions may pass an empty slice.
+    pub(super) fn new(tx: &Transaction, previous_outputs: &[transparent::Output]) -> Option<Self> {
+        let parts = zip244_parts(tx)?;
+        let prevouts = hash_prevouts(parts.inputs);
+        let sequence = hash_sequence(parts.inputs);
+        let outputs = hash_outputs(parts.outputs);
+        let transparent_bundle_present = !parts.inputs.is_empty() || !parts.outputs.is_empty();
+
+        Some(Self {
+            consensus_branch_id: consensus_branch_id(&parts),
+            header: hash_header(&parts),
+            transparent_txid: hash_transparent_txid_from_digests(
+                transparent_bundle_present,
+                &prevouts,
+                &sequence,
+                &outputs,
+            ),
+            prevouts,
+            amounts: hash_amounts(previous_outputs),
+            scriptpubkeys: hash_scriptpubkeys(previous_outputs),
+            sequence,
+            outputs,
+            single_outputs: parts
+                .outputs
+                .iter()
+                .take(parts.inputs.len())
+                .map(|output| hash_outputs(std::slice::from_ref(output)))
+                .collect(),
+            txins: parts
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    previous_outputs
+                        .get(index)
+                        .and_then(|previous_output| hash_txin(input, previous_output))
+                })
+                .collect(),
+            transparent_bundle_present,
+            transparent_is_coinbase_or_has_no_inputs: tx.is_coinbase() || parts.inputs.is_empty(),
+            sapling: hash_sapling_txid(parts.sapling, parts.version),
+            orchard: hash_bundle_txid(parts.orchard, parts.version.orchard_format()),
+            ironwood: parts
+                .version
+                .has_ironwood()
+                .then(|| hash_bundle_txid(parts.ironwood, BundleCommitmentFormat::IronwoodV6)),
+        })
+    }
+
+    /// Computes a ZIP-244 signature hash from the cached transaction data.
+    ///
+    /// `input_index` is `Some` for a transparent signature and `None` for a
+    /// shielded signature. ZIP-244 commits to the spent output's scriptPubKey,
+    /// so the script code supplied to the interpreter is not an input here.
+    pub(super) fn sighash(
+        &self,
+        hash_type: CanonicalHashType,
+        input_index: Option<usize>,
+    ) -> SigHash {
+        let transparent = self.transparent_sig_digest(hash_type, input_index);
+        SigHash(
+            combine_txid_digests(
+                self.consensus_branch_id,
+                &self.header,
+                &transparent,
+                &self.sapling,
+                &self.orchard,
+                self.ironwood.as_ref(),
+            )
+            .as_bytes()
+            .try_into()
+            .expect("BLAKE2b-256 digest is 32 bytes"),
+        )
+    }
+
+    fn transparent_sig_digest(
+        &self,
+        hash_type: CanonicalHashType,
+        input_index: Option<usize>,
+    ) -> Blake2bHash {
+        if !self.transparent_bundle_present || self.transparent_is_coinbase_or_has_no_inputs {
+            return self.transparent_txid;
+        }
+
+        // Shielded signatures always use SIGHASH_ALL in ZIP-244, regardless of
+        // the caller's otherwise-unused hash type argument.
+        let hash_type = input_index.map_or(CanonicalHashType::All, |_| hash_type);
+        let anyone_can_pay = hash_type.anyone_can_pay();
+        let single = hash_type.is_single();
+        let none = hash_type.is_none();
+
+        let prevouts = if anyone_can_pay {
+            hash_prevouts(&[])
+        } else {
+            self.prevouts
+        };
+        let amounts = if anyone_can_pay {
+            hash_amounts(&[])
+        } else {
+            self.amounts
+        };
+        let scriptpubkeys = if anyone_can_pay {
+            hash_scriptpubkeys(&[])
+        } else {
+            self.scriptpubkeys
+        };
+        let sequence = if anyone_can_pay {
+            hash_sequence(&[])
+        } else {
+            self.sequence
+        };
+        let outputs = match input_index {
+            Some(index) if single => self
+                .single_outputs
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| hash_outputs(&[])),
+            Some(_) if none => hash_outputs(&[]),
+            _ => self.outputs,
+        };
+        let txin = match input_index {
+            Some(index) => self
+                .txins
+                .get(index)
+                .and_then(Option::as_ref)
+                .copied()
+                .expect("transparent sighash input has a matching previous output"),
+            None => hasher(ZCASH_TRANSPARENT_INPUT_HASH_PERSONALIZATION).finalize(),
+        };
+
+        let hash_type = hash_type.encode();
+        let mut h = hasher(ZCASH_TRANSPARENT_HASH_PERSONALIZATION);
+        h.update(&[hash_type]);
+        h.update(prevouts.as_bytes());
+        h.update(amounts.as_bytes());
+        h.update(scriptpubkeys.as_bytes());
+        h.update(sequence.as_bytes());
+        h.update(outputs.as_bytes());
+        h.update(txin.as_bytes());
+        h.finalize()
+    }
 }
 
 // --- public entry points ------------------------------------------------------

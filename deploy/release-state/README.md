@@ -55,6 +55,17 @@ Design: `docs/design/verified-commitment-trees.md`, section 16.
   publish RPC-mode Mainnet output: off-grid lines make every later bundle fail
   the workflow's byte-for-byte prefix check.
 
+## Pre-merge rehearsal
+
+`rehearsal.sh <quiesced-cache-dir>` exercises the whole pipeline against a
+real synced state with no R2 or GitHub side effects: export smoke test
+(prefix, gaps, determinism, frontier pairing), the publisher against a local
+rclone backend with digest verification and an idempotency re-run, and a
+replay of the workflow's import/validate block in the checkout (restored on
+exit). Easiest host: dispatch `zakura-pr-node.yml` for this branch with
+`network=mainnet snapshot_mode=tip`, SSH in, stop `zakurad`, and run it
+against the mounted state clone.
+
 ## Failure modes
 
 - `state tip ... is not above the last checkpoint`: the quiesced state predates

@@ -50,7 +50,9 @@ cargo nextest run --profile sync-large-checkpoints-empty
 
 - PR titles must follow [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/#specification) (PRs are squash-merged — the PR title becomes the commit message)
 - Use `.github/pull_request_template.md`. For fixes, connect the root cause to both the solution and the test coverage.
-- For user-visible changes, update `CHANGELOG.md` per `CHANGELOG_GUIDELINES.md`.
+- Every ordinary PR adds one `changelog-unreleased/<PR-number>.md` fragment,
+  including an explicit no-changelog fragment for internal-only work. Do not
+  edit the shared changelog in ordinary PRs. See `CHANGELOG_GUIDELINES.md`.
 
 ## Project Overview
 
@@ -173,9 +175,17 @@ cargo nextest run --profile sync-large-checkpoints-empty
 
 ## Changelog
 
-- Update `CHANGELOG.md` under `[Unreleased]` for user-visible changes
+- After opening a draft PR, add exactly one
+  `changelog-unreleased/<PR-number>.md` file for that PR.
+- Put user-visible `zakurad` entries under the appropriate Keep a Changelog
+  category heading.
+- For internal-only work, use `<!-- changelog: none -->` and explain why.
+- Do not directly edit `[Unreleased]` in ordinary PRs; the release flow
+  assembles fragments into the root changelog.
 - Apply the appropriate PR label (`C-feature`, `C-bug`, `C-security`, etc.)
-- See `CHANGELOG_GUIDELINES.md` for detailed formatting rules
+- Run `./scripts/changelog.py check` and see
+  `changelog-unreleased/README.md` and
+  `CHANGELOG_GUIDELINES.md` for the exact format.
 
 ## Configuration
 

@@ -28,6 +28,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 | `zakura-e2e.yml` | The heaviest PR-path job, isolated in its own workflow: regtest docker-compose end-to-end gate, multi-node testkit test, block-sync fuzz on every push to `main`, and long four-node modes nightly. PR runs are gated by a `changes` job or the `run-zakura-e2e` label. | PR/push (self-gated), merge queue, nightly, manual |
 | `status-checks.patch.yml` | Empty jobs with the same names as required checks, so branch protection passes when path filters skip `lint.yml` / `tests-unit.yml` / `test-crates.yml`. Its `paths-ignore` list **must stay the exact inverse** of those workflows' `paths`. | PR on non-Rust paths only |
 | `docs-check.yml` | markdownlint, codespell, and lychee link checking over all Markdown. | PR/push on Markdown paths |
+| `changelog.yml` | Validates the one-fragment-per-PR contract and tests release assembly. | Every PR/push/merge group |
 | `coverage.yml` | llvm-cov + nextest coverage uploaded to Codecov. A 120-minute instrumented build, kept off the PR path. | Push to `main`/`release/**`, nightly, manual |
 | `benchmarks.yml` | Criterion benchmarks. Runs on PRs carrying the `C-benchmark` label; results publish to the dashboard data on `gh-pages/dev/bench`. | Labeled PRs, manual |
 | `book.yml` | Builds the mdBook and internal rustdoc as a merge gate, and snapshots the benchmark dashboard into the docs output. | Push to `main` on docs/Rust paths |
@@ -38,7 +39,9 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 
 - **`create-release.yml`** — the only supported path for creating `v*` release tags. Calls `release-binaries.yml` (as a reusable workflow) to build and verify every asset, then a protected environment lets the release GitHub App publish the draft and create the immutable tag. See the release runbook before using it.
 - **`release-binaries.yml`** — builds and publishes `zakurad` release assets and Docker images when a `v*` tag is pushed. Also callable from `create-release.yml` for pre-tag staging, and manually dispatchable to repair assets on an existing tag. Gated on the tag matching the `zakura` package version.
-- **`release-drafter.yml`** — manual: compiles PR titles since the last release into a draft release note.
+- **Changelog assembly** — `make prepare-release-changelog` consumes reviewed
+  PR fragments into the versioned root changelog before the release PR runs
+  the protected release gate.
 - **`update-release-state.yml`** — manual + weekly: imports the newest Mainnet checkpoint/VCT-frontier bundle from the release-state publisher (digest-verified, append-only over the committed list) and opens a draft PR for human review. Release creation itself never fetches from R2; `make pre-release` validates only the committed state.
 
 ## Fleet operations (DigitalOcean)

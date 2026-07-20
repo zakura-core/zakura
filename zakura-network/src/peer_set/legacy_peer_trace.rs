@@ -55,11 +55,8 @@ impl LegacyPeerTrace {
     }
 
     pub(super) fn next_request_id(&self) -> u64 {
-        self.next_request_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-                Some(id.saturating_add(1))
-            })
-            .expect("request ID update succeeds because its closure always returns Some")
+        // Wrap-around is unreachable for a process-local u64 counter.
+        self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
     pub(super) fn find_blocks_finish(

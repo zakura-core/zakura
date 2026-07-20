@@ -722,7 +722,7 @@ fn auth_digest_inner(parts: &Zip244Parts) -> AuthDigest {
 
 /// Owned v5/v6 ZIP-244 data reused by signature hash calculations.
 #[derive(Clone, Debug)]
-pub(crate) struct Zip244SighashCache {
+pub(super) struct Zip244SighashCache {
     consensus_branch_id: u32,
     header: Blake2bHash,
     transparent_txid: Blake2bHash,
@@ -745,7 +745,7 @@ impl Zip244SighashCache {
     ///
     /// `previous_outputs` must contain the spent output corresponding to each
     /// transparent input. Coinbase transactions may pass an empty slice.
-    pub(crate) fn new(tx: &Transaction, previous_outputs: &[transparent::Output]) -> Option<Self> {
+    pub(super) fn new(tx: &Transaction, previous_outputs: &[transparent::Output]) -> Option<Self> {
         let parts = zip244_parts(tx)?;
         let prevouts = hash_prevouts(parts.inputs);
         let sequence = hash_sequence(parts.inputs);
@@ -798,7 +798,7 @@ impl Zip244SighashCache {
     /// `input_index` is `Some` for a transparent signature and `None` for a
     /// shielded signature. ZIP-244 commits to the spent output's scriptPubKey,
     /// so the script code supplied to the interpreter is not an input here.
-    pub(crate) fn sighash(&self, hash_type: HashType, input_index: Option<usize>) -> SigHash {
+    pub(super) fn sighash(&self, hash_type: HashType, input_index: Option<usize>) -> SigHash {
         let transparent = self.transparent_sig_digest(hash_type, input_index);
         SigHash(
             combine_txid_digests(

@@ -40,9 +40,9 @@ on:
         required: false
         default: "60"
       droplet_size:
-        description: "Droplet size (disk must be >= the baked image's disk)"
+        description: "Droplet size, or auto for a profile-safe default (disk must fit the baked image)"
         required: false
-        default: c-8
+        default: auto
       teardown_after_run:
         description: "Delete the droplet immediately after the run"
         type: boolean
@@ -212,7 +212,7 @@ jobs:
         env:
           MODE: ${{ inputs.snapshot_mode }}
           TEST_PROFILE: ${{ inputs.test_profile || 'zakura' }}
-          DROPLET_SIZE: ${{ inputs.droplet_size || 'c-8' }}
+          DROPLET_SIZE: ${{ inputs.droplet_size || 'auto' }}
           SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
           IMAGE_ID: ${{ steps.baked.outputs.image_id }}
           ZAKURA_SNAP_ID: ${{ steps.baked.outputs.zakura_snap_id }}
@@ -220,6 +220,16 @@ jobs:
           SLUG: ${{ steps.target.outputs.slug }}
         run: |
           set -euo pipefail
+          if [ "${DROPLET_SIZE}" = auto ]; then
+            if [ "${TEST_PROFILE}" = zcashd-compat ]; then
+              # The compat preflight requires at least 16 GiB of effective
+              # guest RAM. A nominal 16 GB c-8 reports less than that in Linux.
+              DROPLET_SIZE=g-8vcpu-32gb
+            else
+              DROPLET_SIZE=c-8
+            fi
+          fi
+          echo "Using ${DROPLET_SIZE} for the ${TEST_PROFILE} profile."
           VOLUME_ARGS=()
           ZAKURA_VOLUME_NAME=""
           ZAKURA_VOLUME_ID=""

@@ -117,9 +117,11 @@ gh workflow run zakura-pr-node.yml \
 ```
 
 Provide exactly one of `pr_number` or `ref`. Other inputs are
-`duration_minutes` (default `60`), `droplet_size` (default `c-8`), and
-`teardown_after_run`. The run Droplet's disk must be at least as large as the
-baked image's disk.
+`duration_minutes` (default `60`), `droplet_size` (default `auto`), and
+`teardown_after_run`. `auto` uses `c-8` for ordinary Zakura tests and
+`g-8vcpu-32gb` for zcashd compatibility so the guest has more than the
+preflight's 16 GiB effective-memory minimum. An explicit run Droplet size must
+also have a disk at least as large as the baked image's disk.
 
 The summary is available in the Actions job summary and in a
 `zakura-pr-node-<profile>-<run id>` artifact with `summary.json` and node logs.

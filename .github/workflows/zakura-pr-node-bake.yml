@@ -14,9 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       droplet_size:
-        description: "Bake droplet size (its disk becomes the image's minimum disk)"
+        description: "Bake Droplet size (needs at least 16 GiB effective RAM; its disk becomes the image minimum)"
         required: false
-        default: c-8
+        default: g-8vcpu-32gb
       region:
         description: "DO region (must host the run droplets too)"
         required: false
@@ -88,7 +88,7 @@ jobs:
         id: droplet
         env:
           REGION: ${{ inputs.region || 'nyc3' }}
-          DROPLET_SIZE: ${{ inputs.droplet_size || 'c-8' }}
+          DROPLET_SIZE: ${{ inputs.droplet_size || 'g-8vcpu-32gb' }}
           SSH_FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
           EVENT_NAME: ${{ github.event_name }}
           ZCASHD_SEED_DROPLET_ID: ${{ inputs.zcashd_seed_droplet_id }}

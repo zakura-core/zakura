@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Reuse transaction-wide transparent signature hash components across input
   checks instead of hashing them again for every signature.
+- Ban peers that send mempool transactions with invalid Orchard or Ironwood
+  proof sizes.
+- Parse the bundled Sapling proving parameters once per process and reuse the
+  shared prover, instead of re-parsing the parameters on every
+  `getblocktemplate` refresh.
 - Stop pruned nodes from returning retained chain-index hashes through legacy
   `getblocks` when the corresponding block bodies are no longer serveable.
 - Add structured legacy peer request traces that attribute `FindBlocks` hash
@@ -24,8 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   ([#258](https://github.com/zakura-core/zakura/pull/258)).
 - Shut down a managed zcashd-compat process before Zakura exits on SIGINT or
   SIGTERM.
+- Point snapshot links and benchmark defaults at the Zakura snapshot service.
 - Enable all legacy wallet features by default for supervised zcashd-compat
   processes, while allowing `-allowdeprecated=none` to disable them all.
+- Preserve failed shielded proof/signature verification errors so they receive
+  the existing mempool peer-misbehaviour score.
 
 ## [1.0.2-rc0] - 2026-07-19
 

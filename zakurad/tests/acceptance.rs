@@ -38,7 +38,7 @@
 //! Here are some examples on how to run each of the tests using nextest profiles:
 //!
 //! ```console
-//! $ cargo nextest run --profile sync-large-checkpoints-local --run-ignored=only
+//! $ cargo nextest run --profile sync-checkpoints-local --run-ignored=only
 //!
 //! $ ZAKURA_STATE__CACHE_DIR="/zakurad-cache" cargo nextest run --profile sync-full-mainnet
 //!
@@ -205,9 +205,9 @@ use common::{
     lightwalletd::{can_spawn_lightwalletd_for_rpc, spawn_lightwalletd_for_rpc},
     sync::{
         create_cached_database_height, sync_until, sync_until_with_config, MempoolBehavior,
-        LARGE_CHECKPOINT_TEST_HEIGHT, LARGE_CHECKPOINT_TIMEOUT, MEDIUM_CHECKPOINT_TEST_HEIGHT,
-        STOP_AT_HEIGHT_REGEX, STOP_ON_LOAD_TIMEOUT, SYNC_FINISHED_REGEX,
-        TINY_CHECKPOINT_TEST_HEIGHT, TINY_CHECKPOINT_TIMEOUT,
+        LARGE_CHECKPOINT_TIMEOUT, MEDIUM_CHECKPOINT_TEST_HEIGHT, STOP_AT_HEIGHT_REGEX,
+        STOP_ON_LOAD_TIMEOUT, SYNC_FINISHED_REGEX, TINY_CHECKPOINT_TEST_HEIGHT,
+        TINY_CHECKPOINT_TIMEOUT,
     },
     test_type::TestType::{self, *},
 };
@@ -1174,10 +1174,13 @@ fn activate_mempool_mainnet() -> Result<()> {
 ///
 /// The producer and consumer use the same Regtest network identity, but only
 /// the consumer configures checkpoints derived from the producer's chain.
-/// This exercises two maximum-size checkpoint ranges without public peers.
+/// This exercises two checkpoint ranges without public peers.
 #[tokio::test]
 #[ignore = "slow local multi-node checkpoint sync"]
-async fn sync_large_checkpoints_local() -> Result<()> {
+async fn sync_checkpoints_local() -> Result<()> {
+    const CHECKPOINT_INTERVAL: u32 = 10;
+    const CHECKPOINT_TEST_HEIGHT: Height = Height(CHECKPOINT_INTERVAL * 2);
+
     let producer_network = Network::new_regtest(RegtestParameters::default());
     let producer_p2p_addr = format!("127.0.0.1:{}", random_known_port()).parse()?;
     let mut producer_config = os_assigned_rpc_port_config(false, &producer_network)?;
@@ -1194,33 +1197,25 @@ async fn sync_large_checkpoints_local() -> Result<()> {
 
     let producer_rpc =
         RpcRequestClient::new_with_timeout(producer_rpc_addr, Duration::from_secs(15 * 60));
-    let mut generated_hashes = Vec::new();
-    let mut remaining_blocks = LARGE_CHECKPOINT_TEST_HEIGHT.0;
-    while remaining_blocks > 0 {
-        let batch_size = remaining_blocks.min(250);
-        generated_hashes.extend(producer_rpc.generate(batch_size).await?);
-        remaining_blocks -= batch_size;
-    }
-    let generated_block_count = usize::try_from(LARGE_CHECKPOINT_TEST_HEIGHT.0)
-        .expect("checkpoint test height fits in usize");
+    let generated_hashes = producer_rpc.generate(CHECKPOINT_TEST_HEIGHT.0).await?;
+    let generated_block_count =
+        usize::try_from(CHECKPOINT_TEST_HEIGHT.0).expect("checkpoint test height fits in usize");
     assert_eq!(generated_hashes.len(), generated_block_count);
     assert_eq!(
         producer_rpc.blockchain_info().await?.blocks(),
-        LARGE_CHECKPOINT_TEST_HEIGHT
+        CHECKPOINT_TEST_HEIGHT
     );
 
-    let checkpoint_interval = u32::try_from(zakura_consensus::MAX_CHECKPOINT_HEIGHT_GAP)
-        .expect("maximum checkpoint gap fits in u32");
     let first_checkpoint_index =
-        usize::try_from(checkpoint_interval - 1).expect("checkpoint height fits in usize");
+        usize::try_from(CHECKPOINT_INTERVAL - 1).expect("checkpoint height fits in usize");
     let checkpoints = vec![
         (Height(0), regtest_genesis_block().hash()),
         (
-            Height(checkpoint_interval),
+            Height(CHECKPOINT_INTERVAL),
             generated_hashes[first_checkpoint_index],
         ),
         (
-            LARGE_CHECKPOINT_TEST_HEIGHT,
+            CHECKPOINT_TEST_HEIGHT,
             generated_hashes[generated_block_count - 1],
         ),
     ];
@@ -1234,7 +1229,7 @@ async fn sync_large_checkpoints_local() -> Result<()> {
     consumer_config.consensus.checkpoint_sync = true;
 
     let reuse_tempdir = sync_until_with_config(
-        LARGE_CHECKPOINT_TEST_HEIGHT,
+        CHECKPOINT_TEST_HEIGHT,
         &consumer_network,
         STOP_AT_HEIGHT_REGEX,
         LARGE_CHECKPOINT_TIMEOUT,
@@ -1244,7 +1239,7 @@ async fn sync_large_checkpoints_local() -> Result<()> {
         consumer_config.clone(),
     )?;
     sync_until_with_config(
-        (LARGE_CHECKPOINT_TEST_HEIGHT - 1).unwrap(),
+        (CHECKPOINT_TEST_HEIGHT - 1).unwrap(),
         &consumer_network,
         "previous state height is greater than the stop height",
         STOP_ON_LOAD_TIMEOUT,

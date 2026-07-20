@@ -1,6 +1,6 @@
 //! Signature hashes for Zcash transactions
 
-mod legacy;
+mod v4;
 
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use crate::parameters::NetworkUpgrade;
 use crate::{transparent, Error};
 
 use crate::primitives::zcash_primitives::{sighash, sighash_v4_raw, PrecomputedTxData};
-use legacy::LegacySighash;
+use v4::V4Sighash;
 
 bitflags::bitflags! {
     /// The different SigHash types, as defined in <https://zips.z.cash/zip-0143>
@@ -81,7 +81,7 @@ impl From<SigHash> for [u8; 32] {
 #[derive(Debug)]
 pub struct SigHasher {
     precomputed_tx_data: PrecomputedTxData,
-    legacy: Option<LegacySighash>,
+    v4: Option<V4Sighash>,
     zip244: Option<Zip244SighashCache>,
 }
 
@@ -104,7 +104,7 @@ impl SigHasher {
 
         Ok(SigHasher {
             precomputed_tx_data,
-            legacy: LegacySighash::new(trans, nu, &all_previous_outputs),
+            v4: V4Sighash::new(trans, nu, &all_previous_outputs),
             zip244: Zip244SighashCache::new(trans, &all_previous_outputs),
         })
     }
@@ -136,8 +136,8 @@ impl SigHasher {
             );
         }
 
-        if let Some(legacy) = &self.legacy {
-            return legacy
+        if let Some(v4) = &self.v4 {
+            return v4
                 .signature_hash(
                     canonical_hash_type.encode(),
                     input_index_script_code
@@ -156,7 +156,7 @@ impl SigHasher {
         )
     }
 
-    /// Calculate the sighash for the current pre-V5 (V4) transaction using the
+    /// Calculate the sighash for the current pre-V5 transaction using the
     /// raw `hash_type` byte taken directly from the signature.
     ///
     /// This preserves non-canonical bits (e.g. `0x41`) in the preimage so that
@@ -167,8 +167,8 @@ impl SigHasher {
         raw_hash_type: u8,
         input_index_script_code: Option<(usize, Vec<u8>)>,
     ) -> SigHash {
-        if let Some(legacy) = &self.legacy {
-            return legacy
+        if let Some(v4) = &self.v4 {
+            return v4
                 .signature_hash(
                     raw_hash_type,
                     input_index_script_code

@@ -1,4 +1,4 @@
-//! Native ZIP-143 and ZIP-243 signature hashing for V3 and V4 transactions.
+//! Native ZIP-243 signature hashing for V4 transactions.
 
 use std::io;
 
@@ -9,7 +9,7 @@ use zcash_transparent::sighash::{
 
 use super::SigHash;
 use crate::{
-    parameters::{NetworkUpgrade, OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID},
+    parameters::{NetworkUpgrade, SAPLING_VERSION_GROUP_ID},
     primitives::ZkSnarkProof,
     sapling,
     serialization::ZcashSerialize,
@@ -26,7 +26,6 @@ const ZCASH_SHIELDED_SPENDS_HASH_PERSONALIZATION: &[u8; 16] = b"ZcashSSpendsHash
 const ZCASH_SHIELDED_OUTPUTS_HASH_PERSONALIZATION: &[u8; 16] = b"ZcashSOutputHash";
 
 const OVERWINTERED_FLAG: u32 = 1 << 31;
-const V3_VERSION: u32 = 3;
 const V4_VERSION: u32 = 4;
 
 const ZERO_DIGEST: [u8; 32] = [0; 32];
@@ -138,42 +137,14 @@ fn sapling_outputs_hash(
 }
 
 #[derive(Clone, Copy, Debug)]
-enum LegacyVersion {
-    V3,
-    V4 {
-        value_balance: i64,
-        sapling_spends: Option<Blake2bHash>,
-        sapling_outputs: Option<Blake2bHash>,
-    },
-}
-
-impl LegacyVersion {
-    fn header(self) -> u32 {
-        OVERWINTERED_FLAG
-            | match self {
-                Self::V3 => V3_VERSION,
-                Self::V4 { .. } => V4_VERSION,
-            }
-    }
-
-    fn version_group_id(self) -> u32 {
-        match self {
-            Self::V3 => OVERWINTER_VERSION_GROUP_ID,
-            Self::V4 { .. } => SAPLING_VERSION_GROUP_ID,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 struct InputTail {
     outpoint: Option<transparent::OutPoint>,
     sequence: u32,
 }
 
-/// Transaction-wide ZIP-143/243 data reused by every signature hash.
+/// Transaction-wide ZIP-243 data reused by every signature hash.
 #[derive(Clone, Debug)]
-pub(super) struct LegacySighash {
-    version: LegacyVersion,
+pub(super) struct V4Sighash {
     consensus_branch_id: u32,
     lock_time: u32,
     expiry_height: u32,
@@ -184,10 +155,13 @@ pub(super) struct LegacySighash {
     outputs: Blake2bHash,
     single_outputs: Vec<Blake2bHash>,
     joinsplits: Option<Blake2bHash>,
+    value_balance: i64,
+    sapling_spends: Option<Blake2bHash>,
+    sapling_outputs: Option<Blake2bHash>,
 }
 
-impl LegacySighash {
-    /// Returns precomputed data for V3/V4 transactions, and `None` for other versions.
+impl V4Sighash {
+    /// Returns precomputed data for V4 transactions, and `None` for other versions.
     pub(super) fn new(
         transaction: &Transaction,
         network_upgrade: NetworkUpgrade,
@@ -196,22 +170,6 @@ impl LegacySighash {
         let consensus_branch_id = u32::from(network_upgrade.branch_id()?);
 
         match transaction {
-            Transaction::V3 {
-                inputs,
-                outputs,
-                expiry_height,
-                joinsplit_data,
-                ..
-            } => Some(Self::from_parts(
-                LegacyVersion::V3,
-                consensus_branch_id,
-                transaction.raw_lock_time(),
-                expiry_height.0,
-                inputs,
-                outputs,
-                joinsplits_hash(joinsplit_data.as_ref()),
-                all_previous_outputs,
-            )),
             Transaction::V4 {
                 inputs,
                 outputs,
@@ -228,57 +186,32 @@ impl LegacySighash {
                     .as_ref()
                     .and_then(sapling_outputs_hash);
 
-                Some(Self::from_parts(
-                    LegacyVersion::V4 {
-                        value_balance,
-                        sapling_spends,
-                        sapling_outputs,
-                    },
+                Some(Self {
                     consensus_branch_id,
-                    transaction.raw_lock_time(),
-                    expiry_height.0,
-                    inputs,
-                    outputs,
-                    joinsplits_hash(joinsplit_data.as_ref()),
-                    all_previous_outputs,
-                ))
+                    lock_time: transaction.raw_lock_time(),
+                    expiry_height: expiry_height.0,
+                    inputs: inputs
+                        .iter()
+                        .map(|input| InputTail {
+                            outpoint: input.outpoint(),
+                            sequence: input.sequence(),
+                        })
+                        .collect(),
+                    previous_output_values: all_previous_outputs
+                        .iter()
+                        .map(|output| output.value.zatoshis())
+                        .collect(),
+                    prevouts: prevouts_hash(inputs),
+                    sequence: sequence_hash(inputs),
+                    outputs: outputs_hash(outputs),
+                    single_outputs: outputs.iter().map(output_hash).collect(),
+                    joinsplits: joinsplits_hash(joinsplit_data.as_ref()),
+                    value_balance,
+                    sapling_spends,
+                    sapling_outputs,
+                })
             }
             _ => None,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn from_parts(
-        version: LegacyVersion,
-        consensus_branch_id: u32,
-        lock_time: u32,
-        expiry_height: u32,
-        inputs: &[transparent::Input],
-        outputs: &[transparent::Output],
-        joinsplits: Option<Blake2bHash>,
-        all_previous_outputs: &[transparent::Output],
-    ) -> Self {
-        Self {
-            version,
-            consensus_branch_id,
-            lock_time,
-            expiry_height,
-            inputs: inputs
-                .iter()
-                .map(|input| InputTail {
-                    outpoint: input.outpoint(),
-                    sequence: input.sequence(),
-                })
-                .collect(),
-            previous_output_values: all_previous_outputs
-                .iter()
-                .map(|output| output.value.zatoshis())
-                .collect(),
-            prevouts: prevouts_hash(inputs),
-            sequence: sequence_hash(inputs),
-            outputs: outputs_hash(outputs),
-            single_outputs: outputs.iter().map(output_hash).collect(),
-            joinsplits,
         }
     }
 
@@ -312,8 +245,8 @@ impl LegacySighash {
         personalization[12..].copy_from_slice(&self.consensus_branch_id.to_le_bytes());
         let mut state = hasher(&personalization);
 
-        state.update(&self.version.header().to_le_bytes());
-        state.update(&self.version.version_group_id().to_le_bytes());
+        state.update(&(OVERWINTERED_FLAG | V4_VERSION).to_le_bytes());
+        state.update(&SAPLING_VERSION_GROUP_ID.to_le_bytes());
 
         if raw_hash_type & SIGHASH_ANYONECANPAY == 0 {
             state.update(self.prevouts.as_bytes());
@@ -350,29 +283,19 @@ impl LegacySighash {
                 .map_or(ZERO_DIGEST.as_slice(), Blake2bHash::as_bytes),
         );
 
-        if let LegacyVersion::V4 {
-            value_balance,
-            sapling_spends,
-            sapling_outputs,
-        } = self.version
-        {
-            state.update(
-                sapling_spends
-                    .as_ref()
-                    .map_or(ZERO_DIGEST.as_slice(), Blake2bHash::as_bytes),
-            );
-            state.update(
-                sapling_outputs
-                    .as_ref()
-                    .map_or(ZERO_DIGEST.as_slice(), Blake2bHash::as_bytes),
-            );
-            state.update(&self.lock_time.to_le_bytes());
-            state.update(&self.expiry_height.to_le_bytes());
-            state.update(&value_balance.to_le_bytes());
-        } else {
-            state.update(&self.lock_time.to_le_bytes());
-            state.update(&self.expiry_height.to_le_bytes());
-        }
+        state.update(
+            self.sapling_spends
+                .as_ref()
+                .map_or(ZERO_DIGEST.as_slice(), Blake2bHash::as_bytes),
+        );
+        state.update(
+            self.sapling_outputs
+                .as_ref()
+                .map_or(ZERO_DIGEST.as_slice(), Blake2bHash::as_bytes),
+        );
+        state.update(&self.lock_time.to_le_bytes());
+        state.update(&self.expiry_height.to_le_bytes());
+        state.update(&self.value_balance.to_le_bytes());
 
         state.update(&u32::from(raw_hash_type).to_le_bytes());
 

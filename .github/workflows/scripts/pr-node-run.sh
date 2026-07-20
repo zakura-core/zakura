@@ -150,11 +150,13 @@ if [ "$MODE" = "pre-checkpoint" ]; then
     sleep 2
   done
   if [ -z "$START_HEIGHT" ]; then
-    note "pre-checkpoint: could not read the start height over RPC; crossing status unknown."
+    note "**FAILED: pre-checkpoint crossing status unknown** — could not read the start height over RPC, so this run cannot prove a handoff crossing."
+    exit 1
   elif [ "$START_HEIGHT" -lt "$MAX_CKPT" ]; then
     note "pre-checkpoint: start height ${START_HEIGHT} is $((MAX_CKPT - START_HEIGHT)) blocks below max checkpoint ${MAX_CKPT} — this run crosses the checkpoint handoff."
   else
-    note "**WARNING: no handoff crossing** — start height ${START_HEIGHT} is already at or above max checkpoint ${MAX_CKPT}. The tree's checkpoints predate the retained snapshots; re-run against a branch with newer checkpoints (e.g. a release-state bundle PR)."
+    note "**FAILED: no handoff crossing** — start height ${START_HEIGHT} is already at or above max checkpoint ${MAX_CKPT}, so a green run would be a false positive. The tree's checkpoints predate the retained snapshots; re-run against a branch with newer checkpoints (e.g. a release-state bundle PR)."
+    exit 1
   fi
 fi
 

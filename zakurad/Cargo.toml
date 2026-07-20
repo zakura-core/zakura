@@ -7,7 +7,7 @@ name = "zakura"
 # [package.metadata.release] below does it automatically, but only under the
 # full `cargo release` flow (`cargo release version` skips the replace step) -
 # keep the two in sync when bumping by hand.
-version = "1.0.2-rc0"
+version = "1.0.2-rc1"
 authors.workspace = true
 description = "Zakura, an independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true

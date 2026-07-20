@@ -133,6 +133,7 @@ impl SigHasher {
             return zip244.sighash(
                 hash_type,
                 input_index_script_code.as_ref().map(|(index, _)| *index),
+                |index| self.precomputed_tx_data.zip244_txin_parts(index),
             );
         }
 
@@ -206,5 +207,10 @@ impl SigHasher {
         &self,
     ) -> Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>> {
         self.precomputed_tx_data.sapling_bundle()
+    }
+
+    #[cfg(test)]
+    pub(super) fn zip244_cache_counts(&self) -> Option<(usize, usize)> {
+        self.zip244.as_ref().map(Zip244SighashCache::cache_counts)
     }
 }

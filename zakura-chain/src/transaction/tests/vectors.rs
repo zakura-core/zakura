@@ -1269,6 +1269,44 @@ fn zip244_sighash() -> Result<()> {
 }
 
 #[test]
+fn zip244_sighash_caches_only_relevant_components() -> Result<()> {
+    let input =
+        transparent::Input::zcash_deserialize(zakura_test::vectors::DUMMY_INPUT1.as_slice())?;
+    let output =
+        transparent::Output::zcash_deserialize(zakura_test::vectors::DUMMY_OUTPUT1.as_slice())?;
+    let mut transaction = Transaction::clone(&EMPTY_V5_TX);
+
+    let Transaction::V5 {
+        inputs, outputs, ..
+    } = &mut transaction
+    else {
+        unreachable!("EMPTY_V5_TX is a V5 transaction")
+    };
+    inputs.extend(std::iter::repeat_n(input, 2));
+    outputs.extend(std::iter::repeat_n(output.clone(), 4));
+
+    let sighasher =
+        transaction.sighasher(NetworkUpgrade::Nu5, Arc::new(vec![output.clone(), output]))?;
+
+    assert_eq!(sighasher.zip244_cache_counts(), Some((2, 0)));
+
+    let _shielded_sighash = sighasher.sighash(HashType::ALL, None);
+    assert_eq!(sighasher.zip244_cache_counts(), Some((2, 0)));
+
+    let _input_1_sighash = sighasher.sighash(HashType::ALL, Some((1, Vec::new())));
+    assert_eq!(sighasher.zip244_cache_counts(), Some((2, 1)));
+
+    let _repeated_input_1_sighash =
+        sighasher.sighash(HashType::NONE_ANYONECANPAY, Some((1, Vec::new())));
+    assert_eq!(sighasher.zip244_cache_counts(), Some((2, 1)));
+
+    let _input_0_sighash = sighasher.sighash(HashType::SINGLE, Some((0, Vec::new())));
+    assert_eq!(sighasher.zip244_cache_counts(), Some((2, 2)));
+
+    Ok(())
+}
+
+#[test]
 fn v6_zip244_sighash_matches_librustzcash() -> Result<()> {
     let _init_guard = zakura_test::init();
 

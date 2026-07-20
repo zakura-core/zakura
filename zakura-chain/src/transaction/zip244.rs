@@ -27,7 +27,7 @@
 //! [ZIP-244]: https://zips.z.cash/zip-0244
 //! [ZIP-225]: https://zips.z.cash/zip-0225
 
-use std::io;
+use std::{io, sync::OnceLock};
 
 use blake2b_simd::{Hash as Blake2bHash, Params, State};
 
@@ -379,22 +379,18 @@ fn hash_scriptpubkeys(previous_outputs: &[transparent::Output]) -> Blake2bHash {
 
 /// ZIP-244 §S.2g digest for one transparent input.
 fn hash_txin(
-    input: &transparent::Input,
+    outpoint_hash: &[u8; 32],
+    outpoint_index: u32,
     previous_output: &transparent::Output,
-) -> Option<Blake2bHash> {
-    let transparent::Input::PrevOut {
-        outpoint, sequence, ..
-    } = input
-    else {
-        return None;
-    };
-
+    sequence: u32,
+) -> Blake2bHash {
     let mut h = hasher(ZCASH_TRANSPARENT_INPUT_HASH_PERSONALIZATION);
-    update_serialized(&mut h, outpoint);
+    h.update(outpoint_hash);
+    h.update(&outpoint_index.to_le_bytes());
     h.update(&previous_output.value.zatoshis().to_le_bytes());
     update_serialized(&mut h, &previous_output.lock_script);
     h.update(&sequence.to_le_bytes());
-    Some(h.finalize())
+    h.finalize()
 }
 
 fn hash_transparent_txid_from_digests(
@@ -732,7 +728,7 @@ pub(crate) struct Zip244SighashCache {
     sequence: Blake2bHash,
     outputs: Blake2bHash,
     single_outputs: Vec<Blake2bHash>,
-    txins: Vec<Option<Blake2bHash>>,
+    txins: Vec<OnceLock<[u8; 32]>>,
     transparent_bundle_present: bool,
     transparent_is_coinbase_or_has_no_inputs: bool,
     sapling: Blake2bHash,
@@ -766,20 +762,18 @@ impl Zip244SighashCache {
             scriptpubkeys: hash_scriptpubkeys(previous_outputs),
             sequence,
             outputs,
+            // SIGHASH_SINGLE selects the output at the current input index,
+            // so outputs after the final input can never be selected.
             single_outputs: parts
                 .outputs
                 .iter()
+                .take(parts.inputs.len())
                 .map(|output| hash_outputs(std::slice::from_ref(output)))
                 .collect(),
-            txins: parts
-                .inputs
-                .iter()
-                .enumerate()
-                .map(|(index, input)| {
-                    previous_outputs
-                        .get(index)
-                        .and_then(|previous_output| hash_txin(input, previous_output))
-                })
+            // ZIP-244 §S.2g is only relevant to transparent signatures. Cache
+            // each digest when its input is first checked by the interpreter.
+            txins: std::iter::repeat_with(OnceLock::new)
+                .take(parts.inputs.len())
                 .collect(),
             transparent_bundle_present,
             transparent_is_coinbase_or_has_no_inputs: tx.is_coinbase() || parts.inputs.is_empty(),
@@ -797,8 +791,14 @@ impl Zip244SighashCache {
     /// `input_index` is `Some` for a transparent signature and `None` for a
     /// shielded signature. ZIP-244 commits to the spent output's scriptPubKey,
     /// so the script code supplied to the interpreter is not an input here.
-    pub(crate) fn sighash(&self, hash_type: HashType, input_index: Option<usize>) -> SigHash {
-        let transparent = self.transparent_sig_digest(hash_type, input_index);
+    /// `txin_parts` is only called once for each requested transparent input.
+    pub(crate) fn sighash<'a>(
+        &self,
+        hash_type: HashType,
+        input_index: Option<usize>,
+        txin_parts: impl FnOnce(usize) -> (&'a [u8; 32], u32, &'a transparent::Output, u32),
+    ) -> SigHash {
+        let transparent = self.transparent_sig_digest(hash_type, input_index, txin_parts);
         SigHash(
             combine_txid_digests(
                 self.consensus_branch_id,
@@ -814,10 +814,11 @@ impl Zip244SighashCache {
         )
     }
 
-    fn transparent_sig_digest(
+    fn transparent_sig_digest<'a>(
         &self,
         hash_type: HashType,
         input_index: Option<usize>,
+        txin_parts: impl FnOnce(usize) -> (&'a [u8; 32], u32, &'a transparent::Output, u32),
     ) -> Blake2bHash {
         if !self.transparent_bundle_present || self.transparent_is_coinbase_or_has_no_inputs {
             return self.transparent_txid;
@@ -860,13 +861,25 @@ impl Zip244SighashCache {
             _ => self.outputs,
         };
         let txin = match input_index {
-            Some(index) => self
+            Some(index) => *self
                 .txins
                 .get(index)
-                .and_then(Option::as_ref)
-                .copied()
-                .expect("transparent sighash input has a matching previous output"),
-            None => hasher(ZCASH_TRANSPARENT_INPUT_HASH_PERSONALIZATION).finalize(),
+                .expect(
+                    "input digest slot exists because sighash callers provide an in-bounds index",
+                )
+                .get_or_init(|| {
+                    let (outpoint_hash, outpoint_index, previous_output, sequence) =
+                        txin_parts(index);
+                    hash_txin(outpoint_hash, outpoint_index, previous_output, sequence)
+                        .as_bytes()
+                        .try_into()
+                        .expect("BLAKE2b-256 digest is 32 bytes")
+                }),
+            None => hasher(ZCASH_TRANSPARENT_INPUT_HASH_PERSONALIZATION)
+                .finalize()
+                .as_bytes()
+                .try_into()
+                .expect("BLAKE2b-256 digest is 32 bytes"),
         };
 
         let hash_type: u8 = hash_type
@@ -880,8 +893,19 @@ impl Zip244SighashCache {
         h.update(scriptpubkeys.as_bytes());
         h.update(sequence.as_bytes());
         h.update(outputs.as_bytes());
-        h.update(txin.as_bytes());
+        h.update(&txin);
         h.finalize()
+    }
+
+    #[cfg(test)]
+    pub(super) fn cache_counts(&self) -> (usize, usize) {
+        (
+            self.single_outputs.len(),
+            self.txins
+                .iter()
+                .filter(|digest| digest.get().is_some())
+                .count(),
+        )
     }
 }
 

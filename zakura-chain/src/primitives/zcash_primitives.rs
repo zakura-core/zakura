@@ -279,6 +279,36 @@ impl PrecomputedTxData {
         })
     }
 
+    /// Returns the fields committed by the ZIP-244 digest for `input_index`.
+    ///
+    /// # Panics
+    ///
+    /// If `input_index` does not have a matching transparent input and
+    /// previous output. Sighash callers require both to be present.
+    pub(crate) fn zip244_txin_parts(
+        &self,
+        input_index: usize,
+    ) -> (&[u8; 32], u32, &transparent::Output, u32) {
+        let input = self
+            .tx_data
+            .transparent_bundle()
+            .and_then(|bundle| bundle.vin.get(input_index))
+            .expect(
+                "transparent input exists because the precomputed transaction was derived from \
+                 the same transaction as the ZIP-244 cache",
+            );
+        let previous_output = self.all_previous_outputs.get(input_index).expect(
+            "previous output exists because transparent sighash callers provide one per input",
+        );
+
+        (
+            input.prevout().hash(),
+            input.prevout().n(),
+            previous_output,
+            input.sequence(),
+        )
+    }
+
     /// Returns the Orchard bundle in `tx_data`.
     pub fn orchard_bundle(
         &self,

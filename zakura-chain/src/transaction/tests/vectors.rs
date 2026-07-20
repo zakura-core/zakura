@@ -1090,12 +1090,10 @@ fn test_vec243_3() -> Result<()> {
     Ok(())
 }
 
-/// Non-canonical pre-V5 hash types use masked bits for selection but commit to
-/// the complete raw byte in the signature hash.
+/// Pre-V5 hash types use masked bits for selection but commit to the complete
+/// raw byte in the signature hash.
 #[test]
-fn v4_raw_noncanonical_sighash_matches_librustzcash() -> Result<()> {
-    const NON_CANONICAL_SIGHASH_ALL: u8 = 0x41;
-
+fn v4_raw_sighashes_match_librustzcash() -> Result<()> {
     let _init_guard = zakura_test::init();
     let transaction = ZIP243_3.zcash_deserialize_into::<Transaction>()?;
     let value = hex::decode("80f0fa0200000000")?.zcash_deserialize_into::<Amount<_>>()?;
@@ -1116,14 +1114,17 @@ fn v4_raw_noncanonical_sighash_matches_librustzcash() -> Result<()> {
         PrecomputedTxData::new(&transaction, NetworkUpgrade::Sapling, previous_outputs)?;
     let input = Some((0, lock_script.as_raw_bytes().to_vec()));
 
-    assert_eq!(
-        native.sighash_v4_raw(NON_CANONICAL_SIGHASH_ALL, input.clone()),
-        crate::primitives::zcash_primitives::sighash_v4_raw(
-            &librustzcash,
-            NON_CANONICAL_SIGHASH_ALL,
-            input,
-        ),
-    );
+    for raw_hash_type in u8::MIN..=u8::MAX {
+        assert_eq!(
+            native.sighash_v4_raw(raw_hash_type, input.clone()),
+            crate::primitives::zcash_primitives::sighash_v4_raw(
+                &librustzcash,
+                raw_hash_type,
+                input.clone(),
+            ),
+            "raw hash type {raw_hash_type:#04x} must match librustzcash",
+        );
+    }
 
     Ok(())
 }

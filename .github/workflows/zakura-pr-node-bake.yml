@@ -137,13 +137,24 @@ jobs:
 
       - name: Snapshot state volumes
         env:
+          IP: ${{ steps.droplet.outputs.ip }}
           MAINNET_VOL_ID: ${{ steps.droplet.outputs.mainnet_vol_id }}
           TESTNET_VOL_ID: ${{ steps.droplet.outputs.testnet_vol_id }}
         run: |
           set -euo pipefail
+          # The -h<height> suffix lets the pr-node pre-checkpoint mode pick the
+          # newest snapshot whose state is below a branch's max checkpoint.
+          fetch_height() {
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+              "root@${IP}" "cat $1 2>/dev/null" | grep -E '^[0-9]+$' || true
+          }
+          MAINNET_H=$(fetch_height /root/mainnet-state-height)
+          TESTNET_H=$(fetch_height /root/testnet-state-height)
           STAMP=$(date -u +%Y%m%d-%H%M)
-          doctl compute volume snapshot "${MAINNET_VOL_ID}" --snapshot-name "zakura-pr-state-mainnet-${STAMP}"
-          doctl compute volume snapshot "${TESTNET_VOL_ID}" --snapshot-name "zakura-pr-state-testnet-${STAMP}"
+          doctl compute volume snapshot "${MAINNET_VOL_ID}" \
+            --snapshot-name "zakura-pr-state-mainnet-${STAMP}${MAINNET_H:+-h${MAINNET_H}}"
+          doctl compute volume snapshot "${TESTNET_VOL_ID}" \
+            --snapshot-name "zakura-pr-state-testnet-${STAMP}${TESTNET_H:+-h${TESTNET_H}}"
 
       - name: Snapshot droplet image
         env:
@@ -191,16 +202,21 @@ jobs:
             done
           done
           # Keep the newest 2 images so runs never depend on the latest bake
-          # having succeeded, and 3 volume snapshots per network so the oldest
-          # (used by the pr-node pre-checkpoint mode to sync through the last
-          # checkpoint handoff) stays ~2 weeks behind the newest.
+          # having succeeded. Mainnet volume snapshots keep ~a quarter of weekly
+          # generations so the pr-node pre-checkpoint mode can always find a
+          # state below a branch's max checkpoint, even after weeks without a
+          # checkpoint advance; testnet keeps the short window.
           doctl compute image list-user --format ID,Name --no-header | \
             awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | head -n -2 | \
             while read -r _name id; do doctl compute image delete "$id" -f; done
           for NET in mainnet testnet; do
+            case "$NET" in
+              mainnet) KEEP=13 ;;
+              testnet) KEEP=3 ;;
+            esac
             doctl compute snapshot list --resource volume --format ID,Name --no-header | \
               awk -v pre="zakura-pr-state-${NET}-" 'index($2, pre) == 1 {print $2, $1}' | \
-              sort | head -n -3 | \
+              sort | head -n "-${KEEP}" | \
               while read -r _name id; do doctl compute snapshot delete "$id" -f; done
           done
           true

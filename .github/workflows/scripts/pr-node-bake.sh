@@ -119,6 +119,9 @@ TIP_META=$(curl -fsSL --retry 3 "$TIP_MAINNET_LATEST_JSON")
 TIP_URL=$(echo "$TIP_META" | jq -er '.url')
 TIP_SHA=$(echo "$TIP_META" | jq -er '.sha256')
 echo "Mainnet tip: $(echo "$TIP_META" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
+# The workflow embeds this height in the volume snapshot name, so the pr-node
+# pre-checkpoint mode can pick the newest snapshot below a branch's checkpoint.
+echo "$TIP_META" | jq -er '.height' > /root/mainnet-state-height || true
 fetch_state "$TIP_URL" "$TIP_SHA" "$MAINNET_MNT/tip" mainnet
 
 # Mainnet sandblast: pinned archive just before the 2022 spam region.
@@ -133,6 +136,7 @@ TN_FILE=$(echo "$ENTRY" | jq -er '.file')
 TN_SHA=$(echo "$ENTRY" | jq -er '.sha256')
 TN_BASE=$(echo "$TESTNET_META" | jq -r '.siteBaseUrl // empty')
 echo "Testnet tip: $(echo "$ENTRY" | jq -r '"\(.file) height=\(.height) db=\(.dbFormat)"')"
+echo "$ENTRY" | jq -er '.height' > /root/testnet-state-height || true
 if [ -n "$TN_BASE" ] && curl -fsIL --retry 2 "${TN_BASE}/files/${TN_FILE}" >/dev/null 2>&1; then
   fetch_state "${TN_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
 else

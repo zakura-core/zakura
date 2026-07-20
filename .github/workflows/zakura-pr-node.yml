@@ -97,11 +97,28 @@ jobs:
             SLUG=$(echo "${REF}" | tr -c 'a-zA-Z0-9' '-' | tr -s '-' | sed 's/^-//; s/-$//' | cut -c1-24)
           fi
           echo "Testing ${SHA} (${REFSPEC}), PR: ${PR:-none}"
+          # pre-checkpoint needs the target tree's max checkpoint to pick a
+          # state snapshot below it.
+          MAX_CKPT=""
+          if [ "${MODE}" = "pre-checkpoint" ]; then
+            case "${NETWORK}" in
+              mainnet) CKPT_PATH=zakura-chain/src/parameters/checkpoint/main-checkpoints.txt ;;
+              testnet) CKPT_PATH=zakura-chain/src/parameters/checkpoint/test-checkpoints.txt ;;
+            esac
+            MAX_CKPT=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${CKPT_PATH}?ref=${SHA}" \
+              -H "Accept: application/vnd.github.raw" | tail -1 | cut -d' ' -f1)
+            [[ "${MAX_CKPT}" =~ ^[0-9]+$ ]] || {
+              echo "could not read the target tree's max checkpoint" >&2
+              exit 1
+            }
+            echo "Target max checkpoint: ${MAX_CKPT}"
+          fi
           {
             echo "sha=${SHA}"
             echo "refspec=${REFSPEC}"
             echo "pr=${PR}"
             echo "slug=${SLUG}"
+            echo "max_ckpt=${MAX_CKPT}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Install doctl
@@ -126,6 +143,7 @@ jobs:
         env:
           MODE: ${{ inputs.snapshot_mode }}
           NETWORK: ${{ inputs.network }}
+          MAX_CKPT: ${{ steps.target.outputs.max_ckpt }}
         run: |
           set -euo pipefail
           IMAGE=$(doctl compute image list-user --format ID,Name --no-header | \
@@ -146,13 +164,29 @@ jobs:
             exit 1
           fi
           if [ "${MODE}" = "pre-checkpoint" ]; then
-            # The oldest retained bake snapshot sits below any checkpoint advanced
-            # since it was taken, so the run syncs through the checkpoint handoff.
-            if [ "$(echo "${SNAPS}" | wc -l)" -lt 2 ]; then
-              echo "pre-checkpoint needs at least two retained snapshots; only one exists (bake again later)" >&2
+            # Newest retained snapshot whose baked state height (the -h<height>
+            # name suffix) is below the target's max checkpoint: guarantees a
+            # handoff crossing with the shortest possible sync.
+            CANDIDATES=$(echo "${SNAPS}" | while read -r name id; do
+              h=$(printf '%s' "$name" | sed -n 's/.*-h\([0-9][0-9]*\)$/\1/p')
+              [ -n "$h" ] && [ "$h" -lt "${MAX_CKPT}" ] && echo "$name $id"
+            done || true)
+            HEIGHT_NAMED=$(echo "${SNAPS}" | awk '$1 ~ /-h[0-9]+$/' | wc -l)
+            if [ -n "${CANDIDATES}" ]; then
+              SNAP=$(echo "${CANDIDATES}" | tail -1 | awk '{print $2}')
+              echo "picked $(echo "${CANDIDATES}" | tail -1 | awk '{print $1}') (below max checkpoint ${MAX_CKPT})"
+            elif [ "${HEIGHT_NAMED}" -gt 0 ]; then
+              echo "no retained ${NETWORK} snapshot is below the target's max checkpoint ${MAX_CKPT}; a handoff crossing is impossible" >&2
               exit 1
+            else
+              # Transition fallback until a bake produces height-suffixed names:
+              # the oldest retained snapshot is the best below-checkpoint bet.
+              if [ "$(echo "${SNAPS}" | wc -l)" -lt 2 ]; then
+                echo "pre-checkpoint needs at least two retained snapshots; only one exists (bake again later)" >&2
+                exit 1
+              fi
+              SNAP=$(echo "${SNAPS}" | head -1 | awk '{print $2}')
             fi
-            SNAP=$(echo "${SNAPS}" | head -1 | awk '{print $2}')
           else
             SNAP=$(echo "${SNAPS}" | tail -1 | awk '{print $2}')
           fi

@@ -103,10 +103,21 @@ fetch_state() {
   local tarball="${dest%/}.tar.zst"
   echo "Fetching ${url} -> ${dest}"
   df -h "$(dirname "$dest")"
-  # --retry-all-errors + -C - resumes interrupted multi-GB transfers instead of
-  # failing the whole bake (plain --retry does not cover mid-stream resets).
-  curl -fL --retry 8 --retry-delay 15 --retry-all-errors -C - \
-    -o "$tarball" "$url"
+  # Start a fresh curl process after each failure so -C - recomputes the
+  # current file size. Curl's internal retries can restart a partial transfer.
+  local downloaded=false attempt
+  for attempt in $(seq 1 9); do
+    if curl -fL -C - -o "$tarball" "$url"; then
+      downloaded=true
+      break
+    fi
+    echo "Download attempt ${attempt}/9 failed; resuming ${tarball} in 15 seconds." >&2
+    sleep 15
+  done
+  [[ "$downloaded" == true ]] || {
+    echo "Failed to download ${url} after 9 attempts." >&2
+    return 1
+  }
   local checksum_verified=false
   if [ -n "$sha" ]; then
     echo "${sha}  ${tarball}" | sha256sum -c -

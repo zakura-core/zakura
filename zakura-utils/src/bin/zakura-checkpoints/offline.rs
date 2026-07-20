@@ -83,6 +83,22 @@ pub fn select_checkpoints(
     Ok(selected)
 }
 
+/// Verify that a retained header extends the preceding canonical block.
+fn validate_header_link(
+    height: Height,
+    actual_parent: block::Hash,
+    expected_parent: block::Hash,
+) -> Result<()> {
+    ensure!(
+        actual_parent == expected_parent,
+        "retained block header at height {} links to {actual_parent}, but the preceding canonical \
+         hash is {expected_parent}",
+        height.0
+    );
+
+    Ok(())
+}
+
 /// Run the offline export selected by `--state-cache-dir`.
 ///
 /// Prints checkpoint lines to stdout (optionally prefixed with the embedded
@@ -131,25 +147,25 @@ pub fn run_offline(args: &Args) -> Result<()> {
     // different chain (a corrupted or foreign state snapshot). A test-only
     // --last-checkpoint base off the checkpoint grid has no embedded hash to
     // compare.
+    let mut previous_hash = db.hash(base_height).ok_or_else(|| {
+        eyre!(
+            "state database has no block at the base checkpoint {}",
+            base_height.0
+        )
+    })?;
     if let Some(embedded_hash) = network.checkpoint_list().hash(base_height) {
-        let db_hash = db.hash(base_height).ok_or_else(|| {
-            eyre!(
-                "state database has no block at the base checkpoint {}",
-                base_height.0
-            )
-        })?;
         ensure!(
-            db_hash == embedded_hash,
-            "state database hash at base checkpoint {} is {db_hash}, but the embedded checkpoint \
-             list has {embedded_hash}; refusing to export from a mismatched chain",
+            previous_hash == embedded_hash,
+            "state database hash at base checkpoint {} is {previous_hash}, but the embedded \
+             checkpoint list has {embedded_hash}; refusing to export from a mismatched chain",
             base_height.0
         );
     }
 
     // Read every retained candidate row, cross-checking both hash indexes and
-    // recomputing each hash from its retained header (headers survive pruning),
-    // so a corrupt database fails loudly instead of exporting hashes the header
-    // chain never had.
+    // recomputing each hash from its retained header (headers survive pruning).
+    // Each header must also extend the preceding canonical hash, so a corrupt
+    // database fails loudly instead of exporting a disconnected header chain.
     let rows = ((base_height.0 + 1)..=tip_height.0).map(|raw_height| {
         let height = Height(raw_height);
         let hash = db
@@ -166,6 +182,8 @@ pub fn run_offline(args: &Args) -> Result<()> {
             block::Hash::from(header.as_ref()) == hash,
             "hash index disagrees with the retained block header at height {raw_height}"
         );
+        validate_header_link(height, header.previous_block_hash, previous_hash)?;
+        previous_hash = hash;
         let info = db
             .block_info(height.into())
             .ok_or_else(|| eyre!("missing retained BlockInfo at height {raw_height}"))?;
@@ -364,6 +382,20 @@ mod tests {
         assert!(
             result.is_err(),
             "rows must start immediately above the base height"
+        );
+    }
+
+    #[test]
+    fn header_links_must_extend_the_preceding_canonical_hash() {
+        let expected_parent = test_hash(10);
+
+        assert!(
+            validate_header_link(Height(11), expected_parent, expected_parent).is_ok(),
+            "a header linked to the preceding canonical hash is accepted"
+        );
+        assert!(
+            validate_header_link(Height(11), test_hash(9), expected_parent).is_err(),
+            "a disconnected retained header is rejected"
         );
     }
 }

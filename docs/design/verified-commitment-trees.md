@@ -790,6 +790,11 @@ zakura-checkpoints \
   note commitments (v4 JoinSplits still can) or is missing. A failed scan self-heals on a
   later export once the checkpoint sequence passes the Sprout-changing block. The bytes are
   validated through the same parser used for the embedded frontier before being written.
+- Frontier correctness inherits the finalized database's trust boundary: the exporter reads
+  trees produced by Zakura's validated, atomic finalized-state commits rather than replaying
+  historical transaction bodies. The parser validates framing and height, not the tree roots'
+  provenance. This deliberate trust model keeps the exporter compatible with pruned databases;
+  operators must only export from a quiesced state produced by a trusted Zakura node.
 - Checkpoint lines go to stdout; all status goes to stderr. RPC mode remains for Testnet
   updates and diagnostics.
 

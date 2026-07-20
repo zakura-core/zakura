@@ -1269,10 +1269,8 @@ fn zip244_sighash() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn v6_zip244_sighash_matches_librustzcash() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
+fn v6_transparent_sighash_test_data() -> Result<(Transaction, Arc<Vec<transparent::Output>>, usize)>
+{
     let test = ironwood_v6_tx_hash::TEST_VECTORS
         .iter()
         .find(|test| test.scenario == "transparent_sighashes")
@@ -1299,6 +1297,20 @@ fn v6_zip244_sighash_matches_librustzcash() -> Result<()> {
             })
             .collect(),
     );
+    let input_index = usize::try_from(
+        test.transparent_input
+            .expect("transparent vector has an input index"),
+    )
+    .expect("u32 fits in usize");
+
+    Ok((transaction, previous_outputs, input_index))
+}
+
+#[test]
+fn v6_zip244_sighash_matches_librustzcash() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    let (transaction, previous_outputs, input_index) = v6_transparent_sighash_test_data()?;
     let native = SigHasher::new(
         &transaction,
         NetworkUpgrade::Nu6_3,
@@ -1312,11 +1324,6 @@ fn v6_zip244_sighash_matches_librustzcash() -> Result<()> {
         crate::primitives::zcash_primitives::sighash(&librustzcash, HashType::ALL, None),
     );
 
-    let input_index = usize::try_from(
-        test.transparent_input
-            .expect("transparent vector has an input index"),
-    )
-    .expect("u32 fits in usize");
     for hash_type in [
         HashType::ALL,
         HashType::NONE,
@@ -1332,6 +1339,101 @@ fn v6_zip244_sighash_matches_librustzcash() -> Result<()> {
             "V6 {hash_type:?} sighash must match librustzcash",
         );
     }
+
+    Ok(())
+}
+
+#[test]
+fn script_code_commitment_is_version_specific() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    fn assert_script_code_behavior(
+        transaction: &Transaction,
+        network_upgrade: NetworkUpgrade,
+        previous_outputs: Arc<Vec<transparent::Output>>,
+        input_index: usize,
+        script_code_is_committed: bool,
+    ) -> Result<()> {
+        let native = SigHasher::new(transaction, network_upgrade, previous_outputs.clone())?;
+        let librustzcash = PrecomputedTxData::new(transaction, network_upgrade, previous_outputs)?;
+        let [(native_a, librustzcash_a), (native_b, librustzcash_b)] = [vec![0x51], vec![0x52]]
+            .map(|script_code| {
+                let input = Some((input_index, script_code));
+                (
+                    native.sighash(HashType::ALL, input.clone()),
+                    crate::primitives::zcash_primitives::sighash(
+                        &librustzcash,
+                        HashType::ALL,
+                        input,
+                    ),
+                )
+            });
+
+        assert_eq!(native_a, librustzcash_a);
+        assert_eq!(native_b, librustzcash_b);
+        assert_eq!(
+            native_a != native_b,
+            script_code_is_committed,
+            "{network_upgrade:?} script code commitment differs from expectation",
+        );
+
+        Ok(())
+    }
+
+    let v4_transaction = ZIP243_3.zcash_deserialize_into::<Transaction>()?;
+    let v4_value = hex::decode("80f0fa0200000000")?.zcash_deserialize_into::<Amount<_>>()?;
+    let v4_previous_outputs = Arc::new(vec![transparent::Output {
+        value: v4_value,
+        lock_script: Script::new(&hex::decode(
+            "76a914507173527b4c3318a2aecd793bf1cfed705950cf88ac",
+        )?),
+    }]);
+    assert_script_code_behavior(
+        &v4_transaction,
+        NetworkUpgrade::Sapling,
+        v4_previous_outputs,
+        0,
+        true,
+    )?;
+
+    let v5_test = zip0244::TEST_VECTORS
+        .iter()
+        .find(|test| test.transparent_input.is_some())
+        .expect("ZIP-244 vectors include a transparent sighash");
+    let v5_transaction = v5_test.tx.zcash_deserialize_into::<Transaction>()?;
+    let v5_previous_outputs = Arc::new(
+        v5_test
+            .amounts
+            .iter()
+            .zip(v5_test.script_pubkeys.iter())
+            .map(|(amount, script_pubkey)| transparent::Output {
+                value: (*amount).try_into().expect("vector amount is valid"),
+                lock_script: Script::new(script_pubkey),
+            })
+            .collect(),
+    );
+    let v5_input_index = usize::try_from(
+        v5_test
+            .transparent_input
+            .expect("selected vector has a transparent input"),
+    )
+    .expect("u32 fits in usize");
+    assert_script_code_behavior(
+        &v5_transaction,
+        NetworkUpgrade::Nu5,
+        v5_previous_outputs,
+        v5_input_index,
+        false,
+    )?;
+
+    let (v6_transaction, v6_previous_outputs, v6_input_index) = v6_transparent_sighash_test_data()?;
+    assert_script_code_behavior(
+        &v6_transaction,
+        NetworkUpgrade::Nu6_3,
+        v6_previous_outputs,
+        v6_input_index,
+        false,
+    )?;
 
     Ok(())
 }

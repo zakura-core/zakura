@@ -32,14 +32,15 @@ pub struct Config {
     /// Set this to `false` if `zcashd` is managed externally.
     pub manage_zcashd: bool,
 
-    /// Preferred source for the `zcashd` binary.
+    /// Source for the `zcashd` binary.
     ///
-    /// If `zcashd_path` is set, that explicit local path overrides this value.
+    /// Set to `embedded` to use the managed release download and cache, or `path`
+    /// to use [`zcashd_path`](Config::zcashd_path).
     pub zcashd_source: ZcashdBinarySource,
 
     /// Optional explicit path to a local `zcashd` binary with zcashd-compat support.
     ///
-    /// When set, Zebra uses this path directly and skips embedded downloads.
+    /// Used when [`zcashd_source`](Config::zcashd_source) is set to `path`.
     pub zcashd_path: Option<PathBuf>,
 
     /// Optional `zcashd` datadir path.
@@ -54,10 +55,13 @@ pub struct Config {
     /// - a JSON array string (useful for environment variable overrides):
     ///   `ZAKURA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-conf=/path/to/zcash.conf","-debug=1"]'`
     ///
-    /// Zebra passes these arguments through unchanged. For first-start bootstrap,
-    /// Zebra only infers path overrides from the first valid `-conf=/path` or
-    /// `-datadir=/path` form, and logs warnings for paired, empty, or duplicate
-    /// path options.
+    /// Zakura passes these arguments through unchanged, except that supervised
+    /// compatibility mode normalizes and deduplicates `-allowdeprecated`
+    /// arguments while enabling all legacy wallet features by default. An
+    /// explicit `-allowdeprecated=none` overrides those defaults. For first-start
+    /// bootstrap, Zakura only infers path overrides from the first valid
+    /// `-conf=/path` or `-datadir=/path` form, and logs warnings for paired,
+    /// empty, or duplicate path options.
     ///
     /// Supervised zcashd runs always include `-printtoconsole` automatically.
     #[serde(default, deserialize_with = "deserialize_zcashd_extra_args")]

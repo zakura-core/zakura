@@ -294,8 +294,10 @@ pub struct ZakuraConfig {
     pub message_rate_per_second: u32,
     /// Optional directory for structured Zakura JSONL trace tables.
     ///
-    /// When unset, Zakura trace emission is disabled. When set, the native
-    /// Zakura endpoint writes the production trace schema into this directory.
+    /// When unset, Zakura trace emission is disabled. When set, the native Zakura endpoint writes
+    /// the production trace schema and the legacy sync pipeline writes `legacy_sync.jsonl` into
+    /// this directory. Legacy peer fields in `legacy_sync.jsonl` follow
+    /// [`Config::expose_peer_addresses`](crate::config::Config::expose_peer_addresses).
     pub trace_dir: Option<PathBuf>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,

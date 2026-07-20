@@ -18,7 +18,7 @@ use futures::{
 use tower::load_shed::error::Overloaded;
 use tracing::Span;
 
-use zakura_chain::serialization::SerializationError;
+use zakura_chain::{block, serialization::SerializationError};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
@@ -30,7 +30,7 @@ use crate::{
     peer_set::ActiveConnectionCounter,
     protocol::external::Message,
     types::Nonce,
-    PeerError, Request, Response,
+    PeerError, PeerSource, Request, Response,
 };
 
 /// Test that the connection run loop works as a future
@@ -971,6 +971,100 @@ async fn connection_is_randomly_disconnected_on_overload() {
     );
 }
 
+/// Test that operator-configured protected peers (block-gossip / zcashd-compat
+/// sidecars) are never disconnected in response to `Overloaded` errors: their
+/// requests are still shed, but the connection is never severed, even as
+/// repeated overloads would drive an ordinary peer's drop probability toward
+/// `MAX_OVERLOAD_DROP_PROBABILITY`.
+#[tokio::test(flavor = "multi_thread")]
+async fn protected_connection_is_never_disconnected_on_overload() {
+    let _init_guard = zakura_test::init();
+
+    // The real stream and sink are from a split TCP connection,
+    // but that doesn't change how the state machine behaves.
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+
+    let (
+        connection,
+        _client_tx,
+        mut inbound_service,
+        mut peer_outbound_messages,
+        shared_error_slot,
+    ) = new_protected_test_connection();
+
+    // Start the connection run loop future in a spawned task
+    let connection_handle = tokio::spawn(connection.run(peer_rx));
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    // Repeatedly overload the inbound service on the same connection. Each
+    // overload refreshes `last_overload_time`, so for an ordinary peer the drop
+    // probability climbs quadratically toward `MAX_OVERLOAD_DROP_PROBABILITY`.
+    // A protected peer must survive every one of them.
+    const OVERLOADS: usize = 50;
+    for i in 0..OVERLOADS {
+        // Simulate an overloaded connection error in response to an inbound request.
+        peer_tx
+            .send(Ok(Message::GetAddr))
+            .await
+            .expect("send to channel always succeeds");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        inbound_service
+            .expect_request(Request::Peers)
+            .await
+            .respond_error(Overloaded::new().into());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        // The request is shed: no response is sent to the peer.
+        let outbound_result = peer_outbound_messages.try_recv();
+        assert!(
+            outbound_result.is_err(),
+            "overload {i}: protected peer's request must be shed, not answered:\n{outbound_result:?}"
+        );
+
+        // The connection is never severed for a protected peer.
+        let error = shared_error_slot.try_get_error();
+        assert!(
+            error.is_none(),
+            "overload {i}: protected peer must never be disconnected on overload, but got: {error:?}"
+        );
+    }
+
+    // We need to terminate the spawned task
+    connection_handle.abort();
+}
+
+/// A block `getdata` from a configured sidecar carries its classified
+/// connection source into the inbound service.
+#[tokio::test]
+async fn protected_connection_attributes_inbound_block_request() {
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, _client_tx, mut inbound_service, _peer_messages, _error_slot) =
+        new_protected_test_connection();
+    let connection_handle = tokio::spawn(connection.run(peer_rx));
+    let hash = block::Hash([0x11; 32]);
+
+    peer_tx
+        .send(Ok(Message::GetData(vec![hash.into()])))
+        .await
+        .expect("test peer channel is open");
+
+    inbound_service
+        .expect_request(Request::BlocksByHashFrom {
+            hashes: HashSet::from([hash]),
+            source: PeerSource::LegacySocket(
+                "127.0.0.1:4"
+                    .parse()
+                    .expect("test peer socket address is valid"),
+            ),
+        })
+        .await
+        .respond_error(Overloaded::new().into());
+
+    connection_handle.abort();
+}
+
 #[tokio::test]
 async fn connection_ping_pong_round_trip() {
     let _init_guard = zakura_test::init();
@@ -1058,4 +1152,19 @@ fn new_test_connection() -> (
     ErrorSlot,
 ) {
     super::new_test_connection()
+}
+
+/// Creates a new protected-peer [`Connection`] instance for unit tests
+/// (exempt from the inbound-overload connection drop).
+fn new_protected_test_connection() -> (
+    Connection<
+        MockService<Request, Response, PanicAssertion>,
+        SinkMapErr<mpsc::Sender<Message>, fn(mpsc::SendError) -> SerializationError>,
+    >,
+    mpsc::Sender<ClientRequest>,
+    MockService<Request, Response, PanicAssertion>,
+    mpsc::Receiver<Message>,
+    ErrorSlot,
+) {
+    super::new_protected_test_connection()
 }

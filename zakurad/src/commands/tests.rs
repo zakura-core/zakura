@@ -45,3 +45,22 @@ fn args_with_subcommand_pass_through() {
         assert_eq!(matches!(args.cmd(), ZakuradCmd::Start(_)), should_be_start,);
     }
 }
+
+#[test]
+fn validate_vct_sprout_history_requires_network() {
+    let args = EntryPoint::try_parse_from([
+        "zakurad",
+        "validate-vct-sprout-history",
+        "--network",
+        "mainnet",
+        "--cache-dir",
+        "/tmp/zakura-state",
+    ])
+    .expect("validation command with an explicit network should parse");
+    assert!(matches!(
+        args.cmd(),
+        ZakuradCmd::ValidateVctSproutHistory(_)
+    ));
+
+    assert!(EntryPoint::try_parse_from(["zakurad", "validate-vct-sprout-history"]).is_err());
+}

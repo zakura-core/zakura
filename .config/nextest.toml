@@ -114,9 +114,11 @@ failure-output = "immediate"
 default-filter = 'package(zakura-network) and test(~zakura::testkit::blocksync_fuzz)'
 
 
-[profile.sync-large-checkpoints-empty]
-slow-timeout = { period = "60m", terminate-after = 2 }
-default-filter = 'package(zakura) and test(=sync_large_checkpoints_empty)'
+[profile.sync-checkpoints-local]
+test-threads = 1
+slow-timeout = { period = "15m", terminate-after = 1 }
+failure-output = "immediate"
+default-filter = 'package(zakura) and test(=sync_checkpoints_local)'
 
 [profile.sync-full-mainnet]
 slow-timeout = { period = "30000m", terminate-after = 1 }

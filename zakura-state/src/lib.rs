@@ -43,8 +43,8 @@ pub use config::{
 pub use constants::{state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT};
 pub use error::{
     BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError, CommitHeaderRangeError,
-    CommitSemanticallyVerifiedError, DuplicateNullifierError, StateInitError, StoreIncoherentError,
-    ValidateContextError,
+    CommitSemanticallyVerifiedError, DuplicateNullifierError, MissingSproutTipTree, StateInitError,
+    StoreIncoherentError, ValidateContextError,
 };
 pub use request::{
     CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight, MappedRequest,
@@ -64,7 +64,7 @@ pub use service::{
     finalized_state::FinalizedState,
     init, init_read_only,
     non_finalized_state::NonFinalizedState,
-    spawn_init_read_only,
+    spawn_init_read_only, validate_vct_sprout_history,
     watch_receiver::WatchReceiver,
     OutputLocation, ReadState, State, TransactionIndex, TransactionLocation,
 };
@@ -74,6 +74,10 @@ pub use service::{
 pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
 
 pub use service::finalized_state::{
+    generate_mainnet_from_archive, produce_final_frontiers_bytes, validate_final_frontiers_bytes,
+    FinalFrontiersGenerationError, FinalFrontiersValidationError, GeneratorError,
+};
+pub use service::finalized_state::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,
     PruneFinalizedStateOptions, PruneFinalizedStateSummary,
 };
@@ -82,8 +86,7 @@ pub use service::finalized_state::{
     RollbackFinalizedStateError, RollbackFinalizedStateOptions, RollbackFinalizedStateSummary,
 };
 pub use service::finalized_state::{
-    produce_final_frontiers_bytes, validate_final_frontiers_bytes, FinalFrontiersGenerationError,
-    FinalFrontiersValidationError,
+    VctSproutHistoryValidationError, VctSproutHistoryValidationSummary,
 };
 pub use service::{
     finalized_state::{DiskWriteBatch, FromDisk, IntoDisk, WriteDisk, ZakuraDb},

@@ -93,7 +93,7 @@ Use the sidecar `zcashd` build from
 [valargroup/zcashd](https://github.com/valargroup/zcashd). The installer and
 Zakura's embedded download both pin its release archives by SHA256. The
 split-container mode uses the
-[zakuracore/zcashd v1.0.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
+[zakuracore/zcashd v1.0.1 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
 It differs from stock `zcash/zcash` in three ways:
 
 1. **P2P sidecar mode is hard-locked.** The binary refuses to start unless
@@ -177,7 +177,10 @@ On start, Zakura:
 
    The network-selection flags follow Zakura's own configured network, and
    `-printtoconsole` is always included so zcashd's output lands in Zakura's
-   logs.
+   logs. Zakura also passes each legacy wallet `-allowdeprecated` feature once,
+   preserving the full compatibility RPC surface by default. An
+   operator-supplied `-allowdeprecated=none` overrides that behavior; Zakura
+   then passes only `-allowdeprecated=none`.
 
 4. supervises it: restarts on unexpected exit with capped exponential
    backoff, and shuts it down gracefully (SIGTERM, then a configurable grace

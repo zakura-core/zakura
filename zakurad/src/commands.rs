@@ -13,6 +13,7 @@ pub use self::{entry_point::EntryPoint, start::StartCmd};
 use self::{
     copy_state::CopyStateCmd, generate::GenerateCmd, prune_state::PruneStateCmd,
     rollback_state::RollbackStateCmd, tip_height::TipHeightCmd,
+    validate_vct_sprout_history::ValidateVctSproutHistoryCmd,
 };
 
 pub mod start;
@@ -23,6 +24,7 @@ mod generate;
 pub mod prune_state;
 pub mod rollback_state;
 mod tip_height;
+mod validate_vct_sprout_history;
 
 #[cfg(test)]
 mod tests;
@@ -56,6 +58,9 @@ pub enum ZakuradCmd {
 
     /// Print the tip block height of Zebra's chain state on disk
     TipHeight(TipHeightCmd),
+
+    /// Validate repaired VCT Sprout history in the state database
+    ValidateVctSproutHistory(ValidateVctSproutHistoryCmd),
 }
 
 impl ZakuradCmd {
@@ -71,7 +76,11 @@ impl ZakuradCmd {
             CopyState(_) | Start(_) => true,
 
             // Utility commands that don't use server components
-            Generate(_) | PruneState(_) | RollbackState(_) | TipHeight(_) => false,
+            Generate(_)
+            | PruneState(_)
+            | RollbackState(_)
+            | TipHeight(_)
+            | ValidateVctSproutHistory(_) => false,
         }
     }
 
@@ -85,7 +94,12 @@ impl ZakuradCmd {
             Start(_) => true,
 
             // Utility commands
-            CopyState(_) | Generate(_) | PruneState(_) | RollbackState(_) | TipHeight(_) => false,
+            CopyState(_)
+            | Generate(_)
+            | PruneState(_)
+            | RollbackState(_)
+            | TipHeight(_)
+            | ValidateVctSproutHistory(_) => false,
         }
     }
 
@@ -104,7 +118,11 @@ impl ZakuradCmd {
             // This output:
             // - is used by automated tools, or
             // - needs to be read easily.
-            Generate(_) | PruneState(_) | RollbackState(_) | TipHeight(_) => true,
+            Generate(_)
+            | PruneState(_)
+            | RollbackState(_)
+            | TipHeight(_)
+            | ValidateVctSproutHistory(_) => true,
 
             // Commands that generate informative logging output by default.
             CopyState(_) | Start(_) => false,
@@ -129,6 +147,7 @@ impl Runnable for ZakuradCmd {
             RollbackState(cmd) => cmd.run(),
             Start(cmd) => cmd.run(),
             TipHeight(cmd) => cmd.run(),
+            ValidateVctSproutHistory(cmd) => cmd.run(),
         }
     }
 }

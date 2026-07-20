@@ -425,10 +425,8 @@ with a dependency on Tor.
   requests. This might introduce additional network distinguishers.
 
 - Mixnets: Tor provides strong privacy properties in practice, and can be used
-  today. In contrast, mixnets are [not yet][mixnet] at the same level of
-  technology readiness and are significantly more complex to integrate.
-
-[mixnet]: https://web.archive.org/web/20200422224714/https://www.zfnd.org/blog/mixnet-production-readiness/
+  today. In contrast, mixnets are not yet at the same level of technology
+  readiness and are significantly more complex to integrate.
 
 # Prior art
 

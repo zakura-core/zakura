@@ -25,19 +25,17 @@ impl HeaderHashDedup {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct PendingCommitKey {
-    pub(super) peer: ZakuraPeerId,
-    pub(super) session_id: u64,
-    pub(super) start_height: block::Height,
-    pub(super) count: u32,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum HeaderWorkState {
-    InFlight { peer: ZakuraPeerId },
-    Buffered { peer: ZakuraPeerId },
-    Committing { peer: ZakuraPeerId, session_id: u64 },
+    InFlight {
+        peer: ZakuraPeerId,
+    },
+    Buffered {
+        peer: ZakuraPeerId,
+    },
+    Committing {
+        operation: HeaderSyncOperationIdentity,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -49,7 +47,6 @@ pub(super) struct CoveredRange {
 #[derive(Clone, Debug)]
 pub(super) struct HeaderWorkQueue {
     pub(super) forward: VecDeque<RangeRequest>,
-    pub(super) backward: VecDeque<RangeRequest>,
     pub(super) active: HashMap<RangeRequest, HeaderWorkState>,
     pending_starts: HashSet<(RangePriority, block::Height)>,
     active_starts: HashSet<(RangePriority, block::Height)>,
@@ -64,7 +61,6 @@ impl HeaderWorkQueue {
     pub(super) fn new() -> Self {
         Self {
             forward: VecDeque::new(),
-            backward: VecDeque::new(),
             active: HashMap::new(),
             pending_starts: HashSet::new(),
             active_starts: HashSet::new(),
@@ -79,26 +75,23 @@ impl HeaderWorkQueue {
         self.ensure(range, RangePriority::Forward);
     }
 
-    pub(super) fn ensure_backward(&mut self, range: RangeRequest) {
-        self.ensure(range, RangePriority::Backward);
-    }
-
     pub(super) fn ensure(&mut self, range: RangeRequest, priority: RangePriority) {
         if self.is_covered(range)
-            || self.active_starts.contains(&(priority, range.start_height))
+            || self
+                .active_starts
+                .contains(&(priority, range.start_height()))
             || self
                 .pending_starts
-                .contains(&(priority, range.start_height))
+                .contains(&(priority, range.start_height()))
         {
             return;
         }
         let queue = match priority {
             RangePriority::Forward => &mut self.forward,
-            RangePriority::Backward => &mut self.backward,
             RangePriority::Repair => return,
         };
         queue.push_back(range);
-        self.pending_starts.insert((priority, range.start_height));
+        self.pending_starts.insert((priority, range.start_height()));
         self.oldest_missing_since.get_or_insert_with(Instant::now);
         metrics::counter!("sync.header.work.added", "lane" => priority.label()).increment(1);
     }
@@ -114,19 +107,10 @@ impl HeaderWorkQueue {
             !ranges.is_empty()
         });
         let range =
-            Self::pop_assignable(&mut self.forward, &self.retry_avoidance, peer_id, peer, now)
-                .or_else(|| {
-                    Self::pop_assignable(
-                        &mut self.backward,
-                        &self.retry_avoidance,
-                        peer_id,
-                        peer,
-                        now,
-                    )
-                });
+            Self::pop_assignable(&mut self.forward, &self.retry_avoidance, peer_id, peer, now);
         if let Some(range) = range {
             self.pending_starts
-                .remove(&(range.priority, range.start_height));
+                .remove(&(range.priority, range.start_height()));
         }
         range
     }
@@ -142,7 +126,7 @@ impl HeaderWorkQueue {
             range.end_height() <= peer.advertised_tip
                 && retry_avoidance
                     .get(peer_id)
-                    .and_then(|ranges| ranges.get(&(range.start_height, range.priority)))
+                    .and_then(|ranges| ranges.get(&(range.start_height(), range.priority)))
                     .is_none_or(|until| *until <= now)
         })?;
         queue.remove(index)
@@ -153,7 +137,7 @@ impl HeaderWorkQueue {
             .active
             .insert(range, HeaderWorkState::InFlight { peer });
         self.active_starts
-            .insert((range.priority, range.start_height));
+            .insert((range.priority, range.start_height()));
         debug_assert!(previous.is_none(), "pending work has no active owner");
         metrics::counter!("sync.header.work.taken", "lane" => range.priority.label()).increment(1);
     }
@@ -170,17 +154,13 @@ impl HeaderWorkQueue {
 
     pub(super) fn mark_committing(
         &mut self,
-        peer: ZakuraPeerId,
-        session_id: u64,
+        operation: HeaderSyncOperationIdentity,
         range: RangeRequest,
     ) {
-        let previous = self.active.insert(
-            range,
-            HeaderWorkState::Committing {
-                peer: peer.clone(),
-                session_id,
-            },
-        );
+        let peer = operation.wire_request.peer.clone();
+        let previous = self
+            .active
+            .insert(range, HeaderWorkState::Committing { operation });
         debug_assert!(
             matches!(previous, Some(HeaderWorkState::Buffered { peer: owner }) if owner == peer),
             "only buffered header work can enter state commit"
@@ -194,9 +174,9 @@ impl HeaderWorkQueue {
 
         if let Some(state) = self.active.remove(&original) {
             self.active_starts
-                .remove(&(original.priority, original.start_height));
+                .remove(&(original.priority, original.start_height()));
             self.active_starts
-                .insert((narrowed.priority, narrowed.start_height));
+                .insert((narrowed.priority, narrowed.start_height()));
             self.active.insert(narrowed, state);
         }
     }
@@ -204,18 +184,17 @@ impl HeaderWorkQueue {
     pub(super) fn retry(&mut self, range: RangeRequest) {
         self.active.remove(&range);
         self.active_starts
-            .remove(&(range.priority, range.start_height));
+            .remove(&(range.priority, range.start_height()));
         if self.is_covered(range) {
             return;
         }
         let queue = match range.priority {
             RangePriority::Forward => &mut self.forward,
-            RangePriority::Backward => &mut self.backward,
             RangePriority::Repair => return,
         };
         if self
             .pending_starts
-            .insert((range.priority, range.start_height))
+            .insert((range.priority, range.start_height()))
         {
             queue.push_front(range);
         }
@@ -225,7 +204,7 @@ impl HeaderWorkQueue {
 
     pub(super) fn retry_avoiding(&mut self, peer: ZakuraPeerId, range: RangeRequest) {
         self.retry_avoidance.entry(peer).or_default().insert(
-            (range.start_height, range.priority),
+            (range.start_height(), range.priority),
             Instant::now() + HEADER_SYNC_RETRY_AVOIDANCE,
         );
         self.retry(range);
@@ -249,13 +228,13 @@ impl HeaderWorkQueue {
     pub(super) fn clear_assignment(&mut self, range: RangeRequest) {
         self.active.remove(&range);
         self.active_starts
-            .remove(&(range.priority, range.start_height));
+            .remove(&(range.priority, range.start_height()));
     }
 
     pub(super) fn complete(&mut self, range: RangeRequest) {
         let previous = self.active.remove(&range);
         self.active_starts
-            .remove(&(range.priority, range.start_height));
+            .remove(&(range.priority, range.start_height()));
         debug_assert!(
             matches!(previous, Some(HeaderWorkState::Committing { .. })) || previous.is_none(),
             "only committing or externally covered work can complete"
@@ -271,7 +250,7 @@ impl HeaderWorkQueue {
             .forward
             .drain(..)
             .filter_map(|range| {
-                if range.start_height <= height {
+                if range.start_height() <= height {
                     range.suffix_after(height, anchor_hash)
                 } else {
                     Some(range)
@@ -289,12 +268,11 @@ impl HeaderWorkQueue {
     ) {
         let queue = match priority {
             RangePriority::Forward => &mut self.forward,
-            RangePriority::Backward => &mut self.backward,
             RangePriority::Repair => return,
         };
         if let Some(range) = queue
             .iter_mut()
-            .find(|range| range.start_height == start_height)
+            .find(|range| range.start_height() == start_height)
         {
             if range.anchor_hash == Some(anchor_hash) {
                 range.anchor_hash = None;
@@ -328,7 +306,7 @@ impl HeaderWorkQueue {
         let end = range.end_height();
         self.covered
             .iter()
-            .any(|covered| covered.start <= range.start_height && covered.end >= end)
+            .any(|covered| covered.start <= range.start_height() && covered.end >= end)
     }
 
     pub(super) fn mark_covered_interval(&mut self, mut interval: CoveredRange) {
@@ -364,36 +342,33 @@ impl HeaderWorkQueue {
             let end = range.end_height();
             covered
                 .iter()
-                .any(|covered| covered.start <= range.start_height && covered.end >= end)
+                .any(|covered| covered.start <= range.start_height() && covered.end >= end)
         };
         self.forward.retain(|range| !is_covered(range));
-        self.backward.retain(|range| !is_covered(range));
         self.active.retain(|range, state| {
             matches!(state, HeaderWorkState::Committing { .. }) || !is_covered(range)
         });
         self.rebuild_start_indexes();
-        if self.forward.is_empty() && self.backward.is_empty() && self.active.is_empty() {
+        if self.forward.is_empty() && self.active.is_empty() {
             self.oldest_missing_since = None;
         }
     }
 
     pub(super) fn pending_len(&self) -> usize {
-        self.forward.len().saturating_add(self.backward.len())
+        self.forward.len()
     }
 
     pub(super) fn resident_heights(&self) -> u64 {
         self.forward
             .iter()
-            .chain(&self.backward)
             .chain(self.active.keys())
-            .map(|range| u64::from(range.count))
+            .map(|range| u64::from(range.count()))
             .sum()
     }
 
     pub(super) fn highest_end(&self, priority: RangePriority) -> Option<block::Height> {
         self.forward
             .iter()
-            .chain(&self.backward)
             .chain(self.active.keys())
             .filter(|range| range.priority == priority)
             .map(|range| range.end_height())
@@ -414,7 +389,7 @@ impl HeaderWorkQueue {
     }
 
     pub(super) fn has_pending(&self) -> bool {
-        !self.forward.is_empty() || !self.backward.is_empty()
+        !self.forward.is_empty()
     }
 
     pub(super) fn peer_retry_avoided(
@@ -425,10 +400,10 @@ impl HeaderWorkQueue {
         let Some(avoided) = self.retry_avoidance.get(peer) else {
             return false;
         };
-        self.forward.iter().chain(&self.backward).any(|range| {
+        self.forward.iter().any(|range| {
             range.end_height() <= advertised_tip
                 && avoided
-                    .get(&(range.start_height, range.priority))
+                    .get(&(range.start_height(), range.priority))
                     .is_some_and(|until| *until > Instant::now())
         })
     }
@@ -452,9 +427,8 @@ impl HeaderWorkQueue {
     pub(super) fn oldest_missing_height(&self) -> Option<block::Height> {
         self.forward
             .iter()
-            .chain(&self.backward)
             .chain(self.active.keys())
-            .map(|range| range.start_height)
+            .map(|range| range.start_height())
             .min()
     }
 
@@ -463,14 +437,13 @@ impl HeaderWorkQueue {
         self.pending_starts.extend(
             self.forward
                 .iter()
-                .chain(&self.backward)
-                .map(|range| (range.priority, range.start_height)),
+                .map(|range| (range.priority, range.start_height())),
         );
         self.active_starts.clear();
         self.active_starts.extend(
             self.active
                 .keys()
-                .map(|range| (range.priority, range.start_height)),
+                .map(|range| (range.priority, range.start_height())),
         );
     }
 }
@@ -515,10 +488,21 @@ mod tests {
         ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds")
     }
 
+    fn operation(peer: ZakuraPeerId, session_id: u64) -> HeaderSyncOperationIdentity {
+        HeaderSyncOperationIdentity {
+            wire_request: HeaderSyncWireRequestIdentity {
+                peer,
+                session_id,
+                request_id: HeaderSyncRequestId::new(1).expect("test request ID is non-zero"),
+            },
+            op_kind: HeaderSyncOperationKind::CommitHeaders,
+        }
+    }
+
     fn range(start: u32, count: u32, priority: RangePriority) -> RangeRequest {
         RangeRequest {
-            start_height: block::Height(start),
-            count,
+            range: CheckedHeaderRange::from_count(block::Height(start), count)
+                .expect("test range is non-empty and bounded"),
             anchor_hash: None,
             finalized: false,
             want_tree_aux_roots: true,
@@ -563,7 +547,11 @@ mod tests {
             .next_for_peer(&peer, &state)
             .expect("peer can claim the pending range");
         queue.mark_assigned(peer.clone(), claimed);
-        queue.ensure_forward(RangeRequest { count: 3, ..range });
+        queue.ensure_forward(RangeRequest {
+            range: CheckedHeaderRange::from_count(block::Height(1), 3)
+                .expect("test range is non-empty"),
+            ..range
+        });
         assert_eq!(queue.pending_len(), 0);
         assert!(matches!(
             queue.state(range),
@@ -591,8 +579,8 @@ mod tests {
             queue.forward.iter().copied().collect::<Vec<_>>(),
             vec![
                 RangeRequest {
-                    start_height: block::Height(2),
-                    count: 1,
+                    range: CheckedHeaderRange::from_count(block::Height(2), 1)
+                        .expect("test suffix is non-empty"),
                     anchor_hash: Some(anchor),
                     ..first
                 },
@@ -607,14 +595,14 @@ mod tests {
         let poisoned = block::Hash([7; 32]);
         let suffix = RangeRequest {
             anchor_hash: Some(poisoned),
-            ..range(3, 2, RangePriority::Backward)
+            ..range(3, 2, RangePriority::Forward)
         };
-        queue.ensure_backward(suffix);
+        queue.ensure_forward(suffix);
 
-        queue.clear_pending_anchor(RangePriority::Backward, suffix.start_height, poisoned);
+        queue.clear_pending_anchor(RangePriority::Forward, suffix.start_height(), poisoned);
 
         assert_eq!(
-            queue.backward.front().and_then(|range| range.anchor_hash),
+            queue.forward.front().and_then(|range| range.anchor_hash),
             None
         );
     }
@@ -670,34 +658,6 @@ mod tests {
     }
 
     #[test]
-    fn clearing_forward_work_preserves_backward_ownership_and_rebuilds_indexes() {
-        let mut queue = HeaderWorkQueue::new();
-        let forward_pending = range(1, 1, RangePriority::Forward);
-        let forward_active = range(2, 1, RangePriority::Forward);
-        let backward_pending = range(3, 1, RangePriority::Backward);
-        let backward_active = range(4, 1, RangePriority::Backward);
-        let owner = peer(4);
-        queue.ensure_forward(forward_pending);
-        queue.ensure_backward(backward_pending);
-        queue.mark_assigned(owner.clone(), forward_active);
-        queue.mark_assigned(owner.clone(), backward_active);
-        let old_epoch = queue.epoch;
-
-        queue.clear_forward();
-
-        assert_eq!(queue.epoch, old_epoch.wrapping_add(1));
-        assert_eq!(queue.forward, VecDeque::new());
-        assert!(queue.state(forward_active).is_none());
-        assert_eq!(queue.backward, VecDeque::from([backward_pending]));
-        assert!(matches!(
-            queue.state(backward_active),
-            Some(HeaderWorkState::InFlight { peer }) if peer == &owner
-        ));
-        queue.ensure_forward(forward_pending);
-        assert_eq!(queue.forward, VecDeque::from([forward_pending]));
-    }
-
-    #[test]
     fn retry_avoidance_is_local_to_the_failed_peer() {
         let mut queue = HeaderWorkQueue::new();
         let range = range(1, 1, RangePriority::Forward);
@@ -717,21 +677,6 @@ mod tests {
     }
 
     #[test]
-    fn assignment_prefers_forward_work_but_skips_ranges_above_the_peer_tip() {
-        let mut queue = HeaderWorkQueue::new();
-        let forward = range(10, 2, RangePriority::Forward);
-        let backward = range(1, 2, RangePriority::Backward);
-        let (peer, mut state) = peer_state(4, 2);
-
-        queue.ensure_forward(forward);
-        queue.ensure_backward(backward);
-        assert_eq!(queue.next_for_peer(&peer, &state), Some(backward));
-
-        state.advertised_tip = block::Height(11);
-        assert_eq!(queue.next_for_peer(&peer, &state), Some(forward));
-    }
-
-    #[test]
     fn covered_ranges_merge_and_prune_owned_work_except_commits() {
         let mut queue = HeaderWorkQueue::new();
         let owner = peer(5);
@@ -743,7 +688,8 @@ mod tests {
         queue.mark_assigned(owner.clone(), in_flight);
         queue.mark_assigned(owner.clone(), committing);
         queue.mark_buffered(owner.clone(), committing);
-        queue.mark_committing(owner, 7, committing);
+        let operation = operation(owner, 7);
+        queue.mark_committing(operation.clone(), committing);
 
         queue.mark_range_covered(block::Height(1), block::Height(2));
         queue.mark_height_covered(block::Height(3));
@@ -759,7 +705,7 @@ mod tests {
         assert!(queue.state(in_flight).is_none());
         assert!(matches!(
             queue.state(committing),
-            Some(HeaderWorkState::Committing { session_id: 7, .. })
+            Some(HeaderWorkState::Committing { operation: active }) if active == &operation
         ));
 
         queue.ensure_forward(pending);
@@ -781,12 +727,13 @@ mod tests {
         queue.mark_buffered(forgotten.clone(), buffered);
         queue.mark_assigned(forgotten.clone(), committing);
         queue.mark_buffered(forgotten.clone(), committing);
-        queue.mark_committing(forgotten.clone(), 9, committing);
+        let committing_operation = operation(forgotten.clone(), 9);
+        queue.mark_committing(committing_operation.clone(), committing);
         queue.mark_assigned(other.clone(), other_in_flight);
         queue.retry_avoidance.insert(
             forgotten.clone(),
             HashMap::from([(
-                (in_flight.start_height, in_flight.priority),
+                (in_flight.start_height(), in_flight.priority),
                 Instant::now() + HEADER_SYNC_RETRY_AVOIDANCE,
             )]),
         );
@@ -803,7 +750,7 @@ mod tests {
         ));
         assert!(matches!(
             queue.state(committing),
-            Some(HeaderWorkState::Committing { peer, session_id: 9 }) if peer == &forgotten
+            Some(HeaderWorkState::Committing { operation }) if operation == &committing_operation
         ));
         assert!(matches!(
             queue.state(other_in_flight),

@@ -18,37 +18,34 @@ On relevant PR changes, Zakura runs [its end-to-end test workflow](https://githu
 - block-sync fuzz scenarios after merges to `main`
 - longer multi-node modes on a schedule or on demand
 
-When a PR is merged to the `main` branch, we also run a Zakura full sync test from genesis.
+Full-sync coverage against the real network comes from the
+[continuous genesis sync fleet](https://github.com/zakura-core/zakura/blob/main/.github/workflows/zakura-continuous-sync.yml),
+which permanently re-syncs a small set of nodes from genesis and audits their progress on a schedule.
+A PR can also be tested on a real node before merge with the
+[PR node workflow](https://github.com/zakura-core/zakura/blob/main/.github/workflows/zakura-pr-node.yml),
+which boots an ephemeral droplet from a pre-baked chain-state snapshot; see
+[Continuous Delivery](continuous-delivery.md#ephemeral-pr-nodes).
+
 Some of our builds and tests are repeated on the `main` branch, due to:
 
-- GitHub's cache sharing rules,
-- our cached state sharing rules, or
+- GitHub's cache sharing rules, or
 - generating base coverage for PR coverage reports.
-
-Currently, each Zakura and lightwalletd full and update sync will update cached state images,
-which are shared by all tests. Tests prefer the latest image generated from the same commit.
-But if a state from the same commit is not available, tests will use the latest image from
-any branch and commit, as long as the state version is the same.
 
 Zakura also does [a smaller set of tests](https://github.com/zakura-core/zakura/blob/main/.github/workflows/tests-unit.yml) on tier 2 platforms using GitHub actions runners.
 
 ## Automated Merges
 
-We use [Mergify](https://dashboard.mergify.com/github/ZcashFoundation/repo/zakura/queues) to automatically merge most pull requests.
+PRs land through GitHub's native merge queue.
 To merge, a PR has to pass all required `main` branch protection checks, and be approved by a Zakura developer.
 
-We try to use Mergify as much as we can, so all PRs get consistent checks.
-
-Some PRs don't use Mergify:
-
-- Mergify config updates
-- Admin merges, which happen when there are multiple failures on the `main` branch
-- Manual merges (these are allowed by our branch protection rules, but we almost always use Mergify)
+The merge queue revalidates the merged result against the latest `main`: `lint.yml`, `tests-unit.yml`,
+and `zakura-e2e.yml` run on every queued entry via their `merge_group` triggers.
+`merge_group` ignores path filters, so these checks run unconditionally in the queue.
 
 Merging with failing CI is usually disabled by our branch protection rules.
 See the `Admin: Manually Merging PRs` section below for manual merge instructions.
 
-We use workflow conditions to skip some checks on PRs, Mergify, or the `main` branch.
+We use workflow conditions to skip some checks on PRs or the `main` branch.
 For example, some workflow changes skip Rust code checks. When a workflow can skip a check, we need to create [a patch workflow](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks#handling-skipped-but-required-checks)
 with an empty job with the same name. This is a [known Actions issue](https://github.com/orgs/community/discussions/13690#discussioncomment-6653382).
 This lets the branch protection rules pass when the job is skipped. In Zakura, we name these workflows with the extension `.patch.yml`.
@@ -62,9 +59,8 @@ But the following jobs don't need branch protection rules:
 
 - Testnet jobs: testnet is unreliable.
 - Optional linting jobs: some lint jobs are required, but some jobs like spelling and actions are optional.
-- Jobs that rarely run: for example, cached state rebuild jobs.
-- Setup jobs that will fail another later job which always runs, for example: Google Cloud setup jobs.
-  We have branch protection rules for build jobs, but we could remove them if we want.
+- Jobs that rarely run: for example, scheduled-only or manually dispatched jobs.
+- Setup jobs that will fail another later job which always runs.
 
 When a new job is added in a PR, use the `#devops` Slack channel to ask a GitHub admin to add a branch protection rule after it merges.
 Adding a new Zakura crate automatically adds a new job to build that crate by itself in [test-crates.yml](https://github.com/zakura-core/zakura/blob/main/.github/workflows/test-crates.yml),
@@ -72,8 +68,7 @@ so new crate PRs also need to add a branch protection rule.
 
 #### Admin: Changing Branch Protection Rules
 
-[Zakura repository admins](https://github.com/orgs/ZcashFoundation/teams/zakura-admins) and
-[Zcash Foundation organisation owners](https://github.com/orgs/ZcashFoundation/people?query=role%3Aowner)
+Zakura repository admins and organisation owners
 can add or delete branch protection rules in the Zakura repository.
 
 To change branch protection rules:
@@ -106,8 +101,8 @@ And finally:
 
 1. Click `Save changes`, using your security key if needed
 
-If you accidentally delete a lot of rules, and you can't remember what they were, ask a
-ZF organisation owner to send you a copy of the rules from the [audit log](https://github.com/organizations/ZcashFoundation/settings/audit-log).
+If you accidentally delete a lot of rules, and you can't remember what they were, ask an
+organisation owner to send you a copy of the rules from the [audit log](https://github.com/organizations/zakura-core/settings/audit-log).
 
 Organisation owners can also monitor rule changes and other security settings using this log.
 
@@ -126,50 +121,24 @@ Admin:
 
 ### Pull Requests from Forked Repositories
 
-GitHub doesn't allow PRs from forked repositories to have access to our repository secret keys, even after we approve their CI.
-This means that Google Cloud CI fails on these PRs.
+GitHub doesn't give PRs from forked repositories access to our repository secrets and variables, even after we approve their CI.
+This means that workflows needing secrets (for example, the fleet-deploy and PR-node workflows) can't run on these PRs.
 
-Until the inherited [Zebra CI bug](https://github.com/ZcashFoundation/zebra/issues/4529) is resolved, we can merge external PRs by:
+When an external PR needs the full CI suite, we can merge it by:
 
 1. Reviewing the code to make sure it won't give our secret keys to anyone
 2. Pushing a copy of the branch to the Zakura repository
 3. Opening a PR using that branch
-4. Closing the original PR with a note that it will be merged (closing duplicate PRs is required by Mergify)
+4. Closing the original PR with a note that it will be merged
 5. Asking another Zakura developer to approve the new PR
-
-## Manual Testing Using Google Cloud
-
-Some Zakura developers have access to the Zcash Foundation's Google Cloud instance, which also runs our automatic CI.
-
-Please shut down large instances when they are not being used.
-
-### Automated Deletion
-
-The [Delete GCP Resources](https://github.com/zakura-core/zakura/blob/main/.github/workflows/zfnd-delete-gcp-resources.yml)
-workflow automatically deletes test instances, instance templates, disks, and images older than a few days.
-
-If you want to keep instances, instance templates, disks, or images in Google Cloud, name them so they don't match the automated names:
-
-- deleted instances, instance templates and disks end in a commit hash, so use a name that doesn't end in `-[0-9a-f]{7,}`
-- deleted disks and images start with `zakurad-` or `lwd-`, so use a name starting with anything else
-
-Our production Google Cloud project doesn't have automated deletion.
 
 ## Troubleshooting
 
-To improve CI performance, some Docker tests are stateful.
+Some CI jobs are stateful, or depend on external state:
 
-Tests can depend on:
-
-- built Zakura and `lightwalletd` docker images
-- cached state images in Google cloud
-- jobs that launch Google Cloud instances for each test
-- multiple jobs that follow the logs from Google Cloud (to work around the 6 hour GitHub actions limit)
-- a final "Run" job that checks the exit status of the Rust acceptance test
-- the current height and user-submitted transactions on the blockchain, which changes every minute
-
-To support this test state, some Docker tests depend on other tests finishing first.
-This means that the entire workflow must be re-run when a single test fails.
+- the Zakura e2e suite drives a host-networked docker-compose stack of multiple nodes
+- PR-node runs depend on the weekly-baked droplet image and chain-state volume snapshots
+- sync tests depend on the current height and user-submitted transactions on the blockchain, which change every minute
 
 ### Finding Errors
 
@@ -178,24 +147,14 @@ This means that the entire workflow must be re-run when a single test fails.
 
 1. Look for the earliest job that failed, and find the earliest failure.
 
-For example, this failure doesn't tell us what actually went wrong:
+   Later jobs often fail with confusing consequence errors (a missing artifact, an invalid
+   template, a skipped dependency) when the real problem is a compile or test failure a few
+   steps or jobs earlier.
 
-> Error: The template is not valid. zakura-core/zakura/.github/workflows/zfnd-build-docker-image.yml@8bbc5b21c97fafc83b70fbe7f3b5e9d0ffa19593 (Line: 52, Col: 19): Error reading JToken from JsonReader. Path '', line 0, position 0.
-
-<https://github.com/zakura-core/zakura/runs/8181760421?check_suite_focus=true#step:41:4>
-
-But the specific failure is a few steps earlier:
-
-> #24 2117.3 error[E0308]: mismatched types
-> ...
-
-<https://github.com/zakura-core/zakura/runs/8181760421?check_suite_focus=true#step:8:2112>
-
-1. The earliest failure can also be in another job or pull request:
+2. The earliest failure can also be in another job:
    - check the whole workflow run (use the "Summary" button on the top left of the job details, and zoom in)
-   - if Mergify failed with "The pull request embarked with main cannot be merged", look at the PR "Conversation" tab, and find the latest Mergify PR that tried to merge this PR. Then start again from step 1.
 
-2. If that doesn't help, try looking for the latest failure. In Rust tests, the "failure:" notice contains the failed test names.
+3. If that doesn't help, try looking for the latest failure. In Rust tests, the "failure:" notice contains the failed test names.
 
 ### Fixing CI Sync Timeouts
 
@@ -272,13 +231,13 @@ These errors often happen after a new compiler version is released, because the 
 You can find a list of caches using:
 
 ```sh
-gh api -H "Accept: application/vnd.github+json" repos/ZcashFoundation/Zakura/actions/caches
+gh api -H "Accept: application/vnd.github+json" repos/zakura-core/zakura/actions/caches
 ```
 
 And delete a cache by `id` using:
 
 ```sh
-gh api --method DELETE -H "Accept: application/vnd.github+json" /repos/ZcashFoundation/Zakura/actions/caches/<id>
+gh api --method DELETE -H "Accept: application/vnd.github+json" /repos/zakura-core/zakura/actions/caches/<id>
 ```
 
 These commands are from the [GitHub Actions Cache API reference](https://docs.github.com/en/rest/actions/cache).
@@ -289,9 +248,8 @@ Some errors happen due to network connection issues, high load, or other rare si
 
 If it looks like a failure might be temporary, try re-running all the jobs on the PR using one of these methods:
 
-1. `@mergifyio update`
-2. `@dependabot recreate` (for dependabot PRs only)
-3. click on the failed job, and select "re-run all jobs". If the workflow hasn't finished, you might need to cancel it, and wait for it to finish.
+1. `@dependabot recreate` (for dependabot PRs only)
+2. click on the failed job, and select "re-run all jobs". If the workflow hasn't finished, you might need to cancel it, and wait for it to finish.
 
 Here are some of the rare and temporary errors that should be retried:
 

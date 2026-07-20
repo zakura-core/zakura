@@ -1,7 +1,7 @@
 use super::{
     error::*,
     events::*,
-    requester::{HeaderRequesterHandle, HeaderRequesterIdentity},
+    requester::{HeaderRequesterHandle, HeaderRequesterId},
     validation::*,
     wire::*,
     work_queue::*,
@@ -42,8 +42,7 @@ pub(super) struct HeaderSyncCore {
     pub(super) pending_new_blocks: HashSet<block::Hash>,
     pub(super) schedule: HeaderWorkQueue,
     pub(super) buffered: BTreeMap<(RangePriority, block::Height), BufferedHeaderRange>,
-    pub(super) backward_frontier: Option<(block::Height, block::Hash)>,
-    pub(super) pending_commits: HashMap<PendingCommitKey, RangeRequest>,
+    pub(super) pending_operations: HashMap<HeaderSyncOperationIdentity, PendingOperation>,
     pub(super) repair: Option<VctRootRepair>,
     pub(super) advisory: HashMap<ZakuraPeerId, HeaderSyncAdvisoryPeerState>,
     pub(super) stale_anchor: StaleAnchorFailures,
@@ -52,18 +51,23 @@ pub(super) struct HeaderSyncCore {
 impl HeaderSyncCore {
     pub(super) fn new(startup: &HeaderSyncStartup) -> Result<Self, HeaderSyncStartError> {
         validate_anchor(&startup.network, startup.anchor)?;
-        let (best_header_tip, best_header_hash) = startup.best_header_tip.unwrap_or(startup.anchor);
-        let backward_frontier = startup
-            .network
-            .checkpoint_list()
-            .max_height_in_range(..startup.anchor.0)
-            .and_then(|height| {
-                startup
-                    .network
-                    .checkpoint_list()
-                    .hash(height)
-                    .map(|hash| (height, hash))
+        if startup.anchor.0 > startup.frontiers.verified_block_tip {
+            return Err(HeaderSyncStartError::AnchorAboveVerifiedBlockTip {
+                anchor_height: startup.anchor.0,
+                verified_block_tip: startup.frontiers.verified_block_tip,
             });
+        }
+        let (best_header_tip, best_header_hash) = startup
+            .best_header_tip
+            .filter(|(height, hash)| {
+                *height > startup.frontiers.verified_block_tip
+                    || (*height == startup.frontiers.verified_block_tip
+                        && *hash == startup.frontiers.verified_block_hash)
+            })
+            .unwrap_or((
+                startup.frontiers.verified_block_tip,
+                startup.frontiers.verified_block_hash,
+            ));
 
         Ok(Self {
             anchor: startup.anchor,
@@ -79,8 +83,7 @@ impl HeaderSyncCore {
             pending_new_blocks: HashSet::new(),
             schedule: HeaderWorkQueue::new(),
             buffered: BTreeMap::new(),
-            backward_frontier,
-            pending_commits: HashMap::new(),
+            pending_operations: HashMap::new(),
             repair: None,
             advisory: HashMap::new(),
             stale_anchor: StaleAnchorFailures::default(),
@@ -152,80 +155,12 @@ impl HeaderSyncCore {
                 batch_len = count_between(batch_start, checkpoint);
             }
             self.schedule.ensure_forward(RangeRequest {
-                start_height: batch_start,
-                count: batch_len,
+                range: CheckedHeaderRange::from_count(batch_start, batch_len)
+                    .expect("bounded non-empty batch has checked geometry"),
                 anchor_hash,
                 finalized,
                 want_tree_aux_roots: true,
                 priority: RangePriority::Forward,
-            });
-            remaining = remaining.saturating_sub(batch_len);
-            let Some(next_start) = height_after_count(batch_start, batch_len) else {
-                break;
-            };
-            batch_start = next_start;
-            anchor_hash = None;
-        }
-    }
-
-    pub(super) fn refresh_backward_range(&mut self, startup: &HeaderSyncStartup) {
-        if self.anchor.0 == block::Height(0) {
-            return;
-        }
-        let checkpoints = startup.network.checkpoint_list();
-        // v1 backfill schedules one checkpoint bracket below the configured anchor.
-        // Iterating all deeper brackets is left to final node wiring/backfill policy.
-        let Some((frontier_height, frontier_hash)) = self.backward_frontier else {
-            return;
-        };
-        if frontier_height >= self.anchor.0 {
-            return;
-        }
-        let Some(start) = next_height(frontier_height) else {
-            return;
-        };
-        let batch_count = clamp_header_sync_request_count(
-            startup.config.advertised_max_headers_per_response(),
-            startup.config.advertised_max_headers_per_response(),
-            &startup.network,
-            startup.max_frame_bytes,
-            true,
-        );
-        let resident_height_cap =
-            u64::from(batch_count.saturating_mul(HEADER_SYNC_MAX_RESIDENT_BATCHES));
-        let available = resident_height_cap.saturating_sub(self.schedule.resident_heights());
-        let Ok(available) = u32::try_from(available) else {
-            return;
-        };
-        if available == 0 {
-            return;
-        }
-        let batch_start = self
-            .schedule
-            .highest_end(RangePriority::Backward)
-            .and_then(next_height)
-            .unwrap_or(start)
-            .max(start);
-        if batch_start > self.anchor.0 {
-            return;
-        }
-        let mut remaining = count_between(batch_start, self.anchor.0).min(available);
-        let mut batch_start = batch_start;
-        let mut anchor_hash = (batch_start == start).then_some(frontier_hash);
-        while remaining > 0 {
-            let mut batch_len = remaining.min(batch_count);
-            let batch_end = range_end_height(batch_start, batch_len)
-                .expect("bounded backward work batch has an end height");
-            if let Some(checkpoint) = checkpoints.min_height_in_range(batch_start..=batch_end) {
-                batch_len = count_between(batch_start, checkpoint);
-            }
-            self.schedule.ensure_backward(RangeRequest {
-                start_height: batch_start,
-                count: batch_len,
-                anchor_hash,
-                finalized: true,
-                want_tree_aux_roots: true,
-                priority: RangePriority::Backward,
             });
             remaining = remaining.saturating_sub(batch_len);
             let Some(next_start) = height_after_count(batch_start, batch_len) else {
@@ -283,8 +218,7 @@ impl VctRootRepair {
             height,
             generation,
             range: RangeRequest {
-                start_height: height,
-                count,
+                range: CheckedHeaderRange::from_count(height, count)?,
                 anchor_hash: Some(anchor_hash),
                 finalized: false,
                 want_tree_aux_roots: true,
@@ -323,8 +257,13 @@ impl VctRootRepair {
         self.in_flight = Some(peer);
     }
 
-    pub(super) fn finish_attempt(&mut self, peer: &ZakuraPeerId, now: Instant) -> bool {
-        if self.in_flight.as_ref() != Some(peer) {
+    pub(super) fn finish_attempt(
+        &mut self,
+        peer: &ZakuraPeerId,
+        generation: u64,
+        now: Instant,
+    ) -> bool {
+        if self.generation != generation || self.in_flight.as_ref() != Some(peer) {
             return false;
         }
         self.in_flight = None;
@@ -441,7 +380,7 @@ pub(super) struct PeerHeaderState {
     /// which the peer's inbound rate limiter would otherwise treat as spam.
     pub(super) last_sent_status: Option<HeaderSyncStatus>,
     pub(super) outstanding: Vec<OutstandingRange>,
-    pub(super) requester_identity: Option<HeaderRequesterIdentity>,
+    pub(super) requester_id: Option<HeaderRequesterId>,
     pub(super) requester: Option<HeaderRequesterHandle>,
     pub(super) meters: HeaderSyncPeerMeters,
     pub(super) served_headers_inflight: u16,
@@ -471,7 +410,7 @@ impl PeerHeaderState {
             last_received_status_at: None,
             last_sent_status: None,
             outstanding: Vec::new(),
-            requester_identity: None,
+            requester_id: None,
             requester: None,
             meters: HeaderSyncPeerMeters::new(
                 status_refresh_interval,
@@ -494,7 +433,7 @@ impl PeerHeaderState {
     ) -> Option<OutstandingRange> {
         self.outstanding
             .iter()
-            .position(|outstanding| outstanding.request_id == request_id)
+            .position(|outstanding| outstanding.wire_request.request_id == request_id)
             .map(|index| self.outstanding.remove(index))
     }
 
@@ -592,10 +531,10 @@ impl HeaderSyncPeerMeters {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct OutstandingRange {
-    pub(super) request_id: HeaderSyncRequestId,
-    pub(super) range: RangeRequest,
+    pub(super) wire_request: HeaderSyncWireRequestIdentity,
+    pub(super) range_request: RangeRequest,
     pub(super) deadline: Instant,
     pub(super) purpose: RangePurpose,
     pub(super) phase: OutstandingPhase,
@@ -610,18 +549,21 @@ pub(super) enum OutstandingPhase {
 
 #[derive(Clone, Debug)]
 pub(super) struct BufferedHeaderRange {
-    pub(super) peer: ZakuraPeerId,
-    pub(super) session_id: u64,
+    pub(super) wire_request: HeaderSyncWireRequestIdentity,
     pub(super) range: RangeRequest,
-    pub(super) headers: Vec<Arc<block::Header>>,
-    pub(super) body_sizes: Vec<u32>,
-    pub(super) tree_aux_roots: Vec<BlockCommitmentRoots>,
+    pub(super) purpose: RangePurpose,
+    pub(super) payload: HeaderRangePayload,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct PendingOperation {
+    pub(super) range: RangeRequest,
+    pub(super) purpose: RangePurpose,
 }
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct RangeRequest {
-    pub(super) start_height: block::Height,
-    pub(super) count: u32,
+    pub(super) range: CheckedHeaderRange,
     pub(super) anchor_hash: Option<block::Hash>,
     pub(super) finalized: bool,
     pub(super) want_tree_aux_roots: bool,
@@ -629,13 +571,16 @@ pub(super) struct RangeRequest {
 }
 
 impl RangeRequest {
-    pub(super) fn end_height(self) -> block::Height {
-        range_end_height(self.start_height, self.count)
-            .expect("range request is non-zero and clamped to the remaining height domain")
+    pub(super) fn start_height(self) -> block::Height {
+        self.range.start()
     }
 
-    pub(super) fn is_within(self, start: block::Height, end: block::Height) -> bool {
-        self.start_height >= start && self.end_height() <= end
+    pub(super) fn count(self) -> u32 {
+        self.range.count()
+    }
+
+    pub(super) fn end_height(self) -> block::Height {
+        self.range.end()
     }
 
     pub(super) fn suffix_after(
@@ -648,9 +593,9 @@ impl RangeRequest {
             return None;
         }
         let start_height = next_height(covered_through)?;
+        let geometry = CheckedHeaderRange::from_bounds(start_height, end_height)?;
         Some(Self {
-            start_height,
-            count: count_between(start_height, end_height),
+            range: geometry,
             anchor_hash: Some(anchor_hash),
             ..self
         })
@@ -660,7 +605,6 @@ impl RangeRequest {
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) enum RangePriority {
     Forward,
-    Backward,
     Repair,
 }
 
@@ -668,7 +612,6 @@ impl RangePriority {
     pub(super) fn label(self) -> &'static str {
         match self {
             RangePriority::Forward => "forward",
-            RangePriority::Backward => "backward",
             RangePriority::Repair => "repair",
         }
     }

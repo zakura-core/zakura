@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-07-20
+
+### Changed
+
+- Updated the `zakura-chain` dependency to 1.2.0; no APIs defined in this
+  crate changed.
+
 ## [1.0.0] - 2026-07-15
 
 First "stable" release. However, be advised that the API may still greatly

@@ -24,6 +24,21 @@ const SUPERVISOR_ACTIVE_METRIC: &str = "zcashd_compat.supervisor.active";
 const SUPERVISOR_DISABLED_METRIC: &str = "zcashd_compat.supervisor.disabled";
 const SUPERVISOR_EXHAUSTED_METRIC: &str = "zcashd_compat.supervisor.exhausted";
 
+/// All deprecated wallet features supported by the embedded compatibility zcashd.
+const WALLET_DEPRECATED_FEATURES: &[&str] = &[
+    "z_gettotalbalance",
+    "fundrawtransaction",
+    "keypoolrefill",
+    "settxfee",
+    "getnewaddress",
+    "getrawchangeaddress",
+    "z_getnewaddress",
+    "z_getbalance",
+    "z_listaddresses",
+    "legacy_privacy",
+    "wallettxvjoinsplit",
+];
+
 /// The full configuration used by the zcashd-compat supervisor task.
 #[derive(Clone, Debug)]
 pub struct SupervisorConfig {
@@ -98,14 +113,46 @@ impl SupervisorConfig {
             }
         }
 
-        // Always include -printtoconsole and filter it out from extra_args
+        // Always include -printtoconsole and normalize the multi-valued
+        // -allowdeprecated arguments below.
         args.push("-printtoconsole".to_string());
         args.extend(
             self.extra_args
                 .iter()
                 .filter(|arg| arg.as_str() != "-printtoconsole")
+                .filter(|arg| allowdeprecated_value(arg).is_none())
                 .cloned(),
         );
+
+        let disable_deprecated_features = self
+            .extra_args
+            .iter()
+            .filter_map(|arg| allowdeprecated_value(arg))
+            .any(|feature| feature.eq_ignore_ascii_case("none"));
+
+        if disable_deprecated_features {
+            // `none` is an explicit operator override. zcashd rejects it when
+            // combined with any named feature, so emit it by itself.
+            args.push("-allowdeprecated=none".to_string());
+        } else {
+            let mut allowed_features = Vec::new();
+            for feature in self
+                .extra_args
+                .iter()
+                .filter_map(|arg| allowdeprecated_value(arg))
+                .chain(WALLET_DEPRECATED_FEATURES.iter().copied())
+            {
+                if !allowed_features.contains(&feature) {
+                    allowed_features.push(feature);
+                }
+            }
+
+            args.extend(
+                allowed_features
+                    .into_iter()
+                    .map(|feature| format!("-allowdeprecated={feature}")),
+            );
+        }
 
         // zcashd peers only with the local Zebra node: `-connect` pins the
         // single outbound peer, and zcashd itself then soft-disables DNS
@@ -123,6 +170,12 @@ impl SupervisorConfig {
 
         args
     }
+}
+
+fn allowdeprecated_value(arg: &str) -> Option<&str> {
+    let (name, value) = arg.trim_start_matches('-').split_once('=')?;
+    name.eq_ignore_ascii_case("allowdeprecated")
+        .then_some(value)
 }
 
 /// zcashd options that add P2P peers and accumulate across the command line,
@@ -644,7 +697,7 @@ mod tests {
 
     use super::{
         reject_peer_selection_extra_args, restart_backoff_delay, should_reset_restart_count,
-        wait_for_delay_or_shutdown, SupervisorConfig,
+        wait_for_delay_or_shutdown, SupervisorConfig, WALLET_DEPRECATED_FEATURES,
     };
 
     fn test_supervisor_config(extra_args: Vec<String>) -> SupervisorConfig {
@@ -664,7 +717,10 @@ mod tests {
 
     #[test]
     fn command_args_pin_zcashd_to_zakura_p2p() {
-        let config = test_supervisor_config(vec!["-debug=1".to_string()]);
+        let config = test_supervisor_config(vec![
+            "-debug=1".to_string(),
+            "-allowdeprecated=getnewaddress".to_string(),
+        ]);
 
         let args = config.command_args();
 
@@ -678,6 +734,19 @@ mod tests {
         assert!(args.contains(&"-discover=0".to_string()));
         assert!(args.contains(&"-printtoconsole".to_string()));
         assert!(args.contains(&"-debug=1".to_string()));
+        for feature in WALLET_DEPRECATED_FEATURES {
+            assert!(
+                args.contains(&format!("-allowdeprecated={feature}")),
+                "wallet compatibility feature {feature} must be enabled"
+            );
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| *arg == &format!("-allowdeprecated={feature}"))
+                    .count(),
+                1,
+                "wallet compatibility feature {feature} must not be duplicated"
+            );
+        }
         assert!(
             !args.iter().any(|arg| arg.starts_with("-zebra-compat")),
             "P2P sidecar must not pass RPC-ingest flags: {args:?}"
@@ -699,6 +768,23 @@ mod tests {
                 "{forced} must come after extra_args"
             );
         }
+    }
+
+    #[test]
+    fn allowdeprecated_none_overrides_wallet_compatibility_defaults() {
+        let config = test_supervisor_config(vec![
+            "-allowdeprecated=getnewaddress".to_string(),
+            "-allowdeprecated=none".to_string(),
+            "-allowdeprecated=none".to_string(),
+        ]);
+
+        let allowdeprecated_args: Vec<_> = config
+            .command_args()
+            .into_iter()
+            .filter(|arg| arg.starts_with("-allowdeprecated="))
+            .collect();
+
+        assert_eq!(allowdeprecated_args, ["-allowdeprecated=none"]);
     }
 
     #[test]

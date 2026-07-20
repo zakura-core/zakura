@@ -105,6 +105,9 @@ pub struct InventoryRegistry {
 
     /// Interval tracking when we should next rotate our maps.
     interval: IntervalStream,
+
+    /// Whether peer address labels in logs are unredacted.
+    expose_peer_addresses: bool,
 }
 
 impl std::fmt::Debug for InventoryRegistry {
@@ -196,8 +199,11 @@ impl<T: Clone> InventoryStatus<T> {
 }
 
 impl InventoryRegistry {
-    /// Returns a new Inventory Registry for `inv_stream`.
-    pub fn new(inv_stream: broadcast::Receiver<InventoryChange>) -> Self {
+    /// Returns a new Inventory Registry for `inv_stream` and the configured address policy.
+    pub fn new(
+        inv_stream: broadcast::Receiver<InventoryChange>,
+        expose_peer_addresses: bool,
+    ) -> Self {
         let interval = INVENTORY_ROTATION_INTERVAL;
 
         // Don't do an immediate rotation, current and prev are already empty.
@@ -217,6 +223,7 @@ impl InventoryRegistry {
             prev: Default::default(),
             inv_stream: BroadcastStream::new(inv_stream).boxed(),
             interval: IntervalStream::new(interval),
+            expose_peer_addresses,
         }
     }
 
@@ -371,6 +378,7 @@ impl InventoryRegistry {
     fn register(&mut self, change: InventoryChange) {
         let new_status = change.marker();
         let (invs, addr) = change.to_inner();
+        let addr_label = addr.addr_label(self.expose_peer_addresses);
 
         for inv in invs {
             use InventoryHash::*;
@@ -387,14 +395,20 @@ impl InventoryRegistry {
             // and funnel multiple failing requests to themselves.
             if let Some(old_status) = hash_peers.get(&addr) {
                 if old_status.is_missing() && new_status.is_available() {
-                    debug!(?new_status, ?old_status, ?addr, ?inv, "skipping new status");
+                    debug!(
+                        ?new_status,
+                        ?old_status,
+                        peer = %addr_label,
+                        ?inv,
+                        "skipping new status"
+                    );
                     continue;
                 }
 
                 debug!(
                     ?new_status,
                     ?old_status,
-                    ?addr,
+                    peer = %addr_label,
                     ?inv,
                     "keeping both new and old status"
                 );
@@ -405,7 +419,7 @@ impl InventoryRegistry {
             debug!(
                 ?new_status,
                 ?replaced_status,
-                ?addr,
+                peer = %addr_label,
                 ?inv,
                 "inserted new status"
             );

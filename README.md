@@ -50,7 +50,7 @@ The installer can set up either standard Zakura or its
 You can run Zakura using our [Docker
 image](https://hub.docker.com/r/zakuracore/zakura/tags) or install it manually.
 The zcashd-compatible split-container mode uses the
-[zakuracore/zcashd:v1.0.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
+[zakuracore/zcashd:v1.0.1 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
 
 This command will run our latest release and sync it to the tip:
 
@@ -121,7 +121,7 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.0.0 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.0.2 zakura
 ```
 
 You can start Zakura by running

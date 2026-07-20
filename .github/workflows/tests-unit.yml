@@ -86,7 +86,6 @@ jobs:
       - name: Run unit tests
         run: |
           if [[ "${FULL_COVERAGE}" == "true" ]]; then
-            export TEST_LARGE_CHECKPOINTS=1
             cargo nextest run --profile full-tests --locked --release --features "${{ matrix.features }}" --run-ignored=all --partition "hash:${{ matrix.partition }}/3"
           else
             cargo nextest run --profile all-tests --locked --features "${{ matrix.features }}" --partition "hash:${{ matrix.partition }}/3"

@@ -15,7 +15,8 @@ use color_eyre::eyre::Report;
 use futures::{FutureExt, TryFutureExt};
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use tokio::time::timeout;
-use tower::{buffer::Buffer, service_fn, ServiceExt};
+use tower::{buffer::Buffer, service_fn, Service, ServiceExt};
+use tower_batch_control::BatchControl;
 
 use zakura_chain::{
     amount::{Amount, NegativeAllowed, NonNegative},
@@ -2086,9 +2087,8 @@ async fn v4_transaction_with_transparent_transfer_is_rejected_by_the_script() {
 
     assert_eq!(
         result,
-        Err(TransactionError::InternalDowncastError(
-            "downcast to known transaction error type failed, original error: ScriptInvalid"
-                .to_string()
+        Err(TransactionError::Script(
+            zakura_script::Error::ScriptInvalid
         ))
     );
 }
@@ -2757,9 +2757,8 @@ async fn v5_transaction_with_transparent_transfer_is_rejected_by_the_script() {
 
     assert_eq!(
         result,
-        Err(TransactionError::InternalDowncastError(
-            "downcast to known transaction error type failed, original error: ScriptInvalid"
-                .to_string()
+        Err(TransactionError::Script(
+            zakura_script::Error::ScriptInvalid
         ))
     );
 }
@@ -2867,12 +2866,7 @@ fn v4_with_modified_joinsplit_is_rejected() {
     zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
         v4_with_joinsplit_is_rejected_for_modification(
             JoinSplitModification::CorruptSignature,
-            // TODO: Fix error downcast
-            // Err(TransactionError::Ed25519(ed25519::Error::InvalidSignature))
-            TransactionError::InternalDowncastError(
-                "downcast to known transaction error type failed, original error: InvalidSignature"
-                    .to_string(),
-            ),
+            TransactionError::Ed25519(ed25519::Error::InvalidSignature),
         )
         .await;
 
@@ -2999,6 +2993,133 @@ fn v4_with_sapling_spends() {
             expected_hash
         );
     });
+}
+
+/// An invalid Sapling proof is reported as a typed verification error by both
+/// the batch verifier and its single-verification fallback.
+#[test]
+fn v4_with_invalid_sapling_proof_returns_typed_error() {
+    let _init_guard = zakura_test::init();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        let (height, mut transaction) = test_transactions(&network)
+            .rev()
+            .find(|(_, transaction)| {
+                !transaction.is_coinbase()
+                    && transaction.inputs().is_empty()
+                    && transaction.sapling_spends_per_anchor().next().is_some()
+            })
+            .expect("test vectors include a V4 transaction with Sapling spends");
+
+        modify_first_sapling_spend_proof(
+            Arc::get_mut(&mut transaction).expect("transaction only has one active reference"),
+            SaplingProofModification::Corrupt,
+        );
+
+        let sighasher = transaction
+            .sighasher(
+                NetworkUpgrade::current(&network, height),
+                Arc::new(Vec::new()),
+            )
+            .expect("test fixture has no transparent inputs");
+        let batch_bundle = sighasher
+            .sapling_bundle()
+            .expect("test fixture has Sapling shielded data");
+        let single_bundle = sighasher
+            .sapling_bundle()
+            .expect("test fixture has Sapling shielded data");
+        let synchronous_check_bundle = sighasher
+            .sapling_bundle()
+            .expect("test fixture has Sapling shielded data");
+        let sighash = sighasher.sighash(HashType::ALL, None);
+
+        let mut verifier = sapling_crypto::BatchValidator::default();
+        assert!(
+            verifier.check_bundle(synchronous_check_bundle, sighash.into()),
+            "the corrupted proof must pass synchronous checks and fail batch validation"
+        );
+
+        let mut batch_verifier = crate::primitives::sapling::Verifier::default();
+        let batch_result = batch_verifier.call(BatchControl::Item(
+            crate::primitives::sapling::Item::new(batch_bundle, sighash),
+        ));
+        let flush_result = batch_verifier.call(BatchControl::Flush);
+        let (batch_result, flush_result) = futures::join!(batch_result, flush_result);
+        flush_result.expect("batch flush must complete");
+
+        assert_sapling_verification_error(
+            batch_result.expect_err("corrupted Sapling proof must be rejected"),
+        );
+
+        let single_result = crate::primitives::sapling::verify_single(
+            crate::primitives::sapling::Item::new(single_bundle, sighash),
+        )
+        .await;
+        assert_sapling_verification_error(
+            single_result.expect_err("corrupted Sapling proof must be rejected"),
+        );
+    });
+}
+
+/// A malformed Sapling proof is reported as a typed verification error before
+/// it is queued for batch validation.
+#[test]
+fn v4_with_malformed_sapling_proof_returns_typed_error() {
+    let _init_guard = zakura_test::init();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        let (height, mut transaction) = test_transactions(&network)
+            .rev()
+            .find(|(_, transaction)| {
+                !transaction.is_coinbase()
+                    && transaction.inputs().is_empty()
+                    && transaction.sapling_spends_per_anchor().next().is_some()
+            })
+            .expect("test vectors include a V4 transaction with Sapling spends");
+
+        modify_first_sapling_spend_proof(
+            Arc::get_mut(&mut transaction).expect("transaction only has one active reference"),
+            SaplingProofModification::Zero,
+        );
+
+        let sighasher = transaction
+            .sighasher(
+                NetworkUpgrade::current(&network, height),
+                Arc::new(Vec::new()),
+            )
+            .expect("test fixture has no transparent inputs");
+        let check_bundle = sighasher
+            .sapling_bundle()
+            .expect("test fixture has Sapling shielded data");
+        let bundle = sighasher
+            .sapling_bundle()
+            .expect("test fixture has Sapling shielded data");
+        let sighash = sighasher.sighash(HashType::ALL, None);
+
+        let mut verifier = sapling_crypto::BatchValidator::default();
+        assert!(
+            !verifier.check_bundle(check_bundle, sighash.into()),
+            "the malformed proof must fail synchronous bundle checks"
+        );
+
+        let result = crate::primitives::sapling::verify_single(
+            crate::primitives::sapling::Item::new(bundle, sighash),
+        )
+        .await;
+        assert_sapling_verification_error(
+            result.expect_err("malformed Sapling proof must be rejected"),
+        );
+    });
+}
+
+fn assert_sapling_verification_error(error: crate::BoxError) {
+    let error = error
+        .downcast::<TransactionError>()
+        .expect("Sapling verification failure must be a TransactionError");
+
+    assert_eq!(*error, TransactionError::SaplingVerificationFailed);
 }
 
 /// Test if a V4 transaction with a duplicate Sapling spend is rejected by the verifier.
@@ -3406,6 +3527,69 @@ fn set_first_sapling_spend_value_commitment<A: sapling::AnchorVariant + Clone>(
             spends_vec[0].cv = value_commitment;
             *spends = AtLeastOne::from_vec(spends_vec)
                 .expect("replacing a field keeps at least one spend");
+        }
+        sapling::TransferData::JustOutputs { .. } => {
+            panic!("expected Sapling shielded data with spends")
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SaplingProofModification {
+    /// Keep the proof well-formed while making it invalid.
+    Corrupt,
+    /// Make the proof malformed.
+    Zero,
+}
+
+/// Modifies the first Sapling spend proof without changing the transaction's
+/// structure.
+fn modify_first_sapling_spend_proof(
+    transaction: &mut Transaction,
+    modification: SaplingProofModification,
+) {
+    match transaction {
+        Transaction::V4 {
+            sapling_shielded_data: Some(shielded_data),
+            ..
+        } => modify_first_sapling_spend_proof_in_transfers(
+            &mut shielded_data.transfers,
+            modification,
+        ),
+        Transaction::V5 {
+            sapling_shielded_data: Some(shielded_data),
+            ..
+        }
+        | Transaction::V6 {
+            sapling_shielded_data: Some(shielded_data),
+            ..
+        } => modify_first_sapling_spend_proof_in_transfers(
+            &mut shielded_data.transfers,
+            modification,
+        ),
+        _ => panic!("expected a transaction with Sapling spends"),
+    }
+}
+
+fn modify_first_sapling_spend_proof_in_transfers<A: sapling::AnchorVariant + Clone>(
+    transfers: &mut sapling::TransferData<A>,
+    modification: SaplingProofModification,
+) {
+    match transfers {
+        sapling::TransferData::SpendsAndMaybeOutputs { spends, .. } => {
+            let mut spends_vec = spends.as_slice().to_vec();
+            match modification {
+                SaplingProofModification::Corrupt => {
+                    // A Groth16 proof has two 48-byte compressed G1 elements around a
+                    // 96-byte compressed G2 element. Swapping the G1 elements keeps the
+                    // proof well-formed but invalid.
+                    let (first, rest) = spends_vec[0].zkproof.0.split_at_mut(48);
+                    first.swap_with_slice(&mut rest[96..144]);
+                }
+                SaplingProofModification::Zero => spends_vec[0].zkproof.0 = [0; 192],
+            }
+            *spends = AtLeastOne::from_vec(spends_vec)
+                .expect("replacing a proof keeps at least one spend");
         }
         sapling::TransferData::JustOutputs { .. } => {
             panic!("expected Sapling shielded data with spends")
@@ -3915,6 +4099,31 @@ fn public_nu6_3_consensus_branch_id_boundary() {
             check::consensus_branch_id(&tx, activation_height, &network),
             Err(TransactionError::WrongConsensusBranchId),
         );
+        assert!(super::is_nu6_3_branch_id_misbehavior_grace_period(
+            &tx,
+            (activation_height + 39).expect("NU6.3 grace period should fit in a height"),
+            &network,
+        ));
+        assert!(!super::is_nu6_3_branch_id_misbehavior_grace_period(
+            &tx,
+            (activation_height + 40).expect("NU6.3 grace period should fit in a height"),
+            &network,
+        ));
+        assert_eq!(
+            TransactionError::WrongConsensusBranchIdNu6_3GracePeriod.mempool_misbehavior_score(),
+            0,
+        );
+
+        tx.update_network_upgrade(NetworkUpgrade::Nu6_1)
+            .expect("V5 transactions support the NU6.1 branch ID");
+        assert_eq!(
+            check::consensus_branch_id(&tx, activation_height, &network),
+            Err(TransactionError::WrongConsensusBranchId),
+        );
+        assert_eq!(
+            TransactionError::WrongConsensusBranchId.mempool_misbehavior_score(),
+            100,
+        );
 
         tx.update_network_upgrade(NetworkUpgrade::Nu6_3)
             .expect("V5 transactions support the NU6.3 branch ID");
@@ -4002,7 +4211,45 @@ async fn v5_consensus_branch_ids() {
             let (block_rsp, mempool_rsp) = futures::join!(block_req, mempool_req);
 
             assert_eq!(block_rsp, Err(TransactionError::WrongConsensusBranchId));
-            assert_eq!(mempool_rsp, Err(TransactionError::WrongConsensusBranchId));
+            let mempool_expected_error =
+                if network_upgrade == NetworkUpgrade::Nu6_2 && next_nu == NetworkUpgrade::Nu6_3 {
+                    TransactionError::WrongConsensusBranchIdNu6_3GracePeriod
+                } else {
+                    TransactionError::WrongConsensusBranchId
+                };
+            assert_eq!(mempool_rsp, Err(mempool_expected_error));
+
+            if network_upgrade == NetworkUpgrade::Nu6_2 && next_nu == NetworkUpgrade::Nu6_3 {
+                let grace_period_last_height =
+                    (height + 39).expect("NU6.3 grace period should fit in a height");
+                let grace_period_response = verifier
+                    .clone()
+                    .oneshot(Request::Mempool {
+                        transaction: tx.clone().into(),
+                        height: grace_period_last_height,
+                    })
+                    .map_err(|err| *err.downcast().expect("`TransactionError` type"))
+                    .await;
+                assert_eq!(
+                    grace_period_response,
+                    Err(TransactionError::WrongConsensusBranchIdNu6_3GracePeriod),
+                );
+
+                let grace_period_end_height =
+                    (height + 40).expect("NU6.3 grace period should fit in a height");
+                let grace_period_end_response = verifier
+                    .clone()
+                    .oneshot(Request::Mempool {
+                        transaction: tx.clone().into(),
+                        height: grace_period_end_height,
+                    })
+                    .map_err(|err| *err.downcast().expect("`TransactionError` type"))
+                    .await;
+                assert_eq!(
+                    grace_period_end_response,
+                    Err(TransactionError::WrongConsensusBranchId),
+                );
+            }
 
             // Check the currently supported network upgrade.
             let height = network_upgrade.activation_height(&network).expect("height");
@@ -4130,16 +4377,14 @@ fn mock_transparent_transfer(
     transparent::Output,
     HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
 ) {
-    // A standard, signature-free P2SH input that the script interpreter accepts. The redeem
-    // script is OP_TRUE, so the spend is valid without a signature, while the spent output is a
-    // standard P2SH `scriptPubKey`. This lets the input pass the mempool `AreInputsStandard`
-    // gate (`check::mempool_standard_input_scripts`) that now runs before script verification,
-    // as well as the interpreter itself.
+    // Standard, signature-free P2SH inputs that either pass or fail in the script interpreter.
+    // Both variants pass the mempool `AreInputsStandard` gate.
+    const OP_FALSE: u8 = 0x00;
     const OP_TRUE: u8 = 0x51;
-    // `scriptSig`: a single push of the OP_TRUE redeem script (push-only, one stack item).
     let accepting_unlock_script = transparent::Script::new(&[0x01, OP_TRUE]);
-    // `scriptPubKey`: OP_HASH160 <HASH160(OP_TRUE)> OP_EQUAL. The 20-byte hash is precomputed
-    // (RIPEMD160(SHA256([OP_TRUE]))) so the P2SH hash check passes during verification.
+    let rejecting_unlock_script = transparent::Script::new(&[0x01, OP_FALSE]);
+
+    // `scriptPubKey`: OP_HASH160 <HASH160(redeem script)> OP_EQUAL.
     let mut p2sh_lock_bytes = vec![0xa9, 0x14];
     p2sh_lock_bytes.extend_from_slice(&[
         0xda, 0x17, 0x45, 0xe9, 0xb5, 0x49, 0xbd, 0x0b, 0xfa, 0x1a, 0x56, 0x99, 0x71, 0xc7, 0x7e,
@@ -4147,9 +4392,14 @@ fn mock_transparent_transfer(
     ]);
     p2sh_lock_bytes.push(0x87);
     let accepting_lock_script = transparent::Script::new(&p2sh_lock_bytes);
-    // A script with a single opcode that rejects the transaction (OP_FALSE). Only used for block
-    // requests (the standardness gate is mempool-only), so it need not be a standard type.
-    let rejecting_script = transparent::Script::new(&[0]);
+
+    let mut p2sh_lock_bytes = vec![0xa9, 0x14];
+    p2sh_lock_bytes.extend_from_slice(&[
+        0x9f, 0x7f, 0xd0, 0x96, 0xd3, 0x7e, 0xd2, 0xc0, 0xe3, 0xf7, 0xf0, 0xcf, 0xc9, 0x24, 0xbe,
+        0xef, 0x4f, 0xfc, 0xeb, 0x68,
+    ]);
+    p2sh_lock_bytes.push(0x87);
+    let rejecting_lock_script = transparent::Script::new(&p2sh_lock_bytes);
 
     // Mock an unspent transaction output
     let previous_outpoint = transparent::OutPoint {
@@ -4160,9 +4410,7 @@ fn mock_transparent_transfer(
     let (lock_script, unlock_script) = if script_should_succeed {
         (accepting_lock_script, accepting_unlock_script)
     } else {
-        // The spent output's OP_FALSE `scriptPubKey` makes verification fail regardless of the
-        // `scriptSig`, so the `scriptSig` value is irrelevant here.
-        (rejecting_script.clone(), accepting_unlock_script)
+        (rejecting_lock_script, rejecting_unlock_script)
     };
 
     let previous_output = transparent::Output {
@@ -4183,7 +4431,7 @@ fn mock_transparent_transfer(
     // Using the rejecting script pretends the amount is burned because it can't be spent again
     let output = transparent::Output {
         value: Amount::try_from(1).expect("1 is an invalid amount"),
-        lock_script: rejecting_script,
+        lock_script: transparent::Script::new(&[OP_FALSE]),
     };
 
     // Cache the source of the fund so that it can be used during verification
@@ -4746,10 +4994,11 @@ async fn mempool_zip317_error() {
         .expect("Nu5 activation height is specified");
     let fund_height = (height - 1).expect("fake source fund block height is too small");
 
-    // Will produce a small enough miner fee to fail the check.
+    // This transaction has both an insufficient fee and a standard P2SH input whose redeem
+    // script fails. ZIP-317 must reject it before the script interpreter is invoked.
     let (input, output, known_utxos) = mock_transparent_transfer(
         fund_height,
-        true,
+        false,
         0,
         Amount::try_from(10).expect("valid amount"),
     );
@@ -4780,17 +5029,6 @@ async fn mempool_zip317_error() {
                     .get(&input_outpoint)
                     .map(|utxo| utxo.utxo.clone()),
             ));
-
-        state
-            .expect_request_that(|req| {
-                matches!(
-                    req,
-                    zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
-                )
-            })
-            .await
-            .expect("verifier should call mock state service with correct request")
-            .respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
     });
 
     let verifier_response = verifier
@@ -4875,6 +5113,77 @@ async fn mempool_zip317_ok() {
     assert!(
         verifier_response.is_ok(),
         "expected successful verification, got: {verifier_response:?}"
+    );
+}
+
+#[tokio::test]
+async fn mempool_transaction_with_sufficient_fee_is_rejected_by_script() {
+    let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
+    let verifier = Verifier::new_for_tests(&Network::Mainnet, state.clone());
+
+    let height = NetworkUpgrade::Nu5
+        .activation_height(&Network::Mainnet)
+        .expect("Nu5 activation height is specified");
+    let fund_height = (height - 1).expect("fake source fund block height is too small");
+
+    // The fee passes ZIP-317, but the standard P2SH input's redeem script fails.
+    let (input, output, known_utxos) = mock_transparent_transfer(
+        fund_height,
+        false,
+        0,
+        Amount::try_from(10_001).expect("valid amount"),
+    );
+
+    let tx = Transaction::V5 {
+        inputs: vec![input],
+        outputs: vec![output],
+        lock_time: LockTime::unlocked(),
+        network_upgrade: NetworkUpgrade::Nu5,
+        expiry_height: height,
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+
+    let input_outpoint = match tx.inputs()[0] {
+        transparent::Input::PrevOut { outpoint, .. } => outpoint,
+        transparent::Input::Coinbase { .. } => panic!("requires a non-coinbase transaction"),
+    };
+
+    tokio::spawn(async move {
+        state
+            .expect_request(zakura_state::Request::UnspentBestChainUtxo(input_outpoint))
+            .await
+            .expect("verifier should call mock state service with correct request")
+            .respond(zakura_state::Response::UnspentBestChainUtxo(
+                known_utxos
+                    .get(&input_outpoint)
+                    .map(|utxo| utxo.utxo.clone()),
+            ));
+
+        state
+            .expect_request_that(|req| {
+                matches!(
+                    req,
+                    zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+                )
+            })
+            .await
+            .expect("verifier should call mock state service with correct request")
+            .respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
+    });
+
+    let verifier_response = verifier
+        .oneshot(Request::Mempool {
+            transaction: tx.into(),
+            height,
+        })
+        .await;
+
+    assert_eq!(
+        verifier_response,
+        Err(TransactionError::Script(
+            zakura_script::Error::ScriptInvalid
+        ))
     );
 }
 

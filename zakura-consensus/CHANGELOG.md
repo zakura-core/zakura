@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-07-20
+
+### Breaking Changes
+
+- `zakura-state` moved to 3.0.0. State service types appear in this crate's
+  public `init` signatures, so the state major version is part of this crate's
+  API; no APIs defined in this crate changed.
+
+### Added
+
+- Added `sapling_prover()`, re-exported at the crate root, returning the
+  process-wide bundled Sapling prover so callers reuse one parsed copy of the
+  proving parameters.
+- Added `TransactionError::SaplingVerificationFailed` and
+  `TransactionError::Halo2VerificationFailed` variants so failed shielded
+  proof verifications keep their concrete error and mempool misbehavior
+  score.
+
+### Changed
+
+- Mempool transactions must satisfy the ZIP-317 fee policy before script and
+  proof verification runs; block validation is unchanged.
+- Mempool transactions with invalid Orchard or Ironwood proof sizes are
+  rejected before proof verification and the sending peer is banned.
+- Duplicate transparent-spend and duplicate-nullifier mempool errors no
+  longer carry a peer misbehavior penalty.
+- Boxed script and signature verification errors are downcast back to their
+  concrete `TransactionError` variants instead of being reported as internal
+  conversion failures.
+- Mempool rejections of NU6.2 branch-ID transactions no longer penalize the
+  relaying peer during the first 40 heights after NU6.3 activation; consensus
+  validation is unchanged.
+
+## [2.0.0] - 2026-07-17
+
+### Breaking Changes
+
+- `zakura-state` moved to 2.0.0. State service types appear in this crate's
+  public `init` signatures, so the state major version is part of this crate's
+  API; no APIs defined in this crate changed.
+
 ## [1.0.0] - 2026-07-15
 
 First "stable" release. However, be advised that the API may still greatly

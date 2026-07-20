@@ -39,8 +39,8 @@ use zakura_chain::{
 use zakura_consensus::{error::TransactionError, transaction};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_node_services::mempool::{
-    CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolTxSubscriber, Request,
-    Response,
+    CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolTxSubscriber, QueueSource,
+    Request, Response,
 };
 use zakura_state as zs;
 use zakura_state::{ChainTipChange, TipAction};
@@ -78,6 +78,36 @@ use downloads::{
     TRANSACTION_VERIFY_TIMEOUT,
 };
 
+fn legacy_peer_log_label(addr: PeerSocketAddr, expose_peer_addresses: bool) -> String {
+    if expose_peer_addresses {
+        format!("legacy:{}", addr.remove_socket_addr_privacy())
+    } else {
+        "legacy:redacted".to_string()
+    }
+}
+
+fn queue_source_log_label(source: &QueueSource, expose_peer_addresses: bool) -> String {
+    match source {
+        QueueSource::LegacySocket(addr) => {
+            legacy_peer_log_label(PeerSocketAddr::from(*addr), expose_peer_addresses)
+        }
+        QueueSource::Zakura(peer_id) => format!("zakura:{peer_id:?}"),
+    }
+}
+
+fn transaction_error_peer_log_label(
+    error: &TransactionDownloadVerifyError,
+    expose_peer_addresses: bool,
+) -> Option<String> {
+    match error {
+        TransactionDownloadVerifyError::Invalid {
+            advertiser_addr: Some(addr),
+            ..
+        } => Some(legacy_peer_log_label(*addr, expose_peer_addresses)),
+        _ => None,
+    }
+}
+
 type Outbound = Buffer<BoxService<zn::Request, zn::Response, zn::BoxError>, zn::Request>;
 type State = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
 type TxVerifier = Buffer<
@@ -85,6 +115,21 @@ type TxVerifier = Buffer<
     transaction::Request,
 >;
 type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, State>;
+
+fn transaction_misbehavior(
+    error: &TransactionDownloadVerifyError,
+) -> Option<(PeerSocketAddr, u32)> {
+    let TransactionDownloadVerifyError::Invalid {
+        error,
+        advertiser_addr: Some(advertiser_addr),
+    } = error
+    else {
+        return None;
+    };
+
+    let score = error.mempool_misbehavior_score();
+    (score != 0).then_some((*advertiser_addr, score))
+}
 
 /// The state of the mempool.
 ///
@@ -211,6 +256,9 @@ pub struct Mempool {
     /// The configurable options for the mempool, persisted between states.
     config: Config,
 
+    /// Whether legacy peer address labels in logs are unredacted.
+    expose_peer_addresses: bool,
+
     /// The state of the mempool.
     active_state: ActiveState,
 
@@ -273,6 +321,7 @@ impl Mempool {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &Config,
+        expose_peer_addresses: bool,
         outbound: Outbound,
         state: State,
         tx_verifier: TxVerifier,
@@ -287,6 +336,7 @@ impl Mempool {
 
         let mut service = Mempool {
             config: config.clone(),
+            expose_peer_addresses,
             active_state: ActiveState::Disabled,
             sync_status,
             debug_enable_at_height: config.debug_enable_at_height.map(Height),
@@ -364,6 +414,8 @@ impl Mempool {
             Timeout::new(self.outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
             Timeout::new(self.tx_verifier.clone(), TRANSACTION_VERIFY_TIMEOUT),
             self.state.clone(),
+            self.expose_peer_addresses,
+            self.config.max_transaction_bytes,
         ));
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),
@@ -674,22 +726,36 @@ impl Service<Request> for Mempool {
                     }
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
-                        if let TransactionDownloadVerifyError::Invalid {
-                            error,
-                            advertiser_addr: Some(advertiser_addr),
-                        } = &error
-                        {
-                            if error.mempool_misbehavior_score() != 0 {
-                                let _ = self.misbehavior_sender.try_send((
-                                    *advertiser_addr,
-                                    error.mempool_misbehavior_score(),
-                                ));
-                            }
-                        };
+                        if let Some((advertiser_addr, score)) = transaction_misbehavior(&error) {
+                            let _ = self.misbehavior_sender.try_send((advertiser_addr, score));
+                        }
 
-                        tracing::debug!(?tx_id, ?error, "mempool transaction failed to verify");
+                        let peer_label =
+                            transaction_error_peer_log_label(&error, self.expose_peer_addresses);
+                        let peer = peer_label.as_deref().unwrap_or("none");
+                        tracing::debug!(
+                            ?tx_id,
+                            ?error,
+                            peer = %peer,
+                            "mempool transaction was not accepted"
+                        );
 
-                        metrics::counter!("mempool.failed.verify.tasks.total", "reason" => error.to_string()).increment(1);
+                        match &error {
+                            TransactionDownloadVerifyError::PolicyRejected(
+                                storage::NonStandardTransactionError::TransactionTooLarge {
+                                    ..
+                                },
+                            ) => metrics::counter!(
+                                "mempool.rejected.transactions.total",
+                                "reason" => "transaction_too_large"
+                            )
+                            .increment(1),
+                            _ => metrics::counter!(
+                                "mempool.failed.verify.tasks.total",
+                                "reason" => error.to_string()
+                            )
+                            .increment(1),
+                        }
 
                         invalidated_ids.insert(tx_id);
                         storage.reject_if_needed(tx_id, error);
@@ -905,7 +971,24 @@ impl Service<Request> for Mempool {
                                     MempoolError,
                                 > {
                                     let (rsp_tx, rsp_rx) = oneshot::channel();
-                                    storage.should_download_or_verify(gossiped_tx.id())?;
+                                    match storage.should_download_or_verify(gossiped_tx.id()) {
+                                        Ok(()) => {}
+                                        Err(
+                                            error @ MempoolError::StorageExactTip(
+                                                ExactTipRejectionError::FailedStandard(
+                                                    storage::NonStandardTransactionError::TransactionTooLarge {
+                                                        ..
+                                                    },
+                                                ),
+                                            ),
+                                        ) => {
+                                            // A cached policy rejection is a completed admission
+                                            // result, not a failure to queue the request.
+                                            let _ = rsp_tx.send(Err(error.into()));
+                                            return Ok(rsp_rx);
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
                                     tx_downloads.download_if_needed_and_verify(
                                         gossiped_tx,
                                         None,
@@ -931,7 +1014,11 @@ impl Service<Request> for Mempool {
                     transactions,
                     source,
                 } => {
-                    trace!(req_count = ?transactions.len(), ?source, "got mempool QueueFromPeer request");
+                    trace!(
+                        req_count = ?transactions.len(),
+                        source = %queue_source_log_label(&source, self.expose_peer_addresses),
+                        "got mempool QueueFromPeer request"
+                    );
 
                     for gossiped_tx in transactions {
                         if storage.should_download_or_verify(gossiped_tx.id()).is_err() {

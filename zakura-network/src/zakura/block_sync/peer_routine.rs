@@ -126,6 +126,20 @@ impl FillStop {
 }
 const PARK_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoProgressResponse {
+    Park,
+    Disconnect,
+}
+
+fn no_progress_response(allow_no_progress_park: bool) -> NoProgressResponse {
+    if allow_no_progress_park {
+        NoProgressResponse::Park
+    } else {
+        NoProgressResponse::Disconnect
+    }
+}
+
 /// Whether a due block-liveness deadline gets one bounded grace instead of parking the session.
 /// Granted only for *our own* transient outbound write congestion: outbound full **and**
 /// continuously full for less than `request_timeout`. A peer that stopped reading holds
@@ -195,6 +209,10 @@ pub(super) struct PeerRoutine {
     peer: ZakuraPeerId,
     session: BlockSyncPeerSession,
     config: ZakuraBlockSyncConfig,
+    /// A connection gets one local no-progress park/re-admission cycle. A
+    /// repeated stall is connection-fatal so it cannot reclaim download slots
+    /// indefinitely without paying the redial cost.
+    allow_no_progress_park: bool,
 
     // ---- transport inbound (the pipe half) ----
     /// This peer's ordered stream-6 frame reader. Decoded in the routine's own
@@ -274,6 +292,7 @@ impl PeerRoutine {
         session: BlockSyncPeerSession,
         recv: FramedRecv,
         config: ZakuraBlockSyncConfig,
+        allow_no_progress_park: bool,
         generation: u64,
         budget: super::state::ByteBudget,
         work: Arc<WorkQueue>,
@@ -300,6 +319,7 @@ impl PeerRoutine {
             peer,
             session,
             config,
+            allow_no_progress_park,
             recv,
             window,
             received_status: false,
@@ -1154,6 +1174,16 @@ impl PeerRoutine {
             LivenessOutcome::Park => {
                 let error =
                     "block-sync peer made no accepted block progress before liveness deadline";
+                if no_progress_response(self.allow_no_progress_park)
+                    == NoProgressResponse::Disconnect
+                {
+                    tracing::debug!(
+                        peer = ?self.peer,
+                        outstanding = self.window.outstanding.len(),
+                        "disconnecting Zakura block-sync peer after repeated no-progress stall"
+                    );
+                    return Err(SinkReject::protocol(error));
+                }
                 self.registry.park_peer_until(
                     &self.peer,
                     now + self.config.effective_no_progress_peer_cooldown(),
@@ -2430,6 +2460,7 @@ mod tests {
             session,
             in_recv,
             config,
+            true,
             0,
             budget.clone(),
             work.clone(),
@@ -2521,6 +2552,7 @@ mod tests {
             session,
             in_recv,
             config,
+            true,
             0,
             budget,
             Arc::clone(&work),
@@ -2627,5 +2659,17 @@ mod tests {
             now,
             request_timeout
         ));
+    }
+
+    #[test]
+    fn repeated_no_progress_stall_disconnects_instead_of_parking_again() {
+        assert_eq!(
+            super::no_progress_response(true),
+            super::NoProgressResponse::Park
+        );
+        assert_eq!(
+            super::no_progress_response(false),
+            super::NoProgressResponse::Disconnect
+        );
     }
 }

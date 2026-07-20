@@ -604,8 +604,8 @@ where
     #[allow(dead_code)]
     pub(super) connection_tracker: ConnectionTracker,
 
-    /// The metrics label for this peer. Usually the remote IP and port.
-    pub(super) metrics_label: String,
+    /// The configured log and metrics label for this peer. Usually the remote IP and port.
+    pub(super) addr_label: String,
 
     /// The state for this peer, when the metrics were last updated.
     pub(super) last_metrics_state: Option<Cow<'static, str>>,
@@ -628,7 +628,7 @@ where
             .field("request_timer", &self.request_timer)
             .field("cached_addrs", &self.cached_addrs.len())
             .field("error_slot", &self.error_slot)
-            .field("metrics_label", &self.metrics_label)
+            .field("addr_label", &self.addr_label)
             .field("last_metrics_state", &self.last_metrics_state)
             .field("last_overload_time", &self.last_overload_time)
             .finish()
@@ -640,6 +640,7 @@ where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     /// Return a new connection from its channels, services, shared state, and metadata.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inbound_service: S,
         client_rx: futures::channel::mpsc::Receiver<ClientRequest>,
@@ -647,10 +648,9 @@ where
         peer_tx: Tx,
         connection_tracker: ConnectionTracker,
         connection_info: Arc<ConnectionInfo>,
+        addr_label: String,
         initial_cached_addrs: Vec<MetaAddr>,
     ) -> Self {
-        let metrics_label = connection_info.connected_addr.get_transient_addr_label();
-
         Connection {
             connection_info,
             state: State::AwaitingRequest,
@@ -661,7 +661,7 @@ where
             error_slot,
             peer_tx: peer_tx.into(),
             connection_tracker,
-            metrics_label,
+            addr_label,
             last_metrics_state: None,
             last_overload_time: None,
         }
@@ -809,7 +809,7 @@ where
                             metrics::counter!(
                                 "zakura.net.in.responses",
                                 "command" => response.command(),
-                                "addr" => self.metrics_label.clone(),
+                                "addr" => self.addr_label.clone(),
                             )
                             .increment(1);
                         } else {
@@ -993,7 +993,7 @@ where
             metrics::counter!(
                 "zakura.net.out.requests.canceled",
                 "command" => request.command(),
-                "addr" => self.metrics_label.clone(),
+                "addr" => self.addr_label.clone(),
             )
             .increment(1);
             self.update_state_metrics(format!("Out::Req::Canceled::{}", request.command()));
@@ -1007,7 +1007,7 @@ where
         metrics::counter!(
             "zakura.net.out.requests",
             "command" => request.command(),
-            "addr" => self.metrics_label.clone(),
+            "addr" => self.addr_label.clone(),
         )
         .increment(1);
         self.update_state_metrics(format!("Out::Req::{}", request.command()));
@@ -1345,7 +1345,20 @@ where
                         .iter()
                         .any(|item| matches!(item, InventoryHash::Block(_))) =>
                 {
-                    Request::BlocksByHash(block_hashes(items).collect()).into()
+                    let hashes = block_hashes(items).collect();
+
+                    if self.connection_info.is_protected_peer {
+                        let source = self
+                            .connection_info
+                            .connected_addr
+                            .get_transient_addr()
+                            .expect("protected peers have transient inbound addresses")
+                            .into();
+
+                        Request::BlocksByHashFrom { hashes, source }.into()
+                    } else {
+                        Request::BlocksByHash(hashes).into()
+                    }
                 }
                 tx_ids if tx_ids.iter().any(|item| item.unmined_tx_id().is_some()) => {
                     Request::TransactionsById(transaction_ids(items).collect()).into()
@@ -1406,7 +1419,7 @@ where
         metrics::counter!(
             "zakura.net.in.requests",
             "command" => req.command(),
-            "addr" => self.metrics_label.clone(),
+            "addr" => self.addr_label.clone(),
         )
         .increment(1);
         self.update_state_metrics(format!("In::Req::{}", req.command()));
@@ -1477,7 +1490,7 @@ where
         metrics::counter!(
             "zakura.net.out.responses",
             "command" => rsp.command(),
-            "addr" => self.metrics_label.clone(),
+            "addr" => self.addr_label.clone(),
         )
         .increment(1);
         self.update_state_metrics(format!("In::Rsp::{}", rsp.command()));
@@ -1614,6 +1627,24 @@ where
     /// probability of being disconnected increases.
     async fn handle_inbound_overload(&mut self, req: Request, now: Instant, error: PeerError) {
         let prev = self.last_overload_time.replace(now);
+
+        // # Security / liveness
+        //
+        // Operator-configured sidecar / block-gossip peers are trusted and
+        // depended on: they follow this node and learn the chain tip only from
+        // it. Shedding (ignoring) their request is correct backpressure, but
+        // *severing* the connection just makes the sidecar fall behind, and the
+        // `max_connections_per_ip = 1` reconnect refusal can stretch that into a
+        // multi-second blackout. So we never drop them for an overload/timeout.
+        //
+        // This exemption is scoped strictly to configured IPs; every other
+        // peer's denial-of-service protection below is unchanged.
+        if self.connection_info.is_protected_peer {
+            self.update_state_metrics(format!("In::Req::{}/Rsp::{error}::Ignored", req.command()));
+            metrics::counter!("pool.ignored.protected").increment(1);
+            return;
+        }
+
         let drop_connection_probability = overload_drop_connection_probability(now, prev);
 
         if thread_rng().gen::<f32>() < drop_connection_probability {
@@ -1627,7 +1658,7 @@ where
                 drop_connection_probability = format!("{drop_connection_probability:.3}"),
                 remote_user_agent = ?self.connection_info.remote.user_agent,
                 negotiated_version = ?self.connection_info.negotiated_version,
-                peer = ?self.metrics_label,
+                peer = %self.addr_label,
                 last_peer_state = ?self.last_metrics_state,
                 // TODO: remove this detailed debug info once #6506 is fixed
                 remote_height = ?self.connection_info.remote.start_height,
@@ -1710,7 +1741,7 @@ where
         metrics::gauge!(
             "zakura.net.connection.state",
             "command" => current_metrics_state.clone(),
-            "addr" => self.metrics_label.clone(),
+            "addr" => self.addr_label.clone(),
         )
         .increment(1.0);
 
@@ -1723,7 +1754,7 @@ where
             metrics::gauge!(
                 "zakura.net.connection.state",
                 "command" => last_metrics_state,
-                "addr" => self.metrics_label.clone(),
+                "addr" => self.addr_label.clone(),
             )
             .set(0.0);
         }

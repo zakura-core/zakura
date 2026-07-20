@@ -10,6 +10,18 @@ pub enum HeaderSyncStartError {
         anchor: (block::Height, block::Hash),
     },
 
+    /// The configured anchor is ahead of the durable verified body/history-tree base.
+    #[error(
+        "Zakura header-sync anchor height {anchor_height:?} is above the verified block tip \
+         {verified_block_tip:?}"
+    )]
+    AnchorAboveVerifiedBlockTip {
+        /// Rejected anchor height.
+        anchor_height: block::Height,
+        /// Durable verified body/history-tree base.
+        verified_block_tip: block::Height,
+    },
+
     /// Only one anchor field was configured.
     #[error("Zakura header-sync anchor_height and anchor_hash must be configured together")]
     IncompleteAnchor,
@@ -34,6 +46,17 @@ pub enum HeaderSyncWireError {
         actual: usize,
         /// Maximum allowed header count.
         max: usize,
+    },
+
+    /// A locally constructed non-empty range had a zero count or overflowing endpoint.
+    #[error(
+        "Zakura header-sync range starting at {start:?} has invalid or overflowing count {count}"
+    )]
+    InvalidRangeGeometry {
+        /// First requested or delivered height.
+        start: block::Height,
+        /// Number of heights.
+        count: u32,
     },
 
     /// A locally constructed `Headers` message had a different number of size hints.

@@ -9,7 +9,7 @@
 //! original native-discovery wire so peers interoperate.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex as StdMutex,
@@ -157,7 +157,28 @@ pub struct DiscoveryService {
     handle: ZakuraDiscoveryHandle,
     header_sync: Option<HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
-    retired_sessions: Arc<StdMutex<HashSet<(ZakuraPeerId, ZakuraConnId)>>>,
+    session_states: Arc<StdMutex<HashMap<(ZakuraPeerId, ZakuraConnId), DiscoverySessionState>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiscoverySessionState {
+    Active,
+    Retired,
+}
+
+fn retire_discovery_session(
+    session_states: &StdMutex<HashMap<(ZakuraPeerId, ZakuraConnId), DiscoverySessionState>>,
+    peer: &ZakuraPeerId,
+    conn_id: ZakuraConnId,
+) -> bool {
+    let mut session_states = session_states
+        .lock()
+        .expect("discovery session-state mutex is never poisoned");
+    let Some(state) = session_states.get_mut(&(peer.clone(), conn_id)) else {
+        return false;
+    };
+    *state = DiscoverySessionState::Retired;
+    true
 }
 
 impl DiscoveryService {
@@ -167,7 +188,7 @@ impl DiscoveryService {
             handle,
             header_sync: None,
             block_sync: None,
-            retired_sessions: Arc::new(StdMutex::new(HashSet::new())),
+            session_states: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -181,7 +202,7 @@ impl DiscoveryService {
             handle,
             header_sync: Some(header_sync),
             block_sync,
-            retired_sessions: Arc::new(StdMutex::new(HashSet::new())),
+            session_states: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -215,10 +236,11 @@ impl Service for DiscoveryService {
         direction: ServicePeerDirection,
     ) -> OrderedSessionDemand {
         if self
-            .retired_sessions
+            .session_states
             .lock()
-            .expect("discovery retired-session mutex is never poisoned")
-            .contains(&(peer.clone(), conn_id))
+            .expect("discovery session-state mutex is never poisoned")
+            .get(&(peer.clone(), conn_id))
+            == Some(&DiscoverySessionState::Retired)
         {
             return OrderedSessionDemand::Retire;
         }
@@ -273,6 +295,10 @@ impl Service for DiscoveryService {
         );
         let discovery_session = DiscoveryPeerSession::new(&session, peer.direction);
         let conn_id = peer.conn_id;
+        self.session_states
+            .lock()
+            .expect("discovery session-state mutex is never poisoned")
+            .insert((peer.id.clone(), conn_id), DiscoverySessionState::Active);
         let service_cancel = discovery_session.cancel_token();
         let connection_cancel = peer.cancel_token();
         let close_cause = peer.close_cause();
@@ -282,7 +308,7 @@ impl Service for DiscoveryService {
         let handle = self.handle.clone();
         let header_sync = self.header_sync.clone();
         let block_sync = self.block_sync.clone();
-        let retired_sessions = self.retired_sessions.clone();
+        let session_states = self.session_states.clone();
         // SR-1: a panic in the admission task (before it hands off to the
         // exchange) must still disconnect this one peer and cancel its discovery
         // session instead of leaving admitted state behind a half-live
@@ -332,16 +358,16 @@ impl Service for DiscoveryService {
                     connection_cancel,
                     close_cause,
                     other_service_negotiated,
-                    retired_sessions,
+                    session_states,
                 });
             },
         );
     }
 
     fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
-        self.retired_sessions
+        self.session_states
             .lock()
-            .expect("discovery retired-session mutex is never poisoned")
+            .expect("discovery session-state mutex is never poisoned")
             .remove(&(peer.clone(), conn_id));
         let handle = self.handle.clone();
         let peer = peer.clone();
@@ -363,7 +389,7 @@ struct DiscoveryExchangeStart {
     connection_cancel: CancellationToken,
     close_cause: CloseCause,
     other_service_negotiated: bool,
-    retired_sessions: Arc<StdMutex<HashSet<(ZakuraPeerId, ZakuraConnId)>>>,
+    session_states: Arc<StdMutex<HashMap<(ZakuraPeerId, ZakuraConnId), DiscoverySessionState>>>,
 }
 
 fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
@@ -379,7 +405,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         connection_cancel,
         close_cause,
         other_service_negotiated,
-        retired_sessions,
+        session_states,
     } = start;
     let peer_id = discovery_session.peer_id().clone();
     let progress = Arc::new(DiscoveryExchangeProgress::default());
@@ -446,10 +472,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
             let exchanged = source.run().await;
             if exchanged {
                 handle.mark_short_lived_exchange(&peer_node_id).await;
-                retired_sessions
-                    .lock()
-                    .expect("discovery retired-session mutex is never poisoned")
-                    .insert((peer_id.clone(), conn_id));
+                retire_discovery_session(&session_states, &peer_id, conn_id);
             }
             service_cancel.cancel();
             handle.remove_peer(&peer_id, conn_id).await;
@@ -1729,5 +1752,26 @@ mod tests {
 
         header_task.abort();
         Ok(())
+    }
+
+    #[test]
+    fn teardown_before_retirement_does_not_recreate_discovery_session_state() {
+        let peer = ZakuraPeerId::new(vec![71; 32]).expect("test peer id is within bounds");
+        let conn_id = 9;
+        let states = StdMutex::new(HashMap::from([(
+            (peer.clone(), conn_id),
+            DiscoverySessionState::Active,
+        )]));
+
+        states
+            .lock()
+            .expect("test session-state mutex is never poisoned")
+            .remove(&(peer.clone(), conn_id));
+
+        assert!(!retire_discovery_session(&states, &peer, conn_id));
+        assert!(states
+            .lock()
+            .expect("test session-state mutex is never poisoned")
+            .is_empty());
     }
 }

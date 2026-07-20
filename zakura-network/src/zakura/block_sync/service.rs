@@ -386,31 +386,6 @@ impl BlockSyncService {
             .as_ref()
             .and_then(|wiring| wiring.registry.peer_parked_until(peer_id, now))
     }
-
-    /// Whether `add_peer` may install a session for this peer. A peer that is
-    /// already registered may always *replace* its session (the
-    /// connection-symmetry collision where both sides opened a block-sync stream
-    /// resolves to the winner's stream by replacing the loser's already-counted
-    /// session); only genuinely new peers are held to the per-direction cap.
-    fn can_admit_peer(&self, peer_id: &ZakuraPeerId, direction: ServicePeerDirection) -> bool {
-        let peers = self
-            .inner
-            .peers
-            .lock()
-            .expect("block-sync peer map mutex is never poisoned");
-        if peers.contains_key(peer_id) {
-            return true;
-        }
-        let count = peers
-            .values()
-            .filter(|record| record.direction == direction)
-            .count();
-        let cap = match direction {
-            ServicePeerDirection::Inbound => self.inner.config.peer_limits.max_inbound_peers,
-            ServicePeerDirection::Outbound => self.inner.config.peer_limits.max_outbound_peers,
-        };
-        count < cap
-    }
 }
 
 impl Service for BlockSyncService {
@@ -500,10 +475,6 @@ impl Service for BlockSyncService {
             return;
         }
 
-        if !self.can_admit_peer(&peer.id, peer.direction) {
-            return;
-        }
-
         let Some((recv, send)) = peer.take_stream(ZAKURA_STREAM_BLOCK_SYNC) else {
             return;
         };
@@ -532,7 +503,7 @@ impl Service for BlockSyncService {
         // nothing is lost by dropping it.
         drop(send);
 
-        {
+        let old_record = {
             let mut peers = self
                 .inner
                 .peers
@@ -545,7 +516,27 @@ impl Service for BlockSyncService {
                 service_cancel_token.cancel();
                 return;
             }
-            if let Some(old_record) = peers.insert(
+
+            if !peers.contains_key(&peer_id) {
+                let count = peers
+                    .values()
+                    .filter(|record| record.direction == peer.direction)
+                    .count();
+                let cap = match peer.direction {
+                    ServicePeerDirection::Inbound => {
+                        self.inner.config.peer_limits.max_inbound_peers
+                    }
+                    ServicePeerDirection::Outbound => {
+                        self.inner.config.peer_limits.max_outbound_peers
+                    }
+                };
+                if count >= cap {
+                    service_cancel_token.cancel();
+                    return;
+                }
+            }
+
+            peers.insert(
                 peer_id.clone(),
                 BlockSyncPeerRecord {
                     conn_id: peer.conn_id,
@@ -553,11 +544,13 @@ impl Service for BlockSyncService {
                     direction: peer.direction,
                     cancel_token: service_cancel_token.clone(),
                 },
-            ) {
-                old_record.cancel_token.cancel();
-            }
+            )
+        };
+        if let Some(old_record) = old_record {
+            old_record.cancel_token.cancel();
         }
-        self.inner
+        let re_admitted_after_no_progress = self
+            .inner
             .locally_parked_sessions
             .lock()
             .expect("block-sync locally parked-session mutex is never poisoned")
@@ -630,6 +623,7 @@ impl Service for BlockSyncService {
                             block_sync_session,
                             recv,
                             wiring.config,
+                            !re_admitted_after_no_progress,
                             generation,
                             wiring.budget,
                             wiring.work,

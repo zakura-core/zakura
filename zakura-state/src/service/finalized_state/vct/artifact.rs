@@ -25,6 +25,19 @@ const MAX_RECORDS: usize = 1_000_000;
 const MAX_COMMITMENTS_PER_RECORD: usize = 65_535;
 const HEADER_LEN: usize = 8 + 2 + 1 + 4 + 32 + 4 + 32 + 32;
 const MAINNET_ARTIFACT_LEN: usize = 71_710_871;
+const MAINNET_ARTIFACT_HANDOFF: block::Height = block::Height(3_358_006);
+const MAINNET_ARTIFACT_HANDOFF_HASH: block::Hash = block::Hash([
+    0xcf, 0x2c, 0x53, 0x62, 0x9e, 0x4c, 0x38, 0x02, 0x0b, 0x54, 0x9c, 0x10, 0xe2, 0x14, 0xd5, 0x42,
+    0x18, 0xf3, 0xc1, 0xba, 0xf2, 0x6e, 0x09, 0x7a, 0x54, 0xbc, 0xa4, 0x00, 0x00, 0x00, 0x00, 0x00,
+]);
+const MAINNET_ARTIFACT_SPROUT_ROOT: [u8; 32] = [
+    0x4d, 0xef, 0xe0, 0xcd, 0x5a, 0x43, 0x33, 0xd8, 0x0f, 0x8b, 0x78, 0x4e, 0x37, 0x11, 0xb1, 0x16,
+    0xf6, 0x22, 0xce, 0xb8, 0x31, 0x07, 0x61, 0xac, 0x1c, 0xb2, 0x45, 0xd0, 0x0d, 0x65, 0x37, 0xa9,
+];
+const MAINNET_ARTIFACT_SHA256: [u8; 32] = [
+    0xab, 0xf8, 0x9e, 0xc7, 0xb9, 0xea, 0xcb, 0xe7, 0xa2, 0x59, 0xbe, 0x89, 0x1a, 0x17, 0x05, 0x94,
+    0x96, 0xf2, 0xc7, 0xc7, 0xc2, 0x14, 0x4d, 0x3b, 0xab, 0xb3, 0x4f, 0x85, 0xf8, 0x09, 0x88, 0x32,
+];
 
 /// One historical block that changed the Sprout commitment tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +63,8 @@ pub(crate) enum Error {
     ReadFailure,
     #[error("Sprout history artifact length does not match the reviewed artifact")]
     ArtifactLengthMismatch,
+    #[error("Sprout history artifact digest does not match the reviewed artifact")]
+    ArtifactDigestMismatch,
     #[error("Sprout history artifact has too many records")]
     TooManyRecords,
     #[error("Sprout history artifact record has too many commitments")]
@@ -73,7 +88,7 @@ pub(crate) enum Error {
     },
     #[error("Sprout history artifact handoff block hash does not match the canonical database")]
     HandoffHashMismatch,
-    #[error("Sprout history artifact terminal root does not match the embedded handoff frontier")]
+    #[error("Sprout history artifact terminal root does not match its reviewed handoff identity")]
     HandoffRootMismatch,
     #[error("canonical database is missing Sprout history artifact record {height:?}")]
     MissingCanonicalRecord { height: block::Height },
@@ -213,7 +228,7 @@ impl Artifact {
 
     #[allow(clippy::unwrap_in_result)]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        Self::decode_from_readers(bytes.len(), || Cursor::new(bytes), None)
+        Self::decode_from_readers(bytes.len(), || Cursor::new(bytes), None, None)
     }
 
     #[allow(clippy::unwrap_in_result)]
@@ -221,6 +236,7 @@ impl Artifact {
         source_len: usize,
         mut reader: impl FnMut() -> R,
         expected_len: Option<usize>,
+        expected_sha256: Option<[u8; 32]>,
     ) -> Result<Self, Error> {
         if let Some(expected_len) = expected_len {
             if source_len != expected_len {
@@ -238,17 +254,30 @@ impl Artifact {
             decode_header(&header)?;
 
         let mut payload_digest = Sha256::new();
+        let mut artifact_digest = expected_sha256.map(|_| {
+            let mut digest = Sha256::new();
+            digest.update(header);
+            digest
+        });
         let mut buffer = [0; 64 * 1024];
         let mut remaining = source_len - HEADER_LEN;
         while remaining > 0 {
             let read_len = remaining.min(buffer.len());
             read_exact(&mut first_pass, &mut buffer[..read_len])?;
             payload_digest.update(&buffer[..read_len]);
+            if let Some(artifact_digest) = &mut artifact_digest {
+                artifact_digest.update(&buffer[..read_len]);
+            }
             remaining -= read_len;
         }
 
         if <[u8; 32]>::from(payload_digest.finalize()) != expected_payload_digest {
             return Err(Error::DigestMismatch);
+        }
+        if let (Some(artifact_digest), Some(expected_sha256)) = (artifact_digest, expected_sha256) {
+            if <[u8; 32]>::from(artifact_digest.finalize()) != expected_sha256 {
+                return Err(Error::ArtifactDigestMismatch);
+            }
         }
 
         let mut second_pass = reader();
@@ -380,6 +409,14 @@ impl Artifact {
     }
 }
 
+pub(crate) fn mainnet_artifact_identity() -> (block::Height, block::Hash, sprout::tree::Root) {
+    (
+        MAINNET_ARTIFACT_HANDOFF,
+        MAINNET_ARTIFACT_HANDOFF_HASH,
+        MAINNET_ARTIFACT_SPROUT_ROOT.into(),
+    )
+}
+
 /// Errors produced by the offline canonical Mainnet artifact generator.
 #[derive(Debug, Error)]
 pub enum GeneratorError {
@@ -496,11 +533,15 @@ pub fn generate_mainnet_from_archive(config: &Config) -> Result<Vec<u8>, Generat
 ///
 /// This must never be replaced with downloaded or guessed bytes.
 pub(crate) fn embedded_mainnet() -> Result<Artifact, Error> {
-    Artifact::decode_from_readers(
+    let artifact = Artifact::decode_from_readers(
         zakura_vct_sprout_history::TOTAL_LEN,
         zakura_vct_sprout_history::Reader::new,
         Some(MAINNET_ARTIFACT_LEN),
-    )
+        Some(MAINNET_ARTIFACT_SHA256),
+    )?;
+    let (artifact_height, artifact_height_hash, sprout_root) = mainnet_artifact_identity();
+    artifact.validate_last_checkpoint(artifact_height, artifact_height_hash, sprout_root)?;
+    Ok(artifact)
 }
 
 #[cfg(test)]
@@ -508,19 +549,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_mainnet_artifact_matches_handoff() {
-        let network = zakura_chain::parameters::Network::Mainnet;
-        let frontiers =
-            embedded_final_frontiers(&network).expect("Mainnet has embedded final frontiers");
-        let handoff_hash = network
-            .checkpoint_list()
-            .hash(frontiers.height)
-            .expect("the embedded frontier height has a Mainnet checkpoint");
+    fn embedded_mainnet_artifact_matches_frozen_identity_and_current_sprout_root() {
+        let (handoff, handoff_hash, sprout_root) = mainnet_artifact_identity();
         let artifact = embedded_mainnet().expect("the reviewed Mainnet artifact decodes");
 
         artifact
-            .validate_last_checkpoint(frontiers.height, handoff_hash, frontiers.sprout.root())
-            .expect("the reviewed Mainnet artifact matches the embedded handoff");
+            .validate_last_checkpoint(handoff, handoff_hash, sprout_root)
+            .expect("the reviewed Mainnet artifact matches its frozen identity");
+
+        let current_frontier =
+            embedded_final_frontiers(&zakura_chain::parameters::Network::Mainnet)
+                .expect("Mainnet has an embedded final frontier");
+        assert_eq!(
+            artifact.terminal_root,
+            current_frontier.sprout.root(),
+            "the frozen repair artifact must remain Sprout-compatible with the latest checkpoint \
+             frontier; regenerate or remove it if Sprout changes"
+        );
     }
 
     #[test]
@@ -569,13 +614,24 @@ mod tests {
             bytes.len(),
             || Cursor::new(bytes.as_slice()),
             Some(bytes.len()),
+            Some(<[u8; 32]>::from(Sha256::digest(&bytes))),
         )
         .expect("artifact with the expected length decodes");
         assert_eq!(
             Artifact::decode_from_readers(
                 bytes.len(),
                 || Cursor::new(bytes.as_slice()),
+                Some(bytes.len()),
+                Some([0; 32]),
+            ),
+            Err(Error::ArtifactDigestMismatch)
+        );
+        assert_eq!(
+            Artifact::decode_from_readers(
+                bytes.len(),
+                || Cursor::new(bytes.as_slice()),
                 Some(bytes.len() + 1),
+                None,
             ),
             Err(Error::ArtifactLengthMismatch)
         );

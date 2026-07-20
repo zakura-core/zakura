@@ -15,10 +15,7 @@ use zakura_chain::{
 };
 
 use crate::service::finalized_state::{
-    vct::{
-        artifact::{embedded_mainnet, Artifact},
-        embedded_mainnet_final_frontiers,
-    },
+    vct::artifact::{embedded_mainnet, mainnet_artifact_identity, Artifact},
     DiskWriteBatch, ZakuraDb,
 };
 
@@ -90,10 +87,6 @@ pub enum VctSproutHistoryValidationError {
 
 #[derive(Debug, Error)]
 pub(crate) enum RepairValidationError {
-    #[error("the embedded VCT final frontier is invalid: {0}")]
-    InvalidFrontier(String),
-    #[error("the current checkpoint list has no canonical hash at build handoff {height:?}")]
-    MissingBuildCheckpoint { height: Height },
     #[error(
         "the current checkpoint list has no canonical hash at reached database marker {height:?}"
     )]
@@ -265,10 +258,10 @@ impl DiskFormatUpgrade for Upgrade {
 }
 
 fn repair_input(
-    db: &ZakuraDb,
+    _db: &ZakuraDb,
 ) -> Result<(Height, block::Hash, sprout::tree::Root, Artifact), RepairValidationError> {
     #[cfg(test)]
-    if let Some(input) = load_test_repair_input(db) {
+    if let Some(input) = load_test_repair_input(_db) {
         let input = input?;
         return Ok((
             input.handoff,
@@ -278,20 +271,13 @@ fn repair_input(
         ));
     }
 
-    let frontiers = embedded_mainnet_final_frontiers()
-        .map_err(|error| RepairValidationError::InvalidFrontier(error.to_string()))?;
-    let artifact_last_checkpoint_hash = db
-        .network()
-        .checkpoint_list()
-        .hash(frontiers.height)
-        .ok_or(RepairValidationError::MissingBuildCheckpoint {
-            height: frontiers.height,
-        })?;
     let artifact = embedded_mainnet()?;
+    let (artifact_last_checkpoint, artifact_last_checkpoint_hash, artifact_sprout_root) =
+        mainnet_artifact_identity();
     Ok((
-        frontiers.height,
+        artifact_last_checkpoint,
         artifact_last_checkpoint_hash,
-        frontiers.sprout.root(),
+        artifact_sprout_root,
         artifact,
     ))
 }

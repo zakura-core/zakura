@@ -837,8 +837,13 @@ The SHA-256 digest in the artifact detects accidental or malicious byte changes,
 establish provenance. Provenance comes from release review and embedding the approved bytes in
 the binary. The loader must never substitute downloaded, locally generated, or guessed bytes.
 Each record is bound to its canonical block hash, and the header is bound to the canonical
-handoff block hash. The terminal root is independently pinned to the separately embedded VCT
-handoff frontier, so both artifacts must agree before replay.
+handoff block hash. The artifact's historical handoff height, block hash, terminal Sprout root,
+length, and complete digest are independently pinned in the loader. This identity remains frozen
+while the release-state checkpoint and frontier advance, until the temporary repair is removed.
+CI separately requires the frozen terminal Sprout root to equal the latest embedded frontier's
+Sprout root. Ordinary checkpoint advances therefore pass without regenerating the artifact, but
+a new Sprout-changing JoinSplit intentionally blocks the update until the artifact is regenerated
+or the temporary repair is removed.
 
 ### 17.2 Binary format (version 1)
 
@@ -868,9 +873,9 @@ decoder.
 The decoder rejects a wrong magic, version, or network; truncation; digest mismatches; excess
 counts; zero or overflowing/non-increasing height deltas; heights above the handoff; empty
 records; record-root mismatches while replaying commitments from an empty Sprout tree; a
-terminal-root mismatch; and trailing bytes. The generated artifact is authenticated against the
-current build's own identity: its handoff must equal the embedded final frontier's height and its
-terminal Sprout root must equal the embedded final frontier's Sprout root.
+terminal-root mismatch; trailing bytes; or a mismatch with the frozen reviewed artifact identity.
+The production loader does not derive that identity from the moving embedded final frontier; the
+unit test couples only their Sprout roots to detect a divergence at the latest checkpoint.
 
 The offline generator opens a complete current-format Mainnet archive read-only, scans canonical
 block bodies from genesis through the embedded handoff, emits only Sprout-changing blocks with

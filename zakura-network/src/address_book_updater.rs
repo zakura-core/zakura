@@ -1,13 +1,7 @@
 //! The timestamp collector collects liveness information from peers.
 
-use std::{
-    cmp::max,
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-    time::Instant,
-};
+use std::{cmp::max, net::SocketAddr, sync::Arc};
 
-use indexmap::IndexMap;
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, watch},
@@ -17,7 +11,7 @@ use tracing::{Level, Span};
 
 use crate::{
     address_book::AddressMetrics, meta_addr::MetaAddrChange, types::PeerServices, AddressBook,
-    BoxError, Config,
+    BannedIps, BoxError, Config,
 };
 
 /// The minimum size of the address book updater channel.
@@ -40,6 +34,7 @@ impl AddressBookUpdater {
     ///
     /// Returns handles for:
     /// - the address book,
+    /// - the shared list of banned peer IP addresses,
     /// - the transmission channel for address book update events,
     /// - a watch channel for address book metrics, and
     /// - the address book updater task join handle.
@@ -51,7 +46,7 @@ impl AddressBookUpdater {
         advertised_services: PeerServices,
     ) -> (
         Arc<std::sync::Mutex<AddressBook>>,
-        watch::Receiver<Arc<IndexMap<IpAddr, Instant>>>,
+        BannedIps,
         mpsc::Sender<MetaAddrChange>,
         watch::Receiver<AddressMetrics>,
         JoinHandle<Result<(), BoxError>>,
@@ -72,6 +67,10 @@ impl AddressBookUpdater {
         .with_local_listener_services(advertised_services)
         .with_expose_peer_addresses(config.expose_peer_addresses);
         let address_metrics = address_book.address_metrics_watcher();
+
+        // The updater needs mutable address-book access, while peer networking
+        // only needs read-only ban checks. Both handles share the ban list lock.
+        let bans = address_book.bans();
         let address_book = Arc::new(std::sync::Mutex::new(address_book));
 
         #[cfg(feature = "progress-bar")]
@@ -86,12 +85,6 @@ impl AddressBookUpdater {
 
         let worker_address_book = address_book.clone();
         let expose_peer_addresses = config.expose_peer_addresses;
-        let (bans_sender, bans_receiver) = tokio::sync::watch::channel(
-            worker_address_book
-                .lock()
-                .expect("mutex should be unpoisoned")
-                .bans(),
-        );
 
         let worker = move || {
             info!("starting the address book updater");
@@ -107,23 +100,10 @@ impl AddressBookUpdater {
                 //
                 // Briefly hold the address book threaded mutex, to update the
                 // state for a single address.
-                let updated = worker_address_book
+                worker_address_book
                     .lock()
                     .expect("mutex should be unpoisoned")
                     .update(event);
-
-                // `UpdateMisbehavior` events should only be passed to `update()` here,
-                // so that this channel is always updated when new addresses are banned.
-                if updated.is_none() {
-                    let bans = worker_address_book
-                        .lock()
-                        .expect("mutex should be unpoisoned")
-                        .bans();
-
-                    if bans.contains_key(&event.addr().ip()) {
-                        let _ = bans_sender.send(bans);
-                    }
-                }
 
                 #[cfg(feature = "progress-bar")]
                 if matches!(howudoin::cancelled(), Some(true)) {
@@ -172,7 +152,7 @@ impl AddressBookUpdater {
 
         (
             address_book,
-            bans_receiver,
+            bans,
             worker_tx,
             address_metrics,
             address_book_updater_task_handle,

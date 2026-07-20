@@ -32,7 +32,7 @@ use crate::{
     peer::{ClientTestHarness, LoadTrackedClient, MinimumPeerVersion},
     peer_set::{set::MorePeers, InventoryChange, PeerSet},
     protocol::external::types::Version,
-    AddressBook, Config, PeerSocketAddr,
+    AddressBook, BannedIps, Config, PeerSocketAddr,
 };
 
 #[cfg(test)]
@@ -253,7 +253,7 @@ where
             .unwrap_or_else(|| guard.create_inventory_receiver());
 
         let address_metrics = guard.prepare_address_book(self.address_book);
-        let (_bans_sender, bans_receiver) = tokio::sync::watch::channel(Default::default());
+        let bans = BannedIps::default();
 
         let peer_set = PeerSet::new(
             &config,
@@ -262,7 +262,7 @@ where
             demand_signal,
             handle_rx,
             inv_stream,
-            bans_receiver,
+            bans,
             address_metrics,
             minimum_peer_version,
             max_conns_per_ip,

@@ -102,13 +102,15 @@ fn misbehavior_ban_does_not_panic_with_max_connections_per_ip_above_one() {
     assert!(address_book.get(banned_addr).is_some());
     assert!(address_book.get(other_port_same_ip).is_some());
 
+    let bans = address_book.bans();
+
     address_book.update(MetaAddrChange::UpdateMisbehavior {
         addr: banned_addr,
         score_increment: MAX_PEER_MISBEHAVIOR_SCORE,
     });
 
     assert!(
-        address_book.bans().contains_key(&banned_addr.ip()),
+        bans.contains(banned_addr.ip()),
         "ban-threshold misbehavior should ban the peer IP"
     );
     assert!(

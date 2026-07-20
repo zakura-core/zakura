@@ -124,7 +124,7 @@ impl HeaderSyncReactor {
                 u64::from(meta.stream_version),
             );
             insert_u64(row, hs_trace::REQUEST_ID, meta.request_id.get());
-            insert_height(row, hs_trace::RANGE_START, range.start_height);
+            insert_height(row, hs_trace::RANGE_START, range.start_height());
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(count));
             insert_u64(row, hs_trace::ADVERTISED_CAP, u64::from(advertised_cap));
             insert_bool(row, hs_trace::FINALIZED, range.finalized);
@@ -218,7 +218,7 @@ impl HeaderSyncReactor {
     ) {
         self.emit_trace(hs_trace::HEADER_RANGE_REJECTED, |row| {
             insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::RANGE_START, range.start_height);
+            insert_height(row, hs_trace::RANGE_START, range.start_height());
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(count));
             if let Some(anchor_hash) = range.anchor_hash {
                 insert_hash(row, hs_trace::ANCHOR_HASH, anchor_hash);
@@ -640,10 +640,7 @@ fn trace_action_fields(row: &mut serde_json::Map<String, Value>, action: &Header
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*count));
         }
         HeaderSyncAction::CommitHeaderRange {
-            operation,
-            start_height,
-            headers,
-            ..
+            operation, payload, ..
         } => {
             insert_optional_str(row, hs_trace::KIND, Some("commit_header_range"));
             insert_peer(row, hs_trace::PEER, &operation.wire_request.peer);
@@ -658,8 +655,12 @@ fn trace_action_fields(row: &mut serde_json::Map<String, Value>, action: &Header
                 "operation_kind",
                 Some(operation_kind_label(operation.op_kind)),
             );
-            insert_height(row, hs_trace::RANGE_START, *start_height);
-            insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
+            insert_height(row, hs_trace::RANGE_START, payload.range().start());
+            insert_u64(
+                row,
+                hs_trace::RANGE_COUNT,
+                u64::from(payload.range().count()),
+            );
         }
         HeaderSyncAction::QueryBestHeaderTip => {
             insert_optional_str(row, hs_trace::KIND, Some("query_best_header_tip"));
@@ -813,6 +814,7 @@ pub(super) fn header_sync_wire_error_kind(error: &HeaderSyncWireError) -> &'stat
     match error {
         HeaderSyncWireError::OversizedPayload { .. } => "oversized_payload",
         HeaderSyncWireError::HeaderCountLimit { .. } => "header_count_limit",
+        HeaderSyncWireError::InvalidRangeGeometry { .. } => "invalid_range_geometry",
         HeaderSyncWireError::BodySizeCountMismatch { .. } => "body_size_count_mismatch",
         HeaderSyncWireError::TreeAuxRootCountMismatch { .. } => "tree_aux_root_count_mismatch",
         HeaderSyncWireError::TreeAuxRootHeightMismatch { .. } => "tree_aux_root_height_mismatch",
@@ -937,8 +939,8 @@ mod tests {
         header_sync::{
             events::HeaderSyncFrontiers, service::HeaderSyncPeerSession, state::RangePriority,
         },
-        HeaderSyncOperationIdentity, HeaderSyncOperationKind, HeaderSyncServiceSummary,
-        HeaderSyncWireRequestIdentity,
+        HeaderRangePayload, HeaderSyncOperationIdentity, HeaderSyncOperationKind,
+        HeaderSyncServiceSummary, HeaderSyncWireRequestIdentity,
     };
 
     fn peer(byte: u8) -> ZakuraPeerId {
@@ -1190,10 +1192,8 @@ mod tests {
                 HeaderSyncAction::CommitHeaderRange {
                     operation: operation(peer.clone()),
                     anchor: block::Hash([0; 32]),
-                    start_height: block::Height(1),
-                    headers: vec![header],
-                    body_sizes: vec![1],
-                    tree_aux_roots: Vec::new(),
+                    payload: HeaderRangePayload::new(block::Height(1), vec![header], vec![1], None)
+                        .expect("test payload is aligned"),
                     finalized: false,
                 },
                 "commit_header_range",

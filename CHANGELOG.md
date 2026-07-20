@@ -7,11 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
 - Add an offline Mainnet checkpoint and VCT frontier export mode to
   `zakura-checkpoints`, and a committed provenance record
   (`vct/mainnet-frontier.json`) that CI verifies against the embedded
   checkpoint list and frontier on every PR. Groundwork for automated
   release-state updates.
+
+### Fixed
+
+- Keep valid internal-miner work running across mempool-only block template
+  updates ([#226](https://github.com/zakura-core/zakura/pull/226)).
+- Honor `disable_pow = true` during native header sync on configured Testnets,
+  matching semantic and checkpoint block verification
+  ([#289](https://github.com/zakura-core/zakura/pull/289)).
+- Make retained peer-ban insertion and eviction O(1) rather than O(N),
+  preventing ban-list maintenance from slowing as the 20,000-IP bound fills
+  ([#286](https://github.com/zakura-core/zakura/pull/286)).
 
 ## [1.0.2] - 2026-07-20
 

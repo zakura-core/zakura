@@ -915,15 +915,18 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
             HeaderSyncAction::CommitHeaderRange {
                 operation,
                 anchor,
-                start_height,
-                headers,
-                body_sizes,
-                tree_aux_roots,
+                payload,
                 finalized: _finalized,
             } => {
                 let peer = operation.wire_request.peer.clone();
-                let count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
-                let tree_aux_roots_len = u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX);
+                let range = payload.range();
+                let start_height = range.start();
+                let count = range.count();
+                let tree_aux_roots_len = payload
+                    .tree_aux_roots()
+                    .map_or(0, |roots| u32::try_from(roots.len()).unwrap_or(u32::MAX));
+                let (_range, headers, body_sizes, tree_aux_roots) = payload.into_parts();
+                let tree_aux_roots = tree_aux_roots.unwrap_or_default();
                 emit_commit_state(
                     &trace,
                     cs_trace::COMMIT_START,
@@ -1805,15 +1808,16 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
         "header_sync_driver",
         |row| match action {
             HeaderSyncAction::CommitHeaderRange {
-                operation,
-                start_height,
-                headers,
-                ..
+                operation, payload, ..
             } => {
                 insert_cs_str(row, cs_trace::ACTION, "commit_header_range");
                 insert_cs_peer(row, cs_trace::PEER, &operation.wire_request.peer);
-                insert_cs_height(row, cs_trace::RANGE_START, *start_height);
-                insert_cs_u64(row, cs_trace::RANGE_COUNT, headers.len() as u64);
+                insert_cs_height(row, cs_trace::RANGE_START, payload.range().start());
+                insert_cs_u64(
+                    row,
+                    cs_trace::RANGE_COUNT,
+                    u64::from(payload.range().count()),
+                );
             }
             HeaderSyncAction::QueryBestHeaderTip => {
                 insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");

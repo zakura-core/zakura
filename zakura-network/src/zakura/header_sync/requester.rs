@@ -137,8 +137,8 @@ mod tests {
 
     fn range(start: u32, count: u32) -> RangeRequest {
         RangeRequest {
-            start_height: block::Height(start),
-            count,
+            range: CheckedHeaderRange::from_count(block::Height(start), count)
+                .expect("test range is non-empty and bounded"),
             anchor_hash: None,
             finalized: false,
             want_tree_aux_roots: true,
@@ -201,7 +201,11 @@ mod tests {
         let (session, mut frames, _cancel) = session(peer, 1);
         let range = range(5, 2);
         let prepared = session
-            .prepare_get_headers(range.start_height, range.count, range.want_tree_aux_roots)
+            .prepare_get_headers(
+                range.start_height(),
+                range.count(),
+                range.want_tree_aux_roots,
+            )
             .expect("valid test request is prepared");
         let request_id = prepared.request_id();
         let wire_request = wire_request(&requester_id, request_id);
@@ -239,8 +243,8 @@ mod tests {
         assert_eq!(
             message,
             HeaderSyncMessage::GetHeaders {
-                start_height: range.start_height,
-                count: range.count,
+                start_height: range.start_height(),
+                count: range.count(),
                 want_tree_aux_roots: range.want_tree_aux_roots,
             }
         );
@@ -262,7 +266,11 @@ mod tests {
         let (session, frames, _cancel) = session(peer, 1);
         let range = range(9, 1);
         let prepared = session
-            .prepare_get_headers(range.start_height, range.count, range.want_tree_aux_roots)
+            .prepare_get_headers(
+                range.start_height(),
+                range.count(),
+                range.want_tree_aux_roots,
+            )
             .expect("valid test request is prepared");
         let request_id = prepared.request_id();
         let wire_request = wire_request(&requester_id, request_id);

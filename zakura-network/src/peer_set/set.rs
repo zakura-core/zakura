@@ -100,7 +100,6 @@ use std::{
     marker::PhantomData,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
     time::Instant,
 };
@@ -112,7 +111,6 @@ use futures::{
     stream::FuturesUnordered,
     task::noop_waker,
 };
-use indexmap::IndexMap;
 use itertools::Itertools;
 use num_integer::div_ceil;
 use tokio::{
@@ -141,7 +139,7 @@ use crate::{
         external::{canonical_socket_addr, InventoryHash},
         internal::{Request, Response},
     },
-    BoxError, Config, PeerError, PeerSocketAddr, SharedPeerError,
+    BannedIps, BoxError, Config, PeerError, PeerSocketAddr, SharedPeerError,
 };
 
 #[cfg(test)]
@@ -209,8 +207,8 @@ where
     /// A channel that asks the peer crawler task to connect to more peers.
     demand_signal: mpsc::Sender<MorePeers>,
 
-    /// A watch channel receiver with a copy of banned IP addresses.
-    bans_receiver: watch::Receiver<Arc<IndexMap<IpAddr, std::time::Instant>>>,
+    /// A shared list of banned IP addresses.
+    bans: BannedIps,
 
     /// Tracks peers returning empty `FindBlocks`/`FindHeaders` responses.
     /// Mutated only from [`Self::poll_ready`] via [`Self::stall_event_rx`].
@@ -357,7 +355,7 @@ where
     ///   and shuts down all the tasks as soon as one task exits;
     /// - `inv_stream`: receives inventory changes from peers,
     ///   allowing the peer set to direct inventory requests;
-    /// - `bans_receiver`: receives a map of banned IP addresses that should be dropped;
+    /// - `bans`: a map of banned IP addresses that should be dropped;
     /// - `address_book`: when peer set is busy, it logs address book diagnostics.
     /// - `minimum_peer_version`: endpoint to see the minimum peer protocol version in real time.
     /// - `max_conns_per_ip`: configured maximum number of peers that can be in the
@@ -370,7 +368,7 @@ where
         demand_signal: mpsc::Sender<MorePeers>,
         handle_rx: tokio::sync::oneshot::Receiver<Vec<JoinHandle<Result<(), BoxError>>>>,
         inv_stream: broadcast::Receiver<InventoryChange>,
-        bans_receiver: watch::Receiver<Arc<IndexMap<IpAddr, std::time::Instant>>>,
+        bans: BannedIps,
         address_metrics: watch::Receiver<AddressMetrics>,
         minimum_peer_version: MinimumPeerVersion<C>,
         max_conns_per_ip: Option<usize>,
@@ -381,7 +379,7 @@ where
             discover,
             demand_signal,
             // Banned peers
-            bans_receiver,
+            bans,
 
             // Stall tracking
             find_response_stalls: FindResponseStallTracker::new(),
@@ -595,7 +593,7 @@ where
                         "service became ready"
                     );
 
-                    if self.bans_receiver.borrow().contains_key(&key.ip()) {
+                    if self.bans.contains(key.ip()) {
                         warn!(
                             peer = %key.addr_label(self.expose_peer_addresses),
                             "service is banned, dropping service"
@@ -679,7 +677,7 @@ where
             match peer_readiness {
                 // Still ready, add it back to the list.
                 Ok(()) => {
-                    if self.bans_receiver.borrow().contains_key(&key.ip()) {
+                    if self.bans.contains(key.ip()) {
                         debug!(
                             peer = %key.addr_label(self.expose_peer_addresses),
                             "service ip is banned, dropping service"
@@ -1393,8 +1391,7 @@ where
             return;
         };
 
-        let bans = self.bans_receiver.borrow().clone();
-        remaining_peers.retain(|addr| !bans.contains_key(&addr.ip()));
+        remaining_peers.retain(|addr| !self.bans.contains(addr.ip()));
 
         let Ok(reserved_send_slot) = sender.try_reserve() else {
             self.queued_broadcast_all = Some((req, sender, remaining_peers));

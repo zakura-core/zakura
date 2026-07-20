@@ -25,19 +25,17 @@ impl HeaderHashDedup {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct PendingCommitKey {
-    pub(super) peer: ZakuraPeerId,
-    pub(super) session_id: u64,
-    pub(super) start_height: block::Height,
-    pub(super) count: u32,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum HeaderWorkState {
-    InFlight { peer: ZakuraPeerId },
-    Buffered { peer: ZakuraPeerId },
-    Committing { peer: ZakuraPeerId, session_id: u64 },
+    InFlight {
+        peer: ZakuraPeerId,
+    },
+    Buffered {
+        peer: ZakuraPeerId,
+    },
+    Committing {
+        operation: HeaderSyncOperationIdentity,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -154,17 +152,13 @@ impl HeaderWorkQueue {
 
     pub(super) fn mark_committing(
         &mut self,
-        peer: ZakuraPeerId,
-        session_id: u64,
+        operation: HeaderSyncOperationIdentity,
         range: RangeRequest,
     ) {
-        let previous = self.active.insert(
-            range,
-            HeaderWorkState::Committing {
-                peer: peer.clone(),
-                session_id,
-            },
-        );
+        let peer = operation.wire_request.peer.clone();
+        let previous = self
+            .active
+            .insert(range, HeaderWorkState::Committing { operation });
         debug_assert!(
             matches!(previous, Some(HeaderWorkState::Buffered { peer: owner }) if owner == peer),
             "only buffered header work can enter state commit"
@@ -492,6 +486,17 @@ mod tests {
         ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is within bounds")
     }
 
+    fn operation(peer: ZakuraPeerId, session_id: u64) -> HeaderSyncOperationIdentity {
+        HeaderSyncOperationIdentity {
+            wire_request: HeaderSyncWireRequestIdentity {
+                peer,
+                session_id,
+                request_id: HeaderSyncRequestId::new(1).expect("test request ID is non-zero"),
+            },
+            op_kind: HeaderSyncOperationKind::CommitHeaders,
+        }
+    }
+
     fn range(start: u32, count: u32, priority: RangePriority) -> RangeRequest {
         RangeRequest {
             start_height: block::Height(start),
@@ -677,7 +682,8 @@ mod tests {
         queue.mark_assigned(owner.clone(), in_flight);
         queue.mark_assigned(owner.clone(), committing);
         queue.mark_buffered(owner.clone(), committing);
-        queue.mark_committing(owner, 7, committing);
+        let operation = operation(owner, 7);
+        queue.mark_committing(operation.clone(), committing);
 
         queue.mark_range_covered(block::Height(1), block::Height(2));
         queue.mark_height_covered(block::Height(3));
@@ -693,7 +699,7 @@ mod tests {
         assert!(queue.state(in_flight).is_none());
         assert!(matches!(
             queue.state(committing),
-            Some(HeaderWorkState::Committing { session_id: 7, .. })
+            Some(HeaderWorkState::Committing { operation: active }) if active == &operation
         ));
 
         queue.ensure_forward(pending);
@@ -715,7 +721,8 @@ mod tests {
         queue.mark_buffered(forgotten.clone(), buffered);
         queue.mark_assigned(forgotten.clone(), committing);
         queue.mark_buffered(forgotten.clone(), committing);
-        queue.mark_committing(forgotten.clone(), 9, committing);
+        let committing_operation = operation(forgotten.clone(), 9);
+        queue.mark_committing(committing_operation.clone(), committing);
         queue.mark_assigned(other.clone(), other_in_flight);
         queue.retry_avoidance.insert(
             forgotten.clone(),
@@ -737,7 +744,7 @@ mod tests {
         ));
         assert!(matches!(
             queue.state(committing),
-            Some(HeaderWorkState::Committing { peer, session_id: 9 }) if peer == &forgotten
+            Some(HeaderWorkState::Committing { operation }) if operation == &committing_operation
         ));
         assert!(matches!(
             queue.state(other_in_flight),

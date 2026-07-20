@@ -404,11 +404,12 @@ pub(crate) async fn drive_header_sync_actions(
                     .await;
             }
             HeaderSyncAction::CommitHeaderRange {
-                peer,
+                operation,
                 start_height,
                 headers,
                 ..
             } => {
+                let peer = &operation.wire_request.peer;
                 tracing::debug!(
                     ?peer,
                     ?start_height,
@@ -813,7 +814,7 @@ mod request_id_tests {
         let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
         let peer_id = ZakuraPeerId::new(vec![5; 32]).expect("test peer id is valid");
         let session = HeaderSyncPeerSession::from_parts_with_direction_and_commands(
-            peer_id,
+            peer_id.clone(),
             1,
             ServicePeerDirection::Outbound,
             send,
@@ -838,7 +839,16 @@ mod request_id_tests {
         let (requester_tx, requester_rx) = mpsc::channel(1);
         drop(requester_rx);
 
-        let rejected = match requester_tx.try_send(HeaderRequesterCommand { range, prepared }) {
+        let wire_request = HeaderSyncWireRequestIdentity {
+            peer: peer_id,
+            session_id: 1,
+            request_id: prepared.request_id(),
+        };
+        let rejected = match requester_tx.try_send(HeaderRequesterCommand {
+            range,
+            wire_request,
+            prepared,
+        }) {
             Err(mpsc::error::TrySendError::Closed(command)) => command,
             _ => panic!("closed requester queue rejects the prepared command"),
         };

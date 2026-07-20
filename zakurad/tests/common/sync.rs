@@ -206,6 +206,38 @@ pub fn sync_until(
     config.mempool.debug_enable_at_height = mempool_behavior.enable_at_height();
     config.consensus.checkpoint_sync = checkpoint_sync;
 
+    sync_until_with_config(
+        height,
+        network,
+        stop_regex,
+        timeout,
+        reuse_tempdir,
+        mempool_behavior,
+        check_legacy_chain,
+        config,
+    )
+}
+
+/// Sync using `config` until `zakurad` reaches `height`, or logs `stop_regex`.
+///
+/// This variant lets tests supply deterministic local peers while preserving
+/// the same state, shutdown, and log checks as [`sync_until`].
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip(reuse_tempdir, config))]
+pub fn sync_until_with_config(
+    height: Height,
+    network: &Network,
+    stop_regex: &str,
+    timeout: Duration,
+    reuse_tempdir: impl Into<Option<TempDir>>,
+    mempool_behavior: MempoolBehavior,
+    check_legacy_chain: bool,
+    mut config: ZakuradConfig,
+) -> Result<TempDir> {
+    let reuse_tempdir = reuse_tempdir.into();
+    config.state.debug_stop_at_height = Some(height.0);
+    config.mempool.debug_enable_at_height = mempool_behavior.enable_at_height();
+
     // Use the default lookahead limit if we're syncing lots of blocks.
     // (Most tests use a smaller limit to minimise redundant block downloads.)
     if height > MIN_HEIGHT_FOR_DEFAULT_LOOKAHEAD {
@@ -221,7 +253,7 @@ pub fn sync_until(
 
     let child = tempdir.spawn_child(args!["start"])?.with_timeout(timeout);
 
-    let network_log = format!("network: {network},");
+    let network_log = format!("Zcash network: {network}");
 
     if mempool_behavior.require_activation() {
         // require that the mempool activated,
@@ -307,7 +339,7 @@ pub fn check_sync_logs_until(
     mempool_behavior: MempoolBehavior,
     check_legacy_chain: bool,
 ) -> Result<TestChild<TempDir>> {
-    zakurad.expect_stdout_line_matches(format!("network: {network},"))?;
+    zakurad.expect_stdout_line_matches(format!("Zcash network: {network}"))?;
 
     if check_legacy_chain {
         zakurad.expect_stdout_line_matches("starting legacy chain check")?;

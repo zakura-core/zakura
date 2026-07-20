@@ -50,8 +50,8 @@ pub use config::{
 pub use error::{HeaderSyncStartError, HeaderSyncWireError};
 pub use events::{
     ExpectedHeadersResponse, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
-    HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncRequestId,
-    HeaderSyncStartup,
+    HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncOperationIdentity,
+    HeaderSyncOperationKind, HeaderSyncRequestId, HeaderSyncStartup, HeaderSyncWireRequestIdentity,
 };
 pub use reactor::spawn_header_sync_reactor;
 pub use service::HeaderSyncPeerSession;

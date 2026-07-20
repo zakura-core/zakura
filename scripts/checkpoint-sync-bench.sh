@@ -67,9 +67,9 @@ PEERSET_SIZE="${PEERSET_SIZE:-1}"   # 1 = strict single pinned peer; raise to al
 TARGET_P2P_STACK="${TARGET_P2P_STACK:-}"
 BASELINE_P2P_STACK="${BASELINE_P2P_STACK:-}"
 START_HEIGHT="${START_HEIGHT:-1707210}"
-SNAPSHOT_URL="${SNAPSHOT_URL:-https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
-SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769}"
-SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-https://zebra.valargroup.dev/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst}"
+SNAPSHOT_URL="${SNAPSHOT_URL:-https://zakura.valargroup.dev/mainnet/historical/zakura-mainnet-20260717T095333Z-1707210.tar.zst}"
+SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-2bcb3786252300b4163b38a49b2d3a8015ba581d7d3efc854e6ed662a18258ac}"
+SNAPSHOT_MIRROR="${SNAPSHOT_MIRROR:-}"
 BENCH_HOME="${BENCH_HOME:-/opt/zakura-bench}"
 GH_REPO="${GH_REPO:-zakura-core/zakura}"
 OUT_DIR="${OUT_DIR:-$PWD/bench-out}"
@@ -196,8 +196,10 @@ ensure_bench_home() {
 # stored on disk (the box has only ~one disk and can't hold tarball + extracted state).
 # sha256 is computed over the compressed stream via tee and checked after extraction.
 ensure_snapshot() {
-  if [[ -f "$MASTER/state/v27/mainnet/version" ]]; then
-    log "snapshot master present: $MASTER (db v$(cat "$MASTER/state/v27/mainnet/version"))"
+  local version_file
+  version_file="$(find "$MASTER/state" -mindepth 3 -maxdepth 3 -type f -path '*/mainnet/version' -print -quit 2>/dev/null || true)"
+  if [[ -n "$version_file" ]]; then
+    log "snapshot master present: $MASTER (db v$(cat "$version_file"))"
     return
   fi
   local tmp="$MASTER.tmp.$$" sumf; sumf="$BENCH_HOME/snapshots/.sha.$$"
@@ -207,7 +209,7 @@ ensure_snapshot() {
   for url in "$SNAPSHOT_URL" "$SNAPSHOT_MIRROR"; do
     [[ -n "$url" ]] || continue
     log "source: $url"
-    if curl --http1.1 -fL --retry 3 --retry-delay 5 --connect-timeout 30 "$url" \
+    if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 "$url" \
          | tee >(sha256sum | awk '{print $1}' > "$sumf") \
          | zstd -dc --long=31 | tar -x -C "$tmp"; then
       ok=1; break
@@ -229,8 +231,9 @@ ensure_snapshot() {
     [[ -n "$inner" ]] || die "could not locate state/ in extracted snapshot"
     mv "$inner" "$MASTER"; rm -rf "$tmp"
   fi
-  [[ -f "$MASTER/state/v27/mainnet/version" ]] || die "extracted snapshot missing state/v27/mainnet/version"
-  log "snapshot ready: db v$(cat "$MASTER/state/v27/mainnet/version")"
+  version_file="$(find "$MASTER/state" -mindepth 3 -maxdepth 3 -type f -path '*/mainnet/version' -print -quit 2>/dev/null || true)"
+  [[ -n "$version_file" ]] || die "extracted snapshot missing state/v*/mainnet/version"
+  log "snapshot ready: db v$(cat "$version_file")"
 }
 
 # ---- 2. release binary (download once per tag, cached) -----------------------

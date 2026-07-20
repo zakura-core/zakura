@@ -14,12 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature): export Mainnet checkpoints and the coupled VCT frontier artifact
   from a quiesced state database without a running node.
 
-## [1.0.2-rc0] - 2026-07-19
+## [1.0.2] - 2026-07-20
 
 ### Changed
 
-- Updated the bundled tools to the release-candidate Zakura crate graph; no
-  APIs defined in this crate changed.
+- Updated the bundled tools to the Zakura v1.0.2 crate graph; no APIs defined
+  in this crate changed.
 
 ## [1.0.1] - 2026-07-17
 

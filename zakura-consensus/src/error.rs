@@ -423,6 +423,8 @@ impl TransactionError {
             | NotEnoughFlags
             | NotEnoughIronwoodFlags
             | OrchardHasEnableCrossAddress
+            | OrchardProofSize
+            | IronwoodProofSize
             | WrongConsensusBranchId
             | MissingConsensusBranchId
             | LockedUntilAfterBlockHeight(_)
@@ -431,6 +433,13 @@ impl TransactionError {
             // NU6.2 mempool transactions are invalid under NU6.3 rules, but
             // honest peers can relay them briefly while their chain tips converge.
             WrongConsensusBranchIdNu6_3GracePeriod => 0,
+
+            // TODO: Consider add peer penalty 1 if these are very old
+            DuplicateTransparentSpend(_)
+            | DuplicateSproutNullifier(_)
+            | DuplicateSaplingNullifier(_)
+            | DuplicateOrchardNullifier(_)
+            | DuplicateIronwoodNullifier(_) => 0,
 
             // Standardness (policy) rejections must not be punished: non-standard
             // transactions are consensus-valid, and zcashd relays a reject message
@@ -489,6 +498,25 @@ mod tests {
             TransactionError::RedPallas(zakura_chain::primitives::reddsa::Error::InvalidSignature),
         ] {
             assert_eq!(error.mempool_misbehavior_score(), 100);
+        }
+    }
+
+    #[test]
+    fn duplicate_spend_errors_have_no_misbehavior_score() {
+        let orchard_nullifier = orchard::Nullifier::try_from([0; 32])
+            .expect("zero is a valid Pallas base-field encoding");
+
+        for error in [
+            TransactionError::DuplicateTransparentSpend(transparent::OutPoint {
+                hash: [0; 32].into(),
+                index: 0,
+            }),
+            TransactionError::DuplicateSproutNullifier([0; 32].into()),
+            TransactionError::DuplicateSaplingNullifier([0; 32].into()),
+            TransactionError::DuplicateOrchardNullifier(orchard_nullifier),
+            TransactionError::DuplicateIronwoodNullifier(orchard_nullifier),
+        ] {
+            assert_eq!(error.mempool_misbehavior_score(), 0);
         }
     }
 }

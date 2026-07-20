@@ -7,12 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.2.0-rc0] - 2026-07-19
+## [1.2.0] - 2026-07-20
 
 ### Added
 
 - Added `NoteCommitmentTrees::update_sprout_tree` for updating the Sprout
   note-commitment tree from a block.
+
+### Changed
+
+- Transparent signature hashes reuse transaction-wide precomputed ZIP 143,
+  ZIP 243, and ZIP 244 components across input checks instead of hashing them
+  again for every signature
+  ([#281](https://github.com/zakura-core/zakura/pull/281)).
 
 ## [1.1.0] - 2026-07-17
 

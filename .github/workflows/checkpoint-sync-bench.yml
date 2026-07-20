@@ -115,8 +115,8 @@ jobs:
           DL_LIMIT: ${{ inputs.download_concurrency_limit }}
           TARGET_P2P_STACK: ${{ inputs.target_p2p_stack }}
           BASELINE_P2P_STACK: ${{ inputs.baseline_p2p_stack }}
-          SNAPSHOT_URL: ${{ vars.BENCH_SNAPSHOT_URL || 'https://zebra.valargroup.org/mainnet/historical/zebra-mainnet-20260616T032721Z-1707210.tar.zst' }}
-          SNAPSHOT_SHA256: ${{ vars.BENCH_SNAPSHOT_SHA256 || '19ac5d24eaa4e912cc8bbd4e7f5f2aaa2b6c132854e75d93678316016f0f2769' }}
+          SNAPSHOT_URL: ${{ vars.BENCH_SNAPSHOT_URL || 'https://zakura.valargroup.dev/mainnet/historical/zakura-mainnet-20260717T095333Z-1707210.tar.zst' }}
+          SNAPSHOT_SHA256: ${{ vars.BENCH_SNAPSHOT_SHA256 || '2bcb3786252300b4163b38a49b2d3a8015ba581d7d3efc854e6ed662a18258ac' }}
           START_HEIGHT: ${{ vars.BENCH_SNAPSHOT_START_HEIGHT || '1707210' }}
           BENCH_HOME: ${{ vars.BENCH_HOME || '/opt/zakura-bench' }}
           OUT_DIR: ${{ github.workspace }}/bench-out

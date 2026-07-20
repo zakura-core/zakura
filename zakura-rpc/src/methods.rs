@@ -1918,7 +1918,7 @@ where
             }),
 
             zakura_state::ReadResponse::AnyChainTransaction(None) => {
-                Err("No such mempool or main chain transaction")
+                Err("Transaction not found in mempool or best chain")
                     .map_error(server::error::LegacyCode::InvalidAddressOrKey)
             }
 

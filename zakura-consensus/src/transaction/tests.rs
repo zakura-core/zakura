@@ -15,7 +15,8 @@ use color_eyre::eyre::Report;
 use futures::{FutureExt, TryFutureExt};
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use tokio::time::timeout;
-use tower::{buffer::Buffer, service_fn, ServiceExt};
+use tower::{buffer::Buffer, service_fn, Service, ServiceExt};
+use tower_batch_control::BatchControl;
 
 use zakura_chain::{
     amount::{Amount, NegativeAllowed, NonNegative},
@@ -2994,6 +2995,133 @@ fn v4_with_sapling_spends() {
     });
 }
 
+/// An invalid Sapling proof is reported as a typed verification error by both
+/// the batch verifier and its single-verification fallback.
+#[test]
+fn v4_with_invalid_sapling_proof_returns_typed_error() {
+    let _init_guard = zakura_test::init();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        let (height, mut transaction) = test_transactions(&network)
+            .rev()
+            .find(|(_, transaction)| {
+                !transaction.is_coinbase()
+                    && transaction.inputs().is_empty()
+                    && transaction.sapling_spends_per_anchor().next().is_some()
+            })
+            .expect("test vectors include a V4 transaction with Sapling spends");
+
+        modify_first_sapling_spend_proof(
+            Arc::get_mut(&mut transaction).expect("transaction only has one active reference"),
+            SaplingProofModification::Corrupt,
+        );
+
+        let sighasher = transaction
+            .sighasher(
+                NetworkUpgrade::current(&network, height),
+                Arc::new(Vec::new()),
+            )
+            .expect("test fixture has no transparent inputs");
+        let batch_bundle = sighasher
+            .sapling_bundle()
+            .expect("test fixture has Sapling shielded data");
+        let single_bundle = sighasher
+            .sapling_bundle()
+            .expect("test fixture has Sapling shielded data");
+        let synchronous_check_bundle = sighasher
+            .sapling_bundle()
+            .expect("test fixture has Sapling shielded data");
+        let sighash = sighasher.sighash(HashType::ALL, None);
+
+        let mut verifier = sapling_crypto::BatchValidator::default();
+        assert!(
+            verifier.check_bundle(synchronous_check_bundle, sighash.into()),
+            "the corrupted proof must pass synchronous checks and fail batch validation"
+        );
+
+        let mut batch_verifier = crate::primitives::sapling::Verifier::default();
+        let batch_result = batch_verifier.call(BatchControl::Item(
+            crate::primitives::sapling::Item::new(batch_bundle, sighash),
+        ));
+        let flush_result = batch_verifier.call(BatchControl::Flush);
+        let (batch_result, flush_result) = futures::join!(batch_result, flush_result);
+        flush_result.expect("batch flush must complete");
+
+        assert_sapling_verification_error(
+            batch_result.expect_err("corrupted Sapling proof must be rejected"),
+        );
+
+        let single_result = crate::primitives::sapling::verify_single(
+            crate::primitives::sapling::Item::new(single_bundle, sighash),
+        )
+        .await;
+        assert_sapling_verification_error(
+            single_result.expect_err("corrupted Sapling proof must be rejected"),
+        );
+    });
+}
+
+/// A malformed Sapling proof is reported as a typed verification error before
+/// it is queued for batch validation.
+#[test]
+fn v4_with_malformed_sapling_proof_returns_typed_error() {
+    let _init_guard = zakura_test::init();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        let (height, mut transaction) = test_transactions(&network)
+            .rev()
+            .find(|(_, transaction)| {
+                !transaction.is_coinbase()
+                    && transaction.inputs().is_empty()
+                    && transaction.sapling_spends_per_anchor().next().is_some()
+            })
+            .expect("test vectors include a V4 transaction with Sapling spends");
+
+        modify_first_sapling_spend_proof(
+            Arc::get_mut(&mut transaction).expect("transaction only has one active reference"),
+            SaplingProofModification::Zero,
+        );
+
+        let sighasher = transaction
+            .sighasher(
+                NetworkUpgrade::current(&network, height),
+                Arc::new(Vec::new()),
+            )
+            .expect("test fixture has no transparent inputs");
+        let check_bundle = sighasher
+            .sapling_bundle()
+            .expect("test fixture has Sapling shielded data");
+        let bundle = sighasher
+            .sapling_bundle()
+            .expect("test fixture has Sapling shielded data");
+        let sighash = sighasher.sighash(HashType::ALL, None);
+
+        let mut verifier = sapling_crypto::BatchValidator::default();
+        assert!(
+            !verifier.check_bundle(check_bundle, sighash.into()),
+            "the malformed proof must fail synchronous bundle checks"
+        );
+
+        let result = crate::primitives::sapling::verify_single(
+            crate::primitives::sapling::Item::new(bundle, sighash),
+        )
+        .await;
+        assert_sapling_verification_error(
+            result.expect_err("malformed Sapling proof must be rejected"),
+        );
+    });
+}
+
+fn assert_sapling_verification_error(error: crate::BoxError) {
+    let error = error
+        .downcast::<TransactionError>()
+        .expect("Sapling verification failure must be a TransactionError");
+
+    assert_eq!(*error, TransactionError::SaplingVerificationFailed);
+}
+
 /// Test if a V4 transaction with a duplicate Sapling spend is rejected by the verifier.
 #[test]
 fn v4_with_duplicate_sapling_spends() {
@@ -3399,6 +3527,69 @@ fn set_first_sapling_spend_value_commitment<A: sapling::AnchorVariant + Clone>(
             spends_vec[0].cv = value_commitment;
             *spends = AtLeastOne::from_vec(spends_vec)
                 .expect("replacing a field keeps at least one spend");
+        }
+        sapling::TransferData::JustOutputs { .. } => {
+            panic!("expected Sapling shielded data with spends")
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SaplingProofModification {
+    /// Keep the proof well-formed while making it invalid.
+    Corrupt,
+    /// Make the proof malformed.
+    Zero,
+}
+
+/// Modifies the first Sapling spend proof without changing the transaction's
+/// structure.
+fn modify_first_sapling_spend_proof(
+    transaction: &mut Transaction,
+    modification: SaplingProofModification,
+) {
+    match transaction {
+        Transaction::V4 {
+            sapling_shielded_data: Some(shielded_data),
+            ..
+        } => modify_first_sapling_spend_proof_in_transfers(
+            &mut shielded_data.transfers,
+            modification,
+        ),
+        Transaction::V5 {
+            sapling_shielded_data: Some(shielded_data),
+            ..
+        }
+        | Transaction::V6 {
+            sapling_shielded_data: Some(shielded_data),
+            ..
+        } => modify_first_sapling_spend_proof_in_transfers(
+            &mut shielded_data.transfers,
+            modification,
+        ),
+        _ => panic!("expected a transaction with Sapling spends"),
+    }
+}
+
+fn modify_first_sapling_spend_proof_in_transfers<A: sapling::AnchorVariant + Clone>(
+    transfers: &mut sapling::TransferData<A>,
+    modification: SaplingProofModification,
+) {
+    match transfers {
+        sapling::TransferData::SpendsAndMaybeOutputs { spends, .. } => {
+            let mut spends_vec = spends.as_slice().to_vec();
+            match modification {
+                SaplingProofModification::Corrupt => {
+                    // A Groth16 proof has two 48-byte compressed G1 elements around a
+                    // 96-byte compressed G2 element. Swapping the G1 elements keeps the
+                    // proof well-formed but invalid.
+                    let (first, rest) = spends_vec[0].zkproof.0.split_at_mut(48);
+                    first.swap_with_slice(&mut rest[96..144]);
+                }
+                SaplingProofModification::Zero => spends_vec[0].zkproof.0 = [0; 192],
+            }
+            *spends = AtLeastOne::from_vec(spends_vec)
+                .expect("replacing a proof keeps at least one spend");
         }
         sapling::TransferData::JustOutputs { .. } => {
             panic!("expected Sapling shielded data with spends")

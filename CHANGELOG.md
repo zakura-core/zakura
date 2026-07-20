@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Keep valid internal-miner work running across mempool-only block template
+  updates ([#226](https://github.com/zakura-core/zakura/pull/226)).
 - Honor `disable_pow = true` during native header sync on configured Testnets,
   matching semantic and checkpoint block verification
   ([#289](https://github.com/zakura-core/zakura/pull/289)).

@@ -24,7 +24,7 @@ pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_419_500;
 ///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
 /// - Currently set to 18 days
 ///
-/// Note: v1.0.2-rc1 spans the expected Ironwood activation (height 3,428,143,
+/// Note: v1.0.2 spans the expected Ironwood activation (height 3,428,143,
 /// ~2026-07-28) and halts about ten days after it (~2026-08-07, height 3,440,236),
 /// forcing migration to the post-Ironwood release.
 pub const EOS_PANIC_AFTER: u32 = 18;

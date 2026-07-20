@@ -18,10 +18,10 @@ impl PeerRoutine {
         });
     }
 
-    pub(super) fn trace_protocol_reject_liveness(&self, error: &str) {
-        self.emit(bs_trace::BLOCK_PEER_PROTOCOL_REJECT, |row| {
+    pub(super) fn trace_liveness_park(&self, error: &str) {
+        self.emit(bs_trace::BLOCK_PEER_PARKED, |row| {
             row.peer = Some(trace_peer(&self.peer));
-            row.reason = Some(CLOSE_BLOCK_SYNC_NO_BLOCK_PROGRESS);
+            row.reason = Some(PARK_BLOCK_SYNC_NO_BLOCK_PROGRESS);
             row.error = Some(error.to_string());
             row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
             row.bbr_cwnd = Some(saturating_usize(self.window.bbr_effective_cwnd()));

@@ -283,7 +283,15 @@ impl HeaderDriverTraceExt for ZakuraTrace {
                 range_start: payload.range().start().0.into(),
                 range_count: payload.range().count().into(),
             },
-            HeaderSyncAction::QueryBestHeaderTip => ReceivedAction::Action {
+            HeaderSyncAction::AuthenticateHeaderRoots {
+                operation, payload, ..
+            } => ReceivedAction::HeaderRange {
+                action: "authenticate_header_roots",
+                peer: zakura_trace_peer_label(&operation.wire_request.peer),
+                range_start: payload.range().start().0.into(),
+                range_count: payload.range().count().into(),
+            },
+            HeaderSyncAction::QueryBestHeaderTip { .. } => ReceivedAction::Action {
                 action: "query_best_header_tip",
             },
             HeaderSyncAction::QueryHeadersByHeightRange {
@@ -515,6 +523,7 @@ impl HeaderDriverTraceExt for ZakuraTrace {
             range_count: count.into(),
             result: match kind {
                 HeaderSyncCommitFailureKind::InvalidPeerRange => "invalid_peer_range",
+                HeaderSyncCommitFailureKind::UnknownAnchor => "unknown_anchor",
                 HeaderSyncCommitFailureKind::Local => "local_error",
             },
             hash: anchor.to_string(),

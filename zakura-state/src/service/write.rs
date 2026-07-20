@@ -674,6 +674,10 @@ impl WriteBlockWorkerTask {
                 continue;
             }
 
+            // A successfully committed block supersedes any contextual error
+            // recorded for a different block body with the same header hash.
+            parent_error_map.shift_remove(&child_hash);
+
             if should_seed_zakura_header_from_non_finalized_commit(
                 *seed_zakura_header_from_best_chain_commits,
                 non_finalized_state,

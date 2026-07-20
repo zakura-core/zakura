@@ -1090,6 +1090,81 @@ fn test_vec243_3() -> Result<()> {
     Ok(())
 }
 
+/// Pre-V5 hash types use masked bits for selection but commit to the complete
+/// raw byte in the signature hash.
+#[test]
+fn v4_raw_sighashes_match_librustzcash() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let transaction = ZIP243_3.zcash_deserialize_into::<Transaction>()?;
+    let value = hex::decode("80f0fa0200000000")?.zcash_deserialize_into::<Amount<_>>()?;
+    let lock_script = Script::new(&hex::decode(
+        "76a914507173527b4c3318a2aecd793bf1cfed705950cf88ac",
+    )?);
+    let previous_outputs = Arc::new(vec![transparent::Output {
+        value,
+        lock_script: lock_script.clone(),
+    }]);
+
+    let native = SigHasher::new(
+        &transaction,
+        NetworkUpgrade::Sapling,
+        previous_outputs.clone(),
+    )?;
+    let librustzcash =
+        PrecomputedTxData::new(&transaction, NetworkUpgrade::Sapling, previous_outputs)?;
+    let input = Some((0, lock_script.as_raw_bytes().to_vec()));
+
+    for raw_hash_type in u8::MIN..=u8::MAX {
+        assert_eq!(
+            native.sighash_v4_raw(raw_hash_type, input.clone()),
+            crate::primitives::zcash_primitives::sighash_v4_raw(
+                &librustzcash,
+                raw_hash_type,
+                input.clone(),
+            ),
+            "raw hash type {raw_hash_type:#04x} must match librustzcash",
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn v4_raw_sighash_single_without_output_matches_zip243() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let test = zip0243::TEST_VECTORS
+        .last()
+        .expect("ZIP-243 vectors include SIGHASH_SINGLE without an output");
+    let transaction = test.tx.zcash_deserialize_into::<Transaction>()?;
+    let input_index = usize::try_from(
+        test.transparent_input
+            .expect("selected vector has a transparent input"),
+    )
+    .expect("u32 fits in usize");
+
+    assert_eq!(test.hash_type, HashType::SINGLE.bits());
+    assert!(transaction.outputs().get(input_index).is_none());
+
+    let previous_output = transparent::Output {
+        value: test.amount.try_into()?,
+        lock_script: Script::new(&test.script_code),
+    };
+    let native = SigHasher::new(
+        &transaction,
+        NetworkUpgrade::try_from(test.consensus_branch_id).expect("network upgrade"),
+        Arc::new(mock_pre_v5_output_list(previous_output, input_index)),
+    )?;
+    let raw_hash_type = u8::try_from(test.hash_type).expect("ZIP-243 hash type fits in one byte");
+    let input = Some((input_index, test.script_code.clone()));
+
+    assert_eq!(
+        native.sighash_v4_raw(raw_hash_type, input),
+        SigHash(test.sighash),
+    );
+
+    Ok(())
+}
+
 #[test]
 fn zip143_sighash() -> Result<()> {
     let _init_guard = zakura_test::init();
@@ -1191,36 +1266,220 @@ fn zip244_sighash() -> Result<()> {
                 })
                 .collect(),
         );
+        let sighasher = transaction
+            .sighasher(NetworkUpgrade::Nu5, all_previous_outputs)
+            .expect("network upgrade is valid for tx");
 
-        let result = hex::encode(
-            transaction
-                .sighash(
-                    NetworkUpgrade::Nu5,
-                    HashType::ALL,
-                    all_previous_outputs.clone(),
-                    None,
-                )
-                .expect("network upgrade is valid for tx"),
-        );
+        let result = hex::encode(sighasher.sighash(HashType::ALL, None));
         let expected = hex::encode(test.sighash_shielded);
         assert_eq!(expected, result, "test #{i}: sighash does not match");
 
-        if let Some(sighash_all) = test.sighash_all {
-            let result = hex::encode(
-                transaction
-                    .sighash(
-                        NetworkUpgrade::Nu5,
-                        HashType::ALL,
-                        all_previous_outputs,
-                        test.transparent_input
-                            .map(|idx| (idx as _, test.script_pubkeys[idx as usize].clone())),
-                    )
-                    .expect("network upgrade is valid for tx"),
+        for (hash_type, expected) in [
+            (HashType::ALL, test.sighash_all),
+            (HashType::NONE, test.sighash_none),
+            (HashType::SINGLE, test.sighash_single),
+            (HashType::ALL_ANYONECANPAY, test.sighash_all_anyone),
+            (HashType::NONE_ANYONECANPAY, test.sighash_none_anyone),
+            (HashType::SINGLE_ANYONECANPAY, test.sighash_single_anyone),
+        ] {
+            let Some(expected) = expected else {
+                continue;
+            };
+            let input_index = usize::try_from(
+                test.transparent_input
+                    .expect("transparent sighash vector has an input index"),
+            )
+            .expect("u32 input index fits in usize");
+            let result = hex::encode(sighasher.sighash(
+                hash_type,
+                Some((input_index, test.script_pubkeys[input_index].clone())),
+            ));
+            assert_eq!(
+                hex::encode(expected),
+                result,
+                "test #{i}: {hash_type:?} sighash does not match"
             );
-            let expected = hex::encode(sighash_all);
-            assert_eq!(expected, result, "test #{i}: sighash does not match");
         }
     }
+
+    Ok(())
+}
+
+#[test]
+#[should_panic(expected = "raw signature hash types are only supported for pre-V5 transactions")]
+fn zip244_rejects_the_raw_pre_v5_sighash_path() {
+    let sighasher = EMPTY_V5_TX
+        .sighasher(NetworkUpgrade::Nu5, Arc::new(Vec::new()))
+        .expect("NU5 is valid for a V5 transaction");
+
+    let _ = sighasher.sighash_v4_raw(0x41, None);
+}
+
+fn v6_transparent_sighash_test_data() -> Result<(Transaction, Arc<Vec<transparent::Output>>, usize)>
+{
+    let test = ironwood_v6_tx_hash::TEST_VECTORS
+        .iter()
+        .find(|test| test.scenario == "transparent_sighashes")
+        .expect("V6 vectors include transparent sighashes");
+    let mut tx_bytes = test.tx.to_vec();
+    tx_bytes[4..8].copy_from_slice(&crate::parameters::TX_V6_VERSION_GROUP_ID.to_le_bytes());
+    tx_bytes[8..12].copy_from_slice(
+        &u32::from(
+            NetworkUpgrade::Nu6_3
+                .branch_id()
+                .expect("NU6.3 has a consensus branch ID"),
+        )
+        .to_le_bytes(),
+    );
+
+    let transaction = tx_bytes.zcash_deserialize_into::<Transaction>()?;
+    let previous_outputs: Arc<Vec<transparent::Output>> = Arc::new(
+        test.amounts
+            .iter()
+            .zip(test.script_pubkeys.iter())
+            .map(|(amount, script_pubkey)| transparent::Output {
+                value: (*amount).try_into().expect("vector amount is valid"),
+                lock_script: Script::new(script_pubkey),
+            })
+            .collect(),
+    );
+    let input_index = usize::try_from(
+        test.transparent_input
+            .expect("transparent vector has an input index"),
+    )
+    .expect("u32 fits in usize");
+
+    Ok((transaction, previous_outputs, input_index))
+}
+
+#[test]
+fn v6_zip244_sighash_matches_librustzcash() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    let (transaction, previous_outputs, input_index) = v6_transparent_sighash_test_data()?;
+    let native = SigHasher::new(
+        &transaction,
+        NetworkUpgrade::Nu6_3,
+        previous_outputs.clone(),
+    )?;
+    let librustzcash =
+        PrecomputedTxData::new(&transaction, NetworkUpgrade::Nu6_3, previous_outputs)?;
+
+    assert_eq!(
+        native.sighash(HashType::ALL, None),
+        crate::primitives::zcash_primitives::sighash(&librustzcash, HashType::ALL, None),
+    );
+
+    for hash_type in [
+        HashType::ALL,
+        HashType::NONE,
+        HashType::SINGLE,
+        HashType::ALL_ANYONECANPAY,
+        HashType::NONE_ANYONECANPAY,
+        HashType::SINGLE_ANYONECANPAY,
+    ] {
+        let input = Some((input_index, Vec::new()));
+        assert_eq!(
+            native.sighash(hash_type, input.clone()),
+            crate::primitives::zcash_primitives::sighash(&librustzcash, hash_type, input),
+            "V6 {hash_type:?} sighash must match librustzcash",
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn script_code_commitment_is_version_specific() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    fn assert_script_code_behavior(
+        transaction: &Transaction,
+        network_upgrade: NetworkUpgrade,
+        previous_outputs: Arc<Vec<transparent::Output>>,
+        input_index: usize,
+        script_code_is_committed: bool,
+    ) -> Result<()> {
+        let native = SigHasher::new(transaction, network_upgrade, previous_outputs.clone())?;
+        let librustzcash = PrecomputedTxData::new(transaction, network_upgrade, previous_outputs)?;
+        let [(native_a, librustzcash_a), (native_b, librustzcash_b)] = [vec![0x51], vec![0x52]]
+            .map(|script_code| {
+                let input = Some((input_index, script_code));
+                (
+                    native.sighash(HashType::ALL, input.clone()),
+                    crate::primitives::zcash_primitives::sighash(
+                        &librustzcash,
+                        HashType::ALL,
+                        input,
+                    ),
+                )
+            });
+
+        assert_eq!(native_a, librustzcash_a);
+        assert_eq!(native_b, librustzcash_b);
+        assert_eq!(
+            native_a != native_b,
+            script_code_is_committed,
+            "{network_upgrade:?} script code commitment differs from expectation",
+        );
+
+        Ok(())
+    }
+
+    let v4_transaction = ZIP243_3.zcash_deserialize_into::<Transaction>()?;
+    let v4_value = hex::decode("80f0fa0200000000")?.zcash_deserialize_into::<Amount<_>>()?;
+    let v4_previous_outputs = Arc::new(vec![transparent::Output {
+        value: v4_value,
+        lock_script: Script::new(&hex::decode(
+            "76a914507173527b4c3318a2aecd793bf1cfed705950cf88ac",
+        )?),
+    }]);
+    assert_script_code_behavior(
+        &v4_transaction,
+        NetworkUpgrade::Sapling,
+        v4_previous_outputs,
+        0,
+        true,
+    )?;
+
+    let v5_test = zip0244::TEST_VECTORS
+        .iter()
+        .find(|test| test.transparent_input.is_some())
+        .expect("ZIP-244 vectors include a transparent sighash");
+    let v5_transaction = v5_test.tx.zcash_deserialize_into::<Transaction>()?;
+    let v5_previous_outputs = Arc::new(
+        v5_test
+            .amounts
+            .iter()
+            .zip(v5_test.script_pubkeys.iter())
+            .map(|(amount, script_pubkey)| transparent::Output {
+                value: (*amount).try_into().expect("vector amount is valid"),
+                lock_script: Script::new(script_pubkey),
+            })
+            .collect(),
+    );
+    let v5_input_index = usize::try_from(
+        v5_test
+            .transparent_input
+            .expect("selected vector has a transparent input"),
+    )
+    .expect("u32 fits in usize");
+    assert_script_code_behavior(
+        &v5_transaction,
+        NetworkUpgrade::Nu5,
+        v5_previous_outputs,
+        v5_input_index,
+        false,
+    )?;
+
+    let (v6_transaction, v6_previous_outputs, v6_input_index) = v6_transparent_sighash_test_data()?;
+    assert_script_code_behavior(
+        &v6_transaction,
+        NetworkUpgrade::Nu6_3,
+        v6_previous_outputs,
+        v6_input_index,
+        false,
+    )?;
 
     Ok(())
 }

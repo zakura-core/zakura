@@ -53,11 +53,8 @@ impl From<Client> for LoadTrackedClient {
         LoadTrackedClient {
             service,
             connection_info,
-            trace_id: NEXT_PEER_TRACE_ID
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-                    Some(id.saturating_add(1))
-                })
-                .expect("trace ID update succeeds because its closure always returns Some"),
+            // Wrap-around is unreachable for a process-local u64 counter.
+            trace_id: NEXT_PEER_TRACE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 }

@@ -339,13 +339,19 @@ impl Transaction {
     /// `all_previous_outputs` represents the UTXOs being spent by each input
     /// in the transaction.
     ///
-    /// The `input_index_script_code` tuple indicates the index of the
-    /// transparent Input for which we are producing a sighash and the
-    /// respective script code being validated, or None if it's a shielded
-    /// input.
+    /// The `input_index_script_code` tuple contains the transparent input index
+    /// and the script code being validated, or `None` for a shielded signature.
+    /// Pre-V5 sighashes commit to the supplied script code. V5 and later
+    /// transactions ignore it because ZIP-244 commits to the spent output's
+    /// `scriptPubKey` instead.
+    ///
+    /// This method only calculates a digest. For V5 and later transactions,
+    /// callers must separately reject `SIGHASH_SINGLE` when the transparent
+    /// input does not have a corresponding output.
     ///
     /// # Panics
     ///
+    /// - if `hash_type` is not one of the six canonical signature hash types
     /// - if passed in any NetworkUpgrade from before NetworkUpgrade::Overwinter
     /// - if called on a v1 or v2 transaction
     /// - if the input index points to a transparent::Input::CoinBase

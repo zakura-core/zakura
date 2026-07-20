@@ -1024,11 +1024,12 @@ mod tests {
                 HeaderSyncAction::CommitHeaderRange {
                     operation,
                     anchor,
-                    start_height,
-                    headers,
+                    payload,
                     finalized,
                     ..
                 } => {
+                    let start_height = payload.range().start();
+                    let (_range, headers, _body_sizes, _tree_aux_roots) = payload.into_parts();
                     let result = local
                         .store
                         .lock()
@@ -1399,10 +1400,11 @@ mod tests {
                     Some(HeaderSyncAction::CommitHeaderRange {
                         operation,
                         anchor,
-                        start_height,
-                        headers,
+                        payload,
                         ..
                     }) => {
+                        let start_height = payload.range().start();
+                        let (_range, headers, _body_sizes, _tree_aux_roots) = payload.into_parts();
                         return Ok(ControlledHeaderCommit {
                             operation,
                             anchor,

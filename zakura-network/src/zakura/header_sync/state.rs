@@ -155,8 +155,8 @@ impl HeaderSyncCore {
                 batch_len = count_between(batch_start, checkpoint);
             }
             self.schedule.ensure_forward(RangeRequest {
-                start_height: batch_start,
-                count: batch_len,
+                range: CheckedHeaderRange::from_count(batch_start, batch_len)
+                    .expect("bounded non-empty batch has checked geometry"),
                 anchor_hash,
                 finalized,
                 want_tree_aux_roots: true,
@@ -218,8 +218,7 @@ impl VctRootRepair {
             height,
             generation,
             range: RangeRequest {
-                start_height: height,
-                count,
+                range: CheckedHeaderRange::from_count(height, count)?,
                 anchor_hash: Some(anchor_hash),
                 finalized: false,
                 want_tree_aux_roots: true,
@@ -535,7 +534,7 @@ impl HeaderSyncPeerMeters {
 #[derive(Clone, Debug)]
 pub(super) struct OutstandingRange {
     pub(super) wire_request: HeaderSyncWireRequestIdentity,
-    pub(super) range: RangeRequest,
+    pub(super) range_request: RangeRequest,
     pub(super) deadline: Instant,
     pub(super) purpose: RangePurpose,
     pub(super) phase: OutstandingPhase,
@@ -553,9 +552,7 @@ pub(super) struct BufferedHeaderRange {
     pub(super) wire_request: HeaderSyncWireRequestIdentity,
     pub(super) range: RangeRequest,
     pub(super) purpose: RangePurpose,
-    pub(super) headers: Vec<Arc<block::Header>>,
-    pub(super) body_sizes: Vec<u32>,
-    pub(super) tree_aux_roots: Vec<BlockCommitmentRoots>,
+    pub(super) payload: HeaderRangePayload,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -566,8 +563,7 @@ pub(super) struct PendingOperation {
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct RangeRequest {
-    pub(super) start_height: block::Height,
-    pub(super) count: u32,
+    pub(super) range: CheckedHeaderRange,
     pub(super) anchor_hash: Option<block::Hash>,
     pub(super) finalized: bool,
     pub(super) want_tree_aux_roots: bool,
@@ -575,9 +571,16 @@ pub(super) struct RangeRequest {
 }
 
 impl RangeRequest {
+    pub(super) fn start_height(self) -> block::Height {
+        self.range.start()
+    }
+
+    pub(super) fn count(self) -> u32 {
+        self.range.count()
+    }
+
     pub(super) fn end_height(self) -> block::Height {
-        range_end_height(self.start_height, self.count)
-            .expect("range request is non-zero and clamped to the remaining height domain")
+        self.range.end()
     }
 
     pub(super) fn suffix_after(
@@ -590,9 +593,9 @@ impl RangeRequest {
             return None;
         }
         let start_height = next_height(covered_through)?;
+        let geometry = CheckedHeaderRange::from_bounds(start_height, end_height)?;
         Some(Self {
-            start_height,
-            count: count_between(start_height, end_height),
+            range: geometry,
             anchor_hash: Some(anchor_hash),
             ..self
         })

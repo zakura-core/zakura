@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Treat IPv4 and IPv4-mapped IPv6 peer addresses as the same address when
+  enforcing bans, preventing banned peers from reconnecting through the
+  alternate representation
+  ([#314](https://github.com/zakura-core/zakura/pull/314)).
 - Keep valid internal-miner work running across mempool-only block template
   updates ([#226](https://github.com/zakura-core/zakura/pull/226)).
 - Honor `disable_pow = true` during native header sync on configured Testnets,

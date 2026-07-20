@@ -391,7 +391,7 @@ pub(super) fn deliver(
             return Flow::Reject(SinkReject::protocol(protocol_error));
         };
 
-        let (msg, request_id) = match HeaderSyncMessage::decode_frame(
+        let msg = match HeaderSyncMessage::decode_frame(
             frame,
             HeaderSyncDecodeContext::for_headers_response(expected, expected.count),
         ) {
@@ -409,21 +409,16 @@ pub(super) fn deliver(
         };
 
         let HeaderSyncMessage::Headers {
-            headers,
-            body_sizes,
-            tree_aux_roots,
+            request_id,
+            entries,
         } = msg
         else {
             unreachable!("Headers frame type agreement guarantees a Headers message");
         };
-        let entries = HeaderRangeEntry::from_parallel(
-            expected.start_height,
-            headers,
-            body_sizes,
-            tree_aux_roots,
-        )
-        .expect("decoded Headers vectors are structurally aligned");
-        let request_id = request_id.expect("decoded Headers response has a mandatory request ID");
+        debug_assert_eq!(
+            request_id, expected.request_id,
+            "decoded Headers request ID matches the ID used for correlation"
+        );
         return forward(
             handle,
             HeaderSyncEvent::WireHeaders {
@@ -437,7 +432,7 @@ pub(super) fn deliver(
         );
     }
 
-    let (msg, request_id) = match decode_control_frame(frame) {
+    let msg = match decode_control_frame(frame) {
         Ok(msg) => msg,
         Err(error) => {
             let protocol_error =
@@ -450,15 +445,13 @@ pub(super) fn deliver(
         }
     };
 
-    match (msg, request_id) {
-        (
-            HeaderSyncMessage::GetHeaders {
-                start_height,
-                count,
-                want_tree_aux_roots,
-            },
-            Some(request_id),
-        ) => forward(
+    match msg {
+        HeaderSyncMessage::GetHeaders {
+            request_id,
+            start_height,
+            count,
+            want_tree_aux_roots,
+        } => forward(
             handle,
             HeaderSyncEvent::WireGetHeaders {
                 peer: peer_id,
@@ -469,10 +462,7 @@ pub(super) fn deliver(
                 want_tree_aux_roots,
             },
         ),
-        // A `GetHeaders` without a request ID cannot reach here: the decoder rejects
-        // a missing or zero ID before returning. Every other message type is
-        // uncorrelated and carries none.
-        (msg, _) => forward(
+        msg => forward(
             handle,
             HeaderSyncEvent::SessionWireMessage {
                 peer: peer_id,
@@ -556,9 +546,7 @@ fn forward(handle: &HeaderSyncHandle, event: HeaderSyncEvent) -> Flow<()> {
 /// in [`deliver`]; a `Headers` frame reaching this path has no correlated
 /// request, so it is rejected as `UnsolicitedHeaders` exactly as the old
 /// `decode_header_sync_frame` did.
-fn decode_control_frame(
-    frame: Frame,
-) -> Result<(HeaderSyncMessage, Option<HeaderSyncRequestId>), HeaderSyncWireError> {
+fn decode_control_frame(frame: Frame) -> Result<HeaderSyncMessage, HeaderSyncWireError> {
     if u8::try_from(frame.message_type).ok() == Some(MSG_HS_HEADERS) {
         return Err(HeaderSyncWireError::UnsolicitedHeaders);
     }
@@ -780,17 +768,18 @@ mod tests {
             run_inbound,
             &PIPE_SHAPE,
         );
-        let empty_headers = HeaderSyncMessage::Headers {
-            headers: Vec::new(),
-            body_sizes: Vec::new(),
-            tree_aux_roots: Vec::new(),
-        };
-        let second_frame = empty_headers
-            .encode_frame(Some(second_id))
-            .expect("v7 response encodes");
-        let first_frame = empty_headers
-            .encode_frame(Some(first_id))
-            .expect("v7 response encodes");
+        let second_frame = HeaderSyncMessage::Headers {
+            request_id: second_id,
+            entries: Vec::new(),
+        }
+        .encode_frame()
+        .expect("v8 response encodes");
+        let first_frame = HeaderSyncMessage::Headers {
+            request_id: first_id,
+            entries: Vec::new(),
+        }
+        .encode_frame()
+        .expect("v8 response encodes");
 
         assert!(matches!(pipe.run_one(second_frame), Flow::Continue(())));
         match events.try_recv() {
@@ -808,9 +797,12 @@ mod tests {
             other => panic!("expected first response to be forwarded by id, got {other:?}"),
         }
 
-        let duplicate = empty_headers
-            .encode_frame(Some(second_id))
-            .expect("duplicate v7 response encodes");
+        let duplicate = HeaderSyncMessage::Headers {
+            request_id: second_id,
+            entries: Vec::new(),
+        }
+        .encode_frame()
+        .expect("duplicate v8 response encodes");
         assert!(matches!(pipe.run_one(duplicate), Flow::Done));
         assert!(matches!(
             events.try_recv(),
@@ -838,12 +830,11 @@ mod tests {
         );
         for _ in 0..2 {
             let frame = HeaderSyncMessage::Headers {
-                headers: Vec::new(),
-                body_sizes: Vec::new(),
-                tree_aux_roots: Vec::new(),
+                request_id,
+                entries: Vec::new(),
             }
-            .encode_frame(Some(request_id))
-            .expect("v7 response encodes");
+            .encode_frame()
+            .expect("v8 response encodes");
 
             assert!(matches!(pipe.run_one(frame), Flow::Done));
             assert!(matches!(
@@ -961,12 +952,11 @@ mod tests {
             &PIPE_SHAPE,
         );
         let frame = HeaderSyncMessage::Headers {
-            headers: Vec::new(),
-            body_sizes: Vec::new(),
-            tree_aux_roots: Vec::new(),
+            request_id,
+            entries: Vec::new(),
         }
-        .encode_frame(Some(request_id))
-        .expect("v7 response encodes");
+        .encode_frame()
+        .expect("v8 response encodes");
 
         assert!(matches!(pipe.run_one(frame), Flow::Reject(_)));
         match events.try_recv() {
@@ -1028,10 +1018,10 @@ mod tests {
                 .expect("block 2 vector parses"),
         );
         let frame_one = HeaderSyncMessage::NewBlock(block_one.clone())
-            .encode_frame(None)
+            .encode_frame()
             .expect("new block frame encodes");
         let frame_two = HeaderSyncMessage::NewBlock(block_two.clone())
-            .encode_frame(None)
+            .encode_frame()
             .expect("new block frame encodes");
 
         let mut pipe = Pipe::new(
@@ -1093,20 +1083,25 @@ mod tests {
                 .expect("block 1 vector parses"),
         );
         let solicited_headers = HeaderSyncMessage::Headers {
-            headers: vec![block_one.header.clone()],
-            body_sizes: vec![0],
-            tree_aux_roots: vec![BlockCommitmentRoots {
+            request_id,
+            entries: vec![HeaderRangeEntry {
                 height: block::Height(1),
-                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
-                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-                ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-                sapling_tx: 0,
-                orchard_tx: 0,
-                ironwood_tx: 0,
-                auth_data_root: block::merkle::AuthDataRoot::from([0u8; 32]),
+                header: block_one.header.clone(),
+                body_size: 0,
+                tree_aux_root: Some(BlockCommitmentRoots {
+                    height: block::Height(1),
+                    sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+                    orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                    ironwood_root: zakura_chain::ironwood::tree::NoteCommitmentTree::default()
+                        .root(),
+                    sapling_tx: 0,
+                    orchard_tx: 0,
+                    ironwood_tx: 0,
+                    auth_data_root: block::merkle::AuthDataRoot::from([0u8; 32]),
+                }),
             }],
         }
-        .encode_frame(Some(request_id))
+        .encode_frame()
         .expect("headers frame encodes");
 
         let mut pipe = Pipe::new(

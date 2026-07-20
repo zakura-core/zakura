@@ -376,8 +376,6 @@ pub enum HeaderSyncAction {
     SendMessage {
         /// Destination peer.
         peer: ZakuraPeerId,
-        /// Request ID the session allocated, for correlated messages.
-        request_id: Option<HeaderSyncRequestId>,
         /// Message that was queued.
         msg: HeaderSyncMessage,
     },

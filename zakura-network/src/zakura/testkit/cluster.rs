@@ -159,9 +159,9 @@ mod tests {
             HeaderSyncRequestId, HeaderSyncStartup, HeaderSyncStatus,
             HeaderSyncWireRequestIdentity, Peer, Service, ServicePeerLimits, Stream,
             ZakuraBlockSyncConfig, ZakuraConnId, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
-            ZakuraTrace, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
-            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
-            ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
+            ZakuraTrace, MAX_BS_RESPONSE_BYTES, MSG_HS_HEADERS, ZAKURA_CAP_DISCOVERY,
+            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -202,9 +202,14 @@ mod tests {
             .unwrap_or(block::Height(1));
         let tree_aux_roots = roots_from_height(start_height, headers.len());
         HeaderSyncMessage::Headers {
-            headers,
-            body_sizes,
-            tree_aux_roots,
+            request_id: HeaderSyncRequestId::new(1).expect("test request ID is non-zero"),
+            entries: HeaderRangeEntry::from_parallel(
+                start_height,
+                headers,
+                body_sizes,
+                tree_aux_roots,
+            )
+            .expect("test response vectors align"),
         }
     }
 
@@ -551,7 +556,7 @@ mod tests {
         store: Arc<StdMutex<E2eHeaderStore>>,
         observed_gaps: Arc<Mutex<Vec<(block::Height, block::Height)>>>,
         misbehaviors: Arc<Mutex<Vec<(ZakuraPeerId, HeaderSyncMisbehavior)>>>,
-        sent: Arc<Mutex<Vec<(ZakuraPeerId, Option<HeaderSyncRequestId>, HeaderSyncMessage)>>>,
+        sent: Arc<Mutex<Vec<(ZakuraPeerId, HeaderSyncMessage)>>>,
         outbound_receivers: Arc<StdMutex<Vec<FramedRecv>>>,
     }
 
@@ -734,15 +739,9 @@ mod tests {
             node: usize,
             peer: ZakuraPeerId,
             request_id: HeaderSyncRequestId,
-            start_height: block::Height,
             msg: HeaderSyncMessage,
         ) {
-            let HeaderSyncMessage::Headers {
-                headers,
-                body_sizes,
-                tree_aux_roots,
-            } = msg
-            else {
+            let HeaderSyncMessage::Headers { entries, .. } = msg else {
                 panic!("inject_headers requires a Headers message");
             };
             self.nodes[node]
@@ -754,13 +753,7 @@ mod tests {
                         session_id: E2E_SESSION_ID,
                         request_id,
                     },
-                    entries: HeaderRangeEntry::from_parallel(
-                        start_height,
-                        headers,
-                        body_sizes,
-                        tree_aux_roots,
-                    )
-                    .expect("test response vectors align"),
+                    entries,
                 })
                 .await
                 .unwrap();
@@ -884,7 +877,7 @@ mod tests {
                 Duration::from_secs(5),
                 || {
                     sent.try_lock().is_ok_and(|sent| {
-                        sent.iter().any(|(sent_peer, _, msg)| {
+                        sent.iter().any(|(sent_peer, msg)| {
                             sent_peer == &peer && matches_request(msg)
                         })
                     })
@@ -893,12 +886,15 @@ mod tests {
             .await?;
 
             let sent = sent.lock().await;
-            let (_, request_id, _) = sent
+            let (_, message) = sent
                 .iter()
                 .rev()
-                .find(|(sent_peer, _, msg)| sent_peer == &peer && matches_request(msg))
+                .find(|(sent_peer, msg)| sent_peer == &peer && matches_request(msg))
                 .expect("the awaited GetHeaders is recorded");
-            Ok(request_id.expect("an outbound GetHeaders always carries a request ID"))
+            let HeaderSyncMessage::GetHeaders { request_id, .. } = message else {
+                unreachable!("matching message is GetHeaders");
+            };
+            Ok(*request_id)
         }
 
         async fn wait_for_observed_gap(&self, node: usize) -> Result<(), BoxError> {
@@ -932,27 +928,23 @@ mod tests {
         let local = nodes[index].clone();
         while let Some(action) = actions.recv().await {
             match action {
-                HeaderSyncAction::SendMessage {
-                    peer,
-                    request_id,
-                    msg,
-                } => {
+                HeaderSyncAction::SendMessage { peer, msg } => {
                     let Some(target) = peer_to_index.get(&peer) else {
-                        local.sent.lock().await.push((peer, request_id, msg));
+                        local.sent.lock().await.push((peer, msg));
                         continue;
                     };
                     // `GetHeaders` is correlated on the wire, so the simulated
                     // transport must carry its request ID too.
                     let event = match msg {
                         HeaderSyncMessage::GetHeaders {
+                            request_id,
                             start_height,
                             count,
                             want_tree_aux_roots,
                         } => HeaderSyncEvent::WireGetHeaders {
                             peer: local.peer_id.clone(),
                             session_id: E2E_SESSION_ID,
-                            request_id: request_id
-                                .expect("an outbound GetHeaders always carries a request ID"),
+                            request_id,
                             start_height,
                             count,
                             want_tree_aux_roots,
@@ -974,11 +966,11 @@ mod tests {
                             })
                             .await;
                     } else {
-                        local.sent.lock().await.push((
-                            peer,
-                            None,
-                            HeaderSyncMessage::NewBlock(block),
-                        ));
+                        local
+                            .sent
+                            .lock()
+                            .await
+                            .push((peer, HeaderSyncMessage::NewBlock(block)));
                     }
                 }
                 HeaderSyncAction::QueryHeadersByHeightRange {
@@ -996,11 +988,7 @@ mod tests {
                         .headers_by_range(start, count);
                     let returned_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
                     if let Some(target) = peer_to_index.get(&peer) {
-                        let HeaderSyncMessage::Headers {
-                            headers,
-                            body_sizes,
-                            tree_aux_roots,
-                        } = headers_message(headers)
+                        let HeaderSyncMessage::Headers { entries, .. } = headers_message(headers)
                         else {
                             unreachable!("headers_message always returns Headers");
                         };
@@ -1013,13 +1001,7 @@ mod tests {
                                     // Echo the requester's ID, exactly as the wire does.
                                     request_id,
                                 },
-                                entries: HeaderRangeEntry::from_parallel(
-                                    start,
-                                    headers,
-                                    body_sizes,
-                                    tree_aux_roots,
-                                )
-                                .expect("test response vectors align"),
+                                entries,
                             })
                             .await;
                         let _ = local
@@ -1482,21 +1464,23 @@ mod tests {
         let headers = (start..end)
             .map(|height| mainnet_block(block_bytes(height)).header.clone())
             .collect();
-        headers_message(headers)
+        let HeaderSyncMessage::Headers { entries, .. } = headers_message(headers) else {
+            unreachable!("headers_message always returns Headers");
+        };
+        HeaderSyncMessage::Headers {
+            request_id: query.request_id,
+            entries,
+        }
     }
 
     async fn complete_controlled_query(
         handle: &HeaderSyncHandle,
         query: &ControlledHeaderQuery,
     ) -> Result<(), BoxError> {
-        let HeaderSyncMessage::Headers {
-            headers,
-            body_sizes,
-            tree_aux_roots,
-        } = headers_for_query(query)
-        else {
+        let HeaderSyncMessage::Headers { entries, .. } = headers_for_query(query) else {
             unreachable!("headers_for_query always returns Headers");
         };
+        let (headers, body_sizes, tree_aux_roots) = HeaderRangeEntry::into_parallel(entries);
         handle
             .send(HeaderSyncEvent::HeaderRangeResponseReady {
                 peer: query.peer.clone(),
@@ -2721,10 +2705,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn native_stream5_v7_correlates_reversed_physical_responses() -> Result<(), BoxError> {
+    async fn native_stream5_v8_correlates_reversed_physical_responses() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
-            "native_stream5_v7_correlates_reversed_physical_responses",
+            "native_stream5_v8_correlates_reversed_physical_responses",
             false,
         )?;
         let config = ZakuraHeaderSyncConfig {
@@ -2766,7 +2750,7 @@ mod tests {
         hostile
             .reopen_ordered_stream(ZAKURA_STREAM_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION)
             .await?;
-        await_until("v7 physical session registered", TEST_NET_TIMEOUT, || {
+        await_until("v8 physical session registered", TEST_NET_TIMEOUT, || {
             victim.header_sync().is_some_and(|handle| {
                 let peers = handle.peer_snapshot();
                 peers.inbound_peers + peers.outbound_peers == 1
@@ -2781,15 +2765,14 @@ mod tests {
             ),
         )
         .await??;
-        let (initial_status, request_id) =
+        let initial_status =
             HeaderSyncMessage::decode_frame(initial_status, HeaderSyncDecodeContext::control())?;
         assert!(matches!(initial_status, HeaderSyncMessage::Status(_)));
-        assert_eq!(request_id, None);
         hostile
             .send_ordered_raw_frame_with_version(
                 ZAKURA_STREAM_HEADER_SYNC,
                 ZAKURA_HEADER_SYNC_STREAM_VERSION,
-                status_for_tip(4, 2, 2).encode_frame(None)?,
+                status_for_tip(4, 2, 2).encode_frame()?,
             )
             .await?;
 
@@ -2806,20 +2789,16 @@ mod tests {
                 ),
             )
             .await??;
-            let (message, request_id) =
+            let message =
                 HeaderSyncMessage::decode_frame(frame, HeaderSyncDecodeContext::control())?;
             if let HeaderSyncMessage::GetHeaders {
+                request_id,
                 start_height,
                 count,
                 want_tree_aux_roots,
             } = message
             {
-                requests.push((
-                    request_id.expect("v7 GetHeaders carries a request id"),
-                    start_height,
-                    count,
-                    want_tree_aux_roots,
-                ));
+                requests.push((request_id, start_height, count, want_tree_aux_roots));
             }
         }
         assert_ne!(requests[0].0, requests[1].0);
@@ -2848,7 +2827,7 @@ mod tests {
                 .send_ordered_raw_frame_with_version(
                     ZAKURA_STREAM_HEADER_SYNC,
                     ZAKURA_HEADER_SYNC_STREAM_VERSION,
-                    headers_for_query(&query).encode_frame(Some(*request_id))?,
+                    headers_for_query(&query).encode_frame()?,
                 )
                 .await?;
         }
@@ -2887,7 +2866,7 @@ mod tests {
                 })
                 .await?;
         }
-        await_until("v7 correlated header tip", TEST_NET_TIMEOUT, || {
+        await_until("v8 correlated header tip", TEST_NET_TIMEOUT, || {
             victim
                 .header_sync()
                 .is_some_and(|handle| handle.best_header_tip().0 == block::Height(4))
@@ -2901,11 +2880,12 @@ mod tests {
                 ZAKURA_STREAM_HEADER_SYNC,
                 ZAKURA_HEADER_SYNC_STREAM_VERSION,
                 HeaderSyncMessage::GetHeaders {
+                    request_id: inbound_request_id,
                     start_height: block::Height(1),
                     count: 1,
                     want_tree_aux_roots: true,
                 }
-                .encode_frame(Some(inbound_request_id))?,
+                .encode_frame()?,
             )
             .await?;
         let query = next_controlled_header_query(&mut actions).await?;
@@ -2924,16 +2904,7 @@ mod tests {
                 ),
             )
             .await??;
-            if frame.message_type
-                == u16::from(
-                    HeaderSyncMessage::Headers {
-                        headers: Vec::new(),
-                        body_sizes: Vec::new(),
-                        tree_aux_roots: Vec::new(),
-                    }
-                    .message_type(),
-                )
-            {
+            if frame.message_type == u16::from(MSG_HS_HEADERS) {
                 assert_eq!(
                     HeaderSyncMessage::peek_headers_request_id(&frame.payload)?,
                     inbound_request_id
@@ -3057,9 +3028,7 @@ mod tests {
         // regardless of which one the hostile peer picks.
         let unsolicited_headers =
             headers_message(vec![mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone()])
-                .encode_frame(Some(
-                    HeaderSyncRequestId::new(1).expect("non-zero request id"),
-                ))?;
+                .encode_frame()?;
         unsolicited
             .send_raw_frame(ZAKURA_STREAM_HEADER_SYNC, unsolicited_headers)
             .await?;
@@ -3478,11 +3447,15 @@ mod tests {
                 victim,
                 out_of_range,
                 request_id,
-                block::Height(1),
                 HeaderSyncMessage::Headers {
-                    headers: vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()],
-                    body_sizes: vec![0],
-                    tree_aux_roots: roots_from_height(block::Height(1), 1),
+                    request_id: HeaderSyncRequestId::new(1).expect("test request ID is non-zero"),
+                    entries: HeaderRangeEntry::from_parallel(
+                        block::Height(1),
+                        vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()],
+                        vec![0],
+                        roots_from_height(block::Height(1), 1),
+                    )
+                    .expect("test response vectors align"),
                 },
             )
             .await;
@@ -3525,7 +3498,6 @@ mod tests {
                 victim,
                 response_too_long,
                 request_id,
-                block::Height(1),
                 headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
@@ -3565,7 +3537,6 @@ mod tests {
                 bad_continuity_victim,
                 bad_continuity,
                 request_id,
-                block::Height(1),
                 headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     Arc::new(non_contiguous),
@@ -3599,7 +3570,6 @@ mod tests {
                 bad_pow_victim,
                 bad_pow,
                 request_id,
-                block::Height(1),
                 headers_message(vec![Arc::new(bad_pow_header)]),
             )
             .await;
@@ -3634,7 +3604,6 @@ mod tests {
                 bad_daa_victim,
                 bad_daa,
                 request_id,
-                block::Height(1),
                 headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),

@@ -1066,13 +1066,11 @@ mod tests {
             loop {
                 if let Some(HeaderSyncAction::SendMessage {
                     peer,
-                    request_id,
-                    msg: HeaderSyncMessage::GetHeaders { .. },
+                    msg: HeaderSyncMessage::GetHeaders { request_id, .. },
                 }) = fixture.header_actions.recv().await
                 {
                     if peer == fixture.peer_id {
-                        return request_id
-                            .expect("an outbound GetHeaders always carries a request ID");
+                        return request_id;
                     }
                 }
             }

@@ -237,18 +237,17 @@ mod tests {
             event => panic!("unexpected requester event: {event:?}"),
         }
         let frame = frames.recv().await.expect("request frame is queued");
-        let (message, decoded_request_id) =
-            HeaderSyncMessage::decode(&frame.payload, HeaderSyncDecodeContext::control())
-                .expect("request frame decodes");
+        let message = HeaderSyncMessage::decode(&frame.payload, HeaderSyncDecodeContext::control())
+            .expect("request frame decodes");
         assert_eq!(
             message,
             HeaderSyncMessage::GetHeaders {
+                request_id,
                 start_height: range.start_height(),
                 count: range.count(),
                 want_tree_aux_roots: range.want_tree_aux_roots,
             }
         );
-        assert_eq!(decoded_request_id, Some(request_id));
 
         shutdown.cancel();
         assert!(matches!(

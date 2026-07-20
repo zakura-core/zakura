@@ -192,9 +192,9 @@ fn headers_message_from(
     let body_sizes = vec![0; headers.len()];
     let tree_aux_roots = roots_from_height(start_height, headers.len());
     HeaderSyncMessage::Headers {
-        headers,
-        body_sizes,
-        tree_aux_roots,
+        request_id: test_request_id(),
+        entries: HeaderRangeEntry::from_parallel(start_height, headers, body_sizes, tree_aux_roots)
+            .expect("test response vectors align"),
     }
 }
 
@@ -208,9 +208,9 @@ fn headers_message_with_sizes(
         .unwrap_or(block::Height(1));
     let tree_aux_roots = roots_from_height(start_height, headers.len());
     HeaderSyncMessage::Headers {
-        headers,
-        body_sizes,
-        tree_aux_roots,
+        request_id: test_request_id(),
+        entries: HeaderRangeEntry::from_parallel(start_height, headers, body_sizes, tree_aux_roots)
+            .expect("test response vectors align"),
     }
 }
 
@@ -218,12 +218,28 @@ fn rootless_headers_message_from(
     start_height: block::Height,
     headers: Vec<Arc<block::Header>>,
 ) -> HeaderSyncMessage {
-    let _ = start_height;
     let body_sizes = vec![0; headers.len()];
     HeaderSyncMessage::Headers {
-        headers,
-        body_sizes,
-        tree_aux_roots: Vec::new(),
+        request_id: test_request_id(),
+        entries: headers
+            .into_iter()
+            .zip(body_sizes)
+            .enumerate()
+            .map(|(offset, (header, body_size))| {
+                let offset = u32::try_from(offset).expect("test header count fits in u32");
+                HeaderRangeEntry {
+                    height: block::Height(
+                        start_height
+                            .0
+                            .checked_add(offset)
+                            .expect("test header range does not overflow"),
+                    ),
+                    header,
+                    body_size,
+                    tree_aux_root: None,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -242,9 +258,9 @@ fn finalized_headers_message_from(
     let body_sizes = vec![0; headers.len()];
     let tree_aux_roots = roots_from_height(start_height, headers.len());
     HeaderSyncMessage::Headers {
-        headers,
-        body_sizes,
-        tree_aux_roots,
+        request_id: test_request_id(),
+        entries: HeaderRangeEntry::from_parallel(start_height, headers, body_sizes, tree_aux_roots)
+            .expect("test response vectors align"),
     }
 }
 
@@ -258,9 +274,9 @@ fn finalized_headers_message_with_sizes(
         .unwrap_or(block::Height(1));
     let tree_aux_roots = roots_from_height(start_height, headers.len());
     HeaderSyncMessage::Headers {
-        headers,
-        body_sizes,
-        tree_aux_roots,
+        request_id: test_request_id(),
+        entries: HeaderRangeEntry::from_parallel(start_height, headers, body_sizes, tree_aux_roots)
+            .expect("test response vectors align"),
     }
 }
 
@@ -351,7 +367,7 @@ async fn send_get_headers(
 
 /// Encode a correlated message under [`test_request_id`].
 fn encode_correlated(message: &HeaderSyncMessage) -> Result<Vec<u8>, HeaderSyncWireError> {
-    message.encode(Some(test_request_id()))
+    message.encode()
 }
 
 fn headers_context(count: u32, peer_cap: u32) -> HeaderSyncDecodeContext {
@@ -777,17 +793,18 @@ async fn advisory_summary_status_mismatch_uses_status_without_misbehavior_and_ba
             }
             HeaderSyncAction::SendMessage {
                 peer,
-                request_id: sent_request_id,
                 msg:
                     HeaderSyncMessage::GetHeaders {
+                        request_id: message_request_id,
                         start_height,
                         count,
                         want_tree_aux_roots: true,
+                        ..
                     },
             } if peer == peer_id => {
                 assert_eq!(start_height, block::Height(1));
                 assert_eq!(count, 1);
-                request_id = sent_request_id;
+                request_id = Some(message_request_id);
                 saw_status_authoritative_request = true;
                 break;
             }
@@ -850,12 +867,15 @@ async fn advisory_backoff_is_pruned_on_peer_disconnected() {
     {
         if let HeaderSyncAction::SendMessage {
             peer,
-            request_id: sent_request_id,
-            msg: HeaderSyncMessage::GetHeaders { .. },
+            msg:
+                HeaderSyncMessage::GetHeaders {
+                    request_id: sent_request_id,
+                    ..
+                },
         } = action
         {
             if peer == peer_id {
-                request_id = sent_request_id;
+                request_id = Some(sent_request_id);
                 break;
             }
         }
@@ -1012,21 +1032,15 @@ async fn next_outbound_get_headers(
         match next_non_query_action(actions).await {
             HeaderSyncAction::SendMessage {
                 peer,
-                request_id,
                 msg:
                     HeaderSyncMessage::GetHeaders {
+                        request_id,
                         start_height,
                         count,
                         want_tree_aux_roots: true,
+                        ..
                     },
-            } => {
-                return (
-                    peer,
-                    request_id.expect("an outbound GetHeaders always carries a request ID"),
-                    start_height,
-                    count,
-                )
-            }
+            } => return (peer, request_id, start_height, count),
             HeaderSyncAction::Misbehavior { peer, reason } => {
                 panic!("unexpected misbehavior from {peer:?}: {reason:?}")
             }
@@ -1042,12 +1056,11 @@ async fn next_get_headers_request_id(
 ) -> HeaderSyncRequestId {
     loop {
         if let HeaderSyncAction::SendMessage {
-            request_id,
-            msg: HeaderSyncMessage::GetHeaders { .. },
+            msg: HeaderSyncMessage::GetHeaders { request_id, .. },
             ..
         } = next_non_query_action(actions).await
         {
-            return request_id.expect("an outbound GetHeaders always carries a request ID");
+            return request_id;
         }
     }
 }
@@ -1059,32 +1072,8 @@ async fn send_headers(
     request_id: HeaderSyncRequestId,
     msg: HeaderSyncMessage,
 ) {
-    let HeaderSyncMessage::Headers {
-        headers,
-        body_sizes,
-        tree_aux_roots,
-    } = msg
-    else {
+    let HeaderSyncMessage::Headers { entries, .. } = msg else {
         panic!("send_headers requires a Headers message");
-    };
-    let entries = if !headers.is_empty() && tree_aux_roots.is_empty() {
-        headers
-            .into_iter()
-            .zip(body_sizes)
-            .map(|(header, body_size)| HeaderRangeEntry {
-                height: test_header_height(header.as_ref()),
-                header,
-                body_size,
-                tree_aux_root: None,
-            })
-            .collect()
-    } else {
-        let start = tree_aux_roots
-            .first()
-            .map(|root| root.height)
-            .unwrap_or(block::Height(0));
-        HeaderRangeEntry::from_parallel(start, headers, body_sizes, tree_aux_roots)
-            .expect("test response vectors align")
     };
     fixture
         .handle
@@ -1331,50 +1320,37 @@ fn codec_round_trips_status() {
     };
     let message = HeaderSyncMessage::Status(status);
 
-    let encoded = message.encode(None).unwrap();
-    let (decoded, request_id) =
-        HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control()).unwrap();
-
+    let encoded = message.encode().unwrap();
+    let decoded = HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control()).unwrap();
     assert_eq!(decoded, message);
-    assert_eq!(request_id, None);
 }
 
 #[test]
 fn codec_round_trips_get_headers_request_id() {
     let request_id = HeaderSyncRequestId::new(42).expect("non-zero id");
     let message = HeaderSyncMessage::GetHeaders {
+        request_id,
         start_height: block::Height(42),
         count: DEFAULT_HS_RANGE,
         want_tree_aux_roots: false,
     };
 
-    let encoded = message.encode(Some(request_id)).unwrap();
-    let (decoded, decoded_request_id) =
-        HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control()).unwrap();
-
+    let encoded = message.encode().unwrap();
+    let decoded = HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control()).unwrap();
     assert_eq!(decoded, message);
-    assert_eq!(decoded_request_id, Some(request_id));
 }
 
 #[test]
-fn get_headers_rejects_missing_and_zero_request_ids() {
+fn get_headers_rejects_zero_request_ids() {
     let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
     let message = HeaderSyncMessage::GetHeaders {
+        request_id,
         start_height: block::Height(42),
         count: DEFAULT_HS_RANGE,
         want_tree_aux_roots: false,
     };
 
-    assert!(matches!(
-        message.encode(None),
-        Err(HeaderSyncWireError::MissingRequestId {
-            message: "GetHeaders"
-        })
-    ));
-
-    let mut encoded = message
-        .encode(Some(request_id))
-        .expect("valid v7 request encodes");
+    let mut encoded = message.encode().expect("valid v8 request encodes");
     encoded[1..9].fill(0);
     assert!(matches!(
         HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control(),),
@@ -1388,39 +1364,175 @@ fn get_headers_rejects_missing_and_zero_request_ids() {
 fn codec_round_trips_headers_with_bounded_vector_and_request_id() {
     let request_id = HeaderSyncRequestId::new(43).expect("non-zero id");
     let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
-    let message = finalized_headers_message_with_sizes(headers, vec![123_456]);
+    let entries = HeaderRangeEntry::from_parallel(
+        block::Height(1),
+        headers,
+        vec![123_456],
+        roots_from_height(block::Height(1), 1),
+    )
+    .expect("test response vectors align");
+    let message = HeaderSyncMessage::Headers {
+        request_id,
+        entries,
+    };
     let expected = ExpectedHeadersResponse::new(request_id, block::Height(1), 1, true).unwrap();
 
-    let encoded = message.encode(Some(request_id)).unwrap();
-    let (decoded, decoded_request_id) = HeaderSyncMessage::decode(
+    let encoded = message.encode().unwrap();
+    let decoded = HeaderSyncMessage::decode(
         &encoded,
         HeaderSyncDecodeContext::for_headers_response(expected, 1),
     )
     .unwrap();
 
     assert_eq!(decoded, message);
-    assert_eq!(decoded_request_id, Some(request_id));
 }
 
 #[test]
-fn headers_rejects_missing_and_zero_request_ids() {
+fn headers_v8_interleaves_each_height_header_body_size_and_root() {
+    let request_id = HeaderSyncRequestId::new(44).expect("non-zero id");
+    let headers = vec![
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+    ];
+    let body_sizes = vec![111u32, 222u32];
+    let roots = roots_from_height(block::Height(1), 2);
+
+    let mut expected_v8 = vec![MSG_HS_HEADERS];
+    expected_v8.extend_from_slice(&request_id.get().to_le_bytes());
+    expected_v8.extend_from_slice(&2u32.to_le_bytes());
+    expected_v8.push(1);
+    for (offset, ((header, body_size), root)) in
+        headers.iter().zip(&body_sizes).zip(&roots).enumerate()
+    {
+        let height = u32::try_from(offset)
+            .expect("test offset fits in u32")
+            .checked_add(1)
+            .expect("test height does not overflow");
+        expected_v8.extend_from_slice(&height.to_le_bytes());
+        header
+            .zcash_serialize(&mut expected_v8)
+            .expect("test header serializes");
+        expected_v8.extend_from_slice(&body_size.to_le_bytes());
+        root.zcash_serialize(&mut expected_v8)
+            .expect("test root serializes");
+    }
+
+    let mut grouped_v7 = vec![MSG_HS_HEADERS];
+    grouped_v7.extend_from_slice(&request_id.get().to_le_bytes());
+    grouped_v7.extend_from_slice(&2u32.to_le_bytes());
+    grouped_v7.push(1);
+    for (header, body_size) in headers.iter().zip(&body_sizes) {
+        header
+            .zcash_serialize(&mut grouped_v7)
+            .expect("test header serializes");
+        grouped_v7.extend_from_slice(&body_size.to_le_bytes());
+    }
+    for root in &roots {
+        root.zcash_serialize(&mut grouped_v7)
+            .expect("test root serializes");
+    }
+
+    let message = HeaderSyncMessage::Headers {
+        request_id,
+        entries: HeaderRangeEntry::from_parallel(block::Height(1), headers, body_sizes, roots)
+            .expect("test response vectors align"),
+    };
+    let encoded = message.encode().expect("v8 response encodes");
+    assert_eq!(encoded, expected_v8);
+    assert_ne!(encoded, grouped_v7);
+
+    let expected = ExpectedHeadersResponse::new(request_id, block::Height(1), 2, true)
+        .expect("test request is valid");
+    let decoded = HeaderSyncMessage::decode(
+        &encoded,
+        HeaderSyncDecodeContext::for_headers_response(expected, 2),
+    )
+    .expect("interleaved v8 response decodes");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn headers_v8_decode_rejects_explicit_height_outside_requested_sequence() {
+    let request_id = HeaderSyncRequestId::new(45).expect("non-zero id");
+    let message = headers_message_from(
+        block::Height(1),
+        vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+    );
+    let mut encoded = message.encode().expect("valid v8 response encodes");
+    let entry_height_offset = HEADER_SYNC_MESSAGE_TYPE_BYTES
+        + HEADER_SYNC_REQUEST_ID_BYTES
+        + HEADER_SYNC_COUNT_BYTES
+        + HEADER_SYNC_HAS_ROOTS_BYTES;
+    encoded[entry_height_offset..entry_height_offset + HEADER_SYNC_HEIGHT_BYTES]
+        .copy_from_slice(&2u32.to_le_bytes());
+    let expected = ExpectedHeadersResponse::new(request_id, block::Height(1), 1, true)
+        .expect("test request is valid");
+    encoded[1..9].copy_from_slice(&request_id.get().to_le_bytes());
+
+    assert!(matches!(
+        HeaderSyncMessage::decode(
+            &encoded,
+            HeaderSyncDecodeContext::for_headers_response(expected, 1),
+        ),
+        Err(HeaderSyncWireError::EntryHeightMismatch {
+            offset: 0,
+            expected_height: block::Height(1),
+            entry_height: block::Height(2),
+        })
+    ));
+}
+
+#[test]
+fn headers_v8_decode_rejects_root_height_different_from_entry_height() {
+    let request_id = HeaderSyncRequestId::new(46).expect("non-zero id");
+    let message = HeaderSyncMessage::Headers {
+        request_id,
+        entries: HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+            vec![0],
+            roots_from_height(block::Height(1), 1),
+        )
+        .expect("test response vectors align"),
+    };
+    let mut encoded = message.encode().expect("valid v8 response encodes");
+    let root_height_offset = HEADER_SYNC_MESSAGE_TYPE_BYTES
+        + HEADER_SYNC_REQUEST_ID_BYTES
+        + HEADER_SYNC_COUNT_BYTES
+        + HEADER_SYNC_HAS_ROOTS_BYTES
+        + HEADER_SYNC_HEIGHT_BYTES
+        + COMMON_HEADER_BYTES
+        + HEADER_SYNC_BODY_SIZE_BYTES;
+    encoded[root_height_offset..root_height_offset + HEADER_SYNC_HEIGHT_BYTES]
+        .copy_from_slice(&2u32.to_le_bytes());
+    let expected = ExpectedHeadersResponse::new(request_id, block::Height(1), 1, true)
+        .expect("test request is valid");
+
+    assert!(matches!(
+        HeaderSyncMessage::decode(
+            &encoded,
+            HeaderSyncDecodeContext::for_headers_response(expected, 1),
+        ),
+        Err(HeaderSyncWireError::TreeAuxRootHeightMismatch {
+            offset: 0,
+            expected_height: block::Height(1),
+            root_height: block::Height(2),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn headers_rejects_zero_request_ids() {
     let request_id = HeaderSyncRequestId::new(1).expect("non-zero id");
     let message = HeaderSyncMessage::Headers {
-        headers: Vec::new(),
-        body_sizes: Vec::new(),
-        tree_aux_roots: Vec::new(),
+        request_id,
+        entries: Vec::new(),
     };
     let expected = ExpectedHeadersResponse::new(request_id, block::Height(1), 1, false)
         .expect("count is valid");
 
-    assert!(matches!(
-        message.encode(None),
-        Err(HeaderSyncWireError::MissingRequestId { message: "Headers" })
-    ));
-
-    let mut encoded = message
-        .encode(Some(request_id))
-        .expect("valid v7 response encodes");
+    let mut encoded = message.encode().expect("valid v8 response encodes");
     encoded[1..9].fill(0);
     assert!(matches!(
         HeaderSyncMessage::decode(
@@ -1437,8 +1549,7 @@ fn codec_round_trips_headers_with_unknown_body_size_sentinel() {
     let message = finalized_headers_message_with_sizes(headers, vec![0]);
 
     let encoded = encode_correlated(&message).unwrap();
-    let (decoded, _request_id) =
-        HeaderSyncMessage::decode(&encoded, finalized_headers_context(1, 1)).unwrap();
+    let decoded = HeaderSyncMessage::decode(&encoded, finalized_headers_context(1, 1)).unwrap();
 
     assert_eq!(decoded, message);
 }
@@ -1461,12 +1572,9 @@ fn decode_rejects_tree_aux_roots_when_not_requested() {
 fn codec_round_trips_new_block() {
     let message = HeaderSyncMessage::NewBlock(mainnet_block(&BLOCK_MAINNET_1_BYTES));
 
-    let encoded = message.encode(None).unwrap();
-    let (decoded, request_id) =
-        HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control()).unwrap();
-
+    let encoded = message.encode().unwrap();
+    let decoded = HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control()).unwrap();
     assert_eq!(decoded, message);
-    assert_eq!(request_id, None);
 }
 
 #[test]
@@ -1477,6 +1585,7 @@ fn codec_rejects_unknown_message_types_and_trailing_bytes() {
     ));
 
     let mut encoded = encode_correlated(&HeaderSyncMessage::GetHeaders {
+        request_id: test_request_id(),
         start_height: block::Height(1),
         count: 1,
         want_tree_aux_roots: false,
@@ -1496,7 +1605,12 @@ fn headers_codec_rejects_body_size_mismatch_truncation_and_trailing_bytes() {
     let message = headers_message_with_sizes(headers.clone(), vec![100]);
 
     assert!(matches!(
-        encode_correlated(&headers_message_with_sizes(headers.clone(), vec![100, 200])),
+        HeaderRangeEntry::from_parallel(
+            block::Height(1),
+            headers.clone(),
+            vec![100, 200],
+            Vec::new(),
+        ),
         Err(HeaderSyncWireError::BodySizeCountMismatch {
             headers: 1,
             body_sizes: 2,
@@ -1504,11 +1618,7 @@ fn headers_codec_rejects_body_size_mismatch_truncation_and_trailing_bytes() {
     ));
 
     assert!(matches!(
-        encode_correlated(&HeaderSyncMessage::Headers {
-            headers: headers.clone(),
-            body_sizes: vec![100],
-            tree_aux_roots: Vec::new(),
-        }),
+        HeaderRangeEntry::from_parallel(block::Height(1), headers.clone(), vec![100], Vec::new(),),
         Err(HeaderSyncWireError::TreeAuxRootCountMismatch {
             headers: 1,
             roots: 0,
@@ -1630,15 +1740,11 @@ fn headers_codec_does_not_use_legacy_160_header_cap() {
     let message = finalized_headers_message(headers);
 
     let encoded = encode_correlated(&message).unwrap();
-    let (decoded, _request_id) =
-        HeaderSyncMessage::decode(&encoded, finalized_headers_context(161, 161)).unwrap();
+    let decoded = HeaderSyncMessage::decode(&encoded, finalized_headers_context(161, 161)).unwrap();
 
     match decoded {
-        HeaderSyncMessage::Headers {
-            headers,
-            body_sizes,
-            tree_aux_roots,
-        } => {
+        HeaderSyncMessage::Headers { entries, .. } => {
+            let (headers, body_sizes, tree_aux_roots) = HeaderRangeEntry::into_parallel(entries);
             assert_eq!(headers.len(), 161);
             assert_eq!(body_sizes, vec![0; 161]);
             assert_eq!(tree_aux_roots, roots_from_height(block::Height(1), 161));
@@ -1650,6 +1756,7 @@ fn headers_codec_does_not_use_legacy_160_header_cap() {
 #[test]
 fn get_headers_rejects_invalid_counts() {
     assert!(encode_correlated(&HeaderSyncMessage::GetHeaders {
+        request_id: test_request_id(),
         start_height: block::Height(1),
         count: 0,
         want_tree_aux_roots: false,
@@ -1657,6 +1764,7 @@ fn get_headers_rejects_invalid_counts() {
     .is_err());
 
     assert!(encode_correlated(&HeaderSyncMessage::GetHeaders {
+        request_id: test_request_id(),
         start_height: block::Height(1),
         count: MAX_HS_RANGE + 1,
         want_tree_aux_roots: false,
@@ -1683,9 +1791,8 @@ fn advertised_defaults_and_clamping_match_design() {
         max_headers_per_response: MAX_HS_RANGE + 10,
         ..HeaderSyncStatus::default()
     };
-    let encoded = HeaderSyncMessage::Status(status).encode(None).unwrap();
-    let (decoded, _request_id) =
-        HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control()).unwrap();
+    let encoded = HeaderSyncMessage::Status(status).encode().unwrap();
+    let decoded = HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control()).unwrap();
     match decoded {
         HeaderSyncMessage::Status(status) => {
             assert_eq!(status.max_headers_per_response, MAX_HS_RANGE);
@@ -1715,7 +1822,9 @@ fn header_serialized_sizes_are_exact_and_message_cap_has_headroom() {
     let default_response_bytes = HEADER_SYNC_MESSAGE_TYPE_BYTES
         + HEADER_SYNC_REQUEST_ID_BYTES
         + HEADER_SYNC_COUNT_BYTES
-        + (COMMON_HEADER_BYTES
+        + HEADER_SYNC_HAS_ROOTS_BYTES
+        + (HEADER_SYNC_HEIGHT_BYTES
+            + COMMON_HEADER_BYTES
             + HEADER_SYNC_BODY_SIZE_BYTES
             + HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES)
             * DEFAULT_HS_RANGE as usize;
@@ -1808,6 +1917,7 @@ async fn restart_rebuilds_schedule_from_durable_best_tip_and_peer_status() {
                     start_height,
                     count,
                     want_tree_aux_roots: true,
+                    ..
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -2576,6 +2686,7 @@ async fn status_updates_peer_caps_and_scheduler_respects_them() {
                     start_height,
                     count,
                     want_tree_aux_roots: true,
+                    ..
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -2591,7 +2702,7 @@ async fn status_updates_peer_caps_and_scheduler_respects_them() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_fills_v7_outstanding_request_slots() {
+async fn scheduler_fills_v8_outstanding_request_slots() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -2665,6 +2776,7 @@ async fn work_queue_assigns_each_forward_range_to_one_peer() {
                     start_height,
                     count,
                     want_tree_aux_roots: true,
+                    ..
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -2783,6 +2895,7 @@ async fn work_queue_splits_large_ranges_without_duplicate_ownership() {
                     start_height,
                     count,
                     want_tree_aux_roots: true,
+                    ..
                 },
             ..
         } = action
@@ -2827,6 +2940,7 @@ async fn scheduler_starts_forward_work_above_checkpoint_anchor() {
                     start_height,
                     count,
                     want_tree_aux_roots: true,
+                    ..
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -2934,6 +3048,7 @@ async fn forward_ranges_below_checkpoint_handoff_request_tree_aux_roots() {
                     start_height,
                     count,
                     want_tree_aux_roots,
+                    ..
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
@@ -3491,12 +3606,11 @@ async fn local_commit_failure_retries_without_peer_misbehavior() {
     let request_id = loop {
         if let HeaderSyncAction::SendMessage {
             peer,
-            request_id,
-            msg: HeaderSyncMessage::GetHeaders { .. },
+            msg: HeaderSyncMessage::GetHeaders { request_id, .. },
         } = next_non_query_action(&mut fixture.actions).await
         {
             if peer == first_peer {
-                break request_id.expect("an outbound GetHeaders always carries a request ID");
+                break request_id;
             }
         }
     };
@@ -3545,6 +3659,7 @@ async fn local_commit_failure_retries_without_peer_misbehavior() {
                         start_height,
                         count,
                         want_tree_aux_roots: true,
+                        ..
                     },
                 ..
             } if peer == first_peer || peer == second_peer => {
@@ -3743,7 +3858,7 @@ fn response_before_publication_completion_is_not_reinstalled() {
 }
 
 #[test]
-fn completed_v7_inbound_request_id_cannot_be_reused() {
+fn completed_v8_inbound_request_id_cannot_be_reused() {
     let (send, _recv) = crate::zakura::framed_channel(32);
     let session = HeaderSyncPeerSession::from_parts_with_direction(
         peer(82),
@@ -3822,7 +3937,7 @@ async fn failed_status_publication_is_retry_paced() {
     let (send, mut recv) = crate::zakura::framed_channel(1);
     send.try_send(
         HeaderSyncMessage::Status(HeaderSyncStatus::default())
-            .encode_frame(None)
+            .encode_frame()
             .expect("filler status frame encodes"),
     )
     .expect("outbound queue starts full");
@@ -3872,8 +3987,7 @@ async fn failed_status_publication_is_retry_paced() {
         .expect("outbound channel remains open");
     assert!(matches!(
         HeaderSyncMessage::decode_frame(frame, HeaderSyncDecodeContext::control())
-            .expect("retry status decodes")
-            .0,
+            .expect("retry status decodes"),
         HeaderSyncMessage::Status(_)
     ));
     assert!(
@@ -3918,6 +4032,7 @@ async fn reconnect_clears_session_bound_outstanding_ranges() {
                 start_height: block::Height(1),
                 count: 1,
                 want_tree_aux_roots: true,
+                ..
             },
             ..
         } if peer == peer_id
@@ -3948,6 +4063,7 @@ async fn reconnect_clears_session_bound_outstanding_ranges() {
                 start_height: block::Height(1),
                 count: 1,
                 want_tree_aux_roots: true,
+                ..
             },
             ..
         } if peer == peer_id
@@ -4924,7 +5040,7 @@ async fn serving_responses_echo_request_ids_in_completion_order() {
     tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
         .await
         .expect("initial status arrives")
-        .expect("v7 stream stays open");
+        .expect("v8 stream stays open");
     advertise_tip(
         &fixture,
         peer_id.clone(),
@@ -4982,7 +5098,7 @@ async fn serving_responses_echo_request_ids_in_completion_order() {
         let frame = tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
             .await
             .expect("headers response arrives")
-            .expect("v7 stream stays open");
+            .expect("v8 stream stays open");
         assert_eq!(
             HeaderSyncMessage::peek_headers_request_id(&frame.payload).unwrap(),
             request_id
@@ -5970,7 +6086,8 @@ async fn partial_coverage_trims_and_commits_an_already_buffered_suffix() {
             assert_eq!(
                 payload
                     .tree_aux_roots()
-                    .and_then(|mut roots| roots.next().map(|root| root.height)),
+                    .and_then(|mut roots| roots.next())
+                    .map(|root| root.height),
                 Some(block::Height(4))
             );
             break;
@@ -6675,6 +6792,7 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
                         start_height,
                         count: _,
                         want_tree_aux_roots: true,
+                        ..
                     },
                 ..
             } if saw_reanchor_action && start_height == expected_start => {
@@ -6775,19 +6893,20 @@ async fn forward_genesis_backfill_reaches_checkpoint_before_finalized_commit() {
     .await;
     let request_id = loop {
         if let HeaderSyncAction::SendMessage {
-            request_id: sent_request_id,
             msg:
                 HeaderSyncMessage::GetHeaders {
+                    request_id,
                     start_height,
                     count,
                     want_tree_aux_roots: true,
+                    ..
                 },
             ..
         } = next_non_query_action(&mut fixture.actions).await
         {
             assert_eq!(start_height, block::Height(1));
             assert_eq!(count, 3);
-            break sent_request_id.expect("an outbound GetHeaders always carries a request ID");
+            break request_id;
         }
     };
 

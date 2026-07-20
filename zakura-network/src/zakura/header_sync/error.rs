@@ -132,7 +132,7 @@ pub enum HeaderSyncWireError {
     UnsolicitedHeaders,
 
     /// A request-id capable header-sync message was missing its request ID.
-    #[error("Zakura header-sync v7 {message} message is missing a request ID")]
+    #[error("Zakura header-sync v8 {message} message is missing a request ID")]
     MissingRequestId {
         /// Message that required the ID.
         message: &'static str,

@@ -417,7 +417,7 @@ pub mod header_sync_trace {
     pub const ACTIVE_CONNECTIONS: &str = "active_connections";
     /// Ordered-stream generation that owns this header-sync event.
     pub const SESSION_ID: &str = "session_id";
-    /// Header-sync v7 request identifier, when present.
+    /// Header-sync v8 request identifier, when present.
     pub const REQUEST_ID: &str = "request_id";
     /// Negotiated header-sync stream version for this peer session.
     pub const STREAM_VERSION: &str = "stream_version";

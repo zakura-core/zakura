@@ -12,9 +12,11 @@ pub const ZAKURA_STREAM_HEADER_SYNC: u16 = 5;
 /// block's ZIP-244 `auth_data_root` (the co-input to its NU5+ header commitment).
 /// Version 7 prefixes `GetHeaders`/`Headers` with a non-zero request ID so a response is
 /// correlated with the exact request that solicited it, instead of by FIFO arrival order.
+/// Version 8 makes correlated messages self-contained and encodes each `Headers` entry as
+/// one atomic `[height][header][body_size][tree_aux_root]` record when roots are requested.
 /// Each of these is a breaking wire change: a peer that speaks an earlier version cannot
-/// exchange header-sync ranges with version 7 and does not negotiate header sync at all.
-pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 7;
+/// exchange header-sync ranges with version 8 and does not negotiate header sync at all.
+pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 8;
 
 /// Peer status advertisement.
 pub const MSG_HS_STATUS: u8 = 1;
@@ -38,6 +40,7 @@ pub(super) const HEADER_SYNC_MESSAGE_TYPE_BYTES: usize = 1;
 pub(super) const HEADER_SYNC_REQUEST_ID_BYTES: usize = 8;
 pub(super) const HEADER_SYNC_COUNT_BYTES: usize = 4;
 pub(super) const HEADER_SYNC_HAS_ROOTS_BYTES: usize = 1;
+pub(super) const HEADER_SYNC_HEIGHT_BYTES: usize = 4;
 pub(super) const HEADER_SYNC_BODY_SIZE_BYTES: usize = 4;
 /// Encoded [`BlockCommitmentRoots`]: height + Sapling root + Orchard root + Ironwood root
 /// + three `u64` shielded tx-counts (Sapling/Orchard/Ironwood) + auth-data root.
@@ -64,7 +67,8 @@ const _: () = assert!(
     HEADER_SYNC_MESSAGE_TYPE_BYTES
         + HEADER_SYNC_REQUEST_ID_BYTES
         + HEADER_SYNC_COUNT_BYTES
-        + (COMMON_HEADER_BYTES
+        + (HEADER_SYNC_HEIGHT_BYTES
+            + COMMON_HEADER_BYTES
             + HEADER_SYNC_BODY_SIZE_BYTES
             + HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES)
             * (DEFAULT_HS_RANGE as usize)
@@ -78,6 +82,8 @@ pub enum HeaderSyncMessage {
     Status(HeaderSyncStatus),
     /// Request `count` headers starting at `start_height`.
     GetHeaders {
+        /// Request ID allocated within this stream session.
+        request_id: HeaderSyncRequestId,
         /// First requested height.
         start_height: block::Height,
         /// Requested header count.
@@ -93,12 +99,10 @@ pub enum HeaderSyncMessage {
     /// A `0` size means "unknown"; the hint is not consensus data. Tree-aux roots
     /// are peer-sourced execution hints and are verified by state before use.
     Headers {
-        /// Headers in ascending height order.
-        headers: Vec<Arc<block::Header>>,
-        /// Advisory serialized body sizes, parallel to `headers`.
-        body_sizes: Vec<u32>,
-        /// Per-height commitment roots, parallel to `headers`.
-        tree_aux_roots: Vec<BlockCommitmentRoots>,
+        /// Request ID echoed from the matching `GetHeaders`.
+        request_id: HeaderSyncRequestId,
+        /// Structurally aligned per-height records in ascending order.
+        entries: Vec<HeaderRangeEntry>,
     },
     /// Full block tip-flood payload.
     NewBlock(Arc<block::Block>),
@@ -115,56 +119,47 @@ impl HeaderSyncMessage {
         }
     }
 
-    /// Encode this message as `[u8 message_type][request id][bounded fields...]`.
-    ///
-    /// `request_id` is required by `GetHeaders`/`Headers` and unused by the other
-    /// message types, which are not correlated.
-    pub fn encode(
-        &self,
-        request_id: Option<HeaderSyncRequestId>,
-    ) -> Result<Vec<u8>, HeaderSyncWireError> {
+    /// Encode this message as `[u8 message_type][bounded fields...]`.
+    pub fn encode(&self) -> Result<Vec<u8>, HeaderSyncWireError> {
         let mut bytes = Vec::new();
         bytes.write_u8(self.message_type())?;
         match self {
             Self::Status(status) => status.encode_to(&mut bytes)?,
             Self::GetHeaders {
+                request_id,
                 start_height,
                 count,
                 want_tree_aux_roots,
             } => {
                 validate_get_headers_count(*count)?;
-                bytes.write_u64::<LittleEndian>(
-                    request_id
-                        .ok_or(HeaderSyncWireError::MissingRequestId {
-                            message: "GetHeaders",
-                        })?
-                        .get(),
-                )?;
+                bytes.write_u64::<LittleEndian>(request_id.get())?;
                 write_height(&mut bytes, *start_height)?;
                 bytes.write_u32::<LittleEndian>(*count)?;
                 bytes.write_u8(u8::from(*want_tree_aux_roots))?;
             }
             Self::Headers {
-                headers,
-                body_sizes,
-                tree_aux_roots,
+                request_id,
+                entries,
             } => {
-                validate_headers_len(headers.len(), usize_from_u32(MAX_HS_RANGE, "headers cap")?)?;
-                validate_body_sizes_len(headers.len(), body_sizes.len())?;
-                validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len())?;
-                bytes.write_u64::<LittleEndian>(
-                    request_id
-                        .ok_or(HeaderSyncWireError::MissingRequestId { message: "Headers" })?
-                        .get(),
-                )?;
-                bytes.write_u32::<LittleEndian>(u32_from_usize(headers.len(), "headers count")?)?;
-                bytes.write_u8(u8::from(!tree_aux_roots.is_empty()))?;
-                for (header, body_size) in headers.iter().zip(body_sizes) {
-                    header.zcash_serialize(&mut bytes)?;
-                    bytes.write_u32::<LittleEndian>(*body_size)?;
-                }
-                for roots in tree_aux_roots {
-                    roots.zcash_serialize(&mut bytes)?;
+                validate_headers_len(entries.len(), usize_from_u32(MAX_HS_RANGE, "headers cap")?)?;
+                validate_entries(entries)?;
+                bytes.write_u64::<LittleEndian>(request_id.get())?;
+                bytes.write_u32::<LittleEndian>(u32_from_usize(entries.len(), "headers count")?)?;
+                let has_roots = entries
+                    .first()
+                    .is_some_and(|entry| entry.tree_aux_root.is_some());
+                bytes.write_u8(u8::from(has_roots))?;
+                for entry in entries {
+                    write_height(&mut bytes, entry.height)?;
+                    entry.header.zcash_serialize(&mut bytes)?;
+                    bytes.write_u32::<LittleEndian>(entry.body_size)?;
+                    if has_roots {
+                        entry
+                            .tree_aux_root
+                            .as_ref()
+                            .expect("validated rooted entries all have roots")
+                            .zcash_serialize(&mut bytes)?;
+                    }
                 }
             }
             Self::NewBlock(block) => {
@@ -180,13 +175,11 @@ impl HeaderSyncMessage {
         Ok(bytes)
     }
 
-    /// Decode a header-sync message and its request ID using the request bounds in `context`.
-    ///
-    /// The request ID is `None` for the message types that do not carry one.
+    /// Decode a header-sync message using the request bounds in `context`.
     pub fn decode(
         bytes: &[u8],
         context: HeaderSyncDecodeContext,
-    ) -> Result<(Self, Option<HeaderSyncRequestId>), HeaderSyncWireError> {
+    ) -> Result<Self, HeaderSyncWireError> {
         if bytes.len() > MAX_HS_MESSAGE_BYTES {
             return Err(HeaderSyncWireError::OversizedPayload {
                 actual: bytes.len(),
@@ -195,31 +188,27 @@ impl HeaderSyncMessage {
         }
         let mut reader = Cursor::new(bytes);
         let message_type = reader.read_u8()?;
-        let mut request_id = None;
         let message = match message_type {
             MSG_HS_STATUS => Self::Status(HeaderSyncStatus::decode_from(&mut reader)?),
             MSG_HS_GET_HEADERS => {
-                request_id = HeaderSyncRequestId::new(reader.read_u64::<LittleEndian>()?);
-                if request_id.is_none() {
-                    return Err(HeaderSyncWireError::MissingRequestId {
+                let request_id = HeaderSyncRequestId::new(reader.read_u64::<LittleEndian>()?)
+                    .ok_or(HeaderSyncWireError::MissingRequestId {
                         message: "GetHeaders",
-                    });
-                }
+                    })?;
                 let start_height = read_height(&mut reader)?;
                 let count = reader.read_u32::<LittleEndian>()?;
                 let want_tree_aux_roots = read_bool_marker(&mut reader, "want_tree_aux_roots")?;
                 validate_get_headers_count(count)?;
                 Self::GetHeaders {
+                    request_id,
                     start_height,
                     count,
                     want_tree_aux_roots,
                 }
             }
             MSG_HS_HEADERS => {
-                request_id = HeaderSyncRequestId::new(reader.read_u64::<LittleEndian>()?);
-                if request_id.is_none() {
-                    return Err(HeaderSyncWireError::MissingRequestId { message: "Headers" });
-                }
+                let request_id = HeaderSyncRequestId::new(reader.read_u64::<LittleEndian>()?)
+                    .ok_or(HeaderSyncWireError::MissingRequestId { message: "Headers" })?;
                 let count = usize_from_u32(reader.read_u32::<LittleEndian>()?, "headers count")?;
                 let has_roots = read_bool_marker(&mut reader, "has_roots")?;
                 let Some(max_headers) = context.headers_response_limit()? else {
@@ -229,30 +218,51 @@ impl HeaderSyncMessage {
                     return Err(HeaderSyncWireError::UnrequestedTreeAuxRoots);
                 }
                 validate_headers_len(count, max_headers)?;
-                let mut headers = Vec::with_capacity(count);
-                let mut body_sizes = Vec::with_capacity(count);
-                let mut tree_aux_roots = if has_roots {
-                    Vec::with_capacity(count)
-                } else {
-                    Vec::new()
-                };
-                for _ in 0..count {
-                    headers.push(Arc::new(block::Header::zcash_deserialize(&mut reader)?));
-                    body_sizes.push(reader.read_u32::<LittleEndian>()?);
+                if count != 0 && context.wants_tree_aux_roots() && !has_roots {
+                    return Err(HeaderSyncWireError::TreeAuxRootCountMismatch {
+                        headers: count,
+                        roots: 0,
+                    });
                 }
-                if has_roots {
-                    for _ in 0..count {
-                        tree_aux_roots.push(BlockCommitmentRoots::zcash_deserialize(&mut reader)?);
+                let requested = context
+                    .requested
+                    .expect("a bounded Headers response has a matching request");
+                let mut entries = Vec::with_capacity(count);
+                for offset in 0..count {
+                    let height = read_height(&mut reader)?;
+                    let height_offset = u32::try_from(offset)
+                        .map_err(|_| HeaderSyncWireError::NumericOverflow("entry height offset"))?;
+                    let expected_height = requested
+                        .start_height
+                        .0
+                        .checked_add(height_offset)
+                        .map(block::Height)
+                        .ok_or(HeaderSyncWireError::NumericOverflow("entry height"))?;
+                    if height != expected_height {
+                        return Err(HeaderSyncWireError::EntryHeightMismatch {
+                            offset,
+                            expected_height,
+                            entry_height: height,
+                        });
                     }
+                    let header = Arc::new(block::Header::zcash_deserialize(&mut reader)?);
+                    let body_size = reader.read_u32::<LittleEndian>()?;
+                    let tree_aux_root = if has_roots {
+                        Some(BlockCommitmentRoots::zcash_deserialize(&mut reader)?)
+                    } else {
+                        None
+                    };
+                    entries.push(HeaderRangeEntry {
+                        height,
+                        header,
+                        body_size,
+                        tree_aux_root,
+                    });
                 }
-                validate_tree_aux_roots_len(count, tree_aux_roots.len())?;
-                if let Some(requested) = context.requested {
-                    validate_tree_aux_root_heights(requested.start_height, &tree_aux_roots)?;
-                }
+                validate_entries(&entries)?;
                 Self::Headers {
-                    headers,
-                    body_sizes,
-                    tree_aux_roots,
+                    request_id,
+                    entries,
                 }
             }
             MSG_HS_NEW_BLOCK => {
@@ -261,7 +271,7 @@ impl HeaderSyncMessage {
             value => return Err(HeaderSyncWireError::UnknownMessageType(value)),
         };
         reject_trailing(bytes, &reader)?;
-        Ok((message, request_id))
+        Ok(message)
     }
 
     /// Return a `Headers` request ID without decoding the full header payload.
@@ -278,27 +288,23 @@ impl HeaderSyncMessage {
     }
 
     /// Convert this message into a bounded Zakura frame.
-    pub fn encode_frame(
-        &self,
-        request_id: Option<HeaderSyncRequestId>,
-    ) -> Result<Frame, HeaderSyncWireError> {
+    pub fn encode_frame(&self) -> Result<Frame, HeaderSyncWireError> {
         Ok(Frame {
             message_type: u16::from(self.message_type()),
             flags: 0,
-            payload: self.encode(request_id)?,
+            payload: self.encode()?,
         })
     }
 
-    /// Decode this message and its request ID from a Zakura frame, after checking flags
-    /// and type agreement.
+    /// Decode this message from a Zakura frame, after checking flags and type agreement.
     pub fn decode_frame(
         frame: Frame,
         context: HeaderSyncDecodeContext,
-    ) -> Result<(Self, Option<HeaderSyncRequestId>), HeaderSyncWireError> {
+    ) -> Result<Self, HeaderSyncWireError> {
         if frame.flags != 0 {
             return Err(HeaderSyncWireError::UnsupportedFlags(frame.flags));
         }
-        let (message, request_id) = Self::decode(&frame.payload, context)?;
+        let message = Self::decode(&frame.payload, context)?;
         let frame_message_type = u8::try_from(frame.message_type)
             .map_err(|_| HeaderSyncWireError::UnknownFrameMessageType(frame.message_type))?;
         if frame_message_type != message.message_type() {
@@ -307,6 +313,66 @@ impl HeaderSyncMessage {
                 payload: message.message_type(),
             });
         }
-        Ok((message, request_id))
+        Ok(message)
     }
+}
+
+fn validate_entries(entries: &[HeaderRangeEntry]) -> Result<(), HeaderSyncWireError> {
+    let roots = entries
+        .iter()
+        .filter(|entry| entry.tree_aux_root.is_some())
+        .count();
+    if roots != 0 && roots != entries.len() {
+        return Err(HeaderSyncWireError::TreeAuxRootCountMismatch {
+            headers: entries.len(),
+            roots,
+        });
+    }
+
+    for (offset, adjacent) in entries.windows(2).enumerate() {
+        let expected_height = adjacent[0]
+            .height
+            .0
+            .checked_add(1)
+            .map(block::Height)
+            .ok_or(HeaderSyncWireError::NumericOverflow("entry height"))?;
+        if adjacent[1].height != expected_height {
+            return Err(HeaderSyncWireError::EntryHeightMismatch {
+                offset: offset + 1,
+                expected_height,
+                entry_height: adjacent[1].height,
+            });
+        }
+    }
+
+    if roots != 0 {
+        let first_root_height = entries
+            .first()
+            .and_then(|entry| entry.tree_aux_root.as_ref())
+            .expect("all non-empty rooted entries have roots")
+            .height;
+        let last_root_height = entries
+            .last()
+            .and_then(|entry| entry.tree_aux_root.as_ref())
+            .expect("all non-empty rooted entries have roots")
+            .height;
+        for (offset, entry) in entries.iter().enumerate() {
+            let root_height = entry
+                .tree_aux_root
+                .as_ref()
+                .expect("all rooted entries have roots")
+                .height;
+            if root_height != entry.height {
+                return Err(HeaderSyncWireError::TreeAuxRootHeightMismatch {
+                    offset,
+                    expected_height: entry.height,
+                    root_height,
+                    first_root_height,
+                    last_root_height,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }

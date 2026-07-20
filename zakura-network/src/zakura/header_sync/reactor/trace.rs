@@ -737,11 +737,11 @@ fn trace_header_sync_message_fields(
                 u64::from(status.max_inflight_requests),
             );
         }
-        HeaderSyncMessage::Headers { headers, .. } => {
+        HeaderSyncMessage::Headers { entries, .. } => {
             insert_u64(
                 row,
                 hs_trace::RANGE_COUNT,
-                u64::try_from(headers.len()).unwrap_or(u64::MAX),
+                u64::try_from(entries.len()).unwrap_or(u64::MAX),
             );
         }
         HeaderSyncMessage::GetHeaders {
@@ -1183,7 +1183,6 @@ mod tests {
             (
                 HeaderSyncAction::SendMessage {
                     peer: peer.clone(),
-                    request_id: None,
                     msg: HeaderSyncMessage::Status(status()),
                 },
                 "send_message",
@@ -1294,11 +1293,16 @@ mod tests {
         let messages = [
             HeaderSyncMessage::Status(status()),
             HeaderSyncMessage::Headers {
-                headers: vec![block.header.clone()],
-                body_sizes: vec![123],
-                tree_aux_roots: Vec::new(),
+                request_id: request_id(),
+                entries: vec![HeaderRangeEntry {
+                    height: block::Height(1),
+                    header: block.header.clone(),
+                    body_size: 123,
+                    tree_aux_root: None,
+                }],
             },
             HeaderSyncMessage::GetHeaders {
+                request_id: request_id(),
                 start_height: block::Height(4),
                 count: 5,
                 want_tree_aux_roots: true,

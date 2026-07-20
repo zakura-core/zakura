@@ -30,7 +30,7 @@
 //!   height 0, 399/400/401, 2,000, near tip with a 1,000-block gap, and after
 //!   the non-finalized reorg.
 //! - `header-faults`: uses a bounded multi-range chain, restarts node2 with
-//!   outstanding header-sync work, and requires v7 request-id trace coverage.
+//!   outstanding header-sync work, and requires v8 request-id trace coverage.
 //!
 //! It shells out to `docker/zakura-regtest-e2e/run.sh`, which builds `zakurad`
 //! (debug) if needed, brings up four Regtest nodes sharing the host network — a
@@ -77,7 +77,7 @@ fn zakura_regtest_dual_stack_e2e() {
     run_zakura_regtest_e2e(None);
 }
 
-#[ignore = "opt-in docker e2e: header-sync v7 fault lane"]
+#[ignore = "opt-in docker e2e: header-sync v8 fault lane"]
 #[test]
 fn zakura_regtest_header_sync_faults() {
     if std::env::var("ZAKURA_E2E_MODE").is_ok_and(|mode| mode != "header-faults") {

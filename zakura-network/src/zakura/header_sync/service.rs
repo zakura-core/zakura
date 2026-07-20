@@ -199,7 +199,7 @@ impl HeaderSyncPeerSession {
 
     /// Send a typed status advertisement.
     pub fn try_send_status(&self, status: HeaderSyncStatus) -> Result<(), OrderedSendError> {
-        self.try_send_message(HeaderSyncMessage::Status(status), None)
+        self.try_send_message(HeaderSyncMessage::Status(status))
     }
 
     /// Prepare a correlated header request without making its frame visible to the peer.
@@ -214,11 +214,12 @@ impl HeaderSyncPeerSession {
             ExpectedHeadersResponse::new(request_id, start_height, count, want_tree_aux_roots)
                 .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
         let frame = HeaderSyncMessage::GetHeaders {
+            request_id,
             start_height,
             count,
             want_tree_aux_roots,
         }
-        .encode_frame(Some(request_id))
+        .encode_frame()
         .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
 
         let reservation = ExpectedHeadersReservation::new(self.inner.commands.clone(), expected)?;
@@ -235,32 +236,28 @@ impl HeaderSyncPeerSession {
     pub fn try_send_headers_with_sizes_and_roots(
         &self,
         request_id: HeaderSyncRequestId,
+        start_height: block::Height,
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
         tree_aux_roots: Vec<BlockCommitmentRoots>,
     ) -> Result<(), OrderedSendError> {
-        self.try_send_message(
-            HeaderSyncMessage::Headers {
-                headers,
-                body_sizes,
-                tree_aux_roots,
-            },
-            Some(request_id),
-        )
+        let entries =
+            HeaderRangeEntry::from_parallel(start_height, headers, body_sizes, tree_aux_roots)
+                .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+        self.try_send_message(HeaderSyncMessage::Headers {
+            request_id,
+            entries,
+        })
     }
 
     /// Send a typed full tip block announcement.
     pub fn try_send_new_block(&self, block: Arc<block::Block>) -> Result<(), OrderedSendError> {
-        self.try_send_message(HeaderSyncMessage::NewBlock(block), None)
+        self.try_send_message(HeaderSyncMessage::NewBlock(block))
     }
 
-    fn try_send_message(
-        &self,
-        msg: HeaderSyncMessage,
-        request_id: Option<HeaderSyncRequestId>,
-    ) -> Result<(), OrderedSendError> {
+    fn try_send_message(&self, msg: HeaderSyncMessage) -> Result<(), OrderedSendError> {
         let frame = msg
-            .encode_frame(request_id)
+            .encode_frame()
             .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
         match self.inner.send.try_send(frame) {
             Ok(()) => Ok(()),

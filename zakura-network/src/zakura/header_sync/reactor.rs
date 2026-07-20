@@ -268,8 +268,8 @@ impl HeaderSyncReactor {
                         #[cfg(test)]
                         let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
                             peer: requester_id.peer,
-                            request_id: Some(request_id),
                             msg: HeaderSyncMessage::GetHeaders {
+                                request_id,
                                 start_height: range.start_height(),
                                 count: range.count(),
                                 want_tree_aux_roots: range.want_tree_aux_roots,
@@ -1199,6 +1199,7 @@ impl HeaderSyncReactor {
         }
         let send_result = peer_state.session.try_send_headers_with_sizes_and_roots(
             request_id,
+            start_height,
             headers,
             body_sizes,
             tree_aux_roots,
@@ -1802,7 +1803,8 @@ impl HeaderSyncReactor {
             };
 
             let invalid = self.state.buffered.get(&key).and_then(|buffered| {
-                validate_header_range_links(anchor, buffered.payload.headers()).err()
+                let headers = buffered.payload.headers().cloned().collect::<Vec<_>>();
+                validate_header_range_links(anchor, &headers).err()
             });
             if let Some(error) = invalid {
                 let buffered = self
@@ -2385,6 +2387,7 @@ impl HeaderSyncReactor {
     fn publish_work_metrics(&self) {
         let (in_flight, buffered, committing) = self.state.schedule.active_counts();
         let header_bytes = header_sync_header_bytes_for_network(&self.startup.network)
+            .saturating_add(HEADER_SYNC_HEIGHT_BYTES)
             .saturating_add(HEADER_SYNC_BODY_SIZE_BYTES);
         let buffered_headers = self
             .state
@@ -2397,7 +2400,7 @@ impl HeaderSyncReactor {
             .buffered
             .values()
             .map(|range| {
-                let root_bytes = if range.payload.tree_aux_roots().is_some() {
+                let root_bytes = if range.payload.has_tree_aux_roots() {
                     HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES
                 } else {
                     0
@@ -2539,7 +2542,6 @@ impl HeaderSyncReactor {
                 #[cfg(test)]
                 let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
                     peer: peer.clone(),
-                    request_id: None,
                     msg: HeaderSyncMessage::Status(status),
                 });
                 true

@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   preventing ban-list maintenance from slowing as the 20,000-IP bound fills
   ([#286](https://github.com/zakura-core/zakura/pull/286)).
 
+### Changed
+
+- Require header-sync peer protocol v8, with self-contained correlated messages and
+  atomically interleaved header response records. Header-sync v7 peers are incompatible.
+
 ## [1.0.2] - 2026-07-20
 
 ### Added

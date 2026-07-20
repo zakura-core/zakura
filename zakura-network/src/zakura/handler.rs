@@ -213,7 +213,7 @@ const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
 const _: () = assert!(DISCOVERY_STREAM_KIND == super::discovery::ZAKURA_STREAM_DISCOVERY);
 const _: () = assert!(HEADER_SYNC_STREAM_KIND == super::header_sync::ZAKURA_STREAM_HEADER_SYNC);
-const _: () = assert!(ZAKURA_STREAM_VERSION_7 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
+const _: () = assert!(ZAKURA_STREAM_VERSION_8 == ZAKURA_HEADER_SYNC_STREAM_VERSION);
 const _: () =
     assert!(LEGACY_REQUEST_BLOCKS_BY_HASH == super::legacy_gossip::MSG_REQUEST_BLOCKS_BY_HASH);
 const _: () = assert!(
@@ -4585,10 +4585,12 @@ fn should_run_freshness_reaper(
 }
 
 /// The stream-kind versions this handler serves. Most known kinds are at version 1;
-/// header sync is at version 7, which correlates each `Headers` response with the
-/// request that solicited it. Earlier header-sync versions are not served.
+/// header sync is at version 8, which carries self-contained correlated messages
+/// and atomically interleaved header records. Earlier versions are not served.
 const ZAKURA_STREAM_VERSION_1: u16 = 1;
+#[cfg(test)]
 const ZAKURA_STREAM_VERSION_7: u16 = 7;
+const ZAKURA_STREAM_VERSION_8: u16 = 8;
 
 /// Returns whether the handler can serve a stream with this kind and version.
 ///
@@ -5964,14 +5966,14 @@ mod tests {
             flags: 0,
             payload: Vec::new(),
         };
+        let request_id = HeaderSyncRequestId::new(1).expect("non-zero request id");
         let get_headers_frame = HeaderSyncMessage::GetHeaders {
+            request_id,
             start_height: block::Height(1),
             count: 1,
             want_tree_aux_roots: false,
         }
-        .encode_frame(Some(
-            HeaderSyncRequestId::new(1).expect("non-zero request id"),
-        ))?;
+        .encode_frame()?;
 
         let (gossip_result, request_result, header_sync_result) = tokio::join!(
             async { registry.deliver(peer.clone(), LEGACY_GOSSIP_STREAM_KIND, gossip_frame) },
@@ -6050,7 +6052,7 @@ mod tests {
         task.await?;
 
         let valid_status_frame =
-            HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)).encode_frame(None)?;
+            HeaderSyncMessage::Status(status_at_genesis(&Network::Mainnet)).encode_frame()?;
         let valid_result =
             service.deliver_frame(peer.clone(), HEADER_SYNC_STREAM_KIND, valid_status_frame);
         assert!(
@@ -7701,7 +7703,7 @@ mod tests {
                 },
                 Stream {
                     kind: HEADER_SYNC_STREAM_KIND,
-                    version: ZAKURA_STREAM_VERSION_7,
+                    version: ZAKURA_STREAM_VERSION_8,
                     frame_cap: 1024,
                     capability: ZAKURA_CAP_HEADER_SYNC,
                     mode: StreamMode::Ordered,
@@ -7721,7 +7723,7 @@ mod tests {
             (LEGACY_GOSSIP_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (LEGACY_REQUEST_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             (DISCOVERY_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
-            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_7),
+            (HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_8),
             (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_VERSION_1),
         ] {
             assert!(
@@ -7741,6 +7743,10 @@ mod tests {
         assert!(
             !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_1),
             "header-sync v1 is rejected because native header sync uses exact version matching"
+        );
+        assert!(
+            !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, ZAKURA_STREAM_VERSION_7),
+            "header-sync v7 is rejected because v8 changed the correlated message API and layout"
         );
         assert!(
             !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, 5),

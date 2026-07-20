@@ -220,7 +220,7 @@ umount "$TESTNET_MNT"
 # and state bake still succeeds before the first explicit zcashd seed. Once a
 # fixture exists, each scheduled bake clones and refreshes the latest snapshot.
 if [ -n "${ZCASHD_VOLUME_NAME:-}" ]; then
-  ZAKURA_STATE_DIR="$MAINNET_MNT/tip" \
+  FIXTURE_STATE_DIR="$MAINNET_MNT/tip" \
   ZCASHD_VOLUME_NAME="$ZCASHD_VOLUME_NAME" \
   ZCASHD_TX_RETENTION="$ZCASHD_TX_RETENTION" \
     bash /root/pr-node-zcashd-refresh.sh

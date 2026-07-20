@@ -4,7 +4,7 @@
 set -euo pipefail
 
 : "${ZCASHD_VOLUME_NAME:?missing ZCASHD_VOLUME_NAME}"
-: "${ZAKURA_STATE_DIR:?missing ZAKURA_STATE_DIR}"
+: "${FIXTURE_STATE_DIR:?missing FIXTURE_STATE_DIR}"
 : "${ZCASHD_TX_RETENTION:?missing ZCASHD_TX_RETENTION}"
 
 if ! [[ "$ZCASHD_TX_RETENTION" =~ ^[0-9]+$ ]] || (( ZCASHD_TX_RETENTION == 0 )); then
@@ -68,7 +68,7 @@ jq -e '.schema_version == 1 and .fixture == "zcashd-mainnet" and .network == "ma
        and (.tip.height | type == "number") and (.tip.hash | test("^[0-9a-f]{64}$"))' \
   "$MANIFEST" >/dev/null
 
-ZAKURA_MANIFEST="$ZAKURA_STATE_DIR/fixture-manifest.json"
+ZAKURA_MANIFEST="$FIXTURE_STATE_DIR/fixture-manifest.json"
 [[ -f "$ZAKURA_MANIFEST" ]] || { echo "Zakura tip fixture manifest is missing" >&2; exit 1; }
 ZAKURA_CAPTURED_HEIGHT=$(jq -er '.tip.height // .height' "$ZAKURA_MANIFEST")
 ZCASHD_CAPTURED_HEIGHT=$(jq -er '.tip.height' "$MANIFEST")
@@ -106,7 +106,7 @@ identity_dir = "/root/.zakura-fixture-identity"
 p2p_stack = "legacy"
 
 [state]
-cache_dir = "${ZAKURA_STATE_DIR}"
+cache_dir = "${FIXTURE_STATE_DIR}"
 storage_mode = { pruned = { tx_retention = ${ZCASHD_TX_RETENTION} } }
 
 [rpc]
@@ -223,7 +223,7 @@ FINAL_LAG=$((ZAKURA_HEIGHT - ZCASHD_HEIGHT))
 }
 
 ZAKURAD_VERSION=$("$ZAKURAD" --version | head -n 1)
-ZCASHD_BIN=$(find "$ZAKURA_STATE_DIR/zcashd-compat/bin" -type f -name zcashd -perm -111 | sort | tail -n 1)
+ZCASHD_BIN=$(find "$FIXTURE_STATE_DIR/zcashd-compat/bin" -type f -name zcashd -perm -111 | sort | tail -n 1)
 [[ -n "$ZCASHD_BIN" ]] || { echo "managed zcashd binary was not cached" >&2; exit 1; }
 ZCASHD_VERSION=$("$ZCASHD_BIN" --version | head -n 1)
 ZCASHD_BINARY_SHA256=$(sha256sum "$ZCASHD_BIN" | awk '{print $1}')
@@ -279,7 +279,7 @@ jq \
   "$MANIFEST" > "$TMP_MANIFEST"
 mv "$TMP_MANIFEST" "$MANIFEST"
 
-ZAKURA_TMP="$ZAKURA_STATE_DIR/fixture-manifest.json.tmp"
+ZAKURA_TMP="$FIXTURE_STATE_DIR/fixture-manifest.json.tmp"
 jq --arg captured_at "$CAPTURED_AT" --arg hash "$ZAKURA_HASH" --argjson height "$ZAKURA_HEIGHT" \
   '.captured_at = $captured_at | .tip = {height: $height, hash: $hash}' \
   "$ZAKURA_MANIFEST" > "$ZAKURA_TMP"

@@ -330,11 +330,43 @@ jobs:
         run: |
           set -euo pipefail
           STAMP=$(date -u +%Y%m%d-%H%M)
-          doctl compute volume snapshot "${MAINNET_VOL_ID}" --snapshot-name "zakura-pr-state-mainnet-${STAMP}"
-          doctl compute volume snapshot "${TESTNET_VOL_ID}" --snapshot-name "zakura-pr-state-testnet-${STAMP}"
+          MAINNET_SNAPSHOT_NAME="zakura-pr-state-mainnet-${STAMP}"
+          TESTNET_SNAPSHOT_NAME="zakura-pr-state-testnet-${STAMP}"
+          ZCASHD_SNAPSHOT_NAME="zakura-pr-state-zcashd-mainnet-${STAMP}"
+
+          cleanup_partial_snapshot_family() {
+            rc=$?
+            trap - EXIT
+            [ "$rc" -ne 0 ] || return
+            set +e
+            echo "State snapshot creation failed; deleting the partial ${STAMP} family." >&2
+            for snapshot_name in \
+              "$MAINNET_SNAPSHOT_NAME" \
+              "$TESTNET_SNAPSHOT_NAME" \
+              "$ZCASHD_SNAPSHOT_NAME"; do
+              for _ in $(seq 1 6); do
+                if ! snapshot_ids=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
+                  awk -v name="$snapshot_name" '$2 == name {print $1}'); then
+                  sleep 5
+                  continue
+                fi
+                [ -n "$snapshot_ids" ] || break
+                while read -r snapshot_id; do
+                  [ -n "$snapshot_id" ] && doctl compute snapshot delete "$snapshot_id" -f
+                done <<< "$snapshot_ids"
+                sleep 5
+              done
+            done
+            exit "$rc"
+          }
+          trap cleanup_partial_snapshot_family EXIT
+
+          doctl compute volume snapshot "${MAINNET_VOL_ID}" --snapshot-name "$MAINNET_SNAPSHOT_NAME"
+          doctl compute volume snapshot "${TESTNET_VOL_ID}" --snapshot-name "$TESTNET_SNAPSHOT_NAME"
           if [ -n "${ZCASHD_VOL_ID}" ]; then
-            doctl compute volume snapshot "${ZCASHD_VOL_ID}" --snapshot-name "zakura-pr-state-zcashd-mainnet-${STAMP}"
+            doctl compute volume snapshot "${ZCASHD_VOL_ID}" --snapshot-name "$ZCASHD_SNAPSHOT_NAME"
           fi
+          trap - EXIT
 
       - name: Snapshot droplet image
         env:

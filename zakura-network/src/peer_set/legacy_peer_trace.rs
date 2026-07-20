@@ -56,7 +56,7 @@ impl LegacyPeerTrace {
 
     pub(super) fn next_request_id(&self) -> u64 {
         self.next_request_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
                 Some(id.saturating_add(1))
             })
             .expect("request ID update succeeds because its closure always returns Some")

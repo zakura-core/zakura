@@ -54,7 +54,7 @@ impl From<Client> for LoadTrackedClient {
             service,
             connection_info,
             trace_id: NEXT_PEER_TRACE_ID
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
                     Some(id.saturating_add(1))
                 })
                 .expect("trace ID update succeeds because its closure always returns Some"),

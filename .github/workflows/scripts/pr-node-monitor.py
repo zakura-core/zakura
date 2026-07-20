@@ -19,6 +19,10 @@ PRUNED_SIDECAR_ERROR = (
     "cannot serve block because its body has been pruned; a zcashd sidecar "
     "requiring this block cannot continue syncing"
 )
+EXPECTED_ZCASHD_STARTUP_ERROR = re.compile(
+    r'^\S+\s+INFO zcashd_compat\.zcashd: \S+ ERROR Init: main: Read: Failed to open file '
+    r'/mnt/zcashd/(?:peers|banlist)\.dat stream="stdout"$'
+)
 
 
 def rpc_call(url: str, method: str, cookie_file: str | None = None):
@@ -108,18 +112,25 @@ def take_sample(args) -> dict:
     return sample
 
 
-def scan_logs(log_file: str, service: str) -> dict:
-    errors = warns = pruned_sidecar_errors = 0
+def scan_logs(log_file: str, service: str, test_profile: str) -> dict:
+    errors = warns = pruned_sidecar_errors = expected_zcashd_startup_errors = 0
     last_errors: list[str] = []
     try:
         with open(log_file, errors="replace") as fh:
             for line in fh:
+                line = line.rstrip()
                 if PRUNED_SIDECAR_ERROR in line:
                     pruned_sidecar_errors += 1
                 if " ERROR " in line:
-                    errors += 1
-                    last_errors.append(line.rstrip()[:300])
-                    last_errors = last_errors[-5:]
+                    if (
+                        test_profile == "zcashd-compat"
+                        and EXPECTED_ZCASHD_STARTUP_ERROR.fullmatch(line)
+                    ):
+                        expected_zcashd_startup_errors += 1
+                    else:
+                        errors += 1
+                        last_errors.append(line[:300])
+                        last_errors = last_errors[-5:]
                 elif " WARN " in line:
                     warns += 1
     except OSError:
@@ -136,6 +147,7 @@ def scan_logs(log_file: str, service: str) -> dict:
         "warns": warns,
         "panics": panics,
         "pruned_sidecar_errors": pruned_sidecar_errors,
+        "expected_zcashd_startup_errors": expected_zcashd_startup_errors,
         "last_errors": last_errors,
     }
 
@@ -221,6 +233,7 @@ def build_summary(
         "log_warns": logs["warns"],
         "panics": logs["panics"],
         "pruned_sidecar_errors": logs["pruned_sidecar_errors"],
+        "expected_zcashd_startup_errors": logs["expected_zcashd_startup_errors"],
         "last_errors": logs["last_errors"],
         "cold_warm_lifecycle": lifecycle,
         "zakura_fixture_manifest": zakura_fixture,
@@ -315,6 +328,8 @@ def write_markdown(out: Path, summary: dict, samples: list[dict], notes_file: st
             f"{summary['zcashd_child_restarts']} unexpected restart(s) |",
             f"| zcashd connections at end | {fmt(summary['zcashd_connections_at_end'])} |",
             f"| Pruned sidecar diagnostic | {summary['pruned_sidecar_errors']} occurrence(s) |",
+            f"| Expected zcashd startup errors | "
+            f"{summary['expected_zcashd_startup_errors']} occurrence(s) |",
             f"| Cold stop/warm restart | "
             f"{'passed' if (summary.get('cold_warm_lifecycle') or {}).get('passed') else 'failed'} |",
         ]
@@ -431,7 +446,7 @@ def main() -> int:
     summary = build_summary(
         meta,
         samples,
-        scan_logs(args.log_file, args.service),
+        scan_logs(args.log_file, args.service, args.test_profile),
         args.duration_minutes,
         load_json(args.lifecycle_file),
         load_json(args.zakura_fixture_manifest),

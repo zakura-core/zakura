@@ -23,7 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 - Limit pruned block recovery diagnostics to configured inbound zcashd compat
   peers. Ordinary peers still receive `notfound` without a misleading sidecar
-  error.
+  error
+  ([#304](https://github.com/zakura-core/zakura/pull/304)).
 
 ## [1.0.2-rc1] - 2026-07-19
 

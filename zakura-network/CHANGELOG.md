@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added the hidden `Request::BlocksByHashFromProtectedPeer` variant so the
   inbound handler can distinguish requests from configured protected peers.
-  Downstream exhaustive `Request` matches must handle the new variant.
+  Downstream exhaustive `Request` matches must handle the new variant
+  ([#304](https://github.com/zakura-core/zakura/pull/304)).
 
 ## [3.0.0-rc1] - 2026-07-19
 

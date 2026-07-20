@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   checks instead of hashing them again for every signature
   ([#281](https://github.com/zakura-core/zakura/pull/281)).
 
+### Security
+
+- Prevent a peer from stalling chain synchronization by delivering a rejected
+  block body that shares its header hash with a later valid block
+  ([GHSA-8gxx-hc65-vv82](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-8gxx-hc65-vv82)).
+
 ## [1.0.2-rc1] - 2026-07-19
 
 ### Added

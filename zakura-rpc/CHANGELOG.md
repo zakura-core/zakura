@@ -7,23 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [3.0.0-rc1] - 2026-07-19
+## [3.0.0] - 2026-07-20
+
+### Breaking Changes
+
+- `zakura-state`, `zakura-network`, and `zakura-consensus` moved to 3.0.0.
+  Their service types appear in this crate's public server signatures, so
+  their major versions are part of this crate's API; no APIs defined in this
+  crate changed.
 
 ### Changed
 
 - `getblocktemplate` coinbase construction reuses the process-wide Sapling
-  prover from `zakura-consensus` (requiring 3.0.0-rc1 for `sapling_prover`)
+  prover from `zakura-consensus` (requiring 3.0.0 for `sapling_prover`)
   instead of re-parsing the bundled proving parameters on every request; no
   APIs defined in this crate changed.
-
-## [3.0.0-rc0] - 2026-07-19
-
-### Breaking Changes
-
-- `zakura-state`, `zakura-network`, and `zakura-consensus` moved to 3.0.0-rc0.
-  Their service types appear in this crate's public server signatures, so
-  their major versions are part of this crate's API; no APIs defined in this
-  crate changed.
 
 ## [2.0.0] - 2026-07-17
 

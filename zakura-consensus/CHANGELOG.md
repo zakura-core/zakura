@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [3.0.0-rc1] - 2026-07-19
+## [3.0.0] - 2026-07-20
+
+### Breaking Changes
+
+- `zakura-state` moved to 3.0.0. State service types appear in this crate's
+  public `init` signatures, so the state major version is part of this crate's
+  API; no APIs defined in this crate changed.
 
 ### Added
 
@@ -33,14 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Mempool rejections of NU6.2 branch-ID transactions no longer penalize the
   relaying peer during the first 40 heights after NU6.3 activation; consensus
   validation is unchanged.
-
-## [3.0.0-rc0] - 2026-07-19
-
-### Breaking Changes
-
-- `zakura-state` moved to 3.0.0-rc0. State service types appear in this crate's
-  public `init` signatures, so the state major version is part of this crate's
-  API; no APIs defined in this crate changed.
 
 ## [2.0.0] - 2026-07-17
 

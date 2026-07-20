@@ -7,19 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-### Changed
-
-- Reuse transaction-wide transparent signature hash components across input
-  checks instead of hashing them again for every signature
-  ([#281](https://github.com/zakura-core/zakura/pull/281)).
-
-### Security
-
-- Prevent a peer from stalling chain synchronization by delivering a rejected
-  block body that shares its header hash with a later valid block
-  ([GHSA-8gxx-hc65-vv82](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-8gxx-hc65-vv82)).
-
-## [1.0.2-rc1] - 2026-07-19
+## [1.0.2] - 2026-07-20
 
 ### Added
 
@@ -34,9 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Diagnose requests for pruned block bodies with the block height, hash, and
   configured retention, rate limited to once per minute
   ([#279](https://github.com/zakura-core/zakura/pull/279)).
+- Add a configurable 250,000-byte default maximum for individual mempool
+  transactions. Larger transactions are rejected before semantic and contextual
+  verification without penalizing peers, and the policy does not affect block
+  validation ([#255](https://github.com/zakura-core/zakura/pull/255)).
+- Add `zakurad validate-vct-sprout-history` to audit repaired historical
+  Sprout anchors in archive or pruned Mainnet state databases
+  ([#247](https://github.com/zakura-core/zakura/pull/247),
+  [#251](https://github.com/zakura-core/zakura/pull/251)).
 
 ### Changed
 
+- Reuse transaction-wide transparent signature hash components across input
+  checks instead of hashing them again for every signature
+  ([#281](https://github.com/zakura-core/zakura/pull/281)).
 - Reject transactions that do not meet ZIP-317 mempool fee policy before
   running script and proof checks. Block validation is unchanged
   ([#263](https://github.com/zakura-core/zakura/pull/263)).
@@ -49,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   ([#268](https://github.com/zakura-core/zakura/pull/268)).
 - Point snapshot links and benchmark defaults at the Zakura snapshot service
   ([#276](https://github.com/zakura-core/zakura/pull/276)).
+- Source the embedded Mainnet VCT Sprout-history repair artifact from
+  exact-versioned crates.io packages instead of storing its large source
+  bytes in the Zakura repository, and reuse one validated decode throughout
+  startup repair ([#259](https://github.com/zakura-core/zakura/pull/259)).
+- Update the embedded zcashd-compat binary and default split-container image to
+  valargroup/zcashd v1.0.1
+  ([#245](https://github.com/zakura-core/zakura/pull/245)).
+- Header sync now schedules only forward ranges from the durable verified block
+  tip. Startup rejects configured anchors above that base, and no longer
+  backfills headers below a checkpoint anchor
+  ([#227](https://github.com/zakura-core/zakura/pull/227)).
 
 ### Fixed
 
@@ -78,36 +88,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   ([#283](https://github.com/zakura-core/zakura/pull/283)).
 - Ban peers that send mempool transactions with invalid Orchard or Ironwood
   proof sizes ([#285](https://github.com/zakura-core/zakura/pull/285)).
-
-## [1.0.2-rc0] - 2026-07-19
-
-### Added
-
-- Add a configurable 250,000-byte default maximum for individual mempool
-  transactions. Larger transactions are rejected before semantic and contextual
-  verification without penalizing peers, and the policy does not affect block
-  validation ([#255](https://github.com/zakura-core/zakura/pull/255)).
-- Add `zakurad validate-vct-sprout-history` to audit repaired historical
-  Sprout anchors in archive or pruned Mainnet state databases
-  ([#247](https://github.com/zakura-core/zakura/pull/247),
-  [#251](https://github.com/zakura-core/zakura/pull/251)).
-
-### Changed
-
-- Source the embedded Mainnet VCT Sprout-history repair artifact from
-  exact-versioned crates.io packages instead of storing its large source
-  bytes in the Zakura repository, and reuse one validated decode throughout
-  startup repair ([#259](https://github.com/zakura-core/zakura/pull/259)).
-- Update the embedded zcashd-compat binary and default split-container image to
-  valargroup/zcashd v1.0.1
-  ([#245](https://github.com/zakura-core/zakura/pull/245)).
-- Header sync now schedules only forward ranges from the durable verified block
-  tip. Startup rejects configured anchors above that base, and no longer
-  backfills headers below a checkpoint anchor
-  ([#227](https://github.com/zakura-core/zakura/pull/227)).
-
-### Fixed
-
 - Database format upgrades now finish before startup exposes the finalized
   state database; only configured periodic format checks continue in the
   background ([#240](https://github.com/zakura-core/zakura/pull/240)).
@@ -145,6 +125,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   their requests are still shed for backpressure, but the connection is not
   closed. Every other peer's denial-of-service protection is unchanged
   ([#242](https://github.com/zakura-core/zakura/pull/242)).
+
+### Security
+
+- Prevent a peer from stalling chain synchronization by delivering a rejected
+  block body that shares its header hash with a later valid block
+  ([GHSA-8gxx-hc65-vv82](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-8gxx-hc65-vv82)).
 
 ## [1.0.1] - 2026-07-17
 

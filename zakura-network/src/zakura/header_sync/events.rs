@@ -286,25 +286,24 @@ pub enum HeaderSyncEvent {
         /// State repair generation that was resolved.
         generation: u64,
     },
-    /// State successfully committed a header range.
-    HeaderRangeCommitted {
-        /// First committed height.
-        start_height: block::Height,
-        /// New best header tip height.
+    /// State returned the durable best header tip during startup or refresh.
+    BestHeaderTipLoaded {
+        /// Durable best header tip height.
         tip_height: block::Height,
+        /// Durable best header tip hash.
+        tip_hash: block::Hash,
+    },
+    /// State successfully committed a header range.
+    HeaderRangeOperationCompleted {
+        /// Exact header-commit operation that completed.
+        operation: HeaderSyncOperationIdentity,
         /// New best header tip hash.
         tip_hash: block::Hash,
     },
     /// State rejected a previously requested range.
-    HeaderRangeCommitFailed {
-        /// Peer that supplied the failed range.
-        peer: ZakuraPeerId,
-        /// Ordered-stream generation that supplied the range.
-        session_id: u64,
-        /// First failed range height.
-        start_height: block::Height,
-        /// Failed range count.
-        count: u32,
+    HeaderRangeOperationFailed {
+        /// Exact header-commit operation that failed.
+        operation: HeaderSyncOperationIdentity,
         /// Whether state rejected peer data or hit a local resource/channel failure.
         kind: HeaderSyncCommitFailureKind,
     },
@@ -368,8 +367,9 @@ impl HeaderSyncEvent {
             Self::StateFrontiersChanged(_) => "state_frontiers_changed",
             Self::VctRootRepairRequested { .. } => "vct_root_repair_requested",
             Self::VctRootRepairResolved { .. } => "vct_root_repair_resolved",
-            Self::HeaderRangeCommitted { .. } => "header_range_committed",
-            Self::HeaderRangeCommitFailed { .. } => "header_range_commit_failed",
+            Self::BestHeaderTipLoaded { .. } => "best_header_tip_loaded",
+            Self::HeaderRangeOperationCompleted { .. } => "header_range_operation_completed",
+            Self::HeaderRangeOperationFailed { .. } => "header_range_operation_failed",
             Self::HeaderRangeResponseFinished { .. } => "header_range_response_finished",
             Self::HeaderRangeResponseReady { .. } => "header_range_response_ready",
         }
@@ -391,10 +391,8 @@ pub enum HeaderSyncAction {
     },
     /// Ask state to commit a contiguous header range.
     CommitHeaderRange {
-        /// Peer that supplied the range.
-        peer: ZakuraPeerId,
-        /// Ordered-stream generation that supplied the range.
-        session_id: u64,
+        /// Exact header-commit operation represented by this action.
+        operation: HeaderSyncOperationIdentity,
         /// Parent anchor hash for the first header.
         anchor: block::Hash,
         /// First header height.
@@ -539,6 +537,35 @@ impl HeaderSyncRequestId {
     pub fn get(self) -> u64 {
         self.0
     }
+}
+
+/// Exact identity of one outbound header-sync request.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct HeaderSyncWireRequestIdentity {
+    /// Peer that served the request.
+    pub peer: ZakuraPeerId,
+    /// Ordered-stream generation that issued the request.
+    pub session_id: u64,
+    /// Request ID allocated within that stream session.
+    pub request_id: HeaderSyncRequestId,
+}
+
+/// Kind of state operation started from a header-sync response.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum HeaderSyncOperationKind {
+    /// Commit canonical headers to state.
+    CommitHeaders,
+    /// Authenticate supplied commitment roots against canonical headers.
+    AuthenticateRoots,
+}
+
+/// Exact identity of one state operation started from a header-sync request.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct HeaderSyncOperationIdentity {
+    /// Wire request that supplied the operation payload.
+    pub wire_request: HeaderSyncWireRequestIdentity,
+    /// Operation performed on that payload.
+    pub op_kind: HeaderSyncOperationKind,
 }
 
 /// A single outbound `GetHeaders` range expected by a peer session.

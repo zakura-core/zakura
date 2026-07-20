@@ -6,7 +6,7 @@ use super::super::{
     error::HeaderSyncWireError,
     events::{
         HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncMisbehavior,
-        HeaderSyncRequestId,
+        HeaderSyncOperationKind, HeaderSyncRequestId,
     },
     state::RangeRequest,
     validation::count_between,
@@ -509,32 +509,51 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
             insert_optional_str(row, hs_trace::KIND, Some("vct_root_repair_resolved"));
             insert_u64(row, "generation", *generation);
         }
-        HeaderSyncEvent::HeaderRangeCommitted {
-            start_height,
+        HeaderSyncEvent::BestHeaderTipLoaded {
             tip_height,
             tip_hash,
         } => {
-            insert_optional_str(row, hs_trace::KIND, Some("header_range_committed"));
-            insert_height(row, hs_trace::RANGE_START, *start_height);
-            insert_u64(
-                row,
-                hs_trace::RANGE_COUNT,
-                u64::from(count_between(*start_height, *tip_height)),
-            );
+            insert_optional_str(row, hs_trace::KIND, Some("best_header_tip_loaded"));
             insert_height(row, hs_trace::HEIGHT, *tip_height);
             insert_hash(row, hs_trace::HASH, *tip_hash);
         }
-        HeaderSyncEvent::HeaderRangeCommitFailed {
-            peer,
-            start_height,
-            count,
-            kind,
-            ..
+        HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation,
+            tip_hash,
         } => {
-            insert_optional_str(row, hs_trace::KIND, Some("header_range_commit_failed"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::RANGE_START, *start_height);
-            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*count));
+            insert_optional_str(
+                row,
+                hs_trace::KIND,
+                Some("header_range_operation_completed"),
+            );
+            insert_peer(row, hs_trace::PEER, &operation.wire_request.peer);
+            insert_u64(row, hs_trace::SESSION_ID, operation.wire_request.session_id);
+            insert_u64(
+                row,
+                hs_trace::REQUEST_ID,
+                operation.wire_request.request_id.get(),
+            );
+            insert_optional_str(
+                row,
+                "operation_kind",
+                Some(operation_kind_label(operation.op_kind)),
+            );
+            insert_hash(row, hs_trace::HASH, *tip_hash);
+        }
+        HeaderSyncEvent::HeaderRangeOperationFailed { operation, kind } => {
+            insert_optional_str(row, hs_trace::KIND, Some("header_range_operation_failed"));
+            insert_peer(row, hs_trace::PEER, &operation.wire_request.peer);
+            insert_u64(row, hs_trace::SESSION_ID, operation.wire_request.session_id);
+            insert_u64(
+                row,
+                hs_trace::REQUEST_ID,
+                operation.wire_request.request_id.get(),
+            );
+            insert_optional_str(
+                row,
+                "operation_kind",
+                Some(operation_kind_label(operation.op_kind)),
+            );
             insert_optional_str(
                 row,
                 hs_trace::REASON,
@@ -621,13 +640,24 @@ fn trace_action_fields(row: &mut serde_json::Map<String, Value>, action: &Header
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*count));
         }
         HeaderSyncAction::CommitHeaderRange {
-            peer,
+            operation,
             start_height,
             headers,
             ..
         } => {
             insert_optional_str(row, hs_trace::KIND, Some("commit_header_range"));
-            insert_peer(row, hs_trace::PEER, peer);
+            insert_peer(row, hs_trace::PEER, &operation.wire_request.peer);
+            insert_u64(row, hs_trace::SESSION_ID, operation.wire_request.session_id);
+            insert_u64(
+                row,
+                hs_trace::REQUEST_ID,
+                operation.wire_request.request_id.get(),
+            );
+            insert_optional_str(
+                row,
+                "operation_kind",
+                Some(operation_kind_label(operation.op_kind)),
+            );
             insert_height(row, hs_trace::RANGE_START, *start_height);
             insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
         }
@@ -878,6 +908,13 @@ pub(super) fn commit_failure_reason_label(kind: HeaderSyncCommitFailureKind) -> 
     }
 }
 
+fn operation_kind_label(kind: HeaderSyncOperationKind) -> &'static str {
+    match kind {
+        HeaderSyncOperationKind::CommitHeaders => "commit_headers",
+        HeaderSyncOperationKind::AuthenticateRoots => "authenticate_roots",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -900,7 +937,8 @@ mod tests {
         header_sync::{
             events::HeaderSyncFrontiers, service::HeaderSyncPeerSession, state::RangePriority,
         },
-        HeaderSyncServiceSummary,
+        HeaderSyncOperationIdentity, HeaderSyncOperationKind, HeaderSyncServiceSummary,
+        HeaderSyncWireRequestIdentity,
     };
 
     fn peer(byte: u8) -> ZakuraPeerId {
@@ -916,6 +954,17 @@ mod tests {
 
     fn request_id() -> HeaderSyncRequestId {
         HeaderSyncRequestId::new(1).expect("test request id is non-zero")
+    }
+
+    fn operation(peer: ZakuraPeerId) -> HeaderSyncOperationIdentity {
+        HeaderSyncOperationIdentity {
+            wire_request: HeaderSyncWireRequestIdentity {
+                peer,
+                session_id: 7,
+                request_id: request_id(),
+            },
+            op_kind: HeaderSyncOperationKind::CommitHeaders,
+        }
     }
 
     fn root(height: block::Height) -> BlockCommitmentRoots {
@@ -1066,16 +1115,16 @@ mod tests {
                 expected_hashes: vec![(block::Height(5), block::Hash([5; 32]))],
             },
             HeaderSyncEvent::VctRootRepairResolved { generation: 8 },
-            HeaderSyncEvent::HeaderRangeCommitted {
-                start_height: block::Height(5),
+            HeaderSyncEvent::BestHeaderTipLoaded {
                 tip_height: block::Height(7),
                 tip_hash: block::Hash([7; 32]),
             },
-            HeaderSyncEvent::HeaderRangeCommitFailed {
-                peer: peer.clone(),
-                session_id: 7,
-                start_height: block::Height(5),
-                count: 3,
+            HeaderSyncEvent::HeaderRangeOperationCompleted {
+                operation: operation(peer.clone()),
+                tip_hash: block::Hash([7; 32]),
+            },
+            HeaderSyncEvent::HeaderRangeOperationFailed {
+                operation: operation(peer.clone()),
                 kind: HeaderSyncCommitFailureKind::InvalidPeerRange,
             },
             HeaderSyncEvent::HeaderRangeResponseFinished {
@@ -1139,8 +1188,7 @@ mod tests {
             ),
             (
                 HeaderSyncAction::CommitHeaderRange {
-                    peer: peer.clone(),
-                    session_id: 7,
+                    operation: operation(peer.clone()),
                     anchor: block::Hash([0; 32]),
                     start_height: block::Height(1),
                     headers: vec![header],
@@ -1501,12 +1549,11 @@ mod tests {
 
         assert_eq!(count_between(block::Height(3), block::Height(5)), 3);
         assert_eq!(count_between(block::Height(5), block::Height(3)), 0);
-        let committed = event_row(&HeaderSyncEvent::HeaderRangeCommitted {
-            start_height: block::Height(3),
-            tip_height: block::Height(5),
+        let committed = event_row(&HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation: operation(peer(3)),
             tip_hash: block::Hash([5; 32]),
         });
-        assert_eq!(committed[hs_trace::RANGE_COUNT], Value::from(3));
+        assert_eq!(committed[hs_trace::REQUEST_ID], Value::from(1));
         let gaps = action_row(&HeaderSyncAction::BodyGaps {
             from: block::Height(3),
             to: block::Height(5),

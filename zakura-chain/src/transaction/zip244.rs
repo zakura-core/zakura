@@ -594,6 +594,8 @@ fn hash_bundle_txid(
 /// Reference implementation:
 /// <https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L426>
 fn txid_inner(parts: &Zip244Parts) -> Hash {
+    // Compute the level-1 nodes, substituting personalized empty hashes
+    // for absent bundles.
     let header = hash_header(parts);
     let transparent = hash_transparent_txid(parts.inputs, parts.outputs);
     let sapling = hash_sapling_txid(parts.sapling, parts.version);
@@ -607,6 +609,7 @@ fn txid_inner(parts: &Zip244Parts) -> Hash {
     personal[..12].copy_from_slice(ZCASH_TX_PERSONALIZATION_PREFIX);
     personal[12..].copy_from_slice(&consensus_branch_id(parts).to_le_bytes());
 
+    // Commit the level-1 nodes in their ZIP-244 order.
     let mut h = hasher(&personal);
     h.update(header.as_bytes());
     h.update(&transparent);
@@ -717,6 +720,8 @@ fn hash_bundle_auth(
 /// Reference implementation:
 /// <https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L426-L448>
 fn auth_digest_inner(parts: &Zip244Parts) -> AuthDigest {
+    // Compute the level-1 nodes, substituting personalized empty hashes
+    // for absent bundles.
     let transparent = hash_transparent_auth(parts.inputs, parts.outputs);
     let sapling = hash_sapling_auth(parts.sapling, parts.version);
     let orchard = hash_bundle_auth(parts.orchard, parts.version.orchard_format());
@@ -729,6 +734,7 @@ fn auth_digest_inner(parts: &Zip244Parts) -> AuthDigest {
     personal[..12].copy_from_slice(ZCASH_AUTH_PERSONALIZATION_PREFIX);
     personal[12..].copy_from_slice(&consensus_branch_id(parts).to_le_bytes());
 
+    // Commit the level-1 nodes in their ZIP-244 order.
     let mut h = hasher(&personal);
     h.update(&transparent);
     h.update(&sapling);

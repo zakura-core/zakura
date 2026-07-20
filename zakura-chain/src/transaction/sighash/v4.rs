@@ -204,7 +204,7 @@ impl V4Sighash {
                     prevouts: prevouts_hash(inputs),
                     sequence: sequence_hash(inputs),
                     outputs: outputs_hash(outputs),
-                    single_outputs: outputs.iter().map(output_hash).collect(),
+                    single_outputs: outputs.iter().take(inputs.len()).map(output_hash).collect(),
                     joinsplits: joinsplits_hash(joinsplit_data.as_ref()),
                     value_balance,
                     sapling_spends,

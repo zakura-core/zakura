@@ -769,6 +769,7 @@ impl Zip244SighashCache {
             single_outputs: parts
                 .outputs
                 .iter()
+                .take(parts.inputs.len())
                 .map(|output| hash_outputs(std::slice::from_ref(output)))
                 .collect(),
             txins: parts

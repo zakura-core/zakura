@@ -8,6 +8,7 @@
 use std::{
     collections::HashSet,
     future::Future,
+    net::IpAddr,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -99,19 +100,26 @@ type GossipedBlockDownloads =
 #[derive(Debug)]
 struct PrunedBlockNotFoundLogger {
     tx_retention: Option<u32>,
+    peer_ips: HashSet<IpAddr>,
     last_log: Mutex<Option<Instant>>,
 }
 
 impl PrunedBlockNotFoundLogger {
-    fn new(tx_retention: Option<u32>) -> Self {
+    fn new(tx_retention: Option<u32>, peer_ips: Vec<IpAddr>) -> Self {
         Self {
             tx_retention,
+            peer_ips: peer_ips.into_iter().map(canonical_ip).collect(),
             last_log: Mutex::new(None),
         }
     }
 
-    fn is_enabled(&self) -> bool {
-        self.tx_retention.is_some()
+    fn is_enabled_for(&self, source: Option<&zn::PeerSource>) -> bool {
+        let Some(zn::PeerSource::LegacySocket(addr)) = source else {
+            return false;
+        };
+        let source_ip = canonical_ip(addr.remove_socket_addr_privacy().ip());
+
+        self.tx_retention.is_some() && self.peer_ips.contains(&source_ip)
     }
 
     /// Reserves the current log interval and returns the configured retention.
@@ -134,6 +142,16 @@ impl PrunedBlockNotFoundLogger {
 
         *last_log = Some(now);
         Some(tx_retention)
+    }
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        ip => ip,
     }
 }
 
@@ -308,6 +326,7 @@ impl Inbound {
         full_verify_concurrency_limit: usize,
         expose_peer_addresses: bool,
         zcashd_compat_pruning_retention: Option<u32>,
+        zcashd_compat_peer_ips: Vec<IpAddr>,
         setup: oneshot::Receiver<InboundSetupData>,
     ) -> Inbound {
         Inbound {
@@ -318,6 +337,7 @@ impl Inbound {
             expose_peer_addresses,
             pruned_block_not_found_logger: Arc::new(PrunedBlockNotFoundLogger::new(
                 zcashd_compat_pruning_retention,
+                zcashd_compat_peer_ips,
             )),
         }
     }
@@ -508,15 +528,15 @@ impl Service<zn::Request> for Inbound {
             }
             request @ (zn::Request::BlocksByHash(_)
             | zn::Request::BlocksByHashFrom { .. }) => {
-                let (hashes, is_zcashd_compat_peer) = match request {
-                    zn::Request::BlocksByHash(hashes) => (hashes, false),
-                    zn::Request::BlocksByHashFrom {
-                        hashes,
-                        source: zn::PeerSource::LegacySocket(_),
-                    } => (hashes, true),
-                    zn::Request::BlocksByHashFrom { hashes, .. } => (hashes, false),
+                let (hashes, source) = match request {
+                    zn::Request::BlocksByHash(hashes) => (hashes, None),
+                    zn::Request::BlocksByHashFrom { hashes, source } => {
+                        (hashes, Some(source))
+                    }
                     _ => unreachable!("matched block inventory request"),
                 };
+                let log_pruned_block =
+                    pruned_block_not_found_logger.is_enabled_for(source.as_ref());
 
                 // We return an available or missing response to each inventory request,
                 // unless the request is empty, or it reaches a response limit.
@@ -560,9 +580,7 @@ impl Service<zn::Request> for Inbound {
                                 // A retained canonical header with no block body identifies
                                 // history removed by pruning. Unknown hashes remain ordinary
                                 // `notfound` responses without reserving a log interval.
-                                if is_zcashd_compat_peer
-                                    && pruned_block_not_found_logger.is_enabled()
-                                {
+                                if log_pruned_block {
                                     if let Some(height) =
                                         retained_block_height(state.clone(), hash).await
                                     {

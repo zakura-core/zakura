@@ -1352,7 +1352,7 @@ where
                             .connection_info
                             .connected_addr
                             .get_transient_addr()
-                            .expect("protected peers are direct inbound connections")
+                            .expect("protected peers have transient inbound addresses")
                             .into();
 
                         Request::BlocksByHashFrom { hashes, source }.into()

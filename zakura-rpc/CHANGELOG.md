@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0-rc1] - 2026-07-19
+
+### Changed
+
+- `getblocktemplate` coinbase construction reuses the process-wide Sapling
+  prover from `zakura-consensus` (requiring 3.0.0-rc1 for `sapling_prover`)
+  instead of re-parsing the bundled proving parameters on every request; no
+  APIs defined in this crate changed.
+
 ## [3.0.0-rc0] - 2026-07-19
 
 ### Breaking Changes

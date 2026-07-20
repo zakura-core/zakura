@@ -290,7 +290,7 @@ jobs:
           SANDBLAST_URL: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_URL || 'https://zakura.valargroup.dev/mainnet/historical/zakura-mainnet-20260717T095333Z-1707210.tar.zst' }}
           SANDBLAST_SHA256: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_SHA256 || '2bcb3786252300b4163b38a49b2d3a8015ba581d7d3efc854e6ed662a18258ac' }}
           SANDBLAST_HEIGHT: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_HEIGHT || '1707210' }}
-          SANDBLAST_DB_FORMAT: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_DB_FORMAT || '28.0.1' }}
+          SANDBLAST_DB_FORMAT: ${{ vars.ZAKURA_PR_NODE_SANDBLAST_DB_FORMAT || '28.0.0' }}
           TESTNET_SNAPSHOTS_BASE: ${{ vars.ZAKURA_TESTNET_SNAPSHOTS_URL || 'http://167.99.103.111:8091' }}
           ZCASHD_VOLUME_NAME: ${{ steps.droplet.outputs.zcashd_vol }}
           ZCASHD_SOURCE_SNAPSHOT_ID: ${{ steps.droplet.outputs.zcashd_snapshot_id }}

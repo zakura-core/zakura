@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- Reuse transaction-wide transparent signature hash components across input
+  checks instead of hashing them again for every signature
+  ([#281](https://github.com/zakura-core/zakura/pull/281)).
+
 ## [1.0.2-rc1] - 2026-07-19
 
 ### Added

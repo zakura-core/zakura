@@ -1130,6 +1130,42 @@ fn v4_raw_sighashes_match_librustzcash() -> Result<()> {
 }
 
 #[test]
+fn v4_raw_sighash_single_without_output_matches_zip243() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let test = zip0243::TEST_VECTORS
+        .last()
+        .expect("ZIP-243 vectors include SIGHASH_SINGLE without an output");
+    let transaction = test.tx.zcash_deserialize_into::<Transaction>()?;
+    let input_index = usize::try_from(
+        test.transparent_input
+            .expect("selected vector has a transparent input"),
+    )
+    .expect("u32 fits in usize");
+
+    assert_eq!(test.hash_type, HashType::SINGLE.bits());
+    assert!(transaction.outputs().get(input_index).is_none());
+
+    let previous_output = transparent::Output {
+        value: test.amount.try_into()?,
+        lock_script: Script::new(&test.script_code),
+    };
+    let native = SigHasher::new(
+        &transaction,
+        NetworkUpgrade::try_from(test.consensus_branch_id).expect("network upgrade"),
+        Arc::new(mock_pre_v5_output_list(previous_output, input_index)),
+    )?;
+    let raw_hash_type = u8::try_from(test.hash_type).expect("ZIP-243 hash type fits in one byte");
+    let input = Some((input_index, test.script_code.clone()));
+
+    assert_eq!(
+        native.sighash_v4_raw(raw_hash_type, input),
+        SigHash(test.sighash),
+    );
+
+    Ok(())
+}
+
+#[test]
 fn zip143_sighash() -> Result<()> {
     let _init_guard = zakura_test::init();
 

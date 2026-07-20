@@ -593,9 +593,9 @@ impl RangeRequest {
             return None;
         }
         let start_height = next_height(covered_through)?;
+        let geometry = CheckedHeaderRange::from_bounds(start_height, end_height)?;
         Some(Self {
-            geometry: CheckedHeaderRange::from_bounds(start_height, end_height)
-                .expect("suffix bounds are ascending"),
+            geometry,
             anchor_hash: Some(anchor_hash),
             ..self
         })

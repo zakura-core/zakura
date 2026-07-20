@@ -18,8 +18,10 @@ use futures::{
 use tower::load_shed::error::Overloaded;
 use tracing::Span;
 
-use zakura_chain::serialization::SerializationError;
+use zakura_chain::{block, serialization::SerializationError};
 use zakura_test::mock_service::{MockService, PanicAssertion};
+
+use super::new_test_connection_with_metadata;
 
 use crate::{
     constants::{MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY, REQUEST_TIMEOUT},
@@ -30,7 +32,7 @@ use crate::{
     peer_set::ActiveConnectionCounter,
     protocol::external::Message,
     types::Nonce,
-    PeerError, Request, Response,
+    InventoryResponse, PeerError, PeerSocketAddr, Request, Response,
 };
 
 /// Test that the connection run loop works as a future
@@ -236,6 +238,71 @@ async fn connection_run_loop_message_ok() {
     connection_join_handle.abort();
     let outbound_message = peer_outbound_messages.next().await;
     assert_eq!(outbound_message, None);
+}
+
+/// Test that inbound block requests retain the configured protected peer marker.
+#[tokio::test]
+async fn block_getdata_preserves_protected_peer_marker() {
+    let _init_guard = zakura_test::init();
+    let block_hash = block::Hash([0x11; 32]);
+
+    let fake_addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+    let cases = [
+        (
+            crate::peer::ConnectedAddr::OutboundDirect { addr: fake_addr },
+            false,
+        ),
+        (
+            crate::peer::ConnectedAddr::InboundDirect { addr: fake_addr },
+            false,
+        ),
+        (
+            crate::peer::ConnectedAddr::InboundDirect { addr: fake_addr },
+            true,
+        ),
+    ];
+
+    for (connected_addr, is_protected_peer) in cases {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            connection,
+            _client_tx,
+            mut inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection_with_metadata::<PanicAssertion>(connected_addr, is_protected_peer);
+
+        let connection_handle = tokio::spawn(connection.run(peer_rx));
+
+        peer_tx
+            .send(Ok(Message::GetData(vec![block_hash.into()])))
+            .await
+            .expect("send to channel always succeeds");
+
+        let expected_request = if is_protected_peer {
+            Request::BlocksByHashFromProtectedPeer(HashSet::from([block_hash]))
+        } else {
+            Request::BlocksByHash(HashSet::from([block_hash]))
+        };
+        inbound_service
+            .expect_request(expected_request)
+            .await
+            .respond(Response::Blocks(vec![InventoryResponse::Missing(
+                block_hash,
+            )]));
+
+        assert_eq!(
+            peer_outbound_messages.next().await,
+            Some(Message::NotFound(vec![block_hash.into()])),
+            "all missing block bodies must remain wire notfound responses"
+        );
+        assert!(
+            shared_error_slot.try_get_error().is_none(),
+            "the request must not terminate the peer connection"
+        );
+
+        connection_handle.abort();
+    }
 }
 
 /// Test that the connection run loop fails correctly when dropped

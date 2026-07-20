@@ -1702,7 +1702,9 @@ where
     fn call(&mut self, req: Request) -> Self::Future {
         let fut = match req {
             // Only do inventory-aware routing on individual items.
-            Request::BlocksByHash(ref hashes) | Request::BlocksByHashFrom { ref hashes, .. }
+            Request::BlocksByHash(ref hashes)
+            | Request::BlocksByHashFromProtectedPeer(ref hashes)
+            | Request::BlocksByHashFrom { ref hashes, .. }
                 if hashes.len() == 1 =>
             {
                 let hash = InventoryHash::from(*hashes.iter().next().unwrap());

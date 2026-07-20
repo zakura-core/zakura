@@ -88,6 +88,17 @@ pub enum Request {
     /// Returns [`Response::Blocks`](super::Response::Blocks).
     BlocksByHash(HashSet<block::Hash>),
 
+    /// Request block data sent to this node by an operator configured protected peer.
+    ///
+    /// This marker preserves the requester class across the peer connection and
+    /// inbound service boundary without exposing the peer's address.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`Response::Blocks`](super::Response::Blocks).
+    #[doc(hidden)]
+    BlocksByHashFromProtectedPeer(HashSet<block::Hash>),
+
     /// Request block data by block hashes from a known advertising peer.
     ///
     /// This is used by authenticated transports that can safely route a
@@ -232,7 +243,8 @@ pub enum Request {
     /// block hash, allowing the remote peer to choose whether to download
     /// it. Remote peers who choose to download the block will generate a
     /// [`Request::BlocksByHash`] against the "inbound" service passed to
-    /// [`init`](crate::init).
+    /// [`init`](crate::init), or [`Request::BlocksByHashFromProtectedPeer`] when
+    /// the connection is configured as a protected peer.
     ///
     /// The peer set routes this request specially, sending it to *a fraction of*
     /// the available peers. See [`number_of_peers_to_broadcast()`](crate::PeerSet::number_of_peers_to_broadcast)
@@ -272,6 +284,9 @@ impl fmt::Display for Request {
             Request::BlocksByHash(hashes) => {
                 format!("BlocksByHash({})", hashes.len())
             }
+            Request::BlocksByHashFromProtectedPeer(hashes) => {
+                format!("BlocksByHashFromProtectedPeer({})", hashes.len())
+            }
             Request::BlocksByHashFrom { hashes, .. } => {
                 format!("BlocksByHashFrom({})", hashes.len())
             }
@@ -310,7 +325,9 @@ impl Request {
             Request::Peers => "Peers",
             Request::Ping(_) => "Ping",
 
-            Request::BlocksByHash(_) | Request::BlocksByHashFrom { .. } => "BlocksByHash",
+            Request::BlocksByHash(_)
+            | Request::BlocksByHashFromProtectedPeer(_)
+            | Request::BlocksByHashFrom { .. } => "BlocksByHash",
             Request::TransactionsById(_) | Request::TransactionsByIdFrom { .. } => {
                 "TransactionsById"
             }
@@ -331,6 +348,7 @@ impl Request {
         matches!(
             self,
             Request::BlocksByHash(_)
+                | Request::BlocksByHashFromProtectedPeer(_)
                 | Request::BlocksByHashFrom { .. }
                 | Request::TransactionsById(_)
                 | Request::TransactionsByIdFrom { .. }
@@ -341,6 +359,7 @@ impl Request {
     pub fn block_hash_inventory(&self) -> HashSet<block::Hash> {
         match self {
             Request::BlocksByHash(block_hashes)
+            | Request::BlocksByHashFromProtectedPeer(block_hashes)
             | Request::BlocksByHashFrom {
                 hashes: block_hashes,
                 ..

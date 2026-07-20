@@ -2,7 +2,10 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::{iter, net::SocketAddr};
+use std::{
+    iter,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 use futures::FutureExt;
 use indexmap::IndexSet;
@@ -62,7 +65,14 @@ async fn inbound_peers_empty_address_book() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         listen_addr,
-    ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral(), None).await;
+    ) = setup(
+        None,
+        P2pStack::Legacy,
+        StateConfig::ephemeral(),
+        None,
+        Vec::new(),
+    )
+    .await;
 
     // yield and sleep until the address book lock is released.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -156,6 +166,7 @@ async fn dual_stack_node_coexists_with_legacy_tcp_peer() -> Result<(), crate::Bo
         P2pStack::Dual,
         StateConfig::ephemeral(),
         None,
+        Vec::new(),
     )
     .await;
 
@@ -221,7 +232,14 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral(), None).await;
+    ) = setup(
+        None,
+        P2pStack::Legacy,
+        StateConfig::ephemeral(),
+        None,
+        Vec::new(),
+    )
+    .await;
 
     let test_block = block::Hash([0x11; 32]);
 
@@ -284,13 +302,12 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
     Ok(())
 }
 
-/// Check that a retained chain-index hash is not advertised when its block body is pruned.
+/// Check that pruned block diagnostics are limited to configured protected peers.
 ///
 /// Uses a real Zebra network stack, with an isolated Zebra inbound TCP connection.
 #[tokio::test(flavor = "multi_thread")]
 #[tracing_test::traced_test]
-async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
-) -> Result<(), crate::BoxError> {
+async fn pruned_block_diagnostic_is_scoped_to_protected_peer() -> Result<(), crate::BoxError> {
     // `setup` configures checkpoint retention against `Height::MAX`, so block 1 is committed
     // to the retained chain indexes without storing its transaction bytes. Genesis is retained.
     let state_config = StateConfig {
@@ -317,6 +334,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         P2pStack::Legacy,
         state_config,
         Some(PruningConfig::default().tx_retention),
+        vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
     )
     .await;
 
@@ -373,7 +391,9 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
     let unknown_hash = block::Hash([0x11; 32]);
     let unknown_response = inbound_service
         .clone()
-        .oneshot(Request::BlocksByHash(iter::once(unknown_hash).collect()))
+        .oneshot(Request::BlocksByHashFromProtectedPeer(
+            iter::once(unknown_hash).collect(),
+        ))
         .await?;
     assert_eq!(
         unknown_response,
@@ -394,7 +414,10 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         Response::Blocks(vec![Missing(block1.hash())]),
         "inbound maps the unavailable block body to missing inventory"
     );
-    assert!(logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR));
+    assert!(
+        !logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        "ordinary peer requests must not emit a zcashd sidecar diagnostic"
+    );
 
     let wire_response = connected_peer_service
         .clone()
@@ -413,6 +436,10 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
              actual result: {wire_response:?}"
         )
     }
+    assert!(
+        logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        "configured protected peers must receive the actionable pruning diagnostic"
+    );
 
     assert!(
         block_gossip_task_handle.now_or_never().is_none(),
@@ -446,7 +473,14 @@ async fn inbound_tx_empty_state_notfound() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
-    ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral(), None).await;
+    ) = setup(
+        None,
+        P2pStack::Legacy,
+        StateConfig::ephemeral(),
+        None,
+        Vec::new(),
+    )
+    .await;
 
     let test_tx = UnminedTxId::from_legacy_id(TxHash([0x22; 32]));
     let test_wtx: UnminedTxId = WtxId {
@@ -583,6 +617,7 @@ async fn outbound_tx_unrelated_response_notfound() -> Result<(), crate::BoxError
         P2pStack::Legacy,
         StateConfig::ephemeral(),
         None,
+        Vec::new(),
     )
     .await;
 
@@ -738,6 +773,7 @@ async fn outbound_tx_partial_response_notfound() -> Result<(), crate::BoxError> 
         P2pStack::Legacy,
         StateConfig::ephemeral(),
         None,
+        Vec::new(),
     )
     .await;
 
@@ -834,6 +870,7 @@ async fn setup(
     p2p_stack: P2pStack,
     state_config: StateConfig,
     zcashd_compat_pruning_retention: Option<u32>,
+    block_gossip_peer_ips: Vec<IpAddr>,
 ) -> (
     // real services
     // connected peer which responds with isolated_peer_response
@@ -906,12 +943,14 @@ async fn setup(
 
         ..NetworkConfig::default()
     };
-    let (mut peer_set, address_book, _) = zakura_network::init(
+    let (mut peer_set, address_book, _, _) = zakura_network::init_with_zakura_header_sync(
         network_config,
         inbound_service.clone(),
         latest_chain_tip.clone(),
         "Zebra user agent".to_string(),
         PeerServices::NODE_NETWORK,
+        block_gossip_peer_ips,
+        None,
     )
     .await;
 

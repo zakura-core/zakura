@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   block body that shares its header hash with a later valid block
   ([GHSA-8gxx-hc65-vv82](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-8gxx-hc65-vv82)).
 
+### Fixed
+
+- Limit pruned block recovery diagnostics to configured inbound zcashd compat
+  peers. Ordinary peers still receive `notfound` without a misleading sidecar
+  error.
+
 ## [1.0.2-rc1] - 2026-07-19
 
 ### Added

@@ -288,7 +288,9 @@ impl LegacyRequestFrame {
     /// Convert a legacy network request into an inventory request frame.
     pub fn from_request(request: Request) -> Result<Self, LegacyGossipError> {
         match request {
-            Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
+            Request::BlocksByHash(hashes)
+            | Request::BlocksByHashFromProtectedPeer(hashes)
+            | Request::BlocksByHashFrom { hashes, .. } => {
                 let hashes = truncate_to_inventory_cap(hashes)?;
                 Ok(Self::BlocksByHash(hashes))
             }
@@ -1705,6 +1707,7 @@ where
             | Request::AdvertiseBlockToAll(..)
             | Request::AdvertiseTransactionIds(..) => DualStackRoute::Advertise,
             Request::BlocksByHash(..)
+            | Request::BlocksByHashFromProtectedPeer(..)
             | Request::BlocksByHashFrom { .. }
             | Request::TransactionsById(..)
             | Request::TransactionsByIdFrom { .. }
@@ -5063,6 +5066,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn protected_peer_block_request_uses_ordinary_legacy_frame() {
+        let hash = block_hash(1);
+        let frame = LegacyRequestFrame::from_request(Request::BlocksByHashFromProtectedPeer(
+            HashSet::from([hash]),
+        ))
+        .expect("protected peer block requests use the ordinary wire frame");
+
+        assert_eq!(frame, LegacyRequestFrame::BlocksByHash(vec![hash]));
+    }
+
     #[tokio::test]
     async fn first_seen_cache_is_bounded_and_expires() {
         let cache = FirstSeenCache::new(1, Duration::from_millis(20));
@@ -5587,6 +5601,22 @@ mod tests {
             Response::BlockHashes(hashes) => assert_eq!(hashes, vec![block.hash()]),
             other => panic!("unexpected FindBlocks response: {other:?}"),
         }
+
+        let protected_block = composite
+            .ready()
+            .await?
+            .call(Request::BlocksByHashFromProtectedPeer(HashSet::from([
+                block.hash(),
+            ])))
+            .await?;
+        assert!(
+            matches!(
+                protected_block,
+                Response::Blocks(ref blocks)
+                    if matches!(blocks.as_slice(), [InventoryResponse::Available((received, None))] if received.hash() == block.hash())
+            ),
+            "protected peer block requests should be served over Zakura, got {protected_block:?}",
+        );
 
         let find_headers = composite
             .ready()

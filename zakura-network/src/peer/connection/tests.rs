@@ -114,6 +114,24 @@ fn new_test_connection_with_protection<A>(
     mpsc::Receiver<Message>,
     ErrorSlot,
 ) {
+    new_test_connection_with_metadata(ConnectedAddr::Isolated, is_protected_peer)
+}
+
+/// Creates a new [`Connection`] instance for testing with explicit connection
+/// metadata.
+fn new_test_connection_with_metadata<A>(
+    connected_addr: ConnectedAddr,
+    is_protected_peer: bool,
+) -> (
+    Connection<
+        MockService<Request, Response, A>,
+        SinkMapErr<mpsc::Sender<Message>, fn(mpsc::SendError) -> SerializationError>,
+    >,
+    mpsc::Sender<ClientRequest>,
+    MockService<Request, Response, A>,
+    mpsc::Receiver<Message>,
+    ErrorSlot,
+) {
     let mock_inbound_service = MockService::build().finish();
     let (client_tx, client_rx) = mpsc::channel(0);
     let shared_error_slot = ErrorSlot::default();
@@ -148,7 +166,7 @@ fn new_test_connection_with_protection<A>(
     };
 
     let connection_info = ConnectionInfo {
-        connected_addr: ConnectedAddr::Isolated,
+        connected_addr,
         local: remote.clone(),
         remote,
         negotiated_version: fake_version,

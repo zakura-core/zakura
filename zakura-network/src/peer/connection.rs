@@ -1057,7 +1057,12 @@ where
                     .map(|()| Handler::Ping { nonce, ping_sent_at })
             }
 
-            (AwaitingRequest, BlocksByHash(hashes) | BlocksByHashFrom { hashes, .. }) => {
+            (
+                AwaitingRequest,
+                BlocksByHash(hashes)
+                | BlocksByHashFromProtectedPeer(hashes)
+                | BlocksByHashFrom { hashes, .. },
+            ) => {
                 self
                     .peer_tx
                     .send(Message::GetData(
@@ -1345,7 +1350,13 @@ where
                         .iter()
                         .any(|item| matches!(item, InventoryHash::Block(_))) =>
                 {
-                    Request::BlocksByHash(block_hashes(items).collect()).into()
+                    let hashes = block_hashes(items).collect();
+
+                    if self.connection_info.is_protected_peer {
+                        Request::BlocksByHashFromProtectedPeer(hashes).into()
+                    } else {
+                        Request::BlocksByHash(hashes).into()
+                    }
                 }
                 tx_ids if tx_ids.iter().any(|item| item.unmined_tx_id().is_some()) => {
                     Request::TransactionsById(transaction_ids(items).collect()).into()

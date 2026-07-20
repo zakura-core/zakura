@@ -202,16 +202,19 @@ jobs:
             done
           done
           # Keep the newest 2 images so runs never depend on the latest bake
-          # having succeeded. Mainnet volume snapshots keep ~a quarter of weekly
-          # generations so the pr-node pre-checkpoint mode can always find a
-          # state below a branch's max checkpoint, even after weeks without a
-          # checkpoint advance; testnet keeps the short window.
+          # having succeeded. Mainnet volume snapshots keep 6 weekly generations
+          # (~90 GiB each, ~$32/month total) so the pr-node pre-checkpoint mode
+          # can find a state below a branch's max checkpoint even after several
+          # checkpoint-less weeks; testnet keeps the short window. If this ever
+          # needs to be longer, split the static sandblast/ state out of the
+          # weekly snapshot first — it is re-stored identically each week and
+          # is roughly half the bytes.
           doctl compute image list-user --format ID,Name --no-header | \
             awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | head -n -2 | \
             while read -r _name id; do doctl compute image delete "$id" -f; done
           for NET in mainnet testnet; do
             case "$NET" in
-              mainnet) KEEP=13 ;;
+              mainnet) KEEP=6 ;;
               testnet) KEEP=3 ;;
             esac
             doctl compute snapshot list --resource volume --format ID,Name --no-header | \

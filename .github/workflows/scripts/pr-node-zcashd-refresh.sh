@@ -34,7 +34,11 @@ stop_node() {
   kill -INT "$PID" 2>/dev/null || true
   for _ in $(seq 1 66); do
     if ! kill -0 "$PID" 2>/dev/null; then
-      wait "$PID" || true
+      if ! wait "$PID"; then
+        echo "zakurad exited unsuccessfully during supervised zcashd shutdown" >&2
+        PID=""
+        return 1
+      fi
       PID=""
       return 0
     fi
@@ -131,6 +135,7 @@ rpc_result() {
     "$url" | jq -er 'if .error == null then .result else error(.error | tostring) end'
 }
 
+: > "$LOG"
 "$ZAKURAD" -c "$CONFIG" start --zcashd-compat >>"$LOG" 2>&1 &
 PID=$!
 
@@ -225,6 +230,16 @@ ZCASHD_BINARY_SHA256=$(sha256sum "$ZCASHD_BIN" | awk '{print $1}')
 
 stop_node
 pgrep -x zcashd >/dev/null && { echo "zcashd remained running after clean Zakura shutdown" >&2; exit 1; }
+for evidence in \
+  "Shutdown: main: done" \
+  "zcashd-compat zcashd exited cleanly after SIGTERM" \
+  "zcashd-compat zcashd child stopped on shutdown" \
+  "stopping zakurad"; do
+  grep -Fq "$evidence" "$LOG" || {
+    echo "clean-shutdown evidence missing from fixture refresh: $evidence" >&2
+    exit 1
+  }
+done
 
 # These are runtime artifacts, not reusable chain state. Keep deletion explicit
 # so an unexpected new top-level zcashd artifact fails the bake below.

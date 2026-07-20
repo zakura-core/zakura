@@ -18,7 +18,7 @@ use futures::{
 use tower::load_shed::error::Overloaded;
 use tracing::Span;
 
-use zakura_chain::serialization::SerializationError;
+use zakura_chain::{block, serialization::SerializationError};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
@@ -30,7 +30,7 @@ use crate::{
     peer_set::ActiveConnectionCounter,
     protocol::external::Message,
     types::Nonce,
-    PeerError, Request, Response,
+    PeerError, PeerSource, Request, Response,
 };
 
 /// Test that the connection run loop works as a future
@@ -1031,6 +1031,37 @@ async fn protected_connection_is_never_disconnected_on_overload() {
     }
 
     // We need to terminate the spawned task
+    connection_handle.abort();
+}
+
+/// A block `getdata` from a configured sidecar carries its classified
+/// connection source into the inbound service.
+#[tokio::test]
+async fn protected_connection_attributes_inbound_block_request() {
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, _client_tx, mut inbound_service, _peer_messages, _error_slot) =
+        new_protected_test_connection();
+    let connection_handle = tokio::spawn(connection.run(peer_rx));
+    let hash = block::Hash([0x11; 32]);
+
+    peer_tx
+        .send(Ok(Message::GetData(vec![hash.into()])))
+        .await
+        .expect("test peer channel is open");
+
+    inbound_service
+        .expect_request(Request::BlocksByHashFrom {
+            hashes: HashSet::from([hash]),
+            source: PeerSource::LegacySocket(
+                "127.0.0.1:4"
+                    .parse()
+                    .expect("test peer socket address is valid"),
+            ),
+        })
+        .await
+        .respond_error(Overloaded::new().into());
+
     connection_handle.abort();
 }
 

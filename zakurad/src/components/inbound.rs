@@ -506,7 +506,18 @@ impl Service<zn::Request> for Inbound {
                     Ok(response)
                 }.boxed()
             }
-            zn::Request::BlocksByHash(hashes) | zn::Request::BlocksByHashFrom { hashes, .. } => {
+            request @ (zn::Request::BlocksByHash(_)
+            | zn::Request::BlocksByHashFrom { .. }) => {
+                let (hashes, is_zcashd_compat_peer) = match request {
+                    zn::Request::BlocksByHash(hashes) => (hashes, false),
+                    zn::Request::BlocksByHashFrom {
+                        hashes,
+                        source: zn::PeerSource::LegacySocket(_),
+                    } => (hashes, true),
+                    zn::Request::BlocksByHashFrom { hashes, .. } => (hashes, false),
+                    _ => unreachable!("matched block inventory request"),
+                };
+
                 // We return an available or missing response to each inventory request,
                 // unless the request is empty, or it reaches a response limit.
                 if hashes.is_empty() {
@@ -549,7 +560,9 @@ impl Service<zn::Request> for Inbound {
                                 // A retained canonical header with no block body identifies
                                 // history removed by pruning. Unknown hashes remain ordinary
                                 // `notfound` responses without reserving a log interval.
-                                if pruned_block_not_found_logger.is_enabled() {
+                                if is_zcashd_compat_peer
+                                    && pruned_block_not_found_logger.is_enabled()
+                                {
                                     if let Some(height) =
                                         retained_block_height(state.clone(), hash).await
                                     {

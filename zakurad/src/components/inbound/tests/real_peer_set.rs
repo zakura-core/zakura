@@ -394,7 +394,10 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         Response::Blocks(vec![Missing(block1.hash())]),
         "inbound maps the unavailable block body to missing inventory"
     );
-    assert!(logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR));
+    assert!(
+        !logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        "an ordinary peer must not log a zcashd-compat pruning error"
+    );
 
     let wire_response = connected_peer_service
         .clone()
@@ -413,6 +416,10 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
              actual result: {wire_response:?}"
         )
     }
+    assert!(
+        logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        "the configured zcashd-compat peer must log the pruning error"
+    );
 
     assert!(
         block_gossip_task_handle.now_or_never().is_none(),
@@ -906,12 +913,18 @@ async fn setup(
 
         ..NetworkConfig::default()
     };
-    let (mut peer_set, address_book, _) = zakura_network::init(
+    let protected_peer_ips = zcashd_compat_pruning_retention
+        .is_some()
+        .then_some(vec![config_listen_addr.ip()])
+        .unwrap_or_default();
+    let (mut peer_set, address_book, _, _) = zakura_network::init_with_zakura_header_sync(
         network_config,
         inbound_service.clone(),
         latest_chain_tip.clone(),
         "Zebra user agent".to_string(),
         PeerServices::NODE_NETWORK,
+        protected_peer_ips,
+        None,
     )
     .await;
 

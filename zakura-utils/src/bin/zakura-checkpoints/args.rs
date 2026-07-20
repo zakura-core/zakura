@@ -136,7 +136,9 @@ pub struct Args {
     /// newly generated checkpoints, so stdout is a complete replacement
     /// `main-checkpoints.txt`.
     ///
-    /// Requires `--state-cache-dir`; incompatible with `--last-checkpoint`.
+    /// Requires `--state-cache-dir` and `--mainnet-frontier-output` (a
+    /// replacement list must ship with its coupled frontier); incompatible
+    /// with `--last-checkpoint`.
     #[structopt(long)]
     pub full_list: bool,
 
@@ -168,6 +170,13 @@ impl Args {
             if self.full_list && self.last_checkpoint.is_some() {
                 return Err(
                     "--full-list extends the embedded checkpoint list: remove --last-checkpoint"
+                        .to_string(),
+                );
+            }
+            if self.full_list && self.mainnet_frontier_output.is_none() {
+                return Err(
+                    "--full-list emits a replacement main-checkpoints.txt, which must ship with \
+                     its coupled frontier: add --mainnet-frontier-output"
                         .to_string(),
                 );
             }
@@ -235,6 +244,13 @@ mod tests {
         let mut full_list_with_last = offline.clone();
         full_list_with_last.last_checkpoint = Some(Height(100));
         assert!(full_list_with_last.validate_mode().is_err());
+
+        let mut full_list_without_frontier = offline.clone();
+        full_list_without_frontier.mainnet_frontier_output = None;
+        assert!(
+            full_list_without_frontier.validate_mode().is_err(),
+            "a replacement checkpoint list must ship with its coupled frontier"
+        );
 
         let mut resume_without_full_list = offline;
         resume_without_full_list.full_list = false;

@@ -401,7 +401,20 @@ def audit_problem(data: dict[str, Any], max_completion_age: int) -> str | None:
     state = data.get("controller_state") or {}
     sample = data.get("sample") or {}
     if state.get("failed"):
-        return f"controller halted: {state.get('failure')}"
+        failed_sha = state.get("last_failed_sha")
+        failed_run = state.get("last_failed_run")
+        if failed_sha in (None, "") and failed_run in (None, ""):
+            failed_sha = state.get("running_sha")
+            failed_run = state.get("current_run")
+        provenance = (
+            ("sha", failed_sha),
+            ("run", failed_run),
+            ("failed_at", state.get("failed_at")),
+        )
+        suffix = "".join(
+            f" | {key}={value}" for key, value in provenance if value not in (None, "")
+        )
+        return f"controller halted: {state.get('failure')}{suffix}"
     if not data.get("service_active") and state.get("phase") == "syncing":
         return "node service inactive while controller says syncing"
     if sample.get("metrics_status") != "ok" and state.get("phase") == "syncing":

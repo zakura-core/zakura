@@ -233,6 +233,84 @@ class ContinuousSyncTests(unittest.TestCase):
     def test_deploy_creates_zakurad_config_parent_directory(self):
         self.assertIn('dirname "$config_path"', deploy.INSTALL_SCRIPT)
 
+    def test_audit_problem_attributes_halt_to_failed_run(self):
+        problem = deploy.audit_problem(
+            {
+                "mode": "Zakura/v2-only",
+                "controller_state": {
+                    "failed": True,
+                    "failure": "height 2340298 made no progress for 601s",
+                    "running_sha": "stale-running-sha",
+                    "last_failed_sha": "361aff729ca1fa05615d814f2fc5a042108c9503",
+                    "current_run": "stale-current-run",
+                    "last_failed_run": "20260720T180000Z-361aff729ca1",
+                    "failed_at": "20260720T190554Z",
+                },
+            },
+            max_completion_age=0,
+        )
+
+        self.assertEqual(
+            problem,
+            "controller halted: height 2340298 made no progress for 601s"
+            " | sha=361aff729ca1fa05615d814f2fc5a042108c9503"
+            " | run=20260720T180000Z-361aff729ca1"
+            " | failed_at=20260720T190554Z"
+        )
+
+    def test_audit_problem_does_not_mix_partial_failed_provenance(self):
+        problem = deploy.audit_problem(
+            {
+                "controller_state": {
+                    "failed": True,
+                    "failure": "sync stalled",
+                    "running_sha": "newer-running-sha",
+                    "last_failed_sha": "failed-sha",
+                    "current_run": "newer-current-run",
+                    "failed_at": "20260720T190554Z",
+                },
+            },
+            max_completion_age=0,
+        )
+
+        self.assertEqual(
+            problem,
+            "controller halted: sync stalled"
+            " | sha=failed-sha"
+            " | failed_at=20260720T190554Z",
+        )
+
+    def test_audit_problem_uses_legacy_running_provenance(self):
+        problem = deploy.audit_problem(
+            {
+                "controller_state": {
+                    "failed": True,
+                    "failure": "build failed",
+                    "running_sha": "legacy-sha",
+                    "current_run": "legacy-run",
+                },
+            },
+            max_completion_age=0,
+        )
+
+        self.assertEqual(
+            problem,
+            "controller halted: build failed | sha=legacy-sha | run=legacy-run",
+        )
+
+    def test_audit_problem_keeps_legacy_halt_without_provenance(self):
+        problem = deploy.audit_problem(
+            {
+                "controller_state": {
+                    "failed": True,
+                    "failure": "build failed",
+                },
+            },
+            max_completion_age=0,
+        )
+
+        self.assertEqual(problem, "controller halted: build failed")
+
     def test_forced_ssh_wrapper_uses_current_status_script(self):
         self.assertIn(
             "exec /usr/local/sbin/zakura-monitor-status.py",

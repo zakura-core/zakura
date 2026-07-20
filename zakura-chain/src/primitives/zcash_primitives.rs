@@ -403,7 +403,7 @@ pub(crate) fn sighash(
 ) -> SigHash {
     sighash_inner(
         precomputed_tx_data,
-        hash_type.into(),
+        hash_type.try_into().expect("hash type should be canonical"),
         input_index_script_code,
     )
     .expect(

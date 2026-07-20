@@ -30,14 +30,13 @@
 use std::io;
 
 use blake2b_simd::{Hash as Blake2bHash, Params, State};
-use zcash_transparent::sighash::SighashType;
 
 use crate::{
     orchard,
     parameters::{NetworkUpgrade, TX_V5_VERSION_GROUP_ID, TX_V6_VERSION_GROUP_ID},
     sapling,
     serialization::ZcashSerialize,
-    transaction::{AuthDigest, Hash, HashType, SigHash, Transaction},
+    transaction::{sighash::CanonicalHashType, AuthDigest, Hash, SigHash, Transaction},
     transparent,
 };
 
@@ -799,7 +798,11 @@ impl Zip244SighashCache {
     /// `input_index` is `Some` for a transparent signature and `None` for a
     /// shielded signature. ZIP-244 commits to the spent output's scriptPubKey,
     /// so the script code supplied to the interpreter is not an input here.
-    pub(super) fn sighash(&self, hash_type: HashType, input_index: Option<usize>) -> SigHash {
+    pub(super) fn sighash(
+        &self,
+        hash_type: CanonicalHashType,
+        input_index: Option<usize>,
+    ) -> SigHash {
         let transparent = self.transparent_sig_digest(hash_type, input_index);
         SigHash(
             combine_txid_digests(
@@ -818,7 +821,7 @@ impl Zip244SighashCache {
 
     fn transparent_sig_digest(
         &self,
-        hash_type: HashType,
+        hash_type: CanonicalHashType,
         input_index: Option<usize>,
     ) -> Blake2bHash {
         if !self.transparent_bundle_present || self.transparent_is_coinbase_or_has_no_inputs {
@@ -827,7 +830,7 @@ impl Zip244SighashCache {
 
         // Shielded signatures always use SIGHASH_ALL in ZIP-244, regardless of
         // the caller's otherwise-unused hash type argument.
-        let hash_type = input_index.map_or(HashType::ALL, |_| hash_type);
+        let hash_type = input_index.map_or(CanonicalHashType::All, |_| hash_type);
         let anyone_can_pay = hash_type.anyone_can_pay();
         let single = hash_type.is_single();
         let none = hash_type.is_none();
@@ -871,7 +874,7 @@ impl Zip244SighashCache {
             None => hasher(ZCASH_TRANSPARENT_INPUT_HASH_PERSONALIZATION).finalize(),
         };
 
-        let hash_type = SighashType::from(hash_type).encode();
+        let hash_type = hash_type.encode();
         let mut h = hasher(ZCASH_TRANSPARENT_HASH_PERSONALIZATION);
         h.update(&[hash_type]);
         h.update(prevouts.as_bytes());

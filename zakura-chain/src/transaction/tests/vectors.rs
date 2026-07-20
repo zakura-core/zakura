@@ -1117,11 +1117,11 @@ fn v4_raw_sighashes_match_librustzcash() -> Result<()> {
     for raw_hash_type in u8::MIN..=u8::MAX {
         assert_eq!(
             native.sighash_v4_raw(raw_hash_type, input.clone()),
-            Some(crate::primitives::zcash_primitives::sighash_v4_raw(
+            crate::primitives::zcash_primitives::sighash_v4_raw(
                 &librustzcash,
                 raw_hash_type,
                 input.clone(),
-            )),
+            ),
             "raw hash type {raw_hash_type:#04x} must match librustzcash",
         );
     }
@@ -1159,7 +1159,7 @@ fn v4_raw_sighash_single_without_output_matches_zip243() -> Result<()> {
 
     assert_eq!(
         native.sighash_v4_raw(raw_hash_type, input),
-        Some(SigHash(test.sighash)),
+        SigHash(test.sighash),
     );
 
     Ok(())
@@ -1306,12 +1306,13 @@ fn zip244_sighash() -> Result<()> {
 }
 
 #[test]
-fn zip244_rejects_the_raw_pre_v5_sighash_path() -> Result<()> {
-    let sighasher = EMPTY_V5_TX.sighasher(NetworkUpgrade::Nu5, Arc::new(Vec::new()))?;
+#[should_panic(expected = "raw signature hash types are only supported for pre-V5 transactions")]
+fn zip244_rejects_the_raw_pre_v5_sighash_path() {
+    let sighasher = EMPTY_V5_TX
+        .sighasher(NetworkUpgrade::Nu5, Arc::new(Vec::new()))
+        .expect("NU5 is valid for a V5 transaction");
 
-    assert_eq!(sighasher.sighash_v4_raw(0x41, None), None);
-
-    Ok(())
+    let _ = sighasher.sighash_v4_raw(0x41, None);
 }
 
 fn v6_transparent_sighash_test_data() -> Result<(Transaction, Arc<Vec<transparent::Output>>, usize)>

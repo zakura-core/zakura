@@ -59,6 +59,18 @@ impl From<libzcash_script::Error> for Error {
     }
 }
 
+fn parse_zip244_hash_type(raw_hash_type: i32) -> Option<HashType> {
+    match raw_hash_type {
+        0x01 => Some(HashType::ALL),
+        0x02 => Some(HashType::NONE),
+        0x03 => Some(HashType::SINGLE),
+        0x81 => Some(HashType::ALL_ANYONECANPAY),
+        0x82 => Some(HashType::NONE_ANYONECANPAY),
+        0x83 => Some(HashType::SINGLE_ANYONECANPAY),
+        _ => None,
+    }
+}
+
 /// Get the interpreter according to the feature flag
 fn get_interpreter(
     sighash: zcash_script::interpreter::SighashCalculator<'_>,
@@ -190,21 +202,20 @@ impl CachedFfiTransaction {
                             .raw_bits()
                             .try_into()
                             .expect("script signature hash types are one byte");
-                        return self
-                            .sighasher()
-                            .sighash_v4_raw(raw_byte, Some((input_index, script_code_vec)))
-                            .map(|sighash| sighash.0);
+                        return Some(
+                            self.sighasher()
+                                .sighash_v4_raw(raw_byte, Some((input_index, script_code_vec)))
+                                .0,
+                        );
                     }
 
-                    let raw_hash_type = hash_type.raw_bits().try_into().ok()?;
-                    let our_hash_type = HashType::from_bits(raw_hash_type)?;
+                    let our_hash_type = parse_zip244_hash_type(hash_type.raw_bits())?;
 
                     // ZIP-244 §S.2a requires a corresponding output for
                     // SIGHASH_SINGLE.
-                    if matches!(
-                        our_hash_type,
-                        HashType::SINGLE | HashType::SINGLE_ANYONECANPAY
-                    ) && input_index >= self.transaction.outputs().len()
+                    if (our_hash_type == HashType::SINGLE
+                        || our_hash_type == HashType::SINGLE_ANYONECANPAY)
+                        && input_index >= self.transaction.outputs().len()
                     {
                         return None;
                     }

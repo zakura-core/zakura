@@ -351,6 +351,7 @@ impl Transaction {
     ///
     /// # Panics
     ///
+    /// - if `hash_type` is not one of the six canonical signature hash types
     /// - if passed in any NetworkUpgrade from before NetworkUpgrade::Overwinter
     /// - if called on a v1 or v2 transaction
     /// - if the input index points to a transparent::Input::CoinBase

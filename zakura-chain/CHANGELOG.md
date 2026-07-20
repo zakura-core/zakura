@@ -10,8 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Reuse transaction-wide transparent signature hash components across input
-  checks, and restrict canonical signature hash APIs to the six supported
-  hash types.
+  checks.
 
 ## [1.2.0-rc1] - 2026-07-19
 

@@ -21,7 +21,7 @@ use std::{
 
 use chrono::Utc;
 use futures::{channel::mpsc, FutureExt, StreamExt};
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexSet;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpSocket, TcpStream},
@@ -46,7 +46,7 @@ use crate::{
         ActiveConnectionCounter, CandidateSet, ConnectionTracker,
     },
     protocol::types::PeerServices,
-    AddressBook, BoxError, Config, PeerSocketAddr, Request, Response,
+    AddressBook, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
 };
 
 use Network::*;
@@ -1030,7 +1030,7 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
     config.listen_addr = listen_addr;
 
     let (peerset_tx, mut peerset_rx) = mpsc::channel::<DiscoveredPeer>(4);
-    let (_bans_tx, bans_rx) = tokio::sync::watch::channel(Default::default());
+    let bans = BannedIps::default();
 
     let listen_fut = accept_inbound_connections(
         config.clone(),
@@ -1038,7 +1038,7 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
         success_stay_open_inbound_handshaker,
         peerset_tx,
-        bans_rx,
+        bans,
         vec![IpAddr::V6(zcashd_compat_ip.to_ipv6_mapped())],
     );
     let listen_task_handle = tokio::spawn(listen_fut);
@@ -1122,7 +1122,7 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
     config.listen_addr = listen_addr;
 
     let (peerset_tx, mut peerset_rx) = mpsc::channel::<DiscoveredPeer>(2);
-    let (_bans_tx, bans_rx) = tokio::sync::watch::channel(Default::default());
+    let bans = BannedIps::default();
 
     let listen_fut = accept_inbound_connections(
         config,
@@ -1130,7 +1130,7 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
         success_disconnect_inbound_handshaker,
         peerset_tx,
-        bans_rx,
+        bans,
         vec![zcashd_compat_ip.into()],
     );
     let listen_task_handle = tokio::spawn(listen_fut);
@@ -1179,12 +1179,7 @@ async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
     config.listen_addr = listen_addr;
 
     let (peerset_tx, mut peerset_rx) = mpsc::channel::<DiscoveredPeer>(1);
-    let (bans_tx, bans_rx) = tokio::sync::watch::channel(
-        [(zcashd_compat_ip.into(), std::time::Instant::now())]
-            .into_iter()
-            .collect::<IndexMap<_, _>>()
-            .into(),
-    );
+    let bans = BannedIps::with_banned_ip(zcashd_compat_ip.into());
 
     let listen_fut = accept_inbound_connections(
         config,
@@ -1192,7 +1187,7 @@ async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
         unreachable_inbound_handshaker,
         peerset_tx,
-        bans_rx,
+        bans,
         vec![zcashd_compat_ip.into()],
     );
     let listen_task_handle = tokio::spawn(listen_fut);
@@ -1211,7 +1206,6 @@ async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
         "banned zcashd-compat peers must not be admitted"
     );
 
-    std::mem::drop(bans_tx);
     std::mem::drop(banned_connection);
 }
 
@@ -2007,7 +2001,7 @@ where
     let over_limit_connections = config.peerset_inbound_connection_limit() * 2 + 1;
     let (peerset_tx, peerset_rx) = mpsc::channel::<DiscoveredPeer>(over_limit_connections);
 
-    let (_bans_tx, bans_rx) = tokio::sync::watch::channel(Default::default());
+    let bans = BannedIps::default();
 
     // Start listening for connections.
     let listen_fut = accept_inbound_connections(
@@ -2016,7 +2010,7 @@ where
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
         listen_handshaker,
         peerset_tx.clone(),
-        bans_rx,
+        bans,
         Vec::new(),
     );
     let listen_task_handle = tokio::spawn(listen_fut);

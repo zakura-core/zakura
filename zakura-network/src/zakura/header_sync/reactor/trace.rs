@@ -897,11 +897,11 @@ impl From<&HeaderSyncEvent> for HeaderEventProjection {
             },
             HeaderSyncEvent::HeaderRangeOperationFailed { operation, kind } => {
                 Self::HeaderRangeOperationFailed {
-                peer: peer_label(&operation.wire_request.peer),
-                session_id: operation.wire_request.session_id,
-                request_id: operation.wire_request.request_id.get(),
-                operation_kind: operation_kind_label(operation.op_kind),
-                reason: commit_failure_reason_label(*kind),
+                    peer: peer_label(&operation.wire_request.peer),
+                    session_id: operation.wire_request.session_id,
+                    request_id: operation.wire_request.request_id.get(),
+                    operation_kind: operation_kind_label(operation.op_kind),
+                    reason: commit_failure_reason_label(*kind),
                 }
             }
             HeaderSyncEvent::HeaderRangeResponseFinished {
@@ -1196,7 +1196,13 @@ mod tests {
     use crate::zakura::{
         framed_channel,
         header_sync::{
-            events::HeaderSyncFrontiers, service::HeaderSyncPeerSession, state::RangePriority,
+            events::{
+                HeaderSyncFrontiers, HeaderSyncOperationIdentity, HeaderSyncOperationKind,
+                HeaderSyncRequestId, HeaderSyncWireRequestIdentity,
+            },
+            service::HeaderSyncPeerSession,
+            state::RangePriority,
+            HeaderRangePayload,
         },
         HeaderSyncServiceSummary,
     };
@@ -1214,6 +1220,17 @@ mod tests {
 
     fn request_id() -> HeaderSyncRequestId {
         HeaderSyncRequestId::new(1).expect("test request id is non-zero")
+    }
+
+    fn operation(peer: ZakuraPeerId) -> HeaderSyncOperationIdentity {
+        HeaderSyncOperationIdentity {
+            wire_request: HeaderSyncWireRequestIdentity {
+                peer,
+                session_id: 7,
+                request_id: request_id(),
+            },
+            op_kind: HeaderSyncOperationKind::CommitHeaders,
+        }
     }
 
     fn root(height: block::Height) -> BlockCommitmentRoots {
@@ -1453,16 +1470,16 @@ mod tests {
                 expected_hashes: vec![(block::Height(5), block::Hash([5; 32]))],
             },
             HeaderSyncEvent::VctRootRepairResolved { generation: 8 },
-            HeaderSyncEvent::HeaderRangeCommitted {
-                start_height: block::Height(5),
+            HeaderSyncEvent::BestHeaderTipLoaded {
                 tip_height: block::Height(7),
                 tip_hash: block::Hash([7; 32]),
             },
-            HeaderSyncEvent::HeaderRangeCommitFailed {
-                peer: peer.clone(),
-                session_id: 7,
-                start_height: block::Height(5),
-                count: 3,
+            HeaderSyncEvent::HeaderRangeOperationCompleted {
+                operation: operation(peer.clone()),
+                tip_hash: block::Hash([7; 32]),
+            },
+            HeaderSyncEvent::HeaderRangeOperationFailed {
+                operation: operation(peer.clone()),
                 kind: HeaderSyncCommitFailureKind::InvalidPeerRange,
             },
             HeaderSyncEvent::HeaderRangeResponseFinished {
@@ -1526,13 +1543,10 @@ mod tests {
             ),
             (
                 HeaderSyncAction::CommitHeaderRange {
-                    peer: peer.clone(),
-                    session_id: 7,
+                    operation: operation(peer.clone()),
                     anchor: block::Hash([0; 32]),
-                    start_height: block::Height(1),
-                    headers: vec![header],
-                    body_sizes: vec![1],
-                    tree_aux_roots: Vec::new(),
+                    payload: HeaderRangePayload::new(block::Height(1), vec![header], vec![1], None)
+                        .expect("test payload is aligned"),
                     finalized: false,
                 },
                 "commit_header_range",
@@ -1609,6 +1623,61 @@ mod tests {
                 "trace row leaked payload fields: {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn operation_identity_events_preserve_exact_field_order() {
+        let peer = peer(6);
+        let operation = operation(peer.clone());
+        let tip_hash = block::Hash([7; 32]);
+        let completed = HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation: operation.clone(),
+            tip_hash,
+        };
+        assert_eq!(
+            serde_json::to_string(&HeaderEventProjection::from(&completed))
+                .expect("completed operation projection serializes"),
+            format!(
+                r#"{{"kind":"header_range_operation_completed","peer":"{}","session_id":7,"request_id":1,"operation_kind":"commit_headers","hash":"{}"}}"#,
+                peer_label(&peer),
+                hash_label(tip_hash),
+            )
+        );
+
+        let failed = HeaderSyncEvent::HeaderRangeOperationFailed {
+            operation: operation.clone(),
+            kind: HeaderSyncCommitFailureKind::InvalidPeerRange,
+        };
+        assert_eq!(
+            serde_json::to_string(&HeaderEventProjection::from(&failed))
+                .expect("failed operation projection serializes"),
+            format!(
+                r#"{{"kind":"header_range_operation_failed","peer":"{}","session_id":7,"request_id":1,"operation_kind":"commit_headers","reason":"invalid_peer_range"}}"#,
+                peer_label(&peer),
+            )
+        );
+
+        let payload = HeaderRangePayload::new(
+            block::Height(1),
+            vec![block().header.clone()],
+            vec![1],
+            None,
+        )
+        .expect("test payload is aligned");
+        let action = HeaderSyncAction::CommitHeaderRange {
+            operation,
+            anchor: block::Hash([0; 32]),
+            payload,
+            finalized: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&HeaderActionProjection::from(&action))
+                .expect("commit action projection serializes"),
+            format!(
+                r#"{{"kind":"commit_header_range","peer":"{}","session_id":7,"request_id":1,"operation_kind":"commit_headers","range_start":1,"range_count":1}}"#,
+                peer_label(&peer),
+            )
+        );
     }
 
     #[test]
@@ -1689,6 +1758,13 @@ mod tests {
             (
                 HeaderSyncWireError::HeaderCountLimit { actual: 2, max: 1 },
                 "header_count_limit",
+            ),
+            (
+                HeaderSyncWireError::InvalidRangeGeometry {
+                    start: block::Height(1),
+                    count: 0,
+                },
+                "invalid_range_geometry",
             ),
             (
                 HeaderSyncWireError::BodySizeCountMismatch {
@@ -1890,12 +1966,13 @@ mod tests {
 
         assert_eq!(count_between(block::Height(3), block::Height(5)), 3);
         assert_eq!(count_between(block::Height(5), block::Height(3)), 0);
-        let committed = event_row(&HeaderSyncEvent::HeaderRangeCommitted {
-            start_height: block::Height(3),
-            tip_height: block::Height(5),
+        let committed = event_row(&HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation: operation(peer(4)),
             tip_hash: block::Hash([5; 32]),
         });
-        assert_eq!(committed[hs_trace::RANGE_COUNT], Value::from(3));
+        assert_eq!(committed[hs_trace::SESSION_ID], Value::from(7));
+        assert_eq!(committed[hs_trace::REQUEST_ID], Value::from(1));
+        assert_eq!(committed["operation_kind"], "commit_headers");
         let gaps = action_row(&HeaderSyncAction::BodyGaps {
             from: block::Height(3),
             to: block::Height(5),

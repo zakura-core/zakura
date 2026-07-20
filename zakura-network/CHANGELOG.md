@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0-rc1] - 2026-07-19
+
 ### Breaking Changes
 
 - Add an opt-in `Config::expose_peer_addresses` field for unredacted legacy

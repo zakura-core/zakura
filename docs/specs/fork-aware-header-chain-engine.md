@@ -1,8 +1,8 @@
 # Fork-aware headers-only chain engine specification
 
 Status: normative design oracle for the replacement of PR #229  
-Version: 1.1  
-Date: 2026-07-17  
+Version: 1.2  
+Date: 2026-07-20  
 Scope: Zakura native header sync and its integration with Zebra/Zakura full state
 
 ## 1. Scope, language, and authority
@@ -40,7 +40,7 @@ The **correct tip** for this engine is the deterministic greatest-work eligible 
 
 **LC-SCOPE-03 [LS].** The engine MUST NOT infer transaction validity, coinbase height validity, note/nullifier state, value-pool conservation, script/proof validity, or state-transition validity from header acceptance.
 
-**LC-SCOPE-08 [LS].** A headers-only deployment MUST disclose that its automatic 1,000-deep local finality is an irreversible local trust decision: an eclipsed or incomplete view can pin the wrong header-valid branch, and a later greater-work fork conflicting with that pin will be rejected. Its “correct tip” guarantee is therefore relative to its durable finality history as well as the assumptions in LC-SCOPE-02.
+**LC-SCOPE-08 [LS].** A headers-only deployment MUST disclose that its automatic 1,000-deep local finality is an irreversible local trust decision: an eclipsed or incomplete view can pin the wrong header-valid branch, and a later greater-work fork conflicting with that pin will be rejected. Its “correct tip” guarantee is therefore relative to its durable finality history as well as the assumptions in LC-SCOPE-02. The mandatory settled-upgrade pin in LC-ANCHOR-04 applies to headers-only deployments as well, so even a wrongly pinned branch must contain the settled activation hash; and if such a store is later migrated to integrated mode, deterministic body validation can refute the pin, after which recovery requires discarding the migrated header store under LC-FINAL-04.
 
 ### 1.3 Included and excluded work
 
@@ -72,7 +72,7 @@ The durable model is a directed acyclic graph keyed by the consensus block hash.
 
 **LC-DAG-02 [LS].** The store MUST maintain bijective or reconstructible indexes for hash to node, parent to children, height to all retained hashes, selected-header height to hash, eligibility roots/reasons, and durable frontier/version metadata. A height index MUST allow multiple hashes.
 
-**LC-DAG-03 [LS].** A node whose parent is unknown MAY exist only in a bounded staging area and MUST NOT be durable, eligible, counted as candidate work, or published. Admission to the DAG occurs only after the parent or trusted context is known and height is inferred.
+**LC-DAG-03 [LS].** A node whose parent is unknown MAY exist only in a bounded staging area—at most one in-flight response’s headers per peer and at most 4,096 staged headers in total—and MUST NOT be durable, eligible, counted as candidate work, or published. Staging overflow is a temporary resource refusal, not peer misbehavior. Admission to the DAG occurs only after the parent or trusted context is known and height is inferred.
 
 ### 2.2 Independent frontiers
 
@@ -134,15 +134,15 @@ Validation proceeds in the following order so cheap bounds precede CPU work and 
 
 **LC-COMMIT-02 [ZW].** Regtest and configured custom networks MUST run the same commitment parser using their configured activation schedule, including overlapping activation-height behavior. A custom activation schedule MUST NOT bypass or guess the commitment variant.
 
-**LC-VAL-04 [ZC].** On production Mainnet/Testnet, the Equihash solution size and parameters MUST match the network and height, and the Equihash proof MUST verify. Production headers MUST NOT use the short Regtest proof shape.
+**LC-VAL-05 [ZC].** On production Mainnet/Testnet, compact `nBits` MUST decode to a positive, non-overflowing target no easier than the network PoW limit, and the little-endian integer value of the header hash MUST be less than or equal to that target. LC-VAL-05 runs before LC-VAL-04 so the free target checks reject a candidate before any Equihash CPU cost, matching the check order in `zakura-consensus::block::check`.
 
-**LC-VAL-05 [ZC].** On production Mainnet/Testnet, compact `nBits` MUST decode to a positive, non-overflowing target no easier than the network PoW limit, and the little-endian integer value of the header hash MUST be less than or equal to that target.
+**LC-VAL-04 [ZC].** On production Mainnet/Testnet, the Equihash solution size and parameters MUST match the network and height, and the Equihash proof MUST verify. Production headers MUST NOT use the short Regtest proof shape.
 
 **LC-VAL-06 [ZC].** For each non-genesis production Mainnet/Testnet candidate, `nBits` MUST equal the branch-local `ThresholdBits(height)` computed by the same algorithm and network-upgrade parameters as `zakura-state`. Context consists of up to the preceding 28 linked headers: a 17-block averaging window plus the 11-block median span. Early-chain PoW-limit and Testnet minimum-difficulty rules, including ZIP 205/208 behavior, MUST match full state exactly.
 
 **LC-POW-01 [ZW].** Regtest or a configured custom network MAY explicitly disable proof of work only through its authenticated local network parameters. In that mode the engine MUST still enforce the configured solution encoding and parameters and the positive, non-overflowing PoW-limit-bounded target, but MUST mirror full state by waiving exactly the Equihash-proof check, header-hash-to-target filter, and contextual `ThresholdBits` equality. This exception MUST NOT be reachable for production Mainnet/Testnet identifiers.
 
-**LC-VAL-07 [ZC].** For every non-genesis production Mainnet/Testnet candidate, `nTime` MUST be strictly greater than median-time-past of up to the preceding 11 linked headers. On Mainnet from height 2, and on Testnet where `Network::is_max_block_time_enforced(height)` becomes active (currently height 653,606), `nTime` MUST also be no greater than MTP plus 90 minutes.
+**LC-VAL-07 [ZC].** For every non-genesis production Mainnet/Testnet candidate, `nTime` MUST be strictly greater than median-time-past of up to the preceding 11 linked headers. At every non-genesis Mainnet height, and on Testnet where `Network::is_max_block_time_enforced(height)` becomes active (currently height 653,606), `nTime` MUST also be no greater than MTP plus 90 minutes. zcashd deployed the Mainnet bound as a soft fork from height 2; the shared `is_max_block_time_enforced` parity function enforces it at every Mainnet height, the two are observably identical on the real chain, and the shared function is authoritative for LC-PARITY-01.
 
 **LC-TIME-01 [ZW].** Regtest and configured custom networks MUST apply the same MTP algorithm and the exact height-dependent maximum-time policy returned by their authenticated local network parameters and full state. They MUST NOT inherit Mainnet/Testnet activation heights by name or bypass MTP merely because proof of work is disabled.
 
@@ -164,7 +164,7 @@ Validation proceeds in the following order so cheap bounds precede CPU work and 
 
 **LC-ANCHOR-03 [LS].** A client starting at a later checkpoint MUST acquire the checkpoint header and enough linked predecessors to validate the first post-anchor header—up to 27 predecessors before the anchor, for 28 total context headers ending at the anchor. It MUST authenticate the anchor by exact configured hash and authenticate predecessor context by the backward hash links ending in that anchor. This context is immutable validation context below `finalized`, not a selectable fork.
 
-**LC-ANCHOR-04 [ZP].** Before an integrated/full-validator deployment publishes any header or verified frontier for Mainnet or Testnet, its release-authenticated network manifest MUST independently contain the exact `(upgrade, activation_height, activation_hash)` pin for that network’s most recent settled network upgrade. “Release-authenticated” means immutable data compiled into, or cryptographically authenticated with, the installed release artifact; an unsigned runtime file or peer response is insufficient. The engine MUST fail closed if that pin is missing, malformed, duplicated inconsistently, or unavailable for the selected network; enabling or disabling optional sync checkpoints MUST NOT remove or replace it. Every candidate reaching or passing the activation height MUST contain that exact hash in its ancestry. For version 1.1, the settled tuples, with hashes written in the protocol specification’s RPC display order and canonically parsed into `block::Hash`, are:
+**LC-ANCHOR-04 [ZP].** Before a deployment in either mode—integrated/full-validator or headers-only—publishes any header or verified frontier for Mainnet or Testnet, its release-authenticated network manifest MUST independently contain the exact `(upgrade, activation_height, activation_hash)` pin for that network’s most recent settled network upgrade. “Release-authenticated” means immutable data compiled into, or cryptographically authenticated with, the installed release artifact; an unsigned runtime file or peer response is insufficient. The engine MUST fail closed if that pin is missing, malformed, duplicated inconsistently, or unavailable for the selected network; enabling or disabling optional sync checkpoints MUST NOT remove or replace it. Every candidate reaching or passing the activation height MUST contain that exact hash in its ancestry. For version 1.2, the settled tuples, with hashes written in the protocol specification’s RPC display order and canonically parsed into `block::Hash`, are:
 
 | Network | Upgrade | Activation height | Activation hash (RPC display order) |
 | --- | --- | ---: | --- |
@@ -173,7 +173,7 @@ Validation proceeds in the following order so cheap bounds precede CPU work and 
 
 These values MUST come from the release-authenticated manifest rather than peer status or the optional checkpoint files.
 
-Non-normative implementation warning: at version 1.1 publication, `main-checkpoints.txt` ends at height 3,358,006 and `test-checkpoints.txt` ends at 4,023,200, both below their NU6.2 activation height. Those files therefore cannot satisfy LC-ANCHOR-04 without the independent settled-upgrade manifest.
+Non-normative implementation warning: at version 1.2 publication, `main-checkpoints.txt` ends at height 3,358,006 and `test-checkpoints.txt` ends at 4,023,200, both below their NU6.2 activation height. Those files therefore cannot satisfy LC-ANCHOR-04 without the independent settled-upgrade manifest.
 
 **LC-ANCHOR-05 [ZP].** A release that changes which upgrade is most recently settled or changes a settled activation tuple MUST update the manifest and both-network conformance vectors atomically. Runtime peer claims, candidate-upgrade configuration such as NU6.3/NU7, and mere passage of an activation height MUST NOT create, supersede, or mutate a settled-upgrade pin.
 
@@ -199,9 +199,9 @@ Eligibility reasons are a set, not a single overwritable flag. Permanent reasons
 
 **LC-FINAL-03 [LS].** In headers-only mode, after each atomic insertion or reselection, if `header_best.height - finalized.height > 1000`, the same serialized transition MUST advance `finalized` to the unique ancestor of `header_best` at `header_best.height - 1000`, apply LC-FINAL-01, and only then publish. Thus no published headers-only state retains more than 1,000 selected descendants above its local finality pin. This rule is a bounded-resource local trust policy, not proof of body validity or a Zcash consensus rule, and the deployment MUST expose the disclosure in LC-SCOPE-08.
 
-**LC-FINAL-04 [LS].** The durable store MUST record whether it is integrated or headers-only and the finality source for every advancement. Startup MUST fail closed on a mode mismatch or a finality record without the required full-state evidence or headers-only 1,000-deep ancestor proof. Switching modes requires an explicit migration that preserves existing pins; it MUST NOT roll finality back.
+**LC-FINAL-04 [LS].** The durable store MUST record whether it is integrated or headers-only and the finality source for every advancement. Startup MUST fail closed on a mode mismatch or a finality record without the required full-state evidence or headers-only 1,000-deep ancestor proof. Switching modes requires an explicit migration that preserves existing pins; it MUST NOT roll finality back. A headers-only finality record is local trust, never body-verification evidence: a migration to integrated mode MUST import headers-only pins as header trust anchors only, MUST NOT count them as full-state finalization, and integrated mode MUST still body-verify the imported history from its own last full-state-verified anchor. If deterministic body validation refutes an imported headers-only pin, the node MUST fail closed with an explicit incident naming that pin; the only supported recovery is deleting the migrated header store and its finality records and resynchronizing, which discards a local trust artifact rather than rolling back integrated finality, because integrated finality was never granted to the imported pin.
 
-**LC-RETAIN-01 [LS].** The engine MUST retain no more than 64 eligible candidate tips and 65,536 non-finalized DAG nodes. It MUST protect every node on `header_best` and `verified_best` from resource eviction. If integrated-mode verification/finalization stalls and admitting another node would exceed the node cap after all permitted eviction, the engine MUST refuse or stage that admission, retain the current frontiers, and raise an explicit resource-stalled alarm; it MUST NOT evict either protected path or synthesize finality to make room.
+**LC-RETAIN-01 [LS].** The engine MUST retain no more than `MAX_NON_FINALIZED_CHAIN_FORKS` eligible candidate tips—the same shared constant that caps full-state non-finalized chains, currently 10—and 65,536 non-finalized DAG nodes. The tip cap MUST be consumed from the same shared `zakura-chain`-level definition as full state, so the header engine can never retain an eligible fork that integrated full state cannot represent. It MUST protect every node on `header_best` and `verified_best` from resource eviction. If integrated-mode verification/finalization stalls and admitting another node would exceed the node cap after all permitted eviction, the engine MUST refuse or stage that admission, retain the current frontiers, and raise an explicit resource-stalled alarm; it MUST NOT evict either protected path or synthesize finality to make room.
 
 **LC-RETAIN-02 [LS].** On pressure, the engine MUST remove permanently ineligible subtrees first. It MUST then evict unprotected candidate tips in ascending order of cumulative work, breaking equal-work eviction ties by the smallest raw tip hash. Shared ancestors MUST be removed only when no retained path or validation-context window references them.
 
@@ -380,7 +380,9 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 
 **LC-V8-02 [ZW].** `StatusV8` MUST describe one atomic durable snapshot: the selected `header_best`, the finalized/work anchor it descends from, locally recomputed suffix work exclusive of the anchor and inclusive of the selected tip, retention floor, and effective serving caps. A receiver MUST treat height and work as advisory until it downloads and validates headers.
 
-**LC-V8-03 [ZW].** The requester MUST build its locator from the current local selected tip, then ancestors at offsets `1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1000`, and finally `finalized`; it MUST preserve that order, deduplicate hashes, and cap the list at 13.
+**LC-V8-17 [ZW].** `StatusV8` is unsolicited and v8 defines no status request. Each side MUST send its current status immediately after v8 negotiation completes, MUST send an updated snapshot after any committed transition that changes its selected tip, work anchor, retention floor, or advertised serving caps, and MUST refresh at least once per configured status-refresh interval (default 30 seconds, matching the existing v7 `status_refresh_interval`) as a liveness signal. Rapid successive changes MAY be coalesced, but the newest snapshot MUST be sent within 2 seconds of its commit, and a peer is never required to send more than one snapshot per second. Status silence or staleness is grounds for bounded rescheduling and deprioritization, never automatic misbehavior. Header-tip announcement inside a v8 session is carried entirely by these status updates; full-block relay remains on the paths in LC-V8-16.
+
+**LC-V8-03 [ZW].** The requester MUST build its locator from the current local selected tip, then ancestors at offsets `1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1000`, and finally `finalized`; it MUST preserve that order, deduplicate hashes, and cap the list at 13. A continuation of an incomplete response instead uses the continuation locator defined in section 5.2, whose first entry is the returned suffix tip; every fresh target pursuit MUST use the locator above.
 
 **LC-V8-04 [ZW].** `target_tip_hash` MUST come from the status snapshot being pursued. The requester MUST enforce the per-peer and global staged-target limits in LC-RETAIN-04. A newer status MAY supersede an older unstarted target from that peer.
 
@@ -410,7 +412,7 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 
 **LC-V8-11 [ZW].** Unsolicited/mismatched request IDs, a common ancestor not in the sent locator, broken returned ancestry, a completed sequence with the wrong target hash, malformed bounds, or an invalid header MUST be peer-attributable evidence.
 
-**LC-V8-12 [ZW].** A same-height/different-hash status, a shorter tip claiming more work, or any unknown target hash MUST be eligible for discovery scheduling. Locally validated complete suffixes, never advertised heights or work, determine whether selection changes.
+**LC-V8-12 [ZW].** A same-height/different-hash status, a shorter tip claiming more work, or any unknown target hash MUST be eligible for discovery scheduling. Locally validated complete suffixes, never advertised heights or work, determine whether selection changes. Advertised suffix work is commensurable with local work only when both snapshots name the same work anchor or one anchor is a retained ancestor of the other, in which case the requester MAY rebase the claim across the locally known per-block work between the anchors. When the anchors are not comparable, an unknown target remains discovery-eligible on hash evidence alone, and the incomparable work claim MUST NOT be used to suppress or deprioritize discovery below its normal scheduling.
 
 ### 5.5 v7 compatibility
 
@@ -432,7 +434,7 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 | Contextual difficulty | Same branch-local 28-header context and upgrade rules | Same algorithm over full blocks | Zcash consensus |
 | Median time | Same preceding 11 headers and MTP bounds | Same | Zcash consensus |
 | Local two-hour future rule | Deferred and reevaluated | Temporarily rejected/retried | Nondeterministic local-clock policy |
-| Most recent settled upgrade | Mandatory manifest pin in integrated mode | Mandatory manifest pin | Zcash deployment-security requirement, independent of sync checkpoints |
+| Most recent settled upgrade | Mandatory manifest pin in every mode | Mandatory manifest pin | Zcash deployment-security requirement, independent of sync checkpoints |
 | Local sync checkpoints | Exact configured hash plus absolute trust pin | Checkpoint verifier / finalized state | Trusted local policy; normal post-anchor validation |
 | Finality | Automatic 1,000-deep disclosed local pin | Only fully verified full-state finalization | Deliberate mode-specific trust policy |
 | Work | Same target-derived formula | Same | Zcash consensus ordering input |
@@ -472,7 +474,7 @@ Each named test below is a deterministic test target or parameterized suite. Mod
 - **HV-06 `checkpoint_anchor_context`:** genesis, each configured checkpoint fixture, conflicting ancestry, observable checkpoint checks, trusted later-start context of 28 headers, bad backward linkage, and normal first post-anchor validation.
 - **HV-07 `work_vectors`:** compact target to work vectors, suffix sums, overflow fail-close, locally recomputed versus advertised work, and raw-hash equal-work comparator.
 - **HV-08 `commitment_field_structure`:** every production activation boundary, malformed and canonical Sapling-root encodings, zero/nonzero Heartwood activation reserved fields, Canopy-at-Heartwood overlapping activation, NU5-and-later opaque commitment structure, and Regtest/custom activation schedules differential-tested against `Header::commitment(network, height)`.
-- **HV-09 `settled_upgrade_pins`:** Mainnet NU6.2 at 3,364,600 and Testnet NU6.2 at 4,052,000 with correct/wrong/missing hashes; absent, malformed, duplicate-conflicting, stale, and peer-supplied-only manifests; optional checkpoints disabled or ending below activation; candidate-upgrade non-promotion; and fail-closed startup before publication on both networks.
+- **HV-09 `settled_upgrade_pins`:** Mainnet NU6.2 at 3,364,600 and Testnet NU6.2 at 4,052,000 with correct/wrong/missing hashes; absent, malformed, duplicate-conflicting, stale, and peer-supplied-only manifests; optional checkpoints disabled or ending below activation; candidate-upgrade non-promotion; and fail-closed startup before publication on both networks and in both engine modes.
 
 #### DAG, durability, and integration
 
@@ -481,8 +483,8 @@ Each named test below is a deterministic test target or parameterized suite. Mod
 - **DG-03 `atomic_transition_crash`:** crash injection before/after every database write, version CAS, response, publication, and observation boundary; reopen after every injection.
 - **DG-04 `startup_audit_reconstruction`:** corrupt hash/height/parent/index/projection/generation/checkpoint cases, last-complete-transaction repair, deterministic recomputation, and fail-closed cases.
 - **DG-05 `finality_and_reorg`:** fixed-anchor competitors replacing 999, 1,000, 1,001, and longer incumbent descendants in every insertion order; conflicts at/above/below finality; atomic finalization, pruning, work rebasing, and both selected paths.
-- **DG-06 `bounded_retention`:** 65 candidate tips, more than 65,536 nodes, permanent-invalid-first deletion, deterministic work/hash eviction, protected paths, shared ancestors, 17 staged targets, evicted-branch reacquisition, and integrated-mode refusal/alarm when protected paths fill the node cap.
-- **DG-07 `mode_specific_finality`:** integrated finality from exact fully verified evidence with conflicting `header_best` retirement; rejection of header-depth/resource/body-unavailable synthetic finality; headers-only advancement to exactly tip minus 1,000 before publication; deep-fork rejection only after that pin; mode/finality-source restart audit; and non-rollback mode migration.
+- **DG-06 `bounded_retention`:** one more eligible candidate tip than the shared fork cap, more than 65,536 nodes, staging-area overflow refusal, permanent-invalid-first deletion, deterministic work/hash eviction, protected paths, shared ancestors, 17 staged targets, evicted-branch reacquisition, and integrated-mode refusal/alarm when protected paths fill the node cap.
+- **DG-07 `mode_specific_finality`:** integrated finality from exact fully verified evidence with conflicting `header_best` retirement; rejection of header-depth/resource/body-unavailable synthetic finality; headers-only advancement to exactly tip minus 1,000 before publication; deep-fork rejection only after that pin; mode/finality-source restart audit; non-rollback mode migration; and fail-closed incident plus destroy-and-resync recovery when body validation refutes a migrated headers-only pin.
 - **IN-01 `uniform_full_state_transitions`:** direct grow and same/lower/forward reset, full header DAG insertion, empty non-finalized fallback, invalidate, reconsider, finalization, and next-header commit.
 - **IN-02 `body_feedback`:** wrong header, bad Merkle/ZIP 244 commitment, commitment-matching deterministic invalidity, transient verifier/state/storage failure, correct supplier attribution, and descendant propagation.
 - **IN-03 `body_unavailable`:** multi-peer bounded retry/backoff, retained selection, alternative prefetch, persistent alarm, metrics, resume, and no lower-work failover.
@@ -499,6 +501,7 @@ Each named test below is a deterministic test target or parameterized suite. Mod
 - **P8-04 `outcomes_and_attribution`:** all four explicit outcomes, stale refresh, busy backoff, malformed ancestor, mismatched target/ID, invalid header, and score/no-score assertions.
 - **P8-05 `multipeer_fork_discovery`:** shorter-higher-work, longer-lower-work, same-height equal-work, same-height greater-work, unknown fork, same-height status trigger, and permutation-independent convergence.
 - **P8-06 `aux_schema_and_body_hints`:** schema mask/selector negotiation, exact schema-1 156-byte golden vectors, every field and root encoding, height mismatch, preactivation defaults, NU5/NU6.3/NU7 boundaries, all-or-none parallel counts, unavailable metadata fallback, unknown/future schemas, `0`/`1`/`2,000,000`/`2,000,001` body hints, and proof that hints cannot drive allocation or admission credit.
+- **P8-07 `status_propagation`:** initial status immediately after negotiation, change-driven updates for tip/anchor/retention/cap changes, burst coalescing with the two-second freshness and one-per-second floor, configured periodic refresh, snapshot atomicity against concurrent selection changes, and non-punitive handling of silent or stale-status peers.
 - **P7-01 `v7_compatibility`:** selected projection serving, retained-parent acceptance, stale implicit anchor, no false score, unknown fork limitation, locator fallback, and v7-only `NewBlock` discriminant behavior.
 - **DF-01 `header_full_state_parity`:** body-valid generated fork graphs fed to the integrated header engine and full state from the same finalized anchor; require identical observable-header acceptance, work, raw-hash tie order, and selected tip before a full-state finalization event.
 - **DF-02 `intentional_difference_vectors`:** coinbase height, Merkle/body mismatch, transaction/proof/script failure, nullifier/anchor/value-pool/state-transition failure, local future time, and header-valid/body-invalid outcomes, each with an asserted typed explanation.
@@ -520,7 +523,7 @@ The following matrix supersedes the old audit invariant that the verified chain 
 | Same-height and forward resets mishandled | branch identity, never height monotonicity | IN-01/AUD-04 |
 | Restart can select inconsistent overlay | atomic metadata plus startup audit/reconstruction | DG-03, DG-04/AUD-14 |
 | Latest settled activation is only an optional/stale checkpoint | independent release-authenticated settled-upgrade pin and fail-closed startup | HV-09 |
-| Incumbent-relative 1,000-block rule makes arrival order select an unreplacable fork | eligibility relative only to `finalized`; explicit integrated and headers-only finality sources | DG-05, DG-07 |
+| Incumbent-relative 1,000-block rule makes arrival order select an unreplaceable fork | eligibility relative only to `finalized`; explicit integrated and headers-only finality sources | DG-05, DG-07 |
 | Header commitment field is not structurally interpreted at inferred height | mandatory `Header::commitment(network, height)` parity | HV-08, DF-01 |
 | v8 auxiliary records, body hints, and discriminant 4 are underspecified | exact schema/hint codec, immutable schema evolution, and explicit removal of v8 `NewBlock` | P8-01, P8-06, P7-01 |
 | Consensus authority is mixed with custom/checkpoint/Zebra policy | separate ZC, ZP, ZF, ZW, and LS rules and parity assertions | HV-03, HV-06, HV-09, DF-01, conformance-manifest self-test |
@@ -591,6 +594,7 @@ Every normative rule is mapped here. A range such as `LC-SCOPE-01..03` includes 
 | LC-V8-05..07 | P8-03, P8-04 |
 | LC-V8-08..12 | P8-03, P8-04, P8-05 |
 | LC-V8-13..16 | P8-01, P8-06, P7-01 |
+| LC-V8-17 | P8-05, P8-07 |
 | LC-V7-01..03 | P7-01, IN-07 |
 | LC-PARITY-01..03 | HV-03, HV-08, DF-01, DF-02 |
 | LC-TEST-01..02 | conformance-manifest self-test |
@@ -608,7 +612,7 @@ The “architecture dependency check” asserts that wallet scanning, FlyClient 
 
 **LC-ACCEPT-04 [LS].** Body-invalid and body-unavailable cases MUST terminate each retry episode in either deterministic reselection or an explicit persistent alarm; neither may produce an infinite silent retry.
 
-**LC-ACCEPT-05 [LS].** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.1 acceptance MUST contain no unresolved design placeholders.
+**LC-ACCEPT-05 [LS].** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.2 acceptance MUST contain no unresolved design placeholders.
 
 ## 8. Implementation oracle and source authority
 
@@ -619,22 +623,24 @@ The implementation must share code with or remain differential-test equivalent t
 | Concern | Local source |
 | --- | --- |
 | Canonical header/version encoding and local future-time rule | `zakura-chain/src/block/serialize.rs`, `zakura-chain/src/block/header.rs` |
-| Height-dependent header commitment-field interpretation | `zakura-chain/src/block/commitment.rs` (`Header::commitment`) |
+| Height-dependent header commitment-field interpretation | `zakura-chain/src/block/header.rs` (`Header::commitment`), `zakura-chain/src/block/commitment.rs` (`Commitment::from_bytes`) |
 | Compact target, work formula, and integer ordering | `zakura-chain/src/work/difficulty.rs` |
 | Equihash and context-free PoW checks | `zakura-consensus/src/block/check.rs` |
 | Contextual 28-header difficulty, 11-header MTP, and MTP+90-minute rule | `zakura-state/src/service/check/difficulty.rs`, `zakura-state/src/service/check.rs` |
 | Full-state greatest-work/raw-tip-hash ordering | `zakura-state/src/service/non_finalized_state/chain.rs` (`impl Ord for Chain`) |
 | Local 1,000-block finality horizon | `zakura-chain/src/parameters/constants.rs`, `zakura-state/src/constants.rs` |
+| Shared non-finalized fork cap | `MAX_NON_FINALIZED_CHAIN_FORKS` (today `zakura-state/src/constants.rs`; the redesign MUST hoist one shared definition into `zakura-chain::parameters` consumed by both full state and the header engine) |
 | Checkpoint hashes and verification | `zakura-chain/src/parameters/checkpoint/`, `zakura-consensus/src/checkpoint.rs` |
 | Existing v7 framing/bounds/correlation | `zakura-network/src/zakura/header_sync/wire.rs`, `config.rs`, `validation.rs` |
 | Existing reactor, scheduling, coverage, and repair ownership | `zakura-network/src/zakura/header_sync/reactor.rs`, `state.rs`, `work_queue.rs`, `events.rs` |
 | Current provisional persistence/startup audit | `zakura-state/src/service/finalized_state/zakura_db/block.rs`, `.../block/tests/header_store_coherence/` |
 | ZIP 221/244 auxiliary authentication | `zakura-chain/src/parallel/commitment_aux.rs`, `commitment_aux_verify.rs`, `block/commitment.rs` |
-| Failure evidence and required race scenarios | `../art/debug/latest-v2-fails/ROOT_CAUSE.md`, `../art/debug/latest-v2-fails/audit.md` |
+
+Non-normative provenance: the production failure evidence that motivated the audit scenarios (the latest-v2-fails root-cause and audit notes) lives outside this repository. No normative requirement depends on those files; sections 7.2–7.4 fully specify every behavior and race extracted from them.
 
 ### 8.2 Official protocol sources
 
-- [Zcash Protocol Specification](https://zips.z.cash/protocol/protocol.pdf), version `v2026.7.0-33-gc55edc [NU6.2]` dated 2026-07-12 for the version 1.1 settled hashes, and especially its block-header, difficulty-adjustment, work, and best-chain rules.
+- [Zcash Protocol Specification](https://zips.z.cash/protocol/protocol.pdf), version `v2026.7.0-33-gc55edc [NU6.2]` dated 2026-07-12 for the version 1.2 settled hashes, and especially its block-header, difficulty-adjustment, work, and best-chain rules.
 - [ZIP 204: Zcash P2P Network Protocol](https://zips.z.cash/zip-0204), for bounded framing, locators, and contiguous header responses. Native v8 remains Zakura-specific.
 - [ZIP 205](https://zips.z.cash/zip-0205) and [ZIP 208](https://zips.z.cash/zip-0208), for Testnet difficulty and Blossom target-spacing behavior.
 - [ZIP 221: FlyClient consensus-layer changes](https://zips.z.cash/zip-0221), for history-tree commitments and work metadata. Its logarithmic proof protocol is explicitly excluded from v1.
@@ -644,6 +650,6 @@ The implementation must share code with or remain differential-test equivalent t
 
 ### 8.3 Fixed design decisions
 
-This version fixes the following choices: one integrated reusable engine; linear verification of all candidate headers; native v8 fork discovery with limited v7 compatibility; independent `header_best`, `verified_best`, and `finalized`; Zebra’s greater-raw-tip-hash equal-work policy; integrated finality sourced only from fully verified state; headers-only automatic local finality 1,000 descendants behind `header_best`; 64 eligible candidate tips; 65,536 non-finalized DAG nodes; body-invalid branch disqualification; body-unavailable selection plus alarm; independent mandatory settled-upgrade pins for full-validator mode; absolute local checkpoint pins with observable header checks; v8 auxiliary schema 1 and no v8 `NewBlock`; and authenticated-only use of VCT/tree-aux metadata.
+This version fixes the following choices: one integrated reusable engine; linear verification of all candidate headers; native v8 fork discovery with limited v7 compatibility; independent `header_best`, `verified_best`, and `finalized`; Zebra’s greater-raw-tip-hash equal-work policy; integrated finality sourced only from fully verified state; headers-only automatic local finality 1,000 descendants behind `header_best`; an eligible-candidate-tip cap equal to the shared non-finalized fork-cap constant, currently 10; 65,536 non-finalized DAG nodes; body-invalid branch disqualification; body-unavailable selection plus alarm; independent mandatory settled-upgrade pins in every deployment mode; absolute local checkpoint pins with observable header checks; v8 auxiliary schema 1 and no v8 `NewBlock`; and authenticated-only use of VCT/tree-aux metadata.
 
 Any future change to one of these choices requires a new specification version, explicit migration and compatibility rules, and corresponding updates to the conformance manifest. It is not an implementation detail.

@@ -2,7 +2,7 @@
 # Compatibility entry point. The canonical installer is maintained by zakura.com.
 set -euo pipefail
 
-INSTALLER_URL="https://zakura.com/install-zakura.sh"
+INSTALLER_URL="https://zakura.com/install.sh"
 installer="$(mktemp "${TMPDIR:-/tmp}/install-zakura.XXXXXX.sh")"
 trap 'rm -f "$installer"' EXIT
 

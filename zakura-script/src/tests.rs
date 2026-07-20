@@ -366,7 +366,7 @@ fn sighash_divergence_v5_p2pkh_canonical_sighash_all() {
 fn sighash_divergence_v5_p2pkh_canonical_sighash_all_anyonecanpay() {
     let _init_guard = zakura_test::init();
 
-    build_and_verify_v5_p2pkh(HashType::ALL | HashType::ANYONECANPAY, 0x81)
+    build_and_verify_v5_p2pkh(HashType::ALL_ANYONECANPAY, 0x81)
         .expect("canonical SIGHASH_ALL|ANYONECANPAY (0x81) should be accepted");
 }
 
@@ -381,7 +381,7 @@ fn sighash_divergence_v5_p2pkh_canonical_sighash_all_anyonecanpay() {
 fn sighash_divergence_v5_p2pkh_malformed_0x84_rejected() {
     let _init_guard = zakura_test::init();
 
-    let result = build_and_verify_v5_p2pkh(HashType::ALL | HashType::ANYONECANPAY, 0x84);
+    let result = build_and_verify_v5_p2pkh(HashType::ALL_ANYONECANPAY, 0x84);
 
     assert!(
         result.is_err(),
@@ -511,7 +511,7 @@ fn build_and_verify_v5_p2pkh_single_with_missing_output(
     let placeholder_tx = make_tx([Vec::new(), Vec::new()]);
 
     let canonical_hash_type = if anyone_can_pay {
-        HashType::SINGLE | HashType::ANYONECANPAY
+        HashType::SINGLE_ANYONECANPAY
     } else {
         HashType::SINGLE
     };
@@ -660,8 +660,9 @@ fn build_and_verify_v4_p2pkh(sig_hash_type_byte: u8) -> std::result::Result<(), 
     .expect("sighasher creation should succeed");
 
     // V4: use the raw byte to match zcashd's preimage semantics.
-    let sighash =
-        sighasher.sighash_v4_raw(sig_hash_type_byte, Some((0, lock_script_bytes.clone())));
+    let sighash = sighasher
+        .sighash_v4_raw(sig_hash_type_byte, Some((0, lock_script_bytes.clone())))
+        .expect("V4 transactions accept raw signature hash types");
 
     let msg = Message::from_digest(*sighash.as_ref());
     let signature = secp.sign_ecdsa(&msg, &secret_key);
@@ -771,7 +772,9 @@ fn sighash_divergence_v4_raw_canonical_matches_typed() {
 
     for &(typed, raw) in canonical_pairs {
         let typed_digest = sighasher.sighash(typed, Some((0, script_code.clone())));
-        let raw_digest = sighasher.sighash_v4_raw(raw, Some((0, script_code.clone())));
+        let raw_digest = sighasher
+            .sighash_v4_raw(raw, Some((0, script_code.clone())))
+            .expect("V4 transactions accept raw signature hash types");
         let typed_bytes: [u8; 32] = typed_digest.into();
         let raw_bytes: [u8; 32] = raw_digest.into();
         assert_eq!(

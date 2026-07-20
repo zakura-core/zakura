@@ -15,39 +15,88 @@ use crate::{transparent, Error};
 use crate::primitives::zcash_primitives::{sighash, sighash_v4_raw, PrecomputedTxData};
 use v4::V4Sighash;
 
-bitflags::bitflags! {
-    /// The different SigHash types, as defined in <https://zips.z.cash/zip-0143>
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    pub struct HashType: u32 {
-        /// Sign all the outputs
-        const ALL = 0b0000_0001;
-        /// Sign none of the outputs - anyone can spend
-        const NONE = 0b0000_0010;
-        /// Sign one of the outputs - anyone can spend the rest
-        const SINGLE = Self::ALL.bits() | Self::NONE.bits();
-        /// Anyone can add inputs to this transaction
-        const ANYONECANPAY = 0b1000_0000;
+/// The canonical signature hash types.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HashType {
+    /// Sign all the outputs.
+    All,
+    /// Sign none of the outputs.
+    None,
+    /// Sign the output with the same index as the transparent input.
+    Single,
+    /// Sign all outputs and allow additional inputs.
+    AllAnyoneCanPay,
+    /// Sign no outputs and allow additional inputs.
+    NoneAnyoneCanPay,
+    /// Sign the corresponding output and allow additional inputs.
+    SingleAnyoneCanPay,
+}
 
-        /// Sign all the outputs and Anyone can add inputs to this transaction
-        const ALL_ANYONECANPAY = Self::ALL.bits() | Self::ANYONECANPAY.bits();
-        /// Sign none of the outputs and Anyone can add inputs to this transaction
-        const NONE_ANYONECANPAY = Self::NONE.bits() | Self::ANYONECANPAY.bits();
-        /// Sign one of the outputs and Anyone can add inputs to this transaction
-        const SINGLE_ANYONECANPAY = Self::SINGLE.bits() | Self::ANYONECANPAY.bits();
+impl HashType {
+    /// Sign all the outputs.
+    pub const ALL: Self = Self::All;
+    /// Sign none of the outputs.
+    pub const NONE: Self = Self::None;
+    /// Sign the output with the same index as the transparent input.
+    pub const SINGLE: Self = Self::Single;
+    /// Sign all outputs and allow additional inputs.
+    pub const ALL_ANYONECANPAY: Self = Self::AllAnyoneCanPay;
+    /// Sign no outputs and allow additional inputs.
+    pub const NONE_ANYONECANPAY: Self = Self::NoneAnyoneCanPay;
+    /// Sign the corresponding output and allow additional inputs.
+    pub const SINGLE_ANYONECANPAY: Self = Self::SingleAnyoneCanPay;
+
+    /// Parses a canonical signature hash type.
+    pub fn from_bits(bits: u32) -> Option<Self> {
+        let raw = bits.try_into().ok()?;
+        SighashType::parse(raw)?.try_into().ok()
+    }
+
+    /// Returns the encoded signature hash type.
+    pub fn bits(self) -> u32 {
+        u32::from(SighashType::from(self).encode())
+    }
+
+    pub(crate) fn anyone_can_pay(self) -> bool {
+        matches!(
+            self,
+            Self::AllAnyoneCanPay | Self::NoneAnyoneCanPay | Self::SingleAnyoneCanPay
+        )
+    }
+
+    pub(crate) fn is_single(self) -> bool {
+        matches!(self, Self::Single | Self::SingleAnyoneCanPay)
+    }
+
+    pub(crate) fn is_none(self) -> bool {
+        matches!(self, Self::None | Self::NoneAnyoneCanPay)
     }
 }
 
-impl TryFrom<HashType> for SighashType {
+impl From<HashType> for SighashType {
+    fn from(hash_type: HashType) -> Self {
+        match hash_type {
+            HashType::All => Self::ALL,
+            HashType::None => Self::NONE,
+            HashType::Single => Self::SINGLE,
+            HashType::AllAnyoneCanPay => Self::ALL_ANYONECANPAY,
+            HashType::NoneAnyoneCanPay => Self::NONE_ANYONECANPAY,
+            HashType::SingleAnyoneCanPay => Self::SINGLE_ANYONECANPAY,
+        }
+    }
+}
+
+impl TryFrom<SighashType> for HashType {
     type Error = ();
 
-    fn try_from(hash_type: HashType) -> Result<Self, Self::Error> {
+    fn try_from(hash_type: SighashType) -> Result<Self, Self::Error> {
         Ok(match hash_type {
-            HashType::ALL => Self::ALL,
-            HashType::NONE => Self::NONE,
-            HashType::SINGLE => Self::SINGLE,
-            HashType::ALL_ANYONECANPAY => Self::ALL_ANYONECANPAY,
-            HashType::NONE_ANYONECANPAY => Self::NONE_ANYONECANPAY,
-            HashType::SINGLE_ANYONECANPAY => Self::SINGLE_ANYONECANPAY,
+            SighashType::ALL => Self::All,
+            SighashType::NONE => Self::None,
+            SighashType::SINGLE => Self::Single,
+            SighashType::ALL_ANYONECANPAY => Self::AllAnyoneCanPay,
+            SighashType::NONE_ANYONECANPAY => Self::NoneAnyoneCanPay,
+            SighashType::SINGLE_ANYONECANPAY => Self::SingleAnyoneCanPay,
             _other => return Err(()),
         })
     }
@@ -127,15 +176,12 @@ impl SigHasher {
     /// # Panics
     ///
     /// - If the input index is out of bounds for the transaction inputs.
-    /// - If `hash_type` is not `ALL`, `NONE`, `SINGLE`, or one of their
-    ///   `ANYONECANPAY` variants.
     pub fn sighash(
         &self,
         hash_type: HashType,
         input_index_script_code: Option<(usize, Vec<u8>)>,
     ) -> SigHash {
-        let canonical_hash_type: SighashType =
-            hash_type.try_into().expect("hash type should be canonical");
+        let canonical_hash_type: SighashType = hash_type.into();
 
         if let Some(zip244) = &self.zip244 {
             return zip244.sighash(
@@ -170,29 +216,30 @@ impl SigHasher {
     /// This preserves non-canonical bits (e.g. `0x41`) in the preimage so that
     /// the resulting digest matches `zcashd`'s pre-V5 sighash semantics.
     /// Callers handling V5+ transactions must use [`SigHasher::sighash`].
+    /// Returns `None` for V5+ transactions.
     pub fn sighash_v4_raw(
         &self,
         raw_hash_type: u8,
         input_index_script_code: Option<(usize, Vec<u8>)>,
-    ) -> SigHash {
-        if let Some(v4) = &self.v4 {
-            return v4
-                .signature_hash(
-                    raw_hash_type,
-                    input_index_script_code
-                        .as_ref()
-                        .map(|(index, script_code)| (*index, script_code.as_slice())),
-                )
-                .expect(
-                    "sighash precondition violated: callers must pass an in-bounds input_index",
-                );
+    ) -> Option<SigHash> {
+        if self.zip244.is_some() {
+            return None;
         }
 
-        sighash_v4_raw(
+        if let Some(v4) = &self.v4 {
+            return v4.signature_hash(
+                raw_hash_type,
+                input_index_script_code
+                    .as_ref()
+                    .map(|(index, script_code)| (*index, script_code.as_slice())),
+            );
+        }
+
+        Some(sighash_v4_raw(
             &self.precomputed_tx_data,
             raw_hash_type,
             input_index_script_code,
-        )
+        ))
     }
 
     /// Returns the Orchard bundle in the precomputed transaction data.
@@ -214,5 +261,31 @@ impl SigHasher {
         &self,
     ) -> Option<sapling_crypto::Bundle<sapling_crypto::bundle::Authorized, ZatBalance>> {
         self.precomputed_tx_data.sapling_bundle()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HashType, SighashType};
+
+    #[test]
+    fn hash_type_only_accepts_canonical_values() {
+        for (raw, expected) in [
+            (0x01, HashType::ALL),
+            (0x02, HashType::NONE),
+            (0x03, HashType::SINGLE),
+            (0x81, HashType::ALL_ANYONECANPAY),
+            (0x82, HashType::NONE_ANYONECANPAY),
+            (0x83, HashType::SINGLE_ANYONECANPAY),
+        ] {
+            assert_eq!(HashType::from_bits(raw), Some(expected));
+            assert_eq!(expected.bits(), raw);
+        }
+
+        for raw in [0x00, 0x04, 0x41, 0x80, 0x84, 0x100] {
+            assert_eq!(HashType::from_bits(raw), None);
+        }
+
+        assert!(HashType::try_from(SighashType::from_raw(0x41)).is_err());
     }
 }

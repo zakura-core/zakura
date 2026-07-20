@@ -30,6 +30,7 @@
 use std::io;
 
 use blake2b_simd::{Hash as Blake2bHash, Params, State};
+use zcash_transparent::sighash::SighashType;
 
 use crate::{
     orchard,
@@ -827,9 +828,9 @@ impl Zip244SighashCache {
         // Shielded signatures always use SIGHASH_ALL in ZIP-244, regardless of
         // the caller's otherwise-unused hash type argument.
         let hash_type = input_index.map_or(HashType::ALL, |_| hash_type);
-        let anyone_can_pay = hash_type.contains(HashType::ANYONECANPAY);
-        let single = matches!(hash_type, HashType::SINGLE | HashType::SINGLE_ANYONECANPAY);
-        let none = matches!(hash_type, HashType::NONE | HashType::NONE_ANYONECANPAY);
+        let anyone_can_pay = hash_type.anyone_can_pay();
+        let single = hash_type.is_single();
+        let none = hash_type.is_none();
 
         let prevouts = if anyone_can_pay {
             hash_prevouts(&[])
@@ -870,10 +871,7 @@ impl Zip244SighashCache {
             None => hasher(ZCASH_TRANSPARENT_INPUT_HASH_PERSONALIZATION).finalize(),
         };
 
-        let hash_type: u8 = hash_type
-            .bits()
-            .try_into()
-            .expect("canonical ZIP-244 hash types fit in one byte");
+        let hash_type = SighashType::from(hash_type).encode();
         let mut h = hasher(ZCASH_TRANSPARENT_HASH_PERSONALIZATION);
         h.update(&[hash_type]);
         h.update(prevouts.as_bytes());

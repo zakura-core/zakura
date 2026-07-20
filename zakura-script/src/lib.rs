@@ -180,51 +180,35 @@ impl CachedFfiTransaction {
                 // Inner helper: returns None when the hash type is invalid
                 // and the callback should signal failure.
                 let computed: Option<[u8; 32]> = (|| {
-                    // For v5+ transactions: reject undefined hash_type values,
-                    // matching zcashd's SighashType::parse behavior.
-                    // Valid values: {0x01, 0x02, 0x03, 0x81, 0x82, 0x83}.
-                    if self.transaction.version() >= 5 {
-                        let valid_v5_types: &[i32] = &[0x01, 0x02, 0x03, 0x81, 0x82, 0x83];
-                        if !valid_v5_types.contains(&hash_type.raw_bits()) {
-                            return None;
-                        }
-                    }
-
-                    // For v5+ transactions: reject SIGHASH_SINGLE when there is
-                    // no corresponding output (an output at the same index as
-                    // the input being verified). ZIP-244 §S.2a marks this as a
-                    // consensus failure; zcashd throws in `SignatureHash` and
-                    // `CheckSig` catches the exception to fail the script.
-                    if self.transaction.version() >= 5
-                        && hash_type.signed_outputs()
-                            == zcash_script::signature::SignedOutputs::Single
-                        && input_index >= self.transaction.outputs().len()
-                    {
-                        return None;
-                    }
-
                     let script_code_vec = script_code.0.clone();
 
                     // For pre-v5 (v4) transactions: zcashd serializes the raw
                     // hash_type byte into the sighash preimage (only masking with
                     // 0x1f for selection logic). Use the raw byte to match.
                     if self.transaction.version() < 5 {
-                        let raw_byte = hash_type.raw_bits() as u8;
-                        return Some(
-                            self.sighasher()
-                                .sighash_v4_raw(raw_byte, Some((input_index, script_code_vec)))
-                                .0,
-                        );
+                        let raw_byte = hash_type
+                            .raw_bits()
+                            .try_into()
+                            .expect("script signature hash types are one byte");
+                        return self
+                            .sighasher()
+                            .sighash_v4_raw(raw_byte, Some((input_index, script_code_vec)))
+                            .map(|sighash| sighash.0);
                     }
 
-                    let mut our_hash_type = match hash_type.signed_outputs() {
-                        zcash_script::signature::SignedOutputs::All => HashType::ALL,
-                        zcash_script::signature::SignedOutputs::Single => HashType::SINGLE,
-                        zcash_script::signature::SignedOutputs::None => HashType::NONE,
-                    };
-                    if hash_type.anyone_can_pay() {
-                        our_hash_type |= HashType::ANYONECANPAY;
+                    let raw_hash_type = hash_type.raw_bits().try_into().ok()?;
+                    let our_hash_type = HashType::from_bits(raw_hash_type)?;
+
+                    // ZIP-244 §S.2a requires a corresponding output for
+                    // SIGHASH_SINGLE.
+                    if matches!(
+                        our_hash_type,
+                        HashType::SINGLE | HashType::SINGLE_ANYONECANPAY
+                    ) && input_index >= self.transaction.outputs().len()
+                    {
+                        return None;
                     }
+
                     Some(
                         self.sighasher()
                             .sighash(our_hash_type, Some((input_index, script_code_vec)))

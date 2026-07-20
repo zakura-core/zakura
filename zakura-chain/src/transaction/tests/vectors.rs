@@ -1117,11 +1117,11 @@ fn v4_raw_sighashes_match_librustzcash() -> Result<()> {
     for raw_hash_type in u8::MIN..=u8::MAX {
         assert_eq!(
             native.sighash_v4_raw(raw_hash_type, input.clone()),
-            crate::primitives::zcash_primitives::sighash_v4_raw(
+            Some(crate::primitives::zcash_primitives::sighash_v4_raw(
                 &librustzcash,
                 raw_hash_type,
                 input.clone(),
-            ),
+            )),
             "raw hash type {raw_hash_type:#04x} must match librustzcash",
         );
     }
@@ -1159,7 +1159,7 @@ fn v4_raw_sighash_single_without_output_matches_zip243() -> Result<()> {
 
     assert_eq!(
         native.sighash_v4_raw(raw_hash_type, input),
-        SigHash(test.sighash),
+        Some(SigHash(test.sighash)),
     );
 
     Ok(())
@@ -1301,6 +1301,15 @@ fn zip244_sighash() -> Result<()> {
             );
         }
     }
+
+    Ok(())
+}
+
+#[test]
+fn zip244_rejects_the_raw_pre_v5_sighash_path() -> Result<()> {
+    let sighasher = EMPTY_V5_TX.sighasher(NetworkUpgrade::Nu5, Arc::new(Vec::new()))?;
+
+    assert_eq!(sighasher.sighash_v4_raw(0x41, None), None);
 
     Ok(())
 }

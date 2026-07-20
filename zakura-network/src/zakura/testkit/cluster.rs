@@ -1056,7 +1056,10 @@ mod tests {
                         Err(kind) => {
                             let _ = local
                                 .handle
-                                .send(HeaderSyncEvent::HeaderRangeOperationFailed { operation, kind })
+                                .send(HeaderSyncEvent::HeaderRangeOperationFailed {
+                                    operation,
+                                    kind,
+                                })
                                 .await;
                         }
                     }

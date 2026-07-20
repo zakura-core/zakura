@@ -155,12 +155,12 @@ mod tests {
             BlockSyncStatus, DiscoveryMessage, Frame, FramedRecv, FramedSend, HeaderSyncAction,
             HeaderSyncCommitFailureKind, HeaderSyncDecodeContext, HeaderSyncEvent,
             HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMessage, HeaderSyncMisbehavior,
-            HeaderSyncPeerSession, HeaderSyncRequestId, HeaderSyncStartup, HeaderSyncStatus, Peer,
-            Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig, ZakuraConnId,
-            ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace, MAX_BS_RESPONSE_BYTES,
-            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-            ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
-            ZAKURA_STREAM_HEADER_SYNC,
+            HeaderSyncOperationIdentity, HeaderSyncPeerSession, HeaderSyncRequestId,
+            HeaderSyncStartup, HeaderSyncStatus, Peer, Service, ServicePeerLimits, Stream,
+            ZakuraBlockSyncConfig, ZakuraConnId, ZakuraHeaderSyncConfig, ZakuraLocalLimits,
+            ZakuraTrace, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
+            ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -1022,22 +1022,20 @@ mod tests {
                     }
                 }
                 HeaderSyncAction::CommitHeaderRange {
-                    peer,
-                    session_id,
+                    operation,
                     anchor,
                     start_height,
                     headers,
                     finalized,
                     ..
                 } => {
-                    let count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
                     let result = local
                         .store
                         .lock()
                         .expect("test store mutex is not poisoned")
                         .commit_headers(anchor, start_height, headers, finalized);
                     match result {
-                        Ok((tip_height, tip_hash)) => {
+                        Ok((_tip_height, tip_hash)) => {
                             let frontiers = local
                                 .store
                                 .lock()
@@ -1045,9 +1043,8 @@ mod tests {
                                 .frontiers();
                             let _ = local
                                 .handle
-                                .send(HeaderSyncEvent::HeaderRangeCommitted {
-                                    start_height,
-                                    tip_height,
+                                .send(HeaderSyncEvent::HeaderRangeOperationCompleted {
+                                    operation,
                                     tip_hash,
                                 })
                                 .await;
@@ -1059,13 +1056,7 @@ mod tests {
                         Err(kind) => {
                             let _ = local
                                 .handle
-                                .send(HeaderSyncEvent::HeaderRangeCommitFailed {
-                                    peer,
-                                    session_id,
-                                    start_height,
-                                    count,
-                                    kind,
-                                })
+                                .send(HeaderSyncEvent::HeaderRangeOperationFailed { operation, kind })
                                 .await;
                         }
                     }
@@ -1078,8 +1069,7 @@ mod tests {
                         .best_header_tip();
                     let _ = local
                         .handle
-                        .send(HeaderSyncEvent::HeaderRangeCommitted {
-                            start_height: tip_height,
+                        .send(HeaderSyncEvent::BestHeaderTipLoaded {
                             tip_height,
                             tip_hash,
                         })
@@ -1348,8 +1338,7 @@ mod tests {
 
     #[derive(Debug)]
     struct ControlledHeaderCommit {
-        peer: ZakuraPeerId,
-        session_id: u64,
+        operation: HeaderSyncOperationIdentity,
         anchor: block::Hash,
         start_height: block::Height,
         headers: Vec<Arc<block::Header>>,
@@ -1405,16 +1394,14 @@ mod tests {
             loop {
                 match actions.recv().await {
                     Some(HeaderSyncAction::CommitHeaderRange {
-                        peer,
-                        session_id,
+                        operation,
                         anchor,
                         start_height,
                         headers,
                         ..
                     }) => {
                         return Ok(ControlledHeaderCommit {
-                            peer,
-                            session_id,
+                            operation,
                             anchor,
                             start_height,
                             headers,
@@ -1550,23 +1537,13 @@ mod tests {
                             })
                             .await;
                     }
-                    HeaderSyncAction::CommitHeaderRange {
-                        peer,
-                        session_id,
-                        start_height,
-                        headers,
-                        ..
-                    } => {
+                    HeaderSyncAction::CommitHeaderRange { operation, .. } => {
                         let Some(handle) = endpoint.header_sync() else {
                             continue;
                         };
-                        let count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
                         let _ = handle
-                            .send(HeaderSyncEvent::HeaderRangeCommitFailed {
-                                peer,
-                                session_id,
-                                start_height,
-                                count,
+                            .send(HeaderSyncEvent::HeaderRangeOperationFailed {
+                                operation,
                                 kind: HeaderSyncCommitFailureKind::Local,
                             })
                             .await;
@@ -2859,8 +2836,8 @@ mod tests {
 
         for expected_start in [block::Height(1), block::Height(3)] {
             let commit = next_controlled_header_commit(&mut actions).await?;
-            assert_eq!(commit.peer, hostile_id);
-            assert_ne!(commit.session_id, 0);
+            assert_eq!(commit.operation.wire_request.peer, hostile_id);
+            assert_ne!(commit.operation.wire_request.session_id, 0);
             assert_eq!(commit.start_height, expected_start);
             let expected_anchor = if commit.start_height == block::Height(1) {
                 mainnet_genesis_hash()
@@ -2877,11 +2854,6 @@ mod tests {
                 ),
                 commit.start_height
             );
-            let tip_height = block::Height(
-                commit.start_height.0
-                    + u32::try_from(commit.headers.len()).expect("test header count fits u32")
-                    - 1,
-            );
             let tip_hash = commit
                 .headers
                 .last()
@@ -2890,9 +2862,8 @@ mod tests {
             victim
                 .header_sync()
                 .expect("header-sync handle is enabled")
-                .send(HeaderSyncEvent::HeaderRangeCommitted {
-                    start_height: commit.start_height,
-                    tip_height,
+                .send(HeaderSyncEvent::HeaderRangeOperationCompleted {
+                    operation: commit.operation,
                     tip_hash,
                 })
                 .await?;

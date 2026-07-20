@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Skip Equihash and difficulty-filter checks during native header sync for
+  configured Testnets with `disable_pow = true`, rather than only Regtest
+  ([#289](https://github.com/zakura-core/zakura/pull/289)).
+
 ## [3.0.0] - 2026-07-20
 
 ### Breaking Changes

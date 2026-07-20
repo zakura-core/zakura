@@ -7053,16 +7053,25 @@ async fn stateless_validation_rejects_wrong_solution_size_for_network() {
 }
 
 #[test]
-fn regtest_header_validation_accepts_common_and_short_solution_sizes() {
+fn pow_disabled_header_validation_accepts_common_and_short_solution_sizes() {
     let regtest = Network::new_regtest(Default::default());
+    let custom_testnet = Parameters::build()
+        .with_network_name("HeaderSyncNoPowSizeTest")
+        .expect("custom testnet name is valid")
+        .with_disable_pow(true)
+        .to_network()
+        .expect("custom testnet parameters are valid");
     let common_sized = mainnet_header(&BLOCK_MAINNET_1_BYTES);
     let mut short_sized = *common_sized;
     short_sized.solution = Solution::Regtest([0; 36]);
 
-    validate_solution_sizes(std::slice::from_ref(&common_sized), &regtest)
-        .expect("regtest accepts Zebra-mined common-size solutions");
-    validate_solution_sizes(&[Arc::new(short_sized)], &regtest)
-        .expect("regtest accepts short regtest solutions");
+    for network in [&regtest, &custom_testnet] {
+        validate_solution_sizes(std::slice::from_ref(&common_sized), network)
+            .expect("PoW-disabled networks accept common-size solutions");
+        validate_solution_sizes(&[Arc::new(short_sized)], network)
+            .expect("PoW-disabled networks accept short solutions");
+    }
+
     assert!(matches!(
         validate_solution_sizes(&[Arc::new(short_sized)], &Network::Mainnet),
         Err(HeaderSyncWireError::WrongEquihashSolutionSize)
@@ -7085,6 +7094,33 @@ async fn regtest_stateless_validation_skips_pow_filter() {
     validate_headers_stateless(vec![Arc::new(header)], context)
         .await
         .expect("regtest header sync leaves PoW enforcement to block verification");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_testnet_disable_pow_skips_header_sync_pow_filter() {
+    let network = Parameters::build()
+        .with_network_name("HeaderSyncNoPowTest")
+        .expect("custom testnet name is valid")
+        .with_disable_pow(true)
+        .to_network()
+        .expect("custom testnet parameters are valid");
+    assert!(network.disable_pow());
+    assert!(!network.is_regtest());
+
+    let mut header = *mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    header.nonce[0] ^= 1;
+    header.difficulty_threshold =
+        CompactDifficulty::from_bytes_in_display_order(&[0x01, 0x01, 0x00, 0x00]).unwrap();
+    let context = HeaderSyncValidationContext {
+        network: &network,
+        now: Utc::now(),
+        start_height: block::Height(1),
+        decode_context: headers_context(1, DEFAULT_HS_RANGE),
+    };
+
+    validate_headers_stateless(vec![Arc::new(header)], context)
+        .await
+        .expect("custom disable_pow networks must skip native header-sync PoW checks");
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -43,9 +43,15 @@ struct BanList {
     insertion_order: VecDeque<IpAddr>,
 }
 
+fn canonical_banned_ip(ip: IpAddr) -> IpAddr {
+    canonical_socket_addr(SocketAddr::new(ip, 0)).ip()
+}
+
 impl BanList {
     /// Inserts `ip`, evicting the oldest IP when the list exceeds its bound.
     fn insert(&mut self, ip: IpAddr) {
+        let ip = canonical_banned_ip(ip);
+
         if !self.ips.insert(ip) {
             return;
         }
@@ -66,6 +72,8 @@ impl BanList {
 impl BannedIps {
     /// Returns whether `ip` is currently banned.
     pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = canonical_banned_ip(ip);
+
         self.inner
             .read()
             .expect("ban list lock should not be poisoned")

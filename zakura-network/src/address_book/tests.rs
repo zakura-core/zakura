@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use crate::constants::MAX_BANNED_IPS;
 
-use super::BanList;
+use super::{BanList, BannedIps};
 
 mod prop;
 mod vectors;
@@ -27,4 +27,13 @@ fn ban_list_evicts_the_oldest_ip_at_capacity() {
     assert!(bans.ips.contains(&newest));
     assert_eq!(bans.ips.len(), MAX_BANNED_IPS);
     assert_eq!(bans.insertion_order.len(), MAX_BANNED_IPS);
+}
+
+#[test]
+fn banned_ips_match_ipv4_and_ipv4_mapped_ipv6() {
+    let ipv4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let ipv4_mapped = IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+
+    assert!(BannedIps::with_banned_ip(ipv4).contains(ipv4_mapped));
+    assert!(BannedIps::with_banned_ip(ipv4_mapped).contains(ipv4));
 }

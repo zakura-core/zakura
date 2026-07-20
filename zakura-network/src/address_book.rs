@@ -535,13 +535,15 @@ impl AddressBook {
             if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
                 // Ban and skip outbound connections with excessively misbehaving peers.
                 let banned_ip = updated.addr.ip();
-                let mut bans_by_ip = self
-                    .bans_by_ip
-                    .inner
-                    .write()
-                    .expect("ban list lock should not be poisoned");
+                {
+                    let mut bans_by_ip = self
+                        .bans_by_ip
+                        .inner
+                        .write()
+                        .expect("ban list lock should not be poisoned");
 
-                bans_by_ip.insert(banned_ip);
+                    bans_by_ip.insert(banned_ip);
+                }
 
                 // `most_recent_by_ip` is only populated when
                 // `max_connections_per_ip == 1`. The ban path runs for any

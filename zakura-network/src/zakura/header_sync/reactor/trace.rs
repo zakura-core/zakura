@@ -444,10 +444,13 @@ fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSy
             insert_peer(row, hs_trace::PEER, peer);
             trace_header_sync_message_fields(row, msg);
         }
-        HeaderSyncEvent::WireHeaders { peer, headers, .. } => {
+        HeaderSyncEvent::WireHeaders {
+            wire_request,
+            entries,
+        } => {
             insert_optional_str(row, hs_trace::KIND, Some("wire_headers"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
+            insert_peer(row, hs_trace::PEER, &wire_request.peer);
+            insert_u64(row, hs_trace::RANGE_COUNT, entries.len() as u64);
         }
         HeaderSyncEvent::WireGetHeaders {
             peer,
@@ -939,7 +942,7 @@ mod tests {
         header_sync::{
             events::HeaderSyncFrontiers, service::HeaderSyncPeerSession, state::RangePriority,
         },
-        HeaderRangePayload, HeaderSyncOperationIdentity, HeaderSyncOperationKind,
+        HeaderRangeEntry, HeaderRangePayload, HeaderSyncOperationIdentity, HeaderSyncOperationKind,
         HeaderSyncServiceSummary, HeaderSyncWireRequestIdentity,
     };
 
@@ -1085,12 +1088,16 @@ mod tests {
                 msg: HeaderSyncMessage::Status(status()),
             },
             HeaderSyncEvent::WireHeaders {
-                peer: peer.clone(),
-                session_id: 7,
-                request_id: request_id(),
-                headers: vec![header.clone()],
-                body_sizes: vec![1],
-                tree_aux_roots: Vec::new(),
+                wire_request: HeaderSyncWireRequestIdentity {
+                    peer: peer.clone(),
+                    session_id: 7,
+                    request_id: request_id(),
+                },
+                entries: vec![HeaderRangeEntry {
+                    header: header.clone(),
+                    body_size: 1,
+                    tree_aux_root: None,
+                }],
             },
             HeaderSyncEvent::WireGetHeaders {
                 peer: peer.clone(),
@@ -1192,8 +1199,15 @@ mod tests {
                 HeaderSyncAction::CommitHeaderRange {
                     operation: operation(peer.clone()),
                     anchor: block::Hash([0; 32]),
-                    payload: HeaderRangePayload::new(block::Height(1), vec![header], vec![1], None)
-                        .expect("test payload is aligned"),
+                    payload: HeaderRangePayload::new(
+                        block::Height(1),
+                        vec![HeaderRangeEntry {
+                            header,
+                            body_size: 1,
+                            tree_aux_root: None,
+                        }],
+                    )
+                    .expect("test payload is aligned"),
                     finalized: false,
                 },
                 "commit_header_range",

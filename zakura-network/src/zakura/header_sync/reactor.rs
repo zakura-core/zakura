@@ -355,15 +355,11 @@ impl HeaderSyncReactor {
                 }
             }
             HeaderSyncEvent::WireHeaders {
-                peer,
-                session_id,
-                request_id,
-                headers,
-                body_sizes,
-                tree_aux_roots,
+                wire_request,
+                entries,
             } => {
-                if self.is_current_session(&peer, session_id) {
-                    self.handle_headers(peer, request_id, headers, body_sizes, tree_aux_roots)
+                if self.is_current_session(&wire_request.peer, wire_request.session_id) {
+                    self.handle_headers(wire_request.peer, wire_request.request_id, entries)
                         .await;
                 } else {
                     metrics::counter!("sync.header.session.stale_event").increment(1);
@@ -1444,14 +1440,12 @@ impl HeaderSyncReactor {
         peers
     }
 
-    #[tracing::instrument(skip(self, headers))]
+    #[tracing::instrument(skip(self, entries))]
     async fn handle_headers(
         &mut self,
         peer: ZakuraPeerId,
         request_id: HeaderSyncRequestId,
-        headers: Vec<Arc<block::Header>>,
-        body_sizes: Vec<u32>,
-        tree_aux_roots: Vec<BlockCommitmentRoots>,
+        entries: Vec<HeaderRangeEntry>,
     ) {
         metrics::counter!("sync.header.response.received").increment(1);
         let Some(peer_state) = self.state.peers.get_mut(&peer) else {
@@ -1468,6 +1462,7 @@ impl HeaderSyncReactor {
         };
         let peer_max_headers_per_response = peer_state.max_headers_per_response;
         let in_flight_count = peer_state.outstanding.len();
+        let (headers, body_sizes, tree_aux_roots) = HeaderRangeEntry::into_parallel(entries);
 
         self.handle_headers_for_outstanding(
             peer,
@@ -1677,16 +1672,10 @@ impl HeaderSyncReactor {
             return;
         }
 
-        let payload = HeaderRangePayload::new(
-            outstanding.range_request.start_height(),
-            headers,
-            body_sizes,
-            outstanding
-                .range_request
-                .want_tree_aux_roots
-                .then_some(tree_aux_roots),
-        )
-        .expect("validated non-empty response has checked aligned payload data");
+        let entries = HeaderRangeEntry::from_parallel(headers, body_sizes, tree_aux_roots)
+            .expect("validated response vectors are aligned");
+        let payload = HeaderRangePayload::new(outstanding.range_request.start_height(), entries)
+            .expect("validated non-empty response has checked aligned payload data");
         let end_height = payload.range().end();
         if outstanding.range_request.finalized {
             let last_hash = payload

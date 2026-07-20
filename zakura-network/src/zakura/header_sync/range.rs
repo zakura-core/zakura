@@ -6,6 +6,58 @@ use super::{
     *,
 };
 
+/// One header and all data associated with its height.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderRangeEntry {
+    /// Header at this entry's implicit range height.
+    pub header: Arc<block::Header>,
+    /// Advisory serialized body-size hint.
+    pub body_size: u32,
+    /// Commitment roots when the response includes roots.
+    pub tree_aux_root: Option<BlockCommitmentRoots>,
+}
+
+impl HeaderRangeEntry {
+    /// Convert parallel vectors into aligned records at a system boundary.
+    pub fn from_parallel(
+        headers: Vec<Arc<block::Header>>,
+        body_sizes: Vec<u32>,
+        tree_aux_roots: Vec<BlockCommitmentRoots>,
+    ) -> Result<Vec<Self>, HeaderSyncWireError> {
+        validate_body_sizes_len(headers.len(), body_sizes.len())?;
+        validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len())?;
+        let mut roots = if tree_aux_roots.is_empty() {
+            None
+        } else {
+            Some(tree_aux_roots.into_iter())
+        };
+        Ok(headers
+            .into_iter()
+            .zip(body_sizes)
+            .map(|(header, body_size)| Self {
+                header,
+                body_size,
+                tree_aux_root: roots.as_mut().and_then(Iterator::next),
+            })
+            .collect())
+    }
+
+    /// Split aligned records for APIs that still require parallel vectors.
+    pub fn into_parallel(
+        entries: Vec<Self>,
+    ) -> (Vec<Arc<block::Header>>, Vec<u32>, Vec<BlockCommitmentRoots>) {
+        let mut headers = Vec::with_capacity(entries.len());
+        let mut body_sizes = Vec::with_capacity(entries.len());
+        let mut roots = Vec::with_capacity(entries.len());
+        for entry in entries {
+            headers.push(entry.header);
+            body_sizes.push(entry.body_size);
+            roots.extend(entry.tree_aux_root);
+        }
+        (headers, body_sizes, roots)
+    }
+}
+
 /// A non-empty inclusive header-height range whose endpoint cannot overflow.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CheckedHeaderRange {
@@ -59,39 +111,48 @@ impl CheckedHeaderRange {
 #[derive(Clone, Debug)]
 pub struct HeaderRangePayload {
     range: CheckedHeaderRange,
-    headers: Vec<Arc<block::Header>>,
-    body_sizes: Vec<u32>,
-    tree_aux_roots: Option<Vec<BlockCommitmentRoots>>,
+    entries: Vec<HeaderRangeEntry>,
 }
 
 impl HeaderRangePayload {
     /// Validate and construct an aligned payload.
     pub fn new(
         start: block::Height,
-        headers: Vec<Arc<block::Header>>,
-        body_sizes: Vec<u32>,
-        tree_aux_roots: Option<Vec<BlockCommitmentRoots>>,
+        entries: Vec<HeaderRangeEntry>,
     ) -> Result<Self, HeaderSyncWireError> {
-        validate_body_sizes_len(headers.len(), body_sizes.len())?;
-        if let Some(roots) = tree_aux_roots.as_ref() {
-            validate_tree_aux_roots_len(headers.len(), roots.len())?;
-            validate_tree_aux_root_heights(start, roots)?;
+        let root_count = entries
+            .iter()
+            .filter(|entry| entry.tree_aux_root.is_some())
+            .count();
+        if root_count != 0 && root_count != entries.len() {
+            return Err(HeaderSyncWireError::TreeAuxRootCountMismatch {
+                headers: entries.len(),
+                roots: root_count,
+            });
+        }
+        if root_count != 0 {
+            let roots = entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .tree_aux_root
+                        .as_ref()
+                        .expect("all payload entries have roots")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            validate_tree_aux_root_heights(start, &roots)?;
         }
 
         let count =
-            u32::try_from(headers.len()).map_err(|_| HeaderSyncWireError::HeaderCountLimit {
-                actual: headers.len(),
+            u32::try_from(entries.len()).map_err(|_| HeaderSyncWireError::HeaderCountLimit {
+                actual: entries.len(),
                 max: usize::try_from(u32::MAX).unwrap_or(usize::MAX),
             })?;
         let range = CheckedHeaderRange::from_count(start, count)
             .ok_or(HeaderSyncWireError::InvalidRangeGeometry { start, count })?;
 
-        Ok(Self {
-            range,
-            headers,
-            body_sizes,
-            tree_aux_roots,
-        })
+        Ok(Self { range, entries })
     }
 
     /// Return the delivered height range.
@@ -99,19 +160,42 @@ impl HeaderRangePayload {
         self.range
     }
 
-    /// Return the delivered headers.
-    pub fn headers(&self) -> &[Arc<block::Header>] {
-        &self.headers
+    /// Return the structurally aligned entries.
+    pub fn entries(&self) -> &[HeaderRangeEntry] {
+        &self.entries
     }
 
-    /// Return the aligned body-size hints.
-    pub fn body_sizes(&self) -> &[u32] {
-        &self.body_sizes
+    /// Iterate over the delivered headers without cloning.
+    pub fn headers(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &Arc<block::Header>> + ExactSizeIterator {
+        self.entries.iter().map(|entry| &entry.header)
     }
 
-    /// Return the aligned roots when the request asked for them.
-    pub fn tree_aux_roots(&self) -> Option<&[BlockCommitmentRoots]> {
-        self.tree_aux_roots.as_deref()
+    /// Iterate over aligned body-size hints.
+    pub fn body_sizes(&self) -> impl DoubleEndedIterator<Item = u32> + ExactSizeIterator + '_ {
+        self.entries.iter().map(|entry| entry.body_size)
+    }
+
+    /// Iterate over aligned roots when every entry includes one.
+    pub fn tree_aux_roots(
+        &self,
+    ) -> Option<impl DoubleEndedIterator<Item = &BlockCommitmentRoots> + ExactSizeIterator> {
+        self.has_tree_aux_roots().then(|| {
+            self.entries.iter().map(|entry| {
+                entry
+                    .tree_aux_root
+                    .as_ref()
+                    .expect("rooted payload entries all have roots")
+            })
+        })
+    }
+
+    /// Return whether every entry includes a tree-aux root.
+    pub fn has_tree_aux_roots(&self) -> bool {
+        self.entries
+            .first()
+            .is_some_and(|entry| entry.tree_aux_root.is_some())
     }
 
     /// Keep only the part of this payload strictly after `covered_through`.
@@ -123,11 +207,7 @@ impl HeaderRangePayload {
 
         let covered_count = usize::try_from(suffix.start().0 - self.range.start().0)
             .expect("payload length fits in usize");
-        self.headers = self.headers.split_off(covered_count);
-        self.body_sizes = self.body_sizes.split_off(covered_count);
-        if let Some(roots) = self.tree_aux_roots.as_mut() {
-            *roots = roots.split_off(covered_count);
-        }
+        self.entries = self.entries.split_off(covered_count);
         self.range = suffix;
         Some(self)
     }
@@ -141,18 +221,25 @@ impl HeaderRangePayload {
         Vec<u32>,
         Option<Vec<BlockCommitmentRoots>>,
     ) {
-        (
-            self.range,
-            self.headers,
-            self.body_sizes,
-            self.tree_aux_roots,
-        )
+        let has_roots = self.has_tree_aux_roots();
+        let mut headers = Vec::with_capacity(self.entries.len());
+        let mut body_sizes = Vec::with_capacity(self.entries.len());
+        let mut roots = has_roots.then(|| Vec::with_capacity(self.entries.len()));
+        for entry in self.entries {
+            headers.push(entry.header);
+            body_sizes.push(entry.body_size);
+            if let (Some(roots), Some(root)) = (roots.as_mut(), entry.tree_aux_root) {
+                roots.push(root);
+            }
+        }
+        (self.range, headers, body_sizes, roots)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
     #[test]
     fn checked_range_rejects_empty_reversed_and_overflowing_geometry() {
@@ -184,8 +271,8 @@ mod tests {
     }
 
     #[test]
-    fn payload_rejects_misaligned_body_sizes_before_buffering() {
-        let error = HeaderRangePayload::new(block::Height(1), Vec::new(), vec![1], None)
+    fn entry_conversion_rejects_misaligned_body_sizes() {
+        let error = HeaderRangeEntry::from_parallel(Vec::new(), vec![1], Vec::new())
             .expect_err("body sizes must align with headers");
 
         assert!(matches!(
@@ -193,6 +280,24 @@ mod tests {
             HeaderSyncWireError::BodySizeCountMismatch {
                 headers: 0,
                 body_sizes: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn entry_conversion_rejects_missing_roots_for_non_empty_headers() {
+        let header = Arc::new(
+            block::Header::zcash_deserialize(&BLOCK_MAINNET_1_BYTES[..])
+                .expect("test header parses"),
+        );
+        let error = HeaderRangeEntry::from_parallel(vec![header], vec![1], Vec::new())
+            .expect_err("roots must align with non-empty headers");
+
+        assert!(matches!(
+            error,
+            HeaderSyncWireError::TreeAuxRootCountMismatch {
+                headers: 1,
+                roots: 0,
             }
         ));
     }

@@ -115,11 +115,12 @@ pub async fn validate_headers_stateless(
 }
 
 /// Check that a header range links to its anchor and is internally contiguous.
-pub fn validate_header_range_links(
+pub fn validate_header_range_links<'a>(
     anchor: block::Hash,
-    headers: &[Arc<block::Header>],
+    headers: impl IntoIterator<Item = &'a Arc<block::Header>>,
 ) -> Result<(), HeaderSyncWireError> {
-    let Some(first) = headers.first() else {
+    let mut headers = headers.into_iter();
+    let Some(first) = headers.next() else {
         return Ok(());
     };
 
@@ -127,7 +128,14 @@ pub fn validate_header_range_links(
         return Err(HeaderSyncWireError::FirstHeaderDoesNotLink);
     }
 
-    validate_internal_continuity(headers)
+    let mut previous_hash = block::Hash::from(first.as_ref());
+    for header in headers {
+        if previous_hash != header.previous_block_hash {
+            return Err(HeaderSyncWireError::NonContiguousHeaders);
+        }
+        previous_hash = block::Hash::from(header.as_ref());
+    }
+    Ok(())
 }
 
 /// Run all context-free validation checks for an inbound full-block tip flood.

@@ -12,23 +12,26 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use serde_json::{Map, Value};
+use serde::Serialize;
+#[cfg(test)]
+use serde_json::Value;
 use zakura_chain::block::{self, Height};
-use zakura_jsonl_trace::{JsonlTracer, JsonlWriteEvent};
+use zakura_jsonl_trace::{
+    saturating_count, saturating_millis, JsonlDisplay, JsonlEventEmitter, JsonlTraceEvent,
+    JsonlTraceTable, JsonlTracer,
+};
 
 use crate::{protocol::internal::Response, NotFoundClass, PeerSocketAddr, SharedPeerError};
 
-const TABLE: &str = "legacy_peer_request";
-const FILE_NAME: &str = "legacy_peer_request.jsonl";
+const TABLE: JsonlTraceTable =
+    JsonlTraceTable::new("legacy_peer_request", "legacy_peer_request.jsonl");
 
 #[derive(Clone, Debug)]
 pub(super) struct LegacyPeerTrace {
-    tracer: JsonlTracer,
-    node: Arc<str>,
-    started: Instant,
+    emitter: JsonlEventEmitter,
     next_request_id: Arc<AtomicU64>,
 }
 
@@ -40,6 +43,92 @@ pub(super) struct PeerTraceContext {
     pub(super) local_tip_height: Option<Height>,
 }
 
+#[derive(Serialize)]
+#[serde(tag = "event")]
+enum LegacyPeerEvent<'a> {
+    #[serde(rename = "find_blocks_finish")]
+    FindBlocksFinish {
+        request_id: u64,
+        peer_id: u64,
+        peer: JsonlDisplay<'a, PeerSocketAddr>,
+        peer_start_height: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_tip_height: Option<u32>,
+        elapsed_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        locator_tip: Option<JsonlDisplay<'a, block::Hash>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop: Option<JsonlDisplay<'a, block::Hash>>,
+        #[serde(flatten)]
+        result: FindBlocksResult<'a>,
+    },
+    #[serde(rename = "block_request_finish")]
+    BlockRequestFinish {
+        request_id: u64,
+        peer_id: u64,
+        peer: JsonlDisplay<'a, PeerSocketAddr>,
+        peer_start_height: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_tip_height: Option<u32>,
+        elapsed_ms: u64,
+        requested_hash: JsonlDisplay<'a, block::Hash>,
+        route: &'static str,
+        #[serde(flatten)]
+        result: BlockRequestResult<'a>,
+    },
+}
+
+impl JsonlTraceEvent for LegacyPeerEvent<'_> {
+    const TABLE: JsonlTraceTable = TABLE;
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum FindBlocksResult<'a> {
+    BlockHashes {
+        result: &'static str,
+        hash_count: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        inferred_start_height: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        inferred_end_height: Option<u32>,
+    },
+    UnexpectedResponse {
+        result: &'static str,
+        response: &'static str,
+    },
+    Error {
+        result: &'static str,
+        error: JsonlDisplay<'a, SharedPeerError>,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum BlockRequestResult<'a> {
+    Available {
+        result: &'static str,
+        returned_hash: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        returned_height: Option<u32>,
+    },
+    Missing {
+        result: &'static str,
+        missing_hash: String,
+    },
+    Empty {
+        result: &'static str,
+    },
+    UnexpectedResponse {
+        result: &'static str,
+        response: &'static str,
+    },
+    Error {
+        result: &'static str,
+        error: JsonlDisplay<'a, SharedPeerError>,
+    },
+}
+
 impl LegacyPeerTrace {
     pub(super) fn new(trace_dir: Option<PathBuf>) -> Self {
         let tracer = trace_dir
@@ -47,9 +136,7 @@ impl LegacyPeerTrace {
             .unwrap_or_else(JsonlTracer::noop);
 
         Self {
-            tracer,
-            node: zakura_jsonl_trace::node_id().into(),
-            started: Instant::now(),
+            emitter: JsonlEventEmitter::new(tracer, zakura_jsonl_trace::node_id()),
             next_request_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -68,22 +155,38 @@ impl LegacyPeerTrace {
         elapsed: Duration,
         result: &Result<Response, SharedPeerError>,
     ) {
-        self.emit("find_blocks_finish", |row| {
-            insert_request_context(row, request_id, peer, elapsed);
-            insert_hash(row, "locator_tip", locator_tip);
-            insert_hash(row, "stop", stop);
-
-            match result {
+        self.emitter.emit_event(|| {
+            let result = match result {
                 Ok(Response::BlockHashes(hashes)) => {
-                    insert_str(row, "result", "block_hashes");
-                    insert_count(row, "hash_count", hashes.len());
-                    insert_inferred_height_range(row, peer.local_tip_height, hashes.len());
+                    let (inferred_start_height, inferred_end_height) =
+                        inferred_height_range(peer.local_tip_height, hashes.len());
+                    FindBlocksResult::BlockHashes {
+                        result: "block_hashes",
+                        hash_count: saturating_count(hashes.len()),
+                        inferred_start_height,
+                        inferred_end_height,
+                    }
                 }
-                Ok(response) => {
-                    insert_str(row, "result", "unexpected_response");
-                    insert_str(row, "response", response.command());
-                }
-                Err(error) => insert_error(row, error),
+                Ok(response) => FindBlocksResult::UnexpectedResponse {
+                    result: "unexpected_response",
+                    response: response.command(),
+                },
+                Err(error) => FindBlocksResult::Error {
+                    result: error_result_label(error),
+                    error: JsonlDisplay(error),
+                },
+            };
+
+            LegacyPeerEvent::FindBlocksFinish {
+                request_id,
+                peer_id: peer.peer_id,
+                peer: JsonlDisplay(&peer.peer),
+                peer_start_height: peer.peer_start_height.0,
+                local_tip_height: peer.local_tip_height.map(|height| height.0),
+                elapsed_ms: saturating_millis(elapsed),
+                locator_tip: locator_tip.as_ref().map(JsonlDisplay),
+                stop: stop.as_ref().map(JsonlDisplay),
+                result,
             }
         });
     }
@@ -97,149 +200,87 @@ impl LegacyPeerTrace {
         elapsed: Duration,
         result: &Result<Response, SharedPeerError>,
     ) {
-        self.emit("block_request_finish", |row| {
-            insert_request_context(row, request_id, peer, elapsed);
-            insert_hash(row, "requested_hash", Some(requested_hash));
-            insert_str(row, "route", route);
-
-            match result {
+        self.emitter.emit_event(|| {
+            let result = match result {
                 Ok(Response::Blocks(blocks)) => {
                     let available = blocks.iter().find_map(|status| status.available());
                     let missing = blocks.iter().find_map(|status| status.missing());
 
                     if let Some((block, _source)) = available {
                         let returned_hash = block.hash();
-                        insert_str(
-                            row,
-                            "result",
-                            if returned_hash == requested_hash {
+                        BlockRequestResult::Available {
+                            result: if returned_hash == requested_hash {
                                 "available"
                             } else {
                                 "mismatched_block"
                             },
-                        );
-                        insert_hash(row, "returned_hash", Some(returned_hash));
-                        insert_height(row, "returned_height", block.coinbase_height());
+                            returned_hash: returned_hash.to_string(),
+                            returned_height: block.coinbase_height().map(|height| height.0),
+                        }
                     } else if let Some(missing_hash) = missing {
-                        insert_str(row, "result", "missing");
-                        insert_hash(row, "missing_hash", Some(missing_hash));
+                        BlockRequestResult::Missing {
+                            result: "missing",
+                            missing_hash: missing_hash.to_string(),
+                        }
                     } else {
-                        insert_str(row, "result", "empty_blocks");
+                        BlockRequestResult::Empty {
+                            result: "empty_blocks",
+                        }
                     }
                 }
-                Ok(response) => {
-                    insert_str(row, "result", "unexpected_response");
-                    insert_str(row, "response", response.command());
-                }
-                Err(error) => insert_error(row, error),
+                Ok(response) => BlockRequestResult::UnexpectedResponse {
+                    result: "unexpected_response",
+                    response: response.command(),
+                },
+                Err(error) => BlockRequestResult::Error {
+                    result: error_result_label(error),
+                    error: JsonlDisplay(error),
+                },
+            };
+
+            LegacyPeerEvent::BlockRequestFinish {
+                request_id,
+                peer_id: peer.peer_id,
+                peer: JsonlDisplay(&peer.peer),
+                peer_start_height: peer.peer_start_height.0,
+                local_tip_height: peer.local_tip_height.map(|height| height.0),
+                elapsed_ms: saturating_millis(elapsed),
+                requested_hash: JsonlDisplay(&requested_hash),
+                route,
+                result,
             }
         });
     }
-
-    fn emit(&self, event: &'static str, build: impl FnOnce(&mut Map<String, Value>)) {
-        let Ok(permit) = self.tracer.try_reserve() else {
-            return;
-        };
-
-        let mut row = Map::new();
-        row.insert("ts".to_string(), elapsed_micros(self.started.elapsed()));
-        row.insert("node".to_string(), Value::String(self.node.to_string()));
-        insert_str(&mut row, "event", event);
-        build(&mut row);
-
-        if let Ok(line) = serde_json::to_vec(&Value::Object(row)) {
-            permit.send(JsonlWriteEvent {
-                table: TABLE,
-                file_name: FILE_NAME,
-                line,
-            });
-        }
-    }
 }
 
-fn insert_request_context(
-    row: &mut Map<String, Value>,
-    request_id: u64,
-    peer: PeerTraceContext,
-    elapsed: Duration,
-) {
-    row.insert("request_id".to_string(), Value::from(request_id));
-    row.insert("peer_id".to_string(), Value::from(peer.peer_id));
-    row.insert("peer".to_string(), Value::String(peer.peer.to_string()));
-    insert_height(row, "peer_start_height", Some(peer.peer_start_height));
-    insert_height(row, "local_tip_height", peer.local_tip_height);
-    row.insert("elapsed_ms".to_string(), elapsed_millis(elapsed));
-}
-
-fn insert_error(row: &mut Map<String, Value>, error: &SharedPeerError) {
-    let result = match error.not_found_class() {
+fn error_result_label(error: &SharedPeerError) -> &'static str {
+    match error.not_found_class() {
         Some(NotFoundClass::Response) => "notfound_response",
         Some(NotFoundClass::Registry) => "notfound_registry",
         Some(NotFoundClass::Other) | None => "error",
-    };
-
-    insert_str(row, "result", result);
-    row.insert("error".to_string(), Value::String(error.to_string()));
-}
-
-fn insert_str(row: &mut Map<String, Value>, key: &'static str, value: &'static str) {
-    row.insert(key.to_string(), Value::String(value.to_string()));
-}
-
-fn insert_hash(row: &mut Map<String, Value>, key: &'static str, hash: Option<block::Hash>) {
-    if let Some(hash) = hash {
-        row.insert(key.to_string(), Value::String(hash.to_string()));
     }
 }
 
-fn insert_height(row: &mut Map<String, Value>, key: &'static str, height: Option<Height>) {
-    if let Some(height) = height {
-        row.insert(key.to_string(), Value::from(height.0));
-    }
-}
-
-fn insert_count(row: &mut Map<String, Value>, key: &'static str, count: usize) {
-    row.insert(
-        key.to_string(),
-        Value::from(u64::try_from(count).unwrap_or(u64::MAX)),
-    );
-}
-
-/// Insert the response range assuming the peer matched the first locator hash.
+/// Return the response range assuming the peer matched the first locator hash.
 ///
 /// The legacy protocol does not identify which locator hash matched, so these heights are not an
 /// exact or authenticated claim about the peer's response.
-fn insert_inferred_height_range(
-    row: &mut Map<String, Value>,
+fn inferred_height_range(
     local_tip_height: Option<Height>,
     hash_count: usize,
-) {
+) -> (Option<u32>, Option<u32>) {
     if hash_count == 0 {
-        return;
+        return (None, None);
     }
 
     let Some(local_tip_height) = local_tip_height else {
-        return;
+        return (None, None);
     };
     let hash_count = u32::try_from(hash_count).unwrap_or(u32::MAX);
-    insert_height(
-        row,
-        "inferred_start_height",
-        Some(Height(local_tip_height.0.saturating_add(1))),
-    );
-    insert_height(
-        row,
-        "inferred_end_height",
-        Some(Height(local_tip_height.0.saturating_add(hash_count))),
-    );
-}
-
-fn elapsed_millis(duration: Duration) -> Value {
-    Value::from(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-}
-
-fn elapsed_micros(duration: Duration) -> Value {
-    Value::from(u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
+    (
+        Some(local_tip_height.0.saturating_add(1)),
+        Some(local_tip_height.0.saturating_add(hash_count)),
+    )
 }
 
 #[cfg(test)]
@@ -255,14 +296,23 @@ mod tests {
         block::Hash([byte; 32])
     }
 
+    fn assert_key_order(line: &str, keys: &[&str]) {
+        let mut remainder = line;
+        for key in keys {
+            let marker = format!("\"{key}\":");
+            let position = remainder
+                .find(&marker)
+                .unwrap_or_else(|| panic!("trace row is missing key {key}: {line}"));
+            remainder = &remainder[position + marker.len()..];
+        }
+    }
+
     #[tokio::test]
     async fn writes_attributed_find_blocks_and_notfound_events() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
         let trace = LegacyPeerTrace {
-            tracer: guard.tracer(),
-            node: "test-node".into(),
-            started: Instant::now(),
+            emitter: JsonlEventEmitter::new(guard.tracer(), "test-node"),
             next_request_id: Arc::new(AtomicU64::new(1)),
         };
         let peer = PeerTraceContext {
@@ -294,13 +344,53 @@ mod tests {
         drop(trace);
         guard.shutdown().await;
 
-        let events = std::fs::read_to_string(dir.path().join(FILE_NAME))
+        let events = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
             .expect("legacy peer trace file is written");
-        let events: Vec<Value> = events
-            .lines()
+        let lines: Vec<_> = events.lines().collect();
+        let events: Vec<Value> = lines
+            .iter()
             .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
             .collect();
 
+        assert_eq!(TABLE.table(), "legacy_peer_request");
+        assert_eq!(TABLE.file_name(), "legacy_peer_request.jsonl");
+        assert_key_order(
+            lines[0],
+            &[
+                "ts",
+                "node",
+                "event",
+                "request_id",
+                "peer_id",
+                "peer",
+                "peer_start_height",
+                "local_tip_height",
+                "elapsed_ms",
+                "locator_tip",
+                "result",
+                "hash_count",
+                "inferred_start_height",
+                "inferred_end_height",
+            ],
+        );
+        assert_key_order(
+            lines[1],
+            &[
+                "ts",
+                "node",
+                "event",
+                "request_id",
+                "peer_id",
+                "peer",
+                "peer_start_height",
+                "local_tip_height",
+                "elapsed_ms",
+                "requested_hash",
+                "route",
+                "result",
+                "error",
+            ],
+        );
         assert_eq!(events[0]["event"], "find_blocks_finish");
         assert_eq!(events[0]["peer_id"], 7);
         assert_eq!(events[0]["peer_start_height"], 100);
@@ -318,9 +408,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temporary trace directory");
         let guard = JsonlTracer::spawn_guard(dir.path().to_path_buf());
         let trace = LegacyPeerTrace {
-            tracer: guard.tracer(),
-            node: "test-node".into(),
-            started: Instant::now(),
+            emitter: JsonlEventEmitter::new(guard.tracer(), "test-node"),
             next_request_id: Arc::new(AtomicU64::new(1)),
         };
         let peer = PeerTraceContext {
@@ -349,7 +437,7 @@ mod tests {
         drop(trace);
         guard.shutdown().await;
 
-        let event = std::fs::read_to_string(dir.path().join(FILE_NAME))
+        let event = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
             .expect("legacy peer trace file is written");
         let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
 

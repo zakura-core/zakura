@@ -6,14 +6,17 @@ use std::sync::{
 };
 
 use futures::future::BoxFuture;
-use serde_json::{Number, Value};
 use tokio::sync::watch;
 use zakura_chain::block;
 
 use super::{
-    commit_state_trace as cs_trace, BlockApplyResult, BlockApplyToken, BlockSyncBlockMeta,
-    HeaderSyncCommitFailureKind, ZakuraPeerId, ZakuraTrace, COMMIT_STATE_TABLE,
+    BlockApplyResult, BlockApplyToken, BlockSyncBlockMeta, HeaderSyncCommitFailureKind,
+    ZakuraPeerId, ZakuraTrace,
 };
+
+mod trace;
+
+use trace::SyncFrontierTransition;
 
 /// A height/hash pair at one chain frontier.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -133,42 +136,10 @@ impl ZakuraSyncExchange {
         });
 
         if let Some((sequence, old, new, result)) = transition {
-            self.trace_transition(sequence, source, old, new, result);
+            self.inner
+                .trace
+                .emit_event(|| SyncFrontierTransition::new(sequence, source, old, new, result));
         }
-    }
-
-    fn trace_transition(
-        &self,
-        sequence: u64,
-        source: &'static str,
-        old: FrontierUpdate,
-        new: FrontierUpdate,
-        result: &'static str,
-    ) {
-        self.inner.trace.emit_with(COMMIT_STATE_TABLE, |row| {
-            row.insert(
-                cs_trace::EVENT.to_string(),
-                Value::String(cs_trace::SYNC_FRONTIER_TRANSITION.to_string()),
-            );
-            row.insert(
-                cs_trace::SOURCE.to_string(),
-                Value::String(source.to_string()),
-            );
-            row.insert(
-                cs_trace::SEQUENCE.to_string(),
-                Value::Number(Number::from(sequence)),
-            );
-            row.insert(
-                cs_trace::CAUSE.to_string(),
-                Value::String(frontier_change_label(new.change).to_string()),
-            );
-            row.insert(
-                cs_trace::RESULT.to_string(),
-                Value::String(result.to_string()),
-            );
-            insert_frontier_fields(row, "old", old.frontier);
-            insert_frontier_fields(row, "new", new.frontier);
-        });
     }
 }
 
@@ -456,71 +427,6 @@ fn higher_frontier(left: Frontier, right: Frontier) -> Frontier {
     } else {
         left
     }
-}
-
-fn frontier_change_label(change: FrontierChange) -> &'static str {
-    match change {
-        FrontierChange::Snapshot => "snapshot",
-        FrontierChange::VerifiedGrow => "verified_grow",
-        FrontierChange::VerifiedReset => "verified_reset",
-        FrontierChange::HeaderAdvanced => "header_advanced",
-        FrontierChange::HeaderReanchored => "header_reanchored",
-    }
-}
-
-fn insert_frontier_fields(
-    row: &mut serde_json::Map<String, Value>,
-    prefix: &'static str,
-    frontier: ChainFrontier,
-) {
-    let (
-        finalized_height,
-        finalized_hash,
-        verified_body_height,
-        verified_body_hash,
-        best_header_height,
-        best_header_hash,
-    ) = match prefix {
-        "old" => (
-            cs_trace::OLD_FINALIZED_HEIGHT,
-            cs_trace::OLD_FINALIZED_HASH,
-            cs_trace::OLD_VERIFIED_BODY_HEIGHT,
-            cs_trace::OLD_VERIFIED_BODY_HASH,
-            cs_trace::OLD_BEST_HEADER_HEIGHT,
-            cs_trace::OLD_BEST_HEADER_HASH,
-        ),
-        "new" => (
-            cs_trace::NEW_FINALIZED_HEIGHT,
-            cs_trace::NEW_FINALIZED_HASH,
-            cs_trace::NEW_VERIFIED_BODY_HEIGHT,
-            cs_trace::NEW_VERIFIED_BODY_HASH,
-            cs_trace::NEW_BEST_HEADER_HEIGHT,
-            cs_trace::NEW_BEST_HEADER_HASH,
-        ),
-        _ => return,
-    };
-
-    insert_height(row, finalized_height, frontier.finalized.height);
-    insert_hash(row, finalized_hash, frontier.finalized.hash);
-    insert_height(row, verified_body_height, frontier.verified_body.height);
-    insert_hash(row, verified_body_hash, frontier.verified_body.hash);
-    insert_height(row, best_header_height, frontier.best_header.height);
-    insert_hash(row, best_header_hash, frontier.best_header.hash);
-}
-
-fn insert_height(
-    row: &mut serde_json::Map<String, Value>,
-    key: &'static str,
-    height: block::Height,
-) {
-    row.insert(
-        key.to_string(),
-        Value::Number(Number::from(u64::from(height.0))),
-    );
-}
-
-fn insert_hash(row: &mut serde_json::Map<String, Value>, key: &'static str, hash: block::Hash) {
-    row.insert(key.to_string(), Value::String(format!("{hash}")));
 }
 
 #[cfg(test)]

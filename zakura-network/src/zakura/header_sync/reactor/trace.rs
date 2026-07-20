@@ -1,37 +1,38 @@
-use serde_json::{Number, Value};
+use serde::Serialize;
+#[cfg(test)]
+use serde_json::Value;
 use zakura_chain::{block, parallel::commitment_aux::BlockCommitmentRoots};
+use zakura_jsonl_trace::{impl_jsonl_trace_event, JsonlTraceEvent};
 
 use super::super::{
     config::HeaderSyncStatus,
     error::HeaderSyncWireError,
     events::{
         HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncMisbehavior,
-        HeaderSyncOperationKind, HeaderSyncRequestId,
+        HeaderSyncOperationKind, HeaderSyncWireRequestIdentity,
     },
     state::RangeRequest,
     validation::count_between,
     wire::HeaderSyncMessage,
 };
 use super::HeaderSyncReactor;
+#[cfg(test)]
+use crate::zakura::trace::header_sync_trace as hs_trace;
 use crate::zakura::{
     trace::{
-        header_sync_trace as hs_trace, ordered_send_error_label, peer_label as trace_peer_label,
-        queue_send_trace as qs_trace, HEADER_SYNC_TABLE, QUEUE_SEND_TABLE,
+        ordered_send_error_label, peer_label as trace_peer_label, HEADER_SYNC_TABLE,
+        QUEUE_SEND_TABLE,
     },
     OrderedSendError, ServicePeerDirection, ZakuraPeerId,
 };
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct GetHeadersTraceMeta {
-    pub(super) request_id: HeaderSyncRequestId,
-    pub(super) session_id: u64,
-    pub(super) stream_version: u16,
-}
-
-#[derive(Default)]
+#[derive(Default, Serialize)]
 pub(super) struct TreeAuxTraceSummary {
+    #[serde(rename = "tree_aux_roots_len")]
     len: u32,
+    #[serde(rename = "first_root_height", skip_serializing_if = "Option::is_none")]
     first_height: Option<block::Height>,
+    #[serde(rename = "last_root_height", skip_serializing_if = "Option::is_none")]
     last_height: Option<block::Height>,
 }
 
@@ -43,40 +44,465 @@ impl TreeAuxTraceSummary {
             last_height: roots.last().map(|root| root.height),
         }
     }
+}
 
-    fn insert_into(&self, row: &mut serde_json::Map<String, Value>) {
-        if let Some(height) = self.first_height {
-            insert_height(row, hs_trace::FIRST_ROOT_HEIGHT, height);
-        }
-        if let Some(height) = self.last_height {
-            insert_height(row, hs_trace::LAST_ROOT_HEIGHT, height);
+#[derive(Serialize)]
+#[serde(tag = "event")]
+enum HeaderTraceEvent {
+    #[serde(rename = "header_event_received")]
+    EventReceived {
+        #[serde(flatten)]
+        projection: HeaderEventProjection,
+    },
+    #[serde(rename = "header_action_dispatched")]
+    ActionDispatched {
+        #[serde(flatten)]
+        action: HeaderActionProjection,
+    },
+    #[serde(rename = "header_status_sent")]
+    StatusSent {
+        #[serde(flatten)]
+        status: StatusProjection,
+    },
+    #[serde(rename = "header_status_received")]
+    StatusReceived {
+        #[serde(flatten)]
+        status: StatusProjection,
+    },
+    #[serde(rename = "header_peer_connected")]
+    PeerConnected {
+        peer: String,
+        direction: &'static str,
+        active_connections: u64,
+    },
+    #[serde(rename = "header_peer_disconnected")]
+    PeerDisconnected {
+        peer: String,
+        active_connections: u64,
+    },
+    #[serde(rename = "header_get_headers_sent")]
+    GetHeadersSent {
+        peer: String,
+        session_id: u64,
+        stream_version: u16,
+        request_id: u64,
+        range_start: block::Height,
+        range_count: u32,
+        advertised_cap: u32,
+        finalized: bool,
+        want_tree_aux_roots: bool,
+        range_priority: &'static str,
+        verified_block_tip: block::Height,
+        finalized_height: block::Height,
+        best_header_tip: block::Height,
+    },
+    #[serde(rename = "header_headers_received")]
+    HeadersReceived {
+        peer: String,
+        range_start: block::Height,
+        range_count: u32,
+        advertised_cap: u32,
+        expected_count: u32,
+        in_flight_count: u64,
+        want_tree_aux_roots: bool,
+        #[serde(flatten)]
+        roots: TreeAuxTraceSummary,
+    },
+    #[serde(rename = "header_headers_served")]
+    HeadersServed {
+        peer: String,
+        range_start: block::Height,
+        range_count: u32,
+        expected_count: u32,
+        want_tree_aux_roots: bool,
+        #[serde(flatten)]
+        roots: TreeAuxTraceSummary,
+    },
+    #[serde(rename = "header_range_committed")]
+    RangeCommitted {
+        range_start: block::Height,
+        range_count: u32,
+        reason: Option<&'static str>,
+    },
+    #[serde(rename = "header_range_rejected")]
+    RangeRejected {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
+        range_start: block::Height,
+        range_count: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        anchor_hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        validation_stage: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_kind: Option<&'static str>,
+        reason: Option<&'static str>,
+    },
+    #[serde(rename = "header_new_block_received")]
+    NewBlockReceived {
+        peer: String,
+        height: block::Height,
+        hash: String,
+    },
+    #[serde(rename = "header_new_block_forwarded")]
+    NewBlockForwarded {
+        source_peer: String,
+        peer: String,
+        height: block::Height,
+        hash: String,
+        destination_peer_count: u64,
+    },
+    #[serde(rename = "header_new_block_deduped")]
+    NewBlockDeduped {
+        peer: String,
+        height: block::Height,
+        hash: String,
+        reason: &'static str,
+    },
+    #[serde(rename = "header_peer_violation")]
+    PeerViolation { peer: String, reason: &'static str },
+    #[serde(rename = "header_peer_violation_recorded")]
+    PeerViolationRecorded { peer: String, reason: &'static str },
+    #[serde(rename = "header_frontier_advanced")]
+    FrontierAdvanced { height: block::Height, hash: String },
+    #[serde(rename = "header_frontier_reanchored")]
+    FrontierReanchored { height: block::Height, hash: String },
+    #[serde(rename = "header_missing_bodies_reported")]
+    MissingBodiesReported {
+        range_start: block::Height,
+        range_count: u32,
+    },
+    #[serde(rename = "header_maintenance_wakeup")]
+    MaintenanceWakeup,
+}
+
+impl_jsonl_trace_event!(HeaderTraceEvent, HEADER_SYNC_TABLE);
+
+pub(super) fn event_received(event: &HeaderSyncEvent) -> impl JsonlTraceEvent {
+    HeaderTraceEvent::EventReceived {
+        projection: HeaderEventProjection::from(event),
+    }
+}
+
+pub(super) fn action_dispatched(action: &HeaderSyncAction) -> impl JsonlTraceEvent {
+    HeaderTraceEvent::ActionDispatched {
+        action: HeaderActionProjection::from(action),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum HeaderEventProjection {
+    PeerConnected {
+        peer: String,
+    },
+    PeerDisconnected {
+        peer: String,
+    },
+    AdvisoryHeaderSummary {
+        peer: String,
+        height: block::Height,
+    },
+    FullBlockCommitted {
+        height: block::Height,
+        hash: String,
+    },
+    NewBlockAccepted {
+        peer: String,
+        height: block::Height,
+        hash: String,
+    },
+    NewBlockDuplicate {
+        peer: String,
+        height: block::Height,
+        hash: String,
+    },
+    NewBlockAcceptedNonBestChain {
+        peer: String,
+        height: block::Height,
+        hash: String,
+    },
+    NewBlockRejected {
+        peer: String,
+        hash: String,
+    },
+    #[cfg(test)]
+    WireMessage {
+        reason: &'static str,
+        peer: String,
+        #[serde(flatten)]
+        message: HeaderMessageProjection,
+    },
+    SessionWireMessage {
+        reason: &'static str,
+        peer: String,
+        #[serde(flatten)]
+        message: HeaderMessageProjection,
+    },
+    WireHeaders {
+        peer: String,
+        range_count: u64,
+    },
+    WireGetHeaders {
+        peer: String,
+        range_start: block::Height,
+        range_count: u32,
+    },
+    WireDecodeFailed {
+        error_kind: &'static str,
+        peer: String,
+        #[serde(flatten)]
+        error: WireErrorProjection,
+    },
+    WireProtocolFailure {
+        reason: &'static str,
+        error_kind: &'static str,
+        peer: String,
+        #[serde(flatten)]
+        error: WireErrorProjection,
+    },
+    StateFrontiersChanged {
+        finalized_height: block::Height,
+        verified_block_tip: block::Height,
+    },
+    VctRootRepairRequested {
+        height: block::Height,
+        range_count: u64,
+        generation: u64,
+    },
+    VctRootRepairResolved {
+        generation: u64,
+    },
+    BestHeaderTipLoaded {
+        height: block::Height,
+        hash: String,
+    },
+    HeaderRangeOperationCompleted {
+        peer: String,
+        session_id: u64,
+        request_id: u64,
+        operation_kind: &'static str,
+        hash: String,
+    },
+    HeaderRangeOperationFailed {
+        peer: String,
+        session_id: u64,
+        request_id: u64,
+        operation_kind: &'static str,
+        reason: &'static str,
+    },
+    HeaderRangeResponseFinished {
+        peer: String,
+        range_start: block::Height,
+        range_count: u32,
+        expected_count: u32,
+    },
+    HeaderRangeResponseReady {
+        peer: String,
+        range_start: block::Height,
+        range_count: u64,
+        expected_count: u32,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum HeaderActionProjection {
+    #[cfg(test)]
+    SendMessage {
+        reason: &'static str,
+        peer: String,
+        #[serde(flatten)]
+        message: HeaderMessageProjection,
+    },
+    #[cfg(test)]
+    ForwardNewBlock {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_peer: Option<String>,
+        peer: String,
+        height: block::Height,
+        hash: String,
+    },
+    Misbehavior {
+        peer: String,
+        reason: &'static str,
+    },
+    NewBlockReceived {
+        peer: String,
+        height: block::Height,
+        hash: String,
+    },
+    QueryHeadersByHeightRange {
+        peer: String,
+        range_start: block::Height,
+        range_count: u32,
+    },
+    CommitHeaderRange {
+        peer: String,
+        session_id: u64,
+        request_id: u64,
+        operation_kind: &'static str,
+        range_start: block::Height,
+        range_count: u64,
+    },
+    QueryBestHeaderTip,
+    QueryMissingBlockBodies {
+        range_start: block::Height,
+        range_count: u32,
+    },
+    BodyGaps {
+        range_start: block::Height,
+        range_count: u32,
+    },
+    HeaderAdvanced {
+        height: block::Height,
+        hash: String,
+    },
+    HeaderReanchored {
+        height: block::Height,
+        hash: String,
+        range_start: block::Height,
+    },
+}
+
+#[derive(Serialize)]
+struct StatusProjection {
+    peer: String,
+    height: block::Height,
+    hash: String,
+    range_start: block::Height,
+    advertised_cap: u32,
+    in_flight_count: u16,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum HeaderMessageProjection {
+    Status {
+        height: block::Height,
+        hash: String,
+        range_start: block::Height,
+        advertised_cap: u32,
+        in_flight_count: u16,
+    },
+    Headers {
+        range_count: u64,
+    },
+    GetHeaders {
+        range_start: block::Height,
+        range_count: u32,
+    },
+    NewBlock {
+        hash: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<block::Height>,
+    },
+}
+
+#[derive(Default, Serialize)]
+struct WireErrorProjection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_mismatch_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_root_height: Option<block::Height>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_root_height: Option<block::Height>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_root_height: Option<block::Height>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_root_height: Option<block::Height>,
+}
+
+#[derive(Serialize)]
+struct QueueSendTraceEvent {
+    event: &'static str,
+    service: &'static str,
+    message: &'static str,
+    peer: String,
+    error: &'static str,
+    queue_capacity: u64,
+    queue_max_capacity: u64,
+    #[serde(flatten)]
+    context: QueueSendProjection,
+}
+
+impl_jsonl_trace_event!(QueueSendTraceEvent, QUEUE_SEND_TABLE);
+
+pub(super) enum QueueSendContext<'a> {
+    Status,
+    Headers {
+        start_height: block::Height,
+        requested_count: u32,
+        returned_count: u32,
+    },
+    NewBlock {
+        source: &'a ZakuraPeerId,
+        destination: &'a ZakuraPeerId,
+        height: block::Height,
+        hash: block::Hash,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum QueueSendProjection {
+    Empty {},
+    Headers {
+        range_start: block::Height,
+        range_count: u32,
+        returned: u32,
+    },
+    NewBlock {
+        source_peer: String,
+        destination_peer: String,
+        height: block::Height,
+        hash: String,
+    },
+}
+
+impl From<QueueSendContext<'_>> for QueueSendProjection {
+    fn from(context: QueueSendContext<'_>) -> Self {
+        match context {
+            QueueSendContext::Status => Self::Empty {},
+            QueueSendContext::Headers {
+                start_height,
+                requested_count,
+                returned_count,
+            } => Self::Headers {
+                range_start: start_height,
+                range_count: requested_count,
+                returned: returned_count,
+            },
+            QueueSendContext::NewBlock {
+                source,
+                destination,
+                height,
+                hash,
+            } => Self::NewBlock {
+                source_peer: peer_label(source),
+                destination_peer: peer_label(destination),
+                height,
+                hash: hash_label(hash),
+            },
         }
     }
 }
 
 impl HeaderSyncReactor {
-    pub(super) fn trace_event_received(&self, event: &HeaderSyncEvent) {
-        self.emit_trace(hs_trace::HEADER_EVENT_RECEIVED, |row| {
-            trace_event_fields(row, event);
-        });
-    }
-
-    pub(super) fn trace_action_dispatched(&self, action: &HeaderSyncAction) {
-        self.emit_trace(hs_trace::HEADER_ACTION_DISPATCHED, |row| {
-            trace_action_fields(row, action);
-        });
-    }
-
     pub(super) fn trace_status_sent(&self, peer: &ZakuraPeerId, status: HeaderSyncStatus) {
-        self.emit_trace(hs_trace::HEADER_STATUS_SENT, |row| {
-            trace_status_fields(row, peer, status);
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::StatusSent {
+                status: StatusProjection::new(peer, status),
+            });
     }
 
     pub(super) fn trace_status_received(&self, peer: &ZakuraPeerId, status: HeaderSyncStatus) {
-        self.emit_trace(hs_trace::HEADER_STATUS_RECEIVED, |row| {
-            trace_status_fields(row, peer, status);
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::StatusReceived {
+                status: StatusProjection::new(peer, status),
+            });
     }
 
     pub(super) fn trace_peer_connected(
@@ -85,89 +511,70 @@ impl HeaderSyncReactor {
         direction: ServicePeerDirection,
         active_connections: usize,
     ) {
-        self.emit_trace(hs_trace::HEADER_PEER_CONNECTED, |row| {
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_optional_str(row, "direction", Some(direction.trace_label()));
-            insert_u64(
-                row,
-                hs_trace::ACTIVE_CONNECTIONS,
-                u64::try_from(active_connections).unwrap_or(u64::MAX),
-            );
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::PeerConnected {
+                peer: peer_label(peer),
+                direction: direction.trace_label(),
+                active_connections: saturating_usize(active_connections),
+            });
     }
 
     pub(super) fn trace_peer_disconnected(&self, peer: &ZakuraPeerId, active_connections: usize) {
-        self.emit_trace(hs_trace::HEADER_PEER_DISCONNECTED, |row| {
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_u64(
-                row,
-                hs_trace::ACTIVE_CONNECTIONS,
-                u64::try_from(active_connections).unwrap_or(u64::MAX),
-            );
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::PeerDisconnected {
+                peer: peer_label(peer),
+                active_connections: saturating_usize(active_connections),
+            });
     }
 
     pub(super) fn trace_get_headers_sent(
         &self,
-        peer: &ZakuraPeerId,
         range: RangeRequest,
-        count: u32,
         advertised_cap: u32,
-        meta: GetHeadersTraceMeta,
+        identity: &HeaderSyncWireRequestIdentity,
     ) {
-        self.emit_trace(hs_trace::HEADER_GET_HEADERS_SENT, |row| {
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_u64(row, hs_trace::SESSION_ID, meta.session_id);
-            insert_u64(
-                row,
-                hs_trace::STREAM_VERSION,
-                u64::from(meta.stream_version),
-            );
-            insert_u64(row, hs_trace::REQUEST_ID, meta.request_id.get());
-            insert_height(row, hs_trace::RANGE_START, range.start_height());
-            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(count));
-            insert_u64(row, hs_trace::ADVERTISED_CAP, u64::from(advertised_cap));
-            insert_bool(row, hs_trace::FINALIZED, range.finalized);
-            insert_bool(
-                row,
-                hs_trace::WANT_TREE_AUX_ROOTS,
-                range.want_tree_aux_roots,
-            );
-            insert_optional_str(row, hs_trace::RANGE_PRIORITY, Some(range.priority.label()));
-            insert_height(
-                row,
-                hs_trace::VERIFIED_BLOCK_TIP,
-                self.state.verified_block_tip,
-            );
-            insert_height(row, hs_trace::FINALIZED_HEIGHT, self.state.finalized_height);
-            insert_height(row, hs_trace::BEST_HEADER_TIP, self.state.best_header_tip);
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::GetHeadersSent {
+                peer: peer_label(&identity.peer),
+                session_id: identity.session_id,
+                stream_version: super::super::wire::ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                request_id: identity.request_id.get(),
+                range_start: range.start_height(),
+                range_count: range.count(),
+                advertised_cap,
+                finalized: range.finalized,
+                want_tree_aux_roots: range.want_tree_aux_roots,
+                range_priority: range.priority.label(),
+                verified_block_tip: self.state.verified_block_tip,
+                finalized_height: self.state.finalized_height,
+                best_header_tip: self.state.best_header_tip,
+            });
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn trace_headers_received(
         &self,
         peer: &ZakuraPeerId,
-        start_height: block::Height,
-        count: u32,
-        expected_count: u32,
+        range: RangeRequest,
+        headers: &[std::sync::Arc<block::Header>],
         advertised_cap: u32,
         in_flight_count: usize,
-        want_tree_aux_roots: bool,
         tree_aux_roots: &[BlockCommitmentRoots],
     ) {
-        self.emit_trace(hs_trace::HEADER_HEADERS_RECEIVED, |row| {
-            let roots = TreeAuxTraceSummary::new(tree_aux_roots);
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::RANGE_START, start_height);
-            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(count));
-            insert_u64(row, hs_trace::ADVERTISED_CAP, u64::from(advertised_cap));
-            insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(expected_count));
-            insert_u64(row, hs_trace::IN_FLIGHT_COUNT, in_flight_count as u64);
-            insert_bool(row, hs_trace::WANT_TREE_AUX_ROOTS, want_tree_aux_roots);
-            insert_u64(row, hs_trace::TREE_AUX_ROOTS_LEN, u64::from(roots.len));
-            roots.insert_into(row);
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::HeadersReceived {
+                peer: peer_label(peer),
+                range_start: range.start_height(),
+                range_count: u32::try_from(headers.len()).unwrap_or(u32::MAX),
+                advertised_cap,
+                expected_count: range.count(),
+                in_flight_count: saturating_usize(in_flight_count),
+                want_tree_aux_roots: range.want_tree_aux_roots,
+                roots: TreeAuxTraceSummary::new(tree_aux_roots),
+            });
     }
 
     pub(super) fn trace_headers_served(
@@ -179,33 +586,46 @@ impl HeaderSyncReactor {
         want_tree_aux_roots: bool,
         roots: TreeAuxTraceSummary,
     ) {
-        self.emit_trace(hs_trace::HEADER_HEADERS_SERVED, |row| {
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::RANGE_START, start_height);
-            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(returned_count));
-            insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(requested_count));
-            insert_bool(row, hs_trace::WANT_TREE_AUX_ROOTS, want_tree_aux_roots);
-            insert_u64(row, hs_trace::TREE_AUX_ROOTS_LEN, u64::from(roots.len));
-            roots.insert_into(row);
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::HeadersServed {
+                peer: peer_label(peer),
+                range_start: start_height,
+                range_count: returned_count,
+                expected_count: requested_count,
+                want_tree_aux_roots,
+                roots,
+            });
     }
 
-    pub(super) fn trace_range_event(
+    pub(super) fn trace_range_committed(&self, start_height: block::Height, count: u32) {
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::RangeCommitted {
+                range_start: start_height,
+                range_count: count,
+                reason: None,
+            });
+    }
+
+    pub(super) fn trace_range_commit_failed(
         &self,
-        event: &'static str,
+        peer: &ZakuraPeerId,
         start_height: block::Height,
         count: u32,
-        peer: Option<&ZakuraPeerId>,
-        reason: Option<&'static str>,
+        reason: &'static str,
     ) {
-        self.emit_trace(event, |row| {
-            if let Some(peer) = peer {
-                insert_peer(row, hs_trace::PEER, peer);
-            }
-            insert_height(row, hs_trace::RANGE_START, start_height);
-            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(count));
-            insert_optional_str(row, hs_trace::REASON, reason);
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::RangeRejected {
+                peer: Some(peer_label(peer)),
+                range_start: start_height,
+                range_count: count,
+                anchor_hash: None,
+                validation_stage: None,
+                error_kind: None,
+                reason: Some(reason),
+            });
     }
 
     pub(super) fn trace_range_validation_rejected(
@@ -216,23 +636,19 @@ impl HeaderSyncReactor {
         validation_stage: &'static str,
         error_kind: &'static str,
     ) {
-        self.emit_trace(hs_trace::HEADER_RANGE_REJECTED, |row| {
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::RANGE_START, range.start_height());
-            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(count));
-            if let Some(anchor_hash) = range.anchor_hash {
-                insert_hash(row, hs_trace::ANCHOR_HASH, anchor_hash);
-            }
-            insert_optional_str(row, hs_trace::VALIDATION_STAGE, Some(validation_stage));
-            insert_optional_str(row, hs_trace::ERROR_KIND, Some(error_kind));
-            insert_optional_str(
-                row,
-                hs_trace::REASON,
-                Some(misbehavior_reason_label(
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::RangeRejected {
+                peer: Some(peer_label(peer)),
+                range_start: range.start_height(),
+                range_count: count,
+                anchor_hash: range.anchor_hash.map(hash_label),
+                validation_stage: Some(validation_stage),
+                error_kind: Some(error_kind),
+                reason: Some(misbehavior_reason_label(
                     HeaderSyncMisbehavior::InvalidRange,
                 )),
-            );
-        });
+            });
     }
 
     pub(super) fn trace_new_block_received(
@@ -241,11 +657,13 @@ impl HeaderSyncReactor {
         height: block::Height,
         hash: block::Hash,
     ) {
-        self.emit_trace(hs_trace::HEADER_NEW_BLOCK_RECEIVED, |row| {
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::HEIGHT, height);
-            insert_hash(row, hs_trace::HASH, hash);
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::NewBlockReceived {
+                peer: peer_label(peer),
+                height,
+                hash: hash_label(hash),
+            });
     }
 
     pub(super) fn trace_new_block_forwarded(
@@ -256,17 +674,15 @@ impl HeaderSyncReactor {
         hash: block::Hash,
         destination_count: usize,
     ) {
-        self.emit_trace(hs_trace::HEADER_NEW_BLOCK_FORWARDED, |row| {
-            insert_peer(row, hs_trace::SOURCE_PEER, source);
-            insert_peer(row, hs_trace::PEER, destination);
-            insert_height(row, hs_trace::HEIGHT, height);
-            insert_hash(row, hs_trace::HASH, hash);
-            insert_u64(
-                row,
-                hs_trace::DESTINATION_PEER_COUNT,
-                destination_count as u64,
-            );
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::NewBlockForwarded {
+                source_peer: peer_label(source),
+                peer: peer_label(destination),
+                height,
+                hash: hash_label(hash),
+                destination_peer_count: saturating_usize(destination_count),
+            });
     }
 
     pub(super) fn trace_new_block_deduped(
@@ -276,23 +692,23 @@ impl HeaderSyncReactor {
         hash: block::Hash,
         reason: &'static str,
     ) {
-        self.emit_trace(hs_trace::HEADER_NEW_BLOCK_DEDUPED, |row| {
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::HEIGHT, height);
-            insert_hash(row, hs_trace::HASH, hash);
-            insert_optional_str(row, hs_trace::REASON, Some(reason));
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::NewBlockDeduped {
+                peer: peer_label(peer),
+                height,
+                hash: hash_label(hash),
+                reason,
+            });
     }
 
     pub(super) fn trace_peer_violation(&self, peer: &ZakuraPeerId, reason: HeaderSyncMisbehavior) {
-        self.emit_trace(hs_trace::HEADER_PEER_VIOLATION, |row| {
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_optional_str(
-                row,
-                hs_trace::REASON,
-                Some(misbehavior_reason_label(reason)),
-            );
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::PeerViolation {
+                peer: peer_label(peer),
+                reason: misbehavior_reason_label(reason),
+            });
     }
 
     pub(super) fn trace_peer_violation_recorded(
@@ -300,39 +716,45 @@ impl HeaderSyncReactor {
         peer: &ZakuraPeerId,
         reason: HeaderSyncMisbehavior,
     ) {
-        self.emit_trace(hs_trace::HEADER_PEER_VIOLATION_RECORDED, |row| {
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_optional_str(
-                row,
-                hs_trace::REASON,
-                Some(misbehavior_reason_label(reason)),
-            );
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::PeerViolationRecorded {
+                peer: peer_label(peer),
+                reason: misbehavior_reason_label(reason),
+            });
     }
 
     pub(super) fn trace_frontier_advanced(&self, height: block::Height, hash: block::Hash) {
-        self.emit_trace(hs_trace::HEADER_FRONTIER_ADVANCED, |row| {
-            insert_height(row, hs_trace::HEIGHT, height);
-            insert_hash(row, hs_trace::HASH, hash);
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::FrontierAdvanced {
+                height,
+                hash: hash_label(hash),
+            });
     }
 
     pub(super) fn trace_frontier_reanchored(&self, height: block::Height, hash: block::Hash) {
-        self.emit_trace(hs_trace::HEADER_FRONTIER_REANCHORED, |row| {
-            insert_height(row, hs_trace::HEIGHT, height);
-            insert_hash(row, hs_trace::HASH, hash);
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::FrontierReanchored {
+                height,
+                hash: hash_label(hash),
+            });
     }
 
     pub(super) fn trace_missing_bodies(&self, from: block::Height, to: block::Height) {
-        self.emit_trace(hs_trace::HEADER_MISSING_BODIES_REPORTED, |row| {
-            insert_height(row, hs_trace::RANGE_START, from);
-            insert_u64(
-                row,
-                hs_trace::RANGE_COUNT,
-                u64::from(count_between(from, to)),
-            );
-        });
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::MissingBodiesReported {
+                range_start: from,
+                range_count: count_between(from, to),
+            });
+    }
+
+    pub(super) fn trace_maintenance_wakeup(&self) {
+        self.startup
+            .trace
+            .emit_event(|| HeaderTraceEvent::MaintenanceWakeup);
     }
 
     pub(super) fn trace_queue_send_failed(
@@ -342,420 +764,321 @@ impl HeaderSyncReactor {
         error: &OrderedSendError,
         queue_capacity: usize,
         queue_max_capacity: usize,
-        build: impl FnOnce(&mut serde_json::Map<String, Value>),
+        context: QueueSendContext<'_>,
     ) {
-        self.startup.trace.emit_with(QUEUE_SEND_TABLE, |row| {
-            row.insert(
-                qs_trace::EVENT.to_string(),
-                Value::String(qs_trace::QUEUE_SEND_FAILED.to_string()),
-            );
-            insert_optional_str(row, qs_trace::SERVICE, Some("header_sync"));
-            insert_optional_str(row, qs_trace::MESSAGE, Some(message));
-            insert_peer(row, qs_trace::PEER, peer);
-            insert_optional_str(row, qs_trace::ERROR, Some(ordered_send_error_label(error)));
-            insert_u64(
-                row,
-                qs_trace::QUEUE_CAPACITY,
-                u64::try_from(queue_capacity).unwrap_or(u64::MAX),
-            );
-            insert_u64(
-                row,
-                qs_trace::QUEUE_MAX_CAPACITY,
-                u64::try_from(queue_max_capacity).unwrap_or(u64::MAX),
-            );
-            build(row);
-        });
-    }
-
-    pub(super) fn emit_trace(
-        &self,
-        event: &'static str,
-        build: impl FnOnce(&mut serde_json::Map<String, Value>),
-    ) {
-        self.startup.trace.emit_with(HEADER_SYNC_TABLE, |row| {
-            row.insert(
-                hs_trace::EVENT.to_string(),
-                Value::String(event.to_string()),
-            );
-            build(row);
+        self.startup.trace.emit_event(|| QueueSendTraceEvent {
+            event: "queue_send_failed",
+            service: "header_sync",
+            message,
+            peer: peer_label(peer),
+            error: ordered_send_error_label(error),
+            queue_capacity: saturating_usize(queue_capacity),
+            queue_max_capacity: saturating_usize(queue_max_capacity),
+            context: context.into(),
         });
     }
 }
 
-fn trace_event_fields(row: &mut serde_json::Map<String, Value>, event: &HeaderSyncEvent) {
-    match event {
-        HeaderSyncEvent::PeerConnected(session) => {
-            insert_optional_str(row, hs_trace::KIND, Some("peer_connected"));
-            insert_peer(row, hs_trace::PEER, session.peer_id());
-        }
-        HeaderSyncEvent::PeerDisconnected(peer) => {
-            insert_optional_str(row, hs_trace::KIND, Some("peer_disconnected"));
-            insert_peer(row, hs_trace::PEER, peer);
-        }
-        HeaderSyncEvent::AdvisoryHeaderSummary { peer, summary } => {
-            insert_optional_str(row, hs_trace::KIND, Some("advisory_header_summary"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::HEIGHT, summary.best_height);
-        }
-        HeaderSyncEvent::FullBlockCommitted { height, hash, .. } => {
-            insert_optional_str(row, hs_trace::KIND, Some("full_block_committed"));
-            insert_height(row, hs_trace::HEIGHT, *height);
-            insert_hash(row, hs_trace::HASH, *hash);
-        }
-        HeaderSyncEvent::NewBlockAccepted {
-            peer, height, hash, ..
-        } => {
-            insert_optional_str(row, hs_trace::KIND, Some("new_block_accepted"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::HEIGHT, *height);
-            insert_hash(row, hs_trace::HASH, *hash);
-        }
-        HeaderSyncEvent::NewBlockDuplicate { peer, height, hash } => {
-            insert_optional_str(row, hs_trace::KIND, Some("new_block_duplicate"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::HEIGHT, *height);
-            insert_hash(row, hs_trace::HASH, *hash);
-        }
-        HeaderSyncEvent::NewBlockAcceptedNonBestChain { peer, height, hash } => {
-            insert_optional_str(
-                row,
-                hs_trace::KIND,
-                Some("new_block_accepted_non_best_chain"),
-            );
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::HEIGHT, *height);
-            insert_hash(row, hs_trace::HASH, *hash);
-        }
-        HeaderSyncEvent::NewBlockRejected { peer, hash } => {
-            insert_optional_str(row, hs_trace::KIND, Some("new_block_rejected"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_hash(row, hs_trace::HASH, *hash);
-        }
-        #[cfg(test)]
-        HeaderSyncEvent::WireMessage { peer, msg } => {
-            insert_optional_str(row, hs_trace::KIND, Some("wire_message"));
-            insert_optional_str(row, hs_trace::REASON, Some(header_sync_message_label(msg)));
-            insert_peer(row, hs_trace::PEER, peer);
-            trace_header_sync_message_fields(row, msg);
-        }
-        HeaderSyncEvent::SessionWireMessage { peer, msg, .. } => {
-            insert_optional_str(row, hs_trace::KIND, Some("session_wire_message"));
-            insert_optional_str(row, hs_trace::REASON, Some(header_sync_message_label(msg)));
-            insert_peer(row, hs_trace::PEER, peer);
-            trace_header_sync_message_fields(row, msg);
-        }
-        HeaderSyncEvent::WireHeaders { peer, headers, .. } => {
-            insert_optional_str(row, hs_trace::KIND, Some("wire_headers"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
-        }
-        HeaderSyncEvent::WireGetHeaders {
-            peer,
-            start_height,
-            count,
-            ..
-        } => {
-            insert_optional_str(row, hs_trace::KIND, Some("wire_get_headers"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::RANGE_START, *start_height);
-            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*count));
-        }
-        HeaderSyncEvent::WireDecodeFailed { peer, error } => {
-            insert_optional_str(row, hs_trace::KIND, Some("wire_decode_failed"));
-            insert_optional_str(
-                row,
-                hs_trace::ERROR_KIND,
-                Some(header_sync_wire_error_kind(error)),
-            );
-            insert_peer(row, hs_trace::PEER, peer);
-            trace_wire_error_fields(row, error);
-        }
-        HeaderSyncEvent::WireProtocolFailure {
-            peer,
-            reason,
-            error,
-        } => {
-            insert_optional_str(row, hs_trace::KIND, Some("wire_protocol_failure"));
-            insert_optional_str(
-                row,
-                hs_trace::REASON,
-                Some(misbehavior_reason_label(*reason)),
-            );
-            insert_optional_str(
-                row,
-                hs_trace::ERROR_KIND,
-                Some(header_sync_wire_error_kind(error)),
-            );
-            insert_peer(row, hs_trace::PEER, peer);
-            trace_wire_error_fields(row, error);
-        }
-        HeaderSyncEvent::StateFrontiersChanged(frontiers) => {
-            insert_optional_str(row, hs_trace::KIND, Some("state_frontiers_changed"));
-            insert_height(row, "finalized_height", frontiers.finalized_height);
-            insert_height(row, "verified_block_tip", frontiers.verified_block_tip);
-        }
-        HeaderSyncEvent::VctRootRepairRequested {
-            height,
-            generation,
-            expected_hashes,
-            ..
-        } => {
-            insert_optional_str(row, hs_trace::KIND, Some("vct_root_repair_requested"));
-            insert_height(row, hs_trace::HEIGHT, *height);
-            insert_u64(row, hs_trace::RANGE_COUNT, expected_hashes.len() as u64);
-            insert_u64(row, "generation", *generation);
-        }
-        HeaderSyncEvent::VctRootRepairResolved { generation } => {
-            insert_optional_str(row, hs_trace::KIND, Some("vct_root_repair_resolved"));
-            insert_u64(row, "generation", *generation);
-        }
-        HeaderSyncEvent::BestHeaderTipLoaded {
-            tip_height,
-            tip_hash,
-        } => {
-            insert_optional_str(row, hs_trace::KIND, Some("best_header_tip_loaded"));
-            insert_height(row, hs_trace::HEIGHT, *tip_height);
-            insert_hash(row, hs_trace::HASH, *tip_hash);
-        }
-        HeaderSyncEvent::HeaderRangeOperationCompleted {
-            operation,
-            tip_hash,
-        } => {
-            insert_optional_str(
-                row,
-                hs_trace::KIND,
-                Some("header_range_operation_completed"),
-            );
-            insert_peer(row, hs_trace::PEER, &operation.wire_request.peer);
-            insert_u64(row, hs_trace::SESSION_ID, operation.wire_request.session_id);
-            insert_u64(
-                row,
-                hs_trace::REQUEST_ID,
-                operation.wire_request.request_id.get(),
-            );
-            insert_optional_str(
-                row,
-                "operation_kind",
-                Some(operation_kind_label(operation.op_kind)),
-            );
-            insert_hash(row, hs_trace::HASH, *tip_hash);
-        }
-        HeaderSyncEvent::HeaderRangeOperationFailed { operation, kind } => {
-            insert_optional_str(row, hs_trace::KIND, Some("header_range_operation_failed"));
-            insert_peer(row, hs_trace::PEER, &operation.wire_request.peer);
-            insert_u64(row, hs_trace::SESSION_ID, operation.wire_request.session_id);
-            insert_u64(
-                row,
-                hs_trace::REQUEST_ID,
-                operation.wire_request.request_id.get(),
-            );
-            insert_optional_str(
-                row,
-                "operation_kind",
-                Some(operation_kind_label(operation.op_kind)),
-            );
-            insert_optional_str(
-                row,
-                hs_trace::REASON,
-                Some(commit_failure_reason_label(*kind)),
-            );
-        }
-        HeaderSyncEvent::HeaderRangeResponseFinished {
-            peer,
-            start_height,
-            requested_count,
-            returned_count,
-            ..
-        } => {
-            insert_optional_str(row, hs_trace::KIND, Some("header_range_response_finished"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::RANGE_START, *start_height);
-            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*returned_count));
-            insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(*requested_count));
-        }
-        HeaderSyncEvent::HeaderRangeResponseReady {
-            peer,
-            start_height,
-            requested_count,
-            headers,
-            ..
-        } => {
-            insert_optional_str(row, hs_trace::KIND, Some("header_range_response_ready"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::RANGE_START, *start_height);
-            insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
-            insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(*requested_count));
-        }
-    }
-}
-
-fn trace_action_fields(row: &mut serde_json::Map<String, Value>, action: &HeaderSyncAction) {
-    match action {
-        #[cfg(test)]
-        HeaderSyncAction::SendMessage { peer, msg, .. } => {
-            insert_optional_str(row, hs_trace::KIND, Some("send_message"));
-            insert_optional_str(row, hs_trace::REASON, Some(header_sync_message_label(msg)));
-            insert_peer(row, hs_trace::PEER, peer);
-            trace_header_sync_message_fields(row, msg);
-        }
-        #[cfg(test)]
-        HeaderSyncAction::ForwardNewBlock {
-            source,
-            peer,
-            height,
-            hash,
-            ..
-        } => {
-            insert_optional_str(row, hs_trace::KIND, Some("forward_new_block"));
-            if let Some(source) = source {
-                insert_peer(row, hs_trace::SOURCE_PEER, source);
+impl From<&HeaderSyncEvent> for HeaderEventProjection {
+    fn from(event: &HeaderSyncEvent) -> Self {
+        match event {
+            HeaderSyncEvent::PeerConnected(session) => Self::PeerConnected {
+                peer: peer_label(session.peer_id()),
+            },
+            HeaderSyncEvent::PeerDisconnected(peer) => Self::PeerDisconnected {
+                peer: peer_label(peer),
+            },
+            HeaderSyncEvent::AdvisoryHeaderSummary { peer, summary } => {
+                Self::AdvisoryHeaderSummary {
+                    peer: peer_label(peer),
+                    height: summary.best_height,
+                }
             }
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::HEIGHT, *height);
-            insert_hash(row, hs_trace::HASH, *hash);
-        }
-        HeaderSyncAction::Misbehavior { peer, reason } => {
-            insert_optional_str(row, hs_trace::KIND, Some("misbehavior"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_optional_str(
-                row,
-                hs_trace::REASON,
-                Some(misbehavior_reason_label(*reason)),
-            );
-        }
-        HeaderSyncAction::NewBlockReceived {
-            peer, height, hash, ..
-        } => {
-            insert_optional_str(row, hs_trace::KIND, Some("new_block_received"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::HEIGHT, *height);
-            insert_hash(row, hs_trace::HASH, *hash);
-        }
-        HeaderSyncAction::QueryHeadersByHeightRange {
-            peer, start, count, ..
-        } => {
-            insert_optional_str(row, hs_trace::KIND, Some("query_headers_by_height_range"));
-            insert_peer(row, hs_trace::PEER, peer);
-            insert_height(row, hs_trace::RANGE_START, *start);
-            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*count));
-        }
-        HeaderSyncAction::CommitHeaderRange {
-            operation, payload, ..
-        } => {
-            insert_optional_str(row, hs_trace::KIND, Some("commit_header_range"));
-            insert_peer(row, hs_trace::PEER, &operation.wire_request.peer);
-            insert_u64(row, hs_trace::SESSION_ID, operation.wire_request.session_id);
-            insert_u64(
-                row,
-                hs_trace::REQUEST_ID,
-                operation.wire_request.request_id.get(),
-            );
-            insert_optional_str(
-                row,
-                "operation_kind",
-                Some(operation_kind_label(operation.op_kind)),
-            );
-            insert_height(row, hs_trace::RANGE_START, payload.range().start());
-            insert_u64(
-                row,
-                hs_trace::RANGE_COUNT,
-                u64::from(payload.range().count()),
-            );
-        }
-        HeaderSyncAction::QueryBestHeaderTip => {
-            insert_optional_str(row, hs_trace::KIND, Some("query_best_header_tip"));
-        }
-        HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
-            insert_optional_str(row, hs_trace::KIND, Some("query_missing_block_bodies"));
-            insert_height(row, hs_trace::RANGE_START, *from);
-            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*limit));
-        }
-        HeaderSyncAction::BodyGaps { from, to } => {
-            insert_optional_str(row, hs_trace::KIND, Some("body_gaps"));
-            insert_height(row, hs_trace::RANGE_START, *from);
-            insert_u64(
-                row,
-                hs_trace::RANGE_COUNT,
-                u64::from(count_between(*from, *to)),
-            );
-        }
-        HeaderSyncAction::HeaderAdvanced { height, hash } => {
-            insert_optional_str(row, hs_trace::KIND, Some("header_advanced"));
-            insert_height(row, hs_trace::HEIGHT, *height);
-            insert_hash(row, hs_trace::HASH, *hash);
-        }
-        HeaderSyncAction::HeaderReanchored { old, new } => {
-            insert_optional_str(row, hs_trace::KIND, Some("header_reanchored"));
-            insert_height(row, hs_trace::HEIGHT, new.0);
-            insert_hash(row, hs_trace::HASH, new.1);
-            insert_height(row, hs_trace::RANGE_START, old.0);
-        }
-    }
-}
-
-fn trace_status_fields(
-    row: &mut serde_json::Map<String, Value>,
-    peer: &ZakuraPeerId,
-    status: HeaderSyncStatus,
-) {
-    insert_peer(row, hs_trace::PEER, peer);
-    insert_height(row, hs_trace::HEIGHT, status.tip_height);
-    insert_hash(row, hs_trace::HASH, status.tip_hash);
-    insert_height(row, hs_trace::RANGE_START, status.anchor_height);
-    insert_u64(
-        row,
-        hs_trace::ADVERTISED_CAP,
-        u64::from(status.max_headers_per_response),
-    );
-    insert_u64(
-        row,
-        hs_trace::IN_FLIGHT_COUNT,
-        u64::from(status.max_inflight_requests),
-    );
-}
-
-fn trace_header_sync_message_fields(
-    row: &mut serde_json::Map<String, Value>,
-    msg: &HeaderSyncMessage,
-) {
-    match msg {
-        HeaderSyncMessage::Status(status) => {
-            insert_height(row, hs_trace::HEIGHT, status.tip_height);
-            insert_hash(row, hs_trace::HASH, status.tip_hash);
-            insert_height(row, hs_trace::RANGE_START, status.anchor_height);
-            insert_u64(
-                row,
-                hs_trace::ADVERTISED_CAP,
-                u64::from(status.max_headers_per_response),
-            );
-            insert_u64(
-                row,
-                hs_trace::IN_FLIGHT_COUNT,
-                u64::from(status.max_inflight_requests),
-            );
-        }
-        HeaderSyncMessage::Headers { headers, .. } => {
-            insert_u64(
-                row,
-                hs_trace::RANGE_COUNT,
-                u64::try_from(headers.len()).unwrap_or(u64::MAX),
-            );
-        }
-        HeaderSyncMessage::GetHeaders {
-            start_height,
-            count,
-            ..
-        } => {
-            insert_height(row, hs_trace::RANGE_START, *start_height);
-            insert_u64(row, hs_trace::RANGE_COUNT, u64::from(*count));
-        }
-        HeaderSyncMessage::NewBlock(block) => {
-            insert_hash(row, hs_trace::HASH, block.hash());
-            if let Some(height) = block.coinbase_height() {
-                insert_height(row, hs_trace::HEIGHT, height);
+            HeaderSyncEvent::FullBlockCommitted { height, hash, .. } => Self::FullBlockCommitted {
+                height: *height,
+                hash: hash_label(*hash),
+            },
+            HeaderSyncEvent::NewBlockAccepted {
+                peer, height, hash, ..
+            } => Self::NewBlockAccepted {
+                peer: peer_label(peer),
+                height: *height,
+                hash: hash_label(*hash),
+            },
+            HeaderSyncEvent::NewBlockDuplicate { peer, height, hash } => Self::NewBlockDuplicate {
+                peer: peer_label(peer),
+                height: *height,
+                hash: hash_label(*hash),
+            },
+            HeaderSyncEvent::NewBlockAcceptedNonBestChain { peer, height, hash } => {
+                Self::NewBlockAcceptedNonBestChain {
+                    peer: peer_label(peer),
+                    height: *height,
+                    hash: hash_label(*hash),
+                }
             }
+            HeaderSyncEvent::NewBlockRejected { peer, hash } => Self::NewBlockRejected {
+                peer: peer_label(peer),
+                hash: hash_label(*hash),
+            },
+            #[cfg(test)]
+            HeaderSyncEvent::WireMessage { peer, msg } => Self::WireMessage {
+                reason: header_sync_message_label(msg),
+                peer: peer_label(peer),
+                message: msg.into(),
+            },
+            HeaderSyncEvent::SessionWireMessage { peer, msg, .. } => Self::SessionWireMessage {
+                reason: header_sync_message_label(msg),
+                peer: peer_label(peer),
+                message: msg.into(),
+            },
+            HeaderSyncEvent::WireHeaders { peer, headers, .. } => Self::WireHeaders {
+                peer: peer_label(peer),
+                range_count: saturating_usize(headers.len()),
+            },
+            HeaderSyncEvent::WireGetHeaders {
+                peer,
+                start_height,
+                count,
+                ..
+            } => Self::WireGetHeaders {
+                peer: peer_label(peer),
+                range_start: *start_height,
+                range_count: *count,
+            },
+            HeaderSyncEvent::WireDecodeFailed { peer, error } => Self::WireDecodeFailed {
+                error_kind: header_sync_wire_error_kind(error),
+                peer: peer_label(peer),
+                error: error.as_ref().into(),
+            },
+            HeaderSyncEvent::WireProtocolFailure {
+                peer,
+                reason,
+                error,
+            } => Self::WireProtocolFailure {
+                reason: misbehavior_reason_label(*reason),
+                error_kind: header_sync_wire_error_kind(error),
+                peer: peer_label(peer),
+                error: error.as_ref().into(),
+            },
+            HeaderSyncEvent::StateFrontiersChanged(frontiers) => Self::StateFrontiersChanged {
+                finalized_height: frontiers.finalized_height,
+                verified_block_tip: frontiers.verified_block_tip,
+            },
+            HeaderSyncEvent::VctRootRepairRequested {
+                height,
+                generation,
+                expected_hashes,
+                ..
+            } => Self::VctRootRepairRequested {
+                height: *height,
+                range_count: saturating_usize(expected_hashes.len()),
+                generation: *generation,
+            },
+            HeaderSyncEvent::VctRootRepairResolved { generation } => Self::VctRootRepairResolved {
+                generation: *generation,
+            },
+            HeaderSyncEvent::BestHeaderTipLoaded {
+                tip_height,
+                tip_hash,
+            } => Self::BestHeaderTipLoaded {
+                height: *tip_height,
+                hash: hash_label(*tip_hash),
+            },
+            HeaderSyncEvent::HeaderRangeOperationCompleted {
+                operation,
+                tip_hash,
+            } => Self::HeaderRangeOperationCompleted {
+                peer: peer_label(&operation.wire_request.peer),
+                session_id: operation.wire_request.session_id,
+                request_id: operation.wire_request.request_id.get(),
+                operation_kind: operation_kind_label(operation.op_kind),
+                hash: hash_label(*tip_hash),
+            },
+            HeaderSyncEvent::HeaderRangeOperationFailed { operation, kind } => {
+                Self::HeaderRangeOperationFailed {
+                    peer: peer_label(&operation.wire_request.peer),
+                    session_id: operation.wire_request.session_id,
+                    request_id: operation.wire_request.request_id.get(),
+                    operation_kind: operation_kind_label(operation.op_kind),
+                    reason: commit_failure_reason_label(*kind),
+                }
+            }
+            HeaderSyncEvent::HeaderRangeResponseFinished {
+                peer,
+                start_height,
+                requested_count,
+                returned_count,
+                ..
+            } => Self::HeaderRangeResponseFinished {
+                peer: peer_label(peer),
+                range_start: *start_height,
+                range_count: *returned_count,
+                expected_count: *requested_count,
+            },
+            HeaderSyncEvent::HeaderRangeResponseReady {
+                peer,
+                start_height,
+                requested_count,
+                headers,
+                ..
+            } => Self::HeaderRangeResponseReady {
+                peer: peer_label(peer),
+                range_start: *start_height,
+                range_count: saturating_usize(headers.len()),
+                expected_count: *requested_count,
+            },
         }
     }
+}
+
+impl From<&HeaderSyncAction> for HeaderActionProjection {
+    fn from(action: &HeaderSyncAction) -> Self {
+        match action {
+            #[cfg(test)]
+            HeaderSyncAction::SendMessage { peer, msg, .. } => Self::SendMessage {
+                reason: header_sync_message_label(msg),
+                peer: peer_label(peer),
+                message: msg.into(),
+            },
+            #[cfg(test)]
+            HeaderSyncAction::ForwardNewBlock {
+                source,
+                peer,
+                height,
+                hash,
+                ..
+            } => Self::ForwardNewBlock {
+                source_peer: source.as_ref().map(peer_label),
+                peer: peer_label(peer),
+                height: *height,
+                hash: hash_label(*hash),
+            },
+            HeaderSyncAction::Misbehavior { peer, reason } => Self::Misbehavior {
+                peer: peer_label(peer),
+                reason: misbehavior_reason_label(*reason),
+            },
+            HeaderSyncAction::NewBlockReceived {
+                peer, height, hash, ..
+            } => Self::NewBlockReceived {
+                peer: peer_label(peer),
+                height: *height,
+                hash: hash_label(*hash),
+            },
+            HeaderSyncAction::QueryHeadersByHeightRange {
+                peer, start, count, ..
+            } => Self::QueryHeadersByHeightRange {
+                peer: peer_label(peer),
+                range_start: *start,
+                range_count: *count,
+            },
+            HeaderSyncAction::CommitHeaderRange {
+                operation, payload, ..
+            } => Self::CommitHeaderRange {
+                peer: peer_label(&operation.wire_request.peer),
+                session_id: operation.wire_request.session_id,
+                request_id: operation.wire_request.request_id.get(),
+                operation_kind: operation_kind_label(operation.op_kind),
+                range_start: payload.range().start(),
+                range_count: u64::from(payload.range().count()),
+            },
+            HeaderSyncAction::QueryBestHeaderTip => Self::QueryBestHeaderTip,
+            HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
+                Self::QueryMissingBlockBodies {
+                    range_start: *from,
+                    range_count: *limit,
+                }
+            }
+            HeaderSyncAction::BodyGaps { from, to } => Self::BodyGaps {
+                range_start: *from,
+                range_count: count_between(*from, *to),
+            },
+            HeaderSyncAction::HeaderAdvanced { height, hash } => Self::HeaderAdvanced {
+                height: *height,
+                hash: hash_label(*hash),
+            },
+            HeaderSyncAction::HeaderReanchored { old, new } => Self::HeaderReanchored {
+                height: new.0,
+                hash: hash_label(new.1),
+                range_start: old.0,
+            },
+        }
+    }
+}
+
+impl StatusProjection {
+    fn new(peer: &ZakuraPeerId, status: HeaderSyncStatus) -> Self {
+        Self {
+            peer: peer_label(peer),
+            height: status.tip_height,
+            hash: hash_label(status.tip_hash),
+            range_start: status.anchor_height,
+            advertised_cap: status.max_headers_per_response,
+            in_flight_count: status.max_inflight_requests,
+        }
+    }
+}
+
+impl From<&HeaderSyncMessage> for HeaderMessageProjection {
+    fn from(msg: &HeaderSyncMessage) -> Self {
+        match msg {
+            HeaderSyncMessage::Status(status) => Self::Status {
+                height: status.tip_height,
+                hash: hash_label(status.tip_hash),
+                range_start: status.anchor_height,
+                advertised_cap: status.max_headers_per_response,
+                in_flight_count: status.max_inflight_requests,
+            },
+            HeaderSyncMessage::Headers { headers, .. } => Self::Headers {
+                range_count: saturating_usize(headers.len()),
+            },
+            HeaderSyncMessage::GetHeaders {
+                start_height,
+                count,
+                ..
+            } => Self::GetHeaders {
+                range_start: *start_height,
+                range_count: *count,
+            },
+            HeaderSyncMessage::NewBlock(block) => Self::NewBlock {
+                hash: hash_label(block.hash()),
+                height: block.coinbase_height(),
+            },
+        }
+    }
+}
+
+impl From<&HeaderSyncWireError> for WireErrorProjection {
+    fn from(error: &HeaderSyncWireError) -> Self {
+        match error {
+            HeaderSyncWireError::TreeAuxRootHeightMismatch {
+                offset,
+                expected_height,
+                root_height,
+                first_root_height,
+                last_root_height,
+            } => Self {
+                root_mismatch_offset: Some(saturating_usize(*offset)),
+                expected_root_height: Some(*expected_height),
+                actual_root_height: Some(*root_height),
+                first_root_height: Some(*first_root_height),
+                last_root_height: Some(*last_root_height),
+            },
+            _ => Self::default(),
+        }
+    }
+}
+
+fn peer_label(peer: &ZakuraPeerId) -> String {
+    trace_peer_label(peer)
+}
+
+fn hash_label(hash: block::Hash) -> String {
+    format!("{hash}")
+}
+
+fn saturating_usize(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn header_sync_message_label(msg: &HeaderSyncMessage) -> &'static str {
@@ -786,27 +1109,6 @@ pub(super) fn record_wire_validation_metrics(error: &HeaderSyncWireError) {
     .increment(1);
     if matches!(error, HeaderSyncWireError::TreeAuxRootHeightMismatch { .. }) {
         metrics::counter!("sync.header.tree_aux.height_mismatch").increment(1);
-    }
-}
-
-fn trace_wire_error_fields(row: &mut serde_json::Map<String, Value>, error: &HeaderSyncWireError) {
-    if let HeaderSyncWireError::TreeAuxRootHeightMismatch {
-        offset,
-        expected_height,
-        root_height,
-        first_root_height,
-        last_root_height,
-    } = error
-    {
-        insert_u64(
-            row,
-            hs_trace::ROOT_MISMATCH_OFFSET,
-            u64::try_from(*offset).unwrap_or(u64::MAX),
-        );
-        insert_height(row, hs_trace::EXPECTED_ROOT_HEIGHT, *expected_height);
-        insert_height(row, hs_trace::ACTUAL_ROOT_HEIGHT, *root_height);
-        insert_height(row, hs_trace::FIRST_ROOT_HEIGHT, *first_root_height);
-        insert_height(row, hs_trace::LAST_ROOT_HEIGHT, *last_root_height);
     }
 }
 
@@ -841,49 +1143,6 @@ pub(super) fn header_sync_wire_error_kind(error: &HeaderSyncWireError) -> &'stat
         HeaderSyncWireError::Equihash(_) => "equihash",
         HeaderSyncWireError::BlockingTask(_) => "blocking_task",
     }
-}
-
-pub(super) fn insert_peer(
-    row: &mut serde_json::Map<String, Value>,
-    key: &'static str,
-    peer: &ZakuraPeerId,
-) {
-    row.insert(key.to_string(), Value::String(trace_peer_label(peer)));
-}
-
-pub(super) fn insert_height(
-    row: &mut serde_json::Map<String, Value>,
-    key: &'static str,
-    height: block::Height,
-) {
-    insert_u64(row, key, u64::from(height.0));
-}
-
-pub(super) fn insert_hash(
-    row: &mut serde_json::Map<String, Value>,
-    key: &'static str,
-    hash: block::Hash,
-) {
-    row.insert(key.to_string(), Value::String(format!("{hash}")));
-}
-
-pub(super) fn insert_u64(row: &mut serde_json::Map<String, Value>, key: &'static str, value: u64) {
-    row.insert(key.to_string(), Value::Number(Number::from(value)));
-}
-
-fn insert_bool(row: &mut serde_json::Map<String, Value>, key: &'static str, value: bool) {
-    row.insert(key.to_string(), Value::Bool(value));
-}
-
-fn insert_optional_str(
-    row: &mut serde_json::Map<String, Value>,
-    key: &'static str,
-    value: Option<&'static str>,
-) {
-    row.insert(
-        key.to_string(),
-        value.map_or(Value::Null, |value| Value::String(value.to_string())),
-    );
 }
 
 fn misbehavior_reason_label(reason: HeaderSyncMisbehavior) -> &'static str {
@@ -937,10 +1196,15 @@ mod tests {
     use crate::zakura::{
         framed_channel,
         header_sync::{
-            events::HeaderSyncFrontiers, service::HeaderSyncPeerSession, state::RangePriority,
+            events::{
+                HeaderSyncFrontiers, HeaderSyncOperationIdentity, HeaderSyncOperationKind,
+                HeaderSyncRequestId, HeaderSyncWireRequestIdentity,
+            },
+            service::HeaderSyncPeerSession,
+            state::RangePriority,
+            HeaderRangePayload,
         },
-        HeaderRangePayload, HeaderSyncOperationIdentity, HeaderSyncOperationKind,
-        HeaderSyncServiceSummary, HeaderSyncWireRequestIdentity,
+        HeaderSyncServiceSummary,
     };
 
     fn peer(byte: u8) -> ZakuraPeerId {
@@ -999,21 +1263,110 @@ mod tests {
     }
 
     fn event_row(event: &HeaderSyncEvent) -> serde_json::Map<String, Value> {
-        let mut row = serde_json::Map::new();
-        trace_event_fields(&mut row, event);
-        row
+        serde_json::to_value(HeaderEventProjection::from(event))
+            .expect("event projection serializes")
+            .as_object()
+            .expect("event projection is an object")
+            .clone()
     }
 
     fn action_row(action: &HeaderSyncAction) -> serde_json::Map<String, Value> {
-        let mut row = serde_json::Map::new();
-        trace_action_fields(&mut row, action);
-        row
+        serde_json::to_value(HeaderActionProjection::from(action))
+            .expect("action projection serializes")
+            .as_object()
+            .expect("action projection is an object")
+            .clone()
     }
 
     fn message_row(message: &HeaderSyncMessage) -> serde_json::Map<String, Value> {
-        let mut row = serde_json::Map::new();
-        trace_header_sync_message_fields(&mut row, message);
-        row
+        serde_json::to_value(HeaderMessageProjection::from(message))
+            .expect("message projection serializes")
+            .as_object()
+            .expect("message projection is an object")
+            .clone()
+    }
+
+    #[test]
+    fn typed_outer_schemas_preserve_nulls_omissions_and_flattening() {
+        let peer = peer(7);
+        let received = HeaderTraceEvent::EventReceived {
+            projection: HeaderEventProjection::PeerDisconnected {
+                peer: peer_label(&peer),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(received).expect("received event serializes"),
+            serde_json::json!({
+                "event": hs_trace::HEADER_EVENT_RECEIVED,
+                "kind": "peer_disconnected",
+                "peer": peer_label(&peer),
+            })
+        );
+
+        let committed = HeaderTraceEvent::RangeCommitted {
+            range_start: block::Height(3),
+            range_count: 2,
+            reason: None,
+        };
+        assert_eq!(
+            serde_json::to_value(committed).expect("committed range serializes"),
+            serde_json::json!({
+                "event": hs_trace::HEADER_RANGE_COMMITTED,
+                "range_start": 3,
+                "range_count": 2,
+                "reason": null,
+            })
+        );
+
+        let rejected = HeaderTraceEvent::RangeRejected {
+            peer: Some(peer_label(&peer)),
+            range_start: block::Height(4),
+            range_count: 1,
+            anchor_hash: None,
+            validation_stage: None,
+            error_kind: None,
+            reason: Some("local"),
+        };
+        assert_eq!(
+            serde_json::to_value(rejected).expect("rejected range serializes"),
+            serde_json::json!({
+                "event": hs_trace::HEADER_RANGE_REJECTED,
+                "peer": peer_label(&peer),
+                "range_start": 4,
+                "range_count": 1,
+                "reason": "local",
+            })
+        );
+
+        let queue = QueueSendTraceEvent {
+            event: "queue_send_failed",
+            service: "header_sync",
+            message: "headers",
+            peer: peer_label(&peer),
+            error: "full",
+            queue_capacity: 0,
+            queue_max_capacity: 8,
+            context: QueueSendProjection::Headers {
+                range_start: block::Height(5),
+                range_count: 3,
+                returned: 2,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(queue).expect("queue event serializes"),
+            serde_json::json!({
+                "event": "queue_send_failed",
+                "service": "header_sync",
+                "message": "headers",
+                "peer": peer_label(&peer),
+                "error": "full",
+                "queue_capacity": 0,
+                "queue_max_capacity": 8,
+                "range_start": 5,
+                "range_count": 3,
+                "returned": 2,
+            })
+        );
     }
 
     #[test]
@@ -1273,6 +1626,61 @@ mod tests {
     }
 
     #[test]
+    fn operation_identity_events_preserve_exact_field_order() {
+        let peer = peer(6);
+        let operation = operation(peer.clone());
+        let tip_hash = block::Hash([7; 32]);
+        let completed = HeaderSyncEvent::HeaderRangeOperationCompleted {
+            operation: operation.clone(),
+            tip_hash,
+        };
+        assert_eq!(
+            serde_json::to_string(&HeaderEventProjection::from(&completed))
+                .expect("completed operation projection serializes"),
+            format!(
+                r#"{{"kind":"header_range_operation_completed","peer":"{}","session_id":7,"request_id":1,"operation_kind":"commit_headers","hash":"{}"}}"#,
+                peer_label(&peer),
+                hash_label(tip_hash),
+            )
+        );
+
+        let failed = HeaderSyncEvent::HeaderRangeOperationFailed {
+            operation: operation.clone(),
+            kind: HeaderSyncCommitFailureKind::InvalidPeerRange,
+        };
+        assert_eq!(
+            serde_json::to_string(&HeaderEventProjection::from(&failed))
+                .expect("failed operation projection serializes"),
+            format!(
+                r#"{{"kind":"header_range_operation_failed","peer":"{}","session_id":7,"request_id":1,"operation_kind":"commit_headers","reason":"invalid_peer_range"}}"#,
+                peer_label(&peer),
+            )
+        );
+
+        let payload = HeaderRangePayload::new(
+            block::Height(1),
+            vec![block().header.clone()],
+            vec![1],
+            None,
+        )
+        .expect("test payload is aligned");
+        let action = HeaderSyncAction::CommitHeaderRange {
+            operation,
+            anchor: block::Hash([0; 32]),
+            payload,
+            finalized: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&HeaderActionProjection::from(&action))
+                .expect("commit action projection serializes"),
+            format!(
+                r#"{{"kind":"commit_header_range","peer":"{}","session_id":7,"request_id":1,"operation_kind":"commit_headers","range_start":1,"range_count":1}}"#,
+                peer_label(&peer),
+            )
+        );
+    }
+
+    #[test]
     fn message_labels_and_fields_are_exact_and_omit_payloads() {
         let block = block();
         let block_hash = format!("{}", block.hash());
@@ -1350,6 +1758,13 @@ mod tests {
             (
                 HeaderSyncWireError::HeaderCountLimit { actual: 2, max: 1 },
                 "header_count_limit",
+            ),
+            (
+                HeaderSyncWireError::InvalidRangeGeometry {
+                    start: block::Height(1),
+                    count: 0,
+                },
+                "invalid_range_geometry",
             ),
             (
                 HeaderSyncWireError::BodySizeCountMismatch {
@@ -1517,11 +1932,13 @@ mod tests {
             "local"
         );
 
-        let mut row = serde_json::Map::new();
-        insert_optional_str(&mut row, "present", Some("value"));
-        insert_optional_str(&mut row, "absent", None);
-        assert_eq!(row["present"], Value::from("value"));
-        assert_eq!(row["absent"], Value::Null);
+        let committed = serde_json::to_value(HeaderTraceEvent::RangeCommitted {
+            range_start: block::Height(1),
+            range_count: 1,
+            reason: None,
+        })
+        .expect("range event serializes");
+        assert_eq!(committed[hs_trace::REASON], Value::Null);
 
         let no_source = action_row(&HeaderSyncAction::ForwardNewBlock {
             source: None,
@@ -1539,8 +1956,8 @@ mod tests {
             first_root_height: block::Height(10),
             last_root_height: block::Height(11),
         };
-        let mut row = serde_json::Map::new();
-        trace_wire_error_fields(&mut row, &mismatch);
+        let row = serde_json::to_value(WireErrorProjection::from(&mismatch))
+            .expect("wire error projection serializes");
         assert_eq!(row[hs_trace::ROOT_MISMATCH_OFFSET], Value::from(7));
         assert_eq!(row[hs_trace::EXPECTED_ROOT_HEIGHT], Value::from(8));
         assert_eq!(row[hs_trace::ACTUAL_ROOT_HEIGHT], Value::from(9));
@@ -1550,26 +1967,27 @@ mod tests {
         assert_eq!(count_between(block::Height(3), block::Height(5)), 3);
         assert_eq!(count_between(block::Height(5), block::Height(3)), 0);
         let committed = event_row(&HeaderSyncEvent::HeaderRangeOperationCompleted {
-            operation: operation(peer(3)),
+            operation: operation(peer(4)),
             tip_hash: block::Hash([5; 32]),
         });
+        assert_eq!(committed[hs_trace::SESSION_ID], Value::from(7));
         assert_eq!(committed[hs_trace::REQUEST_ID], Value::from(1));
+        assert_eq!(committed["operation_kind"], "commit_headers");
         let gaps = action_row(&HeaderSyncAction::BodyGaps {
             from: block::Height(3),
             to: block::Height(5),
         });
         assert_eq!(gaps[hs_trace::RANGE_COUNT], Value::from(3));
 
-        let empty = TreeAuxTraceSummary::default();
-        let mut row = serde_json::Map::new();
-        empty.insert_into(&mut row);
-        assert!(row.is_empty());
+        let empty = serde_json::to_value(TreeAuxTraceSummary::default())
+            .expect("empty root summary serializes");
+        assert_eq!(empty, serde_json::json!({ "tree_aux_roots_len": 0 }));
 
         let roots = TreeAuxTraceSummary::new(&[root(block::Height(8)), root(block::Height(9))]);
         assert_eq!(roots.len, 2);
-        roots.insert_into(&mut row);
-        assert_eq!(row[hs_trace::FIRST_ROOT_HEIGHT], Value::from(8));
-        assert_eq!(row[hs_trace::LAST_ROOT_HEIGHT], Value::from(9));
+        let roots = serde_json::to_value(roots).expect("root summary serializes");
+        assert_eq!(roots[hs_trace::FIRST_ROOT_HEIGHT], Value::from(8));
+        assert_eq!(roots[hs_trace::LAST_ROOT_HEIGHT], Value::from(9));
 
         assert_eq!(RangePriority::Forward.label(), "forward");
         assert_eq!(RangePriority::Repair.label(), "repair");

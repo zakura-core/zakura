@@ -15,7 +15,6 @@ use futures::{
     stream::{FuturesUnordered, Stream},
 };
 use pin_project::pin_project;
-use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::{
     sync::{oneshot, watch},
@@ -33,7 +32,9 @@ use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
 use crate::components::sync::{
-    legacy_trace::{elapsed_millis, LegacyBlockOutcome, LegacySyncTrace, LegacyTaskState},
+    legacy_trace::{
+        LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
+    },
     FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT,
 };
 
@@ -446,25 +447,7 @@ where
         let state = state.clone();
         drop(states);
 
-        trace.emit("block_phase", |row| {
-            row.insert("hash".to_string(), Value::String(hash.to_string()));
-            row.insert("phase".to_string(), Value::String(phase.to_string()));
-            row.insert(
-                "previous_phase".to_string(),
-                Value::String(previous_phase.to_string()),
-            );
-            if let Some(height) = state.height {
-                row.insert("height".to_string(), Value::from(height.0));
-            }
-            row.insert(
-                "phase_elapsed_ms".to_string(),
-                elapsed_millis(phase_elapsed),
-            );
-            row.insert(
-                "elapsed_ms".to_string(),
-                elapsed_millis(state.started.elapsed()),
-            );
-        });
+        trace.block_phase(hash, phase, previous_phase, state, phase_elapsed);
     }
 
     pub(super) fn emit_diagnostic_snapshot(
@@ -475,58 +458,14 @@ where
         prospective_tips: usize,
         registry_retries: usize,
     ) {
-        let states = self
-            .task_states
-            .lock()
-            .expect("legacy task state lock is only held for synchronous updates");
-        let mut tasks: Vec<_> = states
-            .iter()
-            .map(|(hash, state)| {
-                let mut task = Map::new();
-                task.insert("hash".to_string(), Value::String(hash.to_string()));
-                task.insert("phase".to_string(), Value::String(state.phase.to_string()));
-                if let Some(height) = state.height {
-                    task.insert("height".to_string(), Value::from(height.0));
-                }
-                task.insert(
-                    "elapsed_ms".to_string(),
-                    elapsed_millis(state.started.elapsed()),
-                );
-                task.insert(
-                    "phase_elapsed_ms".to_string(),
-                    elapsed_millis(state.phase_started.elapsed()),
-                );
-                Value::Object(task)
-            })
-            .collect();
-        tasks.sort_by_key(|task| {
-            task.get("height")
-                .and_then(Value::as_u64)
-                .unwrap_or(u64::MAX)
-        });
-        drop(states);
-
-        self.trace.emit(event, |row| {
-            if let Some(state_tip) = state_tip {
-                row.insert("state_tip".to_string(), Value::from(state_tip.0));
-            }
-            row.insert(
-                "in_flight".to_string(),
-                Value::from(u64::try_from(self.in_flight()).unwrap_or(u64::MAX)),
-            );
-            row.insert(
-                "reserve".to_string(),
-                Value::from(u64::try_from(reserve).unwrap_or(u64::MAX)),
-            );
-            row.insert(
-                "prospective_tips".to_string(),
-                Value::from(u64::try_from(prospective_tips).unwrap_or(u64::MAX)),
-            );
-            row.insert(
-                "registry_retries".to_string(),
-                Value::from(u64::try_from(registry_retries).unwrap_or(u64::MAX)),
-            );
-            row.insert("tasks".to_string(), Value::Array(tasks));
+        self.trace.diagnostic_snapshot(LegacyDiagnosticSnapshot {
+            event,
+            state_tip,
+            in_flight: self.in_flight(),
+            reserve,
+            prospective_tips,
+            registry_retries,
+            task_states: &self.task_states,
         });
     }
 
@@ -723,21 +662,12 @@ where
 
                     return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr });
                 };
-                let advertiser_label = advertiser_addr.map(|addr| trace.peer_label(addr));
-                trace.emit("block_downloaded", |row| {
-                    row.insert("hash".to_string(), Value::String(hash.to_string()));
-                    row.insert("height".to_string(), Value::from(block_height.0));
-                    row.insert(
-                        "download_elapsed_ms".to_string(),
-                        elapsed_millis(download_start.elapsed()),
-                    );
-                    if let Some(advertiser_label) = advertiser_label {
-                        row.insert(
-                            "peer".to_string(),
-                            Value::String(advertiser_label),
-                        );
-                    }
-                });
+                trace.block_downloaded(
+                    hash,
+                    block_height,
+                    download_start.elapsed(),
+                    advertiser_addr,
+                );
                 Self::transition_task(
                     &task_states,
                     &trace,

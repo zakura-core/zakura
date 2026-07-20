@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added typed, lazily constructed JSONL events with table-aware non-blocking emission.
+
 ## [1.0.0] - 2026-07-15
 
 Initial stable release.

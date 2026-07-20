@@ -2,11 +2,14 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     path::PathBuf,
     sync::OnceLock,
     time::Duration,
 };
 
+use serde::Serialize;
+use serde_json::{Map, Value};
 use tokio::{
     io::AsyncWriteExt,
     runtime::Handle,
@@ -44,6 +47,184 @@ pub const DEFAULT_FILE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Env var used to label every JSONL trace record with a stable node identifier.
 pub const NODE_ID_ENV: &str = "ZEBRA_NODE_ID";
+
+/// A logical JSONL trace table and its output file.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct JsonlTraceTable {
+    table: &'static str,
+    file_name: &'static str,
+}
+
+impl JsonlTraceTable {
+    /// Create a trace table definition.
+    pub const fn new(table: &'static str, file_name: &'static str) -> Self {
+        Self { table, file_name }
+    }
+
+    /// Return the logical table name used for diagnostics.
+    pub const fn table(self) -> &'static str {
+        self.table
+    }
+
+    /// Return the JSONL output file name.
+    pub const fn file_name(self) -> &'static str {
+        self.file_name
+    }
+}
+
+/// A serializable typed JSONL trace event.
+pub trait JsonlTraceEvent: Serialize {
+    /// The table that receives this event.
+    const TABLE: JsonlTraceTable;
+}
+
+/// A borrowed value serialized using its [`fmt::Display`] representation.
+///
+/// This adapter keeps hash and error formatting inside the lazy serialization
+/// path instead of allocating strings at trace call sites.
+#[derive(Copy, Clone, Debug)]
+pub struct JsonlDisplay<'a, T: ?Sized>(pub &'a T);
+
+impl<T> Serialize for JsonlDisplay<'_, T>
+where
+    T: fmt::Display + ?Sized,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self.0)
+    }
+}
+
+/// Convert a platform-sized count to the stable trace integer type.
+pub fn saturating_count(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Convert a duration to saturating whole milliseconds.
+pub fn saturating_millis(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Convert a duration to saturating whole microseconds.
+pub fn saturating_micros(value: Duration) -> u64 {
+    u64::try_from(value.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Implement [`JsonlTraceEvent`] for an event type.
+#[macro_export]
+macro_rules! impl_jsonl_trace_event {
+    ($event:ty, $table:expr) => {
+        impl $crate::JsonlTraceEvent for $event {
+            const TABLE: $crate::JsonlTraceTable = $table;
+        }
+    };
+}
+
+/// A typed, non-blocking JSONL event emitter.
+#[derive(Clone, Debug)]
+pub struct JsonlEventEmitter {
+    tracer: JsonlTracer,
+    node: std::sync::Arc<str>,
+    started: Instant,
+}
+
+impl JsonlEventEmitter {
+    /// Create a no-op event emitter.
+    pub fn noop() -> Self {
+        Self::new(JsonlTracer::noop(), node_id())
+    }
+
+    /// Create an event emitter with an explicit node label.
+    pub fn new(tracer: JsonlTracer, node: impl Into<std::sync::Arc<str>>) -> Self {
+        Self {
+            tracer,
+            node: node.into(),
+            started: Instant::now(),
+        }
+    }
+
+    /// Return the underlying JSONL tracer.
+    pub fn tracer(&self) -> &JsonlTracer {
+        &self.tracer
+    }
+
+    /// Return true when this emitter can currently reserve output capacity.
+    pub fn is_enabled(&self) -> bool {
+        self.tracer.is_enabled()
+    }
+
+    /// Lazily build and emit a typed event.
+    ///
+    /// The queue slot is reserved before `build` is invoked, so domain
+    /// projections and serialization are skipped when tracing is disabled or
+    /// when the bounded channel is full or closed.
+    pub fn emit_event<E>(&self, build: impl FnOnce() -> E)
+    where
+        E: JsonlTraceEvent,
+    {
+        let Ok(permit) = self.tracer.try_reserve() else {
+            return;
+        };
+
+        let event = build();
+        let row = JsonlEventEnvelope {
+            ts: elapsed_micros(self.started.elapsed()),
+            node: &self.node,
+            event: &event,
+        };
+
+        if let Ok(line) = serde_json::to_vec(&row) {
+            permit.send(JsonlWriteEvent {
+                table: E::TABLE.table(),
+                file_name: E::TABLE.file_name(),
+                line,
+            });
+        }
+    }
+
+    /// Lazily build and emit a raw JSON object for compatibility callers.
+    pub fn emit_with(&self, table: JsonlTraceTable, build: impl FnOnce(&mut Map<String, Value>)) {
+        let Ok(permit) = self.tracer.try_reserve() else {
+            return;
+        };
+
+        let mut row = Map::new();
+        row.insert(
+            "ts".to_string(),
+            Value::from(elapsed_micros(self.started.elapsed())),
+        );
+        row.insert("node".to_string(), Value::String(self.node.to_string()));
+        build(&mut row);
+
+        if let Ok(line) = serde_json::to_vec(&Value::Object(row)) {
+            permit.send(JsonlWriteEvent {
+                table: table.table(),
+                file_name: table.file_name(),
+                line,
+            });
+        }
+    }
+}
+
+impl Default for JsonlEventEmitter {
+    fn default() -> Self {
+        Self::noop()
+    }
+}
+
+#[derive(Serialize)]
+struct JsonlEventEnvelope<'a, E> {
+    ts: u64,
+    node: &'a str,
+    #[serde(flatten)]
+    event: &'a E,
+}
+
+fn elapsed_micros(elapsed: Duration) -> u64 {
+    saturating_micros(elapsed)
+}
 
 /// Returns the process-wide node identifier used to tag JSONL trace records.
 ///
@@ -606,7 +787,92 @@ async fn run_trace_writer(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
     use super::*;
+
+    const TEST_TABLE: JsonlTraceTable = JsonlTraceTable::new("typed", "typed.jsonl");
+
+    #[derive(Serialize)]
+    struct TestEvent {
+        event: &'static str,
+        value: u64,
+        optional: Option<u64>,
+    }
+
+    impl_jsonl_trace_event!(TestEvent, TEST_TABLE);
+
+    #[test]
+    fn common_adapters_use_display_and_saturating_numeric_forms() {
+        assert_eq!(
+            serde_json::to_value(JsonlDisplay(&"displayed")).expect("display adapter serializes"),
+            Value::String("displayed".to_string())
+        );
+        assert_eq!(saturating_count(7), 7);
+        assert_eq!(saturating_millis(Duration::from_millis(9)), 9);
+        assert_eq!(saturating_micros(Duration::from_micros(11)), 11);
+    }
+
+    #[test]
+    fn typed_emitter_serializes_the_event_envelope() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let emitter = JsonlEventEmitter::new(JsonlTracer::new(tx), "node-typed");
+
+        emitter.emit_event(|| TestEvent {
+            event: "typed_event",
+            value: 7,
+            optional: None,
+        });
+
+        let written = rx.try_recv().expect("typed event uses the reserved slot");
+        assert_eq!(written.table, "typed");
+        assert_eq!(written.file_name, "typed.jsonl");
+
+        let row: Value = serde_json::from_slice(&written.line).expect("valid typed event JSON");
+        assert_eq!(row["node"], "node-typed");
+        assert_eq!(row["event"], "typed_event");
+        assert_eq!(row["value"], 7);
+        assert_eq!(row["optional"], Value::Null);
+        assert!(row["ts"].is_u64());
+    }
+
+    #[test]
+    fn typed_emitter_is_lazy_when_disabled_full_or_closed() {
+        fn assert_not_built(emitter: &JsonlEventEmitter) {
+            let called = Arc::new(AtomicBool::new(false));
+            let called_in_build = called.clone();
+
+            emitter.emit_event(|| {
+                called_in_build.store(true, Ordering::SeqCst);
+                TestEvent {
+                    event: "must_not_build",
+                    value: 0,
+                    optional: None,
+                }
+            });
+
+            assert!(!called.load(Ordering::SeqCst));
+        }
+
+        assert_not_built(&JsonlEventEmitter::noop());
+
+        let (full_tx, _full_rx) = mpsc::channel(1);
+        let full = JsonlEventEmitter::new(JsonlTracer::new(full_tx), "full");
+        full.emit_event(|| TestEvent {
+            event: "fills_queue",
+            value: 0,
+            optional: None,
+        });
+        assert_not_built(&full);
+
+        let (closed_tx, closed_rx) = mpsc::channel(1);
+        drop(closed_rx);
+        let closed = JsonlEventEmitter::new(JsonlTracer::new(closed_tx), "closed");
+        assert_not_built(&closed);
+    }
 
     #[tokio::test]
     async fn writer_task_produces_per_table_jsonl() {

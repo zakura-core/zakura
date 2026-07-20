@@ -1,5 +1,7 @@
 //! Zakura P2P v2 endpoint, protocol handler, and bounded connection serving.
 
+mod trace;
+
 use std::{
     collections::{HashMap, HashSet},
     future,
@@ -37,14 +39,9 @@ use zakura_chain::{
     transaction::Transaction,
 };
 
+use self::trace::ZakuraConnTrace;
 use super::discovery::{native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
-use super::{
-    trace::{
-        peer_label as trace_peer_label, reject_reason_label, ZakuraTrace, CONN_TABLE,
-        HANDSHAKE_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
-    },
-    ZakuraTraceEvent,
-};
+use super::trace::{reject_reason_label, ZakuraTrace};
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
@@ -1341,47 +1338,7 @@ impl Drop for RegisteredPeerCleanupGuard {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ZakuraConnTrace {
-    id: u64,
-    peer_label: Option<Arc<str>>,
-}
-
-impl ZakuraConnTrace {
-    fn new(trace: &ZakuraTrace, id: u64, peer_id: &ZakuraPeerId) -> Self {
-        Self {
-            id,
-            peer_label: trace
-                .is_enabled()
-                .then(|| Arc::<str>::from(trace_peer_label(peer_id))),
-        }
-    }
-
-    fn without_peer(id: u64) -> Self {
-        Self {
-            id,
-            peer_label: None,
-        }
-    }
-
-    #[cfg(any(test, feature = "zakura-testkit"))]
-    fn placeholder() -> Self {
-        Self::without_peer(0)
-    }
-
-    fn peer(&self) -> Option<&str> {
-        self.peer_label.as_deref()
-    }
-
-    fn event<'a>(&'a self, event: &'static str) -> ZakuraTraceEvent<'a> {
-        ZakuraTraceEvent::new(event)
-            .conn(self.id)
-            .maybe_peer(self.peer())
-    }
-}
-
 struct StreamAdmission<'a> {
-    trace: ZakuraTrace,
     conn: ZakuraConnTrace,
     peer_id: &'a ZakuraPeerId,
     stream_sem: &'a Arc<Semaphore>,
@@ -1393,12 +1350,6 @@ struct StreamAdmission<'a> {
     connection_token: CancellationToken,
     close_cause: CloseCause,
     freshness_tx: watch::Sender<Instant>,
-}
-
-impl StreamAdmission<'_> {
-    fn event(&self, event: &'static str, stream_id: u64) -> ZakuraTraceEvent<'_> {
-        self.conn.event(event).stream(stream_id)
-    }
 }
 
 struct ConnectionServeContext {
@@ -1434,7 +1385,6 @@ struct RegisteredConnectionServeContext {
 }
 
 struct StreamWorkerContext {
-    trace: ZakuraTrace,
     conn: ZakuraConnTrace,
     peer_id: ZakuraPeerId,
     stream_id: u64,
@@ -1445,12 +1395,6 @@ struct StreamWorkerContext {
     stream_token: CancellationToken,
     close_cause: CloseCause,
     freshness_tx: watch::Sender<Instant>,
-}
-
-impl StreamWorkerContext {
-    fn event(&self, event: &'static str) -> ZakuraTraceEvent<'_> {
-        self.conn.event(event).stream(self.stream_id)
-    }
 }
 
 struct AdmittedOrderedStream {
@@ -1517,9 +1461,13 @@ fn admit_inbound_message(
             "stream_kind" => stream_kind,
         )
         .increment(1);
-        context.trace.emit(
-            RATELIMIT_TABLE,
-            context.event("message.oversize").stream_kind(stream_kind),
+        context.conn.trace_rate_limit(
+            "message.oversize",
+            context.stream_id,
+            stream_kind,
+            None,
+            None,
+            None,
         );
         return InboundMessageAdmission::Oversize;
     }
@@ -1537,9 +1485,13 @@ fn admit_inbound_message(
             "stream_kind" => stream_kind,
         )
         .increment(1);
-        context.trace.emit(
-            RATELIMIT_TABLE,
-            context.event("message.throttled").stream_kind(stream_kind),
+        context.conn.trace_rate_limit(
+            "message.throttled",
+            context.stream_id,
+            stream_kind,
+            None,
+            None,
+            None,
         );
         return InboundMessageAdmission::Throttled;
     }
@@ -1756,12 +1708,12 @@ impl ZakuraProtocolHandler {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let Ok(_admission) = self.admission.clone().try_acquire_owned() else {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
-            let conn = ZakuraConnTrace::without_peer(conn_id);
-            self.trace.emit(
-                CONN_TABLE,
-                conn.event("rejected.admission")
-                    .direction("inbound")
-                    .reason("admission"),
+            let conn = ZakuraConnTrace::without_peer_on(&self.trace, conn_id);
+            conn.trace_connection(
+                "rejected.admission",
+                None,
+                Some("inbound"),
+                Some("admission"),
             );
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"admission");
             return Ok(());
@@ -1834,11 +1786,11 @@ impl ZakuraProtocolHandler {
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
         let Ok(_handshake) = self.pending_handshakes.clone().try_acquire_owned() else {
             metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
-            self.trace.emit(
-                CONN_TABLE,
-                conn.event("rejected.admission")
-                    .direction("inbound")
-                    .reason("pending_handshake"),
+            conn.trace_connection(
+                "rejected.admission",
+                None,
+                Some("inbound"),
+                Some("pending_handshake"),
             );
             connection.close(
                 VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
@@ -1857,12 +1809,11 @@ impl ZakuraProtocolHandler {
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
-        self.trace.emit(
-            HANDSHAKE_TABLE,
-            conn.event("control.started")
-                .role("responder")
-                .phase("control")
-                .network(self.handshake_config.network_label()),
+        conn.trace_handshake(
+            "control.started",
+            "responder",
+            None,
+            self.handshake_config.network_label(),
         );
         let (mut send, mut recv) = timeout(self.limits.control_timeout, connection.accept_bi())
             .await
@@ -1903,13 +1854,11 @@ impl ZakuraProtocolHandler {
             accepted_limits,
         };
         write_control_payload(&mut send, &ack.encode()?, self.limits.control_timeout).await?;
-        self.trace.emit(
-            HANDSHAKE_TABLE,
-            conn.event("control.succeeded")
-                .role("responder")
-                .phase("control")
-                .selected_protocol(ack.selected_zakura_protocol)
-                .network(self.handshake_config.network_label()),
+        conn.trace_handshake(
+            "control.succeeded",
+            "responder",
+            Some(ack.selected_zakura_protocol),
+            self.handshake_config.network_label(),
         );
         Ok(NativeHandshakeNegotiated {
             limits: accepted_limits,
@@ -2238,7 +2187,6 @@ impl ZakuraProtocolHandler {
                     match accepted {
                         Ok((send, recv)) => {
                             let mut admission = StreamAdmission {
-                                trace: self.trace.clone(),
                                 conn: conn.clone(),
                                 peer_id: &peer_id,
                                 stream_sem: &stream_sem,
@@ -2461,10 +2409,11 @@ impl ZakuraProtocolHandler {
         workers.abort_all();
         cleanup_guard.cleanup_registered_peer().await;
         metrics::counter!("zakura.p2p.conn.closed.neutral").increment(1);
-        self.trace.emit(
-            CONN_TABLE,
-            conn.event("closed.neutral")
-                .reason(close_cause.get_or("cancelled")),
+        conn.trace_connection(
+            "closed.neutral",
+            None,
+            None,
+            Some(close_cause.get_or("cancelled")),
         );
         Ok(())
     }
@@ -2517,7 +2466,6 @@ impl ZakuraProtocolHandler {
         );
         let stream_token = connection_token.child_token();
         let context = StreamWorkerContext {
-            trace: self.trace.clone(),
             conn: conn.clone(),
             peer_id,
             stream_id,
@@ -2535,12 +2483,7 @@ impl ZakuraProtocolHandler {
             "stream_kind" => stream_kind_label(stream.kind),
         )
         .increment(1);
-        self.trace.emit(
-            STREAM_TABLE,
-            conn.event("accepted")
-                .stream(stream_id)
-                .stream_kind(stream_kind_label(stream.kind)),
-        );
+        conn.trace_stream("accepted", stream_id, Some(stream_kind_label(stream.kind)));
 
         Ok(spawn_persistent_stream_worker(
             workers,
@@ -2567,10 +2510,9 @@ impl ZakuraProtocolHandler {
         let Ok(permit) = admission.stream_sem.clone().try_acquire_owned() else {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
             metrics::counter!("zakura.p2p.stream.rejected.semaphore").increment(1);
-            admission.trace.emit(
-                STREAM_TABLE,
-                admission.event("rejected.semaphore", stream_id),
-            );
+            admission
+                .conn
+                .trace_stream("rejected.semaphore", stream_id, None);
             return None;
         };
 
@@ -2584,10 +2526,9 @@ impl ZakuraProtocolHandler {
         if !admission.open_limiter.try_take() {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
             metrics::counter!("zakura.p2p.stream.rejected.open_rate").increment(1);
-            admission.trace.emit(
-                STREAM_TABLE,
-                admission.event("rejected.open_rate", stream_id),
-            );
+            admission
+                .conn
+                .trace_stream("rejected.open_rate", stream_id, None);
             return None;
         }
 
@@ -2598,8 +2539,8 @@ impl ZakuraProtocolHandler {
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                 metrics::counter!("zakura.p2p.stream.rejected.prelude").increment(1);
                 admission
-                    .trace
-                    .emit(STREAM_TABLE, admission.event("rejected.prelude", stream_id));
+                    .conn
+                    .trace_stream("rejected.prelude", stream_id, None);
                 return None;
             }
         };
@@ -2620,12 +2561,9 @@ impl ZakuraProtocolHandler {
                 "stream_kind" => stream_kind,
             )
             .increment(1);
-            admission.trace.emit(
-                STREAM_TABLE,
-                admission
-                    .event("rejected.unknown_kind", stream_id)
-                    .stream_kind(stream_kind),
-            );
+            admission
+                .conn
+                .trace_stream("rejected.unknown_kind", stream_id, Some(stream_kind));
             return None;
         };
 
@@ -2642,11 +2580,10 @@ impl ZakuraProtocolHandler {
                 "stream_kind" => stream_kind,
             )
             .increment(1);
-            admission.trace.emit(
-                STREAM_TABLE,
-                admission
-                    .event("rejected.unnegotiated_capability", stream_id)
-                    .stream_kind(stream_kind),
+            admission.conn.trace_stream(
+                "rejected.unnegotiated_capability",
+                stream_id,
+                Some(stream_kind),
             );
             return None;
         }
@@ -2657,11 +2594,10 @@ impl ZakuraProtocolHandler {
             admission.close_cause.record("unexpected_request_id");
             admission.connection_token.cancel();
             metrics::counter!("zakura.p2p.stream.rejected.unexpected_request_id").increment(1);
-            admission.trace.emit(
-                STREAM_TABLE,
-                admission
-                    .event("rejected.unexpected_request_id", stream_id)
-                    .stream_kind(stream_kind),
+            admission.conn.trace_stream(
+                "rejected.unexpected_request_id",
+                stream_id,
+                Some(stream_kind),
             );
             return None;
         }
@@ -2672,11 +2608,10 @@ impl ZakuraProtocolHandler {
             admission.close_cause.record("request_without_id");
             admission.connection_token.cancel();
             metrics::counter!("zakura.p2p.stream.rejected.request_without_id").increment(1);
-            admission.trace.emit(
-                STREAM_TABLE,
-                admission
-                    .event("rejected.request_without_id", stream_id)
-                    .stream_kind(stream_kind),
+            admission.conn.trace_stream(
+                "rejected.request_without_id",
+                stream_id,
+                Some(stream_kind),
             );
             return None;
         }
@@ -2686,12 +2621,9 @@ impl ZakuraProtocolHandler {
             "stream_kind" => stream_kind,
         )
         .increment(1);
-        admission.trace.emit(
-            STREAM_TABLE,
-            admission
-                .event("accepted", stream_id)
-                .stream_kind(stream_kind),
-        );
+        admission
+            .conn
+            .trace_stream("accepted", stream_id, Some(stream_kind));
 
         let message_bucket = message_bucket_for(
             admission.message_buckets,
@@ -2702,7 +2634,6 @@ impl ZakuraProtocolHandler {
         let stream_token = admission.connection_token.child_token();
 
         let context = StreamWorkerContext {
-            trace: admission.trace.clone(),
             conn: admission.conn.clone(),
             peer_id: admission.peer_id.clone(),
             stream_id,
@@ -2807,13 +2738,11 @@ impl ZakuraProtocolHandler {
                 disconnect_token,
             } => {
                 metrics::counter!("zakura.p2p.conn.accepted", "role" => context.role).increment(1);
-                self.trace.emit(
-                    CONN_TABLE,
-                    context
-                        .conn
-                        .event("accepted")
-                        .role(context.role)
-                        .direction(context.direction.trace_label()),
+                context.conn.trace_connection(
+                    "accepted",
+                    Some(context.role),
+                    Some(context.direction.trace_label()),
+                    None,
                 );
                 let cleanup_guard = RegisteredPeerCleanupGuard::new(
                     self.supervisor.clone(),
@@ -2845,13 +2774,11 @@ impl ZakuraProtocolHandler {
             ZakuraRegistration::Duplicate { peer_id } => {
                 debug!(?peer_id, "closing duplicate Zakura peer neutrally");
                 metrics::counter!("zakura.p2p.conn.duplicate").increment(1);
-                self.trace.emit(
-                    CONN_TABLE,
-                    context
-                        .conn
-                        .event("duplicate")
-                        .role(context.role)
-                        .direction(context.direction.trace_label()),
+                context.conn.trace_connection(
+                    "duplicate",
+                    Some(context.role),
+                    Some(context.direction.trace_label()),
+                    None,
                 );
                 connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"duplicate");
                 Ok(())
@@ -2861,14 +2788,11 @@ impl ZakuraProtocolHandler {
                     ?reason,
                     "closing Zakura peer neutrally after registration rejection"
                 );
-                self.trace.emit(
-                    CONN_TABLE,
-                    context
-                        .conn
-                        .event("rejected.admission")
-                        .role(context.role)
-                        .direction(context.direction.trace_label())
-                        .reason(reject_reason_label(reason)),
+                context.conn.trace_connection(
+                    "rejected.admission",
+                    Some(context.role),
+                    Some(context.direction.trace_label()),
+                    Some(reject_reason_label(reason)),
                 );
                 connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"registration");
                 Ok(())
@@ -3242,15 +3166,14 @@ async fn run_native_initiator_handshake(
     limits: &ZakuraLocalLimits,
     handshake_config: &ZakuraHandshakeConfig,
     local_peer_id: &ZakuraPeerId,
-    trace: &ZakuraTrace,
+    _trace: &ZakuraTrace,
     conn: &ZakuraConnTrace,
 ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
-    trace.emit(
-        HANDSHAKE_TABLE,
-        conn.event("control.started")
-            .role("initiator")
-            .phase("control")
-            .network(handshake_config.network_label()),
+    conn.trace_handshake(
+        "control.started",
+        "initiator",
+        None,
+        handshake_config.network_label(),
     );
     let (mut send, mut recv) = timeout(limits.control_timeout, connection.open_bi())
         .await
@@ -3291,13 +3214,11 @@ async fn run_native_initiator_handshake(
         &limits.initial_limits(),
         handshake_config,
     )?;
-    trace.emit(
-        HANDSHAKE_TABLE,
-        conn.event("control.succeeded")
-            .role("initiator")
-            .phase("control")
-            .selected_protocol(ack.selected_zakura_protocol)
-            .network(handshake_config.network_label()),
+    conn.trace_handshake(
+        "control.succeeded",
+        "initiator",
+        Some(ack.selected_zakura_protocol),
+        handshake_config.network_label(),
     );
     Ok(NativeHandshakeNegotiated {
         limits: ack.accepted_limits,
@@ -3416,14 +3337,13 @@ async fn persistent_stream_worker(
                     if let Some((payload_len, frame_len, max_frame_bytes)) =
                         error.oversize_frame_details()
                     {
-                        reader_context.trace.emit(
-                            RATELIMIT_TABLE,
-                            reader_context
-                                .event("frame.oversize")
-                                .stream_kind(stream_kind_label(stream_kind))
-                                .payload_len(payload_len)
-                                .frame_len(frame_len)
-                                .max_frame_bytes(max_frame_bytes),
+                        reader_context.conn.trace_rate_limit(
+                            "frame.oversize",
+                            reader_context.stream_id,
+                            stream_kind_label(stream_kind),
+                            Some(payload_len),
+                            Some(frame_len),
+                            Some(max_frame_bytes),
                         );
                     }
                     Err(error)
@@ -6798,7 +6718,6 @@ mod tests {
             .try_acquire_owned()
             .expect("test semaphore starts with one permit");
         let context = StreamWorkerContext {
-            trace: ZakuraTrace::noop(),
             conn: ZakuraConnTrace::without_peer(1),
             peer_id: test_peer(55),
             stream_id: 1,
@@ -6979,7 +6898,6 @@ mod tests {
                 .try_acquire_owned()
                 .expect("test semaphore starts with one permit");
             let context = StreamWorkerContext {
-                trace: ZakuraTrace::noop(),
                 conn: ZakuraConnTrace::without_peer(1),
                 peer_id: test_peer(80),
                 stream_id,
@@ -7515,7 +7433,6 @@ mod tests {
         let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
 
         let mut admission = StreamAdmission {
-            trace: handler.trace.clone(),
             conn: ZakuraConnTrace::placeholder(),
             peer_id: &peer_id,
             stream_sem: &stream_sem,

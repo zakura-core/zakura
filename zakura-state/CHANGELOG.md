@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `produce_settled_final_frontiers_bytes`: produce VCT final-frontier bytes at
   a height below the finalized tip after proving Sprout is settled across the
-  window, with two new `FinalFrontiersGenerationError` variants
-  (`SproutChangedAboveRequestedHeight`, `MissingBlockInSproutWindow`).
+  window. Retained blocks in that window are authenticated against their
+  canonical headers, parent links, and transaction Merkle roots, with
+  `FinalFrontiersGenerationError` variants for missing or inconsistent data.
 
 ## [3.0.0] - 2026-07-20
 

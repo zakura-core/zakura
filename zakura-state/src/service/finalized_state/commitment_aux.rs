@@ -4,6 +4,7 @@
 #[cfg(test)]
 use std::collections::HashMap;
 use std::{
+    collections::HashSet,
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -12,7 +13,7 @@ use std::{
 };
 
 use thiserror::Error;
-use zakura_chain::{block, ironwood, orchard, sapling, sprout};
+use zakura_chain::{block, ironwood, orchard, sapling, sprout, transaction};
 
 #[cfg(test)]
 use zakura_chain::block::merkle::AuthDataRoot;
@@ -130,6 +131,74 @@ pub enum FinalFrontiersGenerationError {
         height: block::Height,
         /// The finalized database tip height.
         tip: block::Height,
+    },
+
+    /// A height in an authenticated replay window has no canonical hash.
+    #[error("cannot authenticate block at {height:?}: canonical hash is missing")]
+    MissingCanonicalHash {
+        /// The height with no canonical hash.
+        height: block::Height,
+    },
+
+    /// The canonical height-to-hash and hash-to-height indexes disagree.
+    #[error(
+        "cannot authenticate block at {height:?}: canonical hash {hash} maps back to {indexed_height:?}"
+    )]
+    CanonicalIndexMismatch {
+        /// The height being authenticated.
+        height: block::Height,
+        /// The canonical hash indexed at `height`.
+        hash: block::Hash,
+        /// The height found through the reverse index.
+        indexed_height: Option<block::Height>,
+    },
+
+    /// A retained header does not match its canonical hash index entry.
+    #[error(
+        "cannot authenticate block at {height:?}: retained header hashes to {computed}, but the canonical index has {indexed}"
+    )]
+    HeaderHashMismatch {
+        /// The height being authenticated.
+        height: block::Height,
+        /// The canonical indexed hash.
+        indexed: block::Hash,
+        /// The retained header's computed hash.
+        computed: block::Hash,
+    },
+
+    /// A retained header does not link to the preceding canonical block.
+    #[error(
+        "cannot authenticate block at {height:?}: retained header links to {actual_parent}, but the preceding canonical hash is {expected_parent}"
+    )]
+    BrokenHeaderLink {
+        /// The height being authenticated.
+        height: block::Height,
+        /// The preceding canonical block hash.
+        expected_parent: block::Hash,
+        /// The parent hash in the retained header.
+        actual_parent: block::Hash,
+    },
+
+    /// Reconstructed transaction rows do not match the retained header's Merkle root.
+    #[error(
+        "cannot authenticate block at {height:?}: reconstructed transaction Merkle root {computed:?} does not match retained header root {expected:?}"
+    )]
+    TransactionMerkleRootMismatch {
+        /// The height being authenticated.
+        height: block::Height,
+        /// The Merkle root committed by the retained header.
+        expected: block::merkle::Root,
+        /// The Merkle root computed from the retained transaction rows.
+        computed: block::merkle::Root,
+    },
+
+    /// Reconstructed transaction rows contain a duplicate transaction hash.
+    #[error("cannot authenticate block at {height:?}: duplicate transaction hash {hash}")]
+    DuplicateTransaction {
+        /// The height being authenticated.
+        height: block::Height,
+        /// The duplicated transaction hash.
+        hash: transaction::Hash,
     },
 }
 
@@ -649,18 +718,26 @@ pub(super) fn produce_settled_final_frontiers(
     // Scan the whole window rather than stopping at the first change, so the error
     // names the height the next export's grid has to pass.
     let mut last_change = None;
+    let mut previous_hash = db
+        .hash(height)
+        .ok_or(FinalFrontiersGenerationError::MissingCanonicalHash { height })?;
     for raw_height in height.0.saturating_add(1)..=tip.0 {
         let scan_height = block::Height(raw_height);
-        let block = db.block(scan_height.into()).ok_or(
-            FinalFrontiersGenerationError::MissingBlockInSproutWindow {
-                missing: scan_height,
-                height,
-                tip,
-            },
-        )?;
+        let (block, hash) =
+            authenticated_block(db, scan_height, previous_hash).map_err(|error| match error {
+                AuthenticatedBlockError::MissingBlock => {
+                    FinalFrontiersGenerationError::MissingBlockInSproutWindow {
+                        missing: scan_height,
+                        height,
+                        tip,
+                    }
+                }
+                AuthenticatedBlockError::Generation(error) => error,
+            })?;
         if block.sprout_note_commitments().next().is_some() {
             last_change = Some(scan_height);
         }
+        previous_hash = hash;
     }
     if let Some(last_change) = last_change {
         return Err(
@@ -673,6 +750,85 @@ pub(super) fn produce_settled_final_frontiers(
     }
 
     read_final_frontiers_at(db, height, before, || {})
+}
+
+enum AuthenticatedBlockError {
+    MissingBlock,
+    Generation(FinalFrontiersGenerationError),
+}
+
+/// Load one retained block and authenticate its independently stored header and
+/// transaction rows against the canonical indexes and preceding block hash.
+fn authenticated_block(
+    db: &ZakuraDb,
+    height: block::Height,
+    expected_parent: block::Hash,
+) -> Result<(Arc<block::Block>, block::Hash), AuthenticatedBlockError> {
+    let block = db
+        .block(height.into())
+        .ok_or(AuthenticatedBlockError::MissingBlock)?;
+    let indexed = db.hash(height).ok_or_else(|| {
+        AuthenticatedBlockError::Generation(FinalFrontiersGenerationError::MissingCanonicalHash {
+            height,
+        })
+    })?;
+    let indexed_height = db.height(indexed);
+    if indexed_height != Some(height) {
+        return Err(AuthenticatedBlockError::Generation(
+            FinalFrontiersGenerationError::CanonicalIndexMismatch {
+                height,
+                hash: indexed,
+                indexed_height,
+            },
+        ));
+    }
+
+    let computed = block::Hash::from(block.header.as_ref());
+    if computed != indexed {
+        return Err(AuthenticatedBlockError::Generation(
+            FinalFrontiersGenerationError::HeaderHashMismatch {
+                height,
+                indexed,
+                computed,
+            },
+        ));
+    }
+    if block.header.previous_block_hash != expected_parent {
+        return Err(AuthenticatedBlockError::Generation(
+            FinalFrontiersGenerationError::BrokenHeaderLink {
+                height,
+                expected_parent,
+                actual_parent: block.header.previous_block_hash,
+            },
+        ));
+    }
+
+    let transaction_hashes: Vec<_> = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.hash())
+        .collect();
+    let computed = transaction_hashes.iter().copied().collect();
+    if computed != block.header.merkle_root {
+        return Err(AuthenticatedBlockError::Generation(
+            FinalFrontiersGenerationError::TransactionMerkleRootMismatch {
+                height,
+                expected: block.header.merkle_root,
+                computed,
+            },
+        ));
+    }
+
+    let mut unique_hashes = HashSet::with_capacity(transaction_hashes.len());
+    for hash in transaction_hashes {
+        if !unique_hashes.insert(hash) {
+            return Err(AuthenticatedBlockError::Generation(
+                FinalFrontiersGenerationError::DuplicateTransaction { height, hash },
+            ));
+        }
+    }
+
+    Ok((block, indexed))
 }
 
 /// Read the four frontiers for `height` and re-check that the tip identity `before` did not
@@ -746,7 +902,7 @@ mod tests {
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
         request::{CheckpointVerifiedBlock, FinalizedBlock, Treestate},
         service::finalized_state::{
-            disk_db::WriteDisk, DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE,
+            disk_db::WriteDisk, DiskWriteBatch, TransactionLocation, STATE_COLUMN_FAMILIES_IN_CODE,
         },
         Config,
     };
@@ -815,16 +971,20 @@ mod tests {
                 .expect("block height has test data")
                 .zcash_deserialize_into()
                 .expect("test data deserializes");
-            let finalized = FinalizedBlock::from_checkpoint_verified(
-                CheckpointVerifiedBlock::from(block),
-                Treestate::default(),
-            );
-            let mut batch = DiskWriteBatch::new();
-            batch
-                .prepare_block_header_and_transaction_data_batch(db, &finalized, true, None)
-                .expect("test block header and transactions are valid");
-            db.write_batch(batch).expect("seeding block body succeeds");
+            seed_block_body(db, block);
         }
+    }
+
+    fn seed_block_body(db: &ZakuraDb, block: Arc<block::Block>) {
+        let finalized = FinalizedBlock::from_checkpoint_verified(
+            CheckpointVerifiedBlock::from(block),
+            Treestate::default(),
+        );
+        let mut batch = DiskWriteBatch::new();
+        batch
+            .prepare_block_header_and_transaction_data_batch(db, &finalized, true, None)
+            .expect("test block header and transactions are valid");
+        db.write_batch(batch).expect("seeding block body succeeds");
     }
 
     fn seed_sprout_tree(db: &ZakuraDb, tree: &sprout::tree::NoteCommitmentTree) {
@@ -1215,6 +1375,7 @@ mod tests {
         let tip = block::Height(3);
         seed_trees(&db, [2, 3]);
         seed_sprout_tree(&db, &sprout::tree::NoteCommitmentTree::default());
+        seed_finalized_tip(&db, height);
         seed_finalized_tip(&db, tip);
 
         assert_eq!(
@@ -1225,6 +1386,53 @@ mod tests {
                 height,
                 tip,
             },
+        );
+    }
+
+    #[test]
+    fn produce_settled_final_frontiers_authenticates_retained_transactions() {
+        let _init_guard = zakura_test::init();
+        let db = ephemeral_mainnet_db();
+        let height = block::Height(395);
+        let tip = block::Height(396);
+        for bytes in [
+            &**zakura_test::vectors::BLOCK_MAINNET_395_BYTES,
+            &**zakura_test::vectors::BLOCK_MAINNET_396_BYTES,
+        ] {
+            let block: Arc<block::Block> = bytes
+                .zcash_deserialize_into()
+                .expect("Mainnet test vector block deserializes");
+            seed_block_body(&db, block);
+        }
+
+        let changed = db
+            .block(tip.into())
+            .expect("seeded block 396 body is retained");
+        let join_split_index = changed
+            .transactions
+            .iter()
+            .position(|transaction| transaction.sprout_note_commitments().next().is_some())
+            .expect("block 396 contains the first Mainnet JoinSplit");
+        let tx_by_loc = db.db().cf_handle("tx_by_loc").unwrap();
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_delete(
+            &tx_by_loc,
+            TransactionLocation::from_usize(tip, join_split_index),
+        );
+        db.write_batch(batch)
+            .expect("deleting the retained JoinSplit row succeeds");
+
+        assert!(
+            matches!(
+                produce_settled_final_frontiers(&db, height),
+                Err(
+                    FinalFrontiersGenerationError::TransactionMerkleRootMismatch {
+                        height: error_height,
+                        ..
+                    }
+                ) if error_height == tip
+            ),
+            "a missing retained JoinSplit must fail header-bound body authentication"
         );
     }
 

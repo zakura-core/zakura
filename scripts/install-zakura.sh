@@ -21,14 +21,14 @@ fi
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNITY_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
-ZAKURA_RELEASE_TAG="v1.0.2-rc1"
+ZAKURA_RELEASE_TAG="v1.0.2"
 ZAKURA_ARCHIVE="zakurad-${ZAKURA_RELEASE_TAG}-linux-x86_64.tar.gz"
 ZAKURA_URL="https://github.com/zakura-core/zakura/releases/download/${ZAKURA_RELEASE_TAG}/${ZAKURA_ARCHIVE}"
 # Replaced with the archive checksum by release-binaries.yml before publishing.
-ZAKURA_ARCHIVE_SHA256="b7ba6d5805879a998cbf0c34776a19441a17c5a077303d8314bd77859405226b"
+ZAKURA_ARCHIVE_SHA256="53b5a958cfc3768dc0af6b24cae67cb08a43b347554c71b7c32caedeba2c3506"
 ZAKURA_MEMBER="./bin/zakurad"
-ZAKURA_DOCKER_IMAGE="zakuracore/zakura:1.0.2-rc1"
-ZAKURA_COMPAT_DOCKER_IMAGE="zakuracore/zakura:zcashd-compat-1.0.2-rc1"
+ZAKURA_DOCKER_IMAGE="zakuracore/zakura:1.0.2"
+ZAKURA_COMPAT_DOCKER_IMAGE="zakuracore/zakura:zcashd-compat-1.0.2"
 ZAKURA_COMPAT_DOCKER_FALLBACK_IMAGE="zakuracore/zakura:zcashd-compat-latest"
 ZAKURA_DEFAULT_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/zakura"
 # Persistent Zakura iroh identity (NodeId secret). Kept outside the state cache so

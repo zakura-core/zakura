@@ -1345,7 +1345,20 @@ where
                         .iter()
                         .any(|item| matches!(item, InventoryHash::Block(_))) =>
                 {
-                    Request::BlocksByHash(block_hashes(items).collect()).into()
+                    let hashes = block_hashes(items).collect();
+
+                    if self.connection_info.is_protected_peer {
+                        let source = self
+                            .connection_info
+                            .connected_addr
+                            .get_transient_addr()
+                            .expect("protected peers have transient inbound addresses")
+                            .into();
+
+                        Request::BlocksByHashFrom { hashes, source }.into()
+                    } else {
+                        Request::BlocksByHash(hashes).into()
+                    }
                 }
                 tx_ids if tx_ids.iter().any(|item| item.unmined_tx_id().is_some()) => {
                     Request::TransactionsById(transaction_ids(items).collect()).into()

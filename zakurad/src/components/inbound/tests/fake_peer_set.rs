@@ -1063,7 +1063,6 @@ async fn caches_getaddr_response() {
         let inbound_service = ServiceBuilder::new().load_shed().service(Inbound::new(
             MAX_INBOUND_CONCURRENCY,
             false,
-            None,
             setup_rx,
         ));
         let inbound_service = BoxService::new(inbound_service);
@@ -1297,7 +1296,6 @@ async fn setup(
     let inbound_service = ServiceBuilder::new().load_shed().service(Inbound::new(
         MAX_INBOUND_CONCURRENCY,
         false,
-        None,
         setup_rx,
     ));
     let inbound_service = BoxService::new(inbound_service);

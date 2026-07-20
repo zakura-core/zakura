@@ -534,7 +534,7 @@ impl HeaderSyncPeerMeters {
 #[derive(Clone, Debug)]
 pub(super) struct OutstandingRange {
     pub(super) wire_request: HeaderSyncWireRequestIdentity,
-    pub(super) range: RangeRequest,
+    pub(super) range_request: RangeRequest,
     pub(super) deadline: Instant,
     pub(super) purpose: RangePurpose,
     pub(super) phase: OutstandingPhase,

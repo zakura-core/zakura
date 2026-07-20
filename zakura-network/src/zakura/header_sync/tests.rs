@@ -3702,7 +3702,7 @@ fn response_before_publication_completion_is_not_reinstalled() {
             session_id: 0,
             request_id,
         },
-        range,
+        range_request: range,
         deadline: Instant::now() + std::time::Duration::from_secs(1),
         purpose: RangePurpose::Sync,
         phase: OutstandingPhase::Publishing,

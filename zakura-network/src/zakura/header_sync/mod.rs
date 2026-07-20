@@ -32,6 +32,7 @@ mod config;
 mod error;
 mod events;
 mod pipe;
+mod range;
 mod reactor;
 mod requester;
 mod service;
@@ -50,9 +51,10 @@ pub use config::{
 pub use error::{HeaderSyncStartError, HeaderSyncWireError};
 pub use events::{
     ExpectedHeadersResponse, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
-    HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncRequestId,
-    HeaderSyncStartup,
+    HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior, HeaderSyncOperationIdentity,
+    HeaderSyncOperationKind, HeaderSyncRequestId, HeaderSyncStartup, HeaderSyncWireRequestIdentity,
 };
+pub use range::{CheckedHeaderRange, HeaderRangePayload};
 pub use reactor::spawn_header_sync_reactor;
 pub use service::HeaderSyncPeerSession;
 pub(crate) use service::{

@@ -21,8 +21,8 @@ use zakura_consensus::{error::TransactionError, router::RouterError, transaction
 use zakura_network::{
     canonical_peer_addr, connect_isolated_tcp_direct_with_inbound,
     types::{InventoryHash, PeerServices},
-    CacheDir, Config as NetworkConfig, InventoryResponse, P2pStack, PeerError, Request, Response,
-    SharedPeerError,
+    CacheDir, Config as NetworkConfig, InventoryResponse, P2pStack, PeerError, PeerSource, Request,
+    Response, SharedPeerError,
 };
 use zakura_node_services::mempool;
 use zakura_rpc::SubmitBlockChannel;
@@ -394,7 +394,31 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         Response::Blocks(vec![Missing(block1.hash())]),
         "inbound maps the unavailable block body to missing inventory"
     );
-    assert!(logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR));
+    assert!(
+        !logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        "an ordinary peer must not log a zcashd-compat pruning error"
+    );
+
+    let unconfigured_peer_response = inbound_service
+        .clone()
+        .oneshot(Request::BlocksByHashFrom {
+            hashes: iter::once(block1.hash()).collect(),
+            source: PeerSource::LegacySocket(
+                "192.0.2.1:8233"
+                    .parse()
+                    .expect("test peer socket address is valid"),
+            ),
+        })
+        .await?;
+    assert_eq!(
+        unconfigured_peer_response,
+        Response::Blocks(vec![Missing(block1.hash())]),
+        "an unconfigured legacy peer still receives missing inventory"
+    );
+    assert!(
+        !logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        "an unconfigured legacy peer must not log a zcashd-compat pruning error"
+    );
 
     let wire_response = connected_peer_service
         .clone()
@@ -413,6 +437,10 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
              actual result: {wire_response:?}"
         )
     }
+    assert!(
+        logs_contain(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
+        "the configured zcashd-compat peer must log the pruning error"
+    );
 
     assert!(
         block_gossip_task_handle.now_or_never().is_none(),
@@ -868,7 +896,11 @@ async fn setup(
 
     let network = Network::Mainnet;
     // Open a listener on an unused IPv4 localhost port
-    let config_listen_addr = "127.0.0.1:0".parse().unwrap();
+    let config_listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let protected_peer_ips = zcashd_compat_pruning_retention
+        .is_some()
+        .then_some(vec![config_listen_addr.ip()])
+        .unwrap_or_default();
 
     // Inbound
     let (setup_tx, setup_rx) = oneshot::channel();
@@ -876,6 +908,7 @@ async fn setup(
         MAX_INBOUND_CONCURRENCY,
         false,
         zcashd_compat_pruning_retention,
+        protected_peer_ips.clone(),
         setup_rx,
     );
     // TODO: add a timeout just above the service, if needed
@@ -906,12 +939,14 @@ async fn setup(
 
         ..NetworkConfig::default()
     };
-    let (mut peer_set, address_book, _) = zakura_network::init(
+    let (mut peer_set, address_book, _, _) = zakura_network::init_with_zakura_header_sync(
         network_config,
         inbound_service.clone(),
         latest_chain_tip.clone(),
         "Zebra user agent".to_string(),
         PeerServices::NODE_NETWORK,
+        protected_peer_ips,
+        None,
     )
     .await;
 
@@ -1106,7 +1141,8 @@ mod submitblock_test {
 
         // Inbound
         let (_setup_tx, setup_rx) = oneshot::channel();
-        let inbound_service = Inbound::new(MAX_INBOUND_CONCURRENCY, false, None, setup_rx);
+        let inbound_service =
+            Inbound::new(MAX_INBOUND_CONCURRENCY, false, None, Vec::new(), setup_rx);
         let inbound_service = ServiceBuilder::new()
             .load_shed()
             .buffer(10)

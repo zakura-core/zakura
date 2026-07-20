@@ -16,8 +16,8 @@ use zakura_chain::{
 };
 use zakura_network::zakura::{
     commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange, HeaderSyncAction,
-    HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, ZakuraEndpoint,
-    ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
+    HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncOperationIdentity,
+    ZakuraEndpoint, ZakuraHeaderSyncDriverStartup, ZakuraTrace, DEFAULT_HS_RANGE,
 };
 
 #[cfg(test)]
@@ -176,6 +176,68 @@ pub(crate) fn block_roots_cover_range(
             .checked_add(offset)
             .is_some_and(|height| roots.height == block::Height(height))
     })
+}
+
+fn header_range_committed(
+    operation: HeaderSyncOperationIdentity,
+    tip_hash: block::Hash,
+) -> HeaderSyncEvent {
+    HeaderSyncEvent::HeaderRangeOperationCompleted {
+        operation,
+        tip_hash,
+    }
+}
+
+fn header_range_commit_failed(
+    operation: HeaderSyncOperationIdentity,
+    kind: HeaderSyncCommitFailureKind,
+) -> HeaderSyncEvent {
+    HeaderSyncEvent::HeaderRangeOperationFailed { operation, kind }
+}
+
+#[cfg(test)]
+mod operation_identity_tests {
+    use super::*;
+    use zakura_network::zakura::{
+        HeaderSyncOperationKind, HeaderSyncRequestId, HeaderSyncWireRequestIdentity, ZakuraPeerId,
+    };
+
+    fn operation() -> HeaderSyncOperationIdentity {
+        HeaderSyncOperationIdentity {
+            wire_request: HeaderSyncWireRequestIdentity {
+                peer: ZakuraPeerId::new(vec![1; 32]).expect("test peer ID is valid"),
+                session_id: 7,
+                request_id: HeaderSyncRequestId::new(9).expect("test request ID is non-zero"),
+            },
+            op_kind: HeaderSyncOperationKind::CommitHeaders,
+        }
+    }
+
+    #[test]
+    fn commit_completion_events_echo_exact_operation_identity() {
+        let operation = operation();
+        let tip_hash = block::Hash([3; 32]);
+        assert!(matches!(
+            header_range_committed(operation.clone(), tip_hash),
+            HeaderSyncEvent::HeaderRangeOperationCompleted {
+                operation: echoed,
+                tip_hash: echoed_hash,
+            } if echoed == operation && echoed_hash == tip_hash
+        ));
+
+        for kind in [
+            HeaderSyncCommitFailureKind::InvalidPeerRange,
+            HeaderSyncCommitFailureKind::Local,
+        ] {
+            assert!(matches!(
+                header_range_commit_failed(operation.clone(), kind),
+                HeaderSyncEvent::HeaderRangeOperationFailed {
+                    operation: echoed,
+                    kind: echoed_kind,
+                } if echoed == operation && echoed_kind == kind
+            ));
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -851,17 +913,20 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 }
             }
             HeaderSyncAction::CommitHeaderRange {
-                peer,
-                session_id,
+                operation,
                 anchor,
-                start_height,
-                headers,
-                body_sizes,
-                tree_aux_roots,
+                payload,
                 finalized: _finalized,
             } => {
-                let count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
-                let tree_aux_roots_len = u32::try_from(tree_aux_roots.len()).unwrap_or(u32::MAX);
+                let peer = operation.wire_request.peer.clone();
+                let range = payload.range();
+                let start_height = range.start();
+                let count = range.count();
+                let tree_aux_roots_len = payload
+                    .tree_aux_roots()
+                    .map_or(0, |roots| u32::try_from(roots.len()).unwrap_or(u32::MAX));
+                let (_range, headers, body_sizes, tree_aux_roots) = payload.into_parts();
+                let tree_aux_roots = tree_aux_roots.unwrap_or_default();
                 emit_commit_state(
                     &trace,
                     cs_trace::COMMIT_START,
@@ -913,11 +978,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             block::Height(start_height.0.saturating_add(count.saturating_sub(1)));
                         let _ = handles
                             .header_sync
-                            .send(HeaderSyncEvent::HeaderRangeCommitted {
-                                start_height,
-                                tip_height,
-                                tip_hash,
-                            })
+                            .send(header_range_committed(operation, tip_hash))
                             .await;
                         trace_header_reactor_event(
                             &trace,
@@ -960,13 +1021,10 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         );
                         let _ = handles
                             .header_sync
-                            .send(HeaderSyncEvent::HeaderRangeCommitFailed {
-                                peer,
-                                session_id,
-                                start_height,
-                                count,
-                                kind: HeaderSyncCommitFailureKind::Local,
-                            })
+                            .send(header_range_commit_failed(
+                                operation,
+                                HeaderSyncCommitFailureKind::Local,
+                            ))
                             .await;
                     }
                     Err(error) => {
@@ -1017,13 +1075,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         );
                         let _ = handles
                             .header_sync
-                            .send(HeaderSyncEvent::HeaderRangeCommitFailed {
-                                peer,
-                                session_id,
-                                start_height,
-                                count,
-                                kind,
-                            })
+                            .send(header_range_commit_failed(operation, kind))
                             .await;
                     }
                 }
@@ -1080,8 +1132,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         );
                         let _ = handles
                             .header_sync
-                            .send(HeaderSyncEvent::HeaderRangeCommitted {
-                                start_height: tip_height,
+                            .send(HeaderSyncEvent::BestHeaderTipLoaded {
                                 tip_height,
                                 tip_hash,
                             })
@@ -1757,15 +1808,16 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
         "header_sync_driver",
         |row| match action {
             HeaderSyncAction::CommitHeaderRange {
-                peer,
-                start_height,
-                headers,
-                ..
+                operation, payload, ..
             } => {
                 insert_cs_str(row, cs_trace::ACTION, "commit_header_range");
-                insert_cs_peer(row, cs_trace::PEER, peer);
-                insert_cs_height(row, cs_trace::RANGE_START, *start_height);
-                insert_cs_u64(row, cs_trace::RANGE_COUNT, headers.len() as u64);
+                insert_cs_peer(row, cs_trace::PEER, &operation.wire_request.peer);
+                insert_cs_height(row, cs_trace::RANGE_START, payload.range().start());
+                insert_cs_u64(
+                    row,
+                    cs_trace::RANGE_COUNT,
+                    u64::from(payload.range().count()),
+                );
             }
             HeaderSyncAction::QueryBestHeaderTip => {
                 insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");

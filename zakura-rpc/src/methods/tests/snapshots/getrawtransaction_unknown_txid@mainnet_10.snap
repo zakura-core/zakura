@@ -6,6 +6,6 @@ snapshot_kind: text
 {
   "Err": {
     "code": -5,
-    "message": "No such mempool or main chain transaction"
+    "message": "Transaction not found in mempool or best chain"
   }
 }

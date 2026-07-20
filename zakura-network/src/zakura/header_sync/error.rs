@@ -48,6 +48,17 @@ pub enum HeaderSyncWireError {
         max: usize,
     },
 
+    /// A locally constructed non-empty range had a zero count or overflowing endpoint.
+    #[error(
+        "Zakura header-sync range starting at {start:?} has invalid or overflowing count {count}"
+    )]
+    InvalidRangeGeometry {
+        /// First requested or delivered height.
+        start: block::Height,
+        /// Number of heights.
+        count: u32,
+    },
+
     /// A locally constructed `Headers` message had a different number of size hints.
     #[error("Zakura header-sync Headers body-size count {body_sizes} does not match header count {headers}")]
     BodySizeCountMismatch {

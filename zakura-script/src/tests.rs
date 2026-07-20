@@ -410,6 +410,23 @@ fn sighash_divergence_v5_p2pkh_malformed_0x50_rejected() {
     );
 }
 
+/// V5 rejects the two non-canonical values that the public bitflags API can
+/// represent without unknown bits.
+#[test]
+fn sighash_divergence_v5_bare_bitflags_rejected() {
+    let _init_guard = zakura_test::init();
+
+    for (canonical_hash_type, raw_hash_type) in [
+        (HashType::ALL, 0x00),
+        (HashType::ALL | HashType::ANYONECANPAY, 0x80),
+    ] {
+        assert!(
+            build_and_verify_v5_p2pkh(canonical_hash_type, raw_hash_type).is_err(),
+            "non-canonical V5 hash type {raw_hash_type:#04x} must be rejected",
+        );
+    }
+}
+
 /// Negative test: V5 P2PKH spend with malformed hash_type 0x84 but signed with
 /// the WRONG canonical type (ALL instead of ALL|ANYONECANPAY).
 ///
@@ -778,6 +795,31 @@ fn sighash_divergence_v4_raw_canonical_matches_typed() {
             typed_bytes, raw_bytes,
             "sighash_v4_raw({raw:#x}) should equal typed sighash for canonical input"
         );
+    }
+}
+
+#[test]
+fn zip244_hash_type_parser_only_accepts_canonical_bytes() {
+    for raw_hash_type in u8::MIN..=u8::MAX {
+        let expected = match raw_hash_type {
+            0x01 => Some(HashType::ALL),
+            0x02 => Some(HashType::NONE),
+            0x03 => Some(HashType::SINGLE),
+            0x81 => Some(HashType::ALL_ANYONECANPAY),
+            0x82 => Some(HashType::NONE_ANYONECANPAY),
+            0x83 => Some(HashType::SINGLE_ANYONECANPAY),
+            _ => None,
+        };
+
+        assert_eq!(
+            super::parse_zip244_hash_type(i32::from(raw_hash_type)),
+            expected,
+            "unexpected parser result for {raw_hash_type:#04x}",
+        );
+    }
+
+    for raw_hash_type in [-1, i32::from(u8::MAX) + 1, i32::MAX] {
+        assert_eq!(super::parse_zip244_hash_type(raw_hash_type), None);
     }
 }
 

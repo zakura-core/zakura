@@ -40,12 +40,15 @@ else
   [ -e "$DEV" ] || { echo "state volume device not found: $DEV" >&2; exit 1; }
   mkdir -p /mnt/snapshots
   mount "$DEV" /mnt/snapshots
-  STATE_CACHE_DIR="/mnt/snapshots/${MODE}"
+  # pre-checkpoint boots the tip/ state of an older baked volume, so the run
+  # syncs through the last checkpoint handoff instead of starting above it.
   case "$MODE" in
-    tip)       STORAGE_MODE=pruned ;;
-    sandblast) STORAGE_MODE=archive ;;
-    *)         echo "unknown snapshot mode: $MODE" >&2; exit 1 ;;
+    tip)            STATE_SUBDIR=tip;       STORAGE_MODE=pruned ;;
+    pre-checkpoint) STATE_SUBDIR=tip;       STORAGE_MODE=pruned ;;
+    sandblast)      STATE_SUBDIR=sandblast; STORAGE_MODE=archive ;;
+    *)              echo "unknown snapshot mode: $MODE" >&2; exit 1 ;;
   esac
+  STATE_CACHE_DIR="/mnt/snapshots/${STATE_SUBDIR}"
   [ -d "$STATE_CACHE_DIR" ] || { echo "no ${MODE}/ state on the volume" >&2; exit 1; }
   df -h /mnt/snapshots
 fi
@@ -127,6 +130,33 @@ note "Incremental build took $(( $(date +%s) - BUILD_START ))s (warm baked cache
 
 python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
 python3 deploy/deployer/deploy.py status --config /root/fleet.toml || true
+
+# pre-checkpoint is only useful when the state actually starts below the tree's
+# max checkpoint; surface the crossing status so a run that starts above it is
+# never mistaken for a handoff test.
+if [ "$MODE" = "pre-checkpoint" ]; then
+  case "$NETWORK" in
+    mainnet) CKPT_FILE=zakura-chain/src/parameters/checkpoint/main-checkpoints.txt ;;
+    testnet) CKPT_FILE=zakura-chain/src/parameters/checkpoint/test-checkpoints.txt ;;
+  esac
+  MAX_CKPT=$(tail -1 "$CKPT_FILE" | cut -d' ' -f1)
+  START_HEIGHT=""
+  for _ in $(seq 1 30); do
+    START_HEIGHT=$(curl -s -m 5 -H 'Content-Type: application/json' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}' \
+      http://127.0.0.1:8232 | \
+      python3 -c 'import json, sys; print(json.load(sys.stdin)["result"]["blocks"])' \
+      2>/dev/null) && [ -n "$START_HEIGHT" ] && break
+    sleep 2
+  done
+  if [ -z "$START_HEIGHT" ]; then
+    note "pre-checkpoint: could not read the start height over RPC; crossing status unknown."
+  elif [ "$START_HEIGHT" -lt "$MAX_CKPT" ]; then
+    note "pre-checkpoint: start height ${START_HEIGHT} is $((MAX_CKPT - START_HEIGHT)) blocks below max checkpoint ${MAX_CKPT} — this run crosses the checkpoint handoff."
+  else
+    note "**WARNING: no handoff crossing** — start height ${START_HEIGHT} is already at or above max checkpoint ${MAX_CKPT}. The tree's checkpoints predate the retained snapshots; re-run against a branch with newer checkpoints (e.g. a release-state bundle PR)."
+  fi
+fi
 
 # ---------------------------------------------------------------------------- #
 # Monitor for the requested duration, then package outputs

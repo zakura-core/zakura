@@ -21,9 +21,9 @@ on:
         description: "Branch, tag, or SHA to test (exactly one of pr_number / ref)"
         required: false
       snapshot_mode:
-        description: "Chain state to start from"
+        description: "Chain state to start from (pre-checkpoint: oldest retained tip snapshot, to sync through the last checkpoint handoff)"
         type: choice
-        options: [tip, sandblast, genesis]
+        options: [tip, pre-checkpoint, sandblast, genesis]
         default: tip
       network:
         description: "Network (sandblast is mainnet-only)"
@@ -139,12 +139,22 @@ jobs:
             echo "vol_snap_id=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          SNAP=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
-            awk -v pre="zakura-pr-state-${NETWORK}-" 'index($2, pre) == 1 {print $2, $1}' | \
-            sort | tail -1 | awk '{print $2}')
-          if [ -z "${SNAP}" ]; then
+          SNAPS=$(doctl compute snapshot list --resource volume --format ID,Name --no-header | \
+            awk -v pre="zakura-pr-state-${NETWORK}-" 'index($2, pre) == 1 {print $2, $1}' | sort)
+          if [ -z "${SNAPS}" ]; then
             echo "no zakura-pr-state-${NETWORK}-* volume snapshot found; run the bake workflow first" >&2
             exit 1
+          fi
+          if [ "${MODE}" = "pre-checkpoint" ]; then
+            # The oldest retained bake snapshot sits below any checkpoint advanced
+            # since it was taken, so the run syncs through the checkpoint handoff.
+            if [ "$(echo "${SNAPS}" | wc -l)" -lt 2 ]; then
+              echo "pre-checkpoint needs at least two retained snapshots; only one exists (bake again later)" >&2
+              exit 1
+            fi
+            SNAP=$(echo "${SNAPS}" | head -1 | awk '{print $2}')
+          else
+            SNAP=$(echo "${SNAPS}" | tail -1 | awk '{print $2}')
           fi
           echo "vol_snap_id=${SNAP}" >> "$GITHUB_OUTPUT"
 

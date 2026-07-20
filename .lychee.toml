@@ -21,6 +21,12 @@ exclude = [
     # Template placeholder URLs (0000)
     "^https://github.com/.*/issues/0000",
     "^https://github.com/.*/pull/0000",
+    # This repository's own PR/issue links (changelogs carry hundreds). They are
+    # machine-generated against merged PRs, which never disappear, so the only
+    # way they fail is GitHub itself erroring (502s during incidents) — a
+    # recurring source of docs-check flakes with zero real signal.
+    "^https://github.com/zakura-core/zakura/pull/[0-9]+",
+    "^https://github.com/zakura-core/zakura/issues/[0-9]+",
     # Mergify dashboard (requires auth)
     "^https://dashboard.mergify.com/",
     # IACR eprint server returns 403 to automated link checkers

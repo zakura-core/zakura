@@ -917,7 +917,7 @@ Expected: ends with `L0 PASS (zakura-chain)` (first clippy build is slow; later 
 }
 ```
 
-Note: raw `doctl … delete` is denied on purpose — deletion goes through `droplet.sh destroy`, which enforces the tag+prefix guard. Verify the file is ignored: `git check-ignore .claude/settings.local.json` prints the path (if it does not, add it to `.git/info/exclude`, not the repo `.gitignore`).
+Note: raw `doctl … delete` is denied on purpose — deletion goes through `droplet.sh destroy`, which enforces the tag+prefix guard. Permission-semantics facts (verified against Claude Code docs, 2026-07-21): deny always beats allow; compound-command segments are checked independently (a `cd x && …` prefix cannot bypass a deny); rules match only the top-level Bash command, never subprocesses — so the deny stops directly-typed deletes while `droplet.sh`'s internal `doctl` calls rely on the script's own reviewed guards, which is the intended trust model. PLACEMENT: the file must live at the MAIN checkout root (`/Users/czar/Documents/zakura/.claude/settings.local.json`) — Claude Code resolves worktree sessions to that single shared file, so a copy inside a worktree's own `.claude/` is inert. Merge with any existing entries rather than overwriting. Verify it is ignored: `git check-ignore` on it prints the path.
 
 - [ ] **Step 4: Capture the Mac mock-blocksync baseline** (spec Phase 0 item; criterion needs no standing baseline — L1 compares base-vs-head per experiment via critcmp)
 

@@ -282,12 +282,15 @@ mod tests {
     ) -> (
         impl Service<Request, Response = Response, Error = BoxError, Future: Send> + Clone,
         mpsc::Receiver<usize>,
+        mpsc::Receiver<HashSet<UnminedTxId>>,
     ) {
         let pending_batches = Arc::new(Mutex::new(VecDeque::from(pending_batches)));
         let (limit_sender, limit_receiver) = mpsc::channel(16);
+        let (requeue_sender, requeue_receiver) = mpsc::channel(16);
         let service = service_fn(move |request| {
             let pending_batches = pending_batches.clone();
             let limit_sender = limit_sender.clone();
+            let requeue_sender = requeue_sender.clone();
 
             async move {
                 match request {
@@ -310,10 +313,14 @@ mod tests {
                         Ok(Response::PendingGossipTransactionIds(tx_ids))
                     }
                     Request::RequeuePendingGossipTransactionIds(tx_ids) => {
-                        let mut pending_batches = pending_batches
+                        pending_batches
                             .lock()
-                            .expect("pending batch mutex should not be poisoned");
-                        pending_batches.push_front(tx_ids);
+                            .expect("pending batch mutex should not be poisoned")
+                            .push_front(tx_ids.clone());
+                        requeue_sender
+                            .send(tx_ids)
+                            .await
+                            .expect("requeue receiver should be open");
 
                         Ok(Response::RequeuedPendingGossipTransactionIds)
                     }
@@ -324,7 +331,7 @@ mod tests {
             }
         });
 
-        (service, limit_receiver)
+        (service, limit_receiver, requeue_receiver)
     }
 
     fn peer_set_service() -> (
@@ -371,7 +378,8 @@ mod tests {
         let _init_guard = zakura_test::init();
 
         let pending_tx_ids = test_tx_ids(2, 1);
-        let (mempool, mut limit_receiver) = mempool_service(vec![pending_tx_ids.clone()]);
+        let (mempool, mut limit_receiver, _requeue_receiver) =
+            mempool_service(vec![pending_tx_ids.clone()]);
         let (peer_set, mut advertised_receiver) = peer_set_service();
         let (sender, receiver) = broadcast::channel(MEMPOOL_CHANGE_CHANNEL_CAPACITY);
 
@@ -405,7 +413,8 @@ mod tests {
 
         let pending_tx_ids = test_tx_ids(2, 1);
         let dropped_tx_ids = test_tx_ids(2, 2);
-        let (mempool, mut limit_receiver) = mempool_service(vec![pending_tx_ids.clone()]);
+        let (mempool, mut limit_receiver, _requeue_receiver) =
+            mempool_service(vec![pending_tx_ids.clone()]);
         let (peer_set, mut advertised_receiver) = peer_set_service();
         let (sender, receiver) = broadcast::channel(1);
 
@@ -454,7 +463,7 @@ mod tests {
 
         let first_batch = test_tx_ids(MAX_TX_INV_IN_SENT_MESSAGE_USIZE, 1);
         let second_batch = test_tx_ids(2, 2);
-        let (mempool, mut limit_receiver) =
+        let (mempool, mut limit_receiver, _requeue_receiver) =
             mempool_service(vec![first_batch.clone(), second_batch.clone()]);
         let (peer_set, mut advertised_receiver) = peer_set_service();
         let (sender, receiver) = broadcast::channel(1);
@@ -512,52 +521,91 @@ mod tests {
         gossip_task.abort();
     }
 
-    #[tokio::test]
-    async fn failed_broadcast_keeps_transaction_ids_pending_for_retry() {
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_broadcast_is_requeued_and_retried_without_another_wakeup() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let _init_guard = zakura_test::init();
 
         let pending_tx_ids = test_tx_ids(2, 1);
-        let (mut mempool, _limit_receiver) = mempool_service(vec![pending_tx_ids.clone()]);
+        let (mempool, mut limit_receiver, mut requeue_receiver) =
+            mempool_service(vec![pending_tx_ids.clone()]);
+        let mut mempool_query = mempool.clone();
         let attempts = Arc::new(AtomicUsize::new(0));
+        let (advertised_sender, mut advertised_receiver) = mpsc::channel(2);
         let peer_set = service_fn({
             let attempts = Arc::clone(&attempts);
-            move |_request| {
+            move |request| {
                 let attempts = Arc::clone(&attempts);
+                let advertised_sender = advertised_sender.clone();
                 async move {
+                    advertised_sender
+                        .send(request)
+                        .await
+                        .expect("advertisement receiver should be open");
+
                     if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        Err(std::io::Error::other("transient peer-set failure").into())
+                        std::future::pending().await
                     } else {
                         Ok(zn::Response::Nil)
                     }
                 }
             }
         });
-        let mut peer_set = Timeout::new(peer_set, Duration::from_secs(1));
-        let pending_count: u64 = pending_tx_ids
-            .len()
-            .try_into()
-            .expect("test transaction count fits in u64");
+        let (sender, receiver) = broadcast::channel(MEMPOOL_CHANGE_CHANNEL_CAPACITY);
+        sender
+            .send(MempoolChange::added(test_tx_ids(1, 2)))
+            .expect("receiver should be subscribed");
 
-        let (attempted_count, should_retry) =
-            advertise_pending_mempool_transaction_ids(&mut mempool, &mut peer_set, 1)
-                .await
-                .expect("failed advertisements should remain retryable");
-        assert_eq!(attempted_count, pending_count);
-        assert!(should_retry, "failed advertisements should be retried");
+        let gossip_task = tokio::spawn(run_mempool_transaction_id_gossip(
+            receiver, peer_set, mempool,
+        ));
 
-        let (advertised_count, should_retry) =
-            advertise_pending_mempool_transaction_ids(&mut mempool, &mut peer_set, 0)
+        assert_eq!(
+            limit_receiver
+                .recv()
                 .await
-                .expect("the retry should succeed");
-        assert_eq!(advertised_count, pending_count);
-        assert!(
-            !should_retry,
-            "a successful partial batch should wait for another wakeup"
+                .expect("first attempt should take pending txids"),
+            MAX_TX_INV_IN_SENT_MESSAGE_USIZE
+        );
+        assert_eq!(
+            expect_advertised_transaction_ids(&mut advertised_receiver).await,
+            pending_tx_ids,
+            "first attempt should advertise the pending transaction IDs",
         );
 
-        let response = mempool
+        tokio::time::advance(TIPS_RESPONSE_TIMEOUT).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            requeue_receiver
+                .recv()
+                .await
+                .expect("timed out advertisement should be requeued"),
+            pending_tx_ids,
+        );
+        assert!(
+            limit_receiver.try_recv().is_err(),
+            "retry should wait for the peer gossip delay",
+        );
+
+        tokio::time::advance(PEER_GOSSIP_DELAY).await;
+
+        assert_eq!(
+            limit_receiver
+                .recv()
+                .await
+                .expect("retry should take requeued txids without another wakeup"),
+            MAX_TX_INV_IN_SENT_MESSAGE_USIZE
+        );
+        assert_eq!(
+            expect_advertised_transaction_ids(&mut advertised_receiver).await,
+            pending_tx_ids,
+            "retry should advertise the same transaction IDs",
+        );
+
+        tokio::task::yield_now().await;
+        let response = mempool_query
             .ready()
             .await
             .expect("mempool should be ready")
@@ -571,15 +619,22 @@ mod tests {
         };
         assert!(
             remaining_tx_ids.is_empty(),
-            "successfully advertised transaction IDs should be acknowledged"
+            "successfully advertised transaction IDs should not remain pending"
         );
+        assert!(
+            !gossip_task.is_finished(),
+            "gossip task should remain alive after a successful retry"
+        );
+
+        gossip_task.abort();
     }
 
     #[tokio::test]
     async fn empty_pending_mempool_gossip_wakeup_does_not_advertise() {
         let _init_guard = zakura_test::init();
 
-        let (mempool, mut limit_receiver) = mempool_service(vec![HashSet::new()]);
+        let (mempool, mut limit_receiver, _requeue_receiver) =
+            mempool_service(vec![HashSet::new()]);
         let (peer_set, mut advertised_receiver) = peer_set_service();
         let (sender, receiver) = broadcast::channel(MEMPOOL_CHANGE_CHANNEL_CAPACITY);
 

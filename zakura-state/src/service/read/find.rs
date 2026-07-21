@@ -128,7 +128,7 @@ where
                 }
             }
 
-            Err("Zebra is committing too many blocks to the state, \
+            Err("Zakura is committing too many blocks to the state, \
                     wait until it syncs to the chain tip"
                 .into())
         }
@@ -683,7 +683,7 @@ fn best_relevant_chain(
     db: &ZakuraDb,
 ) -> Result<Vec<Arc<Block>>, BoxError> {
     let state_tip_before_queries = read::best_tip(non_finalized_state, db).ok_or_else(|| {
-        BoxError::from("Zebra's state is empty, wait until it syncs to the chain tip")
+        BoxError::from("Zakura's state is empty, wait until it syncs to the chain tip")
     })?;
 
     let best_relevant_chain =
@@ -701,7 +701,7 @@ fn best_relevant_chain(
         read::best_tip(non_finalized_state, db).expect("already checked for an empty tip");
 
     if state_tip_before_queries != state_tip_after_queries {
-        return Err("Zebra is committing too many blocks to the state, \
+        return Err("Zakura is committing too many blocks to the state, \
                     wait until it syncs to the chain tip"
             .into());
     }

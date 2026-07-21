@@ -100,7 +100,7 @@ pub enum RollbackFinalizedStateError {
     /// The on-disk state database format does not match the running code.
     #[error(
         "state database format mismatch: on disk {on_disk:?}, running code {in_code}; \
-         use a Zebra binary with the same state format"
+         use a Zakura binary with the same state format"
     )]
     FormatMismatch {
         /// Version read from disk.

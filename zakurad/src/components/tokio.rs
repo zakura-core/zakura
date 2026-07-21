@@ -135,10 +135,10 @@ fn finish_runtime(runtime: Runtime, result: Result<(), Report>) {
 
     match result {
         Ok(()) => {
-            info!("shutting down Zebra");
+            info!("shutting down Zakura");
         }
         Err(error) => {
-            warn!(?error, "shutting down Zebra due to an error");
+            warn!(?error, "shutting down Zakura due to an error");
             APPLICATION.shutdown(Shutdown::Forced);
         }
     }

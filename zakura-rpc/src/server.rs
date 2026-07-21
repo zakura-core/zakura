@@ -132,7 +132,7 @@ impl RpcServer {
         let http_middleware_layer = if conf.enable_cookie_auth {
             let cookie = Cookie::default();
             cookie::write_to_disk(&cookie, &conf.cookie_dir, Some(&conf.cookie_file_name))
-                .expect("Zebra must be able to write the auth cookie to the disk");
+                .expect("Zakura must be able to write the auth cookie to the disk");
             HttpRequestMiddlewareLayer::new(Some(cookie), max_request_body_size)
         } else {
             HttpRequestMiddlewareLayer::new(None, max_request_body_size)

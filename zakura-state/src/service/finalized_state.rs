@@ -1501,7 +1501,7 @@ impl FinalizedState {
     ///
     /// TODO: move the stop height check to the syncer (#3442)
     fn exit_process() -> ! {
-        tracing::info!("exiting Zebra");
+        tracing::info!("exiting Zakura");
 
         // Some OSes require a flush to send all output to the terminal.
         // Zebra's logging doesn't depend on `tokio`, so we flush the stdlib sync streams.

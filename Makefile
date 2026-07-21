@@ -37,7 +37,7 @@ help:
 	@echo "  compat-zakurad-start-supervised   Start zakurad with zcashd supervision enabled"
 	@echo "  compat-zakurad-start-unsupervised Start zakurad with zcashd supervision disabled"
 	@echo "  compat-zcashd-start-standalone   Start zcashd -zebra-compat as a standalone process"
-	@echo "  compat-zakurad-status             Check zakurad liveness and Zebra RPC health"
+	@echo "  compat-zakurad-status             Check zakurad liveness and Zakura RPC health"
 	@echo "  compat-zcashd-status             Check zcashd liveness and zebra-compat RPC health"
 	@echo "  compat-status-sync               Run both status checks and enforce max drift"
 	@echo "  compat-test-regtest              Run full zcashd-compat test suite (regtest, spawns processes)"

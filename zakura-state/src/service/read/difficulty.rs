@@ -38,7 +38,7 @@ use crate::{
 pub const EXTRA_TIME_TO_MINE_A_BLOCK: u32 = POST_BLOSSOM_POW_TARGET_SPACING * 2;
 
 fn finalized_state_query_interrupted_error() -> BoxError {
-    "Zebra is committing too many blocks to the state, \
+    "Zakura is committing too many blocks to the state, \
      wait until it syncs to the chain tip"
         .into()
 }
@@ -161,7 +161,7 @@ fn best_relevant_chain_and_history_tree(
     db: &ZakuraDb,
 ) -> Result<(Height, block::Hash, Vec<Arc<Block>>, Arc<HistoryTree>), BoxError> {
     let state_tip_before_queries = read::best_tip(non_finalized_state, db).ok_or_else(|| {
-        BoxError::from("Zebra's state is empty, wait until it syncs to the chain tip")
+        BoxError::from("Zakura's state is empty, wait until it syncs to the chain tip")
     })?;
 
     let best_relevant_chain =

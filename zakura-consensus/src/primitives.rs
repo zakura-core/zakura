@@ -28,7 +28,7 @@ pub async fn spawn_fifo_and_convert<
     spawn_fifo(f)
         .await
         .map_err(|_| {
-            "threadpool unexpectedly dropped response channel sender. Is Zebra shutting down?"
+            "threadpool unexpectedly dropped response channel sender. Is Zakura shutting down?"
         })?
         .map_err(BoxError::from)
 }

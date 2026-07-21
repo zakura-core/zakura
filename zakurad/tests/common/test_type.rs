@@ -190,7 +190,7 @@ impl TestType {
             Err(_) => {
                 eprintln!(
                     "skipped {test_name:?} {self:?} lightwalletd test, \
-                     could not load Zebra configuration",
+                     could not load Zakura configuration",
                 );
                 return None;
             }
@@ -369,12 +369,12 @@ impl TestType {
 
         if self.needs_zakura_cached_state() {
             // Fail if we need a cached Zebra state, but it's empty
-            zakurad_failure_messages.push("loaded Zebra state cache .*tip.*=.*None".to_string());
+            zakurad_failure_messages.push("loaded Zakura state cache .*tip.*=.*None".to_string());
         }
         if matches!(*self, LaunchWithEmptyState { .. }) {
             // Fail if we need an empty Zebra state, but it has blocks
             zakurad_failure_messages
-                .push(r"loaded Zebra state cache .*tip.*=.*Height\([1-9][0-9]*\)".to_string());
+                .push(r"loaded Zakura state cache .*tip.*=.*Height\([1-9][0-9]*\)".to_string());
         }
 
         let zakurad_ignore_messages = Vec::new();

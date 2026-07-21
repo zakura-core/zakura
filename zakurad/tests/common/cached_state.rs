@@ -235,7 +235,7 @@ pub async fn raw_future_blocks(
 
     assert!(
         test_type.needs_zakura_cached_state() && test_type.needs_zakura_rpc_server(),
-        "raw_future_blocks needs zebra cached state and rpc server"
+        "raw_future_blocks needs Zakura cached state and rpc server"
     );
 
     let should_sync = true;

@@ -447,7 +447,7 @@ fn sighash_divergence_v5_p2pkh_malformed_0x84_wrong_canonical_type_rejected() {
     assert!(
         result.is_err(),
         "Malformed hash_type 0x84 signed with wrong canonical type should be rejected \
-         by both Zebra and zcashd (sighash mismatch)"
+         by both Zakura and zcashd (sighash mismatch)"
     );
 }
 
@@ -1733,12 +1733,12 @@ fn poc_p2sh_1001_accurate_multisigs_should_stay_below_block_sigop_limit() -> Res
 
     assert_eq!(
         zebra_count, zcashd_accurate_count,
-        "Zebra should count each accurate 1-of-1 P2SH multisig spend as 1 sigop, not 20"
+        "Zakura should count each accurate 1-of-1 P2SH multisig spend as 1 sigop, not 20"
     );
 
     assert!(
         zebra_count <= 20_000,
-        "A zcashd-valid block-level sigop total should not cross Zebra's MAX_BLOCK_SIGOPS"
+        "A zcashd-valid block-level sigop total should not cross Zakura's MAX_BLOCK_SIGOPS"
     );
 
     Ok(())

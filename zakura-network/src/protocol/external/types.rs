@@ -40,7 +40,7 @@ impl Version {
         // shut down if our own version is too old
         assert!(
             constants::CURRENT_NETWORK_PROTOCOL_VERSION >= min_spec,
-            "Zebra does not implement the minimum specified {:?} protocol version for {:?} at {:?}",
+            "Zakura does not implement the minimum specified {:?} protocol version for {:?} at {:?}",
             NetworkUpgrade::current(network, height),
             network,
             height,

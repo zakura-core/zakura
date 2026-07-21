@@ -421,7 +421,7 @@ impl WriteBlockWorkerTask {
             // TODO: split these checks into separate functions
 
             if invalid_block_reset_sender.is_closed() {
-                info!("StateService closed the block reset channel. Is Zebra shutting down?");
+                info!("StateService closed the block reset channel. Is Zakura shutting down?");
                 return;
             }
 
@@ -556,7 +556,7 @@ impl WriteBlockWorkerTask {
 
                     if send_result.is_err() {
                         info!(
-                            "StateService closed the block reset channel. Is Zebra shutting down?"
+                            "StateService closed the block reset channel. Is Zakura shutting down?"
                         );
                         return;
                     }
@@ -567,7 +567,7 @@ impl WriteBlockWorkerTask {
         // Do this check even if the channel got closed before any finalized blocks were sent.
         // This can happen if we're past the finalized tip.
         if invalid_block_reset_sender.is_closed() {
-            info!("StateService closed the block reset channel. Is Zebra shutting down?");
+            info!("StateService closed the block reset channel. Is Zakura shutting down?");
             return;
         }
 

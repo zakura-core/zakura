@@ -732,7 +732,7 @@ where
             // This is probably a bad checkpoint list, a zebra bug, or a bad
             // chain (in a testing mode like regtest).
             assert_eq!(expected_hash, checkpoint_hash,
-                           "checkpoints in the range should match: bad checkpoint list, zebra bug, or bad chain"
+                           "checkpoints in the range should match: bad checkpoint list, Zakura bug, or bad chain"
                 );
         }
 
@@ -883,7 +883,7 @@ where
         // See the detailed checkpoint comparison comment above.
         assert_eq!(
             expected_hash, previous_checkpoint_hash,
-            "the previous checkpoint should match: bad checkpoint list, zebra bug, or bad chain"
+            "the previous checkpoint should match: bad checkpoint list, Zakura bug, or bad chain"
         );
 
         let block_count = rev_valid_blocks.len();
@@ -1008,7 +1008,7 @@ pub enum VerifyCheckpointError {
         expected: block::Hash,
         found: block::Hash,
     },
-    #[error("zebra is shutting down")]
+    #[error("Zakura is shutting down")]
     ShuttingDown,
 }
 

@@ -566,7 +566,7 @@ fn empty_v5_librustzcash_round_trip() {
     let nu = tx.network_upgrade().expect("network upgrade");
 
     tx.to_librustzcash(nu).expect(
-        "librustzcash deserialization might work for empty zebra serialized transactions. \
+        "librustzcash deserialization might work for empty Zakura serialized transactions. \
         Hint: if empty transactions fail, but other transactions work, delete this test",
     );
 }
@@ -664,9 +664,9 @@ fn fake_v5_librustzcash_round_trip_for_network(network: Network) {
 
             let nu = fake_tx.network_upgrade().expect("network upgrade");
 
-            fake_tx
-                .to_librustzcash(nu)
-                .expect("librustzcash deserialization must work for zebra serialized transactions");
+            fake_tx.to_librustzcash(nu).expect(
+                "librustzcash deserialization must work for Zakura serialized transactions",
+            );
         }
     }
 }
@@ -684,7 +684,7 @@ fn zip244_round_trip() -> Result<()> {
         let nu = tx.network_upgrade().expect("network upgrade");
 
         tx.to_librustzcash(nu)
-            .expect("librustzcash deserialization must work for zebra serialized transactions");
+            .expect("librustzcash deserialization must work for Zakura serialized transactions");
     }
 
     Ok(())

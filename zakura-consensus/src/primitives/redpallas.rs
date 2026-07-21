@@ -208,7 +208,7 @@ impl Service<BatchControl<Item>> for Verifier {
                             // We use a new channel for each batch,
                             // so we always get the correct batch result here.
                             let result = rx.borrow()
-                                .ok_or("threadpool unexpectedly dropped response channel sender. Is Zebra shutting down?")?;
+                                .ok_or("threadpool unexpectedly dropped response channel sender. Is Zakura shutting down?")?;
 
                             if result.is_ok() {
                                 tracing::trace!(?result, "validated redpallas signature");

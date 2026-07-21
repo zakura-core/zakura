@@ -149,7 +149,7 @@ impl Handler {
         // TODO: can this be avoided?
         let tmp_state = std::mem::replace(self, Handler::Finished(Ok(Response::Nil)));
 
-        debug!(handler = %tmp_state, %msg, "received peer response to Zebra request");
+        debug!(handler = %tmp_state, %msg, "received peer response to Zakura request");
 
         *self = match (tmp_state, msg) {
             (
@@ -804,7 +804,7 @@ where
                     } = tmp_state
                     {
                         if let Ok(response) = response.as_ref() {
-                            debug!(%response, "finished receiving peer response to Zebra request");
+                            debug!(%response, "finished receiving peer response to Zakura request");
                             // Add a metric for inbound responses to outbound requests.
                             metrics::counter!(
                                 "zakura.net.in.responses",
@@ -813,7 +813,7 @@ where
                             )
                             .increment(1);
                         } else {
-                            debug!(error = ?response, "error in peer response to Zebra request");
+                            debug!(error = ?response, "error in peer response to Zakura request");
                         }
 
                         let _ = tx.send(response.map_err(Into::into));
@@ -1001,7 +1001,7 @@ where
             return;
         }
 
-        debug!(state = %self.state, %request, "sending request from Zebra to peer");
+        debug!(state = %self.state, %request, "sending request from Zakura to peer");
 
         // Add a metric for outbound requests.
         metrics::counter!(
@@ -1598,7 +1598,7 @@ where
             }
         }
 
-        debug!(state = %self.state, %req, %rsp, "sent Zebra response to peer");
+        debug!(state = %self.state, %req, %rsp, "sent Zakura response to peer");
 
         // Give the inbound service time to clear its queue,
         // before checking the connection for the next inbound or outbound request.

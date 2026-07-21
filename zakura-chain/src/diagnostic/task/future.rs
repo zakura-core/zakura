@@ -54,7 +54,7 @@ impl CheckForPanics for JoinError {
                 } else if is_shutting_down() {
                     debug!(
                         ?task_cancelled,
-                        "ignoring task termination because Zebra is shutting down"
+                        "ignoring task termination because Zakura is shutting down"
                     );
 
                     task_cancelled

@@ -453,7 +453,7 @@ impl Service<BatchControl<Item>> for Verifier {
                             let is_valid = *rx
                                 .borrow()
                                 .as_ref()
-                                .ok_or("threadpool unexpectedly dropped response channel sender. Is Zebra shutting down?")?;
+                                .ok_or("threadpool unexpectedly dropped response channel sender. Is Zakura shutting down?")?;
 
                             if is_valid {
                                 tracing::trace!(?is_valid, "verified halo2 proof");

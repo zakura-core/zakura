@@ -2269,7 +2269,7 @@ where
         #[cfg(not(target_os = "windows"))]
         if self.network.is_regtest() {
             match nix::sys::signal::raise(nix::sys::signal::SIGINT) {
-                Ok(_) => Ok("Zebra server stopping".to_string()),
+                Ok(_) => Ok("Zakura server stopping".to_string()),
                 Err(error) => Err(ErrorObject::owned(
                     ErrorCode::InternalError.code(),
                     format!("Failed to shut down: {error}").as_str(),

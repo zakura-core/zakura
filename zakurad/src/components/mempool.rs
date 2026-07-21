@@ -1,4 +1,4 @@
-//! Zebra mempool.
+//! Zakura mempool.
 //!
 //! A zakurad application component that manages the active collection, reception,
 //! gossip, verification, in-memory storage, eviction, and rejection of unmined Zcash
@@ -136,7 +136,7 @@ fn transaction_misbehavior(
 /// Indicates whether it is enabled or disabled and, if enabled, contains
 /// the necessary data to run it.
 //
-// Zebra only has one mempool, so the enum variant size difference doesn't matter.
+// Zakura only has one mempool, so the enum variant size difference doesn't matter.
 #[allow(clippy::large_enum_variant)]
 #[derive(Default)]
 enum ActiveState {
@@ -399,7 +399,7 @@ impl Mempool {
         is_debug_enabled
     }
 
-    /// Returns `true` if Zebra is caught up enough to start the mempool.
+    /// Returns `true` if Zakura is caught up enough to start the mempool.
     ///
     /// During Zakura sync, [`SyncStatus`] is updated from state's effective
     /// best-header frontier. That frontier uses the verified block tip when it
@@ -415,7 +415,10 @@ impl Mempool {
     fn enable_at_tip(&mut self, tip_action: &TipAction) {
         let (last_seen_tip_hash, tip_height) = tip_action.best_tip_hash_and_height();
 
-        info!(?tip_height, "activating mempool: Zebra is close to the tip");
+        info!(
+            ?tip_height,
+            "activating mempool: Zakura is close to the tip"
+        );
 
         let tx_downloads = Box::pin(TxDownloads::new(
             Timeout::new(self.outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
@@ -443,16 +446,17 @@ impl Mempool {
         let is_caught_up_to_start = self.is_caught_up_to_start();
 
         // TODO: revisit these state transitions after header sync can prove
-        // whether Zebra is behind the network tip.
+        // whether Zakura is behind the network tip.
         match (is_caught_up_to_start, self.is_enabled(), tip_action) {
             // the active state is up to date, or there is no tip action to activate the mempool
             (false, false, _) | (true, true, _) | (true, false, None) => return false,
 
-            // Enable state - there should be a chain tip when Zebra is close to the network tip
+            // Enable state - there should be a chain tip when Zakura is close
+            // to the network tip.
             (true, false, Some(tip_action)) => self.enable_at_tip(tip_action),
 
             // TODO: only disable an already-active mempool when a validated
-            // Zakura header/block-sync frontier proves Zebra is behind a
+            // Zakura header/block-sync frontier proves Zakura is behind a
             // higher-work chain that follows this node's consensus rules.
             //
             // The legacy sync status can be triggered by lower-work forks,

@@ -1095,7 +1095,7 @@ impl DiskDb {
 
         match db_result {
             Ok(db) => {
-                info!("Opened Zebra state cache at {}", path.display());
+                info!("Opened Zakura state cache at {}", path.display());
 
                 let db = DiskDb {
                     db_kind: db_kind.to_string(),
@@ -1118,7 +1118,7 @@ impl DiskDb {
 
             Err(e) => panic!(
                 "Opening database {path:?} failed. \
-                        Hint: Try changing the state cache_dir in the Zebra config. \
+                        Hint: Try changing the state cache_dir in the Zakura config. \
                         Error: {e}",
             ),
         }
@@ -1433,7 +1433,7 @@ impl DiskDb {
                     min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
                     ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
                     "unable to increase the open file limit, \
-                     assuming Zebra can open a minimum number of files"
+                     assuming Zakura can open a minimum number of files"
                 );
 
                 return DiskDb::MIN_OPEN_FILE_LIMIT;
@@ -1444,9 +1444,9 @@ impl DiskDb {
             panic!(
                 "open file limit too low: \
                  unable to set the number of open files to {}, \
-                 the minimum number of files required by Zebra. \
+                 the minimum number of files required by Zakura. \
                  Current limit is {:?}. \
-                 Hint: Increase the open file limit to {} before launching Zebra",
+                 Hint: Increase the open file limit to {} before launching Zakura",
                 DiskDb::MIN_OPEN_FILE_LIMIT,
                 current_limit,
                 DiskDb::IDEAL_OPEN_FILE_LIMIT
@@ -1456,8 +1456,8 @@ impl DiskDb {
                 ?current_limit,
                 min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
                 ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
-                "the maximum number of open files is below Zebra's ideal limit. \
-                 Hint: Increase the open file limit to {} before launching Zebra",
+                "the maximum number of open files is below Zakura's ideal limit. \
+                 Hint: Increase the open file limit to {} before launching Zakura",
                 DiskDb::IDEAL_OPEN_FILE_LIMIT
             );
         } else if cfg!(windows) {
@@ -1466,13 +1466,13 @@ impl DiskDb {
             info!(
                 min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
                 ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
-                "assuming the open file limit is high enough for Zebra",
+                "assuming the open file limit is high enough for Zakura",
             );
             #[cfg(test)]
             debug!(
                 min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
                 ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
-                "assuming the open file limit is high enough for Zebra",
+                "assuming the open file limit is high enough for Zakura",
             );
         } else {
             #[cfg(not(test))]
@@ -1480,14 +1480,14 @@ impl DiskDb {
                 ?current_limit,
                 min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
                 ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
-                "the open file limit is high enough for Zebra",
+                "the open file limit is high enough for Zakura",
             );
             #[cfg(test)]
             debug!(
                 ?current_limit,
                 min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
                 ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
-                "the open file limit is high enough for Zebra",
+                "the open file limit is high enough for Zakura",
             );
         }
 
@@ -1762,7 +1762,7 @@ impl DiskDb {
         if let Some(default_cf) = self.cf_handle("default") {
             assert!(
                 self.zs_is_empty(&default_cf),
-                "Zebra should not store data in the 'default' column family"
+                "Zakura should not store data in the 'default' column family"
             );
         }
     }

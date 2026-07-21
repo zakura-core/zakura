@@ -699,7 +699,7 @@ pub(crate) async fn open_listener(config: &Config) -> (TcpListener, SocketAddr) 
         Err(e) => panic!(
             "Opening Zcash network protocol listener {:?} failed: {e:?}. \
              Hint: Check if another zakurad or zcashd process is running. \
-             Try changing the network listen_addr in the Zebra config.",
+             Try changing the network listen_addr in the Zakura config.",
             config.listen_addr,
         ),
     };
@@ -1065,7 +1065,7 @@ where
             // # Concurrency
             //
             // Demand is potentially unlimited, so it must go last in a biased select!.
-            next_demand = demand_rx.next() => next_demand.ok_or("demand stream closed, is Zebra shutting down?".into()).map(|MorePeers|{
+            next_demand = demand_rx.next() => next_demand.ok_or("demand stream closed, is Zakura shutting down?".into()).map(|MorePeers|{
                 if active_outbound_connections.update_count() >= config.peerset_outbound_connection_limit() {
                     // Too many open outbound connections or pending handshakes already
                     DemandDrop
@@ -1220,7 +1220,7 @@ where
         Err(e) => {
             info!(
                 ?e,
-                "candidate set returned an error, is Zebra shutting down?"
+                "candidate set returned an error, is Zakura shutting down?"
             );
             return Err(e);
         }

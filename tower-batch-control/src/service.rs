@@ -263,7 +263,7 @@ where
                 Poll::Ready(Err(task_cancelled)) if task_cancelled.is_cancelled() => {
                     tracing::warn!(
                         "batch task cancelled: {task_cancelled}\n\
-                         Is Zebra shutting down?"
+                         Is Zakura shutting down?"
                     );
 
                     return Poll::Ready(Err(task_cancelled.into()));

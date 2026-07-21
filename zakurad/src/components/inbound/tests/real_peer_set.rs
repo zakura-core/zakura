@@ -988,7 +988,7 @@ async fn setup(
         network_config,
         inbound_service.clone(),
         latest_chain_tip.clone(),
-        "Zebra user agent".to_string(),
+        "Zakura user agent".to_string(),
         PeerServices::NODE_NETWORK,
         protected_peer_ips,
         None,
@@ -1180,7 +1180,7 @@ mod submitblock_test {
             network_config,
             inbound_service.clone(),
             latest_chain_tip.clone(),
-            "Zebra user agent".to_string(),
+            "Zakura user agent".to_string(),
             PeerServices::NODE_NETWORK,
         )
         .await;

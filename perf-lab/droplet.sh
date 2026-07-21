@@ -10,7 +10,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$DIR/config.env"
 DOCTL="${DOCTL_BIN:-doctl}"
 SSH="${SSH_BIN:-ssh}"
-SSH_OPTS=(-i "$SSH_KEY_FILE" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+SSH_OPTS=(-i "$SSH_KEY_FILE" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
 
 die() { echo "droplet.sh: $*" >&2; exit 1; }
 run() { if [ -n "${DRYRUN:-}" ]; then echo "DRYRUN: $*"; else "$@"; fi; }
@@ -45,12 +45,12 @@ import json,sys
 name=sys.argv[1]
 for d in json.load(sys.stdin) or []:
     if d["name"]==name:
-        print(next(n["ip_address"] for n in d["networks"]["v4"] if n["type"]=="public")); break
+        print(next((n["ip_address"] for n in d["networks"]["v4"] if n["type"]=="public"), "")); break
 ' "$1"
 }
 
 cmd_provision() {
-  local name="${NAME_PREFIX}-${1:-$(date +%m%d%H%M)}"
+  local name="${NAME_PREFIX}-${1:-$(date +%m%d%H%M%S)}"
   # hard rule (design §5): concurrent perf-lab droplets <= MAX_DROPLETS.
   # Checked before ensure_key so a refused provision has zero side effects.
   local count; count="$(droplet_json | python3 -c 'import json,sys; print(len(json.load(sys.stdin) or []))')"
@@ -64,6 +64,11 @@ cmd_provision() {
     --ssh-keys "$FP" --tag-name "$PERF_TAG" \
     --wait --format ID,PublicIPv4 --no-header
   [ -n "${DRYRUN:-}" ] && return 0
+  # Self-clean: from here on a failure would orphan a paid droplet that also
+  # counts against MAX_DROPLETS — destroy it on the way out. EXIT (not ERR):
+  # `|| die` failure paths bypass ERR traps. The delete still passes the
+  # assert_ours guard.
+  trap "echo 'provision failed; destroying orphan $name' >&2; cmd_destroy '$name' || true" EXIT
   local ip; ip="$(droplet_ip "$name")"; [ -n "$ip" ] || die "no ip for $name"
   echo "waiting for ssh on $ip ..."
   for _ in $(seq 1 30); do
@@ -71,6 +76,7 @@ cmd_provision() {
   done
   $SSH "${SSH_OPTS[@]}" "root@$ip" true || die "ssh never came up on $ip"
   prepare_remote "$ip"
+  trap - EXIT
   echo "$name ready at $ip"
 }
 
@@ -132,7 +138,8 @@ for d in json.load(sys.stdin) or []:
     created=datetime.datetime.fromisoformat(d["created_at"].replace("Z","+00:00"))
     if (now-created).total_seconds() > max_age: print(d["name"])
 ' "$max" | while read -r name; do
-    echo "reaping stale droplet $name"; cmd_destroy "$name"
+    echo "reaping stale droplet $name"
+    cmd_destroy "$name" || echo "reap skipped (guard refused): $name" >&2
   done
 }
 

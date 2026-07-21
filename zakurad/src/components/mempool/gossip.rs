@@ -28,6 +28,9 @@ use crate::{
 /// The maximum number of channel messages we will combine into a single peer broadcast.
 pub const MAX_CHANGES_BEFORE_SEND: usize = 10;
 
+// Safe because the protocol limit of 25,000 fits in usize on all targets.
+const MAX_TX_INV_IN_SENT_MESSAGE_USIZE: usize = MAX_TX_INV_IN_SENT_MESSAGE as usize;
+
 /// The number of mempool change notifications buffered for gossip subscribers.
 ///
 /// Keep this close to the number of changes the gossip task can drain in one
@@ -50,10 +53,6 @@ where
     ZM: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
     ZM::Future: Send + 'static,
 {
-    let max_tx_inv_in_message: usize = MAX_TX_INV_IN_SENT_MESSAGE
-        .try_into()
-        .expect("constant fits in usize");
-
     info!("initializing transaction gossip task");
 
     // use the same timeout as tips requests,
@@ -124,7 +123,6 @@ where
         let advertised_count = advertise_pending_mempool_transaction_ids(
             &mut mempool,
             &mut broadcast_network,
-            max_tx_inv_in_message,
             combined_changes,
         )
         .await?;
@@ -149,7 +147,6 @@ where
 async fn advertise_pending_mempool_transaction_ids<ZN, ZM>(
     mempool: &mut ZM,
     broadcast_network: &mut Timeout<ZN>,
-    max_tx_inv_in_message: usize,
     combined_changes: usize,
 ) -> Result<u64, BoxError>
 where
@@ -162,7 +159,7 @@ where
         .ready()
         .await?
         .call(Request::TakePendingGossipTransactionIds {
-            limit: max_tx_inv_in_message,
+            limit: MAX_TX_INV_IN_SENT_MESSAGE_USIZE,
         })
         .await?
     else {
@@ -178,7 +175,7 @@ where
     for tx_id in tx_ids {
         chunk.insert(tx_id);
 
-        if chunk.len() >= max_tx_inv_in_message {
+        if chunk.len() >= MAX_TX_INV_IN_SENT_MESSAGE_USIZE {
             advertised_count +=
                 advertise_transaction_id_chunk(broadcast_network, &mut chunk, combined_changes)
                     .await?;
@@ -241,12 +238,6 @@ mod tests {
 
     use super::*;
 
-    fn max_tx_inv_in_message() -> usize {
-        MAX_TX_INV_IN_SENT_MESSAGE
-            .try_into()
-            .expect("constant fits in usize")
-    }
-
     fn test_tx_ids(count: usize, seed: u8) -> HashSet<UnminedTxId> {
         (0..count)
             .map(|index| {
@@ -269,8 +260,6 @@ mod tests {
     ) {
         let pending_batches = Arc::new(Mutex::new(VecDeque::from(pending_batches)));
         let (limit_sender, limit_receiver) = mpsc::channel(16);
-        let max_tx_inv_in_message = max_tx_inv_in_message();
-
         let service = service_fn(move |request| {
             let pending_batches = pending_batches.clone();
             let limit_sender = limit_sender.clone();
@@ -279,7 +268,7 @@ mod tests {
                 match request {
                     Request::TakePendingGossipTransactionIds { limit } => {
                         assert_eq!(
-                            limit, max_tx_inv_in_message,
+                            limit, MAX_TX_INV_IN_SENT_MESSAGE_USIZE,
                             "gossip task should bound each pending drain to one inv"
                         );
                         limit_sender
@@ -366,7 +355,7 @@ mod tests {
                 .recv()
                 .await
                 .expect("gossip task should request pending txids"),
-            max_tx_inv_in_message()
+            MAX_TX_INV_IN_SENT_MESSAGE_USIZE
         );
         assert_eq!(
             expect_advertised_transaction_ids(&mut advertised_receiver).await,
@@ -415,7 +404,7 @@ mod tests {
                 .recv()
                 .await
                 .expect("gossip task should request pending txids"),
-            max_tx_inv_in_message()
+            MAX_TX_INV_IN_SENT_MESSAGE_USIZE
         );
         assert_eq!(
             expect_advertised_transaction_ids(&mut advertised_receiver).await,
@@ -430,7 +419,7 @@ mod tests {
     async fn lagged_mempool_gossip_recovers_pending_transaction_ids_in_bounded_cycles() {
         let _init_guard = zakura_test::init();
 
-        let first_batch = test_tx_ids(max_tx_inv_in_message(), 1);
+        let first_batch = test_tx_ids(MAX_TX_INV_IN_SENT_MESSAGE_USIZE, 1);
         let second_batch = test_tx_ids(2, 2);
         let (mempool, mut limit_receiver) =
             mempool_service(vec![first_batch.clone(), second_batch.clone()]);
@@ -461,13 +450,13 @@ mod tests {
                 .recv()
                 .await
                 .expect("first drain should request pending txids"),
-            max_tx_inv_in_message()
+            MAX_TX_INV_IN_SENT_MESSAGE_USIZE
         );
         let advertised_tx_ids = expect_advertised_transaction_ids(&mut advertised_receiver).await;
         assert_eq!(advertised_tx_ids, first_batch);
         assert_eq!(
             advertised_tx_ids.len(),
-            max_tx_inv_in_message(),
+            MAX_TX_INV_IN_SENT_MESSAGE_USIZE,
             "first recovery cycle should be bounded to one inv-sized batch",
         );
 
@@ -478,12 +467,12 @@ mod tests {
                 .recv()
                 .await
                 .expect("second drain should happen without another wakeup"),
-            max_tx_inv_in_message()
+            MAX_TX_INV_IN_SENT_MESSAGE_USIZE
         );
         let advertised_tx_ids = expect_advertised_transaction_ids(&mut advertised_receiver).await;
         assert_eq!(advertised_tx_ids, second_batch);
         assert!(
-            advertised_tx_ids.len() < max_tx_inv_in_message(),
+            advertised_tx_ids.len() < MAX_TX_INV_IN_SENT_MESSAGE_USIZE,
             "second recovery cycle should only advertise the remaining txids",
         );
 
@@ -511,7 +500,7 @@ mod tests {
                 .recv()
                 .await
                 .expect("gossip task should request pending txids"),
-            max_tx_inv_in_message()
+            MAX_TX_INV_IN_SENT_MESSAGE_USIZE
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(50), advertised_receiver.recv())

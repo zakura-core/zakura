@@ -14,7 +14,7 @@
 //!    * runs in the background to periodically poll peers for fresh unmined transactions
 //!  * [Queue Checker][`queue_checker::QueueChecker`]
 //!    * runs in the background, polling the mempool to store newly verified transactions
-//!  * [Transaction Gossip Task][`gossip::gossip_mempool_transaction_id`]
+//!  * [Transaction Gossip Task][`gossip::run_mempool_transaction_id_gossip`]
 //!    * runs in the background and gossips newly added mempool transactions
 //!      to peers
 
@@ -64,7 +64,7 @@ pub use crate::BoxError;
 pub use config::Config;
 pub use crawler::Crawler;
 pub use error::MempoolError;
-pub use gossip::gossip_mempool_transaction_id;
+pub(crate) use gossip::run_mempool_transaction_id_gossip;
 pub use queue_checker::QueueChecker;
 pub use storage::{
     ExactTipRejectionError, SameEffectsChainRejectionError, SameEffectsTipRejectionError, Storage,

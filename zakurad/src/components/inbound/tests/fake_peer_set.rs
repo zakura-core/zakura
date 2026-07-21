@@ -34,7 +34,7 @@ use crate::{
     components::{
         inbound::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData},
         mempool::{
-            downloads::MAX_INBOUND_CONCURRENCY_PER_PEER, gossip_mempool_transaction_id,
+            downloads::MAX_INBOUND_CONCURRENCY_PER_PEER, run_mempool_transaction_id_gossip,
             Config as MempoolConfig, Mempool, MempoolError, SameEffectsChainRejectionError,
             UnboxMempoolError,
         },
@@ -1288,7 +1288,7 @@ async fn setup(
     let mempool_service = BoxService::new(mempool_service);
     let mempool_service = ServiceBuilder::new().buffer(1).service(mempool_service);
 
-    let tx_gossip_task_handle = tokio::spawn(gossip_mempool_transaction_id(
+    let tx_gossip_task_handle = tokio::spawn(run_mempool_transaction_id_gossip(
         transaction_subscriber.subscribe(),
         peer_set.clone(),
         mempool_service.clone(),

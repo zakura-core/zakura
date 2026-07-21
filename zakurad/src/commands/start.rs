@@ -711,7 +711,7 @@ impl StartCmd {
 
         info!("spawning mempool transaction gossip task");
         let tx_gossip_task_handle = tokio::spawn(
-            mempool::gossip_mempool_transaction_id(
+            mempool::run_mempool_transaction_id_gossip(
                 mempool_transaction_subscriber.subscribe(),
                 peer_set.clone(),
                 mempool.clone(),

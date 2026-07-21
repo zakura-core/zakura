@@ -37,7 +37,7 @@ use zakura_test::mock_service::{MockService, PanicAssertion};
 use crate::{
     components::{
         inbound::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData},
-        mempool::{gossip_mempool_transaction_id, Config as MempoolConfig, Mempool},
+        mempool::{run_mempool_transaction_id_gossip, Config as MempoolConfig, Mempool},
         sync::{self, BlockGossipError, SyncStatus},
     },
     BoxError,
@@ -1070,7 +1070,7 @@ async fn setup(
         Some(submitblock_channel.receiver()),
     ));
 
-    let tx_gossip_task_handle = tokio::spawn(gossip_mempool_transaction_id(
+    let tx_gossip_task_handle = tokio::spawn(run_mempool_transaction_id_gossip(
         transaction_subscriber.subscribe(),
         peer_set.clone(),
         mempool_service.clone(),

@@ -1,9 +1,9 @@
 //! A task that gossips any [`zakura_chain::transaction::UnminedTxId`] that enters the mempool to peers.
 //!
-//! This module is just a function [`gossip_mempool_transaction_id`] that treats
-//! mempool insertion events received in a channel as wakeup signals, drains the
-//! transaction IDs that still need gossip from the mempool service, and
-//! advertises them to peers. Draining from the mempool service lets the task
+//! This module is just a function [`run_mempool_transaction_id_gossip`] that
+//! treats mempool insertion events received in a channel as wakeup signals,
+//! drains the transaction IDs that still need gossip from the mempool service,
+//! and advertises them to peers. Draining from the mempool service lets the task
 //! recover the IDs behind any wakeups dropped by a lagged channel.
 
 use std::collections::HashSet;
@@ -39,7 +39,7 @@ pub(super) const MEMPOOL_CHANGE_CHANNEL_CAPACITY: usize = MAX_CHANGES_BEFORE_SEN
 ///
 /// Broadcasts any new [`UnminedTxId`](zakura_chain::transaction::UnminedTxId)s that
 /// are stored in the mempool to multiple ready peers.
-pub async fn gossip_mempool_transaction_id<ZN, ZM>(
+pub(crate) async fn run_mempool_transaction_id_gossip<ZN, ZM>(
     mut receiver: broadcast::Receiver<MempoolChange>,
     broadcast_network: ZN,
     mut mempool: ZM,
@@ -357,7 +357,9 @@ mod tests {
             .send(MempoolChange::added(test_tx_ids(1, 2)))
             .expect("receiver should be subscribed");
 
-        let gossip_task = tokio::spawn(gossip_mempool_transaction_id(receiver, peer_set, mempool));
+        let gossip_task = tokio::spawn(run_mempool_transaction_id_gossip(
+            receiver, peer_set, mempool,
+        ));
 
         assert_eq!(
             limit_receiver
@@ -404,7 +406,9 @@ mod tests {
             )
             .expect("receiver should be subscribed");
 
-        let gossip_task = tokio::spawn(gossip_mempool_transaction_id(receiver, peer_set, mempool));
+        let gossip_task = tokio::spawn(run_mempool_transaction_id_gossip(
+            receiver, peer_set, mempool,
+        ));
 
         assert_eq!(
             limit_receiver
@@ -448,7 +452,9 @@ mod tests {
             ))
             .expect("receiver should be subscribed");
 
-        let gossip_task = tokio::spawn(gossip_mempool_transaction_id(receiver, peer_set, mempool));
+        let gossip_task = tokio::spawn(run_mempool_transaction_id_gossip(
+            receiver, peer_set, mempool,
+        ));
 
         assert_eq!(
             limit_receiver
@@ -496,7 +502,9 @@ mod tests {
             .send(MempoolChange::added(test_tx_ids(1, 1)))
             .expect("receiver should be subscribed");
 
-        let gossip_task = tokio::spawn(gossip_mempool_transaction_id(receiver, peer_set, mempool));
+        let gossip_task = tokio::spawn(run_mempool_transaction_id_gossip(
+            receiver, peer_set, mempool,
+        ));
 
         assert_eq!(
             limit_receiver

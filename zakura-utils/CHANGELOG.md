@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `zakura-checkpoints` offline mode (`--state-cache-dir`, `--full-list`,
+  `--mainnet-frontier-output`, behind the new `zakura-checkpoints-offline`
+  feature): export Mainnet checkpoints and the coupled VCT frontier artifact
+  from a quiesced state database without a running node.
+
 ## [1.0.2] - 2026-07-20
 
 ### Changed

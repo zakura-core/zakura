@@ -46,7 +46,7 @@ There are two ways to run the pair:
 The recommended way to set up either variant is the interactive installer:
 
 ```console
-curl -fsSL https://raw.githubusercontent.com/zakura-core/zakura/main/scripts/install-zakura.sh | bash
+curl -fsSL https://zakura.com/install.sh | bash
 ```
 
 Choose **2) With Zcashd compatibility** at the first prompt, then one of the

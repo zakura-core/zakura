@@ -52,11 +52,29 @@ pub enum HeaderSyncWireError {
     #[error(
         "Zakura header-sync range starting at {start:?} has invalid or overflowing count {count}"
     )]
-    InvalidRangeGeometry {
+    InvalidRange {
         /// First requested or delivered height.
         start: block::Height,
         /// Number of heights.
         count: u32,
+    },
+
+    /// An aligned payload contained no header entries.
+    #[error("Zakura header-sync header range payload is empty")]
+    EmptyHeaderRangePayload,
+
+    /// An aligned payload entry did not have the next contiguous height.
+    #[error(
+        "Zakura header-sync entry height {entry_height:?} does not match expected height \
+         {expected_height:?} at offset {offset}"
+    )]
+    EntryHeightMismatch {
+        /// Zero-based entry offset within the payload.
+        offset: usize,
+        /// Expected contiguous entry height.
+        expected_height: block::Height,
+        /// Actual entry height.
+        entry_height: block::Height,
     },
 
     /// A locally constructed `Headers` message had a different number of size hints.

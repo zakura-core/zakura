@@ -391,7 +391,7 @@ pub(super) fn deliver(
             return Flow::Reject(SinkReject::protocol(protocol_error));
         };
 
-        let (msg, _request_id) = match HeaderSyncMessage::decode_frame(
+        let (msg, request_id) = match HeaderSyncMessage::decode_frame(
             frame,
             HeaderSyncDecodeContext::for_headers_response(expected, expected.count),
         ) {
@@ -416,17 +416,23 @@ pub(super) fn deliver(
         else {
             unreachable!("Headers frame type agreement guarantees a Headers message");
         };
+        let entries = HeaderRangeEntry::from_parallel(
+            expected.start_height,
+            headers,
+            body_sizes,
+            tree_aux_roots,
+        )
+        .expect("decoded Headers vectors are structurally aligned");
+        let request_id = request_id.expect("decoded Headers response has a mandatory request ID");
         return forward(
             handle,
             HeaderSyncEvent::WireHeaders {
-                peer: peer_id,
-                session_id,
-                // The response was correlated by peeking this exact ID, so the
-                // decoded ID is the expectation's by construction.
-                request_id: expected.request_id,
-                headers,
-                body_sizes,
-                tree_aux_roots,
+                wire_request: HeaderSyncWireRequestIdentity {
+                    peer: peer_id,
+                    session_id,
+                    request_id,
+                },
+                entries,
             },
         );
     }
@@ -788,16 +794,16 @@ mod tests {
 
         assert!(matches!(pipe.run_one(second_frame), Flow::Continue(())));
         match events.try_recv() {
-            Ok(HeaderSyncEvent::WireHeaders { request_id, .. }) => {
-                assert_eq!(request_id, second_id);
+            Ok(HeaderSyncEvent::WireHeaders { wire_request, .. }) => {
+                assert_eq!(wire_request.request_id, second_id);
             }
             other => panic!("expected second response to be forwarded by id, got {other:?}"),
         }
 
         assert!(matches!(pipe.run_one(first_frame), Flow::Continue(())));
         match events.try_recv() {
-            Ok(HeaderSyncEvent::WireHeaders { request_id, .. }) => {
-                assert_eq!(request_id, first_id);
+            Ok(HeaderSyncEvent::WireHeaders { wire_request, .. }) => {
+                assert_eq!(wire_request.request_id, first_id);
             }
             other => panic!("expected first response to be forwarded by id, got {other:?}"),
         }

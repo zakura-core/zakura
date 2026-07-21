@@ -8,11 +8,14 @@ assignees: ""
 
 # Prepare for the Release
 
-# Checkpoints
+# Mainnet Release State
 
-For performance and security, we want to update the Zakura checkpoints in every release.
+For performance and security, every release should carry a current Mainnet checkpoint list and its matching VCT frontier.
 
-- [ ] You can copy the latest checkpoints from CI by following [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/zakura-utils/README.md#zakura-checkpoints).
+- [ ] Run the [Update Mainnet release state workflow](https://github.com/zakura-core/zakura/actions/workflows/update-release-state.yml) from `main`. It imports the newest publisher bundle and opens or updates a draft PR (it exits green with no PR when the committed state is already current).
+- [ ] Review and merge that draft PR: the diff is append-only over the committed checkpoint list; spot-check a few new heights and the terminal hash against an independent node or explorer.
+- [ ] `make pre-release` verifies the committed pairing and rejects pre-pipeline `legacy-bootstrap` state; for an emergency release with a broken publisher, export `ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=1` locally, check the `allow_bootstrap_release_state` input when dispatching the Create release workflow, and note it in the release PR.
+- [ ] Testnet checkpoints are still updated manually when needed, per [the zakura-checkpoints README](https://github.com/zakura-core/zakura/blob/main/zakura-utils/README.md#zakura-checkpoints).
 
 # Missed Dependency Updates
 
@@ -189,7 +192,7 @@ cargo release replace --verbose --execute --allow-branch '*' -p zakura
 The end of support height is calculated from the current blockchain height:
 
 - [ ] Find where the Zcash blockchain tip is now by using a [Zcash Block Explorer](https://mainnet.zcashexplorer.app/) or other tool.
-- [ ] Replace `ESTIMATED_RELEASE_HEIGHT` in [`end_of_support.rs`](https://github.com/zakura-core/zakura/blob/main/zakurad/src/components/sync/end_of_support.rs) with the height you estimate the release will be tagged.
+- [ ] Replace `ESTIMATED_RELEASE_HEIGHT` in [`end_of_support.rs`](https://github.com/zakura-core/zakura/blob/main/zakurad/src/components/sync/end_of_support.rs) with the height you estimate the release will be tagged. (The release-state PR floors this value near its bundle height, but this manual estimate is authoritative — with an 18-day support window, days matter.)
 
 <details>
 
@@ -226,8 +229,6 @@ The end of support height is calculated from the current blockchain height:
 
 - [ ] Wait until the release assets and Docker images have been built:
   - [ ] [release-binaries.yml](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush)
-- [ ] Review and merge the installer metadata update PR opened by the release
-      workflow.
 
 ## Promote Release (stable releases only)
 
@@ -266,7 +267,7 @@ for c in zakura-test zakura-tower-fallback zakura-jsonl-trace zakura-chain zakur
   - [ ] Confirm the manifest contains only the `x86_64-pc-linux-gnu` artifact before publishing zcashd-compat Docker images.
   - [ ] Confirm the workflow logs show the expected `/usr/local/bin/zcashd --version` for the zcashd-compat linux/amd64 image variant.
 - [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush).
-- [ ] Confirm `release-binaries.yml` published `zakurad-<tag>-linux-x86_64.tar.gz`, `zakurad-<tag>-linux-aarch64.tar.gz`, `zakurad-manifest-<tag>.json`, `install-zakura.sh`, and `SHA256SUMS.txt` to the GitHub release.
+- [ ] Confirm `release-binaries.yml` published `zakurad-<tag>-linux-x86_64.tar.gz`, `zakurad-<tag>-linux-aarch64.tar.gz`, `zakurad-manifest-<tag>.json`, and `SHA256SUMS.txt` to the GitHub release.
 - [ ] Wait for the new tag in the [Docker Hub zakura space](https://hub.docker.com/r/zakuracore/zakura/tags)
 - [ ] Confirm `zakuracore/zakura:<version>` includes `linux/amd64` and `linux/arm64`, and `zakuracore/zakura:zcashd-compat-<version>` includes only `linux/amd64`.
 - [ ] Un-freeze the [`batched` queue](https://dashboard.mergify.com/github/valargroup/repo/zakura/queues) using Mergify.

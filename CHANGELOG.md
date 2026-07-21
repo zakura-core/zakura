@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Add an offline Mainnet checkpoint and VCT frontier export mode to
+  `zakura-checkpoints`, and a committed provenance record
+  (`vct/mainnet-frontier.json`) that CI verifies against the embedded
+  checkpoint list and frontier on every PR. Groundwork for automated
+  release-state updates.
+- Automate Mainnet checkpoint and VCT frontier refreshes: the
+  `update-release-state.yml` workflow imports digest-verified publisher bundles
+  from R2 into reviewable draft PRs, and `make pre-release` now verifies the
+  committed checkpoint/frontier/provenance coupling (rejecting pre-pipeline
+  bootstrap state unless explicitly overridden).
+
 ### Fixed
 
 - Fix a permanent block-sync stall after a no-progress peer cooldown by

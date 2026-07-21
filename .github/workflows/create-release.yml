@@ -10,6 +10,11 @@ on:
         description: "Release tag, matching the zakura package version (for example v1.0.0-rc2)"
         required: true
         type: string
+      allow_bootstrap_release_state:
+        description: "Emergency override: accept legacy-bootstrap Mainnet release state (note it in the release PR)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -41,6 +46,8 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           SOURCE_REF: ${{ github.ref }}
           TARGET_SHA: ${{ github.sha }}
+          # The documented emergency override for scripts/check-release-state.sh.
+          ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE: ${{ inputs.allow_bootstrap_release_state && '1' || '0' }}
         run: |
           set -euo pipefail
 
@@ -49,6 +56,8 @@ jobs:
             exit 1
           fi
 
+          # This validates only release state committed to the source ref.
+          # Resolving the moving R2 pointer belongs to update-release-state.yml.
           make pre-release \
             RELEASE_TAG="$RELEASE_TAG" \
             PRE_RELEASE_WARN_CRATE_VERSION_BUMPS=0
@@ -94,7 +103,6 @@ jobs:
 
           expected_assets=(
             "SHA256SUMS.txt"
-            "install-zakura.sh"
             "zakurad-${RELEASE_TAG}-linux-aarch64.tar.gz"
             "zakurad-${RELEASE_TAG}-linux-x86_64.tar.gz"
             "zakurad-manifest-${RELEASE_TAG}.json"
@@ -111,7 +119,6 @@ jobs:
           diff --unified ./expected-assets.txt ./actual-assets.txt
 
           expected_payloads=(
-            "install-zakura.sh"
             "zakurad-${RELEASE_TAG}-linux-aarch64.tar.gz"
             "zakurad-${RELEASE_TAG}-linux-x86_64.tar.gz"
             "zakurad-manifest-${RELEASE_TAG}.json"
@@ -129,38 +136,10 @@ jobs:
           import hashlib
           import json
           import os
-          import re
           from pathlib import Path
 
           release_tag = os.environ["RELEASE_TAG"]
           repository = os.environ["REPOSITORY"]
-          installer = Path("./assets/install-zakura.sh").read_text(encoding="utf-8")
-          assignments = re.findall(
-              r'^ZAKURA_RELEASE_TAG="([^"]*)"$',
-              installer,
-              flags=re.MULTILINE,
-          )
-          if assignments != [release_tag]:
-              raise SystemExit(
-                  f"Installer release tag assignments {assignments!r} do not match {release_tag}."
-              )
-          archive_checksums = re.findall(
-              r'^ZAKURA_ARCHIVE_SHA256="([^"]*)"$',
-              installer,
-              flags=re.MULTILINE,
-          )
-          checksum_lines = Path("./assets/SHA256SUMS.txt").read_text(
-              encoding="utf-8"
-          ).splitlines()
-          checksums = {
-              filename.removeprefix("./"): digest
-              for digest, filename in (line.split(maxsplit=1) for line in checksum_lines)
-          }
-          x86_archive = f"zakurad-{release_tag}-linux-x86_64.tar.gz"
-          if archive_checksums != [checksums[x86_archive]]:
-              raise SystemExit(
-                  "Installer archive checksum does not match the x86_64 release archive."
-              )
 
           manifest_path = Path(f"./assets/zakurad-manifest-{release_tag}.json")
           manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

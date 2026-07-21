@@ -224,18 +224,10 @@ pub enum HeaderSyncEvent {
     },
     /// Inbound `Headers` response with its mandatory request ID.
     WireHeaders {
-        /// Serving peer.
-        peer: ZakuraPeerId,
-        /// Ordered-stream generation that delivered the response.
-        session_id: u64,
-        /// Request ID echoed by the peer.
-        request_id: HeaderSyncRequestId,
-        /// Headers in ascending height order.
-        headers: Vec<Arc<block::Header>>,
-        /// Advisory serialized body sizes, parallel to `headers`.
-        body_sizes: Vec<u32>,
-        /// Per-height commitment roots, parallel to `headers`.
-        tree_aux_roots: Vec<BlockCommitmentRoots>,
+        /// Exact request identity for this response.
+        wire_request: HeaderSyncWireRequestIdentity,
+        /// Structurally aligned per-height records.
+        entries: Vec<HeaderRangeEntry>,
     },
     /// Inbound `GetHeaders` request with its mandatory request ID.
     WireGetHeaders {

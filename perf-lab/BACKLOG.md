@@ -10,8 +10,10 @@ READY | BLOCKED(<why>) | DONE(EXP-NNN) | DROPPED(<why>).
   Node default is 1000 (`DEFAULT_CHECKPOINT_CONCURRENCY_LIMIT` = 500*2 in
   zakurad/src/components/sync.rs); the bench harness pins CKPT_LIMIT=1500 on
   every run, so 1500-point data accrues free from baselines. Hypothesis: the
-  knee sits elsewhere on dedicated CPU. Lane: bench env var only (no code
-  change). Cost: 1 bench run per point, 3 points (500/1000/3000).
+  knee sits elsewhere on dedicated CPU. Lane: absolute cross-invocation sweep
+  per SKILL step 6 (the harness applies the knob to BOTH rows, so the
+  within-run delta is only a noise check). Cost: 1 bench run per point +
+  confirmations, 3 points (500/1000/3000).
 - B-02 READY — Sweep `DL_LIMIT` (download_concurrency_limit) 50/150/400.
   Same shape as B-01.
 - B-03 READY — Block-sync knob sweep: `max_blocks_per_response`, request
@@ -32,6 +34,13 @@ READY | BLOCKED(<why>) | DONE(EXP-NNN) | DROPPED(<why>).
   pool vs core count. Lane: code-default change + L2.
 - B-08 READY — Tokio worker-thread count + channel capacities on the split
   sequencer channels / writer input queue. Lane: code-default change + L2.
+
+- B-13 READY — Per-side knob overrides (`TARGET_CKPT_LIMIT`/
+  `BASELINE_CKPT_LIMIT`, likewise for DL_LIMIT) in
+  scripts/checkpoint-sync-bench.sh plus bench.sh plumbing, mirroring the
+  existing `TARGET_/BASELINE_P2P_STACK` split, so knob sweeps become true
+  within-invocation A/Bs. Harness tooling, PR-able upstream; tightens B-01/
+  B-02 thresholds.
 
 ## Structural-class (yellow)
 

@@ -33,3 +33,22 @@ This file is the sole reporting channel (design D5). Entry template:
 - Attribution at the standard window (1707210→1827210): download head-of-line dominant; commit single-writer 22-26% busy. State/commit-path experiments will NOT register here — campaign 1 must target the download path, raise the window into heavier blocks, or land B-15 first.
 - Timings: snapshot download ~10 min (once per droplet; one transient HTTP/2 mid-stream failure observed — retry succeeded); featured build ~3-20 min (golden cargo cache, features differ from bake); leg ~20-22 min at ~90-100 blk/s.
 - Cost so far: ~US$4-5 droplet time. perf-lab skill registration verified (appears in session skill lists).
+
+## EXP-000 noop-dry-run
+- date / session: 2026-07-21 / SESSION 0
+- backlog id / hypothesis: n/a — a comment-only change must traverse the whole
+  state machine and come out NEUTRAL
+- risk class: green
+- branch: adam/perf-exp/000-noop-dry-run (deleted after verdict; patch:
+  ~/zakura-perf-lab/runs/exp000/exp.patch)
+- diff summary: 2-line comment marker in zakura-utils/src/lib.rs
+- gates: L0 PASS (zakura-utils; fmt+clippy+nextest with --no-tests=pass)
+- bench: exp000 on perf-lab-cal; baseline 96.15 vs candidate 90.36 post-commit
+  blk/s; delta -6.0%; band 8.7%; effective threshold 17.4%
+- verdict: NEUTRAL — correct. The -6% is another live-peer noise sample inside
+  the band; the naive 3% floor would have false-flagged a LOSS, so the
+  calibration already paid for itself on the first verdict.
+- attribution: download-HOL both legs (consistent with SESSION 0)
+- simplicity: 1
+- follow-ups: none — pipeline (worktree → branch → gates → push → pinned bench
+  → verdict → ledger → cleanup) validated end to end

@@ -630,6 +630,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_error_requeues_transaction_ids_and_propagates() {
+        #[derive(Clone)]
+        struct ReadinessErrorPeerSet;
+
+        impl Service<zn::Request> for ReadinessErrorPeerSet {
+            type Response = zn::Response;
+            type Error = BoxError;
+            type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+            fn poll_ready(
+                &mut self,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Err(
+                    std::io::Error::other("terminal peer-set failure").into()
+                ))
+            }
+
+            fn call(&mut self, _request: zn::Request) -> Self::Future {
+                panic!("call must not run after a readiness error");
+            }
+        }
+
+        let _init_guard = zakura_test::init();
+
+        let pending_tx_ids = test_tx_ids(2, 1);
+        let (mut mempool, _limit_receiver, mut requeue_receiver) =
+            mempool_service(vec![pending_tx_ids.clone()]);
+        let mut peer_set = Timeout::new(ReadinessErrorPeerSet, TIPS_RESPONSE_TIMEOUT);
+
+        advertise_pending_mempool_transaction_ids(&mut mempool, &mut peer_set, 1)
+            .await
+            .expect_err("terminal readiness errors should propagate");
+        assert_eq!(
+            requeue_receiver
+                .recv()
+                .await
+                .expect("readiness error should requeue the taken transaction IDs"),
+            pending_tx_ids,
+        );
+    }
+
+    #[tokio::test]
     async fn empty_pending_mempool_gossip_wakeup_does_not_advertise() {
         let _init_guard = zakura_test::init();
 

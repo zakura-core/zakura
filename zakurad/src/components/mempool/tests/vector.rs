@@ -1673,20 +1673,51 @@ async fn mempool_responds_to_await_output() -> Result<(), Report> {
         "pending gossip transaction IDs should contain the verified transaction",
     );
 
-    let pending_gossip_tx_ids = mempool
+    // A failed advertisement restores IDs only when their transactions are
+    // still present in production mempool storage.
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::RequeuePendingGossipTransactionIds(
+            pending_gossip_tx_ids.clone(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        response,
+        Response::RequeuedPendingGossipTransactionIds
+    ));
+
+    let requeued_gossip_tx_ids = mempool
         .ready()
         .await
         .unwrap()
         .call(Request::TakePendingGossipTransactionIds { limit: 1 })
         .await
         .unwrap();
-    let Response::PendingGossipTransactionIds(pending_gossip_tx_ids) = pending_gossip_tx_ids else {
+    let Response::PendingGossipTransactionIds(requeued_gossip_tx_ids) = requeued_gossip_tx_ids
+    else {
         panic!("wrong response from mempool to PendingGossipTransactionIds request");
     };
+    assert_eq!(
+        requeued_gossip_tx_ids, pending_gossip_tx_ids,
+        "stored transaction IDs should be pending again after requeue",
+    );
 
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::TakePendingGossipTransactionIds { limit: 1 })
+        .await
+        .unwrap();
+    let Response::PendingGossipTransactionIds(pending_gossip_tx_ids) = response else {
+        panic!("wrong response from mempool to PendingGossipTransactionIds request");
+    };
     assert!(
         pending_gossip_tx_ids.is_empty(),
-        "pending gossip transaction IDs should be cleared after successful advertisement",
+        "pending gossip transaction IDs should be cleared after the requeued batch is taken",
     );
 
     Ok(())

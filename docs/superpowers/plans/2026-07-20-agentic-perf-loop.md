@@ -322,6 +322,15 @@ class TestVerdict(unittest.TestCase):
         _, out = run(["--aa"], FIXTURE)
         self.assertAlmostEqual(out["observed_noise_pct"], 5.0, places=1)
 
+    def test_unequal_block_coverage_errors(self):
+        # a wall-capped leg covers fewer blocks; comparing the rows is
+        # meaningless (seen live: 83k vs 120k produced a bogus 56% delta)
+        capped = FIXTURE.replace("| 1737210 | 30000 | 1190s | 25.21 | 27.30 |",
+                                 "| 1730000 | 22790 | 2009s | 11.34 | 12.10 |")
+        p, _ = run([], capped)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("different block ranges", p.stderr)
+
     def test_missing_baseline_row_errors(self):
         p, _ = run([], FIXTURE.replace("(baseline)", "(nope)"))
         self.assertNotEqual(p.returncode, 0)
@@ -390,6 +399,12 @@ def main():
     rows = parse_table(open(args.summary).read())
     if "baseline" not in rows or "primary" not in rows:
         print("verdict.py: need both (baseline) and (primary) rows", file=sys.stderr)
+        sys.exit(2)
+
+    if rows["baseline"].get("blocks covered") != rows["primary"].get("blocks covered"):
+        print("verdict.py: legs covered different block ranges (wall cap?) — "
+              f"baseline {rows['baseline'].get('blocks covered')} vs "
+              f"primary {rows['primary'].get('blocks covered')}", file=sys.stderr)
         sys.exit(2)
 
     col = "post-commit blk/s"

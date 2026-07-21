@@ -52,6 +52,12 @@ def main():
         print("verdict.py: need both (baseline) and (primary) rows", file=sys.stderr)
         sys.exit(2)
 
+    if rows["baseline"].get("blocks covered") != rows["primary"].get("blocks covered"):
+        print("verdict.py: legs covered different block ranges (wall cap?) — "
+              f"baseline {rows['baseline'].get('blocks covered')} vs "
+              f"primary {rows['primary'].get('blocks covered')}", file=sys.stderr)
+        sys.exit(2)
+
     col = "post-commit blk/s"
     b, p = fnum(rows["baseline"], col), fnum(rows["primary"], col)
     if b <= 0:

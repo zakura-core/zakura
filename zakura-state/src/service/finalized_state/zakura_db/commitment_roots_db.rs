@@ -619,13 +619,36 @@ impl ZakuraDb {
         let Some(genesis_hash) = checkpoints.hash(Height::MIN) else {
             return Ok(None);
         };
-        let mut completed = CompletedCheckpointFrontier {
-            height: Height::MIN,
-            hash: genesis_hash,
-        };
+        self.advance_completed_checkpoint_through(
+            CompletedCheckpointFrontier {
+                height: Height::MIN,
+                hash: genesis_hash,
+            },
+            canonical_tip,
+            pending,
+        )
+        .map(Some)
+    }
+
+    /// Extends an already startup-validated checkpoint frontier without
+    /// rescanning its historical brackets on every steady-state write.
+    fn advance_completed_checkpoint_through(
+        &self,
+        mut completed: CompletedCheckpointFrontier,
+        canonical_tip: Height,
+        pending: &[(Height, block::Hash, Arc<block::Header>)],
+    ) -> Result<CompletedCheckpointFrontier, HeaderRootAuthFrontierError> {
+        let checkpoints = self.network().checkpoint_list();
+        if checkpoints.hash(completed.height) != Some(completed.hash) {
+            return Err(HeaderRootAuthFrontierError::InvalidCompletedCheckpoint {
+                height: completed.height,
+                hash: completed.hash,
+            });
+        }
+        let completed_height = completed.height;
         for (checkpoint_height, checkpoint_hash) in checkpoints
             .iter_cloned()
-            .skip(1)
+            .skip_while(|(height, _)| *height <= completed_height)
             .take_while(|(height, _)| *height <= canonical_tip)
         {
             let mut expected_parent = completed.hash;
@@ -665,7 +688,7 @@ impl ZakuraDb {
             };
         }
 
-        Ok(Some(completed))
+        Ok(completed)
     }
 
     pub(crate) fn reconstruct_completed_checkpoint(
@@ -1206,13 +1229,16 @@ impl DiskWriteBatch {
         history_tree: &HistoryTree,
     ) -> Result<(), HeaderRootAuthFrontierError> {
         let stored_frontier = db.try_header_root_auth_frontier_compat()?;
-        let reconstructed =
-            db.completed_checkpoint_for_tip(confirmed_height, confirmed_hash, confirmed_header)?;
-        let completed_checkpoint = stored_frontier
-            .as_ref()
-            .map(|frontier| frontier.completed_checkpoint)
-            .filter(|stored| stored.height > reconstructed.height)
-            .unwrap_or(reconstructed);
+        let completed_checkpoint = match stored_frontier.as_ref() {
+            Some(frontier) => db.advance_completed_checkpoint_through(
+                frontier.completed_checkpoint,
+                confirmed_height,
+                &[(confirmed_height, confirmed_hash, confirmed_header)],
+            )?,
+            None => {
+                db.completed_checkpoint_for_tip(confirmed_height, confirmed_hash, confirmed_header)?
+            }
+        };
         if let Some(mut frontier) = stored_frontier.filter(|frontier| {
             frontier.confirmed_height > confirmed_height
                 && db.header_hash(confirmed_height) == Some(confirmed_hash)
@@ -1311,9 +1337,11 @@ impl DiskWriteBatch {
         let Some(mut frontier) = db.try_header_root_auth_frontier()? else {
             return Ok(());
         };
-        let completed = db
-            .reconstruct_completed_checkpoint_through(last_height, headers)?
-            .ok_or(HeaderRootAuthFrontierError::MissingCompletedCheckpoint)?;
+        let completed = db.advance_completed_checkpoint_through(
+            frontier.completed_checkpoint,
+            last_height,
+            headers,
+        )?;
 
         if completed.height > frontier.completed_checkpoint.height {
             frontier.completed_checkpoint = completed;
@@ -1882,6 +1910,22 @@ mod tests {
         batch.zs_delete(&header_hash_by_height, Height(1));
         batch.zs_delete(&header_by_height, Height(1));
         db.write_batch(batch).expect("interior gap fixture writes");
+        assert_eq!(
+            db.advance_completed_checkpoint_through(
+                CompletedCheckpointFrontier {
+                    height: Height(2),
+                    hash: block2.hash(),
+                },
+                Height(2),
+                &[],
+            )
+            .expect("steady-state advancement trusts the startup-validated prefix"),
+            CompletedCheckpointFrontier {
+                height: Height(2),
+                hash: block2.hash(),
+            },
+            "steady-state writes must not rescan completed checkpoint brackets"
+        );
         assert!(matches!(
             db.validate_header_root_auth_state(),
             Err(HeaderRootAuthFrontierError::CompletedCheckpointMismatch {

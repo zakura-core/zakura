@@ -5132,6 +5132,44 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
 }
 
 #[tokio::test]
+async fn connection_cleanup_prevents_delayed_teardown_from_reinserting_parked_state() {
+    let (service, _events) = BlockSyncService::new_for_test(ZakuraBlockSyncConfig::default());
+    let peer = peer(93);
+    let conn_id = 7;
+    let (inbound_tx, inbound_rx) = framed_channel(4);
+    let (outbound_tx, _outbound_rx) = framed_channel(4);
+    service.add_peer(Peer::new_with_conn_id_and_direction(
+        conn_id,
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]),
+        CancellationToken::new(),
+    ));
+    let session_id = service
+        .session_id_for_test(&peer)
+        .expect("the test peer has an active block-sync session");
+
+    service.remove_peer(&peer, conn_id);
+    assert!(
+        !service.finish_session_for_test(&peer, conn_id, session_id, true),
+        "a teardown that lost ownership must not mark the removed connection as parked",
+    );
+    assert!(matches!(
+        service.ordered_session_demand(
+            conn_id,
+            &peer,
+            ZAKURA_CAP_BLOCK_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow
+    ));
+
+    drop(inbound_tx);
+}
+
+#[tokio::test]
 async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let mut config = ZakuraBlockSyncConfig::default();
     config.peer_limits.inbound_queue_depth = 1;
@@ -5367,7 +5405,7 @@ async fn locally_parked_block_sync_session_waits_at_tip_then_reopens_for_new_wor
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let peer = peer(9);
     let conn_id = 17;
-    service.mark_locally_parked_session_for_test(peer.clone(), conn_id);
+    service.mark_session_parked_for_test(peer.clone(), conn_id);
 
     let demand = service.ordered_session_demand(
         conn_id,
@@ -6096,6 +6134,57 @@ async fn block_sync_add_peer_replaces_same_peer_even_at_full_cap() {
         1,
         "the replacement must not leave two sessions for the same peer",
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_block_sync_admission_obeys_direction_cap() {
+    let mut config = immediate_body_download_config();
+    config.peer_limits.max_outbound_peers = 1;
+    config.peer_limits.max_inbound_peers = 0;
+    let (service, mut events) = BlockSyncService::new_for_test(config);
+    let service = Arc::new(service);
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut admissions = Vec::new();
+
+    for byte in [43, 44] {
+        let service = service.clone();
+        let barrier = barrier.clone();
+        admissions.push(tokio::spawn(async move {
+            let peer_id = peer(byte);
+            let (inbound_tx, inbound_rx) = framed_channel(8);
+            let (outbound_tx, outbound_rx) = framed_channel(8);
+            let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+            barrier.wait().await;
+            service.add_peer(Peer::new_with_direction(
+                peer_id,
+                None,
+                ZAKURA_CAP_BLOCK_SYNC,
+                ServicePeerDirection::Outbound,
+                streams,
+                CancellationToken::new(),
+            ));
+            (inbound_tx, outbound_rx)
+        }));
+    }
+
+    barrier.wait().await;
+    let mut held = Vec::new();
+    for admission in admissions {
+        held.push(admission.await.expect("concurrent admission task succeeds"));
+    }
+
+    assert_eq!(service.peer_count(), 1);
+    assert!(matches!(
+        next_event(&mut events).await,
+        BlockSyncEvent::PeerConnected(_)
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), events.recv())
+            .await
+            .is_err(),
+        "only one concurrent outbound admission may emit PeerConnected",
+    );
+    drop(held);
 }
 
 #[tokio::test]

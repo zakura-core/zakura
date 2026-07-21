@@ -1667,6 +1667,20 @@ fn should_reopen_ordered_stream(
         && !connection_cancelled
 }
 
+/// Remove an ordered session only if the exit belongs to the tracked generation.
+fn remove_ordered_stream_session(
+    sessions: &mut HashMap<u16, u64>,
+    kind: u16,
+    session_id: u64,
+) -> bool {
+    if sessions.get(&kind) != Some(&session_id) {
+        return false;
+    }
+
+    sessions.remove(&kind);
+    true
+}
+
 /// Exponential reopen delay for one ordered stream kind, capped so a
 /// persistently failing local open cannot spin the connection loop.
 fn ordered_stream_reopen_backoff(attempts: u32) -> Duration {
@@ -2206,8 +2220,8 @@ impl ZakuraProtocolHandler {
         let mut service_streams = HashMap::new();
         // Ordered-stream kinds this side proactively opened, used by the accept
         // loop to detect same-kind collisions (both sides opened the kind).
-        let mut opened_kinds: HashSet<u16> = HashSet::new();
-        let mut accepted_ordered_kinds = HashSet::new();
+        let mut opened_ordered_sessions: HashMap<u16, u64> = HashMap::new();
+        let mut accepted_ordered_sessions: HashMap<u16, u64> = HashMap::new();
         let run_freshness_reaper =
             should_run_freshness_reaper(queue_split_stream_count, request_response_stream_count);
 
@@ -2262,7 +2276,7 @@ impl ZakuraProtocolHandler {
                         break;
                     }
                 };
-                opened_kinds.insert(admitted.kind);
+                opened_ordered_sessions.insert(admitted.kind, admitted.session_id);
                 service_streams.insert(
                     admitted.kind,
                     ServiceStream::new(
@@ -2318,14 +2332,23 @@ impl ZakuraProtocolHandler {
                     // Stop tracking the dead generation, or a legitimate reopen of the
                     // same kind would look like a duplicate stream and kill the whole
                     // connection, taking block sync and gossip down with header sync.
-                    if exited.opened_locally {
-                        opened_kinds.remove(&exited.stream.kind);
+                    let removed_active_session = if exited.opened_locally {
+                        remove_ordered_stream_session(
+                            &mut opened_ordered_sessions,
+                            exited.stream.kind,
+                            exited.session_id,
+                        )
                     } else {
-                        accepted_ordered_kinds.remove(&exited.stream.kind);
-                    }
+                        remove_ordered_stream_session(
+                            &mut accepted_ordered_sessions,
+                            exited.stream.kind,
+                            exited.session_id,
+                        )
+                    };
                     let policy = self.registry.ordered_stream_policy(exited.stream.kind);
-                    if !opened_kinds.contains(&exited.stream.kind)
-                        && !accepted_ordered_kinds.contains(&exited.stream.kind)
+                    if removed_active_session
+                        && !opened_ordered_sessions.contains_key(&exited.stream.kind)
+                        && !accepted_ordered_sessions.contains_key(&exited.stream.kind)
                         && should_reopen_ordered_stream(
                         exited,
                         policy,
@@ -2354,8 +2377,8 @@ impl ZakuraProtocolHandler {
                     let policy = self.registry.ordered_stream_policy(stream.kind);
                     if connection_token.is_cancelled()
                         || !may_open_ordered_stream(policy, context.is_initiator)
-                        || opened_kinds.contains(&stream.kind)
-                        || accepted_ordered_kinds.contains(&stream.kind)
+                        || opened_ordered_sessions.contains_key(&stream.kind)
+                        || accepted_ordered_sessions.contains_key(&stream.kind)
                         || selected_ordered_streams.get(&stream.kind) != Some(&stream)
                     {
                         continue;
@@ -2396,7 +2419,7 @@ impl ZakuraProtocolHandler {
                     {
                         Ok(admitted) => {
                             ordered_stream_wakes.cancel(admitted.kind);
-                            opened_kinds.insert(admitted.kind);
+                            opened_ordered_sessions.insert(admitted.kind, admitted.session_id);
                             let service_streams = HashMap::from([(
                                 admitted.kind,
                                 ServiceStream::new(
@@ -2494,7 +2517,7 @@ impl ZakuraProtocolHandler {
                                     continue;
                                 }
 
-                                let is_collision = opened_kinds.contains(&kind);
+                                let is_collision = opened_ordered_sessions.contains_key(&kind);
                                 // The deterministic winner keeps its own stream
                                 // and parks the peer's. The loser falls through
                                 // and adopts the peer's stream.
@@ -2510,7 +2533,7 @@ impl ZakuraProtocolHandler {
                                 // We intend to adopt the peer's stream. A second
                                 // accepted stream of the same kind is a real
                                 // duplicate and a fault.
-                                if !accepted_ordered_kinds.insert(kind) {
+                                if accepted_ordered_sessions.contains_key(&kind) {
                                     debug!(
                                         stream_kind = kind,
                                         "closing peer after duplicate ordered stream"
@@ -2519,6 +2542,7 @@ impl ZakuraProtocolHandler {
                                     connection_token.cancel();
                                     continue;
                                 }
+                                accepted_ordered_sessions.insert(kind, admitted.session_id);
 
                                 // Honour the owning service's current per-peer
                                 // demand. For a collision we lost, demand is
@@ -2551,7 +2575,11 @@ impl ZakuraProtocolHandler {
                                     // We are not adopting it after all, so this kind
                                     // is free again -- both for a later re-offer by
                                     // the peer and for the demand re-check below.
-                                    accepted_ordered_kinds.remove(&kind);
+                                    remove_ordered_stream_session(
+                                        &mut accepted_ordered_sessions,
+                                        kind,
+                                        admitted.session_id,
+                                    );
                                     // If this side may open the stream, re-check its
                                     // local demand. Otherwise the entitled remote
                                     // opener observes the parked stream and retries.
@@ -7004,6 +7032,25 @@ mod tests {
             true,
             false,
         ));
+    }
+
+    #[test]
+    fn stale_ordered_stream_exit_keeps_newer_active_generation() {
+        let stream = test_ordered_stream();
+        let mut accepted_sessions = HashMap::from([(stream.kind, 2)]);
+
+        assert!(!remove_ordered_stream_session(
+            &mut accepted_sessions,
+            stream.kind,
+            1,
+        ));
+        assert_eq!(accepted_sessions.get(&stream.kind), Some(&2));
+        assert!(remove_ordered_stream_session(
+            &mut accepted_sessions,
+            stream.kind,
+            2,
+        ));
+        assert!(!accepted_sessions.contains_key(&stream.kind));
     }
 
     #[test]

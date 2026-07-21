@@ -197,6 +197,7 @@ impl HeaderSyncReactor {
                     metrics::counter!("sync.header.reactor.event_started", "kind" => "tick").increment(1);
                     self.handle_timeouts().await;
                     self.refresh_statuses();
+                    self.publish_candidate_state();
                     self.publish_connectivity_metrics();
                     metrics::counter!("sync.header.reactor.event_finished", "kind" => "tick").increment(1);
                 }
@@ -607,10 +608,18 @@ impl HeaderSyncReactor {
         backed_off_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         backed_off_node_ids.dedup();
 
-        let _ = self.candidates.send(ZakuraHeaderSyncCandidateState {
+        let candidate_state = ZakuraHeaderSyncCandidateState {
             target_height: header_sync_candidate_target(self.state.best_header_tip),
             admitted_node_ids,
             backed_off_node_ids,
+        };
+        self.candidates.send_if_modified(|current| {
+            if *current == candidate_state {
+                return false;
+            }
+
+            *current = candidate_state;
+            true
         });
     }
 
@@ -2150,6 +2159,12 @@ impl HeaderSyncReactor {
 
         if let Some(retry) = self.state.schedule.next_retry_deadline() {
             deadline = deadline.min(retry);
+        }
+        for advisory in self.state.advisory.values() {
+            deadline = deadline.min(advisory.observed_at + HEADER_SYNC_ADVISORY_TTL);
+            if let Some(backoff_until) = advisory.backoff_until {
+                deadline = deadline.min(backoff_until);
+            }
         }
         for peer in self.state.peers.values() {
             if let Some(request_deadline) = peer

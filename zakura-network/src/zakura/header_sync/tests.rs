@@ -812,6 +812,87 @@ async fn advisory_summary_status_mismatch_uses_status_without_misbehavior_and_ba
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn advisory_backoff_expiry_reopens_demand_without_an_unrelated_event() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let (peer_id, peer_node_id) = node_peer();
+    let mut candidates = fixture.handle.subscribe_candidate_state();
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::AdvisoryHeaderSummary {
+            peer: peer_id.clone(),
+            summary: advisory_header_summary(block::Height(10), 1),
+        })
+        .await
+        .unwrap();
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(1),
+        1,
+        1,
+    )
+    .await;
+
+    let (requested_peer, request_id, _, _) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(requested_peer, peer_id);
+    send_headers(&fixture, &peer_id, request_id, headers_message(Vec::new())).await;
+    while !candidates
+        .borrow_and_update()
+        .backed_off_node_ids
+        .contains(&peer_node_id)
+    {
+        candidates
+            .changed()
+            .await
+            .expect("the header-sync reactor keeps candidate state open");
+    }
+
+    let service = HeaderSyncService::new(fixture.handle.clone());
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer_id,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::RetryAt(_)
+    ));
+
+    tokio::time::advance(HEADER_SYNC_ADVISORY_BACKOFF).await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while candidates
+            .borrow_and_update()
+            .backed_off_node_ids
+            .contains(&peer_node_id)
+        {
+            candidates
+                .changed()
+                .await
+                .expect("the header-sync reactor keeps candidate state open");
+        }
+    })
+    .await
+    .expect("the advisory deadline publishes candidate expiry");
+    assert!(matches!(
+        service.ordered_session_demand(
+            1,
+            &peer_id,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        ),
+        OrderedSessionDemand::OpenNow
+    ));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn advisory_backoff_is_pruned_on_peer_disconnected() {
     let network = regtest_network();

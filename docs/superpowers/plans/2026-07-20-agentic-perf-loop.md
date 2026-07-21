@@ -843,11 +843,18 @@ cmd_l0() {
 
 cmd_micro_mockbs() {
   local wt="${1:?}" runs="${2:-3}"
-  cd "$wt"
+  [[ "$runs" =~ ^[1-9][0-9]*$ ]] || die "runs must be a positive integer: $runs"
+  cd "$wt"; mkdir -p "$ARTIFACT_ROOT"
+  # stderr goes to a log so an unattended failure is diagnosable; a nonzero
+  # exit from any run means: discard every sample from this invocation
+  local log; log="$ARTIFACT_ROOT/micro-mockbs-$(date +%Y%m%dT%H%M%S).log"
+  local i
   for i in $(seq 1 "$runs"); do
-    ZAKURA_MOCK_BS_RUN=1 cargo test -p zakura-network --release \
-      zakura_mock_blocksync_throughput -- --ignored --nocapture 2>/dev/null \
-      | grep -E "^throughput:" | sed "s/^/run $i /"
+    if ! ZAKURA_MOCK_BS_RUN=1 cargo test -p zakura-network --release \
+        zakura_mock_blocksync_throughput -- --ignored --nocapture 2>>"$log" \
+      | grep -E "^throughput:" | sed "s/^/run $i /"; then
+      die "micro-mockbs run $i: no throughput / cargo failed — see $log"
+    fi
   done
 }
 
@@ -1082,10 +1089,18 @@ metric (default: checkpoint-zone post-commit blk/s), re-ranked top-5 backlog.
    here. Archive the diff before L2:
    `mkdir -p ~/zakura-perf-lab/runs/expNNN && git -C /tmp/perf-exp-NNN diff origin/main > ~/zakura-perf-lab/runs/expNNN/exp.patch`.
 4. **L0**: `bash perf-lab/gates.sh l0 /tmp/perf-exp-NNN <touched crates>`.
-   Fail twice → BROKEN ledger entry, delete worktree+branch, next.
-5. **L1** (only if a micro lane applies): `gates.sh micro-mockbs` for
-   block-sync-layer diffs (3 runs each side; kill on clear regression) or
-   `cargo bench -p <crate>` + critcmp for crypto/serialization diffs.
+   For low-level-crate diffs (zakura-chain, zakura-state) also pass their main
+   downstream crates so a cross-crate break surfaces here instead of wasting a
+   droplet build. Fail twice → BROKEN ledger entry, delete worktree+branch,
+   next.
+5. **L1** (only if a micro lane applies): for block-sync-layer diffs run
+   `gates.sh micro-mockbs` with **4 runs per side and compare the median of
+   runs 2–4** (run 1 is a consistent ~30% cold-start outlier on the Mac
+   baseline). A nonzero exit means discard every sample from that invocation.
+   Kill the experiment only on a clear regression — candidate median ≥10%
+   below base median (warm noise is ~1–2%; anything smaller passes through to
+   L2 for the authoritative verdict). For crypto/serialization diffs use
+   `cargo bench -p <crate>` + critcmp instead.
 6. **L2**: `git push origin adam/perf-exp/NNN-<slug>`, then
    `bash perf-lab/bench.sh start <droplet> expNNN adam/perf-exp/NNN-<slug> main`
    (env-var experiments skip the branch: pass `CKPT_LIMIT=… `-style args and

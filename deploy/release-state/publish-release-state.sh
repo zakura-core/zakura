@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Export a Mainnet release-state bundle from a quiesced state copy and publish
+# Export a Mainnet release-state bundle from a stopped-node state copy and publish
 # it to R2: an immutable release-state/v1/<height>/ bundle plus the mutable
 # latest.json pointer consumed by the update-release-state workflow.
-# Run after the snapshot job, against the same quiesced state directory.
+# Run after the snapshot job stops the node, against the same state directory.
 # See README.md in this directory for host wiring, and
 # docs/design/verified-commitment-trees.md, section 16, for the design.
 #
-# Usage: publish-release-state.sh <quiesced-zakura-cache-dir>
+# Usage: publish-release-state.sh <stopped-node-zakura-cache-dir>
 #
 # Required environment:
 #   RELEASE_STATE_R2_REMOTE   rclone destination, e.g. "r2:zakura-artifacts"
@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-STATE_DIR=${1:?usage: publish-release-state.sh <quiesced-zakura-cache-dir>}
+STATE_DIR=${1:?usage: publish-release-state.sh <stopped-node-zakura-cache-dir>}
 : "${RELEASE_STATE_R2_REMOTE:?set RELEASE_STATE_R2_REMOTE to an rclone destination}"
 : "${RELEASE_STATE_PUBLIC_BASE:?set RELEASE_STATE_PUBLIC_BASE to the public HTTPS base URL}"
 BIN=${ZAKURA_CHECKPOINTS_BIN:-zakura-checkpoints}
@@ -87,7 +87,7 @@ HEIGHT=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f1)
 BLOCK_HASH=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f2)
 GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-# Never move the pointer backwards: an export from a stale quiesced state
+# Never move the pointer backwards: an export from stale stopped-node state
 # would regress latest.json, and retention could then purge the very bundle
 # it points at.
 POINTER_LISTING=$(list_remote_object "$REMOTE_PREFIX/latest.json")
@@ -96,7 +96,7 @@ if [ -n "$POINTER_LISTING" ]; then
     POINTER_HEIGHT=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["height"])' \
         "$STAGE/existing-latest.json")
     if [ "$POINTER_HEIGHT" -gt "$HEIGHT" ]; then
-        echo "refusing to publish height $HEIGHT below the current pointer height $POINTER_HEIGHT; stale quiesced state?" >&2
+        echo "refusing to publish height $HEIGHT below the current pointer height $POINTER_HEIGHT; stale stopped-node state?" >&2
         exit 1
     fi
 fi
@@ -126,7 +126,7 @@ with open(os.path.join(stage, "meta.json"), "w", encoding="utf-8") as out:
 PY
 
 # Immutability with idempotence: a bundle directory is written once. A
-# re-export of the same quiesced state reproduces the same data files (only
+# re-export of the same stopped-node state reproduces the same data files (only
 # the meta timestamp differs), so an existing bundle whose file digests match
 # is reused as-is and only the pointer is refreshed; different contents at the
 # same height mean timestamp-free determinism broke and a human should look.

@@ -4,11 +4,14 @@ Publishes Mainnet release-state bundles — the coupled checkpoint list and VCT
 frontier — from the snapshot host to R2, where the
 `update-release-state.yml` workflow imports them into reviewable draft PRs.
 Design: `docs/design/verified-commitment-trees.md`, section 16.
+Production host wiring, operations, and rollback:
+[`SNAPSHOT_HOST.md`](SNAPSHOT_HOST.md).
 
 ## What runs where
 
-- **This host (snapshot service):** after the snapshot job quiesces its copy of
-  a synced Mainnet state, `publish-release-state.sh <quiesced-cache-dir>` runs
+- **This host (snapshot service):** while the snapshot job holds its lock and
+  has stopped its synced Mainnet node,
+  `publish-release-state.sh <stopped-node-cache-dir>` runs
   the offline export and uploads one immutable bundle
   (`release-state/v1/<height>/{meta.json, main-checkpoints.txt, mainnet-frontier.bin}`),
   then atomically replaces `release-state/latest.json`. Bundles are retained
@@ -38,7 +41,7 @@ Design: `docs/design/verified-commitment-trees.md`, section 16.
    ```sh
    RELEASE_STATE_R2_REMOTE=r2:zakura-artifacts \
    RELEASE_STATE_PUBLIC_BASE=https://zakura-release.valargroup.dev/release-state \
-   /opt/zakura/publish-release-state.sh /mnt/data/quiesced-zakura-cache
+   /opt/zakura/publish-release-state.sh /mnt/data/stopped-node-zakura-cache
    ```
 
 4. Set the repository variable `MAINNET_RELEASE_STATE_LATEST_URL` to
@@ -59,22 +62,11 @@ Design: `docs/design/verified-commitment-trees.md`, section 16.
   publish RPC-mode Mainnet output: off-grid lines make every later bundle fail
   the workflow's byte-for-byte prefix check.
 
-## Pre-merge rehearsal
-
-`rehearsal.sh <quiesced-cache-dir>` exercises the whole pipeline against a
-real synced state with no R2 or GitHub side effects: export smoke test
-(prefix, gaps, determinism, frontier pairing), the publisher against a local
-rclone backend with digest verification and an idempotency re-run, and a
-replay of the workflow's import/validate block in the checkout (restored on
-exit). Easiest host: dispatch `zakura-pr-node.yml` for this branch with
-`network=mainnet snapshot_mode=tip`, SSH in, stop `zakurad`, and run it
-against the mounted state clone.
-
 ## Failure modes
 
-- `state tip ... is not above the last checkpoint`: the quiesced state predates
-  the embedded checkpoint list of the installed tool; sync further or update
-  the tool.
+- `state tip ... is not above the last checkpoint`: the stopped-node state
+  predates the embedded checkpoint list of the installed tool; sync further
+  or update the tool.
 - `Sprout note commitments were appended at ...`: a v4 JoinSplit landed just
   below the state tip; the next day's export self-heals once the checkpoint
   grid passes that block.

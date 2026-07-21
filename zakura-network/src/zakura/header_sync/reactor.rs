@@ -1462,13 +1462,10 @@ impl HeaderSyncReactor {
         };
         let peer_max_headers_per_response = peer_state.max_headers_per_response;
         let in_flight_count = peer_state.outstanding.len();
-        let (headers, body_sizes, tree_aux_roots) = HeaderRangeEntry::into_parallel(entries);
 
         self.handle_headers_for_outstanding(
             peer,
-            headers,
-            body_sizes,
-            tree_aux_roots,
+            entries,
             outstanding,
             peer_max_headers_per_response,
             in_flight_count,
@@ -1480,13 +1477,23 @@ impl HeaderSyncReactor {
     async fn handle_headers_for_outstanding(
         &mut self,
         peer: ZakuraPeerId,
-        headers: Vec<Arc<block::Header>>,
-        body_sizes: Vec<u32>,
-        tree_aux_roots: Vec<BlockCommitmentRoots>,
+        entries: Vec<HeaderRangeEntry>,
         mut outstanding: OutstandingRange,
         peer_max_headers_per_response: u32,
         in_flight_count: usize,
     ) {
+        let headers = entries
+            .iter()
+            .map(|entry| entry.header.clone())
+            .collect::<Vec<_>>();
+        let body_sizes = entries
+            .iter()
+            .map(|entry| entry.body_size)
+            .collect::<Vec<_>>();
+        let tree_aux_roots = entries
+            .iter()
+            .filter_map(|entry| entry.tree_aux_root.clone())
+            .collect::<Vec<_>>();
         if validate_body_sizes_len(headers.len(), body_sizes.len()).is_err()
             || validate_tree_aux_roots_len(headers.len(), tree_aux_roots.len()).is_err()
         {
@@ -1552,6 +1559,41 @@ impl HeaderSyncReactor {
             self.schedule().await;
             return;
         }
+
+        let payload = match HeaderRangePayload::new(entries) {
+            Ok(payload) if payload.range().start() == outstanding.range_request.start_height() => {
+                payload
+            }
+            Ok(payload) => {
+                let error = HeaderSyncWireError::EntryHeightMismatch {
+                    offset: 0,
+                    expected_height: outstanding.range_request.start_height(),
+                    entry_height: payload.range().start(),
+                };
+                tracing::debug!(
+                    ?peer,
+                    ?error,
+                    "Zakura header-sync rejected an entry range starting at the wrong height"
+                );
+                self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::MalformedMessage)
+                    .await;
+                self.retry_or_finish_outstanding(&peer, outstanding);
+                self.schedule().await;
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    ?peer,
+                    ?error,
+                    "Zakura header-sync rejected malformed aligned header entries"
+                );
+                self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::MalformedMessage)
+                    .await;
+                self.retry_or_finish_outstanding(&peer, outstanding);
+                self.schedule().await;
+                return;
+            }
+        };
 
         if let Err(reason) =
             self.validate_vct_repair_response(&outstanding, &headers, &tree_aux_roots)
@@ -1672,10 +1714,6 @@ impl HeaderSyncReactor {
             return;
         }
 
-        let entries = HeaderRangeEntry::from_parallel(headers, body_sizes, tree_aux_roots)
-            .expect("validated response vectors are aligned");
-        let payload = HeaderRangePayload::new(outstanding.range_request.start_height(), entries)
-            .expect("validated non-empty response has checked aligned payload data");
         let end_height = payload.range().end();
         if outstanding.range_request.finalized {
             let last_hash = payload

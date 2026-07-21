@@ -1072,13 +1072,18 @@ async fn send_headers(
             .into_iter()
             .zip(body_sizes)
             .map(|(header, body_size)| HeaderRangeEntry {
+                height: test_header_height(header.as_ref()),
                 header,
                 body_size,
                 tree_aux_root: None,
             })
             .collect()
     } else {
-        HeaderRangeEntry::from_parallel(headers, body_sizes, tree_aux_roots)
+        let start = tree_aux_roots
+            .first()
+            .map(|root| root.height)
+            .unwrap_or(block::Height(0));
+        HeaderRangeEntry::from_parallel(start, headers, body_sizes, tree_aux_roots)
             .expect("test response vectors align")
     };
     fixture
@@ -5076,6 +5081,7 @@ async fn replacement_session_ignores_old_wire_response_with_reused_id() {
                 request_id,
             },
             entries: HeaderRangeEntry::from_parallel(
+                block::Height(4),
                 headers.clone(),
                 vec![0],
                 roots_from_height(block::Height(4), 1),
@@ -5093,6 +5099,7 @@ async fn replacement_session_ignores_old_wire_response_with_reused_id() {
                 request_id,
             },
             entries: HeaderRangeEntry::from_parallel(
+                block::Height(4),
                 headers,
                 vec![0],
                 roots_from_height(block::Height(4), 1),

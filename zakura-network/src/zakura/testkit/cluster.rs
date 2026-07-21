@@ -734,6 +734,7 @@ mod tests {
             node: usize,
             peer: ZakuraPeerId,
             request_id: HeaderSyncRequestId,
+            start_height: block::Height,
             msg: HeaderSyncMessage,
         ) {
             let HeaderSyncMessage::Headers {
@@ -753,8 +754,13 @@ mod tests {
                         session_id: E2E_SESSION_ID,
                         request_id,
                     },
-                    entries: HeaderRangeEntry::from_parallel(headers, body_sizes, tree_aux_roots)
-                        .expect("test response vectors align"),
+                    entries: HeaderRangeEntry::from_parallel(
+                        start_height,
+                        headers,
+                        body_sizes,
+                        tree_aux_roots,
+                    )
+                    .expect("test response vectors align"),
                 })
                 .await
                 .unwrap();
@@ -1008,6 +1014,7 @@ mod tests {
                                     request_id,
                                 },
                                 entries: HeaderRangeEntry::from_parallel(
+                                    start,
                                     headers,
                                     body_sizes,
                                     tree_aux_roots,
@@ -3471,7 +3478,12 @@ mod tests {
                 victim,
                 out_of_range,
                 request_id,
-                headers_message(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()]),
+                block::Height(1),
+                HeaderSyncMessage::Headers {
+                    headers: vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()],
+                    body_sizes: vec![0],
+                    tree_aux_roots: roots_from_height(block::Height(1), 1),
+                },
             )
             .await;
         cluster
@@ -3513,6 +3525,7 @@ mod tests {
                 victim,
                 response_too_long,
                 request_id,
+                block::Height(1),
                 headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
@@ -3552,6 +3565,7 @@ mod tests {
                 bad_continuity_victim,
                 bad_continuity,
                 request_id,
+                block::Height(1),
                 headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     Arc::new(non_contiguous),
@@ -3585,6 +3599,7 @@ mod tests {
                 bad_pow_victim,
                 bad_pow,
                 request_id,
+                block::Height(1),
                 headers_message(vec![Arc::new(bad_pow_header)]),
             )
             .await;
@@ -3619,6 +3634,7 @@ mod tests {
                 bad_daa_victim,
                 bad_daa,
                 request_id,
+                block::Height(1),
                 headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),

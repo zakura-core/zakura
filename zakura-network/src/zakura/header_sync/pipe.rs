@@ -416,8 +416,13 @@ pub(super) fn deliver(
         else {
             unreachable!("Headers frame type agreement guarantees a Headers message");
         };
-        let entries = HeaderRangeEntry::from_parallel(headers, body_sizes, tree_aux_roots)
-            .expect("decoded Headers vectors are structurally aligned");
+        let entries = HeaderRangeEntry::from_parallel(
+            expected.start_height,
+            headers,
+            body_sizes,
+            tree_aux_roots,
+        )
+        .expect("decoded Headers vectors are structurally aligned");
         let request_id = request_id.expect("decoded Headers response has a mandatory request ID");
         return forward(
             handle,

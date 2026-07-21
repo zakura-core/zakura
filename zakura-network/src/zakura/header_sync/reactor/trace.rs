@@ -818,6 +818,8 @@ pub(super) fn header_sync_wire_error_kind(error: &HeaderSyncWireError) -> &'stat
         HeaderSyncWireError::OversizedPayload { .. } => "oversized_payload",
         HeaderSyncWireError::HeaderCountLimit { .. } => "header_count_limit",
         HeaderSyncWireError::InvalidRangeGeometry { .. } => "invalid_range_geometry",
+        HeaderSyncWireError::EmptyHeaderRangePayload => "empty_header_range_payload",
+        HeaderSyncWireError::EntryHeightMismatch { .. } => "entry_height_mismatch",
         HeaderSyncWireError::BodySizeCountMismatch { .. } => "body_size_count_mismatch",
         HeaderSyncWireError::TreeAuxRootCountMismatch { .. } => "tree_aux_root_count_mismatch",
         HeaderSyncWireError::TreeAuxRootHeightMismatch { .. } => "tree_aux_root_height_mismatch",
@@ -1094,6 +1096,7 @@ mod tests {
                     request_id: request_id(),
                 },
                 entries: vec![HeaderRangeEntry {
+                    height: block::Height(1),
                     header: header.clone(),
                     body_size: 1,
                     tree_aux_root: None,
@@ -1199,14 +1202,12 @@ mod tests {
                 HeaderSyncAction::CommitHeaderRange {
                     operation: operation(peer.clone()),
                     anchor: block::Hash([0; 32]),
-                    payload: HeaderRangePayload::new(
-                        block::Height(1),
-                        vec![HeaderRangeEntry {
-                            header,
-                            body_size: 1,
-                            tree_aux_root: None,
-                        }],
-                    )
+                    payload: HeaderRangePayload::new(vec![HeaderRangeEntry {
+                        height: block::Height(1),
+                        header,
+                        body_size: 1,
+                        tree_aux_root: None,
+                    }])
                     .expect("test payload is aligned"),
                     finalized: false,
                 },
@@ -1364,6 +1365,18 @@ mod tests {
             (
                 HeaderSyncWireError::HeaderCountLimit { actual: 2, max: 1 },
                 "header_count_limit",
+            ),
+            (
+                HeaderSyncWireError::EmptyHeaderRangePayload,
+                "empty_header_range_payload",
+            ),
+            (
+                HeaderSyncWireError::EntryHeightMismatch {
+                    offset: 1,
+                    expected_height: block::Height(2),
+                    entry_height: block::Height(3),
+                },
+                "entry_height_mismatch",
             ),
             (
                 HeaderSyncWireError::BodySizeCountMismatch {

@@ -425,8 +425,8 @@ Conventions mirrored from `.github/workflows/zakura-pr-node.yml` (golden-image p
 - [ ] **Step 1: Write the guard test (stub doctl)**
 
 ```bash
-# perf-lab/tests/doctl_stub.sh — records argv; fakes minimal JSON output.
 #!/usr/bin/env bash
+# perf-lab/tests/doctl_stub.sh — records argv; fakes minimal JSON output.
 echo "$@" >> "${DOCTL_LOG:?}"
 case "$*" in
   *"droplet get"*)
@@ -500,10 +500,11 @@ for d in json.load(sys.stdin) or []:
 
 cmd_provision() {
   local name="${NAME_PREFIX}-${1:-$(date +%m%d%H%M)}"
-  ensure_key
-  # hard rule (design §5): concurrent perf-lab droplets <= MAX_DROPLETS
+  # hard rule (design §5): concurrent perf-lab droplets <= MAX_DROPLETS.
+  # Checked before ensure_key so a refused provision has zero side effects.
   local count; count="$(droplet_json | python3 -c 'import json,sys; print(len(json.load(sys.stdin) or []))')"
   [ "$count" -lt "$MAX_DROPLETS" ] || die "refusing: $count perf-lab droplet(s) exist (MAX_DROPLETS=$MAX_DROPLETS)"
+  ensure_key
   local image; image="$(golden_image)"
   if [ -n "$image" ]; then echo "using golden image $image"
   else image="$DO_FALLBACK_IMAGE"; echo "WARN: no ${GOLDEN_IMAGE_PREFIX}* image; falling back to $image (slow bootstrap)"; fi

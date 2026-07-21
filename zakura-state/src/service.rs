@@ -255,6 +255,9 @@ pub struct ReadStateService {
 
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
+    /// Compact durable header-root authentication progress.
+    header_root_auth_receiver:
+        tokio::sync::watch::Receiver<Option<finalized_state::HeaderRootAuthState>>,
 }
 
 impl Drop for StateService {
@@ -416,6 +419,7 @@ impl StateService {
             non_finalized_rejected_receiver,
             highest_completed_checkpoint_receiver,
             vct_root_repair_receiver,
+            header_root_auth_receiver,
             block_write_task,
         ) = write::BlockWriteSender::spawn(
             finalized_state_for_writing,
@@ -433,6 +437,7 @@ impl StateService {
             highest_completed_checkpoint_receiver,
             None,
             vct_root_repair_receiver,
+            header_root_auth_receiver,
         );
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
@@ -1041,6 +1046,51 @@ impl StateService {
         rsp_rx
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn send_authenticate_header_roots(
+        &self,
+        expected_state: finalized_state::HeaderRootAuthState,
+        anchor: block::Hash,
+        start: block::Height,
+        headers: Vec<Arc<block::Header>>,
+        roots: Vec<BlockCommitmentRoots>,
+    ) -> oneshot::Receiver<
+        Result<
+            finalized_state::AuthenticatedHeaderRoots,
+            finalized_state::AuthenticateHeaderRootsError,
+        >,
+    > {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let Some(sender) = &self.block_write_sender.non_finalized else {
+            let _ = rsp_tx.send(Err(
+                finalized_state::AuthenticateHeaderRootsError::Frontier(
+                    finalized_state::HeaderRootAuthFrontierError::WriteTaskUnavailable,
+                ),
+            ));
+            return rsp_rx;
+        };
+        if let Err(tokio::sync::mpsc::error::SendError(error)) =
+            sender.send(NonFinalizedWriteMessage::AuthenticateHeaderRoots {
+                expected_state,
+                anchor,
+                start,
+                headers,
+                roots,
+                rsp_tx,
+            })
+        {
+            let NonFinalizedWriteMessage::AuthenticateHeaderRoots { rsp_tx, .. } = error else {
+                unreachable!("send returned the same authentication message");
+            };
+            let _ = rsp_tx.send(Err(
+                finalized_state::AuthenticateHeaderRootsError::Frontier(
+                    finalized_state::HeaderRootAuthFrontierError::WriteTaskUnavailable,
+                ),
+            ));
+        }
+        rsp_rx
+    }
+
     /// Assert some assumptions about the semantically verified `block` before it is queued.
     fn assert_block_can_be_validated(&self, block: &SemanticallyVerifiedBlock) {
         // required by `Request::CommitSemanticallyVerifiedBlock` call
@@ -1076,6 +1126,9 @@ impl ReadStateService {
             tokio::sync::watch::Sender<Option<finalized_state::HighestCompletedCheckpoint>>,
         >,
         vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
+        header_root_auth_receiver: tokio::sync::watch::Receiver<
+            Option<finalized_state::HeaderRootAuthState>,
+        >,
     ) -> Self {
         let read_service = Self {
             network: finalized_state.network(),
@@ -1085,6 +1138,7 @@ impl ReadStateService {
             highest_completed_checkpoint_receiver,
             _highest_completed_checkpoint_sender: highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
+            header_root_auth_receiver,
         };
 
         tracing::debug!("created new read-only state service");
@@ -1107,6 +1161,13 @@ impl ReadStateService {
         &self,
     ) -> tokio::sync::watch::Receiver<Option<finalized_state::HighestCompletedCheckpoint>> {
         self.highest_completed_checkpoint_receiver.clone()
+    }
+
+    /// Subscribe to compact durable header-root authentication progress.
+    pub fn subscribe_header_root_auth(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<finalized_state::HeaderRootAuthState>> {
+        self.header_root_auth_receiver.clone()
     }
 
     /// Gets a clone of the latest non-finalized state from the `non_finalized_state_receiver`
@@ -1304,6 +1365,42 @@ impl Service<Request> for StateService {
                         .and_then(|result| result)
                         .map_err(BoxError::from)
                         .map(Response::Committed)
+                }
+                .instrument(span)
+                .boxed()
+            }
+
+            Request::AuthenticateHeaderRoots {
+                expected_state,
+                anchor,
+                start,
+                headers,
+                roots,
+            } => {
+                let rsp_rx = tokio::task::block_in_place(move || {
+                    span.in_scope(|| {
+                        self.send_authenticate_header_roots(
+                            expected_state,
+                            anchor,
+                            start,
+                            headers,
+                            roots,
+                        )
+                    })
+                });
+
+                let span = Span::current();
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| {
+                            finalized_state::AuthenticateHeaderRootsError::Frontier(
+                                finalized_state::HeaderRootAuthFrontierError::WriteTaskUnavailable,
+                            )
+                        })
+                        .and_then(|result| result)
+                        .map_err(BoxError::from)
+                        .map(Response::AuthenticatedHeaderRoots)
                 }
                 .instrument(span)
                 .boxed()
@@ -2302,6 +2399,7 @@ pub fn init_read_only(
     let (highest_completed_checkpoint, highest_completed_checkpoint_receiver) =
         finalized_state::HighestCompletedCheckpointTracker::open(&finalized_state.db);
     let highest_completed_checkpoint_sender = Some(highest_completed_checkpoint.keepalive_sender());
+    let (_header_root_auth_sender, header_root_auth_receiver) = tokio::sync::watch::channel(None);
 
     Ok((
         ReadStateService::new(
@@ -2311,6 +2409,7 @@ pub fn init_read_only(
             highest_completed_checkpoint_receiver,
             highest_completed_checkpoint_sender,
             vct_root_repair_receiver,
+            header_root_auth_receiver,
         ),
         finalized_state.db.clone(),
         non_finalized_state_sender,

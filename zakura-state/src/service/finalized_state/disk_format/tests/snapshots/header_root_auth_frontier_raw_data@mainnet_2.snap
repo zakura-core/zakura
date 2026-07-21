@@ -7,4 +7,8 @@ expression: cf_data
     k: "",
     v: "0102000000ed73e297d7c51cb8dc53fc2213d7e2e3f116eb4f26434496fc1926906ca2020000",
   ),
+  KV(
+    k: "01",
+    v: "0000000008ce3d9731b000c08338455c8a4a6bd05da16e26b11daa1b917184ece80f0400",
+  ),
 ]

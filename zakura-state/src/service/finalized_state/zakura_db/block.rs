@@ -2018,7 +2018,7 @@ impl DiskWriteBatch {
         anchor: block::Hash,
         headers: &[Arc<block::Header>],
         body_sizes: &[u32],
-        tree_aux_roots: &[BlockCommitmentRoots],
+        _tree_aux_roots: &[BlockCommitmentRoots],
     ) -> Result<block::Hash, CommitHeaderRangeError> {
         if headers.is_empty() {
             return Err(CommitHeaderRangeError::EmptyRange);
@@ -2028,13 +2028,6 @@ impl DiskWriteBatch {
             return Err(CommitHeaderRangeError::BodySizeCountMismatch {
                 headers: headers.len(),
                 body_sizes: body_sizes.len(),
-            });
-        }
-
-        if headers.len() != tree_aux_roots.len() {
-            return Err(CommitHeaderRangeError::TreeAuxRootCountMismatch {
-                headers: headers.len(),
-                roots: tree_aux_roots.len(),
             });
         }
 
@@ -2081,6 +2074,12 @@ impl DiskWriteBatch {
         let finalized_height = zakura_db.finalized_tip_height();
         let best_header_tip = zakura_db.best_header_tip().map(|(height, _)| height);
         let checkpoints = zakura_db.network().checkpoint_list();
+        let completed_checkpoint_height = zakura_db
+            .try_header_root_auth_frontier()
+            .map_err(|error| CommitHeaderRangeError::HeaderRootAuthFrontier {
+                reason: error.to_string(),
+            })?
+            .map(|frontier| frontier.state().completed_checkpoint_height);
 
         let mut recent_headers = zakura_db.recent_header_context(anchor_height)?;
         if recent_headers.is_empty() {
@@ -2108,7 +2107,6 @@ impl DiskWriteBatch {
                 .ok_or(CommitHeaderRangeError::HeightOverflow)?;
             let hash = block::Hash::from(&**header);
             let body_size = body_sizes[index];
-            let roots = &tree_aux_roots[index];
 
             if header.previous_block_hash != expected_parent {
                 return Err(CommitHeaderRangeError::UnlinkedRange {
@@ -2118,13 +2116,6 @@ impl DiskWriteBatch {
                 });
             }
             expected_parent = hash;
-
-            if roots.height != height {
-                return Err(CommitHeaderRangeError::TreeAuxRootHeightMismatch {
-                    expected_height: height,
-                    root_height: roots.height,
-                });
-            }
 
             if let Some(expected) = checkpoints.hash(height) {
                 if expected != hash {
@@ -2138,6 +2129,11 @@ impl DiskWriteBatch {
 
             if let Some((_existing_hash, existing_header)) = zakura_db.header_by_height(height) {
                 if existing_header != *header {
+                    if completed_checkpoint_height
+                        .is_some_and(|completed_checkpoint| height <= completed_checkpoint)
+                    {
+                        return Err(CommitHeaderRangeError::ImmutableConflict { height });
+                    }
                     if finalized_height.is_some_and(|finalized_height| height <= finalized_height) {
                         return Err(CommitHeaderRangeError::ImmutableConflict { height });
                     }
@@ -2243,18 +2239,13 @@ impl DiskWriteBatch {
                     first_conflicting_height,
                     best_header_tip,
                 );
-            } else if let Some(body_tip) = finalized_height {
-                self.truncate_commitment_roots_after(zakura_db, body_tip);
-                zakura_db
-                    .prepare_header_root_auth_frontier_from_body_tip(self)
-                    .map_err(|error| CommitHeaderRangeError::HeaderRootAuthFrontier {
-                        reason: error.to_string(),
-                    })?;
-            } else {
-                self.truncate_all_commitment_roots(zakura_db);
-                self.delete_header_root_auth_frontier(zakura_db);
             }
         }
+
+        let canonical_range = validated_headers
+            .iter()
+            .map(|(height, hash, header, _body_size)| (*height, *hash, (*header).clone()))
+            .collect::<Vec<_>>();
 
         for (height, hash, header, body_size) in validated_headers {
             // Finalized block heights already have authoritative block rows and
@@ -2285,6 +2276,10 @@ impl DiskWriteBatch {
                 self.zs_delete(&body_size_by_height, height);
             }
         }
+        self.advance_completed_checkpoint_for_header_range(zakura_db, &canonical_range)
+            .map_err(|error| CommitHeaderRangeError::HeaderRootAuthFrontier {
+                reason: error.to_string(),
+            })?;
 
         Ok(block::Hash::from(
             &**headers.last().expect("headers is non-empty"),

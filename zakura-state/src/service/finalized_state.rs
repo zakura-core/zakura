@@ -117,8 +117,9 @@ pub use vct::{
 pub use zakura_db::highest_completed_checkpoint::*;
 #[allow(unused_imports)]
 pub use zakura_db::commitment_roots_db::{
-    HeaderRootAuthFrontier, HeaderRootAuthFrontierError, COMMITMENT_ROOTS_BY_HEIGHT,
-    HEADER_ROOT_AUTH_FRONTIER,
+    AuthenticateHeaderRootsError, AuthenticateHeaderRootsOutcome, AuthenticatedHeaderRoots,
+    CompletedCheckpointFrontier, HeaderRootAuthFrontier, HeaderRootAuthFrontierError,
+    HeaderRootAuthState, COMMITMENT_ROOTS_BY_HEIGHT, HEADER_ROOT_AUTH_FRONTIER,
 };
 pub use zakura_db::ZakuraDb;
 

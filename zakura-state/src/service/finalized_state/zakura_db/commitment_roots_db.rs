@@ -4,14 +4,20 @@
 //! disk-row conversion, contiguous reads, and the distinct body, legacy
 //! header, reorganization, rollback, and repair write policies in one place.
 
-use std::ops::{Bound, RangeBounds, RangeInclusive};
+use std::{
+    ops::{Bound, RangeBounds, RangeInclusive},
+    sync::Arc,
+};
 
 use thiserror::Error;
 use zakura_chain::{
     block::{self, Height},
     history_tree::HistoryTree,
     parallel::{
-        commitment_aux::BlockCommitmentRoots, commitment_aux_verify::VerifiedHeaderCommitmentRoots,
+        commitment_aux::BlockCommitmentRoots,
+        commitment_aux_verify::{
+            verify_supplied_roots_from_parts, SuppliedRootsError, VerifiedHeaderCommitmentRoots,
+        },
     },
     parameters::NetworkUpgrade,
 };
@@ -39,6 +45,152 @@ type HeaderRootAuthFrontierCf<'cf> = TypedColumnFamily<'cf, RawBytes, RawBytes>;
 
 const FRONTIER_FORMAT_VERSION: u8 = 1;
 const FRONTIER_FIXED_BYTES: usize = 1 + 4 + 32 + 1;
+const AUTH_FRONTIER_KEY: &[u8] = &[];
+const COMPLETED_CHECKPOINT_KEY: &[u8] = &[1];
+const COMPLETED_CHECKPOINT_BYTES: usize = 4 + 32;
+
+/// The highest configured checkpoint whose complete canonical bracket is durable.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct CompletedCheckpointFrontier {
+    /// The completed configured checkpoint height.
+    pub height: Height,
+    /// The configured checkpoint hash stored canonically at `height`.
+    pub hash: block::Hash,
+}
+
+/// Compact header-root authentication progress published to header sync.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderRootAuthState {
+    /// The last height whose supplied roots have been authenticated.
+    pub authenticated_height: Height,
+    /// The canonical header hash at `authenticated_height`.
+    pub authenticated_hash: block::Hash,
+    /// The highest completely stored configured checkpoint height.
+    pub completed_checkpoint_height: Height,
+    /// The configured checkpoint hash at `completed_checkpoint_height`.
+    pub completed_checkpoint_hash: block::Hash,
+}
+
+/// A successful supplied-root authentication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedHeaderRoots {
+    /// Authentication progress after the durable write.
+    pub state: HeaderRootAuthState,
+    /// Newly authenticated root heights.
+    pub authenticated: RangeInclusive<Height>,
+}
+
+/// Stable classification for supplied-root authentication outcomes.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AuthenticateHeaderRootsOutcome {
+    /// The caller raced a newer canonical frontier and should refresh.
+    Stale,
+    /// The supplied headers or roots are invalid.
+    Invalid,
+    /// Durable state is incoherent or a local read/write failed.
+    Local,
+}
+
+/// Errors authenticating and durably promoting peer-supplied roots.
+#[derive(Debug, Error)]
+pub enum AuthenticateHeaderRootsError {
+    /// The caller's state snapshot is no longer current.
+    #[error("stale header-root authentication state: expected {expected:?}, current {current:?}")]
+    StaleState {
+        /// State supplied by the caller.
+        expected: HeaderRootAuthState,
+        /// Current durable state.
+        current: HeaderRootAuthState,
+    },
+    /// The supplied anchor does not match the current authenticated frontier.
+    #[error("header-root anchor {actual} does not match current frontier hash {expected}")]
+    AnchorMismatch {
+        /// Current authenticated hash.
+        expected: block::Hash,
+        /// Supplied anchor.
+        actual: block::Hash,
+    },
+    /// The supplied range does not start immediately after the authenticated frontier.
+    #[error("header-root range starts at {actual:?}, expected {expected:?}")]
+    StartMismatch {
+        /// Required start height.
+        expected: Height,
+        /// Supplied start height.
+        actual: Height,
+    },
+    /// Header and root counts differ.
+    #[error("header-root item count mismatch: {headers} headers, {roots} roots")]
+    CountMismatch {
+        /// Number of headers.
+        headers: usize,
+        /// Number of root records.
+        roots: usize,
+    },
+    /// At least one confirmed root and a successor witness are required.
+    #[error("header-root authentication requires at least two aligned items, got {items}")]
+    MissingSuccessorWitness {
+        /// Number of supplied items.
+        items: usize,
+    },
+    /// A root record is not at its required contiguous height.
+    #[error("header-root item is at {actual:?}, expected {expected:?}")]
+    NonContiguous {
+        /// Required item height.
+        expected: Height,
+        /// Supplied item height.
+        actual: Height,
+    },
+    /// A supplied header is not the canonical stored header at its height.
+    #[error("supplied header is not canonical at {height:?}")]
+    NonCanonicalHeader {
+        /// Non-canonical height.
+        height: Height,
+    },
+    /// The successor witness is not itself covered by the completed checkpoint.
+    #[error(
+        "header-root successor witness {witness_height:?} is above completed checkpoint {completed_checkpoint_height:?}"
+    )]
+    WitnessAboveCompletedCheckpoint {
+        /// Successor witness height.
+        witness_height: Height,
+        /// Current completed checkpoint height.
+        completed_checkpoint_height: Height,
+    },
+    /// Cryptographic commitment verification failed.
+    #[error("supplied roots failed authentication at {height:?}: {source}")]
+    Verification {
+        /// First failing height.
+        height: Height,
+        /// Commitment or history-tree failure.
+        #[source]
+        source: SuppliedRootsError,
+    },
+    /// A height operation overflowed.
+    #[error("header-root authentication height overflow")]
+    HeightOverflow,
+    /// Durable authenticated-root state was invalid or could not be updated.
+    #[error("header-root authentication state failure: {0}")]
+    Frontier(#[from] HeaderRootAuthFrontierError),
+}
+
+impl AuthenticateHeaderRootsError {
+    /// Returns the stable outcome class for this error.
+    pub fn outcome(&self) -> AuthenticateHeaderRootsOutcome {
+        match self {
+            Self::StaleState { .. }
+            | Self::AnchorMismatch { .. }
+            | Self::StartMismatch { .. }
+            | Self::NonCanonicalHeader { .. }
+            | Self::WitnessAboveCompletedCheckpoint { .. } => AuthenticateHeaderRootsOutcome::Stale,
+            Self::CountMismatch { .. }
+            | Self::MissingSuccessorWitness { .. }
+            | Self::NonContiguous { .. }
+            | Self::Verification { .. }
+            | Self::HeightOverflow => AuthenticateHeaderRootsOutcome::Invalid,
+            Self::Frontier(_) => AuthenticateHeaderRootsOutcome::Local,
+        }
+    }
+}
 
 /// The durable boundary through which peer-supplied roots have been authenticated.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,6 +198,7 @@ pub struct HeaderRootAuthFrontier {
     confirmed_height: Height,
     confirmed_hash: block::Hash,
     history_tree: HistoryTree,
+    completed_checkpoint: CompletedCheckpointFrontier,
 }
 
 impl HeaderRootAuthFrontier {
@@ -62,6 +215,16 @@ impl HeaderRootAuthFrontier {
     /// Returns the history tree containing roots through the confirmed height.
     pub fn history_tree(&self) -> &HistoryTree {
         &self.history_tree
+    }
+
+    /// Returns compact authentication progress suitable for a watch channel.
+    pub fn state(&self) -> HeaderRootAuthState {
+        HeaderRootAuthState {
+            authenticated_height: self.confirmed_height,
+            authenticated_hash: self.confirmed_hash,
+            completed_checkpoint_height: self.completed_checkpoint.height,
+            completed_checkpoint_hash: self.completed_checkpoint.hash,
+        }
     }
 }
 
@@ -104,6 +267,27 @@ pub enum HeaderRootAuthFrontierError {
     /// A non-empty database has no durable authentication frontier.
     #[error("missing header-root authentication frontier for non-empty finalized state")]
     MissingFrontier,
+    /// A non-empty database has no durable completed-checkpoint frontier.
+    #[error("missing completed-checkpoint frontier for non-empty finalized state")]
+    MissingCompletedCheckpoint,
+    /// The durable completed checkpoint is not a configured checkpoint.
+    #[error("completed checkpoint {height:?} with hash {hash} is not configured")]
+    InvalidCompletedCheckpoint {
+        /// Recorded checkpoint height.
+        height: Height,
+        /// Recorded checkpoint hash.
+        hash: block::Hash,
+    },
+    /// The durable completed checkpoint is not the reconstructed canonical checkpoint.
+    #[error(
+        "completed checkpoint frontier {stored:?} does not match reconstructed frontier {reconstructed:?}"
+    )]
+    CompletedCheckpointMismatch {
+        /// Persisted frontier.
+        stored: CompletedCheckpointFrontier,
+        /// Frontier reconstructed from canonical headers.
+        reconstructed: CompletedCheckpointFrontier,
+    },
     /// Header or root state exists without a finalized tip.
     #[error(
         "header-root authentication state exists without a finalized tip \
@@ -158,6 +342,9 @@ pub enum HeaderRootAuthFrontierError {
     /// The frontier could not be written.
     #[error("could not write header-root authentication frontier: {0}")]
     Storage(#[from] rocksdb::Error),
+    /// The serialized state write task is unavailable.
+    #[error("header-root authentication write task is unavailable")]
+    WriteTaskUnavailable,
 }
 
 fn disk_row(roots: &BlockCommitmentRoots) -> CommitmentRootsByHeight {
@@ -198,6 +385,35 @@ fn frontier_bytes(frontier: &HeaderRootAuthFrontier) -> RawBytes {
         None => bytes.push(0),
     }
     RawBytes::new_raw_bytes(bytes)
+}
+
+fn completed_checkpoint_bytes(frontier: CompletedCheckpointFrontier) -> RawBytes {
+    let mut bytes = Vec::with_capacity(COMPLETED_CHECKPOINT_BYTES);
+    bytes.extend_from_slice(&frontier.height.0.to_le_bytes());
+    bytes.extend_from_slice(&frontier.hash.0);
+    RawBytes::new_raw_bytes(bytes)
+}
+
+fn decode_completed_checkpoint(
+    bytes: &RawBytes,
+) -> Result<CompletedCheckpointFrontier, HeaderRootAuthFrontierError> {
+    let bytes = bytes.raw_bytes();
+    if bytes.len() != COMPLETED_CHECKPOINT_BYTES {
+        return Err(HeaderRootAuthFrontierError::InvalidEncoding);
+    }
+
+    let height = Height(u32::from_le_bytes(
+        bytes[..4]
+            .try_into()
+            .map_err(|_| HeaderRootAuthFrontierError::InvalidEncoding)?,
+    ));
+    let hash = block::Hash(
+        bytes[4..]
+            .try_into()
+            .map_err(|_| HeaderRootAuthFrontierError::InvalidEncoding)?,
+    );
+
+    Ok(CompletedCheckpointFrontier { height, hash })
 }
 
 fn validate_history_tree_height(
@@ -265,6 +481,10 @@ fn decode_frontier(
         confirmed_height,
         confirmed_hash,
         history_tree,
+        completed_checkpoint: CompletedCheckpointFrontier {
+            height: Height::MIN,
+            hash: db.network().genesis_hash(),
+        },
     })
 }
 
@@ -306,14 +526,78 @@ impl ZakuraDb {
     }
 
     /// Restores the authenticated header-root frontier using fallible tree decoding.
-    pub fn try_header_root_auth_frontier(
+    fn try_header_root_auth_frontier_without_checkpoint(
         &self,
     ) -> Result<Option<HeaderRootAuthFrontier>, HeaderRootAuthFrontierError> {
-        self.header_root_auth_frontier_cf()
-            .zs_get(&RawBytes::new_raw_bytes(Vec::new()))
+        let cf = self.header_root_auth_frontier_cf();
+        cf.zs_get(&RawBytes::new_raw_bytes(AUTH_FRONTIER_KEY.to_vec()))
             .as_ref()
             .map(|bytes| decode_frontier(self, bytes))
             .transpose()
+    }
+
+    /// Restores the authenticated header-root frontier using fallible tree decoding.
+    pub fn try_header_root_auth_frontier(
+        &self,
+    ) -> Result<Option<HeaderRootAuthFrontier>, HeaderRootAuthFrontierError> {
+        let Some(mut frontier) = self.try_header_root_auth_frontier_without_checkpoint()? else {
+            return Ok(None);
+        };
+        frontier.completed_checkpoint = self
+            .header_root_auth_frontier_cf()
+            .zs_get(&RawBytes::new_raw_bytes(COMPLETED_CHECKPOINT_KEY.to_vec()))
+            .as_ref()
+            .map(decode_completed_checkpoint)
+            .transpose()?
+            .ok_or(HeaderRootAuthFrontierError::MissingCompletedCheckpoint)?;
+        Ok(Some(frontier))
+    }
+
+    fn try_header_root_auth_frontier_compat(
+        &self,
+    ) -> Result<Option<HeaderRootAuthFrontier>, HeaderRootAuthFrontierError> {
+        match self.try_header_root_auth_frontier() {
+            Ok(frontier) => Ok(frontier),
+            Err(HeaderRootAuthFrontierError::MissingCompletedCheckpoint) => {
+                let Some(mut frontier) = self.try_header_root_auth_frontier_without_checkpoint()?
+                else {
+                    return Ok(None);
+                };
+                frontier.completed_checkpoint = self
+                    .reconstruct_completed_checkpoint()?
+                    .or_else(|| {
+                        self.network()
+                            .checkpoint_list()
+                            .hash(Height::MIN)
+                            .map(|hash| CompletedCheckpointFrontier {
+                                height: Height::MIN,
+                                hash,
+                            })
+                    })
+                    .ok_or(HeaderRootAuthFrontierError::MissingCompletedCheckpoint)?;
+                Ok(Some(frontier))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn reconstruct_and_persist_completed_checkpoint(
+        &self,
+    ) -> Result<(), HeaderRootAuthFrontierError> {
+        let Some(mut frontier) = self.try_header_root_auth_frontier_without_checkpoint()? else {
+            return if self.tip().is_none() {
+                Ok(())
+            } else {
+                Err(HeaderRootAuthFrontierError::MissingFrontier)
+            };
+        };
+        frontier.completed_checkpoint = self
+            .reconstruct_completed_checkpoint()?
+            .ok_or(HeaderRootAuthFrontierError::MissingCompletedCheckpoint)?;
+        let mut batch = DiskWriteBatch::new();
+        batch.set_header_root_auth_frontier(self, &frontier);
+        self.write_batch(batch)?;
+        Ok(())
     }
 
     pub(crate) fn has_commitment_root_rows(&self) -> bool {
@@ -321,7 +605,126 @@ impl ZakuraDb {
     }
 
     pub(crate) fn has_header_root_auth_frontier_row(&self) -> bool {
-        !self.header_root_auth_frontier_cf().zs_is_empty()
+        self.header_root_auth_frontier_cf()
+            .zs_get(&RawBytes::new_raw_bytes(AUTH_FRONTIER_KEY.to_vec()))
+            .is_some()
+    }
+
+    fn reconstruct_completed_checkpoint_through(
+        &self,
+        canonical_tip: Height,
+        pending: &[(Height, block::Hash, Arc<block::Header>)],
+    ) -> Result<Option<CompletedCheckpointFrontier>, HeaderRootAuthFrontierError> {
+        let checkpoints = self.network().checkpoint_list();
+        let Some(genesis_hash) = checkpoints.hash(Height::MIN) else {
+            return Ok(None);
+        };
+        let mut completed = CompletedCheckpointFrontier {
+            height: Height::MIN,
+            hash: genesis_hash,
+        };
+        for (checkpoint_height, checkpoint_hash) in checkpoints
+            .iter_cloned()
+            .skip(1)
+            .take_while(|(height, _)| *height <= canonical_tip)
+        {
+            let mut expected_parent = completed.hash;
+            let mut height = completed
+                .height
+                .next()
+                .map_err(|_| HeaderRootAuthFrontierError::HeightOverflow)?;
+            let mut bracket_complete = true;
+            while height <= checkpoint_height {
+                let item = pending
+                    .iter()
+                    .find(|(pending_height, _, _)| *pending_height == height)
+                    .map(|(_, hash, header)| (*hash, header.clone()))
+                    .or_else(|| self.header_by_height(height));
+                let Some((hash, header)) = item else {
+                    bracket_complete = false;
+                    break;
+                };
+                if block::Hash::from(header.as_ref()) != hash
+                    || header.previous_block_hash != expected_parent
+                {
+                    bracket_complete = false;
+                    break;
+                }
+                expected_parent = hash;
+                height = match height.next() {
+                    Ok(next) => next,
+                    Err(_) => break,
+                };
+            }
+            if !bracket_complete || expected_parent != checkpoint_hash {
+                break;
+            }
+            completed = CompletedCheckpointFrontier {
+                height: checkpoint_height,
+                hash: checkpoint_hash,
+            };
+        }
+
+        Ok(Some(completed))
+    }
+
+    pub(crate) fn reconstruct_completed_checkpoint(
+        &self,
+    ) -> Result<Option<CompletedCheckpointFrontier>, HeaderRootAuthFrontierError> {
+        let canonical_tip = match (self.finalized_tip_height(), self.best_header_tip()) {
+            (Some(body), Some((headers, _))) => Some(body.max(headers)),
+            (Some(body), None) => Some(body),
+            (None, Some((headers, _))) => Some(headers),
+            (None, None) => None,
+        };
+        let Some(canonical_tip) = canonical_tip else {
+            return Ok(None);
+        };
+        self.reconstruct_completed_checkpoint_through(canonical_tip, &[])
+    }
+
+    fn completed_checkpoint_for_tip(
+        &self,
+        tip_height: Height,
+        tip_hash: block::Hash,
+        tip_header: Arc<block::Header>,
+    ) -> Result<CompletedCheckpointFrontier, HeaderRootAuthFrontierError> {
+        self.reconstruct_completed_checkpoint_through(
+            tip_height,
+            &[(tip_height, tip_hash, tip_header)],
+        )?
+        .or_else(|| {
+            self.network()
+                .checkpoint_list()
+                .hash(Height::MIN)
+                .map(|hash| CompletedCheckpointFrontier {
+                    height: Height::MIN,
+                    hash,
+                })
+        })
+        .ok_or(HeaderRootAuthFrontierError::MissingCompletedCheckpoint)
+    }
+
+    fn validate_completed_checkpoint(
+        &self,
+        stored: CompletedCheckpointFrontier,
+    ) -> Result<(), HeaderRootAuthFrontierError> {
+        if self.network().checkpoint_list().hash(stored.height) != Some(stored.hash) {
+            return Err(HeaderRootAuthFrontierError::InvalidCompletedCheckpoint {
+                height: stored.height,
+                hash: stored.hash,
+            });
+        }
+        let reconstructed = self
+            .reconstruct_completed_checkpoint()?
+            .ok_or(HeaderRootAuthFrontierError::MissingCompletedCheckpoint)?;
+        if stored != reconstructed {
+            return Err(HeaderRootAuthFrontierError::CompletedCheckpointMismatch {
+                stored,
+                reconstructed,
+            });
+        }
+        Ok(())
     }
 
     fn has_zakura_header_rows(&self) -> bool {
@@ -360,6 +763,7 @@ impl ZakuraDb {
         let frontier = self
             .try_header_root_auth_frontier()?
             .ok_or(HeaderRootAuthFrontierError::MissingFrontier)?;
+        self.validate_completed_checkpoint(frontier.completed_checkpoint)?;
         if frontier.confirmed_height < body_tip {
             return Err(HeaderRootAuthFrontierError::FrontierBehindBodyTip {
                 frontier_height: frontier.confirmed_height,
@@ -403,9 +807,20 @@ impl ZakuraDb {
         let _ = self
             .header_root_auth_frontier_cf()
             .with_batch_for_writing(&mut batch)
-            .zs_delete(&RawBytes::new_raw_bytes(Vec::new()));
+            .zs_delete(&RawBytes::new_raw_bytes(AUTH_FRONTIER_KEY.to_vec()));
         self.write_batch(batch)
             .expect("test frontier deletion must write successfully");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_completed_checkpoint_frontier_for_test(&self) {
+        let mut batch = DiskWriteBatch::new();
+        let _ = self
+            .header_root_auth_frontier_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_delete(&RawBytes::new_raw_bytes(COMPLETED_CHECKPOINT_KEY.to_vec()));
+        self.write_batch(batch)
+            .expect("test completed-checkpoint deletion must write successfully");
     }
 
     /// Atomically promotes successfully verified roots and advances their durable frontier.
@@ -415,11 +830,14 @@ impl ZakuraDb {
     pub(crate) fn write_verified_header_commitment_roots(
         &self,
         verified: VerifiedHeaderCommitmentRoots,
-    ) -> Result<(), HeaderRootAuthFrontierError> {
+    ) -> Result<HeaderRootAuthState, HeaderRootAuthFrontierError> {
         let confirmed_roots = verified.confirmed_roots();
         let confirmed_hashes = verified.confirmed_hashes();
         let Some(first_roots) = confirmed_roots.first() else {
-            return Ok(());
+            return self
+                .validate_header_root_auth_state()?
+                .map(|frontier| frontier.state())
+                .ok_or(HeaderRootAuthFrontierError::MissingFrontier);
         };
         let Some((&confirmed_hash, last_roots)) =
             confirmed_hashes.last().zip(confirmed_roots.last())
@@ -476,6 +894,7 @@ impl ZakuraDb {
             confirmed_height,
             confirmed_hash,
             history_tree: verified.history_tree().clone(),
+            completed_checkpoint: frontier.completed_checkpoint,
         };
 
         let mut batch = DiskWriteBatch::new();
@@ -484,7 +903,105 @@ impl ZakuraDb {
         }
         batch.set_header_root_auth_frontier(self, &frontier);
         self.write_batch(batch)?;
-        Ok(())
+        Ok(frontier.state())
+    }
+
+    /// Validates supplied roots against the exact durable frontier and atomically promotes them.
+    pub(crate) fn authenticate_header_roots(
+        &self,
+        expected_state: HeaderRootAuthState,
+        anchor: block::Hash,
+        start: Height,
+        headers: &[Arc<block::Header>],
+        roots: &[BlockCommitmentRoots],
+    ) -> Result<AuthenticatedHeaderRoots, AuthenticateHeaderRootsError> {
+        let frontier = self
+            .validate_header_root_auth_state()?
+            .ok_or(HeaderRootAuthFrontierError::MissingFrontier)?;
+        let current = frontier.state();
+        if expected_state != current {
+            return Err(AuthenticateHeaderRootsError::StaleState {
+                expected: expected_state,
+                current,
+            });
+        }
+        if anchor != current.authenticated_hash {
+            return Err(AuthenticateHeaderRootsError::AnchorMismatch {
+                expected: current.authenticated_hash,
+                actual: anchor,
+            });
+        }
+        let expected_start = current
+            .authenticated_height
+            .next()
+            .map_err(|_| AuthenticateHeaderRootsError::HeightOverflow)?;
+        if start != expected_start {
+            return Err(AuthenticateHeaderRootsError::StartMismatch {
+                expected: expected_start,
+                actual: start,
+            });
+        }
+        if headers.len() != roots.len() {
+            return Err(AuthenticateHeaderRootsError::CountMismatch {
+                headers: headers.len(),
+                roots: roots.len(),
+            });
+        }
+        if headers.len() < 2 {
+            return Err(AuthenticateHeaderRootsError::MissingSuccessorWitness {
+                items: headers.len(),
+            });
+        }
+
+        let mut expected_height = start;
+        for (header, roots) in headers.iter().zip(roots) {
+            if roots.height != expected_height {
+                return Err(AuthenticateHeaderRootsError::NonContiguous {
+                    expected: expected_height,
+                    actual: roots.height,
+                });
+            }
+            if self.header_hash(expected_height) != Some(block::Hash::from(header.as_ref())) {
+                return Err(AuthenticateHeaderRootsError::NonCanonicalHeader {
+                    height: expected_height,
+                });
+            }
+            expected_height = expected_height
+                .next()
+                .map_err(|_| AuthenticateHeaderRootsError::HeightOverflow)?;
+        }
+
+        let confirmed_height = roots[roots.len() - 2].height;
+        let witness_height = roots
+            .last()
+            .expect("root delivery has at least two items")
+            .height;
+        if witness_height > current.completed_checkpoint_height {
+            return Err(
+                AuthenticateHeaderRootsError::WitnessAboveCompletedCheckpoint {
+                    witness_height,
+                    completed_checkpoint_height: current.completed_checkpoint_height,
+                },
+            );
+        }
+
+        let verified = verify_supplied_roots_from_parts(
+            &self.network(),
+            frontier.history_tree.clone(),
+            headers
+                .iter()
+                .zip(roots)
+                .map(|(header, roots)| (header.as_ref(), roots)),
+        )
+        .map_err(
+            |(height, source)| AuthenticateHeaderRootsError::Verification { height, source },
+        )?;
+        let authenticated = start..=confirmed_height;
+        let state = self.write_verified_header_commitment_roots(verified)?;
+        Ok(AuthenticatedHeaderRoots {
+            state,
+            authenticated,
+        })
     }
 
     pub(crate) fn prepare_header_root_auth_frontier_from_body_tip(
@@ -494,14 +1011,58 @@ impl ZakuraDb {
         let Some((confirmed_height, confirmed_hash)) = self.tip() else {
             return Ok(());
         };
+        let confirmed_header = self
+            .header_by_height(confirmed_height)
+            .map(|(_, header)| header)
+            .ok_or(HeaderRootAuthFrontierError::CanonicalHashMismatch {
+                height: confirmed_height,
+            })?;
         let history_tree = (*self.try_history_tree()?).clone();
         validate_history_tree_height(self, confirmed_height, &history_tree)?;
+        let reconstructed =
+            self.completed_checkpoint_for_tip(confirmed_height, confirmed_hash, confirmed_header)?;
+        let completed_checkpoint = self
+            .try_header_root_auth_frontier_compat()?
+            .map(|frontier| frontier.completed_checkpoint)
+            .filter(|stored| stored.height > reconstructed.height)
+            .unwrap_or(reconstructed);
         let frontier = HeaderRootAuthFrontier {
             confirmed_height,
             confirmed_hash,
             history_tree,
+            completed_checkpoint,
         };
         batch.set_header_root_auth_frontier(self, &frontier);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_legacy_header_root_auth_frontier_from_body_tip(
+        &self,
+        batch: &mut DiskWriteBatch,
+    ) -> Result<(), HeaderRootAuthFrontierError> {
+        let Some((confirmed_height, confirmed_hash)) = self.tip() else {
+            return Ok(());
+        };
+        let history_tree = (*self.try_history_tree()?).clone();
+        validate_history_tree_height(self, confirmed_height, &history_tree)?;
+        let completed_checkpoint = self
+            .network()
+            .checkpoint_list()
+            .hash(Height::MIN)
+            .map(|hash| CompletedCheckpointFrontier {
+                height: Height::MIN,
+                hash,
+            })
+            .ok_or(HeaderRootAuthFrontierError::MissingCompletedCheckpoint)?;
+        batch.set_header_root_auth_frontier(
+            self,
+            &HeaderRootAuthFrontier {
+                confirmed_height,
+                confirmed_hash,
+                history_tree,
+                completed_checkpoint,
+            },
+        );
         Ok(())
     }
 
@@ -627,6 +1188,13 @@ impl DiskWriteBatch {
                 &RawBytes::new_raw_bytes(Vec::new()),
                 &frontier_bytes(frontier),
             );
+        let _ = db
+            .header_root_auth_frontier_cf()
+            .with_batch_for_writing(self)
+            .zs_insert(
+                &RawBytes::new_raw_bytes(COMPLETED_CHECKPOINT_KEY.to_vec()),
+                &completed_checkpoint_bytes(frontier.completed_checkpoint),
+            );
     }
 
     pub(crate) fn advance_header_root_auth_frontier_from_body(
@@ -634,20 +1202,42 @@ impl DiskWriteBatch {
         db: &ZakuraDb,
         confirmed_height: Height,
         confirmed_hash: block::Hash,
+        confirmed_header: Arc<block::Header>,
         history_tree: &HistoryTree,
     ) -> Result<(), HeaderRootAuthFrontierError> {
-        let stored_frontier = db.try_header_root_auth_frontier()?;
-        if stored_frontier
+        let stored_frontier = db.try_header_root_auth_frontier_compat()?;
+        let reconstructed =
+            db.completed_checkpoint_for_tip(confirmed_height, confirmed_hash, confirmed_header)?;
+        let completed_checkpoint = stored_frontier
             .as_ref()
-            .is_some_and(|frontier| frontier.confirmed_height > confirmed_height)
-            && db.header_hash(confirmed_height) == Some(confirmed_hash)
-        {
+            .map(|frontier| frontier.completed_checkpoint)
+            .filter(|stored| stored.height > reconstructed.height)
+            .unwrap_or(reconstructed);
+        if let Some(mut frontier) = stored_frontier.filter(|frontier| {
+            frontier.confirmed_height > confirmed_height
+                && db.header_hash(confirmed_height) == Some(confirmed_hash)
+        }) {
+            if completed_checkpoint.height > frontier.completed_checkpoint.height {
+                frontier.completed_checkpoint = completed_checkpoint;
+                self.set_header_root_auth_frontier(db, &frontier);
+            }
             return Ok(());
         }
 
-        self.rebase_header_root_auth_frontier(db, confirmed_height, confirmed_hash, history_tree)
+        validate_history_tree_height(db, confirmed_height, history_tree)?;
+        self.set_header_root_auth_frontier(
+            db,
+            &HeaderRootAuthFrontier {
+                confirmed_height,
+                confirmed_hash,
+                history_tree: history_tree.clone(),
+                completed_checkpoint,
+            },
+        );
+        Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn rebase_header_root_auth_frontier(
         &mut self,
         db: &ZakuraDb,
@@ -656,22 +1246,89 @@ impl DiskWriteBatch {
         history_tree: &HistoryTree,
     ) -> Result<(), HeaderRootAuthFrontierError> {
         validate_history_tree_height(db, confirmed_height, history_tree)?;
+        let confirmed_header = db
+            .header_by_height(confirmed_height)
+            .map(|(_, header)| header)
+            .ok_or(HeaderRootAuthFrontierError::CanonicalHashMismatch {
+                height: confirmed_height,
+            })?;
+        let reconstructed =
+            db.completed_checkpoint_for_tip(confirmed_height, confirmed_hash, confirmed_header)?;
+        let completed_checkpoint = db
+            .try_header_root_auth_frontier_compat()?
+            .map(|frontier| frontier.completed_checkpoint)
+            .filter(|stored| stored.height > reconstructed.height)
+            .unwrap_or(reconstructed);
         self.set_header_root_auth_frontier(
             db,
             &HeaderRootAuthFrontier {
                 confirmed_height,
                 confirmed_hash,
                 history_tree: history_tree.clone(),
+                completed_checkpoint,
             },
         );
         Ok(())
     }
 
+    pub(crate) fn rebase_header_root_auth_frontier_for_rollback(
+        &mut self,
+        db: &ZakuraDb,
+        confirmed_height: Height,
+        confirmed_hash: block::Hash,
+        history_tree: &HistoryTree,
+    ) -> Result<(), HeaderRootAuthFrontierError> {
+        validate_history_tree_height(db, confirmed_height, history_tree)?;
+        let confirmed_header = db
+            .header_by_height(confirmed_height)
+            .map(|(_, header)| header)
+            .ok_or(HeaderRootAuthFrontierError::CanonicalHashMismatch {
+                height: confirmed_height,
+            })?;
+        let completed_checkpoint =
+            db.completed_checkpoint_for_tip(confirmed_height, confirmed_hash, confirmed_header)?;
+        self.set_header_root_auth_frontier(
+            db,
+            &HeaderRootAuthFrontier {
+                confirmed_height,
+                confirmed_hash,
+                history_tree: history_tree.clone(),
+                completed_checkpoint,
+            },
+        );
+        Ok(())
+    }
+
+    /// Advances completed-checkpoint progress in the same batch as canonical headers.
+    pub(crate) fn advance_completed_checkpoint_for_header_range(
+        &mut self,
+        db: &ZakuraDb,
+        headers: &[(Height, block::Hash, Arc<block::Header>)],
+    ) -> Result<(), HeaderRootAuthFrontierError> {
+        let Some(last_height) = headers.last().map(|(height, _, _)| *height) else {
+            return Ok(());
+        };
+        let Some(mut frontier) = db.try_header_root_auth_frontier()? else {
+            return Ok(());
+        };
+        let completed = db
+            .reconstruct_completed_checkpoint_through(last_height, headers)?
+            .ok_or(HeaderRootAuthFrontierError::MissingCompletedCheckpoint)?;
+
+        if completed.height > frontier.completed_checkpoint.height {
+            frontier.completed_checkpoint = completed;
+            self.set_header_root_auth_frontier(db, &frontier);
+        }
+        Ok(())
+    }
+
     pub(crate) fn delete_header_root_auth_frontier(&mut self, db: &ZakuraDb) {
-        let _ = db
+        let writer = db
             .header_root_auth_frontier_cf()
             .with_batch_for_writing(self)
-            .zs_delete(&RawBytes::new_raw_bytes(Vec::new()));
+            .zs_delete(&RawBytes::new_raw_bytes(AUTH_FRONTIER_KEY.to_vec()))
+            .zs_delete(&RawBytes::new_raw_bytes(COMPLETED_CHECKPOINT_KEY.to_vec()));
+        let _ = writer;
     }
 
     pub(crate) fn truncate_all_commitment_roots(&mut self, db: &ZakuraDb) {
@@ -808,8 +1465,9 @@ mod tests {
     use zakura_chain::{
         block::Block,
         parallel::commitment_aux_verify::verify_supplied_roots_from_parts,
-        parameters::{Network, NetworkUpgrade},
+        parameters::{testnet, Network, NetworkUpgrade},
         serialization::ZcashDeserializeInto,
+        work::difficulty::ParameterDifficulty,
     };
 
     fn ephemeral_mainnet_db() -> ZakuraDb {
@@ -840,8 +1498,10 @@ mod tests {
 
     fn mainnet_sapling_root_at(height: u32) -> zakura_chain::sapling::tree::Root {
         let (_, roots) = Network::Mainnet.block_sapling_roots_map();
-        zakura_chain::sapling::tree::Root::try_from(**roots.get(&height).expect("test root exists"))
-            .expect("test root is valid")
+        roots.get(&height).map_or_else(
+            || zakura_chain::sapling::tree::NoteCommitmentTree::default().root(),
+            |root| zakura_chain::sapling::tree::Root::try_from(**root).expect("test root is valid"),
+        )
     }
 
     fn roots_from_block(block: &Block) -> BlockCommitmentRoots {
@@ -866,21 +1526,31 @@ mod tests {
         let base_hash = block::Hash([0x55; 32]);
         let hash_by_height = db.db.cf_handle("hash_by_height").unwrap();
         let height_by_hash = db.db.cf_handle("height_by_hash").unwrap();
+        let block_header_by_height = db.db.cf_handle("block_header_by_height").unwrap();
         let header_hash_by_height = db.db.cf_handle("zakura_header_hash_by_height").unwrap();
         let mut batch = DiskWriteBatch::new();
+        let genesis_hash = db.network().genesis_hash();
+        let genesis = mainnet_block_at(0);
+        batch.zs_insert(&hash_by_height, Height::MIN, genesis_hash);
+        batch.zs_insert(&height_by_hash, genesis_hash, Height::MIN);
+        batch.zs_insert(&block_header_by_height, Height::MIN, &genesis.header);
         batch.zs_insert(&hash_by_height, frontier_height, base_hash);
         batch.zs_insert(&height_by_hash, base_hash, frontier_height);
         for (height, hash) in confirmed {
             batch.zs_insert(&header_hash_by_height, *height, *hash);
         }
-        batch
-            .rebase_header_root_auth_frontier(
-                db,
-                frontier_height,
-                base_hash,
-                &HistoryTree::default(),
-            )
-            .expect("pre-Heartwood frontier is coherent");
+        batch.set_header_root_auth_frontier(
+            db,
+            &HeaderRootAuthFrontier {
+                confirmed_height: frontier_height,
+                confirmed_hash: base_hash,
+                history_tree: HistoryTree::default(),
+                completed_checkpoint: CompletedCheckpointFrontier {
+                    height: Height::MIN,
+                    hash: genesis_hash,
+                },
+            },
+        );
         db.write_batch(batch).expect("frontier fixture writes");
     }
 
@@ -907,6 +1577,97 @@ mod tests {
         .expect("real activation roots verify");
         let hash = block::Hash::from(block.header.as_ref());
         (verified, roots, hash)
+    }
+
+    fn two_block_checkpoint_fixture_with_config(
+        config: &Config,
+    ) -> (ZakuraDb, Arc<Block>, Arc<Block>, HeaderRootAuthState) {
+        let genesis = mainnet_block_at(0);
+        let block1 = mainnet_block_at(1);
+        let block2 = mainnet_block_at(2);
+        let network = testnet::Parameters::build()
+            .with_network_name("RootAuthTest")
+            .expect("test network name is valid")
+            .with_genesis_hash(genesis.hash())
+            .expect("genesis hash is valid")
+            .with_target_difficulty_limit(Network::Mainnet.target_difficulty_limit())
+            .expect("difficulty limit is valid")
+            .with_activation_heights(testnet::ConfiguredActivationHeights {
+                heartwood: Some(2),
+                canopy: Some(2),
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .clear_funding_streams()
+            .with_checkpoints(testnet::ConfiguredCheckpoints::HeightsAndHashes(vec![
+                (Height::MIN, genesis.hash()),
+                (Height(2), block2.hash()),
+            ]))
+            .expect("linked checkpoints are valid")
+            .to_network()
+            .expect("test network is valid");
+        let db = ZakuraDb::new(
+            config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &network,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .expect("ephemeral database opens");
+        let hash_by_height = db.db.cf_handle("hash_by_height").unwrap();
+        let height_by_hash = db.db.cf_handle("height_by_hash").unwrap();
+        let block_header_by_height = db.db.cf_handle("block_header_by_height").unwrap();
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(&hash_by_height, Height::MIN, genesis.hash());
+        batch.zs_insert(&height_by_hash, genesis.hash(), Height::MIN);
+        batch.zs_insert(&block_header_by_height, Height::MIN, &genesis.header);
+        db.write_batch(batch).expect("genesis rows write");
+        let mut batch = DiskWriteBatch::new();
+        batch
+            .rebase_header_root_auth_frontier(
+                &db,
+                Height::MIN,
+                genesis.hash(),
+                &HistoryTree::default(),
+            )
+            .expect("genesis frontier is coherent");
+        db.write_batch(batch).expect("genesis fixture writes");
+
+        let header_hash_by_height = db.db.cf_handle("zakura_header_hash_by_height").unwrap();
+        let header_height_by_hash = db.db.cf_handle("zakura_header_height_by_hash").unwrap();
+        let header_by_height = db.db.cf_handle("zakura_header_by_height").unwrap();
+        let mut batch = DiskWriteBatch::new();
+        let linked = [(Height(1), block1.clone()), (Height(2), block2.clone())];
+        for (height, block) in &linked {
+            let hash = block.hash();
+            batch.zs_insert(&header_hash_by_height, height, hash);
+            batch.zs_insert(&header_height_by_hash, hash, height);
+            batch.zs_insert(&header_by_height, height, &block.header);
+        }
+        batch
+            .advance_completed_checkpoint_for_header_range(
+                &db,
+                &[
+                    (Height(1), block1.hash(), block1.header.clone()),
+                    (Height(2), block2.hash(), block2.header.clone()),
+                ],
+            )
+            .expect("linked bracket completes");
+        db.write_batch(batch).expect("linked headers write");
+        let state = db
+            .validate_header_root_auth_state()
+            .expect("linked fixture validates")
+            .expect("frontier exists")
+            .state();
+        (db, block1, block2, state)
+    }
+
+    fn two_block_checkpoint_fixture() -> (ZakuraDb, Arc<Block>, Arc<Block>, HeaderRootAuthState) {
+        two_block_checkpoint_fixture_with_config(&Config::ephemeral())
     }
 
     #[test]
@@ -1075,38 +1836,207 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_body_tip_atomically_rebases_authenticated_frontier() {
-        let db = ephemeral_mainnet_db();
-        let (verified, roots, hash) = verified_activation_root();
-        let base = roots
-            .height
-            .previous()
-            .expect("activation has a predecessor");
-        seed_frontier_and_headers(&db, base, &[(roots.height, hash)]);
-        db.write_verified_header_commitment_roots(verified)
-            .expect("authenticated lead promotes");
-
-        let replacement_body_hash = block::Hash([0x77; 32]);
-        let hash_by_height = db.db.cf_handle("hash_by_height").unwrap();
-        let mut batch = DiskWriteBatch::new();
-        batch.zs_insert(&hash_by_height, base, replacement_body_hash);
-        batch.truncate_commitment_roots_after(&db, base);
-        batch
-            .advance_header_root_auth_frontier_from_body(
-                &db,
-                base,
-                replacement_body_hash,
-                &HistoryTree::default(),
-            )
-            .expect("conflicting body rebases the frontier");
-        db.write_batch(batch).expect("body rebase batch writes");
-
-        let frontier = db
+    fn completed_checkpoint_restores_linked_bracket_and_detects_interior_gap() {
+        let cache = tempfile::tempdir().expect("temporary cache directory is created");
+        let config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            ..Config::default()
+        };
+        let (db, _block1, block2, _state) = two_block_checkpoint_fixture_with_config(&config);
+        let network = db.network();
+        let restored = db
             .validate_header_root_auth_state()
-            .expect("rebased frontier is coherent")
-            .expect("body state has a frontier");
-        assert_eq!(frontier.confirmed_height(), base);
-        assert_eq!(frontier.confirmed_hash(), replacement_body_hash);
-        assert_eq!(db.commitment_roots(roots.height), None);
+            .expect("startup-style validation succeeds")
+            .expect("frontier exists");
+        assert_eq!(restored.completed_checkpoint.height, Height(2));
+        assert_eq!(restored.completed_checkpoint.hash, block2.hash());
+        drop(db);
+
+        let db = ZakuraDb::new(
+            &config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            &network,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .expect("persistent database reopens");
+        assert_eq!(
+            db.validate_header_root_auth_state()
+                .expect("restarted state validates")
+                .expect("frontier exists")
+                .completed_checkpoint,
+            CompletedCheckpointFrontier {
+                height: Height(2),
+                hash: block2.hash(),
+            }
+        );
+
+        let mut batch = DiskWriteBatch::new();
+        let header_hash_by_height = db.db.cf_handle("zakura_header_hash_by_height").unwrap();
+        let header_by_height = db.db.cf_handle("zakura_header_by_height").unwrap();
+        batch.zs_delete(&header_hash_by_height, Height(1));
+        batch.zs_delete(&header_by_height, Height(1));
+        db.write_batch(batch).expect("interior gap fixture writes");
+        assert!(matches!(
+            db.validate_header_root_auth_state(),
+            Err(HeaderRootAuthFrontierError::CompletedCheckpointMismatch {
+                reconstructed: CompletedCheckpointFrontier {
+                    height: Height::MIN,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn authenticates_one_lag_and_rejects_invalid_stale_and_noncanonical_without_writes() {
+        let (db, block, successor, current) = two_block_checkpoint_fixture();
+        let start = Height(1);
+        let roots = roots_from_block(&block);
+        let successor_roots = roots_from_block(&successor);
+        let headers = vec![block.header.clone(), successor.header.clone()];
+        let supplied = vec![roots.clone(), successor_roots];
+
+        let mut invalid = supplied.clone();
+        invalid[0].sapling_root = mainnet_sapling_root_at(
+            NetworkUpgrade::Heartwood
+                .activation_height(&Network::Mainnet)
+                .expect("Mainnet Heartwood height exists")
+                .0,
+        );
+        let invalid_error = db
+            .authenticate_header_roots(
+                current,
+                current.authenticated_hash,
+                start,
+                &headers,
+                &invalid,
+            )
+            .expect_err("invalid supplied roots are rejected");
+        assert!(matches!(
+            &invalid_error,
+            AuthenticateHeaderRootsError::Verification { .. }
+        ));
+        assert_eq!(
+            invalid_error.outcome(),
+            AuthenticateHeaderRootsOutcome::Invalid
+        );
+        assert_eq!(db.commitment_roots(start), None);
+        assert_eq!(
+            db.validate_header_root_auth_state()
+                .expect("failed authentication leaves coherent state")
+                .expect("frontier exists")
+                .state(),
+            current
+        );
+
+        let mut stale = current;
+        stale.authenticated_hash = block::Hash([0x99; 32]);
+        let stale_error = db
+            .authenticate_header_roots(
+                stale,
+                current.authenticated_hash,
+                start,
+                &headers,
+                &supplied,
+            )
+            .expect_err("stale state is rejected");
+        assert!(matches!(
+            &stale_error,
+            AuthenticateHeaderRootsError::StaleState { .. }
+        ));
+        assert_eq!(stale_error.outcome(), AuthenticateHeaderRootsOutcome::Stale);
+
+        let successor_height = Height(2);
+        let mut wrong_successor = *successor.header;
+        *wrong_successor.nonce = [0x77; 32];
+        let wrong_headers = vec![block.header.clone(), Arc::new(wrong_successor)];
+        let noncanonical_error = db
+            .authenticate_header_roots(
+                current,
+                current.authenticated_hash,
+                start,
+                &wrong_headers,
+                &supplied,
+            )
+            .expect_err("noncanonical request is rejected");
+        assert!(matches!(
+            &noncanonical_error,
+            AuthenticateHeaderRootsError::NonCanonicalHeader { height }
+                if *height == successor_height
+        ));
+        assert_eq!(
+            noncanonical_error.outcome(),
+            AuthenticateHeaderRootsOutcome::Stale
+        );
+        assert_eq!(db.commitment_roots(start), None);
+
+        let result = db
+            .authenticate_header_roots(
+                current,
+                current.authenticated_hash,
+                start,
+                &headers,
+                &supplied,
+            )
+            .expect("valid one-lag delivery authenticates");
+        assert_eq!(result.authenticated, start..=start);
+        assert_eq!(result.state.authenticated_height, start);
+        assert_eq!(db.commitment_roots(start), Some(roots));
+    }
+
+    #[test]
+    fn successor_witness_must_be_at_or_below_completed_checkpoint() {
+        let (db, block, successor, current) = two_block_checkpoint_fixture();
+        let header_hash_by_height = db.db.cf_handle("zakura_header_hash_by_height").unwrap();
+        let header_height_by_hash = db.db.cf_handle("zakura_header_height_by_hash").unwrap();
+        let header_by_height = db.db.cf_handle("zakura_header_by_height").unwrap();
+        let mut witness = *successor.header;
+        witness.previous_block_hash = successor.hash();
+        let witness = Arc::new(witness);
+        let witness_hash = block::Hash::from(witness.as_ref());
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(&header_hash_by_height, Height(3), witness_hash);
+        batch.zs_insert(&header_height_by_hash, witness_hash, Height(3));
+        batch.zs_insert(&header_by_height, Height(3), &witness);
+        db.write_batch(batch)
+            .expect("uncheckpointed witness writes");
+
+        let first = roots_from_block(&block);
+        let second = roots_from_block(&successor);
+        let mut third = second.clone();
+        third.height = Height(3);
+        let result = db.authenticate_header_roots(
+            current,
+            current.authenticated_hash,
+            Height(1),
+            &[block.header.clone(), successor.header.clone(), witness],
+            &[first, second, third],
+        );
+        assert!(matches!(
+            result,
+            Err(
+                AuthenticateHeaderRootsError::WitnessAboveCompletedCheckpoint {
+                    witness_height: Height(3),
+                    completed_checkpoint_height: Height(2),
+                }
+            )
+        ));
+        assert_eq!(db.commitment_roots(Height(1)), None);
+    }
+
+    #[test]
+    fn local_frontier_failures_are_not_peer_invalid() {
+        let error =
+            AuthenticateHeaderRootsError::Frontier(HeaderRootAuthFrontierError::MissingRoot {
+                height: Height(1),
+            });
+        assert_eq!(error.outcome(), AuthenticateHeaderRootsOutcome::Local);
     }
 }

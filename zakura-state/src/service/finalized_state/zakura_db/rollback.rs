@@ -509,7 +509,7 @@ fn prepare_rollback(
     write_address_balances(db, &mut batch, address_balances);
     reset_tip_trees(db, &mut batch, &target_treestate);
     batch
-        .rebase_header_root_auth_frontier(
+        .rebase_header_root_auth_frontier_for_rollback(
             db,
             bounds.new_tip.0,
             bounds.new_tip.1,

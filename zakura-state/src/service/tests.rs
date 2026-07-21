@@ -467,8 +467,10 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
 {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
-    let (mut state_service, read_state, _, _) =
+    let (mut state_service, read_state, _, mut chain_tip_change) =
         StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
+    let mut header_root_auth = read_state.subscribe_header_root_auth();
+    assert_eq!(*header_root_auth.borrow_and_update(), None);
     let genesis =
         zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into::<Arc<Block>>()?;
     let block1 =
@@ -488,6 +490,27 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
             .await?,
         Response::Committed(genesis.hash()),
     );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        chain_tip_change.wait_for_tip_change(),
+    )
+    .await
+    .expect("genesis chain-tip publication is prompt")
+    .expect("chain-tip watch remains open");
+    assert!(
+        matches!(header_root_auth.has_changed(), Ok(true)),
+        "authentication watch must publish before the chain-tip watch"
+    );
+    tokio::time::timeout(Duration::from_secs(1), header_root_auth.changed())
+        .await
+        .expect("genesis authentication publication is prompt")
+        .expect("authentication watch remains open");
+    let genesis_auth = header_root_auth
+        .borrow_and_update()
+        .expect("genesis commit publishes authentication state");
+    assert_eq!(genesis_auth.authenticated_height, Height::MIN);
+    assert_eq!(genesis_auth.authenticated_hash, genesis.hash());
+    assert_eq!(genesis_auth.completed_checkpoint_height, Height::MIN);
 
     state_service.block_write_sender.finalized = None;
     let state = Buffer::new(BoxService::new(state_service), 1);
@@ -539,6 +562,20 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
             })
             .await?,
         Response::Committed(block2_hash),
+    );
+    assert!(
+        matches!(header_root_auth.has_changed(), Ok(true)),
+        "authentication watch must publish before header commit success"
+    );
+    tokio::time::timeout(Duration::from_secs(1), header_root_auth.changed())
+        .await
+        .expect("header authentication publication is prompt")
+        .expect("authentication watch remains open");
+    assert_eq!(
+        header_root_auth
+            .borrow_and_update()
+            .expect("header commit keeps compact state available"),
+        genesis_auth,
     );
 
     assert_eq!(

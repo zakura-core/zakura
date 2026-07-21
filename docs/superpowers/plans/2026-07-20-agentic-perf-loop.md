@@ -678,7 +678,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "$DIR/config.env"
 SSH="${SSH_BIN:-ssh}"; SCP="${SCP_BIN:-scp}"
-SSH_OPTS=(-i "$SSH_KEY_FILE" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+SSH_OPTS=(-i "$SSH_KEY_FILE" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
 die() { echo "bench.sh: $*" >&2; exit 1; }
 
 ip_of() { bash "$DIR/droplet.sh" ip "$1"; }

@@ -77,10 +77,12 @@ impl HeaderWorkQueue {
 
     pub(super) fn ensure(&mut self, range: RangeRequest, priority: RangePriority) {
         if self.is_covered(range)
-            || self.active_starts.contains(&(priority, range.start_height))
+            || self
+                .active_starts
+                .contains(&(priority, range.start_height()))
             || self
                 .pending_starts
-                .contains(&(priority, range.start_height))
+                .contains(&(priority, range.start_height()))
         {
             return;
         }
@@ -89,7 +91,7 @@ impl HeaderWorkQueue {
             RangePriority::Repair => return,
         };
         queue.push_back(range);
-        self.pending_starts.insert((priority, range.start_height));
+        self.pending_starts.insert((priority, range.start_height()));
         self.oldest_missing_since.get_or_insert_with(Instant::now);
         metrics::counter!("sync.header.work.added", "lane" => priority.label()).increment(1);
     }
@@ -108,7 +110,7 @@ impl HeaderWorkQueue {
             Self::pop_assignable(&mut self.forward, &self.retry_avoidance, peer_id, peer, now);
         if let Some(range) = range {
             self.pending_starts
-                .remove(&(range.priority, range.start_height));
+                .remove(&(range.priority, range.start_height()));
         }
         range
     }
@@ -124,7 +126,7 @@ impl HeaderWorkQueue {
             range.end_height() <= peer.advertised_tip
                 && retry_avoidance
                     .get(peer_id)
-                    .and_then(|ranges| ranges.get(&(range.start_height, range.priority)))
+                    .and_then(|ranges| ranges.get(&(range.start_height(), range.priority)))
                     .is_none_or(|until| *until <= now)
         })?;
         queue.remove(index)
@@ -135,7 +137,7 @@ impl HeaderWorkQueue {
             .active
             .insert(range, HeaderWorkState::InFlight { peer });
         self.active_starts
-            .insert((range.priority, range.start_height));
+            .insert((range.priority, range.start_height()));
         debug_assert!(previous.is_none(), "pending work has no active owner");
         metrics::counter!("sync.header.work.taken", "lane" => range.priority.label()).increment(1);
     }
@@ -172,9 +174,9 @@ impl HeaderWorkQueue {
 
         if let Some(state) = self.active.remove(&original) {
             self.active_starts
-                .remove(&(original.priority, original.start_height));
+                .remove(&(original.priority, original.start_height()));
             self.active_starts
-                .insert((narrowed.priority, narrowed.start_height));
+                .insert((narrowed.priority, narrowed.start_height()));
             self.active.insert(narrowed, state);
         }
     }
@@ -182,7 +184,7 @@ impl HeaderWorkQueue {
     pub(super) fn retry(&mut self, range: RangeRequest) {
         self.active.remove(&range);
         self.active_starts
-            .remove(&(range.priority, range.start_height));
+            .remove(&(range.priority, range.start_height()));
         if self.is_covered(range) {
             return;
         }
@@ -192,7 +194,7 @@ impl HeaderWorkQueue {
         };
         if self
             .pending_starts
-            .insert((range.priority, range.start_height))
+            .insert((range.priority, range.start_height()))
         {
             queue.push_front(range);
         }
@@ -202,7 +204,7 @@ impl HeaderWorkQueue {
 
     pub(super) fn retry_avoiding(&mut self, peer: ZakuraPeerId, range: RangeRequest) {
         self.retry_avoidance.entry(peer).or_default().insert(
-            (range.start_height, range.priority),
+            (range.start_height(), range.priority),
             Instant::now() + HEADER_SYNC_RETRY_AVOIDANCE,
         );
         self.retry(range);
@@ -226,13 +228,13 @@ impl HeaderWorkQueue {
     pub(super) fn clear_assignment(&mut self, range: RangeRequest) {
         self.active.remove(&range);
         self.active_starts
-            .remove(&(range.priority, range.start_height));
+            .remove(&(range.priority, range.start_height()));
     }
 
     pub(super) fn complete(&mut self, range: RangeRequest) {
         let previous = self.active.remove(&range);
         self.active_starts
-            .remove(&(range.priority, range.start_height));
+            .remove(&(range.priority, range.start_height()));
         debug_assert!(
             matches!(previous, Some(HeaderWorkState::Committing { .. })) || previous.is_none(),
             "only committing or externally covered work can complete"
@@ -248,7 +250,7 @@ impl HeaderWorkQueue {
             .forward
             .drain(..)
             .filter_map(|range| {
-                if range.start_height <= height {
+                if range.start_height() <= height {
                     range.suffix_after(height, anchor_hash)
                 } else {
                     Some(range)
@@ -270,7 +272,7 @@ impl HeaderWorkQueue {
         };
         if let Some(range) = queue
             .iter_mut()
-            .find(|range| range.start_height == start_height)
+            .find(|range| range.start_height() == start_height)
         {
             if range.anchor_hash == Some(anchor_hash) {
                 range.anchor_hash = None;
@@ -304,7 +306,7 @@ impl HeaderWorkQueue {
         let end = range.end_height();
         self.covered
             .iter()
-            .any(|covered| covered.start <= range.start_height && covered.end >= end)
+            .any(|covered| covered.start <= range.start_height() && covered.end >= end)
     }
 
     pub(super) fn mark_covered_interval(&mut self, mut interval: CoveredRange) {
@@ -340,7 +342,7 @@ impl HeaderWorkQueue {
             let end = range.end_height();
             covered
                 .iter()
-                .any(|covered| covered.start <= range.start_height && covered.end >= end)
+                .any(|covered| covered.start <= range.start_height() && covered.end >= end)
         };
         self.forward.retain(|range| !is_covered(range));
         self.active.retain(|range, state| {
@@ -360,7 +362,7 @@ impl HeaderWorkQueue {
         self.forward
             .iter()
             .chain(self.active.keys())
-            .map(|range| u64::from(range.count))
+            .map(|range| u64::from(range.count()))
             .sum()
     }
 
@@ -401,7 +403,7 @@ impl HeaderWorkQueue {
         self.forward.iter().any(|range| {
             range.end_height() <= advertised_tip
                 && avoided
-                    .get(&(range.start_height, range.priority))
+                    .get(&(range.start_height(), range.priority))
                     .is_some_and(|until| *until > Instant::now())
         })
     }
@@ -426,7 +428,7 @@ impl HeaderWorkQueue {
         self.forward
             .iter()
             .chain(self.active.keys())
-            .map(|range| range.start_height)
+            .map(|range| range.start_height())
             .min()
     }
 
@@ -435,13 +437,13 @@ impl HeaderWorkQueue {
         self.pending_starts.extend(
             self.forward
                 .iter()
-                .map(|range| (range.priority, range.start_height)),
+                .map(|range| (range.priority, range.start_height())),
         );
         self.active_starts.clear();
         self.active_starts.extend(
             self.active
                 .keys()
-                .map(|range| (range.priority, range.start_height)),
+                .map(|range| (range.priority, range.start_height())),
         );
     }
 }
@@ -499,8 +501,8 @@ mod tests {
 
     fn range(start: u32, count: u32, priority: RangePriority) -> RangeRequest {
         RangeRequest {
-            start_height: block::Height(start),
-            count,
+            range: CheckedHeaderRange::from_count(block::Height(start), count)
+                .expect("test range is non-empty and bounded"),
             anchor_hash: None,
             finalized: false,
             want_tree_aux_roots: true,
@@ -545,7 +547,11 @@ mod tests {
             .next_for_peer(&peer, &state)
             .expect("peer can claim the pending range");
         queue.mark_assigned(peer.clone(), claimed);
-        queue.ensure_forward(RangeRequest { count: 3, ..range });
+        queue.ensure_forward(RangeRequest {
+            range: CheckedHeaderRange::from_count(block::Height(1), 3)
+                .expect("test range is non-empty"),
+            ..range
+        });
         assert_eq!(queue.pending_len(), 0);
         assert!(matches!(
             queue.state(range),
@@ -573,8 +579,8 @@ mod tests {
             queue.forward.iter().copied().collect::<Vec<_>>(),
             vec![
                 RangeRequest {
-                    start_height: block::Height(2),
-                    count: 1,
+                    range: CheckedHeaderRange::from_count(block::Height(2), 1)
+                        .expect("test suffix is non-empty"),
                     anchor_hash: Some(anchor),
                     ..first
                 },
@@ -593,7 +599,7 @@ mod tests {
         };
         queue.ensure_forward(suffix);
 
-        queue.clear_pending_anchor(RangePriority::Forward, suffix.start_height, poisoned);
+        queue.clear_pending_anchor(RangePriority::Forward, suffix.start_height(), poisoned);
 
         assert_eq!(
             queue.forward.front().and_then(|range| range.anchor_hash),
@@ -727,7 +733,7 @@ mod tests {
         queue.retry_avoidance.insert(
             forgotten.clone(),
             HashMap::from([(
-                (in_flight.start_height, in_flight.priority),
+                (in_flight.start_height(), in_flight.priority),
                 Instant::now() + HEADER_SYNC_RETRY_AVOIDANCE,
             )]),
         );

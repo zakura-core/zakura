@@ -19,11 +19,10 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
     Future, TryFutureExt,
 };
-use indexmap::IndexMap;
 use rand::seq::SliceRandom;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc, watch},
+    sync::{broadcast, mpsc},
     time::{sleep, Instant},
 };
 use tokio_stream::wrappers::IntervalStream;
@@ -45,7 +44,7 @@ use crate::{
     peer_cache_updater::peer_cache_updater,
     peer_set::{set::MorePeers, ActiveConnectionCounter, CandidateSet, ConnectionTracker, PeerSet},
     protocol::external::{canonical_socket_addr, types::PeerServices},
-    AddressBook, BoxError, Config, PeerSocketAddr, Request, Response,
+    AddressBook, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
 };
 
 #[cfg(test)]
@@ -170,13 +169,8 @@ where
     .await
     .expect("Zakura endpoint should start when P2P v2 is enabled");
 
-    let (
-        address_book,
-        bans_receiver,
-        address_book_updater,
-        address_metrics,
-        address_book_updater_guard,
-    ) = AddressBookUpdater::spawn(&config, listen_addr, advertised_services);
+    let (address_book, bans, address_book_updater, address_metrics, address_book_updater_guard) =
+        AddressBookUpdater::spawn(&config, listen_addr, advertised_services);
 
     let (misbehavior_tx, mut misbehavior_rx) = mpsc::channel(
         // Leave enough room for a misbehaviour update on every peer connection
@@ -304,7 +298,7 @@ where
         demand_tx.clone(),
         handle_rx,
         inv_receiver,
-        bans_receiver.clone(),
+        bans.clone(),
         address_metrics,
         MinimumPeerVersion::new(latest_chain_tip, &config.network),
         None,
@@ -327,7 +321,7 @@ where
             constants::MIN_INBOUND_PEER_CONNECTION_INTERVAL,
             listen_handshaker,
             peerset_tx.clone(),
-            bans_receiver,
+            bans,
             block_gossip_peer_ips,
         );
         task_handles.push(tokio::spawn(listen_fut.in_current_span()));
@@ -733,7 +727,7 @@ async fn accept_inbound_connections<S>(
     min_inbound_peer_connection_interval: Duration,
     handshaker: S,
     peerset_tx: futures::channel::mpsc::Sender<DiscoveredPeer>,
-    bans_receiver: watch::Receiver<Arc<IndexMap<IpAddr, std::time::Instant>>>,
+    bans: BannedIps,
     zcashd_compat_peer_ips: Vec<IpAddr>,
 ) -> Result<(), BoxError>
 where
@@ -784,7 +778,7 @@ where
             let addr: PeerSocketAddr = addr.into();
             let addr_label = addr.addr_label(config.expose_peer_addresses);
 
-            if bans_receiver.borrow().clone().contains_key(&addr.ip()) {
+            if bans.contains(addr.ip()) {
                 debug!(peer = %addr_label, "banned inbound connection attempt");
                 std::mem::drop(tcp_stream);
                 continue;

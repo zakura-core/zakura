@@ -404,16 +404,13 @@ pub(crate) async fn drive_header_sync_actions(
                     .await;
             }
             HeaderSyncAction::CommitHeaderRange {
-                operation,
-                start_height,
-                headers,
-                ..
+                operation, payload, ..
             } => {
                 let peer = &operation.wire_request.peer;
                 tracing::debug!(
                     ?peer,
-                    ?start_height,
-                    count = headers.len(),
+                    start_height = ?payload.range().start(),
+                    count = payload.range().count(),
                     "suppressing Zakura header range commit until state driver is wired"
                 );
             }
@@ -822,15 +819,19 @@ mod request_id_tests {
             Some(commands_tx),
         );
         let range = RangeRequest {
-            start_height: block::Height(1),
-            count: 1,
+            range: CheckedHeaderRange::from_count(block::Height(1), 1)
+                .expect("test range is non-empty"),
             anchor_hash: None,
             finalized: false,
             want_tree_aux_roots: true,
             priority: RangePriority::Forward,
         };
         let prepared = session
-            .prepare_get_headers(range.start_height, range.count, range.want_tree_aux_roots)
+            .prepare_get_headers(
+                range.start_height(),
+                range.count(),
+                range.want_tree_aux_roots,
+            )
             .expect("valid test request is prepared");
         let reserved = match commands_rx.try_recv().expect("reservation is published") {
             HeaderSyncPeerCommand::Reserve(expected) => expected,

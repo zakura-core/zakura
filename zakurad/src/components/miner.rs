@@ -53,6 +53,16 @@ pub const BLOCK_TEMPLATE_REFRESH_LIMIT: Duration = Duration::from_secs(2);
 /// generation.
 pub const BLOCK_MINING_WAIT_TIME: Duration = Duration::from_secs(3);
 
+/// Returns `true` if `new_header` should replace the internal miner's current
+/// block template.
+fn should_replace_mining_template(
+    current_header: Option<block::Header>,
+    new_header: block::Header,
+    submit_old: Option<bool>,
+) -> bool {
+    current_header != Some(new_header) && (current_header.is_none() || submit_old != Some(true))
+}
+
 /// Initialize the miner based on its config, and spawn a task for it.
 ///
 /// This method is CPU and memory-intensive. It uses 144 MB of RAM and one CPU core per configured
@@ -282,7 +292,7 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
-    // Pass the correct arguments, even if Zebra currently ignores them.
+    // Request long polling so each update says whether current work remains valid.
     let mut parameters =
         GetBlockTemplateParameters::new(Template, None, vec![LongPoll, CoinbaseTxn], None, None);
 
@@ -311,11 +321,9 @@ where
             .try_into_template()
             .expect("invalid RPC response: proposal in response to a template request");
 
-        info!(
-            height = ?template.height(),
-            transactions = ?template.transactions().len(),
-            "mining with an updated block template",
-        );
+        let height = template.height();
+        let transaction_count = template.transactions().len();
+        let submit_old = template.submit_old();
 
         // Tell the next get_block_template() call to wait until the template has changed.
         parameters = GetBlockTemplateParameters::new(
@@ -332,14 +340,35 @@ where
             rpc.network(),
         )?;
 
-        // If the template has actually changed, send an updated template.
-        template_sender.send_if_modified(|old_block| {
-            if old_block.as_ref().map(|b| *b.header) == Some(*block.header) {
+        // Only replace the current template when old work is no longer valid.
+        // Mempool-only updates set `submit_old` to true, so cancelling for them
+        // would discard useful solver work.
+        let template_replaced = template_sender.send_if_modified(|old_block| {
+            if !should_replace_mining_template(
+                old_block.as_ref().map(|block| *block.header),
+                *block.header,
+                submit_old,
+            ) {
                 return false;
             }
             *old_block = Some(Arc::new(block));
             true
         });
+
+        if template_replaced {
+            info!(
+                ?height,
+                transactions = ?transaction_count,
+                "mining with an updated block template",
+            );
+        } else {
+            debug!(
+                ?height,
+                transactions = ?transaction_count,
+                ?submit_old,
+                "keeping valid work across a block template update",
+            );
+        }
 
         // If the blockchain is changing rapidly, limit how often we'll update the template.
         // But if we're shutting down, do that immediately.
@@ -612,4 +641,43 @@ where
     Ok(solved_blocks
         .try_into()
         .expect("a 1:1 mapping of AtLeastOne produces at least one block"))
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    use super::*;
+
+    #[test]
+    fn mining_template_updates_respect_submit_old() {
+        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("block 1 deserializes");
+        let current_header = *block.header;
+        let mut changed_header = current_header;
+        changed_header.nonce.0[0] ^= 1;
+
+        assert!(should_replace_mining_template(None, current_header, None));
+        assert!(!should_replace_mining_template(
+            Some(current_header),
+            current_header,
+            Some(false),
+        ));
+        assert!(!should_replace_mining_template(
+            Some(current_header),
+            changed_header,
+            Some(true),
+        ));
+        assert!(should_replace_mining_template(
+            Some(current_header),
+            changed_header,
+            Some(false),
+        ));
+        assert!(should_replace_mining_template(
+            Some(current_header),
+            changed_header,
+            None,
+        ));
+    }
 }

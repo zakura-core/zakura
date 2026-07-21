@@ -620,8 +620,8 @@ fn commit_and_authentication_operations_from_one_request_are_distinct() {
         op_kind: HeaderSyncOperationKind::AuthenticateRoots,
     };
     let range = RangeRequest {
-        start_height: block::Height(1),
-        count: 1,
+        range: CheckedHeaderRange::from_count(block::Height(1), 1)
+            .expect("test range is non-empty"),
         anchor_hash: Some(network.genesis_hash()),
         finalized: false,
         want_tree_aux_roots: true,
@@ -2021,16 +2021,14 @@ async fn vct_repair_bypasses_covered_range_and_commits_exact_h_and_successor() {
         match next_action(&mut fixture.actions).await {
             HeaderSyncAction::CommitHeaderRange {
                 operation,
-                start_height,
-                headers,
-                tree_aux_roots,
+                payload,
                 finalized,
                 ..
             } => {
                 assert_eq!(operation.wire_request.peer, peer_id);
-                assert_eq!(start_height, block::Height(1));
-                assert_eq!(headers.len(), 2);
-                assert_eq!(tree_aux_roots.len(), 2);
+                assert_eq!(payload.range().start(), block::Height(1));
+                assert_eq!(payload.headers().len(), 2);
+                assert_eq!(payload.tree_aux_roots().map(<[_]>::len), Some(2),);
                 assert!(
                     !finalized,
                     "repair ranges are canonical but not checkpoint-terminating"
@@ -2978,7 +2976,7 @@ async fn incoming_headers_match_outstanding_before_commit() {
     match next_non_query_action(&mut fixture.actions).await {
         HeaderSyncAction::CommitHeaderRange {
             operation,
-            start_height,
+            payload,
             finalized,
             ..
         } => {
@@ -2987,7 +2985,7 @@ async fn incoming_headers_match_outstanding_before_commit() {
                 commit_operation(peer_id, 0, request_id),
                 "the commit action preserves the exact wire request identity"
             );
-            assert_eq!(start_height, start);
+            assert_eq!(payload.range().start(), start);
             assert!(!finalized);
         }
         action => panic!("unexpected action: {action:?}"),
@@ -3315,10 +3313,11 @@ async fn truncated_finalized_suffix_still_checks_its_checkpoint_hash() {
                 assert_eq!(peer, peer_id);
                 break;
             }
-            HeaderSyncAction::CommitHeaderRange {
-                start_height: block::Height(3),
-                ..
-            } => panic!("a truncated suffix with the wrong checkpoint hash was committed"),
+            HeaderSyncAction::CommitHeaderRange { payload, .. }
+                if payload.range().start() == block::Height(3) =>
+            {
+                panic!("a truncated suffix with the wrong checkpoint hash was committed")
+            }
             _ => {}
         }
     }
@@ -3495,14 +3494,11 @@ async fn local_commit_failure_retries_without_peer_misbehavior() {
                 panic!("valid headers must not be scored before local commit failure")
             }
             HeaderSyncAction::CommitHeaderRange {
-                operation,
-                start_height,
-                headers,
-                ..
+                operation, payload, ..
             } => {
                 assert_eq!(operation.wire_request.peer, first_peer);
-                assert_eq!(start_height, start);
-                assert_eq!(headers.len(), 1);
+                assert_eq!(payload.range().start(), start);
+                assert_eq!(payload.headers().len(), 1);
                 break operation;
             }
             _ => {}
@@ -3693,8 +3689,8 @@ fn response_before_publication_completion_is_not_reinstalled() {
     );
     let request_id = HeaderSyncRequestId::new(1).expect("non-zero request ID");
     let range = RangeRequest {
-        start_height: block::Height(1),
-        count: 1,
+        range: CheckedHeaderRange::from_count(block::Height(1), 1)
+            .expect("test range is non-empty"),
         anchor_hash: None,
         finalized: false,
         want_tree_aux_roots: true,
@@ -3706,7 +3702,7 @@ fn response_before_publication_completion_is_not_reinstalled() {
             session_id: 0,
             request_id,
         },
-        range,
+        range_request: range,
         deadline: Instant::now() + std::time::Duration::from_secs(1),
         purpose: RangePurpose::Sync,
         phase: OutstandingPhase::Publishing,
@@ -5085,13 +5081,11 @@ async fn replacement_session_ignores_old_wire_response_with_reused_id() {
     loop {
         match next_non_query_action(&mut fixture.actions).await {
             HeaderSyncAction::CommitHeaderRange {
-                operation,
-                start_height,
-                ..
+                operation, payload, ..
             } => {
                 assert_eq!(operation.wire_request.peer, peer_id);
                 assert_eq!(operation.wire_request.session_id, 2);
-                assert_eq!(start_height, block::Height(4));
+                assert_eq!(payload.range().start(), block::Height(4));
                 break;
             }
             HeaderSyncAction::Misbehavior { peer, reason } => {
@@ -5587,18 +5581,15 @@ async fn header_sync_metrics_record_status_range_new_block_dedup_and_violation()
     .await;
     let (operation, committed_hash) = match next_non_query_action(&mut fixture.actions).await {
         HeaderSyncAction::CommitHeaderRange {
-            operation,
-            start_height,
-            headers,
-            ..
+            operation, payload, ..
         } => {
             assert_eq!(
-                start_height,
+                payload.range().start(),
                 next_height(first_checkpoint).expect("checkpoint has a successor")
             );
             (
                 operation,
-                block::Hash::from(headers.last().expect("one header").as_ref()),
+                block::Hash::from(payload.headers().last().expect("one header").as_ref()),
             )
         }
         action => panic!("unexpected action: {action:?}"),
@@ -5917,12 +5908,12 @@ async fn partial_coverage_trims_and_commits_an_already_buffered_suffix() {
         &fixture,
         &peer_id,
         requests[&block::Height(3)],
-        headers_message_from(
-            block::Height(3),
+        headers_message_with_sizes(
             vec![
                 mainnet_header(&BLOCK_MAINNET_3_BYTES),
                 mainnet_header(&BLOCK_MAINNET_4_BYTES),
             ],
+            vec![33, 44],
         ),
     )
     .await;
@@ -5936,14 +5927,16 @@ async fn partial_coverage_trims_and_commits_an_already_buffered_suffix() {
         .unwrap();
 
     loop {
-        if let HeaderSyncAction::CommitHeaderRange {
-            start_height,
-            headers,
-            ..
-        } = next_non_query_action(&mut fixture.actions).await
+        if let HeaderSyncAction::CommitHeaderRange { payload, .. } =
+            next_non_query_action(&mut fixture.actions).await
         {
-            assert_eq!(start_height, block::Height(4));
-            assert_eq!(headers, vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]);
+            assert_eq!(payload.range().start(), block::Height(4));
+            assert_eq!(payload.headers(), [mainnet_header(&BLOCK_MAINNET_4_BYTES)]);
+            assert_eq!(payload.body_sizes(), [44]);
+            assert_eq!(
+                payload.tree_aux_roots().map(|roots| roots[0].height),
+                Some(block::Height(4))
+            );
             break;
         }
     }
@@ -6000,14 +5993,11 @@ async fn loaded_best_tip_reconciles_outstanding_and_buffered_work() {
         .unwrap();
 
     loop {
-        if let HeaderSyncAction::CommitHeaderRange {
-            start_height,
-            headers,
-            ..
-        } = next_non_query_action(&mut fixture.actions).await
+        if let HeaderSyncAction::CommitHeaderRange { payload, .. } =
+            next_non_query_action(&mut fixture.actions).await
         {
-            assert_eq!(start_height, block::Height(4));
-            assert_eq!(headers, vec![mainnet_header(&BLOCK_MAINNET_4_BYTES)]);
+            assert_eq!(payload.range().start(), block::Height(4));
+            assert_eq!(payload.headers(), [mainnet_header(&BLOCK_MAINNET_4_BYTES)]);
             break;
         }
     }
@@ -6136,13 +6126,9 @@ async fn buffered_successor_drains_after_full_block_covers_its_predecessor() {
 
     loop {
         match next_non_query_action(&mut fixture.actions).await {
-            HeaderSyncAction::CommitHeaderRange {
-                start_height,
-                headers,
-                ..
-            } => {
-                assert_eq!(start_height, block::Height(2));
-                assert_eq!(headers.len(), 1);
+            HeaderSyncAction::CommitHeaderRange { payload, .. } => {
+                assert_eq!(payload.range().start(), block::Height(2));
+                assert_eq!(payload.headers().len(), 1);
                 break;
             }
             HeaderSyncAction::Misbehavior { peer, reason } => {
@@ -6204,12 +6190,12 @@ async fn ordered_drain_rejects_a_buffered_range_on_the_wrong_fork() {
     .await;
     let operation = loop {
         if let HeaderSyncAction::CommitHeaderRange {
-            operation,
-            start_height: block::Height(1),
-            ..
+            operation, payload, ..
         } = next_non_query_action(&mut fixture.actions).await
         {
-            break operation;
+            if payload.range().start() == block::Height(1) {
+                break operation;
+            }
         }
     };
     fixture
@@ -6230,10 +6216,11 @@ async fn ordered_drain_rejects_a_buffered_range_on_the_wrong_fork() {
                 assert_eq!(peer, peer_id);
                 break;
             }
-            HeaderSyncAction::CommitHeaderRange {
-                start_height: block::Height(2),
-                ..
-            } => panic!("ordered drain committed a buffered range on the wrong fork"),
+            HeaderSyncAction::CommitHeaderRange { payload, .. }
+                if payload.range().start() == block::Height(2) =>
+            {
+                panic!("ordered drain committed a buffered range on the wrong fork")
+            }
             _ => {}
         }
     }
@@ -6303,15 +6290,12 @@ async fn full_action_queue_preserves_buffer_until_commit_capacity_returns() {
     tokio::task::yield_now().await;
     for _ in 0..129 {
         if let HeaderSyncAction::CommitHeaderRange {
-            operation,
-            start_height,
-            headers,
-            ..
+            operation, payload, ..
         } = next_action(&mut fixture.actions).await
         {
             assert_eq!(operation.wire_request.peer, source);
-            assert_eq!(start_height, block::Height(4));
-            assert_eq!(headers.len(), 1);
+            assert_eq!(payload.range().start(), block::Height(4));
+            assert_eq!(payload.headers().len(), 1);
             assert_no_commit_or_misbehavior(&mut fixture.actions).await;
             return;
         }
@@ -6525,8 +6509,8 @@ fn work_queue_transitions_have_one_explicit_owner() {
 
     let owner = peer(144);
     let range = RangeRequest {
-        start_height: block::Height(1),
-        count: 2,
+        range: CheckedHeaderRange::from_count(block::Height(1), 2)
+            .expect("test range is non-empty"),
         anchor_hash: Some(block::Hash([1; 32])),
         finalized: false,
         want_tree_aux_roots: true,
@@ -6779,15 +6763,14 @@ async fn forward_genesis_backfill_reaches_checkpoint_before_finalized_commit() {
     match next_non_query_action(&mut fixture.actions).await {
         HeaderSyncAction::CommitHeaderRange {
             operation,
-            start_height,
-            headers,
+            payload,
             finalized,
             ..
         } => {
             assert_eq!(operation.wire_request.peer, peer_id);
             assert_eq!(operation.wire_request.request_id, request_id);
-            assert_eq!(start_height, block::Height(1));
-            assert_eq!(headers.len(), 3);
+            assert_eq!(payload.range().start(), block::Height(1));
+            assert_eq!(payload.headers().len(), 3);
             assert!(finalized);
         }
         action => panic!("unexpected action: {action:?}"),
@@ -6833,15 +6816,14 @@ async fn truncated_finalized_backfill_commits_valid_prefix_and_requeues_suffix()
     match next_non_query_action(&mut fixture.actions).await {
         HeaderSyncAction::CommitHeaderRange {
             operation,
-            start_height,
-            headers,
+            payload,
             finalized,
             ..
         } => {
             assert_eq!(operation.wire_request.peer, peer_id);
             assert_eq!(operation.wire_request.request_id, request_id);
-            assert_eq!(start_height, block::Height(1));
-            assert_eq!(headers.len(), 2);
+            assert_eq!(payload.range().start(), block::Height(1));
+            assert_eq!(payload.headers().len(), 2);
             assert!(finalized);
         }
         action => panic!("unexpected action: {action:?}"),
@@ -7071,16 +7053,25 @@ async fn stateless_validation_rejects_wrong_solution_size_for_network() {
 }
 
 #[test]
-fn regtest_header_validation_accepts_common_and_short_solution_sizes() {
+fn pow_disabled_header_validation_accepts_common_and_short_solution_sizes() {
     let regtest = Network::new_regtest(Default::default());
+    let custom_testnet = Parameters::build()
+        .with_network_name("HeaderSyncNoPowSizeTest")
+        .expect("custom testnet name is valid")
+        .with_disable_pow(true)
+        .to_network()
+        .expect("custom testnet parameters are valid");
     let common_sized = mainnet_header(&BLOCK_MAINNET_1_BYTES);
     let mut short_sized = *common_sized;
     short_sized.solution = Solution::Regtest([0; 36]);
 
-    validate_solution_sizes(std::slice::from_ref(&common_sized), &regtest)
-        .expect("regtest accepts Zebra-mined common-size solutions");
-    validate_solution_sizes(&[Arc::new(short_sized)], &regtest)
-        .expect("regtest accepts short regtest solutions");
+    for network in [&regtest, &custom_testnet] {
+        validate_solution_sizes(std::slice::from_ref(&common_sized), network)
+            .expect("PoW-disabled networks accept common-size solutions");
+        validate_solution_sizes(&[Arc::new(short_sized)], network)
+            .expect("PoW-disabled networks accept short solutions");
+    }
+
     assert!(matches!(
         validate_solution_sizes(&[Arc::new(short_sized)], &Network::Mainnet),
         Err(HeaderSyncWireError::WrongEquihashSolutionSize)
@@ -7103,6 +7094,33 @@ async fn regtest_stateless_validation_skips_pow_filter() {
     validate_headers_stateless(vec![Arc::new(header)], context)
         .await
         .expect("regtest header sync leaves PoW enforcement to block verification");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_testnet_disable_pow_skips_header_sync_pow_filter() {
+    let network = Parameters::build()
+        .with_network_name("HeaderSyncNoPowTest")
+        .expect("custom testnet name is valid")
+        .with_disable_pow(true)
+        .to_network()
+        .expect("custom testnet parameters are valid");
+    assert!(network.disable_pow());
+    assert!(!network.is_regtest());
+
+    let mut header = *mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    header.nonce[0] ^= 1;
+    header.difficulty_threshold =
+        CompactDifficulty::from_bytes_in_display_order(&[0x01, 0x01, 0x00, 0x00]).unwrap();
+    let context = HeaderSyncValidationContext {
+        network: &network,
+        now: Utc::now(),
+        start_height: block::Height(1),
+        decode_context: headers_context(1, DEFAULT_HS_RANGE),
+    };
+
+    validate_headers_stateless(vec![Arc::new(header)], context)
+        .await
+        .expect("custom disable_pow networks must skip native header-sync PoW checks");
 }
 
 #[tokio::test(flavor = "current_thread")]

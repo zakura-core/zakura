@@ -63,6 +63,49 @@ pub use status::SyncStatus;
 /// Controls the number of peers used for each ObtainTips and ExtendTips request.
 const FANOUT: usize = 3;
 
+/// Returns the hashes from a bounded header response that continuously extends
+/// a block already present in state.
+fn anchored_header_hashes(
+    headers: Vec<block::CountedHeader>,
+    known_hashes: &HashSet<block::Hash>,
+) -> Vec<block::Hash> {
+    if headers.len() > MAX_TIPS_RESPONSE_HASH_COUNT {
+        debug!(
+            headers.len = headers.len(),
+            max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
+            "discarding oversized FindHeaders response"
+        );
+        return Vec::new();
+    }
+
+    let mut run = Vec::new();
+    let mut run_parent = None;
+    for counted in headers {
+        let hash = counted.header.hash();
+        if known_hashes.contains(&hash) {
+            if !run.is_empty() {
+                return Vec::new();
+            }
+            run_parent = Some(hash);
+            continue;
+        }
+
+        let parent = counted.header.previous_block_hash;
+        let anchored = match run_parent {
+            Some(run_parent) => parent == run_parent,
+            None => known_hashes.contains(&parent),
+        };
+        if !anchored {
+            return Vec::new();
+        }
+
+        run.push(hash);
+        run_parent = Some(hash);
+    }
+
+    run
+}
+
 /// Controls how many times we will retry each block download.
 ///
 /// Failing block downloads is important because it defends against peers who
@@ -1566,6 +1609,10 @@ where
         }
 
         let mut download_set = IndexSet::new();
+        // Responses that offered new blocks but were too short to survive the
+        // trailing-hash strip and the two-hash tip requirement below. They are
+        // the signature of a node restarted 1-2 blocks behind the network.
+        let mut too_short_responses: usize = 0;
         while let Some(res) = requests.next().await {
             match res
                 .unwrap_or_else(|e @ JoinError { .. }| {
@@ -1612,6 +1659,9 @@ where
                         }
                     };
                     if hashes.is_empty() {
+                        // The peer offered exactly one block (we are one block
+                        // behind it), and the strip discarded it.
+                        too_short_responses += 1;
                         continue;
                     }
 
@@ -1652,6 +1702,7 @@ where
                         }
                     } else {
                         debug!("discarding response that extends only one block");
+                        too_short_responses += 1;
                         continue;
                     };
 
@@ -1687,6 +1738,28 @@ where
             }
         }
 
+        // A node that restarts 1-2 blocks behind the network cannot advance
+        // through the fanout above: peers answer `FindBlocks` with 1-2 hashes,
+        // the trailing-hash strip and the two-hash tip requirement discard the
+        // whole response, and gossip cannot fill the gap because the missing
+        // blocks were announced before this node was listening. Fall back to
+        // `FindHeaders`: header parent links prove the offered blocks extend
+        // our chain (which bare hashes cannot), so the trailing-hash quirk does
+        // not apply and even a single-block extension is safe to download.
+        if download_set.is_empty() && too_short_responses > 0 {
+            let anchored = self.headers_anchored_download_set(block_locator).await?;
+            info!(
+                too_short_responses,
+                anchored = anchored.len(),
+                "FindBlocks responses were too short to extend tips; \
+                 downloading header-anchored blocks instead"
+            );
+            metrics::counter!("sync.obtain.header_fallback.count").increment(1);
+            metrics::histogram!("sync.obtain.header_fallback.hash.count")
+                .record(anchored.len() as f64);
+            download_set.extend(anchored);
+        }
+
         debug!(?self.prospective_tips);
 
         // Check that the new tips we got are actually unknown.
@@ -1711,6 +1784,76 @@ where
             .record(stage_start.elapsed().as_secs_f64());
 
         Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into)
+    }
+
+    /// Asks peers for headers extending `block_locator` and returns the hashes
+    /// of offered blocks that provably extend our own chain, in parent-to-child
+    /// order.
+    ///
+    /// This is the near-tip fallback for [`Self::obtain_tips`]: a `FindBlocks`
+    /// response carrying only 1-2 hashes is discarded by the zcashd
+    /// trailing-hash strip, but a header response needs no strip because each
+    /// header names its parent. Only the run of headers that anchors in our
+    /// state counts, using the same anchoring rule as
+    /// [`Self::legacy_peers_blocks_ahead`]: the first unknown header's parent
+    /// must be a block we have, and every later header must link to its
+    /// predecessor in the response. A foreign-fork or gapped response
+    /// contributes nothing.
+    ///
+    /// Best-effort like the `obtain_tips` fanout: failed or unexpected
+    /// responses are skipped. Errors only if the state service fails.
+    #[instrument(skip(self, block_locator))]
+    async fn headers_anchored_download_set(
+        &mut self,
+        block_locator: Vec<block::Hash>,
+    ) -> Result<IndexSet<block::Hash>, Report> {
+        let mut requests = FuturesUnordered::new();
+        for attempt in 0..FANOUT {
+            if attempt > 0 {
+                // Let other tasks run, so we're more likely to choose a different peer.
+                tokio::task::yield_now().await;
+            }
+            let ready_tip_network = self.tip_network.ready().await.map_err(|e| eyre!(e))?;
+            requests.push(tokio::spawn(ready_tip_network.call(
+                zn::Request::FindHeaders {
+                    known_blocks: block_locator.clone(),
+                    stop: None,
+                },
+            )));
+        }
+
+        let mut download_set = IndexSet::new();
+        while let Some(res) = requests.next().await {
+            let headers = match res {
+                Ok(Ok(zn::Response::BlockHeaders(headers))) => headers,
+                Err(e) if e.is_panic() => {
+                    // Avoid swallowing panics.
+                    panic!("panic in headers anchored download set task: {e:?}");
+                }
+                // Best-effort fanout: ignore failed or cancelled requests and
+                // any unexpected response, exactly like the obtain_tips fanout.
+                _ => continue,
+            };
+
+            let mut known_hashes = HashSet::new();
+            if headers.len() <= MAX_TIPS_RESPONSE_HASH_COUNT {
+                let mut checked_hashes = HashSet::new();
+                for counted in &headers {
+                    for hash in [counted.header.hash(), counted.header.previous_block_hash] {
+                        if checked_hashes.insert(hash) && self.state_contains(hash).await? {
+                            known_hashes.insert(hash);
+                        }
+                    }
+                }
+            }
+            let run = anchored_header_hashes(headers, &known_hashes);
+
+            // security: the first response determines our download order, like
+            // the obtain_tips fanout above.
+            download_set.extend(run);
+        }
+
+        Ok(download_set)
     }
 
     /// Asks peers to extend the given prospective `tips`, returning the newly discovered block

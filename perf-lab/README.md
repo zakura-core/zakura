@@ -15,3 +15,10 @@ skill to start/resume a session).
 
 Cost: one c-16 droplet ≈ $0.5/h; a 12 h session ≈ $6. Every create/destroy is
 recorded in LEDGER.md.
+
+## Measured timings
+
+- Mac mock-blocksync baseline (M4 Max, 3 runs, 2026-07-21):
+  - run 1: throughput: 17517.87 blocks/sec, 43.58 MiB/sec, elapsed=5.708s
+  - run 2: throughput: 24828.31 blocks/sec, 61.76 MiB/sec, elapsed=4.028s
+  - run 3: throughput: 25199.50 blocks/sec, 62.69 MiB/sec, elapsed=3.968s

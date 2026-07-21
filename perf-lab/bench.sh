@@ -59,6 +59,7 @@ cd ${CTL_CLONE_REMOTE}
     BUILD_REF='${build_ref}' BASELINE_REF='${baseline_ref}' \
     TARGET_P2P_STACK=zakura BASELINE_P2P_STACK=zakura \
     BENCH_HOME='${BENCH_HOME_REMOTE}' \
+    STOP_HEIGHT='${BENCH_STOP_HEIGHT}' \
     OUT_DIR='${BENCH_OUT_REMOTE}/${label}' DASHBOARD=1${env_str} \
     bash scripts/checkpoint-sync-bench.sh
   echo \$? > ${BENCH_OUT_REMOTE}/${label}.exit
@@ -77,6 +78,10 @@ cmd_status() {
   $SSH "${SSH_OPTS[@]}" "root@$ip" bash -s <<REMOTE
 if [ ! -f ${BENCH_OUT_REMOTE}/${label}.pid ]; then echo ABSENT; exit 0; fi
 if [ -f ${BENCH_OUT_REMOTE}/${label}.exit ]; then echo "DONE:\$(cat ${BENCH_OUT_REMOTE}/${label}.exit)"; exit 0; fi
+# fallback: the wrapper subshell can die at ssh teardown without writing
+# .exit (seen live 2026-07-21); the harness's own final log line marks true
+# completion, and it prints nothing after it
+if tail -3 ${BENCH_OUT_REMOTE}/${label}.log 2>/dev/null | grep -q "] done\. artifacts in"; then echo DONE:0; exit 0; fi
 pid=\$(cat ${BENCH_OUT_REMOTE}/${label}.pid)
 if kill -0 "\$pid" 2>/dev/null; then echo RUNNING; else echo DONE:1; fi
 REMOTE

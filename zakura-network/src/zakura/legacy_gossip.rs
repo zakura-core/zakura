@@ -1540,9 +1540,9 @@ impl Service<Request> for LegacyGossipAdapter {
 
 /// Tower service that adapts legacy request/response traffic onto Zakura streams.
 ///
-/// Legacy `Peers` discovery is intentionally not adapted here. Zakura v1 controlled
-/// networks use configured [`crate::zakura::ZakuraConfig::bootstrap_peers`] until
-/// native Zakura discovery is available, keeping this compatibility layer narrow.
+/// Legacy `Peers` discovery is intentionally not adapted here. Native peers use
+/// the signed Zakura discovery protocol, while legacy address discovery stays on
+/// the legacy peer set, keeping this compatibility layer narrow.
 #[derive(Clone, Debug)]
 pub struct LegacyRequestAdapter {
     client: ZakuraRequestClient,

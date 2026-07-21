@@ -51,15 +51,16 @@ use crate::{
         direct_endpoint_builder, drive_header_sync_actions, spawn_block_sync_reactor,
         spawn_header_sync_reactor, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncService, BlockSyncStartup, Clock, CloseCause, Frame, FramedRecv, FramedSend,
-        Frontier, FrontierChange, FrontierUpdate, HeaderSyncAction, HeaderSyncFrontiers,
-        HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup, Peer, RealClock,
-        Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject, Stream,
-        StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId,
-        ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation,
-        ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits,
-        ZakuraLimits, ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
-        ZakuraSyncExchange, ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC,
-        CONTROL_VERSION, FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
+        Frontier, FrontierChange, FrontierUpdate, HeaderRootAuthState, HeaderSyncAction,
+        HeaderSyncFrontiers, HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup,
+        Peer, RealClock, Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SinkReject,
+        Stream, StreamMode, StreamPrelude, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
+        ZakuraConnId, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole,
+        ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
+        ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
+        ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraSyncExchange,
+        ZakuraUpgradeOutcome, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
+        FRAME_HEADER_BYTES, LOCAL_MAX_CONTROL_FRAME_BYTES, MAX_BS_FRAME_BYTES,
         MAX_CONTROL_PAYLOAD_BYTES, MAX_HS_MESSAGE_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
         TRANSCRIPT_HASH_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_1,
         ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
@@ -549,6 +550,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub best_header_tip: Option<(block::Height, block::Hash)>,
     /// Hash of `frontiers.verified_block_tip`.
     pub verified_block_tip_hash: block::Hash,
+    /// Compact durable header-root authentication progress loaded from state.
+    pub header_root_auth: Option<HeaderRootAuthState>,
 }
 
 impl ZakuraEndpoint {
@@ -3000,6 +3003,9 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.zakura.header_sync.clone(),
         limits.max_frame_bytes,
     );
+    startup.header_root_auth = header_sync_driver_startup
+        .as_ref()
+        .and_then(|driver| driver.header_root_auth);
     startup.trace = trace.clone();
     startup.frontier_updates = sync_frontier
         .as_ref()

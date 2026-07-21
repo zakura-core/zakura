@@ -101,6 +101,43 @@ enum BestTipPublication {
     Reanchored { old: (block::Height, block::Hash) },
 }
 
+pub(super) fn reusable_root_auth_range(
+    auth: HeaderRootAuthState,
+    payload: &HeaderRangePayload,
+) -> Option<RangeRequest> {
+    let expected_start = next_height(auth.authenticated_height)?;
+    (payload.range().start() == expected_start
+        && payload.range().count() >= 2
+        && payload.has_tree_aux_roots()
+        && payload.range().end() <= auth.completed_checkpoint_height)
+        .then_some(RangeRequest {
+            range: payload.range(),
+            anchor_hash: Some(auth.authenticated_hash),
+            finalized: true,
+            want_tree_aux_roots: true,
+            priority: RangePriority::AuthenticateRoots,
+        })
+}
+
+pub(super) fn clamped_request_suffix(
+    original: RangeRequest,
+    requested_count: u32,
+) -> Option<RangeRequest> {
+    if original.priority == RangePriority::AuthenticateRoots || requested_count >= original.count()
+    {
+        return None;
+    }
+    let suffix_start = height_after_count(original.start_height(), requested_count)?;
+    Some(RangeRequest {
+        range: CheckedHeaderRange::from_count(
+            suffix_start,
+            original.count().checked_sub(requested_count)?,
+        )?,
+        anchor_hash: None,
+        ..original
+    })
+}
+
 pub(super) fn complete_request_publication(
     peer: &mut PeerHeaderState,
     request_id: HeaderSyncRequestId,
@@ -140,7 +177,6 @@ impl HeaderSyncReactor {
             // loop count lets an external watcher detect a stall in seconds.
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             tokio::select! {
-                biased;
                 _ = self.startup.shutdown.cancelled() => {
                     exit_reason = "shutdown";
                     break;
@@ -192,13 +228,7 @@ impl HeaderSyncReactor {
                     }
                 }
                 _ = time::sleep_until(maintenance_deadline) => {
-                    metrics::counter!("sync.header.reactor.maintenance_wakeups").increment(1);
-                    self.emit_trace(hs_trace::HEADER_MAINTENANCE_WAKEUP, |_| {});
-                    metrics::counter!("sync.header.reactor.event_started", "kind" => "tick").increment(1);
-                    self.handle_timeouts().await;
-                    self.refresh_statuses();
-                    self.publish_connectivity_metrics();
-                    metrics::counter!("sync.header.reactor.event_finished", "kind" => "tick").increment(1);
+                    self.run_maintenance().await;
                 }
             }
         }
@@ -206,6 +236,16 @@ impl HeaderSyncReactor {
         // keeps running, so it must be loud.
         tracing::warn!(exit_reason, "Zakura header-sync reactor exited");
         metrics::counter!("sync.header.reactor.exited", "reason" => exit_reason).increment(1);
+    }
+
+    async fn run_maintenance(&mut self) {
+        metrics::counter!("sync.header.reactor.maintenance_wakeups").increment(1);
+        self.emit_trace(hs_trace::HEADER_MAINTENANCE_WAKEUP, |_| {});
+        metrics::counter!("sync.header.reactor.event_started", "kind" => "tick").increment(1);
+        self.handle_timeouts().await;
+        self.refresh_statuses();
+        self.publish_connectivity_metrics();
+        metrics::counter!("sync.header.reactor.event_finished", "kind" => "tick").increment(1);
     }
 
     async fn handle_event(&mut self, event: HeaderSyncEvent) {
@@ -399,6 +439,9 @@ impl HeaderSyncReactor {
             HeaderSyncEvent::StateFrontiersChanged(frontiers) => {
                 self.handle_state_frontiers_changed(frontiers).await;
             }
+            HeaderSyncEvent::HeaderRootAuthStateChanged(state) => {
+                self.handle_header_root_auth_state_changed(state).await;
+            }
             HeaderSyncEvent::VctRootRepairRequested {
                 height,
                 generation,
@@ -432,6 +475,14 @@ impl HeaderSyncReactor {
             }
             HeaderSyncEvent::HeaderRangeOperationFailed { operation, kind } => {
                 self.handle_header_range_commit_failed(operation, kind)
+                    .await;
+            }
+            HeaderSyncEvent::HeaderRootAuthenticationCompleted { operation } => {
+                self.handle_header_root_authentication_completed(operation)
+                    .await;
+            }
+            HeaderSyncEvent::HeaderRootAuthenticationFailed { operation, kind } => {
+                self.handle_header_root_authentication_failed(operation, kind)
                     .await;
             }
             HeaderSyncEvent::HeaderRangeResponseFinished {
@@ -699,6 +750,15 @@ impl HeaderSyncReactor {
         }
 
         self.state.parked_peers.remove(&peer);
+        let replaced_session = self
+            .state
+            .peers
+            .get(&peer)
+            .map(|peer| peer.session.session_id());
+        if let Some(replaced_session) = replaced_session {
+            self.state
+                .retire_peer_session_auth(&peer, Some(replaced_session));
+        }
         self.state.schedule.forget_peer(&peer);
         let status_refresh_interval = self.startup.status_refresh_interval;
         self.state
@@ -765,6 +825,7 @@ impl HeaderSyncReactor {
     }
 
     fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId) {
+        self.state.retire_peer_session_auth(&peer, None);
         let was_connected = self.state.peers.remove(&peer).is_some();
         self.state.parked_peers.remove(&peer);
         self.state.advisory.remove(&peer);
@@ -1038,6 +1099,7 @@ impl HeaderSyncReactor {
             return;
         };
         let range = pending.range;
+        let reusable_payload = pending.reusable_payload;
         let start_height = range.start_height();
         let tip_height = range.end_height();
         metrics::counter!("sync.header.range.committed").increment(1);
@@ -1069,6 +1131,14 @@ impl HeaderSyncReactor {
         if tip_height > self.state.best_header_tip {
             self.publish_best_tip(tip_height, tip_hash, BestTipPublication::Advanced)
                 .await;
+        }
+        if let Some(payload) = reusable_payload.filter(|_| {
+            self.is_current_session(
+                &operation.wire_request.peer,
+                operation.wire_request.session_id,
+            )
+        }) {
+            self.try_reuse_committed_payload(operation.wire_request, payload);
         }
         self.drain_buffered_with_permit(None).await;
         self.notify_body_gaps().await;
@@ -1138,6 +1208,106 @@ impl HeaderSyncReactor {
             self.state.schedule.retry_avoiding(peer, range);
         } else {
             self.state.schedule.retry(range);
+        }
+        self.schedule().await;
+    }
+
+    async fn handle_header_root_auth_state_changed(&mut self, state: Option<HeaderRootAuthState>) {
+        if self.state.header_root_auth == state {
+            if self.state.root_auth_waiting_for_watch {
+                self.state.root_auth_waiting_for_watch = false;
+                self.schedule().await;
+            }
+            return;
+        }
+        self.state.header_root_auth = state;
+        self.state.root_auth_waiting_for_watch = false;
+        self.state.schedule.clear_root_auth();
+        self.state
+            .pending_operations
+            .retain(|operation, _| operation.op_kind != HeaderSyncOperationKind::AuthenticateRoots);
+        self.schedule().await;
+    }
+
+    async fn handle_header_root_authentication_completed(
+        &mut self,
+        operation: HeaderSyncOperationIdentity,
+    ) {
+        if operation.op_kind != HeaderSyncOperationKind::AuthenticateRoots {
+            metrics::counter!("sync.header.session.stale_completion").increment(1);
+            return;
+        }
+        if !self.is_current_session(
+            &operation.wire_request.peer,
+            operation.wire_request.session_id,
+        ) {
+            self.state.retire_stale_auth_operation(&operation);
+            metrics::counter!("sync.header.session.stale_completion").increment(1);
+            return;
+        }
+        let Some(pending) = self.state.pending_operations.get_mut(&operation) else {
+            metrics::counter!("sync.header.session.stale_completion").increment(1);
+            return;
+        };
+        if pending.completion_observed {
+            metrics::counter!("sync.header.session.stale_completion").increment(1);
+            return;
+        }
+        pending.completion_observed = true;
+        // Durable frontier progress is accepted only from the state watch. Keep
+        // this operation pending so the old frontier cannot schedule a duplicate.
+        metrics::counter!("sync.header.root_auth.completed").increment(1);
+    }
+
+    async fn handle_header_root_authentication_failed(
+        &mut self,
+        operation: HeaderSyncOperationIdentity,
+        kind: HeaderRootAuthenticationFailureKind,
+    ) {
+        if operation.op_kind != HeaderSyncOperationKind::AuthenticateRoots {
+            metrics::counter!("sync.header.session.stale_completion").increment(1);
+            return;
+        }
+        if !self.is_current_session(
+            &operation.wire_request.peer,
+            operation.wire_request.session_id,
+        ) {
+            self.state.retire_stale_auth_operation(&operation);
+            metrics::counter!("sync.header.session.stale_completion").increment(1);
+            return;
+        }
+        if self
+            .state
+            .pending_operations
+            .get(&operation)
+            .is_some_and(|pending| pending.completion_observed)
+        {
+            metrics::counter!("sync.header.session.stale_completion").increment(1);
+            return;
+        }
+        let Some(pending) = self.state.pending_operations.remove(&operation) else {
+            metrics::counter!("sync.header.session.stale_completion").increment(1);
+            return;
+        };
+        let peer = operation.wire_request.peer;
+        match kind {
+            HeaderRootAuthenticationFailureKind::InvalidPeerRange => {
+                self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
+                    .await;
+                self.state.schedule.retry_avoiding(peer, pending.range);
+            }
+            HeaderRootAuthenticationFailureKind::Stale => {
+                self.state.schedule.clear_assignment(pending.range);
+                self.state.root_auth_waiting_for_watch = true;
+            }
+            HeaderRootAuthenticationFailureKind::Local => {
+                tracing::warn!(
+                    start = ?pending.range.start_height(),
+                    count = pending.range.count(),
+                    "local header-root authentication failure"
+                );
+                self.state.schedule.retry_delayed(pending.range);
+            }
         }
         self.schedule().await;
     }
@@ -1743,6 +1913,26 @@ impl HeaderSyncReactor {
             }
         }
 
+        if outstanding.range_request.priority == RangePriority::AuthenticateRoots {
+            if payload.range().count() < 2 {
+                self.state
+                    .schedule
+                    .retry_avoiding(peer, outstanding.range_request);
+                self.schedule().await;
+                return;
+            }
+            let actual_range = RangeRequest {
+                range: payload.range(),
+                ..outstanding.range_request
+            };
+            self.state
+                .schedule
+                .narrow_queued_range(outstanding.range_request, actual_range);
+            self.start_root_authentication(outstanding.wire_request, actual_range, payload);
+            self.schedule().await;
+            return;
+        }
+
         if header_count < outstanding.range_request.count() {
             let original = outstanding.range_request;
             outstanding.range_request.range = payload.range();
@@ -1892,6 +2082,10 @@ impl HeaderSyncReactor {
                 PendingOperation {
                     range: buffered.range,
                     purpose: buffered.purpose,
+                    reusable_payload: (buffered.range.priority == RangePriority::Forward
+                        && buffered.payload.has_tree_aux_roots())
+                    .then(|| buffered.payload.clone()),
+                    completion_observed: false,
                 },
             );
             let lane = buffered.range.priority.label();
@@ -1931,6 +2125,67 @@ impl HeaderSyncReactor {
         }
 
         None
+    }
+
+    fn try_reuse_committed_payload(
+        &mut self,
+        wire_request: HeaderSyncWireRequestIdentity,
+        payload: HeaderRangePayload,
+    ) {
+        let Some(auth) = self.state.header_root_auth else {
+            return;
+        };
+        if self
+            .state
+            .pending_operations
+            .keys()
+            .any(|operation| operation.op_kind == HeaderSyncOperationKind::AuthenticateRoots)
+        {
+            return;
+        }
+        let Some(range) = reusable_root_auth_range(auth, &payload) else {
+            return;
+        };
+        self.state.schedule.clear_root_auth();
+        self.start_root_authentication(wire_request, range, payload);
+    }
+
+    fn start_root_authentication(
+        &mut self,
+        wire_request: HeaderSyncWireRequestIdentity,
+        range: RangeRequest,
+        payload: HeaderRangePayload,
+    ) {
+        let Some(expected_state) = self.state.header_root_auth else {
+            self.state.schedule.retry(range);
+            return;
+        };
+        let operation = HeaderSyncOperationIdentity {
+            wire_request,
+            op_kind: HeaderSyncOperationKind::AuthenticateRoots,
+        };
+        let action = HeaderSyncAction::AuthenticateHeaderRoots {
+            operation: operation.clone(),
+            expected_state,
+            anchor: expected_state.authenticated_hash,
+            payload,
+        };
+        if !self.dispatch_action(action) {
+            self.state.schedule.retry(range);
+            return;
+        }
+        self.state
+            .schedule
+            .mark_authenticating(operation.clone(), range);
+        self.state.pending_operations.insert(
+            operation,
+            PendingOperation {
+                range,
+                purpose: RangePurpose::AuthenticateRoots,
+                reusable_payload: None,
+                completion_observed: false,
+            },
+        );
     }
 
     fn arm_commit_capacity_waiter(&mut self) {
@@ -1993,7 +2248,7 @@ impl HeaderSyncReactor {
 
     fn retry_or_finish_outstanding(&mut self, peer: &ZakuraPeerId, outstanding: OutstandingRange) {
         match outstanding.purpose {
-            RangePurpose::Sync => self
+            RangePurpose::Sync | RangePurpose::AuthenticateRoots => self
                 .state
                 .schedule
                 .retry_avoiding(peer.clone(), outstanding.range_request),
@@ -2117,7 +2372,7 @@ impl HeaderSyncReactor {
         }
         for (outstanding, peer) in timed_out {
             match outstanding.purpose {
-                RangePurpose::Sync => {
+                RangePurpose::Sync | RangePurpose::AuthenticateRoots => {
                     if outstanding.phase == OutstandingPhase::EmptyRetry {
                         self.state
                             .schedule
@@ -2189,6 +2444,7 @@ impl HeaderSyncReactor {
         }
 
         self.state.refresh_forward_range(&self.startup);
+        self.state.refresh_root_auth_range(&self.startup);
 
         if self.schedule_vct_repair() {
             return;
@@ -2225,7 +2481,18 @@ impl HeaderSyncReactor {
             return false;
         }
 
-        let Some(mut range) = self.state.schedule.next_for_peer(peer_id, peer) else {
+        let root_auth_count = clamp_header_sync_request_count(
+            2,
+            peer.max_headers_per_response,
+            &self.startup.network,
+            self.startup.max_frame_bytes,
+            true,
+        );
+        let Some(mut range) =
+            self.state
+                .schedule
+                .next_for_peer(peer_id, peer, root_auth_count >= 2)
+        else {
             let resident_cap = u64::from(
                 self.startup
                     .config
@@ -2267,24 +2534,16 @@ impl HeaderSyncReactor {
         );
         range.range = CheckedHeaderRange::from_count(range.start_height(), count)
             .expect("clamped request count is non-zero and within the original range");
-        if count < original_range.count() {
-            if let Some(suffix_start) = height_after_count(range.start_height(), count) {
-                self.state.schedule.ensure(
-                    RangeRequest {
-                        range: CheckedHeaderRange::from_count(
-                            suffix_start,
-                            original_range.count().saturating_sub(count),
-                        )
-                        .expect("clamped request leaves a checked non-empty suffix"),
-                        anchor_hash: None,
-                        ..original_range
-                    },
-                    original_range.priority,
-                );
-            }
+        if let Some(suffix) = clamped_request_suffix(original_range, count) {
+            self.state.schedule.ensure(suffix, original_range.priority);
         }
 
-        self.prepare_and_enqueue_request(peer_id, range, RangePurpose::Sync)
+        let purpose = if range.priority == RangePriority::AuthenticateRoots {
+            RangePurpose::AuthenticateRoots
+        } else {
+            RangePurpose::Sync
+        };
+        self.prepare_and_enqueue_request(peer_id, range, purpose)
     }
 
     fn prepare_and_enqueue_request(
@@ -2343,7 +2602,10 @@ impl HeaderSyncReactor {
             drop(prepared);
             return false;
         }
-        if matches!(purpose, RangePurpose::Sync) {
+        if matches!(
+            purpose,
+            RangePurpose::Sync | RangePurpose::AuthenticateRoots
+        ) {
             self.state.schedule.mark_assigned(peer_id.clone(), range);
         }
 
@@ -2375,7 +2637,9 @@ impl HeaderSyncReactor {
         purpose: RangePurpose,
     ) {
         match purpose {
-            RangePurpose::Sync => self.state.schedule.retry(range),
+            RangePurpose::Sync | RangePurpose::AuthenticateRoots => {
+                self.state.schedule.retry(range)
+            }
             RangePurpose::VctRepair { generation, .. } => {
                 self.finish_vct_repair_attempt(peer, generation)
             }

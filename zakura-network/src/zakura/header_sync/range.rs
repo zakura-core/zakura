@@ -130,7 +130,7 @@ impl CheckedHeaderRange {
 }
 
 /// A non-empty delivered header range with structurally aligned per-height data.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderRangePayload {
     entries: Vec<HeaderRangeEntry>,
 }

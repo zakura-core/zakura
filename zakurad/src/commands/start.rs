@@ -99,8 +99,8 @@ use zakura_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 use zakura_state::StorageMode;
 
 use zakura::{
-    drive_block_sync_actions, drive_vct_root_repairs, drive_zakura_header_sync_actions,
-    mirror_zakura_full_block_commits, query_block_sync_frontiers,
+    drive_block_sync_actions, drive_header_root_auth_updates, drive_vct_root_repairs,
+    drive_zakura_header_sync_actions, mirror_zakura_full_block_commits, query_block_sync_frontiers,
     zakura_header_sync_driver_startup, BlocksyncThroughputProbe, BlocksyncThroughputSummary,
     ZakuraHeaderSyncDriverHandles,
 };
@@ -520,6 +520,16 @@ impl StartCmd {
                     .in_current_span(),
                 );
                 endpoint.push_header_sync_task(vct_repair_task).await;
+
+                let root_auth_task = tokio::spawn(
+                    drive_header_root_auth_updates(
+                        read_only_state_service.clone(),
+                        header_sync.clone(),
+                        shutdown.clone().cancelled_owned(),
+                    )
+                    .in_current_span(),
+                );
+                endpoint.push_header_sync_task(root_auth_task).await;
 
                 if let (Some(block_sync), Some(block_actions)) = (
                     endpoint.block_sync(),
@@ -2317,6 +2327,7 @@ mod zakura_header_sync_driver_tests {
                 },
                 best_header_tip: Some((block::Height(0), genesis_hash)),
                 verified_block_tip_hash: genesis_hash,
+                header_root_auth: None,
             }),
         )
         .await
@@ -2425,6 +2436,7 @@ mod zakura_header_sync_driver_tests {
                 },
                 best_header_tip: Some((block::Height(0), genesis_hash)),
                 verified_block_tip_hash: genesis_hash,
+                header_root_auth: None,
             }),
         )
         .await

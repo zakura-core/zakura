@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Add an offline Mainnet checkpoint and VCT frontier export mode to
+  `zakura-checkpoints`, and a committed provenance record
+  (`vct/mainnet-frontier.json`) that CI verifies against the embedded
+  checkpoint list and frontier on every PR. Groundwork for automated
+  release-state updates.
+
 ### Fixed
 
 - Keep valid internal-miner work running across mempool-only block template

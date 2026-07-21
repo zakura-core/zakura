@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "network": "Mainnet",
+  "source": "legacy-bootstrap",
+  "generated_at": "2026-07-11T02:34:55Z",
+  "finalized_height": 3358006,
+  "finalized_hash": "0000000000a4bc547a096ef2bac1f31842d514e2109c540b02384c9e62532ccf",
+  "checkpoints_sha256": "e6e3558b59e22c0761c5f7ce5716089d9edae273c66802bc5069f69b450d52f9",
+  "frontier_sha256": "e2d2ec010753df7640c838439247884dbc35464435896306289baac6bc9f45da",
+  "frontier_size": 1675
+}

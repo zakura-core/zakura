@@ -43,6 +43,9 @@ const _: () = assert!(
 
 pub mod args;
 
+#[cfg(feature = "zakura-checkpoints-offline")]
+mod offline;
+
 use args::{Args, Backend, Transport};
 
 /// Make an RPC call based on `our_args` and `rpc_command`, and return the response as a [`Value`].
@@ -157,6 +160,19 @@ async fn main() -> Result<()> {
     let args = args::Args::from_args();
 
     eprintln!("Command-line arguments: {args:?}");
+
+    args.validate_mode().map_err(|error| eyre!(error))?;
+
+    if args.state_cache_dir.is_some() {
+        #[cfg(feature = "zakura-checkpoints-offline")]
+        return offline::run_offline(&args);
+
+        #[cfg(not(feature = "zakura-checkpoints-offline"))]
+        return Err(eyre!(
+            "offline mode needs a binary built with --features zakura-checkpoints-offline"
+        ));
+    }
+
     eprintln!("Fetching block info and calculating checkpoints...\n\n");
 
     // get the current block count

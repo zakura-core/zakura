@@ -9268,6 +9268,7 @@ dependencies = [
  "zakura-chain",
  "zakura-node-services",
  "zakura-rpc",
+ "zakura-state",
  "zcash_primitives",
  "zcash_protocol",
 ]

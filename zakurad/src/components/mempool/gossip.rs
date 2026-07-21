@@ -61,6 +61,8 @@ where
     let mut drain_pending_without_wakeup = false;
 
     loop {
+        // This count is only used in logs. It is zero for a pending-set drain
+        // that runs without consuming a channel notification.
         let mut combined_changes = 0;
 
         if !drain_pending_without_wakeup {

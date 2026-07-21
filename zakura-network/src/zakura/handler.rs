@@ -552,6 +552,11 @@ pub struct ZakuraHeaderSyncDriverStartup {
 }
 
 impl ZakuraEndpoint {
+    /// Returns the local iroh identity used to authenticate native connections.
+    pub(crate) fn local_node_id(&self) -> NodeId {
+        self.router.endpoint().node_id()
+    }
+
     /// Returns the connector injected into the legacy handshake path.
     pub fn connector(&self) -> super::ZakuraHandshakeConnector {
         super::ZakuraHandshakeConnector::new_with_endpoint(self.clone())
@@ -2916,6 +2921,42 @@ fn bind_native_endpoint(
     }
 }
 
+fn discovery_direct_addrs(config: &Config, local_node_id: NodeId) -> Vec<SocketAddr> {
+    let Some(listen_addr) = config.zakura.listen_addr else {
+        return Vec::new();
+    };
+    let mut direct_addrs = Vec::new();
+
+    if !listen_addr.ip().is_unspecified() {
+        direct_addrs.push(listen_addr);
+    }
+    if let Some(external_addr) = config.external_addr {
+        direct_addrs.push(SocketAddr::new(external_addr.ip(), listen_addr.port()));
+    }
+    for entry in &config.zakura.bootstrap_peers {
+        let Ok(node_addr) = super::discovery::parse_bootstrap_peer(entry) else {
+            continue;
+        };
+        if node_addr.node_id == local_node_id {
+            direct_addrs.extend(node_addr.direct_addresses().copied());
+        }
+    }
+
+    direct_addrs.sort_unstable();
+    direct_addrs.dedup();
+    direct_addrs
+}
+
+fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId) -> usize {
+    bootstrap_peers
+        .iter()
+        .filter_map(|entry| super::discovery::parse_bootstrap_peer(entry).ok())
+        .filter(|node_addr| node_addr.node_id != local_node_id)
+        .map(|node_addr| node_addr.node_id)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
 pub async fn spawn_zakura_endpoint(
     config: &Config,
@@ -2937,6 +2978,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let limits = ZakuraLocalLimits::from_config(config);
     validate_idle_invariant(&limits)?;
     let secret_key = zakura_secret_key(config)?;
+    let local_node_id = secret_key.public();
     let discovery_secret_key = secret_key.clone();
     let builder = direct_endpoint_builder(secret_key).transport_config(limits.transport_config());
     // Bind a fixed address when configured so this node has a stable, advertisable
@@ -2958,11 +3000,11 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     );
     let discovery = super::discovery::build_discovery_handle(
         discovery_secret_key,
-        config.zakura.listen_addr.into_iter().collect(),
+        discovery_direct_addrs(config, local_node_id),
         super::discovery::default_advertised_services(),
         &handshake_config,
         config.zakura.max_connections,
-        config.zakura.bootstrap_peers.len(),
+        remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id),
         supervisor.subscribe(),
     )?;
     let anchor = config.zakura.header_sync.anchor(&config.network)?;
@@ -4830,6 +4872,48 @@ mod tests {
         }
 
         endpoint.close().await;
+    }
+
+    #[test]
+    fn discovery_uses_external_ip_with_the_native_listen_port() {
+        let secret_key = SecretKey::generate(OsRng);
+        let mut config = Config::default();
+        config.zakura.listen_addr = Some("0.0.0.0:8234".parse().expect("test address parses"));
+        config.external_addr = Some("203.0.113.42:8233".parse().expect("test address parses"));
+        config.zakura.bootstrap_peers.clear();
+
+        assert_eq!(
+            discovery_direct_addrs(&config, secret_key.public()),
+            vec!["203.0.113.42:8234".parse().expect("test address parses")]
+        );
+    }
+
+    #[test]
+    fn discovery_uses_matching_local_bootstrap_address_and_counts_only_remote_peers() {
+        let local_secret_key = SecretKey::generate(OsRng);
+        let remote_secret_key = SecretKey::generate(OsRng);
+        let local_node_id = local_secret_key.public();
+        let remote_node_id = remote_secret_key.public();
+        let local_entry = format!("{local_node_id}@198.51.100.7:8234");
+        let remote_entry = format!("{remote_node_id}@198.51.100.8:8234");
+        let mut config = Config::default();
+        config.zakura.listen_addr = Some("0.0.0.0:8234".parse().expect("test address parses"));
+        config.external_addr = None;
+        config.zakura.bootstrap_peers = vec![
+            local_entry,
+            remote_entry.clone(),
+            remote_entry,
+            "malformed".to_string(),
+        ];
+
+        assert_eq!(
+            discovery_direct_addrs(&config, local_node_id),
+            vec!["198.51.100.7:8234".parse().expect("test address parses")]
+        );
+        assert_eq!(
+            remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id),
+            1
+        );
     }
 
     #[derive(Debug, Clone)]

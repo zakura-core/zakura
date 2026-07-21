@@ -2551,7 +2551,9 @@ impl ZakuraDiscoveryBook {
                 last_short_lived_exchange: None,
                 failure_count: 0,
             });
-        candidate.direct_addrs = direct_addrs;
+        candidate.direct_addrs.extend(direct_addrs);
+        candidate.direct_addrs.sort_unstable();
+        candidate.direct_addrs.dedup();
         candidate.last_seen = now;
         Ok(())
     }
@@ -5876,10 +5878,16 @@ mod tests {
         let mut book = ZakuraDiscoveryBook::default();
         let node_id = secret_key().public();
         let loopback_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233);
+        let second_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8234);
         let node_addr = NodeAddr::new(node_id).with_direct_addresses([loopback_addr]);
 
         book.insert_static_candidate(node_addr, NOW)
             .expect("configured static loopback candidate imports");
+        book.insert_static_candidate(
+            NodeAddr::new(node_id).with_direct_addresses([second_addr]),
+            NOW + 1,
+        )
+        .expect("additional address for the same static identity imports");
 
         let mut rng = StdRng::seed_from_u64(7);
         assert!(book.sample_peers(10, &[], &[], NOW, &mut rng).is_empty());
@@ -5900,7 +5908,7 @@ mod tests {
             ),
             vec![ZakuraDiscoveryDialCandidate {
                 node_id,
-                direct_addrs: vec![loopback_addr],
+                direct_addrs: vec![loopback_addr, second_addr],
                 is_static: true,
             }]
         );

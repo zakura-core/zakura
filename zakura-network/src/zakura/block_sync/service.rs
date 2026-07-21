@@ -219,8 +219,8 @@ struct BlockSyncServiceInner {
     peer_snapshot: watch::Receiver<ServicePeerSnapshot>,
     /// Reactor-owned body work used to wake a parked session once it is useful again.
     candidates: watch::Receiver<ZakuraBlockSyncCandidateState>,
-    /// Authoritative lifecycle state for each peer's current transport connection.
-    peer_states: StdMutex<HashMap<ZakuraPeerId, BlockSyncPeerState>>,
+    /// Authoritative active session for each peer's current transport connection.
+    active_peers: StdMutex<HashMap<ZakuraPeerId, BlockSyncPeerRecord>>,
     next_session_id: AtomicU64,
 }
 
@@ -232,52 +232,19 @@ struct BlockSyncPeerRecord {
     cancel_token: CancellationToken,
 }
 
-#[derive(Debug)]
-enum BlockSyncPeerState {
-    Active(BlockSyncPeerRecord),
-    Parked { conn_id: ZakuraConnId },
-}
-
-impl BlockSyncPeerState {
-    fn conn_id(&self) -> ZakuraConnId {
-        match self {
-            Self::Active(record) => record.conn_id,
-            Self::Parked { conn_id } => *conn_id,
-        }
-    }
-
-    fn active(&self) -> Option<&BlockSyncPeerRecord> {
-        match self {
-            Self::Active(record) => Some(record),
-            Self::Parked { .. } => None,
-        }
-    }
-}
-
 impl BlockSyncServiceInner {
-    fn finish_session(
-        &self,
-        peer: &ZakuraPeerId,
-        conn_id: ZakuraConnId,
-        session_id: u64,
-        locally_parked: bool,
-    ) -> bool {
-        let Ok(mut peer_states) = self.peer_states.lock() else {
+    fn finish_session(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId, session_id: u64) -> bool {
+        let Ok(mut active_peers) = self.active_peers.lock() else {
             return false;
         };
-        let owns_session = peer_states
+        let owns_session = active_peers
             .get(peer)
-            .and_then(BlockSyncPeerState::active)
             .is_some_and(|record| record.conn_id == conn_id && record.session_id == session_id);
         if !owns_session {
             return false;
         }
 
-        if locally_parked {
-            peer_states.insert(peer.clone(), BlockSyncPeerState::Parked { conn_id });
-        } else {
-            peer_states.remove(peer);
-        }
+        active_peers.remove(peer);
         true
     }
 }
@@ -295,7 +262,7 @@ impl BlockSyncService {
                 routine_wiring: handle.routine_wiring.clone(),
                 peer_snapshot: handle.subscribe_peer_snapshot(),
                 candidates: handle.subscribe_candidate_state(),
-                peer_states: StdMutex::new(HashMap::new()),
+                active_peers: StdMutex::new(HashMap::new()),
                 next_session_id: AtomicU64::new(1),
             }),
             _held_events: None,
@@ -331,7 +298,7 @@ impl BlockSyncService {
                 routine_wiring: handle.routine_wiring.clone(),
                 peer_snapshot: handle.subscribe_peer_snapshot(),
                 candidates: handle.subscribe_candidate_state(),
-                peer_states: StdMutex::new(HashMap::new()),
+                active_peers: StdMutex::new(HashMap::new()),
                 next_session_id: AtomicU64::new(1),
             }),
             _held_events: None,
@@ -362,7 +329,7 @@ impl BlockSyncService {
                     routine_wiring: None,
                     peer_snapshot,
                     candidates,
-                    peer_states: StdMutex::new(HashMap::new()),
+                    active_peers: StdMutex::new(HashMap::new()),
                     next_session_id: AtomicU64::new(1),
                 }),
                 _held_events: None,
@@ -383,55 +350,20 @@ impl BlockSyncService {
     #[cfg(test)]
     pub(crate) fn peer_count(&self) -> usize {
         self.inner
-            .peer_states
+            .active_peers
             .lock()
             .expect("block-sync peer-state mutex is never poisoned")
-            .values()
-            .filter(|state| state.active().is_some())
-            .count()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mark_session_parked_for_test(&self, peer: ZakuraPeerId, conn_id: ZakuraConnId) {
-        self.inner
-            .peer_states
-            .lock()
-            .expect("block-sync peer-state mutex is never poisoned")
-            .insert(peer, BlockSyncPeerState::Parked { conn_id });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn session_id_for_test(&self, peer: &ZakuraPeerId) -> Option<u64> {
-        self.inner
-            .peer_states
-            .lock()
-            .expect("block-sync peer-state mutex is never poisoned")
-            .get(peer)
-            .and_then(BlockSyncPeerState::active)
-            .map(|record| record.session_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn finish_session_for_test(
-        &self,
-        peer: &ZakuraPeerId,
-        conn_id: ZakuraConnId,
-        session_id: u64,
-        locally_parked: bool,
-    ) -> bool {
-        self.inner
-            .finish_session(peer, conn_id, session_id, locally_parked)
+            .len()
     }
 
     fn peer_slots_free(&self, direction: ServicePeerDirection) -> bool {
-        let peer_states = self
+        let active_peers = self
             .inner
-            .peer_states
+            .active_peers
             .lock()
             .expect("block-sync peer-state mutex is never poisoned");
-        let count = peer_states
+        let count = active_peers
             .values()
-            .filter_map(BlockSyncPeerState::active)
             .filter(|record| record.direction == direction)
             .count();
         let cap = match direction {
@@ -441,17 +373,12 @@ impl BlockSyncService {
         count < cap
     }
 
-    fn session_is_parked(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
-        matches!(
-            self.inner
-                .peer_states
-                .lock()
-                .expect("block-sync peer-state mutex is never poisoned")
-                .get(peer),
-            Some(BlockSyncPeerState::Parked {
-                conn_id: parked_conn_id,
-            }) if *parked_conn_id == conn_id
-        )
+    fn session_needs_body_work(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        self.inner.routine_wiring.as_ref().is_some_and(|wiring| {
+            wiring
+                .registry
+                .session_park_expired(peer, conn_id, Instant::now())
+        })
     }
 
     fn peer_is_parked(&self, peer_id: &ZakuraPeerId) -> bool {
@@ -493,11 +420,8 @@ impl Service for BlockSyncService {
         _negotiated: u64,
         direction: ServicePeerDirection,
     ) -> OrderedSessionDemand {
-        let now = Instant::now();
         if let Some(until) = self.peer_parked_until(peer) {
-            if until > now {
-                return OrderedSessionDemand::RetryAt(until);
-            }
+            return OrderedSessionDemand::RetryAt(until);
         }
 
         let mut peer_snapshot = self.inner.peer_snapshot.clone();
@@ -514,7 +438,7 @@ impl Service for BlockSyncService {
         // exchange status and serve the remote. This gate applies only after a
         // local park: if another peer filled the body gap during the cooldown,
         // keep this session absent until block sync publishes useful work again.
-        if self.session_is_parked(peer, conn_id) {
+        if self.session_needs_body_work(peer, conn_id) {
             let mut candidates = self.inner.candidates.clone();
             if candidates
                 .borrow_and_update()
@@ -575,34 +499,26 @@ impl Service for BlockSyncService {
         // nothing is lost by dropping it.
         drop(send);
 
-        let (old_record, re_admitted_after_no_progress) = {
-            let mut peer_states = self
+        let (old_record, re_admitted_after_no_progress, routine_generation) = {
+            let mut active_peers = self
                 .inner
-                .peer_states
+                .active_peers
                 .lock()
                 .expect("block-sync peer-state mutex is never poisoned");
-            if peer_states
+            if active_peers
                 .get(&peer_id)
-                .is_some_and(|state| state.conn_id() > conn_id)
+                .is_some_and(|record| record.conn_id > conn_id)
             {
                 service_cancel_token.cancel();
                 return;
             }
 
-            let re_admitted_after_no_progress = matches!(
-                peer_states.get(&peer_id),
-                Some(BlockSyncPeerState::Parked {
-                    conn_id: parked_conn_id,
-                }) if *parked_conn_id == conn_id
-            );
-            let already_counted = peer_states
+            let already_counted = active_peers
                 .get(&peer_id)
-                .and_then(BlockSyncPeerState::active)
                 .is_some_and(|record| record.direction == peer.direction);
             if !already_counted {
-                let count = peer_states
+                let count = active_peers
                     .values()
-                    .filter_map(BlockSyncPeerState::active)
                     .filter(|record| record.direction == peer.direction)
                     .count();
                 let cap = match peer.direction {
@@ -619,20 +535,34 @@ impl Service for BlockSyncService {
                 }
             }
 
-            let old_state = peer_states.insert(
+            let (routine_generation, re_admitted_after_no_progress) = if let Some(wiring) =
+                &self.inner.routine_wiring
+            {
+                let generation = wiring
+                    .registry
+                    .admit(&peer_id, peer.direction, &wiring.config);
+                let re_admitted =
+                    wiring
+                        .registry
+                        .take_parked_session(&peer_id, conn_id, Instant::now());
+                (Some(generation), re_admitted)
+            } else {
+                (None, false)
+            };
+            let old_record = active_peers.insert(
                 peer_id.clone(),
-                BlockSyncPeerState::Active(BlockSyncPeerRecord {
+                BlockSyncPeerRecord {
                     conn_id: peer.conn_id,
                     session_id,
                     direction: peer.direction,
                     cancel_token: service_cancel_token.clone(),
-                }),
+                },
             );
-            let old_record = match old_state {
-                Some(BlockSyncPeerState::Active(record)) => Some(record),
-                Some(BlockSyncPeerState::Parked { .. }) | None => None,
-            };
-            (old_record, re_admitted_after_no_progress)
+            (
+                old_record,
+                re_admitted_after_no_progress,
+                routine_generation,
+            )
         };
         if let Some(old_record) = old_record {
             old_record.cancel_token.cancel();
@@ -644,12 +574,7 @@ impl Service for BlockSyncService {
             let peer_id = peer_id.clone();
             let inner = self.inner.clone();
             move || {
-                let locally_parked = inner
-                    .routine_wiring
-                    .as_ref()
-                    .is_some_and(|wiring| wiring.registry.is_peer_parked(&peer_id, Instant::now()));
-                let should_notify =
-                    inner.finish_session(&peer_id, conn_id, session_id, locally_parked);
+                let should_notify = inner.finish_session(&peer_id, conn_id, session_id);
 
                 if should_notify {
                     let _ = lifecycle.send(BlockSyncEvent::PeerDisconnected(peer_id));
@@ -678,13 +603,15 @@ impl Service for BlockSyncService {
             let routine_wiring = self.inner.routine_wiring.clone();
             let block_sync_session = block_sync_session.clone();
             let peer_id = peer_id.clone();
-            let direction = peer.direction;
             async move {
                 let result = match routine_wiring {
                     Some(wiring) => {
-                        let generation = wiring.registry.admit(&peer_id, direction, &wiring.config);
+                        let generation = routine_generation.expect(
+                            "production block-sync wiring allocates a routine generation before spawn",
+                        );
                         let routine = super::peer_routine::PeerRoutine::new(
                             peer_id,
+                            conn_id,
                             block_sync_session,
                             recv,
                             wiring.config,
@@ -727,18 +654,23 @@ impl Service for BlockSyncService {
     }
 
     fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
-        let removed_state = {
-            let mut peer_states = self
+        let removed_record = {
+            let mut active_peers = self
                 .inner
-                .peer_states
+                .active_peers
                 .lock()
                 .expect("block-sync peer-state mutex is never poisoned");
-            match peer_states.get(peer) {
-                Some(state) if state.conn_id() == conn_id => peer_states.remove(peer),
+            match active_peers.get(peer) {
+                Some(record) if record.conn_id == conn_id => active_peers.remove(peer),
                 Some(_) | None => None,
             }
         };
-        let Some(BlockSyncPeerState::Active(record)) = removed_state else {
+        if let Some(wiring) = &self.inner.routine_wiring {
+            wiring
+                .registry
+                .connection_closed(peer, conn_id, Instant::now());
+        }
+        let Some(record) = removed_record else {
             return;
         };
 

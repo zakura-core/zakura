@@ -55,7 +55,7 @@ use super::{
 };
 use crate::zakura::{
     trace::{block_sync_trace as bs_trace, BLOCK_SYNC_TABLE},
-    Admit, FramedRecv, OrderedSendError, SinkReject,
+    Admit, FramedRecv, OrderedSendError, SinkReject, ZakuraConnId,
 };
 use std::{sync::Arc, time::Duration, time::Instant};
 use tokio::time;
@@ -207,6 +207,7 @@ impl Disposition {
 /// (`service::add_peer`) so a protocol reject cancels the whole connection.
 pub(super) struct PeerRoutine {
     peer: ZakuraPeerId,
+    conn_id: ZakuraConnId,
     session: BlockSyncPeerSession,
     config: ZakuraBlockSyncConfig,
     /// A connection gets one local no-progress park/re-admission cycle. A
@@ -289,6 +290,7 @@ impl PeerRoutine {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         peer: ZakuraPeerId,
+        conn_id: ZakuraConnId,
         session: BlockSyncPeerSession,
         recv: FramedRecv,
         config: ZakuraBlockSyncConfig,
@@ -317,6 +319,7 @@ impl PeerRoutine {
         let max_response_bytes = config.advertised_max_response_bytes();
         PeerRoutine {
             peer,
+            conn_id,
             session,
             config,
             allow_no_progress_park,
@@ -1184,8 +1187,10 @@ impl PeerRoutine {
                     );
                     return Err(SinkReject::protocol(error));
                 }
-                self.registry.park_peer_until(
+                self.registry.park_session(
                     &self.peer,
+                    self.conn_id,
+                    self.generation,
                     now + self.config.effective_no_progress_peer_cooldown(),
                 );
                 self.trace_liveness_park(error);
@@ -2457,6 +2462,7 @@ mod tests {
 
         let mut routine = PeerRoutine::new(
             peer,
+            0,
             session,
             in_recv,
             config,
@@ -2549,6 +2555,7 @@ mod tests {
 
         let mut routine = PeerRoutine::new(
             peer,
+            0,
             session,
             in_recv,
             config,

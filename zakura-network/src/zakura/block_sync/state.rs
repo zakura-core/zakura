@@ -218,6 +218,23 @@ impl BlockSyncHandle {
             .park_peer_until(peer, std::time::Instant::now() + cooldown);
     }
 
+    /// Park this connection's session exactly as its no-progress routine does.
+    #[cfg(test)]
+    pub(crate) fn park_session_for_test(
+        &self,
+        peer: &ZakuraPeerId,
+        conn_id: crate::zakura::ZakuraConnId,
+        cooldown: std::time::Duration,
+    ) {
+        let wiring = self
+            .routine_wiring
+            .as_ref()
+            .expect("a handle from spawn_block_sync_reactor always carries routine wiring");
+        wiring
+            .registry
+            .park_session_for_test(peer, conn_id, std::time::Instant::now() + cooldown);
+    }
+
     /// Subscribe to local block-sync status advertisements.
     pub fn subscribe_status(&self) -> watch::Receiver<BlockSyncStatus> {
         self.status.clone()

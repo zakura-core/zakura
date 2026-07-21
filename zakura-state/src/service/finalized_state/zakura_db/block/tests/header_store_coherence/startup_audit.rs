@@ -397,7 +397,7 @@ fn startup_removes_stale_rows_at_committed_heights() {
 /// committed root history from provisional header-sync roots. Preserve the
 /// roots rather than deleting history that header sync cannot restore.
 #[test]
-fn startup_preserves_commitment_roots_when_tip_is_missing() {
+fn startup_purges_authenticated_state_when_tip_is_missing() {
     let _init_guard = zakura_test::init();
     let universe = Universe::new();
     let state = state_with_genesis_config(
@@ -424,20 +424,20 @@ fn startup_preserves_commitment_roots_when_tip_is_missing() {
     state.db.write(batch).expect("raw repair fixture writes");
 
     assert_eq!(state.tip(), None, "the finalized tip index is missing");
-    let original = dump_store(&state);
-
+    assert!(state.has_commitment_root_rows());
     let repair = state
-        .audit_and_repair_zakura_header_store()
-        .expect("audit reads and writes succeed");
+        .audit_and_repair_authenticated_zakura_header_store()
+        .expect("audit reads and writes succeed")
+        .expect("missing-tip authenticated state is repaired");
     assert!(
-        repair.is_none(),
-        "missing tip must not make roots repairable: {repair:?}"
+        repair.violations.iter().any(|violation| matches!(
+            violation,
+            ZakuraStoreViolation::AuthenticatedStateWithoutFinalizedTip
+        )),
+        "repair records the missing-tip frontier violation: {repair:?}"
     );
-    assert_eq!(
-        dump_store(&state),
-        original,
-        "committed roots are preserved when the finalized tip is unavailable"
-    );
+    assert!(!state.has_commitment_root_rows());
+    assert!(!state.has_header_root_auth_frontier_row());
 }
 
 /// The reads.rs anchor-corruption shape (a hash row overwritten with a foreign

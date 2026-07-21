@@ -114,8 +114,12 @@ pub use vct::{
     generate_mainnet_from_archive, validate_final_frontiers_bytes, FinalFrontiersValidationError,
     GeneratorError, NextVctBlock,
 };
-pub use zakura_db::commitment_roots_db::COMMITMENT_ROOTS_BY_HEIGHT;
 pub use zakura_db::highest_completed_checkpoint::*;
+#[allow(unused_imports)]
+pub use zakura_db::commitment_roots_db::{
+    HeaderRootAuthFrontier, HeaderRootAuthFrontierError, COMMITMENT_ROOTS_BY_HEIGHT,
+    HEADER_ROOT_AUTH_FRONTIER,
+};
 pub use zakura_db::ZakuraDb;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -179,6 +183,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     BLOCK_INFO,
     // Verified-commitment-trees serving index
     COMMITMENT_ROOTS_BY_HEIGHT,
+    HEADER_ROOT_AUTH_FRONTIER,
     // Storage policy
     PRUNING_METADATA,
     VCT_SYNC_METADATA,
